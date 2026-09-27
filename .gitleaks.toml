@@ -1,0 +1,239 @@
+# Secret-scan configuration for the Ads Performance Recommendation Engine.
+#
+# The CI job `secret-scan` (.github/workflows/ci.yml) runs this file on a
+# full-history checkout (actions/checkout, fetch-depth: 0) with the SHA-256
+# verified gitleaks 8.30.1 binary. The pass criterion is zero findings:
+#
+#   gitleaks git --redact --exit-code 1 --config .gitleaks.toml --log-opts="--all" .
+#
+# Working-tree check before committing:
+#
+#   gitleaks dir --redact --exit-code 1 --config .gitleaks.toml .
+#
+# Credential placement. Integration secrets exist only as GitHub Actions Secrets
+# and the web database string only as a Vercel variable. The repository holds
+# variable NAMES and placeholders, never values. The only Google-related secret
+# this build knows is GOOGLE_ADS_WEBHOOK_TOKEN: no Google OAuth client secret,
+# developer token or refresh token may appear anywhere.
+#
+# Writing a credential name so that the scan passes:
+#   - an empty value:                  HUBSPOT_PRIVATE_APP_TOKEN=
+#   - an Actions or shell expansion:   ${{ secrets.HUBSPOT_PRIVATE_APP_TOKEN }}, ${HUBSPOT_PRIVATE_APP_TOKEN}
+#   - an angle-bracket placeholder:    postgresql://ads_web.<project_ref>:<password>@<host>:6543/postgres
+#   - a replay-harness placeholder:    placeholder-hubspot-token
+#   - in prose, the name in backticks: `HUBSPOT_PRIVATE_APP_TOKEN`
+#
+# scripts/e2e.sh generates the ads_web and ads_worker test passwords at runtime
+# with `openssl rand -hex 24` and builds its connection strings in memory; they
+# are never written to the repository, so no allowlist entry exists for them.
+#
+# Regex dialect: Go RE2 (no lookarounds, no backreferences). Every custom rule
+# names its secret with `secretGroup` and uses non-capturing groups elsewhere,
+# because gitleaks otherwise treats the first non-empty capture group as the
+# secret. Keywords are lowercase substrings that must occur in the content
+# before a rule's regex runs.
+
+title = "ads-recommendation-engine secret scan"
+
+# `targetRules` on [[allowlists]] needs gitleaks >= 8.25.0; CI pins 8.30.1.
+minVersion = "v8.25.0"
+
+[extend]
+# Keep every built-in rule (generic-api-key, gcp-api-key, hubspot-api-key,
+# linkedin-client-id, linkedin-client-secret, private-key, jwt, ...) and the
+# built-in global allowlist. No default rule is disabled.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# HubSpot
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "hubspot-private-app-token"
+description = "HubSpot private-app access token (pat-<region>-<uuid>); it grants CRM read access and belongs only in GitHub Actions Secrets."
+regex = '''\b(pat-(?:na|eu|ap)\d{1,2}-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b'''
+secretGroup = 1
+keywords = ["pat-"]
+tags = ["hubspot", "token"]
+
+# Separator forms, shared by every *-assignment rule below:
+#   NAME=value              .env and shell (no space before the value)
+#   NAME: value             YAML (the value is unquoted)
+#   NAME = "value", "NAME": "value", env["NAME"] = "value"
+#                           code, JSON and YAML (the value must be a quoted literal,
+#                           so an expression such as `settings.token` is not a finding)
+# The value may not start with `$`, `<` or `{`, which excludes expansions and
+# placeholders. [ \t]* is used rather than \s*, so an empty `NAME=` line can
+# never capture the next line. The entropy floor skips type names and markers
+# such as `SecretStr` (2.28) or `REDACTED` (2.50); random 16-hex tokens score above it.
+[[rules]]
+id = "hubspot-token-assignment"
+description = "HUBSPOT_PRIVATE_APP_TOKEN assigned a literal value; the token must come from GitHub Actions Secrets."
+regex = '''HUBSPOT_PRIVATE_APP_TOKEN(?:=|:[ \t]+|["']?\]?[ \t]*(?::=|[:=])[ \t]*["'])([^\s"'$<{]{8,})'''
+secretGroup = 1
+entropy = 2.5
+keywords = ["hubspot_private_app_token"]
+tags = ["hubspot", "token", "assignment"]
+
+# ---------------------------------------------------------------------------
+# LinkedIn
+# ---------------------------------------------------------------------------
+
+# LinkedIn OAuth access and refresh tokens start with "AQ". The delimiters
+# reject a run that sits inside a larger base64 blob, such as a lockfile
+# integrity hash (preceded or followed by `+`, `/` or `=`), and the entropy floor
+# rejects long low-variety identifiers.
+[[rules]]
+id = "linkedin-oauth-token"
+description = "LinkedIn OAuth access or refresh token; the worker mints access tokens in memory and the refresh token lives only in GitHub Actions Secrets."
+regex = '''(?:^|[^A-Za-z0-9_+/-])(AQ[A-Za-z0-9_-]{60,})(?:[^A-Za-z0-9_+/=-]|$)'''
+secretGroup = 1
+entropy = 4
+keywords = ["aq"]
+tags = ["linkedin", "token"]
+
+[[rules]]
+id = "linkedin-secret-assignment"
+description = "LINKEDIN_CLIENT_SECRET or LINKEDIN_REFRESH_TOKEN assigned a literal value; both must come from GitHub Actions Secrets."
+regex = '''LINKEDIN_(?:CLIENT_SECRET|REFRESH_TOKEN)(?:=|:[ \t]+|["']?\]?[ \t]*(?::=|[:=])[ \t]*["'])([^\s"'$<{]{8,})'''
+secretGroup = 1
+entropy = 2.5
+keywords = ["linkedin_client_secret", "linkedin_refresh_token"]
+tags = ["linkedin", "secret", "assignment"]
+
+# ---------------------------------------------------------------------------
+# Google Ads through the existing n8n webhook
+# ---------------------------------------------------------------------------
+
+# The webhook URL is itself a credential. It is stored only as the
+# GOOGLE_ADS_WEBHOOK_URL GitHub Actions Secret and is logged as host only.
+# The existing instance is not necessarily on the n8n.cloud domain; n8n can be
+# self-hosted under any domain. The rule therefore matches two shapes:
+#   1. any host with "n8n" in its name (n8n Cloud or self-hosted), any webhook path;
+#   2. any host with n8n's default webhook path, /webhook[-test]/<uuid>.
+# Reserved example and loopback hosts, and placeholder paths, are allowlisted
+# for this rule below, so test fixtures such as https://n8n.example.test/webhook/ads pass.
+[[rules]]
+id = "n8n-webhook-url"
+description = "n8n webhook URL; the URL is a credential and belongs only in the GOOGLE_ADS_WEBHOOK_URL GitHub Actions Secret."
+regex = '''\b(https?://(?:(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]*n8n[A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+(?::[0-9]{1,5})?/webhook(?:-test)?/[A-Za-z0-9/_-]+|[A-Za-z0-9.-]+(?::[0-9]{1,5})?/webhook(?:-test)?/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))'''
+secretGroup = 1
+keywords = ["n8n", "/webhook"]
+tags = ["google-ads", "n8n", "url"]
+
+# Header form: `X-Webhook-Token: value` (a raw header, e.g. curl -H) or a
+# quoted literal in a mapping ("X-Webhook-Token": "value"). The Google client's
+# own `{"X-Webhook-Token": <expression>}` is not a finding.
+[[rules]]
+id = "google-webhook-token-assignment"
+description = "GOOGLE_ADS_WEBHOOK_TOKEN or an X-Webhook-Token header set to a literal value; the token must come from GitHub Actions Secrets."
+regex = '''(?:GOOGLE_ADS_WEBHOOK_TOKEN(?:=|:[ \t]+|["']?\]?[ \t]*(?::=|[:=])[ \t]*["'])|(?i:x-webhook-token)(?::[ \t]*|["']\]?[ \t]*[:=][ \t]*["']))([^\s"'$<{]{8,})'''
+secretGroup = 1
+entropy = 2.5
+keywords = ["google_ads_webhook_token", "x-webhook-token"]
+tags = ["google-ads", "n8n", "token", "assignment"]
+
+# No Google credential of any kind may exist in this build. These two rules
+# catch the credentials a direct Google Ads API integration would need.
+[[rules]]
+id = "google-oauth-client-secret"
+description = "Google OAuth client secret (GOCSPX-); this build must hold no Google credential."
+regex = '''\b(GOCSPX-[A-Za-z0-9_-]{20,})'''
+secretGroup = 1
+keywords = ["gocspx-"]
+tags = ["google", "oauth", "secret"]
+
+[[rules]]
+id = "google-ads-developer-token"
+description = "Google Ads API developer token (22 characters) in a header or assignment; this build must hold no Google credential."
+regex = '''(?i)developer[-_]?token["']?\]?[ \t]*(?::=|[:=])[ \t]*["']?([A-Za-z0-9_-]{22})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+entropy = 3
+# "developertoken" covers camelCase `developerToken`, which the optional separator allows.
+keywords = ["developer-token", "developer_token", "developertoken"]
+tags = ["google-ads", "token"]
+
+# ---------------------------------------------------------------------------
+# Database and deployment
+# ---------------------------------------------------------------------------
+
+# A Postgres connection string with a literal password. A password written as
+# <password>, ${VAR}, $VAR or {name} is not a finding. The host is part of the
+# match, so the loopback allowlist below can recognise disposable test containers.
+[[rules]]
+id = "postgres-dsn-password"
+description = "Postgres connection string with an embedded literal password; DATABASE_URL, WORKER_DATABASE_URL and MIGRATIONS_DATABASE_URL live only in Vercel or GitHub Actions Secrets."
+regex = '''\bpostgres(?:ql)?(?:\+[a-z0-9]+)?://[^:\s/@]+:([^@\s$<{]{3,})@[^\s/?#"'\x60]*'''
+secretGroup = 1
+keywords = ["postgres"]
+tags = ["postgres", "password", "dsn"]
+
+[[rules]]
+id = "vercel-bypass-secret"
+description = "Vercel Deployment Protection bypass secret (32 characters); it is stored only as the VERCEL_AUTOMATION_BYPASS_SECRET GitHub Actions Secret."
+regex = '''(?i)(?:VERCEL_AUTOMATION_BYPASS_SECRET|x-vercel-protection-bypass)["']?\]?[ \t]*(?::=|[:=])[ \t]*["']?([A-Za-z0-9]{32})(?:[^A-Za-z0-9]|$)'''
+secretGroup = 1
+entropy = 3
+keywords = ["vercel_automation_bypass_secret", "x-vercel-protection-bypass"]
+tags = ["vercel", "secret"]
+
+# ---------------------------------------------------------------------------
+# Allowlists. They are narrow on purpose: no source, test, fixture or docs
+# directory is skipped wholesale. .env.example, docs/, worker/fixtures/ and the
+# test suites hold names and placeholders only, and must pass on their own merits.
+# ---------------------------------------------------------------------------
+
+# Placeholder values, applied to every rule. These regexes test the extracted
+# secret (the value) and are anchored, rather than testing the whole match
+# (`regexTarget = "match"`). A placeholder elsewhere in a match therefore cannot
+# hide a literal secret next to it, e.g. `<host>` in a DSN whose password is
+# real; neither can a placeholder elsewhere on the same line.
+[[allowlists]]
+description = "Placeholder values: <name>, ${{ expression }}, ${VAR}, placeholder-* (replay harness) and REDACTED markers."
+regexTarget = "secret"
+regexes = [
+    '''^<[A-Za-z0-9_][A-Za-z0-9_ .+-]*>$''',
+    '''^\$\{\{[ \t]*[A-Za-z_][A-Za-z0-9_.]*[ \t]*\}\}$''',
+    '''^\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-)?\}$''',
+    '''^placeholder-[A-Za-z0-9_.-]*$''',
+    '''^\[?REDACTED(?:_[A-Z0-9]+)*\]?$''',
+]
+
+# Lockfile integrity hashes look like generic API keys. Only generic-api-key is
+# silenced, and only for these two files; every provider rule above still scans
+# them. The built-in global allowlist already skips package-lock.json for all
+# rules. uv.lock is not in it, so this entry is what keeps uv.lock hashes quiet.
+[[allowlists]]
+description = "Lockfile integrity hashes (generic-api-key only)."
+targetRules = ["generic-api-key"]
+paths = [
+    '''(?:^|/)web/package-lock\.json$''',
+    '''(?:^|/)worker/uv\.lock$''',
+]
+
+# Test webhook URLs. A URL on an IANA-reserved domain (example.com/.net/.org,
+# .example, .test, .invalid, .localhost; RFC 2606 and RFC 6761) or on a loopback
+# host cannot reach a real n8n instance. Neither can a placeholder- path. Such
+# URLs are what the allowlist and replay-harness tests use. Checked against the
+# extracted URL, anchored.
+[[allowlists]]
+description = "n8n webhook URLs on reserved example or loopback hosts, or with a placeholder path."
+targetRules = ["n8n-webhook-url"]
+regexTarget = "secret"
+regexes = [
+    '''^https?://(?:[A-Za-z0-9-]+\.)*(?:example(?:\.com|\.net|\.org)?|test|invalid|localhost)(?::[0-9]{1,5})?/''',
+    '''^https?://(?:127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?/''',
+    '''/webhook(?:-test)?/placeholder-[A-Za-z0-9_-]*$''',
+]
+
+# Disposable test databases. CI's postgres:17 service container and the local
+# throwaway container of scripts/e2e.sh are reached only on the loopback
+# interface, and their superuser password guards nothing beyond the job. A
+# connection string with a literal password to any other host is still a finding.
+[[allowlists]]
+description = "Postgres connection strings to a loopback host (disposable CI and e2e containers)."
+targetRules = ["postgres-dsn-password"]
+regexTarget = "match"
+regexes = [
+    '''@(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+|:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)?$''',
+]

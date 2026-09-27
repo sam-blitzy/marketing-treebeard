@@ -1,0 +1,54 @@
+# Root ignore rules for web/ (Next.js) and worker/ (Python).
+# Committed despite being generated, so never ignored here:
+# web/package-lock.json, worker/uv.lock, web/src/styles/tokens.css,
+# web/src/server/db/generated.ts, contracts/*.json, web/public/icons/*.svg
+# and everything under worker/fixtures/.
+
+# Secrets and environment files (no credential in version control)
+.env
+.env.*
+*.env
+!.env.example
+.vercel/
+
+# Node / Next.js (web/)
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+coverage/
+test-results/
+playwright-report/
+blob-report/
+# A pattern with an inner slash is anchored to this file's directory, so the
+# **/ prefix is needed for it to match web/playwright/.cache/.
+**/playwright/.cache/
+npm-debug.log*
+
+# Python (worker/)
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+build/
+dist/
+
+# Generated reports (uploaded as CI artefacts, never committed)
+reports/
+token-audit-report.json
+verification.json
+sla-benchmark-report*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
