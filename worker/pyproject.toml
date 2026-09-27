@@ -1,0 +1,157 @@
+# Ads Performance Recommendation Engine (v2) — batch worker manifest.
+#
+# Lockfile policy:
+# - worker/uv.lock is generated from this file by `uv lock` (run from worker/) and committed.
+#   It is never edited by hand.
+# - CI and the scheduled batch install with `uv sync --frozen`, which refuses a lock that does
+#   not match this file. Any change to this file therefore re-runs `uv lock` in the same commit.
+#
+# Quality gates configured here (Gate 2, zero warnings and zero suppressions):
+# - `uv run mypy --strict src tests`
+# - `uv run ruff check` and `uv run ruff format --check`
+# - `uv run pytest` (warnings are errors)
+# No section below ignores, overrides or suppresses a finding; scripts/audit-suppressions.sh
+# also rejects suppression comments in the tree.
+
+[build-system]
+# A build backend is required: without one uv does not install the project into .venv, and
+# `uv run --directory worker python -m ads_worker run` could not import ads_worker from src/.
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ads-worker"
+version = "2.0.0"
+description = "Ads Performance Recommendation Engine (v2) batch worker"
+requires-python = ">=3.12,<3.13"
+# The CLI is `python -m ads_worker` (run, audit-scopes, export-contracts, verify-run), so no
+# [project.scripts] entry is declared.
+dependencies = [
+  "httpx>=0.28.1,<0.29",
+  "pydantic==2.13.5",
+  "pydantic-settings>=2.10,<3",
+  # SQLAlchemy Core only; the 2.1 line is avoided while it is new.
+  "SQLAlchemy>=2.0.54,<2.1",
+  "psycopg[binary]>=3.2,<3.3",
+  "alembic>=1.20,<1.21",
+  "scipy==1.18.1",
+  "numpy>=2.3,<2.5",
+]
+
+[dependency-groups]
+# PEP 735 group; `uv sync` installs `dev` by default.
+dev = [
+  "mypy==2.3.1",
+  "ruff==0.16.8",
+  # Stubs are versioned per SciPy release and must match scipy==1.18.1.
+  "scipy-stubs==1.18.1.0",
+  "pytest>=9.0,<9.1",
+  "pytest-asyncio==1.4.0",
+  "respx>=0.22,<0.23",
+  "pytest-cov>=7.1,<8",
+  # Tests read fixtures/scenarios.yaml; the runtime never parses YAML.
+  "PyYAML>=6.0.2,<7",
+  "types-PyYAML>=6.0.12,<7",
+]
+
+[tool.hatch.build.targets.wheel]
+# src layout: the importable package is src/ads_worker.
+packages = ["src/ads_worker"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+disallow_any_generics = true
+warn_return_any = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+explicit_package_bases = true
+files = ["src", "tests"]
+# Deliberately no per-module mypy overrides: silencing missing imports or errors for a module
+# would be a suppression. Every dependency ships types (SciPy through scipy-stubs, YAML through
+# types-PyYAML); a missing third-party type is fixed with a typed wrapper in code.
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E501 is not selected: the formatter owns line length.
+# S is not selected: S101 fires on every pytest `assert` and would need a per-file ignore.
+# DTZ enforces time-zone-aware datetimes; T20 bans print (the CLI writes through
+# sys.stdout.write or the JSON logger).
+# N999 exempts modules under migrations/ and versions/, so Alembic revisions such as
+# migrations/versions/0001_ads_schema.py are valid names. migrations/script.py.mako must render
+# ruff-clean revisions (`str | Sequence[str] | None` with Sequence from collections.abc).
+# No rule is deselected globally or per file: the whole tree passes this set unsuppressed.
+select = [
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "W",
+  "I",
+  "B",
+  "UP",
+  "N",
+  "SIM",
+  "C4",
+  "RUF",
+  "ASYNC",
+  "DTZ",
+  "PT",
+  "T20",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ads_worker", "tests"]
+
+[tool.ruff.format]
+# Ruff defaults (double quotes, space indentation).
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+# tests/e2e (scripts/e2e.sh: `pytest tests/e2e -m "scenario_${SCENARIO}"`) and tests/perf
+# (ci.yml job sla-benchmark) need a prepared database or a long runtime, so they run only when
+# their path is given explicitly.
+testpaths = ["tests/unit", "tests/integration"]
+# Default `prepend` import mode: tests/ and its subdirectories are packages, so worker/ lands on
+# sys.path and `python -m tests.e2e.replay_run` resolves.
+# --cov is not in addopts: e2e and perf runs must not apply coverage fail_under.
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Warnings are failures and are fixed at their cause, never filtered.
+filterwarnings = ["error"]
+xfail_strict = true
+markers = [
+  "flag(code, case): request Rule 7 flag test; code is one of K1 K2 K3 C1 C2 C3 C4 B1 B2 CC1, case is 'trigger' or 'non_trigger'; tests/conftest.py writes reports/flag-coverage.md",
+  "scenario_baseline: e2e scenario baseline (scripts/e2e.sh --scenario baseline)",
+  "scenario_linkedin_absent: e2e scenario linkedin-absent (scripts/e2e.sh --scenario linkedin-absent)",
+  "scenario_zero_registry: e2e scenario zero-registry (scripts/e2e.sh --scenario zero-registry)",
+]
+
+[tool.coverage.run]
+source_pkgs = ["ads_worker"]
+branch = true
+relative_files = true
+
+[tool.coverage.report]
+# Overall floor (80%). The 90% floor on scoring/, attribution/ and integrations/*/normalize.py is
+# a separate ci.yml step after the `pytest --cov` run, from worker/; keep its patterns aligned:
+#   uv run coverage report --include="src/ads_worker/scoring/*,src/ads_worker/attribution/*,src/ads_worker/integrations/*/normalize.py" --fail-under=90
+# Exclusions are the patterns below only; coverage-exclusion comments are not used in code.
+fail_under = 80
+show_missing = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@overload",
+]

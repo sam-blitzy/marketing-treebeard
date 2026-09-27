@@ -1,0 +1,67 @@
+{
+  "name": "ads-web",
+  "version": "0.0.0",
+  "private": true,
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "node -v && next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit --strict -p tsconfig.json",
+    "lint": "eslint . --max-warnings 0 --report-unused-disable-directives",
+    "lint:css": "stylelint \"src/**/*.css\" --max-warnings 0",
+    "tokens": "node scripts/generate-tokens.mjs",
+    "tokens:check": "node scripts/generate-tokens.mjs --check",
+    "db:codegen": "kysely-codegen",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit --project lint",
+    "test:db": "vitest run --project db",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test tests/e2e",
+    "test:live": "playwright test --project live"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.9.9",
+    "kysely": "0.29.6",
+    "next": "14.2.35",
+    "pg": ">=8.13 <9",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-is": "18.3.1",
+    "recharts": "3.10.1",
+    "server-only": "^0.0.1",
+    "zod": ">=4.1 <5"
+  },
+  "devDependencies": {
+    "@playwright/test": ">=1.63 <1.64",
+    "@testing-library/dom": "^10",
+    "@testing-library/react": ">=16.1 <17",
+    "@types/eslint": "^8.56.12",
+    "@types/node": "^22",
+    "@types/pg": "^8",
+    "@types/react": "^18.3",
+    "@types/react-dom": "^18.3",
+    "@typescript-eslint/eslint-plugin": "8.70.1",
+    "@typescript-eslint/parser": "8.70.1",
+    "@vitejs/plugin-react": ">=6.0 <7",
+    "@vitest/coverage-v8": ">=5.0.1 <5.1",
+    "eslint": "8.57.1",
+    "eslint-config-next": "14.2.35",
+    "eslint-plugin-eslint-comments": "3.2.0",
+    "jsdom": ">=26 <27",
+    "kysely-codegen": "0.20.0",
+    "stylelint": ">=16.10 <17",
+    "stylelint-declaration-strict-value": ">=1.10 <2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.1",
+    "vite": ">=8.3 <8.4",
+    "vitest": ">=5.0.1 <5.1",
+    "yaml": "^2"
+  },
+  "overrides": {
+    "@typescript-eslint/eslint-plugin": "$@typescript-eslint/eslint-plugin",
+    "@typescript-eslint/parser": "$@typescript-eslint/parser"
+  }
+}
