@@ -1,0 +1,539 @@
+{
+  "surface": "linkedin.lead_forms",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-07-29",
+  "request": {
+    "method": "GET",
+    "url": "leadForms?q=owner&owner=(sponsoredAccount:{acct})&count={count}&start={start}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "owner",
+      "count",
+      "start"
+    ],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "page_size": 100
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "Lead Sync 'Find Forms by Owner' (GET /rest/leadForms?q=owner). Sources: the Lead Sync reference served as moniker li-lms-2026-09 (ms.date 2026-07-14, updated_at 2026-07-29, used as last_modified) and the Lead Sync schema page served as li-lms-2026-09 (updated_at 2026-06-24) for the field tables. Request: q=owner and the owner selector are required; the page lists count and start as optional (start defaults to 0), but they are in required_query because the client always sends them: count=100 for the sync, count=1&start=0 for the recovery probe. The owner value is the Rest.li tuple (sponsoredAccount:{acct}) with {acct} the URL-encoded urn%3Ali%3AsponsoredAccount%3A{id}; a request without its owner selector fails contract validation. Requires X-Restli-Protocol-Version 2.0.0. Paging: the client pages by start and count until start + count >= paging.total. The documented sample has no total, so the client also stops when a page returns fewer than count elements. The documented sample's owner is an organization; the product always queries by sponsoredAccount. Versions: each element is a form's current version. Its canonical URN is urn:li:leadGenForm:{id}. Editing a form creates a new version, so a questionId can change meaning between versions; email question ids are therefore stored per (canonical URN, versionId) in lead_form_version. The email question ids are the questions whose predefinedField is EMAIL. Flag for the parse_lead_form owner: WORK_EMAIL is a distinct documented predefinedField value, and the live account's form asks only for WORK_EMAIL (observed 2026-10-07). The AAP names only EMAIL, but a form that asks only for a work email would end every lead as no_email, so parse_lead_form must also treat WORK_EMAIL questions as email questions, after EMAIL, as lead_form_responses.json states for the decoration. The parser owner implements the rule; this contract only records the documented values. Required keys are kept to what the product reads (form id, versionId, content.questions and each questionId), so optional documented fields such as versionTag (not returned by default), reviewInfo and postSubmissionInfo may be absent. Form creation and updates are out of scope; the product only reads forms.",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Forms owned by the account, one element per form at its current version.",
+          "items": {
+            "type": "object",
+            "description": "One lead generation form, as its current version. The canonical URN is urn:li:leadGenForm:{id}; versionId is the current version, and content.questions are that version's questions. The leadForms sync fills lead_form_version for each form's current version from these questions.",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "description": "Form id (64-bit Long). Canonical URN: urn:li:leadGenForm:{id}."
+              },
+              "versionId": {
+                "type": "integer",
+                "description": "Current version of the form; each edit creates a new version."
+              },
+              "versionTag": {
+                "type": "string",
+                "description": "Optional version tag; not returned by default."
+              },
+              "name": {
+                "type": "string",
+                "description": "Form name."
+              },
+              "owner": {
+                "type": "object",
+                "description": "Union: exactly one of sponsoredAccount or organization. The product always queries by sponsoredAccount; the documented sample shows organization.",
+                "properties": {
+                  "sponsoredAccount": {
+                    "type": "string",
+                    "description": "urn:li:sponsoredAccount:{id}"
+                  },
+                  "organization": {
+                    "type": "string",
+                    "description": "urn:li:organization:{id}"
+                  }
+                }
+              },
+              "state": {
+                "type": "string",
+                "description": "Form state.",
+                "enum": [
+                  "DRAFT",
+                  "PUBLISHED",
+                  "ARCHIVED"
+                ]
+              },
+              "creationLocale": {
+                "type": "object",
+                "description": "Locale: language code plus optional country and variant.",
+                "properties": {
+                  "country": {
+                    "type": "string"
+                  },
+                  "language": {
+                    "type": "string"
+                  },
+                  "variant": {
+                    "type": "string"
+                  }
+                }
+              },
+              "hiddenFields": {
+                "type": "array",
+                "description": "Hidden tracking fields (at most 20) passed through to lead responses.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "value"
+                  ]
+                }
+              },
+              "created": {
+                "type": "integer",
+                "description": "Creation time, epoch ms."
+              },
+              "lastModified": {
+                "type": "integer",
+                "description": "Last modification time, epoch ms."
+              },
+              "reviewInfo": {
+                "type": "object",
+                "description": "Optional review state: reviewStatus (PENDING, APPROVED, REJECTED, PREAPPROVED, AUTO_APPROVED, NEEDS_REVIEW, AUTO_REJECTED), lastUpdated and rejectionReasons[]. Open because the product does not read it.",
+                "additionalProperties": true
+              },
+              "content": {
+                "type": "object",
+                "description": "Display content of the current version.",
+                "properties": {
+                  "headline": {
+                    "type": "object",
+                    "description": "MultiLocaleString (form headline). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                    "properties": {
+                      "localized": {
+                        "type": "object",
+                        "description": "Locale-keyed map such as en_US -> text.",
+                        "additionalProperties": true
+                      },
+                      "preferredLocale": {
+                        "type": "object",
+                        "description": "Locale: language code plus optional country and variant.",
+                        "properties": {
+                          "country": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "variant": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "description": {
+                    "type": "object",
+                    "description": "MultiLocaleString (optional form description). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                    "properties": {
+                      "localized": {
+                        "type": "object",
+                        "description": "Locale-keyed map such as en_US -> text.",
+                        "additionalProperties": true
+                      },
+                      "preferredLocale": {
+                        "type": "object",
+                        "description": "Locale: language code plus optional country and variant.",
+                        "properties": {
+                          "country": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "variant": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "legalInfo": {
+                    "type": "object",
+                    "description": "Legal information shown on the form: consents, privacy policy and disclaimer.",
+                    "properties": {
+                      "legalInfoId": {
+                        "type": "integer",
+                        "description": "Legal info id (Long)."
+                      },
+                      "privacyPolicyUrl": {
+                        "type": "string",
+                        "description": "Optional privacy policy URL."
+                      },
+                      "legalDisclaimer": {
+                        "type": "object",
+                        "description": "MultiLocaleString (optional legal disclaimer). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                        "properties": {
+                          "localized": {
+                            "type": "object",
+                            "description": "Locale-keyed map such as en_US -> text.",
+                            "additionalProperties": true
+                          },
+                          "preferredLocale": {
+                            "type": "object",
+                            "description": "Locale: language code plus optional country and variant.",
+                            "properties": {
+                              "country": {
+                                "type": "string"
+                              },
+                              "language": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "consents": {
+                        "type": "array",
+                        "description": "Consent checkboxes; may be empty.",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "integer",
+                              "description": "Consent id; lead responses reference it as consentId."
+                            },
+                            "consent": {
+                              "type": "object",
+                              "description": "MultiLocaleString (consent text). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                              "properties": {
+                                "localized": {
+                                  "type": "object",
+                                  "description": "Locale-keyed map such as en_US -> text.",
+                                  "additionalProperties": true
+                                },
+                                "preferredLocale": {
+                                  "type": "object",
+                                  "description": "Locale: language code plus optional country and variant.",
+                                  "properties": {
+                                    "country": {
+                                      "type": "string"
+                                    },
+                                    "language": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "checkRequired": {
+                              "type": "boolean",
+                              "description": "Whether the box must be checked to submit."
+                            },
+                            "label": {
+                              "type": "string",
+                              "description": "Optional consent label."
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "questions": {
+                    "type": "array",
+                    "description": "Questions of the current version, in display order.",
+                    "items": {
+                      "type": "object",
+                      "description": "One form question. questionId identifies the question within a form version only: editing a form creates a new version, so a questionId can change meaning between versions. Lead responses key their answers by this questionId.",
+                      "properties": {
+                        "questionId": {
+                          "type": "integer",
+                          "description": "Question id (Long), unique within the form version."
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "Machine name of the question, for example firstName."
+                        },
+                        "question": {
+                          "type": "object",
+                          "description": "MultiLocaleString (question text shown to the member). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                          "properties": {
+                            "localized": {
+                              "type": "object",
+                              "description": "Locale-keyed map such as en_US -> text.",
+                              "additionalProperties": true
+                            },
+                            "preferredLocale": {
+                              "type": "object",
+                              "description": "Locale: language code plus optional country and variant.",
+                              "properties": {
+                                "country": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "variant": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "label": {
+                          "type": "string",
+                          "description": "Optional short label of the question."
+                        },
+                        "textPrompt": {
+                          "type": "object",
+                          "description": "MultiLocaleString (optional placeholder prompt shown in the answer box). 'localized' is a locale-keyed map such as en_US to the text; 'preferredLocale' names the locale to show by default.",
+                          "properties": {
+                            "localized": {
+                              "type": "object",
+                              "description": "Locale-keyed map such as en_US -> text.",
+                              "additionalProperties": true
+                            },
+                            "preferredLocale": {
+                              "type": "object",
+                              "description": "Locale: language code plus optional country and variant.",
+                              "properties": {
+                                "country": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "variant": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "predefinedField": {
+                          "type": "string",
+                          "description": "Profile field that pre-fills the answer; absent on custom questions. Kept an open string so a newly added value cannot reject live data. Documented values (23): FIRST_NAME, LAST_NAME, PHONE_NUMBER, EMAIL, CITY, STATE, COUNTRY, ZIP_CODE, JOB_TITLE, JOB_FUNCTION, SENIORITY, COMPANY_NAME, COMPANY_SIZE, INDUSTRY, DEGREE, FIELD_OF_STUDY, SCHOOL, START_DATE, GRADUATION_DATE, GENDER, WORK_EMAIL, LINKEDIN_PROFILE_LINK, WORK_PHONE_NUMBER. Email questions: EMAIL (AAP 0.3.3) and WORK_EMAIL, a distinct documented value and the only email field on the live forms observed 2026-10-07 (see the body description)."
+                        },
+                        "responseEditable": {
+                          "type": "boolean",
+                          "description": "Whether the member may edit a pre-filled answer."
+                        },
+                        "responseRequired": {
+                          "type": "boolean",
+                          "description": "Whether an answer is required to submit."
+                        },
+                        "questionDetails": {
+                          "type": "object",
+                          "description": "Union of question detail types, for example textQuestionDetails{defaultResponse, maxResponseLength} or multipleChoiceQuestionDetails{options[{id, text, label}], defaultSelectedOption}. Open because the union may grow.",
+                          "additionalProperties": true
+                        },
+                        "questionSubmissionCriteria": {
+                          "type": "object",
+                          "description": "Union of submission criteria, for example workEmailSubmissionCriteria{freemiumEmailAllowed}. Open because the union may grow.",
+                          "additionalProperties": true
+                        }
+                      },
+                      "required": [
+                        "questionId"
+                      ]
+                    }
+                  },
+                  "postSubmissionInfo": {
+                    "type": "object",
+                    "description": "Optional thank-you content: message (MultiLocaleString) and callToAction{callToActionLabel, callToActionTarget{landingPageUrl}}. Open because the product does not read it.",
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "questions"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "versionId",
+              "content"
+            ]
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Rest.li collection paging. total is optional: the documented sample omits it.",
+          "properties": {
+            "start": {
+              "type": "integer",
+              "description": "Offset of the first element."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Requested page size."
+            },
+            "total": {
+              "type": "integer",
+              "description": "Total forms, when returned."
+            },
+            "links": {
+              "type": "array",
+              "description": "Rest.li paging links; empty in the documented sample.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rel",
+                  "href"
+                ]
+              }
+            }
+          },
+          "required": [
+            "start",
+            "count"
+          ]
+        }
+      },
+      "required": [
+        "elements",
+        "paging"
+      ]
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "owner": {
+            "organization": "urn:li:organization:5509810"
+          },
+          "hiddenFields": [
+            {
+              "name": "Entity name",
+              "value": "Nimbus 2000"
+            }
+          ],
+          "versionId": 1,
+          "creationLocale": {
+            "country": "US",
+            "language": "en"
+          },
+          "created": 1610579725356,
+          "name": "LeadGen form for Nimbus 2000",
+          "id": 6755260984438374400,
+          "lastModified": 1610579725356,
+          "state": "PUBLISHED",
+          "content": {
+            "questions": [
+              {
+                "questionId": 10548,
+                "question": {
+                  "localized": {
+                    "en_US": "First Name"
+                  }
+                },
+                "responseEditable": true,
+                "name": "firstName",
+                "questionDetails": {
+                  "textQuestionDetails": {
+                    "maxResponseLength": 300
+                  }
+                },
+                "predefinedField": "FIRST_NAME",
+                "responseRequired": true
+              },
+              {
+                "questionId": 10540,
+                "question": {
+                  "localized": {
+                    "en_US": "Last Name"
+                  }
+                },
+                "responseEditable": true,
+                "name": "lastName",
+                "questionDetails": {
+                  "textQuestionDetails": {
+                    "maxResponseLength": 300
+                  }
+                },
+                "predefinedField": "LAST_NAME",
+                "responseRequired": true
+              }
+            ],
+            "description": {
+              "localized": {
+                "en_US": "Share your information below with {localized={en_US=Mario Kart 8 Deluxe, es_ES=Mario Coche 8 Deluxe}, preferredLocale={country=US, language=en}} to be contacted with more information about Nimbus 2000"
+              }
+            },
+            "headline": {
+              "localized": {
+                "en_US": "Contact {localized={en_US=Mario Kart 8 Deluxe, es_ES=Mario Coche 8 Deluxe}, preferredLocale={country=US, language=en}} about Nimbus 2000"
+              }
+            },
+            "legalInfo": {
+              "consents": [
+                {
+                  "checkRequired": false,
+                  "id": 1,
+                  "consent": {
+                    "localized": {
+                      "en_US": "{localized={en_US=Mario Kart 8 Deluxe, es_ES=Mario Coche 8 Deluxe}, preferredLocale={country=US, language=en}} may contact me via email"
+                    }
+                  }
+                }
+              ],
+              "legalInfoId": 5604,
+              "privacyPolicyUrl": "https://cadfad.com/abc",
+              "legalDisclaimer": {
+                "localized": {
+                  "en_US": "All emails include an unsubscribe link; you may opt out at any time. {localized={en_US=Mario Kart 8 Deluxe, es_ES=Mario Coche 8 Deluxe}, preferredLocale={country=US, language=en}} will not sell or distribute your email address. See our Privacy Policy for more information on how we product and manage your data."
+                }
+              }
+            }
+          }
+        }
+      ],
+      "paging": {
+        "start": 0,
+        "count": 1,
+        "links": []
+      }
+    }
+  }
+}

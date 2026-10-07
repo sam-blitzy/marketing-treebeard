@@ -1,0 +1,377 @@
+{
+  "surface": "hubspot.associations_batch_read",
+  "source": "hubspot",
+  "reference_url": "https://developers.hubspot.com/docs/api-reference/latest/crm/associations/associate-records/batch/get-associations",
+  "api_version": "2026-09",
+  "last_modified": "2026-09-09",
+  "request": {
+    "method": "POST",
+    "url": "https://api.hubapi.com/crm/associations/2026-09/{fromObjectType}/{toObjectType}/batch/read",
+    "required_headers": [
+      "Authorization",
+      "Content-Type"
+    ],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": {
+      "type": "object",
+      "description": "BatchInputPublicFetchAssociationsBatchRequest. Read-only batch read of the associations from each input record to toObjectType. Authorization carries Bearer authentication with the server-side HubSpot access token, whose value never appears in a contract; Content-Type is application/json.",
+      "required": [
+        "inputs"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "description": "At most limits.max_inputs (1,000) inputs per call, the batch-read limit in the associations guide. The schema subset has no maxItems, so the request validator and the connector enforce the bound. The initial call sends {id} only. A continuation re-sends {id, after} for each input whose result returned paging.next.after, carrying that input's own cursor; a cursor is never sent on another input or outside its input.",
+          "items": {
+            "type": "object",
+            "description": "PublicFetchAssociationsBatchRequest: one record whose associations are read.",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Id of the record whose associations are fetched, sent as a string."
+              },
+              "after": {
+                "type": "string",
+                "description": "Paging cursor from this same input's previous result (paging.next.after). Absent on the initial call."
+              }
+            }
+          }
+        }
+      }
+    },
+    "gaql": null,
+    "limits": {
+      "max_inputs": 1000
+    }
+  },
+  "response": {
+    "status": [
+      200,
+      207
+    ],
+    "body": {
+      "type": "object",
+      "description": "BatchResponsePublicAssociationMultiWithLabel on 200; BatchResponsePublicAssociationMultiWithLabelWithErrors on 207, which adds errors and numErrors. In a 207, failed inputs are absent from results and identified by errors. An error with NO_ASSOCIATIONS_FOUND in category or in subCategory ('crm.associations.NO_ASSOCIATIONS_FOUND') is the empty-association exception: that input's fetch is ok_empty, a genuine zero. Every other input error makes that input's fetch error. A continuation that fails after earlier pages of an input were read makes that input's fetch partial. Reads of the associated targets are a separate surface, so this contract does not resolve target-read failures. documented_sample is the reference page's rendered 207 example, kept verbatim with its placeholders; its CANCELED status makes it a failed call, not an application-success fixture.",
+      "required": [
+        "status",
+        "results",
+        "startedAt",
+        "completedAt"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "Batch processing state. Only COMPLETE is a successful call. CANCELED, PENDING and PROCESSING are failed calls even when the body is schema-valid.",
+          "enum": [
+            "CANCELED",
+            "COMPLETE",
+            "PENDING",
+            "PROCESSING"
+          ]
+        },
+        "results": {
+          "type": "array",
+          "description": "One entry per input that succeeded on this call.",
+          "items": {
+            "type": "object",
+            "description": "PublicAssociationMultiWithLabel: the associations of one input that succeeded. An empty to array is a genuine zero for that input (ok_empty).",
+            "required": [
+              "from",
+              "to"
+            ],
+            "properties": {
+              "from": {
+                "type": "object",
+                "description": "PublicObjectId of the input record.",
+                "required": [
+                  "id"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Id of the input record, matching the request input's id."
+                  }
+                }
+              },
+              "to": {
+                "type": "array",
+                "description": "Associated target records on this page.",
+                "items": {
+                  "type": "object",
+                  "description": "MultiAssociatedObjectWithLabel: one associated target record.",
+                  "required": [
+                    "toObjectId",
+                    "associationTypes"
+                  ],
+                  "properties": {
+                    "toObjectId": {
+                      "type": [
+                        "string",
+                        "number"
+                      ],
+                      "description": "Id of the associated target record. The reference schema and sample give a string; the associations guide and live responses give a JSON number (an integer id). Both are admitted, and the parser normalises the id to a string."
+                    },
+                    "associationTypes": {
+                      "type": "array",
+                      "description": "Every association type linking the source record to this target.",
+                      "items": {
+                        "type": "object",
+                        "description": "AssociationSpecWithLabel: the type and label of one association to the target record.",
+                        "required": [
+                          "category",
+                          "typeId"
+                        ],
+                        "properties": {
+                          "category": {
+                            "type": "string",
+                            "description": "Association type category, as enumerated by the reference schema.",
+                            "enum": [
+                              "HUBSPOT_DEFINED",
+                              "INTEGRATOR_DEFINED",
+                              "USER_DEFINED",
+                              "WORK"
+                            ]
+                          },
+                          "typeId": {
+                            "type": "integer",
+                            "description": "Unique identifier of the association type."
+                          },
+                          "label": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Association label. Null for an unlabeled association, as the associations guide's examples and simulated responses return it; a string for a labeled one."
+                          },
+                          "fromObjectTypeId": {
+                            "type": "string",
+                            "description": "Object type id of the source record."
+                          },
+                          "toObjectTypeId": {
+                            "type": "string",
+                            "description": "Object type id of the target record."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "paging": {
+                "type": "object",
+                "description": "Present only when this input has more pages; absent once its associations are fully read. No paging key is required on a finished result.",
+                "properties": {
+                  "next": {
+                    "type": "object",
+                    "description": "NextPage for this result's input.",
+                    "required": [
+                      "after"
+                    ],
+                    "properties": {
+                      "after": {
+                        "type": "string",
+                        "description": "Cursor re-sent as {id, after} for this result's input only."
+                      },
+                      "link": {
+                        "type": "string",
+                        "description": "Deprecated by HubSpot and ignored by the connector."
+                      }
+                    }
+                  },
+                  "prev": {
+                    "type": "object",
+                    "description": "PreviousPage. Defined by the reference schema; the connector does not page backwards.",
+                    "required": [
+                      "before"
+                    ],
+                    "properties": {
+                      "before": {
+                        "type": "string",
+                        "description": "Cursor for the previous page."
+                      },
+                      "link": {
+                        "type": "string",
+                        "description": "Deprecated by HubSpot and ignored by the connector."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "startedAt": {
+          "type": "string",
+          "description": "When batch processing began, ISO 8601 date-time."
+        },
+        "completedAt": {
+          "type": "string",
+          "description": "When batch processing completed, ISO 8601 date-time."
+        },
+        "requestedAt": {
+          "type": "string",
+          "description": "When the batch request was made, ISO 8601 date-time."
+        },
+        "links": {
+          "type": "object",
+          "description": "Open map: HubSpot chooses the link names of this server-defined documentation map, each mapped to a URL.",
+          "additionalProperties": true
+        },
+        "errors": {
+          "type": "array",
+          "description": "207 only: one entry per failed input.",
+          "items": {
+            "type": "object",
+            "description": "StandardError: one failed input of a 207 multi-status response. Only status, category and message are required, because live per-input errors can omit the context, errors and links the reference schema marks required.",
+            "required": [
+              "status",
+              "category",
+              "message"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "description": "Error status, for example 'error' in live responses."
+              },
+              "category": {
+                "type": "string",
+                "description": "Main error category. A live input with no associations carries OBJECT_NOT_FOUND here with subCategory 'crm.associations.NO_ASSOCIATIONS_FOUND'; a category of NO_ASSOCIATIONS_FOUND is recognised as the same empty case."
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable description of the error and possible remediation."
+              },
+              "id": {
+                "type": "string",
+                "description": "Unique id of the error instance."
+              },
+              "subCategory": {
+                "type": [
+                  "string",
+                  "object"
+                ],
+                "description": "Live responses carry a string identifier such as 'crm.associations.NO_ASSOCIATIONS_FOUND'. The reference schema types it as an object with no declared properties and its generated sample renders it as {}, so the object variant is open.",
+                "additionalProperties": true
+              },
+              "context": {
+                "type": "object",
+                "description": "Open map: HubSpot chooses the keys per error, for example fromObjectId listing the input ids that have no associations. Values are lists of strings in the reference schema.",
+                "additionalProperties": true
+              },
+              "links": {
+                "type": "object",
+                "description": "Open map: HubSpot chooses the link names, each mapped to a documentation URL.",
+                "additionalProperties": true
+              },
+              "errors": {
+                "type": "array",
+                "description": "Detailed error objects for this input.",
+                "items": {
+                  "type": "object",
+                  "description": "ErrorDetail: one detail of a failed input.",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "description": "Human-readable description of the detail."
+                    },
+                    "code": {
+                      "type": "string",
+                      "description": "Status code associated with the detail."
+                    },
+                    "context": {
+                      "type": [
+                        "object",
+                        "string"
+                      ],
+                      "description": "The reference sample renders it as the string '{missingScopes=[scope1, scope2]}', kept as a string. The reference schema types it as an object map whose keys HubSpot chooses per error, so the object variant is open.",
+                      "additionalProperties": true
+                    },
+                    "in": {
+                      "type": "string",
+                      "description": "Field or parameter in which the error was found."
+                    },
+                    "subCategory": {
+                      "type": "string",
+                      "description": "More specific category of the detail."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "numErrors": {
+          "type": "integer",
+          "description": "Number of entries in errors."
+        }
+      }
+    },
+    "documented_sample": {
+      "completedAt": "2023-11-07T05:31:56Z",
+      "results": [
+        {
+          "from": {
+            "id": "<string>"
+          },
+          "to": [
+            {
+              "associationTypes": [
+                {
+                  "category": "HUBSPOT_DEFINED",
+                  "typeId": 123,
+                  "fromObjectTypeId": "<string>",
+                  "label": "<string>",
+                  "toObjectTypeId": "<string>"
+                }
+              ],
+              "toObjectId": "<string>"
+            }
+          ],
+          "paging": {
+            "next": {
+              "after": "<string>",
+              "link": "<string>"
+            },
+            "prev": {
+              "before": "<string>",
+              "link": "<string>"
+            }
+          }
+        }
+      ],
+      "startedAt": "2023-11-07T05:31:56Z",
+      "status": "CANCELED",
+      "errors": [
+        {
+          "category": "<string>",
+          "context": {},
+          "errors": [
+            {
+              "message": "<string>",
+              "code": "<string>",
+              "context": "{missingScopes=[scope1, scope2]}",
+              "in": "<string>",
+              "subCategory": "<string>"
+            }
+          ],
+          "links": {},
+          "message": "<string>",
+          "status": "<string>",
+          "id": "<string>",
+          "subCategory": {}
+        }
+      ],
+      "links": {},
+      "numErrors": 123,
+      "requestedAt": "2023-11-07T05:31:56Z"
+    }
+  }
+}

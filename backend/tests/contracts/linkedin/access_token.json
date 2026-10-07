@@ -1,0 +1,94 @@
+{
+  "surface": "linkedin.access_token",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/shared/authentication/programmatic-refresh-tokens",
+  "api_version": "202609",
+  "last_modified": "2025-10-08",
+  "request": {
+    "method": "POST",
+    "url": "https://www.linkedin.com/oauth/v2/accessToken",
+    "required_headers": [
+      "Content-Type"
+    ],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": {
+      "description": "Sent as `application/x-www-form-urlencoded` form fields, not JSON. The Content-Type header value is `application/x-www-form-urlencoded`. Validators decode the form body into this object before checking it. The four fields are the page's Step 2 parameters, and all are required. No `redirect_uri` is sent: the page's \"redirect_uri is missing\" error belongs to the authorization-code exchange on the same endpoint, which is out of scope (no consent flow or consent UI in the product).",
+      "type": "object",
+      "properties": {
+        "grant_type": {
+          "description": "Always `refresh_token` for this exchange.",
+          "type": "string",
+          "enum": [
+            "refresh_token"
+          ]
+        },
+        "refresh_token": {
+          "description": "The programmatic refresh token from the original authorization (`LINKEDIN_REFRESH_TOKEN`). Server-side only; never logged.",
+          "type": "string"
+        },
+        "client_id": {
+          "description": "The application's Client ID (`LINKEDIN_CLIENT_ID`).",
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "The application's Client Secret (`LINKEDIN_CLIENT_SECRET`). Server-side only; never logged.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_type",
+        "refresh_token",
+        "client_id",
+        "client_secret"
+      ],
+      "additionalProperties": false
+    },
+    "gaql": null,
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "Successful refresh-token exchange. connectors/linkedin/auth.py (TOKEN_URL) calls this surface when LINKEDIN_REFRESH_TOKEN, LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET are set; a static LINKEDIN_ACCESS_TOKEN skips it. VERSIONING: this OAuth endpoint on www.linkedin.com is unversioned. It is the only LinkedIn contract with an absolute URL and without the Linkedin-Version and X-Restli-Protocol-Version headers. `api_version` records the client's pinned 202609 because every contract carries one, not because the endpoint reads it. CACHING: the planned auth.py keeps the access token in memory only, never in the database or logs, and reuses it until `expires_in` minus 300 s, then exchanges again. ERRORS: `response.status` lists only 200 because only success bodies are validated against this schema. Errors use the OAuth 2.0 shape {\"error\": \"<code>\", \"error_description\": \"<text>\"}. The page documents HTTP 400 `invalid_request` with these descriptions: \"The provided authorization grant or refresh token is invalid, expired or revoked\"; \"A required parameter \"redirect_uri\" is missing\"; \"A required parameter \"grant_type\" is missing\"; \"A required parameter \"client_id\" is missing\"; \"A required parameter \"refresh_token\" is missing\". The RFC 6749 section 5.2 codes `invalid_grant`, `invalid_client` and `unauthorized_client` (HTTP 400 or 401) may also occur. CLASSIFICATION, for connectors/linkedin/auth.py and connectors/errors.py: `invalid_grant`, `invalid_client`, `unauthorized_client` and any 401 are AccessDenied, and other 400s are QueryDefect. Exception: LinkedIn reports an expired or revoked refresh token as 400 `invalid_request`, so a 400 whose `error_description` says the grant or token is \"invalid, expired or revoked\" must be classified as AccessDenied. That switches LinkedIn to simulated data and re-authorization follows the runbook bootstrap; it is not a defect. SCOPES: the sample's `scope` value `r_basicprofile` is the vendor's example; the product's scopes are r_ads, r_ads_reporting and r_marketing_leadgen_automation. SAMPLE: `documented_sample` is the page's Step 2 response copied verbatim. Its token strings are public documentation examples, not credentials.",
+      "type": "object",
+      "properties": {
+        "access_token": {
+          "description": "The new access token, sent as `Authorization: Bearer` on every LinkedIn REST call. About 500 characters; the page advises handling at least 1,000. Held in memory only.",
+          "type": "string"
+        },
+        "expires_in": {
+          "description": "Seconds until the new access token expires. The page states a 60-day default lifetime; its sample shows 86400.",
+          "type": "integer"
+        },
+        "refresh_token": {
+          "description": "The refresh token, returned with the new access token. The exchange keeps the refresh token's original lifetime, counted from the initial authorization.",
+          "type": "string"
+        },
+        "refresh_token_expires_in": {
+          "description": "Seconds remaining until the refresh token expires. The exchange does not extend it; once it expires the member must re-authorize the application.",
+          "type": "integer"
+        },
+        "scope": {
+          "description": "Granted member permissions. The page documents a URL-encoded, space-delimited list; consumers split on spaces or commas, so either delimiter parses.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "access_token",
+        "expires_in"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "access_token": "BBBB2kXITHELmWblJigbHEuoFdfRhOwGA0QNnumBI8XOVSs0HtOHEU-wvaKrkMLfxxaB1O4poRg2svCWWgwhebQhqrETYlLikJJMgRAvH1ostjXd3DP3BtwzCGeTQ7K9vvAqfQK5iG_eyS-q-y8WNt2SnZKZumGaeUw_zKqtgCQavfEVCddKHcHLaLPGVUvjCH_KW0DJIdUMXd90kWqwuw3UKH27ki5raFDPuMyQXLYxkqq4mYU-IUuZRwq1pcrYp1Vv-ltbA_svUxGt_xeWeSxKkmgivY_DlT3jQylL44q36ybGBSbaFn-UU7zzio4EmOzdmm2tlGwG7dDeivdPDsGbj5ig",
+      "expires_in": 86400,
+      "refresh_token": "AQWAft_WjYZKwuWXLC5hQlghgTam-tuT8CvFej9-XxGyqeER_7jTr8HmjiGjqil13i7gMFjyDxh1g7C_G1gyTZmfcD0Bo2oEHofNAkr_76mSk84sppsGbygwW-5oLsb_OH_EXADPIFo0kppznrK55VMIBv_d7SINunt-7DtXCRAv0YnET5KroQOlmAhc1_HwW68EZniFw1YnB2dgDSxCkXnrfHYq7h63w0hjFXmgrdxeeAuOHBHnFFYHOWWjI8sLenPy_EBrgYIitXsAkLUGvZXlCjAWl-W459feNjHZ0SIsyTVwzAQtl5lmw1ht08z5Du-RiQahQE0sv89eimHVg9VSNOaTvw",
+      "refresh_token_expires_in": 439200,
+      "scope": "r_basicprofile"
+    }
+  }
+}

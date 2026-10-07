@@ -1,0 +1,334 @@
+{
+  "surface": "linkedin.ad_campaign_groups",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaign-groups?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-09-16",
+  "request": {
+    "method": "GET",
+    "url": "adAccounts/{id}/adCampaignGroups?q=search&search=(status:(values:List(ACTIVE,PAUSED,ARCHIVED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))&pageSize=100",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "search",
+      "pageSize"
+    ],
+    "optional_query": [
+      "pageToken"
+    ],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "page_size": 100,
+      "max_page_size": 1000
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "Campaign-group search response, LinkedIn Marketing API 202609. Verified against the Microsoft Learn page served as moniker li-lms-2026-09 (last updated 2026-09-16) and against one live 202609 response on 2026-10-07. The request URL is relative to https://api.linkedin.com/rest/ and the Rest.li 2.0 search value is sent with literal parentheses, colons and commas, exactly as the page's samples show, never percent-encoded as a whole. Every documented search status is requested so the tracked set of campaign groups can be diffed against the full list. The page documents exactly seven search.status.values (ACTIVE, ARCHIVED, CANCELED, DRAFT, PAUSED, PENDING_DELETION, REMOVED). COMPLETED is a campaign status, not a campaign-group search value, so it is deliberately not sent: an undocumented enum value risks HTTP 400, which the client treats as a defect (the job fails, with no retry and no simulated fallback), and omitting it cannot raise false missing discrepancies because campaign groups appear in evidence but are never decision or discrepancy subjects. The status list in request.url must equal connectors/linkedin/parser.py CAMPAIGN_GROUP_SEARCH_STATUSES exactly, in the same order. Paging: the client sends pageSize=100 (documented maximum 1,000) and sends metadata.nextPageToken back as pageToken until a response carries no nextPageToken; on the last page live responses return an empty metadata object. Money: totalBudget.amount and dailyBudget are BigDecimal decimal strings in the ad account's currency, never JSON numbers.",
+      "type": "object",
+      "required": [
+        "elements"
+      ],
+      "properties": {
+        "elements": {
+          "description": "One page of campaign groups, sorted by id (ASCENDING unless sortOrder is sent, which the client does not do).",
+          "type": "array",
+          "items": {
+            "description": "One campaign group. Stored in campaign_group and snapshotted on every entity sync as entity_type=campaign_group. Required keys are those present in every documented and live element that parse_campaign_group needs; everything else is optional.",
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "account",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "description": "Numeric campaign-group id, read-only. The URN form is urn:li:sponsoredCampaignGroup:{id}.",
+                "type": "integer"
+              },
+              "name": {
+                "description": "Campaign-group name, at most 200 bytes UTF-8 encoded.",
+                "type": "string"
+              },
+              "account": {
+                "description": "Ad account URN, urn:li:sponsoredAccount:{id} in every sample and live response (the schema table writes the prefix as SponsoredAccount). Immutable.",
+                "type": "string"
+              },
+              "status": {
+                "description": "User-managed status. The search parameter table spells the cancel status CANCELED while the schema table spells it CANCELLED; COMPLETED, documented for campaigns, is accepted defensively. All are admitted so a real response is never rejected. The parser must map CANCELLED exactly like CANCELED (ended) and COMPLETED to ended; a value outside this enum is a contract violation.",
+                "type": "string",
+                "enum": [
+                  "ACTIVE",
+                  "PAUSED",
+                  "ARCHIVED",
+                  "CANCELED",
+                  "CANCELLED",
+                  "COMPLETED",
+                  "DRAFT",
+                  "PENDING_DELETION",
+                  "REMOVED"
+                ]
+              },
+              "totalBudget": {
+                "description": "Lifetime budget as a money object. When set, runSchedule.end is also set. With budgetOptimization.budgetOptimizationStrategy DYNAMIC it is shared by every campaign in the group; otherwise it caps spend across the group's campaigns and creatives for the group's run.",
+                "type": "object",
+                "required": [
+                  "amount",
+                  "currencyCode"
+                ],
+                "properties": {
+                  "amount": {
+                    "description": "BigDecimal decimal string in the account currency.",
+                    "type": "string"
+                  },
+                  "currencyCode": {
+                    "description": "ISO 4217 currency code; must equal the ad account's currency.",
+                    "type": "string"
+                  }
+                }
+              },
+              "dailyBudget": {
+                "description": "Daily budget for DYNAMIC groups only (budgetOptimization.budgetOptimizationStrategy DYNAMIC), from version 202504. Unlike totalBudget it is a bare BigDecimal decimal string with no currencyCode: the schema table types it as BigDecimal and a live 202609 response on 2026-10-07 confirmed the string form. The amount is in the ad account's currency, so the parser must take the currency from the account, never expect an {amount, currencyCode} object here. A DYNAMIC group carries either a daily or a lifetime budget, not both.",
+                "type": "string"
+              },
+              "runSchedule": {
+                "description": "Run schedule in epoch milliseconds. start is inclusive and always set; end is exclusive and absent for an open-ended group.",
+                "type": "object",
+                "required": [
+                  "start"
+                ],
+                "properties": {
+                  "start": {
+                    "description": "Inclusive start instant, epoch milliseconds.",
+                    "type": "integer"
+                  },
+                  "end": {
+                    "description": "Exclusive end instant, epoch milliseconds. Required by LinkedIn when totalBudget is set.",
+                    "type": "integer"
+                  }
+                }
+              },
+              "servingStatuses": {
+                "description": "Service-controlled serving flags, read-only. Documented values: RUNNABLE, STOPPED, BILLING_HOLD, ACCOUNT_TOTAL_BUDGET_HOLD, ACCOUNT_END_DATE_HOLD, CAMPAIGN_GROUP_TOTAL_BUDGET_HOLD, CAMPAIGN_GROUP_START_DATE_HOLD, CAMPAIGN_GROUP_END_DATE_HOLD. Kept as open strings because the hold list is long and grows.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "allowedCampaignTypes": {
+                "description": "Read-only; returned only for ENTERPRISE accounts. Documented values: TEXT_AD, SPONSORED_UPDATES, SPONSORED_INMAILS, DYNAMIC.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "backfilled": {
+                "description": "True for the default group LinkedIn creates with each ad account to backfill existing campaigns; set by the system.",
+                "type": "boolean"
+              },
+              "test": {
+                "description": "True when the group belongs to a test account; read-only.",
+                "type": "boolean"
+              },
+              "changeAuditStamps": {
+                "description": "Creation and last-modification stamps. time is epoch milliseconds; actor is an optional member or system URN.",
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "object",
+                    "required": [
+                      "time"
+                    ],
+                    "properties": {
+                      "time": {
+                        "type": "integer"
+                      },
+                      "actor": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "lastModified": {
+                    "type": "object",
+                    "required": [
+                      "time"
+                    ],
+                    "properties": {
+                      "time": {
+                        "type": "integer"
+                      },
+                      "actor": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              },
+              "objectiveType": {
+                "description": "Optional, immutable group objective inherited by the group's campaigns; absent on some groups. Open string, not an enum: the page lists BRAND_AWARENESS, ENGAGEMENT, JOB_APPLICANTS, LEAD_GENERATION, WEBSITE_CONVERSIONS, WEBSITE_VISIT and VIDEO_VIEWS, while live responses return singular spellings such as WEBSITE_CONVERSION and JOB_APPLICANT.",
+                "type": "string"
+              },
+              "budgetOptimization": {
+                "description": "Group budget optimisation, from version 202501; present only on groups that use it.",
+                "type": "object",
+                "properties": {
+                  "bidStrategy": {
+                    "description": "Documented values: MAXIMUM_DELIVERY, MANUAL, COST_CAP. Every campaign in the group uses the same bid strategy.",
+                    "type": "string"
+                  },
+                  "budgetOptimizationStrategy": {
+                    "description": "Documented value: DYNAMIC (Dynamic Group Budget).",
+                    "type": "string"
+                  }
+                }
+              },
+              "accountInfo": {
+                "description": "Additional-info record describing the ad account, returned only when requested. The product never reads it, so its contents are not constrained.",
+                "type": "object",
+                "additionalProperties": true
+              },
+              "beneficiaryReference": {
+                "description": "Beneficiary of the group, from version 202608; optional and immutable. A union: exactly one of company (urn:li:company:{id}) or organization (urn:li:organization:{id}) is set.",
+                "type": "object",
+                "properties": {
+                  "company": {
+                    "type": "string"
+                  },
+                  "organization": {
+                    "type": "string"
+                  }
+                }
+              },
+              "billingReference": {
+                "description": "URN of the billing object, from version 202608; ENTERPRISE accounts only.",
+                "type": "string"
+              },
+              "billingParentReference": {
+                "description": "URN of the parent of the billing object, from version 202608; ENTERPRISE accounts only.",
+                "type": "string"
+              },
+              "buyingType": {
+                "description": "From version 202608. Documented values: AUCTION, RESERVATION.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        "metadata": {
+          "description": "Cursor paging metadata. Empty on the last page.",
+          "type": "object",
+          "properties": {
+            "nextPageToken": {
+              "description": "Opaque cursor for the next page, sent back as the pageToken query parameter. Absent on the last page.",
+              "type": "string"
+            }
+          }
+        },
+        "paging": {
+          "description": "Rest.li collection paging block. The documented sample omits it, but live 202609 responses carry it (start, count and an empty links array on 2026-10-07). Cursor search pages by metadata.nextPageToken only, so the client never reads this block; it is declared so real responses validate.",
+          "type": "object",
+          "properties": {
+            "start": {
+              "type": "integer"
+            },
+            "count": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "description": "Rest.li paging link.",
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "runSchedule": {
+            "end": 9876543210123,
+            "start": 1234567890987
+          },
+          "changeAuditStamps": {
+            "created": {
+              "time": 1542042798000
+            },
+            "lastModified": {
+              "time": 1542129293297
+            }
+          },
+          "name": "Refresh group",
+          "test": false,
+          "servingStatuses": [
+            "CAMPAIGN_GROUP_END_DATE_HOLD",
+            "BILLING_HOLD"
+          ],
+          "allowedCampaignTypes": [
+            "SPONSORED_UPDATES",
+            "TEXT_AD"
+          ],
+          "backfilled": false,
+          "id": 603407684,
+          "account": "urn:li:sponsoredAccount:506223315",
+          "status": "ACTIVE"
+        },
+        {
+          "runSchedule": {
+            "start": 1493228897000
+          },
+          "changeAuditStamps": {
+            "created": {
+              "time": 1493228897000
+            },
+            "lastModified": {
+              "time": 1493228897000
+            }
+          },
+          "name": "New Campaign Group",
+          "test": false,
+          "servingStatuses": [
+            "BILLING_HOLD"
+          ],
+          "allowedCampaignTypes": [
+            "SPONSORED_UPDATES",
+            "TEXT_AD"
+          ],
+          "backfilled": false,
+          "id": 504293601,
+          "account": "urn:li:sponsoredAccount:506223315",
+          "status": "ACTIVE"
+        }
+      ],
+      "metadata": {
+        "nextPageToken": "DgGerr1iVQreCJVjDOW_rcp63nueBDipsS4DJpvJo"
+      }
+    }
+  }
+}

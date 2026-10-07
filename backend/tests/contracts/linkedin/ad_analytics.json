@@ -1,0 +1,254 @@
+{
+  "surface": "linkedin.ad_analytics",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-06-24",
+  "request": {
+    "method": "GET",
+    "url": "adAnalytics?q=analytics&pivot=CREATIVE&timeGranularity=DAILY&dateRange=(start:(year:{y},month:{m},day:{d}),end:(year:{y},month:{m},day:{d}))&accounts=List({acct})&fields={fields}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "pivot",
+      "timeGranularity",
+      "dateRange",
+      "accounts",
+      "fields"
+    ],
+    "optional_query": [],
+    "fields": "pivotValues,dateRange,costInLocalCurrency,impressions,clicks,landingPageClicks,oneClickLeadFormOpens,oneClickLeads,externalWebsiteConversions",
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "max_fields": 20,
+      "max_elements": 15000,
+      "daily_retention_months": 6
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "LinkedIn adAnalytics Analytics Finder (q=analytics), daily creative performance (pivot=CREATIVE, timeGranularity=DAILY), feeding fact_creative_daily. Sources: the Reporting page at reference_url, served as li-lms-2026-09 (ms.date 2026-06-19, updated_at 2026-06-24), and the Metrics Available schema page https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema?view=li-lms-2026-09, served as li-lms-2026-09 (ms.date 2026-09-14, updated_at 2026-09-16), which types costInLocalCurrency as BigDecimal and the other requested metrics as long. No pagination per the page. The client follows a `next` link only if one ever appears. Otherwise, at 15,000 elements it splits the request by halving the date range. Date ranges are chunked so that creatives × days stays below 15,000 elements. An empty `elements` means no activity or no read access. Without `fields` only impressions and clicks are returned; up to 20 fields may be requested, and request.fields names 9. The 6-month daily retention caps backfill and any custom window at 180 days (AAP 0.2.4); performance data is otherwise retained 10 years and professional demographics 2 years, and timeGranularity=ALL ranges reaching past the daily retention round to month boundaries. The recovery probe sends this request with a one-day range (start equal to end). Throttled at 45 million metric values per 5 minutes. Request conventions: url is relative to https://api.linkedin.com/rest/; {acct} is urn%3Ali%3AsponsoredAccount%3A{id}; the Rest.li dateRange=(...) and List(...) keep literal parentheses, colons and commas; {fields} must equal request.fields exactly and is sent raw, not URL-encoded (an encoded projection is rejected with 400). dateRange.start and at least one facet (accounts, campaigns, campaignGroups, shares or companies) are required; this request uses accounts. pivotValues and dateRange are response fields requested through fields, never request filters.",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Report data points; at most 15,000 per response.",
+          "items": {
+            "type": "object",
+            "description": "One report data point: one creative on one UTC day. Every metric is optional: an element may omit metrics (observed live 2026-10-07), and an absent metric is unavailable, never zero.",
+            "properties": {
+              "pivotValues": {
+                "type": "array",
+                "description": "Values of the pivot for this data point (string[]). This product receives [creative URN], urn:li:sponsoredCreative:{id}; the documented sample pivots by MEMBER_COMPANY and so carries an organization URN.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dateRange": {
+                "type": "object",
+                "description": "UTC calendar day; LinkedIn days are UTC (AAP 0.3.3). Start and end are inclusive; DAILY elements carry start equal to end. The schema page marks start required and end optional.",
+                "properties": {
+                  "start": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "end": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "start"
+                ],
+                "additionalProperties": false
+              },
+              "costInLocalCurrency": {
+                "type": "string",
+                "description": "BigDecimal as a decimal string, in the account currency; parsed to numeric(18,6)."
+              },
+              "impressions": {
+                "type": "integer",
+                "description": "long. Impressions for Sponsored Content, sends for Sponsored Messaging; feeds fact_creative_daily.impressions."
+              },
+              "clicks": {
+                "type": "integer",
+                "description": "long. Chargeable clicks; feeds fact_creative_daily.clicks."
+              },
+              "landingPageClicks": {
+                "type": "integer",
+                "description": "long. Clicks to the creative landing page; feeds fact_creative_daily.landing_page_clicks."
+              },
+              "oneClickLeadFormOpens": {
+                "type": "integer",
+                "description": "long. Lead form opens; feeds fact_creative_daily.form_opens."
+              },
+              "oneClickLeads": {
+                "type": "integer",
+                "description": "long. Leads from One Click Lead Gen; feeds fact_creative_daily.leads."
+              },
+              "externalWebsiteConversions": {
+                "type": "integer",
+                "description": "long, documented default \"0\"; the sample carries an integer. Feeds fact_creative_daily.website_conversions."
+              },
+              "reactions": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "shares": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "likes": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because other documented views and the schema page's metrics table carry it."
+              }
+            },
+            "required": [
+              "pivotValues",
+              "dateRange"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Optional: the documented specific-metrics sample has none, while the first Analytics Finder sample and the live response (2026-10-07) carry {count, links, start}. The endpoint does not paginate; only a rel=next link in links is ever acted on.",
+          "properties": {
+            "count": {
+              "type": "integer"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rel",
+                  "href"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count",
+            "start"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "elements"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            }
+          },
+          "landingPageClicks": 0,
+          "costInLocalCurrency": "0.0",
+          "impressions": 6,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        },
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            }
+          },
+          "landingPageClicks": 11,
+          "costInLocalCurrency": "19.91833",
+          "impressions": 165,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        }
+      ]
+    }
+  }
+}

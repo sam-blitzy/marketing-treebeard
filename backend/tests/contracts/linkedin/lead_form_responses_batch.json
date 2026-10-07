@@ -1,0 +1,664 @@
+{
+  "surface": "linkedin.lead_form_responses_batch",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-07-29",
+  "request": {
+    "method": "GET",
+    "url": "leadFormResponses?ids=List({ids})&owner=(sponsoredAccount:{acct})&leadType=(leadType:SPONSORED)&fields={fields}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "ids",
+      "owner",
+      "leadType",
+      "fields"
+    ],
+    "optional_query": [],
+    "fields": "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,id,submittedAt,testLead,formResponse,form:(hiddenFields,creationLocale,name,id,content)",
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "max_ids": 100,
+      "max_ids_documented": 1000,
+      "client_max_ids": 100
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "LinkedIn Lead Sync batch get of Lead Form Responses by id: the transient email re-fetch behind lead-to-contact matching (AAP 0.3.3). The HubSpot job claims due lead_match rows and re-fetches their responses here. It decodes each email with the form version's map, where the version is parsed only from versionedLeadGenFormUrn because the form decoration carries no version field. It then applies the decoration consistency check and passes the email to one HubSpot contacts batch read (idProperty=email). The email exists only in memory for that one HubSpot batch call and is never stored; the database keeps only the SHA-256 written at ingest. Email: the answerDetails.textQuestionAnswer.answer whose questionId is a decorated question with predefinedField EMAIL, then WORK_EMAIL. The AAP names only EMAIL, but WORK_EMAIL is a distinct documented value, and the live account's only form asks WORK_EMAIL with no EMAIL question (observed 2026-10-07). Without WORK_EMAIL every live lead would end no_email. Consistency check: every answered formResponse.answers[].questionId must appear among form.content.questions[].questionId; otherwise the lead gets lead_match.status = no_email with reason \"form map mismatch\" and is never decoded with another version's map. A version with no known map gets no_email with reason \"unknown form version\". Creative and campaign under LEAD_FIELDS: associatedEntityInfo.associatedCreative.id and leadMetadataInfo.sponsoredLeadMetadataInfo.campaign.id, both URN strings (migration guide; observed live 2026-10-07). associatedEntity and leadMetadata appear only in unprojected responses such as documented_sample, so parsers read the *Info paths first and fall back to them. Failed re-fetch: an id present in errors, or absent from results, is a failed re-fetch for that lead. The row ends as lead_match.status = error with reason \"email no longer retrievable\" and counts as unresolved (AAP 0.3.3, 0.5.4.7). Live returns an unknown id as absent from results with errors {} (observed 2026-10-07), so absence alone must be treated as failure. Source: reference_url, served as moniker li-lms-2026-09 (ms.date 2026-07-14, updated_at 2026-07-29), section \"Get Multiple Lead Form responses\". That section requires the Rest.li 2.0 header and URL-encoded URNs and permits at most 1000 ids. The client sends at most 100 ids per call: limits.max_ids is the cap validators enforce, and it equals client_max_ids, below max_ids_documented. The decorated projection LEAD_FIELDS is the Lead Sync API migration guide's Response Decoration Migration example, verbatim. Errors: a batch get missing leadType or owner gets 400 \"Please specify a concrete LeadType and Owner for your request.\", a request defect that is never retried. A 401 \"The member doesn't have lead access permission.\", or a 403 for missing ad account or page roles, is access denied: Lead Sync needs r_marketing_leadgen_automation, and the denial switches all of LinkedIn to simulated (AAP 0.3.3). Request conventions: url is relative to https://api.linkedin.com/rest/. {acct} is urn%3Ali%3AsponsoredAccount%3A{id}. owner=(sponsoredAccount:...) and leadType=(leadType:SPONSORED) are literal and both required. {ids} is a comma-joined list of plain response ids, never URNs, and they are sent UNQUOTED. The page's sample request, the AAP and the original plan write quoted ids, List(\"{id}\"). Live 202609 returns 200 with empty results, statuses and errors for quoted ids, whether sent as raw quotes or %22 (observed 2026-10-07): every lead would silently fail, while unquoted ids return results keyed by plain id. Validators and payloads.parse_restli must accept unquoted, \"...\" and %22...%22 ids, so the documented vendor request still validates. {fields} must equal request.fields after one URL-decode and is sent raw, with commas, colons and parentheses unencoded. The AAP says it is URL-encoded once as one value, but live rejects an encoded projection with 400 \"Projected field ... not present in schema\" (observed 2026-10-07). request.fields is byte-identical to lead_form_responses.json request.fields and to connectors/linkedin/client.py LEAD_FIELDS. statuses and errors: the documented sample nests empty statuses and errors maps inside results, beside the id key, while live returns them at top level (observed 2026-10-07). Both placements are declared, and parsers skip the non-id keys statuses and errors inside results. Lockstep: the element schema (results.*) is copied verbatim from lead_form_responses.json elements.items, because the schema subset has no $ref. Its form.content.questions schema matches lead_forms.json structurally; only the description wording differs. Undeclared keys fail validation, so a field a newer version adds must be declared in all three files once the page or a live capture shows it.",
+      "type": "object",
+      "properties": {
+        "results": {
+          "description": "map keyed by the requested plain response id; the documented sample also nests empty `statuses`/`errors` maps here, which the parser must skip as non-id keys",
+          "type": "object",
+          "properties": {
+            "statuses": {
+              "description": "Documented-sample placement of the per-id status map (empty in the sample); not a response id.",
+              "type": "object",
+              "additionalProperties": true
+            },
+            "errors": {
+              "description": "Documented-sample placement of the per-id error map (empty in the sample); not a response id.",
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": {
+            "type": "object",
+            "description": "LeadGenFormResponse. Under request.fields LinkedIn returns the projected keys only; the unprojected documented sample carries submitter, associatedEntity and leadMetadata instead of form. The two creative and campaign paths are explained in the root description (KEY RISK).",
+            "required": [
+              "id",
+              "submittedAt",
+              "testLead",
+              "leadType",
+              "versionedLeadGenFormUrn",
+              "owner",
+              "formResponse"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Plain response id such as aaaabbbb-0000-cccc-1111-dddd2222eeee-5, not a URN. The de-duplication key across the 1 h cursor overlap and the id the batch re-fetch sends."
+              },
+              "submittedAt": {
+                "type": "integer",
+                "description": "Epoch milliseconds: the lead's touch instant."
+              },
+              "testLead": {
+                "type": "boolean",
+                "description": "True for test leads, which limitedToTestLeads=false returns with real ones. Dropped at ingest."
+              },
+              "leadType": {
+                "type": "string",
+                "description": "Open string. Documented values: SPONSORED, COMPANY, EVENT, ORGANIZATION_PRODUCT."
+              },
+              "owner": {
+                "type": "object",
+                "description": "Union: sponsoredAccount for sponsored leads, organization for organic ones.",
+                "properties": {
+                  "sponsoredAccount": {
+                    "type": "string",
+                    "description": "urn:li:sponsoredAccount:{id}"
+                  },
+                  "organization": {
+                    "type": "string",
+                    "description": "urn:li:organization:{id}"
+                  }
+                }
+              },
+              "versionedLeadGenFormUrn": {
+                "type": "string",
+                "description": "urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{id},{version}); the only source of the version (AAP 0.3.3). Its canonical urn:li:leadGenForm:{id} joins the content-asset registry."
+              },
+              "submitter": {
+                "type": "string",
+                "description": "Member URN (urn:li:person:...). Unprojected only, and omitted for guest leads since 202408. Never stored; redacted in captures."
+              },
+              "responseId": {
+                "type": "string",
+                "description": "Front-end TrackingId, documented as returned by default; absent from the sample and from request.fields. Unused."
+              },
+              "associatedEntity": {
+                "type": "object",
+                "description": "Unprojected creative link. Absent under request.fields and for leads with no associated entity.",
+                "properties": {
+                  "associatedCreative": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "urn:li:sponsoredCreative:{id}; null or absent means unknown creative."
+                  }
+                }
+              },
+              "leadMetadata": {
+                "type": "object",
+                "description": "Unprojected campaign link. Absent under request.fields; optional for test leads.",
+                "properties": {
+                  "sponsoredLeadMetadata": {
+                    "type": "object",
+                    "properties": {
+                      "campaign": {
+                        "type": "string",
+                        "description": "urn:li:sponsoredCampaign:{id}"
+                      }
+                    }
+                  }
+                }
+              },
+              "ownerInfo": {
+                "type": "object",
+                "description": "Owner decoration: sponsoredAccountInfo or organizationInfo.",
+                "properties": {
+                  "sponsoredAccountInfo": {
+                    "type": "object",
+                    "properties": {
+                      "sponsoredAccount": {
+                        "type": "string",
+                        "description": "urn:li:sponsoredAccount:{id}"
+                      },
+                      "name": {
+                        "type": "string",
+                        "description": "Ad account name."
+                      },
+                      "localizedOrganizationName": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "organizationInfo": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Organization owner details; fields not documented."
+                  }
+                }
+              },
+              "leadMetadataInfo": {
+                "type": "object",
+                "description": "Campaign decoration, the campaign link under request.fields. Can be empty for test leads.",
+                "properties": {
+                  "sponsoredLeadMetadataInfo": {
+                    "type": "object",
+                    "properties": {
+                      "campaign": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "description": "urn:li:sponsoredCampaign:{id}: a URN string in the documented sample and live (the migration guide says to parse out the number), not an integer."
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "TEXT_AD, SPONSORED_UPDATES, SPONSORED_INMAILS or DYNAMIC."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "associatedEntityInfo": {
+                "type": "object",
+                "description": "Creative decoration, the creative link under request.fields. Absent when the lead has no creative.",
+                "properties": {
+                  "associatedCreative": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "urn:li:sponsoredCreative:{id}"
+                      },
+                      "intendedStatus": {
+                        "type": "string"
+                      },
+                      "content": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "description": "Creative content union, e.g. {reference: post URN}; live 202609 returned it empty.",
+                        "properties": {
+                          "reference": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "formResponse": {
+                "type": "object",
+                "required": [
+                  "answers"
+                ],
+                "properties": {
+                  "answers": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "questionId",
+                        "answerDetails"
+                      ],
+                      "properties": {
+                        "questionId": {
+                          "type": "integer",
+                          "description": "long; a question of this response's form version."
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "Question name (schema page; absent from sample and live)."
+                        },
+                        "answerDetails": {
+                          "type": "object",
+                          "additionalProperties": true,
+                          "description": "Union: textQuestionAnswer {answer} or multipleChoiceAnswer {options: [int]}. The schema page's table names this union 'accepted'; the documented sample and live responses use answerDetails. Free-text answers are never stored."
+                        }
+                      }
+                    }
+                  },
+                  "consentResponses": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "consentId",
+                        "accepted"
+                      ],
+                      "properties": {
+                        "consentId": {
+                          "type": "integer"
+                        },
+                        "accepted": {
+                          "type": "boolean"
+                        },
+                        "consent": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "form": {
+                "type": "object",
+                "description": "LeadGenForm decoration added by the form:(hiddenFields,creationLocale,name,id,content) part of request.fields, built from this element's own versionedLeadGenFormUrn. It carries no version field (no versionId or versionTag), so the version comes only from the URN. form.id is the numeric form id; form identity still comes from the URN. Absent from the unprojected documented sample.",
+                "required": [
+                  "id",
+                  "content"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "description": "Long form id (live equals the id inside the URN)."
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "hiddenFields": {
+                    "type": "array",
+                    "description": "Owner tracking fields, at most 20; empty when none are configured.",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "name",
+                        "value"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "creationLocale": {
+                    "type": "object",
+                    "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                    "properties": {
+                      "country": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "variant": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "content": {
+                    "type": "object",
+                    "description": "DisplayContent of this version. questions feeds the email map and the consistency check.",
+                    "required": [
+                      "questions"
+                    ],
+                    "properties": {
+                      "headline": {
+                        "type": "object",
+                        "description": "Form headline.",
+                        "properties": {
+                          "localized": {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "description": "Locale-keyed map such as en_US to the localized string."
+                          },
+                          "preferredLocale": {
+                            "type": "object",
+                            "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                            "properties": {
+                              "country": {
+                                "type": "string"
+                              },
+                              "language": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "description": {
+                        "type": "object",
+                        "description": "Optional form description.",
+                        "properties": {
+                          "localized": {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "description": "Locale-keyed map such as en_US to the localized string."
+                          },
+                          "preferredLocale": {
+                            "type": "object",
+                            "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                            "properties": {
+                              "country": {
+                                "type": "string"
+                              },
+                              "language": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "questions": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "description": "LeadGenFormQuestion (Lead Sync schema); the same question schema as lead_forms.json. A questionId identifies a question within one form version: editing a form creates a new version, so an id can change meaning between versions.",
+                          "required": [
+                            "questionId"
+                          ],
+                          "properties": {
+                            "questionId": {
+                              "type": "integer",
+                              "description": "long. formResponse.answers[].questionId references it."
+                            },
+                            "name": {
+                              "type": "string",
+                              "description": "Owner-facing, language-agnostic question name."
+                            },
+                            "question": {
+                              "type": "object",
+                              "description": "Question prompt shown to the member.",
+                              "properties": {
+                                "localized": {
+                                  "type": "object",
+                                  "additionalProperties": true,
+                                  "description": "Locale-keyed map such as en_US to the localized string."
+                                },
+                                "preferredLocale": {
+                                  "type": "object",
+                                  "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                                  "properties": {
+                                    "country": {
+                                      "type": "string"
+                                    },
+                                    "language": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "textPrompt": {
+                              "type": "object",
+                              "description": "Optional hint shown with the question (MultiLocaleString on the schema page).",
+                              "properties": {
+                                "localized": {
+                                  "type": "object",
+                                  "additionalProperties": true,
+                                  "description": "Locale-keyed map such as en_US to the localized string."
+                                },
+                                "preferredLocale": {
+                                  "type": "object",
+                                  "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                                  "properties": {
+                                    "country": {
+                                      "type": "string"
+                                    },
+                                    "language": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "predefinedField": {
+                              "type": "string",
+                              "description": "Open string, so a newly added value cannot reject live data; absent on custom questions. Documented values: FIRST_NAME, LAST_NAME, PHONE_NUMBER, EMAIL, CITY, STATE, COUNTRY, ZIP_CODE, JOB_TITLE, JOB_FUNCTION, SENIORITY, COMPANY_NAME, COMPANY_SIZE, INDUSTRY, DEGREE, FIELD_OF_STUDY, SCHOOL, START_DATE, GRADUATION_DATE, GENDER, WORK_EMAIL, LINKEDIN_PROFILE_LINK, WORK_PHONE_NUMBER. Email questions: EMAIL (AAP 0.3.3) and WORK_EMAIL, the only email field on the live forms observed 2026-10-07."
+                            },
+                            "responseEditable": {
+                              "type": "boolean",
+                              "description": "Default true."
+                            },
+                            "responseRequired": {
+                              "type": "boolean",
+                              "description": "Default true."
+                            },
+                            "questionDetails": {
+                              "type": "object",
+                              "additionalProperties": true,
+                              "description": "Union: textQuestionDetails {defaultResponse?, maxResponseLength} or multipleChoiceQuestionDetails {options[{id, text, label?}], defaultSelectedOption?}."
+                            },
+                            "questionSubmissionCriteria": {
+                              "type": "object",
+                              "additionalProperties": true,
+                              "description": "Union: workEmailSubmissionCriteria {freemiumEmailAllowed}; predefined-field questions only."
+                            },
+                            "label": {
+                              "type": "string",
+                              "description": "Optional marketer label, unique within the form."
+                            }
+                          }
+                        }
+                      },
+                      "legalInfo": {
+                        "type": "object",
+                        "properties": {
+                          "legalInfoId": {
+                            "type": "integer"
+                          },
+                          "privacyPolicyUrl": {
+                            "type": "string"
+                          },
+                          "legalDisclaimer": {
+                            "type": "object",
+                            "description": "Optional legal disclaimer.",
+                            "properties": {
+                              "localized": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "description": "Locale-keyed map such as en_US to the localized string."
+                              },
+                              "preferredLocale": {
+                                "type": "object",
+                                "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                                "properties": {
+                                  "country": {
+                                    "type": "string"
+                                  },
+                                  "language": {
+                                    "type": "string"
+                                  },
+                                  "variant": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          "consents": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "integer"
+                                },
+                                "consent": {
+                                  "type": "object",
+                                  "description": "Consent checkbox text.",
+                                  "properties": {
+                                    "localized": {
+                                      "type": "object",
+                                      "additionalProperties": true,
+                                      "description": "Locale-keyed map such as en_US to the localized string."
+                                    },
+                                    "preferredLocale": {
+                                      "type": "object",
+                                      "description": "Locale record: ISO-3166 uppercase country, ISO-639-1 lowercase language, optional variant.",
+                                      "properties": {
+                                        "country": {
+                                          "type": "string"
+                                        },
+                                        "language": {
+                                          "type": "string"
+                                        },
+                                        "variant": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "checkRequired": {
+                                  "type": "boolean"
+                                },
+                                "label": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "postSubmissionInfo": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "description": "message and callToAction {callToActionLabel, callToActionTarget {landingPageUrl}}."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "statuses": {
+          "description": "Optional map of requested id to that id's HTTP status; {} when every id succeeded (live placement, observed 2026-10-07).",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "errors": {
+          "description": "Optional map of requested id to its error. An id listed here is a failed re-fetch. Live returns {} even for an unknown id, which is simply absent from results (observed 2026-10-07).",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "results"
+      ]
+    },
+    "documented_sample": {
+      "results": {
+        "aaaabbbb-0000-cccc-1111-dddd2222eeee-5": {
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:522529623"
+          },
+          "submitter": "urn:li:person:MpGcnvaU_p",
+          "versionedLeadGenFormUrn": "urn:li:versionedLeadGenForm:(urn:li:leadGenForm:3162,1)",
+          "leadMetadata": {
+            "sponsoredLeadMetadata": {
+              "campaign": "urn:li:sponsoredCampaign:367378525"
+            }
+          },
+          "ownerInfo": {
+            "sponsoredAccountInfo": {
+              "name": "Angela Test"
+            }
+          },
+          "testLead": false,
+          "associatedEntity": {
+            "associatedCreative": "urn:li:sponsoredCreative:121608865"
+          },
+          "leadType": "SPONSORED",
+          "leadMetadataInfo": {
+            "sponsoredLeadMetadataInfo": {
+              "campaign": {
+                "name": "Brand awareness - May 3, 2022",
+                "type": "SPONSORED_UPDATES",
+                "id": "urn:li:sponsoredCampaign:367378525"
+              }
+            }
+          },
+          "associatedEntityInfo": {
+            "associatedCreative": {
+              "intendedStatus": "ACTIVE",
+              "content": {
+                "reference": "urn:li:ugcPost:6927151919538794496"
+              },
+              "id": "urn:li:sponsoredCreative:121608865"
+            }
+          },
+          "id": "aaaabbbb-0000-cccc-1111-dddd2222eeee-5",
+          "submittedAt": 1686182358881,
+          "formResponse": {
+            "answers": [
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Hello World-testing purpose"
+                  }
+                },
+                "questionId": 1
+              },
+              {
+                "answerDetails": {
+                  "multipleChoiceAnswer": {
+                    "options": [
+                      1,
+                      3
+                    ]
+                  }
+                },
+                "questionId": 2
+              }
+            ],
+            "consentResponses": [
+              {
+                "accepted": true,
+                "consentId": 4
+              }
+            ]
+          }
+        },
+        "statuses": {},
+        "errors": {}
+      }
+    }
+  }
+}
