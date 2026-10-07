@@ -5712,15 +5712,24 @@ def _creative_scenarios() -> Iterator[Scenario]:
             },
         ),
     )
+    # Priority decision: a stage with zero exposure has no Wilson interval, so CR2 can never
+    # report it and CR3 never tests it; every variant has at least cr.min_impressions
+    # impressions, so click and open rate always have exposure. With zero form opens the open
+    # rate (0%) is the weak stage, which is the right advice: change the CTA label, not the
+    # form nobody opened. CR3's "zero exposure" guard is therefore reachable only through
+    # analysis.creative.plan_next_test, and this case pins the behaviour evaluate() shows.
     yield _case(
-        "cr3.not_estimable_zero_exposure",
+        "cr3.zero_exposure",
         module,
-        "CR3 units: zero exposure at the tested stage is not estimable",
+        "CR3 units: a stage with zero exposure (no form opens) is never tested; the 0% open "
+        "rate is weak, so the test changes only the call-to-action label, sized in impressions",
         _creative_world(
-            "cr3.not_estimable_zero_exposure",
+            "cr3.zero_exposure",
             (("cr-a", _funnel_days(20_000, 300, 0, 0)), ("cr-b", _funnel_days(20_000, 300, 0, 0))),
         ),
-        Expectation(CR3, False, {"sample_needed": "not estimable", "reason": "zero exposure"}),
+        Expectation(
+            CR3, True, {"stage": "open_rate", "variable": "cta_label", "unit": "impressions"}
+        ),
     )
     yield _case(
         "cr3.not_estimable_zero_baseline",
