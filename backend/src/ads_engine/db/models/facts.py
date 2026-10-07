@@ -30,11 +30,18 @@ the four daily tables, because every daily source row reports them. Every source
 metric is nullable and ``None`` means "unavailable", never zero; the rules treat it so. A
 ``NULL`` also satisfies each table's ``ck_<table>_non_negative`` check.
 
+**Dataset-qualified entity references** (AAP 0.3.3: only ``lead_match`` links two datasets).
+Every entity reference is a composite foreign key (``<entity>_id``, ``dataset_id``) to the
+entity table's unique (``dataset_id``, ``id``), so the referenced entity must belong to the
+row's own dataset. Only same-dataset lineage therefore enters a computation, and purging
+another dataset can never delete the row. The entity column is listed first, so the naming
+convention still names each constraint ``fk_<table>_<entity>_id_<entity table>``.
+
 **Indexes** (AAP 0.2.1: "Daily facts are indexed by entity and date"). Each daily table has
 an (entity, ``date``) index that serves window aggregation and, because it leads with the
-referencing column, the ``ON DELETE CASCADE`` from the entity table; PostgreSQL does not
-index referencing columns by itself. The natural-key unique constraint leads with
-``dataset_id`` and serves the cascade from ``source_dataset``.
+entity column of the composite foreign key, the ``ON DELETE CASCADE`` from the entity
+table; PostgreSQL does not index referencing columns by itself. The natural-key unique
+constraint leads with ``dataset_id`` and serves the cascade from ``source_dataset``.
 
 Every foreign key is ``ON DELETE CASCADE``, so purging a retired dataset is the single
 ``DELETE FROM source_dataset WHERE id = :retired`` (AAP 0.3.3). Foreign keys name their
@@ -112,7 +119,10 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
     B4). ``date`` is the source's native day and is never rebucketed (AAP 0.5.4.1).
 
     Attributes:
-        campaign_id: The :class:`~ads_engine.db.models.accounts.Campaign` the row measures.
+        campaign_id: The :class:`~ads_engine.db.models.accounts.Campaign` the row measures,
+            which must belong to the row's own dataset: the composite foreign key
+            (``campaign_id``, ``dataset_id``) references the campaign's unique
+            (``dataset_id``, ``id``).
         date: The source's native day: Google in the account's time zone, LinkedIn in UTC.
         cost: Spend in the account's currency (Google ``cost_micros`` / 1,000,000).
         impressions: Impressions on the day.
@@ -132,9 +142,7 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "fact_campaign_daily"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "campaign_id", "date")
 
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-    )
+    campaign_id: Mapped[int]
     date: Mapped[NativeDate]
     cost: Mapped[Decimal]
     impressions: Mapped[int]
@@ -156,6 +164,12 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
             "budget_lost_is",
             "impression_share",
         ),
+        # Dataset-qualified: the campaign must belong to this row's dataset.
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "campaign_id", "date"),
         sa.Index("ix_fact_campaign_daily_campaign_date", "campaign_id", "date"),
     )
@@ -173,7 +187,10 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
     ``leads`` / ``form_opens`` (CR1 to CR3, AAP 0.5.4.6).
 
     Attributes:
-        creative_id: The :class:`~ads_engine.db.models.accounts.Creative` the row measures.
+        creative_id: The :class:`~ads_engine.db.models.accounts.Creative` the row measures,
+            which must belong to the row's own dataset: the composite foreign key
+            (``creative_id``, ``dataset_id``) references the creative's unique
+            (``dataset_id``, ``id``).
         date: The UTC day of LinkedIn's daily bucket.
         cost: ``costInLocalCurrency``, in the account's currency.
         impressions: ``impressions``.
@@ -193,9 +210,7 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "fact_creative_daily"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "creative_id", "date")
 
-    creative_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("creative.id", ondelete="CASCADE"),
-    )
+    creative_id: Mapped[int]
     date: Mapped[NativeDate]
     cost: Mapped[Decimal]
     impressions: Mapped[int]
@@ -221,6 +236,12 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
             "landing_page_clicks",
             "website_conversions",
         ),
+        # Dataset-qualified: the creative must belong to this row's dataset.
+        sa.ForeignKeyConstraint(
+            ["creative_id", "dataset_id"],
+            ["creative.id", "creative.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "creative_id", "date"),
         sa.Index("ix_fact_creative_daily_creative_date", "creative_id", "date"),
     )
@@ -238,7 +259,10 @@ class FactKeywordDaily(IdPkMixin, DatasetScopedMixin, Base):
     the Google account's time zone, as reported (AAP 0.5.4.1).
 
     Attributes:
-        keyword_id: The :class:`~ads_engine.db.models.accounts.Keyword` the row measures.
+        keyword_id: The :class:`~ads_engine.db.models.accounts.Keyword` the row measures,
+            which must belong to the row's own dataset: the composite foreign key
+            (``keyword_id``, ``dataset_id``) references the keyword's unique
+            (``dataset_id``, ``id``).
         date: The Google native day (``segments.date``).
         cost: Spend in the account's currency (``cost_micros`` / 1,000,000).
         impressions: Impressions on the day.
@@ -255,9 +279,7 @@ class FactKeywordDaily(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "fact_keyword_daily"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "keyword_id", "date")
 
-    keyword_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("keyword.id", ondelete="CASCADE"),
-    )
+    keyword_id: Mapped[int]
     date: Mapped[NativeDate]
     cost: Mapped[Decimal]
     impressions: Mapped[int]
@@ -278,6 +300,12 @@ class FactKeywordDaily(IdPkMixin, DatasetScopedMixin, Base):
             "conversions_value",
             "historical_quality_score",
             "average_cpc",
+        ),
+        # Dataset-qualified: the keyword must belong to this row's dataset.
+        sa.ForeignKeyConstraint(
+            ["keyword_id", "dataset_id"],
+            ["keyword.id", "keyword.dataset_id"],
+            ondelete="CASCADE",
         ),
         sa.UniqueConstraint("dataset_id", "keyword_id", "date"),
         sa.Index("ix_fact_keyword_daily_keyword_date", "keyword_id", "date"),
@@ -306,10 +334,16 @@ class FactSearchTermDaily(IdPkMixin, DatasetScopedMixin, Base):
     aggregation (K2's campaign cost per conversion, C3b) needs no join; its own index also
     serves the cascade when a campaign row is deleted.
 
+    Both entity references are dataset-qualified: the composite foreign keys
+    (``ad_group_id``, ``dataset_id``) and (``campaign_id``, ``dataset_id``) reference each
+    entity's unique (``dataset_id``, ``id``), so the ad group and the campaign must belong to
+    the row's own dataset.
+
     Attributes:
         ad_group_id: The :class:`~ads_engine.db.models.accounts.AdGroup` that served the
-            term.
-        campaign_id: The :class:`~ads_engine.db.models.accounts.Campaign` of that ad group.
+            term, of the row's own dataset.
+        campaign_id: The :class:`~ads_engine.db.models.accounts.Campaign` of that ad group,
+            of the row's own dataset.
         date: The Google native day (``segments.date``).
         search_term: ``search_term_view.search_term``, as the user typed it.
         term_status: ``search_term_view.status`` (:data:`SEARCH_TERM_STATUSES`).
@@ -336,12 +370,8 @@ class FactSearchTermDaily(IdPkMixin, DatasetScopedMixin, Base):
         "date",
     )
 
-    ad_group_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("ad_group.id", ondelete="CASCADE"),
-    )
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-    )
+    ad_group_id: Mapped[int]
+    campaign_id: Mapped[int]
     date: Mapped[NativeDate]
     search_term: Mapped[str]
     term_status: Mapped[str]
@@ -359,6 +389,17 @@ class FactSearchTermDaily(IdPkMixin, DatasetScopedMixin, Base):
         check_in("source", SOURCES),
         check_in("term_status", SEARCH_TERM_STATUSES),
         non_negative("cost", "impressions", "clicks", "conversions", "conversions_value"),
+        # Dataset-qualified: the ad group and the campaign must belong to this row's dataset.
+        sa.ForeignKeyConstraint(
+            ["ad_group_id", "dataset_id"],
+            ["ad_group.id", "ad_group.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint(
             "dataset_id",
             "ad_group_id",
@@ -390,7 +431,9 @@ class FactSegmentWindow(IdPkMixin, DatasetScopedMixin, Base):
 
     Attributes:
         campaign_id: The :class:`~ads_engine.db.models.accounts.Campaign` the segment
-            belongs to.
+            describes, which must belong to the row's own dataset: the composite foreign key
+            (``campaign_id``, ``dataset_id``) references the campaign's unique
+            (``dataset_id``, ``id``).
         facet: ``job_function``, ``seniority`` or ``industry`` (:data:`SEGMENT_FACETS`).
         value: The pivot value as LinkedIn returns it, for example
             ``urn:li:seniority:5``.
@@ -416,10 +459,7 @@ class FactSegmentWindow(IdPkMixin, DatasetScopedMixin, Base):
     )
 
     # The natural key leads with dataset_id, so the cascade from campaign needs this index.
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-        index=True,
-    )
+    campaign_id: Mapped[int] = mapped_column(index=True)
     facet: Mapped[str]
     value: Mapped[str]
     window_start: Mapped[NativeDate]
@@ -435,6 +475,12 @@ class FactSegmentWindow(IdPkMixin, DatasetScopedMixin, Base):
         check_in("facet", SEGMENT_FACETS),
         non_negative("impressions", "clicks", "cost", "leads"),
         sa.CheckConstraint("window_end >= window_start", name="window_order"),
+        # Dataset-qualified: the campaign must belong to this row's dataset.
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint(
             "dataset_id",
             "campaign_id",

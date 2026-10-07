@@ -21,19 +21,29 @@ are not stored either.
 
 **Datasets and purge** (AAP 0.3.3): every table except ``lead_match`` mixes in
 :class:`~ads_engine.db.base.DatasetScopedMixin`, and every foreign key between rows of the
-same dataset is ``ON DELETE CASCADE``. ``lead_match`` is the one table that links two
-datasets, a LinkedIn lead and a CRM contact, so it carries ``crm_dataset_id`` instead of the
-mixin and all three of its foreign keys cascade. Purging a retired HubSpot dataset therefore
-deletes only that dataset's own matching rows, and purging a retired LinkedIn dataset deletes
-its leads with every match that references them. Each referencing column is indexed or leads
+same dataset is ``ON DELETE CASCADE``. ``lead``'s references to its campaign and creative
+are dataset-qualified composite foreign keys, (``campaign_id``, ``dataset_id``) ->
+``campaign`` (``id``, ``dataset_id``) and (``creative_id``, ``dataset_id``) -> ``creative``
+(``id``, ``dataset_id``), each backed by the parent's unique (``dataset_id``, ``id``), so a
+lead can only reference entities of its own dataset. ``lead_match`` is the one table that
+links two datasets, a LinkedIn lead and a CRM contact, so it carries ``crm_dataset_id``
+instead of the mixin, and all three of its foreign keys cascade. Its contact key is
+(``contact_id``, ``crm_dataset_id``) -> ``crm_contact`` (``id``, ``dataset_id``), so a match
+can only reference a contact of its own CRM dataset, and a purge of another CRM dataset can
+never delete it. Purging a retired HubSpot dataset therefore deletes only that dataset's own
+matching rows, and purging a retired LinkedIn dataset deletes its leads with every match
+that references them. The first referencing column of every foreign key is indexed or leads
 an index, because PostgreSQL does not index referencing columns and the cascade would
 otherwise scan the child table once per deleted parent row.
 
 **Unknown is never absent** (AAP 0.3.3, 0.5.4.7): association endpoints are HubSpot ids
 stored as ``text`` with no foreign key, so an association whose meeting or deal could not be
-read is still recorded. ``crm_association_fetch`` then says whether that evidence is known:
-only a fetch whose status is ``ok`` or ``ok_empty`` and whose target reads are ``ok`` counts,
-and anything else makes the contact's evidence unknown rather than zero.
+read is still recorded. ``crm_association_fetch`` then says whether that evidence is known,
+in exactly two cases: an ``ok_empty`` fetch is a known genuine zero, with no target reads
+(its ``target_read_status`` is ``None``); an ``ok`` fetch is known only when its
+``target_read_status`` is ``ok``. Anything else (``partial``, ``error``, or ``ok`` with
+target reads ``partial``, ``error`` or ``None``) makes the contact's evidence unknown, never
+zero.
 
 HubSpot ids are ``text`` (they exceed 2**53 and arrive as strings). CRM property columns are
 nullable, and ``None`` means unavailable or not returned, never a default (AAP 0.11.1).
@@ -112,6 +122,20 @@ CRM_OBJECT_TYPES: Final[tuple[str, ...]] = ("contact", "meeting", "deal")
 # characters, the SHA-256 digest of the normalised email. NULL (no email) passes.
 _EMAIL_SHA256_HEX_SQL: Final[str] = "email_sha256 ~ '^[0-9a-f]{64}$'"
 
+# The completed-state CHECK texts the migration repeats verbatim. A ``matched`` lead_match row
+# names its contact and the outcome of reading it; every other status is left unconstrained.
+_MATCHED_HAS_CONTACT_SQL: Final[str] = (
+    "status <> 'matched' OR (contact_id IS NOT NULL AND contact_read_status IS NOT NULL)"
+)
+# An ``ok_empty`` fetch (a genuine zero) has no targets to read and none missing.
+_OK_EMPTY_SHAPE_SQL: Final[str] = (
+    "status <> 'ok_empty' OR (target_read_status IS NULL AND cardinality(missing_target_ids) = 0)"
+)
+# Target reads are ``ok`` only when every associated id was returned, whatever the status.
+_TARGET_READ_OK_COMPLETE_SQL: Final[str] = (
+    "target_read_status <> 'ok' OR cardinality(missing_target_ids) = 0"
+)
+
 
 class Lead(IdPkMixin, DatasetScopedMixin, Base):
     """One LinkedIn lead-form response, traced to the campaign and creative that produced it.
@@ -130,13 +154,23 @@ class Lead(IdPkMixin, DatasetScopedMixin, Base):
     row then records ``no_email`` with the reason ("form map mismatch" or "unknown form
     version"). Each new lead gets a ``pending`` :class:`LeadMatch` row.
 
+    Both entity references are dataset-qualified: the composite foreign keys
+    (``campaign_id``, ``dataset_id``) and (``creative_id``, ``dataset_id``) reference each
+    entity's unique (``dataset_id``, ``id``), so a lead can reference only a campaign and a
+    creative of its own dataset. Only same-dataset lineage therefore enters attribution, and
+    purging another dataset can never delete the lead. A ``NULL`` ``creative_id`` is not
+    checked (``MATCH SIMPLE``). ``ix_lead_campaign_id`` and ``ix_lead_creative_id`` serve the
+    cascades from ``campaign`` and ``creative``.
+
     Attributes:
         external_id: The LinkedIn response id, a plain id rather than a URN.
         submitted_at: The response's ``submittedAt`` instant: the touch that anchors the
             causal check and lead maturity (AAP 0.5.4.1, 0.5.4.7).
-        campaign_id: The campaign from the response's sponsored lead metadata.
-        creative_id: The creative from ``associatedEntity``; ``None`` when LinkedIn reports
-            none, which counts toward the creative share (``creative_floor``).
+        campaign_id: The campaign from the response's sponsored lead metadata, of the lead's
+            own dataset.
+        creative_id: The creative from ``associatedEntity``, of the lead's own dataset;
+            ``None`` when LinkedIn reports none, which counts toward the creative share
+            (``creative_floor``).
         lead_form_urn: The canonical ``urn:li:leadGenForm:{id}``.
         lead_form_version: The integer form version parsed from ``versionedLeadGenFormUrn``.
         email_sha256: SHA-256 hex digest of the normalised email; ``None`` without one.
@@ -147,14 +181,8 @@ class Lead(IdPkMixin, DatasetScopedMixin, Base):
 
     external_id: Mapped[str]
     submitted_at: Mapped[datetime]
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-        index=True,
-    )
-    creative_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("creative.id", ondelete="CASCADE"),
-        index=True,
-    )
+    campaign_id: Mapped[int] = mapped_column(index=True)
+    creative_id: Mapped[int | None] = mapped_column(index=True)
     lead_form_urn: Mapped[str]
     lead_form_version: Mapped[int]
     email_sha256: Mapped[str | None] = mapped_column(sa.CHAR(64))
@@ -162,6 +190,17 @@ class Lead(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.CheckConstraint(_EMAIL_SHA256_HEX_SQL, name="email_sha256_hex"),
+        # Dataset-qualified: the campaign and the creative must belong to this lead's dataset.
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["creative_id", "dataset_id"],
+            ["creative.id", "creative.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "external_id"),
         # Window cohorts select a dataset's leads by submission instant.
         sa.Index("ix_lead_dataset_submitted", "dataset_id", "submitted_at"),
@@ -180,17 +219,28 @@ class LeadMatch(Base):
     ``sync/lead_match.py`` writes these rows directly rather than through a natural-key
     upsert, claiming due rows with ``FOR UPDATE SKIP LOCKED`` and committing per batch, so a
     crash mid-job loses no state. ``ix_lead_match_due`` serves that claim and also the
-    cascade from ``source_dataset``; the primary key serves the cascade from ``lead``.
+    cascade from ``source_dataset``; the primary key serves the cascade from ``lead``, and
+    ``ix_lead_match_contact_id`` the cascade from ``crm_contact``.
 
     Retry schedule: ``no_match`` and ``error`` rows are retried after 1 h, 6 h and 24 h, then
     daily until 30 days after submission, so contacts created late are still found.
     ``no_email`` is terminal. An email LinkedIn no longer returns ends as ``error`` with the
     reason "email no longer retrievable".
 
-    Purge: all three foreign keys are ``ON DELETE CASCADE``. Purging a retired HubSpot
-    dataset deletes only its own rows (through ``crm_dataset_id`` and ``contact_id``), never
-    the rows staged for the active CRM dataset; purging a retired LinkedIn dataset deletes
-    every row of its leads.
+    Completed state: a row becomes ``matched`` together with its ``contact_id`` and
+    ``contact_read_status``, enforced by ``ck_lead_match_matched_has_contact``. The email
+    batch read that finds the contact is itself a successful read of it, so the matching
+    writer sets ``ok``; a later failed refresh by id sets ``error``. ``pending``,
+    ``no_match``, ``no_email`` and ``error`` rows are not constrained further.
+
+    Contact and purge: the contact key is the composite (``contact_id``,
+    ``crm_dataset_id``) -> ``crm_contact`` (``id``, ``dataset_id``), so ``contact_id`` can
+    only name a contact of the match's own CRM dataset; the database rejects a contact of
+    any other dataset, and a ``NULL`` ``contact_id`` is allowed. All three foreign keys
+    (``lead_id``, ``crm_dataset_id`` and the contact key) are ``ON DELETE CASCADE``.
+    Purging a retired HubSpot dataset therefore deletes only its own rows, through
+    ``crm_dataset_id`` and its own contacts, and never a row staged for another CRM
+    dataset; purging a retired LinkedIn dataset deletes every row of its leads.
 
     Attributes:
         lead_id: The :class:`Lead` being matched.
@@ -201,7 +251,8 @@ class LeadMatch(Base):
         attempts: Match attempts made so far (server default ``0``).
         next_attempt_at: When the row is next due; ``None`` when no retry is scheduled.
         last_checked_at: When a match was last attempted; ``None`` while never attempted.
-        contact_id: The matched :class:`CrmContact`, a contact in ``crm_dataset_id``.
+        contact_id: The matched :class:`CrmContact`, a contact in ``crm_dataset_id``
+            (enforced by ``fk_lead_match_contact_id_crm_contact``); ``None`` until matched.
         contact_read_status: Outcome of the latest refresh of the matched contact
             (:data:`CONTACT_READ_STATUSES`); ``None`` until matched.
         reason: Why the row is in its status, for example "form map mismatch".
@@ -221,16 +272,23 @@ class LeadMatch(Base):
     attempts: Mapped[int] = mapped_column(server_default=sa.text("0"))
     next_attempt_at: Mapped[datetime | None]
     last_checked_at: Mapped[datetime | None]
-    contact_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("crm_contact.id", ondelete="CASCADE"),
-        index=True,
-    )
+    contact_id: Mapped[int | None] = mapped_column(index=True)
     contact_read_status: Mapped[str | None]
     reason: Mapped[str | None]
 
     __table_args__ = (
         check_in("status", LEAD_MATCH_STATUSES),
         check_in("contact_read_status", CONTACT_READ_STATUSES),
+        # A matched row always carries its contact and that contact's read status.
+        sa.CheckConstraint(_MATCHED_HAS_CONTACT_SQL, name="matched_has_contact"),
+        # The contact must belong to this match's CRM dataset. contact_id is listed first so
+        # the convention names the key fk_lead_match_contact_id_crm_contact; a NULL
+        # contact_id (no match yet) is not checked.
+        sa.ForeignKeyConstraint(
+            ["contact_id", "crm_dataset_id"],
+            ["crm_contact.id", "crm_contact.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.Index("ix_lead_match_due", "crm_dataset_id", "status", "next_attempt_at"),
     )
 
@@ -248,6 +306,10 @@ class CrmContact(IdPkMixin, DatasetScopedMixin, Base):
     date means the contact skipped that stage: it is not counted, even if its current stage
     is later, and no other date stands in. QL is observed from its own property and never
     derived from MQL.
+
+    ``uq_crm_contact_dataset_id_id`` makes (``dataset_id``, ``id``) a key that
+    :class:`LeadMatch` references, so a match can only point at a contact of its own CRM
+    dataset.
 
     Attributes:
         hs_id: The HubSpot contact id.
@@ -280,6 +342,8 @@ class CrmContact(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "hs_id"),
+        # Anchors lead_match's dataset-qualified contact key, (contact_id, crm_dataset_id).
+        sa.UniqueConstraint("dataset_id", "id"),
         # Lead matching and simulated contact lookups find a dataset's contact by email hash.
         sa.Index("ix_crm_contact_dataset_email", "dataset_id", "email_sha256"),
     )
@@ -412,12 +476,20 @@ class CrmAssociationFetch(IdPkMixin, DatasetScopedMixin, Base):
     (unknown CRM evidence, orphan-deal share). One row per (object, target type) fetch, for
     example a contact's meetings or a deal's contacts.
 
-    An association is known evidence only when ``status`` is ``ok`` or ``ok_empty`` and
-    ``target_read_status`` is ``ok`` (``ok_empty`` has nothing to read, so its
-    ``target_read_status`` is ``None``). An empty successful result is a genuine zero; any
-    failed or partial step is unknown, never absent, and makes the contact's evidence unknown.
-    A deal's orphan status comes from its deal-to-contact fetch: ``ok_empty`` means orphan,
-    ``ok`` with target reads ``ok`` means linked, and anything else is unknown.
+    A fetch is known evidence in exactly two cases. ``status`` ``ok_empty`` is a known
+    genuine zero: there is nothing to read, so ``target_read_status`` is ``None``. ``status``
+    ``ok`` is known only when ``target_read_status`` is ``ok``. Anything else (``partial``,
+    ``error``, or ``ok`` with target reads ``partial``, ``error`` or ``None``) is unknown,
+    never absent or zero, and makes the contact's evidence unknown. A deal's orphan status
+    comes from its deal-to-contact fetch on the same rule: ``ok_empty`` means orphan, ``ok``
+    with target reads ``ok`` means linked, and anything else is unknown.
+
+    Two checks keep each stored outcome consistent with its meaning:
+    ``ck_crm_association_fetch_ok_empty_shape`` gives an ``ok_empty`` fetch a ``None``
+    ``target_read_status`` and an empty ``missing_target_ids``, and
+    ``ck_crm_association_fetch_target_read_ok_complete`` allows ``target_read_status`` ``ok``
+    only with an empty ``missing_target_ids``, whatever the ``status``. ``partial`` and
+    ``error`` fetches are not constrained further.
 
     Attributes:
         object_type: Type of the object whose associations were read
@@ -457,6 +529,10 @@ class CrmAssociationFetch(IdPkMixin, DatasetScopedMixin, Base):
         check_in("to_type", CRM_OBJECT_TYPES),
         check_in("status", ASSOCIATION_FETCH_STATUSES),
         check_in("target_read_status", TARGET_READ_STATUSES),
+        # ok_empty is a genuine zero: no target-read status and no missing target.
+        sa.CheckConstraint(_OK_EMPTY_SHAPE_SQL, name="ok_empty_shape"),
+        # Target reads ok means every associated id was returned, so none is missing.
+        sa.CheckConstraint(_TARGET_READ_OK_COMPLETE_SQL, name="target_read_ok_complete"),
         sa.UniqueConstraint(
             "dataset_id",
             "object_type",

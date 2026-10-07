@@ -353,9 +353,27 @@ class DatasetScopedMixin:
     dataset is a single ``DELETE FROM source_dataset WHERE id = :retired``; the cascade
     removes the rows of every table that carries this mixin.
 
-    Every natural-key unique constraint of a dataset-scoped table includes ``dataset_id``,
-    normally as its first column, so the same external entity can exist once per dataset and
-    the cascade's lookup by ``dataset_id`` is served by that unique index.
+    Natural-key unique constraints of dataset-scoped tables include ``dataset_id``, normally
+    as their first column, so the same external entity can exist once per dataset. There are
+    two exceptions. ``lead_form_version`` keeps the natural key (``lead_form_id``,
+    ``version``), which is scoped through its parent form because a form belongs to one
+    dataset. ``entity_snapshot`` is append-only and has no natural key.
+
+    The purge cascade's lookup is a separate matter. The mixin does not index ``dataset_id``
+    itself, but every dataset-scoped table has an index whose first column is ``dataset_id``,
+    which the cascade uses to find a dataset's rows. That index is the natural-key unique
+    where the key leads with ``dataset_id``, and otherwise an explicit
+    ``ix_<table>_dataset_id`` (``ix_lead_form_version_dataset_id`` and
+    ``ix_entity_snapshot_dataset_id``).
+
+    A foreign key that must stay within the child row's own dataset is, by convention,
+    dataset-qualified: the composite (``<parent>_id``, ``dataset_id``) references
+    ``<parent>`` (``id``, ``dataset_id``) and is backed by the parent's unique
+    (``dataset_id``, ``id``). The fact tables and ``lead`` reference ``campaign``,
+    ``ad_group``, ``keyword`` and ``creative`` this way, and ``lead_match`` references
+    ``crm_contact`` through (``contact_id``, ``crm_dataset_id``) -> ``crm_contact`` (``id``,
+    ``dataset_id``). The database therefore rejects those references across datasets, and
+    ``lead_match`` is the only table designed to link two datasets.
 
     The allowed values of ``source`` live with the dataset constants in
     ``ads_engine.db.models.ops``, which imports this module. Each model therefore adds

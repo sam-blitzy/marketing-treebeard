@@ -161,6 +161,10 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
     ``total_budget`` according to ``budget_period``. Whether the budget is explicitly shared
     fixes the campaign's decision shape (``own_budget`` or ``shared_member``, AAP 0.5.2).
 
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    keys of ``fact_campaign_daily``, ``fact_search_term_daily``, ``fact_segment_window`` and
+    ``lead``, so a row can reference only a campaign of its own dataset.
+
     Attributes:
         account_id: The owning :class:`AdAccount`.
         external_id: The Google campaign id or LinkedIn campaign id.
@@ -206,6 +210,8 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
         check_in("status", CAMPAIGN_STATUSES),
         check_in("budget_period", BUDGET_PERIODS),
         sa.UniqueConstraint("dataset_id", "account_id", "external_id"),
+        # Anchors the dataset-qualified (campaign_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -290,6 +296,10 @@ class AdGroup(IdPkMixin, DatasetScopedMixin, Base):
     context, and their names take part in the C3b "keyword cluster without a campaign"
     check (AAP 0.5.4.4).
 
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    key of ``fact_search_term_daily``, so a search term can reference only an ad group of
+    its own dataset.
+
     Attributes:
         campaign_id: The owning :class:`Campaign`.
         external_id: The Google ``ad_group.id``.
@@ -311,6 +321,8 @@ class AdGroup(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "campaign_id", "external_id"),
+        # Anchors the dataset-qualified (ad_group_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -322,6 +334,10 @@ class Keyword(IdPkMixin, DatasetScopedMixin, Base):
     can fall back to snapshots when daily scores are absent (AAP 0.5.4.3). Google's
     ``criterion_id`` is unique only within an ad group, so the natural key includes
     ``ad_group_id``.
+
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    key of ``fact_keyword_daily``, so a keyword fact can reference only a keyword of its own
+    dataset.
 
     Attributes:
         ad_group_id: The owning :class:`AdGroup`.
@@ -349,6 +365,8 @@ class Keyword(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "ad_group_id", "criterion_id"),
+        # Anchors the dataset-qualified (keyword_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -360,6 +378,10 @@ class Creative(IdPkMixin, DatasetScopedMixin, Base):
     (AAP 0.5.4.7). ``lead_form_urn`` is the canonical form URN of the lead-gen call-to-action
     destination, which resolves the creative's spend to a content asset unless a creative
     override says otherwise. Headline and intro text come from the referenced post.
+
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    keys of ``fact_creative_daily`` and ``lead``, so a row can reference only a creative of
+    its own dataset.
 
     Attributes:
         campaign_id: The owning :class:`Campaign`.
@@ -391,6 +413,8 @@ class Creative(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "urn"),
+        # Anchors the dataset-qualified (creative_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -433,7 +457,9 @@ class LeadFormVersion(IdPkMixin, DatasetScopedMixin, Base):
     The natural key is (``lead_form_id``, ``version``), exactly as AAP 0.5.2 states; it is
     dataset-scoped through ``lead_form_id``, whose form belongs to one dataset. That unique
     index leads with ``lead_form_id``, so the cascade from :class:`LeadForm` needs no
-    separate index.
+    separate index. Because the natural key does not lead with ``dataset_id``, the direct
+    ``dataset_id`` cascade from ``source_dataset`` is served by its own index,
+    ``ix_lead_form_version_dataset_id``.
 
     Attributes:
         lead_form_id: The :class:`LeadForm` this version belongs to.
@@ -456,6 +482,8 @@ class LeadFormVersion(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("lead_form_id", "version"),
+        # The natural key leads with lead_form_id; this serves the purge's dataset_id cascade.
+        sa.Index("ix_lead_form_version_dataset_id", "dataset_id"),
     )
 
 

@@ -335,6 +335,25 @@ def test_documented_sample_conforms_to_its_contract(surface: str) -> None:
     assert _schema_errors(_sample(surface), contract["response"]["body"], surface) == []
 
 
+# The cursor-paged search surfaces. Their official pages document that metadata.nextPageToken
+# is absent or null on the last page, so both terminal shapes must validate.
+CURSOR_SURFACES = ("ad_campaign_groups", "ad_campaigns", "creatives")
+
+
+@pytest.mark.parametrize("surface", CURSOR_SURFACES)
+@pytest.mark.parametrize("metadata", [{"nextPageToken": None}, {}], ids=["null", "absent"])
+def test_cursor_contract_admits_a_terminal_page(surface: str, metadata: dict[str, Any]) -> None:
+    body = {"elements": [], "metadata": metadata}
+    assert _schema_errors(body, _contract(surface)["response"]["body"], surface) == []
+
+
+@pytest.mark.parametrize("surface", CURSOR_SURFACES)
+def test_cursor_contract_rejects_a_non_string_page_token(surface: str) -> None:
+    body = {"elements": [], "metadata": {"nextPageToken": 5}}
+    errors = _schema_errors(body, _contract(surface)["response"]["body"], surface)
+    assert errors == [f"{surface}.metadata.nextPageToken: int is not ['string', 'null']"]
+
+
 def test_contract_check_rejects_an_undeclared_field() -> None:
     element = _sample("ad_account")
     element["notInTheContract"] = True
@@ -374,16 +393,40 @@ def test_sponsored_campaign_urn_accepts_ids_and_urns(value: str | int) -> None:
     assert sponsored_campaign_urn(value) == "urn:li:sponsoredCampaign:123"
 
 
+# Neither a str nor an int: the helpers raise their documented ValueError, never a TypeError,
+# and never build a URN such as ``urn:li:sponsoredAccount:1.5``.
+_NON_INTEGER_IDS: tuple[object, ...] = (
+    1.5,
+    5.0,
+    Decimal("1.5"),
+    Decimal("5"),
+    None,
+    object(),
+    b"1",
+)
+
+
 @pytest.mark.parametrize(
     "value",
-    [True, -1, "", "abc", "12a", "urn:li:sponsoredCampaign:123", "urn:li:sponsoredAccount:"],
+    [
+        True,
+        -1,
+        "",
+        "abc",
+        "12a",
+        "urn:li:sponsoredCampaign:123",
+        "urn:li:sponsoredAccount:",
+        *_NON_INTEGER_IDS,
+    ],
 )
 def test_sponsored_account_urn_rejects_malformed_values(value: Any) -> None:
     with pytest.raises(ValueError, match=r"account_id must be a numeric id or a"):
         sponsored_account_urn(value)
 
 
-@pytest.mark.parametrize("value", [False, -5, "urn:li:sponsoredAccount:123", "x1"])
+@pytest.mark.parametrize(
+    "value", [False, -5, "urn:li:sponsoredAccount:123", "x1", *_NON_INTEGER_IDS]
+)
 def test_sponsored_campaign_urn_rejects_malformed_values(value: Any) -> None:
     with pytest.raises(ValueError, match=r"campaign_id must be a numeric id or a"):
         sponsored_campaign_urn(value)
@@ -702,7 +745,7 @@ def test_parse_campaign_group_decimal_forms(value: object, expected: str) -> Non
         ("runSchedule", {"start": "soon"}, "field 'start' must be an integer"),
         (
             "runSchedule",
-            {"start": 10**20},
+            {"start": 2**63 - 1},
             "field 'start' is outside the representable date range",
         ),
         (
@@ -988,6 +1031,27 @@ def test_parse_creative_rejects_a_malformed_destination() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("reference", "prefix"),
+    [
+        ("urn:li:share:not-a-number", "urn:li:share:"),
+        ("urn:li:share:", "urn:li:share:"),
+        ("urn:li:share:12 ", "urn:li:share:"),
+        ("urn:li:ugcPost:12a", "urn:li:ugcPost:"),
+        ("urn:li:ugcPost:-1", "urn:li:ugcPost:"),
+    ],
+)
+def test_parse_creative_rejects_a_post_reference_with_a_malformed_id(
+    reference: str, prefix: str
+) -> None:
+    element = _creative(content={"reference": reference})
+    error = _expect_defect(
+        lambda: parse_creative(element), "creatives", "field 'content.reference' must be a"
+    )
+    # The message names the field and the expected shape only, never the malformed value.
+    assert error.message == f"creatives: field 'content.reference' must be a {prefix}{{id}} URN"
+
+
 # ---------------------------------------------------------------------------------------------
 # Posts
 # ---------------------------------------------------------------------------------------------
@@ -1047,11 +1111,24 @@ def test_parse_post_blank_or_absent_commentary_is_none() -> None:
 
 @pytest.mark.parametrize(
     "urn",
-    ["urn:li:sponsoredCreative:1", "urn:li:share:", "urn:li:share:abc", "6844785523593134080"],
+    [
+        "urn:li:sponsoredCreative:1",
+        "urn:li:share:",
+        "urn:li:share:abc",
+        "6844785523593134080",
+        "urn:li:ugcPost:12a",
+        6844785523593134080,
+        None,
+    ],
 )
-def test_parse_post_rejects_a_key_that_is_not_a_post_urn(urn: str) -> None:
-    with pytest.raises(ValueError, match=r"urn must be a urn:li:share:"):
-        parse_post(urn, _post())
+def test_parse_post_rejects_a_key_that_is_not_a_post_urn(urn: object) -> None:
+    error = _expect_defect(
+        lambda: parse_post(urn, _post()), "posts", "the batch-result key must be a urn:li:share:"
+    )
+    # The key is LinkedIn's data, so the message states the expected shape and never the key.
+    assert error.message == (
+        "posts: the batch-result key must be a urn:li:share:{id} or urn:li:ugcPost:{id} URN"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1233,6 +1310,304 @@ def test_parse_analytics_daily_rejects_a_non_object() -> None:
         "ad_analytics",
         "an analytics element must be a JSON object",
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Numeric bounds: an oversized numeral is a validation defect, never a raw conversion error
+# ---------------------------------------------------------------------------------------------
+#
+# Rest.li ids, counts, epoch milliseconds, date parts and form versions are 64-bit longs, and
+# amounts stay below 10**19. Without the bounds, int() raises ValueError past 4,300 digits,
+# Decimal() raises InvalidOperation on an exponent beyond its limits, and date() raises
+# OverflowError on a year beyond a C int. The values below are deliberately malformed inputs.
+
+INT64_MAX = 2**63 - 1
+OUT_OF_INT64 = "is out of the 64-bit integer range"
+
+
+def _assert_not_echoed(error: QueryDefect, *raw: str) -> None:
+    """Assert no text of ``error`` carries any of the ``raw`` numeral fragments."""
+    for text in (str(error), error.message, error.reason, repr(error.args)):
+        for fragment in raw:
+            assert fragment not in text, text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "9" * 5000,  # past int()'s 4,300-digit string limit
+        "9" * 20,
+        str(2**63),
+        2**63,
+        2**70,
+        Decimal(2**63),
+        Decimal("1E+30"),
+        Decimal("-1E+30"),
+        Decimal("1E+999999999"),  # int() would build a billion-digit integer
+    ],
+)
+def test_parse_ad_account_rejects_an_id_beyond_64_bits(value: object) -> None:
+    element = _sample("ad_account")
+    element["id"] = value
+    error = _expect_defect(
+        lambda: parse_ad_account(element), "ad_account", f"field 'id' {OUT_OF_INT64}"
+    )
+    _assert_not_echoed(error, str(value)[:8])
+
+
+@pytest.mark.parametrize("value", [INT64_MAX, str(INT64_MAX), Decimal(INT64_MAX)])
+def test_parse_ad_account_accepts_the_largest_64_bit_id(value: object) -> None:
+    element = _sample("ad_account")
+    element["id"] = value
+    row = parse_ad_account(element)
+    assert row.external_id == str(INT64_MAX)
+    assert row.urn == PREFIX_ACCOUNT + str(INT64_MAX)
+
+
+@pytest.mark.parametrize("value", [2**63, "9" * 5000, Decimal("1E+30")])
+def test_parse_analytics_daily_rejects_a_count_beyond_64_bits(value: object) -> None:
+    element = _daily(0)
+    element["impressions"] = value
+    error = _expect_defect(
+        lambda: parse_analytics_daily(element),
+        "ad_analytics",
+        f"field 'impressions' {OUT_OF_INT64}",
+    )
+    _assert_not_echoed(error, str(value)[:8])
+
+
+def test_epoch_milliseconds_beyond_64_bits_are_a_defect() -> None:
+    group = _sample_element("ad_campaign_groups")
+    group["runSchedule"] = {"start": 2**63}
+    _expect_defect(
+        lambda: parse_campaign_group(group, account_currency="USD"),
+        "ad_campaign_groups",
+        f"field 'start' {OUT_OF_INT64}",
+    )
+    lead = _mutate(("submittedAt",), "9" * 5000)
+    error = _expect_defect(
+        lambda: parse_lead(lead, {}), "lead_form_responses", f"field 'submittedAt' {OUT_OF_INT64}"
+    )
+    _assert_not_echoed(error, "9999")
+
+
+@pytest.mark.parametrize(
+    ("date_range", "fragment", "raw"),
+    [
+        (
+            {"start": {"year": 10**12, "month": 5, "day": 28}},
+            "field 'start' is not a valid calendar date",
+            "10000000",
+        ),
+        (
+            {"start": {"year": 2**62, "month": 5, "day": 28}},
+            "field 'start' is not a valid calendar date",
+            "46116860",
+        ),
+        (
+            {"start": {"year": INT64_MAX, "month": 5, "day": 28}},
+            "field 'start' is not a valid calendar date",
+            "92233720",
+        ),
+        (
+            {"start": {"year": 2024, "month": 2**62, "day": 28}},
+            "field 'start' is not a valid calendar date",
+            "46116860",
+        ),
+        (
+            {"start": {"year": 2024, "month": 5, "day": 2**62}},
+            "field 'start' is not a valid calendar date",
+            "46116860",
+        ),
+        (
+            {
+                "start": {"year": 2024, "month": 5, "day": 28},
+                "end": {"year": 10**12, "month": 5, "day": 28},
+            },
+            "field 'end' is not a valid calendar date",
+            "10000000",
+        ),
+        (
+            {"start": {"year": 2**63, "month": 5, "day": 28}},
+            f"field 'year' {OUT_OF_INT64}",
+            "92233720",
+        ),
+        (
+            {"start": {"year": "9" * 5000, "month": 5, "day": 28}},
+            f"field 'year' {OUT_OF_INT64}",
+            "9999",
+        ),
+    ],
+)
+def test_parse_analytics_daily_rejects_a_date_part_beyond_the_calendar(
+    date_range: dict[str, Any], fragment: str, raw: str
+) -> None:
+    element = _daily(0)
+    element["dateRange"] = date_range
+    error = _expect_defect(lambda: parse_analytics_daily(element), "ad_analytics", fragment)
+    _assert_not_echoed(error, raw)
+
+
+@pytest.mark.parametrize(
+    ("value", "fragment", "raw"),
+    [
+        ("1e" + "9" * 25, "is out of range", "9999"),  # Decimal() raises InvalidOperation
+        ("1e-" + "9" * 25, "is out of range", "9999"),
+        ("1" + "0" * 64, "is longer than 64 characters", "0000"),
+        ("0." + "0" * 4997 + "1", "is longer than 64 characters", "0000"),
+        ("9" * 5000, "is longer than 64 characters", "9999"),
+        ("1e30", "is out of range", "1e30"),
+        ("1E+19", "is out of range", "1E+19"),
+        (str(10**19), "is out of range", "10000000"),
+        (Decimal("1E+30"), "is out of range", "1E+30"),
+        (Decimal("1E+999999999999999999"), "is out of range", "1E+99999"),
+        (10**19, "is out of range", "10000000"),
+        (2**70, "is out of range", "11805916"),
+    ],
+)
+def test_parse_analytics_daily_rejects_a_cost_beyond_the_decimal_bounds(
+    value: object, fragment: str, raw: str
+) -> None:
+    element = _daily(1)
+    element["costInLocalCurrency"] = value
+    error = _expect_defect(
+        lambda: parse_analytics_daily(element),
+        "ad_analytics",
+        f"field 'costInLocalCurrency' {fragment}",
+    )
+    _assert_not_echoed(error, raw)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("9999999999999999999.99", "9999999999999999999.99"),  # just below 10**19
+        (Decimal("9.999E+18"), "9.999E+18"),
+        (10**19 - 1, "9999999999999999999"),
+        ("0." + "1" * 62, "0." + "1" * 62),  # exactly 64 characters
+    ],
+)
+def test_parse_analytics_daily_accepts_a_cost_within_the_decimal_bounds(
+    value: object, expected: str
+) -> None:
+    element = _daily(1)
+    element["costInLocalCurrency"] = value
+    cost = parse_analytics_daily(element).cost
+    assert cost is not None
+    assert str(cost) == expected  # exact, never rounded
+
+
+# A zero is below the 10**19 bound whatever its exponent, although Decimal("0E+19").adjusted()
+# is 19, and a signed zero is returned unsigned.
+ZERO_NUMERALS = ["0E+19", "-0E+19", "0e999"]
+ZERO_AMOUNTS: list[object] = [*ZERO_NUMERALS, Decimal("0E+19")]
+
+
+@pytest.mark.parametrize("value", ZERO_AMOUNTS)
+def test_parse_analytics_daily_accepts_a_zero_cost_with_a_large_exponent(value: object) -> None:
+    element = _daily(1)
+    element["costInLocalCurrency"] = value
+    if isinstance(value, str):
+        _conforming("ad_analytics", element)  # a contract-valid BigDecimal string
+    cost = parse_analytics_daily(element).cost
+    assert cost is not None
+    assert cost == Decimal(0)
+    assert not cost.is_signed()
+
+
+@pytest.mark.parametrize("value", ZERO_NUMERALS)
+def test_parse_segment_accepts_a_zero_cost_with_a_large_exponent(value: str) -> None:
+    element = _segment([SAMPLE_SEGMENT_CAMPAIGN, "urn:li:seniority:7"], costInLocalCurrency=value)
+    cost = parse_segment(element, "MEMBER_SENIORITY").cost
+    assert cost is not None
+    assert cost == Decimal(0)
+    assert not cost.is_signed()
+
+
+@pytest.mark.parametrize("value", ZERO_AMOUNTS)
+def test_parse_campaign_group_accepts_a_zero_budget_with_a_large_exponent(value: object) -> None:
+    element = _sample_element("ad_campaign_groups")
+    element["dailyBudget"] = value
+    element["totalBudget"] = {"amount": value, "currencyCode": "USD"}
+    if isinstance(value, str):
+        _conforming("ad_campaign_groups", element)  # contract-valid BigDecimal strings
+    row = parse_campaign_group(element, account_currency="USD")
+    for budget in (row.daily_budget, row.total_budget):
+        assert budget is not None
+        assert budget.currency == "USD"
+        assert budget.amount == Decimal(0)
+        assert not budget.amount.is_signed()
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "fragment"),
+    [
+        ("dailyBudget", "1e30", "field 'dailyBudget' is out of range"),
+        ("dailyBudget", "1e" + "9" * 25, "field 'dailyBudget' is out of range"),
+        ("dailyBudget", Decimal("1E+30"), "field 'dailyBudget' is out of range"),
+        ("dailyBudget", "1" * 65, "field 'dailyBudget' is longer than 64 characters"),
+        (
+            "totalBudget",
+            {"amount": "1e30", "currencyCode": "USD"},
+            "field 'amount' is out of range",
+        ),
+        (
+            "totalBudget",
+            {"amount": "1e" + "9" * 25, "currencyCode": "USD"},
+            "field 'amount' is out of range",
+        ),
+    ],
+)
+def test_parse_campaign_group_rejects_a_budget_beyond_the_decimal_bounds(
+    key: str, value: object, fragment: str
+) -> None:
+    element = _sample_element("ad_campaign_groups")
+    element[key] = value
+    error = _expect_defect(
+        lambda: parse_campaign_group(element, account_currency="USD"),
+        "ad_campaign_groups",
+        fragment,
+    )
+    _assert_not_echoed(error, "1e30", "1E+30", "9999", "1111")
+
+
+@pytest.mark.parametrize("version", ["9" * 5000, "9" * 20, str(2**63)])
+def test_parse_versioned_form_urn_rejects_a_version_beyond_64_bits(version: str) -> None:
+    urn = f"urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{FORM_ID},{version})"
+    for surface in ("lead_form_responses", "lead_form_responses_batch"):
+        error = _expect_defect(
+            lambda surface=surface: parse_versioned_form_urn(urn, surface=surface),
+            surface,
+            f"the form version {OUT_OF_INT64}",
+        )
+        _assert_not_echoed(error, version[:8])
+    error = _expect_defect(
+        lambda: canonical_form_urn(urn), "lead_forms", f"the form version {OUT_OF_INT64}"
+    )
+    _assert_not_echoed(error, version[:8])
+
+
+def test_parse_versioned_form_urn_accepts_the_largest_64_bit_version() -> None:
+    urn = f"urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{FORM_ID},{INT64_MAX})"
+    assert parse_versioned_form_urn(urn) == (FORM_URN, INT64_MAX)
+
+
+def test_a_lead_with_a_version_beyond_64_bits_is_a_defect_on_ingest_and_re_fetch() -> None:
+    urn = f"urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{FORM_ID},{'9' * 5000})"
+    element = _mutate(("versionedLeadGenFormUrn",), urn)
+    for error in (
+        _expect_defect(
+            lambda: parse_lead(element, {}),
+            "lead_form_responses",
+            f"the form version {OUT_OF_INT64}",
+        ),
+        _expect_defect(
+            lambda: decode_email(element, {}),
+            "lead_form_responses_batch",
+            f"the form version {OUT_OF_INT64}",
+        ),
+    ):
+        _assert_not_echoed(error, "9999", "lead.one", "example.com")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1601,12 +1976,38 @@ def test_form_map_from_decoration_orders_email_questions() -> None:
     )
 
 
-def test_form_map_from_decoration_never_repeats_an_email_question() -> None:
-    questions = [_question(EMAIL_QID, "EMAIL"), _question(EMAIL_QID, "WORK_EMAIL")]
+REPEATED_QUESTION = "field 'questionId' repeats a question of the form version"
+REPEATED_ANSWER = "field 'questionId' repeats an answered question"
+
+# Two definitions of one question id: conflicting predefined fields, or the same one twice.
+REPEATED_QUESTION_CASES = [
+    [_question(EMAIL_QID, "EMAIL"), _question(EMAIL_QID, "WORK_EMAIL")],
+    [_question(EMAIL_QID, "EMAIL"), _question(FIRST_NAME_QID), _question(EMAIL_QID, "FIRST_NAME")],
+    [_question(WORK_EMAIL_QID, "WORK_EMAIL"), _question(WORK_EMAIL_QID, "WORK_EMAIL")],
+]
+
+
+def _assert_carries_no_email(error: QueryDefect) -> None:
+    """Assert a defect names fields only: no lead address, raw or normalised, in any text."""
+    for text in (str(error), error.message, error.reason, repr(error.args)):
+        for address in (EMAIL, OTHER_EMAIL):
+            assert address not in text.lower()
+        assert "example.com" not in text.lower()
+
+
+@pytest.mark.parametrize("questions", REPEATED_QUESTION_CASES)
+@pytest.mark.parametrize("surface", ["lead_form_responses", "lead_form_responses_batch"])
+def test_form_map_from_decoration_rejects_a_repeated_question_id(
+    questions: list[dict[str, Any]], surface: str
+) -> None:
     form = _lead([], questions=questions)["form"]
-    version_map = form_map_from_decoration(FORM_URN, FORM_VERSION, form)
-    assert version_map.email_question_ids == (EMAIL_QID,)
-    assert version_map.question_ids == frozenset({EMAIL_QID})
+    error = _expect_defect(
+        lambda: form_map_from_decoration(FORM_URN, FORM_VERSION, form, surface=surface),
+        surface,
+        REPEATED_QUESTION,
+    )
+    # The message names the field only, never the repeated id.
+    assert error.message == f"{surface}: {REPEATED_QUESTION}"
 
 
 @pytest.mark.parametrize(
@@ -1714,6 +2115,24 @@ def test_parse_lead_form_rejects_malformed_fields(key: str, value: object, fragm
 
 def test_parse_lead_form_rejects_a_non_object() -> None:
     _expect_defect(lambda: parse_lead_form(1), "lead_forms", "a lead form must be a JSON object")
+
+
+@pytest.mark.parametrize("questions", REPEATED_QUESTION_CASES)
+def test_parse_lead_form_rejects_a_repeated_question_id(questions: list[dict[str, Any]]) -> None:
+    element: dict[str, Any] = _sample_element("lead_forms")
+    element["content"]["questions"].extend(questions)
+    error = _expect_defect(
+        lambda: parse_lead_form(_conforming("lead_forms", element)), "lead_forms", REPEATED_QUESTION
+    )
+    assert error.message == f"lead_forms: {REPEATED_QUESTION}"
+
+
+def test_parse_lead_form_rejects_a_repeat_of_the_documented_question() -> None:
+    element: dict[str, Any] = _sample_element("lead_forms")
+    element["content"]["questions"].append(copy.deepcopy(element["content"]["questions"][0]))
+    _expect_defect(
+        lambda: parse_lead_form(_conforming("lead_forms", element)), "lead_forms", REPEATED_QUESTION
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1864,11 +2283,108 @@ def test_parse_lead_falls_back_to_work_email_when_email_is_unusable(unusable: st
     assert lead.email_sha256 == OTHER_EMAIL_SHA256
 
 
-def test_parse_lead_first_answer_to_a_question_wins() -> None:
-    element = _lead([_text_answer(EMAIL_QID, RAW_EMAIL), _text_answer(EMAIL_QID, OTHER_EMAIL)])
+# An address carrying an escaped unpaired surrogate, decoded the way the HTTP layer decodes JSON.
+# The string exists but UTF-8 cannot encode it, so it can never be hashed.
+SURROGATE_EMAIL: str = json.loads('"lead\\ud800.one@example.com"')
+
+
+def test_parse_lead_and_decode_email_treat_an_unencodable_answer_as_no_email() -> None:
+    element = _lead([_text_answer(EMAIL_QID, SURROGATE_EMAIL)])
     lead = parse_lead(element, {})
     assert lead is not None
-    assert lead.email_sha256 == EMAIL_SHA256
+    assert lead.email_status == "no_email"
+    assert lead.email_reason == REASON_NO_EMAIL_ANSWER
+    assert lead.email_sha256 is None
+    assert lead.version_map is not None  # the decoration passed the check and is still learned
+    decoded = decode_email(element, {})
+    assert decoded == DecodedEmail(
+        email=None, sha256=None, status="no_email", reason=REASON_NO_EMAIL_ANSWER
+    )
+    for text in (repr(lead), repr(decoded)):
+        assert "example.com" not in text.lower()
+
+
+def test_parse_lead_falls_back_to_work_email_when_email_is_unencodable() -> None:
+    element = _lead(
+        [_text_answer(EMAIL_QID, SURROGATE_EMAIL), _text_answer(WORK_EMAIL_QID, OTHER_EMAIL)]
+    )
+    lead = parse_lead(element, {})
+    assert lead is not None
+    assert lead.email_status == "ok"
+    assert lead.email_sha256 == OTHER_EMAIL_SHA256
+    decoded = decode_email(element, {})
+    assert decoded == DecodedEmail(
+        email=OTHER_EMAIL, sha256=OTHER_EMAIL_SHA256, status="ok", reason=None
+    )
+
+
+def test_parse_lead_accepts_a_non_ascii_address_that_utf8_encodes() -> None:
+    element = _lead([_text_answer(EMAIL_QID, " Léa.Ünal@Exämple.COM ")])
+    expected = "léa.ünal@exämple.com"
+    expected_sha256 = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    lead = parse_lead(element, {})
+    assert lead is not None
+    assert lead.email_status == "ok"
+    assert lead.email_sha256 == expected_sha256
+    decoded = decode_email(element, {})
+    assert decoded == DecodedEmail(email=expected, sha256=expected_sha256, status="ok", reason=None)
+
+
+@pytest.mark.parametrize(
+    ("answers", "decorated"),
+    [
+        # Two answers to the email question: neither address may be chosen.
+        ([_text_answer(EMAIL_QID, RAW_EMAIL), _text_answer(EMAIL_QID, OTHER_EMAIL)], True),
+        ([_text_answer(EMAIL_QID, RAW_EMAIL), _text_answer(EMAIL_QID, OTHER_EMAIL)], False),
+        # A repeated non-email answer is the same defect, before any map is consulted.
+        (
+            [
+                _text_answer(FIRST_NAME_QID, "Lead"),
+                _text_answer(EMAIL_QID, RAW_EMAIL),
+                _text_answer(FIRST_NAME_QID, "Lead"),
+            ],
+            True,
+        ),
+    ],
+)
+@pytest.mark.parametrize("surface", ["lead_form_responses", "lead_form_responses_batch"])
+def test_parse_lead_and_decode_email_reject_a_repeated_answer(
+    answers: list[dict[str, Any]], decorated: bool, surface: str
+) -> None:
+    element = _lead(answers, decorated=decorated)
+    for error in (
+        _expect_defect(
+            lambda: parse_lead(element, _stored(), surface=surface), surface, REPEATED_ANSWER
+        ),
+        _expect_defect(
+            lambda: decode_email(element, _stored(), surface=surface), surface, REPEATED_ANSWER
+        ),
+    ):
+        assert error.message == f"{surface}: {REPEATED_ANSWER}"
+        _assert_carries_no_email(error)
+
+
+@pytest.mark.parametrize("questions", REPEATED_QUESTION_CASES)
+@pytest.mark.parametrize("surface", ["lead_form_responses", "lead_form_responses_batch"])
+def test_parse_lead_and_decode_email_reject_a_repeated_decorated_question(
+    questions: list[dict[str, Any]], surface: str
+) -> None:
+    # The decoration defines one question twice, so its version's meaning is ambiguous: the
+    # response is rejected, never decoded, even with a stored map for the same version.
+    element = _lead(
+        [_text_answer(EMAIL_QID, RAW_EMAIL), _text_answer(WORK_EMAIL_QID, OTHER_EMAIL)],
+        questions=questions,
+    )
+    for error in (
+        _expect_defect(
+            lambda: parse_lead(element, _stored(), surface=surface), surface, REPEATED_QUESTION
+        ),
+        _expect_defect(
+            lambda: decode_email(element, _stored(), surface=surface), surface, REPEATED_QUESTION
+        ),
+    ):
+        assert error.message == f"{surface}: {REPEATED_QUESTION}"
+        _assert_carries_no_email(error)
 
 
 def test_parse_lead_form_map_mismatch_never_uses_another_versions_map() -> None:

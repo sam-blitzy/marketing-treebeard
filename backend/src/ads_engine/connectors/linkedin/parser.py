@@ -51,7 +51,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Final, Literal, overload
 
@@ -174,6 +174,13 @@ _ENUM_TOKEN_RE: Final = re.compile(r"[A-Z][A-Z_]{0,39}")
 _CURRENCY_RE: Final = re.compile(r"[A-Z]{3}")
 # BigDecimal strings as Rest.li serialises them: plain or scientific, never a JSON float.
 _DECIMAL_RE: Final = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+# Rest.li ids, counts, epoch milliseconds and date parts are 64-bit longs. Numerals are bounded
+# before conversion: int() refuses a string of more than 4,300 digits, and Decimal() an exponent
+# beyond the decimal module's limits.
+_INT64_MAX: Final = 2**63 - 1
+_MAX_INT_DIGITS: Final = len(str(_INT64_MAX))  # 19
+# The longest BigDecimal string accepted, far above any amount LinkedIn returns.
+_MAX_DECIMAL_CHARS: Final = 64
 _VERSIONED_FORM_RE: Final = re.compile(
     r"urn:li:versionedLeadGenForm:\(urn:li:leadGenForm:([0-9]+),([0-9]+)\)"
 )
@@ -254,9 +261,11 @@ CAMPAIGN_GROUP_STATUS_MAP: Final[Mapping[str, NormalisedStatus]] = MappingProxyT
         "DRAFT": "paused",
         "ARCHIVED": _ENDED,
         "CANCELED": _ENDED,
-        # The group schema table spells the cancel status CANCELLED and admits COMPLETED,
-        # although neither is a search value; both are accepted so a real response is
-        # never rejected, and both mean the group has ended.
+        # CANCELLED is the group schema table's spelling of the cancel status that search
+        # spells CANCELED, a documented alias. COMPLETED is not a documented campaign-group
+        # status (it is documented for campaigns); it is tolerated defensively, as the
+        # ad_campaign_groups contract does, so a real response is never rejected. Neither
+        # is sent as a search value, and both mean the group has ended.
         "CANCELLED": _ENDED,
         "COMPLETED": _ENDED,
         "PENDING_DELETION": _ENDED,
@@ -405,10 +414,13 @@ def _str(parent: JsonObject, key: str, surface: str, *, required: bool) -> str |
 
 
 def _to_int(value: object, what: str, surface: str) -> int:
-    """Convert an int, an integral Decimal or a digit string to a non-negative int.
+    """Convert an int, an integral Decimal or a digit string to a non-negative 64-bit int.
 
     ``bool`` is rejected although it subclasses ``int``. ``connectors/http.py`` decodes JSON
     floats as ``Decimal``, so an integral ``Decimal`` such as ``Decimal("5")`` is accepted.
+    Rest.li sends ids, counts and epoch milliseconds as longs, so a value above ``2**63 - 1``
+    is a defect. The bound is checked before conversion: a digit string over 19 characters or
+    a ``Decimal`` such as ``Decimal("1E+999999999")`` never reaches ``int()``.
     """
     if isinstance(value, bool):
         raise _defect(f"{what} must be an integer, not a boolean", surface)
@@ -417,13 +429,19 @@ def _to_int(value: object, what: str, surface: str) -> int:
     elif isinstance(value, Decimal):
         if not value.is_finite() or value != value.to_integral_value():
             raise _defect(f"{what} must be an integer", surface)
+        if value.copy_abs() > _INT64_MAX:
+            raise _defect(f"{what} is out of the 64-bit integer range", surface)
         number = int(value)
     elif isinstance(value, str) and _DIGITS_RE.fullmatch(value):
+        if len(value) > _MAX_INT_DIGITS:
+            raise _defect(f"{what} is out of the 64-bit integer range", surface)
         number = int(value)
     else:
         raise _defect(f"{what} must be an integer", surface)
     if number < 0:
         raise _defect(f"{what} must not be negative", surface)
+    if number > _INT64_MAX:
+        raise _defect(f"{what} is out of the 64-bit integer range", surface)
     return number
 
 
@@ -459,7 +477,11 @@ def _to_decimal(value: object, what: str, surface: str) -> Decimal:
     """Convert a BigDecimal string, an int or a Decimal to a finite, non-negative Decimal.
 
     Floats are rejected: a binary float cannot carry an exact money amount, and LinkedIn
-    serialises BigDecimal values as strings.
+    serialises BigDecimal values as strings. A string longer than 64 characters is a defect
+    before it reaches ``Decimal()``, as is one whose exponent the decimal module cannot hold.
+    An amount of ``10**19`` or more, in any input form, is out of range: the same 19-digit
+    bound as a 64-bit integer. A zero such as ``0E+19`` or ``-0E+19`` is below that bound
+    whatever its exponent, and is returned unsigned.
     """
     if isinstance(value, bool):
         raise _defect(f"{what} must be a decimal, not a boolean", surface)
@@ -468,14 +490,25 @@ def _to_decimal(value: object, what: str, surface: str) -> Decimal:
     elif isinstance(value, int):
         amount = Decimal(value)
     elif isinstance(value, str) and _DECIMAL_RE.fullmatch(value):
-        # The pattern admits only plain or scientific numerals, which Decimal always parses.
-        amount = Decimal(value)
+        if len(value) > _MAX_DECIMAL_CHARS:
+            raise _defect(f"{what} is longer than {_MAX_DECIMAL_CHARS} characters", surface)
+        # The pattern admits only plain or scientific numerals; Decimal() refuses only an
+        # exponent beyond its limits, such as 1e9999999999999999999.
+        try:
+            amount = Decimal(value)
+        except InvalidOperation as exc:
+            raise _defect(f"{what} is out of range", surface) from exc
     else:
         raise _defect(f"{what} must be a decimal string", surface)
     if not amount.is_finite():
         raise _defect(f"{what} must be finite", surface)
     if amount < 0:
         raise _defect(f"{what} must not be negative", surface)
+    # adjusted() is the exponent of the leading digit, so for a nonzero amount it is 19 or
+    # more exactly when |amount| >= 10**19. Zero is exempt whatever its exponent: 0E+19 has
+    # adjusted() 19, but its value is below the bound.
+    if not amount.is_zero() and amount.adjusted() >= _MAX_INT_DIGITS:
+        raise _defect(f"{what} is out of range", surface)
     # "-0.0" compares equal to zero; store it unsigned.
     return amount.copy_abs() if amount.is_zero() else amount
 
@@ -519,14 +552,18 @@ def _instant(parent: JsonObject, key: str, surface: str, *, required: bool) -> d
 
 
 def _calendar_date(parent: JsonObject, key: str, surface: str) -> date:
-    """Read a required Rest.li ``{year, month, day}`` date as a calendar date."""
+    """Read a required Rest.li ``{year, month, day}`` date as a calendar date.
+
+    Each part is a 64-bit long. A date ``datetime.date`` cannot represent is a defect, whether
+    a part is out of its calendar range (``ValueError``) or beyond a C int (``OverflowError``).
+    """
     obj = _obj(parent, key, surface, required=True)
     year = _int(obj, "year", surface, required=True)
     month = _int(obj, "month", surface, required=True)
     day = _int(obj, "day", surface, required=True)
     try:
         return date(year, month, day)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         raise _defect(f"field '{key}' is not a valid calendar date", surface) from exc
 
 
@@ -550,13 +587,17 @@ def _normalise_status(
 # ---------------------------------------------------------------------------
 
 
-def _urn_for(value: str | int, prefix: str, what: str) -> str:
-    """Build ``{prefix}{id}`` from a numeric id, a digit string or an existing URN."""
+def _urn_for(value: object, prefix: str, what: str) -> str:
+    """Build ``{prefix}{id}`` from a numeric id, a digit string or an existing URN.
+
+    Only a non-negative ``int`` (never a ``bool``) or a ``str`` is accepted; a float, a
+    ``Decimal``, ``bytes``, ``None`` or any other type raises ``ValueError``.
+    """
     if isinstance(value, str):
         tail = value.removeprefix(prefix)
         if _DIGITS_RE.fullmatch(tail):
             return prefix + tail
-    elif not isinstance(value, bool) and value >= 0:
+    elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return f"{prefix}{value}"
     raise ValueError(f"{what} must be a numeric id or a {prefix}{{id}} URN")
 
@@ -988,7 +1029,9 @@ def parse_creative(element: object) -> CreativeRow:
     The lead-gen call-to-action destination, documented as ``urn:li:adForm:{id}``, is stored
     as the canonical ``urn:li:leadGenForm:{id}``, so every version of the form joins the same
     content asset. Headline and intro text come from the referenced post
-    (:func:`parse_post`).
+    (:func:`parse_post`). A ``content.reference`` with a share or ugcPost prefix must carry a
+    numeric id, because it becomes a posts batch key; any other reference, such as message-ad
+    content, leaves ``post_urn`` ``None``.
 
     Args:
         element: One element of the criteria search response.
@@ -997,7 +1040,8 @@ def parse_creative(element: object) -> CreativeRow:
         The creative row.
 
     Raises:
-        QueryDefect: When the element breaks its contract or its intended status is unmapped.
+        QueryDefect: When the element breaks its contract, its post reference has a
+            malformed id, or its intended status is unmapped.
     """
     surface = _SURFACE_CREATIVES
     obj = _as_obj(element, "a creative", surface)
@@ -1006,8 +1050,11 @@ def parse_creative(element: object) -> CreativeRow:
     content = _obj(obj, "content", surface, required=False)
     if content is not None:
         reference = _str(content, "reference", surface, required=False)
-        if reference is not None and reference.startswith(_POST_PREFIXES):
-            post_urn = reference
+        if reference is not None:
+            for prefix in _POST_PREFIXES:
+                if reference.startswith(prefix):
+                    post_urn = _checked_urn(reference, prefix, "field 'content.reference'", surface)
+                    break
     lead_form_urn: str | None = None
     cta_label: str | None = None
     cta = _obj(obj, "leadgenCallToAction", surface, required=False)
@@ -1037,7 +1084,7 @@ def _clean_text(value: str | None) -> str | None:
     return text or None
 
 
-def parse_post(urn: str, element: object) -> PostRow:
+def parse_post(urn: object, element: object) -> PostRow:
     """Parse one value of the ``posts?ids=List(...)`` batch-result map (contract ``posts``).
 
     ``content`` is a union with at most one member set, so the headline is
@@ -1045,20 +1092,23 @@ def parse_post(urn: str, element: object) -> PostRow:
     the posts contract and is immaterial for a valid post.
 
     Args:
-        urn: The batch-result key, a ``urn:li:share:`` or ``urn:li:ugcPost:`` URN, already
-            unquoted by the client.
+        urn: The batch-result key exactly as LinkedIn returned it, already unquoted by the
+            client. It must be a ``urn:li:share:{id}`` or ``urn:li:ugcPost:{id}`` URN with a
+            numeric id.
         element: The post object.
 
     Returns:
         The post row; blank texts are ``None``.
 
     Raises:
-        ValueError: When ``urn`` is not a share or ugcPost URN.
-        QueryDefect: When the post breaks its contract.
+        QueryDefect: When the batch-result key is not a share or ugcPost URN, or the post
+            breaks its contract.
     """
     surface = _SURFACE_POSTS
-    if not any(_is_urn(urn, prefix) for prefix in _POST_PREFIXES):
-        raise ValueError("urn must be a urn:li:share:{id} or urn:li:ugcPost:{id} URN")
+    if not isinstance(urn, str) or not any(_is_urn(urn, prefix) for prefix in _POST_PREFIXES):
+        raise _defect(
+            "the batch-result key must be a urn:li:share:{id} or urn:li:ugcPost:{id} URN", surface
+        )
     obj = _as_obj(element, "a post", surface)
     headline: str | None = None
     content = _obj(obj, "content", surface, required=False)
@@ -1277,17 +1327,18 @@ def parse_versioned_form_urn(
         surface: The contract surface the URN came from, for the defect.
 
     Returns:
-        ``("urn:li:leadGenForm:{id}", version)``.
+        ``("urn:li:leadGenForm:{id}", version)``, the version a 64-bit integer.
 
     Raises:
-        QueryDefect: When ``urn`` is malformed (``code="validation"``).
+        QueryDefect: When ``urn`` is malformed, or its version exceeds ``2**63 - 1``
+            (``code="validation"``).
         ValueError: When ``surface`` is not a LinkedIn contract surface.
     """
     surface = _check_surface(surface)
     match = _VERSIONED_FORM_RE.fullmatch(urn)
     if match is None:
         raise _defect("a versioned lead-form URN is malformed", surface)
-    return PREFIX_LEAD_FORM + match.group(1), int(match.group(2))
+    return PREFIX_LEAD_FORM + match.group(1), _to_int(match.group(2), "the form version", surface)
 
 
 def canonical_form_urn(value: str, *, surface: str = _SURFACE_LEAD_FORMS) -> str:
@@ -1417,19 +1468,25 @@ class LeadFormRow:
 def _version_map(
     canonical_urn: str, version: int, content: JsonObject, surface: str
 ) -> FormVersionMap:
-    """Build a version map from a ``content.questions`` list."""
+    """Build a version map from a ``content.questions`` list.
+
+    A ``questionId`` identifies one question within a form version, so a repeated id is a
+    defect: two definitions would leave the question's meaning, and the email choice,
+    ambiguous.
+    """
     question_ids: set[int] = set()
     by_field: dict[str, set[int]] = {name: set() for name in _EMAIL_FIELDS}
     for item in _list(content, "questions", surface, required=True):
         question = _as_obj(item, "a form question", surface)
         question_id = _int(question, "questionId", surface, required=True)
+        if question_id in question_ids:
+            raise _defect("field 'questionId' repeats a question of the form version", surface)
         question_ids.add(question_id)
         predefined = _str(question, "predefinedField", surface, required=False)
         if predefined is not None and predefined in by_field:
             by_field[predefined].add(question_id)
-    email_ids: list[int] = []
-    for name in _EMAIL_FIELDS:
-        email_ids.extend(qid for qid in sorted(by_field[name]) if qid not in email_ids)
+    # Each id has one definition, so the EMAIL and WORK_EMAIL sets are disjoint.
+    email_ids = [qid for name in _EMAIL_FIELDS for qid in sorted(by_field[name])]
     return FormVersionMap(
         canonical_urn=canonical_urn,
         version=version,
@@ -1461,7 +1518,8 @@ def form_map_from_decoration(
         The map with every question id and the email question ids in preference order.
 
     Raises:
-        QueryDefect: When ``form.content.questions`` is missing or malformed.
+        QueryDefect: When ``form.content.questions`` is missing or malformed, or repeats a
+            ``questionId``.
         ValueError: When ``canonical_urn`` or ``version`` is malformed, or ``surface`` is
             unknown.
     """
@@ -1481,7 +1539,8 @@ def parse_lead_form(element: object) -> LeadFormRow:
         The form row with the current version's map.
 
     Raises:
-        QueryDefect: When the element breaks its contract.
+        QueryDefect: When the element breaks its contract, including a ``questionId`` that
+            repeats among the version's questions.
     """
     surface = _SURFACE_LEAD_FORMS
     obj = _as_obj(element, "a lead form", surface)
@@ -1625,18 +1684,34 @@ def _answers(obj: JsonObject, surface: str) -> list[tuple[int, JsonObject]]:
     """Read ``formResponse.answers`` as ``(questionId, answer)`` pairs, in response order.
 
     Only question ids are read here; an answer's content is read solely for email questions.
-    ``consentResponses`` and hidden fields are never read.
+    ``consentResponses`` and hidden fields are never read. Answers are keyed by question id,
+    so a repeated id is a defect, never an arbitrary choice between two answers.
     """
     form_response = _obj(obj, "formResponse", surface, required=True)
     pairs: list[tuple[int, JsonObject]] = []
+    seen: set[int] = set()
     for item in _list(form_response, "answers", surface, required=True):
         answer = _as_obj(item, "an answer", surface)
-        pairs.append((_int(answer, "questionId", surface, required=True), answer))
+        question_id = _int(answer, "questionId", surface, required=True)
+        if question_id in seen:
+            raise _defect("field 'questionId' repeats an answered question", surface)
+        seen.add(question_id)
+        pairs.append((question_id, answer))
     return pairs
 
 
 def _is_email(candidate: str) -> bool:
-    """Whether ``candidate`` has exactly one ``@`` with non-empty local and domain parts."""
+    """Whether ``candidate`` is a usable address: hashable as UTF-8, with exactly one ``@``.
+
+    The local and domain parts must be non-empty. A JSON answer can carry an escaped unpaired
+    surrogate such as U+D800, which decodes to a string UTF-8 cannot encode, so it could never
+    be hashed for ``email_sha256``; such an answer is not an address. Non-ASCII characters that
+    UTF-8 encodes are accepted.
+    """
+    try:
+        candidate.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
     local, separator, domain = candidate.partition("@")
     return bool(separator) and bool(local) and bool(domain) and "@" not in domain
 
@@ -1644,10 +1719,12 @@ def _is_email(candidate: str) -> bool:
 def _email_answer(
     answers: Sequence[tuple[int, JsonObject]], email_question_ids: Sequence[int], surface: str
 ) -> str | None:
-    """Return the first usable email answer in preference order, normalised."""
-    by_question: dict[int, JsonObject] = {}
-    for question_id, answer in answers:
-        by_question.setdefault(question_id, answer)
+    """Return the first usable email answer in preference order, normalised.
+
+    ``answers`` comes from :func:`_answers`, which rejects a repeated question id, so each
+    question has at most one answer.
+    """
+    by_question: dict[int, JsonObject] = dict(answers)
     for question_id in email_question_ids:
         chosen = by_question.get(question_id)
         if chosen is None:
@@ -1729,7 +1806,8 @@ def parse_lead(
 
     Raises:
         QueryDefect: When ``id``, ``submittedAt``, ``versionedLeadGenFormUrn`` or the
-            campaign is missing, or a field breaks its contract.
+            campaign is missing, a ``questionId`` repeats among the answers or the decorated
+            questions, or a field breaks its contract.
         ValueError: When ``surface`` is not a lead-response surface.
     """
     surface = _lead_surface(surface)
@@ -1789,7 +1867,9 @@ def decode_email(
         The decoded email, or ``status="no_email"`` with its reason.
 
     Raises:
-        QueryDefect: When ``versionedLeadGenFormUrn`` or the answers break the contract.
+        QueryDefect: When ``versionedLeadGenFormUrn``, the answers or the decorated questions
+            break the contract, including a ``questionId`` repeated among the answers or the
+            decorated questions.
         ValueError: When ``surface`` is not a lead-response surface.
     """
     surface = _lead_surface(surface)

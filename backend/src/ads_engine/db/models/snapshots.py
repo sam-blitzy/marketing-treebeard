@@ -6,7 +6,9 @@ Google conversion actions), recording the status, budget and quality score obser
 instant. Rows are never updated or deleted while their dataset is active:
 ``db/repositories.append_snapshots`` only inserts, so the table carries no natural key and
 no ``__natural_key__``. The rows of a retired dataset are removed with it by the
-``dataset_id`` cascade when the dataset is purged (AAP 0.3.3).
+``dataset_id`` cascade when the dataset is purged (AAP 0.3.3). That cascade looks rows up
+through ``ix_entity_snapshot_dataset_id``, because an active dataset's history is never
+purged and no other index of the table leads with ``dataset_id``.
 
 The snapshots are the state the logic depends on beyond the fetched daily facts:
 
@@ -84,6 +86,11 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
     ``captured_at DESC``) serves both "newest snapshot per entity" for the discrepancy check
     and the ordered observation history of one entity for budget-day classification.
 
+    The index ``ix_entity_snapshot_dataset_id`` on (``dataset_id``) serves the purge's
+    ``dataset_id`` cascade from ``source_dataset``. The table has no natural-key unique to
+    lead with ``dataset_id``, and active snapshot history is kept with no purge (AAP 0.3.2),
+    so without it deleting a retired dataset would scan the whole history.
+
     Attributes:
         entity_type: The kind of entity observed (:data:`ENTITY_TYPES`).
         entity_id: Internal id of the observed row in the table named by ``entity_type``;
@@ -139,4 +146,6 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
             "entity_id",
             captured_at.desc(),
         ),
+        # No index above leads with dataset_id; this serves the purge's dataset_id cascade.
+        sa.Index("ix_entity_snapshot_dataset_id", "dataset_id"),
     )

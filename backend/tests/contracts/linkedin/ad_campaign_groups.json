@@ -33,7 +33,7 @@
       200
     ],
     "body": {
-      "description": "Campaign-group search response, LinkedIn Marketing API 202609. Verified against the Microsoft Learn page served as moniker li-lms-2026-09 (last updated 2026-09-16) and against one live 202609 response on 2026-10-07. The request URL is relative to https://api.linkedin.com/rest/ and the Rest.li 2.0 search value is sent with literal parentheses, colons and commas, exactly as the page's samples show, never percent-encoded as a whole. Every documented search status is requested so the tracked set of campaign groups can be diffed against the full list. The page documents exactly seven search.status.values (ACTIVE, ARCHIVED, CANCELED, DRAFT, PAUSED, PENDING_DELETION, REMOVED). COMPLETED is a campaign status, not a campaign-group search value, so it is deliberately not sent: an undocumented enum value risks HTTP 400, which the client treats as a defect (the job fails, with no retry and no simulated fallback), and omitting it cannot raise false missing discrepancies because campaign groups appear in evidence but are never decision or discrepancy subjects. The status list in request.url must equal connectors/linkedin/parser.py CAMPAIGN_GROUP_SEARCH_STATUSES exactly, in the same order. Paging: the client sends pageSize=100 (documented maximum 1,000) and sends metadata.nextPageToken back as pageToken until a response carries no nextPageToken; on the last page live responses return an empty metadata object. Money: totalBudget.amount and dailyBudget are BigDecimal decimal strings in the ad account's currency, never JSON numbers.",
+      "description": "Campaign-group search response, LinkedIn Marketing API 202609. Verified against the Microsoft Learn page served as moniker li-lms-2026-09 (last updated 2026-09-16) and against one live 202609 response on 2026-10-07. The request URL is relative to https://api.linkedin.com/rest/ and the Rest.li 2.0 search value is sent with literal parentheses, colons and commas, exactly as the page's samples show, never percent-encoded as a whole. Every documented search status is requested so the tracked set of campaign groups can be diffed against the full list. The page documents exactly seven search.status.values (ACTIVE, ARCHIVED, CANCELED, DRAFT, PAUSED, PENDING_DELETION, REMOVED). COMPLETED is a campaign status, not a campaign-group search value, so it is deliberately not sent: an undocumented enum value risks HTTP 400, which the client treats as a defect (the job fails, with no retry and no simulated fallback), and omitting it cannot raise false missing discrepancies because campaign groups appear in evidence but are never decision or discrepancy subjects. The status list in request.url must equal connectors/linkedin/parser.py CAMPAIGN_GROUP_SEARCH_STATUSES exactly, in the same order. Paging: the client sends pageSize=100 (documented maximum 1,000) and sends metadata.nextPageToken back as pageToken until a response carries no non-null nextPageToken (an absent or null token ends enumeration); on the last page live responses return an empty metadata object. Money: totalBudget.amount and dailyBudget are BigDecimal decimal strings in the ad account's currency, never JSON numbers.",
       "type": "object",
       "required": [
         "elements"
@@ -225,12 +225,15 @@
           }
         },
         "metadata": {
-          "description": "Cursor paging metadata. Empty on the last page.",
+          "description": "Cursor paging metadata. On the last page it is empty or carries a null nextPageToken.",
           "type": "object",
           "properties": {
             "nextPageToken": {
-              "description": "Opaque cursor for the next page, sent back as the pageToken query parameter. Absent on the last page.",
-              "type": "string"
+              "description": "Opaque cursor for the next page, sent back as the pageToken query parameter. Absent or null on the last page.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
