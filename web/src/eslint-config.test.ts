@@ -29,7 +29,9 @@ const RAW_ELEMENT_MESSAGE =
 const INLINE_STYLE_MESSAGE =
   'No literal styles: use design-system wrappers, layout primitives (Stack, Inline, Grid) and var(--…) tokens (AAP 0.4.4).';
 const VITE_ENV_MESSAGE =
-  'The SPA takes no build-time configuration; never read VITE_* variables (AAP 0.3.2).';
+  "The SPA takes no build-time configuration: import.meta.env is read only for Vite's built-ins BASE_URL, DEV, MODE, PROD and SSR, each by its own name (AAP 0.3.2).";
+const ENV_OBJECT_MESSAGE =
+  'Use import.meta and import.meta.env only in a direct read such as import.meta.env.MODE: an alias, spread, argument or computed member hides which variable is read, and Vite inlines the whole env object, every VITE_* value included, wherever it is used as a value (AAP 0.3.2).';
 const DIRECT_HTTP_MESSAGE =
   'Use the TanStack Query hooks in src/api/queries.ts; only src/api/client.ts calls fetch (AAP 0.11.1).';
 const PROCESS_MESSAGE = 'process is not available in the browser bundle.';
@@ -37,6 +39,8 @@ const DESIGN_SYSTEM_IMPORT_MESSAGE =
   'Import from the design-system index (src/design-system/index.ts) only (AAP 0.4.2).';
 const API_CLIENT_IMPORT_MESSAGE =
   'Features use the hooks and re-exported types in src/api/queries.ts and src/api/types.ts, never apiFetch directly.';
+const UNCHECKED_IMPORT_MESSAGE =
+  'Feature code imports modules by string-literal specifiers only, never by a computed import() or import.meta.glob, so the design-system index (AAP 0.4.2) and Query-hook (AAP 0.11.1) boundaries can be checked.';
 
 /** Every element name the raw-element selector matches. */
 const RAW_ELEMENTS = [
@@ -207,28 +211,34 @@ describe('the style attribute (AAP 0.4.4)', () => {
 });
 
 describe('VITE_* reads (AAP 0.3.2)', () => {
-  it.each([
+  /** One file from every src/ config block that carries the import.meta.env allowlist. */
+  const ENV_READ_FILES = [
     FEATURE_TS,
     API_CLIENT,
     API_QUERIES,
     DESIGN_SYSTEM_COMPONENT,
     'src/features/actions/example.test.ts',
     'src/design-system/components/Button.test.tsx',
-  ])('reports the dotted, computed and destructured reads in %s', async (filePath) => {
-    expect(
-      await lint(
-        filePath,
-        'export const dotted = import.meta.env.VITE_API_URL;',
-        "export const computed = import.meta.env['VITE_API_URL'];",
-        'const { VITE_API_URL } = import.meta.env;',
-        'export const destructured = VITE_API_URL;',
-      ),
-    ).toEqual([
-      syntaxReport(1, VITE_ENV_MESSAGE),
-      syntaxReport(2, VITE_ENV_MESSAGE),
-      syntaxReport(3, VITE_ENV_MESSAGE),
-    ]);
-  });
+  ] as const;
+
+  it.each(ENV_READ_FILES)(
+    'reports the dotted, computed and destructured reads in %s',
+    async (filePath) => {
+      expect(
+        await lint(
+          filePath,
+          'export const dotted = import.meta.env.VITE_API_URL;',
+          "export const computed = import.meta.env['VITE_API_URL'];",
+          'const { VITE_API_URL } = import.meta.env;',
+          'export const destructured = VITE_API_URL;',
+        ),
+      ).toEqual([
+        syntaxReport(1, VITE_ENV_MESSAGE),
+        syntaxReport(2, VITE_ENV_MESSAGE),
+        syntaxReport(3, VITE_ENV_MESSAGE),
+      ]);
+    },
+  );
 
   it.each([FEATURE_TS, API_CLIENT, DESIGN_SYSTEM_COMPONENT])(
     "allows Vite's built-in variables in %s",
@@ -240,6 +250,75 @@ describe('VITE_* reads (AAP 0.3.2)', () => {
           "export const dev = import.meta.env['DEV'];",
           'const { BASE_URL } = import.meta.env;',
           'export const base = BASE_URL;',
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(ENV_READ_FILES)(
+    'reports computed, aliased and non-built-in reads of import.meta.env in %s',
+    async (filePath) => {
+      expect(
+        await lint(
+          filePath,
+          "export const computedEnv = import.meta['env'].VITE_SECRET;",
+          "const { ['VITE_SECRET']: value } = import.meta.env;",
+          "const { 'VITE_X': quoted } = import.meta.env;",
+          "export const template = import.meta.env[`VITE_${'X'}`];",
+          'export const plainTemplate = import.meta.env[`VITE_X`];',
+          "const key = 'VITE_X';",
+          'export const byIdentifier = import.meta.env[key];',
+          'const { ...rest } = import.meta.env;',
+          'const env = import.meta.env;',
+          'const meta = import.meta;',
+          'export const spread = { ...import.meta.env };',
+          'export const passed = String(import.meta.env);',
+          'export const asserted = (import.meta.env as Record<string, string>).VITE_X;',
+          'export const secret = import.meta.env.SECRET_TOKEN;',
+          'export const used = [value, quoted, rest, env.VITE_X, meta.env.VITE_X];',
+        ),
+      ).toEqual([
+        syntaxReport(1, ENV_OBJECT_MESSAGE),
+        syntaxReport(2, VITE_ENV_MESSAGE),
+        syntaxReport(3, VITE_ENV_MESSAGE),
+        syntaxReport(4, VITE_ENV_MESSAGE),
+        syntaxReport(5, VITE_ENV_MESSAGE),
+        syntaxReport(7, VITE_ENV_MESSAGE),
+        syntaxReport(8, VITE_ENV_MESSAGE),
+        syntaxReport(9, ENV_OBJECT_MESSAGE),
+        syntaxReport(10, ENV_OBJECT_MESSAGE),
+        syntaxReport(11, ENV_OBJECT_MESSAGE),
+        syntaxReport(12, ENV_OBJECT_MESSAGE),
+        syntaxReport(13, ENV_OBJECT_MESSAGE),
+        syntaxReport(14, VITE_ENV_MESSAGE),
+      ]);
+    },
+  );
+
+  it.each(ENV_READ_FILES)(
+    'allows every built-in, import.meta.url and new.target in %s',
+    async (filePath) => {
+      expect(
+        await lint(
+          filePath,
+          'export const builtIns = [',
+          '  import.meta.env.BASE_URL,',
+          '  import.meta.env.DEV,',
+          '  import.meta.env.MODE,',
+          '  import.meta.env.PROD,',
+          '  import.meta.env.SSR,',
+          '];',
+          "export const dev = import.meta.env['DEV'];",
+          'const { BASE_URL, MODE } = import.meta.env;',
+          'export const destructured = [BASE_URL, MODE];',
+          'export const moduleUrl = import.meta.url;',
+          'export const optionalMode = import.meta.env?.MODE;',
+          'export class Base {',
+          '  readonly constructedAs: unknown;',
+          '  constructor() {',
+          '    this.constructedAs = new.target;',
+          '  }',
+          '}',
         ),
       ).toEqual([]);
     },
@@ -312,6 +391,69 @@ describe('process (AAP 0.3.2)', () => {
 });
 
 describe('feature import boundaries (AAP 0.4.2, AAP 0.11.1)', () => {
+  /**
+   * Specifiers that reach a restricted module through an equivalent path (a repeated slash, a
+   * `.` segment or a `..` detour) or in another letter case. Static imports and import() share
+   * one definition per boundary, so both must report every one of them.
+   */
+  const EQUIVALENT_SPECIFIERS = [
+    ['../../design-system//components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/./components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../Design-System/components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/../design-system/components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../api//client', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/./client', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/Client', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/queries/../client', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/x/../client', API_CLIENT_IMPORT_MESSAGE],
+  ] as const;
+
+  /**
+   * Specifiers whose path portion, everything before the first `?` or `#`, names a restricted
+   * module. The suffix never changes which module is named, whatever it contains, so static
+   * imports and import() must report every one of them.
+   */
+  const SUFFIXED_SPECIFIERS = [
+    ['../../api/client#fragment', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client?probe=/', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client.ts?probe=/', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client.ts?raw', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client?x#y', API_CLIENT_IMPORT_MESSAGE],
+    ['../../design-system/components/Button?probe=/', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/tokens.css#x', DESIGN_SYSTEM_IMPORT_MESSAGE],
+  ] as const;
+
+  /**
+   * Specifiers that name a design-system internal without a relative prefix: root-relative,
+   * which Vite resolves from web/, and bare. The boundary matches the `design-system` directory
+   * as a whole path segment wherever the path starts, so neither escapes it.
+   */
+  const UNPREFIXED_SPECIFIERS = [
+    ['/src/design-system/components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['design-system/components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+  ] as const;
+
+  /**
+   * Specifiers whose path portion names an allowed module: the design-system index, the query
+   * layer, a `..` that leaves the client, or a module that only shares a prefix or a directory
+   * name with a restricted one. A restricted name inside the `?query` suffix does not make them
+   * restricted.
+   */
+  const UNRESTRICTED_SPECIFIERS = [
+    '../../design-system?x=/components/Button',
+    '../../design-system/index?x=/',
+    '../../design-system/index.ts?x=/',
+    '../../design-system/index.ts#f',
+    '../../design-system/?x',
+    '../../api/queries?x=/api/client',
+    '../../lib/format?x=/design-system/components',
+    '../../api/clientele',
+    '../../api/client-types',
+    '../../myapi/client',
+    '../../my-design-system/components',
+    '../../api/client/../queries',
+  ] as const;
+
   it.each([
     '../../design-system/components',
     '../../design-system/components/Button',
@@ -357,6 +499,28 @@ describe('feature import boundaries (AAP 0.4.2, AAP 0.11.1)', () => {
     ]);
   });
 
+  it.each(EQUIVALENT_SPECIFIERS)(
+    'reports the equivalent path or letter case %s',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `import '${source}';`)).toEqual([
+        importReport(1, source, message),
+      ]);
+    },
+  );
+
+  it('reports re-exports of the API client', async () => {
+    expect(
+      await lint(
+        FEATURE_TS,
+        "export * from '../../api//client';",
+        "export { apiFetch } from '../../api/client';",
+      ),
+    ).toEqual([
+      importReport(1, '../../api//client', API_CLIENT_IMPORT_MESSAGE),
+      importReport(2, '../../api/client', API_CLIENT_IMPORT_MESSAGE),
+    ]);
+  });
+
   it('allows the design-system index and the query layer', async () => {
     expect(
       await lint(
@@ -381,5 +545,188 @@ describe('feature import boundaries (AAP 0.4.2, AAP 0.11.1)', () => {
     ],
   ])('does not apply the feature boundaries to %s', async (filePath, ...imports) => {
     expect(await lint(filePath, ...imports)).toEqual([]);
+  });
+
+  it.each([
+    ['../../design-system/components/Button', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/components/Button.tsx', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/tokens', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../design-system/tokens.css', DESIGN_SYSTEM_IMPORT_MESSAGE],
+    ['../../api/client', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client.ts', API_CLIENT_IMPORT_MESSAGE],
+    ['../../api/client.js', API_CLIENT_IMPORT_MESSAGE],
+  ])('reports import() of %s', async (source, message) => {
+    expect(await lint(FEATURE_TS, `export const load = () => import('${source}');`)).toEqual([
+      syntaxReport(1, message),
+    ]);
+  });
+
+  it('reports import() of internals at any feature depth', async () => {
+    expect(
+      await lint(
+        'src/features/actions/sections/KeywordsSection.tsx',
+        "export const button = () => import('../../../design-system/components/Button');",
+        "export const client = async () => (await import('../../../api/client')).apiFetch;",
+      ),
+    ).toEqual([
+      syntaxReport(1, DESIGN_SYSTEM_IMPORT_MESSAGE),
+      syntaxReport(2, API_CLIENT_IMPORT_MESSAGE),
+    ]);
+  });
+
+  it.each(EQUIVALENT_SPECIFIERS)(
+    'reports import() of the equivalent path or letter case %s',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `export const load = () => import('${source}');`)).toEqual([
+        syntaxReport(1, message),
+      ]);
+    },
+  );
+
+  it.each(SUFFIXED_SPECIFIERS)(
+    'reports %s, whose path portion names a restricted module',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `import '${source}';`)).toEqual([
+        importReport(1, source, message),
+      ]);
+    },
+  );
+
+  it.each(SUFFIXED_SPECIFIERS)(
+    'reports import() of %s, whose path portion names a restricted module',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `export const load = () => import('${source}');`)).toEqual([
+        syntaxReport(1, message),
+      ]);
+    },
+  );
+
+  it('reports an awaited import() of the API client behind a fragment or query', async () => {
+    expect(
+      await lint(
+        FEATURE_TS,
+        "export const a = async () => (await import('../../api/client#fragment')).apiFetch('/x');",
+        "export const b = async () => (await import('../../api/client?probe=/')).apiFetch('/x');",
+        "export const c = async () => (await import('../../api/client.ts?probe=/')).apiFetch('/x');",
+      ),
+    ).toEqual([
+      syntaxReport(1, API_CLIENT_IMPORT_MESSAGE),
+      syntaxReport(2, API_CLIENT_IMPORT_MESSAGE),
+      syntaxReport(3, API_CLIENT_IMPORT_MESSAGE),
+    ]);
+  });
+
+  it.each(UNPREFIXED_SPECIFIERS)(
+    'reports the root-relative or bare design-system internal %s',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `import '${source}';`)).toEqual([
+        importReport(1, source, message),
+      ]);
+    },
+  );
+
+  it.each(UNPREFIXED_SPECIFIERS)(
+    'reports import() of the root-relative or bare design-system internal %s',
+    async (source, message) => {
+      expect(await lint(FEATURE_TS, `export const load = () => import('${source}');`)).toEqual([
+        syntaxReport(1, message),
+      ]);
+    },
+  );
+
+  it.each(UNRESTRICTED_SPECIFIERS)(
+    'allows a static import and import() of %s',
+    async (source) => {
+      expect(
+        await lint(
+          FEATURE_TS,
+          `import '${source}';`,
+          `export const load = () => import('${source}');`,
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it('reports import() by a non-literal specifier and import.meta.glob', async () => {
+    expect(
+      await lint(
+        FEATURE_TS,
+        'export const byTemplate = (name: string) =>',
+        '  import(`../../design-system/components/${name}`);',
+        'export const byPlainTemplate = () => import(`../../api/queries`);',
+        "const specifier = '../../api/client';",
+        'export const byIdentifier = () => import(specifier);',
+        "export const byGlob = import.meta.glob('../../design-system/components/*.tsx');",
+      ),
+    ).toEqual([
+      syntaxReport(2, UNCHECKED_IMPORT_MESSAGE),
+      syntaxReport(3, UNCHECKED_IMPORT_MESSAGE),
+      syntaxReport(5, UNCHECKED_IMPORT_MESSAGE),
+      syntaxReport(6, UNCHECKED_IMPORT_MESSAGE),
+    ]);
+  });
+
+  it('reports import() types of the API client and design-system internals', async () => {
+    expect(
+      await lint(
+        FEATURE_TS,
+        "export type Client = typeof import('../../api/client');",
+        "export type Tokens = typeof import('../../design-system/tokens');",
+      ),
+    ).toEqual([
+      syntaxReport(1, API_CLIENT_IMPORT_MESSAGE),
+      syntaxReport(2, DESIGN_SYSTEM_IMPORT_MESSAGE),
+    ]);
+  });
+
+  it('allows lazy loading and import() of the design-system index and query layer', async () => {
+    expect(
+      await lint(
+        FEATURE_TSX,
+        "import { lazy } from 'react';",
+        "export const ActionsPage = lazy(() => import('./ActionsPage'));",
+        "export const bare = () => import('../../design-system');",
+        "export const trailingSlash = () => import('../../design-system/');",
+        "export const index = () => import('../../design-system/index');",
+        "export const indexTs = () => import('../../design-system/index.ts');",
+        "export const queries = () => import('../../api/queries');",
+        "export const types = () => import('../../api/types');",
+        "export type Queries = typeof import('../../api/queries');",
+      ),
+    ).toEqual([]);
+  });
+
+  it('allows the index by equivalent paths and modules sharing the client prefix', async () => {
+    expect(
+      await lint(
+        FEATURE_TS,
+        "import '../../design-system//index';",
+        "import '../../design-system/./index';",
+        "import '../../api/clientele';",
+        "import '../../api/client-types';",
+        "export const index = () => import('../../design-system//index');",
+        "export const dotIndex = () => import('../../design-system/./index');",
+        "export const clientele = () => import('../../api/clientele');",
+        "export const clientTypes = () => import('../../api/client-types');",
+      ),
+    ).toEqual([]);
+  });
+
+  it.each([
+    'src/router.tsx',
+    'src/design-system/index.ts',
+    'src/api/queries.ts',
+    'src/features/actions/ActionsPage.test.tsx',
+  ])('does not apply the import() boundaries to %s', async (filePath) => {
+    expect(
+      await lint(
+        filePath,
+        "export const button = () => import('../../design-system/components/Button');",
+        "export const client = () => import('../../api/client');",
+        'export const byTemplate = (name: string) => import(`../../features/${name}`);',
+        "export const modules = import.meta.glob('../../features/**/*.tsx');",
+        "export type Client = typeof import('../../api/client');",
+      ),
+    ).toEqual([]);
   });
 });
