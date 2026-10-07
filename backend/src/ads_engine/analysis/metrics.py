@@ -220,6 +220,15 @@ _MAX_UTC_OFFSET: Final = timedelta(hours=15)
 _CRM_LINKED_TYPES: Final[tuple[str, ...]] = ("meeting", "deal")
 """The targets a contact's association fetches read (AAP 0.3.3)."""
 
+_CODE_POINT: Final = "C"
+"""The collation of every text sort key behind the order of a context's collections.
+
+PostgreSQL's ``"C"`` collation compares UTF-8 bytes, which order exactly as Unicode code
+points, the order Python sorts ``str`` in; it exists in every database, whatever the default
+locale. ``load_context`` therefore lists rows in one order on any database, and in the order
+``simulation.scenarios.context_from_world`` builds the same rows in memory.
+"""
+
 _SOURCES_ALL: Final[tuple[Source, ...]] = get_args(Source)
 _DATASET_MODES: Final[tuple[DatasetMode, ...]] = get_args(DatasetMode)
 _DATASET_ROLES: Final[tuple[DatasetRole, ...]] = get_args(DatasetRole)
@@ -662,12 +671,18 @@ async def _search_term_window(scope: QueryScope) -> list[SearchTermRow]:
     (``array_agg(… ORDER BY date DESC)[1]``), so a term excluded mid-window reads as excluded.
     Conversions sum to 0 when every day is ``NULL``, because :class:`SearchTermRow` carries
     them as a number; Q-G6 reports ``metrics.conversions`` on every row it returns.
+
+    Rows are ordered by ad group, then rows with a matched criterion before those without
+    (the stored ``''``, read back as ``None``), then criterion and term in code-point order
+    (:data:`_CODE_POINT`): the order ``context_from_world`` builds, on any database locale.
     """
     dataset_id = scope.dataset_id("google")
     if dataset_id is None:
         return []
     fact = FactSearchTermDaily
     latest_first = (fact.date.desc(), fact.id.desc())
+    # The column is NOT NULL and stores '' for "no keyword segment"; a NULL sorts with it.
+    no_criterion = sa.func.coalesce(fact.matched_criterion_id, "") == ""
     stmt = (
         sa.select(
             fact.ad_group_id,
@@ -688,7 +703,12 @@ async def _search_term_window(scope: QueryScope) -> list[SearchTermRow]:
             fact.date.between(scope.window.start, scope.window.end),
         )
         .group_by(fact.ad_group_id, fact.campaign_id, fact.matched_criterion_id, fact.search_term)
-        .order_by(fact.ad_group_id, fact.matched_criterion_id, fact.search_term)
+        .order_by(
+            fact.ad_group_id,
+            no_criterion,
+            fact.matched_criterion_id.collate(_CODE_POINT),
+            fact.search_term.collate(_CODE_POINT),
+        )
     )
     result = await scope.session.execute(stmt)
     rows: list[SearchTermRow] = []
@@ -755,7 +775,10 @@ async def _google_rate_baseline(scope: QueryScope) -> list[RateBaseline]:
 
 
 async def _segment_window(scope: QueryScope) -> list[SegmentRow]:
-    """``segment_window``: LinkedIn segment rows fetched for exactly this run's window (C3a)."""
+    """``segment_window``: LinkedIn segment rows fetched for exactly this run's window (C3a).
+
+    Ordered by campaign, then facet and value in code-point order (:data:`_CODE_POINT`).
+    """
     dataset_id = scope.dataset_id("linkedin")
     if dataset_id is None:
         return []
@@ -777,7 +800,7 @@ async def _segment_window(scope: QueryScope) -> list[SegmentRow]:
             seg.window_start == scope.window.start,
             seg.window_end == scope.window.end,
         )
-        .order_by(seg.campaign_id, seg.facet, seg.value)
+        .order_by(seg.campaign_id, seg.facet.collate(_CODE_POINT), seg.value.collate(_CODE_POINT))
     )
     result = await scope.session.execute(stmt)
     rows: list[SegmentRow] = []
@@ -1465,9 +1488,11 @@ async def _load_crm(
 ) -> CrmData:
     """Load everything a context reads from one HubSpot dataset (AAP 0.3.3, 0.5.4.7).
 
-    * contacts: the matched leads' contacts (``contact_ids``) and, when ``google_contacts``,
-      the Google-touch contacts: ``google_campaign_ref`` set and ``google_touch_at`` within
-      ``window.utc_bounds()``;
+    * contacts: the matched leads' contacts (``contact_ids``) and, when ``google_contacts``
+      and the dataset's bindings verify the Google link, the Google-touch contacts:
+      ``google_campaign_ref`` set and ``google_touch_at`` within ``window.utc_bounds()``.
+      Bindings never verified, undecodable or with the link unavailable discover none, so
+      Google refs stored under a link that is no longer verified never enter the load;
     * contact-to-meeting and contact-to-deal associations and fetch outcomes of those
       contacts, and the associated meetings and deals;
     * window deals (``created_at`` from window start to ``now``), their deal-to-contact
@@ -1477,9 +1502,15 @@ async def _load_crm(
 
     An associated id with no stored meeting or deal row is simply absent from ``meetings`` or
     ``deals``; its fetch row's target-read status already marks it unknown, never absent.
+
+    Order, as ``context_from_world`` builds it: every mapping is keyed in sorted key order,
+    association targets are in code-point order, window deals are ordered by creation, then
+    id in code-point order, and Google-touch contacts by touch, then id in code-point order
+    (:data:`_CODE_POINT`).
     """
     session = scope.session
     dataset_id = row.id
+    bindings = _bindings(row, scope.now)
     lower, upper = scope.window.utc_bounds()
     contacts: dict[str, ContactInfo] = {}
     ct = CrmContact
@@ -1493,7 +1524,7 @@ async def _load_crm(
             info = _contact_info(*columns)
             contacts[info.hs_id] = info
     discovered: list[ContactInfo] = []
-    if google_contacts:
+    if google_contacts and bindings.google.available:
         result = await session.execute(
             sa.select(*_contact_columns())
             .where(
@@ -1502,7 +1533,7 @@ async def _load_crm(
                 ct.google_touch_at >= lower,
                 ct.google_touch_at < upper,
             )
-            .order_by(ct.google_touch_at, ct.hs_id)
+            .order_by(ct.google_touch_at, ct.hs_id.collate(_CODE_POINT))
         )
         for columns in result.all():
             info = _contact_info(*columns)
@@ -1519,7 +1550,7 @@ async def _load_crm(
             deal.created_at >= lower,
             deal.created_at <= scope.now,
         )
-        .order_by(deal.created_at, deal.hs_id)
+        .order_by(deal.created_at, deal.hs_id.collate(_CODE_POINT))
     )
     window_deal_ids: list[str] = []
     for hs_id, created_at, stage, pipeline, amount in result_deals.all():
@@ -1545,7 +1576,11 @@ async def _load_crm(
                 _any_text(assoc.from_id, from_ids),
                 assoc.to_type.in_(to_types),
             )
-            .order_by(assoc.from_id, assoc.to_type, assoc.to_id)
+            .order_by(
+                assoc.from_id.collate(_CODE_POINT),
+                assoc.to_type.collate(_CODE_POINT),
+                assoc.to_id.collate(_CODE_POINT),
+            )
         )
         for a_from_type, a_from_id, a_to_type, a_to_id in result_assoc.all():
             associations[(a_from_type, a_from_id, a_to_type)].append(a_to_id)
@@ -1625,12 +1660,14 @@ async def _load_crm(
     )
     return CrmData(
         dataset=_dataset_ref(row),
-        bindings=_bindings(row, scope.now),
+        bindings=bindings,
         contacts=MappingProxyType(dict(sorted(contacts.items()))),
         meetings=MappingProxyType(dict(sorted(meetings.items()))),
         deals=MappingProxyType(dict(sorted(deals.items()))),
-        associations=MappingProxyType({key: tuple(ids) for key, ids in associations.items()}),
-        fetches=MappingProxyType(fetches),
+        associations=MappingProxyType(
+            {key: tuple(ids) for key, ids in sorted(associations.items())}
+        ),
+        fetches=MappingProxyType(dict(sorted(fetches.items()))),
         window_deal_ids=tuple(window_deal_ids),
         deal_search_complete=deal_search_complete,
         google_contacts=tuple(discovered),
@@ -3501,8 +3538,9 @@ ContractDay = Literal["last_click", "weighted", "unknown"]
 
 ``last_click``: every included conversion action was whole-day known with
 ``GOOGLE_ADS_LAST_CLICK``, so the day's conversions are unweighted event counts.
-``weighted``: some included action was data-driven or external that day. ``unknown``: some
-action's settings were not whole-day known ("conversion counting contract unknown").
+``weighted``: some included action was data-driven or external that day, as an observation
+captured during the day or the day's whole-day-known settings show. ``unknown``: otherwise,
+some action's settings were not whole-day known ("conversion counting contract unknown").
 """
 
 LAST_CLICK_MODEL: Final = "GOOGLE_ADS_LAST_CLICK"
@@ -3519,6 +3557,22 @@ def _contract_value(obs: Observation) -> tuple[object, object, object]:
     )
 
 
+def _weighted(value: Hashable | None) -> bool:
+    """Whether a :func:`_contract_value` includes the action under a non-last-click model."""
+    return isinstance(value, tuple) and value[0] is True and value[1] != LAST_CLICK_MODEL
+
+
+def _weighted_during(series: _Series, lower: datetime, upper: datetime) -> bool:
+    """Whether an observation captured during ``[lower, upper)`` shows weighted counting.
+
+    A snapshot states what was true at its instant, so one taken inside the day establishes
+    that some of the day's conversions were weighted, whether or not the day is whole-day
+    known.
+    """
+    start, stop = bisect_left(series.times, lower), bisect_left(series.times, upper)
+    return any(_weighted(series.values[index]) for index in range(start, stop))
+
+
 def counting_contract(ctx: AnalysisContext) -> dict[date, ContractDay]:
     """Return the counting contract of every window day in the Google account's zone.
 
@@ -3527,7 +3581,13 @@ def counting_contract(ctx: AnalysisContext) -> dict[date, ContractDay]:
     counting_type)`` is classified per day from its Q-G8 observations with
     :func:`classify_days`. For day ``d``:
 
-    * any action not whole-day known → ``unknown`` (for example before the first Q-G8
+    * an observation captured during ``d`` shows an action with
+      ``include_in_conversions_metric = true`` under a model other than
+      :data:`LAST_CLICK_MODEL` → ``weighted``, whole-day known or not: the snapshot
+      establishes that the action was data-driven or external on ``d`` (AAP 0.5.4.5 B4,
+      "data-driven or external on any day"). A one-day switch to data-driven in a zone the
+      snapshot cadence does not align with is therefore weighted, never merely unknown;
+    * else any action not whole-day known → ``unknown`` (for example before the first Q-G8
       snapshot, or a setting changed during the day); a context without any conversion
       action is ``unknown`` on every day, because nothing verifies the contract;
     * else every action with ``include_in_conversions_metric = true`` uses
@@ -3548,17 +3608,17 @@ def counting_contract(ctx: AnalysisContext) -> dict[date, ContractDay]:
             set(ctx.conversion_actions)
             | {eid for (etype, eid) in ctx.observations if etype == "conversion_action"}
         )
-        spans = [
-            _classify(
-                _Series.of(ctx.observations.get(("conversion_action", aid), ()), _contract_value),
-                dates,
-                tz,
-                gap,
-            )
+        series = [
+            _Series.of(ctx.observations.get(("conversion_action", aid), ()), _contract_value)
             for aid in action_ids
         ]
+        spans = [_classify(item, dates, tz, gap) for item in series]
         contract: dict[date, ContractDay] = {}
         for day in dates:
+            lower, upper = _day_bounds(day, tz)
+            if any(_weighted_during(item, lower, upper) for item in series):
+                contract[day] = "weighted"
+                continue
             day_spans = [by_day[day] for by_day in spans]
             if not day_spans or any(span.klass != "known" for span in day_spans):
                 contract[day] = "unknown"
