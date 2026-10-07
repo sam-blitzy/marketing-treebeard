@@ -1,0 +1,110 @@
+/* Card: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Recommendation card. Card.tsx renders this structure, and the class names are a contract
+ * with it and Card.test.tsx; keep them exactly as written:
+ *
+ *   <article class="ds-card" aria-labelledby="{title id}">
+ *     <div class="ds-card__header">
+ *       <span class="ds-card__rank">            optional: rank, with a visually hidden "Rank "
+ *       <h3|h4 class="ds-card__title">          the action as the headline
+ *       <div class="ds-card__meta">             optional: entity name and its source
+ *     <div class="ds-card__body">               reason, evidence table, window chip, flags row
+ *     <div class="ds-card__footer">             actions (Record decision, Mark done, Dismiss...)
+ *
+ * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
+ * Every colour, spacing, typography, radius and shadow value is a token from ../tokens.css, so
+ * binding Blitzy OS touches tokens.css and the internals here, never feature code. Feature code
+ * places content only inside the slots and adds no CSS to the card itself.
+ *
+ * Hairlines: the card outline and the footer divider are a quarter of --space-1 (1px at the
+ * 16px root), the same derivation as the skip-link border in shared.css. Every value in this
+ * layer resolves to a token, and the hairline follows the spacing scale when Blitzy OS rebinds
+ * it, so this file uses no literal px border width.
+ *
+ * Reflow (WCAG 2.2 SC 1.4.10): the header and footer wrap onto further lines instead of
+ * overflowing a narrow viewport, and overflow-wrap lets long unbroken strings such as search
+ * terms, URNs or campaign names break inside the card rather than widen it.
+ */
+
+/*
+ * The card surface: a column of header, body and footer spaced by the gap. min-inline-size: 0
+ * lets a card placed in a Stack, Inline or Grid track shrink to that track instead of forcing it
+ * wider than its content's longest word. overflow-wrap is inherited, so every slot gets it.
+ */
+.ds-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+  padding: var(--space-4);
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  box-shadow: var(--shadow-1);
+  overflow-wrap: break-word;
+}
+
+/*
+ * Header row: rank, headline and entity line share one baseline while they fit, and wrap onto
+ * further lines when they do not. The row gap is tighter than the column gap, so wrapped header
+ * lines still read as one block.
+ */
+.ds-card__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+}
+
+/* Rank: a quiet number ahead of the headline. Its "Rank " prefix is visually hidden. */
+.ds-card__rank {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-muted);
+}
+
+/*
+ * Headline: the action. It takes the free space on its line and, through min-inline-size: 0,
+ * may shrink below its longest word, so a long headline wraps inside the card. The user-agent
+ * heading margin is cleared so the header gap alone spaces it.
+ */
+.ds-card__title {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+}
+
+/* Entity line: the entity name and its source, secondary to the headline. */
+.ds-card__meta {
+  min-inline-size: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/*
+ * Body: a column of the reason, evidence, window chip and flags. min-inline-size: 0 keeps a wide
+ * child, such as the evidence table, from stretching the card past its track.
+ */
+.ds-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+/*
+ * Footer: the actions, separated from the body by a hairline divider. The actions wrap onto
+ * further lines on narrow screens instead of overflowing the card.
+ */
+.ds-card__footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-block-start: var(--space-3);
+  border-block-start: calc(var(--space-1) / 4) solid var(--color-border);
+}

@@ -1,0 +1,137 @@
+/* Form fields (TextField, Select): product wrapper styles. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Shared form-field styles. TextField.tsx and Select.tsx both import this file, so every class
+ * below stays generic across <input>, <textarea> and <select>; Select.css adds only what is
+ * specific to a select. The markup contract both wrappers render:
+ *
+ *   div.ds-field
+ *     label.ds-field__label[for]           visible label, also the control's accessible name
+ *       span.ds-field__required            " *" when required, aria-hidden="true"
+ *     input.ds-field__control              or textarea.ds-field__control.ds-textfield--multiline
+ *                                          or select.ds-field__control.ds-select
+ *     p.ds-field__hint[id]                 optional, referenced by aria-describedby
+ *     p.ds-field__error[id]                optional, referenced by aria-describedby
+ *
+ * Every colour, spacing, typography and radius value is a token from ../tokens.css, so binding
+ * Blitzy OS values touches tokens.css alone. Border and outline widths are derived from
+ * --space-1 (a quarter is the 1px hairline, a half the 2px ring at the 16px root), the same
+ * derivation the base focus ring in tokens.css and the skip link in shared.css use, rather than
+ * literal px, so one spacing rebind moves every ring and hairline together.
+ */
+
+/*
+ * Field: label, control, hint and error in one column spaced by the gap alone.
+ * min-inline-size: 0 lets the field shrink inside a flex or grid track instead of widening it.
+ */
+.ds-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-inline-size: 0;
+}
+
+/* Visible label (WCAG 2.2 SC 3.3.2): long labels wrap instead of overflowing a narrow track. */
+.ds-field__label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+  overflow-wrap: break-word;
+}
+
+/*
+ * Required marker. It is aria-hidden; the control's native required attribute is what assistive
+ * technology announces, and the visible asterisk glyph means colour is not the only cue.
+ */
+.ds-field__required {
+  color: var(--color-critical);
+}
+
+/*
+ * Control box for input, textarea and select. The border token is at least 3:1 on both the
+ * surface and the page background (WCAG 2.2 SC 1.4.11 non-text contrast). margin: 0 clears the
+ * user-agent margin some engines give form controls, so the field's gap alone spaces them.
+ *
+ * BLITZY [A11Y]: the rendered block size is about 42px (block padding, the normal line height and
+ * two hairline borders at the 16px root), above the WCAG 2.2 AA 24px target minimum (SC 2.5.8)
+ * and below the 44px enhanced recommendation. Implemented per the specified spacing tokens and
+ * min-block-size; flagged for designer review.
+ */
+.ds-field__control {
+  box-sizing: border-box;
+  inline-size: 100%;
+  min-block-size: var(--space-8);
+  margin: 0;
+  padding-block: var(--space-2);
+  padding-inline: var(--space-3);
+  font-family: var(--font-family);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+/*
+ * Placeholder text in the muted token, which meets 4.5:1 on the surface (WCAG 2.2 SC 1.4.3).
+ * opacity: 1 stops engines that dim placeholders by default from dropping it below that ratio.
+ * A placeholder never replaces the visible label.
+ */
+.ds-field__control::placeholder {
+  color: var(--color-text-muted);
+  opacity: 1;
+}
+
+/*
+ * Keyboard focus (WCAG 2.2 SC 2.4.7): refines the base ring from tokens.css with a tighter
+ * offset so it hugs the control's border. The ring is never removed.
+ */
+.ds-field__control:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 4);
+}
+
+/*
+ * Invalid: TextField.tsx and Select.tsx set aria-invalid="true" only while an error message is
+ * shown. The .ds-field__error text identifies the error in words (WCAG 2.2 SC 3.3.1), so the
+ * critical border colour is never the only cue.
+ */
+.ds-field__control[aria-invalid="true"] {
+  border-color: var(--color-critical);
+}
+
+/*
+ * Disabled: the native disabled attribute already blocks interaction and removes the control
+ * from the tab order. pointer-events stays enabled so the not-allowed cursor can show.
+ * Inactive controls are exempt from the contrast minimums (WCAG 2.2 SC 1.4.3, 1.4.11).
+ */
+.ds-field__control:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Multiline TextField: the user may grow the textarea vertically, never sideways. */
+.ds-textfield--multiline {
+  resize: vertical;
+}
+
+/* Hint: supporting text, tied to the control by aria-describedby. */
+.ds-field__hint {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  overflow-wrap: break-word;
+}
+
+/*
+ * Error message: static text tied to the control by aria-describedby. The semibold weight and
+ * the message itself, not only the critical colour, set it apart from the hint.
+ */
+.ds-field__error {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-critical);
+  overflow-wrap: break-word;
+}
