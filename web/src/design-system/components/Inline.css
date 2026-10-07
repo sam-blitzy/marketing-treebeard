@@ -1,0 +1,118 @@
+/* Inline: product layout primitive. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Horizontal layout primitive: a row of children separated by a token gap, wrapping onto new
+ * lines by default. Feature code writes no flex CSS of its own; horizontal spacing and
+ * alignment come only from these classes, which Inline.tsx sets from its props:
+ *
+ *   ds-inline                                             always
+ *   ds-inline--gap-{1..8}                                 always; gap prop, default 2
+ *   ds-inline--nowrap                                     wrap={false}
+ *   ds-inline--align-{start|center|end|baseline|stretch}  align prop: cross-axis alignment
+ *   ds-inline--justify-{start|center|end|between}         justify prop: main-axis distribution
+ *
+ * Every spacing value is a token from ../tokens.css, and the only literal is 0. The modifiers
+ * share the base class's specificity and follow it in source order, so an align modifier always
+ * wins over the default centring and nowrap always wins over the default wrapping.
+ */
+
+/*
+ * Base row. Cross-axis centring is the default because Inline mostly lines up badges, buttons
+ * and short labels of differing heights. min-inline-size: 0 lets the row shrink inside a flex
+ * or grid parent instead of forcing that parent wider than its track.
+ */
+.ds-inline {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  min-inline-size: 0;
+}
+
+/* wrap={false}: keep every child on one line. */
+.ds-inline--nowrap {
+  flex-wrap: nowrap;
+}
+
+/* Gap scale: one modifier per spacing token, written out so each class maps to one token. */
+.ds-inline--gap-1 {
+  gap: var(--space-1);
+}
+
+.ds-inline--gap-2 {
+  gap: var(--space-2);
+}
+
+.ds-inline--gap-3 {
+  gap: var(--space-3);
+}
+
+.ds-inline--gap-4 {
+  gap: var(--space-4);
+}
+
+.ds-inline--gap-5 {
+  gap: var(--space-5);
+}
+
+.ds-inline--gap-6 {
+  gap: var(--space-6);
+}
+
+.ds-inline--gap-7 {
+  gap: var(--space-7);
+}
+
+.ds-inline--gap-8 {
+  gap: var(--space-8);
+}
+
+/* Cross-axis (vertical) alignment of the children within each line. */
+.ds-inline--align-start {
+  align-items: flex-start;
+}
+
+.ds-inline--align-center {
+  align-items: center;
+}
+
+.ds-inline--align-end {
+  align-items: flex-end;
+}
+
+.ds-inline--align-baseline {
+  align-items: baseline;
+}
+
+.ds-inline--align-stretch {
+  align-items: stretch;
+}
+
+/* Main-axis (horizontal) distribution of the children along each line. */
+.ds-inline--justify-start {
+  justify-content: flex-start;
+}
+
+.ds-inline--justify-center {
+  justify-content: center;
+}
+
+.ds-inline--justify-end {
+  justify-content: flex-end;
+}
+
+.ds-inline--justify-between {
+  justify-content: space-between;
+}
+
+/*
+ * List rendering (as="ul" or as="ol"): the caller supplies <li> children. Only the browser's
+ * markers, indentation and outer spacing are cleared, so the row lays out like the div form
+ * while the list element keeps its semantics.
+ */
+ul.ds-inline,
+ol.ds-inline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}

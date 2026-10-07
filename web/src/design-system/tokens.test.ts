@@ -1,14 +1,19 @@
 // @vitest-environment node
 /**
- * Structural tests for tokens.css, the one stylesheet that holds literal design values.
+ * Structural tests for tokens.css, the one stylesheet that holds literal design values, and
+ * for its typed mirror, tokens.ts.
  *
  * The file is read as text and split into blocks and declarations by a small scanner that
  * understands comments, strings and nesting, which is all this stylesheet uses. The assertions
  * hold it to the semantic token contract (AAP 0.4.3) and to the promises its header makes.
+ * The contract list below is kept independently of tokens.ts on purpose: tokens.ts is checked
+ * against it too, so renaming a token in both files at once still fails here.
  */
 import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
+
+import { TOKEN_NAMES as MIRRORED_TOKEN_NAMES, tokens } from './tokens';
 
 const SOURCE = readFileSync(new URL('./tokens.css', import.meta.url), 'utf8');
 
@@ -287,3 +292,25 @@ describe('tokens.css', () => {
     expect(override.filter((declaration) => !declaration.important)).toEqual([]);
   });
 });
+
+/** Every string leaf of a token tree, depth first, in property order. */
+function tokenLeaves(tree: unknown): string[] {
+  if (typeof tree === 'string') {
+    return [tree];
+  }
+  if (typeof tree !== 'object' || tree === null) {
+    throw new Error(`Unexpected token leaf of type ${typeof tree}`);
+  }
+  return Object.values(tree).flatMap(tokenLeaves);
+}
+
+describe('tokens.ts', () => {
+  it('mirrors the contract names one-to-one, in tokens.css order', () => {
+    expect([...MIRRORED_TOKEN_NAMES]).toEqual([...TOKEN_NAMES]);
+  });
+
+  it('references every token exactly once, in contract order, as a bare var()', () => {
+    expect(tokenLeaves(tokens)).toEqual(TOKEN_NAMES.map((name) => `var(${name})`));
+  });
+});
+

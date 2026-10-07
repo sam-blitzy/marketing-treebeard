@@ -1,0 +1,103 @@
+/* Grid: product layout primitive. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Class contract with Grid.tsx. Every grid carries:
+ * - .ds-grid;
+ * - one gap modifier, .ds-grid--gap-1 to .ds-grid--gap-8, mapped to --space-1 to --space-8
+ *   (Grid.tsx defaults to 4);
+ * - exactly one column mode:
+ *   - .ds-grid--fixed: equal tracks, counted by the component-private --ds-grid-columns custom
+ *     property, which Grid.tsx sets to a positive integer string;
+ *   - .ds-grid--narrow: as many auto-fit tracks as fit, each at least six --space-8 steps wide;
+ *   - .ds-grid--wide: as many auto-fit tracks as fit, each at least ten --space-8 steps wide.
+ * Every column mode stacks to a single column below the breakpoint at the end of this file.
+ *
+ * Spacing comes only from tokens (web/.stylelintrc.json). This file sets no colour,
+ * typography, radius or shadow, so feature code gets columns and gaps here and nothing else.
+ */
+
+.ds-grid {
+  display: grid;
+
+  /* Lets a grid nested in a flex or grid parent shrink with it instead of overflowing it. */
+  min-inline-size: 0;
+}
+
+/*
+ * Grid.tsx can render a list, whose items the caller supplies as <li>. Without this reset the
+ * user-agent list indent and markers would offset the first track and decorate every cell.
+ */
+ul.ds-grid,
+ol.ds-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Gap between tracks and rows, one modifier per spacing token. */
+.ds-grid--gap-1 {
+  gap: var(--space-1);
+}
+
+.ds-grid--gap-2 {
+  gap: var(--space-2);
+}
+
+.ds-grid--gap-3 {
+  gap: var(--space-3);
+}
+
+.ds-grid--gap-4 {
+  gap: var(--space-4);
+}
+
+.ds-grid--gap-5 {
+  gap: var(--space-5);
+}
+
+.ds-grid--gap-6 {
+  gap: var(--space-6);
+}
+
+.ds-grid--gap-7 {
+  gap: var(--space-7);
+}
+
+.ds-grid--gap-8 {
+  gap: var(--space-8);
+}
+
+/*
+ * Fixed track count. minmax(0, 1fr) keeps the tracks equal even when a cell holds long
+ * unbreakable content, which a bare 1fr (minimum auto) would let widen its own track.
+ * The fallback of 1 track only applies if the custom property is absent.
+ */
+.ds-grid--fixed {
+  grid-template-columns: repeat(var(--ds-grid-columns, 1), minmax(0, 1fr));
+}
+
+/*
+ * Auto-fit tracks with a token-derived minimum width. min(100%, …) caps the minimum at the
+ * container width, so a single track never overflows a container narrower than the minimum.
+ */
+.ds-grid--narrow {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, calc(var(--space-8) * 6)), 1fr));
+}
+
+.ds-grid--wide {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, calc(var(--space-8) * 10)), 1fr));
+}
+
+/*
+ * Single-column collapse. It comes after the column modes so that, at equal specificity,
+ * it wins below the breakpoint. A length in a media condition resolves against the browser's
+ * initial font size, not the root element's, so this tracks the user's default text size.
+ */
+/* GAP: breakpoint literal (custom properties cannot be used in @media), see GAPS.md */
+@media (max-width: 48rem) {
+  .ds-grid--fixed,
+  .ds-grid--narrow,
+  .ds-grid--wide {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
