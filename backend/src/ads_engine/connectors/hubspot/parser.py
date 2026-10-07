@@ -265,6 +265,20 @@ def _from_epoch_ms(milliseconds: int) -> datetime | None:
         return None
 
 
+def _from_epoch_ms_digits(digits: str) -> datetime | None:
+    """Convert a string of ASCII digits, epoch milliseconds, to a UTC instant.
+
+    ``None`` when the number is out of ``datetime`` range, including a string too long for
+    ``int`` to convert at all (Python refuses more than 4,300 digits with ``ValueError``), so
+    the caller raises its defect outside the ``except`` block.
+    """
+    try:
+        milliseconds = int(digits)
+    except ValueError:
+        return None
+    return _from_epoch_ms(milliseconds)
+
+
 def _from_iso(text: str) -> datetime | None:
     """Parse an ISO-8601 datetime as UTC; ``None`` when it is not one or is out of range.
 
@@ -338,7 +352,7 @@ def parse_instant(value: object, *, what: str = "instant") -> datetime | None:
         if not text:
             return None
         if text.isascii() and text.isdigit():
-            parsed = _from_epoch_ms(int(text))
+            parsed = _from_epoch_ms_digits(text)
         elif _DATE_ONLY_RE.fullmatch(text):
             parsed = _from_date(text)
         elif _ISO_DATETIME_RE.match(text):
