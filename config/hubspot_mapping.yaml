@@ -1,0 +1,93 @@
+# HubSpot CRM mapping for the Ads Action Engine.
+#
+# Binds the two CRM lead counts the product reports, MQL and Qualified Lead
+# (QL), to this HubSpot portal's own lifecycle stages or contact properties,
+# and sets which meetings count as booked. Portals customise lifecycle
+# stages, so none of this is hard-coded.
+#
+# Loading
+# - Read by backend/src/ads_engine/analysis/thresholds.py with PyYAML
+#   safe_load, together with config/thresholds.yaml and
+#   config/content_assets.yaml. All three files feed config_hash, which every
+#   analysis run stores, so a change here shows up in run history.
+# - Mounted read-only into the api and worker containers at /app/config.
+# - Shown read-only by GET /api/v1/config and the /settings screen, beside
+#   the stage properties resolved at startup.
+# - The crm map below is merged with the crm map of config/thresholds.yaml,
+#   which holds lead_maturity_days and veto_min_leads. A key defined in both
+#   files fails config load, so those two keys live in thresholds.yaml only.
+# - The Google-to-CRM link properties are environment variables
+#   (HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY, HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY),
+#   not keys in this file.
+#
+# Binding modes, for mql.mode and ql.mode: stage_label | property
+# - stage_label: at startup, GET /crm/properties/2026-09/contacts/
+#   lifecyclestage resolves the label to its stage id among the property's
+#   options. Default stages have internal names such as
+#   marketingqualifiedlead; custom stages have numeric ids. The count then
+#   uses that stage's "date entered" property, hs_v2_date_entered_{stage id},
+#   after the properties API confirms that property exists. A label must
+#   equal the option's label exactly.
+# - property: the property key names a contact date or datetime property
+#   that records the event directly, for example a custom "first meeting
+#   booked" date. The properties API must confirm it at startup. The label
+#   keys are not used to resolve the count in this mode.
+#
+# Guarantees
+# - Unresolved means unavailable, never zero. When a binding does not resolve
+#   (no matching option, or the property does not exist), its count is
+#   "unavailable" and is shown as "unavailable", never as 0, and a finding
+#   names the missing stage. When QL cannot be resolved, the pipeline is
+#   unavailable: the C2 veto is not evaluated and its items carry
+#   pipeline_unavailable, and C1b and W2 do not fire.
+# - HubSpot's default "Marketing Qualified Lead" stage is never assumed to
+#   mean "First meeting booked". MQL uses it only if mql names it explicitly.
+# - QL is observed from its own bound property and is never derived from
+#   MQL. MQL and QL are shown side by side and never blended in any field,
+#   total or sort key.
+# - A contact whose bound date is empty is not counted, even when its current
+#   lifecycle stage is later. It is reported in a skipped_stage finding
+#   ("N contacts skipped this stage (not counted)"), and no other date
+#   stands in, so every count is an observed stage entry.
+# - A bound date counts only at or after the contact's touch with the content
+#   (the lead's submittedAt); earlier entries are reported as "already
+#   MQL/QL before this touch".
+
+# MQL: the user's "First meeting booked" stage. The white paper table heads
+# its MQL column with this label, as "MQL (First meeting booked)".
+# A portal with no lifecycle stage of that label leaves MQL unavailable. It
+# can bind the event's own date property instead by setting
+# mode: property and property: <contact property name>, for example a
+# date_first_meeting_was_booked property.
+mql:
+  mode: stage_label
+  stage_label: "First meeting booked"
+  property: null
+
+# QL: Qualified Lead. Labels are tried in order and the first one that
+# matches a lifecyclestage option wins: a custom "Qualified Lead" stage
+# first, then HubSpot's default "Sales Qualified Lead" stage. Cost per lead
+# is computed only against QL (spend / QL).
+ql:
+  mode: stage_label
+  stage_labels: ["Qualified Lead", "Sales Qualified Lead"]
+  property: null
+
+# Meeting rules, exposed as crm.booking_sources and
+# crm.meeting_outcome_exclusions after the merge with config/thresholds.yaml.
+crm:
+  # Meeting sources whose meetings can count as "booked after touch".
+  # HubSpot records no booking instant, so booking time is proxied by the
+  # meeting record's creation (hs_createdate), labelled "booked (record
+  # created)". For these sources the booking itself creates the record, so
+  # creation is the booking instant; MEETINGS_PUBLIC is a scheduling-page
+  # booking. Such a meeting counts only when its creation and its
+  # hs_meeting_start_time are both at or after the contact's touch.
+  # Meetings from any other source (imported, synced from a calendar, logged
+  # by hand) may be created after the real booking. They pass the same time
+  # checks but go to "Other meetings (ordering unverified)", carry the
+  # meeting_time_proxy flag and are excluded from cost per meeting booked.
+  booking_sources: [MEETINGS_PUBLIC]
+  # hs_meeting_outcome values that are never counted, in either meeting
+  # column.
+  meeting_outcome_exclusions: [CANCELED]
