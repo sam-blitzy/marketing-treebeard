@@ -6550,8 +6550,12 @@ def _precedence_scenarios() -> Iterator[Scenario]:
     module = MODULE_PRECEDENCE
     k1_world = _keywords_world("precedence.k1", target=_target(61))
     plain = ContextSpec(content_assets=_NO_ASSETS)
+    # Priority decision: the pause lands after the window (02:00 New York on the anchor day,
+    # before FIXED_NOW), so the snapshots still raise the status discrepancy P1 holds on while
+    # the window keeps the target's 61 clicks. A pause inside the window stops delivery from
+    # its native day and drops the term below K1's n* of 61, so K1 would rightly not fire.
     paused = PlatformChange(
-        "google", "campaign", "search", field="status", value="PAUSED", at_offset_hours=-30
+        "google", "campaign", "search", field="status", value="PAUSED", at_offset_hours=6
     )
     yield _case(
         "p1.holds",
@@ -6672,12 +6676,16 @@ def _precedence_scenarios() -> Iterator[Scenario]:
             },
         ),
     )
+    # Priority decision: the target delivers its 61 clicks inside the 20-day custom window. The
+    # 28-day k1_world spreads them over 28 days, leaving 45 in this window, below K1's n* of 61
+    # (the 90-day baseline is unchanged), so K1 would rightly not fire.
+    short_target = _spread(_offsets(-20, -1), cost="61", impressions=610, clicks=61)
     yield _case(
         "p5.configured_min",
         module,
         "P5: the short-window flag uses the configured minimum (window.trusted_min_days: 21 "
         "flags a 20-day window)",
-        k1_world,
+        _keywords_world("p5.configured_min", target=short_target),
         Expectation(
             K1, True, {"window_days": 20, "trusted_min_days": 21}, flags=(FLAG_SHORT_WINDOW,)
         ),
