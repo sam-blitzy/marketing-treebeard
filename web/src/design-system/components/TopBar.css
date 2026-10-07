@@ -48,12 +48,25 @@
   line-height: var(--line-height-tight);
 }
 
-/* Actions: a wrapping row of controls, packed towards the inline end of their line. */
+/*
+ * Actions: a wrapping row of controls, packed towards the inline end of their line.
+ *
+ * margin-inline-start: auto keeps the row at the inline end even when it wraps onto a line of
+ * its own; without it the bar's space-between places a lone item at the inline start. On a
+ * shared line the auto margin takes the same free space space-between would, so the wide layout
+ * is unchanged. min-inline-size: 0 and overflow-wrap: anywhere (inherited by the email and other
+ * text children) let a long unbroken value, such as a signed-in email, shrink and break inside
+ * the bar instead of overflowing a 320 CSS px viewport (WCAG 1.4.10 reflow); a browser check
+ * measured a 49-character email overflowing to 376px without them.
+ */
 .ds-topbar__actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-3);
+  min-inline-size: 0;
+  margin-inline-start: auto;
+  overflow-wrap: anywhere;
   font-size: var(--font-size-sm);
 }
