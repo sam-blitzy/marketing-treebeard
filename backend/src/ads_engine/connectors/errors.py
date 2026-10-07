@@ -28,9 +28,11 @@ HTTP status. Classification is pure: :func:`classify` and :func:`classify_except
 perform no I/O, log nothing and never raise.
 
 Every error message passes through :func:`sanitize_message` when the error is built, so
-an exception's text never carries an email address, a configured secret or the n8n
-webhook URL. That matters because :attr:`ConnectorError.reason` is persisted as the
-source-mode reason, and HubSpot errors can echo the email that was looked up.
+an exception's text never carries an email address, a configured secret, the n8n webhook
+URL, a credential assigned to a sensitive key or a ``Bearer`` token, whether written
+plainly or percent-encoded. That matters because :attr:`ConnectorError.reason` is
+persisted as the source-mode reason, and HubSpot errors can echo the email that was
+looked up.
 
 Example:
     A connector decodes the body, classifies the response and raises what it gets::
@@ -449,8 +451,9 @@ def _configured_secrets() -> tuple[str, ...]:
 
     That is every set ``SecretStr`` and, beyond them, the n8n webhook URL and its path:
     the URL is a capability URL that ``ads_engine.logging`` never logs either. When the
-    settings cannot load, nothing is collected and only emails and URL passwords are
-    redacted.
+    settings cannot load, nothing is collected, and only the rules that need no
+    configured secret apply: emails, URL passwords, sensitive assignments and ``Bearer``
+    tokens, plain or percent-encoded.
     """
     try:
         settings = get_settings()
@@ -472,11 +475,14 @@ def _configured_secrets() -> tuple[str, ...]:
 def sanitize_message(text: str) -> str:
     r"""Make platform or exception text safe to persist and log.
 
-    Email addresses become ``[REDACTED_EMAIL]`` and URL passwords and every configured
-    secret (of at least 8 characters) become ``[REDACTED]``, exactly as
-    :func:`ads_engine.logging.redact` does for log lines; the n8n webhook URL is removed
-    too. Whitespace runs collapse to one space, and the result is cut to 300 characters.
-    Redaction runs before the cut, so a secret is never left half-matched.
+    Email addresses become ``[REDACTED_EMAIL]``; URL passwords, every configured secret
+    (of at least 8 characters), values assigned to sensitive keys (``access_token=...``,
+    ``Authorization: ...``, ``{"refresh_token": "..."}``) and ``Bearer`` tokens become
+    ``[REDACTED]``, exactly as :func:`ads_engine.logging.redact` does for log lines; the
+    n8n webhook URL is removed too. Percent-encoded forms are covered as well, also when
+    encoded twice: ``lead%40example.com`` and ``lead%2540example.com`` become
+    ``[REDACTED_EMAIL]``. Whitespace runs collapse to one space, and the result is cut to
+    300 characters. Redaction runs before the cut, so a secret is never left half-matched.
 
     Example::
 

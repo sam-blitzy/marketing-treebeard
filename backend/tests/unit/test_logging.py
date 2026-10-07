@@ -13,13 +13,18 @@ import datetime as dt
 import io
 import json
 import logging
+import numbers
 import os
+import sys
+import threading
+import time
 import uuid
 from collections import UserList, deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, cast
+from urllib.parse import unquote
 
 import pytest
 import structlog
@@ -64,7 +69,9 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     The root handlers saved here include pytest's own session handlers, which
     ``configure_logging`` removes; they are re-attached, and the handler it installed is
-    removed and closed, so other test modules see logging exactly as before.
+    removed and closed, so other test modules see logging exactly as before. The
+    ``logging.lastResort`` handler it replaces is restored too, and so are the stream and
+    formatter of a handler installed before the test, which it reconfigures in place.
     """
     for key in list(os.environ):
         if key.lower() in SETTINGS_ENV_NAMES:
@@ -82,10 +89,18 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     structlog_config = structlog.get_config()
     state = ads_logging._STATE
     saved_redactor, saved_handler = state.redactor, state.handler
+    saved_last_resort = logging.lastResort
+    saved_output = (
+        (saved_handler.stream, saved_handler.formatter) if saved_handler is not None else None
+    )
 
     yield
 
     structlog.contextvars.clear_contextvars()
+    logging.lastResort = saved_last_resort
+    if saved_handler is not None and saved_output is not None:
+        saved_handler.setStream(saved_output[0])
+        saved_handler.setFormatter(saved_output[1])
     installed = state.handler
     if installed is not None and installed is not saved_handler:
         root.removeHandler(installed)
@@ -190,6 +205,116 @@ def test_every_sensitive_key_loses_its_whole_value(key: str) -> None:
 )
 def test_key_names_are_normalised_before_matching(key: str) -> None:
     assert redact({key: HEADER_VALUE}) == {key: REDACTED}
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "AuThOrIzAtIoN",
+        "AUTHORIZATION",
+        "PROXY-AUTHORIZATION",
+        "pRoXy-AuThOrIzAtIoN",
+        "CooKie",
+        "Set-COOKIE",
+        "X-WeBhOoK-SeCrEt",
+        "ACCESS_TOKEN",
+        "X-Webhook-TOKEN",
+    ],
+)
+def test_mixed_case_header_names_are_sensitive(key: str) -> None:
+    assert redact({key: HEADER_VALUE}) == {key: REDACTED}
+    assert redact([(key, HEADER_VALUE)]) == [(key, REDACTED)]
+    assert redact([(key.encode(), HEADER_VALUE.encode())]) == [(key, REDACTED)]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "accesstoken",
+        "ACCESSTOKEN",
+        "accessTokeN",
+        "refreshtoken",
+        "rEfReShToKeN",
+        "clientsecret",
+        "CLIENTSECRET",
+        "apikey",
+        "XAPIKEY",
+        "proxyauthorization",
+        "PROXYAUTHORIZATION",
+        "setcookie",
+        "SetcooKie",
+        "idtoken",
+        "hubspotaccesstoken",
+        "sessionsecret",
+        "APPADMINPASSWORDHASH",
+        "n8nwebhooksecret",
+        "XWEBHOOKSECRET",
+        "XWEBHOOKTOKEN",
+        "linkedinclientsecret",
+        "dbpassword",
+        "hubspotapikey",
+    ],
+)
+def test_separator_free_key_names_are_sensitive(key: str) -> None:
+    assert redact({key: HEADER_VALUE}) == {key: REDACTED}
+    assert redact({key.encode(): HEADER_VALUE}) == {key: REDACTED}
+    assert redact([(key, HEADER_VALUE)]) == [(key, REDACTED)]
+    assert redact([(key.encode(), HEADER_VALUE.encode())]) == [(key, REDACTED)]
+    assert redact(f"{key}={HEADER_VALUE}&limit=1") == f"{key}={REDACTED}&limit=1"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "tokencount",
+        "TOKENCOUNT",
+        "maxtokens",
+        "tokens",
+        "secretary",
+        "apikeys",
+        "passwordsseen",
+        "pagesize",
+        "idproperty",
+        "confighash",
+        "withheld",
+        "xcustomauth",
+    ],
+)
+def test_separator_free_ordinary_keys_keep_their_values(key: str) -> None:
+    assert redact({key: HEADER_VALUE}) == {key: HEADER_VALUE}
+    assert redact([(key, HEADER_VALUE)]) == [(key, HEADER_VALUE)]
+    assert redact(f"{key}={HEADER_VALUE}") == f"{key}={HEADER_VALUE}"
+
+
+@pytest.mark.parametrize("key", ["XCUSTOMAUTH", "xcustomauth", "XCustomAuth", b"XCUSTOMAUTH"])
+def test_configured_header_name_matches_without_separators(key: str | bytes) -> None:
+    name = key.decode() if isinstance(key, bytes) else key
+    assert redact({key: HEADER_VALUE}, header_names=["X-Custom-Auth"]) == {name: REDACTED}
+    assert redact([(key, HEADER_VALUE)], header_names=["X-Custom-Auth"]) == [(name, REDACTED)]
+    assert redact({key: HEADER_VALUE}) == {name: HEADER_VALUE}
+
+
+class _BadBufferBytes(bytes):
+    """A ``bytes`` name whose buffer cannot be read, so normalising it raises."""
+
+    def __buffer__(self, flags: int) -> memoryview:
+        raise RuntimeError(f"buffer failed for {HEADER_VALUE}")
+
+
+def test_a_name_that_cannot_be_read_fails_closed() -> None:
+    redacted = redact({_BadBufferBytes(b"limit"): HEADER_VALUE})
+    assert isinstance(redacted, dict)
+    assert list(redacted.values()) == [REDACTED]
+
+
+@pytest.mark.parametrize(
+    "key", ["x-CuStOm-AuTh", "X-CUSTOM-AUTH", "x_custom_auth", b"x-CuStOm-AuTh"]
+)
+def test_configured_header_name_matches_in_any_letter_case(key: str | bytes) -> None:
+    name = key.decode() if isinstance(key, bytes) else key
+    assert redact({key: HEADER_VALUE}, header_names=["X-Custom-Auth"]) == {name: REDACTED}
+    assert redact([(key, HEADER_VALUE)], header_names=["X-Custom-Auth"]) == [(name, REDACTED)]
+    assert redact({key: HEADER_VALUE}) == {name: HEADER_VALUE}
 
 
 @pytest.mark.parametrize(
@@ -328,6 +453,431 @@ def test_exported_patterns_match_their_documented_shapes() -> None:
 )
 def test_email_addresses_are_redacted(text: str, expected: str) -> None:
     assert redact(text) == expected
+
+
+@pytest.mark.parametrize("text", ["a@b.c+d@e.f", "a@b.c_d@e.f", "a@b.c..d@e.f", "a@b.c%d@e.f"])
+def test_glued_email_addresses_leave_no_address_behind(text: str) -> None:
+    assert redact(text) == REDACTED_EMAIL
+    assert EMAIL_RE.sub(REDACTED_EMAIL, f"to {text}.") == f"to {REDACTED_EMAIL}."
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("a" * 131072 + "@x", id="long-local-part"),
+        pytest.param("a." * 50000 + "@x", id="dotted-local-part"),
+        pytest.param("a@" + "b-" * 50000, id="long-domain-label"),
+        pytest.param("a@b" + ".c" * 50000 + "!", id="many-domain-labels"),
+        pytest.param("http://" + "u" * 100000 + "@x", id="url-without-password"),
+        pytest.param("token=" * 20000 + "Bearer " * 20000, id="assignments-and-bearer"),
+        pytest.param("%41" * 40000 + " " + "('a', '" * 10000, id="encoded-and-pairs"),
+    ],
+)
+def test_malformed_input_is_redacted_in_linear_time(text: str) -> None:
+    # Backtracking patterns took seconds to minutes on these; a linear scan takes ms.
+    started = time.perf_counter()
+    redact(text, secrets=[N8N_SECRET])
+    assert time.perf_counter() - started < 1.0
+
+
+def test_long_text_keeps_its_length_and_loses_only_the_address() -> None:
+    text = "x" * 50000 + " " + LEAD_EMAIL + " " + "-" * 50000
+    assert redact(text) == "x" * 50000 + " " + REDACTED_EMAIL + " " + "-" * 50000
+
+
+# ---------------------------------------------------------------------------
+# redact(): credentials inside text, whatever secrets are configured
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "Authorization: Bearer test-unknown-token",
+            "Authorization: [REDACTED]",
+            id="header-text",
+        ),
+        pytest.param(
+            "Proxy-Authorization: Basic dGVzdDp0ZXN0\r\nAccept: json",
+            "Proxy-Authorization: [REDACTED]\r\nAccept: json",
+            id="proxy-header-text",
+        ),
+        pytest.param(
+            "Cookie: session=test-cookie; theme=dark", "Cookie: [REDACTED]", id="cookie-header"
+        ),
+        pytest.param(
+            "AUTHORIZATION:Bearer test-unknown-token, next\nAccept: json",
+            "AUTHORIZATION:[REDACTED]\nAccept: json",
+            id="mixed-case-header-text",
+        ),
+        pytest.param(
+            "sent Bearer test-unknown-token upstream",
+            "sent Bearer [REDACTED] upstream",
+            id="standalone-bearer",
+        ),
+        pytest.param(
+            "https://api.example.test/x?access_token=test-a&refresh_token=test-r&limit=5",
+            "https://api.example.test/x?access_token=[REDACTED]&refresh_token=[REDACTED]&limit=5",
+            id="url-query",
+        ),
+        pytest.param(
+            "grant_type=refresh_token&refresh_token=test-r&client_secret=test-c",
+            "grant_type=refresh_token&refresh_token=[REDACTED]&client_secret=[REDACTED]",
+            id="form-body",
+        ),
+        pytest.param(
+            '{"access_token": "test-a", "expires_in": 5184000}',
+            '{"access_token": "[REDACTED]", "expires_in": 5184000}',
+            id="json-body",
+        ),
+        pytest.param(
+            '{\\"refresh_token\\": \\"test-r\\"}',
+            '{\\"refresh_token\\": \\"[REDACTED]\\"}',
+            id="escaped-json-body",
+        ),
+        pytest.param(
+            "body={'refresh_token': 'test-r', 'n': 1}",
+            "body={'refresh_token': '[REDACTED]', 'n': 1}",
+            id="dict-repr",
+        ),
+        pytest.param(
+            "{b'authorization': b'Bearer test-a'}",
+            "{b'authorization': b'[REDACTED]'}",
+            id="bytes-dict-repr",
+        ),
+        pytest.param(
+            "[('Authorization', 'Bearer test-a'), (b'Cookie', b's=test-c'), ['X-Api-Key', 'k']]",
+            "[('Authorization', '[REDACTED]'), (b'Cookie', b'[REDACTED]'), "
+            "['X-Api-Key', '[REDACTED]']]",
+            id="pair-reprs",
+        ),
+        pytest.param(
+            "settings.access_token=test-a accessToken=test-b refreshToken: test-c",
+            "settings.access_token=[REDACTED] accessToken=[REDACTED] refreshToken: [REDACTED]",
+            id="dotted-and-camel-case-keys",
+        ),
+        pytest.param(
+            "authorization=Bearer test-a&x=1\nnext",
+            "authorization=[REDACTED]\nnext",
+            id="scheme-after-=",
+        ),
+        pytest.param("password='test-cut-off", "password='[REDACTED]", id="unterminated-quote"),
+    ],
+)
+def test_textual_credentials_are_redacted_without_configured_secrets(
+    text: str, expected: str
+) -> None:
+    assert redact(text) == expected
+
+
+ROTATED = "test-rotated-token"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            f'Cookie: session="{ROTATED}"; theme=dark\nAccept: json',
+            "Cookie: [REDACTED]\nAccept: json",
+            id="cookie-with-quoted-values",
+        ),
+        pytest.param(f"Cookie: '{ROTATED}'", "Cookie: [REDACTED]", id="quoted-header-value"),
+        pytest.param(
+            f"Cookie: session=b'{ROTATED}'", "Cookie: [REDACTED]", id="bytes-header-value"
+        ),
+        pytest.param(
+            f'Authorization: Digest username="u", realm="r", nonce="{ROTATED}", '
+            f'response="{ROTATED}"',
+            "Authorization: [REDACTED]",
+            id="digest-parameters",
+        ),
+        pytest.param(
+            f"Set-Cookie: sid={ROTATED}; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/",
+            "Set-Cookie: [REDACTED]",
+            id="set-cookie-with-expiry",
+        ),
+        pytest.param(
+            f'Hello, Authorization: Digest nonce="{ROTATED}", response="{ROTATED}"',
+            "Hello, Authorization: [REDACTED]",
+            id="scheme-after-a-comma",
+        ),
+        pytest.param(
+            f'{{"refresh_token": ["{ROTATED}"], "n": 1}}',
+            '{"refresh_token": [REDACTED], "n": 1}',
+            id="json-list-value",
+        ),
+        pytest.param(
+            f"{{'access_token': {{'value': '{ROTATED}'}}, 'n': 1}}",
+            "{'access_token': [REDACTED], 'n': 1}",
+            id="dict-repr-nested-value",
+        ),
+        pytest.param(
+            f"{{'token': Token(value='{ROTATED}'), 'x': 1}}",
+            "{'token': [REDACTED], 'x': 1}",
+            id="object-repr-value",
+        ),
+        pytest.param('{"token": null, "x": 1}', '{"token": [REDACTED], "x": 1}', id="json-null"),
+        pytest.param(
+            f"Client(access_token={ROTATED}, retries=3)",
+            "Client(access_token=[REDACTED], retries=3)",
+            id="keyword-argument-repr",
+        ),
+        pytest.param(
+            f'{{"body": "{{\\"refresh_token\\": [\\"{ROTATED}\\"], \\"n\\": 1}}"}}',
+            '{"body": "{\\"refresh_token\\": [REDACTED], \\"n\\": 1}"}',
+            id="escaped-json-list-value",
+        ),
+        pytest.param(
+            f"[('Authorization', ['Bearer {ROTATED}']), ('Accept', 'json')]",
+            "[('Authorization', [REDACTED]), ('Accept', 'json')]",
+            id="pair-repr-list-value",
+        ),
+        pytest.param(
+            f"token=Token(value='{ROTATED}') sent",
+            "token=[REDACTED] sent",
+            id="token-with-group-after-=",
+        ),
+        pytest.param(f"token=({ROTATED} x)&n=1", "token=[REDACTED]&n=1", id="group-after-="),
+        pytest.param(
+            f'authorization=Digest username="u", nonce="{ROTATED}"\nnext',
+            "authorization=[REDACTED]\nnext",
+            id="digest-after-=",
+        ),
+        pytest.param(
+            f"token: {{\n  'value': '{ROTATED}'\n}} tail\nnext",
+            "token: [REDACTED]\nnext",
+            id="header-group-across-lines",
+        ),
+        pytest.param(
+            f"token: [{ROTATED}\nmore text", "token: [REDACTED]", id="unclosed-group-fails-closed"
+        ),
+    ],
+)
+def test_sensitive_values_are_replaced_whole_however_quoted_or_nested(
+    text: str, expected: str
+) -> None:
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{'token': [",
+        "{'token': [REDACTED], ",
+        "(token=",
+        ", token: ",
+        "token: (",
+        "token: [REDACTED]\n",
+        "token=a(",
+        "token: {'",
+        "[('token', [",
+    ],
+)
+def test_value_extent_scan_runs_in_linear_time(text: str) -> None:
+    started = time.perf_counter()
+    once = redact(text * (100_000 // len(text)))
+    assert time.perf_counter() - started < 1.0
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sync_job_finished rows=120 token_count=3 the token bucket is full",
+        "path=/crm/v3/objects limit=100 at 12:30:00 status: ok",
+        "token: ",
+        "password=",
+        "Accept: application/json, Content-Type: text/plain",
+        "SELECT campaign.id FROM campaign WHERE campaign.status = 'ENABLED' LIMIT 10",
+        "{'status': 'ok', 'rows': [1, 2], 'next': None}",
+    ],
+)
+def test_ordinary_text_is_left_unchanged(text: str) -> None:
+    assert redact(text) == text
+
+
+def test_assignment_after_an_ordinary_key_is_still_found() -> None:
+    text = "error: request failed access_token=test-a, detail: Authorization: Bearer test-b"
+    assert (
+        redact(text)
+        == "error: request failed access_token=[REDACTED], detail: Authorization: [REDACTED]"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "access_token=[REDACTED]&limit=1",
+        "postgresql+psycopg://ads:[REDACTED]@db:5432/ads_engine",
+        "/crm/x?hapikey=[REDACTED]&email=[REDACTED_EMAIL]",
+        "Authorization: [REDACTED]",
+        "Bearer [REDACTED]",
+        "{'refresh_token': '[REDACTED]'}",
+        "[('Cookie', '[REDACTED]')]",
+        "value [UNRENDERABLE]",
+        "{'access_token': [REDACTED], 'n': 1}",
+        "[('Authorization', [REDACTED])]",
+        "token=[REDACTED] sent",
+    ],
+)
+def test_redacted_text_survives_a_second_pass_unchanged(text: str) -> None:
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Bearer test-a lead@example.com https://h.example.test/?token=t&e=lead%40x.io",
+        "{'password': 'test-p', 'headers': [('Cookie', 's=1')]} via redis://:test-pw@cache:6379",
+        "x=%2541%40example.com Bearer abc token%3Dtest-q",
+        "token: [abc] tail, {'refresh_token': {'v': 'x'}} Cookie: a=\"b\"",
+    ],
+)
+def test_redaction_is_idempotent_on(text: str) -> None:
+    once = redact(text, secrets=[N8N_SECRET])
+    assert redact(once, secrets=[N8N_SECRET]) == once
+
+
+# ---------------------------------------------------------------------------
+# redact(): percent-encoded values
+# ---------------------------------------------------------------------------
+
+ENCODED_SECRET = "%74%65%73%74%2D%6E%38%6E-secret-value"  # N8N_SECRET, partly encoded
+ENCODED_SECRET_LOWER = ENCODED_SECRET.lower()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "https://api.example.test/x?email=lead%40example.com",
+            "https://api.example.test/x?email=[REDACTED_EMAIL]",
+            id="encoded-email",
+        ),
+        pytest.param(
+            "https://api.example.test/x?email=lead%2540example.com",
+            "https://api.example.test/x?email=[REDACTED_EMAIL]",
+            id="double-encoded-email",
+        ),
+        pytest.param(
+            "q=lead%40Example.COM and LEAD%40example.com",
+            "q=[REDACTED_EMAIL] and [REDACTED_EMAIL]",
+            id="mixed-case-email",
+        ),
+        pytest.param(
+            "email=lead%2Btag%40example.com",
+            "email=[REDACTED_EMAIL]",
+            id="encoded-plus-tag",
+        ),
+        pytest.param(
+            f"https://x.example.test/?s={ENCODED_SECRET}&email=lead%40example.com",
+            "https://x.example.test/?s=[REDACTED]&email=[REDACTED_EMAIL]",
+            id="encoded-secret-and-email",
+        ),
+        pytest.param(f"v={ENCODED_SECRET_LOWER}", "v=[REDACTED]", id="lowercase-escapes"),
+        pytest.param(
+            "x?access_token%3Dtest-a&y=1", "x?access_token=[REDACTED]&y=1", id="encoded-assignment"
+        ),
+        pytest.param(
+            "Authorization%3A%20Bearer%20test-a", "Authorization: [REDACTED]", id="encoded-header"
+        ),
+        pytest.param(
+            "a%0Alead%40example.com%0D%E2%80%A8",
+            "a%0A[REDACTED_EMAIL]%0D%E2%80%A8",
+            id="controls-stay-encoded",
+        ),
+    ],
+)
+def test_percent_encoded_values_are_redacted(text: str, expected: str) -> None:
+    assert redact(text, secrets=[N8N_SECRET]) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "path=/crm/v3/objects%2Fcontacts limit=100 100%25 done",
+        "%ZZ not an escape, lead%40x is no address",
+        "q=%E2%9C%93%20ok",
+    ],
+)
+def test_percent_encoded_text_without_findings_is_kept_byte_for_byte(text: str) -> None:
+    assert redact(text, secrets=[N8N_SECRET]) == text
+
+
+def test_foreign_records_with_encoded_values_are_redacted() -> None:
+    stream = _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
+    logging.getLogger("httpx").warning(
+        "HTTP Request: GET https://x.example.test/?email=lead%%40example.com"
+        "&access_token=test-rotated-access&s=%s",
+        ENCODED_SECRET,
+    )
+
+    output = stream.getvalue()
+    for plaintext in ("lead", "test-rotated-access", "secret-value"):
+        assert plaintext not in output
+    (record,) = _lines(stream)
+    assert record["event"] == (
+        "HTTP Request: GET https://x.example.test/?email=[REDACTED_EMAIL]"
+        "&access_token=[REDACTED]&s=[REDACTED]"
+    )
+
+
+def _layered(text: str, layers: int) -> str:
+    """Return ``email=<LEAD_EMAIL> s=<N8N_SECRET> <text>``, both values encoded ``layers`` times."""
+    email, secret = "lead%40example.com", "%74est-n8n-secret-value"
+    for _ in range(layers - 1):
+        email, secret = email.replace("%", "%25"), secret.replace("%", "%25")
+    return f"email={email} s={secret} {text}"
+
+
+def _fully_decoded(text: str) -> str:
+    """Percent-decode ``text`` until it no longer changes."""
+    while (decoded := unquote(text)) != text:
+        text = decoded
+    return text
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 4])
+def test_values_encoded_up_to_the_decode_limit_are_redacted(layers: int) -> None:
+    text = _layered("rejected", layers)
+    assert redact(text, secrets=[N8N_SECRET]) == "email=[REDACTED_EMAIL] s=[REDACTED] rejected"
+
+
+@pytest.mark.parametrize("layers", [5, 6])
+def test_values_encoded_beyond_the_decode_limit_fail_closed(layers: int) -> None:
+    result = str(redact(_layered("rejected", layers), secrets=[N8N_SECRET]))
+    assert result == "[REDACTED] [REDACTED] rejected"
+    decoded = _fully_decoded(result)
+    assert LEAD_EMAIL not in decoded
+    assert N8N_SECRET not in decoded
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected"),
+    [
+        pytest.param(4, "email=[REDACTED_EMAIL] s=[REDACTED] rejected", id="at-the-limit"),
+        pytest.param(5, "[REDACTED] [REDACTED] rejected", id="one-beyond"),
+        pytest.param(6, "[REDACTED] [REDACTED] rejected", id="two-beyond"),
+    ],
+)
+def test_deeply_encoded_values_in_foreign_records_and_exception_text_never_leak(
+    layers: int, expected: str
+) -> None:
+    stream = _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
+    text = _layered("rejected", layers)
+    logging.getLogger("tests.third_party").warning("lookup failed: %s", text)
+    try:
+        raise RuntimeError(text)
+    except RuntimeError:
+        get_logger("tests.logging.encoded").exception("call_failed")
+
+    decoded = _fully_decoded(stream.getvalue())
+    assert LEAD_EMAIL not in decoded
+    assert N8N_SECRET not in decoded
+    foreign, native = _lines(stream)
+    assert foreign["event"] == f"lookup failed: {expected}"
+    assert native["exception"][0]["exc_value"] == expected
 
 
 def test_bytes_are_decoded_and_redacted() -> None:
@@ -542,6 +1092,27 @@ def test_configured_secret_header_name_is_redacted() -> None:
     assert record["x-hook-auth"] == REDACTED
 
 
+def test_separator_free_names_are_redacted_in_json_output() -> None:
+    stream = _configure(Settings(n8n_webhook_secret_header="X-Custom-Auth"))
+    get_logger("tests.logging.separator_free").info(
+        "webhook_called",
+        headers=[("XCUSTOMAUTH", HEADER_VALUE), (b"PROXYAUTHORIZATION", HEADER_VALUE.encode())],
+        body={"rEfReShToKeN": HEADER_VALUE, "maxtokens": 5},
+        detail=f"retrying with accesstoken={HEADER_VALUE}&limit=1",
+        xcustomauth=HEADER_VALUE,
+        hubspotaccesstoken=HEADER_VALUE,
+        tokencount=3,
+    )
+    assert HEADER_VALUE not in stream.getvalue()
+    (record,) = _lines(stream)
+    assert record["headers"] == [["XCUSTOMAUTH", REDACTED], ["PROXYAUTHORIZATION", REDACTED]]
+    assert record["body"] == {"rEfReShToKeN": REDACTED, "maxtokens": 5}
+    assert record["detail"] == "retrying with accesstoken=[REDACTED]&limit=1"
+    assert record["xcustomauth"] == REDACTED
+    assert record["hubspotaccesstoken"] == REDACTED
+    assert record["tokencount"] == 3
+
+
 def test_url_secret_passwords_are_redacted_raw_and_percent_decoded() -> None:
     database_url = "postgresql+psycopg://ads:test%2Fdb%40password@db:5432/ads_engine"
     stream = _configure(Settings(database_url=SecretStr(database_url)))
@@ -709,6 +1280,154 @@ def test_standard_library_exceptions_are_rendered_and_redacted() -> None:
         assert "locals" not in frame
 
 
+def test_exception_arguments_are_redacted_as_data() -> None:
+    stream = _configure()
+    log = get_logger("tests.logging.exception_args")
+    errors = (
+        RuntimeError({"Authorization": "Bearer test-rotated-access", "refresh_token": "test-r"}),
+        RuntimeError({"refresh_token": {"v": "test-nested-value"}}),
+        RuntimeError("Authorization", "Bearer test-pair-value"),
+        RuntimeError(),
+    )
+    for error in errors:
+        try:
+            raise error
+        except RuntimeError:
+            log.exception("call_failed")
+
+    output = stream.getvalue()
+    for plaintext in ("test-rotated-access", "test-r'", "test-nested-value", "test-pair-value"):
+        assert plaintext not in output
+    assert [record["exception"][0]["exc_value"] for record in _lines(stream)] == [
+        "{'Authorization': '[REDACTED]', 'refresh_token': '[REDACTED]'}",
+        "{'refresh_token': '[REDACTED]'}",
+        "('Authorization', '[REDACTED]')",
+        "",
+    ]
+
+
+def test_chained_and_grouped_exception_arguments_are_redacted() -> None:
+    stream = _configure()
+    try:
+        try:
+            raise KeyError({"token": "test-inner-token"})
+        except KeyError as inner:
+            members = [RuntimeError({"access_token": "test-member-token"})]
+            raise ExceptionGroup("batch failed", members) from inner
+    except ExceptionGroup:
+        logging.getLogger("tests.third_party").exception("batch")
+
+    output = stream.getvalue()
+    assert "test-inner-token" not in output
+    assert "test-member-token" not in output
+    (record,) = _lines(stream)
+    group, cause = record["exception"]
+    assert group["exc_type"] == "ExceptionGroup"
+    assert group["exceptions"][0][0]["exc_value"] == "{'access_token': '[REDACTED]'}"
+    assert cause["exc_type"] == "KeyError"
+    assert cause["exc_value"] == "{'token': '[REDACTED]'}"
+
+
+class _KeyLookupError(KeyError):
+    """A user-defined ``KeyError`` that keeps the built-in ``KeyError.__str__``."""
+
+
+class _CustomStrError(Exception):
+    """An exception with a ``__str__`` of its own, left to the text rules."""
+
+    def __str__(self) -> str:
+        return f"custom {self.args[0]!r}"
+
+
+def _unicode_error_with_replaced_args() -> UnicodeDecodeError:
+    """A ``UnicodeDecodeError`` whose arguments its constructor would reject."""
+    error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    error.args = ({"token": {"v": ROTATED}},)
+    return error
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(
+            KeyError({"access_token": {"value": ROTATED}}),
+            "{'access_token': '[REDACTED]'}",
+            id="key-error-nested-mapping",
+        ),
+        pytest.param(KeyError("campaign-123"), "'campaign-123'", id="key-error-plain-string"),
+        pytest.param(
+            KeyError("token", ROTATED.encode()), "('token', '[REDACTED]')", id="key-error-pair"
+        ),
+        pytest.param(
+            _KeyLookupError({"refresh_token": [ROTATED]}),
+            "{'refresh_token': '[REDACTED]'}",
+            id="key-error-subclass",
+        ),
+        pytest.param(
+            OSError(13, f"denied access_token={ROTATED}"),
+            "[Errno 13] denied access_token=[REDACTED]",
+            id="os-error-strerror",
+        ),
+        pytest.param(
+            FileNotFoundError(2, "No such file or directory", f"/data/token={ROTATED}"),
+            "[Errno 2] No such file or directory: '/data/token=[REDACTED]'",
+            id="os-error-filename",
+        ),
+        pytest.param(
+            OSError({"token": {"v": ROTATED}}), "{'token': '[REDACTED]'}", id="os-error-mapping"
+        ),
+        pytest.param(
+            ExceptionGroup("batch failed", [ValueError("member")]),
+            "batch failed (1 sub-exception)",
+            id="exception-group",
+        ),
+        pytest.param(
+            UnicodeDecodeError("utf-8", b"\xff to " + LEAD_EMAIL.encode(), 0, 1, "invalid"),
+            "'utf-8' codec can't decode byte 0xff in position 0: invalid",
+            id="unicode-decode-error",
+        ),
+        pytest.param(
+            _unicode_error_with_replaced_args(),
+            "{'token': '[REDACTED]'}",
+            id="unbuildable-clone-falls-back-to-redacted-arguments",
+        ),
+        pytest.param(
+            _CustomStrError({"token": {"v": ROTATED}}),
+            "custom {'token': [REDACTED]}",
+            id="custom-str-uses-text-rules",
+        ),
+    ],
+)
+def test_builtin_exception_text_is_rendered_from_redacted_arguments(
+    error: BaseException, expected: str
+) -> None:
+    stream = _configure()
+    try:
+        raise error
+    except KeyError, OSError, ExceptionGroup, UnicodeDecodeError, _CustomStrError:
+        get_logger("tests.logging.builtin_str").exception("call_failed")
+
+    output = stream.getvalue()
+    assert ROTATED not in output
+    assert LEAD_EMAIL not in output
+    (record,) = _lines(stream)
+    assert record["exception"][0]["exc_value"] == expected
+
+
+def test_exception_values_are_patched_only_when_the_walk_lines_up() -> None:
+    aligned = ads_logging._aligned_stacks
+    error = RuntimeError({"token": "test-t"})
+    assert aligned("not a list", RuntimeError, error, set()) is None
+    assert aligned([], RuntimeError, error, set()) is None
+    assert aligned([{"exc_type": "ValueError"}], RuntimeError, error, set()) is None
+    two = [{"exc_type": "RuntimeError"}, {"exc_type": "RuntimeError"}]
+    assert aligned(two, RuntimeError, error, set()) is None
+    group = ExceptionGroup("g", [ValueError("v")])
+    assert aligned([{"exc_type": "ExceptionGroup"}], ExceptionGroup, group, set()) is None
+    stack = {"exc_type": "RuntimeError"}
+    assert aligned([stack], RuntimeError, error, set()) == [(stack, error)]
+
+
 def test_redact_processor_renders_and_redacts_exc_info() -> None:
     _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
     try:
@@ -753,6 +1472,195 @@ def test_reconfiguring_replaces_the_handler_and_applies_to_cached_loggers() -> N
     (record,) = _lines(second)
     assert record["event"] == "second_event"
     assert record["detail"] == REDACTED
+
+
+def test_reconfiguring_keeps_the_attached_handler_and_swaps_its_output() -> None:
+    first = _configure()
+    (handler,) = logging.getLogger().handlers
+    second = _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
+    assert logging.getLogger().handlers == [handler]
+    assert ads_logging._STATE.handler is handler
+    logging.getLogger("tests.third_party").warning("uses %s", N8N_SECRET)
+    assert first.getvalue() == ""
+    (record,) = _lines(second)
+    assert record["event"] == "uses [REDACTED]"
+
+
+def test_a_new_handler_is_attached_before_any_other_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = logging.getLogger()
+    foreign = logging.StreamHandler(io.StringIO())
+    root.addHandler(foreign)
+    counts: list[int] = []
+    original = root.removeHandler
+
+    def remove_and_count(handler: logging.Handler) -> None:
+        original(handler)
+        counts.append(len(root.handlers))
+
+    monkeypatch.setattr(root, "removeHandler", remove_and_count)
+    stream = _configure()
+    assert counts
+    assert min(counts) >= 1
+    assert root.handlers == [ads_logging._STATE.handler]
+    assert foreign not in root.handlers
+    logging.getLogger("tests.third_party").warning("kept")
+    assert [record["event"] for record in _lines(stream)] == ["kept"]
+
+
+def test_a_detached_previous_handler_is_closed_after_the_new_one_is_attached() -> None:
+    _configure()
+    previous = ads_logging._STATE.handler
+    assert previous is not None
+    logging.getLogger().removeHandler(previous)
+    stream = _configure()
+    assert ads_logging._STATE.handler is not previous
+    assert logging.getLogger().handlers == [ads_logging._STATE.handler]
+    logging.getLogger("tests.third_party").warning("after")
+    assert [record["event"] for record in _lines(stream)] == ["after"]
+
+
+def test_uvicorn_loggers_propagate_before_their_handlers_are_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    access = logging.getLogger("uvicorn.access")
+    access.addHandler(logging.StreamHandler(io.StringIO()))
+    access.propagate = False
+    seen: list[bool] = []
+    original = access.removeHandler
+
+    def remove_and_record(handler: logging.Handler) -> None:
+        seen.append(access.propagate)
+        original(handler)
+
+    monkeypatch.setattr(access, "removeHandler", remove_and_record)
+    _configure()
+    assert seen == [True]
+    assert access.handlers == []
+
+
+def test_concurrent_reconfiguration_never_leaks_a_raw_token(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    streams = [_configure()]
+    stop = threading.Event()
+    handler_counts: set[int] = set()
+
+    def emit() -> None:
+        foreign = logging.getLogger("tests.race")
+        native = get_logger("tests.race.native")
+        while not stop.is_set():
+            foreign.warning("Authorization: Bearer %s for %s", RAW_TOKEN, LEAD_EMAIL)
+            native.warning("race", access_token=RAW_TOKEN, detail=f"Bearer {RAW_TOKEN}")
+            time.sleep(0)
+
+    def sample() -> None:
+        while not stop.is_set():
+            handler_counts.add(len(logging.getLogger().handlers))
+            time.sleep(0)
+
+    threads = [threading.Thread(target=emit) for _ in range(3)]
+    threads.append(threading.Thread(target=sample))
+    for thread in threads:
+        thread.start()
+    try:
+        for _ in range(150):
+            streams.append(_configure())
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
+
+    captured = capsys.readouterr()
+    assert RAW_TOKEN not in captured.err
+    assert LEAD_EMAIL not in captured.err
+    assert handler_counts == {1}
+    written = 0
+    for stream in streams:
+        for line in stream.getvalue().splitlines():
+            assert RAW_TOKEN not in line
+            assert LEAD_EMAIL not in line
+            assert isinstance(_strict_json(line), dict)
+            written += 1
+    assert written > 0
+
+
+def test_last_resort_renders_redacted_json_on_the_current_stderr(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure()
+    last_resort = logging.lastResort
+    assert isinstance(last_resort, ads_logging._SafeLastResortHandler)
+    assert last_resort.level == logging.WARNING
+    orphan = logging.getLogger("tests.orphan")
+    monkeypatch.setattr(orphan, "propagate", False)
+    orphan.warning("Authorization: Bearer %s for %s", RAW_TOKEN, LEAD_EMAIL)
+    orphan.info("below the last-resort level")
+    record = logging.LogRecord(
+        "tests.orphan", logging.ERROR, __file__, 1, "token=%s", (RAW_TOKEN,), None
+    )
+    last_resort.handle(record)
+
+    err = capsys.readouterr().err
+    assert RAW_TOKEN not in err
+    assert LEAD_EMAIL not in err
+    first, second = (_strict_json(line) for line in err.splitlines())
+    assert isinstance(first, dict)
+    assert first["event"] == "Authorization: [REDACTED]"
+    assert first["logger"] == "tests.orphan"
+    assert isinstance(second, dict)
+    assert second["event"] == "token=[REDACTED]"
+
+
+def test_last_resort_reports_a_failed_write_without_the_record(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure()
+    last_resort = logging.lastResort
+    assert last_resort is not None
+    real_stderr = sys.stderr
+    monkeypatch.setattr("sys.stderr", _FailingStream())
+    record = logging.LogRecord("tests.orphan", logging.ERROR, __file__, 1, RAW_TOKEN, (), None)
+    last_resort.handle(record)
+    monkeypatch.setattr("sys.stderr", real_stderr)
+    assert RAW_TOKEN not in capsys.readouterr().err
+
+
+def test_native_records_reach_other_handlers_already_redacted() -> None:
+    seen: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append(record)
+
+    stream = _configure()
+    child = logging.getLogger("tests.logging.child")
+    capture = _Capture()
+    child.addHandler(capture)
+    try:
+        get_logger("tests.logging.child").warning(
+            "native", access_token=RAW_TOKEN, contact=LEAD_EMAIL, headers=[("Cookie", "s=1")]
+        )
+    finally:
+        child.removeHandler(capture)
+
+    (record,) = seen
+    message = record.getMessage()
+    assert RAW_TOKEN not in message
+    assert LEAD_EMAIL not in message
+    assert record.msg == {
+        "access_token": REDACTED,
+        "contact": REDACTED_EMAIL,
+        "headers": [("Cookie", REDACTED)],
+        "event": "native",
+        "level": "warning",
+        "logger": "tests.logging.child",
+        "timestamp": cast(dict[str, Any], record.msg)["timestamp"],
+    }
+    (line,) = _lines(stream)
+    assert line["access_token"] == REDACTED
+    assert line["headers"] == [["Cookie", REDACTED]]
 
 
 def test_default_stream_is_stdout(capsys: pytest.CaptureFixture[str]) -> None:
@@ -816,6 +1724,43 @@ def test_values_json_cannot_encode_render_through_the_json_default() -> None:
     assert record["opaque"] == f"<_Opaque [REDACTED_EMAIL] {N8N_SECRET}>"
 
 
+def _strict_json(line: str) -> object:
+    """Parse ``line`` as strict JSON, rejecting the NaN and Infinity extensions."""
+
+    def reject(constant: str) -> object:
+        raise ValueError(f"non-standard JSON constant {constant}")
+
+    return json.loads(line, parse_constant=reject)
+
+
+class _Float(float):
+    """A float subclass, as numpy's ``float64`` is."""
+
+
+def test_non_finite_numbers_are_logged_as_null() -> None:
+    stream = _configure()
+    get_logger("tests.logging.numbers").info(
+        "numbers",
+        sample=float("nan"),
+        exposure=float("inf"),
+        nested={"a": [float("-inf"), 1.5], "b": (_Float("nan"),)},
+        subclass=_Float("inf"),
+        amount=Decimal("NaN"),
+        finite=2.5,
+    )
+
+    (line,) = stream.getvalue().splitlines()
+    record = _strict_json(line)
+    assert isinstance(record, dict)
+    assert record["sample"] is None
+    assert record["exposure"] is None
+    assert record["nested"] == {"a": [None, 1.5], "b": [None]}
+    assert record["subclass"] is None
+    assert record["amount"] == "NaN"
+    assert record["finite"] == 2.5
+    assert redact([float("nan"), {"x": _Float("-inf")}]) == [None, {"x": None}]
+
+
 def test_json_default_fallbacks() -> None:
     json_default = ads_logging._json_default
     assert json_default(Decimal("0.1")) == "0.1"
@@ -825,6 +1770,395 @@ def test_json_default_fallbacks() -> None:
     assert json_default({3, 1, 2}) == [1, 2, 3]
     assert json_default(_Hooked("hooked-form")) == "hooked-form"
     assert json_default(_Opaque()) == f"<_Opaque {LEAD_EMAIL} {N8N_SECRET}>"
+
+
+# ---------------------------------------------------------------------------
+# configure_logging(): failures fail closed
+# ---------------------------------------------------------------------------
+
+RAW_TOKEN = "test-raw-token-value"
+
+
+class _BadHook:
+    """An object whose ``__structlog__`` hook raises with the token in the error text."""
+
+    def __structlog__(self) -> object:
+        raise RuntimeError(f"hook failed with {RAW_TOKEN}")
+
+    def __repr__(self) -> str:
+        return "<_BadHook>"
+
+
+class _BadRepr:
+    """An object whose ``repr`` raises with the token in the error text."""
+
+    def __repr__(self) -> str:
+        raise ValueError(f"repr failed with {RAW_TOKEN}")
+
+
+class _BadMapping(Mapping[str, str]):
+    """A mapping whose iteration raises."""
+
+    def __getitem__(self, key: str) -> str:
+        return RAW_TOKEN
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError(f"iteration failed with {RAW_TOKEN}")
+
+
+class _BadLengthList(list[object]):
+    """A list whose ``len`` raises, so header-pair detection fails on it."""
+
+    def __len__(self) -> int:
+        raise RuntimeError(f"len failed with {RAW_TOKEN}")
+
+
+class _BadStr(str):
+    """A str subclass whose methods raise; redaction reads its plain characters."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None) -> str:
+        raise RuntimeError(f"strip failed with {RAW_TOKEN}")
+
+    def __contains__(self, key: object) -> bool:
+        raise RuntimeError(f"contains failed with {RAW_TOKEN}")
+
+
+class _BadNumber(numbers.Number):
+    """A number that passes redaction unchanged and that JSON rendering cannot print."""
+
+    __hash__ = object.__hash__
+
+    def __repr__(self) -> str:
+        raise ValueError(f"repr failed with {RAW_TOKEN}")
+
+
+class _BadStrError(Exception):
+    """An exception whose ``__str__`` raises with the token in the error text."""
+
+    def __str__(self) -> str:
+        raise RuntimeError(f"str failed with {RAW_TOKEN}")
+
+
+class _BadNotesError(Exception):
+    """An exception whose notes cannot be read or written, so traceback rendering raises."""
+
+    @property
+    def __notes__(self) -> list[str]:
+        raise RuntimeError(f"notes failed with {RAW_TOKEN}")
+
+    @__notes__.setter
+    def __notes__(self, notes: list[str]) -> None:
+        raise RuntimeError(f"notes failed with {RAW_TOKEN}")
+
+
+def _assert_clean(stream: io.StringIO, capsys: pytest.CaptureFixture[str]) -> list[Any]:
+    """Assert no output carries the raw token and every line is strict JSON; return them."""
+    captured = capsys.readouterr()
+    for text in (stream.getvalue(), captured.out, captured.err):
+        assert RAW_TOKEN not in text
+    assert captured.err == ""
+    return [_strict_json(line) for line in stream.getvalue().splitlines()]
+
+
+def test_values_that_cannot_be_rendered_fail_closed(capsys: pytest.CaptureFixture[str]) -> None:
+    stream = _configure()
+    get_logger("tests.logging.unrenderable").warning(
+        "bad_values",
+        access_token=RAW_TOKEN,
+        hook=_BadHook(),
+        shown=_BadRepr(),
+        mapping=_BadMapping(),
+        nested=[_BadLengthList([1, 2]), "kept", {_BadRepr(): 1}],
+        text=_BadStr(f"contact {LEAD_EMAIL}"),
+        **{_BadStr("Authorization"): RAW_TOKEN},
+    )
+
+    (record,) = _assert_clean(stream, capsys)
+    assert record["access_token"] == REDACTED
+    assert record["hook"] == "[UNRENDERABLE]"
+    assert record["shown"] == "[UNRENDERABLE]"
+    assert record["mapping"] == "[UNRENDERABLE]"
+    assert record["nested"] == ["[UNRENDERABLE]", "kept", {"[UNRENDERABLE]": 1}]
+    assert record["text"] == "contact [REDACTED_EMAIL]"
+    assert record["Authorization"] == REDACTED
+    assert record["event"] == "bad_values"
+
+
+def test_unrenderable_values_are_marked_by_redact() -> None:
+    assert redact({"a": _BadHook(), "b": [_BadRepr(), 1]}) == {
+        "a": "[UNRENDERABLE]",
+        "b": ["[UNRENDERABLE]", 1],
+    }
+    event: dict[Any, Any] = {_BadRepr(): 1, "event": "e"}
+    assert ads_logging._STATE.redactor.event(event) == {"[UNRENDERABLE]": 1, "event": "e"}
+
+
+def test_exceptions_that_cannot_be_rendered_fail_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _configure()
+    log = get_logger("tests.logging.bad_exception")
+    for error_type in (_BadStrError, _BadNotesError):
+        try:
+            raise error_type(RAW_TOKEN)
+        except Exception:
+            log.exception("call_failed", access_token=RAW_TOKEN)
+
+    first, second = _assert_clean(stream, capsys)
+    assert first["exception"][0]["exc_type"] == "_BadStrError"
+    assert first["exception"][0]["exc_value"] == "[UNRENDERABLE]"
+    assert first["exception"][0]["frames"]
+    assert second["exception"] == [{"exc_type": "_BadNotesError", "exc_value": "[UNRENDERABLE]"}]
+    assert second["access_token"] == REDACTED
+
+
+def test_values_json_cannot_encode_fall_back_to_a_minimal_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _configure()
+    get_logger("tests.logging.json").error("bad_json", value=_BadNumber(), token=RAW_TOKEN)
+
+    (record,) = _assert_clean(stream, capsys)
+    assert set(record) == {"event", "level", "logger", "timestamp", "error_type"}
+    assert record["event"] == "log_record_unrenderable"
+    assert record["level"] == "error"
+    assert record["logger"] == "tests.logging.json"
+    assert record["error_type"] == "ValueError"
+    assert record["timestamp"].endswith("Z")
+    assert dt.datetime.fromisoformat(record["timestamp"]).utcoffset() == dt.timedelta(0)
+
+
+def test_foreign_records_with_bad_arguments_fall_back_to_a_minimal_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _configure()
+    logging.getLogger("tests.third_party").warning("token %s %d", RAW_TOKEN, "not-a-number")
+    logging.getLogger(f"odd name {RAW_TOKEN}").error("%d", "x")
+
+    first, second = _assert_clean(stream, capsys)
+    assert first["event"] == "log_record_unrenderable"
+    assert first["level"] == "warning"
+    assert first["logger"] == "tests.third_party"
+    assert first["error_type"] == "TypeError"
+    assert second["logger"] == "unknown"
+    assert second["level"] == "error"
+
+
+def test_formatter_failures_including_recursion_never_escape() -> None:
+    def overflow(logger: object, method_name: str, event_dict: object) -> str:
+        raise RecursionError(RAW_TOKEN)
+
+    formatter = ads_logging._SafeProcessorFormatter(processors=[overflow])
+    record = logging.LogRecord("tests.formatter", logging.INFO, __file__, 1, RAW_TOKEN, (), None)
+    line = formatter.format(record)
+    assert RAW_TOKEN not in line
+    parsed = _strict_json(line)
+    assert isinstance(parsed, dict)
+    assert parsed["error_type"] == "RecursionError"
+    assert parsed["level"] == "info"
+
+
+class _FailingStream(io.StringIO):
+    """A stream whose writes fail, as a closed pipe's do."""
+
+    def write(self, text: str) -> int:
+        raise OSError(f"write failed for {RAW_TOKEN}")
+
+
+def test_stream_write_failures_report_only_a_minimal_diagnostic(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure_logging(stream=_FailingStream(), settings=Settings())
+    get_logger("tests.logging.write").warning("lost", access_token=RAW_TOKEN, detail=RAW_TOKEN)
+    logging.getLogger("tests.third_party").error("lost %s", RAW_TOKEN)
+
+    captured = capsys.readouterr()
+    assert RAW_TOKEN not in captured.err
+    assert "Traceback" not in captured.err
+    lines = [_strict_json(line) for line in captured.err.splitlines()]
+    assert lines == [{"event": "log_handler_error", "error_type": "OSError"}] * 2
+
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    get_logger("tests.logging.write").warning("lost_quietly", access_token=RAW_TOKEN)
+    assert capsys.readouterr().err == ""
+
+
+def test_handler_error_report_survives_a_broken_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_logging(stream=_FailingStream(), settings=Settings())
+    broken = _FailingStream()
+    monkeypatch.setattr("sys.stderr", broken)
+    get_logger("tests.logging.write").warning("lost", access_token=RAW_TOKEN)
+    monkeypatch.setattr("sys.stderr", None)
+    get_logger("tests.logging.write").warning("lost", access_token=RAW_TOKEN)
+    assert broken.getvalue() == ""
+
+
+# The names a fallback line keeps (logger, level, error class) pass the configured redaction.
+# KNOWN_PLAINTEXT is configured as the n8n webhook secret; no name here pairs a credential
+# word with a literal, so the generic secret-scan rule has nothing to flag.
+KNOWN_PLAINTEXT = "DummyKnownSecret123"
+
+
+class _PlaintextNamedError(Exception):
+    """An exception whose class name is renamed to the configured secret below."""
+
+
+_PlaintextNamedError.__name__ = KNOWN_PLAINTEXT
+
+
+class _PlaintextNamedNotesError(_BadNotesError):
+    """An exception named after the secret whose traceback cannot be rendered."""
+
+
+_PlaintextNamedNotesError.__name__ = KNOWN_PLAINTEXT
+
+
+class _PlaintextNamedStrHook:
+    """A ``%s`` argument whose ``__str__`` hook raises the secret-named exception."""
+
+    def __str__(self) -> str:
+        raise _PlaintextNamedError(RAW_TOKEN)
+
+
+class _PlaintextNamedFailingStream(io.StringIO):
+    """A stream whose writes raise the secret-named exception."""
+
+    def write(self, text: str) -> int:
+        raise _PlaintextNamedError(RAW_TOKEN)
+
+
+def _configure_fallback_secret(secret: str = KNOWN_PLAINTEXT) -> io.StringIO:
+    """Configure logging into a fresh buffer with ``secret`` as the n8n webhook secret."""
+    return _configure(Settings(n8n_webhook_secret=SecretStr(secret)))
+
+
+def _assert_no_fallback_secret(
+    stream: io.StringIO, capsys: pytest.CaptureFixture[str], secret: str = KNOWN_PLAINTEXT
+) -> list[Any]:
+    """Assert no output holds the secret in any letter case, the token or the address.
+
+    Returns:
+        The strict-JSON lines of ``stream`` followed by those of the captured stderr.
+    """
+    captured = capsys.readouterr()
+    for text in (stream.getvalue(), captured.out, captured.err):
+        assert secret.casefold() not in text.casefold()
+        assert RAW_TOKEN not in text
+        assert LEAD_EMAIL not in text
+    assert captured.out == ""
+    lines = (*stream.getvalue().splitlines(), *captured.err.splitlines())
+    return [_strict_json(line) for line in lines]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (KNOWN_PLAINTEXT, "unknown"),
+        (f"probe.{KNOWN_PLAINTEXT}", "unknown"),
+        (LEAD_EMAIL, "unknown"),
+        ("ads_engine.sync", "ads_engine.sync"),
+    ],
+)
+def test_fallback_line_keeps_a_logger_name_only_when_redaction_leaves_it_unchanged(
+    name: str, expected: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = _configure_fallback_secret()
+    logging.getLogger(name).warning("%d", RAW_TOKEN)
+
+    (record,) = _assert_no_fallback_secret(stream, capsys)
+    assert set(record) == {"event", "level", "logger", "timestamp", "error_type"}
+    assert record["event"] == "log_record_unrenderable"
+    assert record["logger"] == expected
+    assert record["level"] == "warning"
+    assert record["error_type"] == "TypeError"
+
+
+def test_fallback_line_drops_an_error_class_named_after_a_secret(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _configure_fallback_secret()
+    logging.getLogger("tests.fallback.hook").warning("%s", _PlaintextNamedStrHook())
+
+    (record,) = _assert_no_fallback_secret(stream, capsys)
+    assert record["event"] == "log_record_unrenderable"
+    assert record["logger"] == "tests.fallback.hook"
+    assert record["error_type"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("secret", "level_name"),
+    [
+        (KNOWN_PLAINTEXT, KNOWN_PLAINTEXT),
+        # Written lower-cased, an upper-cased level name would spell a lower-case secret.
+        (KNOWN_PLAINTEXT.lower(), KNOWN_PLAINTEXT.upper()),
+    ],
+)
+def test_fallback_line_drops_a_level_name_the_redaction_would_change(
+    secret: str,
+    level_name: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # addLevelName writes these module-level maps; copies keep its change to this test, and
+    # monkeypatch restores the originals however the test ends.
+    monkeypatch.setattr(logging, "_levelToName", dict(logging._levelToName))
+    monkeypatch.setattr(logging, "_nameToLevel", dict(logging._nameToLevel))
+    stream = _configure_fallback_secret(secret)
+    level = logging.WARNING + 5
+    logging.addLevelName(level, level_name)
+    logging.getLogger("tests.fallback.level").log(level, "%d", RAW_TOKEN)
+
+    (record,) = _assert_no_fallback_secret(stream, capsys, secret)
+    assert record["event"] == "log_record_unrenderable"
+    assert record["level"] == "unknown"
+    assert record["logger"] == "tests.fallback.level"
+
+
+def test_exception_marker_drops_a_class_name_the_redaction_would_change(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _configure_fallback_secret()
+    try:
+        raise _PlaintextNamedNotesError(RAW_TOKEN)
+    except _PlaintextNamedNotesError:
+        get_logger("tests.fallback.marker").exception("call_failed")
+
+    (record,) = _assert_no_fallback_secret(stream, capsys)
+    assert record["event"] == "call_failed"
+    assert record["exception"] == [{"exc_type": "unknown", "exc_value": "[UNRENDERABLE]"}]
+
+
+def test_handler_error_report_drops_an_error_class_named_after_a_secret(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = _PlaintextNamedFailingStream()
+    configure_logging(
+        stream=stream, settings=Settings(n8n_webhook_secret=SecretStr(KNOWN_PLAINTEXT))
+    )
+    get_logger("tests.fallback.write").warning("lost", access_token=RAW_TOKEN)
+    logging.getLogger("tests.third_party").error("lost %s", RAW_TOKEN)
+
+    lines = _assert_no_fallback_secret(stream, capsys)
+    assert lines == [{"event": "log_handler_error", "error_type": "unknown"}] * 2
+
+
+def test_safe_name_fails_closed_when_redaction_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _RaisingRedactor:
+        def text(self, text: str) -> str:
+            raise RuntimeError(RAW_TOKEN)
+
+    assert ads_logging._safe_name("ads_engine.sync") == "ads_engine.sync"
+    monkeypatch.setattr(ads_logging._STATE, "redactor", _RaisingRedactor())
+    assert ads_logging._safe_name("ads_engine.sync") == "unknown"
+    assert ads_logging._type_name(ValueError()) == "unknown"
+    assert ads_logging._exc_info_type_name(ValueError()) == "unknown"
 
 
 # ---------------------------------------------------------------------------

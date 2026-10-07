@@ -76,6 +76,15 @@ WEBHOOK_PATH = "/webhook/test-webhook-path"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
 REDACTED_WEBHOOK = f"https://{WEBHOOK_HOST}/<redacted>"
 CUSTOMER_ID = "1234567890"
+RAW_QUERY_VALUE = "test-raw-query-value-0042"
+# Each source's request URL and the path redact_url renders for it.
+REDACT_URL_PATHS: Mapping[Source, tuple[str, str]] = {
+    "hubspot": (
+        "https://api.hubapi.com/crm/objects/2026-09/contacts",
+        "/crm/objects/2026-09/contacts",
+    ),
+    "linkedin": ("https://api.linkedin.com/rest/adAnalytics", "/rest/adAnalytics"),
+}
 
 ENDPOINTS: Mapping[Source, str] = {
     "google": "search Q-G2",
@@ -468,6 +477,96 @@ def test_google_urls_keep_only_scheme_and_host(url: str, expected: str) -> None:
 )
 def test_credential_query_values_are_redacted(source: Source, url: str, expected: str) -> None:
     assert redact_url(httpx.URL(url), source=source) == expected
+
+
+@pytest.mark.parametrize("source", ["hubspot", "linkedin"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "AcCeSs_ToKeN",
+        "ACCESS_TOKEN",
+        "aCcEsS-tOkEn",
+        "Refresh_Token",
+        "ReFrEsH_ToKeN",
+        "HAPIKEY",
+        "HapiKey",
+        "hApIkEy",
+        "CLIENT_SECRET",
+        "ClIeNt_SeCrEt",
+        "CoDe",
+        "ToKeN",
+        "X_API_KEY",
+        "X_ApI_KeY",
+        "X-aPi-KeY",
+        "Db_PaSsWoRd",
+        "NeXt_PaGe_ToKeN",
+        "PageToken",
+        "pageToken",
+        "AcCeSs%5FtOkEn",
+    ],
+)
+def test_credential_query_keys_are_matched_in_any_letter_case(source: Source, key: str) -> None:
+    url, path = REDACT_URL_PATHS[source]
+    redacted = redact_url(httpx.URL(f"{url}?{key}={RAW_QUERY_VALUE}&limit=1"), source=source)
+    assert redacted == f"{path}?{key}={REDACTED}&limit=1"
+    assert RAW_QUERY_VALUE not in redacted
+
+
+@pytest.mark.parametrize("source", ["hubspot", "linkedin"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "accesstoken",
+        "ACCESSTOKEN",
+        "accessTokeN",
+        "refreshtoken",
+        "rEfReShToKeN",
+        "clientsecret",
+        "CLIENTSECRET",
+        "apikey",
+        "XAPIKEY",
+        "idtoken",
+        "hubspotaccesstoken",
+        "oauth2accesstoken",
+        "nextpagetoken",
+        "PAGETOKEN",
+        "dbpassword",
+        "c-o-d-e",
+        "access%5Ftoken%5F",
+    ],
+)
+def test_separator_free_credential_query_keys_are_redacted(source: Source, key: str) -> None:
+    url, path = REDACT_URL_PATHS[source]
+    redacted = redact_url(httpx.URL(f"{url}?{key}={RAW_QUERY_VALUE}&limit=1"), source=source)
+    assert redacted == f"{path}?{key}={REDACTED}&limit=1"
+    assert RAW_QUERY_VALUE not in redacted
+
+
+@pytest.mark.parametrize("source", ["hubspot", "linkedin"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "pagesize=100&idproperty=email&maxtokens=5&tokencount=3&TOKENS=5",
+        "timegranularity=ALL&daterange=x&apikeys=2&secretary=x&passwordsseen=1&zipcode=1",
+    ],
+)
+def test_separator_free_ordinary_query_params_are_kept(source: Source, query: str) -> None:
+    url, path = REDACT_URL_PATHS[source]
+    assert redact_url(httpx.URL(f"{url}?{query}"), source=source) == f"{path}?{query}"
+
+
+@pytest.mark.parametrize("source", ["hubspot", "linkedin"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "limit=100&count=25&fields=impressions,clicks&q=analytics&after=12345",
+        "LIMIT=100&Count=25&FiElDs=impressions&Q=analytics&AFTER=12345",
+        "pageSize=100&start=0&tokens=5&idProperty=hs_object_id&archived=false",
+    ],
+)
+def test_ordinary_query_params_are_kept_in_any_letter_case(source: Source, query: str) -> None:
+    url, path = REDACT_URL_PATHS[source]
+    assert redact_url(httpx.URL(f"{url}?{query}"), source=source) == f"{path}?{query}"
 
 
 @pytest.mark.parametrize(

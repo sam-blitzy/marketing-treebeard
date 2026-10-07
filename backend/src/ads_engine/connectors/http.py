@@ -136,15 +136,26 @@ STARTED_EXTENSION: Final = "ads_engine_started"
 
 _REDACTED_PATH: Final = "<redacted>"
 
-# Query parameters whose whole value is a credential. Names are compared after the
-# normalisation of `_normalise_key`.
+# Query parameters whose whole value is a credential. A name matches when one of the three
+# forms of `_key_forms` does: its raw form, case-folded as written, or its camelCase-split
+# form is listed here or ends with a suffix below; or its separator-free form, the raw form
+# with every `_` removed (`ACCESSTOKEN`, `rEfReShToKeN` and `X-API-KEY` give `accesstoken`,
+# `refreshtoken` and `xapikey`), is a listed name or ends with a suffix, each with `_`
+# removed.
 _SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {"access_token", "token", "client_secret", "refresh_token", "hapikey", "code"}
 )
 # Fail-closed widening, matching the key rule of ads_engine.logging: any parameter whose
-# normalised name ends like a credential is redacted too. That includes LinkedIn's
+# name ends like a credential in any form is redacted too. That includes LinkedIn's
 # `pageToken` cursor, which carries no credential but loses nothing by being hidden.
 _SENSITIVE_QUERY_SUFFIXES: Final[tuple[str, ...]] = ("_token", "_secret", "_password", "_api_key")
+# The listed names and suffixes with `_` removed, compared with the separator-free form.
+_SEPARATOR_FREE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
+    key.replace("_", "") for key in _SENSITIVE_QUERY_KEYS
+)
+_SEPARATOR_FREE_QUERY_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    suffix.replace("_", "") for suffix in _SENSITIVE_QUERY_SUFFIXES
+)
 _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 # Configured secrets shorter than this would mangle ordinary URL text (the local database
@@ -154,8 +165,8 @@ _MIN_SECRET_LENGTH: Final = 8
 # Longest non-JSON error body, in characters, that is sanitised whole and then used for
 # classification and the error message. Redaction runs on the complete text before any
 # cut, so no secret or address is ever split into a fragment it no longer recognises.
-# The email pattern's cost grows quadratically with long address-like runs, so a longer
-# body is never redacted whole: it is classified from a window of its first this many
+# The limit bounds the work spent on an error body and the text kept from it: a longer
+# body is never redacted, only classified from a window of its first this many
 # characters, and the error raised is described by the body's size, keeping no text.
 _ERROR_TEXT_SCAN_MAX: Final = 16_384
 
@@ -266,13 +277,23 @@ def redact_url(url: httpx.URL, *, source: Source, secrets: Collection[str] = ())
     * ``google``: only ``"{scheme}://{host}/<redacted>"``. The n8n webhook path is a
       capability URL: knowing it is enough to call the workflow.
     * ``linkedin`` and ``hubspot``: the raw path and query, with the value of every
-      credential parameter (``access_token``, ``token``, ``client_secret``,
-      ``refresh_token``, ``hapikey``, ``code``, and any name ending in ``_token``,
-      ``_secret``, ``_password`` or ``_api_key`` once camelCase is split) replaced by
-      ``[REDACTED]``. Beyond those names, a path segment or query value that holds an
-      email address or one of ``secrets`` once percent-decoded is rendered decoded with
-      ``[REDACTED_EMAIL]`` or ``[REDACTED]`` in its place, because the logging processors
-      match plaintext only and would miss ``lead%40example.com``.
+      credential parameter replaced by ``[REDACTED]`` and its name kept as sent. A
+      credential parameter's name, percent-decoded and in any letter case, is
+      ``access_token``, ``token``, ``client_secret``, ``refresh_token``, ``hapikey`` or
+      ``code``, or ends in ``_token``, ``_secret``, ``_password`` or ``_api_key``. The
+      name is compared case-folded as written, with camelCase split, and with every
+      ``_`` and ``-`` removed against those names and suffixes with ``_`` removed, so
+      ``ACCESS_TOKEN``, ``AcCeSs_ToKeN``, ``access%5Ftoken``, ``pageToken``,
+      ``ACCESSTOKEN``, ``rEfReShToKeN`` and ``XAPIKEY`` all match.
+      Beyond those names, a path segment, query name or query value that holds an email
+      address or one of ``secrets`` has ``[REDACTED_EMAIL]`` or ``[REDACTED]`` in its
+      place. It is checked percent-decoded, so ``lead%40example.com`` is caught and the
+      component is rendered decoded; a secret that itself holds ``%`` escapes is matched
+      as written.
+
+    This is the first line of defence: the HTTP layer redacts the percent-encoded forms
+    itself, decoding each name and component once, rather than leaving them to the log.
+    The redaction processors of :mod:`ads_engine.logging` are the second line.
 
     Example::
 
@@ -303,16 +324,41 @@ def redact_url(url: httpx.URL, *, source: Source, secrets: Collection[str] = ())
     return f"{safe_path}?{_redact_query(query, secrets)}"
 
 
-def _normalise_key(name: str) -> str:
-    """Normalise a query parameter name: percent-decoded, camelCase split, lowercased."""
+def _key_forms(name: str) -> tuple[str, str, str]:
+    """Normalise a query parameter name into the three forms compared with the credential names.
+
+    All three forms are percent-decoded and stripped, with ``-`` replaced by ``_``. The raw
+    form is case-folded as written; the camelCase form splits each lowercase-to-uppercase
+    boundary with ``_`` before lowercasing; the separator-free form is the raw form with
+    every ``_`` removed. Splitting alone would turn a mixed-case ``AcCeSs_ToKeN`` into
+    ``ac_ce_ss_to_ke_n`` and miss it, and neither of the first two forms separates a name
+    written without ``_``, ``-`` or a camelCase boundary. So ``AcCeSs_ToKeN`` gives
+    ``access_token``, ``ac_ce_ss_to_ke_n`` and ``accesstoken``; ``pageToken`` gives
+    ``pagetoken``, ``page_token`` and ``pagetoken``; and ``rEfReShToKeN`` gives
+    ``refreshtoken``, ``r_ef_re_sh_to_ke_n`` and ``refreshtoken``.
+    """
     decoded = unquote(name).strip()
-    return _CAMEL_BOUNDARY_RE.sub("_", decoded).lower().replace("-", "_")
+    raw = decoded.casefold().replace("-", "_")
+    camel = _CAMEL_BOUNDARY_RE.sub("_", decoded).lower().replace("-", "_")
+    return raw, camel, raw.replace("_", "")
 
 
 def _is_sensitive_key(name: str) -> bool:
-    """Whether the query parameter ``name`` carries a credential."""
-    normalised = _normalise_key(name)
-    return normalised in _SENSITIVE_QUERY_KEYS or normalised.endswith(_SENSITIVE_QUERY_SUFFIXES)
+    """Whether the query parameter ``name`` carries a credential, in any letter case.
+
+    Its raw or camelCase form is a credential name or ends with a credential suffix
+    (``ACCESS_TOKEN``, ``pageToken``), or its separator-free form is one of those names or
+    ends with one of those suffixes, each with ``_`` removed (``ACCESSTOKEN``, ``XAPIKEY``).
+    """
+    raw, camel, separator_free = _key_forms(name)
+    return (
+        any(
+            form in _SENSITIVE_QUERY_KEYS or form.endswith(_SENSITIVE_QUERY_SUFFIXES)
+            for form in (raw, camel)
+        )
+        or separator_free in _SEPARATOR_FREE_QUERY_KEYS
+        or separator_free.endswith(_SEPARATOR_FREE_QUERY_SUFFIXES)
+    )
 
 
 def _redact_query(query: str, secrets: Collection[str]) -> str:

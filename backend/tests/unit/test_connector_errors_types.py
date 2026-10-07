@@ -18,6 +18,7 @@ import pickle
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, get_args
+from urllib.parse import unquote
 
 import pytest
 from pydantic import AliasChoices
@@ -751,6 +752,94 @@ def test_sanitize_message_removes_emails_and_configured_secrets(
         },
     )
     assert sanitize_message(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "No contact ?email=alice%40example.com found",
+            "No contact ?email=[REDACTED_EMAIL] found",
+            id="encoded-email",
+        ),
+        pytest.param(
+            "email=alice%2540example.com rejected",
+            "email=[REDACTED_EMAIL] rejected",
+            id="double-encoded-email",
+        ),
+        pytest.param(
+            "q=alice%40Example.COM",
+            "q=[REDACTED_EMAIL]",
+            id="mixed-case-encoded-email",
+        ),
+        pytest.param(
+            "bad token %74%65%73%74%2d%6e%38%6e-secret",
+            "bad token [REDACTED]",
+            id="encoded-configured-secret",
+        ),
+        pytest.param(
+            "Authorization: Bearer test-rotated-token\nrejected",
+            "Authorization: [REDACTED] rejected",
+            id="authorization-header-text",
+        ),
+        pytest.param(
+            "sent Bearer test-rotated-token upstream",
+            "sent Bearer [REDACTED] upstream",
+            id="unconfigured-bearer-token",
+        ),
+        pytest.param(
+            "https://api.example.test/x?access_token=test-rotated-token&limit=1",
+            "https://api.example.test/x?access_token=[REDACTED]&limit=1",
+            id="query-credential",
+        ),
+        pytest.param(
+            "path /crm/v3/objects%2Fcontacts at 100%25",
+            "path /crm/v3/objects%2Fcontacts at 100%25",
+            id="ordinary-encoded-text-kept",
+        ),
+    ],
+)
+def test_sanitize_message_redacts_encoded_values_and_textual_credentials(
+    monkeypatch: pytest.MonkeyPatch, text: str, expected: str
+) -> None:
+    """Percent-encoded emails and secrets, and unconfigured credentials, never persist."""
+    _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": N8N_SECRET})
+    assert sanitize_message(text) == expected
+
+
+def _layered(layers: int) -> str:
+    """Return a provider message whose email and ``N8N_SECRET`` are encoded ``layers`` times."""
+    email, secret = "alice%40example.com", "%74est-n8n-secret"
+    for _ in range(layers - 1):
+        email, secret = email.replace("%", "%25"), secret.replace("%", "%25")
+    return f"email={email} s={secret} rejected"
+
+
+def _fully_decoded(text: str) -> str:
+    """Percent-decode ``text`` until it no longer changes."""
+    while (decoded := unquote(text)) != text:
+        text = decoded
+    return text
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected"),
+    [
+        pytest.param(4, "email=[REDACTED_EMAIL] s=[REDACTED] rejected", id="at-the-limit"),
+        pytest.param(5, "[REDACTED] [REDACTED] rejected", id="one-beyond"),
+        pytest.param(6, "[REDACTED] [REDACTED] rejected", id="two-beyond"),
+    ],
+)
+def test_sanitize_message_leaves_no_deeply_encoded_email_or_secret(
+    monkeypatch: pytest.MonkeyPatch, layers: int, expected: str
+) -> None:
+    """An email or secret encoded at or beyond the decode limit is never recoverable."""
+    _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": N8N_SECRET})
+    reason = sanitize_message(_layered(layers))
+    assert reason == expected
+    decoded = _fully_decoded(reason)
+    assert EMAIL not in decoded
+    assert N8N_SECRET not in decoded
 
 
 def test_sanitize_message_ignores_secrets_shorter_than_8_characters(
