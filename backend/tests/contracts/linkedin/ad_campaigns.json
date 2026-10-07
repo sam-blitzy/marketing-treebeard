@@ -1,0 +1,538 @@
+{
+  "surface": "linkedin.ad_campaigns",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaigns?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-07-15",
+  "request": {
+    "method": "GET",
+    "url": "adAccounts/{id}/adCampaigns?q=search&search=(status:(values:List(ACTIVE,PAUSED,ARCHIVED,COMPLETED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))&pageSize=100",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "search",
+      "pageSize"
+    ],
+    "optional_query": [
+      "pageToken"
+    ],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "page_size": 100,
+      "max_page_size": 1000
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "LinkedIn campaign search: GET https://api.linkedin.com/rest/adAccounts/{id}/adCampaigns?q=search with Linkedin-Version 202609 and X-Restli-Protocol-Version 2.0.0. The reference page was served as moniker li-lms-2026-09 (updated_at 2026-07-15T10:38:00Z, ms.date 2026-07-13). Correction to the plan: the plan reuses the campaign-group status list for campaigns, but the campaign page documents eight search.status values, including COMPLETED (the campaign reached a specified budgetary or chronological limit). Leaving COMPLETED out would make every finished campaign look missing to the discrepancy check, so the request lists all eight, in the order of connectors/linkedin/parser.py CAMPAIGN_SEARCH_STATUSES, and the tracked set is diffed against that full list. The search value is Rest.li 2.0 syntax and keeps its parentheses, colons and commas literal. The client sends pageSize=100 (maximum 1,000) and resends metadata.nextPageToken as pageToken until no token is returned; the token is absent or null on the last page. Money amounts are BigDecimal strings in the ad account's currency. Neither budget is required: the own_budget decision shape carries daily_budget and/or total_budget according to which of dailyBudget and totalBudget the campaign has, and never invents the other. totalBudget is deprecated for campaigns not using lifetime pacing.",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Campaigns on this page, sorted by id.",
+          "items": {
+            "type": "object",
+            "description": "One ad campaign (AdCampaign) as returned by the 202609 search finder. Every key the page documents, every key in the documented sample and every key observed in live 202609 responses is declared, so unknown keys still fail validation.",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "description": "Campaign id; the sponsored campaign URN is urn:li:sponsoredCampaign:{id}."
+              },
+              "name": {
+                "type": "string",
+                "description": "Campaign name."
+              },
+              "account": {
+                "type": "string",
+                "description": "Owning ad account URN, urn:li:sponsoredAccount:{id}. Immutable once set."
+              },
+              "campaignGroup": {
+                "type": "string",
+                "description": "Parent campaign group URN, urn:li:sponsoredCampaignGroup:{id}."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ACTIVE",
+                  "PAUSED",
+                  "ARCHIVED",
+                  "COMPLETED",
+                  "CANCELED",
+                  "DRAFT",
+                  "PENDING_DELETION",
+                  "REMOVED"
+                ],
+                "description": "Raw platform status, kept verbatim and normalised to active, paused or ended through the LinkedIn status map. The enum is exactly the eight values the page documents for the campaign status field and for search.status.values; the campaign page never uses the CANCELLED spelling. COMPLETED means the campaign reached a specified budgetary or chronological limit; REMOVED means deleted but still fetchable because performance data exists."
+              },
+              "type": {
+                "type": "string",
+                "description": "Campaign type, for example TEXT_AD, SPONSORED_UPDATES, SPONSORED_INMAILS or DYNAMIC."
+              },
+              "objectiveType": {
+                "type": "string",
+                "description": "Campaign objective. Deliberately not an enum: the page's schema table lists BRAND_AWARENESS, ENGAGEMENT, JOB_APPLICANTS, LEAD_GENERATION, WEBSITE_CONVERSIONS, WEBSITE_VISITS and VIDEO_VIEWS, its request samples use WEBSITE_VISIT and WEBSITE_TRAFFIC, and live 202609 responses return the singular forms JOB_APPLICANT, VIDEO_VIEW, WEBSITE_CONVERSION and WEBSITE_VISIT, so a closed enum would reject real data. Optional: the documented sample omits it. LEAD_GENERATION selects oneClickLeads as the campaign outcome and other objectives select externalWebsiteConversions; how a missing objective is treated is decided by the LinkedIn parser."
+              },
+              "costType": {
+                "type": "string",
+                "description": "Pricing model, for example CPC, CPM or CPV."
+              },
+              "creativeSelection": {
+                "type": "string",
+                "description": "Creative rotation, for example OPTIMIZED (default) or ROUND_ROBIN."
+              },
+              "optimizationTargetType": {
+                "type": "string",
+                "description": "Bidding optimisation target, for example NONE (default), ENHANCED_CONVERSION, MAX_CLICK, MAX_LEAD or CAP_COST_AND_MAXIMIZE_LEADS."
+              },
+              "format": {
+                "type": "string",
+                "description": "Campaign-level ad format, for example STANDARD_UPDATE, SINGLE_VIDEO, CAROUSEL or SPONSORED_INMAIL."
+              },
+              "pacingStrategy": {
+                "type": "string",
+                "description": "Budget pacing, LIFETIME or ACCELERATED (versions 202501 and later). Optional."
+              },
+              "politicalIntent": {
+                "type": "string",
+                "description": "Political advertising declaration: POLITICAL, NOT_POLITICAL or NOT_DECLARED."
+              },
+              "dailyBudget": {
+                "type": "object",
+                "description": "Maximum spend per UTC day. Optional: present when the campaign has a daily budget. Money object; amount is a BigDecimal real-number string in the ad account's currency, never converted or summed across currencies.",
+                "properties": {
+                  "amount": {
+                    "type": "string",
+                    "description": "BigDecimal as a real-number string, for example \"18\"."
+                  },
+                  "currencyCode": {
+                    "type": "string",
+                    "description": "ISO 4217 currency code; LinkedIn requires it to match the ad account's currency."
+                  }
+                },
+                "required": [
+                  "amount",
+                  "currencyCode"
+                ]
+              },
+              "totalBudget": {
+                "type": "object",
+                "description": "Maximum spend over the campaign's life; deprecated for campaigns not using lifetime pacing. Optional, and absent from the documented sample. Money object; amount is a BigDecimal real-number string in the ad account's currency, never converted or summed across currencies.",
+                "properties": {
+                  "amount": {
+                    "type": "string",
+                    "description": "BigDecimal as a real-number string, for example \"18\"."
+                  },
+                  "currencyCode": {
+                    "type": "string",
+                    "description": "ISO 4217 currency code; LinkedIn requires it to match the ad account's currency."
+                  }
+                },
+                "required": [
+                  "amount",
+                  "currencyCode"
+                ]
+              },
+              "unitCost": {
+                "type": "object",
+                "description": "Bid, target cost or cost cap per billable event; defaults to 0 in the account currency. Money object; amount is a BigDecimal real-number string in the ad account's currency, never converted or summed across currencies.",
+                "properties": {
+                  "amount": {
+                    "type": "string",
+                    "description": "BigDecimal as a real-number string, for example \"18\"."
+                  },
+                  "currencyCode": {
+                    "type": "string",
+                    "description": "ISO 4217 currency code; LinkedIn requires it to match the ad account's currency."
+                  }
+                },
+                "required": [
+                  "amount",
+                  "currencyCode"
+                ]
+              },
+              "runSchedule": {
+                "type": "object",
+                "description": "Scheduled run range in epoch milliseconds; start is inclusive, end is exclusive and optional (an open range).",
+                "properties": {
+                  "start": {
+                    "type": "integer",
+                    "description": "Inclusive start, epoch milliseconds."
+                  },
+                  "end": {
+                    "type": "integer",
+                    "description": "Exclusive end, epoch milliseconds; absent for an open range."
+                  }
+                },
+                "required": [
+                  "start"
+                ]
+              },
+              "locale": {
+                "type": "object",
+                "description": "Campaign locale.",
+                "properties": {
+                  "country": {
+                    "type": "string",
+                    "description": "Uppercase ISO 3166 two-letter country code."
+                  },
+                  "language": {
+                    "type": "string",
+                    "description": "Lowercase ISO 639 two-letter language code."
+                  }
+                },
+                "required": [
+                  "country",
+                  "language"
+                ]
+              },
+              "servingStatuses": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Service-controlled serving states, for example RUNNABLE, STOPPED, ACCOUNT_SERVING_HOLD or CAMPAIGN_END_DATE_HOLD. Open strings, because LinkedIn adds hold reasons."
+              },
+              "audienceExpansionEnabled": {
+                "type": "boolean",
+                "description": "Audience Expansion flag; defaults to false."
+              },
+              "offsiteDeliveryEnabled": {
+                "type": "boolean",
+                "description": "LinkedIn Audience Network delivery flag."
+              },
+              "connectedTelevisionOnly": {
+                "type": "boolean",
+                "description": "Connected Television only flag (versions 202408 and later); absence means false."
+              },
+              "storyDeliveryEnabled": {
+                "type": "boolean",
+                "description": "Observed in live 202609 responses but not documented on the page; declared so captured payloads validate."
+              },
+              "test": {
+                "type": "boolean",
+                "description": "True when the campaign belongs to a test account. Read-only."
+              },
+              "associatedEntity": {
+                "type": "string",
+                "description": "URN of the advertised organization or member, for example urn:li:organization:{id}."
+              },
+              "changeAuditStamps": {
+                "type": "object",
+                "description": "Creation and last-modification stamps.",
+                "properties": {
+                  "created": {
+                    "type": "object",
+                    "description": "When and by whom the campaign was created.",
+                    "properties": {
+                      "time": {
+                        "type": "integer",
+                        "description": "Epoch milliseconds."
+                      },
+                      "actor": {
+                        "type": "string",
+                        "description": "URN of the member or application that made the change. Present in live responses, absent from the documented sample."
+                      }
+                    },
+                    "required": [
+                      "time"
+                    ]
+                  },
+                  "lastModified": {
+                    "type": "object",
+                    "description": "When and by whom the campaign was last modified.",
+                    "properties": {
+                      "time": {
+                        "type": "integer",
+                        "description": "Epoch milliseconds."
+                      },
+                      "actor": {
+                        "type": "string",
+                        "description": "URN of the member or application that made the change. Present in live responses, absent from the documented sample."
+                      }
+                    },
+                    "required": [
+                      "time"
+                    ]
+                  }
+                },
+                "required": [
+                  "created",
+                  "lastModified"
+                ]
+              },
+              "version": {
+                "type": "object",
+                "description": "Entity version; versionTag starts at 1 and increases by 1 on every update.",
+                "properties": {
+                  "versionTag": {
+                    "type": "string",
+                    "description": "Version counter as a string."
+                  }
+                },
+                "required": [
+                  "versionTag"
+                ]
+              },
+              "optimizationPreference": {
+                "type": "object",
+                "description": "Union of optimisation preference kinds (versions 202408 and later). The documented frequencyOptimizationPreference member is declared; other members are accepted because the union may grow.",
+                "properties": {
+                  "frequencyOptimizationPreference": {
+                    "type": "object",
+                    "description": "Frequency cap preference.",
+                    "properties": {
+                      "optimizationType": {
+                        "type": "string",
+                        "description": "Strategy, for example MAX_FREQUENCY."
+                      },
+                      "frequency": {
+                        "type": "integer",
+                        "description": "Impressions per member; 3 to 30 for MAX_FREQUENCY."
+                      },
+                      "timeSpan": {
+                        "type": "object",
+                        "description": "Window of the frequency rule.",
+                        "properties": {
+                          "duration": {
+                            "type": "integer",
+                            "description": "Length of the window; allowed value 7."
+                          },
+                          "unit": {
+                            "type": "string",
+                            "description": "Unit of the window; allowed value DAY."
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "additionalProperties": true
+              },
+              "targeting": {
+                "type": "object",
+                "description": "Deprecated targeting record, superseded by targetingCriteria. Its facet maps are keyed by facet name; the product never reads it.",
+                "additionalProperties": true
+              },
+              "targetingCriteria": {
+                "type": "object",
+                "description": "Boolean targeting expression: include.and[] of {or: {facet URN: [value URNs]}}, with an optional exclude.or map. Facet maps are keyed by facet URN, so the subtree stays open; the product never reads it.",
+                "properties": {
+                  "include": {
+                    "type": "object",
+                    "description": "Facets the member must match.",
+                    "additionalProperties": true
+                  },
+                  "exclude": {
+                    "type": "object",
+                    "description": "Facets the member must not match.",
+                    "additionalProperties": true
+                  }
+                },
+                "additionalProperties": true
+              },
+              "offsitePreferences": {
+                "type": "object",
+                "description": "Audience Network inclusion and exclusion preferences. The two documented members are declared; the record stays open for further preference kinds. The product never reads it.",
+                "properties": {
+                  "iabCategories": {
+                    "type": "object",
+                    "description": "IAB categories the campaign may or may not serve on.",
+                    "properties": {
+                      "include": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Included urn:li:iabCategory URNs; defaults to []."
+                      },
+                      "exclude": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Excluded urn:li:iabCategory URNs; defaults to []. Exclude wins over include."
+                      }
+                    }
+                  },
+                  "publisherRestrictionFiles": {
+                    "type": "object",
+                    "description": "Uploaded publisher files of domains or app store URLs.",
+                    "properties": {
+                      "include": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Included urn:li:adPublisherFile URNs; defaults to []."
+                      },
+                      "exclude": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Excluded urn:li:adPublisherFile URNs; defaults to []. Exclude wins over include."
+                      }
+                    }
+                  }
+                },
+                "additionalProperties": true
+              },
+              "accountInfo": {
+                "type": "object",
+                "description": "Read-only additional-info record for the ad account, returned only when requested as an additional info field. The product never reads it.",
+                "additionalProperties": true
+              },
+              "associatedEntityInfo": {
+                "type": "object",
+                "description": "Read-only additional-info union for associatedEntity (OrganizationInfo or PersonInfo), returned only when requested. The product never reads it.",
+                "additionalProperties": true
+              },
+              "campaignGroupInfo": {
+                "type": "object",
+                "description": "Read-only additional-info record for the campaign group, returned only when requested. The product never reads it.",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "account",
+              "campaignGroup",
+              "status"
+            ]
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Cursor paging metadata.",
+          "properties": {
+            "nextPageToken": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Opaque cursor for the next page, sent back as pageToken; absent or null on the last page."
+            }
+          }
+        }
+      },
+      "required": [
+        "elements"
+      ]
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "targetingCriteria": {
+            "include": {
+              "and": [
+                {
+                  "or": {
+                    "urn:li:adTargetingFacet:employers": [
+                      "urn:li:company:1035"
+                    ]
+                  }
+                },
+                {
+                  "or": {
+                    "urn:li:adTargetingFacet:locations": [
+                      "urn:li:geo:103644278"
+                    ]
+                  }
+                },
+                {
+                  "or": {
+                    "urn:li:adTargetingFacet:interfaceLocales": [
+                      "urn:li:locale:en_US"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "servingStatuses": [
+            "ACCOUNT_SERVING_HOLD"
+          ],
+          "type": "SPONSORED_UPDATES",
+          "locale": {
+            "country": "US",
+            "language": "en"
+          },
+          "version": {
+            "versionTag": "1"
+          },
+          "associatedEntity": "urn:li:organization:2414183",
+          "test": false,
+          "runSchedule": {
+            "end": 9876543210123,
+            "start": 1234567890987
+          },
+          "targeting": {
+            "includedTargetingFacets": {
+              "employers": [
+                "urn:li:organization:1035"
+              ],
+              "locations": [
+                "urn:li:geo:103644278"
+              ],
+              "interfaceLocales": [
+                {
+                  "country": "US",
+                  "language": "en"
+                }
+              ]
+            }
+          },
+          "optimizationPreference": {
+            "frequencyOptimizationPreference": {
+              "timeSpan": {
+                "duration": 7,
+                "unit": "DAY"
+              },
+              "optimizationType": "MAX_FREQUENCY",
+              "frequency": 10
+            }
+          },
+          "optimizationTargetType": "NONE",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1543365082000
+            },
+            "lastModified": {
+              "time": 1543365082000
+            }
+          },
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:603030884",
+          "dailyBudget": {
+            "amount": "18",
+            "currencyCode": "USD"
+          },
+          "unitCost": {
+            "amount": "15",
+            "currencyCode": "USD"
+          },
+          "creativeSelection": "OPTIMIZED",
+          "costType": "CPC",
+          "name": "Campaign Sponsored update B",
+          "offsiteDeliveryEnabled": false,
+          "id": 145282384,
+          "audienceExpansionEnabled": false,
+          "account": "urn:li:sponsoredAccount:506333826",
+          "status": "ACTIVE"
+        }
+      ],
+      "metadata": {
+        "nextPageToken": "DgGerr1iVQreCJVjZDOW_grcp63nueBDipsS4DJpvJo"
+      }
+    }
+  }
+}
