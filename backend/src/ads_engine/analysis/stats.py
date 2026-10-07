@@ -7,8 +7,9 @@ declares a winner from "currently ahead" counts or a time pattern from noise:
 * CR1 distinguishability: :func:`compare_proportions` runs Fisher's exact test when any
   expected cell of the 2x2 table is below ``cr.fisher_min_expected`` (5), otherwise the
   pooled two-proportion z-test. :func:`holm` applies the Holm step-down correction across a
-  campaign's pairwise comparisons. :func:`additional_n_for_difference` sizes the extra sample
-  a not-yet-distinguishable pair needs at its observed difference.
+  campaign's pairwise comparisons. :func:`additional_n_for_difference` sizes the extra trials
+  that, added to each variant's own (possibly unequal) sample, let a not-yet-distinguishable
+  pair reach the target power at its observed difference.
 * CR2 weak stage: :func:`wilson` gives the Wilson score interval of a funnel-stage rate,
   which stays valid at small counts and at rates near zero.
 * CR3 next test: :func:`required_n` sizes a two-variant test to detect a relative lift, from
@@ -21,9 +22,11 @@ declares a winner from "currently ahead" counts or a time pattern from noise:
 
 Libraries, never hand-written numerics: ``scipy.stats.fisher_exact`` and, from statsmodels,
 ``proportions_ztest``, ``multipletests(method="holm")``, ``proportion_confint(method="wilson")``,
-``proportion_effectsize``, ``NormalIndPower`` and ``test_poisson_2indep(method="score")``.
+``proportion_effectsize``, ``NormalIndPower`` with the root finder ``brentq_expanding`` and
+``test_poisson_2indep(method="score")``.
 The only arithmetic done here is exact bookkeeping: expected cells as fractions, rates as
-decimal ratios and the percentile interpolation.
+decimal ratios and the percentile interpolation, plus the arguments of the power analysis
+(group sizes, their ratio, and power less its target for the root finder).
 
 Conventions:
 
@@ -39,10 +42,12 @@ Conventions:
 * Invalid input is a programming or configuration error and raises: ``TypeError`` for a
   wrong type (a ``float`` or ``bool`` where an ``int`` count or ``Decimal`` is required) and
   ``ValueError`` for a value out of range (a negative count, more successes than trials, a
-  probability outside [0, 1], a non-finite ``Decimal``).
+  probability outside [0, 1], a level outside (0, 1) or one whose float is not strictly
+  inside it, a non-finite ``Decimal``).
 * Pure and thread-safe: no I/O, no logging, no module state. Every decimal operation uses a
-  fresh context and every power analysis a fresh ``NormalIndPower``, whose solver keeps
-  per-instance state.
+  fresh context and every power analysis a fresh ``NormalIndPower``. No warnings filter is
+  touched, that state being process-wide: the root finder gets its direction rather than
+  inferring it, so it cannot fall back to the library's warning paths.
 
 Example:
     >>> from decimal import Decimal
@@ -58,7 +63,7 @@ Example:
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decimal
 from fractions import Fraction
@@ -75,6 +80,7 @@ from statsmodels.stats.proportion import (
 
 # Aliased so the module namespace holds no ``test_*`` name for a test collector to pick up.
 from statsmodels.stats.rates import test_poisson_2indep as _poisson_2indep
+from statsmodels.tools.rootfinding import brentq_expanding
 
 __all__ = [
     "DEFAULT_ALPHA",
@@ -122,8 +128,8 @@ _ONE: Final = Decimal(1)
 _ZERO_6: Final = Decimal("0.000000")
 _ONE_6: Final = Decimal("1.000000")
 _TWO_SIDED: Final = "two-sided"
-# The power solver brackets the sample size from 2 upwards, so samples of 1 and 2 per group
-# are checked directly with the power function before the solver runs (see _per_group_n).
+# The root finder brackets the sample size from 2 upwards, so samples of 1 and 2 per group
+# are checked directly with the power function before it runs (see _per_group_n).
 _SMALLEST_SAMPLES: Final = (1, 2)
 
 
@@ -247,17 +253,42 @@ def _require_level(name: str, value: object) -> Decimal:
     return result
 
 
+def _float_level(name: str, value: Decimal) -> float:
+    """Return a level validated in (0, 1) as the float a library method receives.
+
+    A ``Decimal`` holds levels no float represents: ``1E-1000`` converts to 0.0 and
+    ``0.99999999999999999999`` to 1.0, where the library methods are undefined. The
+    converted float must therefore lie strictly inside (0, 1) as well.
+    """
+    number = float(value)
+    if not 0.0 < number < 1.0:
+        raise ValueError(
+            f"{name} ({value}) is not representable strictly inside (0, 1) as a float "
+            f"(converts to {number!r})"
+        )
+    return number
+
+
 def _require_power_levels(alpha: object, power: object) -> tuple[float, float]:
     """Validate ``alpha`` and ``power`` for a sample-size estimate and return them as floats.
 
     A two-sided test attains power ``alpha`` with no data at all, so a target power at or
-    below ``alpha`` has no sample size and is a configuration error.
+    below ``alpha`` has no sample size and is a configuration error. Both checks hold for
+    the floats the power analysis receives too: each level converts strictly inside (0, 1),
+    and a power just above alpha must not convert to the same float.
     """
     level = _require_level("alpha", alpha)
     target = _require_level("power", power)
     if target <= level:
         raise ValueError(f"power ({target}) must exceed alpha ({level})")
-    return float(level), float(target)
+    alpha_float = _float_level("alpha", level)
+    power_float = _float_level("power", target)
+    if power_float <= alpha_float:
+        raise ValueError(
+            f"power ({target}) must exceed alpha ({level}) as a float; "
+            f"both convert to {power_float!r}"
+        )
+    return alpha_float, power_float
 
 
 def _ratio(numerator: int | Decimal, denominator: int | Decimal) -> Decimal:
@@ -296,30 +327,68 @@ def _require_finite(value: Decimal | None, what: str) -> Decimal:
     return value
 
 
-def _power_at(analysis: NormalIndPower, effect: float, nobs: int, alpha: float) -> float:
-    """Power of the two-sided two-sample normal test at ``nobs`` per group."""
+def _power_at(
+    analysis: NormalIndPower, effect: float, nobs: float, alpha: float, *, ratio: float = 1.0
+) -> float:
+    """Power of the two-sided two-sample normal test with ``nobs`` and ``ratio * nobs`` trials."""
     return float(
         analysis.power(
-            effect_size=effect, nobs1=nobs, alpha=alpha, ratio=1.0, alternative=_TWO_SIDED
+            effect_size=effect, nobs1=nobs, alpha=alpha, ratio=ratio, alternative=_TWO_SIDED
         )
     )
+
+
+def _increasing_root(
+    function: Callable[[float], float],
+    *,
+    low: float,
+    upp: float | None = None,
+    start_upp: float | None = None,
+) -> float | None:
+    """Root of an increasing ``function``, from statsmodels' ``brentq_expanding``.
+
+    The direction is given, never inferred: inferring it compares the function at the two
+    starting bounds and, when those values are equal in floating point, searches the wrong
+    way. Without ``upp`` the upper bound expands from ``start_upp`` by factors of 10, at most
+    100 times, before ``brentq`` runs on the bracket.
+
+    Returns:
+        The root, or ``None`` when none is within reach: the root finder raises (the function
+        keeps one sign over the bracket) or does not converge, or the root is not finite.
+    """
+    try:
+        root, info = brentq_expanding(
+            function, low=low, upp=upp, start_upp=start_upp, increasing=True, full_output=True
+        )
+    except ValueError, RuntimeError:
+        return None
+    value = float(root)
+    if not bool(info.converged) or not math.isfinite(value):
+        return None
+    return value
 
 
 def _per_group_n(rate_1: float, rate_2: float, *, alpha: float, power: float) -> int | None:
     """Smallest whole sample per group that detects ``rate_1`` vs ``rate_2``.
 
     Cohen's h (``proportion_effectsize``) feeds ``NormalIndPower``, the two-sided two-sample
-    normal test with equal groups (``ratio=1``). The solver brackets the sample size from 2
-    upwards and fails (NaN plus a ConvergenceWarning) when fewer than 2 observations per
-    group suffice, which happens for very large effects (h above about 2.8 at alpha 0.05 and
-    power 0.8). The power function settles those cases directly: 1 when one observation per
-    group attains ``power``, otherwise 2 when two do. Larger samples come from the solver,
-    rounded up.
+    normal test with equal groups (``ratio=1``). Its power, less the target, goes to
+    statsmodels' ``brentq_expanding`` with the bracket ``NormalIndPower.solve_power`` uses
+    (from 2, the upper bound expanding from 50), and the root is rounded up. The direction
+    is given rather than inferred, because power grows with the sample for any non-zero
+    effect: ``solve_power`` infers it from the power at 2 and at 50, and fails (NaN plus a
+    ConvergenceWarning) whenever the two are equal in floating point, as for alpha of 1e-20
+    and below at a 10% to 12% lift, or for effects h of 1e-9 and below. Where
+    ``solve_power`` converges, the result is the same.
+
+    The bracket starts at 2, so samples of 1 and 2 per group, which very large effects need
+    (h above about 2.8 at alpha 0.05 and power 0.8), are settled with the power function
+    first: 1 when one observation per group attains ``power``, otherwise 2 when two do.
 
     Returns:
         The per-group sample size, or ``None`` when the rates give no effect in floating
-        point or the solver cannot reach a finite answer (effects so small that the sample
-        exceeds anything a campaign delivers).
+        point or the target power is unreachable: no sample up to the root finder's
+        expansion limit (5 x 10**102 per group) attains it.
     """
     effect = abs(float(proportion_effectsize(rate_2, rate_1)))
     if not math.isfinite(effect) or effect == 0.0:
@@ -328,17 +397,13 @@ def _per_group_n(rate_1: float, rate_2: float, *, alpha: float, power: float) ->
     if _power_at(analysis, effect, _SMALLEST_SAMPLES[1], alpha) >= power:
         smallest, second = _SMALLEST_SAMPLES
         return smallest if _power_at(analysis, effect, smallest, alpha) >= power else second
-    solved = float(
-        analysis.solve_power(
-            effect_size=effect,
-            nobs1=None,
-            alpha=alpha,
-            power=power,
-            ratio=1.0,
-            alternative=_TWO_SIDED,
-        )
-    )
-    if not math.isfinite(solved) or solved <= 0.0:
+
+    def shortfall(nobs: float) -> float:
+        # Power with ``nobs`` trials per group, minus the target power.
+        return _power_at(analysis, effect, nobs, alpha) - power
+
+    solved = _increasing_root(shortfall, low=2.0, start_upp=50.0)
+    if solved is None or solved <= 0.0:
         return None
     return math.ceil(solved)
 
@@ -450,20 +515,19 @@ def holm(p_values: Sequence[Decimal], alpha: Decimal = DEFAULT_ALPHA) -> list[De
 
     Raises:
         TypeError: A p-value or ``alpha`` is not a ``Decimal``.
-        ValueError: A p-value lies outside [0, 1] or ``alpha`` outside (0, 1).
+        ValueError: A p-value lies outside [0, 1], or ``alpha`` lies outside (0, 1) or does
+            not convert to a float strictly inside it.
         ArithmeticError: The library returned a non-finite adjusted value.
 
     Example:
         >>> holm([Decimal("0.04"), Decimal("0.03")])  # both below 0.05 before adjustment
         [Decimal('0.060000'), Decimal('0.060000')]
     """
-    level = _require_level("alpha", alpha)
+    level = _float_level("alpha", _require_level("alpha", alpha))
     checked = [_require_probability(f"p_values[{i}]", p) for i, p in enumerate(p_values)]
     if not checked:
         return []
-    _, corrected, _, _ = multipletests(
-        [float(p) for p in checked], alpha=float(level), method="holm"
-    )
+    _, corrected, _, _ = multipletests([float(p) for p in checked], alpha=level, method="holm")
     return [
         _require_finite(_probability_from_float(value), "multipletests(method='holm')")
         for value in corrected
@@ -482,9 +546,19 @@ def additional_n_for_difference(
     """Extra trials per variant needed to distinguish the observed rates (CR1).
 
     Feeds the CR1 label "about {n} more impressions per variant needed at the observed
-    difference": the per-group sample that detects the observed lower rate against the
-    observed higher rate (Cohen's h and ``NormalIndPower``, two-sided, as in
-    :func:`required_n`) minus the larger of the two samples already observed, floored at 0.
+    difference": the smallest whole number ``k`` of extra trials that, added to each
+    variant's own observed sample, lets the two-sided two-sample normal test on Cohen's h of
+    the observed rates reach ``power`` at ``alpha``. The test is ``NormalIndPower`` with
+    unequal allocation, ``nobs1 = n_smaller + k`` and ``ratio = (n_larger + k) / nobs1``.
+    The arcsine transform makes the test's variance independent of the rates, so which
+    variant holds which rate does not matter.
+
+    The equal-group sample ``n*`` of :func:`required_n` bounds the answer: ``n* - n_smaller``
+    more trials leave both variants with at least ``n*``, which suffices. The continuous
+    root on ``[0, n* - n_smaller]`` comes from statsmodels' ``brentq_expanding``, and the
+    power function then picks the smallest whole increment next to it. Should the root
+    finder fail, or no whole increment next to its root reach the target (floating-point
+    noise), the bound itself is returned. Equal samples of ``n`` reduce to ``n* - n``.
 
     Unlike :func:`required_n`, a lower rate of 0 is estimable here: a variant with
     impressions and no leads still has an observed rate, and CR1 calls the figure not
@@ -501,12 +575,14 @@ def additional_n_for_difference(
     Returns:
         The additional trials per variant (0 when the samples already suffice), or ``None``
         ("not estimable") when either variant has zero trials, the observed rates are
-        identical ("no observed difference"), or the difference is too small for the power
-        solver to size.
+        identical ("no observed difference"), or the target power is unreachable at the
+        observed difference: the rates give no effect in floating point, or no sample up to
+        the root finder's expansion limit (5 x 10**102 per group) attains the power.
 
     Raises:
         TypeError: A count is not an ``int``, or a level is not a ``Decimal``.
-        ValueError: Invalid counts, levels outside (0, 1), or power not above alpha.
+        ValueError: Invalid counts, a level outside (0, 1) or not representable strictly
+            inside it as a float, or power not above alpha (as a ``Decimal`` or as a float).
     """
     successes_a, trials_a = _require_successes("x_a", x_a, "n_a", n_a)
     successes_b, trials_b = _require_successes("x_b", x_b, "n_b", n_b)
@@ -520,7 +596,30 @@ def additional_n_for_difference(
     needed = _per_group_n(low, high, alpha=level, power=target_power)
     if needed is None:
         return None
-    return max(0, needed - max(trials_a, trials_b))
+    smaller, larger = sorted((trials_a, trials_b))
+    # Already holding the equal-group sample, both variants need nothing more.
+    bound = needed - smaller
+    if bound <= 0:
+        return 0
+    effect = abs(float(proportion_effectsize(high, low)))
+    analysis = NormalIndPower()
+
+    def shortfall(extra: float) -> float:
+        # Power with ``extra`` more trials in each variant, minus the target power.
+        grown = smaller + extra
+        ratio = (larger + extra) / grown
+        return _power_at(analysis, effect, grown, level, ratio=ratio) - target_power
+
+    if shortfall(0.0) >= 0.0:
+        return 0
+    root = _increasing_root(shortfall, low=0.0, upp=float(bound))
+    if root is None:
+        return bound
+    estimate = math.ceil(root)
+    for extra in (estimate - 1, estimate, estimate + 1):
+        if 0 < extra < bound and shortfall(extra) >= 0.0:
+            return extra
+    return bound
 
 
 # --- CR2: stage-rate uncertainty --------------------------------------------------------------
@@ -547,7 +646,8 @@ def wilson(
 
     Raises:
         TypeError: A count is not an ``int``, or ``confidence`` is not a ``Decimal``.
-        ValueError: A negative count, successes above non-zero trials, or a level outside (0, 1).
+        ValueError: A negative count, successes above non-zero trials, a level outside (0, 1),
+            or ``1 - confidence`` not representable strictly inside (0, 1) as a float.
         ArithmeticError: The library returned a non-finite bound.
 
     Example:
@@ -556,11 +656,10 @@ def wilson(
     """
     x, n = _require_successes("successes", successes, "trials", trials)
     level = _require_level("confidence", confidence)
+    alpha = _float_level("1 - confidence", _context().subtract(_ONE, level))
     if n == 0:
         return None
-    low_raw, high_raw = proportion_confint(
-        x, n, alpha=float(_context().subtract(_ONE, level)), method="wilson"
-    )
+    low_raw, high_raw = proportion_confint(x, n, alpha=alpha, method="wilson")
     low = _require_finite(_probability_from_float(low_raw), "proportion_confint")
     high = _require_finite(_probability_from_float(high_raw), "proportion_confint")
     point = _ratio(x, n)
@@ -607,7 +706,8 @@ def required_n(p_base: Decimal, p_target: Decimal, *, alpha: Decimal, power: Dec
     20%) of the tested stage's baseline rate: ``p_target = p_base * (1 + lift)``. The
     estimate is Cohen's h (:func:`cohens_h`) solved for the per-group sample of the
     two-sided two-sample normal test with equal groups (statsmodels' ``NormalIndPower``,
-    ``ratio=1``), rounded up to a whole number.
+    ``ratio=1``, its power solved by the root finder ``brentq_expanding``), rounded up to a
+    whole number.
 
     The result counts the tested stage's own denominator: impressions for click and open
     rate, form opens for completion rate. The caller names the unit and, for completion
@@ -622,13 +722,15 @@ def required_n(p_base: Decimal, p_target: Decimal, *, alpha: Decimal, power: Dec
     Returns:
         Trials per variant, or ``None`` ("not estimable") when the baseline rate is 0 or
         below, the target is 0 or below or above 100% (baseline x 1.2 > 1), the baseline
-        is not a proportion (above 1), the target equals the baseline, or the difference is
-        too small for the power solver to size.
+        is not a proportion (above 1), the target equals the baseline, or the target power
+        is unreachable: the rates give no effect in floating point, or no sample up to the
+        root finder's expansion limit (5 x 10**102 per group) attains the power.
 
     Raises:
         TypeError: A rate or level is not a ``Decimal``.
-        ValueError: A rate is not finite, a level lies outside (0, 1), or power is not
-            above alpha.
+        ValueError: A rate is not finite, a level lies outside (0, 1) or is not
+            representable strictly inside it as a float, or power is not above alpha (as a
+            ``Decimal`` or as a float).
 
     Example:
         >>> required_n(Decimal("0.9"), Decimal("1.08"), alpha=Decimal("0.05"), power=Decimal("0.8"))

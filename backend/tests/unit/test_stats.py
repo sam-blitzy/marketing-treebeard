@@ -7,7 +7,8 @@ from SciPy or statsmodels (the Holm and Wilson boundary values are also checked 
   pooled two-proportion z-test otherwise, the Holm step-down correction, and the extra sample
   a pair needs at its observed difference;
 * CR2: Wilson score intervals; CR3: Cohen's h and the per-variant sample of a two-variant test,
-  including samples of 1 and 2 per group, which the library solver cannot size;
+  including samples of 1 and 2 per group, which the library solver cannot size, and tiny
+  levels and effects, where it fails;
 * B4: the two-sample Poisson score test on unweighted counts; B3: the linear-interpolation
   percentile of daily spend, exact in ``Decimal``.
 
@@ -41,6 +42,7 @@ from statsmodels.stats.proportion import (
     proportions_ztest,
 )
 from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep_reference
+from statsmodels.tools.rootfinding import brentq_expanding
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from ads_engine.analysis import stats
@@ -137,14 +139,36 @@ def solver_n(rate_1: float, rate_2: float, *, alpha: float = 0.05, power: float 
     return math.ceil(float(solved))
 
 
-def power_at(rate_1: float, rate_2: float, nobs: int, *, alpha: float = 0.05) -> float:
-    """statsmodels' power of the two-sided two-sample normal test at ``nobs`` per group."""
+def power_at(
+    rate_1: float, rate_2: float, nobs: int, *, alpha: float = 0.05, ratio: float = 1.0
+) -> float:
+    """statsmodels' power of the two-sided two-sample normal test, ``nobs`` and ``ratio * nobs``."""
     effect = abs(proportion_effectsize(rate_2, rate_1))
     return float(
         NormalIndPower().power(
-            effect_size=effect, nobs1=nobs, alpha=alpha, ratio=1.0, alternative=TWO_SIDED
+            effect_size=effect, nobs1=nobs, alpha=alpha, ratio=ratio, alternative=TWO_SIDED
         )
     )
+
+
+def common_increment_power(x_a: int, n_a: int, x_b: int, n_b: int, extra: int) -> float:
+    """Power at the observed rates once each variant has ``extra`` more trials (unequal groups)."""
+    low, high = sorted((x_a / n_a, x_b / n_b))
+    smaller, larger = sorted((n_a, n_b))
+    grown = smaller + extra
+    return power_at(low, high, grown, ratio=(larger + extra) / grown)
+
+
+def library_solver_fails(rate_1: float, rate_2: float, *, alpha: float) -> bool:
+    """Whether statsmodels' ``solve_power`` returns NaN with a ConvergenceWarning (power 0.8)."""
+    effect = abs(proportion_effectsize(rate_2, rate_1))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solved = NormalIndPower().solve_power(
+            effect_size=effect, nobs1=None, alpha=alpha, power=0.8, ratio=1.0, alternative=TWO_SIDED
+        )
+    warned = any(issubclass(w.category, ConvergenceWarning) for w in caught)
+    return math.isnan(float(solved)) and warned
 
 
 def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> Decimal:
@@ -422,6 +446,13 @@ def test_holm_of_nothing_is_empty() -> None:
         ([Decimal("0.1")], Decimal(0), ValueError, r"alpha must be in \(0, 1\)"),
         ([Decimal("0.1")], Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
         ([], Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
+        (
+            [Decimal("0.1")],
+            Decimal("1e-1000"),
+            ValueError,
+            r"alpha \(1E-1000\) is not representable strictly inside \(0, 1\) as a float",
+        ),
+        ([], Decimal("0.99999999999999999999"), ValueError, r"alpha \(0.99999999999999999999\)"),
     ],
 )
 def test_holm_rejects_invalid_input(
@@ -525,6 +556,22 @@ def test_wilson_interval_is_immutable() -> None:
         (1, 10, Decimal("Infinity"), ValueError, "confidence must be finite"),
         # The level is validated even when there are no trials.
         (0, 0, Decimal("1.5"), ValueError, r"confidence must be in \(0, 1\)"),
+        # Inside (0, 1), but 1 - confidence is no float strictly inside it.
+        (
+            1,
+            10,
+            Decimal("1e-20"),
+            ValueError,
+            r"1 - confidence \(0.99999999999999999999\) is not representable strictly inside",
+        ),
+        (
+            1,
+            10,
+            Decimal("0." + "9" * 1000),
+            ValueError,
+            r"1 - confidence \(1E-1000\) is not representable strictly inside \(0, 1\)",
+        ),
+        (0, 0, Decimal("1e-20"), ValueError, r"1 - confidence \(0.99999999999999999999\)"),
     ],
 )
 def test_wilson_rejects_invalid_input(
@@ -643,11 +690,10 @@ def test_samples_of_one_and_two_per_group_are_sized_before_the_solver_runs(
     assert power_at(0.0001, 1.0, 1) >= 0.5
     assert power_at(0.0001, 1.0, 1) < 0.8 <= power_at(0.0001, 1.0, 2)
 
-    class NoSolver(NormalIndPower):  # type: ignore[misc]
-        def solve_power(self, *args: object, **kwargs: object) -> float:
-            raise AssertionError("solve_power must not run for samples of 1 or 2 per group")
+    def no_root_finder(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the root finder must not run for samples of 1 or 2 per group")
 
-    monkeypatch.setattr(stats, "NormalIndPower", NoSolver)
+    monkeypatch.setattr(stats, "brentq_expanding", no_root_finder)
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -686,11 +732,72 @@ def test_required_n_allows_a_target_of_exactly_one_and_a_baseline_of_one() -> No
     assert required_n(Decimal(1), Decimal("0.8"), alpha=ALPHA, power=POWER) == solver_n(1.0, 0.8)
 
 
-def test_required_n_too_small_for_the_solver_is_not_estimable() -> None:
-    with pytest.warns(ConvergenceWarning):
+@pytest.mark.parametrize("alpha", [Decimal("1e-30"), Decimal("1e-300")])
+def test_required_n_at_a_tiny_alpha_is_sized_where_the_library_solver_fails(
+    alpha: Decimal,
+) -> None:
+    # solve_power infers the direction from the power at 2 and at 50, equal here in floats.
+    assert library_solver_fails(0.1, 0.12, alpha=float(alpha))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = required_n(Decimal("0.1"), Decimal("0.12"), alpha=alpha, power=POWER)
+
+    assert result is not None
+    assert power_at(0.1, 0.12, result, alpha=float(alpha)) >= 0.8
+    assert power_at(0.1, 0.12, result - 1, alpha=float(alpha)) < 0.8
+
+
+def test_required_n_for_a_tiny_effect_is_sized_where_the_library_solver_fails() -> None:
+    # h is about 2e-11, below what the power at 2 and at 50 can tell apart in floats.
+    assert library_solver_fails(0.5, 0.50000000001, alpha=0.05)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         result = required_n(Decimal("0.5"), Decimal("0.50000000001"), alpha=ALPHA, power=POWER)
 
+    assert result is not None
+    assert result > 10**22
+    # Whole samples this large differ by less than float resolution; a millionth less fails.
+    assert power_at(0.5, 0.50000000001, result) >= 0.8
+    assert power_at(0.5, 0.50000000001, result - result // 1_000_000) < 0.8
+
+
+def test_required_n_for_an_unreachable_power_is_not_estimable_without_a_warning() -> None:
+    # h is about 8e-101: the power stays below 0.8 up to the root finder's 5e102 per group.
+    assert power_at(1e-200, 2e-200, 5 * 10**102) < 0.8
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = required_n(Decimal("1e-200"), Decimal("2e-200"), alpha=ALPHA, power=POWER)
+        extra = additional_n_for_difference(1, 10**200, 2, 10**200, alpha=ALPHA, power=POWER)
+
     assert result is None
+    assert extra is None
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ValueError("f(a) and f(b) must have different signs"),
+        RuntimeError("Failed to converge after 100 iterations"),
+        (3834.2, SimpleNamespace(converged=False)),
+        (math.inf, SimpleNamespace(converged=True)),
+        (-1.0, SimpleNamespace(converged=True)),
+    ],
+)
+def test_required_n_without_a_usable_root_is_not_estimable(
+    monkeypatch: pytest.MonkeyPatch, outcome: Exception | tuple[float, SimpleNamespace]
+) -> None:
+    def root_finder(*args: object, **kwargs: object) -> object:
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(stats, "brentq_expanding", root_finder)
+
+    assert required_n(Decimal("0.1"), Decimal("0.12"), alpha=ALPHA, power=POWER) is None
+    assert additional_n_for_difference(10, 100, 12, 100, alpha=ALPHA, power=POWER) is None
 
 
 @pytest.mark.parametrize(
@@ -709,6 +816,31 @@ def test_required_n_too_small_for_the_solver_is_not_estimable() -> None:
         (Decimal("0.1"), Decimal("0.12"), Decimal("0.5"), Decimal("0.4"), ValueError, "exceed"),
         # A configuration error is never masked as "not estimable".
         (Decimal(0), Decimal("0.1"), ALPHA, ALPHA, ValueError, "must exceed alpha"),
+        # Levels inside (0, 1) as Decimals, but not as the floats the power analysis takes.
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            Decimal("1e-1000"),
+            POWER,
+            ValueError,
+            r"alpha \(1E-1000\) is not representable strictly inside \(0, 1\) as a float",
+        ),
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            ALPHA,
+            Decimal("0.99999999999999999999"),
+            ValueError,
+            r"power \(0.99999999999999999999\) is not representable strictly inside \(0, 1\)",
+        ),
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            Decimal("0.3"),
+            Decimal("0.30000000000000000001"),
+            ValueError,
+            r"must exceed alpha \(0.3\) as a float; both convert to 0.3",
+        ),
     ],
 )
 def test_required_n_rejects_invalid_input(
@@ -727,20 +859,53 @@ def test_required_n_rejects_invalid_input(
         (20, 1000, 30, 1000),
         (1, 1000, 2, 1000),
         (0, 50, 1, 50),  # a variant without leads still has an observed rate of 0
-        (12, 800, 30, 1500),  # unequal samples: the larger one is subtracted
+        (12, 800, 30, 1500),  # unequal samples: each variant grows by the same increment
         (45, 3000, 40, 2000),
+        (20, 1000, 3000, 100000),  # the larger sample alone exceeds the equal-group sample
     ],
 )
-def test_additional_n_is_the_solver_sample_minus_the_larger_observed_sample(
+def test_additional_n_is_the_smallest_common_increment_that_reaches_the_power(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    result = additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER)
+
+    assert result is not None
+    assert result > 0
+    assert common_increment_power(x_a, n_a, x_b, n_b, result) >= 0.8
+    assert common_increment_power(x_a, n_a, x_b, n_b, result - 1) < 0.8
+    # Growing both variants to the equal-group sample always suffices.
+    low, high = sorted((x_a / n_a, x_b / n_b))
+    assert result <= solver_n(low, high) - min(n_a, n_b)
+    assert additional_n_for_difference(x_b, n_b, x_a, n_a, alpha=ALPHA, power=POWER) == result
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [(20, 1000, 30, 1000), (1, 1000, 2, 1000), (0, 50, 1, 50), (2, 1000, 9, 1000)],
+)
+def test_additional_n_for_equal_samples_is_the_solver_sample_minus_the_observed_one(
     x_a: int, n_a: int, x_b: int, n_b: int
 ) -> None:
     result = additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER)
 
     low, high = sorted((x_a / n_a, x_b / n_b))
-    expected = solver_n(low, high) - max(n_a, n_b)
-    assert expected > 0
-    assert result == expected
-    assert additional_n_for_difference(x_b, n_b, x_a, n_a, alpha=ALPHA, power=POWER) == result
+    assert result == solver_n(low, high) - n_a
+    assert result is not None
+    assert result > 0
+
+
+def test_imbalanced_delivery_still_needs_more_impressions_per_variant() -> None:
+    # 2% on 1,000 impressions against 3% on 100,000: the larger variant alone holds far more
+    # than the equal-group sample, yet the pair is not distinguishable.
+    comparison = compare_proportions(20, 1000, 3000, 100000)
+    result = additional_n_for_difference(20, 1000, 3000, 100000, alpha=ALPHA, power=POWER)
+
+    assert comparison is not None
+    assert comparison.p_value > Decimal("0.05")
+    assert solver_n(0.02, 0.03) == 3789
+    assert result == 931
+    assert power_at(0.02, 0.03, 1931, ratio=100931 / 1931) >= 0.8
+    assert power_at(0.02, 0.03, 1930, ratio=100930 / 1930) < 0.8
 
 
 def test_additional_n_uses_the_given_alpha_and_power() -> None:
@@ -753,17 +918,60 @@ def test_additional_n_uses_the_given_alpha_and_power() -> None:
 
 @pytest.mark.parametrize(
     ("x_a", "n_a", "x_b", "n_b"),
-    [(0, 10, 10, 10), (0, 1000, 5, 1000), (300, 1000, 30, 1000), (90, 100, 10, 100)],
+    [
+        (0, 10, 10, 10),
+        (0, 1000, 5, 1000),
+        (300, 1000, 30, 1000),
+        (90, 100, 10, 100),
+        # The smaller variant holds fewer than the equal-group 3,789; the larger makes up for it.
+        (40, 2000, 30000, 1000000),
+    ],
 )
 def test_additional_n_is_zero_when_the_samples_already_suffice(
     x_a: int, n_a: int, x_b: int, n_b: int
 ) -> None:
-    # Power grows with the sample, so the larger observed sample already reaching the target
-    # power means the smallest sufficient sample is no larger than it.
-    low, high = sorted((x_a / n_a, x_b / n_b))
-    assert power_at(low, high, max(n_a, n_b)) >= 0.8
+    # Power grows with either variant's sample, so observed samples that already reach the
+    # target power need no common increment, and the result is never negative.
+    assert common_increment_power(x_a, n_a, x_b, n_b, 0) >= 0.8
 
     assert additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER) == 0
+
+
+def test_a_larger_variant_can_make_up_for_a_smaller_one() -> None:
+    # The smaller variant alone falls short of the equal-group sample at 2% against 3%.
+    assert solver_n(0.02, 0.03) > 2000
+    assert additional_n_for_difference(40, 2000, 30000, 1000000, alpha=ALPHA, power=POWER) == 0
+    assert additional_n_for_difference(30000, 1000000, 40, 2000, alpha=ALPHA, power=POWER) == 0
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ValueError("f(a) and f(b) must have different signs"),
+        RuntimeError("Failed to converge after 100 iterations"),
+        (931.5, SimpleNamespace(converged=False)),
+        (math.nan, SimpleNamespace(converged=True)),
+        # A root no whole increment next to it confirms, as floating-point noise could give.
+        (0.5, SimpleNamespace(converged=True)),
+    ],
+)
+def test_additional_n_falls_back_to_the_equal_group_bound_when_the_root_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, outcome: Exception | tuple[float, SimpleNamespace]
+) -> None:
+    def root_finder(function: Any, **kwargs: Any) -> Any:
+        if kwargs["upp"] is None:  # the equal-group sample, sized by the real root finder
+            return brentq_expanding(function, **kwargs)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(stats, "brentq_expanding", root_finder)
+
+    result = additional_n_for_difference(20, 1000, 3000, 100000, alpha=ALPHA, power=POWER)
+
+    # Both variants at the equal-group sample: always enough, if far more than needed.
+    assert result == solver_n(0.02, 0.03) - 1000 == 2789
+    assert common_increment_power(20, 1000, 3000, 100000, 2789) >= 0.8
 
 
 @pytest.mark.parametrize(
@@ -799,6 +1007,21 @@ def test_float_equal_rates_really_differ_exactly() -> None:
         ((1, 10, 2, 10), ALPHA, Decimal("1.2"), ValueError, r"power must be in \(0, 1\)"),
         ((1, 10, 2, 10), Decimal("0.2"), Decimal("0.1"), ValueError, "must exceed alpha"),
         ((1, 0, 2, 10), ALPHA, ALPHA, ValueError, "must exceed alpha"),
+        ((1, 10, 2, 10), Decimal("1e-1000"), POWER, ValueError, r"alpha \(1E-1000\) is not"),
+        (
+            (1, 10, 2, 10),
+            ALPHA,
+            Decimal("0.99999999999999999999"),
+            ValueError,
+            r"power \(0.99999999999999999999\) is not representable strictly inside \(0, 1\)",
+        ),
+        (
+            (1, 0, 2, 10),
+            Decimal("0.3"),
+            Decimal("0.30000000000000000001"),
+            ValueError,
+            r"must exceed alpha \(0.3\) as a float",
+        ),
     ],
 )
 def test_additional_n_rejects_invalid_input(
