@@ -6,16 +6,23 @@ AAP 0.3.2 ("Freshness and coverage per dataset"). Every source dataset has one
 one named dataset as a :class:`FreshnessOutcome`, and :func:`record_freshness` folds that
 outcome into the stored row:
 
-* ``last_attempt_at`` moves on every attempt; ``last_success_at`` only on success.
+* ``last_attempt_at`` moves on every later attempt; ``last_success_at`` only on a later
+  success.
 * ``covered_from`` / ``covered_through`` are the native dates the stored data covers. A
-  success extends the stored range when the new range overlaps or touches it, and replaces
-  it otherwise, so a gap in coverage is never hidden behind one wide range.
+  success extends the stored range when the new range overlaps or touches it, and a later
+  success replaces it otherwise, so a gap in coverage is never hidden behind one wide range.
 * ``completeness`` is ``complete``, ``incomplete`` or ``unknown``. A success writes
   ``complete`` or ``incomplete``, never ``unknown``. An incremental success that re-reads
   only part of the stored range never turns an ``incomplete`` row ``complete``: only an
   attempt that re-covers the whole stored range may do that.
 * A failure changes only ``last_attempt_at`` and ``reason``; the last good data, its
   coverage and its completeness stand (AAP 0.3.3, transient row of the fallback table).
+* Outcomes are folded in the order their attempts started, whatever order they commit
+  in. Both timestamps only move forward. A failure that started before the stored latest
+  attempt is obsolete and changes nothing. A success that started before the stored
+  latest success is merged conservatively: it never makes the row look better or newer,
+  and a range that leaves a gap to the stored one changes nothing. A success that started
+  before a stored failed attempt keeps that newer failure's reason.
 
 Consumers (the analysis runner and the current-state overlay) derive the per-item
 ``stale`` and ``incomplete`` flags from these rows and the item's required datasets. This
@@ -398,6 +405,61 @@ def _failure_reason(stored: _State, failure: str) -> str:
     return failure
 
 
+def _later(stored: datetime | None, attempted_at: datetime) -> datetime:
+    """Return the later of a stored instant and an attempt's start; ``None`` is earliest."""
+    return attempted_at if stored is None else max(stored, attempted_at)
+
+
+def _newer_failure_reason(stored: _State, attempted_at: datetime) -> str | None:
+    """Return the reason of a stored failed attempt that started after ``attempted_at``.
+
+    The stored latest attempt is a failure when it is later than the stored latest success,
+    or when there is no success at all. Its reason is the text after
+    :data:`_FAILURE_MARKER` when a failure note was appended to a shortfall, and the whole
+    stored reason otherwise (see :func:`_failure_reason`).
+
+    Returns:
+        The failure's reason, or ``None`` when the stored latest attempt is not a failure
+        that started after ``attempted_at``, or the row records no reason for it.
+    """
+    last_attempt, last_success = stored.last_attempt_at, stored.last_success_at
+    if last_attempt is None or last_attempt <= attempted_at:
+        return None
+    if last_success is not None and last_success >= last_attempt:
+        return None
+    if stored.reason is None:
+        return None
+    shortfall, marker, note = stored.reason.partition(_FAILURE_MARKER)
+    return (note if marker else shortfall) or None
+
+
+def _ranges_touch(
+    first_from: date, first_through: date, second_from: date, second_through: date
+) -> bool:
+    """Return whether two closed date ranges overlap or are adjacent (no day between)."""
+    return first_from <= second_through + _ONE_DAY and second_from <= first_through + _ONE_DAY
+
+
+def _disjoint(stored: _State, outcome: FreshnessOutcome) -> bool:
+    """Return whether a success's range and the stored verified range leave a gap.
+
+    This is the case in which :func:`_merge_coverage` lets the new range replace the stored
+    one. It is false for a full-state read, for a row with no stored range and for an
+    ``unknown`` row, where nothing verified stands to be replaced.
+    """
+    new_from, new_through = outcome.covered_from, outcome.covered_through
+    old_from, old_through = stored.covered_from, stored.covered_through
+    if (
+        new_from is None
+        or new_through is None
+        or old_from is None
+        or old_through is None
+        or stored.completeness == "unknown"
+    ):
+        return False
+    return not _ranges_touch(new_from, new_through, old_from, old_through)
+
+
 def _merge_coverage(
     stored: _State, outcome: FreshnessOutcome
 ) -> tuple[date | None, date | None, bool]:
@@ -416,8 +478,7 @@ def _merge_coverage(
     if old_from is None or old_through is None or stored.completeness == "unknown":
         # Nothing verified is stored, so the new range is the coverage.
         return new_from, new_through, True
-    touches = new_from <= old_through + _ONE_DAY and old_from <= new_through + _ONE_DAY
-    if not touches:
+    if not _ranges_touch(new_from, new_through, old_from, old_through):
         # Disjoint ranges: one wide range would hide the gap between them, so the new
         # range replaces the stored one.
         return new_from, new_through, True
@@ -428,12 +489,14 @@ def _merge_coverage(
 
 
 def _worse(stored: _State, outcome: FreshnessOutcome) -> tuple[Completeness, str | None]:
-    """Combine completeness when the attempt re-read only part of the stored range.
+    """Combine completeness when the attempt's own completeness may not replace the stored one.
 
-    ``incomplete`` beats ``complete``. When the stored row is the worse one its shortfall
-    reason is kept, because the attempt did not re-read the part that fell short. When both
-    are incomplete, a repairable reason wins over a permanent one, so a deferred shortfall
-    is never masked by one refetching cannot remove; otherwise the older shortfall stays.
+    That is when the attempt re-read only part of the stored range, or when it started
+    before the stored latest success. ``incomplete`` beats ``complete``. When the stored
+    row is the worse one its shortfall reason is kept, because the attempt did not re-read
+    the part that fell short. When both are incomplete, a repairable reason wins over a
+    permanent one, so a deferred shortfall is never masked by one refetching cannot remove;
+    otherwise the stored shortfall stays.
     """
     shortfall = _without_failure_note(stored.reason)
     if stored.completeness != "incomplete":
@@ -450,30 +513,60 @@ def _worse(stored: _State, outcome: FreshnessOutcome) -> tuple[Completeness, str
 def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
     """Fold one attempt's outcome into the stored state (pure; no I/O).
 
-    A failure moves only ``last_attempt_at`` and ``reason``. A success moves both
-    timestamps, merges coverage with :func:`_merge_coverage`, and takes the attempt's
-    completeness when it re-read the whole stored range, or :func:`_worse` otherwise.
+    Attempts can commit out of start order (a slow attempt finishes after a later, faster
+    one), so the merge is chronological on ``attempted_at`` rather than on commit order:
+
+    * Timestamps never move back: ``last_attempt_at`` becomes the later of the stored value
+      and ``attempted_at``, and on success so does ``last_success_at``.
+    * A failure that started before the stored latest attempt is obsolete: a later attempt
+      already recorded the dataset's health, so the stored state is returned unchanged.
+      Otherwise the failure moves only ``last_attempt_at`` and ``reason``.
+    * A success that started before the stored latest success is obsolete for the data and
+      never makes the row look better or newer. A range that leaves a gap to the stored one
+      changes nothing; otherwise the coverage merges with :func:`_merge_coverage` and the
+      completeness and reason come from :func:`_worse`.
+    * Any other success merges coverage with :func:`_merge_coverage` and takes the
+      attempt's completeness when it re-read the whole stored range, or :func:`_worse`
+      otherwise.
+    * A success that started before a stored failed attempt keeps that failure's reason
+      (:func:`_failure_reason`), so the row reads as if both had committed in start order.
     """
+    attempted_at = outcome.attempted_at
+    last_attempt_at = _later(stored.last_attempt_at, attempted_at)
     if not outcome.succeeded:
+        if stored.last_attempt_at is not None and attempted_at < stored.last_attempt_at:
+            return stored
         failure = outcome.reason or "attempt failed"
         return replace(
             stored,
-            last_attempt_at=outcome.attempted_at,
+            last_attempt_at=last_attempt_at,
             reason=_failure_reason(stored, failure),
         )
-    covered_from, covered_through, recovered_all = _merge_coverage(stored, outcome)
-    if recovered_all:
-        completeness, reason = outcome.completeness, outcome.reason
-    else:
+    if stored.last_success_at is not None and attempted_at < stored.last_success_at:
+        if _disjoint(stored, outcome):
+            # The older range must neither replace the newer one nor be united with it
+            # across the gap, so the stored coverage, completeness and reason stand.
+            return replace(stored, last_attempt_at=last_attempt_at)
+        covered_from, covered_through, _ = _merge_coverage(stored, outcome)
         completeness, reason = _worse(stored, outcome)
-    return _State(
-        last_attempt_at=outcome.attempted_at,
-        last_success_at=outcome.attempted_at,
+    else:
+        covered_from, covered_through, recovered_all = _merge_coverage(stored, outcome)
+        if recovered_all:
+            completeness, reason = outcome.completeness, outcome.reason
+        else:
+            completeness, reason = _worse(stored, outcome)
+    merged = _State(
+        last_attempt_at=last_attempt_at,
+        last_success_at=_later(stored.last_success_at, attempted_at),
         covered_from=covered_from,
         covered_through=covered_through,
         completeness=completeness,
         reason=reason,
     )
+    newer_failure = _newer_failure_reason(stored, attempted_at)
+    if newer_failure is not None:
+        return replace(merged, reason=_failure_reason(merged, newer_failure))
+    return merged
 
 
 async def record_freshness(
@@ -487,22 +580,35 @@ async def record_freshness(
     The row is keyed (``dataset_id``, ``dataset``) and only that row is touched, so
     recording ``google.entities`` never changes ``google.metrics_daily``.
 
-    * **Failure**: ``last_attempt_at`` and ``reason`` change. ``last_success_at``, the
-      coverage and the completeness stand, so the last good data keeps its standing until
-      consumers judge it stale; a first-ever failure records ``unknown``. On an
-      ``incomplete`` row the failure is appended to the stored shortfall reason.
-    * **Success**: ``last_attempt_at`` and ``last_success_at`` become ``attempted_at``.
-      The coverage becomes the union of the stored and new ranges when they overlap or
-      are adjacent, and the new range otherwise. The attempt's completeness and reason
-      apply when it re-read the whole stored range; otherwise the worse of stored and new
-      is kept, so a trailing-days refresh never turns a backfill-incomplete row complete.
-      ``unknown`` is never written on success.
+    * **Failure** started no earlier than the stored ``last_attempt_at``:
+      ``last_attempt_at`` and ``reason`` change. ``last_success_at``, the coverage and the
+      completeness stand, so the last good data keeps its standing until consumers judge
+      it stale; a first-ever failure records ``unknown``. On an ``incomplete`` row the
+      failure is appended to the stored shortfall reason.
+    * **Success** started no earlier than the stored ``last_success_at``:
+      ``last_success_at`` becomes ``attempted_at``, and so does ``last_attempt_at``
+      unless a later attempt is already stored. The coverage becomes the union of the
+      stored and new ranges when they overlap or are adjacent, and the new range
+      otherwise. The attempt's completeness and reason apply when it re-read the whole
+      stored range; otherwise the worse of stored and new is kept, so a trailing-days
+      refresh never turns a backfill-incomplete row complete. ``unknown`` is never
+      written on success.
+    * **Chronology**: outcomes fold in the order their attempts started, not the order
+      they commit in, and ``last_attempt_at`` and ``last_success_at`` never move back. A
+      failure that started before the stored ``last_attempt_at`` is obsolete and leaves
+      the row unchanged. A success that started before the stored ``last_success_at`` is
+      merged conservatively and never makes the row look better or newer: a range that
+      leaves a gap to the stored one changes nothing, and otherwise the coverage merges as
+      above while the worse completeness and its reason are kept. A success that started
+      before a stored failed attempt keeps that failure's reason, as if the two had
+      committed in start order. Recording the same outcome again changes nothing.
 
     Concurrent writers of the same row serialize: an empty row is first inserted with
     ``ON CONFLICT DO NOTHING`` so that the following ``SELECT ... FOR UPDATE`` always has
     a row to lock, then the merged state is written with ``INSERT ... ON CONFLICT DO
-    UPDATE``. The function flushes but never commits; the caller's transaction makes the
-    freshness row atomic with the data it describes.
+    UPDATE``. The lock orders the writes but not the attempts, which is why the merge
+    compares start times. The function flushes but never commits; the caller's
+    transaction makes the freshness row atomic with the data it describes.
 
     Args:
         session: The caller's session, inside the transaction that wrote the data.

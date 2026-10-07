@@ -28,6 +28,16 @@ job transaction, under ``SELECT ... FOR UPDATE`` on that row. The row lock is th
 held for milliseconds, and concurrent coroutines and processes cannot overspend. No count
 is ever cached in process, and database errors propagate unchanged.
 
+The clock that places a call in its hour is read only once the row lock is held, so a
+call that waited for the lock is placed at the instant it is admitted, not when it asked.
+An admitted call is booked in the hour that holds that instant plus the dispatch bound
+(140 s), the longest its POST can take to start leaving once ``acquire`` returns: a call
+admitted in the last 140 s of an hour counts in the next hour, which the window already
+counts. The bound runs from the return, not the admission, so the clock is read again
+once the booking has committed. When the commit took so long that the POST could now
+start after the booked hour, the booking stays counted and the call is reserved afresh,
+or refused, so a POST never leaves after the hour it was booked in.
+
 Example:
     One ``acquire`` per POST attempt; a refusal is a deferral, never a retry::
 
@@ -54,6 +64,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.connectors.errors import CallBudgetExhausted
+from ads_engine.connectors.http import CONNECT_TIMEOUT_SECONDS, SOURCE_TIMEOUTS
 from ads_engine.db.models.ops import SourceConnection
 from ads_engine.db.session import get_sessionmaker
 from ads_engine.logging import get_logger
@@ -81,6 +92,21 @@ _LOG_EVERY_CALLS: Final = 50
 # exactly WINDOW_BUCKETS hours after the bucket itself started.
 _LOOKBACK: Final = timedelta(hours=WINDOW_BUCKETS - 1)
 _BUCKET_LIFETIME: Final = timedelta(hours=WINDOW_BUCKETS)
+
+# The dispatch bound: the longest time from acquire() returning to its POST starting to
+# leave. connectors/http.py builds the request at once and hands it to httpx. The AAP's
+# 120 s Google per-call timeout is the client's pool, read and write setting, so httpx
+# waits at most 120 s for a pooled connection. A new connection then opens under the
+# 10 s connect timeout, which httpcore applies to the TCP connect (name resolution
+# included) and again to the TLS handshake of the https webhook. Past either limit httpx
+# raises PoolTimeout or ConnectTimeout instead of sending later, so on a direct connection
+# the POST starts to leave within 120 + 10 + 10 = 140 s. The call is booked in the hour
+# holding admission + bound, and acquire() re-checks that hour against the clock after
+# the commit, so the booked bucket is never earlier than the hour the POST leaves in and
+# the call keeps counting for at least 24 h after it is made. That bucket is at most the
+# next one, which _evaluate already counts as a bucket ahead of the current one, so the
+# call also counts from the moment it is reserved.
+_DISPATCH_BOUND: Final = timedelta(seconds=SOURCE_TIMEOUTS["google"] + 2 * CONNECT_TIMEOUT_SECONDS)
 
 _BUCKET_KEY_FORMAT: Final = "%Y-%m-%dT%H"
 _BUCKET_KEY_RE: Final = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})")
@@ -172,8 +198,9 @@ class _Window:
         now: The UTC instant the window was evaluated at.
         current: Start of the current UTC hour bucket.
         buckets: Counted bucket starts and their positive counts. Buckets later than
-            ``current`` (written by a process whose clock runs ahead) are kept and
-            counted, which errs towards refusing a call rather than overspending.
+            ``current`` (a call booked in the next hour under the dispatch bound, or one
+            written by a process whose clock runs ahead) are kept and counted, which errs
+            towards refusing a call rather than overspending.
         used: The sum of ``buckets``.
         dirty: Whether the stored row differs from this pruned state and must be written.
     """
@@ -184,10 +211,36 @@ class _Window:
     used: int
     dirty: bool
 
+    @property
+    def reservation(self) -> datetime:
+        """Start of the bucket a call admitted at ``now`` is booked in.
+
+        It is the UTC hour holding ``now`` plus the 140 s dispatch bound: ``current`` for
+        most of the hour, and the next hour for a call admitted within the bound of the
+        hour's end, whose POST may start after that end. ``acquire`` relies on the booking
+        only when :meth:`covers_dispatch_after` holds for the instant it returns at.
+        """
+        return _hour_start(self.now + _DISPATCH_BOUND)
+
+    def covers_dispatch_after(self, instant: datetime) -> bool:
+        """Whether a POST that starts within the dispatch bound of ``instant`` stays booked.
+
+        Args:
+            instant: The aware UTC instant from which the POST may still be delayed by up
+                to the dispatch bound, read after the booking committed.
+
+        Returns:
+            ``True`` when the latest such POST falls in the :attr:`reservation` hour or
+            before it, so the booking keeps counting for at least 24 h after the POST.
+            ``False`` when it could fall in a later hour, whose call the booking would
+            stop counting less than 24 h after it was made.
+        """
+        return _hour_start(instant + _DISPATCH_BOUND) <= self.reservation
+
     def with_call(self) -> dict[datetime, int]:
-        """Return the buckets with one more call in the current hour."""
+        """Return the buckets with one more call in the :attr:`reservation` bucket."""
         buckets = dict(self.buckets)
-        buckets[self.current] = buckets.get(self.current, 0) + 1
+        buckets[self.reservation] = buckets.get(self.reservation, 0) + 1
         return buckets
 
     def seconds_until_free(self, cap: int) -> float | None:
@@ -262,28 +315,37 @@ def _evaluate(stored_hourly: object, stored_total: int, now: datetime) -> _Windo
 
 @overload
 async def _lock_window(
-    session: AsyncSession, now: datetime, *, create: Literal[True]
+    session: AsyncSession, clock: Callable[[], datetime], *, create: Literal[True]
 ) -> _Window: ...
 
 
 @overload
 async def _lock_window(
-    session: AsyncSession, now: datetime, *, create: Literal[False]
+    session: AsyncSession, clock: Callable[[], datetime], *, create: Literal[False]
 ) -> _Window | None: ...
 
 
-async def _lock_window(session: AsyncSession, now: datetime, *, create: bool) -> _Window | None:
+async def _lock_window(
+    session: AsyncSession, clock: Callable[[], datetime], *, create: bool
+) -> _Window | None:
     """Lock the Google ``source_connection`` row and evaluate its window.
+
+    The clock is read only after the row lock is held, on the create path too. However
+    long the lock wait took, the window is evaluated, and a call booked, at the instant
+    the row is this transaction's, which no other holder can still change.
 
     Args:
         session: A session inside the transaction that will write the row.
-        now: The aware UTC instant to evaluate at.
+        clock: Returns the aware UTC instant to evaluate at; read once, under the lock.
         create: Whether to create the row when it does not exist yet.
 
     Returns:
         The pruned window, or ``None`` when the row is absent and ``create`` is false.
+        The clock is not read when ``None`` is returned.
 
     Raises:
+        ValueError: When ``clock`` raises it for a naive instant; the caller's transaction
+            then rolls back and nothing is counted.
         sqlalchemy.exc.SQLAlchemyError: On any database failure, including a lock wait
             beyond the lock timeout.
     """
@@ -296,7 +358,7 @@ async def _lock_window(session: AsyncSession, now: datetime, *, create: bool) ->
         # once per database, and ON CONFLICT covers two processes creating it at once.
         await session.execute(_ENSURE_ROW)
         row = (await session.execute(_LOCK_ROW)).one()
-    return _evaluate(row.calls_hourly, row.calls_24h, now)
+    return _evaluate(row.calls_hourly, row.calls_24h, clock())
 
 
 async def _store(session: AsyncSession, buckets: Mapping[datetime, int], used: int) -> None:
@@ -322,22 +384,29 @@ class GoogleCallBudget:
     and a CLI process holding separate instances share one count.
 
     **Window.** Calls are counted in UTC hour buckets, and the window is the current hour
-    bucket plus the 24 preceding ones (:data:`WINDOW_BUCKETS`). Hour buckets can only
-    approximate a sliding 24 h, so the approximation is deliberately conservative: any
-    24 h interval ending now lies inside those 25 buckets, so the count is never below the
-    true number of calls in the trailing 24 h, and no 24 h interval can ever exceed the
-    cap. The price is that a call keeps counting for up to 25 h. Advancing 25 h from a
-    call always frees it.
+    bucket plus the 24 preceding ones (:data:`WINDOW_BUCKETS`), together with any bucket
+    ahead of it. Hour buckets can only approximate a sliding 24 h, so the approximation is
+    deliberately conservative: any 24 h interval ending now lies inside those 25 buckets,
+    so the count is never below the true number of calls in the trailing 24 h, and no 24 h
+    interval can ever exceed the cap. A call is booked in the hour holding its admission
+    instant plus the 140 s dispatch bound, the longest its POST can take to start leaving
+    once :meth:`acquire` returns: a call admitted within 140 s of an hour's end is booked
+    in the next hour. The price is that a call keeps counting for up to 25 h plus that
+    bound. Advancing 25 h plus the bound from a call's last admission always frees it. A
+    reservation whose commit lasts so long that the POST could start after the booked
+    hour is not relied on: it stays counted, and the call is reserved again or refused, so
+    one such call may count twice for a day.
 
     **Cap.** ``Settings.google_daily_call_budget`` (``GOOGLE_DAILY_CALL_BUDGET``, 1,000 by
     default). A cap of 0 refuses every call. A lowered cap takes effect at once: calls
     already counted above it stay counted until they leave the window.
 
-    **Transactions.** Each method opens its own short session and transaction, never the
-    caller's, takes ``SELECT ... FOR UPDATE`` on the row (waiting at most 10 s for the
-    lock) and commits before returning or raising. Correctness rests on that row lock, so
-    concurrent coroutines and processes cannot overspend, and nothing is cached in
-    process. Database errors (:class:`sqlalchemy.exc.SQLAlchemyError`) propagate.
+    **Transactions.** Each method opens its own short sessions and transactions, never the
+    caller's: one per reservation or read, each taking ``SELECT ... FOR UPDATE`` on the
+    row (waiting at most 10 s for the lock) and committing before the method returns or
+    raises. Correctness rests on that row lock, so concurrent coroutines and processes
+    cannot overspend, and nothing is cached in process. Database errors
+    (:class:`sqlalchemy.exc.SQLAlchemyError`) propagate.
 
     Example:
         Two processes share one cap through the database::
@@ -397,27 +466,49 @@ class GoogleCallBudget:
         partition and retry attempts. A counted call stays counted whether or not the POST
         then succeeds: Google charges an operation even for a rejected request.
 
+        The clock is checked before any session is opened, but the instant that admits and
+        places the call is read only once the row lock is held, so a wait for the lock
+        across an hour's end cannot book the call in the hour it asked in. The call is
+        booked in the hour holding that instant plus the 140 s dispatch bound.
+
+        The bound runs from this method's return, so the clock is read again after the
+        booking commits. When the UPDATE or the COMMIT took so long that the POST could
+        now start after the booked hour, the booking would stop counting less than 24 h
+        after the POST, so it is not relied on: ``google.budget.reservation_expired`` is
+        logged, the booking stays counted (an over-count, which only errs towards
+        refusing), and the call is reserved afresh in a new short transaction, with the
+        clock read under the lock and the cap checked again. That repeats until a booking
+        covers the POST, or a reservation is refused.
+
         Raises:
             CallBudgetExhausted: When the window already holds ``cap`` calls. Its
                 ``retry_after`` is the number of seconds until a call frees up, which is
                 when the oldest counted hour bucket leaves the window whenever the window
-                holds exactly ``cap`` calls; ``None`` for a cap of 0. Nothing is counted
-                for a refused call.
-            ValueError: When the injected clock returns a naive datetime.
-            sqlalchemy.exc.SQLAlchemyError: On any database failure; nothing is counted.
+                holds exactly ``cap`` calls; ``None`` for a cap of 0. A refused
+                reservation counts nothing; an expired booking it was to replace stays
+                counted. No POST may be made.
+            ValueError: When the injected clock returns a naive datetime. On a reading
+                after a commit, the booking stays counted and no POST may be made.
+            sqlalchemy.exc.SQLAlchemyError: On any database failure; the failed
+                reservation counts nothing.
         """
-        now = self._now()
-        async with self._sessions()() as session, session.begin():
-            window = await _lock_window(session, now, create=True)
-            refused = window.used >= self._cap
-            if refused:
-                if window.dirty:
-                    await _store(session, window.buckets, window.used)
-            else:
-                await _store(session, window.with_call(), window.used + 1)
-        # Raised and logged only after the commit, so the pruned counters persist.
-        if refused:
-            raise self._exhausted(window)
+        # Fails fast on a clock without an offset; this reading places nothing.
+        self._now()
+        window = await self._reserve()
+        # A booking fails this check only when the clock passed its hour's end less the
+        # dispatch bound between the reading under the lock and the one after the commit.
+        # A fresh booking is placed by a reading taken no earlier than that one, so each
+        # further failure needs wall time to pass another hour's end, and each
+        # re-reservation takes one more call of the cap: the loop runs at most once more
+        # per elapsed hour, and at most ``cap`` times before a reservation is refused.
+        while not window.covers_dispatch_after(after_commit := self._now()):
+            _log.warning(
+                "google.budget.reservation_expired",
+                source=_SOURCE,
+                booked=_bucket_key(window.reservation),
+                needed=_bucket_key(_hour_start(after_commit + _DISPATCH_BOUND)),
+            )
+            window = await self._reserve()
         used = window.used + 1
         if used % _LOG_EVERY_CALLS == 0:
             self._log_usage(used)
@@ -427,7 +518,8 @@ class GoogleCallBudget:
 
         Persists the pruned ``calls_hourly`` and the recomputed ``calls_24h``, so
         ``/sources`` stays current while no calls are made; the scheduler calls this on
-        each wake. The row is written only when pruning changed it.
+        each wake. The row is written only when pruning changed it. As in :meth:`acquire`,
+        the window is evaluated at the clock read once the row lock is held.
 
         Returns:
             The calls counted in the window. 0 when no Google call was ever metered, in
@@ -438,9 +530,10 @@ class GoogleCallBudget:
             ValueError: When the injected clock returns a naive datetime.
             sqlalchemy.exc.SQLAlchemyError: On any database failure.
         """
-        now = self._now()
+        # Fails fast on a clock without an offset; this reading is not the one evaluated.
+        self._now()
         async with self._sessions()() as session, session.begin():
-            window = await _lock_window(session, now, create=False)
+            window = await _lock_window(session, self._now, create=False)
             if window is not None and window.dirty:
                 await _store(session, window.buckets, window.used)
         return 0 if window is None else window.used
@@ -456,6 +549,33 @@ class GoogleCallBudget:
             sqlalchemy.exc.SQLAlchemyError: On any database failure.
         """
         return max(self._cap - await self.used_24h(), 0)
+
+    async def _reserve(self) -> _Window:
+        """Book one call in a short transaction of its own, or refuse it.
+
+        Returns:
+            The window the call was admitted in, evaluated at the clock read under the row
+            lock; its :attr:`_Window.reservation` is the bucket the call was booked in, and
+            ``used`` excludes the call.
+
+        Raises:
+            CallBudgetExhausted: When the window already holds ``cap`` calls; nothing is
+                booked.
+            ValueError: When the clock read under the lock is naive; nothing is booked.
+            sqlalchemy.exc.SQLAlchemyError: On any database failure; nothing is booked.
+        """
+        async with self._sessions()() as session, session.begin():
+            window = await _lock_window(session, self._now, create=True)
+            refused = window.used >= self._cap
+            if refused:
+                if window.dirty:
+                    await _store(session, window.buckets, window.used)
+            else:
+                await _store(session, window.with_call(), window.used + 1)
+        # Raised and logged only after the commit, so the pruned counters persist.
+        if refused:
+            raise self._exhausted(window)
+        return window
 
     def _now(self) -> datetime:
         """Read the clock as an aware UTC instant.

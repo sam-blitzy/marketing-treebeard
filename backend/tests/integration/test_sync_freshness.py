@@ -725,6 +725,307 @@ def test_merge_of_a_partial_re_read_keeps_the_worse_completeness() -> None:
 
 
 # ---------------------------------------------------------------------------------------
+# Merge rules: chronology (outcomes committed out of start order)
+# ---------------------------------------------------------------------------------------
+
+NOTED = f"{DEFERRED}{FAILURE_MARKER}timeout"
+"""An incomplete row's reason after a ``timeout`` failure."""
+
+
+@pytest.mark.parametrize(
+    ("stored", "attempt", "expected"),
+    [
+        pytest.param(None, 1, 1, id="none-is-earliest"),
+        pytest.param(2, 1, 2, id="stored-later"),
+        pytest.param(1, 2, 2, id="attempt-later"),
+        pytest.param(1, 1, 1, id="tie"),
+    ],
+)
+def test_later_never_moves_an_instant_back(stored: int | None, attempt: int, expected: int) -> None:
+    """The later of the stored instant and the attempt's start wins; ``None`` is earliest."""
+    assert freshness._later(None if stored is None else _at(stored), _at(attempt)) == _at(expected)
+
+
+@pytest.mark.parametrize(
+    ("stored", "attempt", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2), 1, "timeout", id="complete-row"
+        ),
+        pytest.param(_stored((1, 28), "incomplete", NOTED, attempt=2), 1, "timeout", id="noted"),
+        pytest.param(
+            _stored((1, 28), "incomplete", "timeout", attempt=2),
+            1,
+            "timeout",
+            id="incomplete-row-without-shortfall",
+        ),
+        pytest.param(
+            _stored(None, "unknown", "HTTP 502", attempt=2, success=None),
+            1,
+            "HTTP 502",
+            id="never-succeeded",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete", attempt=2, success=2), 1, None, id="latest-is-a-success"
+        ),
+        pytest.param(_stored((1, 28), "complete", "timeout", attempt=2), 2, None, id="tie"),
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2), 3, None, id="failure-before-attempt"
+        ),
+        pytest.param(_stored((1, 28), "complete", attempt=2), 1, None, id="no-reason-recorded"),
+        pytest.param(
+            _stored((1, 28), "incomplete", f"{DEFERRED}{FAILURE_MARKER}", attempt=2),
+            1,
+            None,
+            id="empty-note",
+        ),
+    ],
+)
+def test_newer_failure_reason_reads_a_later_failed_attempt_only(
+    stored: freshness._State, attempt: int, expected: str | None
+) -> None:
+    """Only a stored failure that started after the attempt yields its reason."""
+    assert freshness._newer_failure_reason(stored, _at(attempt)) == expected
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(_stored((1, 28), "complete", attempt=2, success=2), id="newer-success"),
+        pytest.param(
+            _stored((1, 28), "incomplete", DEFERRED, attempt=2, success=2),
+            id="newer-incomplete-success",
+        ),
+        pytest.param(_stored((1, 28), "complete", "HTTP 429", attempt=2), id="newer-failure"),
+        pytest.param(_stored((1, 28), "incomplete", NOTED, attempt=2), id="newer-noted-failure"),
+        pytest.param(
+            _stored(None, "unknown", "HTTP 502", attempt=2, success=None), id="newer-first-failure"
+        ),
+    ],
+)
+def test_merge_ignores_a_failure_older_than_the_stored_attempt(stored: freshness._State) -> None:
+    """A delayed failure changes nothing: a later attempt already recorded the health."""
+    late = FreshnessOutcome.failure(_at(1), reason="HTTP 503 after 3 attempts")
+    assert freshness._merge(stored, late) == stored
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "complete", attempt=2, success=2),
+            _success(1, (26, 30)),
+            freshness._State(_at(2), _at(2), _day(1), _day(30), "complete", None),
+            id="overlapping-ranges-unite",
+        ),
+        pytest.param(
+            _stored((10, 20), "complete", attempt=2, success=2),
+            _success(1, (1, 9)),
+            freshness._State(_at(2), _at(2), _day(1), _day(20), "complete", None),
+            id="adjacent-ranges-unite",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", DEFERRED, attempt=2, success=2),
+            _success(1, (1, 30)),
+            freshness._State(_at(2), _at(2), _day(1), _day(30), "incomplete", DEFERRED),
+            id="complete-superset-never-upgrades",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete", attempt=2, success=2),
+            _deferred(1, (26, 30)),
+            freshness._State(_at(2), _at(2), _day(1), _day(30), "incomplete", DEFERRED),
+            id="incomplete-read-downgrades",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", None, attempt=2, success=2),
+            _success(1, (20, 30)),
+            freshness._State(
+                _at(2), _at(2), _day(1), _day(30), "incomplete", freshness._UNSPECIFIED_SHORTFALL
+            ),
+            id="incomplete-always-has-a-reason",
+        ),
+        pytest.param(
+            _stored((12, 15), "complete", attempt=2, success=2),
+            _success(1, (1, 5)),
+            _stored((12, 15), "complete", attempt=2, success=2),
+            id="disjoint-earlier-range-changes-nothing",
+        ),
+        pytest.param(
+            _stored((1, 5), "incomplete", DEFERRED, attempt=2, success=2),
+            _success(1, (12, 15)),
+            _stored((1, 5), "incomplete", DEFERRED, attempt=2, success=2),
+            id="disjoint-later-range-changes-nothing",
+        ),
+        pytest.param(
+            _stored(None, "incomplete", INTERRUPTED, attempt=2, success=2),
+            _success(1, None),
+            freshness._State(_at(2), _at(2), None, None, "incomplete", INTERRUPTED),
+            id="full-state-read-never-upgrades",
+        ),
+        pytest.param(
+            _stored(None, "complete", attempt=2, success=2),
+            _success(1, (1, 28)),
+            freshness._State(_at(2), _at(2), _day(1), _day(28), "complete", None),
+            id="no-stored-range-takes-the-range",
+        ),
+        pytest.param(
+            _stored((1, 10), "unknown", attempt=2, success=2),
+            _success(1, (12, 15)),
+            freshness._State(_at(2), _at(2), _day(12), _day(15), "complete", None),
+            id="unknown-row-takes-the-range",
+        ),
+    ],
+)
+def test_merge_of_a_success_older_than_the_stored_success_is_conservative(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """A delayed success moves no timestamp back and never makes the row look better."""
+    merged = freshness._merge(stored, outcome)
+    assert merged == expected
+    assert merged.completeness != "unknown"
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2),
+            _success(1, (26, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "complete", "timeout"),
+            id="complete-row",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2),
+            _success(1, (26, 30), complete=False, reason=REASON_FINEST_PARTITION),
+            freshness._State(
+                _at(2),
+                _at(1),
+                _day(1),
+                _day(30),
+                "incomplete",
+                f"{REASON_FINEST_PARTITION}{FAILURE_MARKER}timeout",
+            ),
+            id="complete-row-incomplete-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", NOTED, attempt=2),
+            _success(1, (26, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "incomplete", NOTED),
+            id="incomplete-row-partial-re-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", NOTED, attempt=2),
+            _success(1, (1, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "complete", "timeout"),
+            id="incomplete-row-full-re-read",
+        ),
+        pytest.param(
+            _stored(None, "unknown", "HTTP 502", attempt=2, success=None),
+            _success(1, (1, 28)),
+            freshness._State(_at(2), _at(1), _day(1), _day(28), "complete", "HTTP 502"),
+            id="never-succeeded",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2, success=1),
+            _success(0, (26, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "complete", "timeout"),
+            id="obsolete-success-on-a-complete-row",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", NOTED, attempt=2, success=1),
+            _success(0, (1, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "incomplete", NOTED),
+            id="obsolete-success-on-an-incomplete-row",
+        ),
+    ],
+)
+def test_merge_of_a_success_older_than_a_stored_failure_keeps_its_reason(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """The newer failure's reason survives a success that started before it."""
+    assert freshness._merge(stored, outcome) == expected
+
+
+@pytest.mark.parametrize(
+    ("first", "earlier", "later"),
+    [
+        pytest.param(
+            None,
+            _success(1, (1, 28)),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="first-success-then-failure",
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            _success(1, (26, 30)),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="complete-success-then-failure",
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            _success(1, (26, 30), complete=False, reason=REASON_FINEST_PARTITION),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="incomplete-success-then-failure",
+        ),
+        pytest.param(
+            _deferred(0, (1, 28)),
+            _success(1, (26, 30)),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="partial-re-read-then-failure",
+        ),
+        pytest.param(
+            _deferred(0, (1, 28)),
+            _success(1, (1, 30)),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="full-re-read-then-failure",
+        ),
+        pytest.param(
+            _deferred(0, (1, 28)),
+            FreshnessOutcome.failure(_at(1), reason="timeout"),
+            _success(2, (26, 30)),
+            id="failure-then-success",
+        ),
+        pytest.param(
+            _deferred(0, (1, 28)),
+            FreshnessOutcome.failure(_at(1), reason="timeout"),
+            FreshnessOutcome.failure(_at(2), reason="HTTP 429"),
+            id="failure-then-failure",
+        ),
+    ],
+)
+def test_merge_with_a_failure_is_independent_of_commit_order(
+    first: FreshnessOutcome | None, earlier: FreshnessOutcome, later: FreshnessOutcome
+) -> None:
+    """A failure and another attempt leave the same row whichever commits first."""
+    start = freshness._State.of(None)
+    if first is not None:
+        start = freshness._merge(start, first)
+    in_start_order = freshness._merge(freshness._merge(start, earlier), later)
+    in_reverse_order = freshness._merge(freshness._merge(start, later), earlier)
+    assert in_reverse_order == in_start_order
+    assert in_start_order.last_attempt_at == _at(2)
+
+
+def test_merge_treats_an_attempt_at_the_stored_instant_as_current() -> None:
+    """Ties are current: re-recording is idempotent and a tied success is not obsolete."""
+    deferred = freshness._merge(freshness._State.of(None), _deferred(1, (1, 28)))
+    assert freshness._merge(deferred, _deferred(1, (1, 28))) == deferred
+
+    # A tied full re-read repairs the row, which an obsolete success never does.
+    repaired = freshness._merge(deferred, _success(1, (1, 30)))
+    assert repaired == freshness._State(_at(1), _at(1), _day(1), _day(30), "complete", None)
+
+    timeout = FreshnessOutcome.failure(_at(2), reason="timeout")
+    failed = freshness._merge(repaired, timeout)
+    assert failed == freshness._State(_at(2), _at(1), _day(1), _day(30), "complete", "timeout")
+    assert freshness._merge(failed, timeout) == failed
+
+    # A success that started with the failure did not start before it, so it clears it.
+    cleared = freshness._merge(failed, _success(2, (29, 30)))
+    assert cleared == freshness._State(_at(2), _at(2), _day(1), _day(30), "complete", None)
+
+
+# ---------------------------------------------------------------------------------------
 # needs_repair
 # ---------------------------------------------------------------------------------------
 
@@ -1222,3 +1523,71 @@ async def test_concurrent_writers_of_one_row_serialize(sessions: Sessions) -> No
     assert second_waited
     loaded = await _load(sessions, dataset_id)
     assert _state(loaded[METRICS]) == _expected(2, 2, (1, 31), "incomplete", DEFERRED)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_delayed_older_success_never_regresses_a_newer_one(sessions: Sessions) -> None:
+    """Committed after a newer success, an older one moves no timestamp back or upgrades."""
+    dataset_id = await _create_dataset(sessions)
+    search_terms = "google.search_terms"
+    await _record(sessions, dataset_id, METRICS, _success(2, (12, 15)))
+    await _record(sessions, dataset_id, search_terms, _deferred(2, (1, 28)))
+
+    metrics = await _record(sessions, dataset_id, METRICS, _success(1, (1, 5)))
+    terms = await _record(sessions, dataset_id, search_terms, _success(1, (1, 30)))
+
+    assert _state(metrics) == _expected(2, 2, (12, 15), "complete")
+    assert _state(terms) == _expected(2, 2, (1, 30), "incomplete", DEFERRED)
+    assert needs_repair(terms) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_delayed_older_failure_leaves_a_newer_success_standing(
+    sessions: Sessions,
+) -> None:
+    """Committed after a newer success, an older failure changes nothing on the row."""
+    dataset_id = await _create_dataset(sessions)
+    search_terms = "google.search_terms"
+    await _record(sessions, dataset_id, METRICS, _success(2, (1, 28)))
+    await _record(sessions, dataset_id, search_terms, _deferred(2, (1, 28)))
+
+    timeout = FreshnessOutcome.failure(_at(1), reason="timeout")
+    metrics = await _record(sessions, dataset_id, METRICS, timeout)
+    terms = await _record(sessions, dataset_id, search_terms, timeout)
+
+    assert _state(metrics) == _expected(2, 2, (1, 28), "complete")
+    assert _state(terms) == _expected(2, 2, (1, 28), "incomplete", DEFERRED)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_delayed_older_success_keeps_a_newer_failure(sessions: Sessions) -> None:
+    """Committed after a newer failure, an older success lands as in start order."""
+    commit_order = await _create_dataset(sessions)
+    start_order = await _create_dataset(sessions)
+    search_terms = "google.search_terms"
+    failure = FreshnessOutcome.failure(_at(2), reason="HTTP 503 after 3 attempts")
+    trailing = _success(1, (26, 30))
+    for dataset, first in ((METRICS, _success(0, (1, 28))), (search_terms, _deferred(0, (1, 28)))):
+        for dataset_id, outcomes in (
+            (commit_order, (first, failure, trailing)),
+            (start_order, (first, trailing, failure)),
+        ):
+            for outcome in outcomes:
+                await _record(sessions, dataset_id, dataset, outcome)
+
+    reversed_rows = await _load(sessions, commit_order)
+    ordered_rows = await _load(sessions, start_order)
+    assert _state(reversed_rows[METRICS]) == _expected(
+        2, 1, (1, 30), "complete", "HTTP 503 after 3 attempts"
+    )
+    noted = f"{DEFERRED}{FAILURE_MARKER}HTTP 503 after 3 attempts"
+    assert _state(reversed_rows[search_terms]) == _expected(2, 1, (1, 30), "incomplete", noted)
+    assert needs_repair(reversed_rows[search_terms]) is True
+    for dataset in (METRICS, search_terms):
+        assert _state(reversed_rows[dataset]) == _state(ordered_rows[dataset])
+
+    later = await _record(sessions, commit_order, METRICS, _success(3, (29, 31)))
+    assert _state(later) == _expected(3, 3, (1, 31), "complete")

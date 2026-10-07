@@ -180,9 +180,13 @@ class DatasetFreshness(IdPkMixin, DatasetScopedMixin, Base):
     ``incomplete`` when any of them is not ``complete`` over the window. A successful sync of
     one dataset therefore never hides a failed refresh of another.
 
-    ``sync/freshness.py`` upserts these rows on :attr:`__natural_key__` through
-    ``db/repositories.py``. A row may be created as ``unknown`` before its first attempt, so
-    every timestamp and coverage date is nullable.
+    :func:`ads_engine.sync.freshness.record_freshness` writes these rows directly, with no
+    repository helper, because its merge needs the locked row: it seeds the row with
+    ``INSERT ... ON CONFLICT DO NOTHING``, locks it with ``SELECT ... FOR UPDATE``, merges the
+    attempt's outcome and upserts the result on :attr:`__natural_key__` with
+    ``INSERT ... ON CONFLICT DO UPDATE``. It flushes but never commits, so the row lands in
+    the caller's transaction, atomically with the data it describes. A row may be created as
+    ``unknown`` before its first attempt, so every timestamp and coverage date is nullable.
 
     Attributes:
         dataset: The dataset name (:data:`DATASETS`).
@@ -245,8 +249,13 @@ class SourceConnection(IdPkMixin, Base):
     ``calls_hourly`` backs the product's own Google cap of ``GOOGLE_DAILY_CALL_BUDGET``
     webhook calls per sliding 24 h (AAP 0.3.3). The cap must hold across the worker and the
     CLI processes, so the count lives in the database: ``sync/budget_guard.py`` keeps
-    per-UTC-hour call counts here, updated under ``SELECT ... FOR UPDATE`` on this row, and
-    ``calls_24h`` is their sum over the trailing 24 hours, shown on ``/sources``.
+    per-UTC-hour call counts here, updated under ``SELECT ... FOR UPDATE`` on this row.
+    ``calls_24h`` is their total over the counted window, shown on ``/sources``: the
+    current UTC hour bucket, the 24 preceding ones and any bucket ahead of it. That is a
+    conservative upper bound on the calls in the trailing 24 hours, not an exact count: a
+    call stays counted for up to 25 hours, slightly longer when it is booked in the next
+    hour under the call budget's dispatch bound, and a call whose reservation had to be
+    made again may count twice.
 
     Attributes:
         source: The source (:data:`SOURCES`), unique.
@@ -256,7 +265,8 @@ class SourceConnection(IdPkMixin, Base):
             configured" or the platform's error code and failing endpoint.
         active_dataset_id: The source's active primary dataset, if any.
         last_attempt_at: When a job last called the source.
-        calls_24h: Webhook calls in the trailing 24 hours (server default ``0``).
+        calls_24h: Call bookings in the counted window described above, a conservative
+            upper bound on the calls in the trailing 24 hours (server default ``0``).
         calls_hourly: Call counts keyed by UTC hour (server default ``'{}'::jsonb``).
     """
 

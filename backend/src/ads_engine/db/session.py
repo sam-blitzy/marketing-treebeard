@@ -6,9 +6,9 @@ engine is a lazy, process-wide singleton built from ``DATABASE_URL`` on first us
 
 Three entry points cover every caller:
 
-* :func:`session_scope` is the one unit-of-work helper. Repository functions never commit,
-  so everything written inside one scope (for example a decision and the
-  ``analysis_request`` it enqueues) commits atomically or not at all::
+* :func:`session_scope` is the shared unit-of-work helper for requests and jobs.
+  Repository functions never commit, so everything written inside one scope (for example
+  a decision and the ``analysis_request`` it enqueues) commits atomically or not at all::
 
       async with session_scope() as session:
           session.add(decision)
@@ -23,8 +23,9 @@ Three entry points cover every caller:
   shutdown and between tests.
 
 The URL is a secret (it carries the database password). It is read from
-``Settings.database_url`` only where the engine is built, and only its password-hidden
-rendering is ever logged.
+``Settings.database_url`` only where the engine is built, and the URL itself is never
+logged: only an allowlisted descriptor of its driver, host, port and database name is,
+never its credentials or query parameters.
 """
 
 import asyncio
@@ -239,9 +240,15 @@ def _create_engine() -> AsyncEngine:
         json_deserializer=json.loads,
         connect_args={"options": _connect_options(url)},
     )
+    # The URL is never logged, not even rendered with its password hidden: its query string
+    # can carry credentials of its own (libpq `password`, `sslpassword`, key paths), which
+    # password masking leaves in place. Only these allowlisted fields are written.
     _log.info(
         "db_engine_created",
-        url=url.render_as_string(hide_password=True),
+        driver=url.drivername,
+        host=url.host,
+        port=url.port,
+        database=url.database,
         pool_size=_POOL_SIZE,
         max_overflow=_MAX_OVERFLOW,
     )
@@ -387,13 +394,20 @@ async def _abandon_session(session: AsyncSession) -> None:
 async def session_scope() -> AsyncIterator[AsyncSession]:
     """Run one unit of work in a session that commits on success and rolls back on error.
 
-    This is the only place that commits. Repository functions add, upsert and flush but
-    never commit, so every write inside one scope (a sync job's rows and its
-    ``dataset_freshness`` update, or a decision and its ``analysis_request``) lands
+    This is the shared unit-of-work helper for requests and jobs. Repository functions add,
+    upsert and flush but never commit, so every write inside one scope (a sync job's rows
+    and its ``dataset_freshness`` update, or a decision and its ``analysis_request``) lands
     atomically::
 
         async with session_scope() as session:
             await upsert_facts(session, FactCampaignDaily, rows, dataset_id)
+
+    Not every commit passes through a scope. ``GoogleCallBudget.acquire`` and
+    ``GoogleCallBudget.used_24h`` (and so ``remaining``) in ``sync/budget_guard.py`` run
+    independent short transactions of their own and commit them outside any caller's
+    scope, so the row lock that enforces the call cap across processes is held for
+    milliseconds rather than for a whole job. A call counted inside a job therefore stays
+    counted even when that job's scope rolls back.
 
     On normal exit the session is committed and closed. On any exception, including
     cancellation, the session is rolled back and closed and the exception is re-raised

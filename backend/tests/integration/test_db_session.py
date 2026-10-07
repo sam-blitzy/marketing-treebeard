@@ -33,6 +33,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import InterfaceError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.pool import QueuePool
 
 from ads_engine.db import session as db_session
 from ads_engine.db.session import (
@@ -479,10 +480,10 @@ def test_connect_options_keeps_url_options_and_appends_utc_last(raw: str, expect
 
 
 @pytest.mark.anyio
-async def test_get_engine_builds_without_connecting_and_logs_only_a_hidden_password(
+async def test_get_engine_builds_without_connecting_and_logs_only_an_allowlisted_descriptor(
     engine_state: None, monkeypatch: pytest.MonkeyPatch, log_events: list[LogEvent]
 ) -> None:
-    """Building the engine opens no connection and logs the URL with its password hidden."""
+    """Building the engine opens no connection and logs driver, host, port and database only."""
     password = "s3cret-session-test"
     _use_database_url(monkeypatch, f"postgres://ads:{password}@127.0.0.1:1/nowhere")
 
@@ -498,13 +499,59 @@ async def test_get_engine_builds_without_connecting_and_logs_only_a_hidden_passw
             "info",
             "db_engine_created",
             {
-                "url": "postgresql+psycopg://ads:***@127.0.0.1:1/nowhere",
+                "driver": "postgresql+psycopg",
+                "host": "127.0.0.1",
+                "port": 1,
+                "database": "nowhere",
                 "pool_size": 5,
                 "max_overflow": 10,
             },
         )
     ]
     assert password not in repr(log_events)
+
+
+@pytest.mark.anyio
+async def test_get_engine_never_logs_query_credentials_or_the_user(
+    engine_state: None, monkeypatch: pytest.MonkeyPatch, log_events: list[LogEvent]
+) -> None:
+    """Credentials in the URL's query string, and the user name, never reach the log."""
+    # Assembled at run time so the secret scan never sees a literal credential.
+    username = "-".join(("svc", "reader", "x41"))
+    password = "-".join(("pw", "authority", "q8z"))
+    ssl_password = "-".join(("key", "phrase", "m3v"))
+    query_password = "-".join(("pw", "query", "k7d"))
+    url = make_url("postgresql+psycopg://127.0.0.1:1/nowhere").set(
+        username=username,
+        password=password,
+        query={
+            "sslpassword": ssl_password,
+            "password": query_password,
+            "sslmode": "require",
+            "application_name": "x",
+        },
+    )
+    _use_database_url(monkeypatch, url.render_as_string(hide_password=False))
+
+    built = get_engine()
+
+    assert built.url.query["sslpassword"] == ssl_password
+    assert isinstance(built.pool, QueuePool)
+    assert built.pool.checkedout() == 0
+    assert [(level, name) for level, name, _ in log_events] == [("info", "db_engine_created")]
+    fields = log_events[0][2]
+    assert set(fields) == {"driver", "host", "port", "database", "pool_size", "max_overflow"}
+    assert fields == {
+        "driver": "postgresql+psycopg",
+        "host": "127.0.0.1",
+        "port": 1,
+        "database": "nowhere",
+        "pool_size": 5,
+        "max_overflow": 10,
+    }
+    logged = repr(log_events)
+    for leaked in (password, ssl_password, query_password, username, "sslpassword"):
+        assert leaked not in logged
 
 
 @pytest.mark.anyio
