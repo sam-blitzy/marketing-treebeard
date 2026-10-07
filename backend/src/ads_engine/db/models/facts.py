@@ -25,10 +25,15 @@ reported: Google ``segments.date`` is a day in the customer account's time zone 
 days are UTC. Dates are never relabelled or rebucketed, and no computation combines two
 sources' daily rows into one daily series.
 
-**Missing values** (AAP 0.11.1). ``cost``, ``impressions`` and ``clicks`` are ``NOT NULL`` on
-the four daily tables, because every daily source row reports them. Every source-specific
-metric is nullable and ``None`` means "unavailable", never zero; the rules treat it so. A
-``NULL`` also satisfies each table's ``ck_<table>_non_negative`` check.
+**Missing values** (AAP 0.11.1). ``None`` (``NULL``) means "unavailable", never zero, and the
+rules treat it so. ``cost``, ``impressions`` and ``clicks`` are ``NOT NULL`` on the three
+Google-fed daily tables (``fact_campaign_daily``, ``fact_keyword_daily`` and
+``fact_search_term_daily``), because every Google row carries them; their other metrics are
+nullable. On ``fact_creative_daily`` every metric is nullable, ``cost``, ``impressions`` and
+``clicks`` included, because a LinkedIn analytics element may omit any metric (the
+``ad_analytics`` contract); an omitted metric is stored as ``NULL``, never coerced to zero.
+Every ``fact_segment_window`` metric is nullable for the same reason. A ``NULL`` also
+satisfies each table's ``ck_<table>_non_negative`` check.
 
 **Dataset-qualified entity references** (AAP 0.3.3: only ``lead_match`` links two datasets).
 Every entity reference is a composite foreign key (``<entity>_id``, ``dataset_id``) to the
@@ -49,7 +54,8 @@ target tables as strings; ``ads_engine.db.models`` imports ``accounts`` before t
 so the targets are registered on ``Base.metadata`` before the schema is compiled.
 
 ``backend/migrations/versions/0001_initial_schema.py`` mirrors every column, type,
-nullability, constraint and index name declared here; ``alembic check`` must report no
+nullability, constraint and index name declared here, including the nullable ``cost``,
+``impressions`` and ``clicks`` of ``fact_creative_daily``; ``alembic check`` must report no
 drift.
 """
 
@@ -186,15 +192,21 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
     ``impressions``, open rate = ``form_opens`` / ``impressions`` and completion rate =
     ``leads`` / ``form_opens`` (CR1 to CR3, AAP 0.5.4.6).
 
+    Every metric is nullable, because a LinkedIn analytics element may omit any metric (the
+    ``ad_analytics`` contract): ``None`` means unavailable, never zero, and the rules treat
+    it so.
+
     Attributes:
         creative_id: The :class:`~ads_engine.db.models.accounts.Creative` the row measures,
             which must belong to the row's own dataset: the composite foreign key
             (``creative_id``, ``dataset_id``) references the creative's unique
             (``dataset_id``, ``id``).
         date: The UTC day of LinkedIn's daily bucket.
-        cost: ``costInLocalCurrency``, in the account's currency.
-        impressions: ``impressions``.
-        clicks: ``clicks``.
+        cost: ``costInLocalCurrency``, in the account's currency; ``None`` when the element
+            omits it (unavailable, never 0).
+        impressions: ``impressions``; ``None`` when the element omits it (unavailable,
+            never 0).
+        clicks: ``clicks``; ``None`` when the element omits it (unavailable, never 0).
         conversions: Not reported by LinkedIn's creative analytics, so ``None`` for LinkedIn
             rows; LinkedIn outcomes are ``leads`` and ``website_conversions``.
         conversions_value: ``None`` for LinkedIn rows, as for ``conversions``.
@@ -212,9 +224,9 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
 
     creative_id: Mapped[int]
     date: Mapped[NativeDate]
-    cost: Mapped[Decimal]
-    impressions: Mapped[int]
-    clicks: Mapped[int]
+    cost: Mapped[Decimal | None]
+    impressions: Mapped[int | None]
+    clicks: Mapped[int | None]
     conversions: Mapped[Decimal | None]
     conversions_value: Mapped[Decimal | None]
     form_opens: Mapped[int | None]

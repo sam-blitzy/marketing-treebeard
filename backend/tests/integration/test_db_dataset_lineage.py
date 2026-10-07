@@ -8,6 +8,14 @@ PostgreSQL, that a row cannot reference another dataset's entity, that purging o
 never deletes another dataset's rows, and that the catalog holds exactly the planned
 constraint names, columns and delete actions.
 
+On the seeded LinkedIn creative, the module also shows that ``fact_creative_daily`` stores
+the base metrics (``cost``, ``impressions`` and ``clicks``) a LinkedIn analytics element
+omits as ``NULL``, never as zero (AAP 0.11.1). The element is the ``ad_analytics`` contract's
+documented sample, decoded as ``connectors/http.py`` decodes bodies, with its organization
+pivot value replaced by the creative's URN as the parser docstring names, and is parsed by
+``parse_analytics_daily``. A restating ``ON CONFLICT`` upsert overwrites stored values with
+``NULL``, and ``ck_fact_creative_daily_non_negative`` still rejects a negative metric.
+
 The tests run against the PostgreSQL 18 test database named by ``TEST_DATABASE_URL``
 (falling back to ``DATABASE_URL``). The module creates a private schema, builds only the
 tables these tests touch in it, points every connection's ``search_path`` at it alone, and
@@ -16,20 +24,26 @@ untouched. Each test runs inside one transaction that is rolled back afterwards.
 unreachable database fails the tests; it never skips them.
 """
 
+import json
 import os
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
 from psycopg import errors as pg_errors
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import ArgumentError, IntegrityError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
+
+from ads_engine.connectors.linkedin.parser import CreativeDailyRow, parse_analytics_daily
 
 # Importing the model modules registers their tables on ``Base.metadata``.
 from ads_engine.db.base import Base
@@ -689,3 +703,211 @@ def test_every_composite_key_leads_an_index_for_its_cascade(
 
     for table_name, column, _, index_name in EDGES:
         assert leading.get((table_name, index_name)) == column
+
+
+AD_ANALYTICS_CONTRACT: Path = (
+    Path(__file__).resolve().parents[1] / "contracts" / "linkedin" / "ad_analytics.json"
+)
+"""The LinkedIn daily creative analytics contract whose documented sample feeds the
+unavailable-metric tests."""
+
+BASE_METRICS: tuple[str, ...] = ("cost", "impressions", "clicks")
+"""The ``fact_creative_daily`` base metrics, nullable because an element may omit them."""
+
+WIRE_BASE_METRICS: tuple[str, ...] = ("costInLocalCurrency", "impressions", "clicks")
+"""The analytics element fields :data:`BASE_METRICS` are parsed from."""
+
+RESTATED_AT = FETCHED_AT + timedelta(hours=6)
+"""When the incremental metrics sync restates a stored day (AAP 0.3.2: every 6 h)."""
+
+
+def _analytics_element(
+    creative_urn: str, *, omit: tuple[str, ...] = (), **fields: object
+) -> dict[str, Any]:
+    """Return the ``ad_analytics`` contract's second documented element for ``creative_urn``.
+
+    The contract is decoded as ``connectors/http.py`` decodes bodies (floats as ``Decimal``).
+    The sample pivots by ``MEMBER_COMPANY``, so its organization pivot value is replaced by
+    the creative URN; ``fields`` then sets contract-declared metrics and the wire fields in
+    ``omit`` are removed, as a live element omits them. The element is checked to carry only
+    fields its contract declares and every field the contract requires.
+    """
+    contract: dict[str, Any] = json.loads(
+        AD_ANALYTICS_CONTRACT.read_text(encoding="utf-8"), parse_float=Decimal
+    )
+    schema: dict[str, Any] = contract["response"]["body"]["properties"]["elements"]["items"]
+    element: dict[str, Any] = contract["response"]["documented_sample"]["elements"][1]
+    element["pivotValues"] = [creative_urn]
+    element.update(fields)
+    for name in omit:
+        element.pop(name, None)
+    undeclared = sorted(set(element) - set(schema["properties"]))
+    assert undeclared == [], undeclared
+    assert set(schema["required"]) <= set(element)
+    return element
+
+
+def _seeded_creative(connection: Connection, dataset: SeededDataset) -> tuple[int, str]:
+    """Return the id and URN of the creative seeded in ``dataset``."""
+    creative = _table("creative")
+    statement = sa.select(creative.c.id, creative.c.urn).where(
+        creative.c.id == dataset.refs["creative_id"], creative.c.dataset_id == dataset.id
+    )
+    creative_id, urn = connection.execute(statement).one()
+    return int(creative_id), str(urn)
+
+
+def _creative_daily_values(
+    dataset: SeededDataset, creative_id: int, row: CreativeDailyRow, fetched_at: datetime
+) -> dict[str, object]:
+    """Map a parsed analytics row onto a ``fact_creative_daily`` row, value for value."""
+    return {
+        "source": dataset.source,
+        "dataset_id": dataset.id,
+        "creative_id": creative_id,
+        "date": row.date,
+        "cost": row.cost,
+        "impressions": row.impressions,
+        "clicks": row.clicks,
+        "landing_page_clicks": row.landing_page_clicks,
+        "form_opens": row.form_opens,
+        "leads": row.leads,
+        "website_conversions": row.website_conversions,
+        "fetched_at": fetched_at,
+    }
+
+
+def _stored_creative_daily(connection: Connection, fact_id: int) -> dict[str, object]:
+    """Return the stored date, metrics and fetch time of one ``fact_creative_daily`` row."""
+    fact = _table("fact_creative_daily")
+    columns = (
+        "date",
+        *BASE_METRICS,
+        "landing_page_clicks",
+        "form_opens",
+        "leads",
+        "website_conversions",
+        "fetched_at",
+    )
+    statement = sa.select(*(fact.c[name] for name in columns)).where(fact.c.id == fact_id)
+    return dict(connection.execute(statement).mappings().one())
+
+
+def _null_base_metric_rows(connection: Connection, fact_id: int) -> int:
+    """Count, on the server, the rows with ``fact_id`` whose base metrics are all ``NULL``."""
+    fact = _table("fact_creative_daily")
+    statement = (
+        sa.select(sa.func.count())
+        .select_from(fact)
+        .where(fact.c.id == fact_id, *(fact.c[name].is_(None) for name in BASE_METRICS))
+    )
+    return int(connection.execute(statement).scalar_one())
+
+
+@pytest.mark.db
+def test_unavailable_creative_base_metrics_are_stored_as_null(
+    connection: Connection, world: World
+) -> None:
+    """An element without ``costInLocalCurrency``, ``impressions`` and ``clicks`` parses to
+    ``None`` for each and is stored with each ``NULL``, never ``0``, while the metrics it
+    reports round-trip exactly."""
+    active = world["linkedin", ACTIVE]
+    creative_id, urn = _seeded_creative(connection, active)
+    row = parse_analytics_daily(_analytics_element(urn, omit=WIRE_BASE_METRICS))
+    assert row.creative_urn == urn
+    assert (row.cost, row.impressions, row.clicks) == (None, None, None)
+
+    fact_id = _insert(
+        connection,
+        "fact_creative_daily",
+        _creative_daily_values(active, creative_id, row, FETCHED_AT),
+    )
+
+    stored = _stored_creative_daily(connection, fact_id)
+    for name in BASE_METRICS:
+        assert stored[name] is None, name
+    assert stored == {
+        "date": date(2024, 5, 29),
+        "cost": None,
+        "impressions": None,
+        "clicks": None,
+        "landing_page_clicks": 11,
+        "form_opens": None,
+        "leads": None,
+        "website_conversions": 0,
+        "fetched_at": FETCHED_AT,
+    }
+    assert _null_base_metric_rows(connection, fact_id) == 1
+
+
+@pytest.mark.db
+def test_a_restated_day_without_base_metrics_overwrites_them_with_null(
+    connection: Connection, world: World
+) -> None:
+    """``INSERT ... ON CONFLICT (dataset_id, creative_id, date) DO UPDATE``, the upsert
+    ``db/repositories.upsert_facts`` is specified to run, replaces stored base metrics with
+    ``NULL`` on the same row when the restated element omits them, and records the
+    restatement's ``fetched_at``."""
+    active = world["linkedin", ACTIVE]
+    creative_id, urn = _seeded_creative(connection, active)
+    reported = parse_analytics_daily(_analytics_element(urn, clicks=14))
+    first_id = _insert(
+        connection,
+        "fact_creative_daily",
+        _creative_daily_values(active, creative_id, reported, FETCHED_AT),
+    )
+    before = _stored_creative_daily(connection, first_id)
+    assert (before["cost"], before["impressions"], before["clicks"]) == (
+        Decimal("19.918330"),
+        165,
+        14,
+    )
+
+    restated = parse_analytics_daily(_analytics_element(urn, omit=WIRE_BASE_METRICS))
+    fact = _table("fact_creative_daily")
+    natural_key = facts.FactCreativeDaily.__natural_key__
+    values = _creative_daily_values(active, creative_id, restated, RESTATED_AT)
+    statement = pg_insert(fact).values(values)
+    upsert = statement.on_conflict_do_update(
+        index_elements=list(natural_key),
+        set_={name: statement.excluded[name] for name in values if name not in natural_key},
+    ).returning(fact.c.id)
+    assert int(connection.execute(upsert).scalar_one()) == first_id
+
+    assert _row_ids(connection, "fact_creative_daily", active.id) == {first_id}
+    after = _stored_creative_daily(connection, first_id)
+    for name in BASE_METRICS:
+        assert after[name] is None, name
+    assert after == {
+        **before,
+        "cost": None,
+        "impressions": None,
+        "clicks": None,
+        "fetched_at": RESTATED_AT,
+    }
+    assert _null_base_metric_rows(connection, first_id) == 1
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("column", "negative"),
+    [("cost", Decimal("-0.000001")), ("impressions", -1), ("clicks", -1)],
+)
+def test_a_negative_creative_base_metric_violates_the_non_negative_check(
+    connection: Connection, world: World, column: str, negative: object
+) -> None:
+    """Nullable base metrics stay guarded: a negative value beside ``NULL`` metrics fails with
+    a check violation (23514) of ``ck_fact_creative_daily_non_negative``."""
+    active = world["linkedin", ACTIVE]
+    creative_id, urn = _seeded_creative(connection, active)
+    row = parse_analytics_daily(_analytics_element(urn, omit=WIRE_BASE_METRICS))
+    values = {**_creative_daily_values(active, creative_id, row, FETCHED_AT), column: negative}
+
+    with pytest.raises(IntegrityError) as caught, connection.begin_nested():
+        connection.execute(sa.insert(_table("fact_creative_daily")).values(values))
+
+    violation = caught.value.orig
+    assert isinstance(violation, pg_errors.CheckViolation)
+    assert violation.sqlstate == "23514"
+    assert violation.diag.constraint_name == "ck_fact_creative_daily_non_negative"
+    assert _row_ids(connection, "fact_creative_daily", active.id) == set()
