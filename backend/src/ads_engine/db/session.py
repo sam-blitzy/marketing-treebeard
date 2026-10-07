@@ -1,0 +1,478 @@
+"""Async engine, transactional session scope and the dedicated advisory-lock connection.
+
+The API, the worker and the ``ads-engine`` CLI all reach PostgreSQL 18 through this module,
+using SQLAlchemy 2.1 async sessions on psycopg 3. Nothing connects at import time: the
+engine is a lazy, process-wide singleton built from ``DATABASE_URL`` on first use.
+
+Three entry points cover every caller:
+
+* :func:`session_scope` is the one unit-of-work helper. Repository functions never commit,
+  so everything written inside one scope (for example a decision and the
+  ``analysis_request`` it enqueues) commits atomically or not at all::
+
+      async with session_scope() as session:
+          session.add(decision)
+          await enqueue_analysis_request(session, reason="decision")
+
+* :func:`dedicated_connection` checks out one physical connection in ``AUTOCOMMIT`` mode
+  for holding session-level advisory locks (the ``analysis`` lock and the scheduler lock).
+  The lock keys and the lock statements belong to their owners, ``analysis/lock.py`` and
+  ``sync/scheduler.py``; this module only supplies the connection and guarantees that no
+  advisory lock survives the block.
+* :func:`dispose_engine` and :func:`reset_engine` end or forget the engine at process
+  shutdown and between tests.
+
+The URL is a secret (it carries the database password). It is read from
+``Settings.database_url`` only where the engine is built, and only its password-hidden
+rendering is ever logged.
+"""
+
+import asyncio
+import json
+import threading
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Final
+
+from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from ads_engine.logging import get_logger
+from ads_engine.settings import get_settings
+
+__all__ = [
+    "dedicated_connection",
+    "dispose_engine",
+    "get_engine",
+    "get_sessionmaker",
+    "json_dumps",
+    "reset_engine",
+    "session_scope",
+]
+
+_log = get_logger(__name__)
+
+# The plan's only driver: psycopg 3. One URL serves both the sync dialect (Alembic) and the
+# async dialect, which create_async_engine selects automatically for this driver name.
+_DRIVERNAME: Final = "postgresql+psycopg"
+# Plain schemes that carry no driver and are normalised to psycopg. `postgres://` is the
+# form many hosting providers emit; SQLAlchemy itself no longer accepts it.
+_PLAIN_SCHEMES: Final = frozenset({"postgresql", "postgres"})
+
+# Pool sizing per process: the API and the worker each hold at most 15 connections (5 kept
+# open plus 10 overflow), dedicated lock connections included, since they are drawn from
+# the same pool.
+_POOL_SIZE: Final = 5
+_MAX_OVERFLOW: Final = 10
+
+# Every session runs in UTC, so `timestamptz` values come back tz-aware in UTC and no SQL
+# depends on the server's zone. Native-day semantics are owned by the application.
+_UTC_SESSION_OPTION: Final = "-c TimeZone=UTC"
+
+# Releases every session-level advisory lock held by this database session. Run on each
+# dedicated connection before it returns to the pool.
+_UNLOCK_ALL: Final = text("SELECT pg_advisory_unlock_all()")
+
+# Process-wide lazy singletons. Guarded by a re-entrant lock so that two threads (for
+# example FastAPI's threadpool and the event loop thread) never build two engines, and so
+# that get_sessionmaker() may call get_engine() while holding it.
+_state_lock: Final = threading.RLock()
+_engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+
+
+# ---------------------------------------------------------------------------
+# JSON serialisation for jsonb columns
+# ---------------------------------------------------------------------------
+
+
+def _json_default(value: object) -> object:
+    """Convert a value the standard JSON encoder cannot handle into a JSON-native one.
+
+    Args:
+        value: The object :func:`json.dumps` could not encode.
+
+    Returns:
+        ``Decimal`` as an exact fixed-point string with no exponent (``Decimal("1E+2")``
+        gives ``"100"``); an aware ``datetime`` or a ``date`` as its ISO 8601 string; a
+        ``set`` or ``frozenset`` as a sorted list, whose items are encoded in turn.
+
+    Raises:
+        ValueError: For a non-finite ``Decimal`` (``NaN``, ``Infinity``) or a naive
+            ``datetime``, neither of which has an exact, unambiguous JSON form.
+        TypeError: For any other type, naming it.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"non-finite Decimal {value} cannot be stored in jsonb")
+        return format(value, "f")
+    # datetime is a subclass of date, so it is checked first.
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("naive datetime cannot be stored in jsonb; instants must be tz-aware")
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, set | frozenset):
+        return sorted(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable for jsonb")
+
+
+def json_dumps(value: object) -> str:
+    """Serialise a value for a ``jsonb`` column; the engine's ``json_serializer``.
+
+    Evidence, decision patches, raw payloads and configuration bindings carry ``Decimal``,
+    ``date`` and ``datetime`` values, which the standard encoder rejects. Money is stored and
+    served as decimal strings, so amounts stay exact end to end; that matches the API's
+    serialisation of money as decimal strings. Reading back uses :func:`json.loads`, so a
+    stored amount returns as its string, never as a binary float.
+
+    Output is compact (no spaces), keeps non-ASCII text as is, and rejects ``NaN`` and
+    infinite floats instead of writing the non-standard ``NaN`` token PostgreSQL refuses.
+
+    Example::
+
+        >>> json_dumps({"a": Decimal("1.500000"), "d": date(2026, 10, 1)})
+        '{"a":"1.500000","d":"2026-10-01"}'
+
+    Args:
+        value: Any JSON-compatible value, possibly containing ``Decimal``, ``date``, aware
+            ``datetime``, ``set`` or ``frozenset`` items.
+
+    Returns:
+        The JSON text.
+
+    Raises:
+        ValueError: For ``NaN`` or infinite floats, a non-finite ``Decimal`` or a naive
+            ``datetime``.
+        TypeError: For a value of any other unsupported type.
+    """
+    return json.dumps(
+        value,
+        default=_json_default,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Engine and sessionmaker
+# ---------------------------------------------------------------------------
+
+
+def _normalise_url(raw: str) -> URL:
+    """Parse ``DATABASE_URL`` and pin it to the psycopg 3 driver.
+
+    Args:
+        raw: The secret URL text from ``Settings.database_url``.
+
+    Returns:
+        The URL with driver name ``postgresql+psycopg``. The plain schemes
+        ``postgresql://`` and ``postgres://`` are rewritten to it.
+
+    Raises:
+        ValueError: When the text is not a SQLAlchemy URL, or names any other backend or
+            driver (for example ``postgresql+asyncpg``). The message never contains the
+            URL, and the parse error is not chained, because the URL carries the password.
+    """
+    try:
+        url = make_url(raw)
+    except ArgumentError, ValueError:
+        # ValueError covers a malformed port, which make_url reports from int().
+        raise ValueError("DATABASE_URL is not a valid SQLAlchemy database URL") from None
+    if url.drivername in _PLAIN_SCHEMES:
+        return url.set(drivername=_DRIVERNAME)
+    if url.drivername != _DRIVERNAME:
+        raise ValueError(
+            f"DATABASE_URL must use the {_DRIVERNAME} driver (psycopg 3); got {url.drivername!r}"
+        )
+    return url
+
+
+def _connect_options(url: URL) -> str:
+    """Build the libpq ``options`` value that sets the session time zone to UTC.
+
+    ``connect_args`` replace a same-named URL query parameter, so any ``options`` given in
+    the URL (for example a ``search_path``) are kept and the UTC setting is appended last,
+    where it takes precedence over an earlier ``TimeZone``.
+
+    Args:
+        url: The normalised database URL.
+
+    Returns:
+        The space-separated ``-c name=value`` options.
+    """
+    existing = url.query.get("options")
+    given = [existing] if isinstance(existing, str) else list(existing or ())
+    return " ".join([*(option for option in given if option.strip()), _UTC_SESSION_OPTION])
+
+
+def _create_engine() -> AsyncEngine:
+    """Build the process engine from the current settings.
+
+    Returns:
+        A new :class:`AsyncEngine` with a pre-pinged pool and the ``jsonb`` serialiser.
+        Building it opens no connection.
+
+    Raises:
+        ValueError: When ``DATABASE_URL`` is malformed or names another driver.
+        pydantic.ValidationError: When the environment cannot be parsed into settings.
+    """
+    url = _normalise_url(get_settings().database_url.get_secret_value())
+    engine = create_async_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=_POOL_SIZE,
+        max_overflow=_MAX_OVERFLOW,
+        json_serializer=json_dumps,
+        json_deserializer=json.loads,
+        connect_args={"options": _connect_options(url)},
+    )
+    _log.info(
+        "db_engine_created",
+        url=url.render_as_string(hide_password=True),
+        pool_size=_POOL_SIZE,
+        max_overflow=_MAX_OVERFLOW,
+    )
+    return engine
+
+
+def get_engine() -> AsyncEngine:
+    """Return the process-wide async engine, building it on first call.
+
+    The engine uses psycopg 3's async dialect, a pre-pinged pool of 5 connections plus 10
+    overflow, :func:`json_dumps` and :func:`json.loads` for ``jsonb``, and a UTC session
+    time zone. Building it opens no connection; the first connection is made on first use.
+
+    Returns:
+        The cached :class:`AsyncEngine`.
+
+    Raises:
+        ValueError: When ``DATABASE_URL`` is malformed or names a driver other than
+            ``postgresql+psycopg``.
+    """
+    global _engine
+    engine = _engine
+    if engine is not None:
+        return engine
+    with _state_lock:
+        if _engine is None:
+            _engine = _create_engine()
+        return _engine
+
+
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    """Return the process-wide session factory bound to :func:`get_engine`.
+
+    Sessions keep loaded attributes after commit (``expire_on_commit=False``), so objects
+    returned from a :func:`session_scope` stay readable once the scope has committed,
+    without an implicit refresh that async code could not await.
+
+    Returns:
+        The cached :class:`async_sessionmaker`.
+    """
+    global _sessionmaker
+    factory = _sessionmaker
+    if factory is not None:
+        return factory
+    with _state_lock:
+        if _sessionmaker is None:
+            _sessionmaker = async_sessionmaker(get_engine(), expire_on_commit=False)
+        return _sessionmaker
+
+
+async def dispose_engine() -> None:
+    """Close every pooled connection and forget the engine and session factory.
+
+    ``api/app.py`` calls this from its lifespan on shutdown, and the worker on graceful
+    exit. The caches are cleared before the pool is disposed, so a caller arriving during
+    disposal builds a fresh engine instead of using the one being closed. Calling it when
+    no engine exists does nothing.
+    """
+    global _engine, _sessionmaker
+    with _state_lock:
+        engine, _engine, _sessionmaker = _engine, None, None
+    if engine is not None:
+        await engine.dispose()
+        _log.info("db_engine_disposed")
+
+
+def reset_engine() -> None:
+    """Forget the engine and session factory without closing any connection.
+
+    Tests call this after ``get_settings.cache_clear()`` when they switch ``DATABASE_URL``
+    or event loops, so the next :func:`get_engine` call reads the new settings. Async
+    connections belong to the event loop that opened them, so callers first
+    ``await dispose_engine()`` while that loop is still running; this function only
+    clears the caches, for a process or loop where disposal is no longer possible.
+    """
+    global _engine, _sessionmaker
+    with _state_lock:
+        _engine = None
+        _sessionmaker = None
+
+
+# ---------------------------------------------------------------------------
+# Context managers
+# ---------------------------------------------------------------------------
+
+
+async def _run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
+    """Run a cleanup coroutine to completion even if the calling task is cancelled.
+
+    The cleanup runs in a task of its own behind :func:`asyncio.shield`. A cancellation
+    received while waiting is held until the cleanup has finished and then re-raised, so
+    a rollback, a lock release or a connection close is never abandoned halfway and two
+    cleanups never run on one connection at the same time. This mirrors how SQLAlchemy's
+    own async context managers close sessions and connections.
+
+    Args:
+        cleanup: The coroutine to run; it is awaited exactly once.
+
+    Raises:
+        asyncio.CancelledError: When the caller was cancelled meanwhile, once the cleanup
+            has completed, or when the cleanup task itself was cancelled.
+        Exception: Whatever the cleanup raised.
+    """
+    task = asyncio.create_task(cleanup)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as err:
+            if task.done():
+                raise
+            cancelled = err
+        else:
+            break
+    if cancelled is not None:
+        raise cancelled
+
+
+async def _abandon_session(session: AsyncSession) -> None:
+    """Roll back and close a session whose unit of work failed.
+
+    Runs while the original exception propagates. A database error (any
+    :class:`~sqlalchemy.exc.SQLAlchemyError`, which wraps every psycopg error) from either
+    step is logged and never replaces that exception, which is the one the caller has to
+    see; closing still runs after a failed rollback, and a broken connection is discarded
+    by the close.
+
+    Args:
+        session: The session of the failed :func:`session_scope`.
+    """
+    steps = (
+        ("db_session_rollback_failed", session.rollback),
+        ("db_session_close_failed", session.close),
+    )
+    for event, step in steps:
+        try:
+            await step()
+        except SQLAlchemyError as exc:
+            _log.exception(event, error=type(exc).__name__)
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Run one unit of work in a session that commits on success and rolls back on error.
+
+    This is the only place that commits. Repository functions add, upsert and flush but
+    never commit, so every write inside one scope (a sync job's rows and its
+    ``dataset_freshness`` update, or a decision and its ``analysis_request``) lands
+    atomically::
+
+        async with session_scope() as session:
+            await upsert_facts(session, FactCampaignDaily, rows, dataset_id)
+
+    On normal exit the session is committed and closed. On any exception, including
+    cancellation, the session is rolled back and closed and the exception is re-raised
+    unchanged; nothing is ever swallowed.
+
+    Yields:
+        A new :class:`AsyncSession` from :func:`get_sessionmaker`.
+    """
+    session = get_sessionmaker()()
+    try:
+        yield session
+        await session.commit()
+    except BaseException:
+        await _run_to_completion(_abandon_session(session))
+        raise
+    await _run_to_completion(session.close())
+
+
+async def _release_advisory_locks(conn: AsyncConnection) -> None:
+    """Release every session-level advisory lock before the connection is pooled again.
+
+    An invalidated connection has already closed its database session, which released its
+    locks, so nothing is sent. When the release itself fails with a database error, for
+    example on a broken connection, the error is logged and the connection is invalidated,
+    so the pool discards it rather than hand a connection that may still hold a lock to an
+    unrelated caller. Closing the physical connection ends its database session, which
+    releases any lock it held.
+
+    Args:
+        conn: The dedicated connection being returned.
+    """
+    if conn.invalidated:
+        return
+    try:
+        await conn.execute(_UNLOCK_ALL)
+    except SQLAlchemyError as exc:
+        _log.exception("db_advisory_unlock_failed", error=type(exc).__name__, action="invalidate")
+        await conn.invalidate(exc)
+
+
+@asynccontextmanager
+async def dedicated_connection() -> AsyncIterator[AsyncConnection]:
+    """Check out one physical connection in ``AUTOCOMMIT`` mode for session-level locks.
+
+    The yielded connection stays checked out for the whole block, so a session-level
+    advisory lock taken on it is held until it is released or the block ends.
+    ``AUTOCOMMIT`` keeps a lock held for a whole analysis run, or for the life of the
+    scheduler, from leaving the connection idle in a transaction.
+
+    Consumers own their keys and statements, for example ``analysis/lock.py`` with
+    ``ANALYSIS_LOCK_KEY`` and ``sync/scheduler.py`` with ``SCHEDULER_LOCK_KEY``::
+
+        async with dedicated_connection() as conn:
+            acquired = await conn.scalar(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": ANALYSIS_LOCK_KEY}
+            )
+            if not acquired:
+                raise RunInProgress
+            try:
+                ...  # the whole run
+            finally:
+                await conn.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": ANALYSIS_LOCK_KEY}
+                )
+
+    On exit, whether the block succeeded, raised or was cancelled, the connection runs
+    ``SELECT pg_advisory_unlock_all()`` before it returns to the pool, so a pooled
+    connection never carries a stale advisory lock to another caller. If that statement
+    fails, the connection is invalidated and the failure logged; the block's own exception,
+    if any, is re-raised unchanged. If the process crashes, PostgreSQL ends its database
+    session and releases the lock, which is what lets the next lock holder mark a
+    ``running`` analysis row left behind by the crash as ``failed``.
+
+    Yields:
+        The dedicated :class:`AsyncConnection`, in ``AUTOCOMMIT`` isolation.
+    """
+    async with get_engine().connect() as checked_out:
+        conn = await checked_out.execution_options(isolation_level="AUTOCOMMIT")
+        try:
+            yield conn
+        finally:
+            await _run_to_completion(_release_advisory_locks(conn))

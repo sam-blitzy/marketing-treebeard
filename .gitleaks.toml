@@ -1,0 +1,170 @@
+# Gitleaks secret-scan configuration for the Ads Action Engine.
+#
+# Run only through the pinned image zricethezav/gitleaks:v8.30.1, by `make secret-scan` and CI;
+# a finding fails the job. `gitleaks git` scans every commit, which is the gate. `gitleaks dir`
+# on a working tree also reads the gitignored `.env` that `make init` writes, and reports its
+# SESSION_SECRET and APP_ADMIN_PASSWORD_HASH by design: that file must never be committed.
+#
+# The built-in ruleset and its global allowlist are inherited unchanged. The rules below add the
+# product's own credentials, which the built-in rules cannot recognise by shape:
+#   n8n webhook secret, session secret, LinkedIn OAuth credentials, HubSpot token, argon2 hash.
+#
+# Assignment rules share one shape, so their behaviour is uniform:
+# - a bare name followed directly by `=`, `:=`, `?=`, `+=` or `:` (env files, shell, YAML,
+#   Makefile, keyword arguments). A quoted key (`"NAME": value`, a Python dict or JSON) does not
+#   match; the built-in generic-api-key rule covers quoted keys;
+# - spaces and tabs only around the separator, never a newline, so an empty `KEY=` line in
+#   `.env.example` can never borrow the next line as its value;
+# - a value of at least 16 characters with no whitespace, quote, backtick or template/shell
+#   metacharacter ({ } $ ( ) < > [ ] | \ , ; * %), so `${VAR}`, `$(cmd)`, `{name}`,
+#   `<placeholder>`, `[REDACTED]` and `****` are never read as secrets;
+# - no entropy floor: the live n8n secret is a digits-only string of entropy about 3.2, below
+#   the 3.5 floor the built-in generic rule uses.
+#
+# Allowlists stay narrow: every one is scoped to named rules (targetRules), and those that name
+# paths combine them with a value test (condition = "AND"). Nothing allowlists `.env` or
+# `.env.example`; the template passes because its secrets are empty. All regexes are Go RE2.
+
+title = "Ads Action Engine secret scan"
+minVersion = "v8.30.1"
+
+[extend]
+useDefault = true
+
+# -----------------------------------------------------------------------------------------------
+# Rules
+# -----------------------------------------------------------------------------------------------
+
+[[rules]]
+id = "n8n-webhook-secret"
+description = "n8n Google Ads webhook shared secret assigned a literal value: N8N_WEBHOOK_SECRET, the N8N_GOOGLE_ADS_WEBHOOK_TOKEN alias, or the X-Webhook-Secret / X-Webhook-Token header."
+regex = '''(?i)(?:N8N_WEBHOOK_SECRET|N8N_GOOGLE_ADS_WEBHOOK_TOKEN|X-Webhook-(?:Secret|Token))[ \t]*(?:[:?+]?=|:)[ \t]*['"]?([^\s'"\x60{}$()<>\[\]|\\,;*%]{16,})'''
+secretGroup = 1
+keywords = ["n8n_webhook_secret", "n8n_google_ads_webhook_token", "x-webhook-secret", "x-webhook-token"]
+tags = ["ads-engine"]
+
+[[rules]]
+id = "session-secret"
+description = "SESSION_SECRET (session cookie signing key) assigned a literal value; the real value is written to .env by make init."
+regex = '''(?i)SESSION_SECRET[ \t]*(?:[:?+]?=|:)[ \t]*['"]?([^\s'"\x60{}$()<>\[\]|\\,;*%]{16,})'''
+secretGroup = 1
+keywords = ["session_secret"]
+tags = ["ads-engine"]
+
+[[rules]]
+id = "linkedin-token"
+description = "LinkedIn Marketing API OAuth credential (LINKEDIN_ACCESS_TOKEN, LINKEDIN_REFRESH_TOKEN or LINKEDIN_CLIENT_SECRET) assigned a literal value."
+regex = '''(?i)LINKEDIN_(?:ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)[ \t]*(?:[:?+]?=|:)[ \t]*['"]?([^\s'"\x60{}$()<>\[\]|\\,;*%]{16,})'''
+secretGroup = 1
+keywords = ["linkedin_"]
+tags = ["ads-engine"]
+
+[[rules]]
+id = "hubspot-token"
+description = "HubSpot Service Key or private-app token assigned a literal value: HUBSPOT_ACCESS_TOKEN or the HUBSPOT_PRIVATE_APP_TOKEN alias."
+regex = '''(?i)HUBSPOT_(?:ACCESS_TOKEN|PRIVATE_APP_TOKEN)[ \t]*(?:[:?+]?=|:)[ \t]*['"]?([^\s'"\x60{}$()<>\[\]|\\,;*%]{16,})'''
+secretGroup = 1
+keywords = ["hubspot_access_token", "hubspot_private_app_token"]
+tags = ["ads-engine"]
+
+# The built-in hubspot-api-key rule knows only the retired UUID API key, so the private-app
+# token shape (pat-{region}{n}-{uuid}) is matched wherever it appears, whatever it is named.
+[[rules]]
+id = "hubspot-private-app-token"
+description = "HubSpot private-app access token (pat-<region><n>-<uuid>) anywhere in a file."
+regex = '''\bpat-[a-z]{2}\d-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'''
+keywords = ["pat-"]
+tags = ["ads-engine"]
+
+# A committed admin hash is a credential leak: it permits offline guessing of the admin
+# password. The real hash lives only in .env (APP_ADMIN_PASSWORD_HASH). `$$` is accepted
+# because Compose and make escape `$` that way.
+[[rules]]
+id = "argon2-hash"
+description = "Argon2 password hash in PHC format, such as the APP_ADMIN_PASSWORD_HASH value."
+regex = '''\$\$?argon2(?:id|i|d)\$\$?v=\d+\$\$?m=\d+,t=\d+,p=\d+\$\$?[A-Za-z0-9+/]{11,}\$\$?[A-Za-z0-9+/]{16,}'''
+keywords = ["argon2"]
+tags = ["ads-engine"]
+
+# -----------------------------------------------------------------------------------------------
+# Allowlists
+# -----------------------------------------------------------------------------------------------
+#
+# Every allowlist names its rules. A global allowlist (no targetRules) that lists paths makes
+# gitleaks 8.30.1 `dir` skip each matching file outright, ignoring condition = "AND"
+# (sources/common.go shouldSkipPath), so a path-plus-value allowlist would silently become a
+# whole-directory pass. Targeted allowlists are evaluated per finding with AND honoured in both
+# `git` and `dir` scans. They name only the key-based heuristics: the built-in generic-api-key
+# and the four assignment rules above. A provider-shaped token (HubSpot pat-, AWS, GitHub, JWT
+# and the other built-in shape rules) or an argon2 hash is reported wherever it appears, even
+# beside a redaction marker.
+
+# Code references and obvious placeholders, for the four assignment rules only. A value that is
+# an attribute path (`settings.linkedin_access_token`), an UPPER_SNAKE constant
+# (`LINKEDIN_ACCESS_TOKEN`), a placeholder-prefixed value (`your-token-here`, `test-...`,
+# `ci-...`) or a mask (`xxxxxxxx`) is not a credential. Generated secrets never take these forms:
+# hex and base64 values carry digits or mixed case, and the live n8n secret is digits only.
+[[allowlists]]
+description = "Code references and placeholder values in the ads-engine assignment rules."
+targetRules = ["n8n-webhook-secret", "session-secret", "linkedin-token", "hubspot-token"]
+regexes = [
+  '''^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$''',
+  '''^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$''',
+  '''(?i)^(?:change[-_.]?me|ci[-_.]|dummy|e2e[-_.]|example|fake|not[-_.]?a[-_.]?secret|placeholder|redacted|sample|test|your[-_.])''',
+  '''(?i)x{8,}''',
+]
+
+# Redacted live captures and simulator fixtures. `ads-engine capture-fixtures` redacts emails,
+# names and tokens before writing backend/tests/contracts/*/captured/, and the simulator only
+# emits addresses on the reserved sim.invalid domain. The markers are those of
+# backend/src/ads_engine/logging.py (`[REDACTED]`, `[REDACTED_EMAIL]`, also used by cli.py),
+# plus `<redacted>` and `****`; keep this list in sync with backend/src/ads_engine/cli.py.
+# The test is on the matched text, not the whole line: a capture written as one-line JSON is a
+# single line, so a line test would let one marker excuse every other value in the file.
+[[allowlists]]
+description = "Redacted live captures and simulator fixtures: the matched text carries a redaction marker or a sim.invalid address."
+targetRules = ["generic-api-key", "n8n-webhook-secret", "session-secret", "linkedin-token", "hubspot-token"]
+condition = "AND"
+paths = [
+  '''(?:^|/)backend/tests/contracts/.+\.json$''',
+  '''(?:^|/)backend/tests/fixtures/.+''',
+]
+regexTarget = "match"
+regexes = [
+  '''(?i)<redacted>|\bREDACTED(?:_[A-Z0-9]+)*\b|\*{4}''',
+  '''(?i)@sim\.invalid\b''',
+]
+
+# Documented sample values copied verbatim from official reference pages (LinkedIn Lead Sync,
+# HubSpot associations, Google Ads) into the top-level contract files. Only the secret itself is
+# tested, and only for placeholder wording, so no high-entropy value is ever admitted. Real
+# captured tokens are always redacted before commit, so this allowlist never needs to admit one;
+# captured/ is excluded by the single-segment file pattern.
+[[allowlists]]
+description = "Placeholder sample values from official API reference pages in contract files."
+targetRules = ["generic-api-key", "n8n-webhook-secret", "session-secret", "linkedin-token", "hubspot-token"]
+condition = "AND"
+paths = [
+  '''(?:^|/)backend/tests/contracts/(?:google|linkedin|hubspot)/[^/]+\.json$''',
+]
+regexes = [
+  '''(?i)example|sample|placeholder|x{8,}|your[-_]?token''',
+]
+
+# Opaque pagination cursors (LinkedIn `nextPageToken`/`pageToken`, Google `nextPageToken`,
+# `page_token`). A cursor selects the next page of a request that is itself authenticated; it
+# grants no access, and LinkedIn's documented samples carry high-entropy ones. Scoped to the
+# built-in generic-api-key rule, so a cursor field holding a real provider key shape is still
+# reported by that provider's rule.
+[[allowlists]]
+description = "Pagination cursors in contract and fixture payloads (generic-api-key only)."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''(?:^|/)backend/tests/contracts/.+\.json$''',
+  '''(?:^|/)backend/tests/fixtures/.+''',
+]
+regexTarget = "match"
+regexes = [
+  '''(?i)^["']?(?:next[-_]?)?page[-_]?token["']?[ \t]*[:=]''',
+]
