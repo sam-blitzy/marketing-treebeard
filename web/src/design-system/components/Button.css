@@ -1,0 +1,184 @@
+/* Button: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Action button: Record decision, Mark done, Dismiss, Snooze, Sync now, the DateRangePicker
+ * presets and every other control that performs an action. Class contract with Button.tsx:
+ *
+ *   ds-button                               always
+ *   ds-button--{primary|secondary|quiet}    variant prop, default secondary
+ *   ds-button--{sm|md}                      size prop, default md
+ *   ds-button__label                        span around the children, always rendered
+ *   ds-button__spinner                      span around the Spinner, rendered after the label
+ *                                           only while loading (aria-hidden="true")
+ *
+ * Button.tsx also sets these attributes, which carry the states styled below:
+ *   disabled             disabled prop, and always while loading
+ *   aria-busy="true"     loading prop
+ *   aria-pressed         passed through by toggle callers such as the DateRangePicker presets
+ *
+ * Plain global CSS with the ds- prefix and BEM modifiers, like every stylesheet in this folder.
+ * Colour, spacing, typography, radius and shadow values are tokens from ../tokens.css, so binding
+ * Blitzy OS touches tokens.css alone. Border and focus-ring widths are derived from --space-1 in
+ * the same way as the base focus ring in ../tokens.css and the hairline border in shared.css, so
+ * this file holds no length literal of its own.
+ *
+ * Contrast with the placeholder tokens (WCAG 2.2 AA, re-check when tokens.css changes):
+ * - primary and pressed: --color-surface text on --color-accent is at least 4.5:1;
+ * - secondary: --color-text on --color-surface is at least 4.5:1, and its --color-border
+ *   outline is at least 3:1 (SC 1.4.11);
+ * - quiet: --color-accent text is at least 4.5:1 on both the surface and the page background;
+ * - focus ring: --color-accent is at least 3:1 on both backgrounds (SC 2.4.7, 2.4.13).
+ *
+ * Target size (SC 2.5.8, minimum 24 by 24 CSS px): md is at least --space-8 (32px) tall and sm at
+ * least --space-6 (24px) tall at a 16px root; the inline padding of two --space-3 steps or more
+ * keeps even a one-character label at least 24px wide.
+ */
+
+/*
+ * Base. margin: 0 clears the user-agent button margin some engines add. The transparent border
+ * reserves the border box on every variant, so switching variant or entering the pressed state
+ * never shifts the layout. text-align keeps a wrapped label centred, and text-decoration clears
+ * the underline if the class is ever applied to an anchor.
+ */
+.ds-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-family: var(--font-family);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  text-align: center;
+  text-decoration: none;
+  border: calc(var(--space-1) / 4) solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* Sizes */
+.ds-button--md {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--font-size-md);
+  min-block-size: var(--space-8);
+}
+
+.ds-button--sm {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-size-sm);
+  min-block-size: var(--space-6);
+}
+
+/* Variants */
+.ds-button--primary {
+  background: var(--color-accent);
+  color: var(--color-surface);
+  border-color: var(--color-accent);
+}
+
+.ds-button--secondary {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
+
+.ds-button--quiet {
+  background: transparent;
+  color: var(--color-accent);
+  border-color: transparent;
+}
+
+/*
+ * Pressed toggle (aria-pressed="true", e.g. the selected DateRangePicker preset). It takes the
+ * primary fill whatever the variant, and its attribute selector outranks the variant classes.
+ * The state is not shown by colour alone (SC 1.4.1): the button is also raised by --shadow-2,
+ * and assistive technology reads it from aria-pressed. The raise is an outer shadow rather than
+ * an inset one: web/.stylelintrc.json allows a box-shadow value to be only a token, so the inset
+ * keyword cannot be added to one. The weight restates the base so the cue survives a rebinding
+ * of the base weight.
+ */
+.ds-button[aria-pressed="true"] {
+  background: var(--color-accent);
+  color: var(--color-surface);
+  border-color: var(--color-accent);
+  font-weight: var(--font-weight-semibold);
+  box-shadow: var(--shadow-2);
+}
+
+/*
+ * Hover: a raise by --shadow-1, never a colour shift, so no colour function is needed. Only on
+ * devices whose primary pointer can hover, so the state never sticks after a tap. Disabled
+ * buttons do not react, and a pressed button keeps its own, stronger raise.
+ */
+@media (hover: hover) {
+  .ds-button:hover:not(:disabled):not([aria-pressed="true"]) {
+    box-shadow: var(--shadow-1);
+  }
+}
+
+/*
+ * Keyboard focus. Restates the base ring from ../tokens.css (half of --space-1 wide, 2px at a
+ * 16px root, offset by the same amount) at component specificity, so no later rule can drop it.
+ * The ring is never removed.
+ */
+.ds-button:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/*
+ * Disabled. opacity is a unitless number, not a colour, so every variant dims alike without a
+ * colour function. Inactive controls are exempt from the contrast minimums (SC 1.4.3, 1.4.11).
+ */
+.ds-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Loading. Button.tsx also disables the button; this rule follows :disabled so the cursor reads as busy. */
+.ds-button[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Slots */
+.ds-button__label {
+  display: inline-block;
+}
+
+.ds-button__spinner {
+  display: inline-flex;
+}
+
+/*
+ * The Spinner draws its arc in --color-accent on a --color-border track, which would vanish on
+ * the accent fill of a primary or pressed button. Inside those fills the track goes transparent
+ * and the arc takes the label colour, so the loading cue stays visible. Scoped to this
+ * component's own spinner slot; the Spinner elsewhere is unchanged.
+ */
+.ds-button--primary .ds-button__spinner .ds-spinner__circle,
+.ds-button[aria-pressed="true"] .ds-button__spinner .ds-spinner__circle {
+  border-color: transparent;
+  border-block-start-color: currentColor;
+}
+
+/*
+ * Hover and state changes ease in only for users who have not asked for reduced motion.
+ * GAP: tokens.css has no motion tokens, so the duration is a literal (150ms, within the
+ * 150-300ms ease-out range for hover feedback); move it to a token when Blitzy OS supplies one.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .ds-button {
+    transition: box-shadow 150ms ease-out;
+  }
+}
+
+/*
+ * Forced colours (Windows contrast themes) replace the fill and drop shadows, which would leave
+ * a pressed toggle looking like the others. An underlined label keeps the pressed state visible
+ * there; text decoration is kept in forced-colours mode.
+ */
+@media (forced-colors: active) {
+  .ds-button[aria-pressed="true"] .ds-button__label {
+    text-decoration: underline;
+  }
+}

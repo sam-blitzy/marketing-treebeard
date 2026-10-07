@@ -1,0 +1,140 @@
+/* Dialog: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Modal dialog that hosts DecisionForm ("Record decision", "Record intended state") and any other
+ * modal form. Dialog.tsx portals this markup to document.body; the class names are a contract
+ * with Dialog.tsx and Dialog.test.tsx, so keep them exactly as written:
+ *
+ *   .ds-dialog                  fixed overlay covering the viewport; centres the panel
+ *     .ds-dialog__backdrop      aria-hidden dimming layer; a click on it closes the dialog
+ *     .ds-dialog__panel         role="dialog", aria-modal="true", tabindex="-1"
+ *       .ds-dialog__header      h2.ds-dialog__title and the Close button
+ *       .ds-dialog__body        the caller's content
+ *       .ds-dialog__footer      optional row of the caller's actions
+ *
+ * Every colour, spacing, typography, radius, shadow and z-index value is a token from
+ * ../tokens.css, so binding Blitzy OS touches tokens.css alone. The only literals are layout
+ * keywords, 100% sizes and the backdrop opacity. The border and focus-ring widths derive from
+ * --space-1, the same way the base focus ring in tokens.css and the hairline border in
+ * shared.css do, so no px literal appears here either.
+ *
+ * Accessibility (WCAG 2.2 AA):
+ * - 1.4.10 Reflow: the panel never exceeds the viewport in either axis and scrolls internally,
+ *   so at 320 CSS px wide (or 256 CSS px tall) every control stays reachable without scrolling
+ *   the page in two dimensions.
+ * - 2.4.11 Focus Not Obscured: the overlay's padding is wider than the focus ring's width plus
+ *   offset, and the panel's padding is too, so neither the panel's ring nor the ring of a
+ *   control at the panel's edge is clipped by the viewport or by the panel's own overflow.
+ * - Modal semantics, the focus trap and Escape handling live in Dialog.tsx; this file only
+ *   keeps them visible.
+ */
+
+/*
+ * Overlay. It covers the viewport above page content and banners (--z-dialog sits below
+ * --z-tooltip, so a tooltip opened inside the dialog still shows). The padding keeps a gutter
+ * between the panel and the viewport edge at every viewport size, which is also where the
+ * panel's focus ring is drawn.
+ */
+.ds-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-dialog);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+}
+
+/*
+ * Dimming layer. It is the panel's sibling, not its parent, so its opacity fades only the page
+ * behind the dialog and never the panel. The colour is the text token at half opacity rather
+ * than a colour function, because component CSS may take colours only from tokens.
+ */
+.ds-dialog__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-text);
+  opacity: 0.5;
+}
+
+/*
+ * Panel. position: relative lifts it above the absolutely positioned backdrop in paint order.
+ * It fills the overlay's inline size up to a readable measure of sixteen --space-8 steps, and
+ * its block size is capped at the overlay's content box: taller content scrolls inside the
+ * panel, and overscroll-behavior keeps that scroll from chaining to the page behind the modal.
+ * The header, body and footer are column flex items whose automatic minimum size keeps each at
+ * its content height, so overflow scrolls the panel instead of squashing a section.
+ */
+.ds-dialog__panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  inline-size: 100%;
+  max-inline-size: calc(var(--space-8) * 16);
+  max-block-size: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-5);
+  background: var(--color-surface);
+  color: var(--color-text);
+
+  /* The hairline border width is a quarter of --space-1; its colour comes from the border token */
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+
+/*
+ * The panel takes programmatic focus when its body holds no focusable element. The ring is set
+ * here explicitly, at the base ring's width, offset and accent colour, so the focused panel is
+ * always marked even if the global base layer is rebound; it lands in the overlay's gutter.
+ */
+.ds-dialog__panel:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/*
+ * Header: title at the start, Close button at the end, top-aligned so a title that wraps onto
+ * several lines keeps the button on its first line.
+ */
+.ds-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+/*
+ * Title. It takes the space the Close button leaves and may shrink below its content width
+ * (min-inline-size: 0), and overflow-wrap breaks an unbroken word such as a long campaign name,
+ * so at 320 CSS px the title wraps instead of pushing the Close button out of the panel.
+ */
+.ds-dialog__title {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+/* Body: the caller's content as a column with a token gap between its children. */
+.ds-dialog__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/*
+ * Footer: the caller's actions, aligned to the end and wrapping onto new lines in a narrow
+ * viewport instead of overflowing the panel.
+ */
+.ds-dialog__footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}

@@ -36,12 +36,16 @@ const COMMITTED_STYLESHEETS = [
   TOKENS_CSS,
   'src/design-system/components/Banner.css',
   'src/design-system/components/Card.css',
+  'src/design-system/components/DataTable.css',
+  'src/design-system/components/Dialog.css',
   'src/design-system/components/EmptyState.css',
   'src/design-system/components/Grid.css',
   'src/design-system/components/Inline.css',
+  'src/design-system/components/SideNav.css',
   'src/design-system/components/Stack.css',
   'src/design-system/components/Tabs.css',
   'src/design-system/components/TextField.css',
+  'src/design-system/components/TopBar.css',
   'src/design-system/components/shared.css',
 ] as const;
 

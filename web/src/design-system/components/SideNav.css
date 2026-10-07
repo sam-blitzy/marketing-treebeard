@@ -1,0 +1,131 @@
+/* SideNav: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Vertical navigation list with optional item counts: the app's primary navigation in the router
+ * layout and the /actions section navigation (anchor links with item counts). SideNav.tsx
+ * renders, and router links built through its renderLink prop must keep, this class contract:
+ *
+ *   <nav class="ds-sidenav" aria-label="…">
+ *     <ul class="ds-sidenav__list">
+ *       <li class="ds-sidenav__item">
+ *         <a class="ds-sidenav__link [ds-sidenav__link--current]" [aria-current="page"]>
+ *           <span class="ds-sidenav__label">…</span>
+ *           <span class="ds-sidenav__count">4</span>   (only when the item has a count)
+ *         </a>
+ *       </li>
+ *     </ul>
+ *   </nav>
+ *
+ * Every colour, spacing, typography and radius value is a token from ../tokens.css, so binding
+ * Blitzy OS touches tokens.css alone. The current item is marked by a heavier weight and an
+ * accent bar on its inline-start edge, never by colour alone (WCAG 2.2 SC 1.4.1), and either
+ * the --current modifier or aria-current="page" applies that state, so a router link that only
+ * sets aria-current is styled identically. The ds-sidenav__item hook carries no style of its
+ * own: the list gap spaces the items.
+ */
+
+/* Root: the navigation text size, inherited by every link. */
+.ds-sidenav {
+  font-size: var(--font-size-sm);
+}
+
+/* List: user-agent bullets, indent and outer margin cleared; the gap alone spaces the links. */
+.ds-sidenav__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/*
+ * Link: the label on the inline-start side and the count pushed to the inline-end side. The
+ * transparent inline-start border reserves the accent bar's width on every link, so marking the
+ * current item never shifts its text. The colour overrides the global accent link colour from
+ * tokens.css, because a navigation list reads as text, not as a run of inline links.
+ *
+ * The minimum block size is 44px at the 16px root (--space-8 + --space-3 = 2.75rem), the touch
+ * target minimum that applies when no design source specifies a smaller target; the Blitzy OS
+ * source is unavailable, so none does. It is token-derived, so rebinding the spacing scale
+ * rebinds it, and in rem, so it grows with the user's text size.
+ */
+.ds-sidenav__link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  padding: var(--space-2) var(--space-3);
+  border-inline-start: var(--space-1) solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+/*
+ * Label: may shrink below its longest word and wrap, so a long section name never pushes the
+ * count out of the link or the link out of the navigation.
+ */
+.ds-sidenav__label {
+  min-inline-size: 0;
+  overflow-wrap: break-word;
+}
+
+/* Count: visible text read as part of the link name; tabular figures keep counts aligned. */
+.ds-sidenav__count {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+}
+
+/*
+ * Hover: a background tint plus an underline, so the state does not rely on the tint alone.
+ * Scoped to devices that can hover, so a tap on a touch screen leaves no sticky hover state.
+ * No transition is declared: the token set has no motion token, and every value here comes from
+ * a token.
+ */
+@media (hover: hover) {
+  .ds-sidenav__link:hover {
+    background: var(--color-bg);
+    text-decoration: underline;
+  }
+}
+
+/*
+ * Keyboard focus: restates the base ring from tokens.css on the link itself, so a reset applied
+ * to router links cannot remove it. The width and offset are half of --space-1 (2px at the 16px
+ * root), the same token-derived values as the base ring, rather than a literal 2px.
+ */
+.ds-sidenav__link:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/* Current page or section: heavier weight and the accent bar, with the hover tint at rest. */
+.ds-sidenav__link--current,
+.ds-sidenav__link[aria-current="page"] {
+  font-weight: var(--font-weight-semibold);
+  border-inline-start-color: var(--color-accent);
+  background: var(--color-bg);
+}
+
+/*
+ * Forced colours (for example Windows High Contrast): the browser paints every border in a
+ * system colour, transparent ones included, which would draw the accent bar on every link.
+ * Only the current link keeps its bar here; the others drop the border and take its width
+ * back as padding (--space-3 + --space-1 = --space-4), so the text still never shifts.
+ */
+@media (forced-colors: active) {
+  .ds-sidenav__link {
+    border-inline-start-style: none;
+    padding-inline-start: var(--space-4);
+  }
+
+  .ds-sidenav__link--current,
+  .ds-sidenav__link[aria-current="page"] {
+    border-inline-start-style: solid;
+    padding-inline-start: var(--space-3);
+  }
+}

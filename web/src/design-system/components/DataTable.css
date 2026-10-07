@@ -1,0 +1,144 @@
+/* DataTable: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Class contract with DataTable.tsx, which renders:
+ *
+ *   div.ds-datatable__region           role="region", tabindex="0", named by the caption
+ *     table.ds-datatable
+ *       caption.ds-datatable__caption  every table has one
+ *       thead > tr > th.ds-datatable__header + .ds-datatable__cell--start | --end
+ *       tbody > tr > td | th[scope=row].ds-datatable__cell + .ds-datatable__cell--start | --end
+ *       tbody > tr.ds-datatable__detail-row[hidden] > td.ds-datatable__detail-cell
+ *       tbody > tr > td.ds-datatable__empty                     when there are no rows
+ *
+ * The expand column's header and data cells also carry .ds-datatable__toggle-cell. When the
+ * table is expandable, every data row is followed by its detail row, hidden while collapsed.
+ *
+ * The region scrolls a table wider than its container on the inline axis, so the page itself
+ * never scrolls sideways at a 320 CSS px viewport (WCAG 2.2 SC 1.4.10 Reflow). It is focusable
+ * so keyboard users can scroll it (SC 2.1.1), and shows a visible ring when focused (SC 2.4.7).
+ *
+ * Every colour, spacing, typography and radius value is a token from ../tokens.css. Border and
+ * outline widths are derived from --space-1 (a quarter for hairlines, a half for the focus ring),
+ * as tokens.css and shared.css derive theirs, so rebinding the spacing scale rebinds them too and
+ * no px literal is needed. At the 16px root they are exactly 1px and 2px.
+ */
+
+.ds-datatable__region {
+  overflow-x: auto;
+  max-inline-size: 100%;
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+/* Restates the base :focus-visible ring from ../tokens.css so the region keeps it on rebinding. */
+.ds-datatable__region:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+.ds-datatable {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+}
+
+.ds-datatable__caption {
+  caption-side: top;
+  text-align: start;
+  padding: var(--space-3) var(--space-3) var(--space-2);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* Column headers and body cells share padding and the row separator. */
+.ds-datatable__header,
+.ds-datatable__cell {
+  padding: var(--space-2) var(--space-3);
+  border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
+  vertical-align: top;
+}
+
+/* nowrap keeps each header on one line, which sets the column's minimum width. */
+.ds-datatable__header {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+/* Row headers (th scope="row"), such as the asset name in a white paper row. */
+th.ds-datatable__cell {
+  font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * Alignment modifiers, on header and body cells alike. They also replace the user-agent centring
+ * of th. Logical values mean numeric columns align right in left-to-right text.
+ */
+.ds-datatable__cell--start {
+  text-align: start;
+}
+
+/*
+ * Numeric columns use tabular figures so digits line up down the column. They also stay on one
+ * line: a wrapped value would break that alignment, and a floor such as "≥ 12" would leave its
+ * sign on a line of its own. A wide value widens the column, and the region scrolls.
+ */
+.ds-datatable__cell--end {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/*
+ * The expand column shrinks to its toggle button. In table layout a 1% inline size is the
+ * shrink-to-fit idiom (the column takes its minimum content width), not a design value.
+ */
+.ds-datatable__toggle-cell {
+  inline-size: 1%;
+  white-space: nowrap;
+}
+
+/*
+ * The detail row holds the expanded content, for example per-creative rows. It spans every
+ * column, sits on the page background so it reads as nested under its data row, and ends with
+ * the same row separator, so the next data row starts on a clear line.
+ */
+.ds-datatable__detail-cell {
+  padding: var(--space-3);
+  border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
+  background: var(--color-bg);
+}
+
+/* Explicit, so no display rule on table rows can bring back a collapsed detail row. */
+.ds-datatable__detail-row[hidden] {
+  display: none;
+}
+
+.ds-datatable__empty {
+  padding: var(--space-4) var(--space-3);
+  color: var(--color-text-muted);
+  text-align: start;
+}
+
+/*
+ * The region's own border closes the table, so the last visible row draws no separator; with one
+ * it would show a double line at the bottom edge.
+ */
+tbody tr:last-child > .ds-datatable__cell,
+tbody tr:last-child > .ds-datatable__detail-cell {
+  border-block-end: 0;
+}
+
+/*
+ * In an expandable table the last row is the detail row. While it is collapsed, the data row
+ * just before it is the last visible row. This is a separate rule because a browser without
+ * :has() would drop a whole selector list containing it, taking the reset above with it; such a
+ * browser keeps only the double line on that last collapsed row.
+ */
+tbody tr:has(+ .ds-datatable__detail-row[hidden]:last-child) > .ds-datatable__cell {
+  border-block-end: 0;
+}

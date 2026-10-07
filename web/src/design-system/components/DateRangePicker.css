@@ -1,0 +1,79 @@
+/* DateRangePicker: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Layout and grouping for the analysis-window picker in the status bar. DateRangePicker.tsx
+ * renders this structure; the class names are a contract with it and with its tests:
+ *
+ *   div.ds-daterange                      the whole picker: label, presets, custom panel
+ *     p.ds-daterange__label#{id}          visible label naming the preset group
+ *     div.ds-daterange__presets           role="group", aria-labelledby the label: one toggle
+ *                                         Button per configured preset, then "Custom range"
+ *     div.ds-daterange__custom#{id}       the custom-range panel, [hidden] while collapsed,
+ *                                         controlled by the "Custom range" toggle
+ *       form
+ *         div.ds-daterange__custom-fields start and end TextFields, then the Apply Button
+ *
+ * Only layout and grouping live here. The preset toggles and Apply are Buttons and the dates
+ * are TextFields, each styled by its own stylesheet. Every colour, spacing, typography and
+ * radius value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone.
+ * The picker has no breakpoint of its own: presets and fields wrap onto new lines, so the
+ * picker reflows down to a 320 CSS px viewport without horizontal scrolling (WCAG 1.4.10).
+ */
+
+/*
+ * The picker stacks its label, preset row and custom panel in one column. min-inline-size: 0
+ * lets it shrink inside the status bar's flex or grid track, as Stack and Inline do, so its
+ * rows wrap instead of widening the parent.
+ */
+.ds-daterange {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+/* The label is a paragraph, not a heading, so the UA paragraph margin is cleared. */
+.ds-daterange__label {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+}
+
+/* One row of preset toggles plus the "Custom range" toggle, wrapping on narrow viewports. */
+.ds-daterange__presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/*
+ * The custom-range panel is set apart as a bordered surface. The hairline border width is a
+ * quarter of --space-1 (1px at the 16px root), the same derivation as shared.css, so every
+ * value in this file resolves to a token; its colour comes from the border token.
+ */
+.ds-daterange__custom {
+  padding: var(--space-3);
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+/*
+ * Collapsed panel. The UA stylesheet already hides [hidden], but this keeps the panel hidden
+ * should any later rule give it a display value.
+ */
+.ds-daterange__custom[hidden] {
+  display: none;
+}
+
+/*
+ * Start date, end date and Apply on one wrapping row. Items align to the line's end edge, so
+ * Apply sits level with the bottom of the date fields rather than beside their labels.
+ */
+.ds-daterange__custom-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}

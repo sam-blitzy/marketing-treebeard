@@ -1,0 +1,59 @@
+/* TopBar: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Application top bar. TopBar.tsx renders a plain div, because PageShell already wraps it in
+ * the page's <header> landmark, and the product name is text rather than a heading, because
+ * each page's <h1> is PageShell.Title:
+ *
+ *   <div class="ds-topbar">
+ *     <span class="ds-topbar__product">Ads Action Engine</span>
+ *     <div class="ds-topbar__actions">…</div>           only when TopBar has children
+ *   </div>
+ *
+ * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
+ * Every value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The
+ * class names are a contract with TopBar.tsx; keep them exactly as written.
+ */
+
+/*
+ * The bar: product name at the inline start, actions at the inline end. It wraps instead of
+ * overflowing, so on a narrow viewport the actions drop onto their own line (WCAG 1.4.10).
+ */
+.ds-topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  color: var(--color-text);
+  /*
+   * The hairline border width is a quarter of --space-1, as in shared.css, so the bar carries no
+   * literal design value; its colour comes from the border token.
+   */
+  border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
+}
+
+/*
+ * Product name. min-inline-size: 0 lets it shrink below its longest word inside the flex row,
+ * and overflow-wrap then breaks an unbroken name rather than letting it push the bar wider than
+ * the viewport.
+ */
+.ds-topbar__product {
+  min-inline-size: 0;
+  overflow-wrap: break-word;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+}
+
+/* Actions: a wrapping row of controls, packed towards the inline end of their line. */
+.ds-topbar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  font-size: var(--font-size-sm);
+}

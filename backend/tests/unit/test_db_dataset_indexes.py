@@ -5,10 +5,11 @@ Purging a retired dataset is one ``DELETE FROM source_dataset WHERE id = :retire
 PostgreSQL does not index referencing columns itself, so every table carrying
 :class:`~ads_engine.db.base.DatasetScopedMixin` needs an index, unique constraint or primary
 key whose first column is ``dataset_id``. Most tables get one from their natural-key unique;
-``lead_form_version`` (natural key ``(lead_form_id, version)``) and the append-only
-``entity_snapshot`` (no natural key) declare an explicit ``ix_<table>_dataset_id``.
+``lead_form_version`` (natural key ``(lead_form_id, version)``), the append-only
+``entity_snapshot`` (no natural key) and the decision log's ``decision`` and ``discrepancy``
+(inserted, never upserted, so no natural key) declare an explicit ``ix_<table>_dataset_id``.
 
-The tables are collected from the model classes defined in the six model modules imported
+The tables are collected from the model classes defined in the seven model modules imported
 below, not from all of ``Base.metadata``, so a module added later is covered only once it is
 imported here deliberately. DDL is compiled offline with the PostgreSQL dialect; no database
 is needed.
@@ -24,15 +25,15 @@ from sqlalchemy.schema import CreateIndex
 from sqlalchemy.sql.elements import UnaryExpression
 
 from ads_engine.db.base import Base, DatasetScopedMixin
-from ads_engine.db.models import accounts, analysis, crm, facts, ops, snapshots
+from ads_engine.db.models import accounts, analysis, crm, decisions, facts, ops, snapshots
 
 # The project's own driver dialect, resolved through the typed URL API rather than the untyped
 # ``postgresql.dialect()`` constructor, so this module also passes ``mypy --strict``.
 _PG: Dialect = make_url("postgresql+psycopg://").get_dialect()()
 
-_MODEL_MODULES: tuple[ModuleType, ...] = (ops, accounts, facts, snapshots, crm, analysis)
+_MODEL_MODULES: tuple[ModuleType, ...] = (ops, accounts, facts, snapshots, crm, decisions, analysis)
 
-# Every table of the six model modules that mixes in DatasetScopedMixin. Listed explicitly so
+# Every table of the seven model modules that mixes in DatasetScopedMixin. Listed explicitly so
 # the collection below cannot pass vacuously by finding fewer tables than the schema has.
 _EXPECTED_DATASET_SCOPED_TABLES: frozenset[str] = frozenset(
     {
@@ -59,12 +60,14 @@ _EXPECTED_DATASET_SCOPED_TABLES: frozenset[str] = frozenset(
         "crm_deal",
         "crm_association",
         "crm_association_fetch",
+        "decision",
+        "discrepancy",
     }
 )
 
 
 def _dataset_scoped_tables() -> dict[str, Table]:
-    """Return the tables of the model classes in the six modules that use the mixin.
+    """Return the tables of the model classes in the seven modules that use the mixin.
 
     A class counts only where it is defined, so a model re-exported by another module is
     collected once.
@@ -130,7 +133,7 @@ def _table(name: str) -> Table:
 
 
 def test_collection_finds_every_dataset_scoped_table() -> None:
-    """The six model modules yield exactly the schema's dataset-scoped tables."""
+    """The seven model modules yield exactly the schema's dataset-scoped tables."""
     assert set(_dataset_scoped_tables()) == _EXPECTED_DATASET_SCOPED_TABLES
 
 
@@ -149,12 +152,14 @@ def test_every_dataset_scoped_table_has_a_dataset_id_leading_index() -> None:
     [
         ("lead_form_version", "ix_lead_form_version_dataset_id"),
         ("entity_snapshot", "ix_entity_snapshot_dataset_id"),
+        ("decision", "ix_decision_dataset_id"),
+        ("discrepancy", "ix_discrepancy_dataset_id"),
     ],
 )
 def test_explicit_dataset_id_index_is_a_plain_single_column_index(
     table_name: str, index_name: str
 ) -> None:
-    """The two tables without a dataset-leading natural key get a non-unique ``dataset_id`` index.
+    """Tables without a dataset-leading natural key get a non-unique ``dataset_id`` index.
 
     The name is the one the ``ix_%(column_0_label)s`` convention would give the index.
     """
@@ -179,6 +184,16 @@ def test_explicit_dataset_id_index_is_a_plain_single_column_index(
             "entity_snapshot",
             "ix_entity_snapshot_dataset_id",
             "CREATE INDEX ix_entity_snapshot_dataset_id ON entity_snapshot (dataset_id)",
+        ),
+        (
+            "decision",
+            "ix_decision_dataset_id",
+            "CREATE INDEX ix_decision_dataset_id ON decision (dataset_id)",
+        ),
+        (
+            "discrepancy",
+            "ix_discrepancy_dataset_id",
+            "CREATE INDEX ix_discrepancy_dataset_id ON discrepancy (dataset_id)",
         ),
     ],
 )

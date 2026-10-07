@@ -1,0 +1,174 @@
+/* PageShell: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Page frame for every screen. PageShell.tsx renders the class contract below; keep the names
+ * exactly as written, because PageShell.tsx and PageShell.test.tsx depend on them.
+ *
+ *   .ds-pageshell                 frame: skip link, top bar, then the body row
+ *   .ds-pageshell__skip           "Skip to main content" link; shared.css hides it until focused
+ *   .ds-pageshell__header         <header> landmark holding TopBar
+ *   .ds-pageshell__body           row of side navigation and main content
+ *   .ds-pageshell__sidenav        plain container for SideNav, which supplies the <nav> landmark
+ *   .ds-pageshell__main           <main id="ds-main" tabindex="-1">, the skip link's target
+ *   .ds-pageshell__titlebar       PageShell.Title: the page <h1> plus optional actions
+ *   .ds-pageshell__title          the <h1>
+ *   .ds-pageshell__section        PageShell.Section: <section> whose id is an anchor target,
+ *                                 such as #section-{key} or #group-{sectionKey}-{groupKey}
+ *   .ds-pageshell__section--level-2 | --level-3   heading level of that section
+ *   .ds-pageshell__section-header the section heading row: heading plus optional actions
+ *   .ds-pageshell__section-title  the <h2> or <h3>
+ *   .ds-pageshell__actions        action slot of the title bar and of each section header
+ *
+ * Every colour, spacing and typography value is a token from ../tokens.css, so binding Blitzy OS
+ * touches tokens.css alone (web/.stylelintrc.json enforces this). The two literals are the
+ * viewport-height unit on the frame and the documented Grid breakpoint at the end of this file,
+ * which Grid.css holds in identical form, so the page frame and Grid stack to one column at
+ * the same width.
+ */
+
+/*
+ * Frame: fills at least the viewport so the page background reaches the bottom on short pages.
+ * The viewport unit is a sizing keyword for "the visible page", not a design token value; a
+ * percentage would resolve to auto here, because no ancestor of the frame has a set height.
+ */
+.ds-pageshell {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 100vh;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+/* Header: a positioning context for anything TopBar anchors inside the banner landmark. */
+.ds-pageshell__header {
+  position: relative;
+}
+
+/*
+ * Body row: side navigation beside main content. flex-start keeps the side navigation at its
+ * own height instead of stretching it to the height of main, which position: sticky needs.
+ */
+.ds-pageshell__body {
+  display: flex;
+  flex: 1 1 auto;
+  gap: var(--space-6);
+  align-items: flex-start;
+  padding-block: var(--space-6);
+  padding-inline: var(--space-4);
+}
+
+/*
+ * Side navigation column: a fixed track seven --space-8 steps wide, derived from the spacing
+ * scale so it rebinds with it. It stays in view while main scrolls.
+ */
+.ds-pageshell__sidenav {
+  flex: 0 0 calc(var(--space-8) * 7);
+  position: sticky;
+  inset-block-start: var(--space-4);
+}
+
+/*
+ * Main content: takes the rest of the row. min-inline-size: 0 lets it shrink below the
+ * intrinsic width of long content, so text and tables wrap inside it instead of widening the
+ * page. The gap spaces the title bar and the sections.
+ */
+.ds-pageshell__main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-6);
+  min-inline-size: 0;
+}
+
+/*
+ * Main receives focus from the skip link (tabindex="-1"). The ring is dropped only when the
+ * browser judges the focus non-visible, as after a mouse click on the skip link; keyboard
+ * activation keeps the base :focus-visible ring from ../tokens.css (WCAG 2.2 SC 2.4.7).
+ */
+.ds-pageshell__main:focus:not(:focus-visible) {
+  outline: 0;
+}
+
+/* Title bar: the page heading with its actions, wrapping the actions below on narrow widths. */
+.ds-pageshell__titlebar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/*
+ * Page heading. overflow-wrap: anywhere lets a long unbroken name break, so the heading never
+ * forces horizontal scrolling at the narrowest supported viewport (WCAG 2.2 SC 1.4.10 Reflow).
+ */
+.ds-pageshell__title {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Section: heading row, then content. The scroll margin keeps an anchored section's heading
+ * clear of the viewport edge when the side navigation or a banner link jumps to it.
+ */
+.ds-pageshell__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  scroll-margin-block-start: var(--space-6);
+}
+
+/* Section heading row: the heading with its actions, wrapping like the title bar. */
+.ds-pageshell__section-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/* Section heading. Its size follows the heading level modifier on the section. */
+.ds-pageshell__section-title {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+.ds-pageshell__section--level-2 .ds-pageshell__section-title {
+  font-size: var(--font-size-lg);
+}
+
+.ds-pageshell__section--level-3 .ds-pageshell__section-title {
+  font-size: var(--font-size-md);
+}
+
+/* Action slot: the title bar's or a section header's controls, wrapping onto new lines. */
+.ds-pageshell__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/*
+ * Single-column collapse, last so it wins at equal specificity. Below the Grid breakpoint the
+ * side navigation stacks above main at full width and stops sticking, and the body padding
+ * steps down one notch on each axis.
+ */
+/* GAP: breakpoint literal (custom properties cannot be used in @media), see GAPS.md */
+@media (max-width: 48rem) {
+  .ds-pageshell__body {
+    flex-direction: column;
+    align-items: stretch;
+    padding-block: var(--space-4);
+    padding-inline: var(--space-3);
+  }
+
+  .ds-pageshell__sidenav {
+    flex-basis: auto;
+    position: static;
+  }
+}
