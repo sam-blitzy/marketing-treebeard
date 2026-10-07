@@ -1,0 +1,65 @@
+/* EmptyState: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Empty state: the panel a section shows in place of its list when it has no items, stating
+ * why, for example "No search term met the K1 minimum of 37 clicks". EmptyState.tsx renders:
+ *
+ *   <div class="ds-emptystate">               root, carries the optional id
+ *     <p class="ds-emptystate__title">…</p>     always; a paragraph, never a heading
+ *     <div class="ds-emptystate__reason">…</div> when children are given
+ *     <div class="ds-emptystate__action">…</div> when an action is given
+ *   </div>
+ *
+ * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
+ * Every colour, spacing, radius and typography value is a token from ../tokens.css, so binding
+ * Blitzy OS touches tokens.css alone. The class names are a contract with EmptyState.tsx and
+ * EmptyState.test.tsx; keep them exactly as written.
+ */
+
+/*
+ * Root: a single column, children aligned to the start so the action keeps its own width
+ * instead of stretching across the panel. The dashed border marks the panel as a placeholder
+ * for content, distinct from the solid border of a Card. --color-border is at least 3:1 on both
+ * backgrounds, so the panel's edge stays perceivable (WCAG 2.2 SC 1.4.11).
+ *
+ * The hairline border width is a quarter of --space-1 (1px at the default 16px root), so every
+ * value here resolves to a token and rebinding the spacing scale rebinds the hairline, as in
+ * shared.css; a literal 1px would be the only untokenised value in the rule.
+ *
+ * min-inline-size: 0 lets the panel shrink inside a flex or grid track. overflow-wrap is
+ * inherited by the title and reason; anywhere (not break-word) is used because start-aligned
+ * children are sized to fit their content, and only anywhere lowers that minimum, so an
+ * unbreakable reason such as a long search term or URN wraps inside the panel instead of
+ * overflowing it (WCAG 2.2 SC 1.4.10 Reflow).
+ */
+.ds-emptystate {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-inline-size: 0;
+  padding: var(--space-4);
+  background: var(--color-surface);
+  border: calc(var(--space-1) / 4) dashed var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+/* Title: the user-agent paragraph margin is cleared, so the root's gap alone spaces the parts. */
+.ds-emptystate__title {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--font-size-md);
+}
+
+/* Reason: secondary text; --color-text-muted is at least 4.5:1 on the surface (WCAG 1.4.3). */
+.ds-emptystate__reason {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/* Action: a little extra separation from the reason, added to the root's gap. */
+.ds-emptystate__action {
+  margin-block-start: var(--space-1);
+}

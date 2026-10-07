@@ -34,6 +34,7 @@ const BREAKPOINT_STYLESHEETS = [
 /** The stylesheets committed under src/design-system, which must lint clean as they are. */
 const COMMITTED_STYLESHEETS = [
   TOKENS_CSS,
+  'src/design-system/components/EmptyState.css',
   'src/design-system/components/Grid.css',
   'src/design-system/components/Inline.css',
   'src/design-system/components/Stack.css',
