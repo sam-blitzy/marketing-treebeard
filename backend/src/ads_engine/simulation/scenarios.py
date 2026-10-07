@@ -4750,7 +4750,12 @@ def _veto_scenarios(module: str) -> Iterator[Scenario]:
         _pipeline_world(
             "veto.repeat_contact", {-25: 1, -20: 1}, funnel=_funnel(repeat_person_share=1)
         ),
-        Expectation(C2, True, {"matured_leads": 2, "matched_leads": 2, "eligible_contacts": 1}),
+        Expectation(
+            C2,
+            False,
+            {"matured_leads": 2, "matched_leads": 2, "eligible_contacts": 1},
+            withheld_reason="leads 2 of 5 required",
+        ),
     )
     scale_leads = _lead_days(21, _MATURED)
     yield _case(
