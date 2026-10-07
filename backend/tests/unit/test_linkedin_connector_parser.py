@@ -1317,9 +1317,11 @@ def test_parse_analytics_daily_rejects_a_non_object() -> None:
 # ---------------------------------------------------------------------------------------------
 #
 # Rest.li ids, counts, epoch milliseconds, date parts and form versions are 64-bit longs, and
-# amounts stay below 10**19. Without the bounds, int() raises ValueError past 4,300 digits,
-# Decimal() raises InvalidOperation on an exponent beyond its limits, and date() raises
-# OverflowError on a year beyond a C int. The values below are deliberately malformed inputs.
+# amounts are stored as numeric(18, 6): below 10**12, with no nonzero digit beyond the sixth
+# decimal place. Without the bounds, int() raises ValueError past 4,300 digits, Decimal()
+# raises InvalidOperation on an exponent beyond its limits, date() raises OverflowError on a
+# year beyond a C int, and storage overflows on a larger amount or rounds a finer one. The
+# values below are deliberately malformed inputs, apart from the boundary values accepted.
 
 INT64_MAX = 2**63 - 1
 OUT_OF_INT64 = "is out of the 64-bit integer range"
@@ -1478,29 +1480,191 @@ def test_parse_analytics_daily_rejects_a_cost_beyond_the_decimal_bounds(
     _assert_not_echoed(error, raw)
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("9999999999999999999.99", "9999999999999999999.99"),  # just below 10**19
-        (Decimal("9.999E+18"), "9.999E+18"),
-        (10**19 - 1, "9999999999999999999"),
-        ("0." + "1" * 62, "0." + "1" * 62),  # exactly 64 characters
-    ],
-)
-def test_parse_analytics_daily_accepts_a_cost_within_the_decimal_bounds(
-    value: object, expected: str
-) -> None:
+def _analytics_cost(value: object) -> dict[str, Any]:
+    """The second documented analytics element, ``costInLocalCurrency`` set to ``value``."""
     element = _daily(1)
     element["costInLocalCurrency"] = value
-    cost = parse_analytics_daily(element).cost
-    assert cost is not None
-    assert str(cost) == expected  # exact, never rounded
+    return element
 
 
-# A zero is below the 10**19 bound whatever its exponent, although Decimal("0E+19").adjusted()
-# is 19, and a signed zero is returned unsigned.
-ZERO_NUMERALS = ["0E+19", "-0E+19", "0e999"]
-ZERO_AMOUNTS: list[object] = [*ZERO_NUMERALS, Decimal("0E+19")]
+def _segment_cost(value: object) -> dict[str, Any]:
+    """The documented statistics element, ``costInLocalCurrency`` set to ``value``."""
+    element = _segment([SAMPLE_SEGMENT_CAMPAIGN, "urn:li:seniority:7"])
+    element["costInLocalCurrency"] = value
+    return element
+
+
+def _group_daily_budget(value: object) -> dict[str, Any]:
+    """The first documented campaign group with the bare ``dailyBudget`` set to ``value``."""
+    element: dict[str, Any] = _sample_element("ad_campaign_groups")
+    element["dailyBudget"] = value
+    return element
+
+
+def _group_total_budget(value: object) -> dict[str, Any]:
+    """The first documented campaign group with ``totalBudget.amount`` set to ``value``."""
+    element: dict[str, Any] = _sample_element("ad_campaign_groups")
+    element["totalBudget"] = {"amount": value, "currencyCode": "USD"}
+    return element
+
+
+def _campaign_daily_budget(value: object) -> dict[str, Any]:
+    """The documented campaign with ``dailyBudget.amount`` set to ``value``."""
+    element: dict[str, Any] = _sample_element("ad_campaigns")
+    element["dailyBudget"]["amount"] = value
+    return element
+
+
+def _campaign_total_budget(value: object) -> dict[str, Any]:
+    """The documented campaign with a lifetime budget of ``value`` in place of its daily one."""
+    element: dict[str, Any] = _sample_element("ad_campaigns")
+    del element["dailyBudget"]
+    element["totalBudget"] = {"amount": value, "currencyCode": "USD"}
+    return element
+
+
+def _amount_of(budget: Money | None) -> Decimal | None:
+    """The amount of a parsed budget, or ``None`` when the budget is absent."""
+    return None if budget is None else budget.amount
+
+
+# Every amount the parser reads is stored as numeric(18, 6): (surface, the field a defect names,
+# a documented element carrying the amount, the parsed amount).
+AMOUNT_SITES = [
+    pytest.param(
+        "ad_analytics",
+        "costInLocalCurrency",
+        _analytics_cost,
+        lambda element: parse_analytics_daily(element).cost,
+        id="analytics-cost",
+    ),
+    pytest.param(
+        "ad_analytics_statistics",
+        "costInLocalCurrency",
+        _segment_cost,
+        lambda element: parse_segment(element, "MEMBER_SENIORITY").cost,
+        id="segment-cost",
+    ),
+    pytest.param(
+        "ad_campaign_groups",
+        "dailyBudget",
+        _group_daily_budget,
+        lambda element: _amount_of(
+            parse_campaign_group(element, account_currency="USD").daily_budget
+        ),
+        id="group-daily-budget",
+    ),
+    pytest.param(
+        "ad_campaign_groups",
+        "amount",
+        _group_total_budget,
+        lambda element: _amount_of(
+            parse_campaign_group(element, account_currency="USD").total_budget
+        ),
+        id="group-total-budget",
+    ),
+    pytest.param(
+        "ad_campaigns",
+        "amount",
+        _campaign_daily_budget,
+        lambda element: _amount_of(parse_campaign(element, account_currency="USD").daily_budget),
+        id="campaign-daily-budget",
+    ),
+    pytest.param(
+        "ad_campaigns",
+        "amount",
+        _campaign_total_budget,
+        lambda element: _amount_of(parse_campaign(element, account_currency="USD").total_budget),
+        id="campaign-total-budget",
+    ),
+]
+AMOUNT_SITE_ARGS = ("surface", "field_name", "place", "read")
+
+OUT_OF_RANGE = "is out of range"
+TOO_PRECISE = "has more than 6 decimal places"
+
+# Amounts numeric(18, 6) cannot hold exactly, each with a fragment no message may echo: 10**12
+# or more overflows the column, and a nonzero digit beyond the sixth place would be rounded.
+UNSTORABLE_AMOUNTS: list[tuple[str | int | Decimal, str, str]] = [
+    ("1000000000000", OUT_OF_RANGE, "1000000000000"),  # 10**12, thirteen integral digits
+    ("1000000000000.000000", OUT_OF_RANGE, "1000000000000"),
+    ("1e12", OUT_OF_RANGE, "1e12"),
+    (Decimal("1E+12"), OUT_OF_RANGE, "1E+12"),
+    (10**12, OUT_OF_RANGE, "1000000000000"),
+    ("9999999999999999999.99", OUT_OF_RANGE, "99999999"),  # just below the old 10**19 bound
+    (Decimal("9.999E+18"), OUT_OF_RANGE, "9.999E+18"),
+    (10**19 - 1, OUT_OF_RANGE, "99999999"),
+    ("0.0000001", TOO_PRECISE, "0000001"),
+    ("0.00000010", TOO_PRECISE, "0000001"),
+    ("1e-7", TOO_PRECISE, "1e-7"),
+    (Decimal("1E-7"), TOO_PRECISE, "1E-7"),
+    ("12.3456789", TOO_PRECISE, "3456789"),
+    ("999999999999.9999999", TOO_PRECISE, "9999999"),  # storage would round it up to 10**12
+    ("0." + "1" * 62, TOO_PRECISE, "1111111"),  # exactly 64 characters
+    # 64 characters with a 1 in the 62nd place: rounding to the 28-digit context would hide it.
+    ("1." + "0" * 61 + "1", TOO_PRECISE, "0000001"),
+]
+
+# Amounts numeric(18, 6) holds exactly, at both bounds, each with Decimal's string form of it.
+# Trailing zeros beyond the sixth place change no value, so they are accepted.
+STORABLE_AMOUNTS: list[tuple[str | int | Decimal, str]] = [
+    ("999999999999.999999", "999999999999.999999"),  # the largest storable amount
+    (Decimal("999999999999.999999"), "999999999999.999999"),
+    (999999999999, "999999999999"),
+    ("999999999999.9999990000", "999999999999.9999990000"),
+    ("1e11", "1E+11"),
+    ("0.000001", "0.000001"),  # the smallest nonzero storable amount
+    (Decimal("1E-6"), "0.000001"),
+    ("100.500000000", "100.500000000"),
+    (Decimal("1.0000000"), "1.0000000"),
+    ("0.0000000", "0E-7"),
+    ("1." + "0" * 62, "1." + "0" * 62),  # exactly 64 characters
+]
+
+
+@pytest.mark.parametrize(AMOUNT_SITE_ARGS, AMOUNT_SITES)
+@pytest.mark.parametrize(("value", "fragment", "raw"), UNSTORABLE_AMOUNTS)
+def test_an_amount_numeric_18_6_cannot_hold_is_a_defect_at_every_amount_field(
+    surface: str,
+    field_name: str,
+    place: Callable[[object], dict[str, Any]],
+    read: Callable[[dict[str, Any]], Decimal | None],
+    value: str | int | Decimal,
+    fragment: str,
+    raw: str,
+) -> None:
+    element = place(value)
+    if isinstance(value, str):
+        _conforming(surface, element)  # a contract-valid BigDecimal string
+    error = _expect_defect(lambda: read(element), surface, f"field '{field_name}' {fragment}")
+    _assert_not_echoed(error, raw)
+
+
+@pytest.mark.parametrize(AMOUNT_SITE_ARGS, AMOUNT_SITES)
+@pytest.mark.parametrize(("value", "expected"), STORABLE_AMOUNTS)
+def test_an_amount_numeric_18_6_holds_is_returned_unchanged_at_every_amount_field(
+    surface: str,
+    field_name: str,
+    place: Callable[[object], dict[str, Any]],
+    read: Callable[[dict[str, Any]], Decimal | None],
+    value: str | int | Decimal,
+    expected: str,
+) -> None:
+    element = place(value)
+    if isinstance(value, str):
+        _conforming(surface, element)  # a contract-valid BigDecimal string
+    amount = read(element)
+    assert amount is not None
+    assert amount == Decimal(value)
+    # The same sign, digits and exponent: never rounded, rescaled or normalised.
+    assert amount.as_tuple() == Decimal(value).as_tuple()
+    assert str(amount) == expected
+
+
+# A zero fits numeric(18, 6) whatever its exponent, although Decimal("0E+19").adjusted() is 19
+# and Decimal("0E-30") has thirty decimal places, and a signed zero is returned unsigned.
+ZERO_NUMERALS = ["0E+19", "-0E+19", "0e999", "0E-30"]
+ZERO_AMOUNTS: list[object] = [*ZERO_NUMERALS, Decimal("0E+19"), Decimal("0E-30")]
 
 
 @pytest.mark.parametrize("value", ZERO_AMOUNTS)
@@ -2780,6 +2944,289 @@ def test_parse_lead_and_decode_email_reject_other_surfaces(surface: str) -> None
         parse_lead(element, {}, surface=surface)
     with pytest.raises(ValueError, match=r"surface must be lead_form_responses or"):
         decode_email(element, {}, surface=surface)
+
+
+# ---------------------------------------------------------------------------------------------
+# Storage-bound text: a NUL or an unencodable string is a defect, valid text is unchanged
+# ---------------------------------------------------------------------------------------------
+#
+# JSON escapes decode to strings that PostgreSQL text cannot store: an escaped NUL to "A\x00B",
+# and an escaped unpaired surrogate to "A\ud800B", which UTF-8 cannot encode. The parser rejects
+# both before a row reaches the database driver. They are deliberately malformed inputs, decoded
+# the way connectors/http.py decodes JSON.
+
+NUL_TEXT: str = json.loads('"A\\u0000B"')
+SURROGATE_TEXT: str = json.loads('"A\\ud800B"')
+UNSTORABLE_TEXTS = [
+    pytest.param(NUL_TEXT, "must not contain a NUL character", id="nul"),
+    pytest.param(SURROGATE_TEXT, "must be valid UTF-8 text", id="surrogate"),
+]
+# Valid text, non-ASCII characters, an emoji and inner whitespace included.
+STORABLE_TEXTS = ["Caf\u00e9 \u2013 Q4 \U0001f680", "Z\u00fcrich\tleads \u65e5\u672c\nQ4"]
+
+
+def _assert_text_not_echoed(error: QueryDefect, text: str) -> None:
+    """Assert the defect names the field only: no raw or escaped ``text`` and no chained error.
+
+    A chained ``UnicodeEncodeError`` would carry the raw string in its ``object`` attribute.
+    """
+    _assert_not_echoed(error, text, ascii(text)[1:-1], "\x00", "\ud800", "\\x00", "\\ud800")
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def _account_with(key: str, text: str) -> AdAccountRow:
+    """Parse the documented ad account with ``key`` set to ``text``."""
+    element = _sample("ad_account")
+    element[key] = text
+    return parse_ad_account(element)
+
+
+def _with_value(surface: str, key: str, value: object) -> Any:
+    """The first documented element of ``surface`` with ``key`` set to ``value``.
+
+    Used for fields the contract declares as an enum, so the element is not checked against it.
+    """
+    element: dict[str, Any] = _sample_element(surface)
+    element[key] = value
+    return element
+
+
+def _creative_with_label(text: str) -> CreativeRow:
+    """Parse a lead-gen creative whose call-to-action label (an enum) is ``text``."""
+    cta = {"destination": "urn:li:adForm:990002001", "label": text}
+    return parse_creative(_with_value("creatives", "leadgenCallToAction", cta))
+
+
+def _lead_form_with_name(text: str) -> LeadFormRow:
+    """Parse the documented lead form named ``text``."""
+    element: dict[str, Any] = _sample_element("lead_forms")
+    element["name"] = text
+    return parse_lead_form(_conforming("lead_forms", element))
+
+
+def _lead_with_id(surface: str, text: str) -> ParsedLead | None:
+    """Parse a decorated lead whose response ``id`` is ``text``, on ``surface``."""
+    return parse_lead(_mutate(("id",), text), {}, surface=surface)
+
+
+# Every text field a row hands to storage: (surface, field, parse an element carrying the text,
+# read the parsed text back). ``read`` is None for a field the contract declares as an enum.
+STORED_TEXT_FIELDS = [
+    pytest.param(
+        "ad_account",
+        "name",
+        functools.partial(_account_with, "name"),
+        lambda row: row.name,
+        id="ad_account.name",
+    ),
+    pytest.param(
+        "ad_account",
+        "status",
+        functools.partial(_account_with, "status"),
+        None,
+        id="ad_account.status",
+    ),
+    pytest.param(
+        "ad_campaign_groups",
+        "name",
+        lambda text: parse_campaign_group(_group(name=text)),
+        lambda row: row.name,
+        id="ad_campaign_groups.name",
+    ),
+    pytest.param(
+        "ad_campaign_groups",
+        "status",
+        lambda text: parse_campaign_group(_with_value("ad_campaign_groups", "status", text)),
+        None,
+        id="ad_campaign_groups.status",
+    ),
+    pytest.param(
+        "ad_campaigns",
+        "name",
+        lambda text: parse_campaign(_campaign(name=text)),
+        lambda row: row.name,
+        id="ad_campaigns.name",
+    ),
+    pytest.param(
+        "ad_campaigns",
+        "status",
+        lambda text: parse_campaign(_with_value("ad_campaigns", "status", text)),
+        None,
+        id="ad_campaigns.status",
+    ),
+    pytest.param(
+        "ad_campaigns",
+        "objectiveType",
+        lambda text: parse_campaign(_campaign(objectiveType=text)),
+        lambda row: row.objective_type,
+        id="ad_campaigns.objectiveType",
+    ),
+    pytest.param(
+        "creatives",
+        "name",
+        lambda text: parse_creative(_creative(name=text)),
+        lambda row: row.name,
+        id="creatives.name",
+    ),
+    pytest.param(
+        "creatives",
+        "intendedStatus",
+        lambda text: parse_creative(_with_value("creatives", "intendedStatus", text)),
+        None,
+        id="creatives.intendedStatus",
+    ),
+    pytest.param(
+        "creatives",
+        "label",
+        _creative_with_label,
+        None,
+        id="creatives.leadgenCallToAction.label",
+    ),
+    pytest.param(
+        "posts",
+        "commentary",
+        lambda text: parse_post("urn:li:share:1", _post(commentary=text)),
+        lambda row: row.intro_text,
+        id="posts.commentary",
+    ),
+    pytest.param(
+        "posts",
+        "title",
+        lambda text: parse_post("urn:li:share:1", _post(content={"media": {"title": text}})),
+        lambda row: row.headline,
+        id="posts.media.title",
+    ),
+    pytest.param(
+        "posts",
+        "title",
+        lambda text: parse_post("urn:li:share:1", _post(content={"article": {"title": text}})),
+        lambda row: row.headline,
+        id="posts.article.title",
+    ),
+    pytest.param(
+        "lead_forms",
+        "name",
+        _lead_form_with_name,
+        lambda row: row.name,
+        id="lead_forms.name",
+    ),
+    pytest.param(
+        "lead_form_responses",
+        "id",
+        functools.partial(_lead_with_id, "lead_form_responses"),
+        lambda row: row.external_id,
+        id="lead_form_responses.id",
+    ),
+    pytest.param(
+        "lead_form_responses_batch",
+        "id",
+        functools.partial(_lead_with_id, "lead_form_responses_batch"),
+        lambda row: row.external_id,
+        id="lead_form_responses_batch.id",
+    ),
+]
+FREE_TEXT_FIELDS = [field for field in STORED_TEXT_FIELDS if field.values[3] is not None]
+
+
+@pytest.mark.parametrize(("text", "problem"), UNSTORABLE_TEXTS)
+@pytest.mark.parametrize(("surface", "key", "parse", "read"), STORED_TEXT_FIELDS)
+def test_stored_text_with_a_nul_or_an_unencodable_character_is_a_defect(
+    surface: str,
+    key: str,
+    parse: Callable[[str], object],
+    read: Callable[[Any], object] | None,
+    text: str,
+    problem: str,
+) -> None:
+    error = _expect_defect(lambda: parse(text), surface, f"field '{key}' {problem}")
+    assert error.message == f"{surface}: field '{key}' {problem}"
+    _assert_text_not_echoed(error, text)
+    _assert_not_echoed(error, "lead.one", "example.com")
+
+
+@pytest.mark.parametrize("text", STORABLE_TEXTS)
+@pytest.mark.parametrize(("surface", "key", "parse", "read"), FREE_TEXT_FIELDS)
+def test_stored_text_that_utf8_encodes_is_returned_unchanged(
+    surface: str,
+    key: str,
+    parse: Callable[[str], object],
+    read: Callable[[Any], object],
+    text: str,
+) -> None:
+    row = parse(text)
+    assert row is not None, (surface, key)
+    assert read(row) == text
+
+
+@pytest.mark.parametrize(("text", "problem"), UNSTORABLE_TEXTS)
+def test_a_predefined_field_with_a_nul_or_an_unencodable_character_is_a_defect(
+    text: str, problem: str
+) -> None:
+    # predefinedField is compared, never stored, but a NUL or a lone surrogate is no documented
+    # field name: the decoration breaks its contract, so the lead is a defect, not no_email.
+    questions = [*_standard_questions(), _question(UNDECORATED_QID, f"EMAIL{text}")]
+    element = _lead([_text_answer(EMAIL_QID, RAW_EMAIL)], questions=questions)
+    fragment = f"field 'predefinedField' {problem}"
+    for call, surface in (
+        (lambda: parse_lead(element, {}), "lead_form_responses"),
+        (lambda: decode_email(element, {}), "lead_form_responses_batch"),
+    ):
+        error = _expect_defect(call, surface, fragment)
+        _assert_text_not_echoed(error, text)
+        _assert_not_echoed(error, "lead.one", "example.com")
+    form: dict[str, Any] = _sample_element("lead_forms")
+    form["content"]["questions"].append(_question(UNDECORATED_QID, f"EMAIL{text}"))
+    error = _expect_defect(lambda: parse_lead_form(form), "lead_forms", fragment)
+    _assert_text_not_echoed(error, text)
+
+
+NUL_EMAIL: str = json.loads('"lead\\u0000.one@example.com"')
+NUL_EMAIL_SHA256 = hashlib.sha256(NUL_EMAIL.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        # UTF-8 encodes a NUL, so the address is decoded and hashed: the answer is transient,
+        # never stored, and only its SHA-256 reaches the lead row.
+        pytest.param(
+            NUL_EMAIL,
+            DecodedEmail(email=NUL_EMAIL, sha256=NUL_EMAIL_SHA256, status="ok", reason=None),
+            id="nul-address",
+        ),
+        pytest.param(
+            NUL_TEXT,
+            DecodedEmail(email=None, sha256=None, status="no_email", reason=REASON_NO_EMAIL_ANSWER),
+            id="nul-text",
+        ),
+        # UTF-8 cannot encode a lone surrogate, so the answer is no address, never a defect.
+        pytest.param(
+            SURROGATE_EMAIL,
+            DecodedEmail(email=None, sha256=None, status="no_email", reason=REASON_NO_EMAIL_ANSWER),
+            id="surrogate-address",
+        ),
+        pytest.param(
+            SURROGATE_TEXT,
+            DecodedEmail(email=None, sha256=None, status="no_email", reason=REASON_NO_EMAIL_ANSWER),
+            id="surrogate-text",
+        ),
+    ],
+)
+@pytest.mark.parametrize("surface", ["lead_form_responses", "lead_form_responses_batch"])
+def test_email_answers_are_decoded_without_the_storage_text_checks(
+    surface: str, answer: str, expected: DecodedEmail
+) -> None:
+    element = _lead([_text_answer(EMAIL_QID, answer)])
+    assert decode_email(element, {}, surface=surface) == expected
+    lead = parse_lead(element, {}, surface=surface)
+    assert lead is not None
+    assert lead.email_status == expected.status
+    assert lead.email_reason == expected.reason
+    assert lead.email_sha256 == expected.sha256
+    assert lead.version_map is not None  # the decoration passed the check and is still learned
+    for text in (repr(lead), str(dataclasses.asdict(lead))):
+        assert "example.com" not in text
 
 
 # ---------------------------------------------------------------------------------------------

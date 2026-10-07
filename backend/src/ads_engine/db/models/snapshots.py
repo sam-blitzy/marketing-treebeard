@@ -117,7 +117,8 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
         payload: The remaining observed fields as a JSON object (server default
             ``'{}'::jsonb``), for example a conversion action's
             ``include_in_conversions_metric``, ``counting_type`` and ``attribution_model``,
-            or a budget's ``period`` and ``explicitly_shared``.
+            or a budget's ``period`` and ``explicitly_shared``. An unknown ``counting_type``
+            or ``attribution_model`` is kept as JSON ``null``, never filled in.
     """
 
     __tablename__ = "entity_snapshot"

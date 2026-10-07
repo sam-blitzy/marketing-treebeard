@@ -25,11 +25,18 @@ already leads an index, because PostgreSQL does not index referencing columns an
 cascade would otherwise scan the child table once per deleted parent row.
 
 Normalised enumerations are ``text`` guarded by :func:`~ads_engine.db.base.check_in`. Raw
-platform values (``campaign.raw_status``, ``campaign_group.status``, ``ad_group.status``,
+platform columns (``campaign.raw_status``, ``campaign_group.status``, ``ad_group.status``,
 ``keyword.status`` and ``match_type``, ``creative.intended_status``, and
-``conversion_action.status``, ``counting_type`` and ``attribution_model``) are stored exactly
-as the platform returns them, with no ``CHECK``, so a value a platform adds later is kept
-rather than rejected at ingest.
+``conversion_action.status``, ``counting_type`` and ``attribution_model``) are open ``text``
+with no ``CHECK``: that is the schema's guarantee, so widening a platform vocabulary needs no
+migration.
+
+Validating those values at ingest is the parsers' job, not the schema's. Each parser accepts
+only its pinned wire vocabulary and raises ``QueryDefect`` for anything else, so a value a
+platform adds later is rejected at ingest until the parser's set is extended. Every value the
+parsers accept is stored exactly as the platform returned it, including Google's ``UNKNOWN``
+and ``UNSPECIFIED`` where a pinned set admits them (``keyword.match_type`` and the
+``conversion_action`` columns).
 
 External ids are ``text``: Google INT64 ids arrive as decimal strings and LinkedIn ids are
 URNs. Each dataset-scoped model declares ``__natural_key__``, the columns of its natural-key
@@ -81,6 +88,9 @@ BUDGET_PERIODS: Final[tuple[str, ...]] = ("DAILY", "CUSTOM_PERIOD")
 """Google ``campaign_budget.period``: a ``DAILY`` budget has utilization; a custom-period one
 is a lifetime budget, shown as "n/a" and excluded from cap rules (AAP 0.5.4.1)."""
 
+# The CHECK text the migration repeats verbatim: a budget amount is unknown in both units or none.
+_AMOUNT_PAIR_SQL: Final[str] = "(amount IS NULL) = (amount_micros IS NULL)"
+
 
 class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
     """One ad account of a source: a Google customer or a LinkedIn sponsored account.
@@ -92,7 +102,10 @@ class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
 
     Attributes:
         external_id: The Google customer id (10 digits) or the LinkedIn account id.
-        name: The account's descriptive name.
+        name: The platform's descriptive name of the account; ``None`` when the source
+            reports none (Google omits ``customer.descriptive_name`` for an unnamed account).
+            The account is never rejected for it, and ``None`` is never stored as a string;
+            :attr:`display_name` supplies the label to show.
         currency: ISO 4217 currency code of every amount in the account.
         timezone: IANA time zone of the account (Google ``customer.time_zone``); ``None``
             where the source reports none.
@@ -102,7 +115,7 @@ class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "source", "external_id")
 
     external_id: Mapped[str]
-    name: Mapped[str]
+    name: Mapped[str | None]
     currency: Mapped[str]
     timezone: Mapped[str | None]
 
@@ -110,6 +123,16 @@ class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "source", "external_id"),
     )
+
+    @property
+    def display_name(self) -> str:
+        """The label to show for the account: its ``name``, else its ``external_id``.
+
+        Deterministic and read-only: a non-empty ``name`` is returned as stored; a ``None``
+        or empty one falls back to the platform account id, which is always present. The
+        stored ``name`` stays ``None``.
+        """
+        return self.name if self.name else self.external_id
 
 
 class CampaignGroup(IdPkMixin, DatasetScopedMixin, Base):
@@ -158,7 +181,8 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
     per-source map and ``raw_status`` keeps the platform's own value. A LinkedIn campaign
     carries its budgets on this row; a Google campaign references the ``campaign_budget`` it
     draws from through ``budget_id`` and repeats that budget's amount in ``daily_budget`` or
-    ``total_budget`` according to ``budget_period``. Whether the budget is explicitly shared
+    ``total_budget`` according to ``budget_period``, leaving both ``None`` when the budget's
+    amount is unknown (:class:`Budget`). Whether the budget is explicitly shared
     fixes the campaign's decision shape (``own_budget`` or ``shared_member``, AAP 0.5.2).
 
     The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
@@ -175,8 +199,10 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
             ``advertising_channel_type``; selects the outcome metric (AAP 0.5.4.1).
         campaign_group_id: The LinkedIn :class:`CampaignGroup`; ``None`` for Google.
         budget_id: The Google :class:`Budget` the campaign draws from; ``None`` for LinkedIn.
-        daily_budget: The campaign's daily budget, if it has one.
-        total_budget: The campaign's lifetime or custom-period budget, if it has one.
+        daily_budget: The campaign's daily budget, if it has one; ``None`` for a Google
+            campaign whose budget's amount is unknown.
+        total_budget: The campaign's lifetime or custom-period budget, if it has one; ``None``
+            for a Google campaign whose budget's amount is unknown.
         budget_period: ``DAILY`` or ``CUSTOM_PERIOD`` (:data:`BUDGET_PERIODS`) for Google;
             ``None`` for LinkedIn, whose budget fields say which budgets exist.
     """
@@ -227,10 +253,20 @@ class Budget(IdPkMixin, DatasetScopedMixin, Base):
     compares the decided amount converted exactly to micros without rounding
     (AAP 0.5.4.4). ``amount`` is the same value in the account's currency.
 
+    An identified budget whose own-period amount Google omits (``amount_micros`` for
+    ``DAILY``, ``total_amount_micros`` for ``CUSTOM_PERIOD``) is still stored, with its
+    identity, ``period`` and ``explicitly_shared``, so its campaigns' ``budget_id`` resolves.
+    Its ``amount`` and ``amount_micros`` are then both ``None``: unknown, never zero.
+    ``ck_budget_amount_pair`` keeps the two unknown together. Consumers treat such an amount
+    as unknown and withhold every amount-dependent calculation, such as utilization and the
+    C0 amount comparison, rather than substitute a value.
+
     Attributes:
         external_id: The Google ``campaign_budget.id``.
-        amount: The budget amount in the account's currency.
-        amount_micros: The budget amount in micros, as Google reports it.
+        amount: The budget amount in the account's currency; ``None`` when Google omits the
+            period's own amount.
+        amount_micros: The budget amount in micros, as Google reports it; ``None`` exactly
+            when ``amount`` is.
         period: ``DAILY`` or ``CUSTOM_PERIOD`` (:data:`BUDGET_PERIODS`).
         explicitly_shared: Whether the budget is shared across campaigns (server default
             ``false``).
@@ -240,14 +276,15 @@ class Budget(IdPkMixin, DatasetScopedMixin, Base):
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "external_id")
 
     external_id: Mapped[str]
-    amount: Mapped[Decimal]
-    amount_micros: Mapped[int]
+    amount: Mapped[Decimal | None]
+    amount_micros: Mapped[int | None]
     period: Mapped[str]
     explicitly_shared: Mapped[bool] = mapped_column(server_default=sa.text("false"))
 
     __table_args__ = (
         check_in("source", SOURCES),
         check_in("period", BUDGET_PERIODS),
+        sa.CheckConstraint(_AMOUNT_PAIR_SQL, name="amount_pair"),
         sa.UniqueConstraint("dataset_id", "external_id"),
     )
 
@@ -267,7 +304,10 @@ class ConversionAction(IdPkMixin, DatasetScopedMixin, Base):
         status: The raw Google status, stored as returned.
         include_in_conversions_metric: Whether the action counts toward
             ``metrics.conversions`` (server default ``false``).
-        counting_type: The raw counting type, for example ``ONE_PER_CLICK`` or
+        counting_type: The raw counting type as returned: ``ONE_PER_CLICK``,
+            ``MANY_PER_CLICK``, ``UNKNOWN`` or ``UNSPECIFIED``. ``None`` when Google omits it,
+            which leaves the counting contract unknown (B4 withholds "conversion counting
+            contract unknown"); never replaced by an invented ``ONE_PER_CLICK`` or
             ``MANY_PER_CLICK``.
         attribution_model: The raw attribution model, for example
             ``GOOGLE_ADS_LAST_CLICK``; ``None`` when Google returns none.
@@ -280,7 +320,7 @@ class ConversionAction(IdPkMixin, DatasetScopedMixin, Base):
     name: Mapped[str]
     status: Mapped[str]
     include_in_conversions_metric: Mapped[bool] = mapped_column(server_default=sa.text("false"))
-    counting_type: Mapped[str]
+    counting_type: Mapped[str | None]
     attribution_model: Mapped[str | None]
 
     __table_args__ = (

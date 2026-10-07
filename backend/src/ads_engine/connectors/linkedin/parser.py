@@ -15,6 +15,8 @@ Purity:
     standard library and :class:`ads_engine.connectors.errors.QueryDefect`. Every malformed
     payload raises ``QueryDefect(code="validation")`` naming the contract surface (the file
     names in ``backend/tests/contracts/linkedin/``) and the field, never a value from a lead.
+    A string field carrying a NUL or a character UTF-8 cannot encode is such a defect, so
+    every string a row returns can be stored as PostgreSQL text.
 
 Days and instants:
     LinkedIn days are UTC. A daily analytics row keeps the UTC calendar date LinkedIn returns
@@ -24,6 +26,9 @@ Days and instants:
 Money:
     Amounts are exact :class:`~decimal.Decimal` values in the ad account's currency and are
     never rounded here; the minor-unit check on decisions belongs to ``ads_engine.decisions``.
+    Every amount must be losslessly representable in its ``numeric(18, 6)`` column: below
+    ``10**12``, with no nonzero digit beyond the sixth decimal place. Any other amount is a
+    defect, never rounded.
 
 Personal data:
     A lead email is normalised (trimmed, lowercased) and hashed with SHA-256. The plaintext
@@ -181,6 +186,10 @@ _INT64_MAX: Final = 2**63 - 1
 _MAX_INT_DIGITS: Final = len(str(_INT64_MAX))  # 19
 # The longest BigDecimal string accepted, far above any amount LinkedIn returns.
 _MAX_DECIMAL_CHARS: Final = 64
+# Every amount is stored as numeric(18, 6): 18 significant digits, 6 of them after the point,
+# so an amount holds at most 12 integral digits (below 10**12) and 6 decimal places.
+_AMOUNT_INTEGRAL_DIGITS: Final = 12
+_AMOUNT_SCALE: Final = 6
 _VERSIONED_FORM_RE: Final = re.compile(
     r"urn:li:versionedLeadGenForm:\(urn:li:leadGenForm:([0-9]+),([0-9]+)\)"
 )
@@ -399,17 +408,50 @@ def _list(parent: JsonObject, key: str, surface: str, *, required: bool) -> Sequ
     return value
 
 
-@overload
-def _str(parent: JsonObject, key: str, surface: str, *, required: Literal[True]) -> str: ...
-@overload
-def _str(parent: JsonObject, key: str, surface: str, *, required: Literal[False]) -> str | None: ...
-def _str(parent: JsonObject, key: str, surface: str, *, required: bool) -> str | None:
-    """Read a string field."""
+def _raw_str(parent: JsonObject, key: str, surface: str, *, required: bool) -> str | None:
+    """Read a string field, checking its type only; :func:`_str` adds the storage checks.
+
+    Only a value that is never stored is read with this alone: the email decoder's answers,
+    where an answer UTF-8 cannot encode is not an address (:func:`_is_email`), so the lead is
+    ``no_email``, never a defect.
+    """
     value = _present(parent, key, surface, required=required)
     if value is None:
         return None
     if not isinstance(value, str):
         raise _defect(f"field '{key}' must be a string", surface)
+    return value
+
+
+def _utf8_encodable(value: str) -> bool:
+    """Whether UTF-8 can encode ``value``; an unpaired surrogate such as U+D800 cannot."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@overload
+def _str(parent: JsonObject, key: str, surface: str, *, required: Literal[True]) -> str: ...
+@overload
+def _str(parent: JsonObject, key: str, surface: str, *, required: Literal[False]) -> str | None: ...
+def _str(parent: JsonObject, key: str, surface: str, *, required: bool) -> str | None:
+    """Read a string field; the string returned is safe for text storage, and unchanged.
+
+    JSON escapes can decode to a NUL (U+0000) or an unpaired surrogate (U+D800 to U+DFFF).
+    PostgreSQL text cannot hold a NUL and UTF-8 cannot encode a lone surrogate, so either is
+    a defect naming the field only, raised here rather than in the database driver. The defect
+    chains no exception, because a ``UnicodeEncodeError`` carries the string it failed on.
+    Valid text, non-ASCII characters and whitespace included, is never stripped or replaced.
+    """
+    value = _raw_str(parent, key, surface, required=required)
+    if value is None:
+        return None
+    if "\x00" in value:
+        raise _defect(f"field '{key}' must not contain a NUL character", surface)
+    if not _utf8_encodable(value):
+        raise _defect(f"field '{key}' must be valid UTF-8 text", surface)
     return value
 
 
@@ -479,9 +521,14 @@ def _to_decimal(value: object, what: str, surface: str) -> Decimal:
     Floats are rejected: a binary float cannot carry an exact money amount, and LinkedIn
     serialises BigDecimal values as strings. A string longer than 64 characters is a defect
     before it reaches ``Decimal()``, as is one whose exponent the decimal module cannot hold.
-    An amount of ``10**19`` or more, in any input form, is out of range: the same 19-digit
-    bound as a 64-bit integer. A zero such as ``0E+19`` or ``-0E+19`` is below that bound
-    whatever its exponent, and is returned unsigned.
+
+    Every caller's amount is stored as ``numeric(18, 6)``, so the amount must be exactly
+    representable there: below ``10**12``, in any input form, and with no nonzero digit beyond
+    the sixth decimal place. An amount outside either bound is a defect, never rounded, so
+    ``1000000000000`` is out of range and ``0.0000001`` has more than 6 decimal places.
+    Trailing zeros beyond the sixth place change no value: ``100.500000000`` is accepted and
+    returned unchanged, never rescaled. A zero such as ``0E+19`` or ``-0E+19`` fits whatever
+    its exponent, and is returned unsigned.
     """
     if isinstance(value, bool):
         raise _defect(f"{what} must be a decimal, not a boolean", surface)
@@ -504,13 +551,24 @@ def _to_decimal(value: object, what: str, surface: str) -> Decimal:
         raise _defect(f"{what} must be finite", surface)
     if amount < 0:
         raise _defect(f"{what} must not be negative", surface)
-    # adjusted() is the exponent of the leading digit, so for a nonzero amount it is 19 or
-    # more exactly when |amount| >= 10**19. Zero is exempt whatever its exponent: 0E+19 has
-    # adjusted() 19, but its value is below the bound.
-    if not amount.is_zero() and amount.adjusted() >= _MAX_INT_DIGITS:
+    # A zero fits numeric(18, 6) whatever its exponent: 0E+19 has adjusted() 19 and 0E-30
+    # thirty decimal places, but both are 0. "-0.0" compares equal to zero; store it unsigned.
+    if amount.is_zero():
+        return amount.copy_abs()
+    # adjusted() is the exponent of the leading digit, so for a nonzero amount it is 12 or
+    # more exactly when amount >= 10**12, which numeric(18, 6) cannot hold.
+    if amount.adjusted() >= _AMOUNT_INTEGRAL_DIGITS:
         raise _defect(f"{what} is out of range", surface)
-    # "-0.0" compares equal to zero; store it unsigned.
-    return amount.copy_abs() if amount.is_zero() else amount
+    # Storage would round away a nonzero digit beyond the sixth decimal place, so the digits
+    # there are read from the exact coefficient; Decimal arithmetic (quantize, normalize)
+    # rounds at the context precision and would misjudge a long numeral. Zeros there lose
+    # nothing, so 1.0000000 is accepted and returned unchanged.
+    digits = amount.as_tuple().digits
+    last_digit_exponent = amount.adjusted() - len(digits) + 1
+    excess_places = -last_digit_exponent - _AMOUNT_SCALE
+    if excess_places > 0 and any(digits[-excess_places:]):
+        raise _defect(f"{what} has more than {_AMOUNT_SCALE} decimal places", surface)
+    return amount
 
 
 @overload
@@ -1722,7 +1780,8 @@ def _email_answer(
     """Return the first usable email answer in preference order, normalised.
 
     ``answers`` comes from :func:`_answers`, which rejects a repeated question id, so each
-    question has at most one answer.
+    question has at most one answer. An answer is transient (only its SHA-256 is stored), so
+    it is checked for its type only, and :func:`_is_email` judges whether it is an address.
     """
     by_question: dict[int, JsonObject] = dict(answers)
     for question_id in email_question_ids:
@@ -1730,7 +1789,7 @@ def _email_answer(
         if chosen is None:
             continue
         text = _path(chosen, ("answerDetails", "textQuestionAnswer"), surface)
-        raw = None if text is None else _str(text, "answer", surface, required=False)
+        raw = None if text is None else _raw_str(text, "answer", surface, required=False)
         if raw is None:
             continue
         normalised = raw.strip().lower()
