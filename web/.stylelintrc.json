@@ -1,0 +1,127 @@
+{
+  "allowEmptyInput": true,
+  "rules": {
+    "declaration-no-important": [
+      true,
+      {
+        "message": "Disallowed !important. Only src/design-system/tokens.css may use it, for its prefers-reduced-motion override (WCAG 2.3.3)"
+      }
+    ],
+    "block-no-empty": true,
+    "no-duplicate-selectors": true
+  },
+  "overrides": [
+    {
+      "files": ["src/features/**/*.css", "src/features/**/*.module.css"],
+      "rules": {
+        "declaration-property-value-allowed-list": [
+          {
+            "/.*/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/"
+          },
+          {
+            "message": "Property \"%s\" has disallowed value \"%s\". Feature CSS uses only design tokens: var(--token) with no fallback, or 0, none, auto, inherit, currentColor, transparent"
+          }
+        ],
+        "function-allowed-list": [
+          ["var"],
+          {
+            "message": "Disallowed function \"%s\". Feature CSS may call only var(--token)"
+          }
+        ],
+        "color-no-hex": [
+          true,
+          {
+            "message": "Disallowed hex color \"%s\". Use a colour token from src/design-system/tokens.css"
+          }
+        ],
+        "color-named": [
+          "never",
+          {
+            "message": "Disallowed named color \"%s\". Use a colour token from src/design-system/tokens.css"
+          }
+        ],
+        "property-disallowed-list": [
+          [
+            "display",
+            "flex",
+            "flex-direction",
+            "flex-wrap",
+            "flex-flow",
+            "flex-grow",
+            "flex-shrink",
+            "flex-basis",
+            "order",
+            "gap",
+            "row-gap",
+            "column-gap",
+            "grid",
+            "grid-template",
+            "grid-template-columns",
+            "grid-template-rows",
+            "grid-template-areas",
+            "grid-area",
+            "grid-column",
+            "grid-row",
+            "grid-auto-flow",
+            "grid-auto-columns",
+            "grid-auto-rows",
+            "justify-content",
+            "justify-items",
+            "justify-self",
+            "align-items",
+            "align-content",
+            "align-self",
+            "place-items",
+            "place-content",
+            "place-self",
+            "float",
+            "/^-(webkit|moz|ms|o)-(flex|order|grid|justify-|align-|place-|box-(align|direction|flex|lines|ordinal-group|orient|pack))/"
+          ],
+          {
+            "message": "Disallowed property \"%s\". Feature code lays out only through the Stack, Inline and Grid primitives from src/design-system"
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/design-system/components/**/*.css"],
+      "rules": {
+        "color-no-hex": [
+          true,
+          {
+            "message": "Disallowed hex color \"%s\". Use a colour token from src/design-system/tokens.css"
+          }
+        ],
+        "color-named": [
+          "never",
+          {
+            "message": "Disallowed named color \"%s\". Use a colour token from src/design-system/tokens.css"
+          }
+        ],
+        "function-disallowed-list": [
+          ["rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color", "color-mix"],
+          {
+            "message": "Disallowed colour function \"%s\". Colours come only from tokens in src/design-system/tokens.css"
+          }
+        ],
+        "declaration-property-value-allowed-list": [
+          {
+            "/^(color|background|background-color|border-color|border-(top|right|bottom|left|block|inline|block-start|block-end|inline-start|inline-end)-color|outline-color|fill|stroke)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^((margin|padding)(-.+)?|gap|row-gap|column-gap)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(font-family|font-size|font-weight|line-height)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(border(-.+)?-radius|box-shadow|z-index)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/"
+          },
+          {
+            "message": "Property \"%s\" has disallowed value \"%s\". Colour, spacing, typography, radius, shadow and z-index values are var(--token) with no fallback, or 0, none, auto, inherit, currentColor, transparent"
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/design-system/tokens.css"],
+      "rules": {
+        "declaration-no-important": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "surface": "google.row_ad_group_criterion",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/ad_group_criterion",
+  "api_version": "v25",
+  "last_modified": null,
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G7",
+      "resource": "ad_group_criterion",
+      "select": [
+        "ad_group_criterion.criterion_id",
+        "ad_group.id",
+        "campaign.id",
+        "ad_group_criterion.keyword.text",
+        "ad_group_criterion.keyword.match_type",
+        "ad_group_criterion.status",
+        "ad_group_criterion.quality_info.quality_score"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G7 (FROM ad_group_criterion WHERE ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED', plus either the range clause ad_group.id >= {ad_group_lo} AND ad_group.id <= {ad_group_hi} or the keyset clause ad_group.id = {ad_group_id} AND ad_group_criterion.criterion_id > {last_id} ORDER BY ad_group_criterion.criterion_id LIMIT 9999). The row arrives as one element of results[] in the search.json response envelope, which governs the request body and paging. Keys are camelCase; int64 values arrive as JSON strings and int32 values as JSON numbers. Q-G7 is the current state of every keyword, including keywords with no traffic: each entity sync writes one keyword row and one quality-score snapshot per keyword, even when Q-G5 returns no performance rows for it. Read order (AAP 0.3.3): criterion_id is unique only within its ad group, so Q-G7 first runs per ad_group.id range and halves any range that returns 10,000 rows; a single ad group that still returns 10,000 rows is read by keyset on ad_group_criterion.criterion_id in LIMIT 9999 pages, continuing while a page holds exactly 9,999 rows. Safe absence: a keyword is treated as removed or missing only after a complete read, with no failed or deferred page; an incomplete read marks google.entities incomplete and infers nothing.",
+      "properties": {
+        "adGroupCriterion": {
+          "type": "object",
+          "description": "The FROM resource. The ad_group_criterion report returns only criteria explicitly added to the ad group; the type and status filters keep the keyword criteria that are not REMOVED.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/adGroupCriteria/{ad_group_id}~{criterion_id}. Always returned for the FROM resource."
+            },
+            "criterionId": {
+              "type": "string",
+              "description": "ad_group_criterion.criterion_id: INT64 as a JSON string. Unique only within its ad group, so the keyword's identity is (adGroup.id, criterionId); the keyset field of a single-ad-group Q-G7 scan."
+            },
+            "status": {
+              "type": "string",
+              "description": "ad_group_criterion.status (AdGroupCriterionStatusEnum v25), the status set by the client. Q-G7 excludes REMOVED; ENABLED normalises to active and PAUSED to paused. UNKNOWN is response-only and is a parse defect.",
+              "enum": [
+                "ENABLED",
+                "PAUSED",
+                "REMOVED",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ]
+            },
+            "keyword": {
+              "type": "object",
+              "description": "ad_group_criterion.keyword (KeywordInfo): always set for type = KEYWORD.",
+              "properties": {
+                "text": {
+                  "type": "string",
+                  "description": "ad_group_criterion.keyword.text: STRING of at most 80 characters and 10 words. K2 adjacent terms exclude existing keyword texts and C3b checks cluster head tokens against them (AAP 0.5.4.3, 0.5.4.4)."
+                },
+                "matchType": {
+                  "type": "string",
+                  "description": "ad_group_criterion.keyword.match_type (KeywordMatchTypeEnum v25).",
+                  "enum": [
+                    "BROAD",
+                    "EXACT",
+                    "PHRASE",
+                    "UNKNOWN",
+                    "UNSPECIFIED"
+                  ]
+                }
+              },
+              "required": [
+                "text",
+                "matchType"
+              ],
+              "additionalProperties": false
+            },
+            "qualityInfo": {
+              "type": "object",
+              "description": "ad_group_criterion.quality_info. Absent when Google has no quality score for the keyword; proto3 JSON omits unset fields, and an empty object is accepted.",
+              "properties": {
+                "qualityScore": {
+                  "type": "integer",
+                  "description": "ad_group_criterion.quality_info.quality_score: INT32 as a JSON number, an integer from 1 to 10. May be unpopulated when Google does not have enough information to determine a value; it is then absent, parsed as None and never defaulted to 0. Each entity sync snapshots it as entity_snapshot.quality_score for the K3 fallback when Q-G5 daily scores are absent (AAP 0.5.4.3)."
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "resourceName",
+            "criterionId",
+            "status",
+            "keyword"
+          ],
+          "additionalProperties": false
+        },
+        "adGroup": {
+          "type": "object",
+          "description": "Attributed resource ad_group; its resourceName is returned because ad_group.id is selected.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/adGroups/{ad_group_id}."
+            },
+            "id": {
+              "type": "string",
+              "description": "ad_group.id: INT64 as a JSON string; the range field of Q-G7 partitioning."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "campaign": {
+          "type": "object",
+          "description": "Attributed resource campaign; its resourceName is returned because campaign.id is selected.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/campaigns/{campaign_id}."
+            },
+            "id": {
+              "type": "string",
+              "description": "campaign.id: INT64 as a JSON string."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "adGroupCriterion",
+        "adGroup",
+        "campaign"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}
