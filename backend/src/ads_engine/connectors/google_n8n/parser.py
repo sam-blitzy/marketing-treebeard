@@ -18,7 +18,16 @@ Wire encoding (proto3 JSON, as relayed by n8n):
       A ``float`` or ``str`` is accepted as well and converted through ``str``, never through
       ``Decimal(float)``. No DOUBLE value may be negative, and the impression shares are
       fractions from 0 to 1 inclusive, Google's reporting sentinels ``0.9001`` and ``0.0999``
-      kept as returned; a value outside those bounds is a defect.
+      kept as returned; a value outside those bounds is a defect. Every DOUBLE is stored as
+      ``numeric(18, 6)``, and the parser, never the database, makes each row equal what its
+      column holds. Conversions and conversion value are kept exactly as returned (Google sends
+      at most six decimal places); one the column cannot hold exactly, ``10**12`` or more or
+      finer than six places, is a defect, because rounding could turn a fractional count whole
+      or a converting day into a zero outcome. Impression shares, returned as full doubles, are
+      rounded toward zero to six places, which leaves every comparison with a six-place
+      threshold (the 0.10 capped-day test) unchanged, and a positive share below ``0.000001``
+      is a defect. ``averageCpc`` is rounded half-even to the micro, and one that rounds to
+      ``10**12`` or more, or a positive one that rounds to zero, is a defect.
     * Enums arrive as their names (``"ENABLED"``, ``"CUSTOM_PERIOD"``).
     * Zero-valued and unset fields may be omitted.
     * Booleans come in two presence kinds. An implicit-presence ``bool``
@@ -40,11 +49,20 @@ Missing values:
 Money:
     ``cost_micros`` is divided by 1,000,000 exactly into a ``Decimal`` in the account currency
     (``customer.currency_code``); the integer micros are kept beside it wherever a comparison at
-    native precision needs them (C0 compares budget micros exactly).
+    native precision needs them (C0 compares budget micros exactly). Amounts are stored as
+    ``numeric(18, 6)``, at most ``999999999999.999999``, so the micros of every emitted amount
+    (``metrics.cost_micros``, ``campaign_budget.amount_micros`` and ``total_amount_micros``)
+    must lie in ``0 .. 999999999999999999``. A larger value is a defect, never clamped, and an
+    accepted value is kept exact.
 
 Dates:
     ``segments.date`` is Google's native day in the customer account's time zone
     (``customer.time_zone``). It is parsed as written and never converted or rebucketed.
+
+Strings:
+    Names, search terms, keyword texts, enum names and resource names are kept exactly as
+    returned, any Unicode included, except that a string holding U+0000 or an unpaired
+    surrogate code point is a defect: PostgreSQL ``text`` can store neither.
 
 Errors:
     Every failure raises :class:`~ads_engine.connectors.errors.QueryDefect` with
@@ -73,7 +91,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Final, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -218,6 +236,30 @@ _AMOUNT_QUANTUM: Final = Decimal("0.000001")
 _ZERO: Final = Decimal(0)
 _ONE: Final = Decimal(1)
 
+# Every Decimal row field is stored as numeric(18, 6) (db/base.py maps Decimal to Numeric(18, 6)):
+# 18 digits, 6 of them after the point, so 12 integral digits. The largest storable magnitude is
+# therefore 999999999999.999999 and anything from 10**12 up overflows the column. Integer micros
+# carry exactly the six fractional digits, so 10**18 - 1 micros is the largest count of micros
+# whose amount fits; it is far below INT64_MAX, so the bigint micros columns hold it as well.
+_NUMERIC_LIMIT: Final = Decimal("1E+12")
+_NUMERIC_MAX: Final = Decimal("999999999999.999999")
+_AMOUNT_MICROS_MAX: Final = 999_999_999_999_999_999
+_MICROS_LIMIT: Final = Decimal("1E+18")
+_NUMERIC_RANGE_EXPECTED: Final = f"a value of at most {_NUMERIC_MAX}, the numeric(18, 6) range"
+_NUMERIC_SCALE_EXPECTED: Final = (
+    "a value with at most six decimal places, which numeric(18, 6) stores exactly"
+)
+_FRACTION_POSITIVE_EXPECTED: Final = (
+    "zero or a fraction of at least 0.000001, which six decimal places keep above zero"
+)
+_MICROS_RATE_RANGE_EXPECTED: Final = (
+    "an amount in micros that, divided by 1000000 and rounded half-even to six decimal places, "
+    f"is at most {_NUMERIC_MAX}, the numeric(18, 6) range"
+)
+_MICROS_RATE_POSITIVE_EXPECTED: Final = (
+    "zero or a value above 0.5 micros, which six decimal places keep above zero"
+)
+
 # A private context makes micros conversion and rounding independent of the caller's decimal
 # context: 38 digits hold every INT64 micros value exactly, and an invalid result raises.
 _DECIMAL_CONTEXT: Final = Context(prec=38, rounding=ROUND_HALF_EVEN, traps=[InvalidOperation])
@@ -226,6 +268,11 @@ _DECIMAL_CONTEXT: Final = Context(prec=38, rounding=ROUND_HALF_EVEN, traps=[Inva
 _INT_RE: Final = re.compile(r"[+-]?[0-9]{1,19}")
 _DATE_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _CURRENCY_RE: Final = re.compile(r"[A-Z]{3}")
+# PostgreSQL text cannot store U+0000, and an unpaired surrogate code point (what a lone JSON
+# "\ud800" escape decodes to) has no UTF-8 encoding, so a string holding either is rejected
+# before it reaches a row. A JSON surrogate pair decodes to one astral code point and is kept.
+_UNSTORABLE_TEXT_RE: Final = re.compile(r"[\x00\ud800-\udfff]")
+_STORABLE_TEXT: Final = "a string without U+0000 or unpaired surrogates (PostgreSQL text)"
 # Groups: customer, ad group and criterion id, each a run of at most 19 digits (as _INT_RE).
 _AD_GROUP_CRITERION_RE: Final = re.compile(
     r"customers/([0-9]{1,19})/adGroupCriteria/([0-9]{1,19})~([0-9]{1,19})"
@@ -416,10 +463,13 @@ def _micros_to_amount(micros: int) -> Decimal:
     """Convert integer micros to an exact amount: ``1500000`` becomes ``Decimal("1.500000")``.
 
     Args:
-        micros: Amount in millionths of the account currency.
+        micros: Amount in millionths of the account currency, already bounded to
+            ``0 .. 999999999999999999`` by :meth:`_RowReader.amount_micros` or
+            :meth:`_RowReader.optional_amount_micros`.
 
     Returns:
-        The amount with exponent ``-6``, exact for every INT64 value.
+        The amount with exponent ``-6``, exact and at most ``999999999999.999999``, so the
+        ``numeric(18, 6)`` money columns store it unchanged.
     """
     return Decimal(micros).scaleb(_MICROS_EXPONENT, context=_DECIMAL_CONTEXT)
 
@@ -537,11 +587,28 @@ class _RowReader:
         number = _int(value, surface=self._surface, gaql_field=gaql_field)
         return self._bounded(gaql_field, number, 0, INT64_MAX)
 
-    def optional_count(self, gaql_field: str) -> int | None:
-        """Read a non-negative INT64 value whose absence means unknown, such as a budget."""
+    def amount_micros(self, gaql_field: str) -> int:
+        """Read additive INT64 micros of an emitted amount, such as ``metrics.cost_micros``.
+
+        The micros are bounded to ``0 .. 999999999999999999`` so their amount fits the
+        ``numeric(18, 6)`` money columns; a larger value is a defect, never clamped, and an
+        accepted value is returned exact. Absent (omitted) means zero, because proto3 JSON omits
+        zero values; an explicit JSON ``null`` is a defect, never zero.
+        """
+        value = self.raw(gaql_field)
+        if value is None:
+            return 0
+        number = _int(value, surface=self._surface, gaql_field=gaql_field)
+        return self._bounded(gaql_field, number, 0, _AMOUNT_MICROS_MAX)
+
+    def optional_amount_micros(self, gaql_field: str) -> int | None:
+        """Read amount micros whose absence means unknown (``None``), such as a budget amount.
+
+        Bounded as :meth:`amount_micros`: ``0 .. 999999999999999999``, exact, never clamped.
+        """
         if self.raw(gaql_field) is None:
             return None
-        return self.count(gaql_field)
+        return self.amount_micros(gaql_field)
 
     def score(self, gaql_field: str) -> int | None:
         """Read a 1-10 quality score; absent means unavailable (``None``), never zero."""
@@ -551,22 +618,11 @@ class _RowReader:
         number = _int(value, surface=self._surface, gaql_field=gaql_field)
         return self._bounded(gaql_field, number, _QUALITY_SCORE_MIN, _QUALITY_SCORE_MAX)
 
-    def measure(self, gaql_field: str) -> Decimal:
-        """Read an additive, non-negative DOUBLE metric, such as ``conversions``.
+    def _non_negative(self, gaql_field: str) -> Decimal | None:
+        """Return a non-negative DOUBLE exactly as returned, or ``None`` when absent (omitted).
 
-        Absent (omitted) means zero, because proto3 JSON omits zero values; an explicit JSON
-        ``null`` is a defect, never zero. Fractions are kept; a negative value is a defect.
-        """
-        value = self.optional_measure(gaql_field)
-        return _ZERO if value is None else value
-
-    def optional_measure(self, gaql_field: str) -> Decimal | None:
-        """Read a non-negative DOUBLE whose absence (omission) means unavailable (``None``).
-
-        The DOUBLE metrics read this way (conversions, conversion value, average CPC) are
-        counts, amounts or a ratio of them, so a negative value is a defect; a negative zero is
-        zero and is returned without its sign. An explicit JSON ``null`` is a defect, never
-        unavailable.
+        A negative value is a defect; a negative zero is zero and is returned without its sign.
+        An explicit JSON ``null`` is a defect, never unavailable.
         """
         value = self.raw(gaql_field)
         if value is None:
@@ -576,13 +632,78 @@ class _RowReader:
             raise self.defect(gaql_field, "a non-negative finite JSON number")
         return number.copy_abs()
 
+    def _exact(self, gaql_field: str, number: Decimal) -> Decimal:
+        """Return a non-negative, unsigned DOUBLE measure that ``numeric(18, 6)`` holds exactly.
+
+        The value is returned exactly as given, exponent included (``Decimal("1.0000000")``
+        stays as it is), and is never rounded. A value of ``10**12`` or more overflows the
+        column, and one with a nonzero digit past the sixth decimal place would be changed by
+        storage: ``2.9999996`` would read as a whole count of 3, ``0.0000003`` as no
+        conversion at all. Both are defects naming only the field and its bounds. The range is
+        checked first, so the six-place comparison stays within the context's 38 digits.
+        """
+        if number >= _NUMERIC_LIMIT:
+            raise self.defect(gaql_field, _NUMERIC_RANGE_EXPECTED)
+        # Truncating to six places changes the value exactly when a nonzero digit lies beyond.
+        six_places = number.quantize(_AMOUNT_QUANTUM, rounding=ROUND_DOWN, context=_DECIMAL_CONTEXT)
+        if six_places != number:
+            raise self.defect(gaql_field, _NUMERIC_SCALE_EXPECTED)
+        return number
+
+    def _truncated(self, gaql_field: str, number: Decimal) -> Decimal:
+        """Return an unsigned fraction from 0 to 1 as its ``numeric(18, 6)`` column stores it.
+
+        A value with at most six decimal places is returned exactly as given, exponent
+        included. A finer value is rounded toward zero to six places here, in the parser's own
+        decimal context, so the row already equals what storage holds and no rounding is left
+        to the database. A positive value below ``0.000001`` would be stored as zero, a share
+        Google reported as positive, so it is a defect naming only the field and its bounds.
+        """
+        # Google returns impression shares as full doubles, most of them finer than six places,
+        # so they are rounded rather than rejected. Rounding toward zero keeps every comparison
+        # with a six-place threshold t unchanged: x >= t exactly when the stored value >= t, so
+        # the 0.10 capped-day test on the budget-lost share reads the same on the stored value.
+        stored = number.quantize(_AMOUNT_QUANTUM, rounding=ROUND_DOWN, context=_DECIMAL_CONTEXT)
+        if stored == number:
+            return number
+        if stored.is_zero():
+            raise self.defect(gaql_field, _FRACTION_POSITIVE_EXPECTED)
+        return stored
+
+    def measure(self, gaql_field: str) -> Decimal:
+        """Read an additive, non-negative DOUBLE metric, such as ``conversions``.
+
+        Absent (omitted) means zero, because proto3 JSON omits zero values; an explicit JSON
+        ``null`` is a defect, never zero. Otherwise as :meth:`optional_measure`.
+        """
+        value = self.optional_measure(gaql_field)
+        return _ZERO if value is None else value
+
+    def optional_measure(self, gaql_field: str) -> Decimal | None:
+        """Read a non-negative DOUBLE whose absence (omission) means unavailable (``None``).
+
+        The DOUBLE metrics read this way (conversions, conversion value) are counts or amounts,
+        so a negative value is a defect; a negative zero is zero and is returned without its
+        sign. Fractions are kept exactly as returned, exponent included, and never rounded:
+        rounding could turn a fractional count whole or a positive outcome into zero. Google
+        returns at most six decimal places, so a value the ``numeric(18, 6)`` column cannot
+        hold exactly, ``10**12`` or more or one finer than six places (``2.3333333333333335``),
+        is a defect. An explicit JSON ``null`` is a defect, never unavailable.
+        """
+        number = self._non_negative(gaql_field)
+        return None if number is None else self._exact(gaql_field, number)
+
     def fraction(self, gaql_field: str) -> Decimal | None:
         """Read a DOUBLE fraction from 0 to 1 inclusive, such as an impression share.
 
-        The value is kept as returned, Google's reporting sentinels included (``0.9001`` for a
-        budget-lost share above 90%, ``0.0999`` for an impression share below 10%); a negative
-        zero is returned without its sign. Absent (omitted) means unavailable (``None``), never
-        zero; an explicit JSON ``null`` or a value outside 0 to 1 is a defect.
+        A value with at most six decimal places is kept as returned, Google's reporting
+        sentinels included (``0.9001`` for a budget-lost share above 90%, ``0.0999`` for an
+        impression share below 10%). Google returns shares as full doubles, so a finer one is
+        rounded toward zero to six places, as the ``numeric(18, 6)`` column stores it
+        (``0.09999999`` becomes ``0.099999``, still below 10%), and a positive value below
+        ``0.000001``, which would be stored as zero, is a defect. A negative zero is returned
+        without its sign. Absent (omitted) means unavailable (``None``), never zero; an
+        explicit JSON ``null`` or a value outside 0 to 1 is a defect.
         """
         value = self.raw(gaql_field)
         if value is None:
@@ -590,17 +711,34 @@ class _RowReader:
         number = _decimal(value, surface=self._surface, gaql_field=gaql_field)
         if not _ZERO <= number <= _ONE:
             raise self.defect(gaql_field, "a fraction from 0 to 1")
-        return number.copy_abs()
+        return self._truncated(gaql_field, number.copy_abs())
 
     def text(self, gaql_field: str) -> str:
-        """Read a required string (a name, an enum name or an id-like string)."""
+        """Read a required string (a name, an enum name or an id-like string) unchanged.
+
+        An absent value or a non-string is a defect expecting "a string". A string holding
+        U+0000 or an unpaired surrogate is a defect too, because PostgreSQL ``text`` can store
+        neither; like every defect, it names the field only, never the value. Every other code
+        point, astral characters, tabs and newlines included, is kept as returned.
+        """
         value = self._present(gaql_field, "a string")
         if not isinstance(value, str):
             raise self.defect(gaql_field, "a string")
+        # An ASCII string holds no surrogate, so it needs only the NUL check.
+        if value.isascii():
+            unstorable = "\x00" in value
+        else:
+            unstorable = _UNSTORABLE_TEXT_RE.search(value) is not None
+        if unstorable:
+            raise self.defect(gaql_field, _STORABLE_TEXT)
         return value
 
     def optional_text(self, gaql_field: str) -> str | None:
-        """Read an optional string; absent means ``None``."""
+        """Read an optional string; absent means ``None``.
+
+        A present value is read by :meth:`text`, so a non-string, U+0000 or an unpaired
+        surrogate is a defect; an explicit JSON ``null`` is a defect, never ``None``.
+        """
         if self.raw(gaql_field) is None:
             return None
         return self.text(gaql_field)
@@ -666,20 +804,27 @@ class _RowReader:
         """Read a DOUBLE in micros (such as ``average_cpc``) as an amount rounded to 6 places.
 
         The value is derived (cost divided by clicks), not exact, so it is quantized half-even
-        to the micro. Absent means unavailable. Cost and clicks are never negative, so a
-        negative value is a defect; the sign is checked before rounding, so no negative value
-        can round to zero.
+        to the micro, exactly once, from the value as returned. Absent means unavailable. Cost
+        and clicks are never negative, so a negative value is a defect; the sign is checked
+        before rounding, so no negative value can round to zero. The amount must fit the
+        ``numeric(18, 6)`` column: one that rounds to ``10**12`` or more is a defect, checked on
+        the micros before rounding so a huge value cannot exceed the context's 38 digits, and
+        so is a positive value of at most half a micro, which would round to zero.
         """
-        value = self.optional_measure(gaql_field)
-        if value is None:
+        micros = self._non_negative(gaql_field)
+        if micros is None:
             return None
-        try:
-            amount = value.scaleb(_MICROS_EXPONENT, context=_DECIMAL_CONTEXT)
-            return amount.quantize(
-                _AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN, context=_DECIMAL_CONTEXT
-            )
-        except InvalidOperation as exc:
-            raise self.defect(gaql_field, "an amount in micros within numeric range") from exc
+        if micros >= _MICROS_LIMIT:
+            raise self.defect(gaql_field, _MICROS_RATE_RANGE_EXPECTED)
+        # Rounding the micros to a whole micro, then shifting the point, rounds the exact value
+        # once: the shift is exact, whereas shifting first would round to 38 digits beforehand.
+        whole_micros = micros.quantize(_ONE, rounding=ROUND_HALF_EVEN, context=_DECIMAL_CONTEXT)
+        amount = whole_micros.scaleb(_MICROS_EXPONENT, context=_DECIMAL_CONTEXT)
+        if amount >= _NUMERIC_LIMIT:
+            raise self.defect(gaql_field, _MICROS_RATE_RANGE_EXPECTED)
+        if amount.is_zero() and not micros.is_zero():
+            raise self.defect(gaql_field, _MICROS_RATE_POSITIVE_EXPECTED)
+        return amount
 
 
 # ---------------------------------------------------------------------------------------------
@@ -724,8 +869,10 @@ class CampaignRow:
         budget_amount_micros: The budget's own amount in micros at native precision: Google's
             ``amount_micros`` for a ``DAILY`` budget, ``total_amount_micros`` for a
             ``CUSTOM_PERIOD`` (lifetime) budget; the other period's field is never present.
-            ``None`` when the period's own field is absent (unknown, never zero).
-        budget_amount: ``budget_amount_micros`` as an exact amount in the account currency.
+            From 0 to 999999999999999999, so the amount fits ``numeric(18, 6)``; ``None`` when
+            the period's own field is absent (unknown, never zero).
+        budget_amount: ``budget_amount_micros`` as an exact amount in the account currency, at
+            most ``999999999999.999999``.
         budget_explicitly_shared: Whether the budget is an explicitly shared budget, a decision
             subject of its own; ``False`` when absent or when there is no budget. Never ``True``
             for a ``CUSTOM_PERIOD`` budget.
@@ -760,19 +907,25 @@ class CampaignDailyRow:
     Attributes:
         campaign_id: ``campaign.id``.
         date: ``segments.date``, the native day in the account time zone.
-        cost: ``cost_micros`` as an exact amount in the account currency.
-        cost_micros: ``metrics.cost_micros``.
+        cost: ``cost_micros`` as an exact amount in the account currency, at most
+            ``999999999999.999999`` (``numeric(18, 6)``).
+        cost_micros: ``metrics.cost_micros``, from 0 to 999999999999999999.
         impressions: ``metrics.impressions``.
         clicks: ``metrics.clicks``.
-        conversions: ``metrics.conversions``, kept as a decimal (may be fractional); never
-            negative.
-        conversions_value: ``metrics.conversions_value`` in the account currency; never
-            negative.
+        conversions: ``metrics.conversions``, kept as a decimal (may be fractional) exactly as
+            returned, never rounded: at most six decimal places, never negative and below
+            ``10**12``, so ``numeric(18, 6)`` stores it unchanged.
+        conversions_value: ``metrics.conversions_value`` in the account currency, kept and
+            bounded as ``conversions``.
         search_budget_lost_impression_share: Fraction from 0 to 1 inclusive, as returned
-            (Google reports "> 90%" as ``0.9001``); ``None`` when unavailable. Stored as
-            ``budget_lost_is``.
+            (Google reports "> 90%" as ``0.9001``) or rounded toward zero to six places when
+            finer, so a comparison with ``0.10`` reads the same as on the value returned;
+            never zero when Google reports a positive value; ``None`` when unavailable. Stored
+            as ``budget_lost_is``.
         search_impression_share: Fraction from 0 to 1 inclusive, as returned (Google reports
-            "< 10%" as ``0.0999``); ``None`` when unavailable. Stored as ``impression_share``.
+            "< 10%" as ``0.0999``) or rounded toward zero to six places when finer; never zero
+            when Google reports a positive value; ``None`` when unavailable. Stored as
+            ``impression_share``.
     """
 
     campaign_id: int
@@ -817,12 +970,15 @@ class KeywordViewRow:
         historical_quality_score: ``metrics.historical_quality_score`` from 1 to 10; ``None`` on
             days without a score.
         average_cpc: ``metrics.average_cpc`` converted from micros and rounded half-even to six
-            places (it is derived, not exact); never negative; ``None`` without clicks.
-        cost: ``cost_micros`` as an exact amount in the account currency.
-        cost_micros: ``metrics.cost_micros``.
+            places (it is derived, not exact); never negative, below ``10**12`` and never zero
+            when Google reports a positive value; ``None`` without clicks.
+        cost: ``cost_micros`` as an exact amount in the account currency, at most
+            ``999999999999.999999`` (``numeric(18, 6)``).
+        cost_micros: ``metrics.cost_micros``, from 0 to 999999999999999999.
         clicks: ``metrics.clicks``.
         impressions: ``metrics.impressions``.
-        conversions: ``metrics.conversions``, kept as a decimal; never negative.
+        conversions: ``metrics.conversions``, kept as a decimal exactly as returned, never
+            rounded: at most six decimal places, never negative and below ``10**12``.
     """
 
     ad_group_id: int
@@ -855,14 +1011,16 @@ class SearchTermRow:
         matched_keyword_text: ``segments.keyword.info.text``; ``None`` when absent.
         matched_match_type: ``segments.keyword.info.match_type`` as returned, one of the
             contract's ``KeywordMatchTypeEnum`` names; ``None`` when absent.
-        cost: ``cost_micros`` as an exact amount in the account currency.
-        cost_micros: ``metrics.cost_micros``.
+        cost: ``cost_micros`` as an exact amount in the account currency, at most
+            ``999999999999.999999`` (``numeric(18, 6)``).
+        cost_micros: ``metrics.cost_micros``, from 0 to 999999999999999999.
         clicks: ``metrics.clicks``.
         impressions: ``metrics.impressions``.
-        conversions: ``metrics.conversions``, kept as a decimal; any fraction counts as
-            converting; never negative.
-        conversions_value: ``metrics.conversions_value`` in the account currency; never
-            negative.
+        conversions: ``metrics.conversions``, kept as a decimal exactly as returned, never
+            rounded, so any fraction still counts as converting: at most six decimal places,
+            never negative and below ``10**12``.
+        conversions_value: ``metrics.conversions_value`` in the account currency, kept and
+            bounded as ``conversions``.
     """
 
     campaign_id: int
@@ -1008,8 +1166,9 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
     Raises:
         QueryDefect: When a required field is absent, the status or period is not mapped, a
             present channel type is not one of the contract's enum names, the budget carries
-            the amount field of the other period, a ``CUSTOM_PERIOD`` budget is explicitly
-            shared, or a value has the wrong type.
+            the amount field of the other period, its own amount lies outside
+            ``0 .. 999999999999999999`` micros (the ``numeric(18, 6)`` range), a
+            ``CUSTOM_PERIOD`` budget is explicitly shared, or a value has the wrong type.
     """
     reader = _RowReader(row, "row_campaign")
     status, raw_status = reader.status("campaign.status")
@@ -1025,7 +1184,7 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
                 raise reader.defect(
                     amount_field, f"absent unless campaign_budget.period is {period}"
                 )
-        amount_micros = reader.optional_count(_BUDGET_AMOUNT_FIELD[budget_period])
+        amount_micros = reader.optional_amount_micros(_BUDGET_AMOUNT_FIELD[budget_period])
         shared = reader.flag("campaign_budget.explicitly_shared")
         if shared and budget_period == "CUSTOM_PERIOD":
             raise reader.defect(
@@ -1061,11 +1220,13 @@ def parse_campaign_daily(row: GoogleAdsRow) -> CampaignDailyRow:
 
     Raises:
         QueryDefect: When the campaign id or date is absent, a metric is negative, an
-            impression share lies outside 0 to 1, a key is JSON ``null``, or a value has the
-            wrong type.
+            impression share lies outside 0 to 1, the cost does not fit ``numeric(18, 6)``, a
+            conversion metric is not exactly storable there (``10**12`` or more, or finer than
+            six decimal places), a positive share would be stored as zero, a key is JSON
+            ``null``, or a value has the wrong type.
     """
     reader = _RowReader(row, "row_campaign_daily")
-    cost_micros = reader.count("metrics.cost_micros")
+    cost_micros = reader.amount_micros("metrics.cost_micros")
     return CampaignDailyRow(
         campaign_id=reader.identifier("campaign.id"),
         date=reader.day("segments.date"),
@@ -1117,11 +1278,13 @@ def parse_keyword_view(row: GoogleAdsRow) -> KeywordViewRow:
 
     Raises:
         QueryDefect: When an id or the date is absent, the quality score lies outside 1 to 10,
-            a metric (``average_cpc`` included) is negative, a key is JSON ``null``, or a value
-            has the wrong type.
+            a metric (``average_cpc`` included) is negative, the cost or average CPC does not
+            fit ``numeric(18, 6)`` or a positive average CPC would be stored as zero, the
+            conversions are not exactly storable there (``10**12`` or more, or finer than six
+            decimal places), a key is JSON ``null``, or a value has the wrong type.
     """
     reader = _RowReader(row, "row_keyword_view")
-    cost_micros = reader.count("metrics.cost_micros")
+    cost_micros = reader.amount_micros("metrics.cost_micros")
     return KeywordViewRow(
         ad_group_id=reader.identifier("ad_group.id"),
         criterion_id=reader.identifier("ad_group_criterion.criterion_id"),
@@ -1183,8 +1346,10 @@ def parse_search_term(row: GoogleAdsRow) -> SearchTermRow:
         QueryDefect: When a required field is absent, the term status is not one of
             :data:`SEARCH_TERM_STATUSES`, the matched criterion is not an ``adGroupCriteria``
             resource name of the row's own ad group with ids in the INT64 range, a present
-            match type is not one of the contract's enum names, a metric is negative, a key is
-            JSON ``null``, or a value has the wrong type.
+            match type is not one of the contract's enum names, a metric is negative, the cost
+            does not fit ``numeric(18, 6)``, a conversion metric is not exactly storable there
+            (``10**12`` or more, or finer than six decimal places), a key is JSON ``null``, or a
+            value has the wrong type.
     """
     reader = _RowReader(row, "row_search_term_view")
     term_status = reader.text("search_term_view.status")
@@ -1192,7 +1357,7 @@ def parse_search_term(row: GoogleAdsRow) -> SearchTermRow:
         raise reader.defect(
             "search_term_view.status", "one of " + ", ".join(sorted(SEARCH_TERM_STATUSES))
         )
-    cost_micros = reader.count("metrics.cost_micros")
+    cost_micros = reader.amount_micros("metrics.cost_micros")
     campaign_id = reader.identifier("campaign.id")
     ad_group_id = reader.identifier("ad_group.id")
     return SearchTermRow(

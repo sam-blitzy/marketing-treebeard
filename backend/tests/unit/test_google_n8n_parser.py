@@ -92,6 +92,20 @@ NOT_OBJECT_PATH = "a JSON object at every level of its key path"
 NOT_NULL_PATH = "a non-null value at every level of its key path"
 NOT_NON_NEGATIVE = "a non-negative finite JSON number"
 NOT_FRACTION = "a fraction from 0 to 1"
+# numeric(18, 6), the column of every Decimal row field, holds at most 999999999999.999999.
+NUMERIC_MAX_TEXT = "999999999999.999999"
+AMOUNT_MICROS_MAX_TEXT = "999999999999999999"
+AMOUNT_MICROS_RANGE = f"an integer from 0 to {AMOUNT_MICROS_MAX_TEXT}"
+NUMERIC_RANGE = f"a value of at most {NUMERIC_MAX_TEXT}, the numeric(18, 6) range"
+NUMERIC_SCALE = "a value with at most six decimal places, which numeric(18, 6) stores exactly"
+FRACTION_POSITIVE = (
+    "zero or a fraction of at least 0.000001, which six decimal places keep above zero"
+)
+CPC_RANGE = (
+    "an amount in micros that, divided by 1000000 and rounded half-even to six decimal places, "
+    f"is at most {NUMERIC_MAX_TEXT}, the numeric(18, 6) range"
+)
+CPC_POSITIVE = "zero or a value above 0.5 micros, which six decimal places keep above zero"
 CRITERION_FORM = (
     "an adGroupCriteria resource name customers/{customer}/adGroupCriteria/{ad_group}~{criterion}"
 )
@@ -559,6 +573,137 @@ def test_defect_messages_never_carry_row_values() -> None:
     assert "98765" not in error.message
 
 
+# --- strings PostgreSQL text can store ---------------------------------------------------------
+# PostgreSQL text cannot store U+0000 or an unpaired surrogate, so every string the parser reads
+# (names, search terms, keyword texts, enum names, resource names) rejects both with a defect
+# that names the field only, and keeps every other code point exactly as returned.
+
+NOT_STORABLE_TEXT = "a string without U+0000 or unpaired surrogates (PostgreSQL text)"
+
+# Every field the parser reads through _RowReader.text: surface, REST path, GAQL field.
+STRING_FIELDS: list[tuple[str, str, str]] = [
+    ("row_customer", "customer.descriptiveName", "customer.descriptive_name"),
+    ("row_customer", "customer.currencyCode", "customer.currency_code"),
+    ("row_customer", "customer.timeZone", "customer.time_zone"),
+    ("row_campaign", "campaign.name", "campaign.name"),
+    ("row_campaign", "campaign.status", "campaign.status"),
+    ("row_campaign", "campaign.advertisingChannelType", "campaign.advertising_channel_type"),
+    ("row_campaign", "campaignBudget.period", "campaign_budget.period"),
+    ("row_ad_group", "adGroup.name", "ad_group.name"),
+    ("row_ad_group", "adGroup.status", "ad_group.status"),
+    ("row_search_term_view", "searchTermView.searchTerm", "search_term_view.search_term"),
+    ("row_search_term_view", "searchTermView.status", "search_term_view.status"),
+    (
+        "row_search_term_view",
+        "segments.keyword.adGroupCriterion",
+        "segments.keyword.ad_group_criterion",
+    ),
+    ("row_search_term_view", "segments.keyword.info.text", "segments.keyword.info.text"),
+    (
+        "row_search_term_view",
+        "segments.keyword.info.matchType",
+        "segments.keyword.info.match_type",
+    ),
+    ("row_ad_group_criterion", "adGroupCriterion.status", "ad_group_criterion.status"),
+    ("row_ad_group_criterion", "adGroupCriterion.keyword.text", "ad_group_criterion.keyword.text"),
+    (
+        "row_ad_group_criterion",
+        "adGroupCriterion.keyword.matchType",
+        "ad_group_criterion.keyword.match_type",
+    ),
+    ("row_conversion_action", "conversionAction.name", "conversion_action.name"),
+    ("row_conversion_action", "conversionAction.status", "conversion_action.status"),
+    ("row_conversion_action", "conversionAction.countingType", "conversion_action.counting_type"),
+    (
+        "row_conversion_action",
+        "conversionAction.attributionModelSettings.attributionModel",
+        "conversion_action.attribution_model_settings.attribution_model",
+    ),
+]
+
+# Free-text fields kept as returned: surface, REST path, parsed attribute.
+FREE_TEXT_FIELDS: list[tuple[str, str, str]] = [
+    ("row_customer", "customer.descriptiveName", "descriptive_name"),
+    ("row_campaign", "campaign.name", "name"),
+    ("row_ad_group", "adGroup.name", "name"),
+    ("row_search_term_view", "searchTermView.searchTerm", "search_term"),
+    ("row_search_term_view", "segments.keyword.info.text", "matched_keyword_text"),
+    ("row_ad_group_criterion", "adGroupCriterion.keyword.text", "text"),
+    ("row_conversion_action", "conversionAction.name", "name"),
+]
+
+# Each carries the sentinels "crm" and "tool"; the non-ASCII ones exercise the regex path.
+UNSTORABLE_STRINGS = [
+    pytest.param("crm\x00tool", id="nul-inside"),
+    pytest.param("\x00crm tool", id="nul-first"),
+    pytest.param("crm tool\x00", id="nul-last"),
+    pytest.param("caf\u00e9 crm\x00tool", id="nul-in-non-ascii"),
+    pytest.param("crm\ud800tool", id="unpaired-high-surrogate"),
+    pytest.param("crm tool\udfff", id="unpaired-low-surrogate"),
+    pytest.param("crm \ude00\ud83d tool", id="pair-in-reverse-order"),
+]
+
+STORABLE_STRINGS = [
+    pytest.param("caf\u00e9 \u2615 \U0001f600 \u6771\u4eac\ttab\nnew line", id="unicode"),
+    pytest.param("\x01\x1f\x7f crm tool", id="other-control-characters"),
+    pytest.param("\ud7ff\ue000\ufffd\U0010ffff", id="code-points-beside-the-surrogate-range"),
+]
+
+
+def test_string_fields_are_every_field_read_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    read: set[tuple[str, str]] = set()
+    text = parser._RowReader.text
+
+    def recording_text(reader: Any, gaql_field: str) -> str:
+        read.add((reader._surface, gaql_field))
+        return text(reader, gaql_field)
+
+    monkeypatch.setattr(parser._RowReader, "text", recording_text)
+    for surface in ROW_SURFACES:
+        _parse(surface, BASE_ROWS[surface]())
+    assert read == {(surface, gaql_field) for surface, _, gaql_field in STRING_FIELDS}
+
+
+@pytest.mark.parametrize("value", UNSTORABLE_STRINGS)
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field"), STRING_FIELDS)
+def test_string_postgresql_text_cannot_store_is_a_defect_naming_the_field_only(
+    surface: str, rest_keys: str, gaql_field: str, value: str
+) -> None:
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, value))
+    _assert_defect(error, surface, f"{gaql_field}: expected {NOT_STORABLE_TEXT}")
+    for echoed in (error.message, error.reason):
+        assert echoed.isascii()
+        assert "\x00" not in echoed
+        assert "crm" not in echoed
+        assert "tool" not in echoed
+
+
+@pytest.mark.parametrize("value", STORABLE_STRINGS)
+@pytest.mark.parametrize(("surface", "rest_keys", "attribute"), FREE_TEXT_FIELDS)
+def test_free_text_postgresql_text_can_store_is_kept_unchanged(
+    surface: str, rest_keys: str, attribute: str, value: str
+) -> None:
+    parsed = _parse(surface, _with(BASE_ROWS[surface](), rest_keys, value))
+    assert getattr(parsed, attribute) == value
+
+
+def test_json_surrogate_pair_is_kept_but_lone_surrogate_or_nul_escape_is_a_defect() -> None:
+    # connectors/http.py decodes the body with json.loads: a surrogate-pair escape becomes one
+    # astral code point, while a lone surrogate escape and \u0000 stay as they are.
+    paired = json.loads('"crm \\ud83d\\ude00 tool"')
+    assert paired == "crm \U0001f600 tool"
+    row = _with(search_term_row(), "searchTermView.searchTerm", paired)
+    assert _parse("row_search_term_view", row).search_term == paired
+    for escaped in ('"crm \\ud83d tool"', '"crm\\u0000tool"'):
+        row = _with(search_term_row(), "searchTermView.searchTerm", json.loads(escaped))
+        error = _defect("row_search_term_view", row)
+        _assert_defect(
+            error,
+            "row_search_term_view",
+            f"search_term_view.search_term: expected {NOT_STORABLE_TEXT}",
+        )
+
+
 # --- absent keys versus explicit JSON null -----------------------------------------------------
 # REST JSON omits zero-valued and unset fields, so an absent key keeps the meaning its contract
 # gives it: zero for an additive metric, unavailable for a rate, score or budget amount, false for
@@ -790,6 +935,352 @@ def test_zero_double_metric_negative_zero_included_parses_as_unsigned_zero(
     assert value == 0
     assert isinstance(value, Decimal)
     assert not value.is_signed()
+
+
+# --- numeric(18, 6) storage --------------------------------------------------------------------
+# Every Decimal row field is stored as numeric(18, 6): at most 999999999999.999999, six decimal
+# places. Rows carry only values that column stores unchanged: amount micros are bounded,
+# conversions and conversion value are kept exactly or rejected (never rounded), impression
+# shares finer than six places are rounded toward zero, and a value that would overflow the
+# column, change in storage or turn a positive share into zero is a defect naming only the field
+# and its bounds.
+
+# Each micros field whose amount a row emits: surface, base row, REST path, GAQL field, then the
+# attributes holding the micros and the amount.
+AMOUNT_MICROS_FIELDS = [
+    pytest.param(
+        "row_campaign_daily",
+        campaign_daily_row,
+        "metrics.costMicros",
+        "metrics.cost_micros",
+        "cost_micros",
+        "cost",
+        id="campaign-daily-cost",
+    ),
+    pytest.param(
+        "row_keyword_view",
+        keyword_view_row,
+        "metrics.costMicros",
+        "metrics.cost_micros",
+        "cost_micros",
+        "cost",
+        id="keyword-view-cost",
+    ),
+    pytest.param(
+        "row_search_term_view",
+        search_term_row,
+        "metrics.costMicros",
+        "metrics.cost_micros",
+        "cost_micros",
+        "cost",
+        id="search-term-cost",
+    ),
+    pytest.param(
+        "row_campaign",
+        campaign_row,
+        "campaignBudget.amountMicros",
+        "campaign_budget.amount_micros",
+        "budget_amount_micros",
+        "budget_amount",
+        id="daily-budget",
+    ),
+    pytest.param(
+        "row_campaign",
+        lifetime_campaign_row,
+        "campaignBudget.totalAmountMicros",
+        "campaign_budget.total_amount_micros",
+        "budget_amount_micros",
+        "budget_amount",
+        id="custom-period-budget",
+    ),
+]
+AMOUNT_MICROS_PARAMS = (
+    "surface",
+    "base",
+    "rest_keys",
+    "gaql_field",
+    "micros_attribute",
+    "amount_attribute",
+)
+
+
+@pytest.mark.parametrize(AMOUNT_MICROS_PARAMS, AMOUNT_MICROS_FIELDS)
+def test_amount_micros_at_the_numeric_maximum_are_kept_exact(
+    surface: str,
+    base: Callable[[], dict[str, Any]],
+    rest_keys: str,
+    gaql_field: str,
+    micros_attribute: str,
+    amount_attribute: str,
+) -> None:
+    parsed = _parse(surface, _with(base(), rest_keys, AMOUNT_MICROS_MAX_TEXT))
+    micros = getattr(parsed, micros_attribute)
+    amount = getattr(parsed, amount_attribute)
+    assert type(micros) is int
+    assert micros == 999_999_999_999_999_999
+    assert isinstance(amount, Decimal)
+    assert amount.as_tuple() == Decimal(NUMERIC_MAX_TEXT).as_tuple()
+
+
+@pytest.mark.parametrize(
+    "micros", ["1000000000000000000", INT64_MAX_TEXT, INT64_OVERFLOW_TEXT, "-1"]
+)
+@pytest.mark.parametrize(AMOUNT_MICROS_PARAMS, AMOUNT_MICROS_FIELDS)
+def test_amount_micros_beyond_the_numeric_range_are_a_defect_never_clamped(
+    surface: str,
+    base: Callable[[], dict[str, Any]],
+    rest_keys: str,
+    gaql_field: str,
+    micros_attribute: str,
+    amount_attribute: str,
+    micros: str,
+) -> None:
+    error = _defect(surface, _with(base(), rest_keys, micros))
+    _assert_defect(error, surface, f"{gaql_field}: expected {AMOUNT_MICROS_RANGE}")
+    assert micros not in error.message
+
+
+# The DOUBLE conversion metrics of each surface; average CPC, in micros, is checked separately.
+CONVERSION_DOUBLES = [entry for entry in NON_NEGATIVE_DOUBLES if entry[3] != "average_cpc"]
+
+
+# Google returns conversions and conversion values with at most six decimal places (observed
+# live, 2026-10-07), so a finer value is one numeric(18, 6) would change, and it is rejected,
+# never rounded: rounding 1.0000001 or 2.9999996 would make a fractional count whole (B4 withholds
+# fractional conversions), and 0.0000003 would store a converting day as zero (K1 counts any
+# fraction as converting).
+CONVERSIONS_FINER_THAN_SIX_PLACES = [
+    pytest.param(Decimal("1.0000001"), id="just-above-a-whole-count"),
+    pytest.param(Decimal("2.9999996"), id="just-below-a-whole-count"),
+    pytest.param(Decimal("2.3333333333333335"), id="full-double"),
+    pytest.param(Decimal("5.0467620000001"), id="six-places-then-a-digit"),
+    pytest.param(Decimal("0.0000025"), id="half-even-tie"),
+    pytest.param(Decimal("0.0000015"), id="half-even-tie-upwards"),
+    # Positive values below one millionth, which six places would store as zero.
+    pytest.param(Decimal("0.0000003"), id="below-a-millionth"),
+    pytest.param(Decimal("0.0000005"), id="half-a-millionth"),
+    pytest.param(Decimal("0.00000099"), id="just-below-a-millionth"),
+    pytest.param(Decimal("1E-30"), id="tiny-positive"),
+    # Below 10**12, yet no six-place value equals them.
+    pytest.param(Decimal("999999999999.9999994"), id="just-above-the-maximum"),
+    pytest.param(Decimal("999999999999.9999995"), id="tie-above-the-maximum"),
+    pytest.param(Decimal("999999999999.9999996"), id="just-below-the-limit"),
+]
+
+
+@pytest.mark.parametrize("wire", CONVERSIONS_FINER_THAN_SIX_PLACES)
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), CONVERSION_DOUBLES)
+def test_conversion_doubles_finer_than_six_places_are_a_defect_never_rounded(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: Decimal
+) -> None:
+    # The row conforms to its contract (a JSON number), so _parse checks it before parsing.
+    row = _with(BASE_ROWS[surface](), rest_keys, wire)
+    with pytest.raises(QueryDefect) as caught:
+        _parse(surface, row)
+    _assert_defect(caught.value, surface, f"{gaql_field}: expected {NUMERIC_SCALE}")
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        # str gives 0.30000000000000004, which numeric(18, 6) cannot hold exactly.
+        pytest.param(0.1 + 0.2, id="float-sum"),
+        pytest.param(3e-7, id="float-below-a-millionth"),
+        pytest.param("2.9999996", id="numeric-string"),
+    ],
+)
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), CONVERSION_DOUBLES)
+def test_off_contract_conversions_finer_than_six_places_are_a_defect_never_rounded(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: object
+) -> None:
+    # A float or a numeric string is tolerated off-contract as an encoding, never as a value
+    # finer than six places.
+    row = _with(BASE_ROWS[surface](), rest_keys, wire)
+    with pytest.raises(QueryDefect) as caught:
+        _parse_off_contract(surface, row)
+    _assert_defect(caught.value, surface, f"{gaql_field}: expected {NUMERIC_SCALE}")
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        Decimal(NUMERIC_MAX_TEXT),
+        Decimal("0.000001"),
+        Decimal("123.456789"),
+        Decimal("1E+11"),
+        Decimal("2.5"),
+        Decimal("0.3"),
+        7,
+        # Values observed live (2026-10-07).
+        Decimal("5.046762"),
+        Decimal("0.952596"),
+        # Trailing zeros past the sixth place change no value, so the exponent is kept too.
+        Decimal("1.0000000"),
+        Decimal("0.95259600000"),
+    ],
+)
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), CONVERSION_DOUBLES)
+def test_conversion_doubles_within_six_places_are_kept_as_returned(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: int | Decimal
+) -> None:
+    value = getattr(_parse(surface, _with(BASE_ROWS[surface](), rest_keys, wire)), attribute)
+    assert isinstance(value, Decimal)
+    assert value.as_tuple() == Decimal(wire).as_tuple()
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        Decimal("1E+12"),
+        Decimal("1000000000000"),
+        Decimal("1000000000000.000000"),
+        Decimal("1000000000000.0000001"),
+        Decimal("12345678901234.5"),
+        # Six places of 1E+40 need 47 digits; the range is checked before any six-place step.
+        Decimal("1E+40"),
+    ],
+)
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), CONVERSION_DOUBLES)
+def test_conversion_doubles_beyond_the_numeric_range_are_a_defect(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: Decimal
+) -> None:
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, wire))
+    _assert_defect(error, surface, f"{gaql_field}: expected {NUMERIC_RANGE}")
+
+
+SHARE_FIELDS: list[tuple[str, str, str]] = [
+    (
+        "metrics.searchBudgetLostImpressionShare",
+        "metrics.search_budget_lost_impression_share",
+        "search_budget_lost_impression_share",
+    ),
+    ("metrics.searchImpressionShare", "metrics.search_impression_share", "search_impression_share"),
+]
+
+
+# The capped-day threshold on the budget-lost share: 10%, a six-place value.
+CAPPED_DAY_SHARE = Decimal("0.1")
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        # Full doubles observed live (2026-10-07).
+        (Decimal("0.5407821229050279"), Decimal("0.540782")),
+        (Decimal("0.0011627906976744186"), Decimal("0.001162")),
+        (Decimal("0.2273449920508744"), Decimal("0.227344")),
+        (Decimal("0.123456789"), Decimal("0.123456")),
+        (Decimal("0.0000025"), Decimal("0.000002")),
+        (Decimal("0.90010000001"), Decimal("0.900100")),
+        # Toward zero, never up to a whole share or across 10% in either direction.
+        (Decimal("0.99999999"), Decimal("0.999999")),
+        (Decimal("0.09999999"), Decimal("0.099999")),
+        (Decimal("0.10000009"), Decimal("0.100000")),
+    ],
+)
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), SHARE_FIELDS)
+def test_impression_shares_finer_than_six_places_are_rounded_toward_zero(
+    rest_keys: str, gaql_field: str, attribute: str, wire: Decimal, expected: Decimal
+) -> None:
+    row = _with(campaign_daily_row(), rest_keys, wire)
+    value = getattr(_parse("row_campaign_daily", row), attribute)
+    assert value.as_tuple() == expected.as_tuple()
+    assert value <= wire
+    # The stored share and the share returned fall on the same side of the 10% threshold.
+    assert (value >= CAPPED_DAY_SHARE) is (wire >= CAPPED_DAY_SHARE)
+
+
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), SHARE_FIELDS)
+def test_share_just_below_ten_percent_stays_below_it_once_stored(
+    rest_keys: str, gaql_field: str, attribute: str
+) -> None:
+    below = _with(campaign_daily_row(), rest_keys, Decimal("0.09999999"))
+    value = getattr(_parse("row_campaign_daily", below), attribute)
+    assert value == Decimal("0.099999")
+    assert value < CAPPED_DAY_SHARE
+    at = _with(campaign_daily_row(), rest_keys, Decimal("0.10000009"))
+    assert getattr(_parse("row_campaign_daily", at), attribute) >= CAPPED_DAY_SHARE
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        Decimal("0.0000003"),
+        Decimal("0.0000005"),
+        # Half-even would keep it as 0.000001; toward zero it would be stored as zero.
+        Decimal("0.00000099"),
+        Decimal("1E-9"),
+    ],
+)
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), SHARE_FIELDS)
+def test_positive_impression_share_that_would_round_to_zero_is_a_defect(
+    rest_keys: str, gaql_field: str, attribute: str, wire: Decimal
+) -> None:
+    error = _defect("row_campaign_daily", _with(campaign_daily_row(), rest_keys, wire))
+    _assert_defect(error, "row_campaign_daily", f"{gaql_field}: expected {FRACTION_POSITIVE}")
+
+
+@pytest.mark.parametrize(
+    ("average_cpc", "expected"),
+    [
+        (Decimal(AMOUNT_MICROS_MAX_TEXT), Decimal(NUMERIC_MAX_TEXT)),
+        (Decimal("999999999999999999.4"), Decimal(NUMERIC_MAX_TEXT)),
+        (Decimal("0.6"), Decimal("0.000001")),
+        (Decimal("0.5000001"), Decimal("0.000001")),
+        (Decimal("1.5"), Decimal("0.000002")),
+        (Decimal("2.5"), Decimal("0.000002")),
+    ],
+)
+def test_average_cpc_up_to_the_numeric_maximum_converts_half_even(
+    average_cpc: Decimal, expected: Decimal
+) -> None:
+    row = _with(keyword_view_row(), "metrics.averageCpc", average_cpc)
+    value = _parse("row_keyword_view", row).average_cpc
+    assert value is not None
+    assert value.as_tuple() == expected.as_tuple()
+
+
+@pytest.mark.parametrize("average_cpc", [Decimal("0.4"), Decimal("0.5"), Decimal("1E-20")])
+def test_positive_average_cpc_below_half_a_micro_is_a_defect(average_cpc: Decimal) -> None:
+    # Half a micro is a tie that half-even rounds to zero; a CPC with clicks is never zero.
+    row = _with(keyword_view_row(), "metrics.averageCpc", average_cpc)
+    error = _defect("row_keyword_view", row)
+    _assert_defect(error, "row_keyword_view", f"metrics.average_cpc: expected {CPC_POSITIVE}")
+
+
+@pytest.mark.parametrize(
+    ("surface", "rest_keys", "wire", "fingerprint"),
+    [
+        ("row_campaign_daily", "metrics.costMicros", "4567891234567891234", "4567891234"),
+        ("row_campaign", "campaignBudget.amountMicros", "4567891234567891234", "4567891234"),
+        ("row_campaign_daily", "metrics.conversions", Decimal("4567891234567.25"), "4567891234"),
+        ("row_keyword_view", "metrics.conversions", Decimal("0.00000031"), "31"),
+        ("row_search_term_view", "metrics.conversions", Decimal("2.3333333333333335"), "3333"),
+        ("row_campaign_daily", "metrics.conversionsValue", Decimal("5.0467621"), "0467"),
+        ("row_keyword_view", "metrics.conversions", Decimal("999999999999.9999994"), "9994"),
+        ("row_search_term_view", "metrics.conversionsValue", Decimal("4567891234567.5"), "4567"),
+        ("row_search_term_view", "metrics.conversionsValue", 0.1 + 0.2, "30000000000000004"),
+        ("row_campaign_daily", "metrics.searchImpressionShare", Decimal("0.00000047"), "47"),
+        (
+            "row_campaign_daily",
+            "metrics.searchBudgetLostImpressionShare",
+            Decimal("0.00000083"),
+            "83",
+        ),
+        ("row_keyword_view", "metrics.averageCpc", Decimal("4567891234567891234.5"), "4567"),
+        ("row_keyword_view", "metrics.averageCpc", Decimal("0.37"), "37"),
+    ],
+)
+def test_numeric_storage_defect_messages_never_carry_row_values(
+    surface: str, rest_keys: str, wire: object, fingerprint: str
+) -> None:
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, wire))
+    assert error.code == "validation"
+    assert fingerprint not in error.message
+    assert fingerprint not in error.reason
+    assert str(wire) not in error.message
+    assert len(error.message) <= 300
+    assert "…" not in error.message
 
 
 # --- int64 identifiers --------------------------------------------------------------------------
@@ -1159,17 +1650,21 @@ def test_budget_amount_is_exact_at_native_precision() -> None:
     assert parsed.budget_amount == Decimal(0)
 
 
-def test_budget_amount_at_int64_max_micros_is_exact() -> None:
+def test_budget_amount_at_int64_max_micros_is_a_defect() -> None:
+    # INT64_MAX micros is 9223372036854.775807, 13 integral digits: numeric(18, 6) holds 12.
     row = _with(campaign_row(), "campaignBudget.amountMicros", INT64_MAX_TEXT)
-    parsed = _parse("row_campaign", row)
-    assert parsed.budget_amount_micros == INT64_MAX
-    assert parsed.budget_amount == Decimal("9223372036854.775807")
+    error = _defect("row_campaign", row)
+    _assert_defect(
+        error, "row_campaign", f"campaign_budget.amount_micros: expected {AMOUNT_MICROS_RANGE}"
+    )
 
 
 @pytest.mark.parametrize("micros", ["-1", INT64_OVERFLOW_TEXT])
 def test_budget_amount_outside_the_int64_range_is_a_defect(micros: str) -> None:
     error = _defect("row_campaign", _with(campaign_row(), "campaignBudget.amountMicros", micros))
-    _assert_defect(error, "row_campaign", f"campaign_budget.amount_micros: expected {INT64_RANGE}")
+    _assert_defect(
+        error, "row_campaign", f"campaign_budget.amount_micros: expected {AMOUNT_MICROS_RANGE}"
+    )
 
 
 def test_budget_amount_that_is_not_an_int64_is_a_defect() -> None:
@@ -1417,7 +1912,6 @@ def test_campaign_daily_decodes_wire_json_without_binary_floats() -> None:
         (Decimal("0.000001"), Decimal("0.000001")),
         (Decimal("12345678.123456"), Decimal("12345678.123456")),
         (0.3, Decimal("0.3")),
-        (0.1 + 0.2, Decimal("0.30000000000000004")),
         ("0.3", Decimal("0.3")),
         ("2", Decimal(2)),
     ],
@@ -1496,6 +1990,9 @@ IMPRESSION_SHARES: list[tuple[str, str, str]] = [
         # Google's reporting sentinels: "> 90%" lost to budget and "< 10%" impression share.
         Decimal("0.9001"),
         Decimal("0.0999"),
+        # The smallest positive share six places hold, and trailing zeros past the sixth place.
+        Decimal("0.000001"),
+        Decimal("0.10000000"),
     ],
 )
 @pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), IMPRESSION_SHARES)
@@ -1540,11 +2037,13 @@ def test_impression_share_tolerated_as_a_float_is_still_bounded(
     _assert_defect(error, "row_campaign_daily", f"{gaql_field}: expected {NOT_FRACTION}")
 
 
-def test_cost_micros_at_int64_max_converts_exactly() -> None:
+def test_cost_micros_at_int64_max_is_a_defect() -> None:
+    # INT64_MAX micros is 9223372036854.775807, 13 integral digits: numeric(18, 6) holds 12.
     row = _with(campaign_daily_row(), "metrics.costMicros", INT64_MAX_TEXT)
-    parsed = _parse("row_campaign_daily", row)
-    assert parsed.cost_micros == INT64_MAX
-    assert parsed.cost == Decimal("9223372036854.775807")
+    error = _defect("row_campaign_daily", row)
+    _assert_defect(
+        error, "row_campaign_daily", f"metrics.cost_micros: expected {AMOUNT_MICROS_RANGE}"
+    )
 
 
 def test_cost_micros_as_a_json_integer_is_tolerated() -> None:
@@ -1557,8 +2056,8 @@ def test_cost_micros_as_a_json_integer_is_tolerated() -> None:
 @pytest.mark.parametrize(
     ("rest_keys", "gaql_field", "wire", "expected"),
     [
-        ("metrics.costMicros", "metrics.cost_micros", "-1", INT64_RANGE),
-        ("metrics.costMicros", "metrics.cost_micros", INT64_OVERFLOW_TEXT, INT64_RANGE),
+        ("metrics.costMicros", "metrics.cost_micros", "-1", AMOUNT_MICROS_RANGE),
+        ("metrics.costMicros", "metrics.cost_micros", INT64_OVERFLOW_TEXT, AMOUNT_MICROS_RANGE),
         ("metrics.costMicros", "metrics.cost_micros", "1.5", NOT_INT64),
         ("metrics.impressions", "metrics.impressions", "-10", INT64_RANGE),
         ("metrics.impressions", "metrics.impressions", "ten", NOT_INT64),
@@ -1713,15 +2212,15 @@ def test_historical_quality_score_outside_one_to_ten_is_a_defect(wire: str, expe
     )
 
 
-@pytest.mark.parametrize("average_cpc", [Decimal("1E+40"), Decimal("1E+38")])
-def test_average_cpc_beyond_numeric_range_is_a_defect(average_cpc: Decimal) -> None:
+@pytest.mark.parametrize(
+    "average_cpc",
+    # 999999999999999999.5 micros is a tie that half-even rounds up to 10**18 micros: 10**12.
+    [Decimal("1E+40"), Decimal("1E+38"), Decimal("1E+18"), Decimal("999999999999999999.5"), 10**18],
+)
+def test_average_cpc_beyond_numeric_range_is_a_defect(average_cpc: object) -> None:
     row = _with(keyword_view_row(), "metrics.averageCpc", average_cpc)
     error = _defect("row_keyword_view", row)
-    _assert_defect(
-        error,
-        "row_keyword_view",
-        "metrics.average_cpc: expected an amount in micros within numeric range",
-    )
+    _assert_defect(error, "row_keyword_view", f"metrics.average_cpc: expected {CPC_RANGE}")
 
 
 @pytest.mark.parametrize(

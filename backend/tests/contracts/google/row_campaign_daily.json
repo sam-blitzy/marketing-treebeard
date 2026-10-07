@@ -86,19 +86,19 @@
             },
             "conversions": {
               "type": "number",
-              "description": "DOUBLE as a JSON number, never assumed integral: data-driven attribution makes it fractional and MANY_PER_CLICK conversion actions allow several per click. Whole values arrive without a fractional part, and fractional values occur (both observed in a live n8n response, 2026-10-07). Parsed to Decimal, stored as numeric(18,6). Absent parses as 0."
+              "description": "DOUBLE as a JSON number, never assumed integral: data-driven attribution makes it fractional and MANY_PER_CLICK conversion actions allow several per click. Whole values arrive without a fractional part, and fractional values occur (both observed in a live n8n response, 2026-10-07). Parsed to Decimal, stored as numeric(18,6). Absent parses as 0. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
             },
             "conversionsValue": {
               "type": "number",
-              "description": "DOUBLE as a JSON number, the conversion value in the account currency. Absent parses as 0."
+              "description": "DOUBLE as a JSON number, the conversion value in the account currency. Absent parses as 0. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
             },
             "searchBudgetLostImpressionShare": {
               "type": "number",
-              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed on some campaign-day rows of a live n8n response, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0 to 0.9 and any value above 0.9 is reported as 0.9001 (0.9001 observed live, 2026-10-07); the value is kept as returned. A value of 0.10 or more marks a capped day (AAP 0.5.4.1)."
+              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed on some campaign-day rows of a live n8n response, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0 to 0.9 and any value above 0.9 is reported as 0.9001 (0.9001 observed live, 2026-10-07); that sentinel is kept as returned. A value of 0.10 or more marks a capped day (AAP 0.5.4.1). Any other value is returned as a full double (often more than six decimal places, observed live 2026-10-07); the parser rounds it toward zero to six places for numeric(18,6), which keeps the 0.10 capped-day comparison exact."
             },
             "searchImpressionShare": {
               "type": "number",
-              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed live, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0.1 to 1 and any value below 0.1 is reported as 0.0999 (0.0999 observed live, 2026-10-07); the value is kept as returned."
+              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed live, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0.1 to 1 and any value below 0.1 is reported as 0.0999 (0.0999 observed live, 2026-10-07); that sentinel is kept as returned. Any other value is returned as a full double (often more than six decimal places, observed live 2026-10-07); the parser rounds it toward zero to six places for numeric(18,6), which keeps every comparison with a six-place threshold such as 0.10 exact."
             }
           },
           "additionalProperties": false,

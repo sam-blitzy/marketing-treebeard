@@ -129,7 +129,7 @@
             },
             "conversions": {
               "type": "number",
-              "description": "metrics.conversions, DOUBLE: counts only conversion actions with include_in_conversions_metric = true. Fractional under data-driven attribution and possibly several per click under MANY_PER_CLICK, so never assumed integral."
+              "description": "metrics.conversions, DOUBLE: counts only conversion actions with include_in_conversions_metric = true. Fractional under data-driven attribution and possibly several per click under MANY_PER_CLICK, so never assumed integral. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
             }
           },
           "required": [],
