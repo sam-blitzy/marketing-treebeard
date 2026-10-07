@@ -24,7 +24,9 @@ Contents:
 * **Client identity and brute-force protection**: :func:`client_ip` and
   :class:`LoginRateLimiter`.
 
-Nothing here logs or returns a password, a password hash or an email address.
+Nothing here logs a password, a password hash or an email address, and no password is returned
+or stored. :func:`hash_password` returns a hash and :func:`read_session` returns the session's
+email, each only to the login route or the session dependency, which never log them.
 
 Example:
     The login route combines the helpers in this order::
@@ -191,6 +193,13 @@ def verify_password(stored_hash: str, password: str) -> PasswordCheck:
     the password, because it means the admin cannot sign in until ``ads-engine
     ensure-admin`` stores a valid hash.
 
+    Every call first obtains the process-wide dummy hash that :func:`verify_dummy` checks
+    against. The first call in a process therefore builds it, one hash on top of the
+    verification, whichever login branch made that call, so a known email's wrong
+    password performs the same argon2 operations as an unknown email, cold or warm. Like
+    hashing, verification is CPU- and memory-bound; async callers that care about
+    event-loop latency run it through ``starlette.concurrency.run_in_threadpool`` too.
+
     Args:
         stored_hash: The stored PHC-format hash (argon2id, argon2i or argon2d).
         password: The candidate plaintext password.
@@ -198,6 +207,9 @@ def verify_password(stored_hash: str, password: str) -> PasswordCheck:
     Returns:
         The match result, with ``needs_rehash`` set when the hash parameters are outdated.
     """
+    # Timing equaliser: build the cached dummy hash here, before any branch, so its one-time
+    # cost never falls on the unknown-email branch alone. The value is used by verify_dummy.
+    _dummy_hash()
     # A stored hash is ASCII by construction (PHC string format). argon2-cffi encodes it
     # as ASCII before verifying and raises UnicodeEncodeError for anything else, so a
     # non-ASCII value is rejected up front as unreadable instead of crashing the login.
@@ -227,9 +239,18 @@ def verify_password(stored_hash: str, password: str) -> PasswordCheck:
 def _dummy_hash() -> str:
     """Return a process-wide hash of a random secret, computed on first use.
 
-    It is built with the same hasher, so verifying against it costs the same as verifying
-    a real, current-parameter hash. Two threads racing on the first call may both compute
-    it; the cache then keeps one, which is harmless.
+    :func:`verify_password` calls it before any branch, so the first verification in a
+    process pays for building it, whether that verification checks a real account or
+    comes from :func:`verify_dummy`. It is built with the same hasher, so verifying
+    against it costs the same as verifying a real, current-parameter hash.
+
+    ``functools.cache`` takes no lock: threads racing on the first call may each compute
+    a hash, so each pays the same one-time cost, and the cache keeps the last one stored.
+    Every such hash is of a random secret that never matches, so which one a caller
+    receives is harmless.
+
+    Returns:
+        The PHC-format argon2id hash of a random secret that never leaves this process.
     """
     return _HASHER.hash(secrets.token_urlsafe(32))
 
@@ -237,10 +258,13 @@ def _dummy_hash() -> str:
 def verify_dummy(password: str) -> None:
     """Spend the cost of one password verification without checking any account.
 
-    The login route calls it when no user has the submitted email, so an unknown email
-    takes as long as a wrong password and the response time does not reveal which emails
-    exist. The result is discarded: it can never match, because the dummy secret is a
-    random token that never leaves this process.
+    The login route calls it when no user has the submitted email. It runs
+    :func:`verify_password` against the cached dummy hash, so it performs the same argon2
+    operations as a known email's wrong password: on the first failure in a process both
+    build the dummy hash once and verify, and afterwards both only verify. The response
+    time therefore does not reveal which emails exist. The result is discarded: it can
+    never match, because the dummy secret is a random token that never leaves this
+    process.
 
     Args:
         password: The submitted password.
@@ -328,21 +352,31 @@ def read_session(request: Request, *, now: datetime) -> SessionClaims | None:
     """Return the signed-in user's claims, or ``None`` when there is no valid session.
 
     A session is valid when it holds a positive integer ``uid``, a non-empty string
-    ``email`` and a non-negative integer ``iat``, and fewer than :data:`SESSION_MAX_AGE`
-    seconds have passed since ``iat``. The cookie's signature already proves the data was
-    written by this application; its timestamp only says when the cookie was last
-    written, so checking ``iat`` keeps the 12 h lifetime absolute from sign-in, and makes
-    it testable through the injected clock.
+    ``email`` and a non-negative integer ``iat`` that is not later than ``now``, and fewer
+    than :data:`SESSION_MAX_AGE` seconds have passed since ``iat``. The cookie's signature
+    already proves the data was written by this application; its timestamp only says when
+    the cookie was last written, so checking ``iat`` keeps the 12 h lifetime absolute from
+    sign-in, and makes it testable through the injected clock.
 
-    An expired or malformed session is cleared, so ``SessionMiddleware`` expires the
-    cookie on the response. An empty session is left untouched.
+    An ``iat`` later than ``now`` is rejected with no clock-skew allowance.
+    ``SessionMiddleware`` verifies the cookie with itsdangerous'
+    ``TimestampSigner.unsign(max_age=...)``, which already rejects a signature timestamp
+    ahead of the receiving clock, so a cookie written on a node whose clock runs ahead
+    fails at the signature layer. Holding ``iat`` to the same zero tolerance keeps the
+    12 h lifetime absolute under a clock rollback or replica skew, where a negative
+    elapsed time would otherwise extend it. API replicas therefore need synchronised
+    clocks.
+
+    An expired, future-issued or malformed session is cleared, so ``SessionMiddleware``
+    expires the cookie on the response. An empty session is left untouched.
 
     Args:
         request: The current request; ``SessionMiddleware`` must be installed.
         now: The current instant, timezone-aware (the route's ``NowDep``).
 
     Returns:
-        The claims, or ``None`` when the session is absent, malformed or expired.
+        The claims, or ``None`` when the session is absent, malformed, issued after ``now``
+        or expired.
 
     Raises:
         ValueError: When ``now`` is naive.
@@ -361,6 +395,7 @@ def read_session(request: Request, *, now: datetime) -> SessionClaims | None:
         or not _is_int(iat)
         or uid <= 0
         or iat < 0
+        or iat > current
         or current - iat >= SESSION_MAX_AGE
     ):
         session.clear()
@@ -451,9 +486,9 @@ class RateDecision:
 
 _ALLOWED: Final = RateDecision(allowed=True, retry_after=0)
 
-# Capacity warnings are logged once per episode: after the first eviction, the next
-# warning needs the tracked-key count to fall below this share of max_keys first, so a
-# sustained many-address attack produces one line rather than one per attempt.
+# Capacity warnings are logged once per episode: after the first refused untracked key,
+# the next warning needs the tracked-key count to fall below this share of max_keys first,
+# so a sustained many-address attack produces one line rather than one per attempt.
 _CAPACITY_REARM_SHARE: Final = 0.9
 
 
@@ -471,12 +506,16 @@ class LoginRateLimiter:
       enforces its own window; a restart starts every key afresh. ``api/app.py`` creates
       one instance per application (``app.state.login_limiter``), so every
       ``create_app()``, including each test app, starts clean.
-    * Memory is bounded. Per key, at most ``max_attempts`` timestamps are kept. Keys are
-      ordered by their latest counted attempt, so keys whose attempts have all expired
-      are pruned from the front on every call at amortised constant cost. When more than
-      ``max_keys`` keys are still active, the key with the oldest latest attempt is
-      evicted; that address's counter restarts, the price of a fixed memory ceiling
-      under a many-address attack, which is logged as a warning without any address.
+    * Memory is bounded: at most ``max_keys`` keys, each holding at most ``max_attempts``
+      timestamps. Keys are ordered by their latest counted attempt, so keys whose
+      attempts have all expired are pruned from the front on every call at amortised
+      constant cost, and every key left is active. Capacity fails closed: while
+      ``max_keys`` keys are active, an attempt from an untracked key is refused without
+      being recorded, with ``retry_after`` set to when the least recently active key
+      expires and frees a slot. Active counters are never dropped to make room, so no
+      key is ever allowed more than ``max_attempts`` attempts in any window; the price of
+      the memory ceiling is that new addresses wait during a many-address attack, which
+      is logged as a warning without any address.
 
     Concurrency: :meth:`check` never awaits, so on the asyncio event loop it is atomic.
     It also takes an internal lock, because FastAPI runs synchronous (``def``)
@@ -552,30 +591,32 @@ class LoginRateLimiter:
 
         Returns:
             ``allowed=True`` (and the attempt recorded) when fewer than ``max_attempts``
-            attempts fall within the window; otherwise ``allowed=False`` with
-            ``retry_after`` = ceil(oldest counted attempt + window - now), between 1 and
-            the window length.
+            attempts fall within the window and the key is tracked or a slot is free.
+            Otherwise ``allowed=False`` and nothing is recorded, with ``retry_after``
+            between 1 and the window length: ceil(oldest counted attempt + window - now)
+            for a key at its limit, or, for an untracked key while ``max_keys`` keys are
+            active, ceil(latest attempt of the least recently active key + window - now),
+            when that key expires and frees a slot.
         """
         with self._lock:
             now = self._clock()
             self._prune_idle(now)
+            tracked = len(self._attempts)
+            if self._at_capacity and tracked < self._max_keys * _CAPACITY_REARM_SHARE:
+                self._at_capacity = False
             attempts = self._attempts.get(key)
             if attempts is None:
+                if tracked >= self._max_keys:
+                    return self._refuse_untracked(now)
                 attempts = deque(maxlen=self._max_attempts)
                 self._attempts[key] = attempts
             else:
                 while attempts and now - attempts[0] >= self._window:
                     attempts.popleft()
                 if len(attempts) >= self._max_attempts:
-                    wait = math.ceil(attempts[0] + self._window - now)
-                    # The bounds hold for any clock: at least 1 s, never beyond one window.
-                    return RateDecision(
-                        allowed=False,
-                        retry_after=min(max(wait, 1), math.ceil(self._window)),
-                    )
+                    return self._deny_until_expiry(attempts[0], now)
             attempts.append(now)
             self._attempts.move_to_end(key)
-            self._enforce_capacity()
             return _ALLOWED
 
     def reset(self, key: str | None = None) -> None:
@@ -603,21 +644,21 @@ class LoginRateLimiter:
                 return
             del self._attempts[key]
 
-    def _enforce_capacity(self) -> None:
-        """Evict the least recently active keys beyond ``max_keys`` (caller holds the lock)."""
-        tracked = len(self._attempts)
-        if tracked <= self._max_keys:
-            if self._at_capacity and tracked < self._max_keys * _CAPACITY_REARM_SHARE:
-                self._at_capacity = False
-            return
-        evicted = 0
-        while len(self._attempts) > self._max_keys:
-            self._attempts.popitem(last=False)
-            evicted += 1
+    def _refuse_untracked(self, now: float) -> RateDecision:
+        """Refuse an untracked key while ``max_keys`` keys are active (caller holds the lock).
+
+        Nothing is recorded and no counter is dropped. After pruning, the front key has the
+        oldest latest attempt among active keys, so it is the first to expire and free a
+        slot. The first refusal of a capacity episode is logged, without any address.
+        """
         if not self._at_capacity:
             self._at_capacity = True
-            _log.warning(
-                "auth.login_limiter_at_capacity",
-                max_keys=self._max_keys,
-                evicted=evicted,
-            )
+            _log.warning("auth.login_limiter_at_capacity", max_keys=self._max_keys)
+        front = next(iter(self._attempts.values()))
+        return self._deny_until_expiry(front[-1], now)
+
+    def _deny_until_expiry(self, counted_at: float, now: float) -> RateDecision:
+        """Deny until the attempt counted at ``counted_at`` leaves the window."""
+        wait = math.ceil(counted_at + self._window - now)
+        # The bounds hold for any clock: at least 1 s, never beyond one window.
+        return RateDecision(allowed=False, retry_after=min(max(wait, 1), math.ceil(self._window)))

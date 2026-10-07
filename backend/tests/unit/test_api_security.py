@@ -6,10 +6,11 @@ Each test asserts behaviour the module's docstrings document:
   :func:`verify_password` matches, mismatches, flags outdated parameters for a rehash, and
   turns an unreadable or non-ASCII stored hash into a logged mismatch rather than an
   exception; a lone surrogate in the candidate never raises; :func:`verify_dummy` spends one
-  verification against a current-parameter hash that can never match;
+  verification against a current-parameter hash that can never match; a cold process's
+  first failure performs the same argon2 operations for an unknown and a known email;
 * sessions: :func:`start_session`, :func:`read_session` and :func:`end_session` over a
   hand-built ASGI scope and through Starlette's ``SessionMiddleware``, covering the absolute
-  12 h lifetime, malformed claims and naive datetimes;
+  12 h lifetime, issue times ahead of the clock, malformed claims and naive datetimes;
 * :func:`csrf_ok` on safe and mutating methods, and :func:`client_ip`, which reads only the
   ASGI peer;
 * :class:`LoginRateLimiter` on an injected clock: the sliding window, ``retry_after`` bounds,
@@ -22,10 +23,10 @@ range (RFC 5737, RFC 3849).
 
 import math
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -180,6 +181,38 @@ class _UnparseableParametersHasher(PasswordHasher):
     def check_needs_rehash(self, hash: str | bytes) -> bool:
         """Fail as argon2-cffi does on an encoding its parameter parser cannot read."""
         raise InvalidHashError
+
+
+class _RecordingHasher(PasswordHasher):
+    """A default-parameter hasher that records each hash and verification it performs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.operations: list[str] = []
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        """Record a hash, then compute it for real."""
+        self.operations.append("hash")
+        return super().hash(password, salt=salt)
+
+    def verify(self, hash: str | bytes, password: str | bytes) -> Literal[True]:
+        """Record a verification, then verify for real."""
+        self.operations.append("verify")
+        return super().verify(hash, password)
+
+
+@pytest.fixture
+def recording_hasher(monkeypatch: pytest.MonkeyPatch) -> Iterator[_RecordingHasher]:
+    """Install a recording hasher with a cold dummy-hash cache, as in a fresh process.
+
+    The cache is cleared again on teardown, so no later test reuses a dummy hash built while
+    the recorder was installed.
+    """
+    recorder = _RecordingHasher()
+    monkeypatch.setattr(security, "_HASHER", recorder)
+    security._dummy_hash.cache_clear()
+    yield recorder
+    security._dummy_hash.cache_clear()
 
 
 def _truncate_tag(stored: str) -> str:
@@ -381,6 +414,37 @@ def test_verify_dummy_never_raises_on_a_lone_surrogate(log_warnings: _WarningRec
     assert log_warnings.warnings == []
 
 
+def test_first_failure_performs_the_same_operations_for_unknown_and_known_emails(
+    admin_hash: str, recording_hasher: _RecordingHasher, log_warnings: _WarningRecorder
+) -> None:
+    """A cold process's first failure is ``[hash, verify]`` on both branches, then ``[verify]``.
+
+    Each branch starts from a cold cache: an unknown email (``verify_dummy``) and a known
+    email's wrong password (``verify_password``) both build the dummy hash once and verify.
+    Once either branch has warmed the cache, every failure on both performs one verification.
+    """
+    failures: dict[str, Callable[[], object]] = {
+        "unknown email": lambda: verify_dummy("test-wrong-password"),
+        "known email": lambda: verify_password(admin_hash, "test-wrong-password"),
+    }
+
+    def operations(branch: str) -> list[str]:
+        """Return the hasher operations one failure on ``branch`` performs."""
+        recording_hasher.operations.clear()
+        failures[branch]()
+        return list(recording_hasher.operations)
+
+    cold: dict[str, list[str]] = {}
+    for first, other in (("unknown email", "known email"), ("known email", "unknown email")):
+        security._dummy_hash.cache_clear()
+        cold[first] = operations(first)
+        assert operations(first) == ["verify"]
+        assert operations(other) == ["verify"]
+    assert cold["unknown email"] == cold["known email"] == ["hash", "verify"]
+    assert verify_password(admin_hash, "test-wrong-password") == MISMATCH
+    assert log_warnings.warnings == []
+
+
 # ---------------------------------------------------------------------------
 # Sessions on a hand-built scope
 # ---------------------------------------------------------------------------
@@ -456,12 +520,33 @@ def test_read_session_enforces_the_absolute_lifetime_from_sign_in() -> None:
     assert session.modified is True
 
 
-def test_read_session_accepts_an_issue_time_slightly_ahead_of_the_clock() -> None:
-    """Only elapsed time is bounded: an iat a few seconds ahead (replica clock skew) is valid."""
-    request, _session = _session_request({**VALID_CLAIMS, "iat": T0_EPOCH + 5})
-    assert read_session(request, now=T0) == SessionClaims(
-        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH + 5
+@pytest.mark.parametrize(
+    "ahead",
+    [pytest.param(1, id="one-second-ahead"), pytest.param(3600, id="one-hour-ahead")],
+)
+def test_read_session_clears_claims_issued_after_the_current_instant(ahead: int) -> None:
+    """An iat later than now (clock rollback, replica skew) has no allowance and is cleared."""
+    request, session = _session_request({**VALID_CLAIMS, "iat": T0_EPOCH + ahead})
+    assert read_session(request, now=T0) is None
+    assert dict(session) == {}
+    assert session.modified is True
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        pytest.param(T0, id="same-second"),
+        pytest.param(T0 + timedelta(microseconds=999_999), id="late-in-second"),
+    ],
+)
+def test_read_session_accepts_an_issue_time_equal_to_the_current_second(now: datetime) -> None:
+    """An iat in the current whole second is the sign-in instant itself and stays valid."""
+    request, session = _session_request(VALID_CLAIMS)
+    assert read_session(request, now=now) == SessionClaims(
+        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH
     )
+    assert dict(session) == VALID_CLAIMS
+    assert session.modified is False
 
 
 def _without(key: str) -> dict[str, object]:
@@ -599,6 +684,25 @@ async def test_session_claims_survive_the_signed_cookie_until_they_expire() -> N
         after = await client.get("/me")
         assert after.json() is None
         assert "set-cookie" not in after.headers
+
+
+@pytest.mark.anyio
+async def test_a_cookie_issued_ahead_of_the_clock_is_rejected_and_expired() -> None:
+    """After a clock rollback the signed cookie's iat is ahead of now: refused and expired."""
+    clock = [T0 + timedelta(hours=1)]
+    async with _client(clock) as client:
+        assert (await client.post("/login")).status_code == 200
+        assert client.cookies.get(SESSION_COOKIE)
+
+        clock[0] = T0
+        rejected = await client.get("/me")
+        assert rejected.json() is None
+        assert rejected.headers["set-cookie"].startswith(f"{SESSION_COOKIE}=")
+        assert EXPIRED_COOKIE in rejected.headers["set-cookie"]
+        assert client.cookies.get(SESSION_COOKIE) is None
+
+        clock[0] = T0 + timedelta(hours=1)
+        assert (await client.get("/me")).json() is None
 
 
 @pytest.mark.anyio
@@ -804,70 +908,109 @@ def test_limiter_rejects_out_of_range_configuration(kwargs: dict[str, Any]) -> N
         LoginRateLimiter(**kwargs)
 
 
-def test_limiter_evicts_the_key_with_the_oldest_latest_attempt(
+def test_limiter_at_capacity_refuses_new_keys_and_never_restarts_an_active_counter(
     log_warnings: _WarningRecorder,
 ) -> None:
-    """Beyond ``max_keys`` the least recently active key is evicted and its counter restarts."""
+    """Key churn at ``max_keys`` cannot restart a counter: the new key waits, the 6th is denied."""
     clock = FakeClock()
-    limiter = LoginRateLimiter(max_attempts=2, clock=clock, max_keys=2)
+    limiter = LoginRateLimiter(clock=clock, max_keys=2)
     first, second, third = "198.51.100.1", "198.51.100.2", "198.51.100.3"
-    for offset, key in ((0, first), (1, second), (1.5, second), (2, first)):
-        clock.at(offset)
-        assert limiter.check(key).allowed is True
-    clock.at(3)
-    assert limiter.check(third).allowed is True
-    assert limiter.tracked_keys == 2
-    clock.at(3.5)
-    assert limiter.check(first).allowed is False
-    clock.at(4)
+    for _ in range(LOGIN_MAX_ATTEMPTS):
+        assert limiter.check(first).allowed is True
     assert limiter.check(second).allowed is True
+    refused = limiter.check(third)
+    assert refused == RateDecision(allowed=False, retry_after=LOGIN_WINDOW_SECONDS)
+    assert 1 <= refused.retry_after <= LOGIN_WINDOW_SECONDS
+    assert limiter.check(first) == RateDecision(allowed=False, retry_after=LOGIN_WINDOW_SECONDS)
     assert limiter.tracked_keys == 2
     assert len(log_warnings.warnings) == 1
+
+    clock.at(LOGIN_WINDOW_SECONDS - 0.5)
+    assert limiter.check(third) == RateDecision(allowed=False, retry_after=1)
+    # Every attempt of first and second has left the window, so both slots are free again.
+    clock.at(LOGIN_WINDOW_SECONDS)
+    assert limiter.check(third).allowed is True
+    assert limiter.tracked_keys == 1
+
+
+def test_limiter_refused_new_key_waits_until_the_least_recently_active_key_expires(
+    log_warnings: _WarningRecorder,
+) -> None:
+    """A refused new key's ``retry_after`` is the time until the front key frees a slot."""
+    clock = FakeClock()
+    limiter = LoginRateLimiter(clock=clock, max_keys=2)
+    first, second, third, fourth = (
+        "198.51.100.1",
+        "198.51.100.2",
+        "198.51.100.3",
+        "198.51.100.4",
+    )
+    for offset, key in ((0, first), (10, second), (20, first)):
+        clock.at(offset)
+        assert limiter.check(key).allowed is True
+    # first attempted again at 20, so second (latest attempt at 10) is the first to expire.
+    clock.at(25.5)
+    assert limiter.check(third) == RateDecision(allowed=False, retry_after=45)
+    clock.at(69)
+    assert limiter.check(third) == RateDecision(allowed=False, retry_after=1)
+    clock.at(70)
+    assert limiter.check(third).allowed is True
+    assert limiter.tracked_keys == 2
+    # Now first (latest attempt at 20) is the least recently active key.
+    clock.at(71)
+    assert limiter.check(fourth) == RateDecision(allowed=False, retry_after=9)
+    # A clock that steps back still yields at most one window.
+    clock.at(-100)
+    assert limiter.check(fourth) == RateDecision(allowed=False, retry_after=LOGIN_WINDOW_SECONDS)
+    assert limiter.tracked_keys == 2
+    # Pruning second at 70 left 1 of 2 tracked (below 90%), so the refusal at 71 logged anew.
+    assert len(log_warnings.warnings) == 2
 
 
 def test_limiter_capacity_warning_is_logged_once_per_episode_without_addresses(
     log_warnings: _WarningRecorder,
 ) -> None:
-    """One warning per episode; it re-arms below 90% of ``max_keys`` or on a full reset."""
+    """One warning per episode of refusals; it re-arms below 90% of ``max_keys`` or on reset."""
     assert security._CAPACITY_REARM_SHARE == 0.9
     clock = FakeClock()
     limiter = LoginRateLimiter(clock=clock, max_keys=10)
     addresses = [f"198.51.100.{index}" for index in range(1, 40)]
     pending = iter(addresses)
 
-    def attempt() -> None:
-        """Count one attempt from the next unused address, one second later."""
+    def attempt(*, allowed: bool) -> None:
+        """Make one attempt from the next unused address, one second later."""
         clock.now += 1
-        assert limiter.check(next(pending)).allowed is True
+        assert limiter.check(next(pending)).allowed is allowed
 
-    for _ in range(11):
-        attempt()
+    for _ in range(10):
+        attempt(allowed=True)
+    assert log_warnings.warnings == []
+    attempt(allowed=False)
+    attempt(allowed=False)
+    assert limiter.tracked_keys == 10
+    assert log_warnings.warnings == [("auth.login_limiter_at_capacity", {"max_keys": 10})]
+
+    # Down to 9 of 10 (not below 90%), full again, then refused: still the same episode.
+    limiter.reset(addresses[0])
+    attempt(allowed=True)
+    attempt(allowed=False)
     assert limiter.tracked_keys == 10
     assert len(log_warnings.warnings) == 1
-    _event, fields = log_warnings.warnings[0]
-    assert fields["max_keys"] == 10
-    assert fields["evicted"] == 1
 
-    # Back down to 10 of 10, then over again: still the same episode.
-    limiter.reset(addresses[1])
-    attempt()
-    attempt()
-    assert limiter.tracked_keys == 10
-    assert len(log_warnings.warnings) == 1
-
-    # 7 tracked, then 8 after one attempt: below 9 (90% of 10), so the warning re-arms.
-    for address in addresses[3:6]:
+    # 7 tracked is below 9 (90% of 10), so the warning re-arms and the next refusal logs.
+    for address in addresses[1:4]:
         limiter.reset(address)
-    attempt()
-    assert limiter.tracked_keys == 8
+    assert limiter.tracked_keys == 7
     for _ in range(3):
-        attempt()
+        attempt(allowed=True)
     assert limiter.tracked_keys == 10
+    attempt(allowed=False)
     assert len(log_warnings.warnings) == 2
 
     limiter.reset()
-    for _ in range(11):
-        attempt()
+    for _ in range(10):
+        attempt(allowed=True)
+    attempt(allowed=False)
     assert len(log_warnings.warnings) == 3
 
     logged = log_warnings.text()
@@ -909,16 +1052,73 @@ def test_limiter_counts_concurrent_attempts_on_one_key_exactly() -> None:
     assert limiter.tracked_keys == 1
 
 
-def test_limiter_holds_its_key_ceiling_under_concurrent_eviction(
+def test_limiter_holds_its_key_ceiling_fail_closed_under_concurrency(
     log_warnings: _WarningRecorder,
 ) -> None:
-    """Concurrent attempts from many addresses never leave more than ``max_keys`` tracked."""
+    """Concurrent churn admits exactly ``max_keys`` keys, each to ``max_attempts`` and no more.
+
+    Each thread owns 100 addresses and tries each one 7 times. The clock is fixed, so once
+    50 keys are tracked no slot ever frees: every other address is refused on every try,
+    and each admitted address gets exactly 5 allowed attempts whatever the interleaving.
+    """
+    workers, hosts, rounds = 8, 100, LOGIN_MAX_ATTEMPTS + 2
     limiter = LoginRateLimiter(clock=FakeClock(), max_keys=50)
+    allowed: list[dict[str, int]] = [{} for _ in range(workers)]
 
     def spray(index: int) -> int:
-        """Attempt one login from each of 100 distinct addresses."""
-        return sum(limiter.check(f"10.{index}.0.{host}").allowed for host in range(100))
+        """Try every address of this thread ``rounds`` times; count allowed attempts per key."""
+        counts = allowed[index]
+        for _ in range(rounds):
+            for host in range(hosts):
+                key = f"2001:db8:{index + 1:x}::{host + 1:x}"
+                if limiter.check(key).allowed:
+                    counts[key] = counts.get(key, 0) + 1
+        return sum(counts.values())
 
-    assert _run_concurrently(8, spray) == 800
+    assert _run_concurrently(workers, spray) == 50 * LOGIN_MAX_ATTEMPTS
+    per_key = {key: count for counts in allowed for key, count in counts.items()}
+    assert len(per_key) == 50
+    assert set(per_key.values()) == {LOGIN_MAX_ATTEMPTS}
     assert limiter.tracked_keys == 50
     assert len(log_warnings.warnings) == 1
+
+
+def test_limiter_churn_past_the_default_key_limit_never_exceeds_the_attempt_limit(
+    log_warnings: _WarningRecorder,
+) -> None:
+    """Churn through 12,000 addresses inside one window never gives a key a 6th attempt.
+
+    With the default 10,000-key limit, an address at its limit stays denied however many
+    new addresses arrive; the addresses beyond the limit wait until a tracked key expires.
+    """
+    clock = FakeClock()
+    limiter = LoginRateLimiter(clock=clock)
+    allowed: dict[str, int] = {}
+
+    def attempt(key: str) -> bool:
+        """Make one attempt from ``key`` and tally it when allowed."""
+        decision = limiter.check(key)
+        if decision.allowed:
+            allowed[key] = allowed.get(key, 0) + 1
+        return decision.allowed
+
+    for _ in range(LOGIN_MAX_ATTEMPTS):
+        assert attempt(PEER) is True
+    churn = [f"2001:db8:1::{index:x}" for index in range(1, 12_001)]
+    for index, address in enumerate(churn, start=1):
+        # 12,000 addresses at 4 ms apart span 48 s, inside one 60 s window.
+        clock.at(index * 0.004)
+        for _ in range(LOGIN_MAX_ATTEMPTS + 1):
+            attempt(address)
+        if index % 1_000 == 0:
+            assert attempt(PEER) is False
+    assert allowed[PEER] == LOGIN_MAX_ATTEMPTS
+    assert max(allowed.values()) == LOGIN_MAX_ATTEMPTS
+    assert len(allowed) == 10_000
+    assert limiter.tracked_keys == 10_000
+    assert len(log_warnings.warnings) == 1
+
+    # PEER's attempts were the oldest; once they leave the window its slot goes to a new key.
+    clock.at(LOGIN_WINDOW_SECONDS)
+    assert attempt(churn[-1]) is True
+    assert limiter.tracked_keys == 10_000
