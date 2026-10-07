@@ -9,6 +9,7 @@ import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import cast, get_args
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -702,14 +703,45 @@ def test_api_startup_reports_the_base_url_before_the_session_secret(
         (WEBHOOK_URL, WEBHOOK_URL),
         (f"  {WEBHOOK_URL}  ", WEBHOOK_URL),
         ("http://localhost:5678/webhook/google-ads", "http://localhost:5678/webhook/google-ads"),
+        ("http://127.0.0.1:5678/webhook/x", "http://127.0.0.1:5678/webhook/x"),
+        ("HTTP://LOCALHOST:5678/webhook/google-ads", "HTTP://LOCALHOST:5678/webhook/google-ads"),
     ],
 )
-def test_webhook_url_accepts_absolute_http_urls(
+def test_webhook_url_accepts_https_and_local_http_urls(
     monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
 ) -> None:
     monkeypatch.setenv("N8N_GOOGLE_ADS_WEBHOOK_URL", raw)
 
     assert Settings().n8n_google_ads_webhook_url == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://n8n.example.test/webhook/test-plain-http-path",
+        "HTTP://n8n.example.test/webhook/test-plain-http-path",
+        "http://127.0.0.2:5678/webhook/test-plain-http-path",
+        "http://0.0.0.0:5678/webhook/test-plain-http-path",
+        "http://[::1]:5678/webhook/test-plain-http-path",
+        "http://localhost.example.test/webhook/test-plain-http-path",
+        "http://192.0.2.10/webhook/test-plain-http-path",
+    ],
+)
+def test_plain_http_webhook_url_on_a_non_local_host_is_rejected_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("N8N_GOOGLE_ADS_WEBHOOK_URL", raw)
+    host = urlsplit(raw).hostname
+    assert host
+
+    with pytest.raises(
+        ValidationError, match="N8N_GOOGLE_ADS_WEBHOOK_URL must use https://"
+    ) as excinfo:
+        Settings()
+
+    rendered = f"{excinfo.value}\n{excinfo.value!r}"
+    assert "test-plain-http-path" not in rendered
+    assert host not in rendered
 
 
 @pytest.mark.parametrize(

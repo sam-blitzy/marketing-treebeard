@@ -80,7 +80,8 @@ _LINKEDIN_STATIC_FIELD: Final = "linkedin_access_token"
 _HUBSPOT_CREDENTIAL_FIELDS: Final[tuple[str, ...]] = ("hubspot_access_token",)
 
 _HTTP_SCHEMES: Final = frozenset({"http", "https"})
-# Hosts on which APP_BASE_URL may use plain http (the local default http://localhost:8080).
+# The only hosts on which APP_BASE_URL (local default http://localhost:8080) and
+# N8N_GOOGLE_ADS_WEBHOOK_URL may use plain http; every other host requires https.
 _LOCAL_HOSTS: Final = frozenset({"localhost", "127.0.0.1"})
 _LINKEDIN_ACCOUNT_URN_PREFIX: Final = "urn:li:sponsoredAccount:"
 _DIGITS_RE: Final = re.compile(r"[0-9]+")
@@ -142,7 +143,8 @@ class Settings(BaseSettings):
         backfill_days: ``BACKFILL_DAYS``, the initial backfill length per dataset; the
             sync jobs cap it at LinkedIn's daily retention.
         n8n_google_ads_webhook_url: ``N8N_GOOGLE_ADS_WEBHOOK_URL``, the n8n webhook that
-            relays ``googleAds:search``. Never logged.
+            relays ``googleAds:search``. Must be ``https://``; plain ``http://`` loads only
+            for a ``localhost`` or ``127.0.0.1`` host. Never logged.
         n8n_webhook_secret_header: ``N8N_WEBHOOK_SECRET_HEADER``, the header name the
             n8n Header Auth credential expects.
         n8n_webhook_secret: ``N8N_WEBHOOK_SECRET``, the shared secret sent in that header.
@@ -345,19 +347,30 @@ class Settings(BaseSettings):
     @field_validator("n8n_google_ads_webhook_url", mode="before")
     @classmethod
     def _validate_webhook_url(cls, value: object) -> object:
-        """Require an absolute ``http(s)`` webhook URL when one is set.
+        """Require an absolute ``https://`` webhook URL when one is set.
 
-        The error message never contains the URL, which identifies the workflow.
+        The request carries the n8n shared-secret header, so plain ``http://`` is
+        accepted only when the host is exactly ``localhost`` or ``127.0.0.1``. The error
+        message never contains the URL, which identifies the workflow.
 
         Raises:
-            ValueError: When the value is not an absolute ``http(s)`` URL with a host.
+            ValueError: When the value is not an absolute ``http(s)`` URL with a host, or
+                is plain ``http://`` on a host other than ``localhost`` or ``127.0.0.1``.
         """
         if not isinstance(value, str) or not value.strip():
             return value  # blank: left to _blank_is_unset
         candidate = value.strip()
-        if _split_http_url(candidate) is None:
+        parts = _split_http_url(candidate)
+        if parts is None:
             raise ValueError(
-                "N8N_GOOGLE_ADS_WEBHOOK_URL must be an absolute https:// or http:// URL"
+                "N8N_GOOGLE_ADS_WEBHOOK_URL must be an absolute https:// URL "
+                "(plain http:// only on localhost or 127.0.0.1)"
+            )
+        # urlsplit lowercases the scheme and host, so HTTP://LOCALHOST counts as local.
+        if parts.scheme == "http" and parts.hostname not in _LOCAL_HOSTS:
+            raise ValueError(
+                "N8N_GOOGLE_ADS_WEBHOOK_URL must use https:// unless it is a localhost or "
+                "127.0.0.1 URL"
             )
         return candidate
 
