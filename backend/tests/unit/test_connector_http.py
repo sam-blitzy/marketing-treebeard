@@ -4,7 +4,8 @@ Covers :func:`build_client` (base URL, timeouts, default headers, redirects, the
 transport and the redacting event hooks), :func:`redact_url`, :class:`RetryPolicy`,
 :class:`JsonResponse` and :func:`send_json`: retry with backoff and ``Retry-After``, the
 error kind raised per response, exact-decimal JSON decoding, the ``before_attempt`` call
-budget hook and transport failures.
+budget hook, transport failures, request construction failures and the per-attempt
+deadline.
 
 No test touches the network: every client sends through an ``httpx.MockTransport``, and
 every retry policy records its waits instead of sleeping. Logs are captured with
@@ -15,12 +16,15 @@ stripped of each variable ``Settings`` reads, because the host exports real cred
 every secret is an obvious test literal and every address uses a reserved example domain.
 """
 
+import asyncio
 import math
 import os
-from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 from email.utils import format_datetime
+from types import MappingProxyType
 from typing import Any, cast
 
 import httpx
@@ -37,8 +41,10 @@ from ads_engine.connectors.errors import (
     ConnectorError,
     QueryDefect,
     TransientError,
+    sanitize_message,
 )
 from ads_engine.connectors.http import (
+    _ERROR_TEXT_SCAN_MAX,
     CONNECT_TIMEOUT_SECONDS,
     DEFAULT_RETRY,
     SOURCE_BASE_URLS,
@@ -62,6 +68,9 @@ LINKEDIN_TOKEN = "test-linkedin-access-token"
 HUBSPOT_TOKEN = "test-hubspot-access-token"
 LEAD_EMAIL = "lead@example.com"
 ENCODED_EMAIL = "lead%40example.com"
+# Assembled at run time, so the secret scan never reads this test value as a credential.
+SPANNING_SECRET = "-".join(("test", "spanning", "cut", "secret", "0123456789"))
+SPANNING_EMAIL = "lead.spanning.the.cut@example.com"
 WEBHOOK_HOST = "n8n.example.test"
 WEBHOOK_PATH = "/webhook/test-webhook-path"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -778,6 +787,64 @@ async def test_an_accepted_status_with_a_non_json_body_is_a_defect(content: byte
     assert len(harness.sent) == 1
 
 
+@pytest.mark.parametrize(
+    "number",
+    ["1e9999999999999999999", "-2.5E-9999999999999999999"],
+    ids=["exponent-too-large", "exponent-too-small"],
+)
+async def test_an_accepted_status_with_an_unrepresentable_number_is_a_defect(number: str) -> None:
+    # Valid JSON, but the exponent is beyond the decimal implementation's limits.
+    harness = Harness(httpx.Response(200, content=f'{{"conversions": {number}}}'.encode()))
+    with pytest.raises(QueryDefect, match="unrepresentable number") as excinfo:
+        await harness.call()
+    assert excinfo.value.code == "validation"
+    assert excinfo.value.http_status == 200
+    assert excinfo.value.query_id == "Q-G2"
+    assert len(harness.sent) == 1
+    assert harness.waits == []
+
+
+async def test_an_unrepresentable_number_is_a_defect_whatever_the_ambient_decimal_traps() -> None:
+    harness = Harness(httpx.Response(200, content=b'{"conversions": 1e9999999999999999999}'))
+    with localcontext() as ambient:
+        # With this trap off the ambient context turns the number into a silent NaN.
+        ambient.traps[InvalidOperation] = False
+        assert Decimal("1e9999999999999999999").is_nan()
+        with pytest.raises(QueryDefect, match="unrepresentable number") as excinfo:
+            await harness.call(source="linkedin")
+    assert excinfo.value.code == "validation"
+    assert len(harness.sent) == 1
+    assert harness.waits == []
+
+
+async def test_an_error_status_with_an_unrepresentable_number_is_classified_from_its_text() -> None:
+    text = '{"status": "error", "value": 1e9999999999999999999}'
+    harness = Harness(*(httpx.Response(503, text=text) for _ in range(3)))
+    with pytest.raises(TransientError) as excinfo:
+        await harness.call(source="hubspot")
+    assert excinfo.value.http_status == 503
+    assert excinfo.value.message == text
+    assert len(harness.sent) == 3
+
+
+async def test_exponents_within_the_decimal_limits_decode_as_exact_decimals() -> None:
+    content = (
+        b'{"small": 1e-7, "scaled": 2.5E+3, "large": 1e999999999999999999,'
+        b' "long": 0.12345678901234567890123456789012345}'
+    )
+    harness = Harness(httpx.Response(200, content=content))
+    response = await harness.call(source="hubspot")
+    assert response.body == {
+        "small": Decimal("1E-7"),
+        "scaled": Decimal("2.5E+3"),
+        "large": Decimal("1E+999999999999999999"),
+        # 35 digits, beyond the default 28-digit precision: kept, never rounded.
+        "long": Decimal("0.12345678901234567890123456789012345"),
+    }
+    assert str(response.body["scaled"]) == "2.5E+3"
+    assert all(isinstance(value, Decimal) for value in response.body.values())
+
+
 async def test_accepted_statuses_return_multi_status_batches() -> None:
     body = {"status": "COMPLETE", "results": [], "numErrors": 1, "errors": []}
     harness = Harness(_json(207, body))
@@ -861,6 +928,9 @@ async def test_a_503_then_200_returns_after_one_backoff_wait(captured: list[Even
         "http_status": 503,
         "attempt": 1,
         "retryable": True,
+        "reason": "google search Q-G2: HTTP 503: Service Unavailable",
+        "retry_after": None,
+        "query_id": None,
     }
     (logged_retry,) = _events(captured, "http.retry")
     assert logged_retry == {
@@ -925,13 +995,12 @@ async def test_a_single_attempt_policy_never_retries() -> None:
     [
         ("5", None, 5.0),
         ("0.5", None, 0.5),
-        ("600", None, 120.0),
-        ("600", 10.0, 10.0),
-        (format_datetime(datetime.now(UTC) + timedelta(hours=1), usegmt=True), None, 120.0),
+        ("120", None, 120.0),
+        ("10", 10.0, 10.0),
     ],
-    ids=["seconds", "fraction", "capped-default", "capped-policy", "http-date"],
+    ids=["seconds", "fraction", "at-default-cap", "at-policy-cap"],
 )
-async def test_retry_after_replaces_the_backoff_up_to_the_cap(
+async def test_a_retry_after_within_the_cap_replaces_the_backoff_in_full(
     retry_after: str, cap: float | None, expected: float, captured: list[EventDict]
 ) -> None:
     harness = Harness(
@@ -945,10 +1014,50 @@ async def test_retry_after_replaces_the_backoff_up_to_the_cap(
     policy = harness.policy() if cap is None else harness.policy(max_retry_after_seconds=cap)
     response = await harness.call(source="linkedin", policy=policy)
     assert response.body == {"elements": []}
+    assert len(harness.sent) == 2
     assert harness.waits == [expected]
     (logged_retry,) = _events(captured, "http.retry")
     assert logged_retry["wait_seconds"] == expected
-    assert logged_retry["retry_after"] is not None
+    assert logged_retry["retry_after"] == expected
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "cap", "expected"),
+    [
+        ("600", None, 600.0),
+        ("600", 10.0, 600.0),
+        (timedelta(hours=1), None, 3600.0),
+    ],
+    ids=["above-default-cap", "above-policy-cap", "http-date"],
+)
+async def test_a_retry_after_above_the_cap_is_raised_at_once_and_never_shortened(
+    retry_after: str | timedelta,
+    cap: float | None,
+    expected: float,
+    captured: list[EventDict],
+) -> None:
+    # An HTTP-date is rendered when the test runs, so the delay it encodes stays an hour.
+    header = (
+        retry_after
+        if isinstance(retry_after, str)
+        else format_datetime(datetime.now(UTC) + retry_after, usegmt=True)
+    )
+    harness = Harness(
+        _json(
+            429,
+            {"status": 429, "message": "Too many requests"},
+            headers={"Retry-After": header},
+        ),
+    )
+    policy = harness.policy() if cap is None else harness.policy(max_retry_after_seconds=cap)
+    with pytest.raises(TransientError) as excinfo:
+        await harness.call(source="linkedin", policy=policy)
+    assert excinfo.value.http_status == 429
+    # Delta-seconds parse exactly; an HTTP-date drops sub-seconds and is read a moment later.
+    assert excinfo.value.retry_after == pytest.approx(expected, abs=2.0)
+    assert len(harness.sent) == 1
+    assert harness.waits == []
+    assert _events(captured, "http.retry") == []
 
 
 async def test_an_unparsable_retry_after_falls_back_to_the_backoff() -> None:
@@ -956,6 +1065,27 @@ async def test_an_unparsable_retry_after_falls_back_to_the_backoff() -> None:
     await harness.call(source="hubspot")
     (wait,) = harness.waits
     assert FIRST_BACKOFF[0] <= wait <= FIRST_BACKOFF[1]
+
+
+async def test_a_google_retry_delay_above_the_cap_is_raised_without_a_resend(
+    captured: list[EventDict],
+) -> None:
+    quota = _google_error(
+        429,
+        "RESOURCE_EXHAUSTED",
+        "Too many requests",
+        "quotaError",
+        "RESOURCE_EXHAUSTED",
+        details={"quotaErrorDetails": {"rateScope": "DEVELOPER", "retryDelay": "600s"}},
+    )
+    harness = Harness(_json(200, quota))
+    with pytest.raises(TransientError) as excinfo:
+        await harness.call()
+    assert excinfo.value.http_status == 200
+    assert excinfo.value.retry_after == 600.0
+    assert len(harness.sent) == 1
+    assert harness.waits == []
+    assert _events(captured, "http.retry") == []
 
 
 async def test_google_quota_in_http_200_is_retried_after_its_retry_delay() -> None:
@@ -1040,6 +1170,11 @@ async def test_google_permission_denied_in_http_200_is_access_denied(
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error["kind"] == "access_denied"
     assert logged_error["retryable"] is False
+    assert logged_error["reason"] == (
+        "google search Q-G2: USER_PERMISSION_DENIED: The caller does not have permission"
+    )
+    assert logged_error["retry_after"] is None
+    assert logged_error["query_id"] is None
 
 
 async def test_google_query_error_in_http_200_is_a_defect() -> None:
@@ -1067,7 +1202,220 @@ async def test_non_json_error_bodies_are_classified_from_their_text(
     with pytest.raises(kind) as excinfo:
         await harness.call(source=source)
     assert excinfo.value.http_status == status
+    assert excinfo.value.message == text
     assert len(harness.sent) == sends
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Return ``error`` and every exception reachable through its causes and contexts."""
+    chain: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if any(current is seen for seen in chain):
+            continue
+        chain.append(current)
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    return chain
+
+
+def _fragments(value: str, size: int = 8) -> list[str]:
+    """Return every ``size``-character substring of ``value``, its prefixes included."""
+    return [value[start : start + size] for start in range(len(value) - size + 1)]
+
+
+@pytest.mark.parametrize(
+    ("source", "status", "kind", "sends", "filler_words", "value", "marker"),
+    [
+        ("hubspot", 502, TransientError, 3, 29, SPANNING_SECRET, REDACTED),
+        ("linkedin", 400, QueryDefect, 1, 28, SPANNING_EMAIL, REDACTED_EMAIL),
+    ],
+    ids=["configured-secret", "email"],
+)
+async def test_non_json_error_text_is_redacted_before_it_is_cut(
+    source: Source,
+    status: int,
+    kind: type[ConnectorError],
+    sends: int,
+    filler_words: int,
+    value: str,
+    marker: str,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: list[EventDict],
+) -> None:
+    # Harmless text followed by a value that straddles character 300, the length an
+    # error message is cut to: cutting first would leave a fragment redaction misses.
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", SPANNING_SECRET)
+    get_settings.cache_clear()
+    filler = "Upstream. " * filler_words
+    assert len(filler) < 300 < len(filler) + len(value)
+    text = filler + value
+    harness = Harness(*(httpx.Response(status, text=text) for _ in range(sends)))
+    with pytest.raises(kind) as excinfo:
+        await harness.call(source=source)
+    error = excinfo.value
+    assert error.http_status == status
+    assert len(harness.sent) == sends
+    assert error.message == " ".join(filler.split()) + f" {marker}"
+    rendered = [error.message, error.reason, str(error), repr(error)]
+    rendered.extend(f"{linked!s} {linked!r} {linked.args!r}" for linked in _exception_chain(error))
+    for fragment in _fragments(value):
+        assert all(fragment not in shown for shown in rendered), fragment
+    (logged_error, *_) = _events(captured, "connector.error")
+    assert logged_error["http_status"] == status
+    _assert_logs_exclude(captured, *_fragments(value))
+
+
+@pytest.mark.parametrize(
+    ("extra", "kind", "sends"),
+    [(0, AccessDenied, 1), (1, AccessDenied, 1)],
+    ids=["at-the-scan-limit", "beyond-the-scan-limit"],
+)
+async def test_non_json_error_text_beyond_the_scan_limit_is_described_by_its_size(
+    extra: int, kind: type[ConnectorError], sends: int, captured: list[EventDict]
+) -> None:
+    # Up to the limit the whole text is sanitised, and its Google token classifies it;
+    # beyond it the first _ERROR_TEXT_SCAN_MAX characters classify it (the denial outranks
+    # the 5xx status) and no character is kept: the message describes the body's size.
+    head = "PERMISSION_DENIED: The caller does not have permission. "
+    tail = f" {LEAD_EMAIL}"
+    length = _ERROR_TEXT_SCAN_MAX + extra
+    middle = ("Upstream. " * length)[: length - len(head) - len(tail)]
+    text = head + middle + tail
+    assert len(text) == length
+    harness = Harness(*(httpx.Response(500, text=text) for _ in range(sends)))
+    with pytest.raises(kind) as excinfo:
+        await harness.call()
+    error = excinfo.value
+    assert type(error) is kind
+    assert error.code == "PERMISSION_DENIED"
+    assert error.http_status == 500
+    assert len(harness.sent) == sends
+    if extra:
+        assert error.message == f"non-JSON error body of {length} characters"
+    else:
+        assert error.message.startswith(head.strip())
+    assert LEAD_EMAIL not in error.reason
+    _assert_logs_exclude(captured, LEAD_EMAIL)
+
+
+@pytest.mark.parametrize(
+    ("source", "status", "head", "headers", "kind", "code", "sends", "retry_after"),
+    [
+        ("google", 500, "QueryError: Unrecognized field. ", {}, QueryDefect, "QueryError", 1, None),
+        (
+            "google",
+            400,
+            "RESOURCE_EXHAUSTED: Too many requests. ",
+            {},
+            TransientError,
+            "RESOURCE_EXHAUSTED",
+            3,
+            None,
+        ),
+        ("google", 503, "<html><body>Service Unavailable. ", {}, TransientError, None, 3, None),
+        (
+            "linkedin",
+            429,
+            "Too many requests. ",
+            {"Retry-After": "7"},
+            TransientError,
+            None,
+            3,
+            7.0,
+        ),
+    ],
+    ids=["query-error-under-500", "resource-exhausted-under-400", "plain-503", "429-retry-after"],
+)
+async def test_an_oversized_non_json_error_body_is_classified_from_its_first_characters(
+    source: Source,
+    status: int,
+    head: str,
+    headers: Mapping[str, str],
+    kind: type[ConnectorError],
+    code: str | None,
+    sends: int,
+    retry_after: float | None,
+    captured: list[EventDict],
+) -> None:
+    # A Google token at the start of the body outranks its status, as in a shorter body;
+    # without one the status classifies it, its Retry-After intact.
+    length = _ERROR_TEXT_SCAN_MAX + 1
+    text = (head + "Upstream. " * length)[:length]
+    harness = Harness(*(httpx.Response(status, text=text, headers=headers) for _ in range(sends)))
+    with pytest.raises(kind) as excinfo:
+        await harness.call(source=source)
+    error = excinfo.value
+    assert type(error) is kind
+    assert error.code == code
+    assert error.http_status == status
+    assert error.message == f"non-JSON error body of {length} characters"
+    assert len(harness.sent) == sends
+    if isinstance(error, TransientError):
+        assert error.retry_after == retry_after
+    if retry_after is not None:
+        assert harness.waits == [retry_after] * (sends - 1)
+    if isinstance(error, QueryDefect):
+        assert error.query_id == "Q-G2"
+    logged = _events(captured, "connector.error")
+    assert len(logged) == sends
+    assert all(entry["reason"] == error.reason for entry in logged)
+
+
+@pytest.mark.parametrize(
+    ("source", "status", "head", "kind", "code", "value"),
+    [
+        (
+            "google",
+            500,
+            "PERMISSION_DENIED: The caller does not have permission.",
+            AccessDenied,
+            "PERMISSION_DENIED",
+            SPANNING_SECRET,
+        ),
+        ("linkedin", 400, "Bad Request.", QueryDefect, None, SPANNING_EMAIL),
+    ],
+    ids=["configured-secret", "email"],
+)
+async def test_an_oversized_non_json_error_body_keeps_no_fragment_its_window_cuts(
+    source: Source,
+    status: int,
+    head: str,
+    kind: type[ConnectorError],
+    code: str | None,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: list[EventDict],
+) -> None:
+    # The classification window ends inside the value, so redaction cannot recognise what
+    # the window holds of it. The whitespace filler collapses away, so the window's own
+    # sanitised text would show that fragment: only a message keeping none of it passes.
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", SPANNING_SECRET)
+    get_settings.cache_clear()
+    cut = len(value) // 2
+    prefix = (head + " \n" * _ERROR_TEXT_SCAN_MAX)[: _ERROR_TEXT_SCAN_MAX - cut]
+    text = prefix + value + " Upstream."
+    window = text[:_ERROR_TEXT_SCAN_MAX]
+    assert window.endswith(value[:cut])
+    assert value[:cut] in sanitize_message(window)
+    harness = Harness(httpx.Response(status, text=text))
+    with pytest.raises(kind) as excinfo:
+        await harness.call(source=source)
+    error = excinfo.value
+    assert type(error) is kind
+    assert error.code == code
+    assert error.http_status == status
+    assert len(harness.sent) == 1
+    assert error.message == f"non-JSON error body of {len(text)} characters"
+    rendered = [error.message, error.reason, str(error), repr(error)]
+    rendered.extend(f"{linked!s} {linked!r} {linked.args!r}" for linked in _exception_chain(error))
+    for fragment in _fragments(value):
+        assert all(fragment not in shown for shown in rendered), fragment
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == error.reason
+    _assert_logs_exclude(captured, *_fragments(value))
 
 
 async def test_error_logs_and_messages_carry_no_body_or_email(captured: list[EventDict]) -> None:
@@ -1084,7 +1432,85 @@ async def test_error_logs_and_messages_carry_no_body_or_email(captured: list[Eve
     assert REDACTED_EMAIL in excinfo.value.message
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error["code"] == "VALIDATION_ERROR"
-    _assert_logs_exclude(captured, LEAD_EMAIL, "property values", HUBSPOT_TOKEN, "authorization")
+    # The platform message reaches the log only inside the sanitised reason; the body's
+    # own fields never do.
+    assert logged_error["reason"] == (
+        "hubspot objects_batch_read contacts: VALIDATION_ERROR: "
+        f"Property values were not valid for {REDACTED_EMAIL}"
+    )
+    assert logged_error["query_id"] == "contacts"
+    _assert_logs_exclude(captured, LEAD_EMAIL, "category", HUBSPOT_TOKEN, "authorization")
+
+
+async def test_error_logs_carry_the_sanitised_reason_and_the_query_id(
+    monkeypatch: pytest.MonkeyPatch, captured: list[EventDict]
+) -> None:
+    # Reasons are sanitised against the settings loaded from the environment.
+    monkeypatch.setenv("N8N_WEBHOOK_SECRET", N8N_SECRET)
+    get_settings.cache_clear()
+    leaking = _google_error(
+        400,
+        "INVALID_ARGUMENT",
+        f"Unrecognized field for {LEAD_EMAIL} near {N8N_SECRET}",
+        "queryError",
+        "BAD_FIELD",
+    )
+    other = _google_error(
+        400, "INVALID_ARGUMENT", "Unrecognized field segments.week", "queryError", "BAD_FIELD"
+    )
+    harness = Harness(_json(400, leaking), _json(400, other))
+    for _ in range(2):
+        with pytest.raises(QueryDefect):
+            await harness.call()
+    first, second = _events(captured, "connector.error")
+    assert first == {
+        "event": "connector.error",
+        "log_level": "warning",
+        "source": "google",
+        "endpoint": "search Q-G2",
+        "kind": "defect",
+        "code": "BAD_FIELD",
+        "http_status": 400,
+        "attempt": 1,
+        "retryable": False,
+        "reason": (
+            f"google search Q-G2: BAD_FIELD: Unrecognized field for {REDACTED_EMAIL} "
+            f"near {REDACTED}"
+        ),
+        "retry_after": None,
+        "query_id": "Q-G2",
+    }
+    # Same source, endpoint, kind, code and status: only the reason tells them apart.
+    assert second == {
+        **first,
+        "reason": "google search Q-G2: BAD_FIELD: Unrecognized field segments.week",
+    }
+    _assert_logs_exclude(captured, LEAD_EMAIL, N8N_SECRET)
+
+
+async def test_a_transient_error_log_carries_the_requested_retry_after(
+    captured: list[EventDict],
+) -> None:
+    harness = Harness(
+        _json(429, {"status": 429, "message": "Too many requests"}, headers={"Retry-After": "600"})
+    )
+    with pytest.raises(TransientError):
+        await harness.call(source="linkedin", policy=harness.policy(attempts=1))
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error == {
+        "event": "connector.error",
+        "log_level": "warning",
+        "source": "linkedin",
+        "endpoint": "ad_analytics",
+        "kind": "transient",
+        "code": None,
+        "http_status": 429,
+        "attempt": 1,
+        "retryable": True,
+        "reason": "linkedin ad_analytics: HTTP 429: Too many requests",
+        "retry_after": 600.0,
+        "query_id": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1574,9 @@ async def test_a_connector_error_from_the_transport_is_reraised_unchanged(
     assert len(harness.sent) == 1
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error["code"] == "PERMISSION_DENIED"
+    assert logged_error["reason"] == "google search Q-G2: PERMISSION_DENIED: simulated denial"
+    assert logged_error["retry_after"] is None
+    assert logged_error["query_id"] is None
 
 
 async def test_a_transient_error_from_the_transport_is_retried() -> None:
@@ -1160,6 +1589,276 @@ async def test_a_transient_error_from_the_transport_is_retried() -> None:
         await harness.call()
     assert excinfo.value is errors[-1]
     assert len(harness.sent) == 3
+
+
+# ---------------------------------------------------------------------------
+# send_json(): request construction and per-attempt deadline
+# ---------------------------------------------------------------------------
+
+
+async def _call_building_with(
+    harness: Harness,
+    build: Callable[[httpx.AsyncClient], httpx.Request],
+    *,
+    before_attempt: Callable[[], Awaitable[None]] | None = None,
+) -> JsonResponse:
+    """Send one Google call through :func:`send_json`, building each attempt with ``build``.
+
+    ``harness.order`` records a ``build`` step before every call of ``build``.
+    """
+    async with build_client("google", harness.transport(), settings=Settings()) as client:
+
+        def record_and_build() -> httpx.Request:
+            harness.order.append("build")
+            return build(client)
+
+        return await send_json(
+            client,
+            record_and_build,
+            source="google",
+            endpoint=ENDPOINTS["google"],
+            policy=harness.policy(),
+            before_attempt=before_attempt,
+        )
+
+
+def _raising(error: Exception) -> Callable[[httpx.AsyncClient], httpx.Request]:
+    """Return a request builder that raises ``error`` instead of building."""
+
+    def build(client: httpx.AsyncClient) -> httpx.Request:
+        raise error
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("build", "cause"),
+    [
+        (lambda client: client.build_request("POST", f"{WEBHOOK_URL}\x00"), httpx.InvalidURL),
+        (
+            lambda client: client.build_request("POST", WEBHOOK_URL, json={"query": object()}),
+            TypeError,
+        ),
+        (
+            lambda client: client.build_request(
+                "POST", WEBHOOK_URL, headers={"X-Webhook-Secret": "caf\u00e9"}
+            ),
+            UnicodeEncodeError,
+        ),
+        (_raising(ValueError(f"no contact for {LEAD_EMAIL}")), ValueError),
+        (_raising(httpx.StreamConsumed()), httpx.StreamConsumed),
+        (_raising(httpx.ConnectError("synthetic connect failure")), httpx.ConnectError),
+        (_raising(httpx.ReadTimeout("synthetic read timeout")), httpx.ReadTimeout),
+    ],
+    ids=[
+        "invalid-url",
+        "unserialisable-json",
+        "unencodable-header",
+        "value-error",
+        "stream-error",
+        "transport-error",
+        "timeout-exception",
+    ],
+)
+async def test_a_request_that_cannot_be_built_is_a_defect_and_never_sent(
+    build: Callable[[httpx.AsyncClient], httpx.Request],
+    cause: type[Exception],
+    captured: list[EventDict],
+) -> None:
+    harness = Harness()
+    with pytest.raises(QueryDefect) as excinfo:
+        await _call_building_with(harness, build)
+    error = excinfo.value
+    assert type(error) is QueryDefect
+    assert (error.code, error.http_status, error.query_id) == ("CLIENT", None, "Q-G2")
+    assert isinstance(error.__cause__, cause)
+    assert error.message.startswith(type(error.__cause__).__name__)
+    # Built once, never sent and never retried, whatever classify_exception would say of
+    # the same exception raised by a transport.
+    assert harness.order == ["build"]
+    assert harness.sent == []
+    assert harness.waits == []
+    assert _events(captured, "http.retry") == []
+    (logged_error,) = _events(captured, "connector.error")
+    assert (logged_error["kind"], logged_error["code"], logged_error["attempt"]) == (
+        "defect",
+        "CLIENT",
+        1,
+    )
+    assert logged_error["http_status"] is None
+    assert logged_error["retryable"] is False
+    assert LEAD_EMAIL not in str(error)
+    _assert_logs_exclude(captured, LEAD_EMAIL)
+
+
+async def test_a_connector_error_from_the_builder_is_reraised_unchanged(
+    captured: list[EventDict],
+) -> None:
+    denial = AccessDenied(
+        "token revoked", source="google", endpoint="search Q-G2", code="PERMISSION_DENIED"
+    )
+    harness = Harness()
+    with pytest.raises(AccessDenied) as excinfo:
+        await _call_building_with(harness, _raising(denial))
+    assert excinfo.value is denial
+    assert harness.order == ["build"]
+    assert harness.sent == []
+    assert harness.waits == []
+    (logged_error,) = _events(captured, "connector.error")
+    assert (logged_error["kind"], logged_error["code"], logged_error["attempt"]) == (
+        "access_denied",
+        "PERMISSION_DENIED",
+        1,
+    )
+
+
+async def test_an_exhausted_budget_is_raised_unchanged_before_any_build(
+    captured: list[EventDict],
+) -> None:
+    harness = Harness()
+    exhausted = CallBudgetExhausted()
+
+    async def acquire() -> None:
+        harness.order.append("acquire")
+        raise exhausted
+
+    with pytest.raises(CallBudgetExhausted) as excinfo:
+        await _call_building_with(
+            harness,
+            lambda client: client.build_request("POST", WEBHOOK_URL),
+            before_attempt=acquire,
+        )
+    assert excinfo.value is exhausted
+    assert harness.order == ["acquire"]
+    assert harness.sent == []
+    assert harness.waits == []
+    assert _events(captured, "connector.error") == []
+    assert _events(captured, "http.retry") == []
+
+
+# Per-call deadline of every source in the deadline tests, and the interval between the
+# chunks of a dripping body: each chunk arrives well inside any read timeout, so only a
+# deadline on the whole attempt can end the call.
+SHORT_DEADLINE = 0.2
+DRIP_INTERVAL = 0.05
+
+
+class _DrippingStream(httpx.AsyncByteStream):
+    """A response body sending one chunk per interval: ``chunks``, or spaces forever."""
+
+    def __init__(
+        self, chunks: list[bytes] | None = None, *, interval: float = DRIP_INTERVAL
+    ) -> None:
+        self._chunks = chunks
+        self._interval = interval
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        """Yield the next chunk after each interval; never stop when no chunks are given."""
+        while self._chunks is None:
+            await asyncio.sleep(self._interval)
+            yield b" "
+        for chunk in self._chunks:
+            await asyncio.sleep(self._interval)
+            yield chunk
+
+    async def aclose(self) -> None:
+        """Record that httpx released the body."""
+        self.closed = True
+
+
+@pytest.fixture
+def short_deadlines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every source a per-call deadline of :data:`SHORT_DEADLINE` seconds."""
+    monkeypatch.setattr(
+        "ads_engine.connectors.http.SOURCE_TIMEOUTS",
+        MappingProxyType(dict.fromkeys(SOURCES, SHORT_DEADLINE)),
+    )
+
+
+@pytest.mark.usefixtures("short_deadlines")
+async def test_a_body_dripping_past_the_deadline_times_out_and_is_retried(
+    captured: list[EventDict],
+) -> None:
+    streams = [_DrippingStream() for _ in range(3)]
+    harness = Harness(*(httpx.Response(200, stream=stream) for stream in streams))
+    started = time.monotonic()
+    # A guard far beyond the deadline, so a regression fails instead of hanging.
+    async with asyncio.timeout(5):
+        with pytest.raises(TransientError) as excinfo:
+            await harness.call()
+    elapsed = time.monotonic() - started
+    error = excinfo.value
+    assert (error.code, error.http_status, error.retryable) == ("TIMEOUT", None, True)
+    assert error.message == "call exceeded the 0.2 s per-call deadline"
+    assert isinstance(error.__cause__, TimeoutError)
+    # Each attempt is sent, cut off at its own deadline and its body released.
+    assert len(harness.sent) == 3
+    assert all(stream.closed for stream in streams)
+    assert 3 * SHORT_DEADLINE * 0.9 <= elapsed < 3.0
+    assert len(harness.waits) == 2
+    assert FIRST_BACKOFF[0] <= harness.waits[0] <= FIRST_BACKOFF[1]
+    assert SECOND_BACKOFF[0] <= harness.waits[1] <= SECOND_BACKOFF[1]
+    logged = [
+        (event["code"], event["attempt"], event["retryable"])
+        for event in _events(captured, "connector.error")
+    ]
+    assert logged == [("TIMEOUT", 1, True), ("TIMEOUT", 2, True), ("TIMEOUT", 3, True)]
+    assert len(_events(captured, "http.retry")) == 2
+
+
+@pytest.mark.usefixtures("short_deadlines")
+@pytest.mark.parametrize("source", ["linkedin", "hubspot"])
+async def test_every_source_bounds_its_call_by_its_deadline(source: Source) -> None:
+    stream = _DrippingStream()
+    harness = Harness(httpx.Response(200, stream=stream))
+    async with asyncio.timeout(5):
+        with pytest.raises(TransientError) as excinfo:
+            await harness.call(source=source, policy=harness.policy(attempts=1))
+    assert excinfo.value.code == "TIMEOUT"
+    assert excinfo.value.endpoint == ENDPOINTS[source]
+    assert excinfo.value.message == "call exceeded the 0.2 s per-call deadline"
+    assert len(harness.sent) == 1
+    assert stream.closed
+
+
+@pytest.mark.usefixtures("short_deadlines")
+async def test_a_body_finishing_inside_the_deadline_is_returned(
+    captured: list[EventDict],
+) -> None:
+    stream = _DrippingStream(
+        [b'{"results": [], "fieldMask": "campaign.id",', b' "queryResourceConsumption": "1"}'],
+        interval=0.01,
+    )
+    harness = Harness(httpx.Response(200, stream=stream))
+    response = await harness.call()
+    assert response.body == {
+        "results": [],
+        "fieldMask": "campaign.id",
+        "queryResourceConsumption": "1",
+    }
+    assert len(harness.sent) == 1
+    assert harness.waits == []
+    assert _events(captured, "connector.error") == []
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (httpx.ReadTimeout("timed out"), "ReadTimeout: timed out"),
+        (TimeoutError("timed out"), "TimeoutError: timed out"),
+    ],
+    ids=["httpx-timeout", "builtin-timeout"],
+)
+async def test_a_timeout_raised_inside_the_deadline_keeps_its_own_classification(
+    error: Exception, message: str
+) -> None:
+    harness = Harness(error)
+    with pytest.raises(TransientError) as excinfo:
+        await harness.call(policy=harness.policy(attempts=1))
+    assert excinfo.value.code == "TIMEOUT"
+    assert excinfo.value.message == message
+    assert excinfo.value.__cause__ is error
 
 
 # ---------------------------------------------------------------------------

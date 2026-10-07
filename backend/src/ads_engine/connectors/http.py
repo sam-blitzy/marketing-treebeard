@@ -4,13 +4,15 @@ The Google (n8n webhook), LinkedIn and HubSpot connectors all talk to their plat
 through the two entry points of this module:
 
 * :func:`build_client` returns the ``httpx.AsyncClient`` of a source, with that source's
-  base URL, timeouts (Google: 120 s per call), default headers and redacting event hooks.
+  base URL, per-phase timeouts (:func:`send_json` also bounds each attempt as a whole:
+  Google 120 s per call), default headers and redacting event hooks.
   Its ``transport`` argument is the single injection point for the simulation's
   ``httpx.MockTransport``, the CLI's recording transport and test transports, so the live
   clients and parsers run unchanged in simulated mode.
 * :func:`send_json` sends one logical call: it retries transient failures (3 attempts,
-  exponential backoff from a 2 s base with jitter, ``Retry-After`` honoured), decodes the
-  JSON body with exact decimals, and raises exactly one of the error kinds of
+  exponential backoff from a 2 s base with jitter, ``Retry-After`` honoured in full; a
+  requested wait too long to sleep through ends the call instead), decodes the JSON body
+  with exact decimals, and raises exactly one of the error kinds of
   :mod:`ads_engine.connectors.errors`. ``AccessDenied``, ``QueryDefect`` and
   ``CallBudgetExhausted`` are never retried: a denial sends the source to simulated data,
   a defect fails the job, and an exhausted call budget defers the remaining calls.
@@ -51,7 +53,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Context, Decimal, DecimalException, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Final, NoReturn
 from urllib.parse import unquote
@@ -67,12 +69,14 @@ from tenacity import (
 
 from ads_engine import __version__
 from ads_engine.connectors.errors import (
+    AccessDenied,
     CallBudgetExhausted,
     ConnectorError,
     QueryDefect,
     TransientError,
     classify,
     classify_exception,
+    sanitize_message,
 )
 from ads_engine.db.models.ops import SOURCES
 from ads_engine.logging import EMAIL_RE, REDACTED, REDACTED_EMAIL, get_logger
@@ -114,7 +118,12 @@ SOURCE_TIMEOUTS: Final[Mapping[Source, float]] = MappingProxyType(
         "hubspot": 60.0,
     }
 )
-"""Read, write and pool timeout of each source's client, in seconds."""
+"""Per-call deadline of each source, in seconds; also its client's read, write and pool timeout.
+
+:func:`send_json` bounds each attempt, from sending the request to reading the last byte
+of the response body, by this deadline. The client's httpx timeouts of the same value bound
+each network phase and each read only, so a slowly dripping body never trips them alone.
+"""
 
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 """Connect timeout of every source's client, in seconds."""
@@ -142,8 +151,19 @@ _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 # password `ads` appears in `ads_engine`); ads_engine.logging applies the same floor.
 _MIN_SECRET_LENGTH: Final = 8
 
-# Characters of a non-JSON error body kept for classification.
-_ERROR_TEXT_MAX: Final = 300
+# Longest non-JSON error body, in characters, that is sanitised whole and then used for
+# classification and the error message. Redaction runs on the complete text before any
+# cut, so no secret or address is ever split into a fragment it no longer recognises.
+# The email pattern's cost grows quadratically with long address-like runs, so a longer
+# body is never redacted whole: it is classified from a window of its first this many
+# characters, and the error raised is described by the body's size, keeping no text.
+_ERROR_TEXT_SCAN_MAX: Final = 16_384
+
+# Decimal context of JSON number decoding. Only its traps matter: the constructor keeps
+# every digit whatever the precision, but an exponent beyond the decimal implementation's
+# limits signals InvalidOperation, which an ambient context with that trap off turns into
+# a silent NaN. The flags it accumulates are never read.
+_JSON_DECIMAL_CONTEXT: Final = Context(traps=[InvalidOperation])
 
 _log = get_logger(__name__)
 
@@ -161,13 +181,17 @@ def build_client(
 ) -> httpx.AsyncClient:
     """Build the ``httpx.AsyncClient`` every call to ``source`` goes through.
 
-    The client has the source's base URL (:data:`SOURCE_BASE_URLS`), a timeout of
-    :data:`SOURCE_TIMEOUTS` with a 10 s connect timeout, ``User-Agent`` and
+    The client has the source's base URL (:data:`SOURCE_BASE_URLS`), read, write and pool
+    timeouts of :data:`SOURCE_TIMEOUTS` with a 10 s connect timeout, ``User-Agent`` and
     ``Accept: application/json`` default headers, no redirect following (a redirect is
     an unexpected status, hence a defect), and two event hooks that log each request at
     debug (``http.request``) and each response at info (``http.response``, with
     ``status`` and ``elapsed_ms`` to the response headers). Hooks log only the method and
     :func:`redact_url` of the URL.
+
+    httpx applies those timeouts per network phase and per read, never to a call as a
+    whole; :func:`send_json` adds that bound, the per-attempt deadline of
+    :data:`SOURCE_TIMEOUTS`.
 
     No authentication is attached: each connector adds its own headers per request (the
     n8n secret header, LinkedIn's Bearer and version headers, HubSpot's Bearer), so no
@@ -386,8 +410,11 @@ class RetryPolicy:
 
     The default is the plan's policy: 3 attempts in total, exponential backoff from a 2 s
     base (2 s, then 4 s, each plus up to 1 s of jitter, capped at 30 s), and a platform's
-    ``Retry-After`` (or Google ``retryDelay``) honoured in place of the backoff, capped at
-    120 s.
+    ``Retry-After`` (or Google ``retryDelay``) honoured in place of the backoff. A
+    requested wait is never shortened: :func:`send_json` sleeps through one of up to
+    ``max_retry_after_seconds`` (120 s by default) in full, and raises the
+    ``TransientError`` of a longer one at once, its ``retry_after`` intact, so the caller
+    defers the work instead of calling before the platform allows it.
 
     Example:
         Tests record waits instead of sleeping::
@@ -406,7 +433,9 @@ class RetryPolicy:
         base_seconds: Backoff before the second attempt; doubled for each later one.
         max_seconds: Upper bound of one backoff wait.
         jitter_seconds: Upper bound of the uniform random jitter added to each backoff.
-        max_retry_after_seconds: Upper bound of a wait the platform asked for.
+        max_retry_after_seconds: The longest platform-requested wait :func:`send_json`
+            sleeps through before retrying. A longer one ends the call with its
+            ``TransientError``, whose ``retry_after`` keeps the full delay.
         sleep: Awaitable sleep used between attempts.
     """
 
@@ -440,7 +469,7 @@ class RetryPolicy:
 
 
 DEFAULT_RETRY: Final = RetryPolicy()
-"""The plan's retry policy: 3 attempts, 2 s exponential base, jitter, ``Retry-After``."""
+"""The plan's retry policy: 3 attempts, 2 s exponential base, jitter, ``Retry-After`` honoured."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,7 +482,7 @@ class JsonResponse:
     Attributes:
         status: The HTTP status, one of the call's ``accept_statuses``.
         body: The decoded JSON, with every JSON number that has a fraction or exponent as
-            a :class:`~decimal.Decimal`; ``None`` for an empty body.
+            an exact, finite :class:`~decimal.Decimal`; ``None`` for an empty body.
         headers: The response headers.
     """
 
@@ -482,24 +511,40 @@ async def send_json(
        counts against the product's own cap; a ``CallBudgetExhausted`` raised here means
        no request is sent and nothing is retried;
     2. builds a fresh request with ``build_request``, so a refreshed token or a new body
-       is used;
-    3. sends it; an httpx failure (timeout, network, protocol) is classified with
+       is used. A request that cannot be built (an invalid URL, a body that does not
+       serialise, a header that does not encode) is a ``QueryDefect`` with code
+       ``CLIENT``, raised without a send and never retried; a ``ConnectorError`` the
+       builder raises itself is raised unchanged;
+    3. sends it and reads the whole response body within the source's
+       :data:`SOURCE_TIMEOUTS` deadline (Google: 120 s). An expired deadline is a
+       ``TransientError`` with code ``TIMEOUT``; any other httpx failure (timeout,
+       network, protocol) is classified with
        :func:`~ads_engine.connectors.errors.classify_exception`;
-    4. decodes the body as JSON with ``parse_float=Decimal``, so no binary float reaches a
-       money or conversion value; an empty body decodes to ``None``;
+    4. decodes the body as JSON with exact, finite decimals, so no binary float reaches a
+       money or conversion value; an empty body decodes to ``None``. A body that is not
+       JSON, or holds ``NaN``, ``Infinity`` or an exponent beyond the decimal limits, does
+       not decode, whatever the ambient decimal context: under an accepted status it is a
+       ``QueryDefect`` (``validation``);
     5. returns a :class:`JsonResponse` when the status is in ``accept_statuses``. For
        ``google`` the body is classified first, because n8n relays Google denials,
        quota exhaustion and query errors inside HTTP 200;
     6. otherwise raises the :func:`~ads_engine.connectors.errors.classify` result for the
        response, or a ``QueryDefect`` (``unexpected_status``) when the status signals no
-       error by itself (an unaccepted 2xx, or a redirect).
+       error by itself (an unaccepted 2xx, or a redirect). A body that step 4 could not
+       decode is classified from its text, sanitised whole before it is cut; one longer
+       than 16,384 characters is classified from its first 16,384 characters and
+       described by its size.
 
     Only ``TransientError`` (429, 5xx, timeouts, network, ``RESOURCE_EXHAUSTED``) is
-    retried, waiting ``Retry-After`` when the platform sent one and the policy's
-    exponential backoff otherwise. After the last attempt the last error is raised.
+    retried, waiting the full ``Retry-After`` (or Google ``retryDelay``) when the
+    platform sent one and the policy's exponential backoff otherwise. A requested wait
+    longer than ``policy.max_retry_after_seconds`` is never shortened: that error is
+    raised at once, its ``retry_after`` intact, so no request is sent before the platform
+    allows it. After the last attempt the last error is raised.
     ``AccessDenied``, ``QueryDefect`` and ``CallBudgetExhausted`` are raised on their
     first occurrence. Every classified error is logged as ``connector.error`` (source,
-    endpoint, kind, code, HTTP status, attempt) before it is raised; bodies never are.
+    endpoint, kind, code, HTTP status, attempt, retryability, the sanitised reason,
+    ``retry_after`` and ``query_id``) before it is raised; headers and bodies never are.
 
     Args:
         client: A client from :func:`build_client`.
@@ -520,10 +565,11 @@ async def send_json(
 
     Raises:
         AccessDenied: The platform refused the credentials or their permissions.
-        TransientError: A transient failure survived every attempt.
+        TransientError: A transient failure survived every attempt, or asked for a wait
+            longer than ``policy.max_retry_after_seconds``.
         CallBudgetExhausted: ``before_attempt`` reported the call budget used up.
-        QueryDefect: The request is wrong, the response is not JSON, or its status was
-            unexpected.
+        QueryDefect: The request is wrong, the response is not JSON or holds an
+            unrepresentable number, or its status was unexpected.
         ValueError: When ``source`` is unknown or ``accept_statuses`` is empty.
     """
     _require_source(source)
@@ -533,7 +579,7 @@ async def send_json(
     retrying = AsyncRetrying(
         stop=stop_after_attempt(policy.attempts),
         wait=_RetryWait(policy),
-        retry=retry_if_exception(_is_retryable),
+        retry=retry_if_exception(_retry_predicate(policy)),
         sleep=policy.sleep,
         reraise=True,
         before_sleep=_retry_logger(source, endpoint),
@@ -554,12 +600,32 @@ async def send_json(
 
 
 def _is_retryable(error: BaseException) -> bool:
-    """Whether tenacity retries ``error``: a ``TransientError`` other than the call budget."""
+    """Whether ``error`` is of a retryable kind: a ``TransientError`` other than the call budget."""
     return (
         isinstance(error, TransientError)
         and not isinstance(error, CallBudgetExhausted)
         and error.retryable
     )
+
+
+def _retry_predicate(policy: RetryPolicy) -> Callable[[BaseException], bool]:
+    """Build tenacity's ``retry`` test of :func:`send_json` for ``policy``.
+
+    An error is retried when it is retryable (:func:`_is_retryable`) and the wait the
+    platform asked for, if any, is at most ``policy.max_retry_after_seconds``. A longer
+    requested wait is never shortened: the error is raised at once, its ``retry_after``
+    intact, so no request is sent before the platform allows it and the caller defers
+    the work instead.
+    """
+
+    def should_retry(error: BaseException) -> bool:
+        """Whether tenacity retries ``error`` under ``policy``."""
+        if not _is_retryable(error):
+            return False
+        retry_after = error.retry_after if isinstance(error, TransientError) else None
+        return retry_after is None or retry_after <= policy.max_retry_after_seconds
+
+    return should_retry
 
 
 def _failed_with(retry_state: RetryCallState) -> BaseException | None:
@@ -571,9 +637,14 @@ def _failed_with(retry_state: RetryCallState) -> BaseException | None:
 
 
 class _RetryWait:
-    """tenacity wait strategy: the platform's ``Retry-After``, else exponential jitter."""
+    """tenacity wait strategy: the platform's full ``Retry-After``, else exponential jitter.
 
-    __slots__ = ("_backoff", "_max_retry_after")
+    A platform-requested delay is never shortened. The policy's ``max_seconds`` caps the
+    backoff only; a requested delay beyond ``max_retry_after_seconds`` never reaches this
+    strategy, because the retry predicate of :func:`send_json` stops the call first.
+    """
+
+    __slots__ = ("_backoff",)
 
     def __init__(self, policy: RetryPolicy) -> None:
         self._backoff = wait_exponential_jitter(
@@ -581,13 +652,12 @@ class _RetryWait:
             max=policy.max_seconds,
             jitter=policy.jitter_seconds,
         )
-        self._max_retry_after = policy.max_retry_after_seconds
 
     def __call__(self, retry_state: RetryCallState) -> float:
         """Return the seconds to wait before the next attempt."""
         error = _failed_with(retry_state)
         if isinstance(error, TransientError) and error.retry_after is not None:
-            return min(error.retry_after, self._max_retry_after)
+            return error.retry_after
         return float(self._backoff(retry_state))
 
 
@@ -613,6 +683,26 @@ def _retry_logger(source: Source, endpoint: str) -> Callable[[RetryCallState], N
     return log_retry
 
 
+def _construction_defect(exc: Exception, *, source: Source, endpoint: str) -> QueryDefect:
+    """Classify a failure to build a request as a ``QueryDefect`` with code ``CLIENT``.
+
+    Building a request is deterministic, so the failure never clears on retry. That holds
+    even for an ``httpx.TransportError`` subclass, which
+    :func:`~ads_engine.connectors.errors.classify_exception` files as transient because a
+    transport raising it may succeed on the next attempt.
+    """
+    classified = classify_exception(exc, source=source, endpoint=endpoint)
+    if isinstance(classified, QueryDefect):
+        return classified
+    return QueryDefect(
+        classified.message,
+        source=source,
+        endpoint=endpoint,
+        code="CLIENT",
+        query_id=_query_id(endpoint),
+    )
+
+
 async def _send_once(
     client: httpx.AsyncClient,
     build_request: Callable[[], httpx.Request],
@@ -626,9 +716,26 @@ async def _send_once(
     """Run one attempt of :func:`send_json`: steps 1 to 6 of its docstring."""
     if before_attempt is not None:
         await before_attempt()
-    request = build_request()
     try:
-        response = await client.send(request)
+        request = build_request()
+    except ConnectorError as raised:
+        # A builder may raise a classified error itself; it keeps its kind.
+        _log_error(raised, attempt_number)
+        raise
+    except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, TypeError, ValueError) as exc:
+        # The request cannot be built: an invalid URL, a JSON body that does not serialise,
+        # a header that does not encode. The same failure recurs on every attempt.
+        defect = _construction_defect(exc, source=source, endpoint=endpoint)
+        _log_error(defect, attempt_number)
+        raise defect from exc
+    # httpx's timeouts bound each network phase and each read, not the call: a body that
+    # drips in faster than the read timeout would hold the call open indefinitely. The
+    # deadline bounds the whole attempt, body included, since client.send reads the body.
+    deadline_seconds = SOURCE_TIMEOUTS[source]
+    deadline = asyncio.timeout(deadline_seconds)
+    try:
+        async with deadline:
+            response = await client.send(request)
     except ConnectorError as raised:
         # A transport may raise a classified error itself, as the simulation's mock
         # transport does for an injected fault or a request that breaks its contract.
@@ -636,8 +743,19 @@ async def _send_once(
         raise
     except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, TimeoutError) as exc:
         # Beyond httpx.HTTPError: InvalidURL, StreamError and the built-in TimeoutError do
-        # not derive from it, and classify_exception maps each of them to its kind.
-        failure = classify_exception(exc, source=source, endpoint=endpoint)
+        # not derive from it, and classify_exception maps each of them to its kind. An
+        # expired deadline raises the built-in TimeoutError, or whatever the cancelled send
+        # raised in its place, and is told apart from an httpx timeout by expired().
+        failure: ConnectorError
+        if deadline.expired():
+            failure = TransientError(
+                f"call exceeded the {deadline_seconds:g} s per-call deadline",
+                source=source,
+                endpoint=endpoint,
+                code="TIMEOUT",
+            )
+        else:
+            failure = classify_exception(exc, source=source, endpoint=endpoint)
         _log_error(failure, attempt_number)
         raise failure from exc
 
@@ -647,7 +765,7 @@ async def _send_once(
         if not is_json:
             _raise_logged(
                 QueryDefect(
-                    "response is not JSON",
+                    "response is not JSON or holds an unrepresentable number",
                     source=source,
                     endpoint=endpoint,
                     code="validation",
@@ -663,9 +781,10 @@ async def _send_once(
                 _raise_logged(relayed, attempt_number)
         return JsonResponse(status=status, body=body, headers=response.headers)
 
-    if not is_json:
-        body = response.text[:_ERROR_TEXT_MAX]
-    classified = classify(response, body, source=source, endpoint=endpoint)
+    if is_json:
+        classified = classify(response, body, source=source, endpoint=endpoint)
+    else:
+        classified = _classify_text(response, source=source, endpoint=endpoint)
     if classified is None:
         classified = QueryDefect(
             f"unexpected HTTP {status} response",
@@ -678,21 +797,102 @@ async def _send_once(
     _raise_logged(classified, attempt_number)
 
 
+def _classify_text(
+    response: httpx.Response, *, source: Source, endpoint: str
+) -> ConnectorError | None:
+    """Classify a response whose body is not JSON from its text, keeping no raw fragment.
+
+    A body of at most ``_ERROR_TEXT_SCAN_MAX`` characters is sanitised whole with
+    :func:`~ads_engine.connectors.errors.sanitize_message`, which redacts emails, URL
+    passwords and every configured secret before it cuts the result to 300 characters;
+    that safe text is both the input of :func:`classify` and the error's message.
+
+    A longer body is classified from its first ``_ERROR_TEXT_SCAN_MAX`` characters, so a
+    Google token at its start (``PERMISSION_DENIED``, ``RESOURCE_EXHAUSTED``,
+    ``QueryError``) decides its kind as it would in a shorter body. A secret or address
+    the window cuts in two can no longer be recognised for redaction, so no text of the
+    window is kept: the error raised is a new one of the same class, described by the
+    body's size, that carries over only the code, HTTP status, ``retry_after`` and query id.
+    The error classified from the window is discarded, never raised, chained or logged.
+
+    Returns:
+        The error to raise, or ``None`` when the status and text signal no error.
+    """
+    text = response.text
+    if len(text) <= _ERROR_TEXT_SCAN_MAX:
+        return classify(response, sanitize_message(text), source=source, endpoint=endpoint)
+    probe = classify(response, text[:_ERROR_TEXT_SCAN_MAX], source=source, endpoint=endpoint)
+    description = f"non-JSON error body of {len(text)} characters"
+    if isinstance(probe, AccessDenied):
+        return AccessDenied(
+            description,
+            source=source,
+            endpoint=endpoint,
+            code=probe.code,
+            http_status=probe.http_status,
+        )
+    if isinstance(probe, TransientError):
+        return TransientError(
+            description,
+            source=source,
+            endpoint=endpoint,
+            code=probe.code,
+            http_status=probe.http_status,
+            retry_after=probe.retry_after,
+        )
+    if isinstance(probe, QueryDefect):
+        return QueryDefect(
+            description,
+            source=source,
+            endpoint=endpoint,
+            code=probe.code,
+            http_status=probe.http_status,
+            query_id=probe.query_id,
+        )
+    # Reached only when classify found no error, since it builds no other class: the caller
+    # then raises its unexpected-status defect, which keeps no text of the body either.
+    return None
+
+
 def _decode_json(content: bytes) -> tuple[Any, bool]:
-    """Decode a response body as JSON with exact decimals.
+    """Decode a response body as JSON with exact, finite decimals.
+
+    Every number with a fraction or exponent becomes a :class:`~decimal.Decimal` through
+    :func:`_parse_decimal`, whatever the ambient decimal context; ``NaN`` and ``Infinity``
+    are refused by :func:`_reject_constant`.
 
     Returns:
         ``(body, True)`` for JSON, ``(None, True)`` for an empty or blank body, and
-        ``(None, False)`` for anything else.
+        ``(None, False)`` for anything else: a body that is not JSON, nests beyond the
+        parser's depth, or holds a number no finite ``Decimal`` represents.
     """
     if not content.strip():
         return None, True
     try:
-        return json.loads(content, parse_float=Decimal, parse_constant=_reject_constant), True
-    except ValueError, RecursionError:
-        # ValueError covers JSONDecodeError, UnicodeDecodeError and the constants rejected
-        # below; RecursionError a body nested beyond the parser's depth.
+        body = json.loads(content, parse_float=_parse_decimal, parse_constant=_reject_constant)
+    except ValueError, RecursionError, DecimalException:
+        # ValueError covers JSONDecodeError, UnicodeDecodeError, an integer beyond the
+        # interpreter's digit limit and the numbers rejected below; RecursionError a body
+        # nested beyond the parser's depth; DecimalException an exponent beyond the decimal
+        # implementation's limits.
         return None, False
+    return body, True
+
+
+def _parse_decimal(text: str) -> Decimal:
+    """Decode a JSON number with a fraction or exponent as an exact, finite ``Decimal``.
+
+    The strict context makes an exponent beyond the decimal implementation's limits raise
+    even when the ambient context would return ``NaN``; every digit is kept, unrounded.
+
+    Raises:
+        decimal.InvalidOperation: When the exponent is beyond those limits.
+        ValueError: When the result is not finite.
+    """
+    number = Decimal(text, context=_JSON_DECIMAL_CONTEXT)
+    if not number.is_finite():
+        raise ValueError("JSON number is not a finite decimal")
+    return number
 
 
 def _reject_constant(name: str) -> NoReturn:
@@ -714,7 +914,15 @@ def _query_id(endpoint: str) -> str | None:
 
 
 def _log_error(error: ConnectorError, attempt_number: int) -> None:
-    """Log a classified error as ``connector.error``: kind, code and status, never a body."""
+    """Log a classified error as ``connector.error``, with its reason but never a body.
+
+    The event carries source, endpoint, kind, code, HTTP status, attempt, retryability and
+    :attr:`~ads_engine.connectors.errors.ConnectorError.reason`, which keeps failures that
+    share every other field distinguishable. It also carries ``retry_after``, the wait a
+    ``TransientError`` asked for, and ``query_id``, a ``QueryDefect``'s query id; each is
+    ``None`` for other errors. The reason is already sanitised of emails, configured
+    secrets and the webhook URL; headers and bodies are never logged.
+    """
     _log.warning(
         "connector.error",
         source=error.source,
@@ -724,6 +932,9 @@ def _log_error(error: ConnectorError, attempt_number: int) -> None:
         http_status=error.http_status,
         attempt=attempt_number,
         retryable=_is_retryable(error),
+        reason=error.reason,
+        retry_after=error.retry_after if isinstance(error, TransientError) else None,
+        query_id=error.query_id if isinstance(error, QueryDefect) else None,
     )
 
 
