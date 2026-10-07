@@ -3684,7 +3684,12 @@ def _default_spec() -> WorldSpec:
         name="default",
         google=_default_google(),
         linkedin=_default_linkedin(),
-        hubspot=HubSpotSpec(orphan_deals=6),
+        # One association per page on purpose. Default-world contacts have at most three
+        # meetings, so the 500 default never pages. At 1, every input with two or more
+        # associations returns paging.next.after. First start, the end-to-end simulated run
+        # and the backend/tests/fixtures snapshots then exercise the per-input {id, after}
+        # continuation (AAP 0.3.3). The data read is the same at any page size.
+        hubspot=HubSpotSpec(orphan_deals=6, association_page_size=1),
     )
 
 

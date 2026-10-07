@@ -1,0 +1,668 @@
+{
+  "clock": "2026-10-02T12:00:00Z",
+  "day": "2026-10-01",
+  "entries": [
+    {
+      "file": "google__q_g1.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.time_zone FROM customer"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g2.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.status != 'REMOVED' AND campaign.id > 0 ORDER BY campaign.id LIMIT 9999"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g2b.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.id IN (990000000009)"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g3.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT campaign.id, segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions, metrics.conversions_value, metrics.search_budget_lost_impression_share, metrics.search_impression_share FROM campaign WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g4.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT ad_group.id, ad_group.name, ad_group.status, campaign.id FROM ad_group WHERE ad_group.status != 'REMOVED' AND ad_group.id > 0 ORDER BY ad_group.id LIMIT 9999"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g5.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT ad_group_criterion.criterion_id, ad_group.id, segments.date, metrics.historical_quality_score, metrics.average_cpc, metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions FROM keyword_view WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g6.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT search_term_view.search_term, search_term_view.status, segments.keyword.ad_group_criterion, segments.keyword.info.text, segments.keyword.info.match_type, ad_group.id, campaign.id, segments.date, metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions, metrics.conversions_value FROM search_term_view WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g7.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT ad_group_criterion.criterion_id, ad_group.id, campaign.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.quality_info.quality_score FROM ad_group_criterion WHERE ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED' AND ad_group.id >= 0 AND ad_group.id <= 9223372036854775807"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "google__q_g8.json",
+      "request": {
+        "body": {
+          "customer_id": "9900000001",
+          "page_token": null,
+          "query": "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.include_in_conversions_metric, conversion_action.counting_type, conversion_action.attribution_model_settings.attribution_model FROM conversion_action"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": "<redacted>"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://n8n.sim.invalid/webhook/google-ads"
+      },
+      "source": "google",
+      "surface": "google.search"
+    },
+    {
+      "file": "linkedin__access_token.json",
+      "request": {
+        "body": {
+          "client_id": "<redacted>",
+          "client_secret": "<redacted>",
+          "grant_type": "refresh_token",
+          "refresh_token": "<redacted>"
+        },
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://www.linkedin.com/oauth/v2/accessToken"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.access_token"
+    },
+    {
+      "file": "linkedin__ad_account.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [],
+        "url": "https://api.linkedin.com/rest/adAccounts/990000001"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.ad_account"
+    },
+    {
+      "file": "linkedin__ad_campaign_groups.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "search"
+          ],
+          [
+            "search",
+            "(status:(values:List(ACTIVE,PAUSED,ARCHIVED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))"
+          ],
+          [
+            "pageSize",
+            "100"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/adAccounts/990000001/adCampaignGroups"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.ad_campaign_groups"
+    },
+    {
+      "file": "linkedin__ad_campaigns.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "search"
+          ],
+          [
+            "search",
+            "(status:(values:List(ACTIVE,PAUSED,ARCHIVED,COMPLETED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))"
+          ],
+          [
+            "pageSize",
+            "100"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/adAccounts/990000001/adCampaigns"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.ad_campaigns"
+    },
+    {
+      "file": "linkedin__creatives.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "criteria"
+          ],
+          [
+            "campaigns",
+            "List(urn%3Ali%3AsponsoredCampaign%3A990010000,urn%3Ali%3AsponsoredCampaign%3A990010001,urn%3Ali%3AsponsoredCampaign%3A990010002,urn%3Ali%3AsponsoredCampaign%3A990010003,urn%3Ali%3AsponsoredCampaign%3A990010004,urn%3Ali%3AsponsoredCampaign%3A990010005)"
+          ],
+          [
+            "intendedStatuses",
+            "List(ACTIVE,PAUSED,DRAFT,ARCHIVED,CANCELED,PENDING_DELETION,REMOVED)"
+          ],
+          [
+            "pageSize",
+            "100"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/adAccounts/990000001/creatives"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.creatives"
+    },
+    {
+      "file": "linkedin__posts.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-RestLi-Method": "BATCH_GET",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "ids",
+            "List(urn%3Ali%3Ashare%3A990030000,urn%3Ali%3Ashare%3A990030001,urn%3Ali%3Ashare%3A990030002,urn%3Ali%3Ashare%3A990030003,urn%3Ali%3Ashare%3A990030004,urn%3Ali%3Ashare%3A990030005,urn%3Ali%3Ashare%3A990030007,urn%3Ali%3Ashare%3A990030008,urn%3Ali%3Ashare%3A990030006)"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/posts"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.posts"
+    },
+    {
+      "file": "linkedin__ad_analytics.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "analytics"
+          ],
+          [
+            "pivot",
+            "CREATIVE"
+          ],
+          [
+            "timeGranularity",
+            "DAILY"
+          ],
+          [
+            "dateRange",
+            "(start:(year:2026,month:10,day:1),end:(year:2026,month:10,day:1))"
+          ],
+          [
+            "accounts",
+            "List(urn%3Ali%3AsponsoredAccount%3A990000001)"
+          ],
+          [
+            "fields",
+            "pivotValues,dateRange,costInLocalCurrency,impressions,clicks,landingPageClicks,oneClickLeadFormOpens,oneClickLeads,externalWebsiteConversions"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/adAnalytics"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.ad_analytics"
+    },
+    {
+      "file": "linkedin__ad_analytics_statistics.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "statistics"
+          ],
+          [
+            "pivots",
+            "List(CAMPAIGN,MEMBER_JOB_FUNCTION)"
+          ],
+          [
+            "timeGranularity",
+            "ALL"
+          ],
+          [
+            "dateRange",
+            "(start:(year:2026,month:9,day:4),end:(year:2026,month:10,day:1))"
+          ],
+          [
+            "accounts",
+            "List(urn%3Ali%3AsponsoredAccount%3A990000001)"
+          ],
+          [
+            "fields",
+            "pivotValues,costInLocalCurrency,impressions,clicks,oneClickLeads,externalWebsiteConversions"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/adAnalytics"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.ad_analytics_statistics"
+    },
+    {
+      "file": "linkedin__lead_forms.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "owner"
+          ],
+          [
+            "owner",
+            "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+          ],
+          [
+            "count",
+            "100"
+          ],
+          [
+            "start",
+            "0"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/leadForms"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.lead_forms"
+    },
+    {
+      "file": "linkedin__lead_form_responses.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "q",
+            "owner"
+          ],
+          [
+            "owner",
+            "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+          ],
+          [
+            "leadType",
+            "(leadType:SPONSORED)"
+          ],
+          [
+            "limitedToTestLeads",
+            "false"
+          ],
+          [
+            "submittedAtTimeRange",
+            "(start:1788480000000,end:1790899200000)"
+          ],
+          [
+            "count",
+            "100"
+          ],
+          [
+            "start",
+            "0"
+          ],
+          [
+            "fields",
+            "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,id,submittedAt,testLead,formResponse,form:(hiddenFields,creationLocale,name,id,content)"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/leadFormResponses"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.lead_form_responses"
+    },
+    {
+      "file": "linkedin__lead_form_responses_batch.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Linkedin-Version": "202609",
+          "X-Restli-Protocol-Version": "2.0.0"
+        },
+        "method": "GET",
+        "query": [
+          [
+            "ids",
+            "List(16b17c21-b19d-fb29-4b8f-ccb45e4646c3-2,6786f542-5410-18cf-838d-1f9cda9d623b-0,428acde7-ee7f-94fb-08ba-42a52ffa0b9a-1)"
+          ],
+          [
+            "owner",
+            "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+          ],
+          [
+            "leadType",
+            "(leadType:SPONSORED)"
+          ],
+          [
+            "fields",
+            "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,id,submittedAt,testLead,formResponse,form:(hiddenFields,creationLocale,name,id,content)"
+          ]
+        ],
+        "url": "https://api.linkedin.com/rest/leadFormResponses"
+      },
+      "source": "linkedin",
+      "surface": "linkedin.lead_form_responses_batch"
+    },
+    {
+      "file": "hubspot__properties.json",
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer <redacted>"
+        },
+        "method": "GET",
+        "query": [],
+        "url": "https://api.hubapi.com/crm/properties/2026-09/contacts/lifecyclestage"
+      },
+      "source": "hubspot",
+      "surface": "hubspot.properties"
+    },
+    {
+      "file": "hubspot__objects_batch_read.json",
+      "request": {
+        "body": {
+          "idProperty": "email",
+          "inputs": [
+            {
+              "id": "emery.hayes.4317943d@sim.invalid"
+            },
+            {
+              "id": "morgan.lowell.ec1e9a75@sim.invalid"
+            },
+            {
+              "id": "quinn.sutton.57b95cd5@sim.invalid"
+            }
+          ],
+          "properties": [
+            "email",
+            "hs_additional_emails",
+            "lifecyclestage",
+            "lastmodifieddate",
+            "hs_v2_date_entered_990100000",
+            "hs_v2_date_entered_990100001"
+          ]
+        },
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://api.hubapi.com/crm/objects/2026-09/contacts/batch/read"
+      },
+      "source": "hubspot",
+      "surface": "hubspot.objects_batch_read"
+    },
+    {
+      "file": "hubspot__crm_search.json",
+      "request": {
+        "body": {
+          "filterGroups": [
+            {
+              "filters": [
+                {
+                  "operator": "GTE",
+                  "propertyName": "createdate",
+                  "value": "1790812800000"
+                },
+                {
+                  "operator": "LT",
+                  "propertyName": "createdate",
+                  "value": "1790899200000"
+                }
+              ]
+            }
+          ],
+          "limit": 200,
+          "properties": [
+            "createdate",
+            "dealstage",
+            "pipeline",
+            "amount"
+          ],
+          "sorts": [
+            {
+              "direction": "ASCENDING",
+              "propertyName": "createdate"
+            }
+          ]
+        },
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://api.hubapi.com/crm/objects/2026-09/deals/search"
+      },
+      "source": "hubspot",
+      "surface": "hubspot.crm_search"
+    },
+    {
+      "file": "hubspot__associations_batch_read.json",
+      "request": {
+        "body": {
+          "inputs": [
+            {
+              "id": "9900000000000067"
+            },
+            {
+              "id": "9900000000002534"
+            },
+            {
+              "id": "9900000000002537"
+            }
+          ]
+        },
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://api.hubapi.com/crm/associations/2026-09/contacts/meetings/batch/read"
+      },
+      "source": "hubspot",
+      "surface": "hubspot.associations_batch_read"
+    },
+    {
+      "file": "hubspot__associations_batch_read_continuation.json",
+      "request": {
+        "body": {
+          "inputs": [
+            {
+              "after": "aHNhfGNvbnRhY3RzfG1lZXRpbmdzfDk5MDAwMDAwMDAwMDI1MzR8MQ",
+              "id": "9900000000002534"
+            }
+          ]
+        },
+        "headers": {
+          "Authorization": "Bearer <redacted>",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "query": [],
+        "url": "https://api.hubapi.com/crm/associations/2026-09/contacts/meetings/batch/read"
+      },
+      "source": "hubspot",
+      "surface": "hubspot.associations_batch_read"
+    }
+  ],
+  "scenario": "default",
+  "seed": 42
+}
