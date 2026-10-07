@@ -77,8 +77,9 @@ dev = [
 ]
 
 [tool.uv]
-# uv is pinned at 0.12.21 in backend/Dockerfile and CI.
-required-version = ">=0.12.21,<0.13"
+# uv is pinned at exactly 0.12.21 in backend/Dockerfile and CI; this exact pin makes a
+# local uv of any other version, 0.12.x patch releases included, refuse to lock or sync.
+required-version = "==0.12.21"
 
 [tool.uv.build-backend]
 module-name = "ads_engine"

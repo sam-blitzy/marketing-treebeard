@@ -145,8 +145,11 @@ k3:
   min_clicks_per_half: 30
   # Quality score is compared between the last and the first span of this many days.
   qs_span_days: 7
-  # Daily historical_quality_score must be present on >= this many days in each span;
-  # otherwise the Q-G7 quality-score snapshots at window start and end are compared.
+  # Quality-score branch: daily historical_quality_score must be present on >= this many days
+  # in each span. When daily scores are present on fewer days in either span, the quality-score
+  # branch does not fire and no snapshot fallback applies; the CPC branch is still evaluated.
+  # Only when daily scores are absent are the Q-G7 quality-score snapshots at window start and
+  # end compared instead.
   min_qs_days_per_span: 5
   # A drop >= this in mean quality score (integer 1-10 scale) is material.
   qs_drop: 1
@@ -242,8 +245,11 @@ b4:
 
 # --- CR1-CR3 Copy / creative changes (LinkedIn) -----------------------------------------------
 cr:
-  # A variant is a creative with window impressions >= this; campaigns need >= 2 variants.
+  # A variant is a creative with window impressions >= this; see cr.min_variants.
   min_impressions: 1000
+  # CR1-CR3 analyse a campaign only when it has >= this many variants (creatives meeting
+  # cr.min_impressions).
+  min_variants: 2
   # CR1: a pair is distinguishable when its Holm-adjusted p < this. Also the significance
   # level of the CR1 and CR3 sample-size estimates.
   alpha: 0.05
@@ -261,7 +267,10 @@ cr:
 w:
   # W1 Double down needs QL >= this.
   min_ql: 3
-  # W1: cost/QL <= this x the cohort median cost/QL (assets with QL >= 1).
+  # The cohort median cost/QL used by W1 and W2 is taken over the cohort's assets with
+  # QL >= this.
+  median_min_ql: 1
+  # W1: cost/QL <= this x the cohort median cost/QL (assets with QL >= w.median_min_ql).
   double_down_ratio: 0.8
   # W2 Retire or rework: QL = 0 and spend / cohort median cost/QL >= this.
   retire_spend_multiple: 3
