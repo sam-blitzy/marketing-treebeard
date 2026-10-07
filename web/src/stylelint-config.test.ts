@@ -45,6 +45,7 @@ const COMMITTED_STYLESHEETS = [
   'src/design-system/components/Grid.css',
   'src/design-system/components/Inline.css',
   'src/design-system/components/PageShell.css',
+  'src/design-system/components/Select.css',
   'src/design-system/components/SideNav.css',
   'src/design-system/components/Spinner.css',
   'src/design-system/components/Stack.css',
