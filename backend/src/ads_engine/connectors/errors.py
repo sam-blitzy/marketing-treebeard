@@ -16,6 +16,13 @@ Every connector failure is raised as exactly one of three kinds, and
   a validation error, or a client-side misconfiguration. The job fails and is logged with
   its query id; there is no retry and no mock.
 
+Google errors reach n8n's caller in two body shapes, both read here: the REST error
+envelope ``{"error": {code: <HTTP status>, message, status: <google.rpc code name>,
+details[]}}``, and a bare google.rpc Status ``{code: <numeric google.rpc code>, message,
+details[]}`` relayed as the whole body. A bare Status code counts as its canonical name,
+so 7 is ``PERMISSION_DENIED``, 16 ``UNAUTHENTICATED`` and 8 ``RESOURCE_EXHAUSTED``; every
+other code classifies like the HTTP status ``google.rpc.Code`` maps it to.
+
 Precedence is *access denied > transient > defect*, and body signals are read before the
 HTTP status. Classification is pure: :func:`classify` and :func:`classify_exception`
 perform no I/O, log nothing and never raise.
@@ -116,6 +123,28 @@ _GOOGLE_TOKEN_RE: Final = re.compile(
 # google.rpc statuses that are transient only when they are exactly `error.status`;
 # `INTERNAL` and `UNAVAILABLE` are ordinary words elsewhere.
 _GOOGLE_TRANSIENT_STATUSES: Final = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL"})
+
+# google.rpc.Code (google/rpc/code.proto): each numeric error code with its canonical name
+# and the HTTP status code.proto maps it to. A bare google.rpc Status that n8n relays as
+# the whole body carries this number as its top-level `code`; 0 (OK) is not an error.
+_GOOGLE_RPC_CODES: Final[Mapping[int, tuple[str, int]]] = {
+    1: ("CANCELLED", 499),
+    2: ("UNKNOWN", 500),
+    3: ("INVALID_ARGUMENT", 400),
+    4: ("DEADLINE_EXCEEDED", 504),
+    5: ("NOT_FOUND", 404),
+    6: ("ALREADY_EXISTS", 409),
+    7: ("PERMISSION_DENIED", 403),
+    8: ("RESOURCE_EXHAUSTED", 429),
+    9: ("FAILED_PRECONDITION", 400),
+    10: ("ABORTED", 409),
+    11: ("OUT_OF_RANGE", 400),
+    12: ("UNIMPLEMENTED", 501),
+    13: ("INTERNAL", 500),
+    14: ("UNAVAILABLE", 503),
+    15: ("DATA_LOSS", 500),
+    16: ("UNAUTHENTICATED", 401),
+}
 
 # The error-bearing keys of a body that also carries `results` or `fieldMask`: Google's
 # `error`/`errors` and the keys of n8n's error envelope. Row payloads are never scanned, so
@@ -605,9 +634,42 @@ def _text_signals(text: str) -> list[_Signal]:
     return signals
 
 
+def _google_rpc_status_signal(item: object) -> _Signal | None:
+    """Read the code of a bare google.rpc Status ``{code, message, details[]}``.
+
+    n8n can relay a Google error as a bare Status forming the whole body, under any HTTP
+    status. ``item`` is the unwrapped body; it is a bare Status when it is a mapping with
+    neither ``results`` nor ``fieldMask`` whose top-level ``code`` is a google.rpc.Code
+    from 1 to 16, as an int or a digit string. The signal reports the code's canonical
+    name with the kind of the HTTP status code.proto maps it to: 7 ``PERMISSION_DENIED``
+    (403) and 16 ``UNAUTHENTICATED`` (401) deny access, 8 ``RESOURCE_EXHAUSTED`` (429) and
+    14 ``UNAVAILABLE`` (503) are transient, 3 ``INVALID_ARGUMENT`` (400) is a defect.
+
+    Returns ``None`` for a success payload, whose ``code`` is never read, for 0 (``OK``),
+    and for any other value, such as the HTTP status in n8n's own
+    ``{"code": 403, "message": ...}`` envelope.
+    """
+    if not isinstance(item, Mapping) or any(key in item for key in _GOOGLE_SUCCESS_KEYS):
+        return None
+    number = _as_int(item.get("code"))
+    rpc_code = _GOOGLE_RPC_CODES.get(number) if number is not None else None
+    if rpc_code is None:
+        return None
+    name, http_status = rpc_code
+    kind = _kind_for_status(http_status)
+    return _Signal(kind, name, specific=False) if kind is not None else None
+
+
 def _google_signals(item: object, roots: Sequence[object]) -> list[_Signal]:
-    """Collect every Google error token in ``roots``, plus an exact transient status."""
+    """Collect every Google error signal of a body, in reporting order.
+
+    First a bare google.rpc Status code, the Status's own code; then every error token in
+    ``roots`` in document order; then an exact transient ``error.status``.
+    """
     signals: list[_Signal] = []
+    rpc_status = _google_rpc_status_signal(item)
+    if rpc_status is not None:
+        signals.append(rpc_status)
     for key, node in _walk(roots):
         if key is not None:
             token = _GOOGLE_TOKENS.get(_normalise_token(key))
@@ -634,22 +696,26 @@ def _select_signal(signals: Sequence[_Signal]) -> tuple[ErrorKind, str] | None:
     return None
 
 
-def _as_status(value: object) -> int | None:
-    """Read an HTTP status from a body field: an int or a digit string in 100..599."""
+def _as_int(value: object) -> int | None:
+    """Read an integer from a body field: an int (never a bool) or an unsigned digit string."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        status = value
-    elif isinstance(value, str) and value.strip().isdigit():
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
         try:
-            status = int(value.strip())
+            return int(value.strip())
         except ValueError:
             # isdigit() also accepts superscript digits and digit runs longer than the
-            # interpreter's int conversion limit, which int() rejects; neither is a status.
+            # interpreter's int conversion limit, which int() rejects; neither is a number.
             return None
-    else:
-        return None
-    return status if 100 <= status <= 599 else None
+    return None
+
+
+def _as_status(value: object) -> int | None:
+    """Read an HTTP status from a body field: an int or a digit string in 100..599."""
+    status = _as_int(value)
+    return status if status is not None and 100 <= status <= 599 else None
 
 
 def _google_body_status(item: object) -> int | None:
@@ -844,6 +910,17 @@ def classify(
        or ``error.status`` exactly ``UNAVAILABLE``, ``DEADLINE_EXCEEDED`` or ``INTERNAL``);
        then defect (``QueryError``, ``INVALID_ARGUMENT``, ``requestError``,
        ``fieldError``). A successful payload's rows are never read.
+
+       A bare google.rpc Status joins those signals: an unwrapped body with neither
+       ``results`` nor ``fieldMask`` whose top-level ``code`` is a google.rpc.Code from 1
+       to 16 (an int or a digit string). It reports the code's canonical name with the
+       kind of the HTTP status code.proto maps it to: 7 ``PERMISSION_DENIED`` (403) and 16
+       ``UNAUTHENTICATED`` (401) access denied, even under HTTP 200; 8
+       ``RESOURCE_EXHAUSTED`` (429) and the 5xx codes 2, 4, 12, 13, 14 and 15 transient;
+       3 ``INVALID_ARGUMENT`` (400) and the other 4xx codes 1, 5, 6, 9, 10 and 11 a
+       defect. A GoogleAdsFailure ``errorCode`` value of the chosen kind is still the
+       reported code. Any other top-level ``code`` (0 ``OK``, n8n's HTTP
+       ``{"code": 403, ...}``) is no signal.
     3. Google only: a numeric ``error.code`` / ``error.httpCode`` / ``httpCode`` in the
        body maps like an HTTP status.
     4. The HTTP status: 401/403 access denied; 429 and 5xx transient, with

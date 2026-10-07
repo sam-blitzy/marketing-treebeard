@@ -2,12 +2,13 @@
 
 Covers :func:`classify`, :func:`classify_exception` and the body-inspection helpers behind
 them: the HTTP status per source; Google bodies that n8n relays under any status, also in
-n8n's one-element array shape; OAuth credential rejections; ``Retry-After`` and Google
-``retryDelay``; query ids on defects; the scan limits; and the precedence between
-conflicting signals.
+n8n's one-element array shape; numeric google.rpc codes of a bare Status; OAuth credential
+rejections; ``Retry-After`` and Google ``retryDelay``; query ids on defects; the scan
+limits; and the precedence between conflicting signals.
 
-Error bodies follow the shapes the contract files document: Google's google.rpc Status
-wrapping a GoogleAdsFailure (``tests/contracts/google/search.json``), LinkedIn's OAuth
+Error bodies follow the shapes the contract files document: Google's REST error envelope
+and bare google.rpc Status, each optionally wrapping a GoogleAdsFailure
+(``tests/contracts/google/search.json``), LinkedIn's OAuth
 errors (``tests/contracts/linkedin/access_token.json``) and HubSpot's 207 batch response,
 whose documented sample is loaded verbatim. Responses are built in memory with an attached
 request and are never sent. Every test runs against an environment stripped of each
@@ -26,6 +27,7 @@ from pydantic import AliasChoices
 
 from ads_engine.connectors.errors import (
     _GOOGLE_ERROR_KEYS,
+    _GOOGLE_RPC_CODES,
     _MAX_SCAN_DEPTH,
     _MAX_SCAN_NODES,
     _MAX_SCAN_TEXT,
@@ -34,8 +36,10 @@ from ads_engine.connectors.errors import (
     ConnectorError,
     QueryDefect,
     TransientError,
+    _as_int,
     _as_status,
     _google_body_status,
+    _google_rpc_status_signal,
     _google_scan_roots,
     _kind_for_status,
     _platform_code,
@@ -128,8 +132,18 @@ def _google_error(
     *errors: Mapping[str, object],
 ) -> dict[str, object]:
     """Render Google's documented REST error: a google.rpc Status with a GoogleAdsFailure."""
-    failure = {"@type": GOOGLE_ADS_FAILURE, "errors": list(errors), "requestId": "test-request"}
+    failure = _ads_failure(*errors)
     return {"error": {"code": code, "message": message, "status": status, "details": [failure]}}
+
+
+def _ads_failure(*errors: Mapping[str, object]) -> dict[str, object]:
+    """Render a GoogleAdsFailure detail carrying the GoogleAdsErrors ``errors``."""
+    return {"@type": GOOGLE_ADS_FAILURE, "errors": list(errors), "requestId": "test-request"}
+
+
+def _bare_status(code: object, message: str, *details: Mapping[str, object]) -> dict[str, object]:
+    """Render a bare google.rpc Status ``{code, message, details[]}``, relayed as the body."""
+    return {"code": code, "message": message, "details": list(details)}
 
 
 def _ads_error(error_type: str, value: str, message: str, **extra: object) -> dict[str, object]:
@@ -198,6 +212,56 @@ def _with_retry_delay(delay: str) -> dict[str, object]:
             details={"quotaErrorDetails": {"retryDelay": delay}},
         ),
     )
+
+
+ACCESS_REFUSED = "Access refused"
+USER_PERMISSION_DENIED_FAILURE = _ads_failure(
+    _ads_error(
+        "authorizationError",
+        "USER_PERMISSION_DENIED",
+        "User doesn't have permission to access customer.",
+    )
+)
+QUOTA_STATUS = _bare_status(
+    8,
+    "Resource has been exhausted (e.g. check quota).",
+    _ads_failure(
+        _ads_error(
+            "quotaError",
+            "RESOURCE_EXHAUSTED",
+            "Too many requests. Retry in 30 seconds.",
+            details={
+                "quotaErrorDetails": {
+                    "rateScope": "ACCOUNT",
+                    "rateName": "Requests per service per method",
+                    "retryDelay": "30s",
+                }
+            },
+        )
+    ),
+)
+INVALID_ARGUMENT_MESSAGE = "Request contains an invalid argument."
+
+# google.rpc.Code as google/rpc/code.proto defines it: each code, its canonical name, the
+# HTTP status the proto maps it to, and the error that HTTP status classifies as.
+RPC_CODE_CASES: tuple[tuple[int, str, int, type[ConnectorError]], ...] = (
+    (1, "CANCELLED", 499, QueryDefect),
+    (2, "UNKNOWN", 500, TransientError),
+    (3, "INVALID_ARGUMENT", 400, QueryDefect),
+    (4, "DEADLINE_EXCEEDED", 504, TransientError),
+    (5, "NOT_FOUND", 404, QueryDefect),
+    (6, "ALREADY_EXISTS", 409, QueryDefect),
+    (7, "PERMISSION_DENIED", 403, AccessDenied),
+    (8, "RESOURCE_EXHAUSTED", 429, TransientError),
+    (9, "FAILED_PRECONDITION", 400, QueryDefect),
+    (10, "ABORTED", 409, QueryDefect),
+    (11, "OUT_OF_RANGE", 400, QueryDefect),
+    (12, "UNIMPLEMENTED", 501, TransientError),
+    (13, "INTERNAL", 500, TransientError),
+    (14, "UNAVAILABLE", 503, TransientError),
+    (15, "DATA_LOSS", 500, TransientError),
+    (16, "UNAUTHENTICATED", 401, AccessDenied),
+)
 
 
 def _hubspot_207_sample() -> object:
@@ -879,6 +943,283 @@ def test_unusable_body_status_never_raises_and_is_ignored(value: object) -> None
 
 
 # ---------------------------------------------------------------------------
+# classify: bare google.rpc Status relayed by n8n
+# ---------------------------------------------------------------------------
+
+
+def test_the_search_contract_documents_both_google_error_shapes() -> None:
+    """The REST envelope and bare Status bodies rendered here are those ``search.json`` names."""
+    contract = json.loads((CONTRACTS / "google" / "search.json").read_text())
+    description = contract["response"]["body"]["description"]
+
+    assert (
+        '{"error": {code: <HTTP status>, message, status: <google.rpc code name>, details[]}}'
+        in description
+    )
+    assert (
+        "bare google.rpc Status {code: <numeric google.rpc code>, message, details[]}"
+        in description
+    )
+
+
+def test_the_rpc_code_table_is_google_rpc_code() -> None:
+    """Codes 1..16 carry code.proto's names and HTTP mappings; 0 (``OK``) is not an error."""
+    assert dict(_GOOGLE_RPC_CODES) == {
+        code: (name, http_status) for code, name, http_status, _ in RPC_CODE_CASES
+    }
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "name", "http_status", "expected"),
+    [pytest.param(*case, id=f"{case[0]}-{case[1].lower()}") for case in RPC_CODE_CASES],
+)
+def test_every_bare_rpc_code_classifies_like_its_http_status(
+    rpc_code: int, name: str, http_status: int, expected: type[ConnectorError]
+) -> None:
+    """A bare Status code under HTTP 200 reports its name, classified like its HTTP status."""
+    error = _classify(200, _bare_status(rpc_code, "Relayed Google status."))
+
+    assert type(error) is expected
+    assert type(_classify(http_status, None)) is expected
+    assert error.code == name
+    assert error.message == "Relayed Google status."
+    assert error.http_status == 200
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        pytest.param(_bare_status(7, ACCESS_REFUSED), "PERMISSION_DENIED", id="7"),
+        pytest.param(_bare_status(16, ACCESS_REFUSED), "UNAUTHENTICATED", id="16"),
+        pytest.param([_bare_status(7, ACCESS_REFUSED)], "PERMISSION_DENIED", id="7-in-n8n-array"),
+        pytest.param([_bare_status(16, ACCESS_REFUSED)], "UNAUTHENTICATED", id="16-in-n8n-array"),
+        pytest.param(_bare_status("7", ACCESS_REFUSED), "PERMISSION_DENIED", id="digit-string"),
+        pytest.param(_bare_status(" 16 ", ACCESS_REFUSED), "UNAUTHENTICATED", id="padded-string"),
+        pytest.param(
+            {"code": 7, "message": ACCESS_REFUSED}, "PERMISSION_DENIED", id="without-details"
+        ),
+        pytest.param(
+            _bare_status(7, ACCESS_REFUSED, USER_PERMISSION_DENIED_FAILURE),
+            "USER_PERMISSION_DENIED",
+            id="error-code-value-wins",
+        ),
+    ],
+)
+def test_google_bare_rpc_status_denial_in_a_200_body_is_access_denied(
+    body: object, code: str
+) -> None:
+    """A bare Status with code 7 or 16 under n8n's HTTP 200 is access denied, wrapped or not."""
+    error = _classify(200, body)
+
+    assert isinstance(error, AccessDenied)
+    assert error.code == code
+    assert error.message == ACCESS_REFUSED
+    assert error.http_status == 200
+    assert error.is_unauthorized is False
+    assert error.reason == f"google search Q-G2: {code}: {ACCESS_REFUSED}"
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "headers", "code", "retry_after"),
+    [
+        pytest.param(200, QUOTA_STATUS, None, "RESOURCE_EXHAUSTED", 30.0, id="8-retry-delay"),
+        pytest.param(200, [QUOTA_STATUS], None, "RESOURCE_EXHAUSTED", 30.0, id="8-in-n8n-array"),
+        pytest.param(
+            200,
+            _bare_status(8, "Resource has been exhausted (e.g. check quota)."),
+            None,
+            "RESOURCE_EXHAUSTED",
+            None,
+            id="8-without-details",
+        ),
+        pytest.param(
+            429,
+            QUOTA_STATUS,
+            {"Retry-After": "7"},
+            "RESOURCE_EXHAUSTED",
+            7.0,
+            id="8-retry-after-header-wins-over-retry-delay",
+        ),
+        pytest.param(
+            200,
+            _bare_status(14, "The service is unavailable."),
+            None,
+            "UNAVAILABLE",
+            None,
+            id="14-unavailable",
+        ),
+        pytest.param(
+            200,
+            _bare_status(4, "Deadline exceeded."),
+            None,
+            "DEADLINE_EXCEEDED",
+            None,
+            id="4-deadline-exceeded",
+        ),
+        pytest.param(
+            200,
+            _bare_status("13", "Internal error encountered."),
+            None,
+            "INTERNAL",
+            None,
+            id="13-internal-digit-string",
+        ),
+    ],
+)
+def test_google_bare_rpc_status_transient_is_transient_with_retry_delay(
+    status: int,
+    body: object,
+    headers: Mapping[str, str] | None,
+    code: str,
+    retry_after: float | None,
+) -> None:
+    """Code 8 and the codes mapped to 5xx are transient; ``retryDelay`` gives the wait."""
+    error = _classify(status, body, headers=headers)
+
+    assert isinstance(error, TransientError)
+    assert error.code == code
+    assert error.http_status == status
+    assert error.retry_after == retry_after
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "message"),
+    [
+        pytest.param(
+            _bare_status(3, INVALID_ARGUMENT_MESSAGE),
+            "INVALID_ARGUMENT",
+            INVALID_ARGUMENT_MESSAGE,
+            id="3-invalid-argument",
+        ),
+        pytest.param(
+            [_bare_status(3, INVALID_ARGUMENT_MESSAGE)],
+            "INVALID_ARGUMENT",
+            INVALID_ARGUMENT_MESSAGE,
+            id="3-in-n8n-array",
+        ),
+        pytest.param(
+            _bare_status(
+                3,
+                INVALID_ARGUMENT_MESSAGE,
+                _ads_failure(_ads_error("queryError", "UNRECOGNIZED_FIELD", "Unrecognized field.")),
+            ),
+            "UNRECOGNIZED_FIELD",
+            INVALID_ARGUMENT_MESSAGE,
+            id="3-query-error-code-value-wins",
+        ),
+        pytest.param(
+            _bare_status(9, "Precondition check failed."),
+            "FAILED_PRECONDITION",
+            "Precondition check failed.",
+            id="9-failed-precondition",
+        ),
+    ],
+)
+def test_google_bare_rpc_status_defect_is_a_defect_with_its_query_id(
+    body: object, code: str, message: str
+) -> None:
+    """Code 3 and the codes mapped to other 4xx are defects with the endpoint query id."""
+    error = _classify(200, body, endpoint="search Q-G6")
+
+    assert isinstance(error, QueryDefect)
+    assert error.code == code
+    assert error.message == message
+    assert error.http_status == 200
+    assert error.query_id == "Q-G6"
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected", "code"),
+    [
+        pytest.param(
+            200,
+            _bare_status(8, "Quota.", USER_PERMISSION_DENIED_FAILURE),
+            AccessDenied,
+            "USER_PERMISSION_DENIED",
+            id="denial-token-before-transient-code",
+        ),
+        pytest.param(
+            200,
+            _bare_status(7, "RESOURCE_EXHAUSTED: quota"),
+            AccessDenied,
+            "PERMISSION_DENIED",
+            id="denial-code-before-transient-token",
+        ),
+        pytest.param(
+            200,
+            _bare_status(3, "RESOURCE_EXHAUSTED: quota"),
+            TransientError,
+            "RESOURCE_EXHAUSTED",
+            id="transient-token-before-defect-code",
+        ),
+        pytest.param(
+            200,
+            _bare_status(7, "UNAUTHENTICATED: missing credentials"),
+            AccessDenied,
+            "PERMISSION_DENIED",
+            id="status-code-reported-before-a-token-of-its-kind",
+        ),
+        pytest.param(
+            500,
+            _bare_status(7, ACCESS_REFUSED),
+            AccessDenied,
+            "PERMISSION_DENIED",
+            id="before-5xx",
+        ),
+        pytest.param(
+            400,
+            _bare_status(14, "The service is unavailable."),
+            TransientError,
+            "UNAVAILABLE",
+            id="before-400",
+        ),
+        pytest.param(
+            429,
+            _bare_status(3, INVALID_ARGUMENT_MESSAGE),
+            QueryDefect,
+            "INVALID_ARGUMENT",
+            id="before-429",
+        ),
+    ],
+)
+def test_google_bare_rpc_status_precedence(
+    status: int, body: object, expected: type[ConnectorError], code: str
+) -> None:
+    """The Status code joins the body tokens: denied, transient, defect; body before status."""
+    error = _classify(status, body)
+
+    assert type(error) is expected
+    assert error.code == code
+    assert error.http_status == status
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(_bare_status(True, ACCESS_REFUSED), id="boolean"),
+        pytest.param(_bare_status(None, ACCESS_REFUSED), id="null"),
+        pytest.param(_bare_status(0, "OK"), id="0-ok"),
+        pytest.param(_bare_status(17, ACCESS_REFUSED), id="17-beyond-google-rpc-code"),
+        pytest.param(_bare_status(-1, ACCESS_REFUSED), id="negative"),
+        pytest.param(_bare_status("-7", ACCESS_REFUSED), id="signed-string"),
+        pytest.param(_bare_status(7.0, ACCESS_REFUSED), id="float"),
+        pytest.param(_bare_status("\u2077", ACCESS_REFUSED), id="superscript-digit"),
+        pytest.param({"code": 403, "message": "Authorization data is wrong!"}, id="n8n-403"),
+        pytest.param({"code": 404, "message": "The webhook is not registered."}, id="n8n-404"),
+        pytest.param({**SEARCH_ENVELOPE, "code": 7}, id="success-payload-code-never-read"),
+        pytest.param({"fieldMask": "campaign.id", "code": "16"}, id="zero-row-payload-code"),
+        pytest.param([{**SEARCH_ENVELOPE, "code": 8}], id="success-payload-in-n8n-array"),
+    ],
+)
+def test_other_top_level_codes_are_not_google_rpc_codes(body: object) -> None:
+    """Only a code from 1 to 16 outside a success payload counts; the HTTP status rules."""
+    assert _classify(200, body) is None
+    error = _classify(503, body)
+    assert isinstance(error, TransientError)
+    assert error.code is None
+
+
+# ---------------------------------------------------------------------------
 # classify: OAuth credential rejections
 # ---------------------------------------------------------------------------
 
@@ -1162,7 +1503,7 @@ def test_google_scan_roots(body: object, roots: list[object]) -> None:
 
 def test_google_scan_roots_follow_the_error_key_order() -> None:
     """A success payload's error keys come back in the declared key order."""
-    body = {key: key for key in reversed(_GOOGLE_ERROR_KEYS)} | {"results": []}
+    body: dict[str, object] = {key: key for key in reversed(_GOOGLE_ERROR_KEYS)} | {"results": []}
 
     assert _google_scan_roots(body) == list(_GOOGLE_ERROR_KEYS)
 
@@ -1215,6 +1556,53 @@ def test_as_status(value: object, status: int | None) -> None:
 def test_google_body_status(item: object, status: int | None) -> None:
     """``error.code``, then ``error.httpCode``, then n8n's top-level ``httpCode``."""
     assert _google_body_status(item) == status
+
+
+@pytest.mark.parametrize(
+    ("value", "number"),
+    [
+        pytest.param(7, 7, id="int"),
+        pytest.param(-1, -1, id="negative-int"),
+        pytest.param(" 16 ", 16, id="digit-string"),
+        pytest.param("-7", None, id="signed-string"),
+        pytest.param(True, None, id="bool"),
+        pytest.param(7.0, None, id="float"),
+        pytest.param("\u2077", None, id="superscript"),
+        pytest.param("9" * 5000, None, id="over-long"),
+        pytest.param(None, None, id="none"),
+    ],
+)
+def test_as_int(value: object, number: int | None) -> None:
+    """An int that is not a bool, or an unsigned digit string; anything else is ``None``."""
+    assert _as_int(value) == number
+
+
+@pytest.mark.parametrize(
+    ("item", "signal"),
+    [
+        pytest.param(
+            {"code": 7}, _Signal("access_denied", "PERMISSION_DENIED", specific=False), id="7"
+        ),
+        pytest.param(
+            {"code": 16}, _Signal("access_denied", "UNAUTHENTICATED", specific=False), id="16"
+        ),
+        pytest.param(
+            {"code": "8"}, _Signal("transient", "RESOURCE_EXHAUSTED", specific=False), id="8"
+        ),
+        pytest.param({"code": 1}, _Signal("defect", "CANCELLED", specific=False), id="1"),
+        pytest.param({"code": 0}, None, id="0-ok"),
+        pytest.param({"code": 17}, None, id="17"),
+        pytest.param({}, None, id="no-code"),
+        pytest.param({"results": [], "code": 7}, None, id="results"),
+        pytest.param({"fieldMask": "campaign.id", "code": 7}, None, id="field-mask"),
+        pytest.param({"error": {"code": 7}}, None, id="rest-envelope-code"),
+        pytest.param([{"code": 7}], None, id="not-unwrapped"),
+        pytest.param("7", None, id="not-a-mapping"),
+    ],
+)
+def test_google_rpc_status_signal(item: object, signal: _Signal | None) -> None:
+    """Only the top-level google.rpc code 1..16 of a non-success mapping is a signal."""
+    assert _google_rpc_status_signal(item) == signal
 
 
 @pytest.mark.parametrize(

@@ -89,6 +89,9 @@ NOT_INT64 = "an INT64 decimal string or a JSON integer"
 NOT_NUMBER = "a finite JSON number"
 NOT_DATE = "a YYYY-MM-DD date"
 NOT_OBJECT_PATH = "a JSON object at every level of its key path"
+NOT_NULL_PATH = "a non-null value at every level of its key path"
+NOT_NON_NEGATIVE = "a non-negative finite JSON number"
+NOT_FRACTION = "a fraction from 0 to 1"
 CRITERION_FORM = (
     "an adGroupCriteria resource name customers/{customer}/adGroupCriteria/{ad_group}~{criterion}"
 )
@@ -556,6 +559,239 @@ def test_defect_messages_never_carry_row_values() -> None:
     assert "98765" not in error.message
 
 
+# --- absent keys versus explicit JSON null -----------------------------------------------------
+# REST JSON omits zero-valued and unset fields, so an absent key keeps the meaning its contract
+# gives it: zero for an additive metric, unavailable for a rate, score or budget amount, false for
+# a flag. No row contract declares a null type, so a key present with null is a defect at any
+# level of the path and is never read as that absence.
+
+ABSENT_MEANING: list[tuple[str, str, str, str, object]] = [
+    ("row_campaign_daily", "metrics.costMicros", "metrics.cost_micros", "cost_micros", 0),
+    ("row_campaign_daily", "metrics.impressions", "metrics.impressions", "impressions", 0),
+    ("row_campaign_daily", "metrics.clicks", "metrics.clicks", "clicks", 0),
+    ("row_campaign_daily", "metrics.conversions", "metrics.conversions", "conversions", 0),
+    (
+        "row_campaign_daily",
+        "metrics.conversionsValue",
+        "metrics.conversions_value",
+        "conversions_value",
+        0,
+    ),
+    (
+        "row_campaign_daily",
+        "metrics.searchBudgetLostImpressionShare",
+        "metrics.search_budget_lost_impression_share",
+        "search_budget_lost_impression_share",
+        None,
+    ),
+    (
+        "row_campaign_daily",
+        "metrics.searchImpressionShare",
+        "metrics.search_impression_share",
+        "search_impression_share",
+        None,
+    ),
+    ("row_keyword_view", "metrics.costMicros", "metrics.cost_micros", "cost_micros", 0),
+    ("row_keyword_view", "metrics.conversions", "metrics.conversions", "conversions", 0),
+    ("row_keyword_view", "metrics.averageCpc", "metrics.average_cpc", "average_cpc", None),
+    (
+        "row_keyword_view",
+        "metrics.historicalQualityScore",
+        "metrics.historical_quality_score",
+        "historical_quality_score",
+        None,
+    ),
+    ("row_search_term_view", "metrics.costMicros", "metrics.cost_micros", "cost_micros", 0),
+    ("row_search_term_view", "metrics.conversions", "metrics.conversions", "conversions", 0),
+    (
+        "row_search_term_view",
+        "metrics.conversionsValue",
+        "metrics.conversions_value",
+        "conversions_value",
+        0,
+    ),
+    (
+        "row_search_term_view",
+        "segments.keyword.adGroupCriterion",
+        "segments.keyword.ad_group_criterion",
+        "matched_criterion_id",
+        "",
+    ),
+    (
+        "row_campaign",
+        "campaignBudget.amountMicros",
+        "campaign_budget.amount_micros",
+        "budget_amount_micros",
+        None,
+    ),
+    (
+        "row_campaign",
+        "campaignBudget.explicitlyShared",
+        "campaign_budget.explicitly_shared",
+        "budget_explicitly_shared",
+        False,
+    ),
+    (
+        "row_ad_group_criterion",
+        "adGroupCriterion.qualityInfo.qualityScore",
+        "ad_group_criterion.quality_info.quality_score",
+        "quality_score",
+        None,
+    ),
+    (
+        "row_conversion_action",
+        "conversionAction.includeInConversionsMetric",
+        "conversion_action.include_in_conversions_metric",
+        "include_in_conversions_metric",
+        False,
+    ),
+    (
+        "row_customer",
+        "customer.descriptiveName",
+        "customer.descriptive_name",
+        "descriptive_name",
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("surface", "rest_keys", "gaql_field", "attribute", "absent_value"), ABSENT_MEANING
+)
+def test_absent_key_keeps_its_contract_meaning_but_explicit_null_is_a_defect(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, absent_value: object
+) -> None:
+    value = getattr(_parse(surface, _without(BASE_ROWS[surface](), rest_keys)), attribute)
+    if absent_value is None or isinstance(absent_value, bool):
+        assert value is absent_value
+    else:
+        assert value == absent_value
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, None))
+    _assert_defect(error, surface, f"{gaql_field}: expected {NOT_NULL_PATH}")
+
+
+@pytest.mark.parametrize(
+    ("surface", "rest_keys", "gaql_field"),
+    [
+        *[(surface, rest, gaql) for surface, (gaql, rest) in ID_FIELD_OF_SURFACE.items()],
+        ("row_customer", "customer.timeZone", "customer.time_zone"),
+        ("row_campaign", "campaign.status", "campaign.status"),
+        ("row_campaign", "campaign.advertisingChannelType", "campaign.advertising_channel_type"),
+        ("row_campaign", "campaignBudget.period", "campaign_budget.period"),
+        ("row_campaign_daily", "segments.date", "segments.date"),
+        ("row_ad_group", "adGroup.name", "ad_group.name"),
+        ("row_search_term_view", "searchTermView.searchTerm", "search_term_view.search_term"),
+        ("row_search_term_view", "segments.keyword.info.text", "segments.keyword.info.text"),
+        (
+            "row_search_term_view",
+            "segments.keyword.info.matchType",
+            "segments.keyword.info.match_type",
+        ),
+        (
+            "row_ad_group_criterion",
+            "adGroupCriterion.keyword.matchType",
+            "ad_group_criterion.keyword.match_type",
+        ),
+        (
+            "row_conversion_action",
+            "conversionAction.countingType",
+            "conversion_action.counting_type",
+        ),
+        (
+            "row_conversion_action",
+            "conversionAction.attributionModelSettings.attributionModel",
+            "conversion_action.attribution_model_settings.attribution_model",
+        ),
+    ],
+)
+def test_explicit_json_null_field_is_a_validation_defect(
+    surface: str, rest_keys: str, gaql_field: str
+) -> None:
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, None))
+    _assert_defect(error, surface, f"{gaql_field}: expected {NOT_NULL_PATH}")
+
+
+@pytest.mark.parametrize(
+    ("surface", "rest_keys", "gaql_prefix"),
+    [
+        *[
+            (surface, rest.split(".")[0], gaql.split(".")[0] + ".")
+            for surface, (gaql, rest) in ID_FIELD_OF_SURFACE.items()
+        ],
+        ("row_campaign_daily", "metrics", "metrics."),
+        ("row_campaign_daily", "segments", "segments."),
+        ("row_keyword_view", "metrics", "metrics."),
+        ("row_search_term_view", "metrics", "metrics."),
+        ("row_search_term_view", "segments.keyword", "segments.keyword."),
+        ("row_search_term_view", "segments.keyword.info", "segments.keyword.info."),
+        ("row_campaign", "campaignBudget", "campaign_budget"),
+        (
+            "row_ad_group_criterion",
+            "adGroupCriterion.qualityInfo",
+            "ad_group_criterion.quality_info.",
+        ),
+        ("row_ad_group_criterion", "adGroupCriterion.keyword", "ad_group_criterion.keyword."),
+        (
+            "row_conversion_action",
+            "conversionAction.attributionModelSettings",
+            "conversion_action.attribution_model_settings.",
+        ),
+    ],
+)
+def test_explicit_json_null_object_is_a_validation_defect(
+    surface: str, rest_keys: str, gaql_prefix: str
+) -> None:
+    # A null object never stands for its omitted fields: "metrics": null is not zero metrics.
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, None))
+    assert error.message.startswith(gaql_prefix)
+    assert error.message.endswith(f": expected {NOT_NULL_PATH}")
+    _assert_defect(error, surface, error.message)
+
+
+# --- non-negative DOUBLE metrics -----------------------------------------------------------------
+# Conversions, conversion value and average CPC are counts, amounts or cost divided by clicks;
+# the fact tables carry non-negative checks on each of them.
+
+NON_NEGATIVE_DOUBLES: list[tuple[str, str, str, str]] = [
+    ("row_campaign_daily", "metrics.conversions", "metrics.conversions", "conversions"),
+    (
+        "row_campaign_daily",
+        "metrics.conversionsValue",
+        "metrics.conversions_value",
+        "conversions_value",
+    ),
+    ("row_keyword_view", "metrics.conversions", "metrics.conversions", "conversions"),
+    ("row_keyword_view", "metrics.averageCpc", "metrics.average_cpc", "average_cpc"),
+    ("row_search_term_view", "metrics.conversions", "metrics.conversions", "conversions"),
+    (
+        "row_search_term_view",
+        "metrics.conversionsValue",
+        "metrics.conversions_value",
+        "conversions_value",
+    ),
+]
+
+
+@pytest.mark.parametrize("wire", [Decimal("-0.3"), Decimal("-0.000001"), Decimal("-125.75"), -1])
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), NON_NEGATIVE_DOUBLES)
+def test_negative_double_metric_is_a_validation_defect(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: object
+) -> None:
+    error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, wire))
+    _assert_defect(error, surface, f"{gaql_field}: expected {NOT_NON_NEGATIVE}")
+
+
+@pytest.mark.parametrize("wire", [Decimal("-0"), Decimal("-0.000"), Decimal(0), 0])
+@pytest.mark.parametrize(("surface", "rest_keys", "gaql_field", "attribute"), NON_NEGATIVE_DOUBLES)
+def test_zero_double_metric_negative_zero_included_parses_as_unsigned_zero(
+    surface: str, rest_keys: str, gaql_field: str, attribute: str, wire: object
+) -> None:
+    value = getattr(_parse(surface, _with(BASE_ROWS[surface](), rest_keys, wire)), attribute)
+    assert value == 0
+    assert isinstance(value, Decimal)
+    assert not value.is_signed()
+
+
 # --- int64 identifiers --------------------------------------------------------------------------
 
 
@@ -640,13 +876,36 @@ def test_get_field_returns_raw_values_with_int64_still_strings() -> None:
     assert get_field(keyword_row(), "ad_group_criterion.quality_info.quality_score") == 8
 
 
-def test_get_field_returns_none_for_any_absent_key_or_json_null() -> None:
+def test_get_field_returns_none_for_any_absent_key() -> None:
     row = campaign_row()
     assert get_field(row, "campaign_budget.total_amount_micros") is None
     assert get_field(row, "ad_group.id") is None
     assert get_field(_without(row, "campaignBudget"), "campaign_budget.id") is None
-    assert get_field({"campaign": None}, "campaign.id") is None
+    assert get_field({"campaign": {}}, "campaign.id") is None
     assert get_field({}, "segments.keyword.info.text") is None
+
+
+@pytest.mark.parametrize(
+    ("row", "gaql_field"),
+    [
+        ({"campaign": None}, "campaign.id"),
+        ({"campaign": None}, "campaign"),
+        ({"campaign": {"id": None}}, "campaign.id"),
+        ({"segments": {"keyword": None}}, "segments.keyword.info.text"),
+        ({"segments": {"keyword": {"info": {"text": None}}}}, "segments.keyword.info.text"),
+    ],
+)
+def test_get_field_rejects_json_null_at_any_level_of_the_path(
+    row: dict[str, Any], gaql_field: str
+) -> None:
+    # No row contract declares a null type, so an explicit null is never read as absence.
+    with pytest.raises(QueryDefect) as caught:
+        get_field(row, gaql_field)
+    error = caught.value
+    assert error.message == f"{gaql_field}: expected {NOT_NULL_PATH}"
+    assert error.endpoint == "parse google_ads_row"
+    assert error.code == "validation"
+    assert error.query_id is None
 
 
 @pytest.mark.parametrize(
@@ -788,19 +1047,105 @@ def test_custom_period_budget_reads_total_amount_micros() -> None:
     assert parsed.budget_explicitly_shared is False
 
 
-def test_each_budget_period_reads_only_its_own_amount_field() -> None:
+def test_budget_without_its_own_period_amount_is_unknown_not_zero() -> None:
     # A CUSTOM_PERIOD budget whose total is unset is unknown, never its average daily amount.
-    row = _with(lifetime_campaign_row(), "campaignBudget.amountMicros", "20000000")
-    parsed = _parse("row_campaign", _without(row, "campaignBudget.totalAmountMicros"))
+    parsed = _parse(
+        "row_campaign", _without(lifetime_campaign_row(), "campaignBudget.totalAmountMicros")
+    )
+    assert parsed.budget_period == "CUSTOM_PERIOD"
     assert parsed.budget_amount_micros is None
     assert parsed.budget_amount is None
     assert parsed.total_budget is None
-    # A DAILY budget never reads totalAmountMicros.
-    row = _with(campaign_row(), "campaignBudget.totalAmountMicros", "900000000")
-    parsed = _parse("row_campaign", _without(row, "campaignBudget.amountMicros"))
-    assert parsed.budget_amount_micros is None
-    assert parsed.budget_amount is None
     assert parsed.daily_budget is None
+    parsed = _parse("row_campaign", _without(campaign_row(), "campaignBudget.amountMicros"))
+    assert parsed.budget_period == "DAILY"
+    assert parsed.budget_amount_micros is None
+    assert parsed.daily_budget is None
+
+
+# The amount field of the other period, and the period that owns it.
+DAILY_AMOUNT = ("campaignBudget.amountMicros", "campaign_budget.amount_micros", "DAILY")
+LIFETIME_AMOUNT = (
+    "campaignBudget.totalAmountMicros",
+    "campaign_budget.total_amount_micros",
+    "CUSTOM_PERIOD",
+)
+
+
+@pytest.mark.parametrize(
+    ("base", "removed", "foreign"),
+    [
+        # Both amount fields at once: the period's own field never excuses the other one.
+        pytest.param(campaign_row, None, LIFETIME_AMOUNT, id="daily-with-both"),
+        pytest.param(lifetime_campaign_row, None, DAILY_AMOUNT, id="custom-period-with-both"),
+        # Only the other period's field.
+        pytest.param(campaign_row, "campaignBudget.amountMicros", LIFETIME_AMOUNT, id="daily"),
+        pytest.param(
+            lifetime_campaign_row,
+            "campaignBudget.totalAmountMicros",
+            DAILY_AMOUNT,
+            id="custom-period",
+        ),
+    ],
+)
+def test_amount_field_of_the_other_budget_period_is_a_defect(
+    base: Callable[[], dict[str, Any]], removed: str | None, foreign: tuple[str, str, str]
+) -> None:
+    rest_keys, gaql_field, owner = foreign
+    row = _with(base(), rest_keys, "20000000")
+    if removed is not None:
+        row = _without(row, removed)
+    error = _defect("row_campaign", row)
+    expected = f"absent unless campaign_budget.period is {owner}"
+    _assert_defect(error, "row_campaign", f"{gaql_field}: expected {expected}")
+    assert "20000000" not in error.message
+
+
+def test_budget_without_a_period_rejects_the_custom_period_amount() -> None:
+    # An absent period is Google's default DAILY, so a lifetime amount does not belong to it.
+    row = _without(campaign_row(), "campaignBudget.period", "campaignBudget.amountMicros")
+    error = _defect("row_campaign", _with(row, "campaignBudget.totalAmountMicros", "900000000"))
+    _assert_defect(
+        error,
+        "row_campaign",
+        "campaign_budget.total_amount_micros: expected absent unless campaign_budget.period is "
+        "CUSTOM_PERIOD",
+    )
+
+
+@pytest.mark.parametrize("micros", ["0", "-1", "1500.5"])
+def test_other_period_amount_is_rejected_whatever_its_value(micros: str) -> None:
+    error = _defect(
+        "row_campaign", _with(campaign_row(), "campaignBudget.totalAmountMicros", micros)
+    )
+    _assert_defect(
+        error,
+        "row_campaign",
+        "campaign_budget.total_amount_micros: expected absent unless campaign_budget.period is "
+        "CUSTOM_PERIOD",
+    )
+
+
+def test_explicitly_shared_custom_period_budget_is_a_defect() -> None:
+    row = _with(lifetime_campaign_row(), "campaignBudget.explicitlyShared", True)
+    error = _defect("row_campaign", row)
+    _assert_defect(
+        error,
+        "row_campaign",
+        "campaign_budget.explicitly_shared: expected false or absent when "
+        "campaign_budget.period is CUSTOM_PERIOD",
+    )
+
+
+@pytest.mark.parametrize("shared", [False, None])
+def test_custom_period_budget_that_is_not_shared_is_accepted(shared: bool | None) -> None:
+    row = lifetime_campaign_row()
+    if shared is not None:
+        row = _with(row, "campaignBudget.explicitlyShared", shared)
+    parsed = _parse("row_campaign", row)
+    assert parsed.budget_period == "CUSTOM_PERIOD"
+    assert parsed.budget_explicitly_shared is False
+    assert parsed.total_budget == Decimal("1500.000000")
 
 
 def test_budget_amount_is_exact_at_native_precision() -> None:
@@ -942,9 +1287,34 @@ def test_campaign_without_a_channel_type_keeps_it_unknown() -> None:
     assert _parse_off_contract("row_campaign", row).advertising_channel_type is None
 
 
-def test_campaign_channel_type_is_kept_raw() -> None:
-    row = _with(campaign_row(), "campaign.advertisingChannelType", "PERFORMANCE_MAX")
-    assert _parse("row_campaign", row).advertising_channel_type == "PERFORMANCE_MAX"
+def _one_of(surface: str, rest_keys: str) -> str:
+    """The defect expectation for an enum field: its contract's enum names, sorted."""
+    return "one of " + ", ".join(sorted(_enum(surface, rest_keys)))
+
+
+def test_advertising_channel_types_equal_the_contract_enum() -> None:
+    channel_types = _enum("row_campaign", "campaign.advertisingChannelType")
+    assert channel_types == parser._ADVERTISING_CHANNEL_TYPES
+    assert len(channel_types) == 14
+    assert {"UNKNOWN", "UNSPECIFIED"} <= channel_types
+
+
+@pytest.mark.parametrize("channel_type", sorted(parser._ADVERTISING_CHANNEL_TYPES))
+def test_campaign_channel_type_is_kept_raw(channel_type: str) -> None:
+    row = _with(campaign_row(), "campaign.advertisingChannelType", channel_type)
+    assert _parse("row_campaign", row).advertising_channel_type == channel_type
+
+
+@pytest.mark.parametrize("channel_type", ["", "BOGUS", "search", "SEARCH "])
+def test_campaign_channel_type_outside_the_contract_enum_is_a_defect(channel_type: str) -> None:
+    row = _with(campaign_row(), "campaign.advertisingChannelType", channel_type)
+    error = _defect("row_campaign", row)
+    expected = _one_of("row_campaign", "campaign.advertisingChannelType")
+    _assert_defect(error, "row_campaign", f"campaign.advertising_channel_type: expected {expected}")
+    assert expected == (
+        "one of DEMAND_GEN, DISPLAY, HOTEL, LOCAL, LOCAL_SERVICES, MULTI_CHANNEL, "
+        "PERFORMANCE_MAX, SEARCH, SHOPPING, SMART, TRAVEL, UNKNOWN, UNSPECIFIED, VIDEO"
+    )
 
 
 def test_campaign_channel_type_that_is_not_a_string_is_a_defect() -> None:
@@ -1104,6 +1474,72 @@ def test_other_doubles_that_are_not_numbers_are_defects(rest_keys: str, gaql_fie
     _assert_defect(error, "row_campaign_daily", f"{gaql_field}: expected {NOT_NUMBER}")
 
 
+IMPRESSION_SHARES: list[tuple[str, str, str]] = [
+    (
+        "metrics.searchBudgetLostImpressionShare",
+        "metrics.search_budget_lost_impression_share",
+        "search_budget_lost_impression_share",
+    ),
+    ("metrics.searchImpressionShare", "metrics.search_impression_share", "search_impression_share"),
+]
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        0,
+        1,
+        Decimal(0),
+        Decimal("0.0"),
+        Decimal("0.5"),
+        Decimal("1.0"),
+        # Google's reporting sentinels: "> 90%" lost to budget and "< 10%" impression share.
+        Decimal("0.9001"),
+        Decimal("0.0999"),
+    ],
+)
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), IMPRESSION_SHARES)
+def test_impression_shares_from_zero_to_one_are_kept_as_returned(
+    rest_keys: str, gaql_field: str, attribute: str, wire: int | Decimal
+) -> None:
+    row = _with(campaign_daily_row(), rest_keys, wire)
+    value = getattr(_parse("row_campaign_daily", row), attribute)
+    assert isinstance(value, Decimal)
+    assert value.as_tuple() == Decimal(wire).as_tuple()
+
+
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), IMPRESSION_SHARES)
+def test_negative_zero_impression_share_is_zero_without_its_sign(
+    rest_keys: str, gaql_field: str, attribute: str
+) -> None:
+    row = _with(campaign_daily_row(), rest_keys, Decimal("-0.0"))
+    value = getattr(_parse("row_campaign_daily", row), attribute)
+    assert value == 0
+    assert not value.is_signed()
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [Decimal("-0.1"), Decimal("-0.0001"), Decimal("1.1"), Decimal("1.0001"), Decimal("9E+1"), 2],
+)
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), IMPRESSION_SHARES)
+def test_impression_share_outside_zero_to_one_is_a_defect(
+    rest_keys: str, gaql_field: str, attribute: str, wire: object
+) -> None:
+    error = _defect("row_campaign_daily", _with(campaign_daily_row(), rest_keys, wire))
+    _assert_defect(error, "row_campaign_daily", f"{gaql_field}: expected {NOT_FRACTION}")
+
+
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute"), IMPRESSION_SHARES)
+def test_impression_share_tolerated_as_a_float_is_still_bounded(
+    rest_keys: str, gaql_field: str, attribute: str
+) -> None:
+    row = _with(campaign_daily_row(), rest_keys, 0.25)
+    assert getattr(_parse_off_contract("row_campaign_daily", row), attribute) == Decimal("0.25")
+    error = _defect("row_campaign_daily", _with(campaign_daily_row(), rest_keys, 1.5))
+    _assert_defect(error, "row_campaign_daily", f"{gaql_field}: expected {NOT_FRACTION}")
+
+
 def test_cost_micros_at_int64_max_converts_exactly() -> None:
     row = _with(campaign_daily_row(), "metrics.costMicros", INT64_MAX_TEXT)
     parsed = _parse("row_campaign_daily", row)
@@ -1187,7 +1623,7 @@ def test_ad_group_without_its_campaign_is_a_defect() -> None:
 
 
 def test_ad_group_without_a_name_is_a_defect() -> None:
-    error = _defect("row_ad_group", _with(ad_group_row(), "adGroup.name", None))
+    error = _defect("row_ad_group", _without(ad_group_row(), "adGroup.name"))
     _assert_defect(error, "row_ad_group", "ad_group.name: expected a string")
 
 
@@ -1277,7 +1713,7 @@ def test_historical_quality_score_outside_one_to_ten_is_a_defect(wire: str, expe
     )
 
 
-@pytest.mark.parametrize("average_cpc", [Decimal("1E+40"), Decimal("-1E+40")])
+@pytest.mark.parametrize("average_cpc", [Decimal("1E+40"), Decimal("1E+38")])
 def test_average_cpc_beyond_numeric_range_is_a_defect(average_cpc: Decimal) -> None:
     row = _with(keyword_view_row(), "metrics.averageCpc", average_cpc)
     error = _defect("row_keyword_view", row)
@@ -1286,6 +1722,18 @@ def test_average_cpc_beyond_numeric_range_is_a_defect(average_cpc: Decimal) -> N
         "row_keyword_view",
         "metrics.average_cpc: expected an amount in micros within numeric range",
     )
+
+
+@pytest.mark.parametrize(
+    "average_cpc",
+    # -0.4 micros would round to zero; the sign is checked before rounding.
+    [Decimal("-1234567.5"), Decimal("-1"), Decimal("-0.4"), Decimal("-1E+40"), -2000000],
+)
+def test_negative_average_cpc_is_a_defect(average_cpc: object) -> None:
+    # Average CPC is cost divided by clicks, neither of which is ever negative.
+    row = _with(keyword_view_row(), "metrics.averageCpc", average_cpc)
+    error = _defect("row_keyword_view", row)
+    _assert_defect(error, "row_keyword_view", f"metrics.average_cpc: expected {NOT_NON_NEGATIVE}")
 
 
 def test_average_cpc_as_a_numeric_string_is_tolerated() -> None:
@@ -1397,6 +1845,60 @@ def test_matched_criterion_that_is_not_an_ad_group_criteria_name_is_a_defect(
     )
 
 
+def test_matched_criterion_of_the_rows_own_ad_group_gives_its_criterion_id() -> None:
+    row = _with(search_term_row(), "adGroup.id", "111")
+    row = _with(row, "adGroup.resourceName", f"{CUSTOMER_RN}/adGroups/111")
+    resource_name = f"{CUSTOMER_RN}/adGroupCriteria/111~333"
+    parsed = _parse(
+        "row_search_term_view", _with(row, "segments.keyword.adGroupCriterion", resource_name)
+    )
+    assert parsed.ad_group_id == 111
+    assert parsed.matched_criterion_id == "333"
+    # Ad-group ids compare as numbers, so zero padding on either side is the same ad group.
+    resource_name = f"{CUSTOMER_RN}/adGroupCriteria/000111~333"
+    row = _with(row, "segments.keyword.adGroupCriterion", resource_name)
+    assert _parse("row_search_term_view", row).matched_criterion_id == "333"
+    row = _with(row, "adGroup.id", "0111")
+    assert _parse("row_search_term_view", row).matched_criterion_id == "333"
+
+
+@pytest.mark.parametrize("resource_ad_group", ["222", "0", "1111", "11", INT64_MAX_TEXT])
+def test_matched_criterion_of_another_ad_group_is_a_defect(resource_ad_group: str) -> None:
+    # A criterion id is unique only within its ad group: 222~333 is not criterion 333 of 111.
+    row = _with(search_term_row(), "adGroup.id", "111")
+    resource_name = f"{CUSTOMER_RN}/adGroupCriteria/{resource_ad_group}~333"
+    row = _with(row, "segments.keyword.adGroupCriterion", resource_name)
+    error = _defect("row_search_term_view", row)
+    _assert_defect(
+        error,
+        "row_search_term_view",
+        "segments.keyword.ad_group_criterion: expected an adGroupCriteria resource name of the "
+        "row's ad group (ad_group.id)",
+    )
+    assert "111" not in error.message
+    assert "333" not in error.message
+
+
+@pytest.mark.parametrize(
+    "resource_name",
+    [
+        f"{CUSTOMER_RN}/adGroupCriteria/{AD_GROUP}~{INT64_OVERFLOW_TEXT}",
+        f"{CUSTOMER_RN}/adGroupCriteria/{AD_GROUP}~9999999999999999999",
+        f"{CUSTOMER_RN}/adGroupCriteria/{INT64_OVERFLOW_TEXT}~{CRITERION}",
+        f"customers/{INT64_OVERFLOW_TEXT}/adGroupCriteria/{AD_GROUP}~{CRITERION}",
+    ],
+)
+def test_matched_criterion_with_an_id_beyond_int64_is_a_defect(resource_name: str) -> None:
+    row = _with(search_term_row(), "segments.keyword.adGroupCriterion", resource_name)
+    error = _defect("row_search_term_view", row)
+    _assert_defect(
+        error,
+        "row_search_term_view",
+        "segments.keyword.ad_group_criterion: expected an adGroupCriteria resource name whose "
+        f"ids are integers from 0 to {INT64_MAX}",
+    )
+
+
 def test_matched_criterion_that_is_not_a_string_is_a_defect() -> None:
     row = _with(search_term_row(), "segments.keyword.adGroupCriterion", 555)
     error = _defect("row_search_term_view", row)
@@ -1440,10 +1942,41 @@ def test_search_term_without_its_text_is_a_defect() -> None:
     _assert_defect(error, "row_search_term_view", "search_term_view.search_term: expected a string")
 
 
-@pytest.mark.parametrize("match_type", sorted({"BROAD", "EXACT", "PHRASE"}))
+def test_search_term_match_types_equal_the_contract_enum() -> None:
+    match_types = _enum("row_search_term_view", "segments.keyword.info.matchType")
+    assert match_types == parser._KEYWORD_MATCH_TYPES
+    assert match_types == {"BROAD", "EXACT", "PHRASE", "UNKNOWN", "UNSPECIFIED"}
+
+
+@pytest.mark.parametrize("match_type", sorted(parser._KEYWORD_MATCH_TYPES))
 def test_search_term_match_type_is_kept_raw(match_type: str) -> None:
     row = _with(search_term_row(), "segments.keyword.info.matchType", match_type)
     assert _parse("row_search_term_view", row).matched_match_type == match_type
+
+
+@pytest.mark.parametrize("match_type", ["", "BOGUS", "phrase", "BROAD_MATCH"])
+def test_search_term_match_type_outside_the_contract_enum_is_a_defect(match_type: str) -> None:
+    row = _with(search_term_row(), "segments.keyword.info.matchType", match_type)
+    error = _defect("row_search_term_view", row)
+    _assert_defect(
+        error,
+        "row_search_term_view",
+        "segments.keyword.info.match_type: expected "
+        + _one_of("row_search_term_view", "segments.keyword.info.matchType"),
+    )
+
+
+def test_search_term_without_a_match_type_keeps_it_unknown() -> None:
+    # Off-contract: info requires matchType; an absent match type stays None, never a default.
+    row = _without(search_term_row(), "segments.keyword.info.matchType")
+    parsed = _parse_off_contract("row_search_term_view", row)
+    assert parsed.matched_match_type is None
+    assert parsed.matched_keyword_text == "crm software"
+    row = _with(search_term_row(), "segments.keyword.info.matchType", 2)
+    error = _defect("row_search_term_view", row)
+    _assert_defect(
+        error, "row_search_term_view", "segments.keyword.info.match_type: expected a string"
+    )
 
 
 def test_search_term_without_metrics_has_zero_additive_metrics() -> None:
@@ -1522,10 +2055,27 @@ def test_quality_score_outside_one_to_ten_is_a_defect(wire: object, expected: st
     )
 
 
-@pytest.mark.parametrize("match_type", ["BROAD", "PHRASE", "UNKNOWN"])
+def test_keyword_match_types_equal_the_contract_enum() -> None:
+    match_types = _enum("row_ad_group_criterion", "adGroupCriterion.keyword.matchType")
+    assert match_types == parser._KEYWORD_MATCH_TYPES
+
+
+@pytest.mark.parametrize("match_type", sorted(parser._KEYWORD_MATCH_TYPES))
 def test_keyword_match_type_is_kept_raw(match_type: str) -> None:
     row = _with(keyword_row(), "adGroupCriterion.keyword.matchType", match_type)
     assert _parse("row_ad_group_criterion", row).match_type == match_type
+
+
+@pytest.mark.parametrize("match_type", ["", "BOGUS", "exact", "NEAR_EXACT"])
+def test_keyword_match_type_outside_the_contract_enum_is_a_defect(match_type: str) -> None:
+    row = _with(keyword_row(), "adGroupCriterion.keyword.matchType", match_type)
+    error = _defect("row_ad_group_criterion", row)
+    _assert_defect(
+        error,
+        "row_ad_group_criterion",
+        "ad_group_criterion.keyword.match_type: expected "
+        + _one_of("row_ad_group_criterion", "adGroupCriterion.keyword.matchType"),
+    )
 
 
 def test_keyword_paused_status_is_normalised() -> None:
@@ -1595,6 +2145,112 @@ def test_conversion_action_with_weighted_many_per_click_counting_is_kept_raw() -
 def test_conversion_action_status_is_kept_raw_never_normalised(status: str) -> None:
     row = _with(conversion_action_row(), "conversionAction.status", status)
     assert _parse("row_conversion_action", row).status == status
+
+
+# Each Q-G8 enum field: its REST key path, GAQL field, parsed attribute and parser constant.
+ACTION_ENUMS = [
+    pytest.param(
+        "conversionAction.status",
+        "conversion_action.status",
+        "status",
+        parser._CONVERSION_ACTION_STATUSES,
+        id="status",
+    ),
+    pytest.param(
+        "conversionAction.countingType",
+        "conversion_action.counting_type",
+        "counting_type",
+        parser._COUNTING_TYPES,
+        id="counting_type",
+    ),
+    pytest.param(
+        "conversionAction.attributionModelSettings.attributionModel",
+        "conversion_action.attribution_model_settings.attribution_model",
+        "attribution_model",
+        parser._ATTRIBUTION_MODELS,
+        id="attribution_model",
+    ),
+]
+
+
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute", "values"), ACTION_ENUMS)
+def test_conversion_action_enums_equal_the_contract_enum(
+    rest_keys: str, gaql_field: str, attribute: str, values: frozenset[str]
+) -> None:
+    assert _enum("row_conversion_action", rest_keys) == values
+    assert {"UNKNOWN", "UNSPECIFIED"} <= values
+    assert gaql_field.endswith(attribute)
+
+
+def test_attribution_models_keep_the_retired_rule_based_models() -> None:
+    assert len(parser._ATTRIBUTION_MODELS) == 9
+    assert {
+        "GOOGLE_SEARCH_ATTRIBUTION_FIRST_CLICK",
+        "GOOGLE_SEARCH_ATTRIBUTION_LINEAR",
+        "GOOGLE_SEARCH_ATTRIBUTION_POSITION_BASED",
+        "GOOGLE_SEARCH_ATTRIBUTION_TIME_DECAY",
+    } <= parser._ATTRIBUTION_MODELS
+
+
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute", "values"), ACTION_ENUMS)
+def test_every_conversion_action_enum_value_is_kept_raw(
+    rest_keys: str, gaql_field: str, attribute: str, values: frozenset[str]
+) -> None:
+    for value in sorted(values):
+        row = _with(conversion_action_row(), rest_keys, value)
+        assert getattr(_parse("row_conversion_action", row), attribute) == value
+
+
+@pytest.mark.parametrize("wire", ["", "BOGUS", "last_click", "ENABLED "])
+@pytest.mark.parametrize(("rest_keys", "gaql_field", "attribute", "values"), ACTION_ENUMS)
+def test_conversion_action_enum_outside_the_contract_is_a_defect(
+    rest_keys: str, gaql_field: str, attribute: str, values: frozenset[str], wire: str
+) -> None:
+    error = _defect("row_conversion_action", _with(conversion_action_row(), rest_keys, wire))
+    if attribute == "attribution_model":
+        # Listing the nine attribution model names would overflow QueryDefect's 300-character
+        # message cap, so the defect names the enum and where its names are listed instead.
+        message = (
+            "conversion_action.attribution_model_settings.attribution_model: expected "
+            "a v25 AttributionModelEnum name listed in the row_conversion_action contract"
+        )
+    else:
+        message = f"{gaql_field}: expected {_one_of('row_conversion_action', rest_keys)}"
+    _assert_defect(error, "row_conversion_action", message)
+    assert len(error.message) <= 300
+    assert "…" not in error.message
+    assert wire == "" or wire not in error.message
+
+
+# Each field the parser reads with _RowReader.enum or optional_enum: surface, REST path, constant.
+ENUM_FIELDS = [
+    ("row_campaign", "campaign.advertisingChannelType", parser._ADVERTISING_CHANNEL_TYPES),
+    ("row_search_term_view", "segments.keyword.info.matchType", parser._KEYWORD_MATCH_TYPES),
+    ("row_ad_group_criterion", "adGroupCriterion.keyword.matchType", parser._KEYWORD_MATCH_TYPES),
+    ("row_conversion_action", "conversionAction.status", parser._CONVERSION_ACTION_STATUSES),
+    ("row_conversion_action", "conversionAction.countingType", parser._COUNTING_TYPES),
+    (
+        "row_conversion_action",
+        "conversionAction.attributionModelSettings.attributionModel",
+        parser._ATTRIBUTION_MODELS,
+    ),
+]
+
+
+def test_every_enum_defect_message_is_complete_within_the_message_cap() -> None:
+    assert len({values for _, _, values in ENUM_FIELDS}) == 5
+    for surface, rest_keys, values in ENUM_FIELDS:
+        assert _enum(surface, rest_keys) == values
+        error = _defect(surface, _with(BASE_ROWS[surface](), rest_keys, "BOGUS"))
+        assert error.code == "validation"
+        assert len(error.message) <= 300, rest_keys
+        assert "…" not in error.message, rest_keys
+
+
+def test_conversion_action_with_empty_attribution_settings_has_an_unknown_model() -> None:
+    # Off-contract: attributionModelSettings requires attributionModel when it is present.
+    row = _with(conversion_action_row(), "conversionAction.attributionModelSettings", {})
+    assert _parse_off_contract("row_conversion_action", row).attribution_model is None
 
 
 def test_conversion_action_include_flag_false_or_absent_is_false() -> None:

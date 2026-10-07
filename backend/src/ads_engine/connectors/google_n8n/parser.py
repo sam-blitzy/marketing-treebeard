@@ -16,16 +16,26 @@ Wire encoding (proto3 JSON, as relayed by n8n):
       They stay ``Decimal``: conversions are never assumed integral, because data-driven
       attribution makes them fractional and ``MANY_PER_CLICK`` actions allow several per click.
       A ``float`` or ``str`` is accepted as well and converted through ``str``, never through
-      ``Decimal(float)``.
+      ``Decimal(float)``. No DOUBLE value may be negative, and the impression shares are
+      fractions from 0 to 1 inclusive, Google's reporting sentinels ``0.9001`` and ``0.0999``
+      kept as returned; a value outside those bounds is a defect.
     * Enums arrive as their names (``"ENABLED"``, ``"CUSTOM_PERIOD"``).
     * Zero-valued and unset fields may be omitted.
+    * Booleans come in two presence kinds. An implicit-presence ``bool``
+      (``campaign_budget.explicitly_shared``) is omitted when ``false``. An explicit-presence
+      ``optional bool`` (``conversion_action.include_in_conversions_metric``) is sent whenever
+      it is set, a ``false`` included, and is absent only when unset. Both read absence as
+      ``False``.
 
 Missing values:
-    Absent *additive* metrics (``costMicros``, ``clicks``, ``impressions``, ``conversions``,
+    An *absent* (omitted) key and an explicit JSON ``null`` are different things. Absent
+    *additive* metrics (``costMicros``, ``clicks``, ``impressions``, ``conversions``,
     ``conversionsValue``) are zero, as the row contracts state, because REST JSON omits
     zero-valued fields. Absent *rate or score* values (``historicalQualityScore``,
     ``qualityInfo.qualityScore``, ``averageCpc``, the impression shares) and absent budget
-    amounts are ``None`` ("unavailable"), never zero.
+    amounts are ``None`` ("unavailable"), never zero. No row contract declares a ``null`` type,
+    so a key present with ``null`` (``"metrics": null``, ``"conversions": null``) is a
+    validation defect at any level of a field's key path, never a zero or an unavailable value.
 
 Money:
     ``cost_micros`` is divided by 1,000,000 exactly into a ``Decimal`` in the account currency
@@ -39,8 +49,8 @@ Dates:
 Errors:
     Every failure raises :class:`~ads_engine.connectors.errors.QueryDefect` with
     ``source="google"``, ``endpoint="parse {surface}"`` and ``code="validation"``. Messages name
-    the GAQL field and the expected type only, never a row value, search term or name, so they
-    are safe to persist and log.
+    the GAQL field and the expected type or bounds only, never a row value, search term or
+    name, so they are safe to persist and log.
 
 Example::
 
@@ -136,7 +146,8 @@ _DEFAULT_BUDGET_PERIOD: Final[BudgetPeriod] = "DAILY"
 """Google's documented default ``campaign_budget.period``, applied when the key is absent."""
 
 # Google keeps a DAILY budget's amount in amount_micros and a CUSTOM_PERIOD (lifetime) budget's
-# amount in total_amount_micros; the two are mutually exclusive, so each period reads its own.
+# amount in total_amount_micros; the two are mutually exclusive, so each period reads its own
+# and the other period's field must be absent.
 _BUDGET_AMOUNT_FIELD: Final[Mapping[BudgetPeriod, str]] = MappingProxyType(
     {
         "DAILY": "campaign_budget.amount_micros",
@@ -151,11 +162,61 @@ SEARCH_TERM_STATUSES: Final[frozenset[str]] = frozenset(
 )
 """``search_term_view.status`` values accepted and stored raw as the term status."""
 
+# The v25 enum names each row contract lists for these fields. Values are stored raw, never
+# normalised; UNKNOWN and UNSPECIFIED are accepted wire values that no rule treats as known, and
+# the retired rule-based attribution models stay valid because past days were counted under them.
+_ADVERTISING_CHANNEL_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "DEMAND_GEN",
+        "DISPLAY",
+        "HOTEL",
+        "LOCAL",
+        "LOCAL_SERVICES",
+        "MULTI_CHANNEL",
+        "PERFORMANCE_MAX",
+        "SEARCH",
+        "SHOPPING",
+        "SMART",
+        "TRAVEL",
+        "UNKNOWN",
+        "UNSPECIFIED",
+        "VIDEO",
+    }
+)
+_KEYWORD_MATCH_TYPES: Final[frozenset[str]] = frozenset(
+    {"BROAD", "EXACT", "PHRASE", "UNKNOWN", "UNSPECIFIED"}
+)
+_CONVERSION_ACTION_STATUSES: Final[frozenset[str]] = frozenset(
+    {"ENABLED", "HIDDEN", "REMOVED", "UNKNOWN", "UNSPECIFIED"}
+)
+_COUNTING_TYPES: Final[frozenset[str]] = frozenset(
+    {"MANY_PER_CLICK", "ONE_PER_CLICK", "UNKNOWN", "UNSPECIFIED"}
+)
+_ATTRIBUTION_MODELS: Final[frozenset[str]] = frozenset(
+    {
+        "EXTERNAL",
+        "GOOGLE_ADS_LAST_CLICK",
+        "GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN",
+        "GOOGLE_SEARCH_ATTRIBUTION_FIRST_CLICK",
+        "GOOGLE_SEARCH_ATTRIBUTION_LINEAR",
+        "GOOGLE_SEARCH_ATTRIBUTION_POSITION_BASED",
+        "GOOGLE_SEARCH_ATTRIBUTION_TIME_DECAY",
+        "UNKNOWN",
+        "UNSPECIFIED",
+    }
+)
+# Listing the nine attribution model names would overflow QueryDefect's 300-character message
+# cap and cut the expectation mid-name, so the defect names the enum and where it is listed.
+_ATTRIBUTION_MODEL_EXPECTED: Final = (
+    "a v25 AttributionModelEnum name listed in the row_conversion_action contract"
+)
+
 _QUALITY_SCORE_MIN: Final = 1
 _QUALITY_SCORE_MAX: Final = 10
 _MICROS_EXPONENT: Final = -6
 _AMOUNT_QUANTUM: Final = Decimal("0.000001")
 _ZERO: Final = Decimal(0)
+_ONE: Final = Decimal(1)
 
 # A private context makes micros conversion and rounding independent of the caller's decimal
 # context: 38 digits hold every INT64 micros value exactly, and an invalid result raises.
@@ -165,9 +226,18 @@ _DECIMAL_CONTEXT: Final = Context(prec=38, rounding=ROUND_HALF_EVEN, traps=[Inva
 _INT_RE: Final = re.compile(r"[+-]?[0-9]{1,19}")
 _DATE_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _CURRENCY_RE: Final = re.compile(r"[A-Z]{3}")
-_AD_GROUP_CRITERION_RE: Final = re.compile(r"customers/[0-9]+/adGroupCriteria/[0-9]+~([0-9]{1,19})")
+# Groups: customer, ad group and criterion id, each a run of at most 19 digits (as _INT_RE).
+_AD_GROUP_CRITERION_RE: Final = re.compile(
+    r"customers/([0-9]{1,19})/adGroupCriteria/([0-9]{1,19})~([0-9]{1,19})"
+)
 _AD_GROUP_CRITERION_FORM: Final = (
     "an adGroupCriteria resource name customers/{customer}/adGroupCriteria/{ad_group}~{criterion}"
+)
+_AD_GROUP_CRITERION_IDS: Final = (
+    f"an adGroupCriteria resource name whose ids are integers from 0 to {INT64_MAX}"
+)
+_AD_GROUP_CRITERION_PARENT: Final = (
+    "an adGroupCriteria resource name of the row's ad group (ad_group.id)"
 )
 
 _GENERIC_SURFACE: Final = "google_ads_row"
@@ -217,17 +287,23 @@ def _defect(surface: str, gaql_field: str, expected: str) -> QueryDefect:
 def _walk(row: object, gaql_field: str, surface: str) -> object | None:
     """Return the value at a GAQL field's REST key path, or ``None`` when a key is absent.
 
+    An absent (omitted) key and an explicit JSON ``null`` are told apart. Omission is how REST
+    JSON encodes an unset or default value, so it reads as ``None`` and each reader applies its
+    contract's meaning. No row contract declares a ``null`` type, so a key that is present with
+    ``null`` is a defect: it would otherwise pass for omission and turn an unknown value into a
+    trusted zero.
+
     Args:
         row: The raw row; must be a mapping.
         gaql_field: GAQL field or resource name in snake_case.
         surface: Row surface, for the error.
 
     Returns:
-        The raw JSON value, or ``None`` when any segment is absent or JSON ``null``.
+        The raw JSON value, or ``None`` when any key along the path is absent.
 
     Raises:
-        QueryDefect: When ``gaql_field`` is not a GAQL name, or the row or an intermediate
-            value is not a JSON object.
+        QueryDefect: When ``gaql_field`` is not a GAQL name, the row or an intermediate value is
+            not a JSON object, or any key along the path is present with JSON ``null``.
     """
     try:
         path = rest_path(gaql_field)
@@ -237,9 +313,11 @@ def _walk(row: object, gaql_field: str, surface: str) -> object | None:
     for key in path:
         if not isinstance(node, Mapping):
             raise _defect(surface, gaql_field, "a JSON object at every level of its key path")
-        node = node.get(key)
-        if node is None:
+        if key not in node:
             return None
+        node = node[key]
+        if node is None:
+            raise _defect(surface, gaql_field, "a non-null value at every level of its key path")
     return node
 
 
@@ -256,6 +334,7 @@ def get_field(
 
         get_field({"campaign": {"id": "42"}}, "campaign.id")  # "42"
         get_field({"campaign": {"id": "42"}}, "campaign_budget.id")  # None
+        get_field({"campaign": None}, "campaign.id")  # raises QueryDefect
 
     Args:
         row: The raw row.
@@ -264,11 +343,12 @@ def get_field(
 
     Returns:
         The raw JSON value (int64 values are still strings), or ``None`` when any key along the
-        path is absent.
+        path is absent (omitted).
 
     Raises:
-        QueryDefect: When ``gaql_field`` is not a GAQL name, or the row or an intermediate value
-            is not a JSON object.
+        QueryDefect: When ``gaql_field`` is not a GAQL name, the row or an intermediate value is
+            not a JSON object, or any key along the path is present with JSON ``null``, which no
+            row contract allows.
     """
     return _walk(row, gaql_field, surface)
 
@@ -377,7 +457,14 @@ def _bool(
     surface: str = _GENERIC_SURFACE,
     gaql_field: str = "value",
 ) -> bool:
-    """Read a proto3 JSON boolean, which is omitted when ``false``.
+    """Read a JSON boolean whose absence is read as ``default``.
+
+    Two presence kinds reach this reader. An implicit-presence ``bool`` is omitted from proto3
+    JSON when ``false`` (``campaign_budget.explicitly_shared``, whose contract documents the
+    omission), so its absence means ``false``. An explicit-presence ``optional bool``
+    (``conversion_action.include_in_conversions_metric``) is serialized whenever it is set, a
+    ``false`` included, so its absence means unset; the caller's ``default`` decides what an
+    unset value counts as.
 
     Args:
         value: Raw value; ``None`` (absent) yields ``default``.
@@ -416,7 +503,7 @@ class _RowReader:
         return _defect(self._surface, gaql_field, expected)
 
     def raw(self, gaql_field: str) -> object | None:
-        """Return the raw value, or ``None`` when absent."""
+        """Return the raw value, or ``None`` when absent (omitted); explicit ``null`` raises."""
         return _walk(self._row, gaql_field, self._surface)
 
     def _present(self, gaql_field: str, expected: str) -> object:
@@ -439,7 +526,11 @@ class _RowReader:
         return self._bounded(gaql_field, number, 0, INT64_MAX)
 
     def count(self, gaql_field: str) -> int:
-        """Read an additive INT64 metric; absent means zero (proto3 omits zero values)."""
+        """Read an additive INT64 metric in ``0 .. INT64_MAX``.
+
+        Absent (omitted) means zero, because proto3 JSON omits zero values; an explicit JSON
+        ``null`` is a defect, never zero.
+        """
         value = self.raw(gaql_field)
         if value is None:
             return 0
@@ -461,16 +552,45 @@ class _RowReader:
         return self._bounded(gaql_field, number, _QUALITY_SCORE_MIN, _QUALITY_SCORE_MAX)
 
     def measure(self, gaql_field: str) -> Decimal:
-        """Read an additive DOUBLE metric; absent means zero."""
+        """Read an additive, non-negative DOUBLE metric, such as ``conversions``.
+
+        Absent (omitted) means zero, because proto3 JSON omits zero values; an explicit JSON
+        ``null`` is a defect, never zero. Fractions are kept; a negative value is a defect.
+        """
         value = self.optional_measure(gaql_field)
         return _ZERO if value is None else value
 
     def optional_measure(self, gaql_field: str) -> Decimal | None:
-        """Read a DOUBLE value whose absence means unavailable, such as an impression share."""
+        """Read a non-negative DOUBLE whose absence (omission) means unavailable (``None``).
+
+        The DOUBLE metrics read this way (conversions, conversion value, average CPC) are
+        counts, amounts or a ratio of them, so a negative value is a defect; a negative zero is
+        zero and is returned without its sign. An explicit JSON ``null`` is a defect, never
+        unavailable.
+        """
         value = self.raw(gaql_field)
         if value is None:
             return None
-        return _decimal(value, surface=self._surface, gaql_field=gaql_field)
+        number = _decimal(value, surface=self._surface, gaql_field=gaql_field)
+        if number < _ZERO:
+            raise self.defect(gaql_field, "a non-negative finite JSON number")
+        return number.copy_abs()
+
+    def fraction(self, gaql_field: str) -> Decimal | None:
+        """Read a DOUBLE fraction from 0 to 1 inclusive, such as an impression share.
+
+        The value is kept as returned, Google's reporting sentinels included (``0.9001`` for a
+        budget-lost share above 90%, ``0.0999`` for an impression share below 10%); a negative
+        zero is returned without its sign. Absent (omitted) means unavailable (``None``), never
+        zero; an explicit JSON ``null`` or a value outside 0 to 1 is a defect.
+        """
+        value = self.raw(gaql_field)
+        if value is None:
+            return None
+        number = _decimal(value, surface=self._surface, gaql_field=gaql_field)
+        if not _ZERO <= number <= _ONE:
+            raise self.defect(gaql_field, "a fraction from 0 to 1")
+        return number.copy_abs()
 
     def text(self, gaql_field: str) -> str:
         """Read a required string (a name, an enum name or an id-like string)."""
@@ -491,7 +611,12 @@ class _RowReader:
         return _date(value, surface=self._surface, gaql_field=gaql_field)
 
     def flag(self, gaql_field: str) -> bool:
-        """Read a proto3 boolean; absent means ``False``."""
+        """Read a boolean; absent means ``False`` for both presence kinds.
+
+        Absence is an implicit-presence ``bool`` omitted because it is ``false``, or an
+        explicit-presence ``optional bool`` left unset (a set ``false`` is sent); see
+        :func:`_bool`.
+        """
         return _bool(self.raw(gaql_field), surface=self._surface, gaql_field=gaql_field)
 
     def status(self, gaql_field: str) -> tuple[NormalisedStatus, str]:
@@ -501,6 +626,31 @@ class _RowReader:
         if normalised is None:
             raise self.defect(gaql_field, "one of " + ", ".join(CAMPAIGN_STATUS_MAP))
         return normalised, raw_status
+
+    def enum(self, gaql_field: str, values: frozenset[str], *, expected: str | None = None) -> str:
+        """Read a required enum name that must be one of ``values``; it is returned raw.
+
+        A defect lists ``values`` sorted ("one of ..."), or states ``expected`` instead when
+        given: a complete description, never a row value, for a list too long to fit the
+        error message cap.
+        """
+        raw_value = self.text(gaql_field)
+        if raw_value not in values:
+            if expected is None:
+                expected = "one of " + ", ".join(sorted(values))
+            raise self.defect(gaql_field, expected)
+        return raw_value
+
+    def optional_enum(
+        self, gaql_field: str, values: frozenset[str], *, expected: str | None = None
+    ) -> str | None:
+        """Read an optional enum name; absent means ``None``, present must be one of ``values``.
+
+        ``expected`` replaces the listed values in a defect, as in :meth:`enum`.
+        """
+        if self.raw(gaql_field) is None:
+            return None
+        return self.enum(gaql_field, values, expected=expected)
 
     def budget_period(self, gaql_field: str) -> BudgetPeriod:
         """Read ``campaign_budget.period``; absent means Google's default, ``DAILY``."""
@@ -516,7 +666,9 @@ class _RowReader:
         """Read a DOUBLE in micros (such as ``average_cpc``) as an amount rounded to 6 places.
 
         The value is derived (cost divided by clicks), not exact, so it is quantized half-even
-        to the micro. Absent means unavailable.
+        to the micro. Absent means unavailable. Cost and clicks are never negative, so a
+        negative value is a defect; the sign is checked before rounding, so no negative value
+        can round to zero.
         """
         value = self.optional_measure(gaql_field)
         if value is None:
@@ -564,17 +716,19 @@ class CampaignRow:
         status: Normalised status through :data:`CAMPAIGN_STATUS_MAP`; a Q-G2b ``REMOVED`` row
             is ``ended``.
         raw_status: ``campaign.status`` as returned.
-        advertising_channel_type: ``campaign.advertising_channel_type``, stored as the
-            campaign's objective or channel; ``None`` only when the key is absent.
+        advertising_channel_type: ``campaign.advertising_channel_type`` as returned, one of the
+            contract's ``AdvertisingChannelTypeEnum`` names, stored as the campaign's objective
+            or channel; ``None`` only when the key is absent.
         budget_id: ``campaign_budget.id``; ``None`` when the row has no ``campaignBudget``.
         budget_period: ``DAILY`` or ``CUSTOM_PERIOD``; ``DAILY`` when the budget omits it.
         budget_amount_micros: The budget's own amount in micros at native precision: Google's
             ``amount_micros`` for a ``DAILY`` budget, ``total_amount_micros`` for a
-            ``CUSTOM_PERIOD`` (lifetime) budget. ``None`` when that field is absent (unknown,
-            never zero).
+            ``CUSTOM_PERIOD`` (lifetime) budget; the other period's field is never present.
+            ``None`` when the period's own field is absent (unknown, never zero).
         budget_amount: ``budget_amount_micros`` as an exact amount in the account currency.
         budget_explicitly_shared: Whether the budget is an explicitly shared budget, a decision
-            subject of its own; ``False`` when absent or when there is no budget.
+            subject of its own; ``False`` when absent or when there is no budget. Never ``True``
+            for a ``CUSTOM_PERIOD`` budget.
     """
 
     campaign_id: int
@@ -610,12 +764,15 @@ class CampaignDailyRow:
         cost_micros: ``metrics.cost_micros``.
         impressions: ``metrics.impressions``.
         clicks: ``metrics.clicks``.
-        conversions: ``metrics.conversions``, kept as a decimal (may be fractional).
-        conversions_value: ``metrics.conversions_value`` in the account currency.
-        search_budget_lost_impression_share: Ratio as returned (Google reports "> 90%" as
-            ``0.9001``); ``None`` when unavailable. Stored as ``budget_lost_is``.
-        search_impression_share: Ratio as returned (Google reports "< 10%" as ``0.0999``);
-            ``None`` when unavailable. Stored as ``impression_share``.
+        conversions: ``metrics.conversions``, kept as a decimal (may be fractional); never
+            negative.
+        conversions_value: ``metrics.conversions_value`` in the account currency; never
+            negative.
+        search_budget_lost_impression_share: Fraction from 0 to 1 inclusive, as returned
+            (Google reports "> 90%" as ``0.9001``); ``None`` when unavailable. Stored as
+            ``budget_lost_is``.
+        search_impression_share: Fraction from 0 to 1 inclusive, as returned (Google reports
+            "< 10%" as ``0.0999``); ``None`` when unavailable. Stored as ``impression_share``.
     """
 
     campaign_id: int
@@ -660,12 +817,12 @@ class KeywordViewRow:
         historical_quality_score: ``metrics.historical_quality_score`` from 1 to 10; ``None`` on
             days without a score.
         average_cpc: ``metrics.average_cpc`` converted from micros and rounded half-even to six
-            places (it is derived, not exact); ``None`` without clicks.
+            places (it is derived, not exact); never negative; ``None`` without clicks.
         cost: ``cost_micros`` as an exact amount in the account currency.
         cost_micros: ``metrics.cost_micros``.
         clicks: ``metrics.clicks``.
         impressions: ``metrics.impressions``.
-        conversions: ``metrics.conversions``, kept as a decimal.
+        conversions: ``metrics.conversions``, kept as a decimal; never negative.
     """
 
     ad_group_id: int
@@ -691,18 +848,21 @@ class SearchTermRow:
         search_term: ``search_term_view.search_term``.
         term_status: ``search_term_view.status`` as returned, one of
             :data:`SEARCH_TERM_STATUSES`.
-        matched_criterion_id: Criterion id of the matched keyword, taken from the
-            ``segments.keyword.ad_group_criterion`` resource name; ``""`` when the row matched no
-            keyword criterion (the fact column is not nullable).
+        matched_criterion_id: Criterion id of the matched keyword in canonical decimal form,
+            taken from the ``segments.keyword.ad_group_criterion`` resource name, whose ad-group
+            id must equal ``ad_group_id`` (a criterion id is unique only within its ad group);
+            ``""`` when the row matched no keyword criterion (the fact column is not nullable).
         matched_keyword_text: ``segments.keyword.info.text``; ``None`` when absent.
-        matched_match_type: ``segments.keyword.info.match_type``; ``None`` when absent.
+        matched_match_type: ``segments.keyword.info.match_type`` as returned, one of the
+            contract's ``KeywordMatchTypeEnum`` names; ``None`` when absent.
         cost: ``cost_micros`` as an exact amount in the account currency.
         cost_micros: ``metrics.cost_micros``.
         clicks: ``metrics.clicks``.
         impressions: ``metrics.impressions``.
         conversions: ``metrics.conversions``, kept as a decimal; any fraction counts as
-            converting.
-        conversions_value: ``metrics.conversions_value`` in the account currency.
+            converting; never negative.
+        conversions_value: ``metrics.conversions_value`` in the account currency; never
+            negative.
     """
 
     campaign_id: int
@@ -730,7 +890,8 @@ class KeywordRow:
         criterion_id: ``ad_group_criterion.criterion_id``, unique only within its ad group.
         campaign_id: ``campaign.id``.
         text: ``ad_group_criterion.keyword.text``.
-        match_type: ``ad_group_criterion.keyword.match_type`` as returned.
+        match_type: ``ad_group_criterion.keyword.match_type`` as returned, one of the
+            contract's ``KeywordMatchTypeEnum`` names.
         status: Normalised status through :data:`CAMPAIGN_STATUS_MAP`.
         raw_status: ``ad_group_criterion.status`` as returned.
         quality_score: ``ad_group_criterion.quality_info.quality_score`` from 1 to 10; ``None``
@@ -757,13 +918,16 @@ class ConversionActionRow:
     Attributes:
         conversion_action_id: ``conversion_action.id``.
         name: ``conversion_action.name``.
-        status: ``conversion_action.status`` as returned (``ENABLED``, ``HIDDEN``, ``REMOVED``).
+        status: ``conversion_action.status`` as returned: ``ENABLED``, ``HIDDEN``, ``REMOVED``,
+            ``UNKNOWN`` or ``UNSPECIFIED``.
         include_in_conversions_metric: Whether the action counts in ``metrics.conversions``;
             ``False`` when absent.
-        counting_type: ``ONE_PER_CLICK`` or ``MANY_PER_CLICK`` as returned; ``None`` when absent.
-        attribution_model: ``attribution_model_settings.attribution_model`` as returned (for
-            example ``GOOGLE_ADS_LAST_CLICK``); ``None`` when the action has no attribution
-            settings, which B4 treats as unknown, never as last click.
+        counting_type: ``ONE_PER_CLICK``, ``MANY_PER_CLICK``, ``UNKNOWN`` or ``UNSPECIFIED`` as
+            returned; ``None`` when absent.
+        attribution_model: ``attribution_model_settings.attribution_model`` as returned, one of
+            the contract's ``AttributionModelEnum`` names, the retired rule-based models
+            included (for example ``GOOGLE_ADS_LAST_CLICK``); ``None`` when the action has no
+            attribution settings, which B4 treats as unknown, never as last click.
     """
 
     conversion_action_id: int
@@ -812,8 +976,10 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
     """Parse one Q-G2 or Q-G2b row (contract ``row_campaign``).
 
     The budget amount is read from the field of the budget's own period: ``amount_micros`` for
-    ``DAILY``, ``total_amount_micros`` for ``CUSTOM_PERIOD``. A row without ``campaignBudget``
-    has no budget fields; a ``campaignBudget`` object must carry its id.
+    ``DAILY``, ``total_amount_micros`` for ``CUSTOM_PERIOD``. The two are mutually exclusive, so
+    the other period's field must be absent, and a ``CUSTOM_PERIOD`` budget cannot be explicitly
+    shared. A row without ``campaignBudget`` has no budget fields; a ``campaignBudget`` object
+    must carry its id.
 
     Example::
 
@@ -840,8 +1006,10 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
         The campaign with its budget.
 
     Raises:
-        QueryDefect: When a required field is absent, the status or period is not mapped, or a
-            value has the wrong type.
+        QueryDefect: When a required field is absent, the status or period is not mapped, a
+            present channel type is not one of the contract's enum names, the budget carries
+            the amount field of the other period, a ``CUSTOM_PERIOD`` budget is explicitly
+            shared, or a value has the wrong type.
     """
     reader = _RowReader(row, "row_campaign")
     status, raw_status = reader.status("campaign.status")
@@ -852,8 +1020,18 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
     if reader.raw("campaign_budget") is not None:
         budget_id = reader.identifier("campaign_budget.id")
         budget_period = reader.budget_period("campaign_budget.period")
+        for period, amount_field in _BUDGET_AMOUNT_FIELD.items():
+            if period != budget_period and reader.raw(amount_field) is not None:
+                raise reader.defect(
+                    amount_field, f"absent unless campaign_budget.period is {period}"
+                )
         amount_micros = reader.optional_count(_BUDGET_AMOUNT_FIELD[budget_period])
         shared = reader.flag("campaign_budget.explicitly_shared")
+        if shared and budget_period == "CUSTOM_PERIOD":
+            raise reader.defect(
+                "campaign_budget.explicitly_shared",
+                "false or absent when campaign_budget.period is CUSTOM_PERIOD",
+            )
     return CampaignRow(
         campaign_id=reader.identifier("campaign.id"),
         name=reader.text("campaign.name"),
@@ -861,7 +1039,9 @@ def parse_campaign(row: GoogleAdsRow) -> CampaignRow:
         raw_status=raw_status,
         # The contract always returns the channel type; an absent key stays None (unknown)
         # rather than failing the whole entity sync, as the field's declared type allows.
-        advertising_channel_type=reader.optional_text("campaign.advertising_channel_type"),
+        advertising_channel_type=reader.optional_enum(
+            "campaign.advertising_channel_type", _ADVERTISING_CHANNEL_TYPES
+        ),
         budget_id=budget_id,
         budget_period=budget_period,
         budget_amount_micros=amount_micros,
@@ -880,7 +1060,9 @@ def parse_campaign_daily(row: GoogleAdsRow) -> CampaignDailyRow:
         The campaign's metrics on one native day.
 
     Raises:
-        QueryDefect: When the campaign id or date is absent or a value has the wrong type.
+        QueryDefect: When the campaign id or date is absent, a metric is negative, an
+            impression share lies outside 0 to 1, a key is JSON ``null``, or a value has the
+            wrong type.
     """
     reader = _RowReader(row, "row_campaign_daily")
     cost_micros = reader.count("metrics.cost_micros")
@@ -893,10 +1075,10 @@ def parse_campaign_daily(row: GoogleAdsRow) -> CampaignDailyRow:
         clicks=reader.count("metrics.clicks"),
         conversions=reader.measure("metrics.conversions"),
         conversions_value=reader.measure("metrics.conversions_value"),
-        search_budget_lost_impression_share=reader.optional_measure(
+        search_budget_lost_impression_share=reader.fraction(
             "metrics.search_budget_lost_impression_share"
         ),
-        search_impression_share=reader.optional_measure("metrics.search_impression_share"),
+        search_impression_share=reader.fraction("metrics.search_impression_share"),
     )
 
 
@@ -935,7 +1117,8 @@ def parse_keyword_view(row: GoogleAdsRow) -> KeywordViewRow:
 
     Raises:
         QueryDefect: When an id or the date is absent, the quality score lies outside 1 to 10,
-            or a value has the wrong type.
+            a metric (``average_cpc`` included) is negative, a key is JSON ``null``, or a value
+            has the wrong type.
     """
     reader = _RowReader(row, "row_keyword_view")
     cost_micros = reader.count("metrics.cost_micros")
@@ -953,11 +1136,24 @@ def parse_keyword_view(row: GoogleAdsRow) -> KeywordViewRow:
     )
 
 
-def _matched_criterion_id(reader: _RowReader) -> str:
+def _matched_criterion_id(reader: _RowReader, ad_group_id: int) -> str:
     """Return the criterion id of ``segments.keyword.ad_group_criterion``, or ``""`` without one.
 
-    The resource name has the form ``customers/{customer}/adGroupCriteria/{ad_group}~{criterion}``;
-    the part after ``~`` is the criterion id, returned in canonical decimal form.
+    The resource name has the form ``customers/{customer}/adGroupCriteria/{ad_group}~{criterion}``.
+    A criterion id is unique only within its ad group, so the name's ad-group id must be the
+    row's own ``ad_group.id``; only then is the part after ``~`` returned, in canonical decimal
+    form.
+
+    Args:
+        reader: Reader of the Q-G6 row.
+        ad_group_id: The row's ``ad_group.id``.
+
+    Returns:
+        The criterion id, or ``""`` when the row carries no matched criterion.
+
+    Raises:
+        QueryDefect: When the value is not a string of that form, an id in it exceeds the INT64
+            range, or its ad-group id is not ``ad_group_id``.
     """
     gaql_field = "segments.keyword.ad_group_criterion"
     resource_name = reader.optional_text(gaql_field)
@@ -966,7 +1162,12 @@ def _matched_criterion_id(reader: _RowReader) -> str:
     match = _AD_GROUP_CRITERION_RE.fullmatch(resource_name)
     if match is None:
         raise reader.defect(gaql_field, _AD_GROUP_CRITERION_FORM)
-    return str(int(match.group(1)))
+    customer, ad_group, criterion = (int(part) for part in match.groups())
+    if max(customer, ad_group, criterion) > INT64_MAX:
+        raise reader.defect(gaql_field, _AD_GROUP_CRITERION_IDS)
+    if ad_group != ad_group_id:
+        raise reader.defect(gaql_field, _AD_GROUP_CRITERION_PARENT)
+    return str(criterion)
 
 
 def parse_search_term(row: GoogleAdsRow) -> SearchTermRow:
@@ -981,7 +1182,9 @@ def parse_search_term(row: GoogleAdsRow) -> SearchTermRow:
     Raises:
         QueryDefect: When a required field is absent, the term status is not one of
             :data:`SEARCH_TERM_STATUSES`, the matched criterion is not an ``adGroupCriteria``
-            resource name, or a value has the wrong type.
+            resource name of the row's own ad group with ids in the INT64 range, a present
+            match type is not one of the contract's enum names, a metric is negative, a key is
+            JSON ``null``, or a value has the wrong type.
     """
     reader = _RowReader(row, "row_search_term_view")
     term_status = reader.text("search_term_view.status")
@@ -990,15 +1193,19 @@ def parse_search_term(row: GoogleAdsRow) -> SearchTermRow:
             "search_term_view.status", "one of " + ", ".join(sorted(SEARCH_TERM_STATUSES))
         )
     cost_micros = reader.count("metrics.cost_micros")
+    campaign_id = reader.identifier("campaign.id")
+    ad_group_id = reader.identifier("ad_group.id")
     return SearchTermRow(
-        campaign_id=reader.identifier("campaign.id"),
-        ad_group_id=reader.identifier("ad_group.id"),
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
         date=reader.day("segments.date"),
         search_term=reader.text("search_term_view.search_term"),
         term_status=term_status,
-        matched_criterion_id=_matched_criterion_id(reader),
+        matched_criterion_id=_matched_criterion_id(reader, ad_group_id),
         matched_keyword_text=reader.optional_text("segments.keyword.info.text"),
-        matched_match_type=reader.optional_text("segments.keyword.info.match_type"),
+        matched_match_type=reader.optional_enum(
+            "segments.keyword.info.match_type", _KEYWORD_MATCH_TYPES
+        ),
         cost=_micros_to_amount(cost_micros),
         cost_micros=cost_micros,
         clicks=reader.count("metrics.clicks"),
@@ -1018,8 +1225,9 @@ def parse_keyword(row: GoogleAdsRow) -> KeywordRow:
         The keyword, with its quality score when Google has populated one.
 
     Raises:
-        QueryDefect: When a required field is absent, the status is not mapped, the quality
-            score lies outside 1 to 10, or a value has the wrong type.
+        QueryDefect: When a required field is absent, the status is not mapped, the match type
+            is not one of the contract's enum names, the quality score lies outside 1 to 10, or
+            a value has the wrong type.
     """
     reader = _RowReader(row, "row_ad_group_criterion")
     status, raw_status = reader.status("ad_group_criterion.status")
@@ -1028,7 +1236,7 @@ def parse_keyword(row: GoogleAdsRow) -> KeywordRow:
         criterion_id=reader.identifier("ad_group_criterion.criterion_id"),
         campaign_id=reader.identifier("campaign.id"),
         text=reader.text("ad_group_criterion.keyword.text"),
-        match_type=reader.text("ad_group_criterion.keyword.match_type"),
+        match_type=reader.enum("ad_group_criterion.keyword.match_type", _KEYWORD_MATCH_TYPES),
         status=status,
         raw_status=raw_status,
         quality_score=reader.score("ad_group_criterion.quality_info.quality_score"),
@@ -1045,21 +1253,25 @@ def parse_conversion_action(row: GoogleAdsRow) -> ConversionActionRow:
         The conversion action with its raw counting contract.
 
     Raises:
-        QueryDefect: When the id, name or status is absent or a value has the wrong type.
+        QueryDefect: When the id, name or status is absent, the status or a present counting
+            type or attribution model is not one of the contract's enum names, or a value has
+            the wrong type.
     """
     reader = _RowReader(row, "row_conversion_action")
     return ConversionActionRow(
         conversion_action_id=reader.identifier("conversion_action.id"),
         name=reader.text("conversion_action.name"),
-        status=reader.text("conversion_action.status"),
+        status=reader.enum("conversion_action.status", _CONVERSION_ACTION_STATUSES),
         include_in_conversions_metric=reader.flag(
             "conversion_action.include_in_conversions_metric"
         ),
         # The contract always returns the counting type; an absent key stays None, which B4
         # reads as an unknown counting contract, instead of failing the whole entity sync.
-        counting_type=reader.optional_text("conversion_action.counting_type"),
-        attribution_model=reader.optional_text(
-            "conversion_action.attribution_model_settings.attribution_model"
+        counting_type=reader.optional_enum("conversion_action.counting_type", _COUNTING_TYPES),
+        attribution_model=reader.optional_enum(
+            "conversion_action.attribution_model_settings.attribution_model",
+            _ATTRIBUTION_MODELS,
+            expected=_ATTRIBUTION_MODEL_EXPECTED,
         ),
     )
 
