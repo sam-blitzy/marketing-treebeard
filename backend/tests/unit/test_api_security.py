@@ -182,6 +182,20 @@ class _UnparseableParametersHasher(PasswordHasher):
         raise InvalidHashError
 
 
+def _truncate_tag(stored: str) -> str:
+    """Cut the hash's base64 tag to its longest prefix that no base64 decoder can read.
+
+    Unpadded base64 decodes to whole bytes only at lengths of 0, 2 or 3 modulo 4. Cutting a
+    fixed count can leave a readable shorter tag: ``[:-5]`` turns a 43-character 32-byte tag
+    into 38 characters, a valid 28-byte tag whenever its 4 spare bits are zero (about one
+    hash in 16), which libargon2 verifies as an ordinary mismatch. A length of 1 modulo 4
+    always leaves 6 undecodable bits, so libargon2 rejects the hash as unreadable every time.
+    """
+    head, tag = stored.rsplit("$", 1)
+    keep = len(tag) - 1 - (len(tag) - 2) % 4
+    return f"{head}${tag[:keep]}"
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -317,7 +331,7 @@ def test_verify_password_rehashes_when_the_parameter_parser_cannot_read_the_hash
         pytest.param(lambda _stored: "not-a-hash", id="garbage"),
         pytest.param(lambda _stored: "", id="empty"),
         pytest.param(lambda stored: stored.replace("$argon2id$", "$argon2x$", 1), id="variant"),
-        pytest.param(lambda stored: stored[:-5], id="truncated"),
+        pytest.param(_truncate_tag, id="truncated"),
         pytest.param(lambda stored: stored.replace("m=65536,", "m=1,", 1), id="parameters"),
         pytest.param(lambda stored: stored[:-1] + "é", id="non-ascii"),
     ],
