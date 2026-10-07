@@ -1,0 +1,65 @@
+# Ads Action Engine: files that never belong in the repository.
+#
+# Committed on purpose and never ignored here: .env.example, backend/uv.lock,
+# web/package-lock.json (CI installs with `uv sync --frozen` and `npm ci`), config/*.yaml,
+# backend/migrations/versions/, backend/tests/contracts/** including the redacted live
+# captures in */captured/, and backend/tests/fixtures/**.
+
+# -----------------------------------------------------------------------------
+# Secrets and environment
+# -----------------------------------------------------------------------------
+
+# .env is written by `make init` and holds SESSION_SECRET, APP_ADMIN_PASSWORD_HASH and the
+# source credentials. Every variant is ignored; only the empty-secret template is tracked.
+.env
+.env.*
+!.env.example
+
+# -----------------------------------------------------------------------------
+# Python: backend/ (uv, ruff, mypy, pytest, coverage)
+# -----------------------------------------------------------------------------
+
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+# Package build output (`uv build`); scoped to backend/ so no other tree is affected.
+/backend/build/
+/backend/dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# -----------------------------------------------------------------------------
+# Node: web/ (Vite 8, Vitest 5, Playwright 1.63, TypeScript 6)
+# -----------------------------------------------------------------------------
+
+node_modules/
+/web/dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+# Vitest coverage reports (coverage.reportsDirectory).
+/web/coverage/
+# Vitest 5 writes reporter output, attachments and traces under .vitest/.
+.vitest/
+# Playwright output. test-results/.auth/ holds the e2e session storage state.
+/web/playwright-report/
+/web/test-results/
+/web/blob-report/
+/web/playwright/.cache/
+
+# -----------------------------------------------------------------------------
+# Editors and operating systems
+# -----------------------------------------------------------------------------
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
