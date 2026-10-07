@@ -1,0 +1,1819 @@
+"""Pydantic request and response contract of the ``/api/v1`` REST API (AAP 0.5.3).
+
+Every route in ``ads_engine.api.routes`` declares its request body and ``response_model`` from
+this module, and ``web/src/api/types.ts`` mirrors it field for field, so the names and nesting
+here are the wire contract. The groups are:
+
+* **Shared types**: :data:`Money`, :data:`MetricValue` and the ``Literal`` vocabularies
+  (:data:`SourceName`, :data:`SectionKey`, :data:`FlagCode` …), each declared once.
+* **Errors**: :class:`ErrorResponse` (``{"error": {"code", "message"}}``) and
+  :data:`ERROR_RESPONSES` for the routes' ``responses=``.
+* **Auth and runs**: :class:`LoginRequest`, :class:`Me`, :class:`Run`,
+  :class:`CreateRunRequest`.
+* **Recommendations page**: :class:`RecommendationsPage` with its sections, groups, items,
+  frozen :class:`Evidence` and the read-time :class:`ItemOverlay` and :class:`Overlay`;
+  :class:`FeedbackRequest` and :class:`Feedback`.
+* **Decisions and discrepancies**: :class:`DecisionRequest` (a patch, AAP 0.5.2),
+  :class:`ResolveRequest`, :class:`Decision` and :class:`Discrepancy`.
+* **Sources, config and health**: :class:`Source`, :class:`SyncRequestView`,
+  :class:`ConfigView` and :class:`Health`.
+
+Conventions:
+
+* Money is ``Decimal`` and serialises as a decimal string (``"12.340000"``), never a float,
+  so amounts keep their exact precision. Amounts are never summed across currencies.
+* Responses (:class:`ApiModel`) ignore unknown keys: frozen ``jsonb`` evidence may carry
+  rule-specific keys, which travel in :attr:`Evidence.extra`. Requests (:class:`RequestModel`)
+  forbid unknown keys, so a misspelt field is a 422 rather than a silent no-op.
+* A field typed ``X | None`` without a default is always present and may be ``null``; a field
+  with a ``None`` default is optional in requests and serialised as ``null`` when unset.
+* A missing number is ``null`` ("unavailable"), never ``0`` (AAP 0.11.1).
+
+The ``Literal`` vocabularies duplicate the tuples the database ``CHECK`` constraints are built
+from. :func:`_check_vocabularies` compares every pair once at import and raises
+:class:`RuntimeError` on drift, so the API can never accept or emit a value the schema rejects.
+
+Purity: models and pure mapping helpers (``from_row``) only. No I/O, no database query, no
+settings read; the module imports nothing from ``connectors``, ``sync``, ``simulation`` or
+``api.routes``.
+
+Example:
+    >>> DecisionPatchIn.model_validate({"daily_budget": "120.50"}).present_fields()
+    {'daily_budget': Decimal('120.50')}
+"""
+
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import date
+from decimal import Decimal
+from typing import Annotated, Any, Final, Literal, Self, get_args
+
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from ads_engine.analysis.context import (
+    DATA_STATUS_VALUES,
+    FINDING_CODES,
+    FLAG_CODES,
+    SECTION_ORDER,
+    TONES,
+)
+from ads_engine.analysis.thresholds import ContentAsset, Thresholds
+from ads_engine.db.models.accounts import CAMPAIGN_STATUSES
+from ads_engine.db.models.analysis import (
+    DATA_STATUSES,
+    FEEDBACK_KINDS,
+    RECOMMENDATION_SECTIONS,
+    RUN_KINDS,
+    RUN_STATUSES,
+    RUN_TRIGGERS,
+    AnalysisRun,
+    RecommendationFeedback,
+    RunFinding,
+    RunWithheld,
+)
+from ads_engine.db.models.decisions import (
+    DECISION_ORIGINS,
+    DECISION_SHAPES,
+    DISCREPANCY_KINDS,
+    DISCREPANCY_RESOLUTIONS,
+    DISCREPANCY_STATES,
+    SUBJECT_TYPES,
+)
+from ads_engine.db.models.decisions import Decision as DecisionRow
+from ads_engine.db.models.decisions import Discrepancy as DiscrepancyRow
+from ads_engine.db.models.ops import (
+    COMPLETENESS,
+    CONNECTION_STATUSES,
+    DATASET_ROLES,
+    DATASET_STATES,
+    MODES,
+    SOURCES,
+    SYNC_RUN_STATUSES,
+    DatasetFreshness,
+    SourceDataset,
+    SyncRequest,
+    SyncRun,
+)
+
+__all__ = [
+    "ERROR_RESPONSES",
+    "NOTE_MAX_LENGTH",
+    "ApiModel",
+    "Banner",
+    "BannerTone",
+    "Baseline",
+    "CampaignStatus",
+    "Completeness",
+    "ConfigView",
+    "ConnectionStatus",
+    "ContentAssetView",
+    "CreateRunRequest",
+    "DataModes",
+    "DataStatus",
+    "DatasetCoverage",
+    "DatasetFreshnessView",
+    "DatasetRole",
+    "DatasetState",
+    "DatasetView",
+    "Decision",
+    "DecisionOrigin",
+    "DecisionPatchIn",
+    "DecisionRequest",
+    "DecisionShape",
+    "DecisionSubjectRef",
+    "Discrepancy",
+    "DiscrepancyKind",
+    "DiscrepancyState",
+    "EntityView",
+    "ErrorDetail",
+    "ErrorResponse",
+    "Evidence",
+    "EvidenceWindow",
+    "Feedback",
+    "FeedbackKind",
+    "FeedbackRequest",
+    "Finding",
+    "FindingCode",
+    "Flag",
+    "FlagCode",
+    "Group",
+    "Health",
+    "IntendedStateIn",
+    "Item",
+    "ItemOverlay",
+    "LoginRequest",
+    "Me",
+    "Metric",
+    "MetricValue",
+    "Mode",
+    "Money",
+    "Overlay",
+    "Projection",
+    "ProvenanceEntry",
+    "RecommendationsPage",
+    "RequestModel",
+    "ResolutionKey",
+    "ResolveRequest",
+    "Run",
+    "RunKind",
+    "RunStatus",
+    "RunTrigger",
+    "Sample",
+    "Section",
+    "SectionKey",
+    "Source",
+    "SourceDay",
+    "SourceModes",
+    "SourceName",
+    "StatTest",
+    "SubjectIn",
+    "SubjectType",
+    "SubjectView",
+    "SyncRequestView",
+    "SyncRunStatus",
+    "SyncRunView",
+    "WindowConfig",
+    "Withheld",
+    "WithheldSample",
+]
+
+# ---------------------------------------------------------------------------
+# Shared scalar types
+# ---------------------------------------------------------------------------
+
+
+def _money_input(value: object) -> object:
+    """Refuse JSON numbers with a fraction (``float``) and booleans as money input.
+
+    A float has already lost decimal precision by the time it reaches the API (``0.1`` is not
+    exactly one tenth), so amounts must arrive as decimal strings or whole integers.
+
+    Raises:
+        ValueError: When ``value`` is a ``float`` or a ``bool``.
+    """
+    if isinstance(value, bool | float):
+        raise ValueError('send amounts as decimal strings such as "120.50", not JSON numbers')
+    return value
+
+
+def _money_output(value: Decimal) -> str:
+    """Render an amount as fixed-point text, never exponent notation.
+
+    ``str(Decimal("1E+2"))`` is ``"1E+2"``; an amount submitted that way and returned from a
+    just-written row before the database normalises it must still reach the client as
+    ``"100"``, the form frozen evidence and the decision patch use.
+    """
+    return format(value, "f")
+
+
+Money = Annotated[
+    Decimal,
+    BeforeValidator(_money_input),
+    Field(max_digits=18, decimal_places=6, allow_inf_nan=False),
+    PlainSerializer(_money_output, return_type=str, when_used="json"),
+]
+"""An exact amount in one account's currency, matching the ``numeric(18,6)`` columns.
+
+Serialised as a fixed-point decimal string (``"120.500000"``), never in exponent notation.
+Clients send a decimal string or a whole integer; a JSON number with a fraction is refused,
+because it has already lost precision.
+Validation to the currency's minor unit is ``ads_engine.decisions``' job (AAP 0.5.2).
+"""
+
+
+def _metric_input(value: object) -> object:
+    """Render a ``Decimal`` metric value as the fixed-point string the runner stores.
+
+    Frozen evidence holds Decimals as strings (``analysis.context.json_value``); values read
+    from ``numeric`` columns, such as ``run_withheld.observed``, arrive as ``Decimal`` and are
+    rendered the same way, so one value type reaches the client.
+
+    Raises:
+        ValueError: When the ``Decimal`` is not finite.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"metric values must be finite, found {value}")
+        return format(value, "f")
+    return value
+
+
+MetricValue = Annotated[str | int | float | bool | None, BeforeValidator(_metric_input)]
+"""A value copied from frozen evidence ``jsonb``: decimal strings for exact numbers (money,
+rates, shares), integers for counts, a pre-rendered string such as ``"n/a"``, or ``null`` for
+unavailable (never ``0``)."""
+
+# ---------------------------------------------------------------------------
+# Vocabularies (each equal to its database tuple; checked at import)
+# ---------------------------------------------------------------------------
+
+SourceName = Literal["google", "linkedin", "hubspot"]
+"""An external data source (``db.models.ops.SOURCES``)."""
+
+Mode = Literal["live", "simulated"]
+"""Whether a dataset holds real platform data or seeded mock data (``MODES``)."""
+
+DatasetRole = Literal["primary", "companion"]
+"""A source's own dataset, or the simulated CRM companion of a LinkedIn one."""
+
+DatasetState = Literal["building", "active", "retired"]
+"""Dataset lifecycle (``DATASET_STATES``)."""
+
+Completeness = Literal["complete", "incomplete", "unknown"]
+"""Completeness of a dataset over its covered range (``COMPLETENESS``)."""
+
+ConnectionStatus = Literal["ok", "stale", "denied", "error"]
+"""Health of a source connection (``CONNECTION_STATUSES``)."""
+
+SyncRunStatus = Literal["running", "succeeded", "failed"]
+"""Outcome of one sync job run (``SYNC_RUN_STATUSES``)."""
+
+SectionKey = Literal["keywords", "campaigns", "budget", "creative", "white_papers"]
+"""The five sections, in the fixed order the page returns them (``RECOMMENDATION_SECTIONS``)."""
+
+RunKind = Literal["default", "custom"]
+"""``default``: the worker's run of the configured window; ``custom``: any explicit window."""
+
+RunTrigger = Literal["scheduled", "event", "manual"]
+"""What started a run (``RUN_TRIGGERS``)."""
+
+RunStatus = Literal["running", "succeeded", "failed"]
+"""Run lifecycle (``RUN_STATUSES``)."""
+
+DataStatus = Literal["live", "simulated", "stale", "mixed"]
+"""An item's data status; ``mixed`` marks a join of live and simulated datasets."""
+
+FeedbackKind = Literal["dismiss", "snooze", "done"]
+"""Feedback on an item (``FEEDBACK_KINDS``)."""
+
+SubjectType = Literal["campaign", "budget"]
+"""What a decision or discrepancy is about (``SUBJECT_TYPES``)."""
+
+DecisionShape = Literal["own_budget", "shared_member", "budget"]
+"""The decision shape fixed by the subject's current state (AAP 0.5.2)."""
+
+DecisionOrigin = Literal["baseline", "user", "recommendation", "resolution"]
+"""Who wrote a decision row (``DECISION_ORIGINS``)."""
+
+CampaignStatus = Literal["active", "paused", "ended"]
+"""A campaign's normalised status (``CAMPAIGN_STATUSES``)."""
+
+DiscrepancyKind = Literal["status", "budget", "untracked", "missing"]
+"""The C0 discrepancy kinds (AAP 0.5.4.4)."""
+
+DiscrepancyState = Literal["open", "awaiting_platform", "resolved"]
+"""Discrepancy lifecycle (``DISCREPANCY_STATES``)."""
+
+ResolutionKey = Literal[
+    "platform_correct",
+    "decision_correct",
+    "adopt_platform",
+    "record_intended",
+    "acknowledge_removal",
+]
+"""The resolution API keys (``DISCREPANCY_RESOLUTIONS``, AAP 0.5.4.4)."""
+
+BannerTone = Literal["neutral", "info", "warning", "critical", "success"]
+"""A banner or badge tone (AAP 0.4.2 ``Badge``/``Banner``; ``analysis.context.TONES``)."""
+
+FlagCode = Literal[
+    "simulated",
+    "stale",
+    "incomplete",
+    "short_window",
+    "unverified_discrepancies",
+    "attribution_floor",
+    "creative_floor",
+    "deal_floor",
+    "unknown_crm_evidence",
+    "meeting_time_proxy",
+    "pipeline_unavailable",
+    "no_crm_link",
+    "not_distinguishable",
+    "search_term_coverage",
+    "shared_budget",
+]
+"""Every AAP 0.5.3 ``Flag`` code (``analysis.context.FLAG_CODES``)."""
+
+FindingCode = Literal[
+    "no_crm_link",
+    "search_term_coverage",
+    "k1_no_baseline",
+    "segment_window_unavailable",
+    "pipeline_unavailable",
+    "skipped_stage",
+    "conversion_tracking_absent",
+    "incomplete_dataset",
+]
+"""Every AAP 0.5.3 ``Finding`` code (``analysis.context.FINDING_CODES``)."""
+
+NOTE_MAX_LENGTH: Final = 2000
+"""The longest free-text note a decision, resolution or feedback request may carry."""
+
+
+def _check_vocabularies() -> None:
+    """Fail at import when a ``Literal`` vocabulary drifts from the tuple it mirrors.
+
+    Every alias must hold exactly the values of its database or analysis tuple, and
+    :data:`SectionKey` must also keep the order of ``analysis.context.SECTION_ORDER``, which
+    is the order the page returns sections in. Written as ``if … raise`` so the check also
+    runs under ``python -O``.
+
+    Raises:
+        RuntimeError: Naming the alias, the tuple and both value sets on the first mismatch.
+    """
+    pairs: tuple[tuple[str, object, Sequence[str], str], ...] = (
+        ("SourceName", SourceName, SOURCES, "db.models.ops.SOURCES"),
+        ("Mode", Mode, MODES, "db.models.ops.MODES"),
+        ("DatasetState", DatasetState, DATASET_STATES, "db.models.ops.DATASET_STATES"),
+        ("DatasetRole", DatasetRole, DATASET_ROLES, "db.models.ops.DATASET_ROLES"),
+        ("Completeness", Completeness, COMPLETENESS, "db.models.ops.COMPLETENESS"),
+        (
+            "ConnectionStatus",
+            ConnectionStatus,
+            CONNECTION_STATUSES,
+            "db.models.ops.CONNECTION_STATUSES",
+        ),
+        ("SyncRunStatus", SyncRunStatus, SYNC_RUN_STATUSES, "db.models.ops.SYNC_RUN_STATUSES"),
+        (
+            "SectionKey",
+            SectionKey,
+            RECOMMENDATION_SECTIONS,
+            "db.models.analysis.RECOMMENDATION_SECTIONS",
+        ),
+        ("RunKind", RunKind, RUN_KINDS, "db.models.analysis.RUN_KINDS"),
+        ("RunTrigger", RunTrigger, RUN_TRIGGERS, "db.models.analysis.RUN_TRIGGERS"),
+        ("RunStatus", RunStatus, RUN_STATUSES, "db.models.analysis.RUN_STATUSES"),
+        ("FeedbackKind", FeedbackKind, FEEDBACK_KINDS, "db.models.analysis.FEEDBACK_KINDS"),
+        ("DataStatus", DataStatus, DATA_STATUSES, "db.models.analysis.DATA_STATUSES"),
+        ("DataStatus", DataStatus, DATA_STATUS_VALUES, "analysis.context.DATA_STATUS_VALUES"),
+        ("SubjectType", SubjectType, SUBJECT_TYPES, "db.models.decisions.SUBJECT_TYPES"),
+        ("DecisionShape", DecisionShape, DECISION_SHAPES, "db.models.decisions.DECISION_SHAPES"),
+        (
+            "DecisionOrigin",
+            DecisionOrigin,
+            DECISION_ORIGINS,
+            "db.models.decisions.DECISION_ORIGINS",
+        ),
+        (
+            "CampaignStatus",
+            CampaignStatus,
+            CAMPAIGN_STATUSES,
+            "db.models.accounts.CAMPAIGN_STATUSES",
+        ),
+        (
+            "DiscrepancyKind",
+            DiscrepancyKind,
+            DISCREPANCY_KINDS,
+            "db.models.decisions.DISCREPANCY_KINDS",
+        ),
+        (
+            "DiscrepancyState",
+            DiscrepancyState,
+            DISCREPANCY_STATES,
+            "db.models.decisions.DISCREPANCY_STATES",
+        ),
+        (
+            "ResolutionKey",
+            ResolutionKey,
+            DISCREPANCY_RESOLUTIONS,
+            "db.models.decisions.DISCREPANCY_RESOLUTIONS",
+        ),
+        ("BannerTone", BannerTone, TONES, "analysis.context.TONES"),
+        ("FlagCode", FlagCode, FLAG_CODES, "analysis.context.FLAG_CODES"),
+        ("FindingCode", FindingCode, FINDING_CODES, "analysis.context.FINDING_CODES"),
+    )
+    for alias_name, alias, values, values_name in pairs:
+        literal_values = get_args(alias)
+        if set(literal_values) != set(values) or len(literal_values) != len(values):
+            raise RuntimeError(
+                f"api.schemas.{alias_name} {sorted(literal_values)} does not match "
+                f"{values_name} {sorted(values)}"
+            )
+    if get_args(SectionKey) != tuple(SECTION_ORDER):
+        raise RuntimeError(
+            f"api.schemas.SectionKey order {list(get_args(SectionKey))} does not match "
+            f"analysis.context.SECTION_ORDER {list(SECTION_ORDER)}"
+        )
+
+
+_check_vocabularies()
+
+# ---------------------------------------------------------------------------
+# Base classes and the error shape
+# ---------------------------------------------------------------------------
+
+
+class ApiModel(BaseModel):
+    """Base of every response model.
+
+    Unknown keys are ignored, because frozen ``jsonb`` evidence may gain keys after the
+    contract was written; rule-specific data travels in :attr:`Evidence.extra`.
+    ``from_attributes`` lets a model validate straight from an ORM row whose attribute names
+    match its fields.
+    """
+
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
+
+
+class RequestModel(BaseModel):
+    """Base of every request body: an unknown field is a 422, never silently dropped."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ErrorDetail(ApiModel):
+    """The body of an error response.
+
+    Attributes:
+        code: Machine-readable code, for example ``subject_retired`` or ``run_in_progress``.
+        message: Human-readable explanation.
+    """
+
+    code: str
+    message: str
+
+
+class ErrorResponse(ApiModel):
+    """Every error the API returns: ``{"error": {"code", "message"}}`` (AAP 0.5.3).
+
+    Attributes:
+        error: The error's code and message.
+    """
+
+    error: ErrorDetail
+
+
+ERROR_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    401: {"model": ErrorResponse, "description": "Not signed in (no valid session cookie)"},
+    403: {"model": ErrorResponse, "description": "Missing X-Requested-With: ads-engine header"},
+    404: {"model": ErrorResponse, "description": "Not found"},
+    409: {"model": ErrorResponse, "description": "Conflict, for example subject_retired"},
+    422: {"model": ErrorResponse, "description": "Validation error"},
+    429: {"model": ErrorResponse, "description": "Too many login attempts"},
+}
+"""The documented error statuses, for every route's ``responses=`` (OpenAPI only)."""
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+class LoginRequest(RequestModel):
+    """``POST /auth/login`` body.
+
+    Attributes:
+        email: The admin email, trimmed and lowercased before the length check, so the login
+            matches ``app_user.email`` whatever case the user typed.
+        password: The password exactly as typed: never trimmed or transformed, because every
+            character is part of the secret.
+    """
+
+    email: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _normalise_email(cls, value: object) -> object:
+        """Trim and lowercase the email; non-strings fall through to the type check."""
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class Me(ApiModel):
+    """The signed-in user (``GET /auth/me``, ``POST /auth/login``).
+
+    Attributes:
+        email: The admin email.
+    """
+
+    email: str
+
+
+# ---------------------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------------------
+
+
+class SourceDay(ApiModel):
+    """One source's date range and native day boundary within a window (AAP 0.5.4.1).
+
+    Attributes:
+        source: The day source (Google or LinkedIn; HubSpot holds instants only).
+        start: The first native date, inclusive.
+        end: The last native date, inclusive.
+        boundary: The IANA zone whose midnight ends the source's days, for example
+            ``America/New_York`` for Google or ``UTC`` for LinkedIn.
+    """
+
+    source: SourceName
+    start: date
+    end: date
+    boundary: str
+
+
+class _PerSourceModes(ApiModel):
+    """The mode of each source; ``None`` where a source has no dataset."""
+
+    google: Mode | None = None
+    linkedin: Mode | None = None
+    hubspot: Mode | None = None
+
+
+class DataModes(_PerSourceModes):
+    """The mode of each source as a run read it, frozen with the run (``Run.data_modes``).
+
+    Attributes:
+        google: Google's mode at compute time; ``None`` when it had no active dataset.
+        linkedin: LinkedIn's mode at compute time.
+        hubspot: HubSpot's mode at compute time.
+    """
+
+
+def _source_rank(entry: object) -> int:
+    """Sort key placing a ``source_days`` element in ``SOURCES`` order (unknown last)."""
+    source = entry.get("source") if isinstance(entry, Mapping) else None
+    return SOURCES.index(source) if source in SOURCES else len(SOURCES)
+
+
+class Run(ApiModel):
+    """Run metadata (AAP 0.5.3 ``Run``): ``GET /runs/*``, ``POST /runs`` and the page header.
+
+    Attributes:
+        id: The ``analysis_run`` id; the UI addresses a custom run as ``/actions?run=<id>``.
+        kind: ``default`` or ``custom``.
+        window_start: First calendar date of the window.
+        window_end: Last calendar date of the window, inclusive.
+        days: Days in the window, both ends included.
+        source_days: Each day source's range and native day boundary, Google then LinkedIn.
+        display_timezone: ``DISPLAY_TIMEZONE``, used only to format instants.
+        short_window: Whether ``days`` is below ``trusted_min_days`` (AAP 0.5.4.1).
+        default_days: ``window.default_days``.
+        trusted_min_days: ``window.trusted_min_days``.
+        trigger: ``scheduled``, ``event`` or ``manual``.
+        data_modes: Each source's mode as the run read it.
+        config_hash: Hash of the configuration the run used.
+        status: ``running``, ``succeeded`` or ``failed``.
+        finished_at: When the run finished; ``None`` while running.
+    """
+
+    id: int
+    kind: RunKind
+    window_start: date
+    window_end: date
+    days: int
+    source_days: list[SourceDay]
+    display_timezone: str
+    short_window: bool
+    default_days: int
+    trusted_min_days: int
+    trigger: RunTrigger
+    data_modes: DataModes
+    config_hash: str
+    status: RunStatus
+    finished_at: AwareDatetime | None
+
+    @classmethod
+    def from_row(cls, run: AnalysisRun, *, thresholds: Thresholds, display_timezone: str) -> Self:
+        """Build the view of a stored run.
+
+        ``analysis_run`` stores no window settings, so ``default_days`` and
+        ``trusted_min_days`` come from the loaded configuration, and ``short_window`` is
+        ``days < trusted_min_days`` with that configured minimum, never a literal
+        (AAP 0.5.4.1). The flags frozen in each item's evidence keep the values the run used.
+
+        Args:
+            run: The stored run.
+            thresholds: The loaded configuration (``window.default_days`` and
+                ``window.trusted_min_days``).
+            display_timezone: ``DISPLAY_TIMEZONE`` from the settings.
+
+        Returns:
+            The run view, with ``source_days`` in ``SOURCES`` order and a ``None`` mode for
+            every source absent from ``run.data_modes``.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        days = (run.window_end - run.window_start).days + 1
+        trusted_min_days = thresholds.trusted_min_days
+        modes: Mapping[str, Any] = run.data_modes or {}
+        return cls.model_validate(
+            {
+                "id": run.id,
+                "kind": run.kind,
+                "window_start": run.window_start,
+                "window_end": run.window_end,
+                "days": days,
+                "source_days": sorted(run.source_day_boundaries or [], key=_source_rank),
+                "display_timezone": display_timezone,
+                "short_window": days < trusted_min_days,
+                "default_days": thresholds.default_days,
+                "trusted_min_days": trusted_min_days,
+                "trigger": run.trigger,
+                "data_modes": {source: modes.get(source) for source in SOURCES},
+                "config_hash": run.config_hash,
+                "status": run.status,
+                "finished_at": run.finished_at,
+            }
+        )
+
+
+class CreateRunRequest(RequestModel):
+    """``POST /runs`` body: a custom window of calendar dates applied to each source's days.
+
+    The span (1 day to ``window.max_days``) and the end (no later than the default window
+    end) are validated by ``AnalysisWindow.custom``, whose ``InvalidWindow`` the app maps to
+    422, so those rules live in one place.
+
+    Attributes:
+        window_start: First calendar date, inclusive.
+        window_end: Last calendar date, inclusive.
+    """
+
+    window_start: date
+    window_end: date
+
+
+# ---------------------------------------------------------------------------
+# Recommendations page: entity, flags and evidence (AAP 0.5.3, 0.5.4.8)
+# ---------------------------------------------------------------------------
+
+
+class Flag(ApiModel):
+    """A badge on an item (AAP 0.5.3 ``Flag``).
+
+    Attributes:
+        code: The flag code.
+        message: The badge's explanatory text, for example "Data as of 2026-10-01 03:10".
+    """
+
+    code: FlagCode
+    message: str
+
+
+class EntityView(ApiModel):
+    """The entity an item, finding or withheld pattern is about: ``{source, type, id, name}``.
+
+    ``id`` is an opaque identifier, always serialised as a string: the platform's external id
+    for items, and for findings and withheld patterns the identifier recorded with them at
+    compute time (an internal row id is rendered as its decimal string). ``None`` for an
+    account-wide or composite entity without one.
+
+    Attributes:
+        source: The entity's source.
+        type: The entity type, for example ``campaign``, ``search_term`` or
+            ``content_asset``.
+        id: The identifier, as a string.
+        name: The display name.
+    """
+
+    # Stored entity JSON carries integer ids; coercion keeps the wire type a single string.
+    model_config = ConfigDict(extra="ignore", from_attributes=True, coerce_numbers_to_str=True)
+
+    source: SourceName | None
+    type: str | None
+    id: str | None
+    name: str | None
+
+
+class EvidenceWindow(ApiModel):
+    """The exact window an item was computed over (``Evidence.window``).
+
+    Attributes:
+        start: First calendar date.
+        end: Last calendar date, inclusive.
+        days: Days in the window.
+        source_days: Each day source's range and native day boundary.
+    """
+
+    start: date
+    end: date
+    days: int
+    source_days: list[SourceDay]
+
+
+class Metric(ApiModel):
+    """One number an item's reason cites (``Evidence.metrics``).
+
+    Attributes:
+        key: Stable machine key, for example ``spend`` or ``cost_per_conversion``.
+        label: Display label.
+        value: The value; ``None`` means unavailable and renders "unavailable", never 0.
+        unit: The unit, for example ``currency``, ``clicks``, ``ratio`` or ``days``.
+        currency: ISO currency code for money values.
+        floor: Whether the value is a floor, rendered "≥ N" or "≤ X" (AAP 0.5.4.7).
+        unavailable: Whether the value is unavailable.
+    """
+
+    key: str
+    label: str
+    value: MetricValue
+    unit: str | None
+    currency: str | None = None
+    floor: bool | None = None
+    unavailable: bool | None = None
+
+
+class Baseline(ApiModel):
+    """A value an item's metrics were compared against (``Evidence.baselines``).
+
+    Attributes:
+        key: Stable machine key, for example ``account_cost_per_outcome``.
+        label: Display label.
+        value: The baseline; ``None`` when unavailable.
+    """
+
+    key: str
+    label: str
+    value: MetricValue
+
+
+class Projection(ApiModel):
+    """A labelled projection beside a sample, for example CR3's impressions per variant.
+
+    Attributes:
+        value: The projected figure.
+        unit: Its unit, for example ``impressions`` or ``days``.
+        basis: How it was projected, for example "projected through the observed open rate".
+    """
+
+    value: MetricValue
+    unit: str
+    basis: str
+
+
+class Sample(ApiModel):
+    """A sample size against its minimum, in the unit the rule uses (AAP 0.5.4.8).
+
+    Attributes:
+        observed: The sample observed.
+        required: The minimum the rule requires.
+        unit: The unit, for example ``clicks``, ``impressions``, ``form opens`` or ``days``.
+        projected: An optional labelled projection.
+    """
+
+    observed: MetricValue
+    required: MetricValue
+    unit: str
+    projected: Projection | None = None
+
+
+class StatTest(ApiModel):
+    """The statistical test behind an item (``Evidence.test``).
+
+    Named ``StatTest`` rather than ``Test…`` so pytest never collects it.
+
+    Attributes:
+        name: The test, for example "Fisher's exact test".
+        p_value: The raw p-value; ``None`` when it could not be computed.
+        p_adjusted: The Holm-adjusted p-value, when a correction applies.
+        alpha: The significance level the result is judged at.
+    """
+
+    name: str
+    p_value: MetricValue
+    p_adjusted: MetricValue = None
+    alpha: MetricValue
+
+
+class DatasetCoverage(ApiModel):
+    """A dataset an item read, with its completeness and coverage at compute time.
+
+    Attributes:
+        dataset: The dataset name, for example ``google.search_terms``.
+        completeness: ``complete``, ``incomplete`` or ``unknown``.
+        covered_through: The last native date the dataset covered; ``None`` when unknown.
+    """
+
+    dataset: str
+    completeness: Completeness
+    covered_through: date | None
+
+
+class ProvenanceEntry(ApiModel):
+    """One dataset an item read, as it was when the run computed it (AAP 0.3.2).
+
+    Attributes:
+        source: The dataset's source.
+        dataset_id: The ``source_dataset`` id.
+        mode: ``live`` or ``simulated`` at compute time.
+        role: ``primary``, or ``companion`` for the simulated CRM of a simulated LinkedIn
+            dataset.
+    """
+
+    source: SourceName
+    dataset_id: int
+    mode: Mode
+    role: DatasetRole
+
+
+class Evidence(ApiModel):
+    """Everything an item's conclusion rests on, frozen with the run (AAP 0.5.4.8).
+
+    ``provenance`` is frozen at compute time and never replaced by the current source
+    status; the current status travels separately in :attr:`ItemOverlay.data_status_now`.
+    White-paper items carry their per-creative rows in ``extra.rows``; expansion items carry
+    their adjacent terms in ``extra.adjacent_terms``.
+
+    Attributes:
+        window: The exact window and each source's day boundary.
+        metrics: Every number the reason cites, with units and currency.
+        baselines: The values those metrics were compared against.
+        sample: The sample size against its minimum, when the rule is sample-gated.
+        test: The statistical test, when one was used.
+        thresholds: ``{dotted key: configured value}`` for every threshold applied.
+        datasets: The datasets read, with completeness and coverage.
+        provenance: Each dataset read, with its id, mode and role at compute time.
+        extra: Rule-specific detail.
+    """
+
+    window: EvidenceWindow
+    metrics: list[Metric]
+    baselines: list[Baseline]
+    sample: Sample | None = None
+    test: StatTest | None = None
+    thresholds: dict[str, Any]
+    datasets: list[DatasetCoverage]
+    provenance: list[ProvenanceEntry]
+    extra: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Recommendations page: items, sections and the overlay
+# ---------------------------------------------------------------------------
+
+
+class ItemOverlay(ApiModel):
+    """An item's current state, computed at read time and kept apart from frozen evidence.
+
+    AAP 0.3.2 "Refresh after change, and the current-state overlay". When ``historical`` is
+    true, a dataset the item read is no longer active: every action on the card is disabled.
+
+    Attributes:
+        held_now: Whether an open discrepancy holds the item now, including one detected
+            after the run.
+        held_reason_now: Why it is held now.
+        historical: Whether the item was computed from data that has since been replaced.
+        data_status_now: The data status of the datasets the item reads, as they are now.
+        flags_now: Flags that apply now, such as ``unverified_discrepancies`` or ``stale``.
+        hidden_by: The active feedback hiding the item, if any.
+    """
+
+    held_now: bool
+    held_reason_now: str | None = None
+    historical: bool
+    data_status_now: DataStatus
+    flags_now: list[Flag]
+    hidden_by: FeedbackKind | None = None
+
+
+class DecisionSubjectRef(ApiModel):
+    """The campaign or shared budget a "Record decision" on an item writes.
+
+    Attributes:
+        type: ``campaign`` or ``budget``.
+        id: The subject's internal id in its dataset.
+    """
+
+    type: SubjectType
+    id: int
+
+
+class Item(ApiModel):
+    """One ranked action card (AAP 0.5.3 ``Item``).
+
+    Attributes:
+        id: The ``recommendation`` id, used by ``POST /recommendations/{id}/feedback``.
+        rank: Rank within its group, from 1.
+        rule_id: The rule that produced it, for example ``K1`` or ``C0``.
+        action: The recommended action as a headline.
+        reason: The reason sentence, rendered from the evidence.
+        entity: The entity the item is about.
+        evidence: The frozen evidence.
+        flags: Flags recorded at compute time.
+        data_status: The data status at compute time.
+        held: Whether the item was held at compute time.
+        held_reason: Why it was held.
+        decision_subject: The subject a decision on it writes; ``None`` for items that offer
+            only "Mark done".
+        current: The read-time overlay.
+    """
+
+    id: int
+    rank: int
+    rule_id: str
+    action: str
+    reason: str
+    entity: EntityView
+    evidence: Evidence
+    flags: list[Flag]
+    data_status: DataStatus
+    held: bool
+    held_reason: str | None = None
+    decision_subject: DecisionSubjectRef | None = None
+    current: ItemOverlay
+
+
+class Group(ApiModel):
+    """A group of items within a section, for example ``block`` or ``discrepancies``.
+
+    Attributes:
+        key: The group key; creative groups are ``campaign:{id}`` and white-paper groups
+            ``cohort:{currency}``.
+        title: Display title.
+        items: The items in rank order.
+    """
+
+    key: str
+    title: str
+    items: list[Item]
+
+
+class Finding(ApiModel):
+    """A non-action observation a rule emitted and the run stored (AAP 0.5.3 ``Finding``).
+
+    Attributes:
+        code: The finding code.
+        section: The section the finding is shown in.
+        entity: The entity it is about; ``None`` for a section- or account-wide finding.
+        message: The rendered message.
+        evidence: The numbers behind the message.
+    """
+
+    code: FindingCode
+    section: SectionKey
+    entity: EntityView | None = None
+    message: str
+    evidence: dict[str, Any]
+
+    @classmethod
+    def from_row(cls, row: RunFinding) -> Self:
+        """Build the view of a stored ``run_finding`` row, exactly as recorded.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "code": row.code,
+                "section": row.section,
+                "entity": row.entity,
+                "message": row.message,
+                "evidence": row.evidence or {},
+            }
+        )
+
+
+class WithheldSample(ApiModel):
+    """The sample a withheld pattern saw against the minimum it needed.
+
+    Attributes:
+        observed: The sample observed; ``None`` when no sample applies.
+        required: The minimum required; ``None`` when no sample applies.
+        unit: The sample's unit, for example ``clicks`` or ``days``.
+    """
+
+    observed: MetricValue
+    required: MetricValue
+    unit: str | None
+
+
+class Withheld(ApiModel):
+    """A pattern withheld for sample size or validity; it never becomes an item (P6).
+
+    Attributes:
+        rule_id: The rule whose pattern was withheld, for example ``B4``.
+        entity: The entity it is about; ``None`` for an account-wide withholding.
+        reason: The shortfall, for example "3 weekend days of 4 required".
+        sample: Observed against required, in the rule's unit.
+    """
+
+    rule_id: str
+    entity: EntityView | None
+    reason: str
+    sample: WithheldSample
+
+    @classmethod
+    def from_row(cls, row: RunWithheld) -> Self:
+        """Build the view of a stored ``run_withheld`` row, exactly as recorded.
+
+        ``numeric`` sample sizes render as fixed-point strings, the form frozen evidence uses.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "rule_id": row.rule_id,
+                "entity": row.entity,
+                "reason": row.reason,
+                "sample": {"observed": row.observed, "required": row.required, "unit": row.unit},
+            }
+        )
+
+
+class Section(ApiModel):
+    """One of the five sections of the page.
+
+    Attributes:
+        key: The section key.
+        title: Display title, for example "Keywords to adjust".
+        groups: The section's groups, in display order.
+        findings: The section's findings, shown above its items.
+        withheld: Patterns withheld for sample size, with observed and required sizes.
+        suppressed: Items hidden by feedback, blocked by G1 or suppressed by P2, by reason.
+    """
+
+    key: SectionKey
+    title: str
+    groups: list[Group]
+    findings: list[Finding]
+    withheld: list[Withheld]
+    suppressed: dict[str, int]
+
+
+class SourceModes(_PerSourceModes):
+    """Each source's mode now, read live by the overlay (``Overlay.source_modes``).
+
+    Attributes:
+        google: Google's current mode; ``None`` before its first dataset.
+        linkedin: LinkedIn's current mode.
+        hubspot: HubSpot's current mode.
+    """
+
+
+class Overlay(ApiModel):
+    """The page-level current state, computed at read time (AAP 0.3.2).
+
+    Attributes:
+        open_discrepancies: Every unresolved discrepancy now, including any detected after
+            the run.
+        source_modes: Each source's mode now.
+        stale_datasets: Dataset names that are stale now.
+        incomplete_datasets: Dataset names that are not complete now.
+        computed_at: When the overlay was computed.
+    """
+
+    open_discrepancies: int
+    source_modes: SourceModes
+    stale_datasets: list[str]
+    incomplete_datasets: list[str]
+    computed_at: AwareDatetime
+
+
+class Banner(ApiModel):
+    """A global banner, built from the run plus the overlay (AAP 0.5.5 fixed order).
+
+    Attributes:
+        code: The banner code, for example ``open_discrepancies`` or ``short_window``.
+        tone: The design-system tone.
+        message: The banner text.
+        count: The count it reports, such as open discrepancies.
+    """
+
+    code: str
+    tone: BannerTone
+    message: str
+    count: int | None = None
+
+
+class RecommendationsPage(ApiModel):
+    """``GET /recommendations``: the five sections of one run with the current-state overlay.
+
+    Attributes:
+        run: The run the sections come from.
+        overlay: The page-level current state.
+        banners: The global banners, in their fixed order.
+        sections: Exactly five sections, in the order ``keywords``, ``campaigns``,
+            ``budget``, ``creative``, ``white_papers``; an empty section is still present.
+    """
+
+    run: Run
+    overlay: Overlay
+    banners: list[Banner]
+    sections: list[Section]
+
+    @model_validator(mode="after")
+    def _five_sections_in_order(self) -> Self:
+        """Require the five sections in the fixed order (AAP 0.5.3)."""
+        keys = tuple(section.key for section in self.sections)
+        if keys != tuple(SECTION_ORDER):
+            raise ValueError(
+                f"sections must be exactly {list(SECTION_ORDER)} in that order, found {list(keys)}"
+            )
+        return self
+
+
+class FeedbackRequest(RequestModel):
+    """``POST /recommendations/{id}/feedback`` body.
+
+    Attributes:
+        kind: ``dismiss`` (30 days), ``snooze`` (7 days) or ``done`` (30 days), as configured.
+        note: An optional note.
+    """
+
+    kind: FeedbackKind
+    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+
+
+class Feedback(ApiModel):
+    """A recorded dismiss, snooze or done, suppressing its rule and entity until ``until``.
+
+    Attributes:
+        id: The feedback id.
+        recommendation_id: The item it was given on.
+        rule_id: The item's rule.
+        entity_type: The item's entity type.
+        entity_id: The item's stable entity key (``{source}:{type}:{external_id}``).
+        kind: ``dismiss``, ``snooze`` or ``done``.
+        until: When the suppression ends.
+        note: The user's note.
+        created_at: When the feedback was given.
+        created_by: Who gave it.
+    """
+
+    id: int
+    recommendation_id: int
+    rule_id: str
+    entity_type: str | None
+    # recommendation_feedback.entity_id is a text key (EntityRef.key), not an integer id.
+    entity_id: str | None
+    kind: FeedbackKind
+    until: AwareDatetime
+    note: str | None
+    created_at: AwareDatetime
+    created_by: str | None
+
+    @classmethod
+    def from_row(cls, row: RecommendationFeedback) -> Self:
+        """Build the view of a stored ``recommendation_feedback`` row.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "recommendation_id": row.recommendation_id,
+                "rule_id": row.rule_id,
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "kind": row.kind,
+                "until": row.until,
+                "note": row.note,
+                "created_at": row.created_at,
+                "created_by": row.created_by,
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decisions and discrepancies (AAP 0.5.2 patch model, 0.5.4.4)
+# ---------------------------------------------------------------------------
+
+
+class SubjectIn(RequestModel):
+    """The decision subject a request names.
+
+    Attributes:
+        type: ``campaign`` or ``budget`` (a Google explicitly shared budget).
+        id: The subject's internal id.
+    """
+
+    type: SubjectType
+    id: int = Field(gt=0)
+
+
+class _ExpectedFieldsIn(RequestModel):
+    """The three decidable fields, every one optional and never ``null``.
+
+    A field is part of the submission only when it is present; an explicit ``null`` is
+    refused, because a decided field cannot be cleared. Which fields a subject accepts, empty
+    and no-op submissions, and the currency's minor unit are judged by
+    ``ads_engine.decisions`` against the subject's decision shape, so those 422 rules live
+    in one place.
+    """
+
+    status: CampaignStatus | None = None
+    daily_budget: Money | None = None
+    total_budget: Money | None = None
+
+    @model_validator(mode="after")
+    def _no_explicit_null(self) -> Self:
+        """Refuse a field sent as ``null``: omit it instead."""
+        nulls = [
+            name
+            for name in type(self).model_fields
+            if name in self.model_fields_set and getattr(self, name) is None
+        ]
+        if nulls:
+            raise ValueError(f"omit the field instead of sending null: {', '.join(nulls)}")
+        return self
+
+    def present_fields(self) -> dict[str, Any]:
+        """Return only the fields the submission carried, in declaration order.
+
+        Returns:
+            Field name to value; amounts are ``Decimal`` and the status a string.
+        """
+        return {
+            name: getattr(self, name)
+            for name in type(self).model_fields
+            if name in self.model_fields_set
+        }
+
+
+class DecisionPatchIn(_ExpectedFieldsIn):
+    """The fields a decision submission decides; every other field keeps its decided value.
+
+    The fields a subject accepts depend on its decision shape: ``own_budget`` takes status and
+    its own budget fields, ``shared_member`` takes status only, ``budget`` takes exactly the
+    one amount its period allows (AAP 0.5.2).
+
+    Attributes:
+        status: The decided campaign status.
+        daily_budget: The decided daily budget, as a decimal string.
+        total_budget: The decided lifetime or custom-period budget, as a decimal string.
+    """
+
+
+class DecisionRequest(RequestModel):
+    """``POST /decisions`` body: a patch on one campaign or shared budget.
+
+    Attributes:
+        subject: The decision subject.
+        patch: The fields being decided.
+        recommendation_id: The item the decision was recorded from, if any.
+        note: An optional note.
+    """
+
+    subject: SubjectIn
+    patch: DecisionPatchIn
+    recommendation_id: int | None = Field(default=None, gt=0)
+    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+
+
+class IntendedStateIn(_ExpectedFieldsIn):
+    """The intended state of a ``record_intended`` resolution, in the subject's shape.
+
+    ``own_budget``: ``{status, daily_budget?, total_budget?}`` with the budget fields the
+    campaign has; ``shared_member``: ``{status}``; ``budget``: ``{daily_budget}`` or
+    ``{total_budget}`` per its period (AAP 0.5.4.4).
+
+    Attributes:
+        status: The intended campaign status.
+        daily_budget: The intended daily budget, as a decimal string.
+        total_budget: The intended lifetime or custom-period budget, as a decimal string.
+    """
+
+
+class ResolveRequest(RequestModel):
+    """``POST /discrepancies/{id}/resolve`` body.
+
+    Attributes:
+        resolution: The resolution; which ones apply depends on the discrepancy's kind and
+            the subject's decision shape (AAP 0.5.4.4).
+        intended_state: Required by ``record_intended`` only.
+        note: An optional note.
+    """
+
+    resolution: ResolutionKey
+    intended_state: IntendedStateIn | None = None
+    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+
+
+class SubjectView(ApiModel):
+    """A decision subject with what the log and resolver need to render it.
+
+    Attributes:
+        type: ``campaign`` or ``budget``.
+        id: The subject's internal id.
+        name: The campaign name, or the shared budget's display name.
+        source: The subject's source.
+        currency: The account currency its amounts are in.
+    """
+
+    type: SubjectType
+    id: int
+    name: str | None
+    source: SourceName | None
+    currency: str | None
+
+
+class Decision(ApiModel):
+    """One decision log row: the complete materialised expected state for its shape.
+
+    AAP 0.5.3 ("carrying ``shape`` and the complete materialised expected state"). A
+    budget-only patch keeps the decided status, a status-only patch keeps the decided budget,
+    and ``patch`` records what the submission itself carried.
+
+    Attributes:
+        id: The decision id.
+        subject: The subject decided.
+        shape: ``own_budget``, ``shared_member`` or ``budget``.
+        status: The decided status; ``None`` for budget subjects.
+        daily_budget: The decided daily budget; ``None`` where the shape has none.
+        total_budget: The decided lifetime or custom-period budget.
+        budget_id: For ``shared_member`` rows, the shared budget the campaign is assigned to.
+        tombstone: Whether the row records an acknowledged removal.
+        decided_at: When the decision was recorded.
+        decided_by: Who recorded it; ``None`` for baseline and system rows.
+        origin: ``baseline``, ``user``, ``recommendation`` or ``resolution``.
+        recommendation_id: The item it was recorded from, if any.
+        patch: The fields the submission carried.
+        note: The note entered with it.
+    """
+
+    id: int
+    subject: SubjectView
+    shape: DecisionShape
+    status: CampaignStatus | None
+    daily_budget: Money | None
+    total_budget: Money | None
+    budget_id: int | None
+    tombstone: bool
+    decided_at: AwareDatetime
+    decided_by: str | None
+    origin: DecisionOrigin
+    recommendation_id: int | None
+    patch: dict[str, Any]
+    note: str | None
+
+    @classmethod
+    def from_row(cls, row: DecisionRow, *, subject: SubjectView) -> Self:
+        """Build the view of a stored ``decision`` row.
+
+        Args:
+            row: The decision row.
+            subject: The subject view the route resolved for ``row.subject_id``.
+
+        Returns:
+            The decision view.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "subject": subject,
+                "shape": row.shape,
+                "status": row.status,
+                "daily_budget": row.daily_budget,
+                "total_budget": row.total_budget,
+                "budget_id": row.budget_id,
+                "tombstone": row.tombstone,
+                "decided_at": row.decided_at,
+                "decided_by": row.decided_by,
+                "origin": row.origin,
+                "recommendation_id": row.recommendation_id,
+                "patch": row.patch or {},
+                "note": row.note,
+            }
+        )
+
+
+class Discrepancy(ApiModel):
+    """A mismatch between a subject's platform state and its last decision (rule C0).
+
+    Attributes:
+        id: The discrepancy id.
+        subject: The subject.
+        shape: The subject's current decision shape, which fixes the intended-state fields.
+        kind: ``status``, ``budget``, ``untracked`` or ``missing``.
+        decided_value: The decided side; ``None`` for ``untracked``.
+        platform_value: The platform side; ``None`` for ``missing``.
+        detected_at: When it was detected; the oldest are shown first.
+        state: ``open``, ``awaiting_platform`` or ``resolved``.
+        resolved_at: When it was resolved.
+        resolution: The resolution applied, if any.
+        resolutions: The resolutions valid for its (kind, shape) pair, in the fixed order of
+            ``DISCREPANCY_RESOLUTIONS``; the resolver renders exactly these.
+    """
+
+    id: int
+    subject: SubjectView
+    shape: DecisionShape
+    kind: DiscrepancyKind
+    decided_value: dict[str, Any] | None
+    platform_value: dict[str, Any] | None
+    detected_at: AwareDatetime
+    state: DiscrepancyState
+    resolved_at: AwareDatetime | None
+    resolution: ResolutionKey | None
+    resolutions: list[ResolutionKey]
+
+    @classmethod
+    def from_row(
+        cls,
+        row: DiscrepancyRow,
+        *,
+        subject: SubjectView,
+        shape: str,
+        resolutions: Iterable[str],
+    ) -> Self:
+        """Build the view of a stored ``discrepancy`` row.
+
+        Which resolutions are valid is decided by ``ads_engine.decisions.RESOLUTIONS``; the
+        caller passes them in, and they are only put in their fixed display order here.
+
+        Args:
+            row: The discrepancy row.
+            subject: The subject view the route resolved for ``row.subject_id``.
+            shape: The subject's current decision shape.
+            resolutions: The resolutions valid for the row's kind and the shape, in any order.
+
+        Returns:
+            The discrepancy view.
+
+        Raises:
+            ValueError: When ``resolutions`` holds a key outside ``DISCREPANCY_RESOLUTIONS``.
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        offered = set(resolutions)
+        unknown = offered.difference(DISCREPANCY_RESOLUTIONS)
+        if unknown:
+            raise ValueError(f"unknown discrepancy resolutions {sorted(unknown)}")
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "subject": subject,
+                "shape": shape,
+                "kind": row.kind,
+                "decided_value": row.decided_value,
+                "platform_value": row.platform_value,
+                "detected_at": row.detected_at,
+                "state": row.state,
+                "resolved_at": row.resolved_at,
+                "resolution": row.resolution,
+                "resolutions": [key for key in DISCREPANCY_RESOLUTIONS if key in offered],
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sources (AAP 0.5.3 ``GET /sources``, 0.5.5 ``/sources``)
+# ---------------------------------------------------------------------------
+
+
+class DatasetView(ApiModel):
+    """One dataset of a source.
+
+    Attributes:
+        id: The ``source_dataset`` id.
+        mode: ``live`` or ``simulated``.
+        role: ``primary`` or ``companion``.
+        state: ``building``, ``active`` or ``retired``.
+        reason: Why the dataset exists, for example "credentials not configured".
+        created_at: When it was created.
+        activated_at: When it became active, if it has.
+    """
+
+    id: int
+    mode: Mode
+    role: DatasetRole
+    state: DatasetState
+    reason: str | None
+    created_at: AwareDatetime
+    activated_at: AwareDatetime | None
+
+    @classmethod
+    def from_row(cls, row: SourceDataset) -> Self:
+        """Build the view of a ``source_dataset`` row.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "mode": row.mode,
+                "role": row.role,
+                "state": row.state,
+                "reason": row.reason,
+                "created_at": row.created_at,
+                "activated_at": row.activated_at,
+            }
+        )
+
+
+class DatasetFreshnessView(ApiModel):
+    """Freshness, coverage and completeness of one named dataset (AAP 0.3.2).
+
+    Attributes:
+        dataset: The dataset name, for example ``google.metrics_daily``.
+        last_attempt_at: When a job last tried to refresh it.
+        last_success_at: When a job last refreshed it successfully.
+        covered_from: First native date covered.
+        covered_through: Last native date covered.
+        completeness: ``complete``, ``incomplete`` or ``unknown``.
+        reason: Why it is not complete.
+        stale: Whether it last succeeded more than ``sources.stale_after_hours`` ago, decided
+            by the route from the configuration.
+    """
+
+    dataset: str
+    last_attempt_at: AwareDatetime | None
+    last_success_at: AwareDatetime | None
+    covered_from: date | None
+    covered_through: date | None
+    completeness: Completeness
+    reason: str | None
+    stale: bool
+
+    # Derived, so it can never disagree with ``completeness``; pydantic's documented form for
+    # a computed property needs this ignore under mypy.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def incomplete(self) -> bool:
+        """Whether the dataset is not ``complete`` (``incomplete`` or ``unknown``)."""
+        return self.completeness != "complete"
+
+    @classmethod
+    def from_row(cls, row: DatasetFreshness, *, stale: bool) -> Self:
+        """Build the view of a ``dataset_freshness`` row.
+
+        Args:
+            row: The freshness row.
+            stale: Whether the dataset is stale now, judged by the caller against
+                ``sources.stale_after_hours``.
+
+        Returns:
+            The freshness view.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "dataset": row.dataset,
+                "last_attempt_at": row.last_attempt_at,
+                "last_success_at": row.last_success_at,
+                "covered_from": row.covered_from,
+                "covered_through": row.covered_through,
+                "completeness": row.completeness,
+                "reason": row.reason,
+                "stale": stale,
+            }
+        )
+
+
+class SyncRunView(ApiModel):
+    """One recent sync job run.
+
+    Attributes:
+        id: The ``sync_run`` id.
+        job: The job name.
+        dataset: The dataset it refreshed, when a single one.
+        started_at: When it started.
+        finished_at: When it finished, if it has.
+        status: ``running``, ``succeeded`` or ``failed``.
+        rows: Rows written, once known.
+        completeness: Completeness of what it read, once known.
+        error: The redacted failure message of a failed run.
+    """
+
+    id: int
+    job: str
+    dataset: str | None
+    started_at: AwareDatetime
+    finished_at: AwareDatetime | None
+    status: SyncRunStatus
+    rows: int | None
+    completeness: Completeness | None
+    error: str | None
+
+    @classmethod
+    def from_row(cls, row: SyncRun) -> Self:
+        """Build the view of a ``sync_run`` row.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "job": row.job,
+                "dataset": row.dataset,
+                "started_at": row.started_at,
+                "finished_at": row.finished_at,
+                "status": row.status,
+                "rows": row.rows,
+                "completeness": row.completeness,
+                "error": row.error,
+            }
+        )
+
+
+class Source(ApiModel):
+    """Health, mode, datasets, freshness and call budget of one source (``GET /sources``).
+
+    ``calls_24h`` and ``call_cap`` describe the product's own cap on Google webhook calls
+    (``GOOGLE_DAILY_CALL_BUDGET``, AAP 0.3.3), not Google's token-wide quota, and are ``None``
+    for LinkedIn and HubSpot. The companion fields are set only for HubSpot while a simulated
+    LinkedIn dataset's companion CRM dataset is active.
+
+    Attributes:
+        source: The source.
+        mode: ``live`` or ``simulated``; ``None`` before the worker's first attempt.
+        status: ``ok``, ``stale``, ``denied`` or ``error``; ``None`` before the first attempt.
+        reason: Why the source is in its mode or status.
+        active_dataset: The active primary dataset.
+        companion_dataset: HubSpot only: the active companion CRM dataset.
+        datasets: Freshness of the active dataset's named datasets.
+        companion_datasets: Freshness of the companion's named datasets.
+        last_attempt_at: When a job last called the source.
+        calls_24h: Google webhook calls counted in the trailing 24 h.
+        call_cap: The product's Google webhook call cap.
+        sync_pending: Whether a "Sync now" request is pending.
+        recent_runs: The newest sync runs, newest first.
+    """
+
+    source: SourceName
+    mode: Mode | None
+    status: ConnectionStatus | None
+    reason: str | None
+    active_dataset: DatasetView | None
+    companion_dataset: DatasetView | None
+    datasets: list[DatasetFreshnessView]
+    companion_datasets: list[DatasetFreshnessView]
+    last_attempt_at: AwareDatetime | None
+    calls_24h: int | None
+    call_cap: int | None
+    sync_pending: bool
+    recent_runs: list[SyncRunView]
+
+
+class SyncRequestView(ApiModel):
+    """A queued "Sync now" request (``POST /sources/{source}/sync``, 202).
+
+    Attributes:
+        id: The ``sync_request`` id.
+        source: The source to sync.
+        requested_at: When it was requested.
+        picked_at: When the worker picked it up; ``None`` while pending.
+    """
+
+    id: int
+    source: SourceName
+    requested_at: AwareDatetime
+    picked_at: AwareDatetime | None = None
+
+    @classmethod
+    def from_row(cls, row: SyncRequest) -> Self:
+        """Build the view of a ``sync_request`` row.
+
+        Raises:
+            pydantic.ValidationError: When the stored row holds a value outside the contract.
+        """
+        return cls.model_validate(
+            {
+                "id": row.id,
+                "source": row.source,
+                "requested_at": row.requested_at,
+                "picked_at": row.picked_at,
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Config and health (AAP 0.5.3 ``GET /config``, ``GET /healthz``)
+# ---------------------------------------------------------------------------
+
+
+class WindowConfig(ApiModel):
+    """The configured window settings; the UI reads window lengths only from here.
+
+    Attributes:
+        default_days: ``window.default_days``; the picker marks this preset "default".
+        trusted_min_days: ``window.trusted_min_days``; shorter windows are flagged.
+        presets: ``window.presets``, ascending: the picker's choices.
+        max_days: ``window.max_days``: the longest custom window.
+        sustained_min_days: ``window.sustained_min_days``.
+    """
+
+    default_days: int
+    trusted_min_days: int
+    presets: list[int]
+    max_days: int
+    sustained_min_days: int
+
+    @classmethod
+    def from_thresholds(cls, thresholds: Thresholds) -> Self:
+        """Build the window settings from the loaded configuration, never from literals."""
+        return cls(
+            default_days=thresholds.default_days,
+            trusted_min_days=thresholds.trusted_min_days,
+            presets=list(thresholds.presets),
+            max_days=thresholds.max_days,
+            sustained_min_days=thresholds.sustained_min_days,
+        )
+
+
+class ContentAssetView(ApiModel):
+    """One white paper of the registry (``config/content_assets.yaml``).
+
+    Attributes:
+        slug: The asset's identifier.
+        title: Display title.
+        lead_forms: Canonical lead-form URNs that resolve to the asset.
+        creative_overrides: Creative URNs credited to the asset by override.
+    """
+
+    slug: str
+    title: str
+    lead_forms: list[str]
+    creative_overrides: list[str]
+
+    @classmethod
+    def from_asset(cls, asset: ContentAsset) -> Self:
+        """Build the view of a registry entry, in the file's own key names."""
+        return cls(
+            slug=asset.slug,
+            title=asset.title,
+            lead_forms=list(asset.lead_form_urns),
+            creative_overrides=list(asset.creative_urns),
+        )
+
+
+class ConfigView(ApiModel):
+    """``GET /config``: the read-only configuration behind ``/settings`` and the picker.
+
+    Attributes:
+        thresholds: Every threshold of ``config/thresholds.yaml``, by namespace.
+        window: The window settings.
+        hubspot_mapping: The MQL and Qualified Lead bindings and meeting rules as configured.
+        crm_bindings: The bindings as resolved against HubSpot's active primary portal;
+            ``None`` until verified.
+        companion_crm_bindings: The bindings of the active companion CRM dataset; ``None``
+            when there is none.
+        content_assets: The white paper registry, in file order.
+        config_hash: Hash of the three configuration files.
+    """
+
+    thresholds: dict[str, Any]
+    window: WindowConfig
+    hubspot_mapping: dict[str, Any]
+    crm_bindings: dict[str, Any] | None
+    companion_crm_bindings: dict[str, Any] | None
+    content_assets: list[ContentAssetView]
+    config_hash: str
+
+
+class Health(ApiModel):
+    """``GET /healthz``: the process is up and the database answered.
+
+    Attributes:
+        status: Always ``ok``; a failure is reported as an error response instead.
+    """
+
+    status: Literal["ok"]

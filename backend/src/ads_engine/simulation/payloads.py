@@ -56,7 +56,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
@@ -2206,6 +2206,9 @@ class RenderedResponse:
         headers: Extra headers such as ``Retry-After``.
         timeout: True when the request must time out instead of answering.
         surface: The contract surface that answered.
+        fault: The world fault kinds applied to the request, comma-separated in spec order
+            (``"timeout"``, ``"omit_ids,batch_errors"``), or ``None`` when no fault applied.
+            Set by :func:`render`; ``simulation/transport.py`` journals and logs it.
     """
 
     status: int
@@ -2213,6 +2216,7 @@ class RenderedResponse:
     headers: tuple[tuple[str, str], ...] = ()
     timeout: bool = False
     surface: str = field(kw_only=True)
+    fault: str | None = field(default=None, kw_only=True)
 
 
 class _RejectionError(Exception):
@@ -4481,13 +4485,17 @@ def render(
                 response.body,
                 root=contract.path.parents[1],
             )
+    fault_label = ctx.plan.label()
+    if fault_label != response.fault:
+        # The applied faults travel with the response, so the transport can journal them.
+        response = replace(response, fault=fault_label)
     _LOG.debug(
         "simulation.render",
         source=source,
         surface=surface,
         status=None if response.timeout else response.status,
         elements=_element_count(response.body),
-        fault=ctx.plan.label(),
+        fault=fault_label,
     )
     return response
 
