@@ -1,0 +1,117 @@
+{
+  "surface": "google.row_campaign_daily",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/campaign",
+  "api_version": "v25",
+  "last_modified": null,
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G3",
+      "resource": "campaign",
+      "select": [
+        "campaign.id",
+        "segments.date",
+        "metrics.cost_micros",
+        "metrics.impressions",
+        "metrics.clicks",
+        "metrics.conversions",
+        "metrics.conversions_value",
+        "metrics.search_budget_lost_impression_share",
+        "metrics.search_impression_share"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "properties": {
+        "campaign": {
+          "type": "object",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/campaigns/{campaign_id}. Returned for the FROM resource even though it is not selected (observed on every row of a live n8n Q-G3 response, 2026-10-07)."
+            },
+            "id": {
+              "type": "string",
+              "description": "INT64 as a decimal string. The campaign key of the daily fact row; parsed to an integer."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false,
+          "description": "The FROM resource. Only campaign.id is selected; resourceName is always added by the API."
+        },
+        "segments": {
+          "type": "object",
+          "properties": {
+            "date": {
+              "type": "string",
+              "description": "DATE as YYYY-MM-DD in the customer account time zone (customer.timeZone from Q-G1). Stored as Google's native date and never rebucketed."
+            }
+          },
+          "required": [
+            "date"
+          ],
+          "additionalProperties": false,
+          "description": "Segments of the row. Q-G3 segments by segments.date only, so each row is one campaign on one native Google day. Carries no resourceName."
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "costMicros": {
+              "type": "string",
+              "description": "INT64 as a decimal string: cost in micros of the account currency (customer.currencyCode from Q-G1). Divided by 1,000,000 at parse time into numeric(18,6). Absent parses as 0."
+            },
+            "impressions": {
+              "type": "string",
+              "description": "INT64 as a decimal string. Absent parses as 0."
+            },
+            "clicks": {
+              "type": "string",
+              "description": "INT64 as a decimal string. Absent parses as 0."
+            },
+            "conversions": {
+              "type": "number",
+              "description": "DOUBLE as a JSON number, never assumed integral: data-driven attribution makes it fractional and MANY_PER_CLICK conversion actions allow several per click. Whole values arrive without a fractional part, and fractional values occur (both observed in a live n8n response, 2026-10-07). Parsed to Decimal, stored as numeric(18,6). Absent parses as 0."
+            },
+            "conversionsValue": {
+              "type": "number",
+              "description": "DOUBLE as a JSON number, the conversion value in the account currency. Absent parses as 0."
+            },
+            "searchBudgetLostImpressionShare": {
+              "type": "number",
+              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed on some campaign-day rows of a live n8n response, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0 to 0.9 and any value above 0.9 is reported as 0.9001 (0.9001 observed live, 2026-10-07); the value is kept as returned. A value of 0.10 or more marks a capped day (AAP 0.5.4.1)."
+            },
+            "searchImpressionShare": {
+              "type": "number",
+              "description": "DOUBLE fraction from 0 to 1. Optional and may be absent: it is omitted on rows where the metric does not apply (observed live, 2026-10-07), and absent parses as unavailable, never 0. Google's metrics field reference notes this metric is reported in the range 0.1 to 1 and any value below 0.1 is reported as 0.0999 (0.0999 observed live, 2026-10-07); the value is kept as returned."
+            }
+          },
+          "additionalProperties": false,
+          "description": "Daily metrics of the campaign. May be absent or partial, because REST JSON omits zero-valued or unset fields: absent additive metrics (costMicros, impressions, clicks, conversions, conversionsValue) parse as 0, and absent impression shares parse as unavailable."
+        }
+      },
+      "required": [
+        "campaign",
+        "segments"
+      ],
+      "additionalProperties": false,
+      "description": "One REST GoogleAdsRow of Q-G3: daily campaign metrics FROM campaign, bounded by segments.date BETWEEN the fetch range and carrying no status filter, so spend by a campaign removed during the window still counts. Rows arrive in results[] of the n8n webhook envelope governed by search.json (googleAds:search v25, camelCase keys, INT64 values as strings). Plan correction: campaign.id is added as the first select field, because a per-campaign daily row cannot be keyed without it; the query template makes the same addition. Google dates are in the customer account time zone (customer.timeZone from Q-G1) and are never rebucketed. A response of exactly 10,000 rows with no page token is split by halving the date range down to single days, then by halving an INT64 campaign.id range; Q-G3 has one row per campaign per day, so it cannot overflow at a single campaign and day (AAP 0.3.3). Field types were checked against the Google Ads API metrics and segments field references and a live n8n Q-G3 response (2026-10-07); the last-updated date of the v25 campaign fields page could not be read when this contract was written, so last_modified is null."
+    },
+    "documented_sample": null
+  }
+}
