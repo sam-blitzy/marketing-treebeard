@@ -1,0 +1,121 @@
+{
+  "surface": "google.row_conversion_action",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/conversion_action",
+  "api_version": "v25",
+  "last_modified": "2026-09-30",
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G8",
+      "resource": "conversion_action",
+      "select": [
+        "conversion_action.id",
+        "conversion_action.name",
+        "conversion_action.status",
+        "conversion_action.include_in_conversions_metric",
+        "conversion_action.counting_type",
+        "conversion_action.attribution_model_settings.attribution_model"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G8 (SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.include_in_conversions_metric, conversion_action.counting_type, conversion_action.attribution_model_settings.attribution_model FROM conversion_action), delivered as one element of search.json response.body.results[] (the envelope, paging and completeness rules are governed by search.json). Keys are camelCase and int64 values (id) arrive as strings. Q-G8 has no status filter, so REMOVED and HIDDEN actions are returned: a removed or hidden action may still have contributed to past days' metrics.conversions (AAP 0.3.3). Only the selected fields are returned (the response fieldMask lists them), plus the resourceName of the FROM resource, so no other conversionAction key is declared. Counting contract for B4 (AAP 0.5.4.5): Google conversions are unweighted event counts only when, on every window day, every action with includeInConversionsMetric = true is whole-day known from these snapshots with attributionModel GOOGLE_ADS_LAST_CLICK, which gives each conversion whole credit to one click. Data-driven or EXTERNAL weighting on any day withholds the two-sample Poisson rate test as \"weighted attribution: rate test not valid\", and a day not covered by whole-day snapshots withholds it as \"conversion counting contract unknown\". A model change affects counting only from that day forward (AAP 0.2.4), which is why the contract is read per day from dated snapshots: sync/snapshots.py writes one entity_snapshot (entity_type=conversion_action) per action on every entity sync. Parsed by connectors/google_n8n/parser.py PARSERS[\"row_conversion_action\"] into ConversionActionRow.",
+      "properties": {
+        "conversionAction": {
+          "type": "object",
+          "description": "The selected fields of the v25 ConversionAction resource (fields reference page last updated 2026-09-30). status, countingType and attributionModel are kept as raw enum names and never normalised: conversion actions are not campaign-like subjects and carry no decision. The product only reads them; conversion settings are never mutated. The shape was cross-checked against a published REST row (googleads/google-ads-php issue #329); that row is not an official page, so documented_sample stays null.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "conversion_action.resource_name (RESOURCE_NAME), returned for the FROM resource although Q-G8 does not select it. Form customers/{customer_id}/conversionActions/{conversion_action_id}."
+            },
+            "id": {
+              "type": "string",
+              "description": "conversion_action.id: output-only INT64, rendered by proto3 JSON as a decimal string and parsed to an integer. The natural key of the conversion_action row and of its entity snapshots within a dataset."
+            },
+            "name": {
+              "type": "string",
+              "description": "conversion_action.name (STRING). Shown in B4 evidence when naming the actions of the counting contract; never written to logs."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "ENABLED",
+                "HIDDEN",
+                "REMOVED",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ],
+              "description": "conversion_action.status (ConversionActionStatusEnum): the status for conversion event accrual, kept raw. ENABLED accrues conversions; HIDDEN covers, for example, Google Analytics conversions not imported into Google Ads; REMOVED no longer accrues but may have contributed to past days, which is why Q-G8 has no status filter. The enum is the v25 page's list, verbatim."
+            },
+            "includeInConversionsMetric": {
+              "type": "boolean",
+              "description": "conversion_action.include_in_conversions_metric (BOOLEAN): whether the action is counted in metrics.conversions, the Google outcome every rule uses (AAP 0.5.4.1). It is read-only through the API (inclusion follows primary_for_goal). The v25 proto declares it optional bool (explicit presence), so a set false is serialized as false rather than dropped; the API does not guarantee it is populated for every action, so it is not required. Consumers treat absence as false, because metrics.conversions includes only actions whose flag is true. B4's counting contract covers exactly the actions with true."
+            },
+            "countingType": {
+              "type": "string",
+              "enum": [
+                "MANY_PER_CLICK",
+                "ONE_PER_CLICK",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ],
+              "description": "conversion_action.counting_type (ConversionActionCountingTypeEnum): how conversion events are counted, kept raw. ONE_PER_CLICK counts at most one conversion per ad interaction; MANY_PER_CLICK allows several conversions per click, so conversions divided by clicks can reach or exceed 1 (the K1 baseline rate, AAP 0.2.4). The enum is the v25 page's list, verbatim."
+            },
+            "attributionModelSettings": {
+              "type": "object",
+              "description": "conversion_action.attribution_model_settings. Only attribution_model is selected, so the output-only data_driven_model_status is never returned and is not declared. Absent for action types without attribution settings. Consumers treat an absent model as unknown, never as last-click, which makes B4 \"conversion counting contract unknown\" on every day the snapshot covers.",
+              "properties": {
+                "attributionModel": {
+                  "type": "string",
+                  "enum": [
+                    "EXTERNAL",
+                    "GOOGLE_ADS_LAST_CLICK",
+                    "GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN",
+                    "GOOGLE_SEARCH_ATTRIBUTION_FIRST_CLICK",
+                    "GOOGLE_SEARCH_ATTRIBUTION_LINEAR",
+                    "GOOGLE_SEARCH_ATTRIBUTION_POSITION_BASED",
+                    "GOOGLE_SEARCH_ATTRIBUTION_TIME_DECAY",
+                    "UNKNOWN",
+                    "UNSPECIFIED"
+                  ],
+                  "description": "conversion_action.attribution_model_settings.attribution_model (AttributionModelEnum), kept raw. GOOGLE_ADS_LAST_CLICK gives each conversion whole credit to one click and is the only model that satisfies B4's counting contract. GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN splits credit fractionally and EXTERNAL is weighted outside Google; either on any day withholds B4 as \"weighted attribution: rate test not valid\". New actions can only be set to GOOGLE_ADS_LAST_CLICK or GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN, and the retired rule-based models (FIRST_CLICK, LINEAR, POSITION_BASED, TIME_DECAY) were upgraded to data-driven (AAP 0.2.4). The full v25 list is kept because historical snapshots may carry retired models; no value other than GOOGLE_ADS_LAST_CLICK, including UNKNOWN and UNSPECIFIED, satisfies the contract."
+                }
+              },
+              "required": [
+                "attributionModel"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "resourceName",
+            "id",
+            "name",
+            "status",
+            "countingType"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "conversionAction"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}
