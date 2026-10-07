@@ -1,0 +1,126 @@
+{
+  "surface": "google.search",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/reference/rpc/v25/GoogleAdsService/Search?transport=rest",
+  "api_version": "v25",
+  "last_modified": "2026-07-22",
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [
+      "{N8N_WEBHOOK_SECRET_HEADER}",
+      "Content-Type"
+    ],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": {
+      "type": "object",
+      "description": "n8n webhook request body, exactly as the user prescribed (AAP 0.3.3). Sent with Content-Type: application/json and the shared-secret header {N8N_WEBHOOK_SECRET_HEADER}: {N8N_WEBHOOK_SECRET}; the secret value is never recorded. Exactly these three keys: no Google client id, client secret, refresh token, developer token or login-customer-id is ever sent, because they live only in n8n's credential store. n8n's Google Ads node runs the query as the native REST call POST https://googleads.googleapis.com/v25/customers/{customerId}/googleAds:search, whose body is camelCase {query, pageToken}; the snake_case customer_id and page_token here are the n8n envelope the user prescribed. The native pageSize (deprecated; rejected with PAGE_SIZE_NOT_SUPPORTED), validateOnly and searchSettings are never sent.",
+      "properties": {
+        "customer_id": {
+          "type": "string",
+          "description": "Google Ads customer id: 10 digits, no dashes (GOOGLE_ADS_CUSTOMER_ID); the native {customerId} path parameter."
+        },
+        "query": {
+          "type": "string",
+          "description": "One GAQL query per call; googleAds:search v25, never searchStream. Always one of the templates Q-G1..Q-G8 or Q-G2b in connectors/google_n8n/queries.py; the response rows follow the row_*.json contract chosen by payloads.row_surface_for(query)."
+        },
+        "page_token": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null on a first-page call; otherwise the nextPageToken of the previous response, sent back at once because page tokens expire after a few hours. The native pageToken."
+        }
+      },
+      "required": [
+        "customer_id",
+        "query",
+        "page_token"
+      ],
+      "additionalProperties": false
+    },
+    "gaql": null,
+    "limits": {
+      "page_size": 10000,
+      "timeout_s": 120,
+      "keyset_limit": 9999,
+      "in_list_max": 1000
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "Synchronous n8n response: the SearchGoogleAdsResponse of n8n's Google Ads node running googleAds:search v25 (AAP 0.3.3), with camelCase keys. totalResultsCount and summaryRow are not declared: they are returned only when requested through searchSettings, which the three-key envelope cannot send. Array wrapper: the parser also accepts a one-element JSON array wrapping this object (n8n's \"all incoming items\" response mode) and unwraps it before validation. Completeness: a response with fewer than 10,000 rows is complete; a response carrying nextPageToken is followed at once; exactly 10,000 rows with no token has unknown completeness, and the connector partitions the query: keyset scans (ORDER BY id, id > last id, LIMIT 9999) for Q-G2, Q-G4 and Q-G7, and date, campaign.id and ad_group.id range halving for Q-G3, Q-G5 and Q-G6. A capped single (day, ad group) partition of Q-G6 is stored as returned and marked incomplete (AAP 0.3.3). Body-level errors: n8n may return a Google error with HTTP 200. It is not a success body and no error schema is declared here; connectors/errors.classify reads it. Google's documented error format (Understand API errors, last updated 2026-09-30) is a google.rpc Status {code, message, details[]} whose details[] holds a GoogleAdsFailure {\"@type\": \"type.googleapis.com/google.ads.googleads.v25.errors.GoogleAdsFailure\", errors[] {errorCode {<camelCase error type>: <enum>}, message, trigger, location}, requestId}. The statuses PERMISSION_DENIED (code 7, HTTP 403) and UNAUTHENTICATED (code 16, HTTP 401) and the error types AuthorizationError and AuthenticationError mean access denied (switch to simulated); RESOURCE_EXHAUSTED (code 8, HTTP 429) is transient (retry, then stale); QueryError is a defect. Observed n8n behaviour (2026-10-07): an invalid GAQL query returns HTTP 500 {\"message\": \"Error in workflow\"} with no Google error body, so at the HTTP level a query defect is indistinguishable from a transient 5xx.",
+      "properties": {
+        "results": {
+          "type": "array",
+          "description": "REST GoogleAdsRow objects with camelCase keys; int64 values (ids, *Micros, impressions, clicks) arrive as strings. At most 10,000 rows per page. ABSENT (not an empty array) when the query matches zero rows: an empty Search result is {fieldMask, queryResourceConsumption} (Google Ads Developer Blog, 2025-07-01); the client treats absent results with fieldMask present as zero rows.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "One row. Its shape is governed by the row_*.json contract of this query (payloads.row_surface_for(query)); left open here because the envelope carries every query."
+          }
+        },
+        "fieldMask": {
+          "type": "string",
+          "description": "Comma-joined camelCase paths of the selected fields, e.g. adGroupCriterion.keyword.text,adGroupCriterion.status. Present on every successful response, including zero-row responses; a body with neither results nor fieldMask is a QueryDefect."
+        },
+        "queryResourceConsumption": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "description": "int64 resource units consumed to serve the query. The v25 reference types it as a string in int64 format, as proto3 JSON renders int64, while Google's 2025-07-01 blog example shows the number 123, so both are accepted. Returned for zero-row responses too since August 2025. Not required, so a live capture without it still validates. Informational only; not the quota."
+        },
+        "nextPageToken": {
+          "type": "string",
+          "description": "Present only when more pages exist (more than 10,000 rows); not returned for the last page. Sent back at once as page_token, because page tokens expire after a few hours. Not observed in live n8n responses."
+        },
+        "metricAttributes": {
+          "type": "array",
+          "description": "The metric attributes of the metrics in the results (v25 reference; present since v23). Unlike totalResultsCount and summaryRow it is not gated by searchSettings, so it is declared and a response carrying it still validates. Not observed in live n8n responses (2026-10-07) and never read by the connector.",
+          "items": {
+            "type": "object",
+            "description": "MetricAttributes: one metric and its attributes.",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The name of the metric."
+              },
+              "attributes": {
+                "type": "array",
+                "description": "The attributes of the metric.",
+                "items": {
+                  "type": "object",
+                  "description": "MetricAttributes.Attribute: one attribute as a key-value pair.",
+                  "properties": {
+                    "key": {
+                      "type": "string",
+                      "description": "The key of the attribute."
+                    },
+                    "value": {
+                      "type": "string",
+                      "description": "The value of the attribute."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "fieldMask"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

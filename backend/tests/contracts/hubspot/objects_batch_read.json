@@ -1,0 +1,274 @@
+{
+  "surface": "hubspot.objects_batch_read",
+  "source": "hubspot",
+  "reference_url": "https://developers.hubspot.com/docs/api-reference/latest/crm/objects/objects/batch/get-objects",
+  "api_version": "2026-09",
+  "last_modified": "2026-09-14",
+  "request": {
+    "method": "POST",
+    "url": "https://api.hubapi.com/crm/objects/2026-09/{objectType}/batch/read",
+    "required_headers": [
+      "Authorization",
+      "Content-Type"
+    ],
+    "required_query": [],
+    "optional_query": [
+      "archived"
+    ],
+    "fields": null,
+    "body": {
+      "type": "object",
+      "required": [
+        "inputs",
+        "properties"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "description": "At most 100 per request.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Record id, or the idProperty value (an email for contacts)."
+              }
+            }
+          }
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "propertiesWithHistory": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "idProperty": {
+          "type": "string",
+          "description": "'email' for contacts read by email; omitted for reads by record id."
+        }
+      },
+      "description": "BatchReadInputSimplePublicObjectId. Contacts by email: idProperty='email' and inputs[].id is the normalised email, held in memory only. Contact refresh, meetings and deals: by record id, no idProperty. At most 100 inputs. The OpenAPI marks propertiesWithHistory required; the reference examples and the Using Object APIs guide treat it as optional and the client never sends it. 'archived' is a query parameter (default false), not a body field."
+    },
+    "gaql": null,
+    "limits": {
+      "max_inputs": 100
+    }
+  },
+  "response": {
+    "status": [
+      200,
+      207
+    ],
+    "body": {
+      "type": "object",
+      "required": [
+        "status",
+        "results",
+        "startedAt",
+        "completedAt"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "CANCELED",
+            "COMPLETE",
+            "PENDING",
+            "PROCESSING"
+          ],
+          "description": "Anything other than COMPLETE is a failed call."
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "properties",
+              "createdAt",
+              "updatedAt",
+              "archived"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Open map: property name to string value or null; an unrequested or valueless property may be absent. Parsers read contacts: email, lifecyclestage, hs_v2_date_entered_{stage id}, the configured Google campaign and touch-date properties; meetings: hs_createdate, hs_timestamp, hs_meeting_start_time, hs_meeting_end_time, hs_meeting_outcome, meeting source; deals: createdate, dealstage, pipeline, amount."
+              },
+              "propertiesWithHistory": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Map of property name to [{sourceId?, sourceLabel?, sourceType, timestamp, updatedByUserId?, value}]; requested only when propertiesWithHistory is sent."
+              },
+              "createdAt": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "string"
+              },
+              "archived": {
+                "type": "boolean"
+              },
+              "archivedAt": {
+                "type": "string"
+              },
+              "objectWriteTraceId": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "An input that was not found is absent here (and may appear in errors)."
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "completedAt": {
+          "type": "string"
+        },
+        "requestedAt": {
+          "type": "string"
+        },
+        "links": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Open map of links."
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "status",
+              "category",
+              "message"
+            ],
+            "description": "One failed input of a 207 multi-status batch response. Minimal required set so simulated and live error shapes both validate.",
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "subCategory": {
+                "type": [
+                  "string",
+                  "object"
+                ],
+                "additionalProperties": true,
+                "description": "Live: a string such as 'crm.associations.NO_ASSOCIATIONS_FOUND'. The OpenAPI and rendered example show an object ({})."
+              },
+              "message": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "context": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Open map of string arrays (e.g. ids that failed); keys vary by error."
+              },
+              "links": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Open map of documentation links; keys vary by error."
+              },
+              "errors": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "context": {
+                      "type": [
+                        "object",
+                        "string"
+                      ],
+                      "additionalProperties": true,
+                      "description": "OpenAPI: map of string arrays. The rendered reference examples carry a string here, so a string is admitted too."
+                    },
+                    "in": {
+                      "type": "string"
+                    },
+                    "subCategory": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "numErrors": {
+          "type": "integer"
+        }
+      },
+      "description": "BatchResponseSimplePublicObject (200) and its 207 multi-status form, which adds errors[] and numErrors. An input missing from results is a failed read: contact refresh -> contact_read_status=error; meeting or deal target read -> target_read_status=partial (error when none was read). A status other than COMPLETE is a failed call. documented_sample is the reference page's rendered example (schema-generated placeholders), verbatim."
+    },
+    "documented_sample": {
+      "completedAt": "2023-11-07T05:31:56Z",
+      "results": [
+        {
+          "archived": true,
+          "createdAt": "2023-11-07T05:31:56Z",
+          "id": "<string>",
+          "properties": {},
+          "updatedAt": "2023-11-07T05:31:56Z",
+          "archivedAt": "2023-11-07T05:31:56Z",
+          "objectWriteTraceId": "<string>",
+          "propertiesWithHistory": {},
+          "url": "<string>"
+        }
+      ],
+      "startedAt": "2023-11-07T05:31:56Z",
+      "status": "CANCELED",
+      "errors": [
+        {
+          "category": "<string>",
+          "context": {},
+          "errors": [
+            {
+              "message": "<string>",
+              "code": "<string>",
+              "context": "{\"missingScopes\": [\"scope1\", \"scope2\"]}",
+              "in": "<string>",
+              "subCategory": "<string>"
+            }
+          ],
+          "links": {},
+          "message": "<string>",
+          "status": "<string>",
+          "id": "<string>",
+          "subCategory": {}
+        }
+      ],
+      "links": {},
+      "numErrors": 123,
+      "requestedAt": "2023-11-07T05:31:56Z"
+    }
+  }
+}

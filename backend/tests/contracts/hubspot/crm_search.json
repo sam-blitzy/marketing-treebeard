@@ -1,0 +1,264 @@
+{
+  "surface": "hubspot.crm_search",
+  "source": "hubspot",
+  "reference_url": "https://developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm",
+  "api_version": "2026-09",
+  "last_modified": "2026-09-09",
+  "request": {
+    "method": "POST",
+    "url": "https://api.hubapi.com/crm/objects/2026-09/{objectType}/search",
+    "required_headers": [
+      "Authorization",
+      "Content-Type"
+    ],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": {
+      "type": "object",
+      "required": [
+        "filterGroups",
+        "sorts",
+        "properties",
+        "limit"
+      ],
+      "properties": {
+        "filterGroups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "filters"
+            ],
+            "properties": {
+              "filters": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "propertyName",
+                    "operator"
+                  ],
+                  "properties": {
+                    "propertyName": {
+                      "type": "string"
+                    },
+                    "operator": {
+                      "type": "string",
+                      "enum": [
+                        "BETWEEN",
+                        "CONTAINS_TOKEN",
+                        "EQ",
+                        "GT",
+                        "GTE",
+                        "HAS_PROPERTY",
+                        "IN",
+                        "LT",
+                        "LTE",
+                        "NEQ",
+                        "NOT_CONTAINS_TOKEN",
+                        "NOT_HAS_PROPERTY",
+                        "NOT_IN"
+                      ]
+                    },
+                    "value": {
+                      "type": "string"
+                    },
+                    "highValue": {
+                      "type": "string"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sorts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "propertyName",
+              "direction"
+            ],
+            "properties": {
+              "propertyName": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "ASCENDING",
+                  "DESCENDING"
+                ]
+              }
+            }
+          }
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "after": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "description": "PublicObjectSearchRequest. Deal search: createdate filtered from window start to run time (BETWEEN with epoch-ms strings in value/highValue), one-day partitions halved down to one hour while total > 10,000, sorted by createdate. Google-touch contact discovery: the configured touch-date property over the sync range plus HAS_PROPERTY on the configured campaign property. limit <= 200. after is paging.next.after, absent on the first page (the OpenAPI lists it required; the guide's examples omit it). sorts items are objects per the guide (the OpenAPI types them as strings). Serialized body <= 3,000 characters, else 400. At most 5 filterGroups, 6 filters per group, 18 filters in total."
+    },
+    "gaql": null,
+    "limits": {
+      "page_size": 200,
+      "max_results": 10000,
+      "rate_per_s": 5,
+      "max_body_chars": 3000,
+      "max_filter_groups": 5,
+      "max_filters_per_group": 6,
+      "max_filters_total": 18
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "required": [
+        "total",
+        "results"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "properties",
+              "createdAt",
+              "updatedAt",
+              "archived"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Open map: property name to string value or null. Default contact properties are createdate, email, firstname, hs_object_id, lastmodifieddate, lastname; deal searches request createdate, dealstage, pipeline, amount; contact discovery requests the configured Google campaign and touch-date properties."
+              },
+              "propertiesWithHistory": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Map of property name to value history; not requested by this product."
+              },
+              "createdAt": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "string"
+              },
+              "archived": {
+                "type": "boolean"
+              },
+              "archivedAt": {
+                "type": "string"
+              },
+              "objectWriteTraceId": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Present only when more pages exist. 'link' is deprecated and ignored.",
+          "properties": {
+            "next": {
+              "type": "object",
+              "required": [
+                "after"
+              ],
+              "properties": {
+                "after": {
+                  "type": "string"
+                },
+                "link": {
+                  "type": "string"
+                }
+              }
+            },
+            "prev": {
+              "type": "object",
+              "required": [
+                "before"
+              ],
+              "properties": {
+                "before": {
+                  "type": "string"
+                },
+                "link": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "description": "CollectionResponseWithTotalSimplePublicObject. total counts every match; paging past 10,000 results returns 400. paging is present only when more pages exist. documented_sample is the search-the-crm guide's literal contacts example, verbatim."
+    },
+    "documented_sample": {
+      "total": 2,
+      "results": [
+        {
+          "id": "100451",
+          "properties": {
+            "createdate": "2024-01-17T19:55:04.281Z",
+            "email": "testperson@hubspot.com",
+            "firstname": "Test",
+            "hs_object_id": "100451",
+            "lastmodifieddate": "2024-09-11T13:27:39.356Z",
+            "lastname": "Person"
+          },
+          "createdAt": "2024-01-17T19:55:04.281Z",
+          "updatedAt": "2024-09-11T13:27:39.356Z",
+          "archived": false
+        },
+        {
+          "id": "57156923994",
+          "properties": {
+            "createdate": "2024-09-11T18:21:50.012Z",
+            "email": "emailmaria@hubspot.com",
+            "firstname": "Maria",
+            "hs_object_id": "57156923994",
+            "lastmodifieddate": "2024-10-21T21:36:02.961Z",
+            "lastname": "Johnson (Sample Contact)"
+          },
+          "createdAt": "2024-09-11T18:21:50.012Z",
+          "updatedAt": "2024-10-21T21:36:02.961Z",
+          "archived": false
+        }
+      ]
+    }
+  }
+}
