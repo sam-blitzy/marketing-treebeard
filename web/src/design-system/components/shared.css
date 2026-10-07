@@ -43,8 +43,8 @@
   overflow: visible;
   clip-path: none;
   white-space: normal;
-  /* 1px is the hairline border width; its colour comes from the border token */
-  border: 1px solid var(--color-border);
+  /* The hairline border width is a quarter of --space-1; its colour comes from the border token */
+  border: calc(var(--space-1) / 4) solid var(--color-border);
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: var(--color-text);

@@ -80,6 +80,44 @@
           {
             "message": "Disallowed property \"%s\". Feature code lays out only through the Stack, Inline and Grid primitives from src/design-system"
           }
+        ],
+        "media-feature-name-allowed-list": [
+          [
+            "/^prefers-reduced-motion$/i",
+            "/^prefers-reduced-transparency$/i",
+            "/^prefers-contrast$/i",
+            "/^prefers-color-scheme$/i",
+            "/^forced-colors$/i",
+            "/^inverted-colors$/i"
+          ],
+          {
+            "message": "Disallowed media feature \"%s\". Feature CSS has no breakpoints: responsive layout comes only from the Stack, Inline and Grid primitives in src/design-system. A feature media query may test only the keyword user preferences prefers-reduced-motion, prefers-reduced-transparency, prefers-contrast, prefers-color-scheme, forced-colors and inverted-colors"
+          }
+        ],
+        "media-feature-name-value-allowed-list": [
+          {
+            "/^prefers-reduced-motion$/i": ["/^no-preference$/i", "/^reduce$/i"],
+            "/^prefers-reduced-transparency$/i": ["/^no-preference$/i", "/^reduce$/i"],
+            "/^prefers-contrast$/i": ["/^no-preference$/i", "/^more$/i", "/^less$/i", "/^custom$/i"],
+            "/^prefers-color-scheme$/i": ["/^light$/i", "/^dark$/i"],
+            "/^forced-colors$/i": ["/^none$/i", "/^active$/i"],
+            "/^inverted-colors$/i": ["/^none$/i", "/^inverted$/i"]
+          },
+          {
+            "message": "Media feature \"%s\" has disallowed value \"%s\". A user-preference query in feature CSS takes only that feature's keyword values"
+          }
+        ],
+        "at-rule-disallowed-list": [
+          ["/^(container|custom-media|import)$/i"],
+          {
+            "message": "Disallowed at-rule \"%s\". Feature CSS has no container queries, custom media or @import, because each can carry a breakpoint: responsive layout comes only from the Stack, Inline and Grid primitives in src/design-system"
+          }
+        ],
+        "no-unknown-custom-media": [
+          true,
+          {
+            "message": "Unknown custom media query \"%s\". Feature CSS has no breakpoints, so it defines and references no custom media: responsive layout comes only from the Stack, Inline and Grid primitives in src/design-system"
+          }
         ]
       }
     },
@@ -106,13 +144,58 @@
         ],
         "declaration-property-value-allowed-list": [
           {
-            "/^(color|background|background-color|border-color|border-(top|right|bottom|left|block|inline|block-start|block-end|inline-start|inline-end)-color|outline-color|fill|stroke)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
-            "/^((margin|padding)(-.+)?|gap|row-gap|column-gap)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
-            "/^(font-family|font-size|font-weight|line-height)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
-            "/^(border(-.+)?-radius|box-shadow|z-index)$/": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/"
+            "/^(-(webkit|moz|ms|o)-)?(color|background|background-color|border-color|border-(top|right|bottom|left|block|inline|block-start|block-end|inline-start|inline-end)-color|outline-color|fill|stroke)$/i": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(-(webkit|moz|ms|o)-)?((margin|padding)(-.+)?|gap|row-gap|column-gap)$/i": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(-(webkit|moz|ms|o)-)?(font|font-family|font-size|font-weight|line-height)$/i": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(-(webkit|moz|ms|o)-)?(border(-.+)?-radius|border-radius-(top|bottom)(left|right)|box-shadow|text-shadow|z-index)$/i": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent)(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent))*$/",
+            "/^(-(webkit|moz|ms|o)-)?(inset(-.+)?|top|right|bottom|left)$/i": "/^(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent|-?(\\d+(\\.\\d+)?|\\.\\d+)%|calc\\((\\s|var\\(--[a-z0-9-]+\\)|(\\d+(\\.\\d+)?|\\.\\d+)(?![\\d.])%?|[-+*/()])*\\))(\\s+(var\\(--[a-z0-9-]+\\)|0|none|auto|inherit|currentColor|currentcolor|transparent|-?(\\d+(\\.\\d+)?|\\.\\d+)%|calc\\((\\s|var\\(--[a-z0-9-]+\\)|(\\d+(\\.\\d+)?|\\.\\d+)(?![\\d.])%?|[-+*/()])*\\)))*$/"
           },
           {
-            "message": "Property \"%s\" has disallowed value \"%s\". Colour, spacing, typography, radius, shadow and z-index values are var(--token) with no fallback, or 0, none, auto, inherit, currentColor, transparent"
+            "message": "Property \"%s\" has disallowed value \"%s\". Colour, spacing, typography (the font shorthand included), radius, box and text shadow and z-index values are var(--token) with no fallback, or 0, none, auto, inherit, currentColor, transparent. Positional insets (inset, inset-*, top, right, bottom, left) take those values, a percentage, or calc() over var(--token), unitless numbers and percentages"
+          }
+        ],
+        "media-feature-name-disallowed-list": [
+          [
+            "/^(min-|max-)?(width|height|inline-size|block-size)$/i",
+            "/^(min-|max-)?(device-)?aspect-ratio$/i",
+            "/^(min-|max-)?device-(width|height)$/i"
+          ],
+          {
+            "message": "Disallowed media feature \"%s\". Component CSS has no breakpoints of its own: responsive layout comes from the Grid primitive and PageShell, whose Grid.css and PageShell.css alone hold the documented 48rem Grid breakpoint. Width, height, inline-size, block-size, aspect-ratio and device-width/height conditions are disallowed here; keyword preference queries such as prefers-reduced-motion stay allowed"
+          }
+        ],
+        "at-rule-disallowed-list": [
+          ["/^(container|custom-media)$/i"],
+          {
+            "message": "Disallowed at-rule \"%s\". Component CSS has no container queries or custom media, because each can carry a breakpoint other than the 48rem one that Grid.css documents"
+          }
+        ],
+        "no-unknown-custom-media": [
+          true,
+          {
+            "message": "Unknown custom media query \"%s\". Component CSS defines no custom media, so the documented 48rem Grid breakpoint is written out, in Grid.css and PageShell.css only"
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "src/design-system/components/Grid.css",
+        "src/design-system/components/PageShell.css"
+      ],
+      "rules": {
+        "media-feature-name-disallowed-list": [
+          ["/^(min-|max-)?(device-)?aspect-ratio$/i", "/^(min-|max-)?device-(width|height)$/i"],
+          {
+            "message": "Disallowed media feature \"%s\". Grid.css and PageShell.css break only at the documented 48rem Grid breakpoint, a width or height condition; viewport-shape (aspect-ratio) and device-size (device-width, device-height) queries carry other breakpoints"
+          }
+        ],
+        "media-feature-name-value-allowed-list": [
+          {
+            "/^(min-|max-)?(width|height|inline-size|block-size)$/i": ["/^48rem$/i"]
+          },
+          {
+            "message": "Media feature \"%s\" has disallowed value \"%s\". Grid.css and PageShell.css hold the one documented Grid breakpoint, so every width and height condition in them is exactly 48rem"
           }
         ]
       }

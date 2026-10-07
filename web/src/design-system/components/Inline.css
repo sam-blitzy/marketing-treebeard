@@ -29,7 +29,7 @@
   min-inline-size: 0;
 }
 
-/* wrap={false}: keep every child on one line. */
+/* wrap={false}: keep the flex items on one flex line; child text may still wrap. */
 .ds-inline--nowrap {
   flex-wrap: nowrap;
 }
