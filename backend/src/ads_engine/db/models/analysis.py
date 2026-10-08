@@ -268,7 +268,10 @@ class Recommendation(IdPkMixin, _RunEntityKeysMixin, Base):
     :attr:`~ads_engine.analysis.context.EntityRef.key` ``{source}:{type}:{external_id}``,
     for example ``google:campaign:1234567890``. ``external_id`` is the platform id of an
     entity with a table row (the account, campaign, ``campaign_budget`` or ad group id, a
-    keyword's criterion id, a creative URN) and a composite for an entity without one: a
+    creative URN). A keyword has a row but takes ``{ad_group_external_id}|{criterion_id}``
+    (:func:`~ads_engine.analysis.context.keyword_external_id`), because Google's criterion
+    id is unique only within its ad group, giving keys such as
+    ``google:keyword:123456789|987654``. An entity without a table row takes a composite: a
     search term ``{ad_group_external_id}|{matched_criterion_id}|{term}``, a demographic
     segment ``{campaign_external_id}|{facet}|{value}``, a white paper within one currency
     ``{slug}|{CURRENCY}``, a CR1 creative pair as its two creative URNs sorted and
@@ -283,7 +286,8 @@ class Recommendation(IdPkMixin, _RunEntityKeysMixin, Base):
     (``campaign_id``, ``budget_id``, ``ad_group_id``, ``keyword_id``, ``creative_id``). They
     carry the referential links within the run's datasets and become ``NULL`` when a purge
     removes the entity; ``entity_type``, ``entity_id`` and the evidence keep the item
-    readable.
+    readable. A keyword item's ``keyword_id`` is its internal ``keyword`` row id and never
+    part of its ``entity_id``, which is built from the platform ids above.
 
     Attributes:
         run_id: The :class:`AnalysisRun` that produced the item.
@@ -295,8 +299,8 @@ class Recommendation(IdPkMixin, _RunEntityKeysMixin, Base):
         entity_type: The kind of entity the item is about, for example ``campaign`` or
             ``search_term``; ``None`` for an item without an entity.
         entity_id: The entity's stable external key ``{source}:{type}:{external_id}``,
-            built from platform ids rather than internal row ids; ``None`` for an item
-            without an entity.
+            built from platform ids rather than internal row ids, for example
+            ``google:keyword:123456789|987654``; ``None`` for an item without an entity.
         rank: The item's rank within its group, from 1.
         action: The recommended action as a headline.
         reason: The reason sentence, rendered from the evidence by the rule's template.
