@@ -1,0 +1,89 @@
+{
+  "request": {
+    "body": {
+      "idProperty": "email",
+      "inputs": [
+        {
+          "id": "emery.hayes.4317943d@sim.invalid"
+        },
+        {
+          "id": "quinn.lowell.e1efca2e@sim.invalid"
+        },
+        {
+          "id": "quinn.sutton.57b95cd5@sim.invalid"
+        }
+      ],
+      "properties": [
+        "email",
+        "hs_additional_emails",
+        "lifecyclestage",
+        "lastmodifieddate",
+        "hs_v2_date_entered_990100000",
+        "hs_v2_date_entered_990100001"
+      ]
+    },
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://api.hubapi.com/crm/objects/2026-09/contacts/batch/read"
+  },
+  "response": {
+    "body": {
+      "completedAt": "2026-10-02T12:00:00.000Z",
+      "results": [
+        {
+          "archived": false,
+          "createdAt": "2026-09-04T05:37:07.627Z",
+          "id": "9900002070001501",
+          "properties": {
+            "email": "emery.hayes.4317943d@sim.invalid",
+            "hs_object_id": "9900002070001501",
+            "hs_v2_date_entered_990100000": null,
+            "hs_v2_date_entered_990100001": "2026-09-18T19:04:51.570Z",
+            "lastmodifieddate": "2026-09-18T19:04:51.570Z",
+            "lifecyclestage": "990100001"
+          },
+          "updatedAt": "2026-09-18T19:04:51.570Z"
+        },
+        {
+          "archived": false,
+          "createdAt": "2026-08-30T18:59:43.925Z",
+          "id": "9900002069505001",
+          "properties": {
+            "email": "quinn.lowell.e1efca2e@sim.invalid",
+            "hs_object_id": "9900002069505001",
+            "hs_v2_date_entered_990100000": "2026-09-06T13:11:14.861Z",
+            "hs_v2_date_entered_990100001": null,
+            "lastmodifieddate": "2026-09-06T13:11:14.861Z",
+            "lifecyclestage": "990100000"
+          },
+          "updatedAt": "2026-09-06T13:11:14.861Z"
+        },
+        {
+          "archived": false,
+          "createdAt": "2026-09-04T10:09:59.219Z",
+          "id": "9900002070002000",
+          "properties": {
+            "email": "quinn.sutton.57b95cd5@sim.invalid",
+            "hs_object_id": "9900002070002000",
+            "hs_v2_date_entered_990100000": "2026-09-14T13:34:15.640Z",
+            "hs_v2_date_entered_990100001": "2026-09-26T02:31:41.584Z",
+            "lastmodifieddate": "2026-09-26T02:31:41.584Z",
+            "lifecyclestage": "990100001"
+          },
+          "updatedAt": "2026-09-26T02:31:41.584Z"
+        }
+      ],
+      "startedAt": "2026-10-02T12:00:00.000Z",
+      "status": "COMPLETE"
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "hubspot",
+  "surface": "hubspot.objects_batch_read"
+}
