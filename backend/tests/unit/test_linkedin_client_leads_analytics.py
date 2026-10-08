@@ -481,6 +481,24 @@ def _discovery(campaign_urn: str, impressions: int) -> dict[str, Any]:
     return {"pivotValues": [campaign_urn], "impressions": impressions}
 
 
+def _discovery_body(
+    elements: Sequence[Any], *, next_href: str | None = None, validate: bool = True
+) -> dict[str, Any]:
+    """An ``ad_analytics_campaign_delivery`` response (the fallback's discovery call)."""
+    return _analytics_body(
+        "ad_analytics_campaign_delivery", elements, next_href=next_href, validate=validate
+    )
+
+
+def _member_body(
+    elements: Sequence[Any], *, next_href: str | None = None, validate: bool = True
+) -> dict[str, Any]:
+    """An ``ad_analytics_member_segments`` response (the fallback's per-campaign request)."""
+    return _analytics_body(
+        "ad_analytics_member_segments", elements, next_href=next_href, validate=validate
+    )
+
+
 def _question(question_id: int, predefined: str | None = None) -> dict[str, Any]:
     """A form question with ``questionId``, ``name`` and, when given, ``predefinedField``."""
     question: dict[str, Any] = {"questionId": question_id, "name": f"question{question_id}"}
@@ -608,7 +626,16 @@ def test_request_constants_equal_their_contracts() -> None:
     batch_limits = _contract("lead_form_responses_batch")["request"]["limits"]
     assert batch_limits["client_max_ids"] == LEAD_BATCH_SIZE
     assert batch_limits["max_ids"] == LEAD_BATCH_SIZE
-    for surface in ("ad_analytics", "ad_analytics_statistics"):
+    assert _contract("ad_analytics_member_segments")["request"]["fields"] == SEGMENT_FIELDS
+    assert (
+        _contract("ad_analytics_campaign_delivery")["request"]["fields"] == SEGMENT_DISCOVERY_FIELDS
+    )
+    for surface in (
+        "ad_analytics",
+        "ad_analytics_statistics",
+        "ad_analytics_campaign_delivery",
+        "ad_analytics_member_segments",
+    ):
         assert _contract(surface)["request"]["limits"]["max_elements"] == MAX_ANALYTICS_ELEMENTS
     assert SEGMENT_DISCOVERY_FIELDS == "pivotValues,impressions"
 
@@ -1449,13 +1476,13 @@ def _fallback_handler(
         if params["pivot"] == "CAMPAIGN":
             if callable(discovery):
                 return discovery()
-            return _json(_statistics_body(discovery))
+            return _json(_discovery_body(discovery))
         campaign = unquote(params["campaigns"].removeprefix("List(").removesuffix(")"))
         if campaign in replies:
             return replies[campaign]()
         value, _ = SEGMENT_VALUES[params["pivot"]]
         element = _segment([value], impressions=30, clicks=2, costInLocalCurrency="4.25")
-        return _json(_statistics_body([element]))
+        return _json(_member_body([element]))
 
     return handle
 
@@ -1600,8 +1627,8 @@ async def test_analytics_segments_discovery_at_the_cap_is_incomplete() -> None:
     idle = _discovery(CAMPAIGN_IDLE, 0)
     elements = [idle] * (MAX_ANALYTICS_ELEMENTS - 2)
     elements += [_discovery(CAMPAIGN_HIGH, 9), _discovery(CAMPAIGN_LOW, 5)]
-    _statistics_body(elements[-3:])
-    capped = _statistics_body(elements, validate=False)
+    _discovery_body(elements[-3:])
+    capped = _discovery_body(elements, validate=False)
     server = Server(_fallback_handler(lambda: _json(capped)))
     async with _linkedin(server) as client:
         listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
@@ -1618,8 +1645,8 @@ async def test_analytics_segments_campaign_response_at_the_cap_is_incomplete() -
     """A per-campaign response at the cap keeps its rows and marks the listing incomplete."""
     value, _ = SEGMENT_VALUES["MEMBER_SENIORITY"]
     element = _segment([value], impressions=11)
-    _statistics_body([element])
-    capped = _statistics_body([element] * MAX_ANALYTICS_ELEMENTS, validate=False)
+    _member_body([element])
+    capped = _member_body([element] * MAX_ANALYTICS_ELEMENTS, validate=False)
     server = Server(
         _fallback_handler(
             [_discovery(CAMPAIGN_LOW, 5), _discovery(CAMPAIGN_HIGH, 9)],
@@ -1667,12 +1694,11 @@ async def test_analytics_segments_campaign_transient_failure_stops_the_fallback(
 async def test_analytics_segments_fallback_follows_next_links_past_empty_pages() -> None:
     """Discovery and per-campaign chains read the pages behind an empty page."""
     value, facet = SEGMENT_VALUES["MEMBER_SENIORITY"]
-    surface = "ad_analytics_statistics"
     link = "/rest/adAnalytics?q=analytics&chain="
     continuations = {
-        "discovery-2": _analytics_body(surface, [], next_href=f"{link}discovery-3"),
-        "discovery-3": _analytics_body(surface, [_discovery(CAMPAIGN_HIGH, 9)]),
-        "low-2": _analytics_body(surface, [_segment([value], impressions=11)]),
+        "discovery-2": _discovery_body([], next_href=f"{link}discovery-3"),
+        "discovery-3": _discovery_body([_discovery(CAMPAIGN_HIGH, 9)]),
+        "low-2": _member_body([_segment([value], impressions=11)]),
     }
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -1684,11 +1710,11 @@ async def test_analytics_segments_fallback_follows_next_links_past_empty_pages()
             return _json(continuations[params["chain"]])
         if params["pivot"] == "CAMPAIGN":
             first = [_discovery(CAMPAIGN_LOW, 5)]
-            return _json(_analytics_body(surface, first, next_href=f"{link}discovery-2"))
+            return _json(_discovery_body(first, next_href=f"{link}discovery-2"))
         campaign = unquote(params["campaigns"].removeprefix("List(").removesuffix(")"))
         if campaign == CAMPAIGN_LOW:
-            return _json(_analytics_body(surface, [], next_href=f"{link}low-2"))
-        return _json(_statistics_body([_segment([value], impressions=30)]))
+            return _json(_member_body([], next_href=f"{link}low-2"))
+        return _json(_member_body([_segment([value], impressions=30)]))
 
     server = Server(handle)
     async with _linkedin(server) as client:
@@ -1711,6 +1737,147 @@ async def test_analytics_segments_fallback_follows_next_links_past_empty_pages()
     assert listing.reason is None
     assert listing.interrupted_by is None
     assert listing.calls == 7
+
+
+# ---------------------------------------------------------------------------------------------
+# analytics_segments: capture-only bounds (max_pages, max_campaigns)
+# ---------------------------------------------------------------------------------------------
+
+
+def _bounded_fallback_handler() -> Handler:
+    """Reject q=statistics; serve a paged discovery and paged per-campaign responses.
+
+    Discovery page 1 names ``CAMPAIGN_LOW`` and ``CAMPAIGN_HIGH`` and links to page 2, which
+    names ``CAMPAIGN_THIRD``; every campaign's first page carries one row of the requested
+    pivot's value and links to an empty second page.
+    """
+    link = "/rest/adAnalytics?q=analytics&chain="
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Route one adAnalytics request by finder, pivot and continuation."""
+        params = _params(request)
+        if params["q"] == "statistics":
+            return _error(400, '"MEMBER_SENIORITY" is not an enum symbol')
+        if params.get("chain") == "discovery-2":
+            return _json(_discovery_body([_discovery(CAMPAIGN_THIRD, 4)]))
+        if "chain" in params:
+            return _json(_member_body([]))
+        if params["pivot"] == "CAMPAIGN":
+            first = [_discovery(CAMPAIGN_LOW, 5), _discovery(CAMPAIGN_HIGH, 9)]
+            return _json(_discovery_body(first, next_href=f"{link}discovery-2"))
+        value, _facet = SEGMENT_VALUES[params["pivot"]]
+        return _json(
+            _member_body([_segment([value], impressions=30)], next_href=f"{link}campaign-2")
+        )
+
+    return handle
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_capture_bounds_send_one_discovery_and_one_campaign() -> None:
+    """``max_pages=1, max_campaigns=1``: one discovery and one per-campaign request.
+
+    After the rejected Statistics Finder, the discovery's ``next`` link and the campaign's
+    ``next`` link stay unread and only the lowest-id delivering campaign is read, so the
+    capture costs exactly one request per fallback surface. The rows read are kept and the
+    listing is incomplete with reason "page limit".
+    """
+    server = Server(_bounded_fallback_handler())
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(
+            ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28, max_pages=1, max_campaigns=1
+        )
+
+    statistics, discovery, campaign = server.requests
+    assert _params(statistics)["q"] == "statistics"
+    assert _assert_contract_request(discovery, "ad_analytics_campaign_delivery")["pivot"] == (
+        "CAMPAIGN"
+    )
+    params = _assert_contract_request(campaign, "ad_analytics_member_segments")
+    assert params["campaigns"] == "List(urn%3Ali%3AsponsoredCampaign%3A99000105)"
+    assert [(row.campaign_urn, row.impressions) for row in listing.rows] == [(CAMPAIGN_LOW, 30)]
+    assert (listing.complete, listing.reason, listing.calls) == (False, "page limit", 3)
+    assert listing.interrupted_by is None
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_max_campaigns_alone_leaves_later_campaigns_unread() -> None:
+    """Every discovery page is read, then only the first two campaigns in id order."""
+    server = Server(_bounded_fallback_handler())
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(
+            ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28, max_campaigns=2
+        )
+
+    assert [_params(request).get("chain") for request in server.requests] == [
+        None,
+        None,
+        "discovery-2",
+        None,
+        "campaign-2",
+        None,
+        "campaign-2",
+    ]
+    assert [row.campaign_urn for row in listing.rows] == [CAMPAIGN_LOW, CAMPAIGN_HIGH]
+    assert (listing.complete, listing.reason) == (False, "page limit")
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_without_bounds_read_every_campaign_and_page() -> None:
+    """The default (every sync) reads the whole discovery and every campaign's chain."""
+    server = Server(_bounded_fallback_handler())
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    assert len(server.requests) == 1 + 2 + 3 * 2
+    assert [row.campaign_urn for row in listing.rows] == [
+        CAMPAIGN_LOW,
+        CAMPAIGN_HIGH,
+        CAMPAIGN_THIRD,
+    ]
+    assert (listing.complete, listing.reason) == (True, None)
+
+
+@pytest.mark.anyio
+async def test_a_bounded_discovery_never_stands_in_for_a_full_one() -> None:
+    """A later unbounded call on the same client discovers again instead of reusing the cut."""
+    server = Server(_bounded_fallback_handler())
+    async with _linkedin(server) as client:
+        bounded = await client.analytics_segments(
+            ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28, max_pages=1
+        )
+        full = await client.analytics_segments(ACCOUNT_ID, "MEMBER_JOB_FUNCTION", WINDOW_28)
+
+    discoveries = [
+        request
+        for request in server.requests
+        if _params(request).get("pivot") == "CAMPAIGN" or "discovery" in _query(request)
+    ]
+    assert len(discoveries) == 3
+    assert (bounded.complete, bounded.reason) == (False, "page limit")
+    assert [row.campaign_urn for row in bounded.rows] == [CAMPAIGN_LOW, CAMPAIGN_HIGH]
+    assert full.complete
+    assert [row.campaign_urn for row in full.rows] == [CAMPAIGN_LOW, CAMPAIGN_HIGH, CAMPAIGN_THIRD]
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_statistics_form_reads_one_response_under_max_pages() -> None:
+    """The contracted request reads one response; an unread ``next`` link is "page limit"."""
+    value, _facet = SEGMENT_VALUES["MEMBER_SENIORITY"]
+    link = "/rest/adAnalytics?q=statistics&chain=2"
+    body = _analytics_body(
+        "ad_analytics_statistics", [_segment([CAMPAIGN_LOW, value])], next_href=link
+    )
+    server = Server(_sequence(_json(body)))
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(
+            ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28, max_pages=1, max_campaigns=1
+        )
+
+    (request,) = server.requests
+    assert _assert_contract_request(request, "ad_analytics_statistics")["q"] == "statistics"
+    assert [row.campaign_urn for row in listing.rows] == [CAMPAIGN_LOW]
+    assert (listing.complete, listing.reason, listing.calls) == (False, "page limit", 1)
 
 
 # ---------------------------------------------------------------------------------------------

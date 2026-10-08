@@ -49,19 +49,24 @@ Example::
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
+import errno
 import getpass
 import json
+import os
 import re
 import secrets
+import stat
 import sys
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
+from secrets import token_hex
 from typing import TYPE_CHECKING, Any, Final, NoReturn, Protocol, cast, overload
-from urllib.parse import parse_qsl, unquote, urlencode
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode
 
 import httpx
 from argon2 import Parameters, PasswordHasher, extract_parameters
@@ -70,15 +75,15 @@ from pydantic import ValidationError
 
 from ads_engine import __version__
 from ads_engine.db.models.ops import SOURCES, AppUser
-from ads_engine.logging import EMAIL_RE, configure_logging, get_logger, redact
+from ads_engine.logging import EMAIL_RE, configure_logging, get_logger, logged_as, redact
 from ads_engine.settings import SOURCES as SETTINGS_SOURCES
 from ads_engine.settings import ConfigurationError, Settings, Source, get_settings
 
 if TYPE_CHECKING:
     from ads_engine.analysis.thresholds import Thresholds
-    from ads_engine.connectors.google_n8n.client import CallBudget
     from ads_engine.connectors.linkedin.client import LinkedInClient
     from ads_engine.simulation.payloads import JSONValue, RequestShape
+    from ads_engine.sync.budget_guard import GoogleCallBudget
 
 __all__ = [
     "EXIT_FAILURE",
@@ -100,7 +105,8 @@ EXIT_OK: Final = 0
 
 EXIT_FAILURE: Final = 1
 """The command failed: an expected domain error (one line on stderr) or an unexpected one
-(logged as ``cli_failed`` with its traceback, redacted)."""
+(logged as ``cli_failed`` with its traceback, redacted, or naming the event that already
+logged that traceback)."""
 
 EXIT_USAGE: Final = 2
 """A usage error: argparse's own (its diagnostic names the argument, never the supplied value),
@@ -836,32 +842,96 @@ class _RecordingTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
-class _LocalCallBudget:
-    """A per-process Google call budget for captures made while the database is unreachable.
+class _CallBudgetUnavailableError(Exception):
+    """The shared Google call budget in the database could not be read or reserved.
 
-    It satisfies ``google_n8n.client.CallBudget``. The product's shared cap lives in
-    ``source_connection``; without the database these calls cannot be counted there, so the
-    capture is held to one call per GAQL template and a warning says the calls went unrecorded.
+    Raised in place of a webhook POST that has no durable reservation, so that POST is never
+    sent.
+
+    Attributes:
+        error: The class name of the database error. Its message is left out, because it can
+            name the database host.
     """
 
-    def __init__(self, cap: int) -> None:
-        self._cap = cap
-        self._used = 0
+    def __init__(self, error: str) -> None:
+        super().__init__(f"the shared Google call budget in the database is unavailable ({error})")
+        self.error = error
 
-    async def acquire(self) -> None:
-        """Admit one webhook POST attempt, or refuse it once the local cap is used.
+
+class _CaptureCallBudget:
+    """The call budget of a Google capture: the product's shared ``GoogleCallBudget``.
+
+    It satisfies ``google_n8n.client.CallBudget``. Every webhook POST attempt is reserved in
+    ``source_connection`` first, so capture calls count in ``calls_24h`` against
+    ``GOOGLE_DAILY_CALL_BUDGET`` exactly like the worker's and ``sync``'s, and a full window
+    refuses them with ``CallBudgetExhausted``. It fails closed: no local count ever stands in
+    for the database. The first database failure is remembered, and that attempt and every
+    later one are refused with :class:`_CallBudgetUnavailableError` without touching the
+    database again.
+
+    Attributes:
+        failure: The class name of the database error that made the budget unavailable, or
+            ``None`` while the database answers.
+    """
+
+    __slots__ = ("_shared", "failure")
+
+    def __init__(self, shared: GoogleCallBudget) -> None:
+        self._shared = shared
+        self.failure: str | None = None
+
+    async def remaining(self) -> int:
+        """Read how many calls the shared window still admits; sends nothing.
+
+        Returns:
+            The calls the sliding 24 h window admits before the cap.
 
         Raises:
-            CallBudgetExhausted: When ``cap`` attempts were already admitted.
+            _CallBudgetUnavailableError: When the database cannot be read, now or earlier.
         """
-        from ads_engine.connectors.errors import CallBudgetExhausted
+        return await self._metered(self._shared.remaining, "preflight")
 
-        if self._used >= self._cap:
-            raise CallBudgetExhausted(
-                f"capture-fixtures local cap of {self._cap} webhook calls reached",
-                endpoint="search",
+    async def acquire(self) -> None:
+        """Reserve one webhook POST attempt in the shared budget, or refuse it.
+
+        Raises:
+            CallBudgetExhausted: When the window already holds ``GOOGLE_DAILY_CALL_BUDGET``
+                calls; nothing is counted and no POST may be made.
+            _CallBudgetUnavailableError: When this reservation or an earlier one failed on the
+                database; no POST may be made.
+        """
+        await self._metered(self._shared.acquire, "reservation")
+
+    async def _metered[T](self, call: Callable[[], Coroutine[Any, Any, T]], phase: str) -> T:
+        """Run one call of the shared budget, failing closed on a database error.
+
+        Args:
+            call: The ``GoogleCallBudget`` method to await.
+            phase: ``"preflight"`` or ``"reservation"``, for the log.
+
+        Returns:
+            The call's result.
+
+        Raises:
+            _CallBudgetUnavailableError: When the database failed on this call or an earlier
+                one; after a failure ``call`` is not awaited.
+        """
+        from sqlalchemy.exc import SQLAlchemyError
+
+        if self.failure is not None:
+            raise _CallBudgetUnavailableError(self.failure)
+        try:
+            return await call()
+        except (SQLAlchemyError, OSError) as exc:
+            self.failure = type(exc).__name__
+            log.warning(
+                "capture_call_budget_unavailable",
+                source="google",
+                phase=phase,
+                error=self.failure,
+                detail="no webhook call is sent without a reservation in source_connection",
             )
-        self._used += 1
+            raise _CallBudgetUnavailableError(self.failure) from exc
 
 
 # ---------------------------------------------------------------------------------------------
@@ -892,9 +962,48 @@ _PERSON_KEYS: Final = frozenset(
 _ANSWER_DETAILS_KEY: Final = "answerDetails"
 _AUTHORIZATION: Final = "authorization"
 _FORM_MEDIA_TYPE: Final = "application/x-www-form-urlencoded"
-# A configured secret at least this long is replaced wherever it occurs inside a string; a
-# shorter one only where it is the whole string, so a short value never cuts ids or text apart.
-_MIN_SUBSTRING_SECRET: Final = 8
+# The text redaction itself writes. The leak check reads only what lies between these, so a
+# short secret such as "red" is never found inside a marker.
+_INSERTED_TEXT: Final = re.compile(
+    "|".join(re.escape(text) for text in (_REDACTED_WEBHOOK_URL, _ENCODED_MARKER, _MARKER))
+)
+# The leak check percent-decodes each string with each decoder until it stops changing, so a
+# secret encoded any number of times, or in a spelling the secret pattern does not match, is
+# found.
+_DECODERS: Final[tuple[Callable[[str], str], ...]] = (unquote, unquote_plus)
+
+
+def _hex_digit(digit: str) -> str:
+    """A regular expression matching one hex digit of a percent escape, in either case."""
+    return digit if digit.isdigit() else f"[{digit.upper()}{digit.lower()}]"
+
+
+def _secret_spelling(secret: str) -> str:
+    """A regular expression matching ``secret`` in plain text or any percent-encoded spelling.
+
+    Each character matches itself, the ``%XX`` escapes of its UTF-8 bytes with either case of
+    each hex digit, and, for a space, ``+``, in any mix: ``abc`` is matched as ``%61%62%63``
+    and ``a%62c``, and ``a/b+c`` as ``a%2fb%2bc``. Plain characters match case-sensitively.
+
+    Args:
+        secret: The plaintext of one configured secret.
+
+    Returns:
+        The pattern, without anchors or groups that capture.
+    """
+    characters: list[str] = []
+    for character in secret:
+        # surrogatepass: a lone surrogate (an undecodable environment byte) gets an escape
+        # too, instead of failing the whole command.
+        escape = "".join(
+            "%" + "".join(_hex_digit(digit) for digit in f"{byte:02X}")
+            for byte in character.encode("utf-8", errors="surrogatepass")
+        )
+        alternatives = [re.escape(character), escape]
+        if character == " ":
+            alternatives.append(re.escape("+"))
+        characters.append(f"(?:{'|'.join(alternatives)})")
+    return "".join(characters)
 
 
 def _blank(node: JSONValue, *, numbers: bool) -> JSONValue:
@@ -925,9 +1034,20 @@ def _blank(node: JSONValue, *, numbers: bool) -> JSONValue:
 class _RedactionPolicy:
     """What a capture must lose before it is written: secrets, tokens, people and accounts.
 
+    Every configured secret is removed wherever it occurs, whatever its length: in any string
+    or dict key, in plain text or in any percent-encoded spelling, and as a JSON number equal
+    to it. Capture fidelity gives way to that guarantee, and :meth:`holds_secret` confirms it
+    on each finished document, percent-decoded however many times it was encoded too, so a
+    capture that still holds a secret is never written.
+
     Attributes:
-        secrets: The plaintext of every configured secret and the n8n webhook URL, longest
-            first.
+        secrets: The plaintext of every configured secret, the n8n webhook URL and the
+            LinkedIn client id, longest first.
+        secret_pattern: One alternation of those secrets, longest plaintext first, each
+            matching its plain text and any percent-encoded spelling (see
+            :func:`_secret_spelling`), or ``None`` when nothing is configured. A single pass
+            replaces every occurrence and never rescans the marker it wrote, so a secret
+            such as ``red`` cannot loop or survive.
         header_names: Lower-cased request headers whose values are credentials:
             ``Authorization`` and the configured n8n secret header.
         identifiers: Patterns of the configured Google customer id and LinkedIn ad account
@@ -938,6 +1058,7 @@ class _RedactionPolicy:
     """
 
     secrets: tuple[str, ...]
+    secret_pattern: re.Pattern[str] | None
     header_names: frozenset[str]
     identifiers: tuple[tuple[re.Pattern[str], str], ...]
     identifier_values: frozenset[str]
@@ -948,6 +1069,12 @@ class _RedactionPolicy:
         secrets = set(settings.secret_values())
         if settings.n8n_google_ads_webhook_url:
             secrets.add(settings.n8n_google_ads_webhook_url)
+        # A plain setting, so not among the secret values, but a LinkedIn OAuth credential.
+        client_id = (settings.linkedin_client_id or "").strip()
+        if client_id:
+            secrets.add(client_id)
+        ordered = tuple(sorted(secrets, key=len, reverse=True))
+        alternation = "|".join(_secret_spelling(secret) for secret in ordered)
         ids = list(settings.linkedin_ad_account_ids)
         if settings.google_ads_customer_id:
             ids.append(settings.google_ads_customer_id)
@@ -956,7 +1083,8 @@ class _RedactionPolicy:
             for value in sorted(set(ids), key=len, reverse=True)
         )
         return cls(
-            secrets=tuple(sorted(secrets, key=len, reverse=True)),
+            secrets=ordered,
+            secret_pattern=re.compile(alternation) if ordered else None,
             header_names=frozenset(
                 {_AUTHORIZATION, settings.n8n_webhook_secret_header.strip().lower()}
             ),
@@ -965,22 +1093,87 @@ class _RedactionPolicy:
         )
 
     def text(self, value: str) -> str:
-        """Redact one string: configured secrets, account ids, then email addresses."""
-        for secret in self.secrets:
-            if value == secret:
-                return _MARKER
-            if len(secret) >= _MIN_SUBSTRING_SECRET and secret in value:
-                value = value.replace(secret, _MARKER)
+        """Redact one string: configured secrets, account ids, then email addresses.
+
+        Every configured secret is replaced wherever it occurs, whatever its length: its exact
+        plaintext by ``<redacted>``, and any percent-encoded spelling (either hex case, encoded
+        or literal characters in any mix, ``+`` for a space) by ``%3Credacted%3E``, so a URL
+        or form body stays parseable.
+        """
+        if self.secret_pattern is not None:
+            value = self.secret_pattern.sub(self._secret_marker, value)
         for pattern, replacement in self.identifiers:
             value = pattern.sub(replacement, value)
         return EMAIL_RE.sub(_MARKER, value)
+
+    def _secret_marker(self, match: re.Match[str]) -> str:
+        """The marker for one matched secret: plain for its plaintext, else percent-encoded."""
+        return _MARKER if match.group(0) in self.secrets else _ENCODED_MARKER
+
+    def holds_secret(self, node: JSONValue) -> bool:
+        """Whether a redacted capture still holds a configured secret: the fail-closed check.
+
+        Every dict key, every string and every number (by its JSON text) is searched for a
+        configured secret, outside the markers and the webhook placeholder that redaction
+        writes. Each stretch between them is searched for its plain text and every
+        percent-encoded spelling and, independently of that pattern, percent-decoded until it
+        stops changing, with and without ``+`` as a space, each decoded form being searched
+        for any secret's plaintext, so a secret encoded any number of times is found too.
+        Values redaction keeps as recorded, such as ``captured_at`` and header names, are
+        searched too.
+
+        Args:
+            node: The redacted capture document, or a part of it.
+
+        Returns:
+            ``True`` when a configured secret survives; the capture must not be written.
+        """
+        if isinstance(node, dict):
+            return any(self._holds(key) or self.holds_secret(item) for key, item in node.items())
+        if isinstance(node, list):
+            return any(self.holds_secret(item) for item in node)
+        if isinstance(node, str):
+            return self._holds(node)
+        if isinstance(node, int | float) and not isinstance(node, bool):
+            return self._holds(json.dumps(node))
+        return False
+
+    def _holds(self, text: str) -> bool:
+        """Whether ``text`` holds a configured secret outside the text redaction inserted."""
+        pattern = self.secret_pattern
+        return pattern is not None and any(
+            pattern.search(segment) is not None or self._decodes_to_secret(segment)
+            for segment in _INSERTED_TEXT.split(text)
+        )
+
+    def _decodes_to_secret(self, segment: str) -> bool:
+        """Whether percent-decoding ``segment`` reveals a configured secret's plaintext.
+
+        Each decoder of ``_DECODERS`` is applied again and again until the text no longer
+        changes, with no cap on the number of rounds, and every decoded form is searched.
+        """
+        for decode in _DECODERS:
+            # No round cap is needed. A round that decodes any %XX escape shortens the text,
+            # since each escape becomes at most one character (an invalid byte a single
+            # U+FFFD). The only change that keeps the length is unquote_plus turning "+" into
+            # spaces, which never become "+" again, and it leaves nothing to decode. So at most
+            # len(segment) rounds change the text, and a segment with no "%" (nor, for
+            # unquote_plus, "+") costs one call.
+            decoded, previous = decode(segment), segment
+            while decoded != previous:
+                if any(secret in decoded for secret in self.secrets):
+                    return True
+                decoded, previous = decode(decoded), decoded
+        return False
 
     def value(self, node: JSONValue, keys: frozenset[str]) -> JSONValue:
         """Redact a JSON body recursively.
 
         Values under ``keys`` (credentials and person keys) are blanked, numbers included;
         every ``answerDetails`` is blanked whole; dict keys and every other string go through
-        :meth:`text`; a number equal to a configured account id becomes ``0``.
+        :meth:`text`, which removes every configured secret wherever it occurs; a number equal
+        to a configured account id becomes ``0``, and one whose JSON text equals a configured
+        secret becomes the marker.
 
         Args:
             node: The decoded JSON body or a part of it.
@@ -1010,6 +1203,13 @@ class _RedactionPolicy:
         ):
             # An ad account id sent as a JSON number (LinkedIn's adAccounts `id`).
             return 0
+        if (
+            isinstance(node, int | float)
+            and not isinstance(node, bool)
+            and json.dumps(node) in self.secrets
+        ):
+            # A digits-only secret echoed as a JSON number, blanked as a person number is.
+            return _MARKER
         return node
 
     def url(self, url: str, source: Source) -> str:
@@ -1124,9 +1324,16 @@ def _redact_capture(
     * person-name and contact keys (``firstName``, ``lastName``, ``firstname``,
       ``lastname``, ``fullName``, ``phone``, ``mobilephone``, ``email``);
     * every LinkedIn ``formResponse.answers[].answerDetails`` whole, keys kept;
-    * any email address and the plaintext of every configured secret, in any string;
+    * any email address, and every configured secret (the LinkedIn client id included)
+      wherever it occurs in a body string, dict key, URL or header value, whatever its length,
+      in plain text or in any percent-encoded spelling (the latter as ``%3Credacted%3E``); a
+      JSON number equal to a secret becomes the marker too;
     * the n8n webhook URL (a placeholder URL) and the configured Google customer id and
       LinkedIn ad account ids (same-length zeros).
+
+    :func:`_build_captures` then checks the result with
+    :meth:`_RedactionPolicy.holds_secret` and never writes one that still holds a secret,
+    however many times it was percent-encoded.
 
     Args:
         capture: The document from :func:`_capture_document`.
@@ -1170,8 +1377,14 @@ def _redact_capture(
 # Lead responses and deals are looked for over the last 30 days; every call reads one page.
 _LEAD_LOOKBACK: Final = timedelta(days=30)
 _DEAL_LOOKBACK: Final = timedelta(days=30)
-# One demographic pivot is enough to record the statistics surface (any of the three works).
+# One demographic pivot is enough to record the segment surfaces (any of the three works).
 _SEGMENT_PIVOT: Final = "MEMBER_SENIORITY"
+# Capture-only bounds: each request reads one page (no further page token, next link or
+# association continuation), and the LinkedIn segment fallback reads one delivering campaign,
+# so every capture surface costs one request. Sync never passes these bounds.
+_CAPTURE_PAGES: Final = 1
+_CAPTURE_CAMPAIGNS: Final = 1
+_CAPTURE_CONTINUATIONS: Final = 0
 _LIFECYCLE_STAGE: Final = "lifecyclestage"
 _CONTACTS: Final = "contacts"
 _DEALS: Final = "deals"
@@ -1184,8 +1397,9 @@ class _CaptureRun:
     Attributes:
         source: The source captured.
         recorder: The transport every call went through.
-        failures: ``"<surface>: <reason>"`` for each call that failed; reasons are the
-            connectors' sanitised reasons.
+        failures: ``"<surface>: <reason>"`` for each call that failed, where reasons are the
+            connectors' sanitised reasons, and for each capture left unwritten because a
+            configured secret survived its redaction.
         skipped: Surfaces not called, with why.
         rows: Google only: ``(row surface, exchange)`` of each GAQL query that answered.
         stopped: Set when the platform refused the credentials outright (HTTP 401, or a
@@ -1202,9 +1416,10 @@ class _CaptureRun:
     async def step[T](self, surface: str, call: Callable[[], Coroutine[Any, Any, T]]) -> T | None:
         """Make one capture call, recording a connector failure instead of raising it.
 
-        Only the connectors' classified errors are caught; anything else is a defect of the
-        CLI and propagates. A 401 stops the capture, because no later call can authenticate;
-        a 403 on one surface (a scope the token lacks) only fails that surface.
+        Only the connectors' classified errors are caught; anything else propagates: a
+        defect of the CLI, or the Google call budget becoming unavailable, which
+        :func:`_capture_google` handles. A 401 stops the capture, because no later call can
+        authenticate; a 403 on one surface (a scope the token lacks) only fails that surface.
 
         Args:
             surface: The surface the call addresses, for the report.
@@ -1304,32 +1519,21 @@ def _google_scope(
     return scope
 
 
-async def _google_budget(settings: Settings, cap: int) -> CallBudget:
-    """The call budget of a Google capture.
+async def _google_budget(settings: Settings) -> _CaptureCallBudget:
+    """The call budget of a Google capture, read once before any request is built.
 
-    The product's shared ``GoogleCallBudget`` when the database is reachable, so these calls
-    count against ``GOOGLE_DAILY_CALL_BUDGET`` like every other; otherwise a local budget of
-    ``cap`` calls, with a warning that ``source_connection.calls_24h`` will not show them.
+    The product's shared ``GoogleCallBudget``, so every capture call counts in
+    ``source_connection.calls_24h`` against ``GOOGLE_DAILY_CALL_BUDGET`` like every other
+    webhook call. The window is read first, so a database that cannot meter the calls
+    refuses the capture before any request leaves.
+
+    Raises:
+        _CallBudgetUnavailableError: When the database cannot be read; no webhook call was sent.
     """
-    from sqlalchemy.exc import SQLAlchemyError
-
     from ads_engine.sync.budget_guard import GoogleCallBudget
 
-    budget = GoogleCallBudget(settings)
-    try:
-        remaining = await budget.remaining()
-    except (SQLAlchemyError, OSError) as exc:
-        log.warning(
-            "capture_call_budget_unrecorded",
-            source="google",
-            cap=cap,
-            error=type(exc).__name__,
-            detail=(
-                "the database is unreachable: these webhook calls are capped locally and are "
-                "not recorded in source_connection.calls_24h"
-            ),
-        )
-        return _LocalCallBudget(cap)
+    budget = _CaptureCallBudget(GoogleCallBudget(settings))
+    remaining = await budget.remaining()
     log.info("capture_call_budget", source="google", remaining=remaining)
     return budget
 
@@ -1339,13 +1543,21 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
 
     The first call becomes ``search.json``; the first row of each query becomes its
     ``row_*`` capture. Only the first page is read: a capture records shapes, not data.
+
+    Every POST attempt is reserved in the shared call budget first. When a reservation fails
+    on the database, that query and every later one are not sent and the failure is
+    recorded; the captures already made are kept, because their calls were counted.
+
+    Raises:
+        _CallBudgetUnavailableError: When the shared call budget cannot be read before the
+            first call; no webhook call was sent.
     """
     from ads_engine.connectors.google_n8n.client import GoogleAdsWebhookClient
     from ads_engine.connectors.google_n8n.queries import QUERIES
     from ads_engine.connectors.http import build_client
 
-    # One call per template: 9 calls when the database cannot meter them.
-    budget = await _google_budget(settings, len(QUERIES))
+    # One call per template, each reserved in the shared budget before its POST.
+    budget = await _google_budget(settings)
     day = datetime.now(UTC).date() - timedelta(days=1)
     campaign_id: int | None = None
     ad_group_id: int | None = None
@@ -1353,12 +1565,19 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
         client = GoogleAdsWebhookClient.from_settings(settings, http, budget)
         for query_id, template in QUERIES.items():
             surface = f"search {query_id}"
+            if budget.failure is not None:
+                run.skipped.append(f"{surface}: not sent, the shared call budget is unavailable")
+                continue
             scope = _google_scope(query_id, day, campaign_id, ad_group_id)
             if scope is None:
                 run.skipped.append(f"{surface}: no campaign id was read to look up")
                 continue
             query = template.render(**scope)
-            page = await run.step(surface, partial(client.search_page, query_id, query))
+            try:
+                page = await run.step(surface, partial(client.search_page, query_id, query))
+            except _CallBudgetUnavailableError as exc:
+                run.failures.append(f"{surface}: {exc}; no further webhook call was sent")
+                continue
             if page is None:
                 continue
             # search_page returned, so the last exchange is this query's successful POST.
@@ -1372,11 +1591,18 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
 async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
     """One minimal call per LinkedIn surface, for the first configured ad account.
 
-    ``access_token`` (refresh-token trio only), ``ad_account``, ``ad_campaign_groups``,
-    ``ad_campaigns``, ``creatives`` (first campaign), ``posts`` (first creative's post),
-    ``ad_analytics`` (yesterday, DAILY), ``ad_analytics_statistics`` (one pivot, ALL),
-    ``lead_forms`` (``count=1``), ``lead_form_responses`` (``count=1``) and
-    ``lead_form_responses_batch`` (the lead just read, when there is one).
+    ``access_token`` (refresh-token trio only), ``ad_account``, ``ad_campaign_groups``
+    (first page), ``ad_campaigns`` (first page), ``creatives`` (first campaign, first page),
+    ``posts`` (first creative's post), ``ad_analytics`` (yesterday, DAILY, first response),
+    ``ad_analytics_statistics`` (one pivot, ALL, first response), ``lead_forms``
+    (``count=1``), ``lead_form_responses`` (``count=1``) and ``lead_form_responses_batch``
+    (the lead just read, when there is one). Each call reads one page: no later page token
+    or ``next`` link is followed, so the listings are incomplete ("page limit") by design.
+
+    When LinkedIn rejects the Statistics Finder with HTTP 400, the segment call takes the
+    client's live fallback with the same bounds: one ``ad_analytics_campaign_delivery``
+    discovery request and one ``ad_analytics_member_segments`` request for the first
+    delivering campaign, each captured under its own surface.
     """
     from ads_engine.connectors.http import build_client
     from ads_engine.connectors.linkedin.auth import LinkedInTokenProvider
@@ -1396,10 +1622,15 @@ async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
             return
         client = LinkedInClient(http, tokens)
         await run.step("ad_account", partial(client.get_ad_account, account))
-        groups = await run.step("ad_campaign_groups", partial(client.list_campaign_groups, account))
+        groups = await run.step(
+            "ad_campaign_groups",
+            partial(client.list_campaign_groups, account, max_pages=_CAPTURE_PAGES),
+        )
         if groups is not None:
             run.interrupted("ad_campaign_groups", groups.interrupted_by)
-        campaigns = await run.step("ad_campaigns", partial(client.list_campaigns, account))
+        campaigns = await run.step(
+            "ad_campaigns", partial(client.list_campaigns, account, max_pages=_CAPTURE_PAGES)
+        )
         campaign_urn: str | None = None
         if campaigns is not None:
             run.interrupted("ad_campaigns", campaigns.interrupted_by)
@@ -1407,13 +1638,26 @@ async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
         await _capture_linkedin_creatives(client, account, campaign_urn, run)
         analytics = await run.step(
             "ad_analytics",
-            partial(client.analytics_daily, account, (day, day), expected_creatives=1),
+            partial(
+                client.analytics_daily,
+                account,
+                (day, day),
+                expected_creatives=1,
+                max_pages=_CAPTURE_PAGES,
+            ),
         )
         if analytics is not None:
             run.interrupted("ad_analytics", analytics.interrupted_by)
         segments = await run.step(
             "ad_analytics_statistics",
-            partial(client.analytics_segments, account, _SEGMENT_PIVOT, (day, day)),
+            partial(
+                client.analytics_segments,
+                account,
+                _SEGMENT_PIVOT,
+                (day, day),
+                max_pages=_CAPTURE_PAGES,
+                max_campaigns=_CAPTURE_CAMPAIGNS,
+            ),
         )
         if segments is not None:
             run.interrupted("ad_analytics_statistics", segments.interrupted_by)
@@ -1423,12 +1667,15 @@ async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
 async def _capture_linkedin_creatives(
     client: LinkedInClient, account: str, campaign_urn: str | None, run: _CaptureRun
 ) -> None:
-    """Capture ``creatives`` for one campaign and ``posts`` for one creative's post."""
+    """Capture ``creatives`` (one campaign, first page) and ``posts`` for one creative's post."""
     if campaign_urn is None:
         run.skipped.append("creatives: the account has no campaign")
         run.skipped.append("posts: no creative was read")
         return
-    creatives = await run.step("creatives", partial(client.list_creatives, account, [campaign_urn]))
+    creatives = await run.step(
+        "creatives",
+        partial(client.list_creatives, account, [campaign_urn], max_pages=_CAPTURE_PAGES),
+    )
     if creatives is None:
         run.skipped.append("posts: no creative was read")
         return
@@ -1481,8 +1728,10 @@ async def _capture_hubspot(settings: Settings, run: _CaptureRun, thresholds: Thr
 
     ``properties`` (``contacts/lifecyclestage``), then the CRM binding verification that
     binds the contact properties, ``crm_search`` (deals of the last 30 days, ``limit=1``),
-    ``associations_batch_read`` (that deal's contacts, or one input with no deal) and
-    ``objects_batch_read`` (that contact by id, or the probe email batch with zero matches).
+    ``associations_batch_read`` (that deal's contacts, or one input with no deal; the initial
+    call only, so an input with more pages is ``partial`` and its continuation is never sent)
+    and ``objects_batch_read`` (that contact by id, or the probe email batch with zero
+    matches).
     """
     from ads_engine.connectors.http import build_client
     from ads_engine.connectors.hubspot.client import PROBE_EMAIL, HubSpotClient
@@ -1503,14 +1752,27 @@ async def _capture_hubspot(settings: Settings, run: _CaptureRun, thresholds: Thr
         if deal_id is not None:
             fetch = await run.step(
                 "associations_batch_read",
-                partial(client.associations, _DEALS, _CONTACTS, [deal_id]),
+                partial(
+                    client.associations,
+                    _DEALS,
+                    _CONTACTS,
+                    [deal_id],
+                    max_continuations=_CAPTURE_CONTINUATIONS,
+                ),
             )
             if fetch is not None and fetch.all_targets:
                 contact_id = fetch.all_targets[0]
         else:
             # As the recovery probe does: one input with no deal, answered as a multi-status.
             await run.step(
-                "associations_batch_read", partial(client.associations, _CONTACTS, _DEALS, ["0"])
+                "associations_batch_read",
+                partial(
+                    client.associations,
+                    _CONTACTS,
+                    _DEALS,
+                    ["0"],
+                    max_continuations=_CAPTURE_CONTINUATIONS,
+                ),
             )
         if bindings is None:
             run.skipped.append("objects_batch_read: the contact properties could not be bound")
@@ -1542,6 +1804,10 @@ async def _capture(
 # ---------------------------------------------------------------------------------------------
 
 
+# The failure reported for a capture that fails closed; it never carries the value.
+_FAIL_CLOSED_REASON: Final = "not written: a configured secret survived redaction"
+
+
 def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dict[str, JSONValue]]:
     """Choose the first 2xx JSON exchange per surface and turn each into a redacted capture.
 
@@ -1549,13 +1815,30 @@ def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dic
     uses. For Google, the first row of each query's page is added as its ``row_*`` capture;
     queries that returned no rows are skipped.
 
+    Each redacted capture is checked with :meth:`_RedactionPolicy.holds_secret`, failing
+    closed: one that still holds a configured secret is left out, so it is never written, and
+    ``"<surface>: not written: a configured secret survived redaction"`` is added to
+    ``run.failures``, which makes the command exit 1. A surface is decided by its first
+    exchange either way. A capture that only breaks its contract is kept.
+
     Returns:
-        Redacted capture documents keyed by surface name.
+        Redacted capture documents keyed by surface name, none holding a configured secret.
     """
     from ads_engine.simulation.payloads import UnknownSurface, identify_surface
 
     source = run.source
     documents: dict[str, dict[str, JSONValue]] = {}
+    refused: set[str] = set()
+
+    def admit(surface: str, raw: dict[str, JSONValue]) -> None:
+        """Keep the redacted ``raw`` as ``surface``, unless a configured secret survived."""
+        document = _redact_capture(raw, policy, source)
+        if policy.holds_secret(document):
+            refused.add(surface)
+            run.failures.append(f"{surface}: {_FAIL_CLOSED_REASON}")
+        else:
+            documents[surface] = document
+
     for exchange in run.recorder.exchanges:
         if not exchange.ok:
             continue
@@ -1567,18 +1850,16 @@ def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dic
         except UnknownSurface:
             log.warning("capture_unknown_surface", source=source, method=exchange.method)
             continue
-        if surface not in documents:
-            raw = _capture_document(source, surface, exchange, body)
-            documents[surface] = _redact_capture(raw, policy, source)
+        if surface not in documents and surface not in refused:
+            admit(surface, _capture_document(source, surface, exchange, body))
     for row_surface, exchange in run.rows:
-        if row_surface in documents:
+        if row_surface in documents or row_surface in refused:
             continue
         body, is_json = _decode_json(exchange.content)
         row = _first_row(body) if is_json else None
         if row is None:
             continue
-        raw = _capture_document(source, row_surface, exchange, row)
-        documents[row_surface] = _redact_capture(raw, policy, source)
+        admit(row_surface, _capture_document(source, row_surface, exchange, row))
     return documents
 
 
@@ -1604,8 +1885,229 @@ def _contract_problems(documents: Mapping[str, dict[str, JSONValue]], root: Path
     return problems
 
 
-def _write_captures(directory: Path, documents: Mapping[str, dict[str, JSONValue]]) -> list[Path]:
-    """Write each capture as ``{directory}/{surface}.json``, replacing an older one atomically.
+# The output directory of a source's captures, under tests/contracts/{source}/.
+_CAPTURED_DIR: Final = "captured"
+# Directory opens and temporary-file creation never follow a symbolic link in the last path
+# component, and O_DIRECTORY rejects any other non-directory. No descriptor reaches a child.
+_DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_TEMPORARY_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_CAPTURE_FILE_MODE: Final = 0o644
+_WRITE_PROBE: Final = "write-probe"
+
+
+class _OutputRefusedError(Exception):
+    """The capture output directory cannot be used safely; the message says which and why."""
+
+
+def _directory_problem(exc: OSError, *, writing: bool) -> str:
+    """Why an existing directory cannot be used, from the ``OSError`` an operation raised.
+
+    Args:
+        exc: The error of opening the directory, or of creating an entry in it.
+        writing: Whether the operation created an entry, so a permission error means the
+            directory is not writable rather than not accessible.
+
+    Returns:
+        A predicate for the directory's displayed path.
+    """
+    match exc.errno:
+        case errno.EACCES | errno.EPERM if writing:
+            return (
+                f"is not writable by this user (uid {os.geteuid()}); in the backend image the "
+                "runtime user owns only tests/contracts/*/captured/"
+            )
+        case errno.EACCES | errno.EPERM:
+            return f"is not accessible to this user (uid {os.geteuid()})"
+        case errno.EROFS:
+            return "is on a read-only file system"
+        case _:
+            return f"cannot be used ({exc.strerror or type(exc).__name__})"
+
+
+def _open_directory(parent_fd: int, name: str, path: Path) -> int:
+    """Open the directory ``name`` under ``parent_fd`` without following a symbolic link.
+
+    Linux reports a symbolic link met under ``O_NOFOLLOW | O_DIRECTORY`` as ``ENOTDIR``, the
+    same as a regular file, so a failed open examines the entry itself to say which it is.
+
+    Args:
+        parent_fd: The open parent directory.
+        name: The directory's name, one path component.
+        path: The directory's full path, for the refusal.
+
+    Returns:
+        A read-only descriptor of the directory, which the caller closes.
+
+    Raises:
+        _OutputRefusedError: When ``name`` is a symbolic link, is not a directory or cannot be
+            opened.
+    """
+    try:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        reason = _directory_problem(exc, writing=False)
+        with contextlib.suppress(OSError):
+            mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+            if stat.S_ISLNK(mode):
+                reason = "is a symbolic link; captures are written only into a real directory"
+            elif not stat.S_ISDIR(mode):
+                reason = "is not a directory"
+        raise _OutputRefusedError(f"{_display_path(path)} {reason}") from None
+
+
+def _create_temporary(dir_fd: int, stem: str) -> tuple[str, int]:
+    """Create a new, empty temporary file ``.{stem}.{16 hex digits}.tmp`` in a directory.
+
+    ``O_CREAT | O_EXCL | O_NOFOLLOW`` either creates the file or fails, so an entry already at
+    that name, a symbolic link included, is never opened or written through. The random part
+    keeps concurrent captures of one surface on separate files.
+
+    Args:
+        dir_fd: The open directory.
+        stem: The name the temporary stands in for.
+
+    Returns:
+        The temporary's name, relative to ``dir_fd``, and a descriptor open for writing,
+        which the caller closes.
+
+    Raises:
+        OSError: When the file cannot be created; ``FileExistsError`` when the name is taken.
+    """
+    name = f".{stem}.{token_hex(8)}.tmp"
+    return name, os.open(name, _TEMPORARY_FLAGS, _CAPTURE_FILE_MODE, dir_fd=dir_fd)
+
+
+class _CaptureOutput:
+    """The verified ``tests/contracts/{source}/captured/`` directory of one capture, held open.
+
+    :meth:`open` runs before any request is sent. Every later write goes through its open
+    descriptor, so replacing a directory on the path afterwards cannot redirect a capture.
+
+    Attributes:
+        path: The directory's path; written files are displayed relative to the working
+            directory from it.
+    """
+
+    def __init__(self, fd: int, path: Path) -> None:
+        self._fd = fd
+        self.path = path
+
+    @classmethod
+    def open(cls, root: Path, source: Source) -> _CaptureOutput:
+        """Open ``{root}/{source}/captured/`` and prove this user can write into it.
+
+        The walk from ``root`` takes one component at a time with ``O_NOFOLLOW`` and
+        ``O_DIRECTORY``, so a symbolic link or a non-directory at ``{source}`` or
+        ``captured`` is refused instead of followed. A missing ``captured/`` is created.
+        Writability is proved by creating and removing a real temporary file, because
+        permission bits alone miss read-only mounts and ACLs.
+
+        Args:
+            root: The contracts directory, ``tests/contracts`` under the working directory.
+            source: The source captured.
+
+        Returns:
+            The open output directory; the caller closes it.
+
+        Raises:
+            _OutputRefusedError: When ``{source}`` or ``captured`` is a symbolic link or not a
+                directory, or ``captured/`` cannot be created or written by this user.
+        """
+        source_path = root / source
+        path = source_path / _CAPTURED_DIR
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as exc:
+            reason = _directory_problem(exc, writing=False)
+            raise _OutputRefusedError(f"{_display_path(root)} {reason}") from None
+        try:
+            source_fd = _open_directory(root_fd, source, source_path)
+            try:
+                try:
+                    os.mkdir(_CAPTURED_DIR, dir_fd=source_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    reason = _directory_problem(exc, writing=True)
+                    raise _OutputRefusedError(
+                        f"{_display_path(path)} is missing and cannot be created: "
+                        f"{_display_path(source_path)} {reason}"
+                    ) from None
+                fd = _open_directory(source_fd, _CAPTURED_DIR, path)
+            finally:
+                os.close(source_fd)
+        finally:
+            os.close(root_fd)
+        output = cls(fd, path)
+        try:
+            output._probe()
+        except BaseException:
+            output.close()
+            raise
+        return output
+
+    def _probe(self) -> None:
+        """Create and remove a temporary file through :func:`_create_temporary`.
+
+        Raises:
+            _OutputRefusedError: When the temporary file cannot be created.
+        """
+        try:
+            name, fd = _create_temporary(self._fd, _WRITE_PROBE)
+        except OSError as exc:
+            reason = _directory_problem(exc, writing=True)
+            raise _OutputRefusedError(f"{_display_path(self.path)} {reason}") from None
+        os.close(fd)
+        os.unlink(name, dir_fd=self._fd)
+
+    def write(self, name: str, content: bytes) -> Path:
+        """Replace the file ``name`` in this directory with ``content``, atomically.
+
+        The bytes go to a new temporary sibling from :func:`_create_temporary` and are synced
+        to disk; the closed temporary is then renamed over ``name``. A reader sees the old file
+        or the complete new one, concurrent writers each rename their own complete file, and a
+        symbolic link at ``name`` is replaced, never followed. When any step fails, this
+        call's own temporary is removed and the error propagates.
+
+        Args:
+            name: The file name, one path component.
+            content: The complete file content.
+
+        Returns:
+            The file's path.
+
+        Raises:
+            OSError: When the file cannot be written or renamed into place.
+        """
+        temporary, fd = _create_temporary(self._fd, name)
+        renamed = False
+        try:
+            try:
+                view = memoryview(content)
+                while view:
+                    view = view[os.write(fd, view) :]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)
+            renamed = True
+        finally:
+            if not renamed:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=self._fd)
+        return self.path / name
+
+    def close(self) -> None:
+        """Close the directory descriptor; a second call does nothing."""
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+
+def _write_captures(
+    output: _CaptureOutput, documents: Mapping[str, dict[str, JSONValue]]
+) -> list[Path]:
+    """Write each capture as ``{surface}.json`` in ``output``, replacing an older one atomically.
 
     Files are canonical JSON (sorted keys, two-space indent, UTF-8, trailing newline), the
     format of every fixture.
@@ -1615,14 +2117,10 @@ def _write_captures(directory: Path, documents: Mapping[str, dict[str, JSONValue
     """
     from ads_engine.simulation.payloads import canonical_json
 
-    directory.mkdir(exist_ok=True)
     written: list[Path] = []
     for name in sorted(documents):
-        path = directory / f"{name}.json"
-        temporary = directory / f".{name}.json.tmp"
-        temporary.write_text(canonical_json(documents[name]), encoding="utf-8")
-        temporary.replace(path)
-        written.append(path)
+        content = canonical_json(documents[name]).encode("utf-8")
+        written.append(output.write(f"{name}.json", content))
     return written
 
 
@@ -1637,15 +2135,23 @@ def _display_path(path: Path) -> str:
 def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
     """``capture-fixtures --source S``: record redacted live contract captures.
 
-    Refused (exit 1, nothing sent or written) under ``DATA_MODE=simulated`` and without the
-    source's credentials. The output goes to ``tests/contracts/{source}/captured/`` under the
-    working directory, so run it from ``backend/``.
+    Refused (exit 1, nothing sent or written) under ``DATA_MODE=simulated``, without the
+    source's credentials, when the output directory cannot be written safely:
+    ``tests/contracts/{source}`` or its ``captured/`` is a symbolic link or not a directory,
+    or this user cannot create files in ``captured/`` (:meth:`_CaptureOutput.open`; a missing
+    ``captured/`` is created), and for Google when the shared call budget in the database
+    cannot be read: every Google call is reserved in ``source_connection.calls_24h`` before
+    it is sent, never counted locally. The output goes to
+    ``tests/contracts/{source}/captured/`` under the working directory, so run it from
+    ``backend/``.
 
     Returns:
         :data:`EXIT_OK` when every surface was captured and satisfies its contract;
-        :data:`EXIT_FAILURE` when a refusal applies, a call failed, nothing was captured or a
-        capture breaks its contract (the captures read are still written, because they are
-        the live truth the contract tests must flag).
+        :data:`EXIT_FAILURE` when a refusal applies, a call failed (a Google call the shared
+        budget refused or could not reserve included), nothing was captured, a capture still
+        held a configured secret after redaction (that capture is not written), or a capture
+        breaks its contract (the captures read are still written, because they are the live
+        truth the contract tests must flag).
 
     Raises:
         _UsageError: When ``tests/contracts/{source}/`` is not under the working directory.
@@ -1670,12 +2176,24 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
         raise _UsageError(
             f"{_display_path(source_dir)} not found; run from backend/ (or /app in the image)"
         )
-    thresholds = Thresholds.load() if source == "hubspot" else None
-    policy = _RedactionPolicy.from_settings(settings)
-    run = _run_async(lambda: _capture(source, settings, thresholds))
-    documents = _build_captures(run, policy)
-    problems = _contract_problems(documents, root)
-    written = _write_captures(source_dir / "captured", documents) if documents else []
+    try:
+        output = _CaptureOutput.open(root, source)
+    except _OutputRefusedError as exc:
+        _error(f"capture-fixtures {source}: {_redacted(str(exc))}; nothing was sent")
+        return EXIT_FAILURE
+    try:
+        thresholds = Thresholds.load() if source == "hubspot" else None
+        policy = _RedactionPolicy.from_settings(settings)
+        try:
+            run = _run_async(lambda: _capture(source, settings, thresholds))
+        except _CallBudgetUnavailableError as exc:
+            _error(f"capture-fixtures {source}: {exc}; no webhook call was sent")
+            return EXIT_FAILURE
+        documents = _build_captures(run, policy)
+        problems = _contract_problems(documents, root)
+        written = _write_captures(output, documents) if documents else []
+    finally:
+        output.close()
     for path in written:
         print(_display_path(path), flush=True)
     for failure in run.failures:
@@ -1977,7 +2495,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if message is not None:
             _error(f"{name}: {_redacted(message)}")
             return EXIT_FAILURE
-        log.exception("cli_failed", command=name, error=type(exc).__name__)
+        owner = logged_as(exc)
+        if owner is None:
+            log.exception("cli_failed", command=name, error=type(exc).__name__)
+        else:
+            # Its owner (an analysis run's analysis_run_failed) logged the traceback already.
+            log.warning("cli_failed", command=name, error=type(exc).__name__, logged_as=owner)
         _error(f"{name} failed ({type(exc).__name__}); see the log on stderr")
         return EXIT_FAILURE
 

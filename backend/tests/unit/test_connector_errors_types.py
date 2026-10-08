@@ -11,6 +11,7 @@ host-exported credentials never reach a test; a test that needs configured secre
 obvious test literals. No test performs network or database I/O.
 """
 
+import contextvars
 import copy
 import math
 import os
@@ -31,6 +32,7 @@ from ads_engine.connectors.errors import (
     ErrorKind,
     QueryDefect,
     TransientError,
+    holding_secrets,
     parse_retry_after,
     sanitize_message,
     unwrap_single_item,
@@ -47,6 +49,13 @@ HUBSPOT_TOKEN = "test-hubspot-token"
 DEFAULT_DATABASE_URL = "postgresql+psycopg://ads:ads@db:5432/ads_engine"
 EMAIL = "alice@example.com"
 ELLIPSIS = errors._ELLIPSIS
+# Tokens that exist only in memory, as an exchanged LinkedIn access token or a rotated
+# refresh token does: no setting holds them. Assembled at run time, so the secret scan
+# never reads these test values as credentials. The long one is 400 characters, as long as
+# a LinkedIn access token, and every 8-character run of it occurs in it only once.
+HELD_TOKEN = "-".join(("test", "held", "access", "token", "0123456789"))
+OTHER_HELD_TOKEN = "-".join(("test", "held", "rotated", "refresh", "token"))
+LONG_HELD_TOKEN = "".join(f"{index:04d}tokn" for index in range(50))
 
 # The reference instant of the HTTP-date cases: the docstring example's 12:00 UTC.
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
@@ -934,6 +943,142 @@ def test_sanitize_message_redacts_before_cutting(monkeypatch: pytest.MonkeyPatch
     assert result.endswith(ELLIPSIS)
     assert "test-n8n" not in result
     assert result.startswith("x" * 290 + " [RE")
+
+
+# ---------------------------------------------------------------------------
+# holding_secrets
+# ---------------------------------------------------------------------------
+
+
+def _fragments(value: str, size: int = 8) -> list[str]:
+    """Return every ``size``-character substring of ``value``, its prefixes included."""
+    return [value[start : start + size] for start in range(len(value) - size + 1)]
+
+
+def test_holding_secrets_strips_a_token_no_setting_knows_from_every_error_text() -> None:
+    """A held token echoed in ordinary prose leaves message, code, reason, str and repr."""
+    text = f"Member token {HELD_TOKEN} lacks the r_ads scope"
+    assert sanitize_message(text) == text
+    with holding_secrets([HELD_TOKEN]):
+        assert sanitize_message(text) == "Member token [REDACTED] lacks the r_ads scope"
+        error = AccessDenied(
+            text, source="linkedin", endpoint="ad_account", code=HELD_TOKEN, http_status=403
+        )
+    assert error.message == "Member token [REDACTED] lacks the r_ads scope"
+    assert error.code == "[REDACTED]"
+    assert error.reason == (
+        "linkedin ad_account: [REDACTED]: Member token [REDACTED] lacks the r_ads scope"
+    )
+    for rendered in (error.message, error.reason, str(error), repr(error), str(error.log_fields)):
+        assert HELD_TOKEN not in rendered
+    # The block ended: the token is no longer held.
+    assert sanitize_message(text) == text
+
+
+def test_holding_secrets_strips_percent_encoded_held_tokens() -> None:
+    """A held token echoed percent-encoded is stripped like a configured secret."""
+    encoded = HELD_TOKEN.replace("-", "%2D")
+    with holding_secrets([HELD_TOKEN]):
+        sanitized = sanitize_message(f"rejected {encoded} as stale")
+    assert sanitized == "rejected [REDACTED] as stale"
+
+
+def test_holding_secrets_nests_and_restores_the_outer_set_on_exit_and_on_error() -> None:
+    """An inner block adds its values to the outer ones; each exit restores the outer set."""
+    text = f"{HELD_TOKEN} and {OTHER_HELD_TOKEN}"
+    with holding_secrets([HELD_TOKEN]):
+        assert sanitize_message(text) == f"[REDACTED] and {OTHER_HELD_TOKEN}"
+        with holding_secrets([OTHER_HELD_TOKEN]):
+            assert sanitize_message(text) == "[REDACTED] and [REDACTED]"
+        assert sanitize_message(text) == f"[REDACTED] and {OTHER_HELD_TOKEN}"
+        with (
+            pytest.raises(RuntimeError, match="inner failure"),
+            holding_secrets([OTHER_HELD_TOKEN]),
+        ):
+            raise RuntimeError("inner failure")
+        assert sanitize_message(text) == f"[REDACTED] and {OTHER_HELD_TOKEN}"
+    assert sanitize_message(text) == text
+
+
+def test_held_secrets_are_local_to_their_context() -> None:
+    """The held set is a context variable: code running in another context never sees it."""
+    text = f"echo {HELD_TOKEN}"
+    with holding_secrets([HELD_TOKEN]):
+        assert sanitize_message(text) == "echo [REDACTED]"
+        elsewhere = contextvars.Context().run(sanitize_message, text)
+    assert elsewhere == text
+
+
+def test_holding_secrets_ignores_blank_values() -> None:
+    """Empty and blank values are never held, so they never match ordinary text."""
+    with holding_secrets(["", "   ", HELD_TOKEN]):
+        assert sanitize_message("a b  c") == "a b c"
+        assert sanitize_message(HELD_TOKEN) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(HELD_TOKEN, id="single-string"),
+        pytest.param(HELD_TOKEN.encode(), id="single-bytes"),
+        pytest.param([HELD_TOKEN, 7], id="non-string-item"),
+    ],
+)
+def test_holding_secrets_rejects_anything_but_a_collection_of_strings(values: Any) -> None:
+    """A single string would be read as one-character secrets, so it is refused."""
+    with pytest.raises(TypeError), holding_secrets(values):
+        pytest.fail("the block must not run")
+    assert sanitize_message("a b") == "a b"
+
+
+def test_a_long_held_token_straddling_the_cut_leaves_no_fragment() -> None:
+    """A 400-character held token across character 300 is stripped whole before the cut."""
+    filler = "Upstream refused the call. " * 10
+    assert len(filler) < 300 < len(filler) + len(LONG_HELD_TOKEN)
+    text = f"{filler}{LONG_HELD_TOKEN} again"
+    # Not held, the cut keeps the token's first 29 characters.
+    unheld = sanitize_message(text)
+    assert any(fragment in unheld for fragment in _fragments(LONG_HELD_TOKEN))
+    with holding_secrets([LONG_HELD_TOKEN]):
+        sanitized = sanitize_message(text)
+        error = TransientError(text, source="linkedin", endpoint="ad_account", http_status=503)
+    assert sanitized == f"{' '.join(filler.split())} [REDACTED] again"
+    for rendered in (sanitized, error.message, error.reason, str(error), repr(error)):
+        for fragment in _fragments(LONG_HELD_TOKEN):
+            assert fragment not in rendered, fragment
+
+
+@pytest.mark.parametrize(
+    ("kept", "replaced"),
+    [
+        pytest.param(29, True, id="long-fragment"),
+        pytest.param(4, True, id="shortest-replaced-fragment"),
+        pytest.param(3, False, id="shorter-run-kept"),
+    ],
+)
+def test_a_rebuilt_error_loses_the_start_of_a_held_token_an_earlier_cut_left(
+    kept: int, replaced: bool
+) -> None:
+    """An error cut through a token before it was held, rebuilt inside the hold, keeps none.
+
+    ``copy.copy`` rebuilds the error through its constructor, so its message is sanitised
+    again; the earlier cut left only a start of the token, which no longer matches it
+    whole, and that start is replaced from 4 characters on.
+    """
+    filler = "x" * (299 - kept - 1) + " "
+    original = AccessDenied(
+        f"{filler}{LONG_HELD_TOKEN}", source="linkedin", endpoint="ad_account", http_status=403
+    )
+    assert original.message == f"{filler}{LONG_HELD_TOKEN[:kept]}{ELLIPSIS}"
+    with holding_secrets([LONG_HELD_TOKEN]):
+        rebuilt = copy.copy(original)
+    if replaced:
+        # The marker may itself be cut again when it makes the text longer than 300.
+        assert rebuilt.message == errors._truncate(f"{filler}[REDACTED]{ELLIPSIS}", 300)
+        assert LONG_HELD_TOKEN[:kept] not in rebuilt.message
+    else:
+        assert rebuilt.message == original.message
+    assert len(rebuilt.message) <= 300
 
 
 # ---------------------------------------------------------------------------

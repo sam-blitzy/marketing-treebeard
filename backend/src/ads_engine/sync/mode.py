@@ -176,6 +176,8 @@ _STATUS_ERROR: Final = "error"
 if tuple(CONNECTION_STATUSES) != (_STATUS_OK, _STATUS_STALE, _STATUS_DENIED, _STATUS_ERROR):
     # A renamed status would otherwise surface only as a CHECK violation at run time.
     raise RuntimeError(f"connection statuses {CONNECTION_STATUSES!r} no longer match sync/mode.py")
+_DEGRADED_STATUSES: Final = frozenset({_STATUS_STALE, _STATUS_DENIED, _STATUS_ERROR})
+"""Connection statuses whose ``sync.connection`` transition is logged as a ``WARNING``."""
 
 _ROLE_PRIMARY: Final = "primary"
 _STATE_BUILDING: Final = "building"
@@ -259,11 +261,14 @@ class ProbeCheck:
         name: What was checked, for example ``Q-G1`` or ``leadFormResponses 123``.
         ok: Whether the call succeeded.
         reason: The classified error's reason when it failed; ``None`` when it passed.
+        endpoint: The failing call's endpoint, from the classified error (its contract
+            surface name); ``None`` for a passing check or a configuration check.
     """
 
     name: str
     ok: bool
     reason: str | None = None
+    endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +322,18 @@ class ProbeReport:
         for check in self.checks:
             if not check.ok:
                 return f"{check.name}: {check.reason}" if check.reason else check.name
+        return None
+
+    @property
+    def endpoint(self) -> str | None:
+        """The first failing check's endpoint, or ``None``.
+
+        ``None`` when every check passed, or when the first failing check is a configuration
+        check (forced simulation, missing credentials), which sends no request.
+        """
+        for check in self.checks:
+            if not check.ok:
+                return check.endpoint
         return None
 
 
@@ -500,15 +517,17 @@ class _ActivationAttempt:
 
     Exactly one outcome holds: activated (``activation``), refused as not ready under the
     lock (``readiness``), new rows staged for a changed lead/CRM pair (``restaged``, the
-    caller settles again), refused because matched contacts of the build's own CRM dataset
-    still lack association reads (``unhydrated``, the caller settles again), or void because
-    the access generation changed (``denied``).
+    caller settles again), refused because matched contacts still lack association reads
+    (``unhydrated``, in the CRM dataset ``crm_dataset_id``: the build's own, or HubSpot's
+    active primary for a live LinkedIn build's leads; the caller settles again), or void
+    because the access generation changed (``denied``).
     """
 
     activation: Activation | None = None
     readiness: Readiness | None = None
     restaged: int = 0
     unhydrated: int = 0
+    crm_dataset_id: int | None = None
     denied: bool = False
 
 
@@ -907,12 +926,14 @@ class SourceModeController:
         clear_denied: bool = False,
         sticky_denied: bool = False,
         missing: Sequence[str] = (),
+        endpoint: str | None = None,
         session: AsyncSession | None = None,
     ) -> None:
         """Insert or update ``source``'s ``source_connection`` row; log a mode change.
 
         A change of an existing row's mode also queues its default-window rerun
-        (``mode_changed:<source>``) in the same transaction; see :meth:`_apply_connection`.
+        (``mode_changed:<source>``) in the same transaction; see :meth:`_apply_connection`,
+        which also sets the level of the transition's log event.
 
         Args:
             source: The source.
@@ -927,6 +948,9 @@ class SourceModeController:
                 ``stale`` or ``error``: a transient or defective call on fallback data must not
                 end the fallback, whose recovery probes rely on the marker.
             missing: Names (never values) of the unset credential variables, for the log.
+            endpoint: The failing endpoint that triggered the transition (the classified
+                error's contract surface name), logged as ``endpoint``; ``None`` for a
+                credentials, configuration or activation transition.
             session: Join the caller's transaction instead of committing one here.
         """
         if session is None:
@@ -941,6 +965,7 @@ class SourceModeController:
                     clear_denied=clear_denied,
                     sticky_denied=sticky_denied,
                     missing=missing,
+                    endpoint=endpoint,
                 )
             return
         await self._apply_connection(
@@ -953,6 +978,7 @@ class SourceModeController:
             clear_denied=clear_denied,
             sticky_denied=sticky_denied,
             missing=missing,
+            endpoint=endpoint,
         )
 
     async def _apply_connection(
@@ -967,6 +993,7 @@ class SourceModeController:
         clear_denied: bool,
         sticky_denied: bool,
         missing: Sequence[str],
+        endpoint: str | None,
     ) -> None:
         """Apply :meth:`_record_connection` inside ``session``.
 
@@ -975,6 +1002,13 @@ class SourceModeController:
         reason ``mode_changed:<source>`` is queued in ``session``, so it commits or rolls back
         with the change. A newly created row and a resolution that keeps the mode (a status or
         reason change only) queue nothing, so repeated resolutions never flood the queue.
+
+        Every transition is logged with its reason and ``endpoint``: ``sync.mode.change``
+        when the mode changes, else ``sync.connection`` when the status or reason does. A
+        degradation is a ``WARNING``: ``sync.mode.change`` to simulated from live or on a
+        denial, and ``sync.connection`` to ``stale``, ``error`` or ``denied``. Every other
+        transition is ``INFO``: a first start into simulated data (forced simulation,
+        missing credentials), a recovery to live, and a return to ``ok``.
         """
         if not isinstance(status, _Keep) and status not in CONNECTION_STATUSES:
             raise ValueError(f"unknown connection status {status!r}")
@@ -1009,23 +1043,30 @@ class SourceModeController:
             await repositories.enqueue_analysis_request(session, reason=f"mode_changed:{source}")
 
         if previous_mode != new_mode:
-            _log.info(
+            degraded = new_mode == "simulated" and (
+                previous_mode == "live" or new_status == _STATUS_DENIED
+            )
+            log_change = _log.warning if degraded else _log.info
+            log_change(
                 "sync.mode.change",
                 source=source,
                 from_mode=previous_mode,
                 to_mode=new_mode,
                 status=new_status,
                 reason=new_reason,
+                endpoint=endpoint,
                 missing_credentials=list(missing),
             )
         elif changed:
-            _log.info(
+            log_connection = _log.warning if new_status in _DEGRADED_STATUSES else _log.info
+            log_connection(
                 "sync.connection",
                 source=source,
                 mode=new_mode,
                 from_status=previous_status,
                 status=new_status,
                 reason=new_reason,
+                endpoint=endpoint,
             )
 
     def _default_mode(self, source: Source) -> Mode:
@@ -1069,12 +1110,16 @@ class SourceModeController:
         """Whether a build bound to ``generation`` may still go on; unbound builds always may."""
         return generation is None or await self._access_generation(source) == generation
 
-    async def _enter_fallback(self, source: Source, reason: str) -> None:
+    async def _enter_fallback(
+        self, source: Source, reason: str, *, endpoint: str | None = None
+    ) -> None:
         """Put ``source`` into automatic fallback: simulated, ``denied``, with ``reason``.
 
         Recovery probes then retry live access every 30 minutes (scheduler), instead of a
         live rebuild on every 30-second wake. The same transaction advances the source's
         ``access_generation``, so a live build begun before the fallback cannot activate.
+        ``endpoint`` names the failing call (``None`` when no classified error caused the
+        fallback) and is logged on the transition and on ``sync.fallback``.
         """
         async with self._transaction() as session:
             await self._record_connection(
@@ -1083,10 +1128,11 @@ class SourceModeController:
                 status=_STATUS_DENIED,
                 reason=reason,
                 attempted_at=self.now(),
+                endpoint=endpoint,
                 session=session,
             )
             await self._advance_access_generation(session, source)
-        _log.warning("sync.fallback", source=source, reason=_truncate(reason))
+        _log.warning("sync.fallback", source=source, reason=_truncate(reason), endpoint=endpoint)
 
     async def _reconcile_status(self, source: Source, active: _DatasetRef) -> None:
         """Return a ``stale`` or ``error`` connection to ``ok`` once its data has caught up.
@@ -1119,7 +1165,13 @@ class SourceModeController:
             if row.mode == active.mode:
                 row.reason = active.reason
             await session.flush()
-        _log.info("sync.connection", source=source, from_status=previous, status=_STATUS_OK)
+        _log.info(
+            "sync.connection",
+            source=source,
+            from_status=previous,
+            status=_STATUS_OK,
+            endpoint=None,
+        )
 
     # -- datasets ----------------------------------------------------------------------------
 
@@ -1254,6 +1306,10 @@ class SourceModeController:
         source never flips back and forth. Under ``DATA_MODE=simulated``, or without
         credentials, no request is sent and the report fails with that reason.
 
+        The verdict is logged as ``sync.probe`` with the first failing check's endpoint: a
+        ``WARNING`` when live calls were sent and a check failed, else ``INFO`` (a passing
+        probe, or a configuration refusal that sent no request).
+
         Args:
             source: The source to probe.
 
@@ -1261,11 +1317,13 @@ class SourceModeController:
             The report; ``passed`` only when every check passed.
         """
         checked = _as_source(source)
+        sent = False
         if self._settings.data_mode == "simulated":
             checks: tuple[ProbeCheck, ...] = (ProbeCheck("data_mode", False, REASON_FORCED),)
         elif not self._settings.has_credentials(checked):
             checks = (ProbeCheck("credentials", False, REASON_NO_CREDENTIALS),)
         else:
+            sent = True
             async with self.open_clients(checked, "live") as clients:
                 match checked:
                     case "google":
@@ -1275,13 +1333,15 @@ class SourceModeController:
                     case "hubspot":
                         checks = await self._probe_hubspot(clients)
         report = ProbeReport.of(checked, checks)
-        _log.info(
+        log_probe = _log.warning if sent and not report.passed else _log.info
+        log_probe(
             "sync.probe",
             source=checked,
             passed=report.passed,
             checks=len(report.checks),
             failed=[check.name for check in report.failed],
             reason=report.reason,
+            endpoint=report.endpoint,
         )
         return report
 
@@ -1292,7 +1352,7 @@ class SourceModeController:
         try:
             await google.run_query("Q-G1")
         except ConnectorError as exc:
-            return (ProbeCheck("Q-G1", False, exc.reason),)
+            return (ProbeCheck("Q-G1", False, exc.reason, exc.endpoint),)
         return (ProbeCheck("Q-G1", True),)
 
     async def _probe_linkedin(self, clients: SourceClients) -> tuple[ProbeCheck, ...]:
@@ -1307,7 +1367,7 @@ class SourceModeController:
             try:
                 await linkedin.get_ad_account(account)
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason))
+                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
             else:
                 checks.append(ProbeCheck(name, True))
 
@@ -1317,7 +1377,7 @@ class SourceModeController:
                     account, (yesterday, yesterday), expected_creatives=1
                 )
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason))
+                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
             else:
                 checks.append(_listing_check(name, analytics.interrupted_by))
 
@@ -1325,7 +1385,7 @@ class SourceModeController:
             try:
                 forms = await linkedin.list_lead_forms(account, page_size=1, max_pages=1)
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason))
+                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
             else:
                 checks.append(_listing_check(name, forms.interrupted_by))
 
@@ -1335,7 +1395,7 @@ class SourceModeController:
                     account, submitted, known_versions={}, page_size=1, max_pages=1
                 )
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason))
+                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
             else:
                 checks.append(_listing_check(name, responses.interrupted_by))
         if not checks:
@@ -1349,7 +1409,7 @@ class SourceModeController:
         try:
             await hubspot.probe()
         except ConnectorError as exc:
-            return (ProbeCheck("crm", False, exc.reason),)
+            return (ProbeCheck("crm", False, exc.reason, exc.endpoint),)
         return (ProbeCheck("crm", True),)
 
     # -- error consequences ------------------------------------------------------------------
@@ -1361,6 +1421,7 @@ class SourceModeController:
         *,
         dataset_id: int | None = None,
         datasets: Sequence[str] = (),
+        job: str | None = None,
     ) -> ErrorDisposition:
         """Apply the AAP 0.3.3 fallback table to one classified connector error.
 
@@ -1396,6 +1457,8 @@ class SourceModeController:
                 omitted.
             datasets: The freshness dataset names (for example ``linkedin.analytics_daily``)
                 whose refresh the error interrupted.
+            job: The sync job whose call failed (for example ``metrics``), logged with the
+                classification; ``None`` for builds and probes.
 
         Returns:
             The disposition.
@@ -1408,6 +1471,7 @@ class SourceModeController:
             "error_source": exc.source,
             "dataset_id": dataset_id,
             "datasets": list(datasets),
+            "job": job,
         }
 
         if isinstance(exc, AccessDenied):
@@ -1424,6 +1488,7 @@ class SourceModeController:
                     status=_STATUS_DENIED,
                     reason=exc.reason,
                     attempted_at=now,
+                    endpoint=exc.endpoint,
                     session=session,
                 )
                 await self._advance_access_generation(session, checked)
@@ -1443,6 +1508,7 @@ class SourceModeController:
             reason=await self._failure_reason(checked, exc),
             attempted_at=now,
             sticky_denied=True,
+            endpoint=exc.endpoint,
         )
         # ``fields`` carries the query id of a ``QueryDefect`` (``query_id``) when it has one.
         _log.error(
@@ -1500,6 +1566,7 @@ class SourceModeController:
                 reason=reason,
                 attempted_at=now,
                 sticky_denied=True,
+                endpoint=exc.endpoint,
                 session=session,
             )
             target = dataset_id
@@ -1646,13 +1713,16 @@ class SourceModeController:
            matched there with no association read of their contacts, mark its
            ``hubspot.contacts`` and ``hubspot.associations`` freshness ``unknown`` and rerun
            the backfill, so the new contacts get their contact refresh, associations and
-           target reads; a live LinkedIn build's rows in HubSpot's active primary get one
-           more matching pass. Then assess readiness.
+           target reads. A live LinkedIn build's rows left pending in HubSpot's active
+           primary get one more matching pass; when its leads are then matched there with
+           no association read, that primary's CRM sync runs, so they get the same reads.
+           Then assess readiness.
         6. Ready: activate under the activation lock, which HubSpot and LinkedIn
            activations share, so the pair cannot change during it. Under that lock the
-           current pair is staged once more; new rows, or contacts matched in the build's
-           own CRM dataset with no association read, send the build back to step 5 (at
-           most :data:`_SETTLE_ROUNDS` rounds). Otherwise readiness is assessed again and
+           current pair is staged once more; new rows, or contacts matched with no
+           association read (in the build's own CRM dataset, or for a live LinkedIn build's
+           leads in HubSpot's active primary), send the build back to step 5 (at most
+           :data:`_SETTLE_ROUNDS` rounds). Otherwise readiness is assessed again and
            the dataset activates in one transaction with its companion, retiring the
            previous dataset and its matching state. A build that is not ready is
            discarded; the previous dataset stays active.
@@ -1787,6 +1857,7 @@ class SourceModeController:
                 return _StepResult(companion_id=companion_id, denied=True)
             refused: Readiness | None = None
             unhydrated = 0
+            unhydrated_crm_id: int | None = None
             for _ in range(_SETTLE_ROUNDS):
                 readiness = await self._settle_matching(
                     source, mode, dataset_id, companion_id, generation, backfill
@@ -1812,9 +1883,11 @@ class SourceModeController:
                 if attempt.denied:
                     return _StepResult(companion_id=companion_id, denied=True)
                 # The effective pair changed after settling: rows were staged for it, the
-                # build was not ready under the lock, or contacts were matched in its own
-                # CRM dataset with no association read. Settle again against the current pair.
+                # build was not ready under the lock, or contacts were matched with no
+                # association read (in its own CRM dataset, or for a live LinkedIn build's
+                # leads in HubSpot's active primary). Settle again against the current pair.
                 refused, unhydrated = attempt.readiness, attempt.unhydrated
+                unhydrated_crm_id = attempt.crm_dataset_id
         except ConnectorError as exc:
             return _StepResult(companion_id=companion_id, error=exc)
         except (DatasetStateError, repositories.DatasetNotWritable) as exc:
@@ -1823,12 +1896,11 @@ class SourceModeController:
             return _StepResult(companion_id=companion_id, message=str(exc))
         if unhydrated:
             noun = "matched lead" if unhydrated == 1 else "matched leads"
-            own_crm_id = _own_crm_dataset(source, dataset_id, companion_id)
             return _StepResult(
                 companion_id=companion_id,
                 message=(
                     f"matched contacts still lack association reads after {_SETTLE_ROUNDS} "
-                    f"rounds: {unhydrated} {noun} in CRM dataset {own_crm_id}"
+                    f"rounds: {unhydrated} {noun} in CRM dataset {unhydrated_crm_id}"
                 ),
             )
         if refused is not None:
@@ -1898,7 +1970,11 @@ class SourceModeController:
             # instead of a full live backfill on every 30-second wake, which would burn the
             # shared Google call budget, and a source with no active dataset gets simulated
             # data meanwhile.
-            await self._enter_fallback(source, f"live build failed: {reason}")
+            await self._enter_fallback(
+                source,
+                f"live build failed: {reason}",
+                endpoint=result.error.endpoint if result.error is not None else None,
+            )
         follow = await self._ensure(source, force_simulated=False, allow_live=False)
         return follow if follow is not None else outcome
 
@@ -1961,7 +2037,9 @@ class SourceModeController:
            companion): a contact matched there since the settle, by any matcher, has no
            association read yet (``DatasetManager.unhydrated_matches``). The attempt then
            returns ``unhydrated`` without activating, and the caller settles again, which
-           reruns the CRM backfill for it.
+           reruns the CRM backfill for it. A live LinkedIn build holds no CRM dataset, so
+           the same check covers its own leads' matches in HubSpot's active primary staged
+           in step 3; the settle that follows runs that primary's CRM sync for them.
         6. Activate through ``DatasetManager.activate`` in the same transaction. It records
            ``status='ok'``; a simulated dataset activated while the source is in automatic
            fallback keeps ``denied``, or recovery probes would stop. Both writes share the
@@ -2002,6 +2080,7 @@ class SourceModeController:
                         access_generation=current,
                     )
                     return _ActivationAttempt(denied=True)
+            staging: _Staging | None = None
             if source in _PAIRED_SOURCES:
                 staging = await self._stage_pair(session, source, mode, dataset_id, companion_id)
                 if staging is not None and staging.staged:
@@ -2009,18 +2088,29 @@ class SourceModeController:
             readiness = await self.datasets.readiness(dataset_id, session=session)
             if not readiness.ready:
                 return _ActivationAttempt(readiness=readiness)
+            # The CRM dataset whose matches must be hydrated, and the LinkedIn dataset whose
+            # leads' matches count there (None: every lead's).
             own_crm_id = _own_crm_dataset(source, dataset_id, companion_id)
+            scope: tuple[int, int | None] | None = None
             if own_crm_id is not None:
-                unhydrated = await self.datasets.unhydrated_matches(own_crm_id, session=session)
+                scope = (own_crm_id, None)
+            elif source == "linkedin" and mode == "live" and staging is not None:
+                scope = (staging.match_pass.crm_dataset_id, dataset_id)
+            if scope is not None:
+                crm_id, lead_dataset_id = scope
+                unhydrated = await self.datasets.unhydrated_matches(
+                    crm_id, lead_dataset_id=lead_dataset_id, session=session
+                )
                 if unhydrated:
                     _log.info(
                         "sync.build.unhydrated",
                         source=source,
                         dataset_id=dataset_id,
-                        crm_dataset_id=own_crm_id,
+                        crm_dataset_id=crm_id,
+                        lead_dataset_id=lead_dataset_id,
                         unhydrated=unhydrated,
                     )
-                    return _ActivationAttempt(unhydrated=unhydrated)
+                    return _ActivationAttempt(unhydrated=unhydrated, crm_dataset_id=crm_id)
             try:
                 activation = await self.datasets.activate(
                     dataset_id, reason=reason, session=session
@@ -2045,13 +2135,17 @@ class SourceModeController:
         # A row created by this activation had no mode before it: the change is from none.
         prior_mode = None if created is not None or prior is None else prior.mode
         if prior_mode != mode:
-            _log.info(
+            # An activation is no failing call, so the transition names no endpoint; switching
+            # live data off is a degradation, every other activation a healthy change.
+            log_change = _log.warning if prior_mode == "live" and mode == "simulated" else _log.info
+            log_change(
                 "sync.mode.change",
                 source=source,
                 from_mode=prior_mode,
                 to_mode=mode,
                 reason=reason,
                 dataset_id=dataset_id,
+                endpoint=None,
             )
         return _ActivationAttempt(activation=activation, readiness=readiness)
 
@@ -2083,8 +2177,13 @@ class SourceModeController:
           associations with target reads. Readiness then needs those rows recorded by the
           rerun; a rerun that only fails leaves them ``unknown`` and the build not ready.
         * HubSpot's active primary (a live LinkedIn build). The build owns none of that
-          dataset's data, so one ``lead_match.run_matching`` pass attempts the build's rows
-          there, which is what readiness requires before the LinkedIn dataset activates.
+          dataset's data and the dataset is in use, so its freshness is never withdrawn and
+          the backfill is not rerun. When the build's rows are still pending there, one
+          ``lead_match.run_matching`` pass attempts them, which is what readiness requires.
+          When the build's leads are then matched there with no association read of their
+          contacts (``DatasetManager.unhydrated_matches`` of this dataset's leads), one CRM
+          sync of that primary (``sync/jobs.refresh_crm_dataset``) gives them their contact
+          refresh, associations and target reads before the LinkedIn dataset activates.
 
         Args:
             source: The source built.
@@ -2096,7 +2195,7 @@ class SourceModeController:
 
         Returns:
             The readiness, or ``None`` when the access generation changed while the backfill
-            reran: the live build is then void.
+            or the CRM sync ran: the live build is then void.
         """
         match_pass = await self._restage(source, mode, dataset_id, companion_id)
         readiness = await self.datasets.readiness(dataset_id)
@@ -2112,8 +2211,21 @@ class SourceModeController:
                     return None
                 readiness = await self.datasets.readiness(dataset_id)
             return readiness
-        if readiness.pending_matches and match_pass is not None:
+        if match_pass is None:
+            return readiness
+        settled = False
+        if readiness.pending_matches:
             await self._matching_pass(match_pass)
+            settled = True
+        unhydrated = await self.datasets.unhydrated_matches(
+            match_pass.crm_dataset_id, lead_dataset_id=dataset_id
+        )
+        if unhydrated:
+            await self._hydration_pass(match_pass.crm_dataset_id, dataset_id, unhydrated)
+            if not await self._generation_holds(source, generation):
+                return None
+            settled = True
+        if settled:
             readiness = await self.datasets.readiness(dataset_id)
         return readiness
 
@@ -2280,6 +2392,38 @@ class SourceModeController:
             pending_left=report.pending_left,
         )
 
+    async def _hydration_pass(
+        self, crm_dataset_id: int, lead_dataset_id: int, unhydrated: int
+    ) -> None:
+        """Run one CRM sync of the HubSpot primary a live LinkedIn build's leads matched in.
+
+        Matching stored the contacts of ``unhydrated`` of the build's rows there but read
+        none of their associations. The sync (``sync/jobs.refresh_crm_dataset``) refreshes
+        every matched contact of the dataset and reads its meetings and deals with their
+        targets. A read that fails is recorded as an attempted, unknown outcome; a sync that
+        cannot run (no HubSpot client of the dataset's mode may be opened now) records
+        nothing, so the activation guard still finds the debt and the build settles again.
+
+        Args:
+            crm_dataset_id: HubSpot's active primary, where the build's leads were matched.
+            lead_dataset_id: The building LinkedIn dataset.
+            unhydrated: The build's matched rows there whose contacts lack association reads.
+        """
+        # Deferred import: sync/jobs.py imports this module at its top (controller, clients,
+        # on_error), so a module-level import here would be a cycle.
+        from ads_engine.sync.jobs import refresh_crm_dataset
+
+        result = await refresh_crm_dataset(self, crm_dataset_id)
+        status = "skipped" if result is None else result.status
+        log = _log.info if status == "succeeded" else _log.warning
+        log(
+            "sync.build.crm_hydration",
+            crm_dataset_id=crm_dataset_id,
+            lead_dataset_id=lead_dataset_id,
+            unhydrated=unhydrated,
+            status=status,
+        )
+
     async def _discard_quietly(self, dataset_id: int, *, best_effort: bool = False) -> None:
         """Discard a building dataset, tolerating one already gone or activated elsewhere.
 
@@ -2379,7 +2523,9 @@ class SourceModeController:
         generation = await self._access_generation(source)
         report = await self.probe(source)
         if not report.passed:
-            await self._enter_fallback(source, report.reason or "live probe failed")
+            await self._enter_fallback(
+                source, report.reason or "live probe failed", endpoint=report.endpoint
+            )
             if active is None:
                 return await self._ensure(source, force_simulated=False, allow_live=False)
             return None
@@ -2456,7 +2602,7 @@ def _listing_check(name: str, interrupted_by: TransientError | None) -> ProbeChe
     A one-page probe listing is normally incomplete ("page limit"); that is a pass.
     """
     if interrupted_by is not None:
-        return ProbeCheck(name, False, interrupted_by.reason)
+        return ProbeCheck(name, False, interrupted_by.reason, interrupted_by.endpoint)
     return ProbeCheck(name, True)
 
 

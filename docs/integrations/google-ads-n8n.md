@@ -290,8 +290,9 @@ cd backend
 uv run --frozen ads-engine capture-fixtures --source google
 ```
 
-- It sends one call per template (Q-G1 to Q-G8 and Q-G2b), reads the first page only and counts every call against `GOOGLE_DAILY_CALL_BUDGET`. When the database is unreachable it caps itself at one call per template instead, and those calls are not recorded in `calls_24h`.
-- It is refused, with nothing sent or written, under `DATA_MODE=simulated` or without the Google credentials.
+- It sends one call per template (Q-G1 to Q-G8 and Q-G2b) and reads the first page only. Every call is reserved in the shared budget before it is sent, so it counts in `calls_24h` against `GOOGLE_DAILY_CALL_BUDGET` like the worker's calls. Once the sliding 24 h window holds `GOOGLE_DAILY_CALL_BUDGET` calls, the remaining calls are refused and not sent.
+- It is refused, with nothing sent or written, under `DATA_MODE=simulated`, without the Google credentials, or when the shared call budget in the database cannot be read. It never counts calls locally instead. If the database fails partway through, no further call is sent, the command exits 1 naming the failure, and the captures already made are still written.
+- Inside the backend image the captures land in `/app/tests/contracts/google/captured/`, which only the runtime user (UID 10001) can write. On the host as in the image, the command is refused, with nothing sent, when that directory is not writable by the user running it or is a symbolic link. To keep the files, bind-mount the checkout's `backend/tests/contracts/google/captured/` there, writable by UID 10001, or run the container with `--user` set to that directory's owner.
 - The first call becomes `captured/search.json`, and the first row of each query becomes its `captured/row_*.json`. Each file is shaped `{surface, captured_at, request, response}`.
-- The secret header value, emails and names are replaced by `"<redacted>"`; the webhook URL is replaced by a reserved placeholder URL, and the customer id by zeros of the same length.
+- The secret header value, emails and names are replaced by `"<redacted>"`; the webhook URL is replaced by a reserved placeholder URL, and the customer id by zeros of the same length. Every configured secret is replaced in any string whatever its length, in plain text or in any percent-encoded spelling. A capture that still holds one, however many times it was percent-encoded, is not written, and the command exits with status 1.
 - The contract tests then run against the captured payloads as well as the contracts.

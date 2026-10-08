@@ -8,7 +8,7 @@ and a fixture that carries a field its contract does not define fails. The simul
 (``ads_engine.simulation.payloads``) and the contract tests read the same files, so this module
 guards the files themselves:
 
-* inventory: exactly the 24 surfaces of ``payloads.SURFACES`` exist on disk, one file each, and
+* inventory: exactly the 26 surfaces of ``payloads.SURFACES`` exist on disk, one file each, and
   nothing else sits beside them;
 * shape: each file is UTF-8 JSON with a trailing newline and no tab, holds exactly the
   documented keys, names its own surface and source, carries its source's pinned API version,
@@ -88,6 +88,8 @@ EXPECTED_SURFACES: Final[Mapping[str, tuple[str, ...]]] = {
         "posts",
         "ad_analytics",
         "ad_analytics_statistics",
+        "ad_analytics_campaign_delivery",
+        "ad_analytics_member_segments",
         "lead_forms",
         "lead_form_responses",
         "lead_form_responses_batch",
@@ -99,7 +101,7 @@ EXPECTED_SURFACES: Final[Mapping[str, tuple[str, ...]]] = {
         "properties",
     ),
 }
-"""Every contract surface per source: 9 Google, 11 LinkedIn and 4 HubSpot files."""
+"""Every contract surface per source: 9 Google, 13 LinkedIn and 4 HubSpot files."""
 
 EXPECTED_PAIRS: Final = frozenset(
     (source, name) for source, names in EXPECTED_SURFACES.items() for name in names
@@ -298,7 +300,7 @@ def test_the_fixed_catalogue_equals_payloads_surfaces() -> None:
     for source, names in surfaces.items():
         assert len(set(names)) == len(names), f"{source}: a surface is listed twice"
         assert set(names) == set(EXPECTED_SURFACES[source]), source
-    assert len(EXPECTED_PAIRS) == 24
+    assert len(EXPECTED_PAIRS) == 26
 
 
 def test_the_contract_files_on_disk_are_exactly_the_fixed_catalogue(

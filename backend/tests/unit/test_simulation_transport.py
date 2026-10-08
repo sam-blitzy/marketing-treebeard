@@ -61,7 +61,11 @@ from ads_engine.connectors.linkedin.auth import (
     LinkedInTokenProvider,
     StaticTokenProvider,
 )
-from ads_engine.connectors.linkedin.client import LinkedInClient
+from ads_engine.connectors.linkedin.client import (
+    SEGMENT_DISCOVERY_FIELDS,
+    SEGMENT_FIELDS,
+    LinkedInClient,
+)
 from ads_engine.connectors.linkedin.parser import decode_email
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import SIM_GOOGLE_CUSTOMER_ID
@@ -78,7 +82,11 @@ from ads_engine.simulation.payloads import (
     RenderedResponse,
     RequestShape,
     UnknownSurface,
+    identify_surface,
+    load_contract,
     render,
+    validate_request,
+    validate_response,
 )
 from ads_engine.simulation.transport import (
     UNKNOWN_SURFACE,
@@ -113,6 +121,14 @@ GOOGLE_FAILURE_TYPE = "type.googleapis.com/google.ads.googleads.v25.errors.Googl
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # Marks values sent in query strings, headers and bodies that must never reach the journal.
 LEAK_MARK = "leak-check"
+# A 28-day preset window ending the day before NOW, as the segment job requests it.
+SEGMENT_WINDOW = (date(2026, 9, 4), date(2026, 10, 1))
+SEGMENT_RANGE = "(start:(year:2026,month:9,day:4),end:(year:2026,month:10,day:1))"
+
+
+def _campaign_urn(campaign_id: int) -> str:
+    """A campaign URN percent-encoded once, as it sits inside a Rest.li ``List(...)``."""
+    return f"urn%3Ali%3AsponsoredCampaign%3A{campaign_id}"
 
 
 @functools.cache
@@ -568,6 +584,37 @@ VIOLATIONS = [
         "access_token",
         "body $.client_id: missing required field",
         id="linkedin-oauth-incomplete-grant",
+    ),
+    pytest.param(
+        "linkedin",
+        "GET",
+        f"{LINKEDIN_REST}/adAnalytics?q=analytics&pivot=CAMPAIGN&timeGranularity=ALL"
+        f"&dateRange={SEGMENT_RANGE}&fields={SEGMENT_DISCOVERY_FIELDS}",
+        LINKEDIN_HEADERS,
+        "ad_analytics_campaign_delivery",
+        "query parameter accounts: missing (required)",
+        id="linkedin-segment-discovery-without-accounts",
+    ),
+    pytest.param(
+        "linkedin",
+        "GET",
+        f"{LINKEDIN_REST}/adAnalytics?q=analytics&pivot=MEMBER_SENIORITY&timeGranularity=ALL"
+        f"&dateRange={SEGMENT_RANGE}&fields={SEGMENT_FIELDS}",
+        LINKEDIN_HEADERS,
+        "ad_analytics_member_segments",
+        "query parameter campaigns: missing (required)",
+        id="linkedin-member-segments-without-campaigns",
+    ),
+    pytest.param(
+        "linkedin",
+        "GET",
+        f"{LINKEDIN_REST}/adAnalytics?q=analytics&pivot=MEMBER_SENIORITY&timeGranularity=ALL"
+        f"&dateRange={SEGMENT_RANGE}&campaigns=List({_campaign_urn(990010000)},"
+        f"{_campaign_urn(990010001)})&fields={SEGMENT_FIELDS}",
+        LINKEDIN_HEADERS,
+        "ad_analytics_member_segments",
+        "query parameter campaigns: must name exactly one campaign",
+        id="linkedin-member-segments-for-two-campaigns",
     ),
     pytest.param(
         "hubspot",
@@ -1266,3 +1313,152 @@ async def test_a_rendered_content_type_is_sent_once(monkeypatch: pytest.MonkeyPa
     assert response.status_code == 200
     assert response.headers.get_list("content-type") == [media]
     assert response.json()["results"][0]["customer"]["id"] == CUSTOMER
+
+
+# ---------------------------------------------------------------------------------------------
+# The segment fallback's two request forms
+# ---------------------------------------------------------------------------------------------
+
+# LinkedIn 202609's answer to the contracted Statistics Finder request with a MEMBER_* pivot.
+STATISTICS_REJECTED = Fault(
+    "linkedin",
+    "ad_analytics_statistics",
+    "http_status",
+    status=400,
+    code="FIELD_INVALID",
+    message='"MEMBER_SENIORITY" is not an enum symbol',
+)
+
+
+def _segment_key(row: Any) -> tuple[str, str, str]:
+    """A segment row's natural key: campaign, facet and value."""
+    return row.campaign_urn, row.facet, row.value
+
+
+@pytest.mark.anyio
+async def test_the_segment_fallback_runs_on_the_simulator_under_its_own_contracts() -> None:
+    """A Statistics Finder 400 sends the unchanged client down the fallback, contract-checked.
+
+    The strict transport raises on any request that breaks its contract and every 2xx body is
+    validated against the contract that answered, so the discovery call and each per-campaign
+    request are checked against their own files. The rows equal the statistics form's on the
+    same world: both are drawn from one set of campaign totals.
+    """
+    journal: list[JournalEntry] = []
+    rejecting = mock_transport(
+        "linkedin", _world(STATISTICS_REJECTED), strict=True, journal=journal
+    )
+    async with build_client("linkedin", transport=rejecting) as http:
+        client = LinkedInClient(http, StaticTokenProvider(SIMULATED_TOKEN))
+        fallback = await client.analytics_segments(NA_ACCOUNT, "MEMBER_SENIORITY", SEGMENT_WINDOW)
+        again = await client.analytics_segments(NA_ACCOUNT, "MEMBER_INDUSTRY", SEGMENT_WINDOW)
+    async with build_client(
+        "linkedin", transport=mock_transport("linkedin", _world(), strict=True)
+    ) as http:
+        client = LinkedInClient(http, StaticTokenProvider(SIMULATED_TOKEN))
+        statistics = await client.analytics_segments(NA_ACCOUNT, "MEMBER_SENIORITY", SEGMENT_WINDOW)
+
+    delivering = _world().linkedin_campaign_delivery(NA_ACCOUNT, *SEGMENT_WINDOW)
+    assert delivering
+    assert [(entry.surface, entry.status, entry.fault) for entry in journal] == [
+        ("ad_analytics_statistics", 400, "http_status"),
+        ("ad_analytics_campaign_delivery", 200, None),
+        *[("ad_analytics_member_segments", 200, None)] * (2 * len(delivering)),
+    ]
+    assert fallback.complete
+    assert again.complete
+    assert statistics.complete
+    assert fallback.rows
+    assert sorted(fallback.rows, key=_segment_key) == sorted(statistics.rows, key=_segment_key)
+    assert {row.facet for row in again.rows} == {"industry"}
+
+
+@pytest.mark.parametrize(
+    ("query", "surface", "value_prefix"),
+    [
+        pytest.param(
+            f"q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange={SEGMENT_RANGE}"
+            f"&accounts=List(urn%3Ali%3AsponsoredAccount%3A{NA_ACCOUNT})"
+            f"&fields={SEGMENT_DISCOVERY_FIELDS}",
+            "ad_analytics_campaign_delivery",
+            "urn:li:sponsoredCampaign:",
+            id="campaign-delivery",
+        ),
+        pytest.param(
+            f"q=analytics&pivot=MEMBER_JOB_FUNCTION&timeGranularity=ALL&dateRange={SEGMENT_RANGE}"
+            f"&campaigns=List({_campaign_urn(990010000)})&fields={SEGMENT_FIELDS}",
+            "ad_analytics_member_segments",
+            "urn:li:function:",
+            id="member-segments",
+        ),
+    ],
+)
+def test_each_segment_fallback_form_renders_a_body_its_contract_accepts(
+    query: str, surface: str, value_prefix: str
+) -> None:
+    """Each form is identified as its own surface and rendered in its contract's shape.
+
+    Discovery elements name one campaign with its impressions in the window; per-campaign
+    elements name only the demographic value, the campaign being the request's.
+    """
+    request = httpx.Request("GET", f"{LINKEDIN_REST}/adAnalytics?{query}", headers=LINKEDIN_HEADERS)
+    assert identify_surface("linkedin", request) == surface
+    response = render("linkedin", request, _world())
+    assert (response.status, response.surface) == (200, surface)
+    validate_response(load_contract("linkedin", surface), response.body)
+    body = cast(dict[str, Any], response.body)
+    elements = body["elements"]
+    assert elements
+    for element in elements:
+        (value,) = element["pivotValues"]
+        assert value.startswith(value_prefix)
+        assert set(element) <= set(_top_level(load_contract("linkedin", surface).request.fields))
+    if surface == "ad_analytics_campaign_delivery":
+        expected = _world().linkedin_campaign_delivery(NA_ACCOUNT, *SEGMENT_WINDOW)
+        assert [(element["pivotValues"][0], element["impressions"]) for element in elements] == [
+            (f"urn:li:sponsoredCampaign:{record.campaign_id}", record.impressions)
+            for record in expected
+        ]
+
+
+def test_the_member_segments_form_for_an_unknown_campaign_has_no_elements() -> None:
+    """A campaign the world does not hold reports nothing, as LinkedIn omits inactive entities."""
+    request = httpx.Request(
+        "GET",
+        f"{LINKEDIN_REST}/adAnalytics?q=analytics&pivot=MEMBER_SENIORITY&timeGranularity=ALL"
+        f"&dateRange={SEGMENT_RANGE}&campaigns=List({_campaign_urn(990019999)})"
+        f"&fields={SEGMENT_FIELDS}",
+        headers=LINKEDIN_HEADERS,
+    )
+    response = render("linkedin", request, _world())
+    assert response.status == 200
+    assert cast(dict[str, Any], response.body)["elements"] == []
+
+
+def test_analytics_forms_outside_the_four_contracts_are_routed_to_the_daily_contract() -> None:
+    """Only ``ALL`` with a CAMPAIGN or MEMBER_* pivot is a fallback form; the rest is rejected.
+
+    A ``DAILY`` campaign request and an ``ALL`` creative request fall to ``ad_analytics``,
+    whose contract fixes ``pivot=CREATIVE`` and ``timeGranularity=DAILY``.
+    """
+    for query, problem in (
+        ("q=analytics&pivot=CAMPAIGN&timeGranularity=DAILY", "pivot: must be CREATIVE"),
+        ("q=analytics&pivot=CREATIVE&timeGranularity=ALL", "timeGranularity: must be DAILY"),
+        ("q=analytics&pivot=MEMBER_SENIORITY&timeGranularity=DAILY", "pivot: must be CREATIVE"),
+    ):
+        request = httpx.Request(
+            "GET",
+            f"{LINKEDIN_REST}/adAnalytics?{query}&dateRange={SEGMENT_RANGE}"
+            f"&accounts=List(urn%3Ali%3AsponsoredAccount%3A{NA_ACCOUNT})&fields=pivotValues",
+            headers=LINKEDIN_HEADERS,
+        )
+        assert identify_surface("linkedin", request) == "ad_analytics"
+        with pytest.raises(ContractViolation) as caught:
+            validate_request(load_contract("linkedin", "ad_analytics"), request)
+        assert any(problem in error for error in caught.value.errors), caught.value.errors
+
+
+def _top_level(projection: str | None) -> list[str]:
+    """The top-level field names of a flat ``fields`` projection."""
+    assert projection is not None
+    return projection.split(",")

@@ -210,6 +210,9 @@ _SURFACE_ASSOCIATIONS: Final = "associations_batch_read"
 _SURFACE_PROPERTIES: Final = "properties"
 _BATCH_STATUSES: Final = (200, 207)
 _PROPERTY_STATUSES: Final = (200, 404)
+# The per-input reason of an association read whose next page a continuation bound left
+# unread: the input is partial (or error with no target read), never ok.
+_REASON_CONTINUATION_LIMIT: Final = "continuation limit reached; later pages were not read"
 _OBJECT_NOT_FOUND: Final = "OBJECT_NOT_FOUND"
 _LIFECYCLE_STAGE: Final = "lifecyclestage"
 _CONTACTS: Final = "contacts"
@@ -1586,7 +1589,12 @@ class HubSpotClient:
     # ------------------------------------------------------------------
 
     async def associations(
-        self, from_type: str, to_type: str, ids: Iterable[str]
+        self,
+        from_type: str,
+        to_type: str,
+        ids: Iterable[str],
+        *,
+        max_continuations: int | None = None,
     ) -> AssociationFetch:
         """Read every input's associations to ``to_type``, following each input's cursor.
 
@@ -1609,8 +1617,8 @@ class HubSpotClient:
           ``errors``, or an initial call that failed after its retries or returned a batch
           status other than ``COMPLETE`` (every input of that call);
         * ``partial``: a continuation failed (after its retries, through an error entry or
-          a status other than ``COMPLETE``) after some targets were read; with no target read
-          yet it is ``error``.
+          a status other than ``COMPLETE``) or was left unsent by ``max_continuations``, after
+          some targets were read; with no target read yet it is ``error``.
 
         **Plan correction**: AAP 0.3.3 reads every input listed in a 207 ``errors[]`` as
         ``error``. HubSpot, however, reports an input that simply has no associations
@@ -1632,21 +1640,35 @@ class HubSpotClient:
             from_type: The input records' object type, for example ``contacts``.
             to_type: The target object type, for example ``meetings``.
             ids: The input record ids.
+            max_continuations: The most continuation rounds after the initial calls, each
+                round re-sending every input still carrying a cursor; ``0`` sends the initial
+                calls only. An input whose cursor is left unsent is ``partial`` (``error``
+                with no target read) with the reason "continuation limit reached; later pages
+                were not read". ``None`` (every sync) continues until no paging comes back;
+                ``capture-fixtures`` sends ``0``.
 
         Returns:
             Every requested input's targets and status, in request order.
 
         Raises:
-            ValueError: When an object type is not a path segment, or ``ids`` is one string
-                or holds a blank id.
+            ValueError: When an object type is not a path segment, ``ids`` is one string or
+                holds a blank id, or ``max_continuations`` is given and is not a
+                non-negative integer.
             AccessDenied: When the token or its scopes are refused.
             QueryDefect: When a request or a response breaks the contract.
         """
         path = _associations_batch_read(from_type, to_type)
         requested = _normalise_ids(ids, "ids")
+        if max_continuations is not None and (
+            isinstance(max_continuations, bool)
+            or not isinstance(max_continuations, int)
+            or max_continuations < 0
+        ):
+            raise ValueError("max_continuations must be a non-negative integer when given")
         endpoint = f"{_SURFACE_ASSOCIATIONS} {from_type}/{to_type}"
         states = {input_id: _InputState() for input_id in requested}
         calls = 0
+        rounds = 0
 
         for chunk in _chunks(requested, MAX_ASSOCIATION_INPUTS):
             calls += 1
@@ -1667,6 +1689,11 @@ class HubSpotClient:
             ]
             if not cursors:
                 break
+            if max_continuations is not None and rounds >= max_continuations:
+                for input_id, _after in cursors:
+                    states[input_id].fail(_REASON_CONTINUATION_LIMIT)
+                break
+            rounds += 1
             for page in _chunks(cursors, MAX_ASSOCIATION_INPUTS):
                 calls += 1
                 batch, failure = await self._association_call(

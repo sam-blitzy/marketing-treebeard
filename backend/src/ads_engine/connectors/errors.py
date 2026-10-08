@@ -32,7 +32,10 @@ an exception's text never carries an email address, a configured secret, the n8n
 URL, a credential assigned to a sensitive key or a ``Bearer`` token, whether written
 plainly or percent-encoded. That matters because :attr:`ConnectorError.reason` is
 persisted as the source-mode reason, and HubSpot errors can echo the email that was
-looked up.
+looked up. Secrets that exist only in memory, such as a LinkedIn access token from a
+refresh exchange or a refresh token LinkedIn rotated, are unknown to the settings; code
+that holds them builds its errors inside :func:`holding_secrets`, which strips them just
+as thoroughly, even when a platform echoes one in ordinary prose.
 
 Example:
     A connector decodes the body, classifies the response and raises what it gets::
@@ -53,7 +56,9 @@ library, httpx, pydantic's ``ValidationError``, :mod:`ads_engine.settings` and
 
 import math
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, ClassVar, Final, Literal, NamedTuple
@@ -62,7 +67,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from ads_engine.logging import redact
+from ads_engine.logging import REDACTED, redact
 from ads_engine.settings import ConfigurationError, Source, get_settings
 
 __all__ = [
@@ -74,6 +79,7 @@ __all__ = [
     "TransientError",
     "classify",
     "classify_exception",
+    "holding_secrets",
     "parse_retry_after",
     "sanitize_message",
     "unwrap_single_item",
@@ -93,6 +99,15 @@ _BUDGET_MESSAGE: Final = (
     "the product's own Google Ads webhook call budget (GOOGLE_DAILY_CALL_BUDGET per "
     "sliding 24 h) is used up; remaining calls are deferred"
 )
+
+# The plaintexts `holding_secrets` holds, in memory only. A ContextVar is task-local, so
+# concurrent calls never strip, or learn, each other's secrets.
+_HELD_SECRETS: Final[ContextVar[frozenset[str]]] = ContextVar(
+    "ads_engine_held_secrets", default=frozenset()
+)
+# The shortest start of a held secret replaced at the end of text that was already cut;
+# a shorter run is as likely to be ordinary text as a fragment of the secret.
+_HELD_FRAGMENT_MIN: Final = 4
 
 # Google body tokens, keyed by their normalised form (lowercase, `_` removed), with the
 # kind they signal and the canonical code reported when no specific errorCode value exists.
@@ -185,7 +200,8 @@ class ConnectorError(Exception):
     """Base of every error a connector raises; instantiate a subclass.
 
     The message is sanitised on construction, so neither ``str(error)`` nor
-    :attr:`reason` can carry an email address, a configured secret or the webhook URL.
+    :attr:`reason` can carry an email address, a configured secret, a secret held by
+    :func:`holding_secrets` while the error is built, or the webhook URL.
 
     Attributes:
         kind: The consequence class, set per subclass.
@@ -472,17 +488,90 @@ def _configured_secrets() -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+@contextmanager
+def holding_secrets(values: Iterable[str]) -> Iterator[None]:
+    """Strip ``values`` from every error message built inside the block.
+
+    Some secrets exist only in memory, so the settings :func:`sanitize_message` reads do
+    not know them: an access token LinkedIn issued in a refresh exchange, a refresh token
+    it rotated, the credentials a request carries. While the block runs,
+    :func:`sanitize_message`, and with it every :class:`ConnectorError` constructor,
+    :func:`classify` and :func:`classify_exception`, removes each held value exactly as it
+    removes a configured secret: whatever its length, plain or percent-encoded, and before
+    the message is cut, so a long token is never left half-matched.
+
+    Blocks nest: an inner block holds its values together with those of the blocks around
+    it, and every block restores what was held before it when it ends, also when it
+    raises. The held set is task-local (a :class:`contextvars.ContextVar`), so concurrent
+    tasks never see each other's secrets, and it lives in memory only. Blank values are
+    ignored.
+
+    Example::
+
+        with holding_secrets([access_token]):
+            error = classify(response, body, source="linkedin", endpoint="ad_account")
+
+    Args:
+        values: The plaintexts to hold.
+
+    Yields:
+        Nothing; the values stay held until the block ends.
+
+    Raises:
+        TypeError: When ``values`` is a single string, which would otherwise be read as
+            one-character secrets, or holds anything but strings.
+    """
+    if isinstance(values, str | bytes):
+        raise TypeError("values must be a collection of strings, not a single string")
+    plaintexts = list(values)
+    if not all(isinstance(value, str) for value in plaintexts):
+        raise TypeError("values must hold strings only")
+    added = frozenset(value for value in plaintexts if value.strip())
+    previous = _HELD_SECRETS.set(_HELD_SECRETS.get() | added)
+    try:
+        yield
+    finally:
+        _HELD_SECRETS.reset(previous)
+
+
+def _redact_held_fragment(text: str, held: frozenset[str]) -> str:
+    """Replace the start of a held secret that ends already-cut ``text`` with ``[REDACTED]``.
+
+    Text ending in the ellipsis :func:`_truncate` appends was cut before, for example the
+    message of an error built before a secret was held and rebuilt inside
+    :func:`holding_secrets`. That cut may have gone through the secret, leaving a start of
+    it that no longer matches it whole. The longest such start right before the ellipsis,
+    of at least :data:`_HELD_FRAGMENT_MIN` characters, is replaced.
+    """
+    if not held or not text.endswith(_ELLIPSIS):
+        return text
+    body = text[: -len(_ELLIPSIS)]
+    longest = 0
+    for secret in held:
+        floor = max(longest, _HELD_FRAGMENT_MIN - 1)
+        for size in range(min(len(secret), len(body)), floor, -1):
+            if body.endswith(secret[:size]):
+                longest = size
+                break
+    if not longest:
+        return text
+    return f"{body[: len(body) - longest]}{REDACTED}{_ELLIPSIS}"
+
+
 def sanitize_message(text: str) -> str:
     r"""Make platform or exception text safe to persist and log.
 
     Email addresses become ``[REDACTED_EMAIL]``; URL passwords, every configured secret
-    (whatever its length), values assigned to sensitive keys (``access_token=...``,
-    ``Authorization: ...``, ``{"refresh_token": "..."}``) and ``Bearer`` tokens become
-    ``[REDACTED]``, exactly as :func:`ads_engine.logging.redact` does for log lines; the
-    n8n webhook URL is removed too. Percent-encoded forms are covered as well, also when
-    encoded twice: ``lead%40example.com`` and ``lead%2540example.com`` become
-    ``[REDACTED_EMAIL]``. Whitespace runs collapse to one space, and the result is cut to
-    300 characters. Redaction runs before the cut, so a secret is never left half-matched.
+    and every secret held by :func:`holding_secrets` (whatever its length), values
+    assigned to sensitive keys (``access_token=...``, ``Authorization: ...``,
+    ``{"refresh_token": "..."}``) and ``Bearer`` tokens become ``[REDACTED]``, exactly as
+    :func:`ads_engine.logging.redact` does for log lines; the n8n webhook URL is removed
+    too. Percent-encoded forms are covered as well, also when encoded twice:
+    ``lead%40example.com`` and ``lead%2540example.com`` become ``[REDACTED_EMAIL]``.
+    Whitespace runs collapse to one space, and the result is cut to 300 characters.
+    Redaction runs before the cut, so a secret is never left half-matched. Text that was
+    already cut, and so ends in ``…``, also loses a start of a held secret right before
+    that ellipsis, of 4 characters or more: what an earlier cut through the secret left.
 
     Example::
 
@@ -495,9 +584,10 @@ def sanitize_message(text: str) -> str:
     Returns:
         The sanitised single-line text.
     """
-    redacted = redact(text, secrets=_configured_secrets())
+    held = _HELD_SECRETS.get()
+    redacted = redact(text, secrets=(*_configured_secrets(), *sorted(held)))
     collapsed = " ".join(str(redacted).split())
-    return _truncate(collapsed, _MESSAGE_MAX)
+    return _truncate(_redact_held_fragment(collapsed, held), _MESSAGE_MAX)
 
 
 def unwrap_single_item(body: object) -> object:

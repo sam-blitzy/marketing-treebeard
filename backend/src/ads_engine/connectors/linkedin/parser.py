@@ -136,6 +136,8 @@ _SURFACE_CREATIVES: Final = "creatives"
 _SURFACE_POSTS: Final = "posts"
 _SURFACE_ANALYTICS: Final = "ad_analytics"
 _SURFACE_STATISTICS: Final = "ad_analytics_statistics"
+_SURFACE_CAMPAIGN_DELIVERY: Final = "ad_analytics_campaign_delivery"
+_SURFACE_MEMBER_SEGMENTS: Final = "ad_analytics_member_segments"
 _SURFACE_LEAD_FORMS: Final = "lead_forms"
 _SURFACE_LEAD_RESPONSES: Final = "lead_form_responses"
 _SURFACE_LEAD_RESPONSES_BATCH: Final = "lead_form_responses_batch"
@@ -148,11 +150,16 @@ _SURFACES: Final = frozenset(
         _SURFACE_POSTS,
         _SURFACE_ANALYTICS,
         _SURFACE_STATISTICS,
+        _SURFACE_CAMPAIGN_DELIVERY,
+        _SURFACE_MEMBER_SEGMENTS,
         _SURFACE_LEAD_FORMS,
         _SURFACE_LEAD_RESPONSES,
         _SURFACE_LEAD_RESPONSES_BATCH,
     }
 )
+# The two contracts a demographic segment element can come from: the Statistics Finder and
+# the per-campaign Analytics Finder fallback.
+_SEGMENT_SURFACES: Final = frozenset({_SURFACE_STATISTICS, _SURFACE_MEMBER_SEGMENTS})
 
 # ---------------------------------------------------------------------------
 # URN prefixes
@@ -1300,35 +1307,47 @@ def parse_analytics_daily(element: object) -> CreativeDailyRow:
     )
 
 
-def parse_segment(element: object, pivot: str, *, campaign_urn: str | None = None) -> SegmentRow:
-    """Parse one demographic segment element (contract ``ad_analytics_statistics``).
+def parse_segment(
+    element: object,
+    pivot: str,
+    *,
+    campaign_urn: str | None = None,
+    surface: str = _SURFACE_STATISTICS,
+) -> SegmentRow:
+    """Parse one demographic segment element.
 
-    Two request forms return the same element shape:
+    Two request forms return the same element shape, each under its own contract:
 
-    * the Statistics Finder (``q=statistics&pivots=List(CAMPAIGN,{pivot})``), whose
-      ``pivotValues`` holds the campaign URN and the demographic value in either order;
+    * the Statistics Finder (``q=statistics&pivots=List(CAMPAIGN,{pivot})``, contract
+      ``ad_analytics_statistics``), whose ``pivotValues`` holds the campaign URN and the
+      demographic value in either order;
     * the Analytics Finder fallback (``q=analytics&pivot={pivot}&campaigns=List(...)`` for one
-      campaign), whose ``pivotValues`` holds only the demographic value; the caller passes the
-      requested campaign as ``campaign_urn``. LinkedIn 202609 rejects ``MEMBER_*`` values in
-      ``pivots``, so this is the form that works live.
+      campaign, contract ``ad_analytics_member_segments``), whose ``pivotValues`` holds only
+      the demographic value; the caller passes the requested campaign as ``campaign_urn``.
+      LinkedIn 202609 rejects ``MEMBER_*`` values in ``pivots``, so this is the form that
+      works live.
 
     Args:
         element: One element of the response.
         pivot: The requested demographic pivot, one of :data:`SEGMENT_PIVOTS`.
         campaign_urn: The campaign the request was scoped to (an id or URN). Required when
             ``pivotValues`` carries no campaign; when both exist they must agree.
+        surface: The contract the element came from, for defects:
+            ``ad_analytics_statistics`` (the default) or ``ad_analytics_member_segments``.
 
     Returns:
         The segment row. A metric the pivot does not return is ``None``.
 
     Raises:
-        ValueError: When ``pivot`` is not a segment pivot or ``campaign_urn`` is malformed.
+        ValueError: When ``pivot`` is not a segment pivot, ``campaign_urn`` is malformed or
+            ``surface`` is not a segment surface.
         QueryDefect: When the campaign is unknown or contradicts ``campaign_urn``, the
             demographic value is missing or of another facet, or a field breaks its contract.
     """
     if pivot not in SEGMENT_FACETS:
         raise ValueError(f"pivot must be one of {', '.join(SEGMENT_PIVOTS)}")
-    surface = _SURFACE_STATISTICS
+    if surface not in _SEGMENT_SURFACES:
+        raise ValueError("surface must be ad_analytics_statistics or ad_analytics_member_segments")
     requested = sponsored_campaign_urn(campaign_urn) if campaign_urn is not None else None
     obj = _as_obj(element, "a segment element", surface)
     campaigns: list[str] = []

@@ -25,11 +25,15 @@ generator, as ``docs/runbook.md`` describes, and granted these read-only scopes:
 The client's ``get_posts`` also needs post read access for creative copy (see
 ``connectors/linkedin/client.py``).
 
-Tokens are never persisted, logged or returned anywhere but :meth:`TokenSource.get`.
-Secrets stay :class:`~pydantic.SecretStr` and are revealed only while the token request is
-built. A refresh token that LinkedIn rotates in an exchange response replaces the
-configured one in memory only, so a restarted process starts again from
-``LINKEDIN_REFRESH_TOKEN``.
+Tokens are never persisted or logged. They are returned only by :meth:`TokenSource.get`, as
+the bearer value, and by :meth:`HoldsSecrets.held_secrets`, solely so that errors are
+stripped of them. Secrets stay :class:`~pydantic.SecretStr` and are revealed only while the
+token request is built or the held secrets are read. A refresh token that LinkedIn rotates
+in an exchange response replaces the configured one in memory only, so a restarted process
+starts again from ``LINKEDIN_REFRESH_TOKEN``. The provider also keeps, in memory only, the
+last few access tokens it dropped and refresh tokens rotated away, so that an error echoing
+any token it ever held, from an exchange or from a REST call of the client it serves, is
+stripped of it before the error is logged.
 
 Error handling follows the source fallback table. The token endpoint answers OAuth 2.0
 errors (``{"error": ..., "error_description": ...}``) under HTTP 400 or 401, and this
@@ -60,16 +64,22 @@ Example:
 import asyncio
 import re
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import SecretStr
 
-from ads_engine.connectors.errors import AccessDenied, QueryDefect, sanitize_message
+from ads_engine.connectors.errors import (
+    AccessDenied,
+    QueryDefect,
+    holding_secrets,
+    sanitize_message,
+)
 from ads_engine.connectors.http import DEFAULT_RETRY, JsonResponse, RetryPolicy, send_json
-from ads_engine.logging import REDACTED, get_logger
+from ads_engine.logging import get_logger
 from ads_engine.settings import Settings
 
 __all__ = [
@@ -78,6 +88,7 @@ __all__ = [
     "SIMULATED_TOKEN",
     "TOKEN_SURFACE",
     "TOKEN_URL",
+    "HoldsSecrets",
     "LinkedInTokenProvider",
     "StaticTokenProvider",
     "TokenMode",
@@ -135,6 +146,10 @@ _FORBIDDEN_TOKEN_HEADERS: Final[tuple[str, ...]] = (
 # Statuses whose OAuth error body this module reads itself; send_json classifies the rest.
 _ACCEPTED_STATUSES: Final[tuple[int, ...]] = (200, 400, 401)
 
+# Tokens a provider stopped using (dropped access tokens, refresh tokens rotated away) that
+# it keeps in memory to strip from exchange and REST errors; the oldest goes first beyond this.
+_RETIRED_TOKENS_MAX: Final = 8
+
 _log = get_logger(__name__)
 
 
@@ -177,8 +192,27 @@ class TokenSource(Protocol):
         """Drop any cached access token, so the next :meth:`get` refreshes it."""
 
 
+@runtime_checkable
+class HoldsSecrets(Protocol):
+    """The optional capability of a :class:`TokenSource` to name every secret it holds.
+
+    A token source offering it lists the plaintexts it holds in memory, or held before,
+    that no error or log may carry: the client secret, the current and rotated refresh
+    tokens, the cached access token and the tokens it retired, or a static token.
+    ``LinkedInClient`` checks for it with ``isinstance`` on every REST call and has
+    ``send_json`` hold what :meth:`held_secrets` returns at that moment, so a platform
+    error echoing a token the source rotated since an earlier call never carries it.
+
+    It is separate from :class:`TokenSource`, so a token source without it, such as a test
+    fake, still serves a client, which then holds only the tokens it obtained itself.
+    """
+
+    def held_secrets(self) -> tuple[str, ...]:
+        """Return every plaintext held or retired that an error text must never carry."""
+
+
 class StaticTokenProvider:
-    """A :class:`TokenSource` serving one fixed bearer value.
+    """A :class:`TokenSource` serving one fixed bearer value; it also :class:`HoldsSecrets`.
 
     It never refreshes: :attr:`can_refresh` is ``False`` and :meth:`invalidate` does
     nothing, so a 401 propagates at once as access denied. Its ``repr`` never shows the
@@ -217,6 +251,14 @@ class StaticTokenProvider:
     def invalidate(self) -> None:
         """Do nothing: there is no cached token to drop."""
 
+    def held_secrets(self) -> tuple[str, ...]:
+        """Return the fixed bearer value, the only secret held.
+
+        ``send_json`` never holds the public :data:`SIMULATED_TOKEN` placeholder, so a
+        simulated client strips nothing for it.
+        """
+        return (self._token.get_secret_value(),)
+
     def __repr__(self) -> str:
         """Return the class name only; the token is never shown."""
         return f"{type(self).__name__}()"
@@ -232,6 +274,14 @@ class LinkedInTokenProvider:
     until :data:`EXPIRY_MARGIN_SECONDS` before it expires, measured on ``clock``. An
     :class:`asyncio.Lock` serialises exchanges, so concurrent callers that find no valid
     token share one exchange. :meth:`invalidate` drops the cached token.
+
+    The last 8 tokens the provider stopped using, access tokens it dropped (invalidated,
+    replaced, or too short-lived to cache) and refresh tokens LinkedIn rotated away, stay
+    in memory as :class:`~pydantic.SecretStr`, never persisted or logged. The provider
+    :class:`HoldsSecrets`: :meth:`held_secrets` lists them with the current credentials.
+    Every exchange holds that list through ``send_json``'s ``secrets``, and so does every
+    REST call of the ``LinkedInClient`` it serves, so no exchange or REST error can carry a
+    token this provider ever held.
 
     **Static mode** applies otherwise, when ``LINKEDIN_ACCESS_TOKEN`` is set: :meth:`get`
     returns it without any network call, and :attr:`can_refresh` is ``False``.
@@ -277,6 +327,8 @@ class LinkedInTokenProvider:
         # The cached access token and the clock() instant from which it must be refreshed.
         self._access_token: SecretStr | None = None
         self._refresh_at: float | None = None
+        # Tokens no longer in use, oldest first, kept only to strip them from errors.
+        self._retired: deque[SecretStr] = deque(maxlen=_RETIRED_TOKENS_MAX)
         # Refresh mode holds the trio; static mode holds the configured access token.
         self._credentials: _RefreshCredentials | SecretStr
 
@@ -341,10 +393,28 @@ class LinkedInTokenProvider:
     def invalidate(self) -> None:
         """Drop the cached access token; the next :meth:`get` exchanges again.
 
-        A no-op in static mode, which caches nothing and has nothing to refresh.
+        The dropped token is retired: kept in memory only, so later exchange and REST
+        errors are stripped of it. A no-op in static mode, which caches nothing and has
+        nothing to refresh.
         """
+        self._retire(self._access_token)
         self._access_token = None
         self._refresh_at = None
+
+    def held_secrets(self) -> tuple[str, ...]:
+        """Return every plaintext this provider holds or retired, read at this moment.
+
+        In refresh mode: the client secret, the current refresh token (a rotated one once
+        LinkedIn rotates it), the cached access token and every retired token, both refresh
+        tokens rotated away and access tokens dropped. In static mode: the configured
+        access token. ``LinkedInClient`` holds them on every REST call and the exchange on
+        every attempt, so no error or log carries one. They are returned for that stripping
+        only and never persisted or logged.
+        """
+        credentials = self._credentials
+        if isinstance(credentials, SecretStr):
+            return (credentials.get_secret_value(),)
+        return self._held_secrets(credentials)
 
     def __repr__(self) -> str:
         """Return the mode only; no credential or token is ever shown."""
@@ -362,11 +432,27 @@ class LinkedInTokenProvider:
             return None
         return token.get_secret_value()
 
+    def _retire(self, token: SecretStr | None) -> None:
+        """Keep ``token``, no longer in use, in memory so later errors are stripped of it.
+
+        Only the last :data:`_RETIRED_TOKENS_MAX` distinct tokens are kept; a blank or
+        already retired token is not added again.
+        """
+        if token is None:
+            return
+        plaintext = token.get_secret_value()
+        if not plaintext.strip():
+            return
+        if any(retired.get_secret_value() == plaintext for retired in self._retired):
+            return
+        self._retired.append(token)
+
     def _held_secrets(self, credentials: _RefreshCredentials) -> tuple[str, ...]:
         """Return the plaintexts held in memory that an error text must never carry.
 
-        ``sanitize_message`` strips the configured secrets; a rotated refresh token and an
-        exchanged access token exist only here, so they are stripped explicitly as well.
+        ``sanitize_message`` strips the configured secrets; a rotated refresh token, an
+        exchanged access token and every retired token exist only here, so they are
+        stripped explicitly as well.
         """
         held = [
             credentials.client_secret.get_secret_value(),
@@ -374,6 +460,7 @@ class LinkedInTokenProvider:
         ]
         if self._access_token is not None:
             held.append(self._access_token.get_secret_value())
+        held.extend(retired.get_secret_value() for retired in self._retired)
         return tuple(held)
 
     async def _exchange(self, credentials: _RefreshCredentials) -> str:
@@ -387,6 +474,10 @@ class LinkedInTokenProvider:
         A 401 whose body is not JSON reaches this method as ``send_json``'s ``validation``
         defect, because 401 is an accepted status; any 401 rejects the credentials, so it
         is raised as :class:`AccessDenied` instead.
+
+        Every token this provider holds or retired (:meth:`held_secrets`) is passed to
+        ``send_json`` as ``secrets``, so no error it builds or logs, 403, 429, 5xx and
+        non-JSON failures included, carries one; :func:`_rejection` holds them too.
         """
 
         def build() -> httpx.Request:
@@ -410,6 +501,7 @@ class LinkedInTokenProvider:
                 request.headers.pop(name, None)
             return request
 
+        held = self.held_secrets()
         requested_at = self._clock()
         try:
             response = await send_json(
@@ -419,6 +511,7 @@ class LinkedInTokenProvider:
                 endpoint=TOKEN_SURFACE,
                 policy=self._retry,
                 accept_statuses=_ACCEPTED_STATUSES,
+                secrets=held,
             )
         except QueryDefect as defect:
             if defect.http_status != 401:
@@ -432,7 +525,7 @@ class LinkedInTokenProvider:
                 )
             ) from defect
         if response.status != 200:
-            raise _rejection(response, secrets=self._held_secrets(credentials))
+            raise _rejection(response, secrets=held)
         return self._accept(response.body, credentials, requested_at)
 
     def _accept(self, body: object, credentials: _RefreshCredentials, requested_at: float) -> str:
@@ -460,12 +553,16 @@ class LinkedInTokenProvider:
             raise _invalid_success("the token response has no positive integer expires_in")
 
         cached = expires_in > EXPIRY_MARGIN_SECONDS
+        # The token the new one replaces is retired, whether or not the new one is cached.
+        self._retire(self._access_token)
         if cached:
             self._access_token = SecretStr(token)
             self._refresh_at = requested_at + expires_in - EXPIRY_MARGIN_SECONDS
         else:
             # A token this short-lived is returned once and never served from the cache;
-            # LinkedIn's access tokens normally last about 60 days.
+            # LinkedIn's access tokens normally last about 60 days. It is retired at once,
+            # so the errors of later exchanges are stripped of it as well.
+            self._retire(SecretStr(token))
             self._access_token = None
             self._refresh_at = None
 
@@ -474,7 +571,9 @@ class LinkedInTokenProvider:
             rotated is not None and rotated != credentials.refresh_token.get_secret_value()
         )
         if rotated is not None and refresh_rotated:
-            # In memory only: never persisted, logged or returned.
+            # In memory only: never persisted, logged or returned. The refresh token it
+            # replaces is retired, in memory only too.
+            self._retire(credentials.refresh_token)
             credentials.refresh_token = SecretStr(rotated)
 
         # Numbers and flags only, so operators see when to re-bootstrap (docs/runbook.md).
@@ -565,14 +664,6 @@ def _denies_credentials(status: int, code: str | None, description: str | None) 
     )
 
 
-def _strip_held(text: str, secrets: tuple[str, ...]) -> str:
-    """Replace every occurrence of the in-memory ``secrets`` in ``text`` with ``[REDACTED]``."""
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, REDACTED)
-    return text
-
-
 def _rejection(response: JsonResponse, *, secrets: tuple[str, ...]) -> AccessDenied | QueryDefect:
     """Classify a 400 or 401 exchange response and log it.
 
@@ -580,48 +671,46 @@ def _rejection(response: JsonResponse, *, secrets: tuple[str, ...]) -> AccessDen
     ``sync/mode.py`` sends LinkedIn to simulated data with the reason, for example
     ``"linkedin access_token: invalid_grant: LinkedIn token refresh rejected: invalid_grant"``.
     Every other 400 is a :class:`QueryDefect` carrying the OAuth ``error`` as its code.
-    The code and ``error_description`` lose the held ``secrets`` first, then the
-    description passes through :func:`~ads_engine.connectors.errors.sanitize_message`
-    before it joins the message (the error's constructor sanitises the code and message
-    once more).
+    The error is built inside :func:`~ads_engine.connectors.errors.holding_secrets` with
+    the held ``secrets``: the ``error_description`` passes through
+    :func:`~ads_engine.connectors.errors.sanitize_message` before it joins the message,
+    and the error's constructor sanitises the code and message once more, each time
+    stripping the held secrets with the configured ones.
 
     Args:
         response: The accepted 400 or 401 response.
-        secrets: Plaintexts held only in memory (see ``_held_secrets``).
+        secrets: Plaintexts held only in memory (see
+            :meth:`LinkedInTokenProvider.held_secrets`).
     """
     body = response.body
     status = response.status
-    raw_code = _error_code(body)
+    code = _error_code(body)
     raw_description = _text_field(body, "error_description") or _text_field(body, "message")
-    denied = _denies_credentials(status, raw_code, raw_description)
-    code = _strip_held(raw_code, secrets) if raw_code is not None else None
-    description = (
-        sanitize_message(_strip_held(raw_description, secrets))
-        if raw_description is not None
-        else None
-    )
-    detail = code or f"HTTP {status}"
+    denied = _denies_credentials(status, code, raw_description)
     error: AccessDenied | QueryDefect
-    if denied:
-        message = f"LinkedIn token refresh rejected: {detail}"
-        if description:
-            message = f"{message}: {description}"
-        error = AccessDenied(
-            message,
-            source="linkedin",
-            endpoint=TOKEN_SURFACE,
-            code=code,
-            http_status=status,
-        )
-    else:
-        message = f"LinkedIn token refresh failed: {detail}"
-        if description:
-            message = f"{message}: {description}"
-        error = QueryDefect(
-            message,
-            source="linkedin",
-            endpoint=TOKEN_SURFACE,
-            code=code,
-            http_status=status,
-        )
+    with holding_secrets(secrets):
+        description = sanitize_message(raw_description) if raw_description is not None else None
+        detail = code or f"HTTP {status}"
+        if denied:
+            message = f"LinkedIn token refresh rejected: {detail}"
+            if description:
+                message = f"{message}: {description}"
+            error = AccessDenied(
+                message,
+                source="linkedin",
+                endpoint=TOKEN_SURFACE,
+                code=code,
+                http_status=status,
+            )
+        else:
+            message = f"LinkedIn token refresh failed: {detail}"
+            if description:
+                message = f"{message}: {description}"
+            error = QueryDefect(
+                message,
+                source="linkedin",
+                endpoint=TOKEN_SURFACE,
+                code=code,
+                http_status=status,
+            )
     return _logged(error)

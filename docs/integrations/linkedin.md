@@ -100,7 +100,9 @@ grant_type=refresh_token&refresh_token=<refresh token>&client_id=<client id>&cli
   300 s or less is used for that call and not cached. Concurrent callers share one exchange.
 - **Rotation**: when LinkedIn returns a new refresh token, it replaces the configured one in
   memory only. It is never persisted or logged, so a restarted process starts again from
-  `LINKEDIN_REFRESH_TOKEN`.
+  `LINKEDIN_REFRESH_TOKEN`. The provider keeps the last 8 tokens it stopped using (refresh
+  tokens rotated away, access tokens dropped or replaced) in memory as well, only so that an
+  error echoing one is stripped of it before it is logged.
 - **Rejected credentials**: OAuth `invalid_grant`, `invalid_client` or `unauthorized_client`,
   any 401, and a 400 `invalid_request` whose description says the grant or token is expired or
   revoked are access denied. LinkedIn then switches to simulated data. Any other 400, or a 200
@@ -198,6 +200,8 @@ GET leadFormResponses?ids=List({id1},{id2},...)&owner=(sponsoredAccount:{acct})&
 | `posts` | `get_posts` | Headline (`content.media.title` or `content.article.title`) and intro text (`commentary`). Only `urn:li:share:` and `urn:li:ugcPost:` URNs with a numeric id are requested | At most 50 URNs per call (`POST_BATCH_SIZE`); batch envelope `{results, statuses, errors}` |
 | `ad_analytics` | `analytics_daily` | Daily per-creative spend, impressions, clicks, landing-page clicks, lead form opens, leads and website conversions, into `fact_creative_daily` | Date chunks sized to the response cap; `next` links followed (see [Limits and retention](#limits-and-retention)) |
 | `ad_analytics_statistics` | `analytics_segments` | Demographic segments per campaign for one exact preset window, into `fact_segment_window` (see [Demographic segments](#demographic-segments)) | `next` links followed |
+| `ad_analytics_campaign_delivery` | `analytics_segments` (live fallback) | The account's campaigns with delivery in the window, after LinkedIn rejects the Statistics Finder with HTTP 400 | `next` links followed; cached per account and window |
+| `ad_analytics_member_segments` | `analytics_segments` (live fallback) | One pivot's demographic values for one delivering campaign; the campaign is taken from the request | One request per delivering campaign; `next` links followed |
 | `lead_forms` | `list_lead_forms` | Each form's canonical URN, current `versionId` and that version's `content.questions` | `count`/`start` (see [Lead Sync](#lead-sync)) |
 | `lead_form_responses` | `list_lead_responses` | Sponsored lead responses submitted in a time range | `count`/`start` |
 | `lead_form_responses_batch` | `get_lead_responses` | The transient email re-fetch by response id, for HubSpot matching | At most 100 ids per call (`LEAD_BATCH_SIZE`) |
@@ -259,7 +263,9 @@ Professional-demographic pivots are documented only for the Analytics Finder `pi
 - **On HTTP 400**: it switches, for the rest of that client's life, to the documented Analytics
   Finder fallback. One discovery call finds the account's campaigns with delivery in the window.
   Then one request per campaign, pivot and preset reads the segment, and the campaign is taken
-  from the request:
+  from the request. Each form has its own contract, `ad_analytics_campaign_delivery.json` and
+  `ad_analytics_member_segments.json`, and `payloads.identify_surface` routes it there by `q`,
+  `pivot` and `timeGranularity`:
 
   ```text
   GET adAnalytics?q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange=({window})&accounts=List({acct})&fields=pivotValues,impressions
@@ -270,7 +276,10 @@ Professional-demographic pivots are documented only for the Analytics Finder `pi
   account and window, so the three pivots of one preset share one discovery call. A defect in
   the fallback itself fails the job, chained to the original 400.
 - **In simulated mode**: the simulator answers the contracted form, so simulated runs never take
-  the fallback.
+  the fallback unless a world fault rejects `ad_analytics_statistics` with HTTP 400. The
+  simulator validates and renders both fallback forms from the same world as the Statistics
+  Finder: campaign delivery is each campaign's impressions over the window, and member segments
+  are the demographic values of the one requested campaign.
 
 **Segment semantics.**
 
@@ -613,7 +622,15 @@ LinkedIn in its simulated-sources banner with the reason.
   credential parameters (`pageToken` included) and any email address.
 - **Second line of defence**: the structlog processors also strip `Authorization` values.
 - **Clean error messages**: messages are sanitised, so a persisted source-mode reason carries no
-  email, secret or token.
+  email, secret or token. That covers tokens no setting knows: `send_json` holds the call's own
+  `Authorization` token, the form fields of the exchange and the provider's exchanged, rotated
+  and retired tokens while each error is built. Every REST call also holds the last 8
+  distinct access tokens the client used and, read as the call is sent, every secret the
+  token provider holds: the client secret, the current and rotated refresh tokens, and the
+  cached and retired access tokens, or the static access token. No REST request carries a
+  refresh token or the client secret, but an error echoing one is stripped of it all the same.
+  A platform echoing any of these in plain prose, even a token replaced by an earlier refresh
+  or rotation, therefore never reaches `connector.error` or any later reason.
 - **Opaque reprs**: `LeadBatch` and `DecodedEmail` hide their contents from `repr`.
 
 ## Contract files and references
@@ -633,6 +650,8 @@ sample. The simulator and the contract tests both read these files.
 | `posts.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api?view=li-lms-2026-09> | `202609` | 2026-05-13 |
 | `ad_analytics.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09> | `202609` | 2026-06-24 |
 | `ad_analytics_statistics.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09> | `202609` | 2026-06-24 |
+| `ad_analytics_campaign_delivery.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09> | `202609` | 2026-06-24 |
+| `ad_analytics_member_segments.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09> | `202609` | 2026-06-24 |
 | `lead_forms.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2026-09> | `202609` | 2026-07-29 |
 | `lead_form_responses.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2026-09> | `202609` | 2026-07-29 |
 | `lead_form_responses_batch.json` | <https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync?view=li-lms-2026-09> | `202609` | 2026-07-29 |
@@ -660,7 +679,20 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
 ```
 
 - **Refusals**: the command is refused, with nothing sent or written, under
-  `DATA_MODE=simulated` or without LinkedIn credentials.
+  `DATA_MODE=simulated`, without LinkedIn credentials, or when
+  `tests/contracts/linkedin/captured/` is not writable by the user running it or is a symbolic
+  link.
+- **Bounds**: each surface costs one request. The capture calls the same client methods as sync,
+  with capture-only bounds that sync never passes: `max_pages=1` on `list_campaign_groups`,
+  `list_campaigns`, `list_creatives` (one campaign), `analytics_daily` and
+  `analytics_segments`, and `max_campaigns=1` on `analytics_segments`. No later `pageToken` or
+  `next` link is followed, so those listings end incomplete with the reason "page limit" by
+  design; lead forms and responses read one page of `count=1`.
+- **Segment fallback**: when LinkedIn rejects the Statistics Finder with HTTP 400, the segment
+  call sends one `ad_analytics_campaign_delivery` discovery request and one
+  `ad_analytics_member_segments` request for the first delivering campaign. Both are captured
+  under their own surfaces, and `ad_analytics_statistics` is then not captured, because its
+  only response was the 400.
 - **Output**: it writes `tests/contracts/linkedin/captured/{surface}.json`, each shaped
   `{surface, captured_at, request, response}`. `access_token` is captured only in refresh mode,
   and `lead_form_responses_batch` only when a lead was read in the last 30 days.
@@ -672,9 +704,12 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
   - person-name and contact keys: `firstName`, `lastName`, `firstname`, `lastname`, `fullName`,
     `phone`, `mobilephone` and `email`;
   - every `formResponse.answers[].answerDetails` object, whole;
-  - any email address and the plaintext of every configured secret, in any string.
+  - any email address, and every configured secret, `LINKEDIN_CLIENT_ID` included, in any
+    string whatever its length, in plain text or in any percent-encoded spelling.
 
-  Configured ad account ids become zeros of the same length. The `LEAD_FIELDS` projection does
-  not request `submitter`, the member URN, so captures of lead responses do not carry it.
+  Configured ad account ids become zeros of the same length. A capture that still holds a
+  configured secret, however many times it was percent-encoded, is not written, and the
+  command exits with status 1. The `LEAD_FIELDS` projection does not request `submitter`,
+  the member URN, so captures of lead responses do not carry it.
 - **Use in tests**: the contract tests then validate the parsers against the captured payloads
   as well as the documented samples.

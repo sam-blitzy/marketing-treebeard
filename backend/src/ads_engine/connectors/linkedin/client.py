@@ -57,6 +57,7 @@ Example:
 """
 
 import re
+from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -64,13 +65,14 @@ from typing import Final
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
+from pydantic import SecretStr
 
 from ads_engine.connectors.errors import AccessDenied, QueryDefect, TransientError
 from ads_engine.connectors.http import DEFAULT_RETRY, JsonResponse, RetryPolicy, send_json
 from ads_engine.connectors.linkedin._projections_generated import (
     LEAD_FIELDS as _GENERATED_LEAD_FIELDS,
 )
-from ads_engine.connectors.linkedin.auth import TokenSource
+from ads_engine.connectors.linkedin.auth import HoldsSecrets, TokenSource
 from ads_engine.connectors.linkedin.parser import (
     CAMPAIGN_GROUP_SEARCH_STATUSES,
     CAMPAIGN_SEARCH_STATUSES,
@@ -213,6 +215,8 @@ _SURFACE_CREATIVES: Final = "creatives"
 _SURFACE_POSTS: Final = "posts"
 _SURFACE_ANALYTICS: Final = "ad_analytics"
 _SURFACE_STATISTICS: Final = "ad_analytics_statistics"
+_SURFACE_CAMPAIGN_DELIVERY: Final = "ad_analytics_campaign_delivery"
+_SURFACE_MEMBER_SEGMENTS: Final = "ad_analytics_member_segments"
 _SURFACE_LEAD_FORMS: Final = "lead_forms"
 _SURFACE_LEAD_RESPONSES: Final = "lead_form_responses"
 _SURFACE_LEAD_RESPONSES_BATCH: Final = "lead_form_responses_batch"
@@ -240,6 +244,11 @@ _MAX_NEXT_LINKS: Final = 1_000
 _REASON_PAGE_LIMIT: Final = "page limit"
 _REASON_ONE_DAY_CAP: Final = "result limit reached at finest partition (one day)"
 _REASON_CAP: Final = "result limit reached"
+
+# Distinct bearer tokens a client keeps in memory, oldest dropped first, only to strip them
+# from the errors of its later calls. The same bound as the token provider's retired tokens
+# in ``auth.py``, so the client holds as many past tokens as the provider does.
+_USED_TOKENS_MAX: Final = 8
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +397,12 @@ def _check_page_size(page_size: int, max_pages: int | None) -> None:
         raise ValueError("max_pages must be at least 1 when given")
 
 
+def _check_limit(name: str, value: int | None) -> None:
+    """Validate an optional request bound: ``None`` (no bound) or an integer of at least 1."""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError(f"{name} must be at least 1 when given")
+
+
 def _check_date_range(date_range: tuple[date, date]) -> tuple[date, date]:
     """Return an inclusive ``(start, end)`` date range, rejecting a start after its end."""
     start, end = date_range
@@ -524,11 +539,13 @@ class _Pages:
         elements: Every element read, in response order.
         capped: Whether the last response held at least :data:`MAX_ANALYTICS_ELEMENTS`
             elements with no ``next`` link, so it may be truncated.
+        limited: Whether a ``max_pages`` bound stopped the chain with a ``next`` link unread.
         interrupted_by: The transient error that stopped the next-link chain, or ``None``.
     """
 
     elements: list[_Element] = field(default_factory=list)
     capped: bool = False
+    limited: bool = False
     interrupted_by: TransientError | None = None
 
 
@@ -927,6 +944,18 @@ class LinkedInClient:
     LinkedIn's daily per-application and per-member limits are unpublished and reset at
     midnight UTC; a 429 is transient and is retried by ``send_json``.
 
+    Tokens in errors: the client keeps, in memory only and as ``SecretStr``, the last
+    :data:`_USED_TOKENS_MAX` distinct bearer tokens it obtained from ``tokens``, and every
+    call holds all of them through ``send_json``'s ``secrets``. An error echoing a token
+    replaced by a refresh, on any later call, therefore never carries it, nor does any log.
+    No REST request sends a refresh token or the client secret, yet a platform error can
+    still echo one, so the client fails closed: when ``tokens`` also
+    :class:`~ads_engine.connectors.linkedin.auth.HoldsSecrets`, as ``LinkedInTokenProvider``
+    and ``StaticTokenProvider`` do, every call holds what ``tokens.held_secrets()`` returns
+    when it is sent (the client secret, the current and rotated refresh tokens, and the
+    access tokens the provider cached or retired). The client copies none of them; a
+    rotation between two calls is covered by the later one.
+
     Days: LinkedIn reports daily buckets on UTC days, and rows keep the dates as returned.
 
     Recovery probe (AAP 0.3.3, used by ``sync/mode.py``), one call each:
@@ -980,9 +1009,13 @@ class LinkedInClient:
         # Set once LinkedIn rejects the Statistics Finder segment request with HTTP 400, so
         # later segment calls of this client go straight to the Analytics Finder fallback.
         self._statistics_finder_rejected = False
-        # Campaigns with delivery per (account URN, window start, window end), found by the
-        # segment fallback's discovery call and shared by the three demographic pivots.
-        self._delivering_campaigns: dict[tuple[str, date, date], tuple[tuple[str, ...], bool]] = {}
+        # Campaigns with delivery and the discovery's incompleteness reason per (account URN,
+        # window start, window end, max_pages), found by the segment fallback's discovery call
+        # and shared by the three demographic pivots. A bounded discovery is cached under its
+        # own bound, so it never stands in for a full one.
+        self._delivering_campaigns: dict[
+            tuple[str, date, date, int | None], tuple[tuple[str, ...], str | None]
+        ] = {}
         # Creatives per account URN, from the de-duplicated rows of this client's most recent
         # list_creatives of that account; analytics_daily sizes its date chunks with it when
         # the caller passes no expected_creatives.
@@ -992,6 +1025,9 @@ class LinkedInClient:
         # that account. list_lead_responses decodes with them when the caller passes no
         # known_versions; each map only ever decodes responses of its own version.
         self._form_versions: dict[str, dict[tuple[str, int], FormVersionMap]] = {}
+        # Distinct bearer tokens obtained from the token source, oldest first, kept in
+        # memory only so no error or log of a later call carries one.
+        self._used_tokens: deque[SecretStr] = deque(maxlen=_USED_TOKENS_MAX)
 
     def __repr__(self) -> str:
         """Return the class name only; the token source is never shown."""
@@ -1006,8 +1042,35 @@ class LinkedInClient:
         token: str,
         extra_headers: Mapping[str, str] | None,
         tally: _Tally,
+        *,
+        held: Sequence[str] = (),
     ) -> JsonResponse:
-        """Send one ``GET`` through ``send_json``; one retry sequence counts as one call."""
+        """Send one ``GET`` through ``send_json``; one retry sequence counts as one call.
+
+        No error or log of the call may carry a token this client obtained from its token
+        source (``_used_tokens``), nor one of ``held``, tokens beyond ``token`` such as the
+        one a 401 refresh replaced, nor, when the token source
+        :class:`~ads_engine.connectors.linkedin.auth.HoldsSecrets`, any secret its
+        ``held_secrets()`` returns: its client secret, current and rotated refresh tokens
+        and cached or retired access tokens. Those are read for each call, so a refresh
+        token rotated since an earlier call is held too. ``send_json`` holds them all as its
+        ``secrets``, with the bearer token the request itself carries, so a token from
+        before a refresh stays out of the errors of every later call too.
+
+        Raises:
+            TypeError: When ``held`` is a single string, which would otherwise be read as
+                one-character tokens.
+        """
+        if isinstance(held, str):
+            raise TypeError("held must be a sequence of strings, not a single string")
+        provider_held = (
+            self._tokens.held_secrets() if isinstance(self._tokens, HoldsSecrets) else ()
+        )
+        secrets = (
+            *(used.get_secret_value() for used in self._used_tokens),
+            *held,
+            *provider_held,
+        )
         headers: dict[str, str] = dict(extra_headers or {})
         headers.update(
             {
@@ -1024,7 +1087,7 @@ class LinkedInClient:
 
         tally.calls += 1
         return await send_json(
-            self._http, build, source=SOURCE, endpoint=surface, policy=self._retry
+            self._http, build, source=SOURCE, endpoint=surface, policy=self._retry, secrets=secrets
         )
 
     async def _get_url(
@@ -1039,18 +1102,37 @@ class LinkedInClient:
 
         AAP 0.3.3 classifies LinkedIn's "401 after one token refresh" as access denied: the
         first 401 of a refreshable token source invalidates the cached token and the call is
-        repeated once; a 403 or a second 401 propagates as ``AccessDenied``.
+        repeated once; a 403 or a second 401 propagates as ``AccessDenied``. Each token
+        obtained from the token source, before the first send and after the refresh, is
+        retained at once (:meth:`_retain`), so this call and every later one hold it; the
+        repeated call also names the rejected token, so an error echoing it never carries it.
         """
         token = await self._tokens.get()
+        self._retain(token)
         try:
             return await self._send(surface, url, token, extra_headers, tally)
         except AccessDenied as denied:
             if not (denied.is_unauthorized and self._tokens.can_refresh):
                 raise
+        rejected = token
         self._tokens.invalidate()
         log.info("linkedin.token.retry_after_401", surface=surface)
         token = await self._tokens.get()
-        return await self._send(surface, url, token, extra_headers, tally)
+        self._retain(token)
+        return await self._send(surface, url, token, extra_headers, tally, held=(rejected,))
+
+    def _retain(self, token: str) -> None:
+        """Keep ``token``, obtained from the token source, in memory as a ``SecretStr``.
+
+        Only the last :data:`_USED_TOKENS_MAX` distinct tokens are kept, the oldest dropped
+        first; a blank or already kept token is not added again. The kept tokens are never
+        logged, persisted or shown by ``repr``; :meth:`_send` holds them on every call.
+        """
+        if not token.strip():
+            return
+        if any(used.get_secret_value() == token for used in self._used_tokens):
+            return
+        self._used_tokens.append(SecretStr(token))
 
     async def _get(
         self,
@@ -1065,7 +1147,9 @@ class LinkedInClient:
         url = f"{path}?{restli_query(pairs)}" if pairs else path
         return await self._get_url(surface, url, tally=tally, extra_headers=extra_headers)
 
-    async def _follow(self, surface: str, url: str, tally: _Tally) -> _Pages:
+    async def _follow(
+        self, surface: str, url: str, tally: _Tally, *, max_pages: int | None = None
+    ) -> _Pages:
         """Read a request and every ``rel=next`` link it leads to.
 
         ``adAnalytics`` documents no pagination, but live responses can carry a ``next``
@@ -1074,12 +1158,14 @@ class LinkedInClient:
         any request already read is a defect, and so is a chain of more than
         :data:`_MAX_NEXT_LINKS` links, so the chain always terminates. A transient failure
         stops the chain, keeps the elements already read and sets ``interrupted_by``, so the
-        caller reports the listing incomplete.
+        caller reports the listing incomplete. With ``max_pages``, at most that many
+        responses are read (the request and its ``next`` links); a ``next`` link left unread
+        sets ``limited``, so the caller reports the listing incomplete too.
         """
         pages = _Pages()
         seen: set[str] = {url}
         current = url
-        for _ in range(_MAX_NEXT_LINKS + 1):
+        for read in range(1, _MAX_NEXT_LINKS + 2):
             try:
                 response = await self._get_url(surface, current, tally=tally)
             except TransientError as exc:
@@ -1091,6 +1177,9 @@ class LinkedInClient:
             href = _next_href(body, surface)
             if href is None:
                 pages.capped = len(elements) >= MAX_ANALYTICS_ELEMENTS
+                return pages
+            if max_pages is not None and read >= max_pages:
+                pages.limited = True
                 return pages
             if href in seen:
                 raise _defect("a 'next' link repeats an earlier request", surface)
@@ -1105,33 +1194,41 @@ class LinkedInClient:
         pairs: Sequence[tuple[str, str]],
         parse: Callable[[_Element], T],
         tally: _Tally,
-    ) -> tuple[list[T], TransientError | None]:
+        *,
+        max_pages: int | None = None,
+    ) -> tuple[list[T], TransientError | None, str | None, int]:
         """Page a search by ``pageToken`` until ``metadata.nextPageToken`` is absent.
 
         Each page sends ``pageSize=100`` and, after the first, the previous response's
         ``metadata.nextPageToken`` percent-encoded once as ``pageToken``. The legacy
         ``paging`` block that live responses also carry is ignored: its links can hold a
         stale ``next`` href. A token that repeats is a defect, so enumeration terminates.
+        With ``max_pages``, paging stops after that many pages; when the last page read
+        still carries a token, the search is incomplete with reason "page limit".
 
         Returns:
-            The parsed rows and the transient error that ended paging early, or ``None``.
+            ``(rows, interrupted_by, reason, pages)``: the parsed rows, the transient error
+            that ended paging early or ``None``, "page limit" when ``max_pages`` left a page
+            unread or ``None``, and the number of pages read.
         """
         rows: list[T] = []
         token: str | None = None
         seen: set[str] = set()
-        for _ in range(_MAX_CURSOR_PAGES):
+        for page in range(1, _MAX_CURSOR_PAGES + 1):
             page_pairs = [*pairs, ("pageSize", str(ENTITY_PAGE_SIZE))]
             if token is not None:
                 page_pairs.append(("pageToken", quote(token, safe="")))
             try:
                 response = await self._get(surface, path, page_pairs, tally=tally)
             except TransientError as exc:
-                return rows, exc
+                return rows, exc, None, page - 1
             body = _body_object(response, surface)
             rows.extend(parse(element) for element in _elements(body, surface))
             next_token = _cursor_token(body, surface)
             if next_token is None:
-                return rows, None
+                return rows, None, None, page
+            if max_pages is not None and page >= max_pages:
+                return rows, None, _REASON_PAGE_LIMIT, page
             if next_token in seen:
                 raise _defect("page token did not advance", surface)
             seen.add(next_token)
@@ -1244,7 +1341,11 @@ class LinkedInClient:
         return row
 
     async def list_campaign_groups(
-        self, account_id: str, *, account_currency: str | None = None
+        self,
+        account_id: str,
+        *,
+        account_currency: str | None = None,
+        max_pages: int | None = None,
     ) -> Listing[CampaignGroupRow]:
         """List the account's campaign groups in every status (contract ``ad_campaign_groups``).
 
@@ -1261,10 +1362,18 @@ class LinkedInClient:
         Args:
             account_id: The numeric ad account id or its URN.
             account_currency: The ad account's ISO 4217 currency, when already known.
+            max_pages: Stop after this many pages; ``complete`` is then ``False`` with reason
+                "page limit" when another page exists. ``None`` (every sync) reads every
+                page; ``capture-fixtures`` sends 1.
 
         Returns:
-            The groups; ``complete`` is ``False`` when a page failed transiently.
+            The groups; ``complete`` is ``False`` when a page failed transiently or
+            ``max_pages`` left a page unread.
+
+        Raises:
+            ValueError: When ``max_pages`` is given and is not an integer of at least 1.
         """
+        _check_limit("max_pages", max_pages)
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_CAMPAIGN_GROUPS
         tally = _Tally()
@@ -1281,17 +1390,22 @@ class LinkedInClient:
             ("search", f"(status:(values:{restli_list(CAMPAIGN_GROUP_SEARCH_STATUSES)}))"),
         ]
         path = f"adAccounts/{urn_id(account_urn, PREFIX_ACCOUNT)}/adCampaignGroups"
-        rows, interrupted = await self._cursor_pages(
+        rows, interrupted, reason, _pages = await self._cursor_pages(
             surface,
             path,
             pairs,
             lambda element: parse_campaign_group(element, account_currency=known_currency),
             tally,
+            max_pages=max_pages,
         )
-        return self._listing(surface, rows, tally, interrupted, key=_urn_key)
+        return self._listing(surface, rows, tally, interrupted, key=_urn_key, reason=reason)
 
     async def list_campaigns(
-        self, account_id: str, *, account_currency: str | None = None
+        self,
+        account_id: str,
+        *,
+        account_currency: str | None = None,
+        max_pages: int | None = None,
     ) -> Listing[CampaignRow]:
         """List the account's campaigns in every status (contract ``ad_campaigns``).
 
@@ -1307,17 +1421,24 @@ class LinkedInClient:
         diffed against the full list; omitting ``COMPLETED`` would raise false ``missing``
         discrepancies for finished campaigns.
 
-        A listing cut short (any page failed) has ``complete=False``, and ``sync`` never
-        infers ``missing`` from it.
+        A listing cut short (any page failed, or ``max_pages`` left a page unread) has
+        ``complete=False``, and ``sync`` never infers ``missing`` from it.
 
         Args:
             account_id: The numeric ad account id or its URN.
             account_currency: The ad account's currency; when given, or learned earlier by
                 :meth:`get_ad_account`, a budget in another currency is a defect.
+            max_pages: Stop after this many pages; ``complete`` is then ``False`` with reason
+                "page limit" when another page exists. ``None`` (every sync) reads every
+                page; ``capture-fixtures`` sends 1.
 
         Returns:
             The campaigns.
+
+        Raises:
+            ValueError: When ``max_pages`` is given and is not an integer of at least 1.
         """
+        _check_limit("max_pages", max_pages)
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_CAMPAIGNS
         tally = _Tally()
@@ -1327,17 +1448,18 @@ class LinkedInClient:
             ("search", f"(status:(values:{restli_list(CAMPAIGN_SEARCH_STATUSES)}))"),
         ]
         path = f"adAccounts/{urn_id(account_urn, PREFIX_ACCOUNT)}/adCampaigns"
-        rows, interrupted = await self._cursor_pages(
+        rows, interrupted, reason, _pages = await self._cursor_pages(
             surface,
             path,
             pairs,
             lambda element: parse_campaign(element, account_currency=currency),
             tally,
+            max_pages=max_pages,
         )
-        return self._listing(surface, rows, tally, interrupted, key=_urn_key)
+        return self._listing(surface, rows, tally, interrupted, key=_urn_key, reason=reason)
 
     async def list_creatives(
-        self, account_id: str, campaigns: Sequence[str]
+        self, account_id: str, campaigns: Sequence[str], *, max_pages: int | None = None
     ) -> Listing[CreativeRow]:
         """List the creatives of the given campaigns in every status (contract ``creatives``).
 
@@ -1363,13 +1485,19 @@ class LinkedInClient:
             account_id: The numeric ad account id or its URN.
             campaigns: Campaign ids or ``urn:li:sponsoredCampaign:{id}`` URNs; repeats are
                 sent once.
+            max_pages: Stop after this many pages in total, across the campaign chunks;
+                ``complete`` is then ``False`` with reason "page limit" when another page or
+                chunk remains. ``None`` (every sync) reads every page of every chunk;
+                ``capture-fixtures`` sends 1.
 
         Returns:
             The creatives; complete only when every chunk completed.
 
         Raises:
-            ValueError: When an id is neither numeric nor a campaign URN.
+            ValueError: When an id is neither numeric nor a campaign URN, or ``max_pages``
+                is given and is not an integer of at least 1.
         """
+        _check_limit("max_pages", max_pages)
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_CREATIVES
         tally = _Tally()
@@ -1378,19 +1506,26 @@ class LinkedInClient:
         statuses = restli_list(CREATIVE_INTENDED_STATUSES)
         rows: list[CreativeRow] = []
         interrupted: TransientError | None = None
+        reason: str | None = None
+        remaining = max_pages
         for chunk in _chunks(campaign_urns, CREATIVE_CAMPAIGN_CHUNK):
+            if remaining == 0:
+                reason = _REASON_PAGE_LIMIT
+                break
             pairs = [
                 ("q", "criteria"),
                 ("campaigns", restli_list(encode_urn(urn) for urn in chunk)),
                 ("intendedStatuses", statuses),
             ]
-            chunk_rows, interrupted = await self._cursor_pages(
-                surface, path, pairs, parse_creative, tally
+            chunk_rows, interrupted, reason, read = await self._cursor_pages(
+                surface, path, pairs, parse_creative, tally, max_pages=remaining
             )
             rows.extend(chunk_rows)
-            if interrupted is not None:
+            if interrupted is not None or reason is not None:
                 break
-        listing = self._listing(surface, rows, tally, interrupted, key=_urn_key)
+            if remaining is not None:
+                remaining -= read
+        listing = self._listing(surface, rows, tally, interrupted, key=_urn_key, reason=reason)
         self._creative_counts[account_urn] = len(listing.rows)
         return listing
 
@@ -1508,6 +1643,7 @@ class LinkedInClient:
         date_range: tuple[date, date],
         *,
         expected_creatives: int | None = None,
+        max_pages: int | None = None,
     ) -> Listing[CreativeDailyRow]:
         """Read daily per-creative performance on UTC days (contract ``ad_analytics``).
 
@@ -1531,7 +1667,10 @@ class LinkedInClient:
           rows are discarded and its range is split at the midpoint into ``[start, mid]``
           and ``[mid + 1, end]``, read in that order;
         * a single day at the cap keeps its rows and makes the listing incomplete with the
-          reason "result limit reached at finest partition (one day)".
+          reason "result limit reached at finest partition (one day)";
+        * with ``max_pages``, each chunk's request reads at most that many responses (the
+          request and its ``next`` links); a ``next`` link left unread keeps the rows read
+          and makes the listing incomplete with the reason "page limit".
 
         The creative count only sizes the first chunks; completeness never depends on it,
         because any chunk at the cap is split as above.
@@ -1546,19 +1685,23 @@ class LinkedInClient:
                 the creative count of the account's entity sync. ``None`` (the default) uses
                 the count from this client's most recent :meth:`list_creatives` of the
                 account, or one chunk for the whole range when there is none.
+            max_pages: The most responses each chunk's request reads. ``None`` (every sync)
+                follows every ``next`` link; ``capture-fixtures`` sends 1.
 
         Returns:
             One row per creative and UTC day, de-duplicated on that pair.
 
         Raises:
-            ValueError: When the range starts after it ends, or ``expected_creatives`` is
-                given and is negative or a ``bool``.
+            ValueError: When the range starts after it ends, ``expected_creatives`` is
+                given and is negative or a ``bool``, or ``max_pages`` is given and is not an
+                integer of at least 1.
         """
         start, end = _check_date_range(date_range)
         if expected_creatives is not None and (
             isinstance(expected_creatives, bool) or expected_creatives < 0
         ):
             raise ValueError("expected_creatives must be a non-negative integer")
+        _check_limit("max_pages", max_pages)
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_ANALYTICS
         tally = _Tally()
@@ -1595,11 +1738,15 @@ class LinkedInClient:
                 ("accounts", accounts),
                 ("fields", DAILY_FIELDS),
             ]
-            pages = await self._follow(surface, f"adAnalytics?{restli_query(pairs)}", tally)
+            pages = await self._follow(
+                surface, f"adAnalytics?{restli_query(pairs)}", tally, max_pages=max_pages
+            )
             if pages.interrupted_by is not None:
                 rows.extend(parse_analytics_daily(element) for element in pages.elements)
                 interrupted = pages.interrupted_by
                 break
+            if pages.limited:
+                reason = _REASON_PAGE_LIMIT
             if pages.capped:
                 if chunk_start < chunk_end:
                     mid = chunk_start + timedelta(days=(chunk_end - chunk_start).days // 2)
@@ -1616,7 +1763,13 @@ class LinkedInClient:
         return self._listing(surface, rows, tally, interrupted, key=_daily_key, reason=reason)
 
     async def analytics_segments(
-        self, account_id: str, pivot: str, window: tuple[date, date]
+        self,
+        account_id: str,
+        pivot: str,
+        window: tuple[date, date],
+        *,
+        max_pages: int | None = None,
+        max_campaigns: int | None = None,
     ) -> Listing[SegmentRow]:
         """Read one demographic pivot per campaign over one exact preset window.
 
@@ -1632,13 +1785,15 @@ class LinkedInClient:
         live segment fetch and with it every live LinkedIn dataset build, keeping LinkedIn
         simulated for good. On that 400 the client therefore switches, for the rest of its
         life, to the Analytics Finder form the contract documents as the verified fallback:
-        one ``q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&accounts=List(...)`` call finds
-        the campaigns with delivery in the window, then ``q=analytics&pivot={pivot}
-        &timeGranularity=ALL&dateRange=({window})&campaigns=List({one campaign URN})
-        &fields={SEGMENT_FIELDS}`` is read per campaign, the campaign attributed from the
+        one ``q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&accounts=List(...)`` call
+        (contract ``ad_analytics_campaign_delivery``) finds the campaigns with delivery in the
+        window, then ``q=analytics&pivot={pivot}&timeGranularity=ALL&dateRange=({window})
+        &campaigns=List({one campaign URN})&fields={SEGMENT_FIELDS}`` (contract
+        ``ad_analytics_member_segments``) is read per campaign, the campaign attributed from the
         request (``parse_segment(..., campaign_urn=...)``). The simulator answers the
-        contracted form, so simulated runs never take the fallback; a defect of the fallback
-        itself propagates, chained to the original 400.
+        contracted form, so simulated runs take the fallback only when a world fault rejects
+        that form with HTTP 400; a defect of the fallback itself propagates, chained to the
+        original 400.
 
         Segment values are approximate and privacy-thresholded: LinkedIn returns at most the
         top 100 values per pivot and omits values reached by too few members, so a window's
@@ -1647,26 +1802,45 @@ class LinkedInClient:
         listing incomplete with reason "result limit reached": the window must stay exact,
         so it cannot be split by date.
 
+        Capture bounds (``capture-fixtures`` sends 1 for both; every sync sends neither):
+        ``max_pages`` caps the responses each request reads (the request and its ``next``
+        links), and ``max_campaigns`` caps the delivering campaigns the fallback reads, one
+        request each in ascending id order. A ``next`` link or campaign left unread keeps
+        the rows read and makes the listing incomplete with the reason "page limit".
+
         Args:
             account_id: The numeric ad account id or its URN.
             pivot: One of ``parser.SEGMENT_PIVOTS``.
             window: The inclusive ``(start, end)`` UTC dates of one preset window.
+            max_pages: The most responses each request reads; ``None`` follows every link.
+            max_campaigns: The most delivering campaigns the fallback reads; ``None`` reads
+                every one.
 
         Returns:
             One row per campaign and demographic value, de-duplicated on that pair.
 
         Raises:
-            ValueError: When ``pivot`` is not a segment pivot or the window starts after it
-                ends.
+            ValueError: When ``pivot`` is not a segment pivot, the window starts after it
+                ends, or a bound is given and is not an integer of at least 1.
         """
         if pivot not in SEGMENT_PIVOTS:
             raise ValueError(f"pivot must be one of {', '.join(SEGMENT_PIVOTS)}")
         start, end = _check_date_range(window)
+        _check_limit("max_pages", max_pages)
+        _check_limit("max_campaigns", max_campaigns)
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_STATISTICS
         tally = _Tally()
         if self._statistics_finder_rejected:
-            return await self._segments_by_campaign(account_urn, pivot, start, end, tally)
+            return await self._segments_by_campaign(
+                account_urn,
+                pivot,
+                start,
+                end,
+                tally,
+                max_pages=max_pages,
+                max_campaigns=max_campaigns,
+            )
         pairs = [
             ("q", "statistics"),
             ("pivots", restli_list(("CAMPAIGN", pivot))),
@@ -1676,7 +1850,9 @@ class LinkedInClient:
             ("fields", SEGMENT_FIELDS),
         ]
         try:
-            pages = await self._follow(surface, f"adAnalytics?{restli_query(pairs)}", tally)
+            pages = await self._follow(
+                surface, f"adAnalytics?{restli_query(pairs)}", tally, max_pages=max_pages
+            )
         except QueryDefect as rejected:
             if rejected.http_status != 400:
                 raise
@@ -1688,38 +1864,51 @@ class LinkedInClient:
                 error_code=rejected.code,
             )
             try:
-                return await self._segments_by_campaign(account_urn, pivot, start, end, tally)
+                return await self._segments_by_campaign(
+                    account_urn,
+                    pivot,
+                    start,
+                    end,
+                    tally,
+                    max_pages=max_pages,
+                    max_campaigns=max_campaigns,
+                )
             except QueryDefect as fallback_defect:
                 raise fallback_defect from rejected
         rows = [parse_segment(element, pivot) for element in pages.elements]
+        reason = _REASON_CAP if pages.capped else _REASON_PAGE_LIMIT if pages.limited else None
         return self._listing(
-            surface,
-            rows,
-            tally,
-            pages.interrupted_by,
-            key=_segment_key,
-            reason=_REASON_CAP if pages.capped else None,
+            surface, rows, tally, pages.interrupted_by, key=_segment_key, reason=reason
         )
 
     async def _delivering(
-        self, account_urn: str, start: date, end: date, tally: _Tally
-    ) -> tuple[tuple[str, ...], bool, TransientError | None]:
+        self,
+        account_urn: str,
+        start: date,
+        end: date,
+        tally: _Tally,
+        *,
+        max_pages: int | None,
+    ) -> tuple[tuple[str, ...], str | None, TransientError | None]:
         """Find the account's campaigns with delivery in a window (segment fallback).
 
         ``GET adAnalytics?q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange=(...)
-        &accounts=List(...)&fields=pivotValues,impressions``. A campaign reported with zero
+        &accounts=List(...)&fields=pivotValues,impressions`` (contract
+        ``ad_analytics_campaign_delivery``). A campaign reported with zero
         impressions has no demographic values and is left out. The result is cached per
-        account and window, so the three pivots of one preset share one discovery call; an
-        interrupted discovery is not cached.
+        account, window and ``max_pages``, so the three pivots of one preset share one
+        discovery call; an interrupted discovery is not cached.
 
         Returns:
-            ``(campaign URNs in ascending id order, complete, interrupted_by)``.
+            ``(campaign URNs in ascending id order, reason, interrupted_by)``, where
+            ``reason`` is ``None`` for a complete discovery, else "result limit reached" or
+            "page limit".
         """
-        cache_key = (account_urn, start, end)
+        cache_key = (account_urn, start, end, max_pages)
         cached = self._delivering_campaigns.get(cache_key)
         if cached is not None:
             return cached[0], cached[1], None
-        surface = _SURFACE_STATISTICS
+        surface = _SURFACE_CAMPAIGN_DELIVERY
         pairs = [
             ("q", "analytics"),
             ("pivot", "CAMPAIGN"),
@@ -1728,9 +1917,11 @@ class LinkedInClient:
             ("accounts", restli_list([encode_urn(account_urn)])),
             ("fields", SEGMENT_DISCOVERY_FIELDS),
         ]
-        pages = await self._follow(surface, f"adAnalytics?{restli_query(pairs)}", tally)
+        pages = await self._follow(
+            surface, f"adAnalytics?{restli_query(pairs)}", tally, max_pages=max_pages
+        )
         if pages.interrupted_by is not None:
-            return (), False, pages.interrupted_by
+            return (), None, pages.interrupted_by
         delivering: list[str] = []
         for element in pages.elements:
             campaign = _discovered_campaign(element, surface)
@@ -1741,19 +1932,35 @@ class LinkedInClient:
         campaigns = tuple(
             sorted(_distinct(delivering), key=lambda urn: int(urn.removeprefix(PREFIX_CAMPAIGN)))
         )
-        complete = not pages.capped
-        self._delivering_campaigns[cache_key] = (campaigns, complete)
-        return campaigns, complete, None
+        reason = _REASON_CAP if pages.capped else _REASON_PAGE_LIMIT if pages.limited else None
+        self._delivering_campaigns[cache_key] = (campaigns, reason)
+        return campaigns, reason, None
 
     async def _segments_by_campaign(
-        self, account_urn: str, pivot: str, start: date, end: date, tally: _Tally
+        self,
+        account_urn: str,
+        pivot: str,
+        start: date,
+        end: date,
+        tally: _Tally,
+        *,
+        max_pages: int | None,
+        max_campaigns: int | None,
     ) -> Listing[SegmentRow]:
-        """Read one pivot per delivering campaign with the Analytics Finder (live fallback)."""
-        surface = _SURFACE_STATISTICS
-        campaigns, discovery_complete, interrupted = await self._delivering(
-            account_urn, start, end, tally
+        """Read one pivot per delivering campaign with the Analytics Finder (live fallback).
+
+        Each request is the ``ad_analytics_member_segments`` contract's form and its rows are
+        parsed and logged under that surface. ``max_campaigns`` reads only the first
+        delivering campaigns in ascending id order; the rest make the listing incomplete
+        with the reason "page limit".
+        """
+        surface = _SURFACE_MEMBER_SEGMENTS
+        campaigns, reason, interrupted = await self._delivering(
+            account_urn, start, end, tally, max_pages=max_pages
         )
-        reason = None if discovery_complete or interrupted is not None else _REASON_CAP
+        if max_campaigns is not None and len(campaigns) > max_campaigns:
+            campaigns = campaigns[:max_campaigns]
+            reason = reason or _REASON_PAGE_LIMIT
         rows: list[SegmentRow] = []
         if interrupted is None:
             date_range = restli_date_range(start, end)
@@ -1766,9 +1973,11 @@ class LinkedInClient:
                     ("campaigns", restli_list([encode_urn(campaign)])),
                     ("fields", SEGMENT_FIELDS),
                 ]
-                pages = await self._follow(surface, f"adAnalytics?{restli_query(pairs)}", tally)
+                pages = await self._follow(
+                    surface, f"adAnalytics?{restli_query(pairs)}", tally, max_pages=max_pages
+                )
                 rows.extend(
-                    parse_segment(element, pivot, campaign_urn=campaign)
+                    parse_segment(element, pivot, campaign_urn=campaign, surface=surface)
                     for element in pages.elements
                 )
                 if pages.interrupted_by is not None:
@@ -1776,6 +1985,8 @@ class LinkedInClient:
                     break
                 if pages.capped:
                     reason = _REASON_CAP
+                elif pages.limited:
+                    reason = _REASON_PAGE_LIMIT
         return self._listing(surface, rows, tally, interrupted, key=_segment_key, reason=reason)
 
     # -- Lead Sync ----------------------------------------------------------------------

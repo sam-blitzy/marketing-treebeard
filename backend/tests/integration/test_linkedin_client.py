@@ -10,7 +10,9 @@ Every guarantee of the AAP 0.11.2 row is a named test below:
   fails contract validation, in the contract checks and in the simulator alike.
 * **Analytics**: ``adAnalytics`` carries ``dateRange``, ``timeGranularity`` and an ``accounts``
   facet, with ``pivotValues`` only in ``fields``; ``q=statistics`` with
-  ``pivots=List(CAMPAIGN,...)``; the 15,000-element split; a ``next`` link followed.
+  ``pivots=List(CAMPAIGN,...)``; the 15,000-element split; a ``next`` link followed. The live
+  segment fallback's campaign-delivery and member-segments forms are requested and validated
+  under their own contracts against a world that rejects ``q=statistics`` with HTTP 400.
 * **Lead projection**: ``fields`` equals ``LEAD_FIELDS``; decoding reads
   ``form.content.questions[].predefinedField`` and takes the version only from
   ``versionedLeadGenFormUrn``.
@@ -48,6 +50,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
+from secrets import token_hex
 from typing import Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote
 
@@ -101,10 +104,11 @@ from ads_engine.connectors.linkedin.parser import (
     parse_post,
     parse_segment,
     parse_versioned_form_urn,
+    sponsored_campaign_urn,
 )
 from ads_engine.settings import Settings, get_settings
 from ads_engine.simulation import SIM_EMAIL_DOMAIN
-from ads_engine.simulation.generator import SimulatedWorld
+from ads_engine.simulation.generator import Fault, SimulatedWorld
 from ads_engine.simulation.payloads import (
     Contract,
     ContractViolation,
@@ -143,14 +147,34 @@ LINKEDIN_SURFACES: Final = (
     "posts",
     "ad_analytics",
     "ad_analytics_statistics",
+    "ad_analytics_campaign_delivery",
+    "ad_analytics_member_segments",
     "lead_forms",
     "lead_form_responses",
     "lead_form_responses_batch",
 )
-"""The eleven LinkedIn contract surfaces, one file each in ``tests/contracts/linkedin/``."""
+"""The thirteen LinkedIn contract surfaces, one file each in ``tests/contracts/linkedin/``."""
 
 REST_SURFACES: Final = frozenset(LINKEDIN_SURFACES) - {"access_token"}
-"""The ten surfaces under ``https://api.linkedin.com/rest/`` that carry the version headers."""
+"""The twelve surfaces under ``https://api.linkedin.com/rest/`` that carry the version headers."""
+
+FALLBACK_SURFACES: Final = frozenset(
+    {"ad_analytics_campaign_delivery", "ad_analytics_member_segments"}
+)
+"""The segment fallback's two surfaces: requested only after a 400 on ``q=statistics``."""
+
+STATISTICS_REJECTED: Final = Fault(
+    "linkedin",
+    "ad_analytics_statistics",
+    "http_status",
+    status=400,
+    code="FIELD_INVALID",
+    message='"MEMBER_INDUSTRY" is not an enum symbol',
+)
+"""The live 202609 rejection of ``MEMBER_*`` values in the Statistics Finder ``pivots``."""
+
+SAMPLE_CAMPAIGN: Final = "urn:li:sponsoredCampaign:1234567"
+"""The campaign the fallback samples are attributed to (the statistics sample's campaign)."""
 
 LEAD_FIELDS_LITERAL: Final = (
     "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,"
@@ -405,6 +429,27 @@ def simulated(
 
 
 @pytest.fixture
+def fallback(
+    world: SimulatedWorld,
+    mock_transport_for: Callable[..., httpx.MockTransport],
+    serve: Callable[[Responder], Served],
+) -> Served:
+    """The strict simulator for :func:`world` with the Statistics Finder rejected (HTTP 400).
+
+    Every segment read therefore takes the live fallback: one campaign-delivery discovery,
+    then one member-segments request per delivering campaign, each under its own contract.
+    """
+    rejecting = SimulatedWorld(
+        world.seed,
+        world.spec.adding(faults=(STATISTICS_REJECTED,)),
+        clock=lambda: NOW,
+        content_assets=world.content_assets,
+    )
+    simulator = mock_transport_for("linkedin", rejecting, strict=True)
+    return serve(cast("Responder", simulator.handler))
+
+
+@pytest.fixture
 def sample(contract: Callable[[str, str], Contract]) -> Callable[[str], dict[str, Any]]:
     """Return ``sample(name)``: a private deep copy of a LinkedIn contract's documented sample."""
 
@@ -418,7 +463,7 @@ def sample(contract: Callable[[str, str], Contract]) -> Callable[[str], dict[str
 
 
 async def exercise_every_rest_surface(client: LinkedInClient, account_id: str) -> None:
-    """Call every client method once, so each of the ten REST surfaces is requested.
+    """Call every client method once, so each contracted REST surface is requested.
 
     The order follows the entity sync, the analytics jobs and the lead job: the account, its
     groups, campaigns and their creatives, the creatives' posts, daily analytics, one
@@ -442,22 +487,31 @@ async def exercise_every_rest_surface(client: LinkedInClient, account_id: str) -
 
 
 async def test_every_request_carries_version_headers(
-    simulated: Served, world: SimulatedWorld
+    simulated: Served, fallback: Served, world: SimulatedWorld
 ) -> None:
     """Headers: every REST call carries the Bearer token, ``202609`` and Rest.li ``2.0.0``.
 
-    Every client method is called once against the simulator; all ten REST surfaces are
-    requested, every request is a read-only ``GET`` under ``https://api.linkedin.com/rest/``,
-    and each passed its contract's ``required_headers`` check on the way.
+    Every client method is called once against the simulator, and one segment read against a
+    world whose Statistics Finder is rejected; all twelve REST surfaces are requested (the
+    segment fallback's two only in the second run), every request is a read-only ``GET``
+    under ``https://api.linkedin.com/rest/``, and each passed its contract's
+    ``required_headers`` check on the way.
     """
     account_id = world.linkedin_account_ids[0]
     async with open_client(simulated) as client:
         await exercise_every_rest_surface(client, account_id)
+    async with open_client(fallback) as client:
+        await client.analytics_segments(account_id, "MEMBER_JOB_FUNCTION", WINDOW)
 
     assert LINKEDIN_VERSION == "202609"
     assert RESTLI_PROTOCOL_VERSION == "2.0.0"
-    assert {surface_of(request) for request in simulated.requests} == REST_SURFACES
-    for request in simulated.requests:
+    contracted = {surface_of(request) for request in simulated.requests}
+    assert contracted == REST_SURFACES - FALLBACK_SURFACES
+    assert {surface_of(request) for request in fallback.requests} == {
+        "ad_analytics_statistics",
+        *FALLBACK_SURFACES,
+    }
+    for request in [*simulated.requests, *fallback.requests]:
         assert request.method == "GET"
         assert request.url.scheme == "https"
         assert request.url.host == "api.linkedin.com"
@@ -1854,6 +1908,378 @@ async def test_tokens_never_logged(
     assert "Bearer" not in text
 
 
+def volatile_token(label: str) -> str:
+    """A 384-character token no setting knows, as long as a LinkedIn access token.
+
+    Derived at run time, so the secret scan never reads a test value as a credential.
+    """
+    return hashlib.sha256(f"test-volatile-{label}".encode()).hexdigest() * 6
+
+
+@dataclass(slots=True)
+class EchoingLinkedIn:
+    """A hand-written LinkedIn whose every failure echoes tokens in ordinary prose.
+
+    Each exchange answers the next entry of ``exchanges``, each REST call the next entry
+    of ``api``: an ``httpx.Response``, or a callable building one from the request.
+
+    Attributes:
+        exchanges: The scripted token-endpoint answers, in order.
+        api: The scripted REST answers, in order.
+        seen: Every request received, exchanges included.
+    """
+
+    exchanges: list[httpx.Response | Callable[[httpx.Request], httpx.Response]]
+    api: list[httpx.Response | Callable[[httpx.Request], httpx.Response]]
+    seen: list[httpx.Request] = field(default_factory=list)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request from its script."""
+        self.seen.append(request)
+        script = self.exchanges if surface_of(request) == "access_token" else self.api
+        assert script, f"unexpected {surface_of(request)} request"
+        answer = script.pop(0)
+        return answer(request) if callable(answer) else answer
+
+
+async def test_exchanged_and_rotated_tokens_never_reach_an_error_or_a_log(
+    serve: Callable[[Responder], Served],
+    sample: Callable[[str], dict[str, Any]],
+    captured_logs: Any,
+) -> None:
+    """Logs never contain tokens, even ones only the provider holds, echoed in plain prose.
+
+    The exchange issues an access token and rotates the refresh token, neither of which any
+    setting knows. REST calls then fail with a 403 and three 503 text bodies echoing the
+    access token without any ``Bearer`` or assignment marker; a 401 makes the client
+    refresh, and the repeated call's 403 echoes both the rejected and the new token. Later
+    exchanges fail with 500 three times, then a 400 ``invalid_grant``, each echoing the
+    refresh tokens rotated away and the access tokens dropped. No error text, and no
+    logged event (``connector.error``, ``linkedin.token.failed``, ``http.retry``),
+    carries any of them.
+    """
+    captured_logs.configure(level="DEBUG")
+    first_access, second_access = volatile_token("access-1"), volatile_token("access-2")
+    first_rotated, second_rotated = volatile_token("refresh-1"), volatile_token("refresh-2")
+
+    def issued(access: str, refresh: str) -> httpx.Response:
+        """A successful exchange issuing ``access`` and rotating to ``refresh``."""
+        return ok(
+            {
+                "access_token": access,
+                "expires_in": 3600,
+                "refresh_token": refresh,
+                "refresh_token_expires_in": 31_536_000,
+                "scope": "r_ads,r_ads_reporting,r_marketing_leadgen_automation",
+            }
+        )
+
+    def echo_retired(request: httpx.Request) -> httpx.Response:
+        """Fail the exchange, quoting every token the provider stopped using."""
+        presented = parse_qs(request.content.decode("ascii"))["refresh_token"][0]
+        assert presented == second_rotated
+        return httpx.Response(
+            500,
+            json={
+                "message": f"Refresh {first_rotated} was superseded; {REFRESH_TOKEN} too. "
+                f"Access {first_access} and {second_access} were dropped."
+            },
+        )
+
+    server = EchoingLinkedIn(
+        exchanges=[
+            issued(first_access, first_rotated),
+            issued(second_access, second_rotated),
+            echo_retired,
+            echo_retired,
+            echo_retired,
+            httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": f"{first_rotated} and {second_rotated} are revoked; "
+                    f"so is {first_access}",
+                },
+            ),
+        ],
+        api=[
+            linkedin_error(403, "ACCESS_DENIED", f"Member {first_access} lacks r_ads"),
+            *(
+                httpx.Response(503, text=f"Upstream unavailable while checking {first_access}")
+                for _ in range(3)
+            ),
+            linkedin_error(401, "INVALID_ACCESS_TOKEN", f"Token {first_access} expired"),
+            linkedin_error(
+                403, "ACCESS_DENIED", f"Neither {first_access} nor {second_access} may read it"
+            ),
+        ],
+    )
+    served = serve(server)
+    errors: list[Exception] = []
+    async with build_client("linkedin", transport=served.transport) as http:
+        tokens = LinkedInTokenProvider(refresh_settings(), http, retry=NO_SLEEP)
+        client = LinkedInClient(http, tokens, retry=NO_SLEEP)
+        with pytest.raises(AccessDenied) as denied:
+            await client.get_ad_account("123456")
+        errors.append(denied.value)
+        with pytest.raises(TransientError) as unavailable:
+            await client.get_ad_account("123456")
+        errors.append(unavailable.value)
+        with pytest.raises(AccessDenied) as refreshed_denied:
+            await client.get_ad_account("123456")
+        errors.append(refreshed_denied.value)
+        tokens.invalidate()
+        with pytest.raises(TransientError) as exchange_failed:
+            await tokens.get()
+        errors.append(exchange_failed.value)
+        with pytest.raises(AccessDenied) as exchange_rejected:
+            await tokens.get()
+        errors.append(exchange_rejected.value)
+
+    assert server.exchanges == []
+    assert server.api == []
+    assert denied.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: Member [REDACTED] lacks r_ads"
+    )
+    assert unavailable.value.reason == (
+        "linkedin ad_account: HTTP 503: Upstream unavailable while checking [REDACTED]"
+    )
+    assert refreshed_denied.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: Neither [REDACTED] nor [REDACTED] may read it"
+    )
+    assert exchange_failed.value.http_status == 500
+    assert (exchange_rejected.value.code, exchange_rejected.value.http_status) == (
+        "invalid_grant",
+        400,
+    )
+    secrets = (
+        first_access,
+        second_access,
+        first_rotated,
+        second_rotated,
+        REFRESH_TOKEN,
+        REFRESH_CLIENT_SECRET,
+    )
+    for error in errors:
+        assert isinstance(error, AccessDenied | TransientError)
+        rendered = (error.message, error.reason, str(error), repr(error), str(error.log_fields))
+        for shown in rendered:
+            for secret in secrets:
+                assert secret not in shown
+                assert secret[:16] not in shown
+    events = [record.get("event") for record in captured_logs()]
+    # 403, three 503s, 401 and 403 on REST; three 500s on the exchange. The 400 is read by
+    # the provider itself and logged as linkedin.token.failed.
+    assert events.count("connector.error") == 9
+    assert {"http.retry", "linkedin.token.failed", "linkedin.token.refreshed"} <= set(events)
+    text = captured_logs.text
+    for secret in secrets:
+        assert secret not in text
+        assert secret[:16] not in text
+
+
+async def test_a_token_replaced_by_a_refresh_never_reaches_a_later_call_error_or_log(
+    serve: Callable[[Responder], Served],
+    sample: Callable[[str], dict[str, Any]],
+    captured_logs: Any,
+) -> None:
+    """Logs never contain a token the client stopped using, echoed by a later call.
+
+    The first exchange issues a random 420-character access token; ``GET adAccounts``
+    answers 401, so the client invalidates it, the second exchange issues another, and the
+    repeated call succeeds. A new call, whose request carries only the second token, then
+    gets a 403 whose message opens with the first one in plain prose, so a 300-character
+    cut of an unstripped reason would keep its start. Neither token, nor any 16-character
+    fragment of either, reaches the raised error or any logged event.
+    """
+    captured_logs.configure(level="DEBUG")
+    first_access, second_access = token_hex(210), token_hex(210)
+
+    def issued(access: str) -> httpx.Response:
+        """A successful exchange issuing ``access``."""
+        return ok(
+            {
+                "access_token": access,
+                "expires_in": 3600,
+                "scope": "r_ads,r_ads_reporting,r_marketing_leadgen_automation",
+            }
+        )
+
+    server = EchoingLinkedIn(
+        exchanges=[issued(first_access), issued(second_access)],
+        api=[
+            linkedin_error(401, "INVALID_ACCESS_TOKEN", "Invalid access token"),
+            ok(sample("ad_account")),
+            linkedin_error(403, "ACCESS_DENIED", f"{first_access} may not read this account"),
+        ],
+    )
+    served = serve(server)
+    async with build_client("linkedin", transport=served.transport) as http:
+        tokens = LinkedInTokenProvider(refresh_settings(), http, retry=NO_SLEEP)
+        client = LinkedInClient(http, tokens, retry=NO_SLEEP)
+        row = await client.get_ad_account("123456")
+        with pytest.raises(AccessDenied) as denied:
+            await client.get_ad_account("123456")
+
+    assert row.external_id == "123456"
+    assert server.exchanges == []
+    assert server.api == []
+    assert len(first_access) == len(second_access) == 420
+    rest = [request for request in server.seen if surface_of(request) != "access_token"]
+    assert [request.headers["Authorization"] for request in rest] == [
+        f"Bearer {first_access}",
+        f"Bearer {second_access}",
+        f"Bearer {second_access}",
+    ]
+    error = denied.value
+    assert (error.http_status, error.code) == (403, "ACCESS_DENIED")
+    assert error.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] may not read this account"
+    )
+    fragments = {
+        token[start : start + 16]
+        for token in (first_access, second_access)
+        for start in range(len(token) - 15)
+    }
+    rendered = (
+        error.message,
+        error.reason,
+        str(error),
+        repr(error),
+        str(error.code),
+        str(error.log_fields),
+    )
+    for shown in rendered:
+        assert not any(fragment in shown for fragment in fragments)
+    events = [record.get("event") for record in captured_logs()]
+    # The 401 that made the client refresh, then the later call's 403.
+    assert events.count("connector.error") == 2
+    assert {"linkedin.token.refreshed", "linkedin.token.retry_after_401"} <= set(events)
+    text = captured_logs.text
+    assert not any(fragment in text for fragment in fragments)
+
+
+async def test_provider_held_refresh_tokens_never_reach_a_rest_error_or_a_log(
+    serve: Callable[[Responder], Served],
+    captured_logs: Any,
+) -> None:
+    """Logs never contain a secret only the token provider holds, echoed by a REST call.
+
+    The first exchange issues a random access token and rotates the configured refresh
+    token to a random 400-character one that no setting knows and no REST request carries.
+    ``GET adAccounts`` then answers 403 with a message opening with that rotated token in
+    plain prose, so a 300-character cut of an unstripped reason would keep its start. A
+    second exchange, after an invalidation, rotates it again: the next call's 403 opens with
+    the refresh token now retired, and a third call's quotes the configured refresh token,
+    the client secret and the current rotated token. No 16-character fragment of any of
+    them, nor of the access tokens, reaches a raised error or any logged event.
+    """
+    captured_logs.configure(level="DEBUG")
+    first_access, second_access = token_hex(200), token_hex(200)
+    first_rotated, second_rotated = token_hex(200), token_hex(200)
+
+    def issued(access: str, refresh: str) -> httpx.Response:
+        """A successful exchange issuing ``access`` and rotating to ``refresh``."""
+        return ok(
+            {
+                "access_token": access,
+                "expires_in": 3600,
+                "refresh_token": refresh,
+                "refresh_token_expires_in": 31_536_000,
+                "scope": "r_ads,r_ads_reporting,r_marketing_leadgen_automation",
+            }
+        )
+
+    server = EchoingLinkedIn(
+        exchanges=[issued(first_access, first_rotated), issued(second_access, second_rotated)],
+        api=[
+            linkedin_error(403, "ACCESS_DENIED", f"{first_rotated} grants no r_ads"),
+            linkedin_error(403, "ACCESS_DENIED", f"{first_rotated} was revoked"),
+            linkedin_error(
+                403,
+                "ACCESS_DENIED",
+                f"{REFRESH_TOKEN} and {REFRESH_CLIENT_SECRET} were revoked; so is {second_rotated}",
+            ),
+        ],
+    )
+    served = serve(server)
+    errors: list[AccessDenied] = []
+    async with build_client("linkedin", transport=served.transport) as http:
+        tokens = LinkedInTokenProvider(refresh_settings(), http, retry=NO_SLEEP)
+        client = LinkedInClient(http, tokens, retry=NO_SLEEP)
+        with pytest.raises(AccessDenied) as current_denied:
+            await client.get_ad_account("123456")
+        errors.append(current_denied.value)
+        tokens.invalidate()
+        with pytest.raises(AccessDenied) as retired_denied:
+            await client.get_ad_account("123456")
+        errors.append(retired_denied.value)
+        with pytest.raises(AccessDenied) as configured_denied:
+            await client.get_ad_account("123456")
+        errors.append(configured_denied.value)
+        shown_objects = (repr(tokens), str(tokens), repr(client), str(client))
+
+    assert server.exchanges == []
+    assert server.api == []
+    assert all(len(token) == 400 for token in (first_rotated, second_rotated))
+    exchanges = [request for request in server.seen if surface_of(request) == "access_token"]
+    presented = [parse_qs(request.content.decode("ascii")) for request in exchanges]
+    assert [form["refresh_token"] for form in presented] == [[REFRESH_TOKEN], [first_rotated]]
+    rest = [request for request in server.seen if surface_of(request) != "access_token"]
+    # No REST request carries a refresh token or the client secret: only the bearer token.
+    assert [request.headers["Authorization"] for request in rest] == [
+        f"Bearer {first_access}",
+        f"Bearer {second_access}",
+        f"Bearer {second_access}",
+    ]
+    assert current_denied.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] grants no r_ads"
+    )
+    assert retired_denied.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] was revoked"
+    )
+    assert configured_denied.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] and [REDACTED] were revoked; "
+        "so is [REDACTED]"
+    )
+    fragments = {
+        secret[start : start + 16]
+        for secret in (
+            first_access,
+            second_access,
+            first_rotated,
+            second_rotated,
+            REFRESH_TOKEN,
+            REFRESH_CLIENT_SECRET,
+        )
+        for start in range(len(secret) - 15)
+    }
+    for error in errors:
+        assert (error.http_status, error.code) == (403, "ACCESS_DENIED")
+        rendered = (
+            error.message,
+            error.reason,
+            str(error),
+            repr(error),
+            str(error.code),
+            str(error.log_fields),
+        )
+        for shown in rendered:
+            assert not any(fragment in shown for fragment in fragments)
+    assert shown_objects == (
+        "LinkedInTokenProvider(mode='refresh')",
+        "LinkedInTokenProvider(mode='refresh')",
+        "LinkedInClient()",
+        "LinkedInClient()",
+    )
+    events = [record.get("event") for record in captured_logs()]
+    # The three REST 403s; both exchanges succeeded.
+    assert events.count("connector.error") == 3
+    assert events.count("linkedin.token.refreshed") == 2
+    text = captured_logs.text
+    assert not any(fragment in text for fragment in fragments)
+
+
 # ---------------------------------------------------------------------------------------------
 # Traceability (AAP 0.11.2 "External fixtures are traceable to verified contracts")
 # ---------------------------------------------------------------------------------------------
@@ -1863,7 +2289,9 @@ async def call_surface(surface: str, http: httpx.AsyncClient, account_id: str) -
     """Make the client call that requests ``surface``, after any call it depends on.
 
     Creatives need campaign URNs and posts need creatives, so those listings run first; the
-    target surface is always requested last.
+    target surface is requested last, except the fallback's campaign-delivery discovery, which
+    precedes the per-campaign member-segments requests it selects. The two fallback surfaces
+    are requested only when ``http`` rejects the Statistics Finder with HTTP 400.
     """
     client = LinkedInClient(http, StaticTokenProvider(TOKEN), retry=NO_SLEEP)
     match surface:
@@ -1883,7 +2311,11 @@ async def call_surface(surface: str, http: httpx.AsyncClient, account_id: str) -
                 await client.get_posts(posts)
         case "ad_analytics":
             await client.analytics_daily(account_id, WINDOW)
-        case "ad_analytics_statistics":
+        case (
+            "ad_analytics_statistics"
+            | "ad_analytics_campaign_delivery"
+            | "ad_analytics_member_segments"
+        ):
             await client.analytics_segments(account_id, "MEMBER_INDUSTRY", WINDOW)
         case "lead_forms":
             await client.list_lead_forms(account_id)
@@ -1904,21 +2336,29 @@ async def call_surface(surface: str, http: httpx.AsyncClient, account_id: str) -
 async def test_every_surface_request_validates(
     surface: str,
     simulated: Served,
+    fallback: Served,
     world: SimulatedWorld,
     contract: Callable[[str, str], Contract],
 ) -> None:
     """Traceability: each surface's request matches its contract file and is identified as it.
 
-    The client's call for the surface goes through the contract-checked simulator; every
-    request it sent is identified by ``payloads.identify_surface`` and validated again against
-    the contract that names the reference URL and version it was written from.
+    The client's call for the surface goes through the contract-checked simulator (for the
+    segment fallback's two surfaces, one rejecting the Statistics Finder); every request it
+    sent is identified by ``payloads.identify_surface`` and validated again against the
+    contract that names the reference URL and version it was written from.
     """
-    async with build_client("linkedin", transport=simulated.transport) as http:
+    served = fallback if surface in FALLBACK_SURFACES else simulated
+    async with build_client("linkedin", transport=served.transport) as http:
         await call_surface(surface, http, world.linkedin_account_ids[0])
 
-    assert simulated.requests
-    assert surface_of(simulated.requests[-1]) == surface
-    for request in simulated.requests:
+    requested = [surface_of(request) for request in served.requests]
+    assert requested
+    if surface == "ad_analytics_campaign_delivery":
+        assert requested[:2] == ["ad_analytics_statistics", surface]
+        assert set(requested[2:]) == {"ad_analytics_member_segments"}
+    else:
+        assert requested[-1] == surface
+    for request in served.requests:
         loaded = contract("linkedin", surface_of(request))
         assert loaded.api_version == "202609"
         assert loaded.reference_url.startswith("https://")
@@ -1928,14 +2368,23 @@ async def test_every_surface_request_validates(
 def adapted_sample(surface: str, documented: dict[str, Any]) -> dict[str, Any]:
     """The documented sample as the client path can parse it, with documented adaptations.
 
-    Every sample is used verbatim except two whose pivot does not match the request the
-    product sends: the ``ad_analytics`` sample pivots by ``MEMBER_COMPANY`` and gets a creative
-    URN (daily rows key creatives), and the ``ad_analytics_statistics`` sample pivots by
-    campaign only and gets the requested demographic value beside it.
+    Every sample is used verbatim except those whose pivot does not match the request the
+    product sends: the Analytics Finder sample (shared by ``ad_analytics`` and the segment
+    fallback's two contracts) pivots by ``MEMBER_COMPANY`` and gets a creative URN (daily rows
+    key creatives), a distinct campaign URN per element (campaign-delivery discovery) or a
+    distinct ``MEMBER_SENIORITY`` value per element (member segments of one campaign); the
+    ``ad_analytics_statistics`` sample pivots by campaign only and gets the requested
+    demographic value beside it.
     """
     if surface == "ad_analytics":
         for element in documented["elements"]:
             element["pivotValues"] = ["urn:li:sponsoredCreative:121608865"]
+    elif surface == "ad_analytics_campaign_delivery":
+        for index, element in enumerate(documented["elements"]):
+            element["pivotValues"] = [f"urn:li:sponsoredCampaign:{1234567 + index}"]
+    elif surface == "ad_analytics_member_segments":
+        for index, element in enumerate(documented["elements"]):
+            element["pivotValues"] = [f"urn:li:seniority:{5 + index}"]
     elif surface == "ad_analytics_statistics":
         for element in documented["elements"]:
             element["pivotValues"] = [
@@ -1968,7 +2417,7 @@ def parse_body(
     Args:
         surface: The LinkedIn contract surface.
         body: The decoded response body.
-        pivot: The demographic pivot of an ``ad_analytics_statistics`` request.
+        pivot: The demographic pivot of a segment request.
         campaign_urn: The campaign of an Analytics Finder segment request, when it names one.
         account_currency: The ad account's currency, for bare campaign-group budgets.
     """
@@ -2004,11 +2453,18 @@ def parse_body(
             )
         case "ad_analytics":
             return len([parse_analytics_daily(element) for element in body["elements"]])
-        case "ad_analytics_statistics":
+        case "ad_analytics_campaign_delivery":
+            campaigns = [element["pivotValues"] for element in body["elements"]]
+            assert all(len(values) == 1 for values in campaigns)
+            assert all(sponsored_campaign_urn(values[0]) == values[0] for values in campaigns)
+            return len(campaigns)
+        case "ad_analytics_statistics" | "ad_analytics_member_segments":
             assert pivot is not None, "a segment body needs its request's pivot"
+            if surface == "ad_analytics_member_segments":
+                assert campaign_urn is not None, "a member-segments body needs its campaign"
             return len(
                 [
-                    parse_segment(element, pivot, campaign_urn=campaign_urn)
+                    parse_segment(element, pivot, campaign_urn=campaign_urn, surface=surface)
                     for element in body["elements"]
                 ]
             )
@@ -2069,7 +2525,11 @@ async def read_sample(surface: str, http: httpx.AsyncClient, documented: Mapping
                 "990000001", (date(2024, 5, 28), date(2024, 5, 29))
             )
             return len(daily.rows)
-        case "ad_analytics_statistics":
+        case (
+            "ad_analytics_statistics"
+            | "ad_analytics_campaign_delivery"
+            | "ad_analytics_member_segments"
+        ):
             segments = await client.analytics_segments("990000001", "MEMBER_SENIORITY", WINDOW)
             return len(segments.rows)
         case "lead_forms":
@@ -2098,13 +2558,31 @@ async def test_documented_samples_parse(
     Each contract's sample from the official reference page is served (adapted only as
     :func:`adapted_sample` documents) behind the contract checks, read through the client
     call of that surface, and parsed again directly by the matching parser. A cursor search's
-    second page and the forms' second offset page are empty, so paging ends.
+    second page and the forms' second offset page are empty, so paging ends. For the segment
+    fallback's two surfaces the Statistics Finder is rejected with LinkedIn's 400, and the
+    step that is not under test answers with one hand-built element: one delivering campaign
+    (:data:`SAMPLE_CAMPAIGN`) for the member-segments sample, and one demographic value per
+    discovered campaign for the campaign-delivery sample, so each discovered campaign is one
+    row read.
     """
     documented = adapted_sample(surface, sample(surface))
+    seniority = DEMOGRAPHIC_VALUES["MEMBER_SENIORITY"]
+
+    def fallback_step(requested: str) -> httpx.Response:
+        """Answer the fallback request that is not the surface under test."""
+        if requested == "ad_analytics_statistics":
+            return linkedin_error(400, "FIELD_INVALID", '"MEMBER_SENIORITY" is not an enum symbol')
+        if requested == "ad_analytics_campaign_delivery":
+            return ok({"elements": [{"pivotValues": [SAMPLE_CAMPAIGN], "impressions": 1}]})
+        assert requested == "ad_analytics_member_segments"
+        return ok({"elements": [{"pivotValues": [seniority], "impressions": 1}]})
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Serve the sample on the first page and an empty page after it."""
-        assert surface_of(request) == surface
+        requested = surface_of(request)
+        if surface in FALLBACK_SURFACES and requested != surface:
+            return fallback_step(requested)
+        assert requested == surface
         if query_value(request, "pageToken") is not None:
             return ok({"elements": []})
         start = query_value(request, "start")
@@ -2117,7 +2595,8 @@ async def test_documented_samples_parse(
         read = await read_sample(surface, http, documented)
 
     assert read >= 1
-    assert parse_body(surface, documented, pivot="MEMBER_SENIORITY") == read
+    campaign = SAMPLE_CAMPAIGN if surface == "ad_analytics_member_segments" else None
+    assert parse_body(surface, documented, pivot="MEMBER_SENIORITY", campaign_urn=campaign) == read
     assert served.requests
 
 
@@ -2128,9 +2607,10 @@ async def test_captured_payloads_parse(
 
     Each ``captured/`` file written by ``ads-engine capture-fixtures`` is checked by
     ``payloads.validate_capture`` (surface identification, request and response contracts)
-    and its 2xx body is parsed with the connector's parser. A segment body is parsed with the
-    pivot (and, for the Analytics Finder form, the campaign) of its own request, and a
-    campaign-group body with the currency of a captured ad account when there is one.
+    and its 2xx body is parsed with the connector's parser. A segment body (Statistics Finder
+    or the fallback's member segments) is parsed with the pivot (and, for the Analytics Finder
+    form, the campaign) of its own request, and a campaign-group body with the currency of a
+    captured ad account when there is one.
     """
     captures = captured_payloads("linkedin")
     assert isinstance(captures, list)
@@ -2149,7 +2629,9 @@ async def test_captured_payloads_parse(
             continue
         url = httpx.URL(RequestShape.from_capture(capture["request"]).url)
         pivot, campaign = (
-            segment_selector(url) if loaded.name == "ad_analytics_statistics" else (None, None)
+            segment_selector(url)
+            if loaded.name in {"ad_analytics_statistics", "ad_analytics_member_segments"}
+            else (None, None)
         )
         segments = url.path.split("/")
         account_id = segments[3] if len(segments) > 3 and segments[2] == "adAccounts" else ""

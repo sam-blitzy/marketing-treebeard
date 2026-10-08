@@ -2962,7 +2962,8 @@ async def test_load_context_logs_counts_without_personal_data(
         "feedback_without_entity": 1,
         "segment_windows": 2,
     }
-    assert isinstance(fields["elapsed_ms"], int)
+    assert isinstance(fields["duration_ms"], int)
+    assert "elapsed_ms" not in fields
     [(warning, bindings)] = log.named("analysis_crm_bindings_unreadable")
     assert (warning, bindings["dataset_id"], bindings["key"]) == ("warning", world.c, "verified_at")
     rendered = repr(log.events)

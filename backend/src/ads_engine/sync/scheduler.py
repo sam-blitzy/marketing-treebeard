@@ -85,7 +85,7 @@ from ads_engine.db import repositories
 from ads_engine.db.models.analysis import AnalysisRequest
 from ads_engine.db.models.ops import SourceDataset, SyncRequest, SyncRun
 from ads_engine.db.session import dedicated_connection
-from ads_engine.logging import get_logger
+from ads_engine.logging import get_logger, logged_as
 from ads_engine.settings import SOURCES, Settings, Source, get_settings
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
@@ -757,6 +757,7 @@ class Scheduler:
            another holder of the ``analysis`` lock the requests stay pending.
 
         A step failing with one of :data:`JOB_FAILURES` is logged as ``scheduler.step_failed``
+        (with its traceback, or as a warning naming the event that already logged it in full)
         and recorded in :attr:`TickReport.errors`; the tick continues. The tick is logged as
         ``scheduler.tick``: at debug level when nothing happened, at info level otherwise.
 
@@ -794,13 +795,24 @@ class Scheduler:
     async def _step(self, tick: _Tick, name: str) -> AsyncIterator[None]:
         """Isolate one step: a :data:`JOB_FAILURES` error is logged and recorded, not raised.
 
-        Anything else, cancellation included, propagates unchanged.
+        ``scheduler.step_failed`` carries the traceback, unless the error's owner already
+        logged it in full (an analysis run's ``analysis_run_failed``): then it is a warning
+        naming that event (``logged_as``). Anything else, cancellation included, propagates
+        unchanged.
         """
         try:
             yield
         except JOB_FAILURES as exc:
             tick.errors.append(name)
-            _log.error("scheduler.step_failed", step=name, error=type(exc).__name__, exc_info=exc)
+            owner = logged_as(exc)
+            if owner is None:
+                _log.error(
+                    "scheduler.step_failed", step=name, error=type(exc).__name__, exc_info=exc
+                )
+            else:
+                _log.warning(
+                    "scheduler.step_failed", step=name, error=type(exc).__name__, logged_as=owner
+                )
 
     # step 1 ----------------------------------------------------------------------------------
 

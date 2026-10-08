@@ -28,7 +28,7 @@ import copy
 import functools
 import json
 import re
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
@@ -38,14 +38,22 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from structlog.testing import capture_logs
 from structlog.typing import EventDict
 
 from ads_engine.connectors.errors import AccessDenied, QueryDefect, TransientError
 from ads_engine.connectors.http import JsonResponse, RetryPolicy, build_client
 from ads_engine.connectors.linkedin import client as client_module
-from ads_engine.connectors.linkedin.auth import StaticTokenProvider
+from ads_engine.connectors.linkedin.auth import (
+    _RETIRED_TOKENS_MAX,
+    SIMULATED_TOKEN,
+    HoldsSecrets,
+    LinkedInTokenProvider,
+    StaticTokenProvider,
+)
 from ads_engine.connectors.linkedin.client import (
+    _USED_TOKENS_MAX,
     CREATIVE_CAMPAIGN_CHUNK,
     DAILY_FIELDS,
     ENTITY_PAGE_SIZE,
@@ -1414,6 +1422,182 @@ async def test_a_token_source_failure_propagates_before_any_request() -> None:
 
 
 @pytest.mark.anyio
+async def test_the_client_keeps_only_the_last_eight_distinct_tokens_it_used() -> None:
+    """The client keeps the last eight distinct bearer tokens it obtained, as secrets only.
+
+    Nine calls, each answered 401 and then 200, make a refreshable source hand out ten
+    tokens, the second to the ninth twice (served from its cache, then refreshed away). The
+    client keeps the last eight, once each, as ``SecretStr``; neither its ``repr`` nor that
+    of what it keeps shows a token. A later call's 403 echoing one it still keeps, but that
+    request no longer carries, comes back with that token redacted.
+    """
+    issued = [f"test-linkedin-token-{index:02d}-of-ten" for index in range(10)]
+    server = Server(
+        *(
+            outcome
+            for _ in range(9)
+            for outcome in (_error(401, "INVALID_ACCESS_TOKEN", "Expired"), _ok(_account()))
+        ),
+        _error(403, "ACCESS_DENIED", f"{issued[2]} may not read this account"),
+    )
+    tokens = RefreshingTokens(*issued)
+    async with _linkedin(server, tokens) as linkedin:
+        for _ in range(9):
+            await linkedin.get_ad_account(ACCOUNT_ID)
+        with pytest.raises(AccessDenied) as raised:
+            await linkedin.get_ad_account(ACCOUNT_ID)
+        kept = list(linkedin._used_tokens)
+        shown = (repr(linkedin), str(linkedin), repr(linkedin._used_tokens))
+
+    assert (tokens.exchanges, tokens.invalidations) == (10, 9)
+    assert _USED_TOKENS_MAX == _RETIRED_TOKENS_MAX == 8
+    assert all(isinstance(token, SecretStr) for token in kept)
+    assert [token.get_secret_value() for token in kept] == issued[2:]
+    assert shown[:2] == ("LinkedInClient()", "LinkedInClient()")
+    assert not any(token in text for token in issued for text in shown)
+    assert server.requests[-1].headers["Authorization"] == f"Bearer {issued[-1]}"
+    assert raised.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] may not read this account"
+    )
+
+
+def _exchanged(access: str, refresh: str) -> httpx.Response:
+    """Return a successful token exchange issuing ``access`` and rotating to ``refresh``."""
+    return _ok({"access_token": access, "expires_in": 3600, "refresh_token": refresh})
+
+
+@pytest.mark.anyio
+async def test_held_secrets_cover_current_rotated_and_retired_tokens() -> None:
+    """``held_secrets()`` lists every plaintext a provider holds or retired, read when called.
+
+    Refresh mode: the client secret and the configured refresh token before any exchange;
+    then the rotated refresh token, the cached access token and the refresh token rotated
+    away; after an invalidation and a second rotation, also the dropped access token and
+    the first rotated refresh token. Static mode, of the provider and of
+    ``StaticTokenProvider``: the static token alone. No ``repr`` shows any of them.
+    """
+    client_secret = "test-linkedin-held-client-secret"
+    configured = "test-linkedin-held-refresh-0"
+    first_access, first_rotated = "test-linkedin-held-access-1", "test-linkedin-held-refresh-1"
+    second_access, second_rotated = "test-linkedin-held-access-2", "test-linkedin-held-refresh-2"
+    settings = Settings(
+        linkedin_client_id="test-linkedin-held-client-id",
+        linkedin_client_secret=SecretStr(client_secret),
+        linkedin_refresh_token=SecretStr(configured),
+    )
+    server = Server(
+        _exchanged(first_access, first_rotated), _exchanged(second_access, second_rotated)
+    )
+    transport = httpx.MockTransport(server.handle)
+    async with build_client("linkedin", transport, settings=Settings()) as http:
+        tokens = LinkedInTokenProvider(settings, http, retry=RetryPolicy(sleep=server.sleep))
+        before = tokens.held_secrets()
+        assert await tokens.get() == first_access
+        after_first = tokens.held_secrets()
+        tokens.invalidate()
+        assert await tokens.get() == second_access
+        after_second = tokens.held_secrets()
+        shown = (repr(tokens), str(tokens))
+        static = LinkedInTokenProvider(Settings(linkedin_access_token=SecretStr(TOKEN)), http)
+
+    assert tokens.mode == "refresh"
+    assert len(server.requests) == 2
+    assert set(before) == {client_secret, configured}
+    assert set(after_first) == {client_secret, first_rotated, first_access, configured}
+    assert set(after_second) == {
+        client_secret,
+        second_rotated,
+        second_access,
+        configured,
+        first_access,
+        first_rotated,
+    }
+    assert all(isinstance(secret, str) for secret in after_second)
+    assert shown == ("LinkedInTokenProvider(mode='refresh')",) * 2
+    assert static.mode == "static"
+    assert static.held_secrets() == (TOKEN,)
+    assert repr(static) == "LinkedInTokenProvider(mode='static')"
+    assert StaticTokenProvider(TOKEN).held_secrets() == (TOKEN,)
+    assert StaticTokenProvider(SIMULATED_TOKEN).held_secrets() == (SIMULATED_TOKEN,)
+    assert TOKEN not in repr(StaticTokenProvider(TOKEN))
+
+
+@pytest.mark.anyio
+async def test_only_token_sources_offering_held_secrets_are_holds_secrets() -> None:
+    """Both providers are :class:`HoldsSecrets`; a source without ``held_secrets`` is not."""
+    transport = httpx.MockTransport(Server().handle)
+    async with build_client("linkedin", transport, settings=Settings()) as http:
+        refreshing = LinkedInTokenProvider(
+            Settings(
+                linkedin_client_id="test-linkedin-held-client-id",
+                linkedin_client_secret=SecretStr("test-linkedin-held-client-secret"),
+                linkedin_refresh_token=SecretStr("test-linkedin-held-refresh-0"),
+            ),
+            http,
+        )
+        static = LinkedInTokenProvider(Settings(linkedin_access_token=SecretStr(TOKEN)), http)
+    assert (refreshing.mode, static.mode) == ("refresh", "static")
+    assert isinstance(refreshing, HoldsSecrets)
+    assert isinstance(static, HoldsSecrets)
+    assert isinstance(StaticTokenProvider(TOKEN), HoldsSecrets)
+    assert not isinstance(RefreshingTokens(OLD_TOKEN), HoldsSecrets)
+
+
+class HoldingTokens(RefreshingTokens):
+    """A refreshable token source that also :class:`HoldsSecrets`, held as given."""
+
+    def __init__(self, *tokens: str) -> None:
+        super().__init__(*tokens)
+        self.held: list[str] = []
+        self.reads = 0
+
+    def held_secrets(self) -> tuple[str, ...]:
+        """Return the secrets currently set in ``held``, counting each read."""
+        self.reads += 1
+        return tuple(self.held)
+
+
+@pytest.mark.anyio
+async def test_every_rest_call_holds_what_the_token_source_holds_when_it_is_sent() -> None:
+    """A REST error echoing a secret only the token source holds never carries it.
+
+    The source's held secrets are read for each call: a secret it starts holding between
+    two calls is stripped from the second call's 403, as is the one it held before. A
+    source without ``held_secrets`` still serves the client, which holds its own tokens.
+    """
+    rotated, rotated_again = "test-linkedin-only-held-1", "test-linkedin-only-held-2"
+    server = Server(
+        _error(403, "ACCESS_DENIED", f"{rotated} may not read this account"),
+        _error(403, "ACCESS_DENIED", f"{rotated} and {rotated_again} may not read it"),
+    )
+    tokens = HoldingTokens(TOKEN)
+    tokens.held = [rotated]
+    async with _linkedin(server, tokens) as linkedin:
+        with pytest.raises(AccessDenied) as first:
+            await linkedin.get_ad_account(ACCOUNT_ID)
+        tokens.held = [rotated_again, rotated]
+        with pytest.raises(AccessDenied) as second:
+            await linkedin.get_ad_account(ACCOUNT_ID)
+
+    assert tokens.reads == 2
+    assert first.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] may not read this account"
+    )
+    assert second.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] and [REDACTED] may not read it"
+    )
+    assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in server.requests)
+
+    plain = Server(_error(403, "ACCESS_DENIED", f"{TOKEN} may not read this account"))
+    async with _linkedin(plain, RefreshingTokens(TOKEN)) as linkedin:
+        with pytest.raises(AccessDenied) as unheld:
+            await linkedin.get_ad_account(ACCOUNT_ID)
+    assert unheld.value.reason == (
+        "linkedin ad_account: ACCESS_DENIED: [REDACTED] may not read this account"
+    )
+
+
+@pytest.mark.anyio
 async def test_transient_failures_are_retried_with_backoff_and_retry_after() -> None:
     """A 503 waits the exponential backoff, a 429 its ``Retry-After``; it is one call."""
     server = Server(
@@ -2678,3 +2862,226 @@ async def test_listing_assembly_lets_an_interruption_reason_win() -> None:
         None,
         0,
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Capture-only bounds: every sync passes none, ``capture-fixtures`` passes 1
+# ---------------------------------------------------------------------------------------------
+
+
+def _analytics_chain() -> tuple[httpx.Response, ...]:
+    """A fresh three-response ``next``-link chain over :data:`ANALYTICS_URL`."""
+    return (
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=10")),
+        _ok(_analytics_page([_daily_element(2)], f"/rest/{ANALYTICS_URL}&start=20")),
+        _ok(_analytics_page([_daily_element(3)])),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("max_pages", "requests", "limited"),
+    [(1, 1, True), (2, 2, True), (3, 3, False), (None, 3, False)],
+)
+async def test_follow_reads_at_most_max_pages_responses(
+    max_pages: int | None, requests: int, limited: bool
+) -> None:
+    """A bounded chain stops with its ``next`` link unread and says so; ``None`` reads on."""
+    server = Server(*_analytics_chain()[:requests])
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally, max_pages=max_pages)
+    assert len(server.requests) == requests == tally.calls
+    assert [e["impressions"] for e in pages.elements] == list(range(1, requests + 1))
+    assert (pages.limited, pages.capped, pages.interrupted_by) == (limited, False, None)
+
+
+@pytest.mark.anyio
+async def test_follow_bound_on_a_response_without_a_next_link_is_not_limited() -> None:
+    """A single response that ends the chain is complete under any bound."""
+    server = Server(_ok(_analytics_page([_daily_element(1)])))
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally(), max_pages=1)
+    assert (len(server.requests), pages.limited) == (1, False)
+
+
+def _entity_listing(
+    surface: str, linkedin: LinkedInClient, max_pages: int | None
+) -> Awaitable[Listing[Any]]:
+    """Call the cursor listing of ``surface`` with ``max_pages``."""
+    if surface == "ad_campaign_groups":
+        return linkedin.list_campaign_groups(
+            ACCOUNT_ID, account_currency="USD", max_pages=max_pages
+        )
+    return linkedin.list_campaigns(ACCOUNT_ID, max_pages=max_pages)
+
+
+def _entity(surface: str, entity_id: int) -> dict[str, Any]:
+    """One element of the cursor listing of ``surface``."""
+    return _group(entity_id) if surface == "ad_campaign_groups" else _campaign(entity_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", ["ad_campaign_groups", "ad_campaigns"])
+async def test_entity_listings_read_at_most_max_pages(
+    surface: str, captured: list[EventDict]
+) -> None:
+    """``max_pages=1`` sends one request; the unread page makes the listing "page limit".
+
+    The request is the contract's first page, the rows read are kept, and the listing is
+    incomplete without an interruption, so ``sync`` would infer nothing from it.
+    """
+    server = Server(_ok(_cursor_page(surface, [_entity(surface, 1), _entity(surface, 2)], "t-2")))
+    async with _linkedin(server) as linkedin:
+        listing = await _entity_listing(surface, linkedin, 1)
+    (request,) = server.requests
+    assert _relative(request) == _contract_url(surface, id=ACCOUNT_ID)
+    _assert_contract_request(surface, request)
+    assert [row.external_id for row in listing.rows] == ["1", "2"]
+    assert (listing.complete, listing.reason, listing.calls) == (False, "page limit", 1)
+    assert listing.interrupted_by is None
+    (event,) = _listing_events(captured, surface)
+    assert (event["complete"], event["reason"], event["calls"]) == (False, "page limit", 1)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", ["ad_campaign_groups", "ad_campaigns"])
+@pytest.mark.parametrize("max_pages", [2, 3, None])
+async def test_entity_listings_within_their_bound_are_complete(
+    surface: str, max_pages: int | None
+) -> None:
+    """A search that ends within the bound, or with no bound, reads every page and is complete."""
+    server = Server(
+        _ok(_cursor_page(surface, [_entity(surface, 1)], "t-2")),
+        _ok(_cursor_page(surface, [_entity(surface, 2)])),
+    )
+    async with _linkedin(server) as linkedin:
+        listing = await _entity_listing(surface, linkedin, max_pages)
+    assert len(server.requests) == 2
+    assert [row.external_id for row in listing.rows] == ["1", "2"]
+    assert (listing.complete, listing.reason, listing.calls) == (True, None, 2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("max_pages", "requests", "creatives", "reason"),
+    [
+        pytest.param(1, 1, ["11"], "page limit", id="first-page-only"),
+        pytest.param(2, 2, ["11", "12"], "page limit", id="second-chunk-unread"),
+        pytest.param(3, 3, ["11", "12", "13"], None, id="bound-not-reached"),
+        pytest.param(None, 3, ["11", "12", "13"], None, id="unbounded"),
+    ],
+)
+async def test_list_creatives_max_pages_counts_pages_across_chunks(
+    max_pages: int | None, requests: int, creatives: list[str], reason: str | None
+) -> None:
+    """The bound is the total number of pages over every campaign chunk.
+
+    Chunk 1 (100 campaigns) has two pages and chunk 2 one; a chunk or page left unread by
+    the bound makes the listing incomplete with reason "page limit".
+    """
+    ids = list(range(1, CREATIVE_CAMPAIGN_CHUNK + 2))
+    server = Server(
+        *(
+            _ok(_cursor_page("creatives", [_creative(11, 1)], "chunk-1-token")),
+            _ok(_cursor_page("creatives", [_creative(12, 2)])),
+            _ok(_cursor_page("creatives", [_creative(13, ids[-1])])),
+        )[:requests]
+    )
+    async with _linkedin(server) as linkedin:
+        listing = await linkedin.list_creatives(
+            ACCOUNT_ID, [str(cid) for cid in ids], max_pages=max_pages
+        )
+    assert len(server.requests) == requests
+    assert [row.urn.rpartition(":")[2] for row in listing.rows] == creatives
+    assert (listing.complete, listing.reason, listing.calls) == (reason is None, reason, requests)
+
+
+@pytest.mark.anyio
+async def test_list_creatives_of_one_campaign_reads_one_page_under_the_capture_bound() -> None:
+    """The capture's call (one campaign, ``max_pages=1``) is the contract's one request."""
+    server = Server(_ok(_cursor_page("creatives", [_creative(11, 1)], "more")))
+    async with _linkedin(server) as linkedin:
+        listing = await linkedin.list_creatives(ACCOUNT_ID, ["1"], max_pages=1)
+    (request,) = server.requests
+    assert _relative(request) == _creatives_url([1])
+    assert (listing.complete, listing.reason, len(listing.rows)) == (False, "page limit", 1)
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_max_pages_leaves_the_next_link_unread() -> None:
+    """One response is read; its rows are kept and the unread link makes it "page limit"."""
+    day = date(2026, 9, 1)
+    server = Server(*_analytics_chain()[:1])
+    async with _linkedin(server) as linkedin:
+        listing = await linkedin.analytics_daily(
+            ACCOUNT_ID, (day, day), expected_creatives=1, max_pages=1
+        )
+    (request,) = server.requests
+    assert _relative(request) == ANALYTICS_URL
+    _assert_contract_request("ad_analytics", request)
+    assert [row.impressions for row in listing.rows] == [1]
+    assert (listing.complete, listing.reason, listing.calls) == (False, "page limit", 1)
+    assert listing.interrupted_by is None
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_without_a_bound_follows_every_next_link() -> None:
+    """The default reads the whole chain, as every sync does."""
+    day = date(2026, 9, 1)
+    server = Server(*_analytics_chain())
+    async with _linkedin(server) as linkedin:
+        listing = await linkedin.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=1)
+    assert len(server.requests) == 3
+    assert [row.impressions for row in listing.rows] == [1, 2, 3]
+    assert (listing.complete, listing.reason) == (True, None)
+
+
+_BOUNDED_CALLS: list[tuple[str, Callable[[LinkedInClient, Any], Awaitable[object]]]] = [
+    (
+        "max_pages",
+        lambda linkedin, bound: linkedin.list_campaign_groups(
+            ACCOUNT_ID, account_currency="USD", max_pages=bound
+        ),
+    ),
+    ("max_pages", lambda linkedin, bound: linkedin.list_campaigns(ACCOUNT_ID, max_pages=bound)),
+    (
+        "max_pages",
+        lambda linkedin, bound: linkedin.list_creatives(ACCOUNT_ID, ["1"], max_pages=bound),
+    ),
+    (
+        "max_pages",
+        lambda linkedin, bound: linkedin.analytics_daily(
+            ACCOUNT_ID, (date(2026, 9, 1), date(2026, 9, 1)), max_pages=bound
+        ),
+    ),
+    (
+        "max_pages",
+        lambda linkedin, bound: linkedin.analytics_segments(
+            ACCOUNT_ID, "MEMBER_SENIORITY", (date(2026, 9, 1), date(2026, 9, 1)), max_pages=bound
+        ),
+    ),
+    (
+        "max_campaigns",
+        lambda linkedin, bound: linkedin.analytics_segments(
+            ACCOUNT_ID,
+            "MEMBER_SENIORITY",
+            (date(2026, 9, 1), date(2026, 9, 1)),
+            max_campaigns=bound,
+        ),
+    ),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("name", "call"), _BOUNDED_CALLS)
+@pytest.mark.parametrize("bound", [0, -1, True])
+async def test_capture_bounds_reject_invalid_values_before_any_request(
+    name: str, call: Callable[[LinkedInClient, Any], Awaitable[object]], bound: object
+) -> None:
+    """A bound below 1, or a ``bool``, is a ``ValueError`` and nothing is sent."""
+    server = Server()
+    async with _linkedin(server) as linkedin:
+        with pytest.raises(ValueError, match=f"{name} must be at least 1 when given"):
+            await call(linkedin, bound)
+    assert server.requests == []

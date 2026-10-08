@@ -1262,6 +1262,36 @@ def test_segment_privacy_settings_limit_the_values_returned() -> None:
     assert private.linkedin_segments(NA, "MEMBER_SENIORITY", start, end) == ()
 
 
+def test_campaign_delivery_is_the_total_the_segments_split(world: SimulatedWorld) -> None:
+    """The segment fallback's discovery view: per-campaign impressions over the exact range.
+
+    Each delivering campaign of the account appears once, in id order, with the impressions of
+    its creatives' days in the range; every campaign with segment rows is among them, and a
+    campaign without delivery, or of another account, is not.
+    """
+    start, end = full_days(28)
+    delivery = world.linkedin_campaign_delivery(NA, start, end)
+    assert delivery
+    assert [record.campaign_id for record in delivery] == sorted(
+        {record.campaign_id for record in delivery}
+    )
+    assert all(record.account_id == NA and record.impressions > 0 for record in delivery)
+    daily: Counter[int] = Counter()
+    for row in world.linkedin_creative_daily(NA, start, end):
+        daily[row.campaign_id] += row.impressions
+    assert {record.campaign_id: record.impressions for record in delivery} == {
+        campaign: impressions for campaign, impressions in daily.items() if impressions
+    }
+    segmented = {
+        row.campaign_id for row in world.linkedin_segments(NA, "MEMBER_SENIORITY", start, end)
+    }
+    assert segmented <= {record.campaign_id for record in delivery}
+    emea = {record.campaign_id for record in world.linkedin_campaign_delivery(EMEA, start, end)}
+    assert emea.isdisjoint(record.campaign_id for record in delivery)
+    future = end + timedelta(days=400)
+    assert world.linkedin_campaign_delivery(NA, future, future) == ()
+
+
 def test_a_linkedin_daily_budget_scales_down_the_campaign_demand(world: SimulatedWorld) -> None:
     capped = build(
         SPEC.with_(
@@ -2455,6 +2485,14 @@ def test_fault_catalogues_name_every_contract_surface() -> None:
     assert set(FAULT_SURFACES) == {"google", "linkedin", "hubspot"}
     assert FAULT_SURFACES["google"][0] == "search"
     assert "associations_batch_read" in FAULT_SURFACES["hubspot"]
+    # The segment fallback's two request forms are surfaces of their own, so a fault can
+    # disturb the discovery call or the per-campaign request alone.
+    assert FAULT_SURFACES["linkedin"][6:10] == (
+        "ad_analytics",
+        "ad_analytics_statistics",
+        "ad_analytics_campaign_delivery",
+        "ad_analytics_member_segments",
+    )
     assert "http_status" in FAULT_KINDS
     assert set(SEGMENT_PIVOTS) == {"MEMBER_JOB_FUNCTION", "MEMBER_SENIORITY", "MEMBER_INDUSTRY"}
 

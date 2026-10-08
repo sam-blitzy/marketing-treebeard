@@ -1715,6 +1715,103 @@ async def test_associations_propagate_access_denied_and_skip_empty_input() -> No
     assert len(server.calls) == 1
 
 
+CONTINUATION_LIMIT = "continuation limit reached; later pages were not read"
+
+
+@pytest.mark.anyio
+async def test_associations_without_a_bound_follow_every_continuation() -> None:
+    """``max_continuations=None`` (the default, every sync) reads every page."""
+    pages = {"501": [[601], [602], [603]], "502": [[604]]}
+    unbounded = Server(_paged_portal(pages))
+    async with _client(unbounded) as client:
+        fetch = await client.associations("contacts", "deals", ["501", "502"])
+        explicit = await client.associations(
+            "contacts", "deals", ["501", "502"], max_continuations=None
+        )
+    assert len(unbounded.bodies("associations_batch_read")) == 6
+    for read in (fetch, explicit):
+        assert read.per_input["501"] == InputAssociations(
+            targets=("601", "602", "603"), status="ok", error=None
+        )
+        assert read.per_input["502"] == InputAssociations(targets=("604",), status="ok", error=None)
+
+
+@pytest.mark.anyio
+async def test_associations_with_no_continuation_send_only_the_initial_call(
+    captured: list[EventDict],
+) -> None:
+    """``max_continuations=0`` is one call; a paged input is partial, never ``ok``.
+
+    An input settled by the initial call keeps its status; one whose result still carries a
+    cursor is ``partial`` with the continuation-limit reason (``error`` when it had no
+    target), and its continuation is never sent.
+    """
+    server = Server(
+        scripted(
+            _associations(
+                [_assoc("501", [601], "c-1"), _assoc("502", [], "d-1"), _assoc("503", [603])],
+                [_no_associations("504")],
+            )
+        )
+    )
+    async with _client(server) as client:
+        fetch = await client.associations(
+            "contacts", "deals", ["501", "502", "503", "504"], max_continuations=0
+        )
+    assert server.bodies("associations_batch_read") == [
+        {"inputs": [{"id": "501"}, {"id": "502"}, {"id": "503"}, {"id": "504"}]}
+    ]
+    reads = fetch.per_input
+    assert reads["501"] == InputAssociations(
+        targets=("601",), status="partial", error=CONTINUATION_LIMIT
+    )
+    assert reads["502"] == InputAssociations(targets=(), status="error", error=CONTINUATION_LIMIT)
+    assert reads["503"] == InputAssociations(targets=("603",), status="ok", error=None)
+    assert reads["504"] == InputAssociations(targets=(), status="ok_empty", error=None)
+    assert not reads["501"].is_known
+    assert fetch.all_targets == ("601", "603")
+    [event] = _events(captured, "hubspot.associations")
+    assert event["log_level"] == "warning"
+    assert (event["calls"], event["partial"], event["error"]) == (1, 1, 1)
+
+
+@pytest.mark.anyio
+async def test_associations_stop_after_max_continuation_rounds() -> None:
+    """Each round re-sends every pending input once; inputs still paged after it are partial."""
+    pages = {"501": [[601], [602], [603]], "502": [[604], [605]], "503": [[606]]}
+    server = Server(_paged_portal(pages))
+    async with _client(server) as client:
+        fetch = await client.associations(
+            "contacts", "deals", ["501", "502", "503"], max_continuations=1
+        )
+    assert server.bodies("associations_batch_read") == [
+        {"inputs": [{"id": "501"}, {"id": "502"}, {"id": "503"}]},
+        {"inputs": [{"id": "501", "after": "501-1"}, {"id": "502", "after": "502-1"}]},
+    ]
+    reads = fetch.per_input
+    assert reads["501"] == InputAssociations(
+        targets=("601", "602"), status="partial", error=CONTINUATION_LIMIT
+    )
+    assert reads["502"] == InputAssociations(targets=("604", "605"), status="ok", error=None)
+    assert reads["503"] == InputAssociations(targets=("606",), status="ok", error=None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("bound", [-1, True, 1.5])
+async def test_associations_reject_an_invalid_continuation_bound(bound: object) -> None:
+    """A negative, boolean or non-integer bound is a ``ValueError`` before any call."""
+    server = Server(scripted())
+    async with _client(server) as client:
+        with pytest.raises(ValueError, match="max_continuations must be a non-negative integer"):
+            await client.associations(
+                "contacts",
+                "deals",
+                ["501"],
+                max_continuations=bound,  # type: ignore[arg-type]
+            )
+    assert server.calls == []
+
+
 # ---------------------------------------------------------------------------------------------
 # CRM Search pages and partitioned search
 # ---------------------------------------------------------------------------------------------

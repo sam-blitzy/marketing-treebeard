@@ -11,6 +11,9 @@
  * - `ds-stack--align-{start|center|end|stretch}`: only when `align` is set;
  * - `ds-stack--break-long-words`: only when `breakLongWords` is `true`.
  *
+ * `Stack.css` also takes an empty `role="status"` child out of the column, so a polite live
+ * region rendered ahead of its first message adds no space and no gap (see {@link Stack}).
+ *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
  * binding Blitzy OS later changes only this file and `Stack.css` (AAP 0.4.5, `../GAPS.md`).
@@ -75,7 +78,10 @@ export interface StackProps {
    * never announce it. An empty label is treated as no label.
    */
   'aria-label'?: string;
-  /** The stacked content. With `as="ul"` or `as="ol"`, `<li>` elements only. */
+  /**
+   * The stacked content. With `as="ul"` or `as="ol"`, `<li>` elements only. A direct child with
+   * `role="status"` and no child nodes adds no space or gap until it has content.
+   */
   children?: ReactNode;
 }
 
@@ -89,6 +95,13 @@ export interface StackProps {
  * non-empty `aria-label` carries `role="group"`, so its name is exposed; without one it has no
  * role. `breakLongWords` lets long unbroken text anywhere inside the stack break so it wraps
  * within the column.
+ *
+ * Empty live regions: a direct child with `role="status"` and no child nodes adds no space or
+ * gap until it has content. A polite status region can therefore be rendered ahead of its
+ * first message, as WCAG 2.2 SC 4.1.3 needs for that message to be announced, without leaving a
+ * blank gap in the column. Render nothing inside it, not even whitespace, while there is no
+ * message; it stays in the accessibility tree and takes its place in the column, spaced by
+ * `gap`, as soon as it has content.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *

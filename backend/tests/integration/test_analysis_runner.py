@@ -26,11 +26,14 @@ engine is pointed at; an unreachable database fails the tests, never skips them.
 
 import asyncio
 import dataclasses
+import itertools
 import os
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -38,7 +41,8 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
@@ -77,6 +81,7 @@ from ads_engine.db.models.analysis import (
 )
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.db.session import dispose_engine, reset_engine, session_scope
+from ads_engine.logging import logged_as
 from ads_engine.settings import Settings, get_settings
 from ads_engine.simulation.scenarios import FIXED_NOW, SCENARIOS, ContextSpec
 
@@ -91,6 +96,12 @@ NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 END = date(2026, 10, 6)
 GOOGLE_TZ = "America/New_York"
 _KEY_COLUMNS = ("campaign_id", "budget_id", "ad_group_id", "keyword_id", "creative_id")
+
+_CALLER_CONTEXT: ContextVar[str] = ContextVar("analysis_runner_test_caller", default="unset")
+"""A context variable the caller sets, to show the analysis thread runs in its context."""
+
+_WAIT_S = 30.0
+"""The longest any test waits on a thread event before it fails instead of hanging."""
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +520,10 @@ async def test_run_reads_one_snapshot_and_records_what_it_read(
     assert summary[0]["config_hash"] == run.config_hash
     assert set(summary[0]["items"]) == set(SECTION_ORDER)
     assert summary[0]["requests"] == 2
-    assert isinstance(summary[0]["elapsed_ms"], int)
+    # The run's total duration shares the sync jobs' field name; the stages keep their own.
+    assert isinstance(summary[0]["duration_ms"], int)
+    assert "elapsed_ms" not in summary[0]
+    assert all(isinstance(summary[0][key], int) for key in ("load_ms", "compute_ms", "persist_ms"))
 
 
 @pytest.mark.anyio
@@ -895,6 +909,11 @@ async def test_a_failing_rule_fails_the_run_and_stores_nothing(
     assert served == [run.id, run.id]
     (failed,) = log.named("analysis_run_failed")
     assert (failed["run_id"], failed["stage"], failed["error"]) == (run.id, "rules", "RuntimeError")
+    assert failed["exc_info"] is raised.value
+    assert isinstance(failed["duration_ms"], int)
+    assert "elapsed_ms" not in failed
+    # The run's failure is logged once with its traceback; callers read the marker.
+    assert logged_as(raised.value) == "analysis_run_failed"
     async with analysis_lock():
         pass  # the lock was released
 
@@ -911,7 +930,7 @@ async def test_a_contradicting_override_fails_the_run(
         raise ConfigError("content_assets.yaml", "assets[0].creative_overrides[0]", "contradicts")
 
     monkeypatch.setattr(Thresholds, "check_overrides", contradicting)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as raised:
         await runner.run_analysis(await runner.default_window(now=NOW), "default", "event", now=NOW)
     assert seen == [{}]
     (run,) = await _runs()
@@ -919,6 +938,7 @@ async def test_a_contradicting_override_fails_the_run(
     (failed,) = log.named("analysis_run_failed")
     assert failed["stage"] == "check_overrides"
     assert failed["config_file"] == "content_assets.yaml"
+    assert logged_as(raised.value) == "analysis_run_failed"
 
 
 @pytest.mark.anyio
@@ -981,3 +1001,302 @@ async def test_a_rule_writing_a_runner_owned_key_fails_the_run(
     (run,) = await _runs()
     assert run.status == "failed"
     assert await _count(Recommendation) == 0
+
+
+# ---------------------------------------------------------------------------
+# Off the event loop, and cancellation that never outlives the lock
+# ---------------------------------------------------------------------------
+
+_Evaluate = Callable[[AnalysisContext], Any]
+
+
+def _wrapped_rules(
+    wrap: Callable[[str, _Evaluate], _Evaluate],
+) -> tuple[tuple[str, _Evaluate], ...]:
+    """``runner._RULES`` with every rule module's evaluator passed through ``wrap``."""
+    return tuple((name, wrap(name, evaluate)) for name, evaluate in runner._RULES)
+
+
+@pytest.mark.anyio
+async def test_rules_run_off_the_event_loop_which_stays_responsive(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    busy_s = 0.5
+    seen: dict[str, Any] = {}
+
+    def wrap(name: str, evaluate: _Evaluate) -> _Evaluate:
+        if name != "keywords":
+            return evaluate
+
+        def busy(ctx: AnalysisContext) -> Any:
+            seen["thread"] = threading.current_thread()
+            seen["caller"] = _CALLER_CONTEXT.get()
+            seen["start"] = time.perf_counter()
+            deadline = seen["start"] + busy_s
+            while time.perf_counter() < deadline:
+                pass  # CPU-bound and holding the GIL, as the statistical rules are
+            seen["end"] = time.perf_counter()
+            return evaluate(ctx)
+
+        return busy
+
+    monkeypatch.setattr(runner, "_RULES", _wrapped_rules(wrap))
+    window = await runner.default_window(now=NOW)
+    ticks: list[float] = []
+    done = asyncio.Event()
+
+    async def ticking() -> None:
+        while not done.is_set():
+            ticks.append(time.perf_counter())
+            await asyncio.sleep(0.01)
+
+    token = _CALLER_CONTEXT.set("run_analysis caller")
+    ticker = asyncio.create_task(ticking())
+    try:
+        run = await runner.run_analysis(window, "default", "event", now=NOW)
+    finally:
+        done.set()
+        await ticker
+        _CALLER_CONTEXT.reset(token)
+
+    assert run.status == "succeeded"
+    assert seen["thread"] is not threading.current_thread()
+    assert seen["thread"].name.startswith("ads-engine-analysis")
+    assert seen["caller"] == "run_analysis caller"
+    # A blocked loop would leave no tick inside the busy half second, one 0.5 s gap.
+    during = [tick for tick in ticks if seen["start"] <= tick <= seen["end"]]
+    assert len(during) >= 5, len(during)
+    points = [seen["start"], *during, seen["end"]]
+    assert max(later - earlier for earlier, later in itertools.pairwise(points)) < 0.2
+    (summary,) = log.named("analysis_run_summary")
+    assert summary["compute_ms"] >= round(busy_s * 1000)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_run_holds_the_lock_until_its_computation_stops(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    pending = await _requests(2)
+    entered = threading.Event()
+    release = threading.Event()
+    ran: list[str] = []
+
+    def wrap(name: str, evaluate: _Evaluate) -> _Evaluate:
+        def evaluating(ctx: AnalysisContext) -> Any:
+            ran.append(name)
+            if name == "keywords":
+                entered.set()
+                assert release.wait(_WAIT_S), "the test never released the rule"
+            return evaluate(ctx)
+
+        return evaluating
+
+    monkeypatch.setattr(runner, "_RULES", _wrapped_rules(wrap))
+    window = await runner.default_window(now=NOW)
+    task = asyncio.create_task(
+        runner.run_analysis(window, "default", "event", request_ids=pending, now=NOW)
+    )
+    assert await asyncio.to_thread(entered.wait, _WAIT_S)
+    task.cancel()
+    await asyncio.sleep(0.2)
+    assert not task.done()
+    # The computation still runs, so the lock is still held: a second run is refused.
+    with pytest.raises(RunInProgress):
+        await runner.run_analysis(window, "default", "event", now=NOW)
+    task.cancel()  # a repeated cancellation is held as well
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert [row.status for row in await _runs()] == ["running"]
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    # The computation stopped at the next checkpoint: no later rule module ran.
+    assert ran == ["discrepancy", "keywords"]
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert await _count(Recommendation) == 0
+    async with session_scope() as session:
+        rows = await session.execute(select(AnalysisRequest).order_by(AnalysisRequest.id))
+        served = [row.run_id for row in rows.scalars()]
+    assert served == [run.id, run.id]
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "rules",
+        "CancelledError",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+async def _served_by() -> list[int | None]:
+    """The ``run_id`` of every analysis request, by id."""
+    async with session_scope() as session:
+        rows = await session.execute(select(AnalysisRequest).order_by(AnalysisRequest.id))
+        return [row.run_id for row in rows.scalars()]
+
+
+@pytest.mark.anyio
+async def test_a_cancellation_as_the_running_row_commits_fails_that_row(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    pending = await _requests(2)
+    window = await runner.default_window(now=NOW)
+    target: dict[str, asyncio.Task[AnalysisRun]] = {}
+    original_close = AsyncSession.close
+
+    async def closing(self: AsyncSession) -> None:
+        # The insert's session closes after its commit, still holding the run row: the run
+        # is cancelled there, as a caller giving up at that instant would cancel it.
+        task = target.get("run")
+        if task is not None and any(
+            isinstance(item, AnalysisRun) for item in self.identity_map.values()
+        ):
+            del target["run"]
+            task.cancel()
+        await original_close(self)
+
+    monkeypatch.setattr(AsyncSession, "close", closing)
+    task = asyncio.create_task(
+        runner.run_analysis(window, "default", "event", request_ids=pending, now=NOW)
+    )
+    target["run"] = task
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert target == {}  # the cancellation arrived while the committed insert closed
+    assert task.cancelled()
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert await _served_by() == [run.id, run.id]
+    assert log.named("analysis_run_started") == []
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "insert",
+        "CancelledError",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+@pytest.mark.parametrize("first", ["rule_error", "cancelled"])
+@pytest.mark.anyio
+async def test_repeated_cancellation_while_the_failure_is_recorded_still_fails_the_row(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder, first: str
+) -> None:
+    await _seed()
+    pending = await _requests(2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def wrap(name: str, evaluate: _Evaluate) -> _Evaluate:
+        if name != "keywords":
+            return evaluate
+
+        def failing(ctx: AnalysisContext) -> Any:
+            if first == "rule_error":
+                raise RuntimeError("rule exploded")
+            entered.set()
+            assert release.wait(_WAIT_S), "the test never released the rule"
+            return evaluate(ctx)
+
+        return failing
+
+    monkeypatch.setattr(runner, "_RULES", _wrapped_rules(wrap))
+    target: dict[str, asyncio.Task[AnalysisRun]] = {}
+    cancels: list[int] = []
+    original_serve = runner._serve_requests
+
+    async def serving(
+        session: AsyncSession, run_id: int, request_ids: Any, picked_at: datetime
+    ) -> list[int]:
+        # Only the failure record stamps requests here. Its update of the run row has run in
+        # this transaction: cancel the run again and again, as a level-triggered cancel
+        # scope would, before the requests are stamped and the transaction commits.
+        task = target["run"]
+        for _ in range(3):
+            task.cancel()
+            cancels.append(run_id)
+            await asyncio.sleep(0)
+        return await original_serve(session, run_id, request_ids, picked_at)
+
+    monkeypatch.setattr(runner, "_serve_requests", serving)
+    window = await runner.default_window(now=NOW)
+    task = asyncio.create_task(
+        runner.run_analysis(window, "default", "event", request_ids=pending, now=NOW)
+    )
+    target["run"] = task
+    if first == "cancelled":
+        assert await asyncio.to_thread(entered.wait, _WAIT_S)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    (run,) = await _runs()
+    assert cancels == [run.id] * 3
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert await _served_by() == [run.id, run.id]
+    assert log.named("analysis_run_mark_failed_error") == []
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["stage"], failed["error"]) == (
+        "rules",
+        "RuntimeError" if first == "rule_error" else "CancelledError",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+@pytest.mark.parametrize("failure", ["database_error", "timeout"])
+@pytest.mark.anyio
+async def test_a_failure_to_record_the_failure_keeps_the_run_error(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder, failure: str
+) -> None:
+    await _seed()
+    pending = await _requests(1)
+
+    def exploding(_ctx: AnalysisContext) -> Any:
+        raise RuntimeError("rule exploded")
+
+    async def unavailable(*_args: Any, **_kwargs: Any) -> list[int]:
+        if failure == "timeout":
+            await asyncio.sleep(_WAIT_S)
+        raise OperationalError("UPDATE analysis_request", {}, ConnectionError("server closed"))
+
+    monkeypatch.setattr(
+        runner,
+        "_RULES",
+        _wrapped_rules(lambda name, evaluate: exploding if name == "keywords" else evaluate),
+    )
+    monkeypatch.setattr(runner, "_serve_requests", unavailable)
+    monkeypatch.setattr(runner, "_FAILURE_RECORD_TIMEOUT_S", 0.2)
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match="rule exploded"):
+        await runner.run_analysis(
+            await runner.default_window(now=NOW), "default", "event", request_ids=pending, now=NOW
+        )
+
+    assert time.perf_counter() - started < _WAIT_S / 2
+    (error,) = log.named("analysis_run_mark_failed_error")
+    assert error["error"] == ("OperationalError" if failure == "database_error" else "TimeoutError")
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["stage"], failed["error"]) == ("rules", "RuntimeError")
+    # The failure record rolled back whole: the row stays running and the request pending
+    # until the next process to take the lock marks the row failed (crash recovery).
+    (run,) = await _runs()
+    assert run.status == "running"
+    assert await _served_by() == [None]
+    async with analysis_lock():
+        pass
+    assert [row.status for row in await _runs()] == ["failed"]

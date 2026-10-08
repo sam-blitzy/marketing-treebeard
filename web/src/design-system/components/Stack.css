@@ -7,6 +7,10 @@
  * true, the ds-stack--break-long-words modifier. Feature code writes no flex or grid CSS of its
  * own: it spaces and aligns content only through Stack, Inline and Grid.
  *
+ * An empty polite live region (a role="status" element with no child nodes) that is a direct
+ * child of a stack takes no space and no gap until it has content; see "Empty live regions"
+ * below.
+ *
  * Plain global CSS with the ds- prefix and BEM modifiers, like every stylesheet in this folder.
  * Every spacing value is a token from ../tokens.css, so binding Blitzy OS spacing touches
  * tokens.css alone. The class names are a contract with Stack.tsx and Stack.test.tsx; keep them
@@ -106,4 +110,17 @@ ol.ds-stack {
 /* Sections: no outer margin, so a section Stack is spaced only by its parent's gap. */
 section.ds-stack {
   margin: 0;
+}
+
+/*
+ * Empty live regions: a polite status region must exist before its first message so that the
+ * message is announced (WCAG 2.2 SC 4.1.3), yet an empty flex item still takes a gap. While a
+ * role="status" child of a stack has no child nodes, it is taken out of flow: an absolutely
+ * positioned flex child takes no gap, and with no content and no inset it is 0 by 0 at its
+ * static position. It stays the same element in the accessibility tree, which display: none,
+ * visibility: hidden or display: contents would not guarantee, and it returns to the column as
+ * an ordinary child, spaced by the gap, as soon as it has content.
+ */
+.ds-stack > [role="status"]:empty {
+  position: absolute;
 }

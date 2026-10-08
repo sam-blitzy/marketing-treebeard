@@ -43,8 +43,24 @@ Pipeline of one run (each step in its own short transaction where it touches the
    ``analysis_request`` rows. The run row is locked first and must still be ``running``: if
    the lock connection was lost and another process marked it ``failed``, nothing is written
    (:class:`RunNoLongerRunning`).
-8. On any failure after step 2 the run is marked ``failed`` in a fresh transaction, the
-   failure is logged as ``analysis_run_failed``, and the exception is re-raised.
+8. On any failure from the flush of the ``running`` row on (its commit and session close
+   included) the run is marked ``failed`` in a fresh transaction, the failure is logged as
+   ``analysis_run_failed``, and the exception is re-raised.
+
+Off the event loop. Steps 4 to 6 and the rendering of step 7's rows are synchronous and
+CPU-bound (statistical tests, attribution, clustering). They run as one function on the
+analysis thread, a single-worker pool created on first use, so the API process keeps
+serving stored pages and lock conflicts while a custom run computes (AAP 0.1.1: stored
+reads under 2 s). The thread runs in a copy of the caller's context variables, so the
+bound log context stays on its lines, and only the thread touches the context while it
+computes. The event loop keeps every database step (AAP 0.11.1 async I/O).
+
+Cancellation never outlives the lock. A cancellation of :func:`run_analysis` while the
+thread computes sets a stop flag, checked before the override check, before each rule
+module, before precedence and before row rendering; the cancellation, repeated ones
+included, is held until the thread has finished and then re-raised. The failure record of
+step 8 runs to completion despite cancellation, bounded by a timeout, so a cancelled run's
+row is ``failed`` and its requests stamped before the lock is released.
 
 What each stored recommendation carries (AAP 0.5.3 ``Item``, 0.5.4.8): its section, group,
 rule id, rank, action, reason, data status, hold and required datasets as columns; its
@@ -68,9 +84,14 @@ Example::
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import functools
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import MappingProxyType
@@ -125,8 +146,8 @@ from ads_engine.db.models.analysis import (
     RunWithheld,
 )
 from ads_engine.db.repositories import active_datasets
-from ads_engine.db.session import session_scope, use_session
-from ads_engine.logging import get_logger
+from ads_engine.db.session import run_to_completion, session_scope, use_session
+from ads_engine.logging import get_logger, mark_logged
 
 __all__ = [
     "DATASET_ID_KEYS",
@@ -214,6 +235,18 @@ key itself breaks the contract, and the run fails rather than overwrite it.
 
 _SINGLE_RUNNING_INDEX: Final = "uq_analysis_run_single_running"
 _REASON_LOG_LIMIT: Final = 500
+
+_ANALYSIS_THREAD_PREFIX: Final = "ads-engine-analysis"
+"""The name prefix of the thread the pure part of every run executes on."""
+
+_FAILURE_RECORD_TIMEOUT_S: Final = 30.0
+"""The bound, in seconds, on marking a failed run ``failed`` and stamping its requests."""
+
+# The analysis thread pool: one worker, created on first use. The analysis lock admits one
+# run per process at a time, and run_analysis waits for its computation to stop before the
+# lock is released, so a second worker would never be busy.
+_executor_lock: Final = threading.Lock()
+_executor: ThreadPoolExecutor | None = None
 
 
 class RunNoLongerRunning(RuntimeError):  # noqa: N818 - names the state, like RunInProgress
@@ -709,10 +742,8 @@ def _evidence_json(candidate: Candidate) -> dict[str, Any]:
     return rendered
 
 
-def _recommendation_row(
-    run_id: int, item: RankedItem, keys: dict[str, int | None]
-) -> dict[str, Any]:
-    """Return the ``recommendation`` row of one ranked item.
+def _recommendation_row(run_id: int, item: RankedItem) -> dict[str, Any]:
+    """Return the ``recommendation`` row of one ranked item, without its typed entity keys.
 
     Raises:
         ValueError: When precedence left the item without a data status, or the rule set a
@@ -742,14 +773,11 @@ def _recommendation_row(
         "held_reason": candidate.held_reason,
         "required_datasets": list(candidate.required_datasets),
         "decision_subject": None if subject is None else subject.to_json(),
-        **keys,
     }
 
 
-def _finding_row(
-    run_id: int, section: str, finding: Finding, keys: dict[str, int | None]
-) -> dict[str, Any]:
-    """Return the ``run_finding`` row of one finding."""
+def _finding_row(run_id: int, section: str, finding: Finding) -> dict[str, Any]:
+    """Return the ``run_finding`` row of one finding, without its typed entity keys."""
     return {
         "run_id": run_id,
         "section": section,
@@ -757,7 +785,6 @@ def _finding_row(
         "entity": None if finding.entity is None else finding.entity.to_json(),
         "message": finding.message,
         "evidence": finding.to_json()["evidence"],
-        **keys,
     }
 
 
@@ -766,10 +793,8 @@ def _sample_size(value: Decimal | int | None) -> Decimal | None:
     return None if value is None else Decimal(value)
 
 
-def _withheld_row(
-    run_id: int, section: str, withheld: Withheld, keys: dict[str, int | None]
-) -> dict[str, Any]:
-    """Return the ``run_withheld`` row of one withheld pattern."""
+def _withheld_row(run_id: int, section: str, withheld: Withheld) -> dict[str, Any]:
+    """Return the ``run_withheld`` row of one withheld pattern, without its typed entity keys."""
     return {
         "run_id": run_id,
         "section": section,
@@ -779,7 +804,6 @@ def _withheld_row(
         "observed": _sample_size(withheld.observed),
         "required": _sample_size(withheld.required),
         "unit": withheld.unit,
-        **keys,
     }
 
 
@@ -812,22 +836,50 @@ def _run_datasets(ctx: AnalysisContext) -> tuple[dict[str, Any], dict[str, Any]]
     return modes, ids
 
 
-@dataclass(frozen=True, slots=True)
-class _Outputs:
-    """The rows of one run, keyed and ready to insert, built before the write transaction."""
+_KeyedRow = tuple[dict[str, Any], _TypedKeys]
+"""A run-output row without its typed entity keys, and the keys it is about."""
 
-    recommendations: tuple[tuple[RankedItem, _TypedKeys], ...]
-    findings: tuple[tuple[str, Finding, _TypedKeys], ...]
-    withheld: tuple[tuple[str, Withheld, _TypedKeys], ...]
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRun:
+    """Every output row of one run, rendered on the analysis thread before the write.
+
+    Built from the context and the precedence output, so that :func:`_persist` never reads
+    either: the event loop only adds the typed entity keys a stored row carries
+    (:func:`_known_ids`) and inserts. Rows keep section and rank order.
+
+    Attributes:
+        recommendations: The ``recommendation`` rows, in ``PrecedenceOutput.all_items`` order.
+        findings: The ``run_finding`` rows, in section order.
+        withheld: The ``run_withheld`` rows, in section order.
+        suppression: The ``run_suppression`` rows with a positive count.
+        data_modes: ``analysis_run.data_modes``, as the context read them.
+        dataset_ids: ``analysis_run.dataset_ids``, as the context read them.
+        summary: The per-section counts of the ``analysis_run_summary`` line.
+    """
+
+    recommendations: tuple[_KeyedRow, ...]
+    findings: tuple[_KeyedRow, ...]
+    withheld: tuple[_KeyedRow, ...]
+    suppression: tuple[dict[str, Any], ...]
+    data_modes: dict[str, Any]
+    dataset_ids: dict[str, Any]
+    summary: dict[str, Any]
 
     @classmethod
-    def of(cls, ctx: AnalysisContext, out: PrecedenceOutput) -> _Outputs:
-        """Resolve every output's typed entity keys from the context."""
+    def of(cls, run_id: int, ctx: AnalysisContext, out: PrecedenceOutput) -> _PreparedRun:
+        """Render every output row of run ``run_id`` and resolve its typed entity keys.
+
+        Raises:
+            ValueError: When an item breaks the persistence contract (no data status, or a
+                rule set a runner-owned evidence key).
+        """
         index = _KeyIndex.of(ctx)
+        data_modes, dataset_ids = _run_datasets(ctx)
         return cls(
             recommendations=tuple(
                 (
-                    item,
+                    _recommendation_row(run_id, item),
                     _typed_keys(
                         ctx, index, item.candidate.entity_ref, item.candidate.evidence.extra
                     ),
@@ -835,25 +887,37 @@ class _Outputs:
                 for item in out.all_items()
             ),
             findings=tuple(
-                (section, finding, _typed_keys(ctx, index, finding.entity))
+                (
+                    _finding_row(run_id, section, finding),
+                    _typed_keys(ctx, index, finding.entity),
+                )
                 for section in SECTION_ORDER
                 for finding in out.findings[section]
             ),
             withheld=tuple(
-                (section, withheld, _typed_keys(ctx, index, withheld.entity))
+                (
+                    _withheld_row(run_id, section, withheld),
+                    _typed_keys(ctx, index, withheld.entity),
+                )
                 for section in SECTION_ORDER
                 for withheld in out.withheld[section]
             ),
+            suppression=tuple(_suppression_rows(run_id, out)),
+            data_modes=data_modes,
+            dataset_ids=dataset_ids,
+            summary=_summary(out),
         )
 
     def keys(self) -> Iterable[_TypedKeys]:
         """Every row's typed keys."""
-        for _, keys in self.recommendations:
-            yield keys
-        for _, _, keys in self.findings:
-            yield keys
-        for _, _, keys in self.withheld:
-            yield keys
+        for rows in (self.recommendations, self.findings, self.withheld):
+            for _, keys in rows:
+                yield keys
+
+
+def _keyed(rows: Iterable[_KeyedRow], known: Mapping[str, frozenset[int]]) -> list[dict[str, Any]]:
+    """Return ``rows`` with their typed entity keys, each id no stored row carries ``None``."""
+    return [{**row, **keys.row(known)} for row, keys in rows]
 
 
 async def _serve_requests(
@@ -889,27 +953,25 @@ async def _serve_requests(
 
 async def _persist(
     run_id: int,
-    ctx: AnalysisContext,
-    out: PrecedenceOutput,
+    prepared: _PreparedRun,
     request_ids: Sequence[int],
 ) -> AnalysisRun:
     """Write every output of the run and mark it ``succeeded``, in one transaction.
 
     The run row is locked first (``SELECT … FOR UPDATE``) and must still be ``running``: a
     process that took the ``analysis`` lock after this one lost its lock connection may have
-    marked it ``failed``, and then nothing is written. Rows are inserted in section and rank
-    order with the ORM's bulk ``INSERT``; outputs are never updated afterwards.
+    marked it ``failed``, and then nothing is written. The rows were rendered on the analysis
+    thread (:class:`_PreparedRun`); here they only gain the typed entity keys a stored row
+    carries and are inserted in section and rank order with the ORM's bulk ``INSERT``;
+    outputs are never updated afterwards.
 
     Returns:
         The persisted run, ``succeeded``, readable after the session closes.
 
     Raises:
         RunNoLongerRunning: When the row is no longer ``running``; the transaction rolls back.
-        ValueError: When an item breaks the persistence contract.
         sqlalchemy.exc.SQLAlchemyError: When a statement fails; the transaction rolls back.
     """
-    outputs = _Outputs.of(ctx, out)
-    data_modes, dataset_ids = _run_datasets(ctx)
     async with session_scope() as session:
         run = (
             await session.execute(
@@ -918,35 +980,56 @@ async def _persist(
         ).scalar_one_or_none()
         if run is None or run.status != "running":
             raise RunNoLongerRunning(run_id, None if run is None else run.status)
-        known = await _known_ids(session, outputs.keys())
-        recommendations = [
-            _recommendation_row(run_id, item, keys.row(known))
-            for item, keys in outputs.recommendations
-        ]
-        findings = [
-            _finding_row(run_id, section, finding, keys.row(known))
-            for section, finding, keys in outputs.findings
-        ]
-        withheld = [
-            _withheld_row(run_id, section, item, keys.row(known))
-            for section, item, keys in outputs.withheld
-        ]
-        suppression = _suppression_rows(run_id, out)
+        known = await _known_ids(session, prepared.keys())
         for model, rows in (
-            (Recommendation, recommendations),
-            (RunFinding, findings),
-            (RunWithheld, withheld),
-            (RunSuppression, suppression),
+            (Recommendation, _keyed(prepared.recommendations, known)),
+            (RunFinding, _keyed(prepared.findings, known)),
+            (RunWithheld, _keyed(prepared.withheld, known)),
+            (RunSuppression, list(prepared.suppression)),
         ):
             if rows:
                 await session.execute(insert(model), rows)
         finished = datetime.now(UTC)
         run.status = "succeeded"
         run.finished_at = finished
-        run.data_modes = data_modes
-        run.dataset_ids = dataset_ids
+        run.data_modes = prepared.data_modes
+        run.dataset_ids = prepared.dataset_ids
         await _serve_requests(session, run_id, request_ids, finished)
     return run
+
+
+async def _mark_failed(run_id: int, request_ids: Sequence[int], failed_at: datetime) -> None:
+    """Mark the run ``failed`` and stamp the requests it served, in one bounded transaction.
+
+    :func:`_record_failure` runs this to completion whatever cancels the run, so
+    :data:`_FAILURE_RECORD_TIMEOUT_S` bounds it instead of a cancellation. The update is
+    conditioned on the row still being ``running``, so a row another process already marked
+    ``failed`` keeps its state (and its requests are still stamped). A row that does not
+    exist, because the interrupted commit of the ``running`` row never landed, stamps
+    nothing: its requests stay pending for the next run.
+
+    A database error or the timeout is logged as ``analysis_run_mark_failed_error`` and never
+    raised, so the run's own exception reaches the caller. The transaction then rolls back,
+    and a row left ``running`` is marked ``failed`` by the next process to take the
+    ``analysis`` lock (AAP 0.5.3 crash recovery).
+    """
+    try:
+        async with asyncio.timeout(_FAILURE_RECORD_TIMEOUT_S), session_scope() as session:
+            marked = await session.execute(
+                update(AnalysisRun)
+                .where(AnalysisRun.id == run_id, AnalysisRun.status == "running")
+                .values(status="failed", finished_at=failed_at)
+                .returning(AnalysisRun.id)
+                .execution_options(synchronize_session=False)
+            )
+            if marked.scalar_one_or_none() is None:
+                found = await session.scalar(select(AnalysisRun.id).where(AnalysisRun.id == run_id))
+                if found is None:
+                    _log.warning("analysis_run_row_missing", run_id=run_id)
+                    return
+            await _serve_requests(session, run_id, request_ids, failed_at)
+    except (SQLAlchemyError, TimeoutError) as db_exc:
+        _log.exception("analysis_run_mark_failed_error", run_id=run_id, error=type(db_exc).__name__)
 
 
 async def _record_failure(
@@ -954,43 +1037,56 @@ async def _record_failure(
 ) -> None:
     """Mark the run ``failed`` in a fresh transaction and log ``analysis_run_failed``.
 
-    The update is conditioned on the row still being ``running``, so a row another process
-    already marked ``failed`` keeps its state. The requests the run was serving are stamped
-    as picked by this failed run: leaving them pending would make the scheduler start a new
-    failing run every coalescing window for a deterministic failure (a contradicting
+    The terminal state is written by :func:`_mark_failed` through
+    :func:`~ads_engine.db.session.run_to_completion`, so a cancellation arriving meanwhile,
+    repeated or level-triggered, waits until the row is ``failed`` and its requests are
+    stamped. :func:`run_analysis` calls this inside the ``analysis`` lock, so the terminal
+    state is persisted before the lock is released. The requests the run was serving are
+    stamped as picked by this failed run: leaving them pending would make the scheduler start
+    a new failing run every coalescing window for a deterministic failure (a contradicting
     configuration), while the next sync, decision or feedback enqueues a fresh request.
 
-    A database error while recording the failure is logged, never raised, so the run's own
-    exception always reaches the caller. A row that cannot be updated stays ``running`` and
-    is marked ``failed`` by the next process to take the ``analysis`` lock (AAP 0.5.3 crash
-    recovery).
+    A database error or timeout while recording the failure is logged, never raised, so the
+    run's own exception always reaches the caller, which re-raises it. A row the failed write
+    leaves ``running`` is marked ``failed`` by the next process to take the ``analysis`` lock
+    (AAP 0.5.3 crash recovery).
+
+    ``analysis_run_failed`` is the failure's one record with its traceback: the exception is
+    marked with :func:`~ads_engine.logging.mark_logged`, and the callers that receive it
+    (the API, the scheduler, the worker, the CLI) read
+    :func:`~ads_engine.logging.logged_as` and log their own outcome without a second
+    traceback. Cancellation is logged as a warning without one, and is not marked.
+
+    Raises:
+        asyncio.CancelledError: When the caller was cancelled while the failure was being
+            recorded and ``exc`` is an ordinary error (an ``Exception``); ``exc`` is its
+            context. The cancellation is raised once the failure is recorded and logged. A
+            cancellation, interrupt or exit in ``exc`` is left for the caller to re-raise.
     """
     failed_at = datetime.now(UTC)
+    interrupted: asyncio.CancelledError | None = None
     try:
-        async with session_scope() as session:
-            await session.execute(
-                update(AnalysisRun)
-                .where(AnalysisRun.id == run_id, AnalysisRun.status == "running")
-                .values(status="failed", finished_at=failed_at)
-                .execution_options(synchronize_session=False)
-            )
-            await _serve_requests(session, run_id, request_ids, failed_at)
-    except SQLAlchemyError as db_exc:
-        _log.exception("analysis_run_mark_failed_error", run_id=run_id, error=type(db_exc).__name__)
+        await run_to_completion(_mark_failed(run_id, request_ids, failed_at))
+    except asyncio.CancelledError as cancel:
+        interrupted = cancel
     fields: dict[str, Any] = {
         "run_id": run_id,
         "stage": stage,
         "error": type(exc).__name__,
-        "elapsed_ms": round((time.perf_counter() - started) * 1000),
+        "duration_ms": round((time.perf_counter() - started) * 1000),
     }
     if isinstance(exc, ConfigError):
         fields["config_file"] = exc.file
         fields["config_key"] = exc.key
     if isinstance(exc, Exception):
         _log.error("analysis_run_failed", exc_info=exc, **fields)
+        mark_logged(exc, "analysis_run_failed")
     else:
         # Cancellation or interpreter exit: no traceback, the caller is shutting down.
         _log.warning("analysis_run_failed", **fields)
+    if interrupted is not None and isinstance(exc, Exception):
+        # The caller was cancelled meanwhile: propagate that, rather than lose it.
+        raise interrupted
 
 
 # ---------------------------------------------------------------------------
@@ -1011,12 +1107,20 @@ async def _insert_running(
     trigger: RunTrigger,
     config: Thresholds,
     instant: datetime,
+    progress: _RunProgress,
 ) -> AnalysisRun:
     """Insert the run's ``running`` row and commit it at once.
 
+    The row is flushed first and its id recorded in ``progress.run_id`` before the commit.
+    A failure or cancellation from then on, in the commit, while the session closes or at
+    any later step, therefore reaches the failure handling of :func:`run_analysis` with the
+    id of a row that may already be committed. When the commit itself was interrupted the
+    row may not exist, and recording the failure finds nothing to update.
+
     Raises:
         RunInProgress: When ``uq_analysis_run_single_running`` rejects the row, the
-            database-enforced second guard: another run is ``running``.
+            database-enforced second guard: another run is ``running``. The insert rolled
+            back, so ``progress.run_id`` is ``None``.
     """
     run = AnalysisRun(
         kind=kind,
@@ -1034,7 +1138,11 @@ async def _insert_running(
     try:
         async with session_scope() as session:
             session.add(run)
+            await session.flush()
+            progress.run_id = run.id
     except IntegrityError as exc:
+        # The insert's transaction rolled back: no row exists to record a failure on.
+        progress.run_id = None
         if _constraint_name(exc) == _SINGLE_RUNNING_INDEX:
             _log.info("analysis_run_already_running", code=RunInProgress.code)
             raise RunInProgress from exc
@@ -1060,20 +1168,181 @@ async def _load(
         return await metrics.load_context(session, window, config, kind=kind, now=instant)
 
 
-def _evaluate(ctx: AnalysisContext) -> tuple[RuleResult, ...]:
-    """Evaluate every rule module in :data:`EVALUATION_ORDER`.
+# ---------------------------------------------------------------------------
+# The pure computation, on the analysis thread (AAP 0.11.1, 0.1.1)
+# ---------------------------------------------------------------------------
+
+
+class _ComputationStoppedError(Exception):
+    """Raised on the analysis thread at a stop checkpoint once its run was cancelled.
+
+    It never leaves the runner: :func:`_in_analysis_thread` replaces it with the caller's
+    :class:`asyncio.CancelledError` once the thread has stopped.
+    """
+
+
+@dataclass(slots=True)
+class _RunProgress:
+    """How far one run got, shared by :func:`run_analysis` and its analysis thread.
+
+    The event loop writes :attr:`stage` up to the hand-off to the analysis thread, the thread
+    writes it while it computes, and the loop reads it again only after the thread has
+    finished, for the ``analysis_run_failed`` line. :attr:`stop` goes the other way: the loop
+    sets it when the run is cancelled and the thread checks it at every checkpoint.
+
+    Attributes:
+        stage: The step in progress: ``insert`` (the ``running`` row's commit and close),
+            ``load_context``, ``check_overrides``, ``rules``, ``precedence`` or ``persist``
+            (row rendering included).
+        run_id: The ``running`` row's id, recorded by :func:`_insert_running` once the row
+            is flushed and before it commits; ``None`` while no row can exist.
+        stop: Set once the run is cancelled; the computation stops at its next checkpoint.
+    """
+
+    stage: str
+    run_id: int | None = None
+    stop: threading.Event = field(default_factory=threading.Event)
+
+    def checkpoint(self) -> None:
+        """Stop the computation here when its run was cancelled.
+
+        Raises:
+            _ComputationStoppedError: When :attr:`stop` is set.
+        """
+        if self.stop.is_set():
+            raise _ComputationStoppedError(self.stage)
+
+    def enter(self, stage: str) -> None:
+        """Pass a checkpoint, then record that ``stage`` begins.
+
+        Raises:
+            _ComputationStoppedError: When :attr:`stop` is set; the stage stays the one the
+                run was cancelled in.
+        """
+        self.checkpoint()
+        self.stage = stage
+
+
+def _evaluate(ctx: AnalysisContext, checkpoint: Callable[[], None]) -> tuple[RuleResult, ...]:
+    """Evaluate every rule module in :data:`EVALUATION_ORDER`, passing ``checkpoint`` first.
+
+    ``_RULES`` is read at call time, and ``checkpoint`` runs before each module, so a
+    cancelled run stops before the next module starts rather than after the last.
 
     Raises:
+        _ComputationStoppedError: From ``checkpoint``, after the run was cancelled.
         Exception: Whatever a rule raises, with a note naming the rule module; the run fails.
     """
     results: list[RuleResult] = []
     for name, evaluate in _RULES:
+        checkpoint()
         try:
             results.append(evaluate(ctx))
         except Exception as exc:
             exc.add_note(f"raised by analysis rule module {name!r}")
             raise
     return tuple(results)
+
+
+def _compute(
+    run_id: int, ctx: AnalysisContext, config: Thresholds, progress: _RunProgress
+) -> tuple[_PreparedRun, float]:
+    """Run the pure part of run ``run_id``: steps 4 to 6 and the row rendering of step 7.
+
+    Executes on the analysis thread (:func:`_in_analysis_thread`) and alone touches ``ctx``
+    meanwhile, including its per-run ``cache``. It checks the white-paper creative overrides,
+    evaluates the rule modules, applies precedence and renders every output row with its
+    typed keys and the summary counts. The override check, the rule modules and precedence
+    are looked up when they run, never bound at import. A checkpoint precedes the override
+    check, each rule module, precedence and the row rendering; once ``progress.stop`` is set
+    the computation raises there. ``progress.stage`` names the step in progress.
+
+    Returns:
+        The rendered rows and the :func:`time.perf_counter` reading taken when precedence
+        finished, which ends ``compute_ms``.
+
+    Raises:
+        _ComputationStoppedError: At a checkpoint after the run was cancelled.
+        ConfigError: When a creative override contradicts its creative's form.
+        PrecedenceInvariantError: When a precedence guarantee breaks.
+        ValueError: When an item breaks the persistence contract.
+        Exception: Whatever a rule raises, with a note naming its module.
+    """
+    progress.checkpoint()
+    config.check_overrides({item.urn: item.lead_form_urn for item in ctx.creatives.values()})
+    progress.enter("rules")
+    results = _evaluate(ctx, progress.checkpoint)
+    progress.enter("precedence")
+    out = precedence.apply_precedence(results, ctx)
+    computed = time.perf_counter()
+    progress.enter("persist")
+    return _PreparedRun.of(run_id, ctx, out), computed
+
+
+def _analysis_executor() -> ThreadPoolExecutor:
+    """Return the process's analysis thread pool, creating it on first use.
+
+    One worker thread, named ``ads-engine-analysis-<n>``: the analysis lock admits one run
+    per process at a time, so a run never queues behind another one's computation.
+    """
+    global _executor
+    executor = _executor
+    if executor is not None:
+        return executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=_ANALYSIS_THREAD_PREFIX
+            )
+        return _executor
+
+
+async def _in_analysis_thread[T](compute: Callable[[], T], stop: threading.Event) -> T:
+    """Run ``compute`` on the analysis thread and await it without blocking the event loop.
+
+    The rules are synchronous and CPU-bound (statistical tests, attribution, clustering), so
+    running them on the event loop would stall every other request of the process for the
+    whole computation. ``compute`` runs in a copy of the caller's :mod:`contextvars`
+    context, so the structlog context bound around the run stays on its log lines.
+
+    The wait is cancellation-safe: the first cancellation of the caller sets ``stop``, on
+    which the computation raises at its next checkpoint; it and any repeated cancellation
+    are held until the thread has actually finished, and then re-raised. The caller holds
+    the analysis lock around this wait, so the lock is never released while a computation
+    still runs, and no computation outlives its run. The future is waited on with
+    :func:`asyncio.wait`, which leaves it untouched when the wait is cancelled; re-shielding
+    it after a cancellation would make asyncio log the expected stop as an error.
+
+    Returns:
+        What ``compute`` returned.
+
+    Raises:
+        asyncio.CancelledError: When the caller was cancelled meanwhile, once ``compute`` has
+            finished, whatever it returned or raised (an error other than the stop is
+            chained as the cause).
+        Exception: Whatever ``compute`` raised, unchanged and with its notes, when no
+            cancellation arrived.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(
+        _analysis_executor(), functools.partial(contextvars.copy_context().run, compute)
+    )
+    cancelled: asyncio.CancelledError | None = None
+    # Only this function holds the future, which therefore completes only once ``compute``
+    # has returned or raised: from then on nothing runs on the thread for this run.
+    while not future.done():
+        try:
+            await asyncio.wait((future,))
+        except asyncio.CancelledError as err:
+            stop.set()
+            if cancelled is None:
+                cancelled = err
+    if cancelled is None:
+        return future.result()
+    error = None if future.cancelled() else future.exception()
+    if error is None or isinstance(error, _ComputationStoppedError):
+        raise cancelled from None
+    raise cancelled from error
 
 
 def _check_default_shape(window: AnalysisWindow, config: Thresholds) -> None:
@@ -1147,6 +1416,13 @@ async def run_analysis(
     ``succeeded`` state in one transaction. Any failure after the row exists marks it
     ``failed`` and re-raises; a run is never partial.
 
+    The override check, the rules, precedence and the rendering of the output rows run on
+    the analysis thread, so the event loop stays free while the run computes. Cancelling
+    the call stops that computation at its next checkpoint (before a rule module,
+    precedence or row rendering); the lock is released only after the thread has stopped
+    and the row is ``failed`` with its requests stamped, and then ``CancelledError``
+    propagates.
+
     ``kind="default"`` is the worker's run of the configured default window and must be
     given that window (:func:`default_window`); ``kind="custom"`` takes any valid window,
     even one equal to the default (AAP 0.5.3 "Run kinds").
@@ -1179,6 +1455,8 @@ async def run_analysis(
         ValueError: For an unknown ``kind`` or ``trigger``, a naive ``now``, or a default run
             over a window other than the configured default.
         sqlalchemy.exc.SQLAlchemyError: When the database fails.
+        asyncio.CancelledError: When the call is cancelled, once the computation has
+            stopped and the run, if its row exists, is recorded ``failed``.
     """
     window_value: object = window
     if not isinstance(window_value, AnalysisWindow):
@@ -1196,36 +1474,34 @@ async def run_analysis(
         config = thresholds if thresholds is not None else Thresholds.load()
         if kind == "default":
             _check_default_shape(window, config)
-        run = await _insert_running(window, kind, trigger, config, instant)
-        _log.info(
-            "analysis_run_started",
-            run_id=run.id,
-            kind=kind,
-            trigger=trigger,
-            reason=log_reason,
-            window_start=window.start.isoformat(),
-            window_end=window.end.isoformat(),
-            days=window.days,
-            requests=len(served),
-            config_hash=config.config_hash,
-        )
-        stage = "load_context"
+        progress = _RunProgress(stage="insert")
         try:
+            run = await _insert_running(window, kind, trigger, config, instant, progress)
+            _log.info(
+                "analysis_run_started",
+                run_id=run.id,
+                kind=kind,
+                trigger=trigger,
+                reason=log_reason,
+                window_start=window.start.isoformat(),
+                window_end=window.end.isoformat(),
+                days=window.days,
+                requests=len(served),
+                config_hash=config.config_hash,
+            )
+            progress.stage = "load_context"
             ctx = await _load(window, config, kind, instant)
             loaded = time.perf_counter()
-            stage = "check_overrides"
-            config.check_overrides(
-                {item.urn: item.lead_form_urn for item in ctx.creatives.values()}
+            progress.stage = "check_overrides"
+            prepared, computed = await _in_analysis_thread(
+                functools.partial(_compute, run.id, ctx, config, progress), progress.stop
             )
-            stage = "rules"
-            results = _evaluate(ctx)
-            stage = "precedence"
-            out = precedence.apply_precedence(results, ctx)
-            computed = time.perf_counter()
-            stage = "persist"
-            stored = await _persist(run.id, ctx, out, served)
+            stored = await _persist(run.id, prepared, served)
         except BaseException as exc:
-            await _record_failure(run.id, served, exc, stage, started)
+            # From the flush of the running row on, every failure, cancellation included,
+            # leaves that row failed before the lock is released.
+            if progress.run_id is not None:
+                await _record_failure(progress.run_id, served, exc, progress.stage, started)
             raise
         finished = time.perf_counter()
 
@@ -1244,7 +1520,7 @@ async def run_analysis(
         load_ms=round((loaded - started) * 1000),
         compute_ms=round((computed - loaded) * 1000),
         persist_ms=round((finished - computed) * 1000),
-        elapsed_ms=round((finished - started) * 1000),
-        **_summary(out),
+        duration_ms=round((finished - started) * 1000),
+        **prepared.summary,
     )
     return stored

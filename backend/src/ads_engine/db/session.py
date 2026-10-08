@@ -17,6 +17,10 @@ These entry points cover every caller:
 * :func:`use_session` backs the interfaces whose ``session`` is optional: it joins the
   caller's session untouched, or runs the call in a :func:`session_scope` of its own.
 
+* :func:`run_to_completion` runs a cleanup coroutine to completion even when its caller is
+  cancelled. The scopes here close and release through it, and the analysis runner records
+  a failed run's terminal state through it.
+
 * :func:`dedicated_connection` checks out one physical connection in ``AUTOCOMMIT`` mode
   for holding session-level advisory locks (the ``analysis`` lock and the scheduler lock).
   The lock keys and the lock statements belong to their owners, ``analysis/lock.py`` and
@@ -61,6 +65,7 @@ __all__ = [
     "get_sessionmaker",
     "json_dumps",
     "reset_engine",
+    "run_to_completion",
     "session_scope",
     "use_session",
 ]
@@ -339,14 +344,15 @@ def reset_engine() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
+async def run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
     """Run a cleanup coroutine to completion even if the calling task is cancelled.
 
     The cleanup runs in a task of its own behind :func:`asyncio.shield`. A cancellation
     received while waiting is held until the cleanup has finished and then re-raised, so
     a rollback, a lock release or a connection close is never abandoned halfway and two
     cleanups never run on one connection at the same time. This mirrors how SQLAlchemy's
-    own async context managers close sessions and connections.
+    own async context managers close sessions and connections. The analysis runner records
+    a failed run's terminal state through it as well.
 
     Args:
         cleanup: The coroutine to run; it is awaited exactly once.
@@ -425,9 +431,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         yield session
         await session.commit()
     except BaseException:
-        await _run_to_completion(_abandon_session(session))
+        await run_to_completion(_abandon_session(session))
         raise
-    await _run_to_completion(session.close())
+    await run_to_completion(session.close())
 
 
 @asynccontextmanager
@@ -520,4 +526,4 @@ async def dedicated_connection() -> AsyncIterator[AsyncConnection]:
         try:
             yield conn
         finally:
-            await _run_to_completion(_release_advisory_locks(conn))
+            await run_to_completion(_release_advisory_locks(conn))

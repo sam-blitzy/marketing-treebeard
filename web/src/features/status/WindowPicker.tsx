@@ -19,6 +19,13 @@
  * and every other API error, the 422 window-validation errors included, with the API's own
  * message.
  *
+ * The two reads the picker depends on never fail silently. A failed `GET /runs/latest`
+ * and a failed `GET /runs?kind=custom` are each stated in a warning banner that names the read,
+ * gives the API's message and offers a Retry button; meanwhile the presets end on the last
+ * default run read, or else on the run on screen, and the reopen select keeps the runs it last
+ * listed. A 404 `not_found` or 409 `run_not_ready` from `GET /runs/latest` is not a failure: no
+ * default run has succeeded yet, and the read polls by itself until one has.
+ *
  * Rules this file keeps:
  * - **No window length in the client** (AAP 0.5.4.1, 0.5.5). The presets, the default and the
  *   longest span come from `config.window`; window ends come from runs. While the configuration
@@ -26,29 +33,42 @@
  * - **Calendar dates stay calendar dates.** A window is one calendar-date range applied to each
  *   source's native days, so dates are computed in UTC only and shown exactly as stored; no
  *   time zone ever moves a day.
- * - **Messages are announced politely.** The error banner sits in a `role="status"` region that
- *   is always rendered, so the message is announced when it appears (WCAG 2.2 SC 4.1.3) without
- *   `role="alert"`, which AAP 0.5.5 reserves for discrepancies.
- * - **Boundaries.** UI comes only from the design-system index and is laid out with `Inline`,
- *   with no styles of its own (AAP 0.4.4); server state comes only from the TanStack Query hooks
- *   (AAP 0.11.1); navigation goes through TanStack Router's `useNavigate`. `src/router.tsx` is
- *   never imported: it imports the feature pages, and its `Register` augmentation types `to` and
- *   `search` here without an import.
+ * - **Messages are announced politely.** Every warning banner of a failed computation or read
+ *   sits in one `role="status"` region that every state of the picker renders in the same
+ *   place, so a message is announced when it appears (WCAG 2.2 SC 4.1.3) without
+ *   `role="alert"`, which AAP 0.5.5 reserves for discrepancies. While it is empty, `Stack` takes
+ *   the region out of the column, so it adds no space.
+ * - **Boundaries.** UI comes only from the design-system index and is laid out with `Stack` and
+ *   `Inline`, with no styles of its own (AAP 0.4.4); server state comes only from the TanStack
+ *   Query hooks (AAP 0.11.1); navigation goes through TanStack Router's `useNavigate`.
+ *   `src/router.tsx` is never imported: it imports the feature pages, and its `Register`
+ *   augmentation types `to` and `search` here without an import.
  *
  * @packageDocumentation
  */
 import { useNavigate } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import {
   isApiError,
+  isAwaitingFirstRun,
   useConfig,
   useCreateRun,
   useCustomRuns,
   useDefaultRun,
 } from '../../api/queries';
+import type { ApiError } from '../../api/queries';
 import type { CreateRunRequest, IsoDate, Run } from '../../api/types';
-import { Banner, DateRangePicker, Inline, Select, Spinner } from '../../design-system';
+import {
+  Banner,
+  Button,
+  DateRangePicker,
+  Inline,
+  Select,
+  Spinner,
+  Stack,
+} from '../../design-system';
 import type { DateRangeValue, SelectOption } from '../../design-system';
 import { formatDateRange, formatDays } from '../../lib/format';
 
@@ -155,6 +175,21 @@ const RUN_FAILED_MESSAGE = 'Could not compute the custom window.';
 /** Shown when `GET /config` succeeded without the window settings the picker needs. */
 const NO_WINDOW_CONFIG_MESSAGE = 'The configuration carried no window settings.';
 
+/** The title of the warning for a failed `GET /runs/latest`. */
+const DEFAULT_RUN_FAILED_TITLE = 'Could not read the latest default run';
+
+/** The title of the warning for a failed `GET /runs?kind=custom`. */
+const CUSTOM_RUNS_FAILED_TITLE = 'Could not load recent custom windows';
+
+/** Stated for a failed read whose error carries no message of its own. */
+const READ_FAILED_REASON = 'No reason was given.';
+
+/**
+ * The visible label of both Retry buttons. Each has its own accessible name, which starts with
+ * this label (WCAG 2.2 SC 2.5.3).
+ */
+const RETRY_LABEL = 'Retry';
+
 /** The empty choice of the reopen select, which keeps the select on no run. */
 const NO_CUSTOM_RUN: SelectOption = { value: '', label: 'Choose a custom window' };
 
@@ -180,6 +215,15 @@ function createRunErrorMessage(error: unknown): string {
 }
 
 /**
+ * The reason a failed read states: the `ApiError`'s message, which `api/client.ts` already words
+ * for the user (a network failure or an unavailable server, for example), or
+ * {@link READ_FAILED_REASON} for anything else or an empty message.
+ */
+function readErrorMessage(error: unknown): string {
+  return isApiError(error) && error.message !== '' ? error.message : READ_FAILED_REASON;
+}
+
+/**
  * The reopen-select label of a custom run: "{window_start} – {window_end} · {days}", for
  * example "2026-09-25 – 2026-10-01 · 7 days". The dates are shown exactly as stored and the
  * length is the run's own `days`.
@@ -191,6 +235,67 @@ function customRunLabel(run: Run): string {
 // ---------------------------------------------------------------------------------------------
 // WindowPicker
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * The error a read last settled with, kept while the read runs again.
+ *
+ * TanStack Query v5 puts a query that holds no data back to `status: 'pending'` with
+ * `error: null` each time it fetches, so while a failed first read is retried or polled, its
+ * result no longer carries the failure. Its warning and Retry button would leave the page for
+ * the length of the request and return as new elements, and focus would be lost. The error the
+ * read last settled with is therefore kept until the read settles again: with a new error, which
+ * replaces it, or with data, which clears it. A read that holds data keeps its own `error` while
+ * it refetches, so it is returned unchanged.
+ *
+ * @param error - The query's `error`.
+ * @param isFetching - The query's `isFetching`.
+ * @param hasData - Whether the query holds data.
+ * @returns The error to state, or `null` while the read has not settled or last settled with
+ *   data.
+ */
+function useSettledError(
+  error: ApiError | null,
+  isFetching: boolean,
+  hasData: boolean,
+): ApiError | null {
+  const [kept, setKept] = useState<ApiError | null>(null);
+  const settled = error === null && isFetching && !hasData ? kept : error;
+  if (settled !== kept) {
+    // State adjusted while rendering, from the read's result: React's pattern for information
+    // kept from earlier renders. React renders again at once, before it commits anything.
+    setKept(settled);
+  }
+  return settled;
+}
+
+/** Props of {@link PickerFrame}. */
+interface PickerFrameProps {
+  /** What the picker shows: a loading spinner, the missing-configuration warning or controls. */
+  children: ReactNode;
+  /** The warnings to announce, each a keyed `Banner`, in order. Omitted or empty: none. */
+  notices?: readonly ReactElement[];
+}
+
+/**
+ * The one root of every picker state: a column of the state's content followed by the picker's
+ * polite live region.
+ *
+ * Every state renders this frame, so the root element and the region's place in it never change
+ * and React keeps the same region element from the first render. A message that appears later
+ * therefore lands in a live region that already exists, and is announced politely
+ * (WCAG 2.2 SC 4.1.3) without `role="alert"`, which AAP 0.5.5 reserves for discrepancies.
+ */
+function PickerFrame({ children, notices = [] }: PickerFrameProps) {
+  return (
+    <Stack gap={3}>
+      {children}
+      {/* Always rendered, and always the frame's last child. With no notice nothing is rendered
+          inside it, so it stays empty, and Stack takes an empty status region out of the
+          column: it adds no space and no gap until a notice appears. */}
+      <div role="status">{notices.length > 0 && <Stack gap={2}>{notices}</Stack>}</div>
+    </Stack>
+  );
+}
 
 /** Props of {@link WindowPicker}. */
 export interface WindowPickerProps {
@@ -216,13 +321,26 @@ export interface WindowPickerProps {
  * - **Choosing**: the default preset navigates to `/actions` with no search params; any other
  *   preset or a valid custom range posts `POST /runs` and, once the run is created, navigates to
  *   `/actions?run=<id>`. While it computes, every control is disabled and a "Computing custom
- *   window" spinner shows beside the controls; afterwards focus returns to the control that
- *   started it.
- * - **Failure**: a warning banner states it ({@link createRunErrorMessage}) until the next
- *   choice clears it. It is a polite status message, never an alert.
+ *   window" spinner shows after the controls, beside them or, where the row has no room, below
+ *   them; afterwards focus returns to the control that started it.
+ * - **Failure to compute**: a warning banner states it ({@link createRunErrorMessage}) until the
+ *   next choice clears it.
+ * - **Failure to read the default run**: when `GET /runs/latest` fails with anything but "no
+ *   default run yet" ({@link isAwaitingFirstRun}), a "Could not read the latest default run"
+ *   warning gives the API's message and the date the presets end on meanwhile: the last
+ *   default run read, or else `run.window_end`.
+ * - **Failure to list custom runs**: when `GET /runs?kind=custom` fails, a "Could not load
+ *   recent custom windows" warning gives the API's message; runs an earlier read listed stay in
+ *   the select.
+ * - **Retrying**: each read's warning has a Retry button that reads it again. The button is
+ *   disabled while a run computes, and shows a spinner while its read runs, with the warning
+ *   kept in place ({@link useSettledError}); when the read fails again, focus returns to it, and
+ *   when the read succeeds the warning goes.
+ * - **Announcing**: every warning is a polite status message, never an alert, and the warnings
+ *   appear in the order above.
  * - **Reopening**: when succeeded custom runs exist, "Reopen a custom window" lists them newest
- *   first; choosing one navigates to it by id. The select is hidden while the list loads, when
- *   it fails and when it is empty.
+ *   first; choosing one navigates to it by id. The select is hidden while the list first loads,
+ *   when its first read fails, and when it holds no succeeded run.
  *
  * The component must render inside a TanStack `RouterProvider` and a `QueryClientProvider`, as
  * every `/actions` screen does.
@@ -244,14 +362,38 @@ export function WindowPicker({ run }: WindowPickerProps) {
   const [inputError, setInputError] = useState<string | null>(null);
   const pending = createRun.isPending;
 
-  // The control that started the computation: a preset button, Apply or a date field. Every
-  // control is disabled while the run computes, and a disabled control loses focus to the page
-  // body, so focus is returned to it once the controls are enabled again (WCAG 2.2 SC 2.4.3).
-  // Focus the user has moved elsewhere in the meantime is left alone, and a control that has
-  // left the page, after navigation to the created run for example, is skipped.
+  // The reads whose failure is stated in a warning with a Retry button, kept while they run
+  // again (useSettledError). A 404 `not_found` or 409 `run_not_ready` from GET /runs/latest is
+  // not a failure: it means no default run has succeeded yet, and the query polls by itself
+  // until one has.
+  const defaultRunError = useSettledError(
+    defaultRun.error,
+    defaultRun.isFetching,
+    defaultRun.data !== undefined,
+  );
+  const customRunsError = useSettledError(
+    customRuns.error,
+    customRuns.isFetching,
+    customRuns.data !== undefined,
+  );
+  const defaultRunFailed = defaultRunError !== null && !isAwaitingFirstRun(defaultRunError);
+  const customRunsFailed = customRunsError !== null;
+  // Busy while a run computes, or while a failed read runs again: that read's Retry button is
+  // then loading, hence disabled.
+  const busy =
+    pending ||
+    (defaultRunFailed && defaultRun.isFetching) ||
+    (customRunsFailed && customRuns.isFetching);
+
+  // The control that started the work: a preset button, Apply or a date field for a
+  // computation, or a Retry button. Every control is disabled while the run computes, and a
+  // Retry button while its read runs, and a disabled control loses focus to the page body, so
+  // focus is returned to it once the picker is no longer busy (WCAG 2.2 SC 2.4.3). Focus the
+  // user has moved elsewhere in the meantime is left alone, and a control that has left the
+  // page, after navigation to the created run or a successful retry for example, is skipped.
   const focusReturnRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
-    if (pending) {
+    if (busy) {
       return;
     }
     const target = focusReturnRef.current;
@@ -265,27 +407,41 @@ export function WindowPicker({ run }: WindowPickerProps) {
     ) {
       target.focus();
     }
-  }, [pending]);
+  }, [busy]);
 
   const windowConfig = config.data?.window;
   if (windowConfig === undefined) {
     if (config.isPending) {
-      return <Spinner label="Loading windows" />;
+      return (
+        <PickerFrame>
+          <Spinner label="Loading windows" />
+        </PickerFrame>
+      );
     }
     // Never fall back to presets of the client's own: without the configuration no window
     // length is known (AAP 0.5.5).
     return (
-      <Banner tone="warning" title="Window presets unavailable">
-        {config.error?.message ?? NO_WINDOW_CONFIG_MESSAGE}
-      </Banner>
+      <PickerFrame>
+        <Banner tone="warning" title="Window presets unavailable">
+          {config.error?.message ?? NO_WINDOW_CONFIG_MESSAGE}
+        </Banner>
+      </PickerFrame>
     );
   }
-  if (defaultRun.isPending) {
-    return <Spinner label="Loading windows" />;
+  // Only until the first answer: a read with no data is reported pending again each time it
+  // runs again (useSettledError), and the picker then stays on screen with its warning.
+  if (defaultRun.isPending && !defaultRun.isFetched) {
+    return (
+      <PickerFrame>
+        <Spinner label="Loading windows" />
+      </PickerFrame>
+    );
   }
 
-  // The default window end: the latest succeeded default run's last date. Before the first
-  // default run, or when it cannot be read, the run on screen ends the presets instead.
+  // The default window end: the latest succeeded default run's last date. When a later read of
+  // it fails, the last one read still ends the presets; before the first default run, or when
+  // it has never been read, the run on screen ends them instead. A failed read is stated in a
+  // warning below.
   const defaultEnd: IsoDate = defaultRun.data?.window_end ?? run.window_end;
 
   const value: DateRangeValue =
@@ -294,7 +450,8 @@ export function WindowPicker({ run }: WindowPickerProps) {
       : { kind: 'custom', start: run.window_start, end: run.window_end };
 
   // A run that has not succeeded cannot be shown (its page answers 409 `run_not_ready`), so
-  // only succeeded custom runs can be reopened. The API lists them newest first.
+  // only succeeded custom runs can be reopened. The API lists them newest first. Runs listed by
+  // an earlier read stay listed when a later read fails, which is stated in a warning below.
   const reopenable = (customRuns.data ?? []).filter((custom) => custom.status === 'succeeded');
   const reopenOptions: readonly SelectOption[] = [
     NO_CUSTOM_RUN,
@@ -318,12 +475,17 @@ export function WindowPicker({ run }: WindowPickerProps) {
     void navigate({ to: '/actions', search: { run: id } });
   };
 
-  /** Computes a custom-window run and opens it once created; `mutate` clears the last error. */
-  const compute = (body: CreateRunRequest) => {
-    setInputError(null);
+  /** Records the focused control as the one focus returns to once the picker is not busy. */
+  const rememberFocus = () => {
     const active = document.activeElement;
     focusReturnRef.current =
       active instanceof HTMLElement && active !== document.body ? active : null;
+  };
+
+  /** Computes a custom-window run and opens it once created; `mutate` clears the last error. */
+  const compute = (body: CreateRunRequest) => {
+    setInputError(null);
+    rememberFocus();
     createRun.mutate(body, {
       onSuccess: (created) => {
         openRun(created.id);
@@ -370,38 +532,102 @@ export function WindowPicker({ run }: WindowPickerProps) {
     openRun(found.id);
   };
 
+  /** Reads the latest default run again, from its warning's Retry button. */
+  const retryDefaultRun = () => {
+    rememberFocus();
+    void defaultRun.refetch();
+  };
+
+  /** Lists the recent custom runs again, from their warning's Retry button. */
+  const retryCustomRuns = () => {
+    rememberFocus();
+    void customRuns.refetch();
+  };
+
+  // In this order: the choice just made, then the reads the picker depends on.
+  const notices: ReactElement[] = [];
+  if (errorMessage !== null) {
+    notices.push(<Banner key="create-run" tone="warning" title={errorMessage} />);
+  }
+  if (defaultRunFailed) {
+    notices.push(
+      <Banner
+        key="default-run"
+        tone="warning"
+        title={DEFAULT_RUN_FAILED_TITLE}
+        actions={
+          <Button
+            size="sm"
+            aria-label="Retry reading the latest default run"
+            loading={defaultRun.isFetching}
+            disabled={pending}
+            onClick={retryDefaultRun}
+          >
+            {RETRY_LABEL}
+          </Button>
+        }
+      >
+        <Stack gap={1}>
+          <span>{readErrorMessage(defaultRunError)}</span>
+          <span>
+            {`Until the latest default run can be read, preset windows end on ${defaultEnd}.`}
+          </span>
+        </Stack>
+      </Banner>,
+    );
+  }
+  if (customRunsFailed) {
+    notices.push(
+      <Banner
+        key="custom-runs"
+        tone="warning"
+        title={CUSTOM_RUNS_FAILED_TITLE}
+        actions={
+          <Button
+            size="sm"
+            aria-label="Retry loading recent custom windows"
+            loading={customRuns.isFetching}
+            disabled={pending}
+            onClick={retryCustomRuns}
+          >
+            {RETRY_LABEL}
+          </Button>
+        }
+      >
+        {readErrorMessage(customRunsError)}
+      </Banner>,
+    );
+  }
+
   return (
-    // Top-aligned, so the picker's and the select's labels share a line and opening the custom
-    // range never moves the controls beside it. The spinner follows the controls, so showing it
-    // shifts nothing.
-    <Inline gap={4} align="start">
-      <DateRangePicker
-        label="Analysis window"
-        presets={windowConfig.presets}
-        defaultPreset={windowConfig.default_days}
-        value={value}
-        onSelectPreset={selectPreset}
-        onSelectCustom={selectCustom}
-        maxDate={defaultEnd}
-        maxDays={windowConfig.max_days}
-        disabled={pending}
-      />
-      {reopenable.length > 0 && (
-        <Select
-          label="Reopen a custom window"
-          options={reopenOptions}
-          value={reopenValue}
-          onChange={reopen}
+    <PickerFrame notices={notices}>
+      {/* Top-aligned, so the picker's and the select's labels share a line and opening the
+          custom range never moves the controls beside it. The spinner follows the controls, so
+          showing it never moves them; where the row has no room left for it, it wraps onto a
+          line below them for as long as the run computes. */}
+      <Inline gap={4} align="start">
+        <DateRangePicker
+          label="Analysis window"
+          presets={windowConfig.presets}
+          defaultPreset={windowConfig.default_days}
+          value={value}
+          onSelectPreset={selectPreset}
+          onSelectCustom={selectCustom}
+          maxDate={defaultEnd}
+          maxDays={windowConfig.max_days}
           disabled={pending}
         />
-      )}
-      {pending && <Spinner label="Computing custom window" />}
-      {/* Always rendered, so the live region exists before a message appears and the message
-          is announced politely (WCAG 2.2 SC 4.1.3); role="alert" is reserved for discrepancies
-          (AAP 0.5.5). Empty, it adds nothing visible to the row. */}
-      <div role="status">
-        {errorMessage !== null && <Banner tone="warning" title={errorMessage} />}
-      </div>
-    </Inline>
+        {reopenable.length > 0 && (
+          <Select
+            label="Reopen a custom window"
+            options={reopenOptions}
+            value={reopenValue}
+            onChange={reopen}
+            disabled={pending}
+          />
+        )}
+        {pending && <Spinner label="Computing custom window" />}
+      </Inline>
+    </PickerFrame>
   );
 }

@@ -2308,7 +2308,7 @@ async def load_context(
             "feedback_without_entity": entityless_feedback,
             "segment_windows": len(segment_windows),
         },
-        elapsed_ms=round((time.perf_counter() - started) * 1000),
+        duration_ms=round((time.perf_counter() - started) * 1000),
     )
     return context
 

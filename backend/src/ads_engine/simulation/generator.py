@@ -146,6 +146,7 @@ __all__ = [
     "HubSpotSpec",
     "LinkedInAccountRecord",
     "LinkedInAccountSpec",
+    "LinkedInCampaignDelivery",
     "LinkedInCampaignGroupRecord",
     "LinkedInCampaignGroupSpec",
     "LinkedInCampaignRecord",
@@ -369,6 +370,8 @@ FAULT_SURFACES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "posts",
             "ad_analytics",
             "ad_analytics_statistics",
+            "ad_analytics_campaign_delivery",
+            "ad_analytics_member_segments",
             "lead_forms",
             "lead_form_responses",
             "lead_form_responses_batch",
@@ -2822,6 +2825,19 @@ class LinkedInSegmentRecord:
     cost: Decimal | None
     leads: int | None
     website_conversions: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class LinkedInCampaignDelivery:
+    """One campaign's impressions over one exact requested range (``pivot=CAMPAIGN``, ``ALL``).
+
+    The totals :class:`LinkedInSegmentRecord` rows split by demographic value, so the segment
+    fallback's discovery call finds exactly the campaigns the statistics form reports on.
+    """
+
+    account_id: int
+    campaign_id: int
+    impressions: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -5493,6 +5509,43 @@ class _LinkedInModel:
                 result.append((value, portion, rest_leads * share / base))
         return result, segment.leads_available
 
+    def _campaign_totals(self, campaign_key: str, days: Sequence[date]) -> DayMetrics:
+        """A campaign's full-day creative metrics summed over ``days`` (``ALL`` granularity)."""
+        totals = _ZERO_DAY
+        for day in days:
+            for key in self.campaign_creatives[campaign_key]:
+                metrics = self.creative_full(key, day)
+                if not metrics.is_zero:
+                    totals = _plus(totals, metrics)
+        return totals
+
+    def campaign_delivery(
+        self, account_id: int, start: date, end: date
+    ) -> tuple[LinkedInCampaignDelivery, ...]:
+        """Impressions per delivering campaign of an account over the exact range, by id.
+
+        The totals are the ones :meth:`segment_records` splits, so a campaign is listed here
+        exactly when it has delivery the demographic rows are drawn from; a campaign without
+        impressions in the range is omitted, as LinkedIn omits entities with no activity.
+        """
+        days = self.core.days(start, end, None)
+        records: list[LinkedInCampaignDelivery] = []
+        for campaign_key, campaign in self.campaigns.items():
+            if campaign.account_id != account_id:
+                continue
+            totals = self._campaign_totals(campaign_key, days)
+            if totals.impressions == 0:
+                continue
+            records.append(
+                LinkedInCampaignDelivery(
+                    account_id=account_id,
+                    campaign_id=self.campaign_ids[campaign_key],
+                    impressions=totals.impressions,
+                )
+            )
+        records.sort(key=lambda record: record.campaign_id)
+        return tuple(records)
+
     def segment_records(
         self,
         account_id: int,
@@ -5512,12 +5565,7 @@ class _LinkedInModel:
                 wanted is not None and campaign_id not in wanted
             ):
                 continue
-            totals = _ZERO_DAY
-            for day in days:
-                for key in self.campaign_creatives[campaign_key]:
-                    metrics = self.creative_full(key, day)
-                    if not metrics.is_zero:
-                        totals = _plus(totals, metrics)
+            totals = self._campaign_totals(campaign_key, days)
             if totals.impressions == 0:
                 continue
             distribution, available = self._distribution(campaign_key, pivot)
@@ -7454,6 +7502,16 @@ class SimulatedWorld:
     ) -> tuple[LinkedInCreativeDay, ...]:
         """Daily creative analytics of an account over ``[start, end]`` (UTC dates)."""
         return self._require_linkedin().creative_days(self._account(account_id), start, end)
+
+    def linkedin_campaign_delivery(
+        self, account_id: int | str, start: date, end: date
+    ) -> tuple[LinkedInCampaignDelivery, ...]:
+        """Impressions per delivering campaign of an account for exactly ``[start, end]``.
+
+        The ``pivot=CAMPAIGN``, ``timeGranularity=ALL`` view the segment fallback's discovery
+        call reads; the totals are those :meth:`linkedin_segments` splits by value.
+        """
+        return self._require_linkedin().campaign_delivery(self._account(account_id), start, end)
 
     def linkedin_segments(
         self,

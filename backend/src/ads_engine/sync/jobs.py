@@ -18,10 +18,12 @@ Job                      What it reads and writes                               
 :class:`MetricsSyncJob`  Daily facts on each source's native dates: incremental      6 h
                          (trailing 3 days), restatement (Google 30, LinkedIn 14      03:00
                          days) or backfill (``BACKFILL_DAYS``, LinkedIn capped at
-                         180). Upserts overwrite, so restated data wins.
+                         180). Upserts overwrite, so restated data wins, and a
+                         complete re-fetch drops the rows it no longer returns.
 :class:`SegmentSyncJob`  LinkedIn demographic aggregates for each exact preset       04:00
                          window ending on the default window end; never summed from
-                         daily rows.
+                         daily rows. A complete re-fetch drops the values it no
+                         longer returns.
 :class:`LeadSyncJob`     LinkedIn lead responses since the last success minus 1 h;    3 h
                          test leads never stored, emails only as SHA-256; every lead
                          staged for matching. A lead with no stored ad account fails
@@ -35,16 +37,20 @@ Job                      What it reads and writes                               
 
 Shared plumbing (:class:`_JobBase`): one ``sync_run`` row per freshness dataset a job writes,
 inserted ``running`` at start (the scheduler's due check reads ``started_at``) and closed at
-finish; ``sync.job.start`` and ``sync.job.finish`` log events (source, job, dataset, rows,
-calls, completeness, duration; never an email, a secret or a token); the dataset's writability
-check (a dataset retired mid-job ends the job quietly as failed); and error hand-off. Only
-``ConnectorError`` subclasses are caught, and every one goes to
+finish, a row whose completion rolled back closed as failed (completions reach the job's
+bookkeeping only once committed); ``sync.job.start`` and exactly one ``sync.job.finish`` per
+run, also when it raises or is cancelled (source, job, dataset, rows, calls, completeness,
+duration; never an email, a secret or a token); the dataset's writability check (a dataset
+retired mid-job ends the job quietly as failed); and error hand-off. Only
+``ConnectorError`` subclasses are handed off, and every one goes to
 :meth:`~ads_engine.sync.mode.SourceModeController.on_error`, which alone decides what it means
 (AAP 0.3.3 fallback table). ``on_error`` is never called while a transaction of this module is
 open, because it takes the ``source_connection`` lock that a concurrent activation takes before
-the dataset guard this module holds. A job that succeeded for an **active** dataset queues one
-``analysis_request`` in the same transaction as its freshness write (AAP 0.3.2); a building
-dataset queues nothing, its activation does.
+the dataset guard this module holds. For an **active** dataset, every transaction that records
+a success queues one ``analysis_request`` with its freshness write, so the job's last write is
+always followed by a pending request (AAP 0.3.2; the worker coalesces requests within 60 s),
+and a stand-alone matching pass that attempted rows queues one after it; a building dataset
+queues nothing, its activation does.
 
 Interruptions. Connectors return what they read when a ``TransientError`` survives their
 retries. A Google call-budget deferral is recorded as an ``incomplete`` success whose reason
@@ -55,7 +61,9 @@ stale (AAP 0.3.3 transient row). An interrupted full-state entity read is ``inco
 its reason: no removal or disappearance is inferred from it (AAP 0.3.3 "Safe absence").
 
 Entry points: :func:`run_source_jobs` (the scheduler's due jobs and ``sync_request`` rows, and
-``ads-engine sync``) and :func:`backfill_dataset` (the build in ``sync/mode.py``). Tests and
+``ads-engine sync``), :func:`backfill_dataset` (the build in ``sync/mode.py``) and
+:func:`refresh_crm_dataset` (a live LinkedIn build's CRM sync of the HubSpot primary its
+leads were matched in after its backfill, also in ``sync/mode.py``). Tests and
 tools can run one job directly on injected clients through :meth:`JobContext.for_dataset`::
 
     async with controller.open_clients("google", "simulated") as clients:
@@ -65,6 +73,7 @@ tools can run one job directly on injected clients through :meth:`JobContext.for
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from abc import ABC, abstractmethod
@@ -76,10 +85,24 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import (
+    ARRAY,
+    BigInteger,
+    ColumnElement,
+    any_,
+    column,
+    delete,
+    event,
+    exists,
+    literal,
+    select,
+    update,
+)
+from sqlalchemy import values as sql_values
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import InstrumentedAttribute, Session, SessionTransaction
 
 from ads_engine.analysis.runner import window_inputs
 from ads_engine.analysis.thresholds import CrmBindings, Thresholds
@@ -136,6 +159,7 @@ from ads_engine.connectors.linkedin.parser import (
     PREFIX_ACCOUNT,
     PREFIX_CAMPAIGN,
     PREFIX_CAMPAIGN_GROUP,
+    SEGMENT_FACETS,
     SEGMENT_PIVOTS,
     CreativeDailyRow,
     CreativeRow,
@@ -222,6 +246,7 @@ __all__ = [
     "backfill_dataset",
     "default_window_end",
     "parse_segment_reason",
+    "refresh_crm_dataset",
     "run_source_jobs",
     "segment_reason",
     "segments_due",
@@ -323,6 +348,9 @@ _REMOVED_RAW_STATUS: Final = "REMOVED"
 _UTC_ZONE: Final = "UTC"
 _ID_CHUNK: Final = 1_000
 _ERROR_MAX: Final = 500
+# The ``sync_run.error`` of rows a run left open when it raised or was cancelled.
+_REASON_UNEXPECTED: Final = "job failed unexpectedly"
+_REASON_CANCELLED: Final = "job cancelled"
 
 # HubSpot API object types (plural, as paths name them) and the singular names stored.
 _CONTACTS: Final = "contacts"
@@ -864,7 +892,6 @@ class _JobBase(ABC):
         self._calls = 0
         self._runs: dict[str | None, list[int]] = {}
         self._closed: set[str | None] = set()
-        self._enqueued = False
         self._disposition: ErrorDisposition | None = None
         self._error: str | None = None
 
@@ -887,14 +914,22 @@ class _JobBase(ABC):
     async def run(self) -> JobResult:
         """Run the job once and return what it did.
 
+        Every run logs one ``sync.job.start`` and exactly one ``sync.job.finish``, whether it
+        returns, raises or is cancelled (:meth:`_result`).
+
         Returns:
             The result. A ``ConnectorError`` the connectors raise is handed to ``on_error``
             and returned as a failed result with its disposition; a dataset retired while
             the job ran ends it as failed with that reason.
 
         Raises:
-            Any non-connector error (a database error, a bug) after the job's ``sync_run``
-            rows were marked failed; the scheduler logs it and the next slot retries.
+            Exception: Any non-connector error (a database error, a bug), unchanged, after
+                the job's still-open ``sync_run`` rows were closed as failed (best effort)
+                and ``sync.job.finish`` was logged ``failed`` with the error's class name;
+                the scheduler logs its traceback and the next slot retries.
+            asyncio.CancelledError: When the run is cancelled (the worker's graceful
+                shutdown), after the still-open rows were closed as failed, ``job
+                cancelled`` (best effort), and ``sync.job.finish`` was logged ``cancelled``.
         """
         ctx = self.ctx
         started = time.perf_counter()
@@ -906,7 +941,31 @@ class _JobBase(ABC):
             mode=ctx.mode,
             role=ctx.role,
             active=ctx.active,
+            rows=0,
+            calls=0,
+            duration_ms=0,
         )
+        try:
+            await self._attempt()
+        except (Exception, asyncio.CancelledError) as exc:
+            reason = (
+                _REASON_CANCELLED if isinstance(exc, asyncio.CancelledError) else _REASON_UNEXPECTED
+            )
+            try:
+                await self._close_remaining(reason, quiet=True)
+            finally:
+                # Logged even when the cleanup is itself cancelled or fails.
+                self._result(started, raised=exc)
+            raise
+        return self._result(started)
+
+    async def _attempt(self) -> None:
+        """Open the ``sync_run`` rows, execute, and settle what the run may return (:meth:`run`).
+
+        A ``ConnectorError`` is handed to ``on_error`` and a retired dataset ends the job;
+        both close the rows here. Anything else propagates to :meth:`run`.
+        """
+        ctx = self.ctx
         try:
             await self._open_runs(self.freshness_datasets())
             await self._execute()
@@ -918,34 +977,49 @@ class _JobBase(ABC):
             text = _failure_text(exc)
             self._error = text
             failures = {name: FreshnessOutcome.failure(ctx.now, reason=text) for name in pending}
-            for name, outcome in failures.items():
-                self._failed[name] = text
-                self._freshness[name] = outcome
             if self._disposition != "stale":
                 # ``on_error`` records a transient's failure on the named rows itself; a
                 # defect or a denial is recorded here, so ``last_attempt_at`` moves on every
                 # attempt (AAP 0.5.2) and a due check backing off from a failed attempt
                 # (``segments_due``) sees it.
                 await self._record_failures(failures)
+            # Published once recorded, as completions are once committed.
+            for name, outcome in failures.items():
+                self._failed[name] = text
+                self._freshness[name] = outcome
             await self._close_remaining(text)
         except repositories.DatasetNotWritable as exc:
             # Retired (or discarded) while the job ran: its rows are read-only history now.
             self._error = str(exc)
             _log.info("sync.job.not_writable", source=ctx.source, job=self.job, reason=self._error)
             await self._close_remaining(self._error)
-        except Exception:
-            await self._close_remaining("job failed unexpectedly", quiet=True)
-            raise
         else:
             await self._report_interruptions()
             await self._close_remaining(None)
-        return self._result(started)
 
-    def _result(self, started: float) -> JobResult:
-        """Build the result and log ``sync.job.finish``."""
+    def _result(self, started: float, *, raised: BaseException | None = None) -> JobResult:
+        """Build the result and log the run's one ``sync.job.finish``.
+
+        Every path of :meth:`run` ends here exactly once, so the event has one shape: source,
+        job, dataset, status, rows, calls, completeness, the outcome per freshness dataset,
+        disposition, duration and error. Outcomes are those committed (or, for a failure,
+        recorded); the event carries counts, names and an exception's class, never an email,
+        a secret, a token or an exception's text.
+
+        Args:
+            started: ``time.perf_counter()`` when the run started.
+            raised: The exception :meth:`run` re-raises after this, if any: the status logged
+                is ``cancelled`` for a cancellation and ``failed`` otherwise, and ``error``
+                is its class name (``None`` when the run returns).
+
+        Returns:
+            The result :meth:`run` returns; discarded when ``raised`` is given.
+        """
         ctx = self.ctx
         status: Literal["succeeded", "failed"] = (
-            "failed" if self._error is not None or self._failed else "succeeded"
+            "failed"
+            if raised is not None or self._error is not None or self._failed
+            else "succeeded"
         )
         result = JobResult(
             job=self.job,
@@ -965,13 +1039,14 @@ class _JobBase(ABC):
             source=ctx.source,
             job=self.job,
             dataset_id=ctx.dataset_id,
-            status=status,
+            status="cancelled" if isinstance(raised, asyncio.CancelledError) else status,
             rows=result.rows,
             calls=result.calls,
             completeness=result.completeness,
             datasets={name: outcome.completeness for name, outcome in self._freshness.items()},
             disposition=result.disposition,
             duration_ms=result.duration_ms,
+            error=None if raised is None else type(raised).__name__,
         )
         return result
 
@@ -1005,9 +1080,17 @@ class _JobBase(ABC):
     ) -> None:
         """Record freshness outcomes in the transaction that wrote their data.
 
-        Closes the outcomes' ``sync_run`` rows and, the first time a success is recorded for
-        an active dataset, queues the job's ``analysis_request`` in the same transaction
-        (AAP 0.3.2 "a completed entity, metrics, segment, lead or CRM sync").
+        Closes the outcomes' ``sync_run`` rows and, when at least one outcome is a success,
+        queues an ``analysis_request`` in the same transaction (:meth:`_queue_analysis`; AAP
+        0.3.2 "a completed entity, metrics, segment, lead or CRM sync"). Every such
+        transaction queues its own request, so data a later transaction of the job writes is
+        never left behind by a run that served an earlier request; the worker coalesces the
+        requests that arrive within 60 s into one run.
+
+        The job's own bookkeeping learns of the completion only when the transaction commits
+        (:meth:`_publish_on_commit`): a completion rolled back by a later failure of its
+        transaction is neither reported nor logged, and its ``sync_run`` rows stay open, so
+        :meth:`run` closes them as failed in a fresh transaction.
 
         Raises:
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
@@ -1016,48 +1099,97 @@ class _JobBase(ABC):
         dataset = await repositories.ensure_writable(session, ctx.dataset_id)
         for name, outcome in outcomes.items():
             await freshness.record_freshness(session, ctx.dataset_id, name, outcome)
-            self._freshness[name] = outcome
+        closed: list[str | None] = []
         for name, outcome in outcomes.items():
-            await self._close(
+            if await self._close(
                 session,
                 name,
                 status="succeeded" if outcome.succeeded else "failed",
                 completeness=outcome.completeness,
                 error=None if outcome.succeeded else outcome.reason,
-            )
-        succeeded = any(outcome.succeeded for outcome in outcomes.values())
-        if succeeded and not self._enqueued and ctx.active and dataset.state == "active":
+            ):
+                closed.append(name)
+        if any(outcome.succeeded for outcome in outcomes.values()):
+            await self._queue_analysis(session, dataset)
+        self._publish_on_commit(session, outcomes, closed)
+
+    def _publish_on_commit(
+        self,
+        session: AsyncSession,
+        outcomes: Mapping[str, FreshnessOutcome],
+        closed: Sequence[str | None],
+    ) -> None:
+        """Publish a completion to the job's bookkeeping once ``session``'s transaction commits.
+
+        The outcomes join the ones :meth:`run` reports and logs, and the closed datasets the
+        ones :meth:`_close_remaining` skips, only after the commit. A rollback of the
+        transaction (a failed statement after the completion, a failed enqueue or commit)
+        discards them, and a later transaction of the same session never publishes them. A
+        savepoint released inside the transaction is not its commit.
+
+        Args:
+            session: The transaction the completion was written in.
+            outcomes: The freshness outcomes it recorded.
+            closed: The datasets whose ``sync_run`` rows it closed.
+        """
+        published = dict(outcomes)
+        names = tuple(closed)
+        settled = False
+
+        def on_commit(committed: Session) -> None:
+            nonlocal settled
+            if settled or committed.in_nested_transaction():
+                return
+            settled = True
+            self._freshness.update(published)
+            self._closed.update(names)
+
+        def on_rollback(_session: Session, previous: SessionTransaction) -> None:
+            nonlocal settled
+            if previous.parent is None:
+                settled = True
+
+        # Listeners cannot be removed while their event is dispatched; ``settled`` makes the
+        # pair one-shot, and they go with the session.
+        event.listen(session.sync_session, "after_commit", on_commit)
+        event.listen(session.sync_session, "after_soft_rollback", on_rollback)
+
+    async def _queue_analysis(self, session: AsyncSession, dataset: SourceDataset) -> None:
+        """Queue the job's default-window ``analysis_request`` in ``session``'s transaction.
+
+        Only an active context writing a dataset that is still ``active`` queues one: a
+        building dataset queues nothing, its activation does (AAP 0.3.2).
+
+        Args:
+            session: The transaction to queue it in: the one writing the change it reports,
+                or, after a matching pass whose batches committed on their own, one of its own.
+            dataset: The job's dataset, as :func:`repositories.ensure_writable` locked it in
+                this transaction.
+        """
+        if self.ctx.active and dataset.state == "active":
             await repositories.enqueue_analysis_request(
-                session, reason=f"sync:{ctx.source}.{self.job}"
+                session, reason=f"sync:{self.ctx.source}.{self.job}"
             )
-            self._enqueued = True
 
     async def _hand_over(self, error: ConnectorError, datasets: Sequence[str]) -> ErrorDisposition:
         """Hand one connector error to ``on_error``; no transaction of this job is open.
 
         An error of another source (LinkedIn during a CRM job's matching) is that source's
-        error, reported without this job's dataset.
+        error, reported without this job's dataset. ``on_error`` logs the error's one record,
+        ``sync.classification``, with its reason, disposition and this job's name; the job's
+        outcome is reported by ``sync.job.finish``.
         """
         ctx = self.ctx
         error_source = _as_source(error.source) if error.source in SOURCES else ctx.source
         if error_source == ctx.source:
-            disposition = await ctx.controller.on_error(
-                error_source, error, dataset_id=ctx.dataset_id, datasets=tuple(datasets)
+            return await ctx.controller.on_error(
+                error_source,
+                error,
+                dataset_id=ctx.dataset_id,
+                datasets=tuple(datasets),
+                job=self.job,
             )
-        else:
-            disposition = await ctx.controller.on_error(error_source, error)
-        # ``log_fields`` carries the error's own ``source``; it is logged as ``error_source``
-        # so the job's source keeps its key.
-        fields: dict[str, object] = {
-            **error.log_fields,
-            "source": ctx.source,
-            "error_source": error.source,
-            "job": self.job,
-            "dataset_id": ctx.dataset_id,
-            "disposition": disposition,
-        }
-        _log.warning("sync.job.connector_error", **fields)
-        return disposition
+        return await ctx.controller.on_error(error_source, error, job=self.job)
 
     async def _record_failures(self, outcomes: Mapping[str, FreshnessOutcome]) -> None:
         """Record failed attempts on their freshness rows, in a transaction of their own.
@@ -1121,15 +1253,22 @@ class _JobBase(ABC):
         status: Literal["succeeded", "failed"],
         completeness: str | None,
         error: str | None,
-    ) -> None:
-        """Close one dataset's ``sync_run`` rows in ``session``."""
+    ) -> bool:
+        """Close one dataset's still-``running`` ``sync_run`` rows in ``session``.
+
+        Only the UPDATE is issued: the caller marks the dataset closed once its transaction
+        commits. A row a committed transaction already closed is never overwritten.
+
+        Returns:
+            Whether the dataset had rows of this job left to close.
+        """
         ids = self._runs.get(name)
         if not ids or name in self._closed:
-            return
+            return False
         rows = self._total_rows if name is None else self._rows.get(name, 0)
         await session.execute(
             update(SyncRun)
-            .where(SyncRun.id.in_(ids))
+            .where(SyncRun.id.in_(ids), SyncRun.status == "running")
             .values(
                 finished_at=self.ctx.controller.now(),
                 status=status,
@@ -1138,10 +1277,15 @@ class _JobBase(ABC):
                 error=None if error is None else _truncate(error),
             )
         )
-        self._closed.add(name)
+        return True
 
     async def _close_remaining(self, error: str | None, *, quiet: bool = False) -> None:
         """Close every still-open ``sync_run`` row: failed datasets failed, the rest by ``error``.
+
+        Open rows include those of a completion whose transaction rolled back, so a raised
+        run leaves no ``running`` row. They are closed in a transaction of their own and
+        count as closed once it commits; rows a committed completion closed stay as it
+        closed them.
 
         Args:
             error: The job's error, or ``None`` when it finished normally.
@@ -1171,6 +1315,7 @@ class _JobBase(ABC):
                         completeness=None if failed else "complete",
                         error=reason if reason is not None else error,
                     )
+            self._closed.update(open_names)
 
         if not quiet:
             await close_all()
@@ -1204,22 +1349,42 @@ async def _insert_missing(
 
     ``INSERT ... ON CONFLICT (<natural key>) DO NOTHING``: a stub must never overwrite an
     entity an entity sync stored (``upsert_entities`` would). Provenance comes from the
-    dataset, as for every repository write.
+    dataset, as for every repository write. Nothing is committed: the rows and the dataset
+    guard belong to the caller's transaction.
+
+    The rows go to one ORM bulk insert as an executemany of one parameter set per row, the
+    way the repository upserts write, never as a single multi-row ``VALUES`` statement.
+    The driver therefore binds one row's columns per statement (psycopg's pipelined
+    ``executemany``, or insertmanyvalues pages under SQLAlchemy's parameter cap), so a batch
+    of any size stays under PostgreSQL's 65,535 bind parameters per statement: thousands of
+    campaigns referenced by facts or leads before any entity sync stored them still ingest.
+    Rows are sent in ascending natural-key order whatever the caller's order, so concurrent
+    writers of overlapping keys take their unique-index locks in one order and queue instead
+    of deadlocking.
 
     Returns:
         The number of rows requested.
 
     Raises:
         repositories.DatasetNotWritable: If the dataset is missing or retired.
+        repositories.NaturalKeyError: If a row lacks a natural-key value or carries ``None``
+            for one, before any row is inserted.
     """
     if not rows:
         return 0
     dataset = await repositories.ensure_writable(session, dataset_id)
-    values = [{**row, "dataset_id": dataset_id, "source": dataset.source} for row in rows]
+    stubs = [{**row, "dataset_id": dataset_id, "source": dataset.source} for row in rows]
+    for position, stub in enumerate(stubs):
+        absent = [name for name in natural_key if stub.get(name) is None]
+        if absent:
+            raise repositories.NaturalKeyError(
+                f"{model.__name__} row {position} lacks natural-key values {absent}"
+            )
+    stubs.sort(key=lambda stub: tuple(stub[name] for name in natural_key))
     await session.execute(
-        insert(model).values(values).on_conflict_do_nothing(index_elements=list(natural_key))
+        insert(model).on_conflict_do_nothing(index_elements=list(natural_key)), stubs
     )
-    return len(values)
+    return len(stubs)
 
 
 async def _lock_subjects(session: AsyncSession, dataset_id: int) -> SourceDataset:
@@ -1355,11 +1520,15 @@ async def _store_form_versions(
     Each map is keyed by its canonical form URN and the version parsed from a response's
     ``versionedLeadGenFormUrn`` (or a form's current ``versionId``). A form not stored yet
     gets a stand-in ``lead_form`` row (its URN only; the next entity sync fills its name). A
-    new version gets ``first_seen_at = now``; a known version keeps its first sighting and
-    only its email question ids are rewritten.
+    new version gets ``first_seen_at = now``; a known version keeps its first sighting, and
+    its email question ids are rewritten only when they differ from the stored list (order
+    included, as it is the preference order). The stored versions of the maps' forms are
+    read in one query per :data:`_ID_CHUNK` forms and the changed ones rewritten in one
+    statement per :data:`_ID_CHUNK` rows, never one statement per version.
 
     Returns:
-        The number of version rows written.
+        The number of version rows written: new versions plus known versions whose email
+        question ids changed. An unchanged known version is not written.
     """
     distinct: dict[tuple[str, int], FormVersionMap] = {}
     for version_map in maps:
@@ -1377,40 +1546,72 @@ async def _store_form_versions(
             dataset_id,
         )
         forms = await _lead_form_ids(session, dataset_id)
-    existing = await repositories.entity_id_map(session, LeadFormVersion, dataset_id)
+    # (lead_form_id, version) -> (id, stored email question ids), for the maps' forms only.
+    stored: dict[tuple[int, int], tuple[int, list[str]]] = {}
+    for form_chunk in _chunks(sorted({forms[urn] for urn, _ in distinct})):
+        result = await session.execute(
+            select(
+                LeadFormVersion.id,
+                LeadFormVersion.lead_form_id,
+                LeadFormVersion.version,
+                LeadFormVersion.email_question_ids,
+            ).where(
+                LeadFormVersion.dataset_id == dataset_id,
+                LeadFormVersion.lead_form_id.in_(form_chunk),
+            )
+        )
+        for version_id, form_id, version, question_ids in result:
+            stored[(form_id, version)] = (version_id, list(question_ids))
     new_rows: list[dict[str, Any]] = []
-    known: list[tuple[int, list[str]]] = []
+    changed: list[tuple[int, list[str]]] = []
     for (urn, version), version_map in sorted(distinct.items()):
         form_id = forms[urn]
-        version_id = existing.get((form_id, version))
-        if version_id is None:
+        question_ids = version_map.stored_email_question_ids
+        known = stored.get((form_id, version))
+        if known is None:
             new_rows.append(
                 {
                     "lead_form_id": form_id,
                     "version": version,
-                    "email_question_ids": version_map.stored_email_question_ids,
+                    "email_question_ids": question_ids,
                     "first_seen_at": now,
                 }
             )
-        else:
-            known.append((version_id, list(version_map.stored_email_question_ids)))
+        elif known[1] != question_ids:
+            changed.append((known[0], question_ids))
     # PostgreSQL checks NOT NULL on the proposed tuple before ON CONFLICT arbitration, so a
     # known version cannot go through the upsert without ``first_seen_at``; supplying it
-    # would overwrite the first sighting. Known versions therefore rewrite only their email
-    # question ids, in id order (the order every writer of these rows locks them in).
+    # would overwrite the first sighting. Changed known versions therefore rewrite only their
+    # email question ids, one ``UPDATE ... FROM (VALUES ...)`` per chunk. A join locks rows
+    # in its plan's order, so each chunk's rows are first locked ``FOR NO KEY UPDATE`` in id
+    # order (the order every writer of these rows locks them in); the UPDATE re-locks them.
     await repositories.upsert_entities(session, LeadFormVersion, new_rows, dataset_id)
-    if known:
+    if changed:
         await repositories.ensure_writable(session, dataset_id)
-        for version_id, question_ids in sorted(known):
+        for chunk in _chunks(sorted(changed)):
+            await session.execute(
+                select(LeadFormVersion.id)
+                .where(
+                    LeadFormVersion.id.in_([version_id for version_id, _ in chunk]),
+                    LeadFormVersion.dataset_id == dataset_id,
+                )
+                .order_by(LeadFormVersion.id)
+                .with_for_update(key_share=True)
+            )
+            rewritten = sql_values(
+                column("id", LeadFormVersion.id.type),
+                column("email_question_ids", LeadFormVersion.email_question_ids.type),
+                name="rewritten",
+            ).data(list(chunk))
             await session.execute(
                 update(LeadFormVersion)
                 .where(
-                    LeadFormVersion.id == version_id,
+                    LeadFormVersion.id == rewritten.c.id,
                     LeadFormVersion.dataset_id == dataset_id,
                 )
-                .values(email_question_ids=question_ids)
+                .values(email_question_ids=rewritten.c.email_question_ids)
             )
-    return len(new_rows) + len(known)
+    return len(new_rows) + len(changed)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2276,6 +2477,96 @@ def _fetch_reason(outcome: FetchOutcome) -> str | None:
     return None if outcome.complete else (outcome.reason or "result limit reached")
 
 
+# The fact tables whose fetch scopes :func:`_remove_absent` reconciles.
+type _ReconciledFact = (
+    FactCampaignDaily
+    | FactCreativeDaily
+    | FactKeywordDaily
+    | FactSearchTermDaily
+    | FactSegmentWindow
+)
+
+
+def _proven_complete(fetch: FetchOutcome | Listing[Any]) -> bool:
+    """Whether a fetch read its whole scope: complete, and not interrupted.
+
+    Only such a fetch shows that a stored key it did not return is no longer reported. A
+    deferred, interrupted or capped read says nothing about what it did not reach, so its
+    rows are only upserted and the last good data stands (AAP 0.3.3 "Budget", transient row).
+    """
+    return fetch.complete and fetch.interrupted_by is None
+
+
+def _any_id(attribute: InstrumentedAttribute[int], ids: Iterable[int]) -> ColumnElement[bool]:
+    """``attribute = ANY(:ids)``: one array parameter however many ids, never one bind per id."""
+    clause: ColumnElement[bool] = attribute == any_(literal(sorted(ids), ARRAY(BigInteger())))
+    return clause
+
+
+async def _remove_absent(
+    session: AsyncSession,
+    model: type[_ReconciledFact],
+    dataset_id: int,
+    *,
+    scope: Sequence[ColumnElement[bool]],
+    key: Sequence[InstrumentedAttribute[Any]],
+    returned: set[tuple[Any, ...]],
+    guarded: bool,
+    event: str,
+    fields: Mapping[str, object],
+) -> int:
+    """Delete the stored facts of one proven-complete fetch scope that the fetch did not return.
+
+    AAP 0.1.1 ("Restated platform data overwrites earlier values") and 0.3.2 (daily facts are
+    restated; segment rows belong to their exact window). Once a :func:`_proven_complete`
+    re-fetch of a scope is upserted, a stored row inside that scope whose natural key the
+    fetch no longer returned holds values the platform has withdrawn, so it is removed in the
+    same transaction as the upsert, and the scope then holds exactly what the platform
+    reports for it, nothing at all after an empty complete answer. Rows outside ``scope``
+    (other days, windows, facets, accounts or datasets) are neither read nor touched, and the
+    run tables are never involved: their evidence is denormalised ``jsonb``.
+
+    The scope's ``(id, key)`` pairs are read with a fixed number of bind parameters (id sets
+    travel as one array, :func:`_any_id`), diffed against ``returned`` here, and the obsolete
+    rows deleted by id in ascending order, at most :data:`_ID_CHUNK` per statement, so a
+    reconcile of any size stays under PostgreSQL's bind-parameter limit. Running the same
+    fetch again removes nothing more.
+
+    Args:
+        session: The open transaction that upserted the fetch's rows.
+        model: The fact table.
+        dataset_id: The dataset written; every read and delete is limited to it.
+        scope: The conditions, besides ``dataset_id``, that select exactly the fetched scope.
+        key: The natural-key columns that vary inside the scope, in the order of ``returned``.
+        returned: The keys of the returned rows that resolve to stored entities.
+        guarded: Whether the transaction already holds the dataset guard (an upsert or a stub
+            insert in it wrote rows); when not, :func:`repositories.ensure_writable` takes it.
+        event: The log event that reports a removal.
+        fields: The context logged with it (source, query id or facet, scope).
+
+    Returns:
+        The number of rows removed.
+
+    Raises:
+        repositories.DatasetNotWritable: If the dataset is missing or retired.
+    """
+    if not guarded:
+        await repositories.ensure_writable(session, dataset_id)
+    result = await session.execute(
+        select(model.id, *key).where(model.dataset_id == dataset_id, *scope)
+    )
+    obsolete = sorted(int(row[0]) for row in result if tuple(row[1:]) not in returned)
+    for chunk in _chunks(obsolete):
+        await session.execute(
+            delete(model)
+            .where(model.dataset_id == dataset_id, model.id.in_(chunk))
+            .execution_options(synchronize_session=False)
+        )
+    if obsolete:
+        _log.info(event, dataset_id=dataset_id, rows=len(obsolete), **fields)
+    return len(obsolete)
+
+
 class MetricsSyncJob(_JobBase):
     """Daily facts of one Google or LinkedIn dataset over a native date range.
 
@@ -2285,16 +2576,27 @@ class MetricsSyncJob(_JobBase):
     Every upsert overwrites the stored day and stamps ``fetched_at``, so a restatement
     replaces earlier values and a re-run changes no row count.
 
+    Restatement also withdraws rows (AAP 0.1.1, 0.3.2). When a fetch is
+    :func:`_proven_complete`, the rows stored inside its scope whose key it no longer
+    returned are deleted in the transaction that upserts it (:func:`_remove_absent`), an
+    empty answer included, so the scope holds exactly what the platform now reports. An
+    incomplete, deferred or interrupted fetch only upserts, and every other stored row stands
+    ("last good data is kept", AAP 0.3.3).
+
     * **Google**: Q-G3 to ``fact_campaign_daily`` and Q-G5 to ``fact_keyword_daily``
       (``google.metrics_daily``), Q-G6 to ``fact_search_term_daily``
       (``google.search_terms``), each query committed on its own. A campaign or ad group no
       entity sync stored (removed before tracking) gets a stand-in so its spend counts; a
       keyword row of an unknown keyword is skipped and counted (campaign spend is covered
-      by Q-G3, and K3 reviews current keywords only).
+      by Q-G3, and K3 reviews current keywords only). A query's reconcile scope is the
+      dataset (one customer) over the native ``[start, end]`` that query fetched, stand-in
+      campaigns included.
     * **LinkedIn**: per account, daily creative analytics to ``fact_creative_daily``
       (``linkedin.analytics_daily``); ``conversions`` and ``conversions_value`` stay
       ``NULL`` (LinkedIn reports leads and website conversions instead). Rows of creatives
-      the dataset does not know are counted and make the dataset ``incomplete``.
+      the dataset does not know are counted and make the dataset ``incomplete``. An
+      account's reconcile scope is the creatives of its campaigns over the fetched
+      ``[start, end]``. The creatives are read once per job, not once per account.
 
     Args of the constructor: ``kind`` selects the range (:func:`_metrics_range`); a
     ``restatement`` run records ``sync_run`` rows under :data:`JOB_RESTATEMENT`, a
@@ -2369,18 +2671,18 @@ class MetricsSyncJob(_JobBase):
         calls_before = client.calls_made
         daily = await fetcher.partitioned_fetch("Q-G3", scope)
         self._calls += client.calls_made - calls_before
-        await self._store_campaign_daily(daily, account_id)
+        await self._store_campaign_daily(daily, account_id, (start, end))
         calls_before = client.calls_made
         keyword_view = await fetcher.partitioned_fetch("Q-G5", scope)
         self._calls += client.calls_made - calls_before
-        await self._store_keyword_daily(keyword_view)
+        await self._store_keyword_daily(keyword_view, (start, end))
         await self._record_google("google.metrics_daily", (start, end), (daily, keyword_view))
 
         start, end = ranges["google.search_terms"]
         calls_before = client.calls_made
         terms = await fetcher.partitioned_fetch("Q-G6", {_SCOPE_START: start, _SCOPE_END: end})
         self._calls += client.calls_made - calls_before
-        await self._store_search_terms(terms, account_id)
+        await self._store_search_terms(terms, account_id, (start, end))
         await self._record_google("google.search_terms", (start, end), (terms,))
 
     async def _record_google(
@@ -2417,11 +2719,19 @@ class MetricsSyncJob(_JobBase):
         if deferral is not None:
             self._interrupted(deferral, dataset=None)
 
-    async def _store_campaign_daily(self, outcome: FetchOutcome, account_id: int | None) -> None:
-        """Upsert Q-G3 rows into ``fact_campaign_daily``, stubbing unknown campaigns."""
+    async def _store_campaign_daily(
+        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date]
+    ) -> None:
+        """Store Q-G3 over ``covered`` in ``fact_campaign_daily``, stubbing unknown campaigns.
+
+        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
+        dated inside ``covered`` whose (campaign, day) it did not return are deleted in the
+        same transaction (:func:`_remove_absent`), also when it returned no row at all.
+        """
         ctx = self.ctx
         rows = [parse_campaign_daily(row) for row in outcome.rows]
-        if not rows:
+        reconcile = _proven_complete(outcome)
+        if not rows and not reconcile:
             return
         async with ctx.sessionmaker() as session, session.begin():
             campaigns = await _campaign_ids(session, ctx.dataset_id)
@@ -2446,6 +2756,18 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactCampaignDaily, facts, ctx.dataset_id, session=session
             )
+            if reconcile:
+                await _remove_absent(
+                    session,
+                    FactCampaignDaily,
+                    ctx.dataset_id,
+                    scope=(FactCampaignDaily.date.between(*covered),),
+                    key=(FactCampaignDaily.campaign_id, FactCampaignDaily.date),
+                    returned={(fact["campaign_id"], fact["date"]) for fact in facts},
+                    guarded=bool(facts),
+                    event="sync.metrics.rows_removed",
+                    fields={"source": "google", "query_id": "Q-G3"},
+                )
         self._count("google.metrics_daily", written)
         if len(facts) < len(rows):
             _log.warning(
@@ -2456,11 +2778,17 @@ class MetricsSyncJob(_JobBase):
                 reason="no Google account stored to attach stand-in campaigns to",
             )
 
-    async def _store_keyword_daily(self, outcome: FetchOutcome) -> None:
-        """Upsert Q-G5 rows into ``fact_keyword_daily``; rows of unknown keywords are skipped."""
+    async def _store_keyword_daily(self, outcome: FetchOutcome, covered: tuple[date, date]) -> None:
+        """Store Q-G5 over ``covered`` in ``fact_keyword_daily``; unknown keywords are skipped.
+
+        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
+        dated inside ``covered`` whose (keyword, day) it did not return are deleted in the
+        same transaction (:func:`_remove_absent`), also when it returned no row at all.
+        """
         ctx = self.ctx
         rows = [parse_keyword_view(row) for row in outcome.rows]
-        if not rows:
+        reconcile = _proven_complete(outcome)
+        if not rows and not reconcile:
             return
         async with ctx.sessionmaker() as session, session.begin():
             groups = _by_last_key(
@@ -2495,6 +2823,18 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactKeywordDaily, facts, ctx.dataset_id, session=session
             )
+            if reconcile:
+                await _remove_absent(
+                    session,
+                    FactKeywordDaily,
+                    ctx.dataset_id,
+                    scope=(FactKeywordDaily.date.between(*covered),),
+                    key=(FactKeywordDaily.keyword_id, FactKeywordDaily.date),
+                    returned={(fact["keyword_id"], fact["date"]) for fact in facts},
+                    guarded=bool(facts),
+                    event="sync.metrics.rows_removed",
+                    fields={"source": "google", "query_id": "Q-G5"},
+                )
         self._count("google.metrics_daily", written)
         if len(facts) < len(rows):
             # Campaign spend is complete through Q-G3; K3 reviews current keywords only.
@@ -2506,11 +2846,21 @@ class MetricsSyncJob(_JobBase):
                 reason="keyword not in the current keyword list",
             )
 
-    async def _store_search_terms(self, outcome: FetchOutcome, account_id: int | None) -> None:
-        """Upsert Q-G6 rows into ``fact_search_term_daily``, stubbing unknown parents."""
+    async def _store_search_terms(
+        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date]
+    ) -> None:
+        """Store Q-G6 over ``covered`` in ``fact_search_term_daily``, stubbing unknown parents.
+
+        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
+        dated inside ``covered`` whose (ad group, matched criterion, term, day) it did not
+        return are deleted in the same transaction (:func:`_remove_absent`), also when it
+        returned no row at all. A finest (day, ad group) partition at the result limit makes
+        the fetch incomplete, so its rows are stored as returned and nothing is deleted.
+        """
         ctx = self.ctx
         rows = [parse_search_term(row) for row in outcome.rows]
-        if not rows:
+        reconcile = _proven_complete(outcome)
+        if not rows and not reconcile:
             return
         async with ctx.sessionmaker() as session, session.begin():
             campaigns = await _campaign_ids(session, ctx.dataset_id)
@@ -2552,6 +2902,34 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactSearchTermDaily, facts, ctx.dataset_id, session=session
             )
+            if reconcile:
+                # Keyed on every returned row whose ad group is stored, even one skipped for an
+                # unattachable campaign, so a returned key is never taken for an absent one.
+                await _remove_absent(
+                    session,
+                    FactSearchTermDaily,
+                    ctx.dataset_id,
+                    scope=(FactSearchTermDaily.date.between(*covered),),
+                    key=(
+                        FactSearchTermDaily.ad_group_id,
+                        FactSearchTermDaily.matched_criterion_id,
+                        FactSearchTermDaily.search_term,
+                        FactSearchTermDaily.date,
+                    ),
+                    returned={
+                        (
+                            groups[str(row.ad_group_id)],
+                            row.matched_criterion_id,
+                            row.search_term,
+                            row.date,
+                        )
+                        for row in rows
+                        if str(row.ad_group_id) in groups
+                    },
+                    guarded=bool(facts),
+                    event="sync.metrics.rows_removed",
+                    fields={"source": "google", "query_id": "Q-G6"},
+                )
         self._count("google.search_terms", written)
         if len(facts) < len(rows):
             _log.warning(
@@ -2565,24 +2943,32 @@ class MetricsSyncJob(_JobBase):
     # -- LinkedIn --------------------------------------------------------------------------
 
     async def _linkedin(self) -> None:
-        """Fetch and store daily creative analytics per account (class docstring)."""
+        """Fetch and store daily creative analytics per account (class docstring).
+
+        The dataset's creatives are read once for the job (:func:`_linkedin_creatives`): the
+        URN map every account's rows resolve through, and each account's creative ids, which
+        size its date chunks and bound its reconcile scope. The job stores no creative, so the
+        map stays exact for its whole run.
+        """
         ctx = self.ctx
         name = "linkedin.analytics_daily"
         client = ctx.clients.require_linkedin()
         today = ctx.now.astimezone(UTC).date()
         start, end = (await self._ranges(today))[name]
         async with ctx.sessionmaker() as session:
-            creative_counts = await _creatives_per_account(session, ctx.dataset_id)
+            creatives = await _linkedin_creatives(session, ctx.dataset_id)
         reasons: list[str | None] = []
         failure: TransientError | None = None
         unknown_rows = 0
         for account_id in ctx.clients.linkedin_account_ids:
-            expected = creative_counts.get(account_id)
+            scope = creatives.of(account_id)
             listing = await client.analytics_daily(
-                account_id, (start, end), expected_creatives=expected or None
+                account_id, (start, end), expected_creatives=len(scope) or None
             )
             self._calls += listing.calls
-            unknown_rows += await self._store_creative_daily(listing.rows)
+            unknown_rows += await self._store_creative_daily(
+                listing, (start, end), creatives.by_key, scope
+            )
             if listing.interrupted_by is not None and failure is None:
                 failure = listing.interrupted_by
             if not listing.complete:
@@ -2596,15 +2982,35 @@ class MetricsSyncJob(_JobBase):
         async with ctx.sessionmaker() as session, session.begin():
             await self._complete(session, {name: outcome})
 
-    async def _store_creative_daily(self, rows: Sequence[CreativeDailyRow]) -> int:
-        """Upsert creative-day rows; return how many named a creative the dataset lacks."""
+    async def _store_creative_daily(
+        self,
+        listing: Listing[CreativeDailyRow],
+        covered: tuple[date, date],
+        creatives: Mapping[str, int],
+        scope: frozenset[int],
+    ) -> int:
+        """Store one account's creative-day rows; return how many named an unknown creative.
+
+        The rows are upserted. When the account's listing is :func:`_proven_complete`, the
+        rows of the account's creatives (``scope``) dated inside ``covered`` whose (creative,
+        day) it did not return are deleted in the same transaction (:func:`_remove_absent`),
+        also when it returned no row at all.
+
+        Args:
+            listing: The account's daily analytics listing.
+            covered: The UTC ``[start, end]`` the listing read.
+            creatives: The dataset's creative ids by URN, read once per job.
+            scope: The ids of the account's creatives, read once per job.
+
+        Returns:
+            The number of rows whose creative the dataset does not store.
+        """
         ctx = self.ctx
-        if not rows:
+        rows = listing.rows
+        reconcile = _proven_complete(listing) and bool(scope)
+        if not rows and not reconcile:
             return 0
         async with ctx.sessionmaker() as session, session.begin():
-            creatives = _by_last_key(
-                await repositories.entity_id_map(session, Creative, ctx.dataset_id)
-            )
             facts = [
                 {
                     "creative_id": creatives[row.creative_urn],
@@ -2625,6 +3031,21 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactCreativeDaily, facts, ctx.dataset_id, session=session
             )
+            if reconcile:
+                await _remove_absent(
+                    session,
+                    FactCreativeDaily,
+                    ctx.dataset_id,
+                    scope=(
+                        _any_id(FactCreativeDaily.creative_id, scope),
+                        FactCreativeDaily.date.between(*covered),
+                    ),
+                    key=(FactCreativeDaily.creative_id, FactCreativeDaily.date),
+                    returned={(fact["creative_id"], fact["date"]) for fact in facts},
+                    guarded=bool(facts),
+                    event="sync.metrics.rows_removed",
+                    fields={"source": "linkedin", "surface": "ad_analytics"},
+                )
         self._count("linkedin.analytics_daily", written)
         unknown = len(rows) - len(facts)
         if unknown:
@@ -2637,18 +3058,60 @@ class MetricsSyncJob(_JobBase):
         return unknown
 
 
-async def _creatives_per_account(session: AsyncSession, dataset_id: int) -> dict[str, int]:
-    """Count a LinkedIn dataset's creatives per ad account external id (chunk sizing)."""
+@dataclass(frozen=True, slots=True)
+class _AccountEntities:
+    """A LinkedIn dataset's campaigns or creatives, read once per job.
+
+    Attributes:
+        by_key: Internal id by external key: a campaign's external id or a creative's URN.
+        by_account: Internal ids by ad account external id (numeric), the reconcile scopes.
+    """
+
+    by_key: Mapping[str, int]
+    by_account: Mapping[str, frozenset[int]]
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[tuple[str, int, str]]) -> _AccountEntities:
+        """Build both maps from ``(external key, id, account external id)`` rows."""
+        by_key: dict[str, int] = {}
+        by_account: dict[str, set[int]] = {}
+        for key, entity_id, account in rows:
+            by_key[str(key)] = entity_id
+            by_account.setdefault(str(account), set()).add(entity_id)
+        return cls(
+            by_key=MappingProxyType(by_key),
+            by_account=MappingProxyType(
+                {account: frozenset(ids) for account, ids in by_account.items()}
+            ),
+        )
+
+    def of(self, account_id: str) -> frozenset[int]:
+        """The ids under one configured ad account (numeric id or URN); empty when none."""
+        return self.by_account.get(_account_external(account_id), frozenset())
+
+
+async def _linkedin_creatives(session: AsyncSession, dataset_id: int) -> _AccountEntities:
+    """Read a LinkedIn dataset's creatives in one query: by URN and per ad account.
+
+    A creative belongs to the account of its campaign (both keys are ``NOT NULL``).
+    """
     result = await session.execute(
-        select(AdAccount.external_id, Creative.id)
+        select(Creative.urn, Creative.id, AdAccount.external_id)
         .join(Campaign, Campaign.id == Creative.campaign_id)
         .join(AdAccount, AdAccount.id == Campaign.account_id)
         .where(Creative.dataset_id == dataset_id)
     )
-    counts: dict[str, int] = {}
-    for external_id, _ in result.all():
-        counts[external_id] = counts.get(external_id, 0) + 1
-    return counts
+    return _AccountEntities.from_rows(result)
+
+
+async def _linkedin_campaigns(session: AsyncSession, dataset_id: int) -> _AccountEntities:
+    """Read a LinkedIn dataset's campaigns in one query: by external id and per ad account."""
+    result = await session.execute(
+        select(Campaign.external_id, Campaign.id, AdAccount.external_id)
+        .join(AdAccount, AdAccount.id == Campaign.account_id)
+        .where(Campaign.dataset_id == dataset_id)
+    )
+    return _AccountEntities.from_rows(result)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2675,6 +3138,16 @@ class SegmentSyncJob(_JobBase):
     Freshness covers ``[end - max(presets) + 1, end]``; a complete fetch records
     :func:`segment_reason`, which :func:`segments_due` reads back to see whether the windows
     or presets moved on. An incomplete fetch records ``"<windows>; <shortfall>"``.
+
+    Each (account, pivot, window) listing is its own scope: the dataset's rows of that
+    account's campaigns, the pivot's facet and exactly that ``window_start`` and
+    ``window_end``. When a listing is :func:`_proven_complete`, the rows of its scope whose
+    (campaign, value) it no longer returned, such as a value that fell out of the top 100 or
+    below the privacy threshold, are deleted in the transaction that upserts it
+    (:func:`_remove_absent`), all of them after an empty complete answer, so C3a never reads
+    a withdrawn segment as current evidence. An incomplete or interrupted listing only
+    upserts. Rows of other windows (earlier end dates included), facets, accounts and
+    datasets are never touched. The campaigns are read once per job.
     """
 
     job = JOB_SEGMENTS
@@ -2694,23 +3167,31 @@ class SegmentSyncJob(_JobBase):
         return ("linkedin.segments",)
 
     async def _execute(self) -> None:
-        """Fetch every (account, pivot, preset) window and store it."""
+        """Fetch every (account, pivot, preset) window and store it.
+
+        The dataset's campaigns are read once for the job (:func:`_linkedin_campaigns`), not
+        once per batch: the job stores no campaign, so the map stays exact for its whole run.
+        """
         ctx = self.ctx
         name = "linkedin.segments"
         client = ctx.clients.require_linkedin()
         presets = ctx.thresholds.presets
         async with ctx.sessionmaker() as session:
             end = await default_window_end(session, now=ctx.now, thresholds=ctx.thresholds)
+            campaigns = await _linkedin_campaigns(session, ctx.dataset_id)
         windows = [(end - timedelta(days=days - 1), end) for days in presets]
         reasons: list[str | None] = []
         failure: TransientError | None = None
         unknown_rows = 0
         for account_id in ctx.clients.linkedin_account_ids:
+            scope = campaigns.of(account_id)
             for pivot in SEGMENT_PIVOTS:
                 for window in windows:
                     listing = await client.analytics_segments(account_id, pivot, window)
                     self._calls += listing.calls
-                    unknown_rows += await self._store(listing.rows, window)
+                    unknown_rows += await self._store(
+                        listing, window, SEGMENT_FACETS[pivot], campaigns.by_key, scope
+                    )
                     if listing.interrupted_by is not None:
                         failure = failure or listing.interrupted_by
                     if not listing.complete:
@@ -2738,14 +3219,38 @@ class SegmentSyncJob(_JobBase):
         async with ctx.sessionmaker() as session, session.begin():
             await self._complete(session, {name: outcome})
 
-    async def _store(self, rows: Sequence[SegmentRow], window: tuple[date, date]) -> int:
-        """Upsert one window's segment rows; return how many named an unknown campaign."""
+    async def _store(
+        self,
+        listing: Listing[SegmentRow],
+        window: tuple[date, date],
+        facet: str,
+        campaigns: Mapping[str, int],
+        scope: frozenset[int],
+    ) -> int:
+        """Store one (account, pivot, window) listing; return how many named an unknown campaign.
+
+        The rows are upserted. When the listing is :func:`_proven_complete`, the rows of the
+        account's campaigns (``scope``) for ``facet`` and exactly ``window`` whose (campaign,
+        value) it did not return are deleted in the same transaction (:func:`_remove_absent`),
+        also when it returned no row at all.
+
+        Args:
+            listing: The listing of one account, pivot and window.
+            window: The exact ``(window_start, window_end)`` the listing read.
+            facet: The pivot's facet (``SEGMENT_FACETS[pivot]``).
+            campaigns: The dataset's campaign ids by external id, read once per job.
+            scope: The ids of the account's campaigns, read once per job.
+
+        Returns:
+            The number of rows whose campaign the dataset does not store.
+        """
         ctx = self.ctx
-        if not rows:
+        rows = listing.rows
+        reconcile = _proven_complete(listing) and bool(scope)
+        if not rows and not reconcile:
             return 0
         start, end = window
         async with ctx.sessionmaker() as session, session.begin():
-            campaigns = await _campaign_ids(session, ctx.dataset_id)
             facts: list[dict[str, Any]] = []
             for row in rows:
                 external = _urn_tail(row.campaign_urn, PREFIX_CAMPAIGN)
@@ -2768,6 +3273,32 @@ class SegmentSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactSegmentWindow, facts, ctx.dataset_id, session=session
             )
+            if reconcile:
+                await _remove_absent(
+                    session,
+                    FactSegmentWindow,
+                    ctx.dataset_id,
+                    scope=(
+                        _any_id(FactSegmentWindow.campaign_id, scope),
+                        FactSegmentWindow.facet == facet,
+                        FactSegmentWindow.window_start == start,
+                        FactSegmentWindow.window_end == end,
+                    ),
+                    key=(FactSegmentWindow.campaign_id, FactSegmentWindow.value),
+                    returned={
+                        (fact["campaign_id"], fact["value"])
+                        for fact in facts
+                        if fact["facet"] == facet
+                    },
+                    guarded=bool(facts),
+                    event="sync.segments.rows_removed",
+                    fields={
+                        "source": "linkedin",
+                        "facet": facet,
+                        "window_start": start.isoformat(),
+                        "window_end": end.isoformat(),
+                    },
+                )
         self._count("linkedin.segments", written)
         unknown = len(rows) - len(facts)
         if unknown:
@@ -3133,7 +3664,9 @@ class LeadMatchJob(_JobBase):
     by a live LinkedIn backfill, so every row staged against HubSpot's active primary is
     attempted before the LinkedIn dataset activates; :class:`CrmSyncJob` runs the same pass
     as its matching step. ``AccessDenied`` from LinkedIn is handed to
-    ``on_error("linkedin", …)``, from HubSpot to ``on_error("hubspot", …)``.
+    ``on_error("linkedin", …)``, from HubSpot to ``on_error("hubspot", …)``. A pass that
+    attempted rows in an active context queues one ``analysis_request``; the backfill's
+    inactive context queues none.
     """
 
     job = JOB_LEAD_MATCH
@@ -3167,7 +3700,15 @@ class LeadMatchJob(_JobBase):
         return ()
 
     async def _execute(self) -> None:
-        """Run the pass and count the rows attempted."""
+        """Run the pass, count the rows attempted, and queue the request their changes need.
+
+        Matching commits per batch, so a pass that attempted rows of an active CRM dataset
+        queues one ``analysis_request`` afterwards (AAP 0.5.1 "analysis requests after each
+        job"); an inactive context (a backfill's) or a pass with nothing due queues none.
+
+        Raises:
+            repositories.DatasetNotWritable: If the dataset was retired meanwhile.
+        """
         hubspot = self.ctx.clients.require_hubspot()
         calls_before = hubspot.calls
         bindings = await _crm_bindings(self.ctx)
@@ -3190,6 +3731,10 @@ class LeadMatchJob(_JobBase):
                 matched=report.matched,
                 pending_left=report.pending_left,
             )
+            if report.attempted and self.ctx.active:
+                async with self.ctx.sessionmaker() as session, session.begin():
+                    dataset = await repositories.ensure_writable(session, self.ctx.dataset_id)
+                    await self._queue_analysis(session, dataset)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3941,8 +4486,8 @@ async def backfill_dataset(
 ) -> SourceSyncReport:
     """Backfill a building primary dataset: the contract ``sync/mode.py`` builds call.
 
-    By the dataset's source (every job with ``active=False``, so no analysis request; the
-    activation queues one):
+    By the dataset's source (every job of the building dataset with ``active=False``, so no
+    analysis request; the activation queues one):
 
     * **Google**: entities (the first entity sync writes the baseline), then metrics over
       ``BACKFILL_DAYS``.
@@ -3950,7 +4495,8 @@ async def backfill_dataset(
       backfill range. Simulated: then the companion CRM dataset's sync with
       ``backfill=True``. Live: then one matching pass of this dataset's leads in HubSpot's
       active primary, so every staged row is attempted before the dataset activates, and on
-      success a CRM sync of that primary, so the new matches' evidence is read too.
+      success a CRM sync of that primary, so the new matches' evidence is read too. That
+      primary is active, so the sync's success queues its own analysis request.
     * **HubSpot** primary: the CRM sync with ``backfill=True`` (``sync/mode.py`` staged the
       rows before calling this).
 
@@ -4047,16 +4593,71 @@ async def _linkedin_crm_backfill(
         _log.warning("sync.backfill.matching_skipped", crm_dataset_id=crm_id, reason=blocked)
         return ()
     async with controller.open_clients("hubspot", crm_mode) as crm_clients:
-        # Inactive: the CRM dataset is active, but this runs inside another source's build,
-        # whose activation queues the analysis request (no request per backfill job).
-        crm_ctx = _inactive(
-            await JobContext.for_dataset(
-                controller, crm_id, crm_clients, now=ctx.now, thresholds=ctx.thresholds
-            )
+        crm_ctx = await JobContext.for_dataset(
+            controller, crm_id, crm_clients, now=ctx.now, thresholds=ctx.thresholds
         )
+        # The matching pass writes only this build's own rows in the CRM dataset and records
+        # no freshness, so it runs inactive. The CRM sync keeps the dataset's own context:
+        # it refreshes data of an active dataset already in use, so its success queues the
+        # rerun every completed CRM sync queues (AAP 0.3.2), even if this build is then
+        # discarded and never activates.
         matched = await LeadMatchJob(
-            crm_ctx, lead_dataset_id=ctx.dataset_id, lead_client=clients.require_linkedin()
+            _inactive(crm_ctx),
+            lead_dataset_id=ctx.dataset_id,
+            lead_client=clients.require_linkedin(),
         ).run()
         if matched.status != "succeeded":
             return (matched,)
         return matched, await CrmSyncJob(crm_ctx).run()
+
+
+async def refresh_crm_dataset(
+    controller: SourceModeController, crm_dataset_id: int, *, now: datetime | None = None
+) -> JobResult | None:
+    """Run one CRM sync of a HubSpot dataset on behalf of another source's build.
+
+    ``sync/mode.py`` calls it while a live LinkedIn build settles. When HubSpot replaced its
+    primary after the build's backfill, the build's leads are staged and matched in the new
+    primary by a matching pass alone, which stores the contacts but reads none of their
+    associations. This sync of that primary runs the CRM steps of :class:`CrmSyncJob`
+    (matching of due rows, contact refresh, the window deal search, associations with their
+    target reads and, when configured, Google-touch discovery), so the build's new matches
+    are hydrated before the LinkedIn dataset activates (AAP 0.3.3, staged matching).
+
+    The sync runs on the dataset's own context. For an ``active`` dataset, the data in use,
+    its success queues a default-window ``analysis_request`` like every completed CRM sync
+    (AAP 0.3.2 "Events that trigger a rerun"), whether or not the LinkedIn build then
+    activates; the worker coalesces it with the activation's request when both arrive
+    within 60 s. A ``building`` dataset queues none. Connector errors go to ``on_error`` and
+    come back as a failed result, as for any job.
+
+    Args:
+        controller: The controller running the build.
+        crm_dataset_id: The HubSpot dataset (normally HubSpot's active primary) to sync.
+        now: The run's instant; the controller's clock when omitted.
+
+    Returns:
+        The CRM sync's result, or ``None`` when no client of the dataset's mode may be
+        opened now (a live dataset under ``DATA_MODE=simulated`` or without HubSpot
+        credentials), in which case nothing ran.
+
+    Raises:
+        ValueError: If the dataset is not a HubSpot dataset.
+        ads_engine.sync.datasets.DatasetNotFoundError: If the dataset does not exist.
+        ads_engine.analysis.thresholds.ConfigError: If the configuration fails to load.
+    """
+    instant = now if now is not None else controller.now()
+    dataset = await controller.datasets.get(crm_dataset_id)
+    if dataset.source != "hubspot":
+        raise ValueError(
+            f"dataset {crm_dataset_id} is a {dataset.source} dataset; the CRM sync runs in a "
+            "HubSpot dataset"
+        )
+    mode = _as_mode(dataset.mode)
+    blocked = _live_blocked(controller.settings, "hubspot", mode)
+    if blocked is not None:
+        _log.warning("sync.crm_refresh.skipped", crm_dataset_id=crm_dataset_id, reason=blocked)
+        return None
+    async with controller.open_clients("hubspot", mode) as clients:
+        crm_ctx = await JobContext.for_dataset(controller, crm_dataset_id, clients, now=instant)
+        return await CrmSyncJob(crm_ctx).run()

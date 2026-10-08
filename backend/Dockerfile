@@ -16,7 +16,11 @@
 #   migrations/        Alembic environment and revisions
 #   src/               the project source the wheel was built from
 #   tests/contracts/   the external API contracts the simulator reads at runtime, the same
-#                      files the contract tests read; nothing else from tests/ is copied
+#                      files the contract tests read; nothing else from tests/ is copied.
+#                      Root-owned like every file, except each {source}/captured/: the
+#                      runtime user owns those, so `ads-engine capture-fixtures` can write
+#                      its redacted live captures there (bind-mount the checkout's own
+#                      captured/ directory over one to keep them)
 #   config/            NOT in the image: it lies outside the build context, and Compose
 #                      bind-mounts the repository's config/ read-only here
 #
@@ -40,8 +44,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.21 /uv /uvx /bin/
 # UV_PYTHON_DOWNLOADS=never, UV_PYTHON=python3.14: use the base image's interpreter only.
 # UV_PROJECT_ENVIRONMENT: the virtual environment every process runs from.
 # PYTHONUNBUFFERED: structlog JSON reaches stdout immediately.
-# PYTHONDONTWRITEBYTECODE: the image filesystem is read-only to the runtime user, so Python
-#   does not attempt to write __pycache__ for modules outside site-packages (migrations/).
+# PYTHONDONTWRITEBYTECODE: the image filesystem is read-only to the runtime user (outside
+#   tests/contracts/*/captured/), so Python does not attempt to write __pycache__ for modules
+#   outside site-packages (migrations/).
 ENV UV_COMPILE_BYTECODE=1 \
   UV_LINK_MODE=copy \
   UV_PYTHON_DOWNLOADS=never \
@@ -76,6 +81,10 @@ COPY --exclude=**/__pycache__ src ./src
 COPY alembic.ini ./
 COPY --exclude=**/__pycache__ migrations ./migrations
 COPY tests/contracts ./tests/contracts
+# The capture directories alone, not their contents and not the contracts, go to the runtime
+# user, so `ads-engine capture-fixtures` can write into them; a glob that matches nothing fails
+# the build.
+RUN chown 10001:10001 tests/contracts/*/captured
 
 # Installs ads_engine into /app/.venv as a regular (non-editable) wheel built by uv_build,
 # which also creates the `ads-engine` console script.
@@ -84,8 +93,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
-# Every file stays root-owned and read-only to the runtime user; no process writes to the
-# image filesystem.
+# Every file stays root-owned and read-only to the runtime user, with one exception: the
+# tests/contracts/*/captured/ directories it owns, where `ads-engine capture-fixtures` writes
+# its redacted live captures. The api, worker and migrate processes write nothing to the image
+# filesystem.
 USER 10001:10001
 
 EXPOSE 8000

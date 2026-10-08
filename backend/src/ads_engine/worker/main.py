@@ -63,7 +63,7 @@ from ads_engine.analysis.window import AnalysisWindow
 from ads_engine.db.models.analysis import AnalysisRequest
 from ads_engine.db.repositories import enqueue_analysis_request, sync_content_assets
 from ads_engine.db.session import dispose_engine, session_scope
-from ads_engine.logging import configure_logging, get_logger
+from ads_engine.logging import configure_logging, get_logger, logged_as
 from ads_engine.settings import SOURCES, Settings, get_settings
 from ads_engine.sync.mode import BootstrapReport, bootstrap_sources
 from ads_engine.sync.scheduler import JOB_FAILURES, Scheduler
@@ -326,9 +326,19 @@ async def _startup_analysis(thresholds: Thresholds) -> None:
         await _requeue_startup_analysis()
         return
     except JOB_FAILURES as exc:
-        _log.exception(
-            "startup_analysis_failed", error=type(exc).__name__, requests=len(request_ids)
-        )
+        owner = logged_as(exc)
+        if owner is None:
+            _log.exception(
+                "startup_analysis_failed", error=type(exc).__name__, requests=len(request_ids)
+            )
+        else:
+            # The runner logged the failure with its traceback (analysis_run_failed).
+            _log.warning(
+                "startup_analysis_failed",
+                error=type(exc).__name__,
+                requests=len(request_ids),
+                logged_as=owner,
+            )
         await _requeue_startup_analysis()
         return
     _log.info(
@@ -413,7 +423,8 @@ async def _run(settings: Settings) -> int:
 
     Raises:
         asyncio.CancelledError: When this coroutine itself is cancelled, not by a signal.
-        Exception: Any other failure, after logging it as ``worker_fatal``.
+        Exception: Any other failure, after logging it as ``worker_fatal``: with its
+            traceback, or as a warning naming the event that already logged it in full.
     """
     loop = asyncio.get_running_loop()
     stopping = False
@@ -453,8 +464,13 @@ async def _run(settings: Settings) -> int:
             error=str(exc),
         )
         return EXIT_FAILURE
-    except Exception:
-        _log.exception("worker_fatal")
+    except Exception as exc:
+        owner = logged_as(exc)
+        if owner is None:
+            _log.exception("worker_fatal")
+        else:
+            # Its owner (an analysis run's analysis_run_failed) logged the traceback already.
+            _log.warning("worker_fatal", error=type(exc).__name__, logged_as=owner)
         raise
     finally:
         _remove_stop_handlers(loop, installed)
@@ -508,9 +524,10 @@ def main() -> None:
     try:
         exit_code = asyncio.run(_run(settings))
     except Exception as exc:
-        # _run logged the failure as worker_fatal, with its traceback redacted. Exiting with
-        # a code instead of letting it reach the interpreter keeps the unredacted default
-        # traceback off stderr; the container restart policy acts on the exit code alike.
+        # _run logged the failure as worker_fatal: with its traceback redacted, or naming the
+        # event that already logged that traceback (logged_as). Exiting with a code instead
+        # of letting it reach the interpreter keeps the unredacted default traceback off
+        # stderr; the container restart policy acts on the exit code alike.
         _log.error("worker_exited", error=type(exc).__name__, exit_code=EXIT_FAILURE)
         raise SystemExit(EXIT_FAILURE) from exc
     if exit_code != EXIT_OK:

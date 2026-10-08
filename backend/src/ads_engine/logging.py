@@ -85,6 +85,8 @@ __all__ = [
     "URL_CREDENTIALS_RE",
     "configure_logging",
     "get_logger",
+    "logged_as",
+    "mark_logged",
     "redact",
     "redact_processor",
     "redact_secret_matches",
@@ -1499,6 +1501,81 @@ def _settings_secrets(settings: Settings) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+# The instance-dict key under which mark_logged records the event that logged an exception.
+_LOGGED_AS_KEY: Final[str] = "_ads_engine_logged_as"
+
+
+def mark_logged(exc: BaseException, event: str) -> None:
+    """Record that the owner of a failure's consequence logged ``exc`` in full as ``event``.
+
+    The owner logs the failure once, traceback included; a caller that receives the same
+    exception afterwards reads :func:`logged_as` and reports its own outcome without a
+    second traceback. The marker is written to the exception's instance dict, which every
+    :class:`BaseException` has, so it works for exceptions whose ``__setattr__`` refuses
+    (frozen dataclasses) as well. A later call replaces the recorded event.
+
+    Example::
+
+        _log.error("analysis_run_failed", exc_info=exc, run_id=run_id)
+        mark_logged(exc, "analysis_run_failed")
+
+    Args:
+        exc: The exception that was logged.
+        event: The name of the event that logged it.
+
+    Raises:
+        ValueError: When ``event`` is empty.
+    """
+    if not event:
+        raise ValueError("event must name the log event that recorded the exception")
+    vars(exc)[_LOGGED_AS_KEY] = event
+
+
+def logged_as(exc: BaseException) -> str | None:
+    """Return the event that already logged ``exc`` in full, or ``None``.
+
+    Example::
+
+        owner = logged_as(exc)
+        if owner is None:
+            _log.error("scheduler.step_failed", exc_info=exc)
+        else:
+            _log.warning("scheduler.step_failed", logged_as=owner)
+
+    Args:
+        exc: An exception, logged or not.
+
+    Returns:
+        The event name :func:`mark_logged` recorded for ``exc``, or ``None`` when no owner
+        logged it.
+    """
+    marker = vars(exc).get(_LOGGED_AS_KEY)
+    return marker if isinstance(marker, str) else None
+
+
+class _OwnedExceptionFilter(logging.Filter):
+    """Drop a record whose exception an owner already logged in full (:func:`mark_logged`).
+
+    Starlette's ``ServerErrorMiddleware`` re-raises an exception after the API's catch-all
+    handler has answered and logged it, and uvicorn then logs it on ``uvicorn.error`` as
+    "Exception in ASGI application" with the same traceback. This filter drops that copy.
+    """
+
+    @override
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return ``False`` when ``record`` carries an exception :func:`logged_as` names."""
+        exc_info: object = record.exc_info
+        # A record built by hand may hold anything here; only a real exc_info tuple counts.
+        if not isinstance(exc_info, tuple) or len(exc_info) != 3:
+            return True
+        exc: object = exc_info[1]
+        return not isinstance(exc, BaseException) or logged_as(exc) is None
+
+
+_OWNED_EXCEPTION_FILTER: Final = _OwnedExceptionFilter()
+"""The one filter instance attached to ``uvicorn.error``, so attaching it again is a no-op."""
+
+
 def _resolve_level(level: str) -> int:
     """Translate a level name such as ``"INFO"`` into its ``logging`` number.
 
@@ -1548,6 +1625,11 @@ def configure_logging(
     that cannot be rendered, or whose write fails, yields a minimal JSON line naming only
     the error class, never the record. ``logging.lastResort`` is replaced by a handler
     that writes redacted JSON to ``sys.stderr``.
+
+    ``uvicorn.error`` gets a filter that drops a record whose exception was already logged
+    in full (:func:`mark_logged`): uvicorn logs every exception that leaves the application
+    as "Exception in ASGI application", including one the API's catch-all handler has just
+    logged with the same traceback, so each failure keeps one traceback.
 
     Calling it again reconfigures in place without duplicate handlers: while the handler
     it installed is still attached, its formatter and stream are swapped under the
@@ -1643,6 +1725,8 @@ def configure_logging(
             routed.propagate = True
             for existing in list(routed.handlers):
                 routed.removeHandler(existing)
+        # The same instance every time, so a repeated configuration attaches it only once.
+        logging.getLogger("uvicorn.error").addFilter(_OWNED_EXCEPTION_FILTER)
         structlog.configure(
             processors=[
                 # Drop disabled levels before any processor runs.

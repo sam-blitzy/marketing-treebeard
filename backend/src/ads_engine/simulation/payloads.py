@@ -105,6 +105,7 @@ from ads_engine.simulation.generator import (
     GoogleSearchTermDay,
     HubSpotRecord,
     LinkedInAccountRecord,
+    LinkedInCampaignDelivery,
     LinkedInCampaignGroupRecord,
     LinkedInCampaignRecord,
     LinkedInCreativeDay,
@@ -227,6 +228,8 @@ SURFACES: Final[Mapping[Source, tuple[str, ...]]] = MappingProxyType(
             "posts",
             "ad_analytics",
             "ad_analytics_statistics",
+            "ad_analytics_campaign_delivery",
+            "ad_analytics_member_segments",
             "lead_forms",
             "lead_form_responses",
             "lead_form_responses_batch",
@@ -1342,6 +1345,8 @@ _CONTINUATION_QUERY: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {
         "linkedin.ad_analytics": ("start", "count"),
         "linkedin.ad_analytics_statistics": ("start", "count"),
+        "linkedin.ad_analytics_campaign_delivery": ("start", "count"),
+        "linkedin.ad_analytics_member_segments": ("start", "count"),
     }
 )
 
@@ -1809,11 +1814,22 @@ def _date_range(value: RestliValue | None, errors: list[str]) -> tuple[date, dat
 
 
 def _rule_analytics(contract: Contract, query: _Query, body: JSONValue, errors: list[str]) -> None:
-    """``adAnalytics``: finder, granularity, pivot(s), date range and account facet."""
+    """``adAnalytics``: finder, granularity, pivot(s), date range and facet of each form.
+
+    * ``ad_analytics``: ``q=analytics``, ``pivot=CREATIVE``, ``DAILY``, ``accounts``;
+    * ``ad_analytics_statistics``: ``q=statistics``, ``pivots=List(CAMPAIGN,MEMBER_*)``,
+      ``ALL``, ``accounts``;
+    * ``ad_analytics_campaign_delivery``: ``q=analytics``, ``pivot=CAMPAIGN``, ``ALL``,
+      ``accounts`` (the segment fallback's discovery call);
+    * ``ad_analytics_member_segments``: ``q=analytics``, ``pivot=MEMBER_*``, ``ALL`` and a
+      ``campaigns`` facet of exactly one campaign URN, because the response names only the
+      demographic value and the campaign comes from the request (the per-campaign fallback).
+    """
     del body
-    statistics = contract.name == "ad_analytics_statistics"
+    name = contract.name
+    statistics = name == "ad_analytics_statistics"
     _expect_leaf(query, "q", "statistics" if statistics else "analytics", errors)
-    _expect_leaf(query, "timeGranularity", "ALL" if statistics else "DAILY", errors)
+    _expect_leaf(query, "timeGranularity", "DAILY" if name == "ad_analytics" else "ALL", errors)
     if statistics:
         pivots = _restli_param(contract, query, "pivots", errors)
         if pivots is not None and not (
@@ -1826,12 +1842,33 @@ def _rule_analytics(contract: Contract, query: _Query, body: JSONValue, errors: 
                 "query parameter pivots: must be List(CAMPAIGN,MEMBER_JOB_FUNCTION|"
                 "MEMBER_SENIORITY|MEMBER_INDUSTRY)"
             )
+    elif name == "ad_analytics_member_segments":
+        pivot = _leaf_param(query, "pivot", errors)
+        if pivot is not None and pivot not in SEGMENT_PIVOTS:
+            errors.append(
+                "query parameter pivot: must be MEMBER_JOB_FUNCTION|MEMBER_SENIORITY|"
+                "MEMBER_INDUSTRY"
+            )
     else:
-        _expect_leaf(query, "pivot", "CREATIVE", errors)
+        expected = "CAMPAIGN" if name == "ad_analytics_campaign_delivery" else "CREATIVE"
+        _expect_leaf(query, "pivot", expected, errors)
     _date_range(_restli_param(contract, query, "dateRange", errors), errors)
-    _urn_list(
-        _restli_param(contract, query, "accounts", errors), _ACCOUNT_URN_RE, "accounts", errors
-    )
+    if name == "ad_analytics_member_segments":
+        campaigns = _urn_list(
+            _restli_param(contract, query, "campaigns", errors),
+            _CAMPAIGN_URN_RE,
+            "campaigns",
+            errors,
+        )
+        if len(campaigns) > 1:
+            errors.append(
+                "query parameter campaigns: must name exactly one campaign; the response "
+                "carries only the demographic value"
+            )
+    else:
+        _urn_list(
+            _restli_param(contract, query, "accounts", errors), _ACCOUNT_URN_RE, "accounts", errors
+        )
     _int_param(query, "start", 0, errors)
     _int_param(query, "count", 1, errors)
 
@@ -2072,6 +2109,8 @@ _SURFACE_RULES: Final[Mapping[str, _Rule]] = MappingProxyType(
         "google.search": _rule_google_search,
         "linkedin.ad_analytics": _rule_analytics,
         "linkedin.ad_analytics_statistics": _rule_analytics,
+        "linkedin.ad_analytics_campaign_delivery": _rule_analytics,
+        "linkedin.ad_analytics_member_segments": _rule_analytics,
         "linkedin.ad_campaign_groups": _rule_entity_search,
         "linkedin.ad_campaigns": _rule_entity_search,
         "linkedin.creatives": _rule_creatives,
@@ -2105,9 +2144,14 @@ def identify_surface(source: Source, request: RequestShape | httpx.Request) -> s
     * google: any ``POST`` whose JSON body is an object with a ``query`` key is ``search``.
     * linkedin: ``POST`` OAuth ``accessToken``; under ``/rest/`` (``GET``): ``adAccounts/{id}``,
       ``adAccounts/{id}/adCampaignGroups``, ``adAccounts/{id}/adCampaigns``,
-      ``adAccounts/{id}/creatives``, ``posts``, ``adAnalytics`` (``q=statistics`` is
-      ``ad_analytics_statistics``, anything else ``ad_analytics``), ``leadForms`` and
+      ``adAccounts/{id}/creatives``, ``posts``, ``adAnalytics``, ``leadForms`` and
       ``leadFormResponses`` (with ``ids`` the batch get, otherwise the owner finder).
+      ``adAnalytics`` is routed by finder, pivot and granularity: ``q=statistics`` is
+      ``ad_analytics_statistics``; ``q=analytics`` with ``timeGranularity=ALL`` is
+      ``ad_analytics_campaign_delivery`` for ``pivot=CAMPAIGN`` and
+      ``ad_analytics_member_segments`` for a ``MEMBER_*`` pivot (the two forms of the live
+      segment fallback); anything else is ``ad_analytics``, whose contract then rejects any
+      pivot but ``CREATIVE`` and any granularity but ``DAILY``.
     * hubspot: the ``2026-09`` paths ``POST /crm/objects/2026-09/{type}/batch/read``,
       ``POST /crm/objects/2026-09/{type}/search``,
       ``POST /crm/associations/2026-09/{from}/{to}/batch/read`` and
@@ -2167,14 +2211,38 @@ def _linkedin_surface(shape: RequestShape, url: httpx.URL) -> str:
         elif segments == ["posts"]:
             return "posts"
         elif segments == ["adAnalytics"]:
-            finder = query.raw("q")
-            return "ad_analytics_statistics" if finder == "statistics" else "ad_analytics"
+            return _analytics_surface(query)
         elif segments == ["leadForms"]:
             return "lead_forms"
         elif segments == ["leadFormResponses"]:
             batch = "ids" in query.names()
             return "lead_form_responses_batch" if batch else "lead_form_responses"
     raise UnknownSurface(f"linkedin: no surface serves {shape.method} {path}")
+
+
+def _routing_value(query: _Query, name: str) -> str | None:
+    """A query value decoded once for routing; ``None`` when absent or malformed."""
+    raw = query.raw(name)
+    if raw is None:
+        return None
+    try:
+        return _decode_once(raw)
+    except ValueError:
+        return None
+
+
+def _analytics_surface(query: _Query) -> str:
+    """The ``adAnalytics`` surface of a request, by finder, pivot and granularity."""
+    finder = _routing_value(query, "q")
+    if finder == "statistics":
+        return "ad_analytics_statistics"
+    if finder == "analytics" and _routing_value(query, "timeGranularity") == "ALL":
+        pivot = _routing_value(query, "pivot")
+        if pivot == "CAMPAIGN":
+            return "ad_analytics_campaign_delivery"
+        if pivot is not None and pivot.startswith("MEMBER_"):
+            return "ad_analytics_member_segments"
+    return "ad_analytics"
 
 
 _ACCOUNT_SUBRESOURCES: Final[Mapping[str, str]] = MappingProxyType(
@@ -3521,10 +3589,20 @@ def _daily_element(day: LinkedInCreativeDay, fields: frozenset[str]) -> JSONObje
     return {name: value for name, value in values.items() if name in fields}
 
 
-def _segment_element(record: LinkedInSegmentRecord, fields: frozenset[str]) -> JSONObject:
-    """One (campaign, demographic value) aggregate; metrics the pivot lacks are absent."""
+def _segment_element(
+    record: LinkedInSegmentRecord, fields: frozenset[str], *, with_campaign: bool = True
+) -> JSONObject:
+    """One (campaign, demographic value) aggregate; metrics the pivot lacks are absent.
+
+    The Statistics Finder names the campaign in ``pivotValues`` beside the value; the
+    Analytics Finder fallback (``with_campaign=False``) names only the value, because its
+    request is scoped to one campaign.
+    """
+    pivot_values: list[JSONValue] = [record.value]
+    if with_campaign:
+        pivot_values.insert(0, f"{_CAMPAIGN_URN}{record.campaign_id}")
     values: dict[str, JSONValue | None] = {
-        "pivotValues": [f"{_CAMPAIGN_URN}{record.campaign_id}", record.value],
+        "pivotValues": pivot_values,
         "costInLocalCurrency": None if record.cost is None else _amount(record.cost),
         "impressions": record.impressions,
         "clicks": record.clicks,
@@ -3534,8 +3612,33 @@ def _segment_element(record: LinkedInSegmentRecord, fields: frozenset[str]) -> J
     return {name: value for name, value in values.items() if name in fields and value is not None}
 
 
+def _delivery_element(record: LinkedInCampaignDelivery, fields: frozenset[str]) -> JSONObject:
+    """One campaign's delivery over the window (``pivot=CAMPAIGN``), projected fields only."""
+    values: dict[str, JSONValue] = {
+        "pivotValues": [f"{_CAMPAIGN_URN}{record.campaign_id}"],
+        "impressions": record.impressions,
+    }
+    return {name: value for name, value in values.items() if name in fields}
+
+
+def _campaign_account(ctx: _Ctx, campaign_id: int) -> str | None:
+    """The simulated ad account holding ``campaign_id``, or ``None`` for an unknown campaign."""
+    for account_id in ctx.world.linkedin_account_ids:
+        if any(record.id == campaign_id for record in ctx.world.linkedin_campaigns(account_id)):
+            return account_id
+    return None
+
+
 def _render_analytics(ctx: _Ctx) -> RenderedResponse:
-    """``adAnalytics``: daily creative facts (``q=analytics``) or demographic aggregates.
+    """``adAnalytics``: daily creative facts, demographic aggregates or campaign delivery.
+
+    * ``ad_analytics``: one element per creative and UTC day;
+    * ``ad_analytics_statistics``: one element per (campaign, value), ``pivotValues``
+      naming both;
+    * ``ad_analytics_campaign_delivery``: one element per campaign with impressions in the
+      window, from the totals the segment rows split;
+    * ``ad_analytics_member_segments``: the statistics rows of the one requested campaign,
+      ``pivotValues`` naming only the value; an unknown campaign has no elements.
 
     Responses are capped at the contract's ``max_elements`` (15,000). Beyond the cap, live
     LinkedIn truncates without a link; a world with ``analytics_next_links`` adds a
@@ -3560,6 +3663,34 @@ def _render_analytics(ctx: _Ctx) -> RenderedResponse:
         days.sort(key=lambda day: (day.date, day.creative_id))
         ctx.faults(attributes)
         elements = [cast(JSONValue, _daily_element(day, fields)) for day in days]
+    elif ctx.surface == "ad_analytics_campaign_delivery":
+        ctx.faults(attributes)
+        for account_id in sorted(set(accounts), key=int):
+            delivery = ctx.world.linkedin_campaign_delivery(account_id, start, end)
+            elements.extend(
+                cast(JSONValue, _delivery_element(record, fields)) for record in delivery
+            )
+    elif ctx.surface == "ad_analytics_member_segments":
+        pivot = cast(str, ctx.leaf("pivot"))
+        [campaign_urn] = _urn_list(ctx.restli("campaigns"), _CAMPAIGN_URN_RE, "campaigns", [])
+        campaign_id = campaign_urn.removeprefix(_CAMPAIGN_URN)
+        owner = _campaign_account(ctx, int(campaign_id))
+        ctx.faults(
+            {
+                "account_id": owner or "",
+                "campaign_id": campaign_id,
+                "pivot": pivot,
+                "page": attributes["page"],
+            }
+        )
+        if owner is not None:
+            segments = ctx.world.linkedin_segments(
+                owner, pivot, start, end, campaign_ids=[campaign_id]
+            )
+            elements.extend(
+                cast(JSONValue, _segment_element(record, fields, with_campaign=False))
+                for record in segments
+            )
     else:
         pivot = cast(str, cast(list[RestliValue], ctx.restli("pivots"))[1])
         ctx.faults({**attributes, "pivot": pivot})
@@ -3853,6 +3984,8 @@ _LINKEDIN_RENDERERS: Final[Mapping[str, Callable[[_Ctx], RenderedResponse]]] = M
         "posts": _render_posts,
         "ad_analytics": _render_analytics,
         "ad_analytics_statistics": _render_analytics,
+        "ad_analytics_campaign_delivery": _render_analytics,
+        "ad_analytics_member_segments": _render_analytics,
         "lead_forms": _render_lead_forms,
         "lead_form_responses": _render_lead_responses,
         "lead_form_responses_batch": _render_lead_batch,
@@ -4490,7 +4623,8 @@ def render(
     never retried as a transient 5xx.
 
     Fault request attributes for ``match``: Google ``query_id``, ``customer_id``, ``page``;
-    LinkedIn ``account_id``, ``page`` (and ``pivot`` for statistics); HubSpot
+    LinkedIn ``account_id``, ``page`` (and ``pivot`` for statistics and member segments, plus
+    ``campaign_id`` for member segments, whose account is the campaign's); HubSpot
     ``object_type``, ``to_object_type`` (associations), ``property_name`` (properties) and
     ``page``. ``page`` is 1-based; a HubSpot association continuation call is page ``2``.
 

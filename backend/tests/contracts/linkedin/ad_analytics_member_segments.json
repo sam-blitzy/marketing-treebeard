@@ -1,0 +1,248 @@
+{
+  "surface": "linkedin.ad_analytics_member_segments",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-06-24",
+  "request": {
+    "method": "GET",
+    "url": "adAnalytics?q=analytics&pivot={member_pivot}&timeGranularity=ALL&dateRange=(start:(year:{y},month:{m},day:{d}),end:(year:{y},month:{m},day:{d}))&campaigns=List({campaign})&fields={fields}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "pivot",
+      "timeGranularity",
+      "dateRange",
+      "campaigns",
+      "fields"
+    ],
+    "optional_query": [],
+    "fields": "pivotValues,costInLocalCurrency,impressions,clicks,oneClickLeads,externalWebsiteConversions",
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "max_fields": 20,
+      "max_elements": 15000,
+      "campaigns_per_request": 1,
+      "demographic_top_values": 100,
+      "demographic_min_events": 3,
+      "demographic_retention_years": 2
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "Analytics Finder (`q=analytics`) demographic-segment response for one campaign: the per-campaign request of the live demographic-segment fallback (connector `analytics_segments`, `_segments_by_campaign`). One request per campaign with delivery (found by `ad_analytics_campaign_delivery.json`), demographic pivot (MEMBER_JOB_FUNCTION, MEMBER_SENIORITY or MEMBER_INDUSTRY, `parser.SEGMENT_PIVOTS`) and preset window, `timeGranularity=ALL`, the `campaigns` facet naming exactly that campaign and the same projection as the Statistics Finder form. The connector sends it only after LinkedIn 202609 rejected the contracted Statistics Finder request (`ad_analytics_statistics.json`) with HTTP 400 on 2026-10-07; the Reporting schema page documents professional-demographic pivots only for the Analytics Finder `pivot`, and this finder with a MEMBER_* pivot and `timeGranularity=ALL` was verified live on 2026-10-07 (HTTP 200, each `pivotValues` a single `urn:li:seniority:{id}` entry) with the accounts facet; the `campaigns` facet is documented for the finder. Rows are written to `fact_segment_window` exactly as the Statistics Finder's are, keyed by the exact window, the campaign taken from the request. The simulator answers the contracted Statistics Finder form, so simulated runs take this request only when a world fault rejects that form with HTTP 400. Sources: the Ads Reporting page at reference_url (served moniker li-lms-2026-09, ms.date 2026-06-19, updated_at 2026-06-24) for the Analytics Finder, its sample response and the demographic restrictions; the Reporting schema page (https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema?view=li-lms-2026-09; served moniker li-lms-2026-09, ms.date 2026-09-14, updated_at 2026-09-16) for the query parameters, the pivot enum and the metric types. URL template: `{member_pivot}` is one of `parser.SEGMENT_PIVOTS`; `{campaign}` is the URL-encoded urn%3Ali%3AsponsoredCampaign%3A{id} of exactly one campaign, because the response carries only the demographic value; `{fields}` must equal request.fields exactly, which equals `client.SEGMENT_FIELDS`, and is sent raw (LinkedIn rejects an encoded projection with 400); Rest.li parentheses, colons and commas stay literal. Demographic restrictions (reporting page): only the top 100 values per creative per day; no values for ads reaching too few members; values with fewer than 3 events dropped; the metrics are approximate, so daily values and narrower windows do not sum to a window's value; any metric the pivot does not return is stored as unavailable (AAP 0.3.3); demographic metrics are delayed 12 to 24 hours and retained 2 years. Limits (reporting page): up to 20 fields; at most 15,000 elements per response; the endpoint does not paginate and the client follows a rel=next link only when one is returned; a response at the cap without one makes the listing incomplete with the reason \"result limit reached\". An empty `elements` means no activity to report or no read access. documented_sample is the Reporting page's Analytics Finder sample response, verbatim and identical to ad_analytics.json's (q=analytics, pivot=MEMBER_COMPANY, timeGranularity=DAILY, two elements, each pivotValues a single urn:li:organization value); the page publishes no Analytics Finder sample for this exact pivot and granularity, and no sample is invented.",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Report data points; at most 15,000 per response. A response at the cap with no rel=next link may be truncated and is recorded incomplete.",
+          "items": {
+            "type": "object",
+            "description": "One demographic value of the requested campaign over the whole window (`timeGranularity=ALL`), written to `fact_segment_window`. Only `pivotValues` is required; a metric the pivot does not return, or that LinkedIn withholds, is absent, never zero, and is stored as unavailable (AAP 0.3.3).",
+            "properties": {
+              "pivotValues": {
+                "type": "array",
+                "description": "Values of the requested pivot (string[]). For this request: exactly one demographic value URN, such as urn:li:function:{id} (MEMBER_JOB_FUNCTION), urn:li:seniority:{id} (MEMBER_SENIORITY) or urn:li:industry:{id} (MEMBER_INDUSTRY). The campaign is not in the response: the parser takes it from the request's one-campaign `campaigns` facet (`parse_segment(..., campaign_urn=...)`). The live Analytics Finder response observed on 2026-10-07 carried exactly this form, each pivotValues a single urn:li:seniority:{id} entry; the documented sample pivots by MEMBER_COMPANY and so carries an organization URN. Prefixes from the Targeting Criteria Facet URNs reference (https://learn.microsoft.com/en-us/linkedin/shared/references/v2/ads/targeting-criteria-facet-urns).",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "costInLocalCurrency": {
+                "type": "string",
+                "description": "BigDecimal as a decimal string, in the account currency; parsed to numeric(18,6) into `fact_segment_window.cost`. The schema page notes that cost is not adjusted for over-delivery with a member demographic pivot."
+              },
+              "impressions": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.impressions`, the numerator of the segment's impression share of its campaign (C3a)."
+              },
+              "clicks": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.clicks`."
+              },
+              "oneClickLeads": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.leads`; absent means unavailable (leads null), never zero, and C3a does not fire on a segment without a lead metric (AAP 0.5.4.4)."
+              },
+              "externalWebsiteConversions": {
+                "type": "integer",
+                "description": "long, documented default \"0\"; it arrives as an integer. The outcome for campaigns whose objective is not LEAD_GENERATION (AAP 0.5.4.1); absent means unavailable."
+              },
+              "dateRange": {
+                "type": "object",
+                "description": "Not in this request's projection, so absent from live responses; declared because the documented sample carries it. UTC calendar days, start and end inclusive. The schema page marks start required and end optional.",
+                "properties": {
+                  "start": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "end": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "start"
+                ],
+                "additionalProperties": false
+              },
+              "landingPageClicks": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "shares": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "reactions": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              }
+            },
+            "required": [
+              "pivotValues"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Optional. The documented sample carries {count, links, start} with an empty `links`, and the live Analytics Finder fallback response (2026-10-07) carried a rel=next link and no `total`. The reporting page states that adAnalytics does not support pagination; only a rel=next link in `links` is ever acted on.",
+          "properties": {
+            "count": {
+              "type": "integer"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rel",
+                  "href"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count",
+            "start"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "elements"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            }
+          },
+          "landingPageClicks": 0,
+          "costInLocalCurrency": "0.0",
+          "impressions": 6,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        },
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            }
+          },
+          "landingPageClicks": 11,
+          "costInLocalCurrency": "19.91833",
+          "impressions": 165,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        }
+      ]
+    }
+  }
+}

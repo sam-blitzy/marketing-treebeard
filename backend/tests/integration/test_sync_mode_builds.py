@@ -14,6 +14,11 @@ Covered (AAP 0.3.3, "Staged matching on a CRM dataset change" and "Recovery read
   association read, do the same, whether matched before the settle or before the
   activation lock; a build whose matched contacts still lack association reads after
   every settle round is discarded.
+* A live LinkedIn build's leads matched in HubSpot's active primary after its backfill (by
+  the late matching pass in a primary activated meanwhile, or by another matcher before
+  the activation lock) get that primary's CRM sync before the LinkedIn dataset activates,
+  with the primary's freshness left as it is; a build whose matches there are never
+  hydrated is discarded after every settle round.
 * A denial or fallback entry recorded by another controller voids a live build bound to
   the earlier access generation: after its backfill, under the activation lock, and when it
   lands while a recovery probe runs. A denial that lands while a source's first activation
@@ -28,8 +33,9 @@ Covered (AAP 0.3.3, "Staged matching on a CRM dataset change" and "Recovery read
 backfill records, attempts the ``lead_match`` rows its CRM passes attempt and reads their
 matched contacts' associations, and which runs another process's activations or denials at
 chosen points. No connector client is opened:
-CRM-binding verification and the live matching pass are replaced, so no request leaves the
-process. The database tests run against the PostgreSQL 18 test database named by
+CRM-binding verification, the live matching pass and the CRM hydration pass (or the CRM
+sync it runs) are replaced, so no request leaves the process. The database tests run
+against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``) in a private schema built from the
 model metadata and dropped at teardown, as in ``test_sync_datasets.py``. Every clock stands
 at :data:`T0`.
@@ -231,6 +237,30 @@ def matching_passes(monkeypatch: pytest.MonkeyPatch, sessions: Sessions) -> list
 
     monkeypatch.setattr(SourceModeController, "verify_crm_bindings", verify_nothing)
     monkeypatch.setattr(SourceModeController, "_matching_pass", attempt_pass)
+    return passes
+
+
+@pytest.fixture
+def hydration_passes(
+    monkeypatch: pytest.MonkeyPatch, sessions: Sessions
+) -> list[tuple[int, int, int]]:
+    """Keep a live LinkedIn build's CRM hydration offline; return the passes it ran.
+
+    The hydration pass runs HubSpot's CRM sync job in the primary the build's leads were
+    matched in, which would call HubSpot. It is replaced by the association pass that job
+    records (:func:`_hydrate`). Each pass is recorded as ``(crm_dataset_id,
+    lead_dataset_id, unhydrated)``.
+    """
+    passes: list[tuple[int, int, int]] = []
+
+    async def hydrate(
+        self: SourceModeController, crm_dataset_id: int, lead_dataset_id: int, unhydrated: int
+    ) -> None:
+        """Read the associations of the CRM dataset's matched contacts, recording the pass."""
+        passes.append((crm_dataset_id, lead_dataset_id, unhydrated))
+        await _hydrate(sessions, crm_dataset_id)
+
+    monkeypatch.setattr(SourceModeController, "_hydration_pass", hydrate)
     return passes
 
 
@@ -515,6 +545,25 @@ async def _match_elsewhere(sessions: Sessions, crm_dataset_id: int, lead_ids: li
                     contact_read_status="ok",
                 )
             )
+
+
+async def _pending_leads(
+    sessions: Sessions, crm_dataset_id: int, lead_dataset_id: int
+) -> list[int]:
+    """Return the ids of a LinkedIn dataset's leads whose row in a CRM dataset is pending."""
+    async with sessions() as session:
+        return list(
+            await session.scalars(
+                select(LeadMatch.lead_id)
+                .join(Lead, Lead.id == LeadMatch.lead_id)
+                .where(
+                    LeadMatch.crm_dataset_id == crm_dataset_id,
+                    LeadMatch.status == "pending",
+                    Lead.dataset_id == lead_dataset_id,
+                )
+                .order_by(LeadMatch.lead_id)
+            )
+        )
 
 
 async def _match_in_active_hubspot(sessions: Sessions, lead_dataset_id: int) -> None:
@@ -1226,6 +1275,223 @@ async def test_unhydrated_matches_counts_matched_contacts_without_association_re
         f"freshness not yet recorded: {', '.join(HUBSPOT_NAMES)}",
         f"1 lead match not yet attempted in CRM dataset {crm}",
     )
+
+
+# ---------------------------------------------------------------------------------------
+# AAP2-F02: a live LinkedIn build's matches in HubSpot's active primary
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_matches_in_a_hubspot_primary_activated_during_a_live_linkedin_build_are_hydrated(
+    settings: Settings,
+    sessions: Sessions,
+    manager: DatasetManager,
+    backfill: Backfill,
+    matching_passes: list[mode._MatchPass],
+    hydration_passes: list[tuple[int, int, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replaced = await _activate_hubspot(manager, sessions, "live")
+    previous = await _activate_simulated_linkedin(manager, sessions)
+    backfill.linkedin_leads = 2
+    activated: list[int] = []
+
+    async def hubspot_activates() -> None:
+        """HubSpot activates a new primary after the LinkedIn build settled."""
+        activated.append(await _activate_hubspot(manager, sessions, "live"))
+
+    async def pass_finds_contacts(self: SourceModeController, match_pass: mode._MatchPass) -> None:
+        """Attempt the pass's pending rows once, each finding a contact; record the pass."""
+        matching_passes.append(match_pass)
+        assert match_pass.lead_dataset_id is not None
+        found = await _pending_leads(
+            sessions, match_pass.crm_dataset_id, match_pass.lead_dataset_id
+        )
+        await _match_elsewhere(sessions, match_pass.crm_dataset_id, found)
+
+    monkeypatch.setattr(SourceModeController, "_matching_pass", pass_finds_contacts)
+    _after_first_settle(monkeypatch, hubspot_activates)
+    with anyio.fail_after(60):
+        outcome = await _controller(settings, sessions).build_dataset(
+            "linkedin", "live", reason="recovered"
+        )
+
+    [current] = activated
+    building = outcome.dataset_id
+    assert building is not None
+    assert (outcome.activated, outcome.mode) == (True, "live")
+    assert previous in outcome.retired
+    assert await _state(sessions, replaced) == "retired"
+    leads = await _lead_ids(sessions, building)
+    assert len(leads) == 2
+    # Staged in the new primary under the activation lock and matched there by the late
+    # matching pass; then that primary's CRM sync read every new match's associations.
+    assert await _matches(sessions, current, leads) == dict.fromkeys(leads, "matched")
+    assert matching_passes == [mode._MatchPass(current, "live", "live", building)]
+    assert hydration_passes == [(current, building, 2)]
+    contacts = await _matched_contacts(sessions, current)
+    assert len(contacts) == 2
+    assert await _contact_fetches(sessions, current) == {
+        contact: set(ASSOCIATED_TYPES) for contact in contacts
+    }
+    assert await manager.unhydrated_matches(current, lead_dataset_id=building) == 0
+    # The primary is in use: its evidence is never withdrawn, and no backfill reruns.
+    assert await _freshness(sessions, current) == dict.fromkeys(HUBSPOT_NAMES, ("complete", None))
+    assert backfill.calls == [building]
+    connection = await _connection(sessions, "linkedin")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "live",
+        "ok",
+        building,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_live_linkedin_contacts_matched_before_the_lock_hold_activation_until_hydrated(
+    settings: Settings,
+    sessions: Sessions,
+    manager: DatasetManager,
+    backfill: Backfill,
+    matching_passes: list[mode._MatchPass],
+    hydration_passes: list[tuple[int, int, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crm = await _activate_hubspot(manager, sessions, "live")
+    await _activate_simulated_linkedin(manager, sessions)
+    backfill.linkedin_leads = 2
+    found: list[int] = []
+
+    async def matched_elsewhere() -> None:
+        """Another matcher's retry finds a contact for one of the build's leads, before the lock."""
+        found.extend((await _lead_ids(sessions, backfill.calls[-1]))[:1])
+        await _match_elsewhere(sessions, crm, found)
+
+    _after_first_settle(monkeypatch, matched_elsewhere)
+    with capture_logs() as entries, anyio.fail_after(60):
+        outcome = await _controller(settings, sessions).build_dataset(
+            "linkedin", "live", reason="recovered"
+        )
+
+    building = outcome.dataset_id
+    assert building is not None
+    assert (outcome.activated, outcome.mode) == (True, "live")
+    # Refused under the activation lock for the match in HubSpot's primary, then the next
+    # round ran that primary's CRM sync for it before the build activated.
+    [refused] = _events(entries, "sync.build.unhydrated")
+    assert (
+        refused["dataset_id"],
+        refused["crm_dataset_id"],
+        refused["lead_dataset_id"],
+        refused["unhydrated"],
+    ) == (building, crm, building, 1)
+    assert hydration_passes == [(crm, building, 1)]
+    leads = await _lead_ids(sessions, building)
+    assert await _matches(sessions, crm, leads) == {found[0]: "matched", leads[1]: "no_match"}
+    contacts = await _matched_contacts(sessions, crm)
+    assert len(contacts) == 1
+    assert await _contact_fetches(sessions, crm) == {
+        contact: set(ASSOCIATED_TYPES) for contact in contacts
+    }
+    assert await _freshness(sessions, crm) == dict.fromkeys(HUBSPOT_NAMES, ("complete", None))
+    assert backfill.calls == [building]
+    assert matching_passes == []
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_live_linkedin_matches_never_hydrated_in_the_hubspot_primary_fail_the_build(
+    settings: Settings,
+    sessions: Sessions,
+    manager: DatasetManager,
+    backfill: Backfill,
+    matching_passes: list[mode._MatchPass],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crm = await _activate_hubspot(manager, sessions, "live")
+    previous = await _activate_simulated_linkedin(manager, sessions)
+    backfill.linkedin_leads = 2
+    refreshes: list[int] = []
+
+    async def matched_elsewhere() -> None:
+        """Another matcher finds a contact for every lead of the build, before the lock."""
+        await _match_elsewhere(sessions, crm, await _lead_ids(sessions, backfill.calls[-1]))
+
+    async def refresh_skipped(
+        controller: SourceModeController, crm_dataset_id: int, *, now: datetime | None = None
+    ) -> None:
+        """The CRM sync cannot run: no HubSpot client may be opened, nothing is read."""
+        refreshes.append(crm_dataset_id)
+
+    # The real hydration pass runs, against a CRM sync that never reads an association.
+    monkeypatch.setattr(
+        sys.modules["ads_engine.sync.jobs"], "refresh_crm_dataset", refresh_skipped, raising=False
+    )
+    _after_first_settle(monkeypatch, matched_elsewhere)
+    with capture_logs() as entries, anyio.fail_after(60):
+        outcome = await _controller(settings, sessions).build_dataset(
+            "linkedin", "live", reason="recovered"
+        )
+
+    building = outcome.dataset_id
+    assert building is not None
+    lacking = (
+        "matched contacts still lack association reads after 3 rounds: 2 matched leads in CRM "
+        f"dataset {crm}"
+    )
+    assert (outcome.activated, outcome.reason) == (False, lacking)
+    # Rounds one to three were each refused under the lock; rounds two and three each ran
+    # the CRM sync of HubSpot's primary first.
+    refused = _events(entries, "sync.build.unhydrated")
+    assert [(entry["crm_dataset_id"], entry["lead_dataset_id"]) for entry in refused] == [
+        (crm, building)
+    ] * 3
+    assert refreshes == [crm, crm]
+    hydrations = _events(entries, "sync.build.crm_hydration")
+    assert [
+        (entry["crm_dataset_id"], entry["lead_dataset_id"], entry["unhydrated"], entry["status"])
+        for entry in hydrations
+    ] == [(crm, building, 2, "skipped")] * 2
+    assert await _state(sessions, building) is None
+    assert await _state(sessions, previous) == "active"
+    assert await _state(sessions, crm) == "active"
+    connection = await _connection(sessions, "linkedin")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "simulated",
+        "denied",
+        previous,
+    )
+    assert connection.reason == f"live build failed: {lacking}"
+    assert matching_passes == []
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_unhydrated_matches_counts_only_the_given_linkedin_datasets_leads(
+    sessions: Sessions, manager: DatasetManager
+) -> None:
+    crm = await _activate_hubspot(manager, sessions, "live")
+    active, active_leads = await _activate_live_linkedin(manager, sessions, 2)
+    building = await manager.begin("linkedin", "live", reason="recovered")
+    building_leads = await _leads(sessions, building, 3)
+    unstaged = await manager.begin("linkedin", "live", reason="another build")
+    await _leads(sessions, unstaged, 1)
+    async with sessions() as session, session.begin():
+        await lead_match.stage_rows(session, crm, building, since=EPOCH, now=T0)
+    # One active lead and two of the building dataset's are matched with no association read.
+    await _match_elsewhere(sessions, crm, active_leads[:1] + building_leads[:2])
+
+    assert await manager.unhydrated_matches(crm) == 3
+    assert await manager.unhydrated_matches(crm, lead_dataset_id=building) == 2
+    assert await manager.unhydrated_matches(crm, lead_dataset_id=active) == 1
+    assert await manager.unhydrated_matches(crm, lead_dataset_id=unstaged) == 0
+    async with sessions() as session:
+        assert await manager.unhydrated_matches(crm, lead_dataset_id=building, session=session) == 2
+    await _hydrate(sessions, crm)
+    assert await manager.unhydrated_matches(crm, lead_dataset_id=building) == 0
+    assert await manager.unhydrated_matches(crm) == 0
 
 
 # ---------------------------------------------------------------------------------------

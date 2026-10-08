@@ -21,8 +21,13 @@ through the two entry points of this module:
 Logging never carries a request or response body or header. Bodies hold personal data
 (HubSpot email batch reads, LinkedIn lead responses) and requests carry the n8n secret
 header and ``Authorization``. URLs are logged only through :func:`redact_url`, which keeps
-nothing of the n8n capability URL but its host. The redaction processors of
-:mod:`ads_engine.logging` are the second line of defence, not the first.
+nothing of the n8n capability URL but its host. Error reasons never carry a credential of
+the call either, configured or not: :func:`send_json` holds every credential its requests
+carry, and those the caller passes as ``secrets`` (an exchanged LinkedIn access token, a
+rotated refresh token), with :func:`~ads_engine.connectors.errors.holding_secrets` while
+each error is built, so a platform echoing one in ordinary prose never reaches a log. The
+redaction processors of :mod:`ads_engine.logging` are the second line of defence, not the
+first.
 
 Example:
     A connector owns its client and sends each call through :func:`send_json`::
@@ -47,17 +52,18 @@ Example:
 """
 
 import asyncio
+import copy
 import functools
 import json
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Context, Decimal, DecimalException, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Final, NoReturn
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote
 
 import httpx
 from tenacity import (
@@ -77,6 +83,7 @@ from ads_engine.connectors.errors import (
     TransientError,
     classify,
     classify_exception,
+    holding_secrets,
     sanitize_message,
 )
 from ads_engine.db.models.ops import SOURCES
@@ -85,6 +92,7 @@ from ads_engine.logging import (
     REDACTED,
     REDACTED_EMAIL,
     get_logger,
+    redact,
     redact_secret_matches,
 )
 from ads_engine.settings import Settings, Source, get_settings
@@ -165,6 +173,15 @@ _SEPARATOR_FREE_QUERY_SUFFIXES: Final[tuple[str, ...]] = tuple(
 )
 _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
+# Headers whose whole value, and the credential after its scheme, authenticate a request.
+_AUTHORIZATION_HEADERS: Final = frozenset({"authorization", "proxy-authorization"})
+_FORM_CONTENT_TYPE: Final = "application/x-www-form-urlencoded"
+# The credential every simulated client sends: LinkedIn's SIMULATED_TOKEN, Google's
+# SIMULATED_SECRET and the simulated HubSpot token of ads_engine.sync.mode all equal it. It
+# is a public placeholder, not a secret, and holding it would strip the word from
+# simulated-mode reasons such as "ReadTimeout: simulated timeout", so it is never held.
+_SIMULATED_PLACEHOLDER: Final = "simulated"
+
 # Longest non-JSON error body, in characters, that is sanitised whole and then used for
 # classification and the error message. Redaction runs on the complete text before any
 # cut, so no secret or address is ever split into a fragment it no longer recognises.
@@ -200,7 +217,7 @@ def build_client(
     ``Accept: application/json`` default headers, no redirect following (a redirect is
     an unexpected status, hence a defect), and two event hooks that log each request at
     debug (``http.request``) and each response at info (``http.response``, with
-    ``status`` and ``elapsed_ms`` to the response headers). Hooks log only the method and
+    ``status`` and ``duration_ms`` to the response headers). Hooks log only the method and
     :func:`redact_url` of the URL.
 
     httpx applies those timeouts per network phase and per read, never to a call as a
@@ -347,11 +364,12 @@ def _key_forms(name: str) -> tuple[str, str, str]:
 
 
 def _is_sensitive_key(name: str) -> bool:
-    """Whether the query parameter ``name`` carries a credential, in any letter case.
+    """Whether the query parameter, header or form field ``name`` carries a credential.
 
-    Its raw or camelCase form is a credential name or ends with a credential suffix
-    (``ACCESS_TOKEN``, ``pageToken``), or its separator-free form is one of those names or
-    ends with one of those suffixes, each with ``_`` removed (``ACCESSTOKEN``, ``XAPIKEY``).
+    In any letter case, its raw or camelCase form is a credential name or ends with a
+    credential suffix (``ACCESS_TOKEN``, ``pageToken``, ``X-Webhook-Secret``), or its
+    separator-free form is one of those names or ends with one of those suffixes, each
+    with ``_`` removed (``ACCESSTOKEN``, ``XAPIKEY``).
     """
     raw, camel, separator_free = _key_forms(name)
     return (
@@ -455,10 +473,14 @@ def _logging_hooks(
         )
 
     async def log_response(response: httpx.Response) -> None:
-        """Log a response at info: method, URL, status and milliseconds to its headers."""
+        """Log a response at info: method, URL, status and ``duration_ms`` to its headers.
+
+        ``duration_ms`` is the milliseconds from the request's start stamp to the response
+        headers, to one decimal; ``None`` for a request the request hook never stamped.
+        """
         request = response.request
         started = request.extensions.get(STARTED_EXTENSION)
-        elapsed_ms = (
+        duration_ms = (
             round((time.monotonic() - started) * 1000.0, 1) if isinstance(started, float) else None
         )
         _log.info(
@@ -467,7 +489,7 @@ def _logging_hooks(
             method=request.method,
             url=redact_url(request.url, source=source, secrets=secrets),
             status=response.status_code,
-            elapsed_ms=elapsed_ms,
+            duration_ms=duration_ms,
         )
 
     return log_request, log_response
@@ -575,6 +597,7 @@ async def send_json(
     policy: RetryPolicy = DEFAULT_RETRY,
     before_attempt: Callable[[], Awaitable[None]] | None = None,
     accept_statuses: Collection[int] = (200,),
+    secrets: Collection[str] = (),
 ) -> JsonResponse:
     """Send one logical call, retrying transient failures, and decode its JSON response.
 
@@ -588,7 +611,7 @@ async def send_json(
        is used. A request that cannot be built (an invalid URL, a body that does not
        serialise, a header that does not encode) is a ``QueryDefect`` with code
        ``CLIENT``, raised without a send and never retried; a ``ConnectorError`` the
-       builder raises itself is raised unchanged;
+       builder raises itself is raised unchanged, unless it carries a held secret (below);
     3. sends it and reads the whole response body within the source's
        :data:`SOURCE_TIMEOUTS` deadline (Google: 120 s). An expired deadline is a
        ``TransientError`` with code ``TIMEOUT``; any other httpx failure (timeout,
@@ -618,7 +641,28 @@ async def send_json(
     ``AccessDenied``, ``QueryDefect`` and ``CallBudgetExhausted`` are raised on their
     first occurrence. Every classified error is logged as ``connector.error`` (source,
     endpoint, kind, code, HTTP status, attempt, retryability, the sanitised reason,
-    ``retry_after`` and ``query_id``) before it is raised; headers and bodies never are.
+    ``retry_after``, ``query_id`` and ``will_retry``) before it is raised; headers and
+    bodies never are. An attempt that will be retried is logged at debug level and the
+    error raised at info level; the owner of its consequence logs the terminal record.
+
+    No error of the call carries one of its credentials, even one the settings do not
+    know. Each attempt runs inside :func:`~ads_engine.connectors.errors.holding_secrets`,
+    holding ``secrets`` and the credentials of every request the call has built so far:
+    the ``Authorization`` value and the credential after its scheme, and each header,
+    query parameter and ``application/x-www-form-urlencoded`` body field with a credential
+    name (:func:`redact_url`'s names, which cover the n8n secret header, ``refresh_token``
+    and ``client_secret``). A token from an earlier attempt therefore stays held after a
+    retry. Every error built during the attempt, here, in
+    :mod:`~ads_engine.connectors.errors` or by a transport, loses them before its message
+    is cut, and so does the reason logged. A logged traceback renders the text, the
+    arguments and the notes of the error raised and of every exception linked to it, and
+    the log redaction does not know a held secret. So a ``ConnectorError`` built before the
+    call that the builder or transport raises carrying one, in its message, its code, a
+    note or a linked exception, is replaced by a copy rebuilt without them, with no
+    notes, cause or context; and an exception quoting one in any of those texts, plain or
+    percent-encoded as deeply as the log redaction decodes, is raised for with neither
+    cause nor context. Blank values and the public ``simulated`` placeholder are never
+    held.
 
     Args:
         client: A client from :func:`build_client`.
@@ -633,6 +677,10 @@ async def send_json(
             rate limiter.
         accept_statuses: Statuses returned as data instead of raised, for example
             ``(200, 207)`` for HubSpot batch reads or ``(200, 404)`` for a property read.
+        secrets: Plaintexts held only in memory that no error or log of the call may
+            carry, beyond the credentials its requests carry: for example the LinkedIn
+            token provider's exchanged, rotated and retired tokens, or the access token a
+            refresh replaced.
 
     Returns:
         The accepted response with its decoded body.
@@ -644,12 +692,21 @@ async def send_json(
         CallBudgetExhausted: ``before_attempt`` reported the call budget used up.
         QueryDefect: The request is wrong, the response is not JSON or holds an
             unrepresentable number, or its status was unexpected.
+        TypeError: When ``secrets`` is a single string, which would otherwise be read as
+            one-character secrets, or holds anything but strings.
         ValueError: When ``source`` is unknown or ``accept_statuses`` is empty.
     """
     _require_source(source)
     accepted = frozenset(accept_statuses)
     if not accepted:
         raise ValueError("accept_statuses must name at least one HTTP status")
+    if isinstance(secrets, str | bytes):
+        raise TypeError("secrets must be a collection of strings, not a single string")
+    if not all(isinstance(secret, str) for secret in secrets):
+        raise TypeError("secrets must hold strings only")
+    # Grows with the credentials of each attempt's request and is held by every later
+    # attempt, so a token replaced between attempts stays out of their errors too.
+    held = _holdable(secrets)
     retrying = AsyncRetrying(
         stop=stop_after_attempt(policy.attempts),
         wait=_RetryWait(policy),
@@ -668,6 +725,8 @@ async def send_json(
                 accepted=accepted,
                 before_attempt=before_attempt,
                 attempt_number=attempt.retry_state.attempt_number,
+                held=held,
+                policy=policy,
             )
     # tenacity either returns from inside the loop or raises the last error (reraise=True).
     raise RuntimeError("retry loop ended without an outcome")  # pragma: no cover
@@ -777,6 +836,123 @@ def _construction_defect(exc: Exception, *, source: Source, endpoint: str) -> Qu
     )
 
 
+def _holdable(values: Iterable[str]) -> set[str]:
+    """Return the ``values`` worth holding: neither blank nor the simulated placeholder."""
+    return {value for value in values if value.strip() and value.strip() != _SIMULATED_PLACEHOLDER}
+
+
+def _request_secrets(request: httpx.Request) -> set[str]:
+    """Return the credentials ``request`` carries, for :func:`send_json` to hold.
+
+    They are the whole value of an ``Authorization`` or ``Proxy-Authorization`` header and
+    the credential after its scheme (the token of ``Bearer <token>``), and the value of
+    every header, query parameter and ``application/x-www-form-urlencoded`` body field
+    whose name :func:`_is_sensitive_key` reads as a credential: the n8n secret header
+    (``X-Webhook-Secret``, ``X-Webhook-Token``), ``refresh_token``, ``client_secret``. A
+    streamed body that was never read is not inspected. Blank values and the simulated
+    placeholder are left out (:func:`_holdable`).
+    """
+    values: list[str] = []
+    for name, value in request.headers.multi_items():
+        if name.lower() in _AUTHORIZATION_HEADERS:
+            credential = value.strip().partition(" ")[2].strip()
+            if credential != _SIMULATED_PLACEHOLDER:
+                values.extend((value, credential))
+        elif _is_sensitive_key(name):
+            values.append(value)
+    values.extend(
+        value for name, value in request.url.params.multi_items() if _is_sensitive_key(name)
+    )
+    media_type = request.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+    if media_type == _FORM_CONTENT_TYPE:
+        try:
+            content = request.content
+        except httpx.RequestNotRead:
+            content = b""
+        fields = parse_qsl(content.decode("utf-8", errors="replace"), keep_blank_values=True)
+        values.extend(value for name, value in fields if _is_sensitive_key(name))
+    return _holdable(values)
+
+
+def _rendered_texts(exc: BaseException) -> list[str] | None:
+    """Return every text a logged traceback renders for ``exc`` itself, its links aside.
+
+    They are its ``str``; the ``repr`` of its arguments, from which the log re-renders an
+    exception whose ``__str__`` is a built-in one; each of its notes (PEP 678
+    ``add_note``), as ``str`` renders it whatever its type; and, for a ``SyntaxError``, its
+    message, file name and source line.
+
+    Returns:
+        The texts, or ``None`` when one cannot be rendered (a ``__str__`` or ``repr`` that
+        raises) or the notes are not a list or tuple, which ``add_note`` never leaves.
+    """
+    try:
+        notes = getattr(exc, "__notes__", ())
+        if not isinstance(notes, list | tuple):
+            return None
+        texts = [str(exc), repr(exc.args), *(str(note) for note in notes)]
+        if isinstance(exc, SyntaxError):
+            parts = (exc.msg, exc.filename, exc.text)
+            texts.extend(str(part) for part in parts if part is not None)
+    # No-blind-except yields: an exception's __str__, an argument's repr or a note's __str__
+    # can raise anything; the caller fails closed.
+    except Exception:  # noqa: BLE001
+        return None
+    return texts
+
+
+def _quotes_held(error: BaseException, held: Collection[str]) -> bool:
+    """Whether a logged traceback of ``error`` would render a held secret.
+
+    Every text the traceback renderer emits (:func:`_rendered_texts`: the text, the
+    arguments and the notes) is read for ``error`` and for every exception linked to it,
+    however deep: each cause, each context and each member of an exception group. A text
+    quotes a held secret when its log redaction (:func:`ads_engine.logging.redact`)
+    changes once the held secrets are redacted as well. That finds a secret plain or
+    percent-encoded, in either letter case of the escapes, through the four decoding
+    rounds the redaction applies; a run encoded more deeply is replaced whole by the log
+    redaction anyway. Such an exception is never chained to the error raised for it,
+    because the log redaction does not know a held secret. Text that cannot be rendered
+    counts as quoting one.
+    """
+    secrets = tuple(sorted({secret for secret in held if secret}))
+    if not secrets:
+        return False
+    pending: list[BaseException] = [error]
+    seen: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if any(current is known for known in seen):
+            continue
+        seen.append(current)
+        texts = _rendered_texts(current)
+        if texts is None or any(redact(text, secrets=secrets) != redact(text) for text in texts):
+            return True
+        linked: list[BaseException | None] = [current.__cause__, current.__context__]
+        if isinstance(current, BaseExceptionGroup):
+            linked.extend(current.exceptions)
+        pending.extend(link for link in linked if link is not None)
+    return False
+
+
+def _without_held(error: ConnectorError, held: Collection[str]) -> ConnectorError:
+    """Return ``error`` when it quotes no held secret, else a copy rebuilt without them.
+
+    Called while ``held`` is held, for an error a builder or transport raised. One built
+    before the secrets were held can still carry one in its message or code, in a note
+    added to it, or in an exception linked to it (:func:`_quotes_held`). The original is
+    kept only when rebuilding leaves its message and code unchanged and none of those
+    quotes a held secret. ``copy.copy`` rebuilds the error through its constructor
+    (``ConnectorError.__reduce__``), whose sanitising strips them now, also a start of
+    one that an earlier cut left, and the copy has no traceback, notes, cause or context.
+    """
+    rebuilt = copy.copy(error)
+    unchanged = (rebuilt.message, rebuilt.code) == (error.message, error.code)
+    if unchanged and not _quotes_held(error, held):
+        return error
+    return rebuilt
+
+
 async def _send_once(
     client: httpx.AsyncClient,
     build_request: Callable[[], httpx.Request],
@@ -786,35 +962,84 @@ async def _send_once(
     accepted: frozenset[int],
     before_attempt: Callable[[], Awaitable[None]] | None,
     attempt_number: int,
+    held: set[str],
+    policy: RetryPolicy,
 ) -> JsonResponse:
-    """Run one attempt of :func:`send_json`: steps 1 to 6 of its docstring."""
-    if before_attempt is not None:
-        await before_attempt()
-    try:
-        request = build_request()
-    except ConnectorError as raised:
-        # A builder may raise a classified error itself; it keeps its kind.
-        _log_error(raised, attempt_number)
-        raise
-    except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, TypeError, ValueError) as exc:
-        # The request cannot be built: an invalid URL, a JSON body that does not serialise,
-        # a header that does not encode. The same failure recurs on every attempt.
-        defect = _construction_defect(exc, source=source, endpoint=endpoint)
-        _log_error(defect, attempt_number)
-        raise defect from exc
+    """Run one attempt of :func:`send_json`: steps 1 to 6 of its docstring.
+
+    Every step runs while ``held`` is held. Once the request is built, ``held`` gains the
+    credentials it carries, and the call keeps them for its later attempts.
+    """
+    replacement: ConnectorError | None = None
+    with holding_secrets(held):
+        if before_attempt is not None:
+            await before_attempt()
+        try:
+            request = build_request()
+        except ConnectorError as raised:
+            # A builder may raise a classified error itself; it keeps its kind.
+            replacement = _without_held(raised, held)
+            _log_error(replacement, attempt_number, policy)
+            if replacement is raised:
+                raise
+        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, TypeError, ValueError) as exc:
+            # The request cannot be built: an invalid URL, a JSON body that does not serialise,
+            # a header that does not encode. The same failure recurs on every attempt.
+            defect = _construction_defect(exc, source=source, endpoint=endpoint)
+            _log_error(defect, attempt_number, policy)
+            if not _quotes_held(exc, held):
+                raise defect from exc
+            replacement = defect
+    if replacement is not None:
+        # Raised outside the handler, so the error or exception that quoted a held secret
+        # is neither its cause nor its context.
+        raise replacement
+    held.update(_request_secrets(request))
+    with holding_secrets(held):
+        return await _send_request(
+            client,
+            request,
+            source=source,
+            endpoint=endpoint,
+            accepted=accepted,
+            attempt_number=attempt_number,
+            held=held,
+            policy=policy,
+        )
+
+
+async def _send_request(
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+    *,
+    source: Source,
+    endpoint: str,
+    accepted: frozenset[int],
+    attempt_number: int,
+    held: Collection[str],
+    policy: RetryPolicy,
+) -> JsonResponse:
+    """Run steps 3 to 6 of a :func:`send_json` attempt for its built ``request``.
+
+    Called while ``held``, the request's own credentials included, is held. ``policy``
+    decides whether each ``connector.error`` it logs reports a retry (:func:`_log_error`).
+    """
     # httpx's timeouts bound each network phase and each read, not the call: a body that
     # drips in faster than the read timeout would hold the call open indefinitely. The
     # deadline bounds the whole attempt, body included, since client.send reads the body.
     deadline_seconds = SOURCE_TIMEOUTS[source]
     deadline = asyncio.timeout(deadline_seconds)
+    replacement: ConnectorError | None = None
     try:
         async with deadline:
             response = await client.send(request)
     except ConnectorError as raised:
         # A transport may raise a classified error itself, as the simulation's mock
         # transport does for an injected fault or a request that breaks its contract.
-        _log_error(raised, attempt_number)
-        raise
+        replacement = _without_held(raised, held)
+        _log_error(replacement, attempt_number, policy)
+        if replacement is raised:
+            raise
     except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, TimeoutError) as exc:
         # Beyond httpx.HTTPError: InvalidURL, StreamError and the built-in TimeoutError do
         # not derive from it, and classify_exception maps each of them to its kind. An
@@ -830,8 +1055,14 @@ async def _send_once(
             )
         else:
             failure = classify_exception(exc, source=source, endpoint=endpoint)
-        _log_error(failure, attempt_number)
-        raise failure from exc
+        _log_error(failure, attempt_number, policy)
+        if not _quotes_held(exc, held):
+            raise failure from exc
+        replacement = failure
+    if replacement is not None:
+        # Raised outside the handler, so the error or exception that quoted a held secret
+        # is neither its cause nor its context.
+        raise replacement
 
     status = response.status_code
     body, is_json = _decode_json(response.content)
@@ -847,12 +1078,13 @@ async def _send_once(
                     query_id=_query_id(endpoint),
                 ),
                 attempt_number,
+                policy,
             )
         if source == "google":
             # n8n answers HTTP 200 for Google denials and quota errors; the body decides.
             relayed = classify(response, body, source=source, endpoint=endpoint)
             if relayed is not None:
-                _raise_logged(relayed, attempt_number)
+                _raise_logged(relayed, attempt_number, policy)
         return JsonResponse(status=status, body=body, headers=response.headers)
 
     if is_json:
@@ -868,7 +1100,7 @@ async def _send_once(
             http_status=status,
             query_id=_query_id(endpoint),
         )
-    _raise_logged(classified, attempt_number)
+    _raise_logged(classified, attempt_number, policy)
 
 
 def _classify_text(
@@ -987,7 +1219,7 @@ def _query_id(endpoint: str) -> str | None:
     return parts[1] if len(parts) == 2 else None
 
 
-def _log_error(error: ConnectorError, attempt_number: int) -> None:
+def _log_error(error: ConnectorError, attempt_number: int, policy: RetryPolicy) -> None:
     """Log a classified error as ``connector.error``, with its reason but never a body.
 
     The event carries source, endpoint, kind, code, HTTP status, attempt, retryability and
@@ -995,9 +1227,18 @@ def _log_error(error: ConnectorError, attempt_number: int) -> None:
     share every other field distinguishable. It also carries ``retry_after``, the wait a
     ``TransientError`` asked for, and ``query_id``, a ``QueryDefect``'s query id; each is
     ``None`` for other errors. The reason is already sanitised of emails, configured
-    secrets and the webhook URL; headers and bodies are never logged.
+    secrets, the webhook URL and every secret :func:`send_json` holds for the call (its
+    ``secrets`` and its requests' credentials); headers and bodies are never logged.
+
+    ``will_retry`` says whether :func:`send_json` sends another attempt, by the retry test
+    and attempt limit its retry loop applies under ``policy``. An attempt that will be
+    retried is logged at debug level, and the error :func:`send_json` raises at info level:
+    the owner of its consequence (``ads_engine.sync.mode``'s ``on_error``, or the connector
+    or CLI code that catches it) logs the failure's terminal record.
     """
-    _log.warning(
+    will_retry = attempt_number < policy.attempts and _retry_predicate(policy)(error)
+    log = _log.debug if will_retry else _log.info
+    log(
         "connector.error",
         source=error.source,
         endpoint=error.endpoint,
@@ -1009,10 +1250,11 @@ def _log_error(error: ConnectorError, attempt_number: int) -> None:
         reason=error.reason,
         retry_after=error.retry_after if isinstance(error, TransientError) else None,
         query_id=error.query_id if isinstance(error, QueryDefect) else None,
+        will_retry=will_retry,
     )
 
 
-def _raise_logged(error: ConnectorError, attempt_number: int) -> NoReturn:
+def _raise_logged(error: ConnectorError, attempt_number: int, policy: RetryPolicy) -> NoReturn:
     """Log ``error`` as ``connector.error`` and raise it."""
-    _log_error(error, attempt_number)
+    _log_error(error, attempt_number, policy)
     raise error

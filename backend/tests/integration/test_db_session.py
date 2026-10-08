@@ -1145,7 +1145,7 @@ async def test_dedicated_connection_sends_nothing_on_an_invalidated_connection(
 
 
 # ---------------------------------------------------------------------------
-# _run_to_completion
+# run_to_completion
 # ---------------------------------------------------------------------------
 
 
@@ -1157,7 +1157,7 @@ async def test_run_to_completion_runs_the_cleanup_once() -> None:
     async def cleanup() -> None:
         calls.append("cleanup")
 
-    await db_session._run_to_completion(cleanup())
+    await db_session.run_to_completion(cleanup())
 
     assert calls == ["cleanup"]
 
@@ -1170,7 +1170,7 @@ async def test_run_to_completion_propagates_what_the_cleanup_raised() -> None:
         raise LookupError("cleanup failed")
 
     with pytest.raises(LookupError, match="cleanup failed"):
-        await db_session._run_to_completion(cleanup())
+        await db_session.run_to_completion(cleanup())
 
 
 @pytest.mark.anyio
@@ -1185,7 +1185,7 @@ async def test_run_to_completion_holds_cancellation_until_the_cleanup_finishes()
         await release.wait()
         finished.append(True)
 
-    task = asyncio.create_task(db_session._run_to_completion(cleanup()))
+    task = asyncio.create_task(db_session.run_to_completion(cleanup()))
     await started.wait()
     for _ in range(2):
         task.cancel()
@@ -1210,4 +1210,4 @@ async def test_run_to_completion_raises_when_the_cleanup_itself_is_cancelled() -
         raise asyncio.CancelledError
 
     with pytest.raises(asyncio.CancelledError):
-        await db_session._run_to_completion(cleanup())
+        await db_session.run_to_completion(cleanup())

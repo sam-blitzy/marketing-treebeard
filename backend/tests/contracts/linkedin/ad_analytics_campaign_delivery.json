@@ -1,0 +1,236 @@
+{
+  "surface": "linkedin.ad_analytics_campaign_delivery",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-06-24",
+  "request": {
+    "method": "GET",
+    "url": "adAnalytics?q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange=(start:(year:{y},month:{m},day:{d}),end:(year:{y},month:{m},day:{d}))&accounts=List({acct})&fields={fields}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "pivot",
+      "timeGranularity",
+      "dateRange",
+      "accounts",
+      "fields"
+    ],
+    "optional_query": [],
+    "fields": "pivotValues,impressions",
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "max_fields": 20,
+      "max_elements": 15000
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "Analytics Finder (`q=analytics`) campaign-delivery response: the discovery call of the live demographic-segment fallback (connector `analytics_segments`, `_delivering`). One request per ad account and preset window: `pivot=CAMPAIGN`, `timeGranularity=ALL`, the exact window of the segment request and the `accounts` facet, projecting only `pivotValues` and `impressions`. The connector sends it only after LinkedIn 202609 rejected the contracted Statistics Finder request (`ad_analytics_statistics.json`) with HTTP 400 (observed live on 2026-10-07: '\"MEMBER_SENIORITY\" is not an enum symbol'); it then reads each campaign with impressions through `ad_analytics_member_segments.json`, and the discovery result is shared by the three demographic pivots of one window. A campaign reported with zero impressions has no demographic values and is skipped. The simulator answers the contracted Statistics Finder form, so simulated runs take this request only when a world fault rejects that form with HTTP 400. Sources: the Ads Reporting page at reference_url (served moniker li-lms-2026-09, ms.date 2026-06-19, updated_at 2026-06-24) for the Analytics Finder, its sample response and its limits; the Reporting schema page (https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema?view=li-lms-2026-09; served moniker li-lms-2026-09, ms.date 2026-09-14, updated_at 2026-09-16) for the query parameters, the Analytics Finder `pivot` enum, which lists CAMPAIGN, and the metric types. Request conventions: url is relative to https://api.linkedin.com/rest/; {acct} is urn%3Ali%3AsponsoredAccount%3A{id}; Rest.li parentheses, colons and commas stay literal; {fields} must equal request.fields exactly, which equals `client.SEGMENT_DISCOVERY_FIELDS`, and is sent raw (LinkedIn rejects an encoded projection with 400). `dateRange.start`, `timeGranularity` and at least one facet are required; `pivotValues` is a response field requested through `fields`, never a filter. Limits (reporting page): up to 20 fields; at most 15,000 elements per response; the endpoint does not paginate and the client follows a rel=next link only when one is returned; a response at the cap without one makes the segment listing incomplete with the reason \"result limit reached\". An empty `elements` means no delivery in the window or no read access. documented_sample is the Reporting page's Analytics Finder sample response, verbatim and identical to ad_analytics.json's (q=analytics, pivot=MEMBER_COMPANY, timeGranularity=DAILY, two elements, each pivotValues a single urn:li:organization value); the page publishes no Analytics Finder sample for this exact pivot and granularity, and no sample is invented.",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Report data points, one per campaign with activity in the window; at most 15,000 per response.",
+          "items": {
+            "type": "object",
+            "description": "One campaign over the whole requested window (`timeGranularity=ALL`). Only `pivotValues` is required; an absent metric is unavailable, never zero.",
+            "properties": {
+              "pivotValues": {
+                "type": "array",
+                "description": "Values of the requested pivot (string[]). For this request: exactly one campaign URN, urn:li:sponsoredCampaign:{id}; the connector rejects any other form as a defect. The documented sample pivots by MEMBER_COMPANY and so carries an organization URN.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "impressions": {
+                "type": "integer",
+                "description": "long. The campaign's impressions over the window; a campaign with 0 is skipped by the fallback."
+              },
+              "dateRange": {
+                "type": "object",
+                "description": "Not in this request's projection, so absent from live responses; declared because the documented sample carries it. UTC calendar days, start and end inclusive. The schema page marks start required and end optional.",
+                "properties": {
+                  "start": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "end": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "start"
+                ],
+                "additionalProperties": false
+              },
+              "costInLocalCurrency": {
+                "type": "string",
+                "description": "BigDecimal as a decimal string, in the account currency. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "landingPageClicks": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "externalWebsiteConversions": {
+                "type": "integer",
+                "description": "long, documented default \"0\". Not requested by this product; declared only because the documented sample carries it."
+              },
+              "shares": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              },
+              "reactions": {
+                "type": "integer",
+                "description": "long. Not requested by this product; declared only because the documented sample carries it."
+              }
+            },
+            "required": [
+              "pivotValues"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Optional. The documented sample carries {count, links, start} with an empty `links`, and the live Analytics Finder fallback response (2026-10-07) carried a rel=next link and no `total`. The reporting page states that adAnalytics does not support pagination; only a rel=next link in `links` is ever acted on.",
+          "properties": {
+            "count": {
+              "type": "integer"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rel",
+                  "href"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count",
+            "start"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "elements"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 28
+            }
+          },
+          "landingPageClicks": 0,
+          "costInLocalCurrency": "0.0",
+          "impressions": 6,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        },
+        {
+          "pivotValues": [
+            "urn:li:organization:1111"
+          ],
+          "dateRange": {
+            "start": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            },
+            "end": {
+              "month": 5,
+              "year": 2024,
+              "day": 29
+            }
+          },
+          "landingPageClicks": 11,
+          "costInLocalCurrency": "19.91833",
+          "impressions": 165,
+          "shares": 0,
+          "externalWebsiteConversions": 0,
+          "reactions": 0
+        }
+      ]
+    }
+  }
+}

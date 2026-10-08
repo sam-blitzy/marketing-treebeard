@@ -9,6 +9,7 @@ reserved example domain.
 """
 
 import copy
+import dataclasses
 import datetime as dt
 import io
 import json
@@ -40,6 +41,8 @@ from ads_engine.logging import (
     URL_CREDENTIALS_RE,
     configure_logging,
     get_logger,
+    logged_as,
+    mark_logged,
     redact,
     redact_processor,
     redact_secret_matches,
@@ -1454,6 +1457,92 @@ def test_uvicorn_loggers_are_routed_through_redaction() -> None:
     (record,) = _lines(stream)
     assert record["event"] == '127.0.0.1 - "GET /actions?email=[REDACTED_EMAIL] HTTP/1.1" 200'
     assert record["logger"] == "uvicorn.access"
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenError(Exception):
+    """An exception whose ``__setattr__`` refuses every assignment."""
+
+    code: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FrozenSlotsError(Exception):
+    """A frozen dataclass exception with slots: its instance dict comes from BaseException."""
+
+    code: int
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("boom"), _FrozenError(7), _FrozenSlotsError(8), KeyboardInterrupt()],
+    ids=["plain", "frozen-dataclass", "frozen-slots-dataclass", "base-exception"],
+)
+def test_mark_logged_records_the_owning_event(error: BaseException) -> None:
+    assert logged_as(error) is None
+    mark_logged(error, "analysis_run_failed")
+    assert logged_as(error) == "analysis_run_failed"
+    # A later owner replaces the event; other exceptions stay unmarked.
+    mark_logged(error, "api.unhandled_error")
+    assert logged_as(error) == "api.unhandled_error"
+    assert logged_as(RuntimeError("boom")) is None
+
+
+def test_mark_logged_needs_an_event_name() -> None:
+    error = RuntimeError("boom")
+    with pytest.raises(ValueError, match="event must name the log event"):
+        mark_logged(error, "")
+    assert logged_as(error) is None
+
+
+def test_logged_as_ignores_a_marker_that_is_not_an_event_name() -> None:
+    error = RuntimeError("boom")
+    vars(error)[ads_logging._LOGGED_AS_KEY] = 3
+    assert logged_as(error) is None
+
+
+def _raised(message: str) -> RuntimeError:
+    """Return a ``RuntimeError`` that was raised, so it carries a traceback."""
+    try:
+        raise RuntimeError(message)
+    except RuntimeError as caught:
+        return caught
+
+
+def test_uvicorn_error_drops_a_record_of_an_exception_already_logged() -> None:
+    stream = _configure()
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    owned = _raised("logged by its owner")
+    mark_logged(owned, "api.unhandled_error")
+    unowned = _raised("logged nowhere else")
+
+    uvicorn_error.error("Exception in ASGI application\n", exc_info=owned)
+    uvicorn_error.error("Exception in ASGI application\n", exc_info=unowned)
+    uvicorn_error.info("Application startup complete.")
+
+    records = _lines(stream)
+    assert [record["event"] for record in records] == [
+        "Exception in ASGI application\n",
+        "Application startup complete.",
+    ]
+    (exception,) = records[0]["exception"]
+    assert exception["exc_value"] == "logged nowhere else"
+    # Reconfiguring attaches the one filter instance once.
+    _configure()
+    assert uvicorn_error.filters.count(ads_logging._OWNED_EXCEPTION_FILTER) == 1
+
+
+def test_owned_exception_filter_passes_records_without_a_real_exception() -> None:
+    owned_filter = ads_logging._OWNED_EXCEPTION_FILTER
+    plain = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "msg", None, None)
+    assert owned_filter.filter(plain) is True
+    cleared = logging.LogRecord(
+        "uvicorn.error", logging.ERROR, __file__, 1, "msg", None, (None, None, None)
+    )
+    assert owned_filter.filter(cleared) is True
+    odd = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "msg", None, None)
+    odd.exc_info = cast(Any, ("not", "an", "exc_info", "tuple"))
+    assert owned_filter.filter(odd) is True
 
 
 def _raise_with_secret_local() -> None:

@@ -362,13 +362,23 @@ def _parse_captures(captures: Sequence[Mapping[str, Any]]) -> dict[str, int]:
             for element in _capture_elements(body):
                 parse_analytics_daily(element)
                 parsed += 1
-        elif name == "ad_analytics_statistics":
+        elif name == "ad_analytics_campaign_delivery":
+            for element in _capture_elements(body):
+                (campaign_urn,) = element["pivotValues"]
+                assert sponsored_campaign_urn(campaign_urn) == campaign_urn
+                parsed += 1
+        elif name in ("ad_analytics_statistics", "ad_analytics_member_segments"):
             pivots = _MEMBER_PIVOT_RE.findall(url)
             assert len(pivots) == 1, "a segment capture requests exactly one MEMBER_* pivot"
             campaign = _CAMPAIGN_FACET_RE.search(url)
+            if name == "ad_analytics_member_segments":
+                assert campaign is not None, "a member-segments capture names its one campaign"
             for element in _capture_elements(body):
                 parse_segment(
-                    element, pivots[0], campaign_urn=campaign.group(1) if campaign else None
+                    element,
+                    pivots[0],
+                    campaign_urn=campaign.group(1) if campaign else None,
+                    surface=name,
                 )
                 parsed += 1
         elif name == "lead_forms":
@@ -403,12 +413,16 @@ def test_live_captures_parse_with_their_surface_parser(
     assert set(counts) <= {str(capture["surface"]).partition(".")[2] for capture in captures}
 
 
-def test_capture_dispatch_parses_every_surface_shape(contract: ContractLoader) -> None:
+def test_capture_dispatch_parses_every_surface_shape(
+    contract: ContractLoader, conform: Conform
+) -> None:
     """The capture dispatcher reaches every parser, proven on captures built from the samples.
 
     The dispatcher above otherwise runs only once live captures exist, so it is exercised here
     on capture records whose bodies are the documented samples (with the two documented
-    substitutions), plus an error response that is skipped and an access-token exchange.
+    substitutions), plus an error response that is skipped and an access-token exchange. The
+    two segment-fallback surfaces share the organization-pivoted Analytics Finder sample, so
+    their bodies are hand-built elements checked against their own contracts.
     """
     analytics = _sample(contract, "ad_analytics")
     for element in analytics["elements"]:
@@ -424,6 +438,26 @@ def test_capture_dispatch_parses_every_surface_shape(contract: ContractLoader) -
         "posts": _sample(contract, "posts"),
         "ad_analytics": analytics,
         "ad_analytics_statistics": statistics,
+        "ad_analytics_campaign_delivery": {
+            "elements": [
+                conform(
+                    "ad_analytics_campaign_delivery",
+                    {"pivotValues": [CAMPAIGN_URN], "impressions": 400},
+                ),
+                conform(
+                    "ad_analytics_campaign_delivery",
+                    {"pivotValues": [OTHER_CAMPAIGN_URN], "impressions": 0},
+                ),
+            ]
+        },
+        "ad_analytics_member_segments": {
+            "elements": [
+                conform(
+                    "ad_analytics_member_segments",
+                    {"pivotValues": ["urn:li:seniority:5"], "impressions": 120, "clicks": 3},
+                )
+            ]
+        },
         "lead_forms": _sample(contract, "lead_forms"),
         "lead_form_responses": _sample(contract, "lead_form_responses"),
         "lead_form_responses_batch": _sample(contract, "lead_form_responses_batch"),
@@ -432,6 +466,14 @@ def test_capture_dispatch_parses_every_surface_shape(contract: ContractLoader) -
         "ad_analytics_statistics": (
             "https://api.linkedin.com/rest/adAnalytics?q=statistics"
             "&pivots=List(CAMPAIGN,MEMBER_SENIORITY)&timeGranularity=ALL"
+        ),
+        "ad_analytics_campaign_delivery": (
+            "https://api.linkedin.com/rest/adAnalytics?q=analytics&pivot=CAMPAIGN"
+            "&timeGranularity=ALL&accounts=List(urn%3Ali%3AsponsoredAccount%3A990000001)"
+        ),
+        "ad_analytics_member_segments": (
+            "https://api.linkedin.com/rest/adAnalytics?q=analytics&pivot=MEMBER_SENIORITY"
+            "&timeGranularity=ALL&campaigns=List(urn%3Ali%3AsponsoredCampaign%3A990000201)"
         ),
     }
     captures: list[dict[str, Any]] = [
@@ -471,6 +513,8 @@ def test_capture_dispatch_parses_every_surface_shape(contract: ContractLoader) -
         "posts": 1,
         "ad_analytics": 2,
         "ad_analytics_statistics": 1,
+        "ad_analytics_campaign_delivery": 2,
+        "ad_analytics_member_segments": 1,
         "lead_forms": 1,
         "lead_form_responses": 1,
         "lead_form_responses_batch": 1,

@@ -11,9 +11,12 @@ No test touches the network: every client sends through an ``httpx.MockTransport
 every retry policy records its waits instead of sleeping. Logs are captured with
 ``structlog.testing.capture_logs`` as raw event dicts, before the redaction processors of
 ``ads_engine.logging`` run, so the assertions prove the HTTP layer itself never emits a
-header, body, secret, webhook path or email. Every test runs against an environment
-stripped of each variable ``Settings`` reads, because the host exports real credentials;
-every secret is an obvious test literal and every address uses a reserved example domain.
+header, body, secret, webhook path or email. The checks that an escaped error's logged
+traceback carries no held secret render it through the production JSON pipeline instead
+(the ``captured_logs`` fixture), as the scheduler logs a failed step. Every test runs
+against an environment stripped of each variable ``Settings`` reads, because the host
+exports real credentials; every secret is an obvious test literal and every address uses
+a reserved example domain.
 """
 
 import asyncio
@@ -21,12 +24,13 @@ import math
 import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from email.utils import format_datetime
 from types import MappingProxyType
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any, Protocol, cast
+from urllib.parse import quote, unquote
 
 import httpx
 import pytest
@@ -44,9 +48,14 @@ from ads_engine.connectors.errors import (
     TransientError,
     sanitize_message,
 )
-from ads_engine.connectors.google_n8n.client import UNMETERED, GoogleAdsWebhookClient
+from ads_engine.connectors.google_n8n.client import (
+    SIMULATED_SECRET,
+    UNMETERED,
+    GoogleAdsWebhookClient,
+)
 from ads_engine.connectors.http import (
     _ERROR_TEXT_SCAN_MAX,
+    _SIMULATED_PLACEHOLDER,
     CONNECT_TIMEOUT_SECONDS,
     DEFAULT_RETRY,
     SOURCE_BASE_URLS,
@@ -60,8 +69,10 @@ from ads_engine.connectors.http import (
     redact_url,
     send_json,
 )
-from ads_engine.logging import REDACTED, REDACTED_EMAIL
+from ads_engine.connectors.linkedin.auth import SIMULATED_TOKEN
+from ads_engine.logging import REDACTED, REDACTED_EMAIL, get_logger
 from ads_engine.settings import SOURCES, Settings, Source, get_settings
+from ads_engine.sync.mode import _SIMULATED_HUBSPOT_TOKEN
 
 pytestmark = pytest.mark.anyio
 
@@ -73,6 +84,18 @@ ENCODED_EMAIL = "lead%40example.com"
 # Assembled at run time, so the secret scan never reads this test value as a credential.
 SPANNING_SECRET = "-".join(("test", "spanning", "cut", "secret", "0123456789"))
 SPANNING_EMAIL = "lead.spanning.the.cut@example.com"
+# Credentials no setting knows, as an exchanged LinkedIn access token, a rotated refresh
+# token or a request's own credentials are; assembled at run time like the ones above. The
+# volatile token is 400 characters, as long as a LinkedIn access token, and every
+# 8-character run of it occurs in it only once.
+VOLATILE_TOKEN = "".join(f"{index:04d}vola" for index in range(50))
+ROTATED_TOKENS = tuple("-".join(("test", "rotated", "bearer", str(index))) for index in (1, 2, 3))
+FORM_REFRESH_TOKEN = "-".join(("test", "form", "refresh", "value"))
+FORM_CLIENT_SECRET = "-".join(("test", "form", "client", "value"))
+FORM_CLIENT_ID = "test-form-client-id"
+QUERY_CREDENTIAL = "-".join(("test", "query", "access", "value"))
+HEADER_CREDENTIAL = "-".join(("test", "renamed", "webhook", "value"))
+PROVIDER_SECRET = "-".join(("test", "provider", "held", "value"))
 WEBHOOK_HOST = "n8n.example.test"
 WEBHOOK_PATH = "/webhook/test-webhook-path"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -654,9 +677,9 @@ async def test_linkedin_logs_carry_no_header_token_cursor_or_email(
         "url": expected_url,
     }
     (logged_response,) = _events(captured, "http.response")
-    elapsed_ms = logged_response.pop("elapsed_ms")
-    assert isinstance(elapsed_ms, float)
-    assert elapsed_ms >= 0.0
+    duration_ms = logged_response.pop("duration_ms")
+    assert isinstance(duration_ms, float)
+    assert duration_ms >= 0.0
     assert logged_response == {
         "event": "http.response",
         "log_level": "info",
@@ -783,7 +806,7 @@ async def test_invalid_settings_still_give_a_client_with_url_redaction(
     )
 
 
-async def test_response_hook_logs_no_elapsed_time_without_a_start_stamp(
+async def test_response_hook_logs_no_duration_without_a_start_stamp(
     captured: list[EventDict],
 ) -> None:
     async with build_client(
@@ -793,7 +816,8 @@ async def test_response_hook_logs_no_elapsed_time_without_a_start_stamp(
         request = httpx.Request("GET", "https://api.hubapi.com/crm/x")
         await log_response(httpx.Response(204, request=request))
     (logged_response,) = _events(captured, "http.response")
-    assert logged_response["elapsed_ms"] is None
+    assert logged_response["duration_ms"] is None
+    assert "elapsed_ms" not in logged_response
     assert logged_response["status"] == 204
     assert logged_response["url"] == "/crm/x"
 
@@ -1050,7 +1074,7 @@ async def test_a_503_then_200_returns_after_one_backoff_wait(captured: list[Even
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error == {
         "event": "connector.error",
-        "log_level": "warning",
+        "log_level": "debug",
         "source": "google",
         "endpoint": "search Q-G2",
         "kind": "transient",
@@ -1061,6 +1085,7 @@ async def test_a_503_then_200_returns_after_one_backoff_wait(captured: list[Even
         "reason": "google search Q-G2: HTTP 503: Service Unavailable",
         "retry_after": None,
         "query_id": None,
+        "will_retry": True,
     }
     (logged_retry,) = _events(captured, "http.retry")
     assert logged_retry == {
@@ -1093,6 +1118,51 @@ async def test_three_429s_raise_the_last_transient_error_after_three_sends(
     assert SECOND_BACKOFF[0] <= second <= SECOND_BACKOFF[1]
     assert [event["attempt"] for event in _events(captured, "connector.error")] == [1, 2, 3]
     assert [event["attempt"] for event in _events(captured, "http.retry")] == [1, 2]
+
+
+async def test_retried_attempts_log_at_debug_and_the_raised_error_at_info(
+    captured: list[EventDict],
+) -> None:
+    # Only the error send_json raises is logged above debug, and below warning: the owner of
+    # its consequence (sync.mode on_error, or the code that catches it) logs the terminal
+    # record, so one failure never yields a warning per attempt.
+    harness = Harness(
+        *(_json(429, {"status": 429, "message": f"throttled {n}"}) for n in ("one", "two", "three"))
+    )
+    with pytest.raises(TransientError) as excinfo:
+        await harness.call(source="linkedin")
+    logged = [
+        (event["attempt"], event["log_level"], event["will_retry"], event["reason"])
+        for event in _events(captured, "connector.error")
+    ]
+    assert logged == [
+        (1, "debug", True, "linkedin ad_analytics: HTTP 429: throttled one"),
+        (2, "debug", True, "linkedin ad_analytics: HTTP 429: throttled two"),
+        (3, "info", False, excinfo.value.reason),
+    ]
+    assert all(event["retryable"] for event in _events(captured, "connector.error"))
+    assert [event["log_level"] for event in _events(captured, "http.retry")] == ["info"] * 2
+
+
+async def test_an_error_beyond_the_policys_attempts_or_retry_test_logs_at_info(
+    captured: list[EventDict],
+) -> None:
+    # One attempt allowed: the retryable 503 is raised at once, so it is not retried.
+    single = Harness(httpx.Response(503))
+    with pytest.raises(TransientError):
+        await single.call(policy=single.policy(attempts=1))
+    # A Retry-After beyond max_retry_after_seconds fails the retry test on the first attempt.
+    long_wait = Harness(
+        _json(429, {"status": 429, "message": "slow down"}, headers={"Retry-After": "600"})
+    )
+    with pytest.raises(TransientError):
+        await long_wait.call(source="linkedin")
+    assert (len(long_wait.sent), long_wait.waits) == (1, [])
+    logged = [
+        (event["attempt"], event["log_level"], event["retryable"], event["will_retry"])
+        for event in _events(captured, "connector.error")
+    ]
+    assert logged == [(1, "info", True, False), (1, "info", True, False)]
 
 
 async def test_each_attempt_builds_a_fresh_request() -> None:
@@ -1664,7 +1734,7 @@ async def test_error_logs_carry_the_sanitised_reason_and_the_query_id(
     first, second = _events(captured, "connector.error")
     assert first == {
         "event": "connector.error",
-        "log_level": "warning",
+        "log_level": "info",
         "source": "google",
         "endpoint": "search Q-G2",
         "kind": "defect",
@@ -1678,6 +1748,7 @@ async def test_error_logs_carry_the_sanitised_reason_and_the_query_id(
         ),
         "retry_after": None,
         "query_id": "Q-G2",
+        "will_retry": False,
     }
     # Same source, endpoint, kind, code and status: only the reason tells them apart.
     assert second == {
@@ -1698,7 +1769,7 @@ async def test_a_transient_error_log_carries_the_requested_retry_after(
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error == {
         "event": "connector.error",
-        "log_level": "warning",
+        "log_level": "info",
         "source": "linkedin",
         "endpoint": "ad_analytics",
         "kind": "transient",
@@ -1709,6 +1780,7 @@ async def test_a_transient_error_log_carries_the_requested_retry_after(
         "reason": "linkedin ad_analytics: HTTP 429: Too many requests",
         "retry_after": 600.0,
         "query_id": None,
+        "will_retry": False,
     }
 
 
@@ -2058,6 +2130,495 @@ async def test_a_timeout_raised_inside_the_deadline_keeps_its_own_classification
     assert excinfo.value.code == "TIMEOUT"
     assert excinfo.value.message == message
     assert excinfo.value.__cause__ is error
+
+
+# ---------------------------------------------------------------------------
+# send_json(): secrets held for the call
+# ---------------------------------------------------------------------------
+
+
+async def _send_built(
+    harness: Harness,
+    build: Callable[[httpx.AsyncClient], httpx.Request],
+    *,
+    source: Source = "linkedin",
+    secrets: Collection[str] = (),
+    policy: RetryPolicy | None = None,
+) -> JsonResponse:
+    """Send one ``source`` call through :func:`send_json`, building each attempt with ``build``.
+
+    ``harness.built`` records every request built.
+    """
+    async with build_client(source, harness.transport(), settings=Settings()) as client:
+
+        def record_and_build() -> httpx.Request:
+            request = build(client)
+            harness.order.append("build")
+            harness.built.append(request)
+            return request
+
+        return await send_json(
+            client,
+            record_and_build,
+            source=source,
+            endpoint=ENDPOINTS[source],
+            policy=policy if policy is not None else harness.policy(),
+            secrets=secrets,
+        )
+
+
+def _bearer(token: str) -> Callable[[httpx.AsyncClient], httpx.Request]:
+    """Return a builder of a LinkedIn ``GET`` carrying ``Authorization: Bearer <token>``."""
+
+    def build(client: httpx.AsyncClient) -> httpx.Request:
+        return client.build_request(
+            "GET", "adAnalytics?q=analytics", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    return build
+
+
+def _assert_nowhere(
+    error: BaseException, entries: list[EventDict], *secrets: str, fragments: bool = False
+) -> None:
+    """Assert no secret is rendered by ``error``, its chain or any captured event.
+
+    With ``fragments``, no 8-character run of a secret is rendered either.
+    """
+    rendered = [f"{linked!s} {linked!r} {linked.args!r}" for linked in _exception_chain(error)]
+    if isinstance(error, ConnectorError):
+        rendered.extend((error.message, error.reason, str(error.log_fields)))
+    forbidden = [
+        piece for secret in secrets for piece in (_fragments(secret) if fragments else [secret])
+    ]
+    for piece in forbidden:
+        assert all(piece not in shown for shown in rendered), piece
+    _assert_logs_exclude(entries, *forbidden)
+
+
+async def test_an_unregistered_bearer_token_echoed_in_prose_stays_out_of_errors_and_logs(
+    captured: list[EventDict],
+) -> None:
+    # No setting knows the token, and the platform echoes it with no Bearer or
+    # assignment marker the text rules would recognise.
+    harness = Harness(_json(403, {"message": f"Member {VOLATILE_TOKEN} may not read it"}))
+    with pytest.raises(AccessDenied) as excinfo:
+        await _send_built(harness, _bearer(VOLATILE_TOKEN))
+    denial = excinfo.value
+    assert len(harness.sent) == 1
+    assert denial.reason == f"linkedin ad_analytics: HTTP 403: Member {REDACTED} may not read it"
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == denial.reason
+    _assert_nowhere(denial, captured, VOLATILE_TOKEN, fragments=True)
+
+
+async def test_the_tokens_of_every_attempt_stay_held_through_the_retries(
+    captured: list[EventDict],
+) -> None:
+    # Each attempt sends a new token, as after a refresh, and each 503 text body echoes
+    # every token sent so far: the last one quotes two tokens its request no longer carries.
+    tokens = iter(ROTATED_TOKENS)
+
+    def build(client: httpx.AsyncClient) -> httpx.Request:
+        return _bearer(next(tokens))(client)
+
+    harness = Harness(
+        *(
+            httpx.Response(503, text=f"Unavailable, seen {' and '.join(ROTATED_TOKENS[:count])}")
+            for count in (1, 2, 3)
+        )
+    )
+    with pytest.raises(TransientError) as excinfo:
+        await _send_built(harness, build)
+    error = excinfo.value
+    assert len(harness.sent) == 3
+    assert [request.headers["Authorization"] for request in harness.sent] == [
+        f"Bearer {token}" for token in ROTATED_TOKENS
+    ]
+    assert error.reason == (
+        f"linkedin ad_analytics: HTTP 503: Unavailable, seen {REDACTED} and {REDACTED} and "
+        f"{REDACTED}"
+    )
+    logged = _events(captured, "connector.error")
+    assert [event["attempt"] for event in logged] == [1, 2, 3]
+    assert logged[-1]["reason"] == error.reason
+    assert len(_events(captured, "http.retry")) == 2
+    _assert_nowhere(error, captured, *ROTATED_TOKENS)
+
+
+@pytest.mark.parametrize(
+    ("source", "build", "message", "expected"),
+    [
+        pytest.param(
+            "linkedin",
+            lambda client: client.build_request(
+                "POST",
+                "https://www.linkedin.com/oauth/v2/accessToken",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": FORM_REFRESH_TOKEN,
+                    "client_id": FORM_CLIENT_ID,
+                    "client_secret": FORM_CLIENT_SECRET,
+                },
+            ),
+            f"grant {FORM_REFRESH_TOKEN} of {FORM_CLIENT_ID} with {FORM_CLIENT_SECRET} refused",
+            f"grant {REDACTED} of {FORM_CLIENT_ID} with {REDACTED} refused",
+            id="form-body-fields",
+        ),
+        pytest.param(
+            "linkedin",
+            lambda client: client.build_request(
+                "GET", f"adAnalytics?q=analytics&access_token={QUERY_CREDENTIAL}"
+            ),
+            f"query credential {QUERY_CREDENTIAL} refused",
+            f"query credential {REDACTED} refused",
+            id="query-parameter",
+        ),
+        pytest.param(
+            "google",
+            lambda client: client.build_request(
+                "POST", WEBHOOK_URL, json={}, headers={"X-Webhook-Token": HEADER_CREDENTIAL}
+            ),
+            f"header value {HEADER_CREDENTIAL} refused",
+            f"header value {REDACTED} refused",
+            id="renamed-n8n-secret-header",
+        ),
+    ],
+)
+async def test_credentials_a_request_carries_are_held_wherever_they_travel(
+    source: Source,
+    build: Callable[[httpx.AsyncClient], httpx.Request],
+    message: str,
+    expected: str,
+    captured: list[EventDict],
+) -> None:
+    harness = Harness(_json(403, {"message": message}))
+    with pytest.raises(AccessDenied) as excinfo:
+        await _send_built(harness, build, source=source)
+    denial = excinfo.value
+    assert denial.reason == f"{source} {ENDPOINTS[source]}: HTTP 403: {expected}"
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == denial.reason
+    _assert_nowhere(
+        denial,
+        captured,
+        FORM_REFRESH_TOKEN,
+        FORM_CLIENT_SECRET,
+        QUERY_CREDENTIAL,
+        HEADER_CREDENTIAL,
+    )
+
+
+async def test_secrets_the_caller_holds_are_stripped_beside_the_request_credentials(
+    captured: list[EventDict],
+) -> None:
+    harness = Harness(_json(429, {"message": f"slow down {PROVIDER_SECRET}"}))
+    with pytest.raises(TransientError) as excinfo:
+        await _send_built(
+            harness,
+            _bearer(VOLATILE_TOKEN),
+            secrets=[PROVIDER_SECRET],
+            policy=harness.policy(attempts=1),
+        )
+    assert excinfo.value.reason == f"linkedin ad_analytics: HTTP 429: slow down {REDACTED}"
+    _assert_nowhere(excinfo.value, captured, PROVIDER_SECRET)
+
+
+@pytest.mark.parametrize("raised_by", ["transport", "builder"])
+async def test_an_error_built_before_the_call_is_raised_rebuilt_without_the_held_token(
+    raised_by: str, captured: list[EventDict]
+) -> None:
+    # Built outside the call, before the token was held: the cut at 300 characters went
+    # through the token, leaving its first 29 characters, which no longer match it whole.
+    filler = "Upstream refused the call. " * 10
+    prebuilt = AccessDenied(
+        f"{filler}{VOLATILE_TOKEN}", source="linkedin", endpoint="ad_analytics", http_status=403
+    )
+    assert prebuilt.message.endswith(f"{VOLATILE_TOKEN[:29]}\u2026")
+    if raised_by == "transport":
+        harness = Harness(prebuilt)
+        build, secrets = _bearer(VOLATILE_TOKEN), ()
+    else:
+        harness = Harness()
+        build, secrets = _raising(prebuilt), (VOLATILE_TOKEN,)
+    with pytest.raises(AccessDenied) as excinfo:
+        await _send_built(harness, build, secrets=secrets)
+    error = excinfo.value
+    assert error is not prebuilt
+    assert (error.endpoint, error.code, error.http_status) == ("ad_analytics", None, 403)
+    assert error.message == f"{' '.join(filler.split())} {REDACTED}\u2026"
+    # Neither the original nor anything else travels with the copy.
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert len(harness.sent) == (1 if raised_by == "transport" else 0)
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == error.reason
+    _assert_nowhere(error, captured, VOLATILE_TOKEN, fragments=True)
+
+
+@pytest.mark.parametrize("raised_by", ["transport", "builder"])
+async def test_an_exception_quoting_a_held_token_is_never_chained(
+    raised_by: str, captured: list[EventDict]
+) -> None:
+    # A logged traceback renders every cause, and log redaction does not know the token.
+    if raised_by == "transport":
+        leak: Exception = httpx.LocalProtocolError(f"Illegal header value {VOLATILE_TOKEN}")
+        harness = Harness(leak)
+        build, secrets = _bearer(VOLATILE_TOKEN), ()
+    else:
+        leak = ValueError(f"cannot encode {VOLATILE_TOKEN}")
+        harness = Harness()
+        build, secrets = _raising(leak), (VOLATILE_TOKEN,)
+    with pytest.raises(QueryDefect) as excinfo:
+        await _send_built(harness, build, secrets=secrets)
+    error = excinfo.value
+    assert (error.code, error.http_status) == ("CLIENT", None)
+    assert error.message.startswith(f"{type(leak).__name__}: ")
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == error.reason
+    _assert_nowhere(error, captured, VOLATILE_TOKEN, fragments=True)
+
+
+class LogCapture(Protocol):
+    """The ``captured_logs`` fixture: the product's JSON log lines, redacted as in production."""
+
+    @property
+    def text(self) -> str:
+        """Everything written so far, raw."""
+        ...
+
+    def __call__(self) -> list[dict[str, Any]]:
+        """Every line written so far, parsed."""
+        ...
+
+
+def _raised[E: BaseException](error: E, *, context: BaseException | None = None) -> E:
+    """Return ``error`` raised once, so it has a traceback, with ``context`` as its context.
+
+    That is the context an exception raised while ``context`` was being handled carries,
+    and a logged traceback renders it.
+    """
+    error.__context__ = context
+    with suppress(type(error)):
+        raise error
+    return error
+
+
+def _percent_encoded(text: str, rounds: int) -> str:
+    """Return ``text`` with every character percent-encoded ``rounds`` times over."""
+    encoded = "".join(f"%{ord(char):02X}" for char in text)
+    for _ in range(rounds - 1):
+        encoded = quote(encoded, safe="")
+    return encoded
+
+
+def _noted[E: BaseException](error: E, note: str) -> E:
+    """Return ``error`` with ``note`` added to it, as PEP 678 ``add_note`` adds one."""
+    error.add_note(note)
+    return error
+
+
+# A note naming both held tokens with no marker the log redaction would recognise.
+HELD_NOTE = f"Upstream rejected member {VOLATILE_TOKEN} and grant {PROVIDER_SECRET}"
+
+
+def _protocol_error_with_a_note() -> Exception:
+    """Return a transport exception whose text is clean and whose note quotes the tokens."""
+    return _noted(httpx.LocalProtocolError("Invalid HTTP framing"), HELD_NOTE)
+
+
+def _prebuilt_denial_with_a_note() -> Exception:
+    """Return an error built before the call, clean but for a note quoting the tokens."""
+    denial = AccessDenied("Forbidden", source="linkedin", endpoint="ad_analytics", http_status=403)
+    return _noted(denial, HELD_NOTE)
+
+
+def _encoded_protocol_error(rounds: int) -> Callable[[], Exception]:
+    """Return a factory of a transport exception quoting the tokens encoded ``rounds`` times."""
+
+    def make() -> Exception:
+        member = _percent_encoded(VOLATILE_TOKEN, rounds)
+        grant = _percent_encoded(PROVIDER_SECRET, rounds)
+        return httpx.LocalProtocolError(f"Upstream rejected member {member} and grant {grant}")
+
+    return make
+
+
+def _note_two_contexts_deep() -> Exception:
+    """Return a clean transport exception whose context's context has a note quoting the tokens."""
+    deepest = _raised(_noted(KeyError("member"), HELD_NOTE))
+    middle = _raised(ValueError("could not decode the member"), context=deepest)
+    return _raised(httpx.LocalProtocolError("Invalid HTTP framing"), context=middle)
+
+
+def _decodings(text: str) -> list[str]:
+    """Return ``text`` and each of the four percent-decodings the log redaction applies."""
+    forms = [text]
+    for _ in range(4):
+        forms.append(unquote(forms[-1]))
+    return forms
+
+
+def _log_step_failure(error: BaseException) -> None:
+    """Log ``error`` as the scheduler logs a failed step, with its traceback."""
+    get_logger("ads_engine.sync.scheduler").error(
+        "scheduler.step_failed", step="probe", error=type(error).__name__, exc_info=error
+    )
+
+
+def _logged(logs: LogCapture, event: str) -> list[dict[str, Any]]:
+    """Return the JSON log records called ``event``, in order."""
+    return [record for record in logs() if record.get("event") == event]
+
+
+@pytest.mark.parametrize("raised_by", ["transport", "builder"])
+@pytest.mark.parametrize(
+    ("make_leak", "kind"),
+    [
+        pytest.param(_protocol_error_with_a_note, QueryDefect, id="note-on-the-exception"),
+        pytest.param(_prebuilt_denial_with_a_note, AccessDenied, id="note-on-a-prebuilt-error"),
+        pytest.param(_encoded_protocol_error(2), QueryDefect, id="encoded-twice"),
+        pytest.param(_encoded_protocol_error(3), QueryDefect, id="encoded-three-times"),
+        pytest.param(_note_two_contexts_deep, QueryDefect, id="note-two-contexts-deep"),
+    ],
+)
+async def test_a_held_token_a_traceback_would_render_never_travels_with_the_error(
+    make_leak: Callable[[], Exception],
+    kind: type[ConnectorError],
+    raised_by: str,
+    captured_logs: LogCapture,
+) -> None:
+    # A logged traceback renders the notes, arguments and text of every linked exception,
+    # and the log redaction neither knows the held tokens nor decodes past four rounds.
+    leak = make_leak()
+    if raised_by == "transport":
+        harness = Harness(leak)
+        build, secrets = _bearer(VOLATILE_TOKEN), (PROVIDER_SECRET,)
+    else:
+        harness = Harness()
+        build, secrets = _raising(leak), (VOLATILE_TOKEN, PROVIDER_SECRET)
+    with pytest.raises(kind) as excinfo:
+        await _send_built(harness, build, secrets=secrets)
+    error = excinfo.value
+    assert type(error) is kind
+    assert error is not leak
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert getattr(error, "__notes__", None) is None
+    assert len(harness.sent) == (1 if raised_by == "transport" else 0)
+    _assert_nowhere(error, [], VOLATILE_TOKEN, PROVIDER_SECRET)
+    _log_step_failure(error)
+    (failed,) = _logged(captured_logs, "scheduler.step_failed")
+    assert [(entry["exc_type"], entry["exc_notes"]) for entry in failed["exception"]] == [
+        (kind.__name__, [])
+    ]
+    (logged_error,) = _logged(captured_logs, "connector.error")
+    assert logged_error["reason"] == error.reason
+    for form in _decodings(captured_logs.text):
+        for secret in (VOLATILE_TOKEN, PROVIDER_SECRET):
+            assert secret not in form
+
+
+@pytest.mark.parametrize("raised_by", ["transport", "builder"])
+async def test_an_exception_quoting_nothing_held_stays_chained_with_its_notes(
+    raised_by: str, captured_logs: LogCapture
+) -> None:
+    # Neither a note nor an encoded run alone makes an exception quote a held secret.
+    context = _raised(KeyError("member"))
+    leak = _raised(
+        httpx.LocalProtocolError(f"Invalid HTTP framing near {quote('%2F', safe='')}"),
+        context=context,
+    )
+    leak.add_note("Upstream closed the connection")
+    if raised_by == "transport":
+        harness = Harness(leak)
+        build, secrets = _bearer(VOLATILE_TOKEN), (PROVIDER_SECRET,)
+    else:
+        harness = Harness()
+        build, secrets = _raising(leak), (VOLATILE_TOKEN, PROVIDER_SECRET)
+    with pytest.raises(QueryDefect) as excinfo:
+        await _send_built(harness, build, secrets=secrets)
+    error = excinfo.value
+    assert error.__cause__ is leak
+    assert leak.__context__ is context
+    _log_step_failure(error)
+    (failed,) = _logged(captured_logs, "scheduler.step_failed")
+    assert [(entry["exc_type"], entry["exc_notes"]) for entry in failed["exception"]] == [
+        ("QueryDefect", []),
+        ("LocalProtocolError", ["Upstream closed the connection"]),
+        ("KeyError", []),
+    ]
+
+
+@pytest.mark.parametrize("raised_by", ["transport", "builder"])
+async def test_a_prebuilt_error_whose_note_quotes_nothing_held_is_reraised_unchanged(
+    raised_by: str,
+) -> None:
+    denial = _noted(
+        AccessDenied("Forbidden", source="linkedin", endpoint="ad_analytics", http_status=403),
+        "Upstream denied the member",
+    )
+    if raised_by == "transport":
+        harness = Harness(denial)
+        build, secrets = _bearer(VOLATILE_TOKEN), (PROVIDER_SECRET,)
+    else:
+        harness = Harness()
+        build, secrets = _raising(denial), (VOLATILE_TOKEN, PROVIDER_SECRET)
+    with pytest.raises(AccessDenied) as excinfo:
+        await _send_built(harness, build, secrets=secrets)
+    assert excinfo.value is denial
+    assert denial.__notes__ == ["Upstream denied the member"]
+
+
+def test_every_simulated_credential_is_the_placeholder_send_json_never_holds() -> None:
+    assert _SIMULATED_PLACEHOLDER == "simulated"
+    assert SIMULATED_TOKEN == _SIMULATED_PLACEHOLDER
+    assert SIMULATED_SECRET == _SIMULATED_PLACEHOLDER
+    assert _SIMULATED_HUBSPOT_TOKEN.get_secret_value() == _SIMULATED_PLACEHOLDER
+
+
+async def test_the_simulated_placeholder_is_never_held(captured: list[EventDict]) -> None:
+    # Holding it would strip the word from every simulated-mode reason.
+    timeout = TransientError(
+        "ReadTimeout: simulated timeout", source="linkedin", endpoint="ad_analytics"
+    )
+    harness = Harness(timeout, _json(403, {"message": "The simulated world has no such account"}))
+    with pytest.raises(TransientError) as timed_out:
+        await _send_built(
+            harness,
+            _bearer(SIMULATED_TOKEN),
+            secrets=[SIMULATED_TOKEN],
+            policy=harness.policy(attempts=1),
+        )
+    assert timed_out.value is timeout
+    assert timed_out.value.reason == "linkedin ad_analytics: ReadTimeout: simulated timeout"
+    with pytest.raises(AccessDenied) as denied:
+        await _send_built(harness, _bearer(SIMULATED_TOKEN), secrets=[SIMULATED_TOKEN])
+    assert denied.value.reason == (
+        "linkedin ad_analytics: HTTP 403: The simulated world has no such account"
+    )
+    assert [event["reason"] for event in _events(captured, "connector.error")] == [
+        timed_out.value.reason,
+        denied.value.reason,
+    ]
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    [
+        pytest.param(VOLATILE_TOKEN, id="single-string"),
+        pytest.param(VOLATILE_TOKEN.encode(), id="single-bytes"),
+        pytest.param([VOLATILE_TOKEN, 7], id="non-string-item"),
+    ],
+)
+async def test_send_json_rejects_secrets_that_are_not_strings(secrets: Any) -> None:
+    harness = Harness()
+    with pytest.raises(TypeError, match="secrets must"):
+        await _send_built(harness, _bearer(VOLATILE_TOKEN), secrets=secrets)
+    assert harness.built == []
+    assert harness.sent == []
 
 
 # ---------------------------------------------------------------------------

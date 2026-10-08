@@ -19,8 +19,9 @@ ids never join within one source. :class:`DatasetManager` owns every state chang
   such a dataset; a simulated LinkedIn dataset's companion is ready too. Staging the rows
   is the job of ``sync/lead_match.py``; readiness only counts.
 * :meth:`DatasetManager.unhydrated_matches` counts a CRM dataset's matches whose contact's
-  meeting or deal associations are not read yet: the debt a build's own CRM dataset must
-  clear before it activates. It is not part of readiness.
+  meeting or deal associations are not read yet: the debt a build's own CRM dataset, or a
+  live LinkedIn build's leads in HubSpot's active primary, must clear before the build
+  activates. It is not part of readiness.
 
 * :meth:`DatasetManager.activate` flips a ready dataset (and its companion) to ``active``
   and retires the source's previous active primary (and its companions) in one
@@ -971,7 +972,11 @@ class DatasetManager:
         return int(count or 0)
 
     async def unhydrated_matches(
-        self, crm_dataset_id: int, *, session: AsyncSession | None = None
+        self,
+        crm_dataset_id: int,
+        *,
+        lead_dataset_id: int | None = None,
+        session: AsyncSession | None = None,
     ) -> int:
         """Count a CRM dataset's matches whose contact's associations are not read yet.
 
@@ -984,14 +989,18 @@ class DatasetManager:
         attribution's concern.
 
         Matching stores a contact and its outcome but reads none of its associations, so a
-        row matched after the dataset's CRM backfill, by a build or by any other matcher,
-        leaves this debt behind. ``sync/mode.py`` reruns the backfill of a build's own CRM
-        dataset until it is 0 before that dataset activates. The count is not part of
+        row matched after the dataset's last CRM sync, by a build or by any other matcher,
+        leaves this debt behind. ``sync/mode.py`` clears it before a build activates: it
+        reruns the backfill of a build's own CRM dataset until the dataset's count is 0,
+        and runs the CRM sync of HubSpot's active primary until a live LinkedIn build's own
+        leads (``lead_dataset_id``) count 0 there. The count is not part of
         :meth:`readiness`, which counts freshness, unattempted rows and unstaged leads, not
         association reads.
 
         Args:
             crm_dataset_id: A HubSpot dataset, primary or companion.
+            lead_dataset_id: Count only the rows of this LinkedIn dataset's leads; ``None``
+                counts every lead's.
             session: Read in the caller's session.
 
         Returns:
@@ -1012,27 +1021,30 @@ class DatasetManager:
             .exists()
             for to_type in _HYDRATED_TARGETS
         ]
-        async with self._unit(session) as unit:
-            count = await unit.scalar(
-                select(func.count())
-                .select_from(LeadMatch)
-                .join(
-                    CrmContact,
-                    and_(
-                        CrmContact.id == LeadMatch.contact_id,
-                        CrmContact.dataset_id == LeadMatch.crm_dataset_id,
-                    ),
-                )
-                .join(Lead, Lead.id == LeadMatch.lead_id)
-                .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
-                .where(
-                    LeadMatch.crm_dataset_id == crm_dataset_id,
-                    LeadMatch.status == _MATCHED,
-                    LeadMatch.contact_read_status == _CONTACT_READ_OK,
-                    SourceDataset.state != _RETIRED,
-                    ~and_(*hydrated),
-                )
+        statement = (
+            select(func.count())
+            .select_from(LeadMatch)
+            .join(
+                CrmContact,
+                and_(
+                    CrmContact.id == LeadMatch.contact_id,
+                    CrmContact.dataset_id == LeadMatch.crm_dataset_id,
+                ),
             )
+            .join(Lead, Lead.id == LeadMatch.lead_id)
+            .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
+            .where(
+                LeadMatch.crm_dataset_id == crm_dataset_id,
+                LeadMatch.status == _MATCHED,
+                LeadMatch.contact_read_status == _CONTACT_READ_OK,
+                SourceDataset.state != _RETIRED,
+                ~and_(*hydrated),
+            )
+        )
+        if lead_dataset_id is not None:
+            statement = statement.where(Lead.dataset_id == lead_dataset_id)
+        async with self._unit(session) as unit:
+            count = await unit.scalar(statement)
         return int(count or 0)
 
     # -- transitions -------------------------------------------------------------------

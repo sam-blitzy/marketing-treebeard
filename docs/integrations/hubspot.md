@@ -413,6 +413,12 @@ throughout.
   matching state is never deleted or requeued.
 - If LinkedIn activates a new dataset during a HubSpot build, the build stages rows for the
   new leads before it can become ready.
+- If HubSpot activates a new primary during a live LinkedIn build, the build stages its leads
+  there and matches them. When any are matched, it runs that primary's CRM sync, so the new
+  matches get their contact refresh, associations and target reads before LinkedIn
+  activates. The activation lock refuses a LinkedIn build whose matched contacts there still
+  have no association read, and a build whose contacts still lack them after three settle
+  rounds is discarded.
 - Leads ingested after activation get rows in the active dataset as usual.
 
 ## Contact refresh
@@ -906,15 +912,36 @@ uv run --frozen ads-engine capture-fixtures --source hubspot
 ```
 
 Inside the backend image the same command runs as `ads-engine capture-fixtures --source hubspot`
-from `/app`.
+from `/app`. The captures then land in `/app/tests/contracts/hubspot/captured/`, which only the
+runtime user (UID 10001) can write. On the host as in the image, the command is refused, with
+nothing sent, when that directory is not writable by the user running it or is a symbolic link.
+To keep the files, bind-mount the checkout's `backend/tests/contracts/hubspot/captured/` there,
+writable by UID 10001, or run the container with `--user` set to that directory's owner.
 
-- It sends one minimal read per surface: the `lifecyclestage` property with binding
-  verification, a one-result deal search over the last 30 days, that deal's contacts (or one
-  input when there is no deal), and that contact by id (or the probe email).
+- It sends minimal reads: the `lifecyclestage` property with binding verification, a
+  one-result deal search over the last 30 days, that deal's contacts (or one input when there
+  is no deal), and that contact by id (or the probe email).
+- Request counts exclude retries. `crm_search`, `associations_batch_read` and
+  `objects_batch_read` cost one request each, and `objects_batch_read` is skipped when binding
+  verification fails. The associations read, `associations(..., max_continuations=0)`, sends
+  the initial batch call only: an input whose result carries `paging.next.after` is reported
+  `partial` (`error` with no target read), with the reason "continuation limit reached; later
+  pages were not read", and its continuation is never sent. Sync passes no bound and follows
+  every continuation.
+- `properties` costs the `lifecyclestage` read plus the fixed reads of CRM binding
+  verification, which reads each property it needs once: `lifecyclestage` again when a
+  binding is in `stage_label` mode, the `hs_v2_date_entered_{stage id}` property of the stage
+  each such binding matches, a `property`-mode binding's own property, and both Google link
+  properties when `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY` and `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`
+  are both set. No property is listed and nothing is paged. With the shipped mapping, when
+  both bindings match a stage, that is four requests; the Google link properties add two.
 - It writes `backend/tests/contracts/hubspot/captured/{stem}.json`, for example
   `captured/objects_batch_read.json`, each shaped `{surface, captured_at, request, response}`.
 - Emails, names, identifying contact property values, the `Authorization` credential and
   every configured secret are replaced by `"<redacted>"`; `Authorization` keeps its scheme.
+  A configured secret is replaced in any string whatever its length, in plain text or in any
+  percent-encoded spelling. A capture that still holds one, however many times it was
+  percent-encoded, is not written, and the command exits with status 1.
 - The contract tests then validate the parser against the captured payloads as well as the
   documented samples.
 - The command is refused under `DATA_MODE=simulated` or without the token. It exits with

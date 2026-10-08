@@ -75,7 +75,7 @@ from ads_engine.api.schemas import ErrorDetail, ErrorResponse
 from ads_engine.db.repositories import DatasetNotWritable
 from ads_engine.db.session import dispose_engine
 from ads_engine.decisions import DecisionError, SubjectRetired
-from ads_engine.logging import configure_logging, get_logger
+from ads_engine.logging import configure_logging, get_logger, logged_as, mark_logged
 from ads_engine.settings import ConfigurationError, Settings, get_settings
 
 __all__ = ["API_PREFIX", "create_app"]
@@ -304,7 +304,10 @@ async def _handle_config_error(request: Request, exc: Exception) -> JSONResponse
     The error's full text, with its file, dotted key and detail, is logged as
     ``api.config_error`` through the redacting log pipeline, and is never returned. The
     detail can quote disk paths, YAML parser diagnostics and source lines, and the
-    ``file`` of a missing config directory is itself a disk path (CWE-209).
+    ``file`` of a missing config directory is itself a disk path (CWE-209). An error the
+    analysis runner already logged in full (a contradicting override fails the run as
+    ``analysis_run_failed``) is logged here as a warning naming that event (``logged_as``);
+    any other at error level.
 
     The response message is built from logical parts only: ``Configuration error``, then
     ``in <file>`` when the file is one of the three config files or
@@ -324,14 +327,26 @@ async def _handle_config_error(request: Request, exc: Exception) -> JSONResponse
     # Read defensively: a ConfigError built without its attributes still renders.
     raw_file: object = getattr(error, "file", None)
     raw_key: object = getattr(error, "key", None)
-    _log.error(
-        "api.config_error",
-        error=str(error),
-        file=raw_file,
-        key=raw_key,
-        path=request.url.path,
-        method=request.method,
-    )
+    owner = logged_as(error)
+    if owner is None:
+        _log.error(
+            "api.config_error",
+            error=str(error),
+            file=raw_file,
+            key=raw_key,
+            path=request.url.path,
+            method=request.method,
+        )
+    else:
+        _log.warning(
+            "api.config_error",
+            error=str(error),
+            file=raw_file,
+            key=raw_key,
+            path=request.url.path,
+            method=request.method,
+            logged_as=owner,
+        )
     message = _CONFIG_ERROR_MESSAGE
     if isinstance(raw_file, str) and raw_file in _PUBLIC_CONFIG_FILES:
         message += f" in {raw_file}"
@@ -429,7 +444,11 @@ async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
 
     The response names nothing about the failure. The log carries the traceback through
     the redaction processors of :mod:`ads_engine.logging`, which strip secrets, tokens and
-    emails, plus the path and method, never the body.
+    emails, plus the path and method, never the body. The exception is then marked logged
+    (:func:`~ads_engine.logging.mark_logged`), so uvicorn's own record of it, made when
+    Starlette re-raises it after this response, is dropped. An exception its owner already
+    logged in full (the analysis runner's ``analysis_run_failed``) is logged as a warning
+    naming that event (``logged_as``), without a second traceback.
 
     Args:
         request: The failed request.
@@ -438,12 +457,23 @@ async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
     Returns:
         500 with ``internal_error`` and "Internal server error".
     """
-    _log.exception(
-        "api.unhandled_error",
-        path=request.url.path,
-        method=request.method,
-        error_type=type(exc).__name__,
-    )
+    owner = logged_as(exc)
+    if owner is None:
+        _log.exception(
+            "api.unhandled_error",
+            path=request.url.path,
+            method=request.method,
+            error_type=type(exc).__name__,
+        )
+        mark_logged(exc, "api.unhandled_error")
+    else:
+        _log.warning(
+            "api.unhandled_error",
+            path=request.url.path,
+            method=request.method,
+            error_type=type(exc).__name__,
+            logged_as=owner,
+        )
     return _error_response(
         http.HTTPStatus.INTERNAL_SERVER_ERROR, _INTERNAL_ERROR_CODE, _INTERNAL_ERROR_MESSAGE
     )

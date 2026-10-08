@@ -1021,7 +1021,7 @@ async def test_p1_a_discrepancy_on_an_allocation_partner_after_the_run_holds_at_
         )
         session.add(run)
         await session.flush()
-        rows = [Recommendation(**runner._recommendation_row(run.id, item, {})) for item in funding]
+        rows = [Recommendation(**runner._recommendation_row(run.id, item)) for item in funding]
         session.add_all(rows)
         await session.flush()
         subjects = {row.id: (row.rule_id, row.decision_subject["id"]) for row in rows}

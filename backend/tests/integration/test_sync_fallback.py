@@ -11,7 +11,9 @@ guarantee of that row it proves:
 * **Partial permissions**: LinkedIn ads readable while Lead Sync returns 403 stays simulated,
   with no dataset flip.
 * **Recovery**: a live dataset is built and activated only after its backfill; a build failure
-  discards the building dataset; frozen runs still render after a purge.
+  discards the building dataset; frozen runs still render after a purge; a live LinkedIn
+  build's late matches in HubSpot's active primary get that primary's CRM sync, and every
+  completed CRM sync of that primary queues its rerun, even when the build is voided.
 * **Cross-dataset purge**: purging a retired HubSpot dataset deletes only its own ``lead_match``
   rows; purging a retired LinkedIn dataset removes its leads and every match referencing them;
   a companion is purged with its parent; no foreign-key error at any step.
@@ -47,7 +49,7 @@ from typing import Any, Final
 
 import httpx
 import pytest
-from sqlalchemy import Table, func, select
+from sqlalchemy import Table, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.analysis import metrics, runner
@@ -55,8 +57,10 @@ from ads_engine.connectors.errors import AccessDenied
 from ads_engine.connectors.http import RetryPolicy
 from ads_engine.db import repositories
 from ads_engine.db.models import (
+    AnalysisRequest,
     Budget,
     Campaign,
+    CrmAssociationFetch,
     CrmContact,
     DatasetFreshness,
     Decision,
@@ -1780,6 +1784,209 @@ async def test_simulated_hubspot_ids_never_collide_and_leave_on_activation(
     window_leads = {lead.id for lead in context.leads}
     in_context = {lead.id for lead in context.leads if lead.match_status == "matched"}
     assert in_context != {lead_id for lead_id in expected if lead_id in window_leads}
+
+
+async def _new_requests(
+    rig: Rig, earlier: set[int]
+) -> list[tuple[str, datetime | None, int | None]]:
+    """``(reason, picked_at, run_id)`` of every ``analysis_request`` not in ``earlier``, by id.
+
+    A pending default-window request has neither ``picked_at`` nor ``run_id``.
+    """
+    return [
+        (row.reason, row.picked_at, row.run_id)
+        for row in await rig.all(AnalysisRequest)
+        if row.id not in earlier
+    ]
+
+
+def _crm_requests(result: jobs.JobResult) -> list[tuple[str, datetime | None, int | None]]:
+    """The pending ``sync:hubspot.crm`` requests a CRM sync of an active primary queued.
+
+    AAP 0.3.2 "Events that trigger a rerun": the CRM sync commits each freshness dataset in
+    a transaction of its own (contacts, the deal search, associations and, when configured,
+    Google-touch contacts), and every transaction that records a success queues its own
+    default-window request with that write; the worker coalesces them into one run. So
+    there is one request per success in ``result.freshness``, which holds only committed
+    outcomes, and at least the three datasets every CRM sync refreshes.
+    """
+    completed = {name for name, outcome in result.freshness.items() if outcome.succeeded}
+    assert {"hubspot.contacts", "hubspot.associations", "hubspot.deal_search"} <= completed
+    return [(f"sync:hubspot.{jobs.JOB_CRM}", None, None)] * len(completed)
+
+
+async def test_crm_refresh_hydrates_a_live_linkedin_datasets_matches_in_the_active_primary(
+    rig: Rig,
+) -> None:
+    """Recovery: a live LinkedIn build's late matches get the active primary's CRM sync.
+
+    AAP 0.3.3 "Staged matching on a CRM dataset change": when a live LinkedIn build's leads
+    are matched in HubSpot's active primary after its backfill, ``jobs.refresh_crm_dataset``
+    runs that primary's CRM sync, so the matched contacts get their contact refresh,
+    associations and target reads before the LinkedIn dataset activates. The primary is
+    active, so the completed sync queues its default-window analysis requests, one per
+    dataset it commits (AAP 0.3.2 "Events that trigger a rerun"; :func:`_crm_requests`); a
+    building HubSpot dataset's sync queues none. A live HubSpot dataset that may not be
+    synced now (no HubSpot credentials) is left alone, and a dataset of another source is
+    refused.
+    """
+    rig.go_live("linkedin")
+    real_emails = _RealLeadEmails(rig.live("linkedin", rig.world(ISOLATION)))
+    controller = rig.controller({"linkedin": real_emails})
+    crm = _activated(await controller.ensure_dataset("hubspot"), "simulated").dataset_id
+    leads = _activated(await controller.ensure_dataset("linkedin"), "live").dataset_id
+    assert crm is not None
+    assert leads is not None
+    assert await controller.datasets.unhydrated_matches(crm, lead_dataset_id=leads) == 0
+    # As a matching pass alone leaves them: matched, with no association read of the contacts.
+    async with rig.sessions() as session, session.begin():
+        await session.execute(
+            delete(CrmAssociationFetch).where(
+                CrmAssociationFetch.dataset_id == crm,
+                CrmAssociationFetch.object_type == "contact",
+            )
+        )
+    assert await controller.datasets.unhydrated_matches(crm, lead_dataset_id=leads) > 0
+    earlier = {row.id for row in await rig.all(AnalysisRequest)}
+
+    result = await jobs.refresh_crm_dataset(controller, crm)
+
+    assert result is not None
+    assert (result.job, result.source, result.dataset_id, result.status) == (
+        jobs.JOB_CRM,
+        "hubspot",
+        crm,
+        "succeeded",
+    )
+    assert await controller.datasets.unhydrated_matches(crm, lead_dataset_id=leads) == 0
+    assert await _new_requests(rig, earlier) == _crm_requests(result)
+    earlier = {row.id for row in await rig.all(AnalysisRequest)}
+
+    building = await controller.datasets.begin("hubspot", "simulated", reason=REASON_FORCED)
+    built = await jobs.refresh_crm_dataset(controller, building)
+    assert built is not None
+    assert (built.dataset_id, built.status) == (building, "succeeded")
+    live = await controller.datasets.begin("hubspot", "live", reason=REASON_RECOVERED)
+    runs = await rig.count(SyncRun)
+    assert await jobs.refresh_crm_dataset(controller, live) is None
+    assert await rig.count(SyncRun) == runs
+    with pytest.raises(ValueError, match="the CRM sync runs in a HubSpot dataset"):
+        await jobs.refresh_crm_dataset(controller, leads)
+    assert await _new_requests(rig, earlier) == [], "a building dataset's sync queues none"
+
+
+@pytest.mark.parametrize("step", ["backfill", "late-refresh"])
+async def test_active_crm_sync_queues_its_rerun_when_the_linkedin_recovery_build_is_voided(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    """Recovery: a live LinkedIn build's CRM sync of the active primary queues its own rerun.
+
+    AAP 0.3.2 "Events that trigger a rerun" and 0.3.3 "Recovery readiness": LinkedIn's
+    recovery build runs a CRM sync of HubSpot's active primary, the CRM data in use: in its
+    backfill (``backfill``), or, when HubSpot replaced its primary after that backfill, as
+    the refresh that hydrates the build's late matches there (``late-refresh``). A LinkedIn
+    denial recorded right after that sync voids the build: it is discarded, the previous
+    simulated LinkedIn dataset stays active and the connection's mode does not change, so
+    neither an activation nor a mode change queues a rerun. The completed CRM sync has
+    queued its own pending default-window ``analysis_request`` rows, one per dataset it
+    committed (:func:`_crm_requests`), so the current recommendations do not keep the CRM
+    evidence it replaced. The build's matching passes queue none.
+    """
+    rig.go_live("linkedin")
+    refusing = rig.controller({"linkedin": rig.live("linkedin", rig.world(LEADSYNC_403))})
+    _activated(await refusing.ensure_dataset("hubspot"), "simulated")
+    previous = _activated(await refusing.ensure_dataset("linkedin"), "simulated").dataset_id
+    assert await refusing.in_fallback("linkedin") is True
+    recovering = rig.controller(
+        {"linkedin": _RealLeadEmails(rig.live("linkedin", rig.world(ISOLATION)))}, at=T1
+    )
+    replacing = rig.controller(at=T1)
+    backfill = jobs.backfill_dataset
+    refresh = jobs.refresh_crm_dataset
+    builds: list[int] = []
+    replaced: list[int] = []
+    synced: list[jobs.JobResult] = []
+    earlier: set[int] = set()
+    before_build: set[int] = set()
+
+    async def deny(controller: SourceModeController) -> None:
+        """Record a LinkedIn denial against the build, as another LinkedIn call would."""
+        denial = AccessDenied(
+            "Denied during recovery",
+            source="linkedin",
+            endpoint=LEAD_SYNC_SURFACE,
+            http_status=403,
+        )
+        disposition = await controller.on_error("linkedin", denial, dataset_id=builds[0])
+        assert disposition == "switched_to_simulated"
+
+    async def backfilling(
+        controller: SourceModeController, dataset_id: int, *, now: datetime | None = None
+    ) -> jobs.SourceSyncReport:
+        """Run the real backfill; deny after it, or have HubSpot replace its primary."""
+        dataset = await rig.dataset(dataset_id)
+        assert dataset is not None
+        if (dataset.source, dataset.mode) != ("linkedin", "live"):
+            return await backfill(controller, dataset_id, now=now)
+        builds.append(dataset_id)
+        before_build.update(row.id for row in await rig.all(AnalysisRequest))
+        if step == "backfill":
+            earlier.update(before_build)
+        report = await backfill(controller, dataset_id, now=now)
+        if step == "backfill":
+            synced.extend(result for result in report.results if result.job == jobs.JOB_CRM)
+            await deny(controller)
+        else:
+            replacement = _activated(
+                await replacing.build_dataset("hubspot", "simulated", reason=REASON_NO_CREDENTIALS),
+                "simulated",
+            )
+            assert replacement.dataset_id is not None
+            replaced.append(replacement.dataset_id)
+        return report
+
+    async def refreshing(
+        controller: SourceModeController, crm_dataset_id: int, *, now: datetime | None = None
+    ) -> jobs.JobResult | None:
+        """Run the real CRM refresh, then deny."""
+        earlier.update(row.id for row in await rig.all(AnalysisRequest))
+        result = await refresh(controller, crm_dataset_id, now=now)
+        assert result is not None
+        synced.append(result)
+        await deny(controller)
+        return result
+
+    monkeypatch.setattr(jobs, "backfill_dataset", backfilling)
+    monkeypatch.setattr(jobs, "refresh_crm_dataset", refreshing)
+
+    outcome = await recovering.recover("linkedin")
+
+    assert outcome is not None
+    assert (outcome.source, outcome.mode, outcome.activated) == ("linkedin", "live", False)
+    assert [outcome.dataset_id] == builds
+    assert await rig.dataset(outcome.dataset_id) is None, "the voided build was discarded"
+    active = await rig.active("linkedin")
+    assert active is not None
+    assert (active.id, active.mode, active.state) == (previous, "simulated", "active")
+    connection = await rig.connection("linkedin")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "simulated",
+        "denied",
+        previous,
+    )
+    crm = await rig.active("hubspot")
+    assert crm is not None
+    assert replaced == ([crm.id] if step == "late-refresh" else [])
+    [result] = synced
+    assert (result.source, result.dataset_id, result.status) == ("hubspot", crm.id, "succeeded")
+    # In both steps the window holds only the requests of the one CRM sync in ``synced``: in
+    # ``late-refresh`` it opens at the refresh, after the backfill's own CRM sync of the
+    # replaced primary and the replacement's activation queued theirs.
+    assert await _new_requests(rig, earlier) == _crm_requests(result)
+    # The build's matching passes (its backfill's inactive LeadMatchJob, and the late-restaged
+    # pass in the replacement primary) queue no request of their own.
+    since_build = {reason for reason, _, _ in await _new_requests(rig, before_build)}
+    assert f"sync:hubspot.{jobs.JOB_LEAD_MATCH}" not in since_build
 
 
 # ---------------------------------------------------------------------------------------------
