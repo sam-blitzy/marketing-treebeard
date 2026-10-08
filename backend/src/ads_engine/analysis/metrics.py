@@ -38,7 +38,12 @@ the sum as 0. That applies only to
   account baseline (``RateBaseline``).
 
 Every other unreported metric stays ``None``, outcomes included: Google campaign-day and
-keyword-day ``conversions``, LinkedIn ``leads`` and ``website_conversions``.
+keyword-day ``conversions``, LinkedIn ``leads`` and ``website_conversions``. An optional
+LinkedIn metric summed over several rows (a campaign day's creatives, a creative's window
+days) is ``None`` as soon as one summed row did not report it (:func:`_complete_sum`):
+PostgreSQL's ``SUM`` skips ``NULL``, so the reporting rows alone would read as a complete
+count. A campaign day keeps those rows' sum in ``DayFact.reported_floors``, a lower bound
+that only P2's :func:`source_totals` reads.
 
 Budget history (AAP 0.5.4.1) in one paragraph: snapshots are *observations*, never effective
 times. A native day is **whole-day known** only when an observation exists at or before the
@@ -403,6 +408,42 @@ def _int_sum(column: Any) -> sa.Cast[int]:
     return sa.cast(sa.func.sum(column), sa.BigInteger)
 
 
+def _complete_sum(column: Any, *, integer: bool) -> sa.Case[Any]:
+    """The group's ``SUM(column)`` when every row reported ``column``, else ``NULL``.
+
+    ``CASE WHEN count(column) = count(*) THEN SUM(column) END``. PostgreSQL's ``SUM`` skips
+    ``NULL`` inputs, so a plain sum of a group mixing reported and unreported rows would read
+    as a complete count; one unreported row makes this ``NULL`` instead ("unavailable", AAP
+    0.11.1). An ``integer`` column is summed as ``bigint`` (:func:`_int_sum`).
+    """
+    total = _int_sum(column) if integer else sa.func.sum(column)
+    return sa.case((sa.func.count(column) == sa.func.count(), total))
+
+
+def _partial_sum(column: Any, *, integer: bool) -> sa.Case[Any]:
+    """The sum of the rows that reported ``column`` when only some rows of the group did.
+
+    ``CASE WHEN count(column) < count(*) THEN SUM(column) END``: ``NULL`` when every row
+    reported it (:func:`_complete_sum` holds the value) and when none did (nothing was
+    recorded). Otherwise a lower bound of the group's value, never its count.
+    """
+    total = _int_sum(column) if integer else sa.func.sum(column)
+    return sa.case((sa.func.count(column) < sa.func.count(), total))
+
+
+_LINKEDIN_DAY_OPTIONAL: Final[tuple[tuple[str, bool], ...]] = (
+    ("conversions", False),
+    ("conversions_value", False),
+    ("form_opens", True),
+    ("leads", True),
+    ("landing_page_clicks", True),
+    ("website_conversions", True),
+)
+"""The optional ``fact_creative_daily`` metrics of a LinkedIn campaign day, in
+:class:`DayFact` field order, each with whether it is a whole count (summed as ``bigint``)
+or a ``numeric`` amount."""
+
+
 @overload
 async def aggregate_sql(
     scope: QueryScope, grain: Literal["campaign_day_google", "campaign_day_linkedin"]
@@ -439,11 +480,15 @@ async def aggregate_sql(scope: QueryScope, grain: Grain) -> list[Any]:
     * ``campaign_day_google``: ``fact_campaign_daily`` rows, one per campaign per Google date
       (the natural key already makes each (campaign, date) a single row).
     * ``campaign_day_linkedin``: ``fact_creative_daily`` summed per ``creative.campaign_id``
-      per UTC date. ``SUM`` semantics: an optional metric is ``None`` only when every summed
-      value is ``NULL``; cost, impressions and clicks, which :class:`DayFact` requires, sum
-      an all-``NULL`` group to 0.
+      per UTC date. An optional metric is the sum only when every creative row of the day
+      reported it, and ``None`` as soon as one row did not (:func:`_complete_sum`), so a
+      partial sum never reads as the day's count; the reporting rows' sum is kept as a
+      :attr:`DayFact.reported_floors` entry, a lower bound. Cost, impressions and clicks,
+      which :class:`DayFact` requires, sum the reported values, and an all-``NULL`` group
+      to 0.
     * ``creative_window``: window totals per creative, with ``delivery_days`` = dates with
-      impressions > 0.
+      impressions > 0. An optional count is ``None`` unless every window day of the creative
+      reported it; cost, impressions and clicks sum as in ``campaign_day_linkedin``.
     * ``keyword_day``: ``fact_keyword_daily`` rows.
     * ``search_term_window``: ``fact_search_term_daily`` summed per (ad group, campaign,
       matched criterion, term); ``term_status``, the matched keyword text and match type are
@@ -528,11 +573,18 @@ async def _campaign_days_google(scope: QueryScope) -> list[CampaignDay]:
 
 
 async def _campaign_days_linkedin(scope: QueryScope) -> list[CampaignDay]:
-    """``campaign_day_linkedin``: creative days summed per campaign per UTC date."""
+    """``campaign_day_linkedin``: creative days summed per campaign per UTC date.
+
+    Each optional metric (:data:`_LINKEDIN_DAY_OPTIONAL`) is the day's sum only when every
+    creative row reported it (:func:`_complete_sum`); otherwise it is ``None``, and the sum of
+    the rows that did report it (:func:`_partial_sum`) becomes a
+    :attr:`DayFact.reported_floors` entry.
+    """
     dataset_id = scope.dataset_id("linkedin")
     if dataset_id is None:
         return []
     fact = FactCreativeDaily
+    optional = [(getattr(fact, name), integer) for name, integer in _LINKEDIN_DAY_OPTIONAL]
     stmt = (
         sa.select(
             Creative.campaign_id,
@@ -540,12 +592,8 @@ async def _campaign_days_linkedin(scope: QueryScope) -> list[CampaignDay]:
             sa.func.sum(fact.cost),
             _int_sum(fact.impressions),
             _int_sum(fact.clicks),
-            sa.func.sum(fact.conversions),
-            sa.func.sum(fact.conversions_value),
-            _int_sum(fact.form_opens),
-            _int_sum(fact.leads),
-            _int_sum(fact.landing_page_clicks),
-            _int_sum(fact.website_conversions),
+            *(_complete_sum(column, integer=integer) for column, integer in optional),
+            *(_partial_sum(column, integer=integer) for column, integer in optional),
         )
         .select_from(fact)
         .join(
@@ -574,7 +622,13 @@ async def _campaign_days_linkedin(scope: QueryScope) -> list[CampaignDay]:
             leads,
             landing_page_clicks,
             website_conversions,
+            *partial,
         ) = list(row)
+        floors = tuple(
+            (name, _as_int(floor) if integer else _as_decimal(floor))
+            for (name, integer), floor in zip(_LINKEDIN_DAY_OPTIONAL, partial, strict=True)
+            if floor is not None
+        )
         days.append(
             CampaignDay(
                 campaign_id,
@@ -589,6 +643,7 @@ async def _campaign_days_linkedin(scope: QueryScope) -> list[CampaignDay]:
                     leads=_as_optional_int(leads),
                     landing_page_clicks=_as_optional_int(landing_page_clicks),
                     website_conversions=_as_optional_int(website_conversions),
+                    reported_floors=floors,
                 ),
             )
         )
@@ -596,7 +651,11 @@ async def _campaign_days_linkedin(scope: QueryScope) -> list[CampaignDay]:
 
 
 async def _creative_window(scope: QueryScope) -> list[CreativeTotals]:
-    """``creative_window``: window totals per LinkedIn creative, with its delivery days."""
+    """``creative_window``: window totals per LinkedIn creative, with its delivery days.
+
+    Each optional count is the window's sum only when every window day of the creative
+    reported it (:func:`_complete_sum`), and otherwise ``None``.
+    """
     dataset_id = scope.dataset_id("linkedin")
     if dataset_id is None:
         return []
@@ -608,10 +667,10 @@ async def _creative_window(scope: QueryScope) -> list[CreativeTotals]:
             sa.func.sum(fact.cost),
             _int_sum(fact.impressions),
             _int_sum(fact.clicks),
-            _int_sum(fact.form_opens),
-            _int_sum(fact.leads),
-            _int_sum(fact.landing_page_clicks),
-            _int_sum(fact.website_conversions),
+            _complete_sum(fact.form_opens, integer=True),
+            _complete_sum(fact.leads, integer=True),
+            _complete_sum(fact.landing_page_clicks, integer=True),
+            _complete_sum(fact.website_conversions, integer=True),
             sa.func.count().filter(fact.impressions > 0),
         )
         .select_from(fact)
@@ -2542,12 +2601,17 @@ def _baseline_totals(ctx: AnalysisContext, account_id: int, objective_group: str
 
 
 def source_totals(ctx: AnalysisContext) -> dict[Source, tuple[Decimal, Decimal]]:
-    """Return ``{source: (window spend, window outcomes)}`` for Google and LinkedIn.
+    """Return ``{source: (window spend, window outcomes recorded)}`` for Google and LinkedIn.
 
     The input of P2's ``conversion_tracking_absent`` check (AAP 0.5.4.2): a source with spend
     > 0 and zero outcomes across the window. Outcomes are each campaign's own objective-group
-    outcome; an unreported value adds nothing, because P2 asks whether any outcome was
-    *recorded*. A source appears when it has an active dataset or campaigns in the context.
+    outcome as recorded (:meth:`DayFact.recorded_outcome`): a day's complete count, or, on a
+    day only some of whose fact rows reported it, the sum of those rows
+    (:attr:`DayFact.reported_floors`). A value no row reported adds nothing, because P2 asks
+    whether any outcome was *recorded*. The total is therefore a lower bound of the window's
+    outcomes, for P2 alone: counts, rates and efficiency read :meth:`DayFact.outcome`, which
+    keeps a partially reported day unavailable. A source appears when it has an active
+    dataset or campaigns in the context.
     """
     totals: dict[Source, tuple[Decimal, Decimal]] = {}
     for source in _AD_SOURCES:
@@ -2560,7 +2624,7 @@ def source_totals(ctx: AnalysisContext) -> dict[Source, tuple[Decimal, Decimal]]
             if not window.start <= day.date <= window.end:
                 continue
             spend += day.cost
-            value = day.outcome(campaign.objective_group)
+            value = day.recorded_outcome(campaign.objective_group)
             if value is not None:
                 outcomes += value
         totals[campaign.source] = (spend, outcomes)

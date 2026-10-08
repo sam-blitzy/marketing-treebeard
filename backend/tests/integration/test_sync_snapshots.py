@@ -57,6 +57,7 @@ from ads_engine.decisions import (
     DecisionPatch,
     DecisionShape,
     DecisionSource,
+    PlatformStateUnknown,
     SubjectRef,
     SubjectState,
     auto_resolve,
@@ -377,6 +378,213 @@ def test_entity_type_tables_must_cover_entity_types(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(snapshots, "_ENTITY_SOURCES", stray)
     with pytest.raises(RuntimeError, match="unknown"):
         snapshots._check_tables()
+
+
+# Storage bounds: entity_snapshot's money columns are numeric(18, 6); its ids and
+# budget_amount_micros are bigint. A validated row must be stored exactly as observed.
+
+LARGEST_AMOUNT = Decimal("999999999999.999999")
+"""The largest amount ``numeric(18, 6)`` stores exactly."""
+
+LARGEST_MICROS = 999_999_999_999_999_999
+""":data:`LARGEST_AMOUNT` in micros (``10**18 - 1``)."""
+
+BIGINT_MAX = 2**63 - 1
+
+
+def _money_rows(amount: Decimal) -> list[SnapshotRow]:
+    """Build every row that carries ``amount`` in ``budget_daily`` and ``budget_total``."""
+    return [
+        SnapshotRow.campaign(
+            source="linkedin",
+            entity_id=1,
+            status="active",
+            raw_status="ACTIVE",
+            daily_budget=amount,
+            total_budget=amount,
+        ),
+        SnapshotRow.campaign_group(
+            entity_id=1, status="ACTIVE", daily_budget=amount, total_budget=amount
+        ),
+        SnapshotRow(
+            source="google",
+            entity_type="budget",
+            entity_id=1,
+            budget_daily=amount,
+            budget_total=amount,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "amount",
+    [
+        Decimal(0),
+        Decimal("0.000001"),
+        Decimal("1.2345670000"),
+        Decimal("12.3456780000000000000000000000"),
+        Decimal("1E+3"),
+        LARGEST_AMOUNT,
+    ],
+)
+def test_amounts_numeric_18_6_stores_exactly_are_kept_as_observed(amount: Decimal) -> None:
+    for row in _money_rows(amount):
+        assert row.budget_daily is amount
+        assert row.budget_total is amount
+        assert row.to_row(1, T0)["budget_daily"] is amount
+
+
+@pytest.mark.parametrize(
+    ("amount", "match"),
+    [
+        (Decimal("1.2345678"), "finer than six decimal places"),
+        (Decimal("0.0000001"), "finer than six decimal places"),
+        (Decimal("12.3456780000000000000000000001"), "finer than six decimal places"),
+        (Decimal("999999999999.9999995"), "finer than six decimal places"),
+        (Decimal(10**12), r"at least 10\*\*12"),
+        (Decimal("1E+12"), r"at least 10\*\*12"),
+        (Decimal("1000000000000.000000"), r"at least 10\*\*12"),
+        (Decimal(2**63), r"at least 10\*\*12"),
+        (Decimal("-0.01"), "non-negative"),
+        (Decimal("NaN"), "finite"),
+        (Decimal("sNaN"), "finite"),
+        (Decimal("Infinity"), "finite"),
+    ],
+)
+def test_amounts_numeric_18_6_cannot_store_exactly_are_refused(amount: Decimal, match: str) -> None:
+    for column in ("budget_daily", "budget_total"):
+        with pytest.raises(ValueError, match=match):
+            SnapshotRow(source="google", entity_type="budget", entity_id=1, **{column: amount})  # type: ignore[arg-type]
+    for argument in ("daily_budget", "total_budget"):
+        with pytest.raises(ValueError, match=match):
+            SnapshotRow.campaign(
+                source="linkedin",
+                entity_id=1,
+                status="active",
+                raw_status="ACTIVE",
+                **{argument: amount},  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match=match):
+            SnapshotRow.campaign_group(entity_id=1, status="ACTIVE", **{argument: amount})  # type: ignore[arg-type]
+
+
+def test_a_float_amount_is_still_refused() -> None:
+    with pytest.raises(ValueError, match="Decimal"):
+        SnapshotRow.campaign_group(entity_id=1, status="ACTIVE", daily_budget=2.5)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("period", ["DAILY", "CUSTOM_PERIOD"])
+def test_the_largest_storable_micros_yield_the_largest_storable_amount(period: str) -> None:
+    campaign = SnapshotRow.campaign(
+        source="google",
+        entity_id=1,
+        status="active",
+        raw_status="ENABLED",
+        budget_id=2,
+        budget_period=period,
+        budget_amount_micros=LARGEST_MICROS,
+    )
+    budget = SnapshotRow.budget(
+        entity_id=2, period=period, amount_micros=LARGEST_MICROS, explicitly_shared=True
+    )
+    direct = SnapshotRow(
+        source="google", entity_type="budget", entity_id=2, budget_amount_micros=LARGEST_MICROS
+    )
+    assert direct.budget_amount_micros == LARGEST_MICROS
+    for row in (campaign, budget):
+        assert row.budget_amount_micros == LARGEST_MICROS
+        amount = row.budget_daily if period == "DAILY" else row.budget_total
+        assert amount == LARGEST_AMOUNT
+        assert str(amount) == "999999999999.999999"
+
+
+@pytest.mark.parametrize("micros", [10**18, BIGINT_MAX, 2**63])
+def test_micros_beyond_the_money_range_are_refused(micros: int) -> None:
+    match = r"below 10\*\*18"
+    with pytest.raises(ValueError, match=match):
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=1,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=2,
+            budget_period="DAILY",
+            budget_amount_micros=micros,
+        )
+    with pytest.raises(ValueError, match=match):
+        SnapshotRow.budget(
+            entity_id=2, period="CUSTOM_PERIOD", amount_micros=micros, explicitly_shared=False
+        )
+    for entity_type in ("campaign", "budget"):
+        with pytest.raises(ValueError, match=match):
+            SnapshotRow(
+                source="google",
+                entity_type=entity_type,
+                entity_id=1,
+                status="active" if entity_type == "campaign" else None,
+                budget_amount_micros=micros,
+            )
+
+
+def test_ids_up_to_the_bigint_maximum_are_accepted() -> None:
+    campaign = SnapshotRow.campaign(
+        source="google",
+        entity_id=BIGINT_MAX,
+        status="active",
+        raw_status="ENABLED",
+        budget_id=BIGINT_MAX,
+        budget_period="DAILY",
+        budget_amount_micros=1,
+    )
+    assert (campaign.entity_id, campaign.budget_id) == (BIGINT_MAX, BIGINT_MAX)
+    assert campaign.to_row(BIGINT_MAX, T0)["dataset_id"] == BIGINT_MAX
+    keyword = SnapshotRow.keyword(
+        entity_id=BIGINT_MAX, status="ENABLED", match_type="EXACT", quality_score=None
+    )
+    assert keyword.entity_id == BIGINT_MAX
+    enumeration = EnumerationResult(
+        source="google",
+        complete=True,
+        present_campaign_ids=frozenset({BIGINT_MAX}),
+        present_budget_ids=frozenset({BIGINT_MAX}),
+    )
+    assert enumeration.present_campaign_ids == frozenset({BIGINT_MAX})
+
+
+def test_ids_beyond_bigint_are_refused() -> None:
+    beyond = 2**63
+    with pytest.raises(ValueError, match=r"entity_id.*beyond bigint"):
+        SnapshotRow(source="google", entity_type="campaign", entity_id=beyond, status="active")
+    with pytest.raises(ValueError, match=r"entity_id.*beyond bigint"):
+        SnapshotRow.keyword(entity_id=beyond, status="ENABLED", match_type="EXACT", quality_score=7)
+    with pytest.raises(ValueError, match=r"budget_id.*beyond bigint"):
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=1,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=beyond,
+            budget_period="DAILY",
+            budget_amount_micros=1,
+        )
+    row = SnapshotRow.creative(entity_id=1, intended_status="ACTIVE", lead_form_urn=None)
+    with pytest.raises(ValueError, match=r"dataset_id.*beyond bigint"):
+        row.to_row(beyond, T0)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "present_campaign_ids",
+        "present_budget_ids",
+        "removed_campaign_ids",
+        "missing_campaign_ids",
+        "missing_budget_ids",
+    ],
+)
+def test_enumeration_ids_beyond_bigint_are_refused(name: str) -> None:
+    with pytest.raises(ValueError, match=rf"{name}.*beyond bigint"):
+        EnumerationResult(source="google", complete=True, **{name: frozenset({2**63})})  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------------------
@@ -1092,6 +1300,48 @@ async def test_write_snapshots_refuses_bad_input(sessions: Sessions) -> None:
     async with sessions() as session:
         with pytest.raises(DatasetNotWritable):
             await write_snapshots(session, world.dataset_id, [row], captured_at=_at(1))
+
+
+@pytest.mark.anyio
+async def test_write_snapshots_stores_the_largest_storable_amounts_exactly(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions, state="building")
+    rows = [
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=world.own,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=world.own_budget,
+            budget_period="DAILY",
+            budget_amount_micros=LARGEST_MICROS,
+        ),
+        SnapshotRow.budget(
+            entity_id=world.shared_budget,
+            period="CUSTOM_PERIOD",
+            amount_micros=LARGEST_MICROS,
+            explicitly_shared=True,
+        ),
+    ]
+    async with sessions() as session, session.begin():
+        ids = await write_snapshots(session, world.dataset_id, rows, captured_at=_at(0))
+    async with sessions() as session:
+        campaign = await session.get(EntitySnapshot, ids[("campaign", world.own)])
+        budget = await session.get(EntitySnapshot, ids[("budget", world.shared_budget)])
+    assert campaign is not None
+    assert budget is not None
+    assert (campaign.budget_daily, campaign.budget_total, campaign.budget_amount_micros) == (
+        LARGEST_AMOUNT,
+        None,
+        LARGEST_MICROS,
+    )
+    assert (budget.budget_daily, budget.budget_total, budget.budget_amount_micros) == (
+        None,
+        LARGEST_AMOUNT,
+        LARGEST_MICROS,
+    )
+    assert str(campaign.budget_daily) == str(budget.budget_total) == "999999999999.999999"
 
 
 # ---------------------------------------------------------------------------------------
@@ -2079,8 +2329,10 @@ async def test_baseline_and_detection_statements_do_not_grow_with_the_subjects(
     assert small == large
     # Reads are a fixed handful; writes follow only the rows created or changed.
     first, unchanged, changed, again, restored = runs[200]
+    # Each pass includes the three statements that lock the dataset, its campaigns and its
+    # shared budgets before anything else is read.
     assert first.baseline_statements <= 20
-    assert unchanged.detection_statements <= 15
+    assert unchanged.detection_statements <= 18
     assert changed.detection_statements - unchanged.detection_statements <= 5 * 3 + 1
     assert restored.detection_statements - unchanged.detection_statements <= 5 + 1
 
@@ -2137,6 +2389,144 @@ async def test_a_baseline_deferred_by_the_sealing_sync_is_written_once_known(
         sessions, world.dataset_id, _google_rows(world, shared_micros=60_000_000), at=_at(9)
     )
     assert dict(changed.report.raised) == {"status": 0, "budget": 1, "untracked": 0, "missing": 0}
+
+
+def _own_unreported(world: GoogleWorld) -> list[SnapshotRow]:
+    """Return the world's rows with the own-budget campaign's DAILY amount omitted by Google.
+
+    The campaign's snapshot still names its budget and period; Google omits the amount on
+    the campaign's row and on its budget's row alike.
+    """
+    unreported = {("campaign", world.own), ("budget", world.own_budget)}
+    return [
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=world.own,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=world.own_budget,
+            budget_period="DAILY",
+            budget_amount_micros=None,
+        ),
+        SnapshotRow.budget(
+            entity_id=world.own_budget, period="DAILY", amount_micros=None, explicitly_shared=False
+        ),
+        *(row for row in _google_rows(world) if row.key not in unreported),
+    ]
+
+
+async def _own_decisions(sessions: Sessions, world: GoogleWorld) -> list[Decision]:
+    """Return the own-budget campaign's decisions in insertion order."""
+    return [
+        row
+        for row in await _decisions(sessions, world.dataset_id)
+        if (row.subject_type, row.subject_id) == ("campaign", world.own)
+    ]
+
+
+NOTHING_RAISED = {"status": 0, "budget": 0, "untracked": 0, "missing": 0}
+"""A detection report's ``raised`` counts when no discrepancy of any kind was raised."""
+
+
+@pytest.mark.anyio
+async def test_baseline_waits_for_an_own_budget_amount_google_omitted(sessions: Sessions) -> None:
+    # The omitted amount is unknown, never absent. A baseline without it would
+    # make the unchanged amount, once reported, a false C0 budget discrepancy.
+    world = await _google_world(sessions)
+    first = await _sync(
+        sessions, world.dataset_id, _own_unreported(world), at=_at(0), complete=False
+    )
+    assert (first.sealed, first.baselines, first.report.skipped) == (False, 4, 1)
+    assert dict(first.report.raised) == NOTHING_RAISED
+    assert await _own_decisions(sessions, world) == []
+    assert await _open(sessions, world.dataset_id) == []
+    known = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(3))
+    assert (known.sealed, known.baselines, known.report.skipped) == (False, 1, 0)
+    assert dict(known.report.raised) == NOTHING_RAISED
+    assert await _open(sessions, world.dataset_id) == []
+    assert [
+        (row.origin, row.shape, row.status, row.daily_budget, row.total_budget, row.decided_at)
+        for row in await _own_decisions(sessions, world)
+    ] == [("baseline", "own_budget", "active", Decimal("100.000000"), None, _at(3))]
+    sealed = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    assert (sealed.sealed, sealed.baselines) == (True, 0)
+    assert dict(sealed.report.raised) == NOTHING_RAISED
+
+
+@pytest.mark.anyio
+async def test_an_own_budget_baseline_deferred_by_the_sealing_sync_is_written_once_known(
+    sessions: Sessions,
+) -> None:
+    # The first, complete sync seals the baseline although Google omitted the own-budget
+    # campaign's amount; the campaign was observed with the baseline population, so it is
+    # baselined once the amount is reported and is never untracked (AAP 0.5.4.4).
+    world = await _google_world(sessions)
+    first = await _sync(sessions, world.dataset_id, _own_unreported(world), at=_at(0))
+    assert (first.sealed, first.baselines, first.report.skipped) == (False, 4, 1)
+    still_unknown = await _sync(sessions, world.dataset_id, _own_unreported(world), at=_at(3))
+    assert (still_unknown.sealed, still_unknown.baselines) == (True, 0)
+    assert dict(still_unknown.report.raised) == NOTHING_RAISED
+    assert still_unknown.report.skipped == 1
+    assert await _open(sessions, world.dataset_id) == []
+    known = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    assert (known.sealed, known.baselines, known.report.skipped) == (True, 1, 0)
+    assert dict(known.report.raised) == NOTHING_RAISED
+    assert await _open(sessions, world.dataset_id) == []
+    assert [
+        (row.origin, row.shape, row.status, row.daily_budget, row.total_budget, row.decided_at)
+        for row in await _own_decisions(sessions, world)
+    ] == [("baseline", "own_budget", "active", Decimal("100.000000"), None, _at(6))]
+    changed = await _sync(
+        sessions, world.dataset_id, _google_rows(world, own_micros=OWN_MICROS + 1), at=_at(9)
+    )
+    assert dict(changed.report.raised) == {**NOTHING_RAISED, "budget": 1}
+
+
+@pytest.mark.anyio
+async def test_a_tombstone_is_not_corrected_from_an_own_budget_amount_google_omitted(
+    sessions: Sessions,
+) -> None:
+    # A tombstoned campaign's platform_correct writes the whole platform state, which
+    # needs the amount; the status-only correction of a live decision does not apply.
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    absent = _google_rows(world, without=frozenset({world.own}))
+    await _sync(
+        sessions, world.dataset_id, absent, at=_at(3), missing_campaigns=frozenset({world.own})
+    )
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+    reappeared = await _sync(sessions, world.dataset_id, _own_unreported(world), at=_at(6))
+    assert dict(reappeared.report.raised) == {**NOTHING_RAISED, "status": 1}
+    (status,) = await _open(sessions, world.dataset_id)
+    decided = [row.id for row in await _own_decisions(sessions, world)]
+
+    with pytest.raises(PlatformStateUnknown) as refused:
+        async with sessions() as session, session.begin():
+            await resolve_discrepancy(status.id, "platform_correct", session=session, now=_at(7))
+
+    assert (refused.value.status_code, refused.value.code) == (409, "platform_state_unknown")
+    assert refused.value.details == {
+        "snapshot_id": reappeared.snapshot_ids[("campaign", world.own)]
+    }
+    assert [row.id for row in await _own_decisions(sessions, world)] == decided
+    assert [(row.id, row.state) for row in await _open(sessions, world.dataset_id)] == [
+        (status.id, "open")
+    ]
+    known = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(9))
+    assert known.report.refreshed == 1
+    async with sessions() as session, session.begin():
+        closed = await resolve_discrepancy(
+            status.id, "platform_correct", session=session, now=_at(10)
+        )
+    assert (closed.state, closed.resolution) == ("resolved", "platform_correct")
+    latest = (await _own_decisions(sessions, world))[-1]
+    assert (latest.status, latest.daily_budget, latest.tombstone) == (
+        "active",
+        Decimal("100.000000"),
+        False,
+    )
 
 
 @pytest.mark.anyio
@@ -2302,20 +2692,40 @@ async def test_the_waiting_untracked_row_shows_the_current_platform_and_decision
         assert _amounts(folded.platform_value) == ("active", Decimal(100), OWN_MICROS)
         assert _amounts(folded.decided_value) == ("paused", Decimal(130), 130_000_000)
         assert folded.detected_at == _at(3)
-        # Measured against an older decision and no snapshot, the decided side is that
-        # decision and the reported platform fields are merged into the stored ones.
+        # A status comparison always names the snapshot it read; without one it is refused
+        # before the waiting row changes.
+        with pytest.raises(ValueError, match="a status discrepancy needs the snapshot"):
+            await raise_discrepancy(
+                session,
+                SubjectRef(type="campaign", id=late),
+                "status",
+                decided_value={"status": "paused"},
+                platform_value={"status": "ended"},
+                snapshot_id=None,
+                decision_id=intended_id,
+                detected_at=_at(10),
+            )
+        assert (folded.snapshot_id, folded.decision_id) == (first_seen, later_id)
+        assert _amounts(folded.platform_value) == ("active", Decimal(100), OWN_MICROS)
+        # Measured against an older decision, the decided side is that decision and the
+        # platform side the complete state the named snapshot observed.
+        converged_seen = converged.snapshot_ids[("campaign", late)]
         older = await raise_discrepancy(
             session,
             SubjectRef(type="campaign", id=late),
             "status",
             decided_value={"status": "paused"},
-            platform_value={"status": "ended"},
-            snapshot_id=None,
+            platform_value={"status": "active"},
+            snapshot_id=converged_seen,
             decision_id=intended_id,
             detected_at=_at(10),
         )
-        assert (older.id, older.snapshot_id, older.decision_id) == (untracked.id, None, intended_id)
-        assert _amounts(older.platform_value) == ("ended", Decimal(100), OWN_MICROS)
+        assert (older.id, older.snapshot_id, older.decision_id) == (
+            untracked.id,
+            converged_seen,
+            intended_id,
+        )
+        assert _amounts(older.platform_value) == ("active", Decimal(120), 120_000_000)
         assert _amounts(older.decided_value) == ("paused", Decimal(120), 120_000_000)
 
     matched = await _sync(sessions, world.dataset_id, rows("paused", 130_000_000), at=_at(12))

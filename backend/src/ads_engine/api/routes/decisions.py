@@ -15,8 +15,14 @@ What this module does, and what it leaves to the domain:
 * **Writing** delegates every rule to :func:`ads_engine.decisions.record_decision`: the
   decision shape, the per-shape field rules, the currency's minor unit, empty and no-op
   patches, retired subjects and the rerun request all live there (AAP 0.5.2, 0.3.2). The
-  route adds only what is about the *request*: a decision recorded from an item must come
-  from an item that still rests on current data, and the transaction is committed here.
+  route adds only what is about the *request*, and commits the transaction. A decision
+  recorded from an item must be the one the item offers: an item without a
+  ``decision_subject`` is 422 ``decision_not_offered``, one naming another subject 422
+  ``subject_mismatch`` (:func:`_require_offered_subject`). The item must also still rest
+  on current data, and stay so until the commit: every dataset its provenance names, and
+  the subject's, is locked ``FOR SHARE`` in ``id`` order and the check repeated under the
+  locks (:func:`_hold_item_current`), so an activation of another source cannot retire a
+  dataset the item read before the decision commits (409 ``subject_retired``).
 * **Errors** raised by the domain (``PatchRejected`` 422, ``SubjectRetired`` 409
   ``subject_retired``, ``SubjectNotFound`` 404) and ``DatasetNotWritable`` propagate
   unchanged to the handlers ``api/app.py`` registers, which render the AAP error shape.
@@ -37,7 +43,7 @@ Example:
              "daily_budget": "120.000000", "patch": {"daily_budget": "120.00"}, ...}
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Query
@@ -45,12 +51,12 @@ from sqlalchemy import BigInteger, Select, and_, case, column, distinct, func, s
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from ads_engine.analysis.overlay import item_is_current
+from ads_engine.analysis.overlay import current_dataset_ids, is_current, item_provenance
 from ads_engine.api import schemas
 from ads_engine.api.deps import ApiError, NowDep, SessionDep, UserDep, conflict, not_found
 from ads_engine.db.models import AdAccount, Budget, Campaign, Recommendation
 from ads_engine.db.models import Decision as DecisionRow
-from ads_engine.db.repositories import active_datasets
+from ads_engine.db.repositories import active_datasets, lock_dataset
 from ads_engine.decisions import DecisionPatch, SubjectRef, record_decision
 from ads_engine.logging import get_logger
 
@@ -73,6 +79,9 @@ _HISTORICAL_MESSAGE: Final = "Computed from data that has since been replaced"
 # The display name ads_engine.decisions gives a shared budget, which has no name of its own
 # on the platform; the log uses the same wording as the domain's messages.
 _SHARED_BUDGET_NAME: Final = "Shared budget {external_id}"
+
+# The subject types an item's stored ``decision_subject`` may name (AAP 0.5.2 ``decision``).
+_SUBJECT_TYPES: Final[frozenset[str]] = frozenset({"campaign", "budget"})
 
 # Aliases for the budget-currency subqueries. They must differ from the outer statement's
 # ``ad_account`` and ``campaign``: SQLAlchemy auto-correlates a scalar subquery with any
@@ -289,6 +298,144 @@ async def _read_views(
 
 
 # ---------------------------------------------------------------------------
+# Decisions recorded from an item
+# ---------------------------------------------------------------------------
+
+
+def _offered_subject(value: object) -> tuple[str, int] | None:
+    """Decode an item's stored ``decision_subject``, or ``None`` when it offers no decision.
+
+    The runner stores ``{type, id}`` (``DecisionSubject.to_json``) on the items that carry
+    "Record decision" and ``NULL`` on every other item (AAP 0.5.5). Stored ``jsonb`` may hold
+    any JSON value, so anything that is not an object with a ``campaign`` or ``budget``
+    ``type`` and a positive integer ``id`` (a JSON ``true`` is not an id) offers nothing.
+
+    Args:
+        value: ``recommendation.decision_subject`` as loaded.
+
+    Returns:
+        ``(type, id)`` of the subject the item offers a decision on, or ``None``.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    subject_type = value.get("type")
+    subject_id = value.get("id")
+    if not isinstance(subject_type, str) or subject_type not in _SUBJECT_TYPES:
+        return None
+    if isinstance(subject_id, bool) or not isinstance(subject_id, int) or subject_id < 1:
+        return None
+    return (subject_type, subject_id)
+
+
+def _require_offered_subject(recommendation: Recommendation, subject: schemas.SubjectIn) -> None:
+    """Refuse a decision its item does not offer, before anything is locked or written.
+
+    A decision recorded from an item is stored with ``origin='recommendation'`` and the
+    item's id, so the item must offer exactly that decision: its ``decision_subject`` is the
+    campaign or shared budget the decision writes (AAP 0.5.2, 0.5.5). The messages name the
+    item and the subjects by type and id only.
+
+    Args:
+        recommendation: The item named by ``recommendation_id``.
+        subject: The subject the request names.
+
+    Raises:
+        ApiError: 422 ``decision_not_offered`` when the item stores no decision subject, or
+            one that does not decode; 422 ``subject_mismatch`` when it offers a decision on
+            another subject (another id, or the other subject type).
+    """
+    offered = _offered_subject(recommendation.decision_subject)
+    if offered is None:
+        raise ApiError(
+            422,
+            "decision_not_offered",
+            f"Recommendation {recommendation.id} offers no decision to record; record the "
+            "decision without recommendation_id",
+        )
+    offered_type, offered_id = offered
+    if (offered_type, offered_id) != (subject.type, subject.id):
+        raise ApiError(
+            422,
+            "subject_mismatch",
+            f"Recommendation {recommendation.id} offers a decision on {offered_type} "
+            f"{offered_id}, not on {subject.type} {subject.id}",
+        )
+
+
+async def _subject_dataset_id(session: AsyncSession, subject: schemas.SubjectIn) -> int | None:
+    """Return the dataset of the campaign or budget ``subject`` names, read without a lock.
+
+    A subject row never moves to another dataset, so the unlocked read is the value the
+    domain locks later.
+
+    Returns:
+        The subject's ``dataset_id``, or ``None`` when no such subject exists.
+    """
+    if subject.type == "campaign":
+        statement = select(Campaign.dataset_id).where(Campaign.id == subject.id)
+    else:
+        statement = select(Budget.dataset_id).where(Budget.id == subject.id)
+    return await session.scalar(statement)
+
+
+async def _hold_item_current(
+    session: AsyncSession, recommendation: Recommendation, subject: schemas.SubjectIn
+) -> None:
+    """Keep the item's data current until the caller's transaction ends, or refuse with 409.
+
+    An item computed from a replaced dataset is historical-only and permits no write (AAP
+    0.3.2). The domain locks only the subject's own dataset, but an item may also have read
+    another source's dataset (a LinkedIn campaign's CRM evidence reads HubSpot's primary or
+    the companion), whose activation could otherwise retire it between the check and the
+    commit. In order:
+
+    1. The stored provenance must decode and be current (:func:`is_current` against
+       :func:`current_dataset_ids`), and so must the subject's dataset. Every dataset locked
+       next was therefore active, never a dataset still building.
+    2. Every provenance dataset and the subject's dataset is locked ``FOR SHARE``
+       (:func:`~ads_engine.db.repositories.lock_dataset`) in ascending ``id`` order: a
+       primary before its companion, the order activation and the domain's subject lock
+       use, so no lock cycle can form with an activation. The domain's later lock of the
+       subject's dataset is already held.
+    3. Currentness is checked again under the locks. An activation that retired a dataset
+       first has committed by now and is seen (READ COMMITTED); one that comes later waits
+       for this transaction to end.
+
+    A subject that does not exist is not locked, so the domain still answers 404.
+
+    Args:
+        session: The request's session; its transaction holds the locks.
+        recommendation: The item, already known to offer a decision on ``subject``.
+        subject: The subject the request names.
+
+    Raises:
+        ApiError: 409 ``subject_retired`` when the provenance is unverifiable, any of its
+            datasets is not current before or after the locks, or the subject's dataset is
+            not active.
+    """
+    provenance = item_provenance(recommendation)
+    if not provenance:
+        raise conflict("subject_retired", _HISTORICAL_MESSAGE)
+    current_ids = await current_dataset_ids(session)
+    if not is_current(provenance, current_ids):
+        raise conflict("subject_retired", _HISTORICAL_MESSAGE)
+    dataset_ids = {entry.dataset_id for entry in provenance}
+    subject_dataset_id = await _subject_dataset_id(session, subject)
+    if subject_dataset_id is not None:
+        if subject_dataset_id not in current_ids:
+            raise conflict(
+                "subject_retired",
+                f"{subject.type.capitalize()} {subject.id} does not belong to an active "
+                "dataset; decisions apply only to the active dataset's subjects",
+            )
+        dataset_ids.add(subject_dataset_id)
+    for dataset_id in sorted(dataset_ids):
+        await lock_dataset(session, dataset_id)
+    if not is_current(provenance, await current_dataset_ids(session)):
+        raise conflict("subject_retired", _HISTORICAL_MESSAGE)
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -388,9 +535,14 @@ async def create_decision(
     unit with 422; a subject of a non-active dataset with 409 ``subject_retired``; and it
     queues the analysis rerun in the same transaction (AAP 0.3.2). This route commits.
 
-    A decision recorded from an item (``recommendation_id``) is accepted only while the
+    A decision recorded from an item (``recommendation_id``) must be the decision that item
+    offers, on the subject its ``decision_subject`` names, and is accepted only while the
     item still rests on current data: an item computed from a replaced dataset is
-    historical-only, and every action on it is disabled (AAP 0.3.2).
+    historical-only, and every action on it is disabled (AAP 0.3.2, 0.5.5). The checks run
+    404, then 422, then 409 before any lock, then 409 again under the dataset locks
+    (:func:`_hold_item_current`), which stay held until this route commits; nothing is
+    written and no rerun is queued when any of them refuses. A request without
+    ``recommendation_id`` goes straight to the domain.
 
     Args:
         body: The subject, the patch, and optionally the item and a note.
@@ -402,8 +554,12 @@ async def create_decision(
         The new decision with its shape and complete materialised expected state.
 
     Raises:
-        ApiError: 404 ``not_found`` when ``recommendation_id`` names no item; 409
-            ``subject_retired`` when that item is historical-only.
+        ApiError: 404 ``not_found`` when ``recommendation_id`` names no item; 422
+            ``decision_not_offered`` when that item offers no decision, and
+            ``subject_mismatch`` when it offers one on another subject; 409
+            ``subject_retired`` when the item is historical-only, before the locks or under
+            them because a dataset it read was retired meanwhile, or the subject's dataset
+            is not active.
         ads_engine.decisions.DecisionError: Propagated to the error handlers:
             ``PatchRejected`` (422), ``SubjectRetired`` (409), ``SubjectNotFound`` (404).
     """
@@ -412,8 +568,8 @@ async def create_decision(
         recommendation = await session.get(Recommendation, recommendation_id)
         if recommendation is None:
             raise not_found(f"Recommendation {recommendation_id}")
-        if not await item_is_current(session, recommendation):
-            raise conflict("subject_retired", _HISTORICAL_MESSAGE)
+        _require_offered_subject(recommendation, body.subject)
+        await _hold_item_current(session, recommendation, body.subject)
     decision = await record_decision(
         SubjectRef(type=body.subject.type, id=body.subject.id),
         # Only the fields the client sent: an absent field keeps its decided value.

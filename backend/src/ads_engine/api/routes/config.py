@@ -58,20 +58,21 @@ __all__ = ["get_config", "router"]
 router = APIRouter(tags=["config"])
 
 
-def _bindings_view(dataset: SourceDataset | None) -> dict[str, Any] | None:
-    """Return a HubSpot dataset's stored CRM bindings as normalised JSON, or ``None``.
+def _bindings_view(dataset: SourceDataset | None) -> schemas.CrmBindingsView | None:
+    """Return a HubSpot dataset's stored CRM bindings as their typed view, or ``None``.
 
-    The stored document is decoded with :meth:`CrmBindings.from_json` and re-encoded with
-    :meth:`CrmBindings.to_json`. The round trip normalises the document (every key present,
-    ``verified_at`` as ISO-8601 UTC) and fails loudly on a corrupt row instead of passing an
-    unvalidated document to the client.
+    The stored document is decoded strictly with :meth:`CrmBindings.from_json` and rendered
+    with :meth:`~ads_engine.api.schemas.CrmBindingsView.from_bindings`. The response therefore
+    carries every key of :meth:`CrmBindings.to_json`, with ``verified_at`` as the same instant
+    in UTC, and a corrupt row fails loudly instead of passing an unvalidated document to the
+    client.
 
     Args:
         dataset: The HubSpot dataset whose bindings to show; ``None`` when there is none.
 
     Returns:
-        The bindings as plain JSON, or ``None`` when there is no dataset or its bindings have
-        not been verified yet, which the UI shows as "not yet verified".
+        The bindings view, or ``None`` when there is no dataset or its bindings have not been
+        verified yet, which the UI shows as "not yet verified".
 
     Raises:
         ads_engine.analysis.thresholds.ConfigError: When the stored document is not a valid
@@ -82,7 +83,7 @@ def _bindings_view(dataset: SourceDataset | None) -> dict[str, Any] | None:
     stored: Mapping[str, Any] | None = dataset.crm_bindings
     if stored is None:
         return None
-    return CrmBindings.from_json(stored).to_json()
+    return schemas.CrmBindingsView.from_bindings(CrmBindings.from_json(stored))
 
 
 @router.get(
@@ -146,7 +147,7 @@ async def get_config(
     return schemas.ConfigView(
         thresholds=thresholds.as_view(),
         window=schemas.WindowConfig.from_thresholds(thresholds),
-        hubspot_mapping=thresholds.mapping.to_json(),
+        hubspot_mapping=schemas.HubSpotMappingView.from_mapping(thresholds.mapping),
         crm_bindings=_bindings_view(primary),
         companion_crm_bindings=_bindings_view(companion),
         content_assets=[

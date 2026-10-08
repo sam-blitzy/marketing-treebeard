@@ -3,14 +3,16 @@
 Each test asserts behaviour that AAP 0.5.3 or the module's docstrings set:
 
 * shared scalars: :data:`Money` refuses floats, booleans, non-finite and over-precise
-  amounts and serialises as a fixed-point decimal string; :data:`MetricValue` renders a
+  amounts, serialises as a fixed-point decimal string, and publishes a request schema of
+  decimal strings or whole integers only; :data:`MetricValue` renders a
   ``Decimal`` exactly as ``analysis.context.json_value`` freezes it and keeps ``None``
   ("unavailable") as ``null``, never ``0``;
 * vocabularies: every ``Literal`` holds exactly the AAP values and its database or analysis
   tuple, and :func:`_check_vocabularies` raises on drift in values, count or section order;
 * base classes: responses ignore unknown keys and validate from ORM attributes, requests
   forbid unknown keys, and no field is aliased, so the wire names are the snake_case field
-  names;
+  names; a response emits every ``None`` default as ``null`` and publishes every field as
+  required, while a defaulted request field stays optional;
 * requests: :class:`LoginRequest`, :class:`CreateRunRequest` (whose window bounds
   ``AnalysisWindow.custom`` enforces), :class:`FeedbackRequest`, :class:`DecisionRequest`,
   :class:`DecisionPatchIn`, :class:`IntendedStateIn` and :class:`ResolveRequest`, whose ids
@@ -26,11 +28,14 @@ the configuration is the shipped ``config/`` directory.
 
 import copy
 import doctest
+import json
+import re
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, Literal, TypeAliasType, get_args
+from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
@@ -44,6 +49,10 @@ from ads_engine.analysis.thresholds import (
     HUBSPOT_MAPPING_FILE,
     THRESHOLDS_FILE,
     ContentAsset,
+    CrmBindings,
+    GoogleCrmBinding,
+    ResolvedBinding,
+    StageBinding,
     Thresholds,
 )
 from ads_engine.analysis.window import AnalysisWindow, InvalidWindow, SourceDayInfo
@@ -55,6 +64,7 @@ from ads_engine.api.schemas import (
     ConfigView,
     ContentAssetView,
     CreateRunRequest,
+    CrmBindingsView,
     DatasetFreshnessView,
     DatasetView,
     Decision,
@@ -70,8 +80,10 @@ from ads_engine.api.schemas import (
     FeedbackRequest,
     Finding,
     Flag,
+    GoogleCrmBindingView,
     Group,
     Health,
+    HubSpotMappingView,
     IntendedStateIn,
     Item,
     ItemOverlay,
@@ -81,11 +93,13 @@ from ads_engine.api.schemas import (
     Overlay,
     Projection,
     RecommendationsPage,
+    ResolvedBindingView,
     ResolveRequest,
     Run,
     Sample,
     Section,
     Source,
+    StageBindingView,
     StatTest,
     SubjectView,
     SyncRequestView,
@@ -110,7 +124,19 @@ from ads_engine.db.models.ops import (
     SyncRequest,
     SyncRun,
 )
-from ads_engine.decisions import RESOLUTIONS
+from ads_engine.db.models.snapshots import EntitySnapshot
+from ads_engine.decisions import (
+    RESOLUTIONS,
+    DecisionPatch,
+    ExpectedState,
+    SubjectRef,
+    SubjectState,
+    compare,
+    describe_decision,
+    describe_expected,
+    describe_snapshot,
+    is_valid_amount,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -2484,7 +2510,7 @@ def test_config_view_carries_thresholds_window_mapping_registry_and_hash(
     view = ConfigView(
         thresholds=context.json_value(thresholds.raw),
         window=WindowConfig.from_thresholds(thresholds),
-        hubspot_mapping={"mql": {"mode": "stage", "stage": "marketingqualifiedlead"}},
+        hubspot_mapping=HubSpotMappingView.from_mapping(thresholds.mapping),
         crm_bindings=None,
         companion_crm_bindings=None,
         content_assets=[ContentAssetView.from_asset(a) for a in thresholds.content_assets],
@@ -2516,3 +2542,1074 @@ def test_health_is_status_ok_only() -> None:
     with pytest.raises(ValidationError) as error:
         Health.model_validate({"status": "degraded"})
     assert _error_types(error) == ["literal_error"]
+
+
+# ---------------------------------------------------------------------------
+# Response-key presence: a None default is emitted as null and published as required
+# ---------------------------------------------------------------------------
+
+_DEFAULTED_RESPONSE_KEYS: tuple[
+    tuple[type[schemas.ApiModel], Callable[[], dict[str, Any]], tuple[str, ...]], ...
+] = (
+    (schemas.DataModes, dict, ("google", "linkedin", "hubspot")),
+    (schemas.SourceModes, dict, ("google", "linkedin", "hubspot")),
+    (
+        Metric,
+        lambda: {"key": "spend", "label": "Spend", "value": "412.500000", "unit": "currency"},
+        ("currency", "floor", "unavailable"),
+    ),
+    (Sample, lambda: {"observed": 240, "required": 300, "unit": "clicks"}, ("projected",)),
+    (
+        StatTest,
+        lambda: {"name": "Fisher's exact test", "p_value": "0.012", "alpha": "0.05"},
+        ("p_adjusted",),
+    ),
+    (Evidence, _evidence, ("sample", "test", "extra")),
+    (ItemOverlay, _overlay_now, ("held_reason_now", "hidden_by")),
+    (Item, _item, ("held_reason", "decision_subject")),
+    (
+        Finding,
+        lambda: {
+            "code": "search_term_coverage",
+            "section": "keywords",
+            "message": "Search terms cover 72% of spend",
+            "evidence": {},
+        },
+        ("entity",),
+    ),
+    (
+        Banner,
+        lambda: {"code": "short_window", "tone": "warning", "message": "Short window"},
+        ("count",),
+    ),
+    (
+        SyncRequestView,
+        lambda: {"id": 7, "source": "google", "requested_at": NOW},
+        ("picked_at",),
+    ),
+)
+"""Every response model with a defaulted field: a minimal payload and its ``None``-default
+keys, which ``web/src/api/types.ts`` declares as required ``X | null`` properties."""
+
+_DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]], ...] = (
+    (DecisionPatchIn, ("status", "daily_budget", "total_budget")),
+    (IntendedStateIn, ("status", "daily_budget", "total_budget")),
+    (DecisionRequest, ("recommendation_id", "note")),
+    (ResolveRequest, ("intended_state", "note")),
+    (FeedbackRequest, ("note",)),
+)
+"""Every request model with a defaulted field and the keys a client may omit (``?`` in TS)."""
+
+
+def test_the_defaulted_response_keys_cover_every_defaulted_response_field() -> None:
+    listed = {model: set(keys) for model, _, keys in _DEFAULTED_RESPONSE_KEYS}
+    assert len(listed) == 11
+    assert sum(len(keys) for keys in listed.values()) == 21
+    for model, keys in listed.items():
+        defaulted = {name for name, field in model.model_fields.items() if not field.is_required()}
+        assert defaulted == keys, model.__name__
+        assert all(model.model_fields[key].default is None for key in keys), model.__name__
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "keys"),
+    _DEFAULTED_RESPONSE_KEYS,
+    ids=[model.__name__ for model, _, _ in _DEFAULTED_RESPONSE_KEYS],
+)
+def test_a_response_model_emits_every_none_default_as_null(
+    model: type[schemas.ApiModel],
+    payload: Callable[[], dict[str, Any]],
+    keys: tuple[str, ...],
+) -> None:
+    sent = payload()
+    assert not set(keys) & set(sent)
+    dumped = model.model_validate(sent).model_dump(mode="json")
+    for key in keys:
+        assert key in dumped, f"{model.__name__}.{key}"
+        assert dumped[key] is None, f"{model.__name__}.{key}"
+
+
+@pytest.mark.parametrize(
+    ("model", "keys"),
+    [(model, keys) for model, _, keys in _DEFAULTED_RESPONSE_KEYS],
+    ids=[model.__name__ for model, _, _ in _DEFAULTED_RESPONSE_KEYS],
+)
+def test_a_response_schema_publishes_every_field_as_required(
+    model: type[schemas.ApiModel], keys: tuple[str, ...]
+) -> None:
+    serialization = model.model_json_schema(mode="serialization")
+    assert set(keys) <= set(serialization["required"]), model.__name__
+    assert set(serialization["required"]) == set(serialization["properties"]), model.__name__
+    # Only the published response schema changes: validation still fills the defaults.
+    validation = model.model_json_schema(mode="validation")
+    assert not set(keys) & set(validation.get("required", [])), model.__name__
+
+
+@pytest.mark.parametrize(
+    ("model", "keys"),
+    _DEFAULTED_REQUEST_KEYS,
+    ids=[model.__name__ for model, _ in _DEFAULTED_REQUEST_KEYS],
+)
+def test_a_request_schema_keeps_its_defaulted_fields_optional(
+    model: type[schemas.RequestModel], keys: tuple[str, ...]
+) -> None:
+    validation = model.model_json_schema(mode="validation")
+    assert set(keys) <= set(validation["properties"]), model.__name__
+    assert not set(keys) & set(validation.get("required", [])), model.__name__
+    assert model.model_config.get("json_schema_serialization_defaults_required") is None
+
+
+# ---------------------------------------------------------------------------
+# Published request schema: Money input and never-null decision fields
+# ---------------------------------------------------------------------------
+
+_EXPECTED_FIELD_MODELS: tuple[type[schemas.RequestModel], ...] = (DecisionPatchIn, IntendedStateIn)
+"""The request models built on ``_ExpectedFieldsIn``: optional fields, never ``null``."""
+
+_MONEY_FIELDS = ("daily_budget", "total_budget")
+
+
+def _schema_types(fragment: object) -> set[str]:
+    """Every JSON-schema ``type`` named anywhere in ``fragment``, nested branches included."""
+    if isinstance(fragment, dict):
+        found = {fragment["type"]} if isinstance(fragment.get("type"), str) else set()
+        for value in fragment.values():
+            found |= _schema_types(value)
+        return found
+    if isinstance(fragment, list):
+        found = set()
+        for item in fragment:
+            found |= _schema_types(item)
+        return found
+    return set()
+
+
+def _money_request_schema(model: type[BaseModel], field: str) -> dict[str, Any]:
+    """The published validation-mode schema of one money field of ``model``."""
+    schema: dict[str, Any] = model.model_json_schema(mode="validation")["properties"][field]
+    return schema
+
+
+def _published_money_accepts(schema: dict[str, Any], value: object) -> bool:
+    """Whether a JSON value satisfies a published money schema.
+
+    A Python ``float`` stands for a JSON number written with a decimal point and ``bool`` for
+    ``true``/``false``; neither is a JSON-schema ``integer`` here. The checker implements
+    exactly the keywords the schema uses, and the assertion keeps it that way.
+    """
+    accepted = False
+    for branch in schema["anyOf"]:
+        assert set(branch) <= {"type", "pattern", "minimum", "maximum"}, branch
+        if branch["type"] == "string" and isinstance(value, str):
+            accepted |= re.search(branch["pattern"], value) is not None
+        elif branch["type"] == "integer" and type(value) is int:
+            accepted |= branch["minimum"] <= value <= branch["maximum"]
+    return accepted
+
+
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_decision_fields_publish_optional_properties_with_no_null_branch_or_null_default(
+    model: type[schemas.RequestModel],
+) -> None:
+    schema = model.model_json_schema(mode="validation")
+    properties = schema["properties"]
+    assert list(properties) == ["status", "daily_budget", "total_budget"]
+    assert "required" not in schema
+    for name, field in properties.items():
+        assert "null" not in _schema_types(field), f"{model.__name__}.{name}"
+        assert "default" not in field, f"{model.__name__}.{name}"
+    assert properties["status"] == {
+        "enum": ["active", "paused", "ended"],
+        "title": "Status",
+        "type": "string",
+    }
+
+
+@pytest.mark.parametrize("field", _MONEY_FIELDS)
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_money_request_schema_is_a_decimal_string_or_a_whole_integer_never_a_number(
+    model: type[schemas.RequestModel], field: str
+) -> None:
+    schema = _money_request_schema(model, field)
+    assert [branch["type"] for branch in schema["anyOf"]] == ["string", "integer"]
+    assert _schema_types(schema) == {"string", "integer"}
+    assert not {"max_digits", "decimal_places"} & set(schema)
+    string, integer = schema["anyOf"]
+    assert set(string) == {"type", "pattern"}
+    assert integer == {"type": "integer", "minimum": 1, "maximum": 10**12 - 1}
+    description = schema["description"]
+    for phrase in ("positive", "below 10^12", "minor unit", "422", "120.0"):
+        assert phrase in description, phrase
+
+
+def test_the_request_bodies_reference_the_null_free_decision_fields() -> None:
+    decision = DecisionRequest.model_json_schema(mode="validation")
+    assert decision["properties"]["patch"] == {"$ref": "#/$defs/DecisionPatchIn"}
+    assert "patch" in decision["required"]
+    assert decision["$defs"]["DecisionPatchIn"] == DecisionPatchIn.model_json_schema()
+    resolve = ResolveRequest.model_json_schema(mode="validation")
+    # ``intended_state`` itself may be omitted or null: only ``record_intended`` needs it.
+    assert {"$ref": "#/$defs/IntendedStateIn"} in resolve["properties"]["intended_state"]["anyOf"]
+    assert resolve["$defs"]["IntendedStateIn"] == IntendedStateIn.model_json_schema()
+    for body in (decision["$defs"]["DecisionPatchIn"], resolve["$defs"]["IntendedStateIn"]):
+        assert "null" not in _schema_types(body["properties"])
+        assert "number" not in _schema_types(body["properties"])
+
+
+@pytest.mark.parametrize("field", _MONEY_FIELDS)
+def test_money_response_schema_stays_a_string(field: str) -> None:
+    schema = Decision.model_json_schema(mode="serialization")["properties"][field]
+    branches = [branch for branch in schema["anyOf"] if branch != {"type": "null"}]
+    assert [branch["type"] for branch in branches] == ["string"]
+    assert _schema_types(schema) == {"string", "null"}
+    assert "pattern" not in branches[0]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("120.50", Decimal("120.50")),
+        ("12", Decimal(12)),
+        ("0.5", Decimal("0.5")),
+        ("0.000001", Decimal("0.000001")),
+        ("999999999999.999999", Decimal("999999999999.999999")),
+        (12, Decimal(12)),
+        (1, Decimal(1)),
+        (10**12 - 1, Decimal(10**12 - 1)),
+    ],
+)
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_every_published_money_example_is_accepted_by_the_validators_and_the_decision_rules(
+    model: type[schemas.RequestModel], value: object, expected: Decimal
+) -> None:
+    assert _published_money_accepts(_money_request_schema(model, "daily_budget"), value)
+    amount = model.model_validate({"daily_budget": value}).present_fields()["daily_budget"]
+    assert isinstance(amount, Decimal)
+    assert amount == expected
+    assert is_valid_amount(amount, source="google", currency="USD")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        120.5,
+        120.0,
+        0.1,
+        True,
+        None,
+        "NaN",
+        "Infinity",
+        "1.1234567",
+        "1000000000000",
+        10**12,
+        "0",
+        "0.000000",
+        0,
+        "-5",
+        -5,
+        "",
+        "twelve",
+    ],
+)
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_the_published_money_schema_refuses_what_the_validators_or_decision_rules_refuse(
+    model: type[schemas.RequestModel], value: object
+) -> None:
+    assert not _published_money_accepts(_money_request_schema(model, "total_budget"), value)
+    try:
+        amount = model.model_validate({"total_budget": value}).present_fields()["total_budget"]
+    except ValidationError:
+        return
+    # Zero and negative amounts parse; ``ads_engine.decisions`` refuses them with a 422.
+    assert not is_valid_amount(amount, source="google", currency="USD"), value
+
+
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_the_decision_field_validators_still_refuse_null_and_floats(
+    model: type[schemas.RequestModel],
+) -> None:
+    for field in ("status", *_MONEY_FIELDS):
+        with pytest.raises(
+            ValidationError, match=rf"omit the field instead of sending null: {field}"
+        ):
+            model.model_validate_json(f'{{"{field}": null}}')
+    for number in ("120.5", "120.0"):
+        with pytest.raises(ValidationError, match=r"not JSON numbers") as error:
+            model.model_validate_json(f'{{"daily_budget": {number}}}')
+        assert error.value.errors()[0]["loc"] == ("daily_budget",)
+
+
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_the_decision_field_validators_still_accept_a_decimal_string_and_a_whole_integer(
+    model: type[schemas.RequestModel],
+) -> None:
+    parsed = model.model_validate_json('{"daily_budget": "120.50", "total_budget": 12}')
+    assert parsed.present_fields() == {
+        "daily_budget": Decimal("120.50"),
+        "total_budget": Decimal(12),
+    }
+    assert model.model_validate_json("{}").present_fields() == {}
+
+
+# ---------------------------------------------------------------------------
+# Config: the HubSpot mapping and CRM binding views of ``GET /config``
+# ---------------------------------------------------------------------------
+
+_AVAILABLE_BINDINGS = CrmBindings(
+    mql=ResolvedBinding(
+        available=True,
+        property="hs_v2_date_entered_1093456",
+        stage_id="1093456",
+        label="First meeting booked",
+    ),
+    ql=ResolvedBinding(
+        available=True,
+        property="hs_v2_date_entered_salesqualifiedlead",
+        stage_id="salesqualifiedlead",
+        label="Sales Qualified Lead",
+    ),
+    google=GoogleCrmBinding(
+        available=True,
+        campaign_property="google_ads_campaign_id",
+        touch_date_property="google_ads_touch_at",
+    ),
+    verified_at=datetime(2026, 10, 6, 2, 30, 15, 250000, tzinfo=ZoneInfo("America/New_York")),
+)
+"""Bindings verified at 06:30:15.25 UTC, stamped in a zone other than UTC."""
+
+_MAPPING_JSON: dict[str, Any] = {
+    "mql": {"mode": "stage_label", "stage_labels": ["First meeting booked"], "property": None},
+    "ql": {
+        "mode": "stage_label",
+        "stage_labels": ["Qualified Lead", "Sales Qualified Lead"],
+        "property": None,
+    },
+    "booking_sources": ["MEETINGS_PUBLIC"],
+    "meeting_outcome_exclusions": ["CANCELED"],
+}
+"""``HubSpotMapping.to_json`` of the shipped ``config/hubspot_mapping.yaml`` (AAP 0.5.4.7)."""
+
+_BINDING_VIEWS: tuple[type[schemas.ApiModel], ...] = (
+    StageBindingView,
+    HubSpotMappingView,
+    ResolvedBindingView,
+    GoogleCrmBindingView,
+    CrmBindingsView,
+)
+
+
+def _without_instant(document: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in document.items() if key != "verified_at"}
+
+
+def test_binding_mode_holds_exactly_the_mapping_modes() -> None:
+    assert get_args(schemas.BindingMode) == ("stage_label", "property")
+    assert get_args(schemas.BindingMode) == get_args(schemas.ConfigBindingMode.__value__)
+
+
+def test_check_vocabularies_raises_when_the_binding_modes_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = TypeAliasType("BindingMode", Literal["stage_label", "property", "formula"])
+    monkeypatch.setattr(schemas, "ConfigBindingMode", drifted)
+    with pytest.raises(
+        RuntimeError,
+        match=r"^api\.schemas\.BindingMode \[.*\] does not match "
+        r"analysis\.thresholds\.BindingMode \['formula', ",
+    ):
+        schemas._check_vocabularies()
+
+
+def test_hubspot_mapping_view_serialises_exactly_the_shipped_mapping(
+    thresholds: Thresholds,
+) -> None:
+    mapping = thresholds.mapping
+    view = HubSpotMappingView.from_mapping(mapping)
+    assert view.model_dump(mode="json") == mapping.to_json() == _MAPPING_JSON
+    assert HubSpotMappingView.model_validate(mapping.to_json()) == view
+    assert HubSpotMappingView.model_validate_json(view.model_dump_json()) == view
+    assert isinstance(view.mql, StageBindingView)
+    assert isinstance(view.ql, StageBindingView)
+
+
+def test_stage_binding_view_keeps_a_property_mode_binding() -> None:
+    binding = StageBinding(
+        mode="property",
+        stage_labels=("First meeting booked",),
+        property="date_first_meeting_was_booked",
+    )
+    view = StageBindingView.from_binding(binding)
+    assert view.model_dump(mode="json") == binding.to_json()
+    assert view.model_dump(mode="json") == {
+        "mode": "property",
+        "stage_labels": ["First meeting booked"],
+        "property": "date_first_meeting_was_booked",
+    }
+
+
+def test_config_view_validates_the_shipped_mapping_and_serialises_it_unchanged(
+    thresholds: Thresholds,
+) -> None:
+    payload = {
+        "thresholds": thresholds.as_view(),
+        "window": WindowConfig.from_thresholds(thresholds).model_dump(),
+        "hubspot_mapping": thresholds.mapping.to_json(),
+        "crm_bindings": _AVAILABLE_BINDINGS.to_json(),
+        "companion_crm_bindings": None,
+        "content_assets": [asset.to_json() for asset in thresholds.content_assets],
+        "config_hash": thresholds.config_hash,
+    }
+    view = ConfigView.model_validate(payload)
+    assert view.hubspot_mapping == HubSpotMappingView.from_mapping(thresholds.mapping)
+    assert view.crm_bindings == CrmBindingsView.from_bindings(_AVAILABLE_BINDINGS)
+    assert view.companion_crm_bindings is None
+    dumped = view.model_dump(mode="json")
+    assert dumped["hubspot_mapping"] == thresholds.mapping.to_json()
+    assert _without_instant(dumped["crm_bindings"]) == _without_instant(
+        _AVAILABLE_BINDINGS.to_json()
+    )
+    assert ConfigView.model_validate_json(view.model_dump_json()) == view
+
+
+def test_crm_bindings_view_round_trips_available_bindings() -> None:
+    view = CrmBindingsView.from_bindings(_AVAILABLE_BINDINGS)
+    dumped = view.model_dump(mode="json")
+    stored = _AVAILABLE_BINDINGS.to_json()
+    assert list(dumped) == list(stored) == ["mql", "ql", "google", "verified_at"]
+    assert _without_instant(dumped) == _without_instant(stored)
+    assert stored["verified_at"] == "2026-10-06T06:30:15.250000+00:00"
+    assert dumped["verified_at"] == "2026-10-06T06:30:15.250000Z"
+    assert datetime.fromisoformat(dumped["verified_at"]) == _AVAILABLE_BINDINGS.verified_at
+    assert CrmBindings.from_json(dumped) == _AVAILABLE_BINDINGS
+    assert CrmBindingsView.model_validate(stored) == view
+
+
+def test_crm_bindings_view_keeps_every_null_key_of_unavailable_bindings() -> None:
+    reason = "CRM bindings not yet verified"
+    bindings = CrmBindings.unavailable(reason, at=NOW)
+    dumped = CrmBindingsView.from_bindings(bindings).model_dump(mode="json")
+    unavailable = {
+        "available": False,
+        "property": None,
+        "stage_id": None,
+        "label": None,
+        "reason": reason,
+    }
+    assert dumped == {
+        "mql": unavailable,
+        "ql": unavailable,
+        "google": {
+            "available": False,
+            "campaign_property": None,
+            "touch_date_property": None,
+            "reason": reason,
+        },
+        "verified_at": "2026-10-06T12:00:00Z",
+    }
+    assert _without_instant(dumped) == _without_instant(bindings.to_json())
+    assert CrmBindings.from_json(dumped) == bindings
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "error_type", "location"),
+    [
+        (
+            StageBindingView,
+            {**_MAPPING_JSON["mql"], "mode": "stage"},
+            "literal_error",
+            ("mode",),
+        ),
+        (
+            StageBindingView,
+            {"mode": "stage_label", "stage_labels": ["First meeting booked"]},
+            "missing",
+            ("property",),
+        ),
+        (
+            HubSpotMappingView,
+            {key: value for key, value in _MAPPING_JSON.items() if key != "ql"},
+            "missing",
+            ("ql",),
+        ),
+        (
+            HubSpotMappingView,
+            {**_MAPPING_JSON, "mql": {**_MAPPING_JSON["mql"], "mode": "stage"}},
+            "literal_error",
+            ("mql", "mode"),
+        ),
+        (
+            ResolvedBindingView,
+            {"available": True, "property": "hs_v2_date_entered_1", "label": None, "reason": None},
+            "missing",
+            ("stage_id",),
+        ),
+        (
+            GoogleCrmBindingView,
+            {"available": False, "campaign_property": None, "touch_date_property": None},
+            "missing",
+            ("reason",),
+        ),
+        (
+            CrmBindingsView,
+            _without_instant(_AVAILABLE_BINDINGS.to_json()),
+            "missing",
+            ("verified_at",),
+        ),
+        (
+            CrmBindingsView,
+            {**_AVAILABLE_BINDINGS.to_json(), "verified_at": "2026-10-06T06:30:15"},
+            "timezone_aware",
+            ("verified_at",),
+        ),
+    ],
+)
+def test_binding_views_refuse_an_unknown_mode_a_missing_key_and_a_naive_instant(
+    model: type[BaseModel], payload: dict[str, Any], error_type: str, location: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(payload)
+    assert [(item["type"], item["loc"]) for item in error.value.errors()] == [
+        (error_type, location)
+    ]
+
+
+def test_config_view_refuses_an_open_mapping_document(thresholds: Thresholds) -> None:
+    with pytest.raises(ValidationError) as error:
+        ConfigView.model_validate(
+            {
+                "thresholds": thresholds.as_view(),
+                "window": WindowConfig.from_thresholds(thresholds),
+                "hubspot_mapping": {"mql": {"mode": "stage", "stage": "marketingqualifiedlead"}},
+                "crm_bindings": None,
+                "companion_crm_bindings": None,
+                "content_assets": [],
+                "config_hash": thresholds.config_hash,
+            }
+        )
+    assert {item["loc"][0] for item in error.value.errors()} == {"hubspot_mapping"}
+
+
+def test_config_view_serialisation_schema_references_the_binding_components() -> None:
+    schema = ConfigView.model_json_schema(mode="serialization")
+    definitions = schema["$defs"]
+    properties = schema["properties"]
+    assert properties["hubspot_mapping"] == {"$ref": "#/$defs/HubSpotMappingView"}
+    for name in ("crm_bindings", "companion_crm_bindings"):
+        assert properties[name]["anyOf"] == [
+            {"$ref": "#/$defs/CrmBindingsView"},
+            {"type": "null"},
+        ], name
+    assert schema["required"] == list(ConfigView.model_fields)
+    for model in _BINDING_VIEWS:
+        definition = definitions[model.__name__]
+        assert definition["type"] == "object", model.__name__
+        assert definition["required"] == list(model.model_fields), model.__name__
+        assert "additionalProperties" not in definition, model.__name__
+    mapping = definitions["HubSpotMappingView"]["properties"]
+    assert mapping["mql"] == mapping["ql"] == {"$ref": "#/$defs/StageBindingView"}
+    stage = definitions["StageBindingView"]["properties"]
+    assert stage["mode"]["enum"] == ["stage_label", "property"]
+    assert stage["stage_labels"]["items"] == {"type": "string"}
+    crm = definitions["CrmBindingsView"]["properties"]
+    assert crm["mql"] == crm["ql"] == {"$ref": "#/$defs/ResolvedBindingView"}
+    assert crm["google"] == {"$ref": "#/$defs/GoogleCrmBindingView"}
+    assert crm["verified_at"]["format"] == "date-time"
+    resolved = definitions["ResolvedBindingView"]["properties"]
+    for name in ("property", "stage_id", "label", "reason"):
+        assert resolved[name]["anyOf"] == [{"type": "string"}, {"type": "null"}], name
+    google = definitions["GoogleCrmBindingView"]["properties"]
+    for name in ("campaign_property", "touch_date_property", "reason"):
+        assert google[name]["anyOf"] == [{"type": "string"}, {"type": "null"}], name
+
+
+# ---------------------------------------------------------------------------
+# Decision patches and discrepancy values: stored jsonb returned key for key
+# ---------------------------------------------------------------------------
+
+C0_CAMPAIGN = SubjectRef(type="campaign", id=12)
+"""The campaign subject of :func:`_decision_row` and :func:`_discrepancy_row`."""
+
+C0_BUDGET = SubjectRef(type="budget", id=4)
+"""A Google explicitly shared budget subject."""
+
+MEMBER_BUDGET = 7
+"""The explicitly shared budget a member campaign was decided onto."""
+
+MOVED_BUDGET = 8
+"""Another explicitly shared budget, which the member draws from after a move."""
+
+GOOGLE_MONEY_KEYS = {"daily_budget", "total_budget", "currency", "amount_micros"}
+LINKEDIN_MONEY_KEYS = {"daily_budget", "total_budget", "currency"}
+ASSIGNMENT_KEYS = {"budget_id", "budget_external_id"}
+
+
+def _as_stored(value: dict[str, Any] | None) -> Any:
+    """Return ``value`` as a ``jsonb`` column stores and returns it."""
+    return json.loads(json.dumps(value))
+
+
+def _json_text(value: object) -> str:
+    """Render ``value`` canonically, so ``True`` never passes for ``1``, nor ``100.0`` for 100."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _external_id(budget_id: int) -> str:
+    """Return the Google id of a shared budget."""
+    return str(5_550_000 + budget_id)
+
+
+def _c0_state(
+    *,
+    ref: SubjectRef = C0_CAMPAIGN,
+    source: Literal["google", "linkedin"] = "google",
+    budget_id: int | None = None,
+    decision: DecisionRow | None = None,
+) -> SubjectState:
+    """Return a subject's current state; Google budgets are ``DAILY``, LinkedIn's daily.
+
+    ``budget_id`` makes a Google campaign a shared member of that budget now.
+    """
+    shape: Literal["own_budget", "shared_member", "budget"]
+    if ref.type == "budget":
+        shape = "budget"
+    else:
+        shape = "own_budget" if budget_id is None else "shared_member"
+    decided_budget = None if decision is None else decision.budget_id
+    return SubjectState(
+        ref=ref,
+        dataset_id=1,
+        dataset_state="active",
+        source=source,
+        currency="EUR" if source == "linkedin" else "USD",
+        name="Brand - US" if ref.type == "campaign" else f"Shared budget {ref.id}",
+        shape=shape,
+        has_daily_budget=shape != "shared_member",
+        has_total_budget=False,
+        budget_period=None if source == "linkedin" else "DAILY",
+        budget_id=budget_id,
+        budget_external_id=None if budget_id is None else _external_id(budget_id),
+        latest_snapshot=None,
+        current_decision=decision,
+        decided_budget_external_id=None if decided_budget is None else _external_id(decided_budget),
+    )
+
+
+def _c0_snapshot(ref: SubjectRef = C0_CAMPAIGN, **columns: object) -> EntitySnapshot:
+    """Return the subject's newest snapshot, captured at ``NOW``."""
+    values: dict[str, object] = {
+        "id": 88,
+        "dataset_id": 1,
+        "source": "google",
+        "entity_type": ref.type,
+        "entity_id": ref.id,
+        "captured_at": NOW,
+        "status": None if ref.type == "budget" else "active",
+        "budget_daily": None,
+        "budget_total": None,
+        "budget_amount_micros": None,
+        "budget_id": None,
+    }
+    values.update(columns)
+    return EntitySnapshot(**values)
+
+
+def _own_decision(**overrides: Any) -> DecisionRow:
+    """Return a Google ``own_budget`` decision: active, 100 a day."""
+    values: dict[str, Any] = {"daily_budget": Decimal("100.000000"), **overrides}
+    return _decision_row(**values)
+
+
+def _member_decision(budget_id: int = MEMBER_BUDGET, **overrides: Any) -> DecisionRow:
+    """Return a ``shared_member`` decision assigning ``budget_id``."""
+    values: dict[str, Any] = {
+        "shape": "shared_member",
+        "daily_budget": None,
+        "budget_id": budget_id,
+        "patch": {},
+        **overrides,
+    }
+    return _decision_row(**values)
+
+
+def _budget_decision(**overrides: Any) -> DecisionRow:
+    """Return a ``budget`` decision on :data:`C0_BUDGET`: 50 a day, no status."""
+    values: dict[str, Any] = {
+        "subject_type": "budget",
+        "subject_id": C0_BUDGET.id,
+        "shape": "budget",
+        "status": None,
+        "daily_budget": Decimal("50.000000"),
+        "origin": "baseline",
+        "decided_by": None,
+        "recommendation_id": None,
+        "patch": {},
+        **overrides,
+    }
+    return _decision_row(**values)
+
+
+DAY_BEFORE = {"decided_at": NOW - timedelta(days=1)}
+"""A tombstone written before the snapshot that reports the entity again."""
+
+C0Case = tuple[str, SubjectState, dict[str, Any] | None, dict[str, Any] | None]
+"""A discrepancy's kind, its subject's state and both values, as ``decisions`` built them."""
+
+
+def _compared(state: SubjectState, snapshot: EntitySnapshot, decision: DecisionRow) -> C0Case:
+    """Return the one mismatch ``decisions.compare`` finds, as a case."""
+    [mismatch] = compare(snapshot, decision, state=state)
+    return mismatch.kind, state, mismatch.decided_value, mismatch.platform_value
+
+
+def _status_case() -> C0Case:
+    return _compared(_c0_state(), _c0_snapshot(status="paused"), _own_decision())
+
+
+def _campaign_tombstone_case(status: str | None) -> C0Case:
+    decision = _own_decision(status="ended", tombstone=True, origin="resolution", **DAY_BEFORE)
+    return _compared(_c0_state(), _c0_snapshot(status=status), decision)
+
+
+def _google_money_case() -> C0Case:
+    snapshot = _c0_snapshot(budget_amount_micros=120_500_000)
+    return _compared(_c0_state(), snapshot, _own_decision())
+
+
+def _linkedin_money_case() -> C0Case:
+    snapshot = _c0_snapshot(source="linkedin", budget_daily=Decimal("90.00"))
+    decision = _own_decision(source="linkedin", daily_budget=Decimal("120.50"))
+    return _compared(_c0_state(source="linkedin"), snapshot, decision)
+
+
+def _budget_money_case() -> C0Case:
+    snapshot = _c0_snapshot(C0_BUDGET, budget_amount_micros=60_000_000)
+    return _compared(_c0_state(ref=C0_BUDGET), snapshot, _budget_decision())
+
+
+def _budget_tombstone_case() -> C0Case:
+    decision = _budget_decision(tombstone=True, origin="resolution", **DAY_BEFORE)
+    snapshot = _c0_snapshot(C0_BUDGET, budget_amount_micros=50_000_000)
+    return _compared(_c0_state(ref=C0_BUDGET), snapshot, decision)
+
+
+def _moved_onto_shared_case() -> C0Case:
+    snapshot = _c0_snapshot(budget_id=MEMBER_BUDGET)
+    return _compared(_c0_state(budget_id=MEMBER_BUDGET), snapshot, _own_decision())
+
+
+def _member_moved_case() -> C0Case:
+    decision = _member_decision()
+    state = _c0_state(budget_id=MOVED_BUDGET, decision=decision)
+    return _compared(state, _c0_snapshot(budget_id=MOVED_BUDGET), decision)
+
+
+def _own_untracked_case() -> C0Case:
+    state = _c0_state()
+    snapshot = _c0_snapshot(status="paused", budget_amount_micros=75_250_000)
+    return "untracked", state, None, describe_snapshot(snapshot, state=state)
+
+
+def _linkedin_untracked_unreported_case() -> C0Case:
+    state = _c0_state(source="linkedin")
+    snapshot = _c0_snapshot(source="linkedin", status=None, budget_total=Decimal("900.00"))
+    return "untracked", state, None, describe_snapshot(snapshot, state=state)
+
+
+def _member_untracked_case() -> C0Case:
+    state = _c0_state(budget_id=MEMBER_BUDGET)
+    snapshot = _c0_snapshot(status="paused", budget_id=MEMBER_BUDGET)
+    return "untracked", state, None, describe_snapshot(snapshot, state=state)
+
+
+def _budget_intended_case() -> C0Case:
+    state = _c0_state(ref=C0_BUDGET)
+    intended = ExpectedState(shape="budget", daily_budget=Decimal("65.5"))
+    snapshot = _c0_snapshot(C0_BUDGET, budget_amount_micros=60_000_000)
+    return (
+        "untracked",
+        state,
+        describe_expected(intended, state=state),
+        describe_snapshot(snapshot, state=state),
+    )
+
+
+def _own_missing_case() -> C0Case:
+    state = _c0_state()
+    return "missing", state, describe_decision(_own_decision(), state=state), None
+
+
+def _member_missing_case() -> C0Case:
+    state = _c0_state(budget_id=MEMBER_BUDGET)
+    return "missing", state, describe_decision(_member_decision(), state=state), None
+
+
+def _tombstone_state_case() -> C0Case:
+    state = _c0_state()
+    decision = _own_decision(status="ended", tombstone=True, origin="resolution")
+    return "missing", state, describe_decision(decision, state=state), None
+
+
+C0_CASES: list[tuple[Callable[[], C0Case], set[str] | None, set[str] | None]] = [
+    pytest.param(_status_case, {"status"}, {"status"}, id="status"),
+    pytest.param(
+        lambda: _campaign_tombstone_case("active"),
+        {"status", "tombstone"},
+        {"status"},
+        id="campaign-tombstone-reappears",
+    ),
+    pytest.param(
+        lambda: _campaign_tombstone_case(None),
+        {"status", "tombstone"},
+        {"status"},
+        id="campaign-tombstone-reappears-without-status",
+    ),
+    pytest.param(_google_money_case, GOOGLE_MONEY_KEYS, GOOGLE_MONEY_KEYS, id="google-money"),
+    pytest.param(
+        _linkedin_money_case, LINKEDIN_MONEY_KEYS, LINKEDIN_MONEY_KEYS, id="linkedin-money"
+    ),
+    pytest.param(_budget_money_case, GOOGLE_MONEY_KEYS, GOOGLE_MONEY_KEYS, id="budget-money"),
+    pytest.param(
+        _budget_tombstone_case,
+        GOOGLE_MONEY_KEYS | {"tombstone"},
+        GOOGLE_MONEY_KEYS,
+        id="budget-tombstone-reappears",
+    ),
+    pytest.param(_moved_onto_shared_case, ASSIGNMENT_KEYS, ASSIGNMENT_KEYS, id="moved-onto-shared"),
+    pytest.param(_member_moved_case, ASSIGNMENT_KEYS, ASSIGNMENT_KEYS, id="assignment"),
+    pytest.param(
+        _own_untracked_case, None, {"status"} | GOOGLE_MONEY_KEYS, id="own-budget-untracked"
+    ),
+    pytest.param(
+        _linkedin_untracked_unreported_case,
+        None,
+        {"status"} | LINKEDIN_MONEY_KEYS,
+        id="linkedin-untracked-unreported-status",
+    ),
+    pytest.param(_member_untracked_case, None, {"status"} | ASSIGNMENT_KEYS, id="member-untracked"),
+    pytest.param(
+        _budget_intended_case,
+        GOOGLE_MONEY_KEYS,
+        GOOGLE_MONEY_KEYS,
+        id="budget-record-intended",
+    ),
+    pytest.param(_own_missing_case, {"status"} | GOOGLE_MONEY_KEYS, None, id="own-budget-missing"),
+    pytest.param(
+        _member_missing_case, {"status"} | ASSIGNMENT_KEYS, None, id="shared-member-missing"
+    ),
+    pytest.param(
+        _tombstone_state_case,
+        {"status", "tombstone"} | GOOGLE_MONEY_KEYS,
+        None,
+        id="tombstone-complete-state",
+    ),
+]
+"""Every value variant the ``decisions`` writers store, built with those writers."""
+
+
+@pytest.mark.parametrize(("case", "decided_keys", "platform_keys"), C0_CASES)
+def test_discrepancy_values_return_every_stored_variant_key_for_key(
+    case: Callable[[], C0Case], decided_keys: set[str] | None, platform_keys: set[str] | None
+) -> None:
+    kind, state, decided, platform = case()
+    stored_decided, stored_platform = _as_stored(decided), _as_stored(platform)
+    assert (None if stored_decided is None else set(stored_decided)) == decided_keys
+    assert (None if stored_platform is None else set(stored_platform)) == platform_keys
+    row = _discrepancy_row(
+        source=state.source,
+        subject_type=state.ref.type,
+        subject_id=state.ref.id,
+        kind=kind,
+        decided_value=stored_decided,
+        platform_value=stored_platform,
+    )
+    discrepancy = Discrepancy.from_row(
+        row,
+        subject=_subject(type=state.ref.type, id=state.ref.id, source=state.source),
+        shape=state.shape,
+        resolutions=RESOLUTIONS[(kind, state.shape)],
+    )
+    dumped = discrepancy.model_dump(mode="json")
+    wire = json.loads(discrepancy.model_dump_json())
+    for side, stored in (("decided_value", stored_decided), ("platform_value", stored_platform)):
+        assert _json_text(dumped[side]) == _json_text(stored), side
+        assert _json_text(wire[side]) == _json_text(stored), side
+
+
+def test_discrepancy_amounts_keep_their_stored_decimal_text_and_integer_micros() -> None:
+    for case, decided, platform in (
+        (
+            _google_money_case,
+            {
+                "daily_budget": "100.000000",
+                "total_budget": None,
+                "currency": "USD",
+                "amount_micros": 100_000_000,
+            },
+            {
+                "daily_budget": "120.500000",
+                "total_budget": None,
+                "currency": "USD",
+                "amount_micros": 120_500_000,
+            },
+        ),
+        (
+            _linkedin_money_case,
+            {"daily_budget": "120.50", "total_budget": None, "currency": "EUR"},
+            {"daily_budget": "90.00", "total_budget": None, "currency": "EUR"},
+        ),
+    ):
+        kind, state, decided_value, platform_value = case()
+        discrepancy = Discrepancy.from_row(
+            _discrepancy_row(
+                kind=kind,
+                decided_value=_as_stored(decided_value),
+                platform_value=_as_stored(platform_value),
+            ),
+            subject=_subject(source=state.source),
+            shape=state.shape,
+            resolutions=RESOLUTIONS[(kind, state.shape)],
+        )
+        wire = json.loads(discrepancy.model_dump_json())
+        assert _json_text(wire["decided_value"]) == _json_text(decided)
+        assert _json_text(wire["platform_value"]) == _json_text(platform)
+
+
+@pytest.mark.parametrize(
+    ("submitted", "stored"),
+    [
+        (
+            {"status": "paused", "daily_budget": "120.50"},
+            {"status": "paused", "daily_budget": "120.50"},
+        ),
+        ({"total_budget": "100.000000"}, {"total_budget": "100.000000"}),
+        ({"daily_budget": "1E+2"}, {"daily_budget": "100"}),
+        ({"status": "ended"}, {"status": "ended"}),
+    ],
+)
+def test_a_user_decision_returns_the_patch_it_stored_key_for_key(
+    submitted: dict[str, str], stored: dict[str, str]
+) -> None:
+    patch = _as_stored(DecisionPatch.from_mapping(submitted).as_json())
+    assert _json_text(patch) == _json_text(stored)
+    decision = Decision.from_row(_decision_row(patch=patch), subject=_subject())
+    assert _json_text(decision.model_dump(mode="json")["patch"]) == _json_text(stored)
+    assert _json_text(json.loads(decision.model_dump_json())["patch"]) == _json_text(stored)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"origin": "baseline", "decided_by": None}, id="baseline"),
+        pytest.param({"origin": "resolution"}, id="resolution"),
+        pytest.param(
+            {"origin": "resolution", "status": "ended", "tombstone": True}, id="tombstone"
+        ),
+    ],
+)
+def test_baseline_and_resolution_decisions_return_an_empty_patch(overrides: dict[str, Any]) -> None:
+    decision = Decision.from_row(
+        _decision_row(recommendation_id=None, patch={}, **overrides), subject=_subject()
+    )
+    assert decision.model_dump(mode="json")["patch"] == {}
+    assert json.loads(decision.model_dump_json())["patch"] == {}
+
+
+def test_stored_decision_json_drops_unknown_keys_as_every_response_model_does() -> None:
+    decision = Decision.from_row(
+        _decision_row(patch={"daily_budget": "120.50", "budget_id": 4}), subject=_subject()
+    )
+    assert decision.model_dump(mode="json")["patch"] == {"daily_budget": "120.50"}
+    discrepancy = Discrepancy.from_row(
+        _discrepancy_row(decided_value={"status": "active", "legacy": 1}),
+        subject=_subject(),
+        shape="own_budget",
+        resolutions=[],
+    )
+    assert discrepancy.model_dump(mode="json")["decided_value"] == {"status": "active"}
+    for view in (schemas.DecisionPatchView, schemas.DiscrepancyValue):
+        assert view.__pydantic_config__["extra"] == "ignore", view.__name__
+
+
+@pytest.mark.parametrize(
+    ("patch", "error_type"),
+    [
+        ({"status": "removed"}, "literal_error"),
+        ({"daily_budget": None}, "decimal_type"),
+        ({"total_budget": 12.5}, "value_error"),
+        ({"daily_budget": "0.0000001"}, "decimal_max_places"),
+    ],
+)
+def test_decision_patch_rejects_a_stored_value_outside_the_contract(
+    patch: dict[str, Any], error_type: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        Decision.from_row(_decision_row(patch=patch), subject=_subject())
+    assert _error_types(error) == [error_type]
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [
+        ({"status": "removed"}, "literal_error"),
+        ({"amount_micros": "many"}, "int_parsing"),
+        ({"tombstone": "maybe"}, "bool_parsing"),
+        ({"daily_budget": 12.5}, "value_error"),
+    ],
+)
+def test_discrepancy_value_rejects_a_stored_value_outside_the_contract(
+    value: dict[str, Any], error_type: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        Discrepancy.from_row(
+            _discrepancy_row(platform_value=value),
+            subject=_subject(),
+            shape="own_budget",
+            resolutions=[],
+        )
+    assert _error_types(error) == [error_type]
+
+
+def test_the_response_schemas_publish_the_named_patch_and_value_properties() -> None:
+    decision = Decision.model_json_schema(mode="serialization")
+    assert decision["properties"]["patch"] == {"$ref": "#/$defs/DecisionPatchView"}
+    patch = decision["$defs"]["DecisionPatchView"]
+    assert patch["type"] == "object"
+    assert "required" not in patch
+    assert list(patch["properties"]) == ["status", "daily_budget", "total_budget"]
+    assert patch["properties"]["status"]["enum"] == list(get_args(schemas.CampaignStatus))
+    for name in ("daily_budget", "total_budget"):
+        assert patch["properties"][name]["type"] == "string", name
+
+    discrepancy = Discrepancy.model_json_schema(mode="serialization")
+    for name in ("decided_value", "platform_value"):
+        assert discrepancy["properties"][name]["anyOf"] == [
+            {"$ref": "#/$defs/DiscrepancyValue"},
+            {"type": "null"},
+        ], name
+    value = discrepancy["$defs"]["DiscrepancyValue"]
+    assert value["type"] == "object"
+    assert "required" not in value
+    assert list(value["properties"]) == [
+        "status",
+        "daily_budget",
+        "total_budget",
+        "currency",
+        "amount_micros",
+        "budget_id",
+        "budget_external_id",
+        "tombstone",
+    ]
+    for name, prop in value["properties"].items():
+        if name == "tombstone":
+            assert prop["type"] == "boolean"
+        else:
+            assert prop["anyOf"][-1] == {"type": "null"}, name
+    assert value["properties"]["status"]["anyOf"][0]["enum"] == list(
+        get_args(schemas.CampaignStatus)
+    )
+    for name in ("daily_budget", "total_budget"):
+        assert value["properties"][name]["anyOf"][0]["type"] == "string", name
+
+
+def test_the_stored_json_views_are_exported() -> None:
+    assert {"DecisionPatchView", "DiscrepancyValue"} <= set(schemas.__all__)

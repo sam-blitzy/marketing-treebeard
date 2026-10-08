@@ -529,6 +529,40 @@ def test_source_totals_list_sources_with_a_dataset_or_campaigns(thresholds: Thre
     assert set(source_totals(_totals_context(thresholds))) == {"linkedin"}
 
 
+def test_only_p2_counts_the_floor_of_a_partially_reported_day(thresholds: Thresholds) -> None:
+    first, second = _dates(TEN_DAYS)[:2]
+    ctx = _context(
+        thresholds,
+        _window(thresholds, TEN_DAYS, google_tz=None, sources=("linkedin",)),
+        accounts={LINKEDIN_ACCOUNT.id: LINKEDIN_ACCOUNT},
+        campaigns={1: _li_campaign(1), 2: _li_campaign(2, objective="WEBSITE_CONVERSION")},
+        campaign_days={
+            # One creative recorded 3 leads and another none: the day's leads are unknown.
+            1: (
+                _li_day(first, "40", None, reported_floors=(("leads", 3),)),
+                _li_day(second, "10", None),
+            ),
+            2: (
+                _li_day(first, "5", 2, reported_floors=(("website_conversions", 1),)),
+                _li_day(second, "5", 0, website_conversions=0),
+            ),
+        },
+    )
+    # Counts, efficiency and the baseline see the partial days as unavailable ...
+    lead_gen = window_totals(ctx, (1,))
+    assert (lead_gen.spend, lead_gen.outcomes, lead_gen.unreported_days) == (
+        Decimal(50),
+        None,
+        2,
+    )
+    other = window_totals(ctx, (2,))
+    assert (other.outcomes, other.unreported_days) == (None, 1)
+    assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") is None
+    # ... while P2 counts what was recorded: campaign 1's 3 leads and campaign 2's 1 website
+    # conversion (its 2 leads are not its objective's outcome). Unreported values add nothing.
+    assert source_totals(ctx) == {"linkedin": (Decimal(60), Decimal(4))}
+
+
 # ---------------------------------------------------------------------------
 # aggregate(ctx, grain): every grain read back from the context (AAP 0.5.1)
 # ---------------------------------------------------------------------------

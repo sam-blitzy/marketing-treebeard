@@ -20,6 +20,9 @@ Covered (AAP 0.3.3, "Staged matching on a CRM dataset change" and "Recovery read
   runs waits for it, because the activation holds the source's newly created row.
 * A live LinkedIn dataset with leads waits for an effective CRM dataset; one with no lead
   needs none.
+* A simulated LinkedIn build stages every lead its backfill stored, one submitted before
+  the backfill range included, in its companion, whose CRM backfill reruns and attempts
+  them before the pair activates.
 
 ``ads_engine.sync.jobs`` is replaced by :class:`Backfill`, which records the freshness a
 backfill records, attempts the ``lead_match`` rows its CRM passes attempt and reads their
@@ -37,7 +40,7 @@ import os
 import sys
 import types
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -244,8 +247,11 @@ class Backfill:
       records only failures, as if contact refresh and associations kept failing.
     * Live LinkedIn: stores :attr:`linkedin_leads` leads, stages and attempts them in
       HubSpot's active primary (the lead-match job), then records ``linkedin.*``.
-    * Simulated LinkedIn: runs the same CRM pass on its companion (attempt, associations,
-      ``hubspot.*``) and records its own ``linkedin.*``.
+    * Simulated LinkedIn: on its first backfill stores one lead per age in
+      :attr:`simulated_leads`, submitted that long before :data:`T0`, with no row in its
+      companion (a rerun stores none: the real backfill upserts the same leads). Then runs
+      the same CRM pass on its companion (attempt, associations, ``hubspot.*``) and records
+      its own ``linkedin.*``.
 
     :attr:`after` maps a call number (1-based, over every call) to a hook run at the end of
     that call: another process acting while the build's backfill runs.
@@ -260,6 +266,7 @@ class Backfill:
         self.sessions = sessions
         self.calls: list[int] = []
         self.linkedin_leads = 0
+        self.simulated_leads: list[timedelta] = []
         self.failing_reruns = False
         self.after: dict[int, Hook] = {}
         self.seen: dict[int, list[dict[str, tuple[str, str | None]]]] = {}
@@ -286,6 +293,8 @@ class Backfill:
             await _record(controller.datasets, self.sessions, dataset_id)
         else:
             if dataset.source == "linkedin":
+                if self.calls.count(dataset_id) == 1:
+                    await _aged_leads(self.sessions, dataset_id, self.simulated_leads)
                 companion = await controller.datasets.companion_of(dataset_id)
                 if companion is not None:
                     await _attempt(self.sessions, companion)
@@ -344,8 +353,22 @@ async def _record(
 
 
 async def _leads(sessions: Sessions, dataset_id: int, count: int) -> list[int]:
-    """Commit ``count`` leads of one LinkedIn campaign in a dataset; return their ids."""
-    if count == 0:
+    """Commit ``count`` leads of one LinkedIn campaign in a dataset; return their ids.
+
+    The lead at index ``i`` was submitted ``i + 1`` days before :data:`T0`.
+    """
+    return await _aged_leads(
+        sessions, dataset_id, [timedelta(days=index + 1) for index in range(count)]
+    )
+
+
+async def _aged_leads(sessions: Sessions, dataset_id: int, ages: Sequence[timedelta]) -> list[int]:
+    """Commit one lead of one LinkedIn campaign per age, submitted that long before T0.
+
+    Returns:
+        The leads' ids, in the order of ``ages``.
+    """
+    if not ages:
         return []
     async with sessions() as session, session.begin():
         account = AdAccount(
@@ -376,7 +399,7 @@ async def _leads(sessions: Sessions, dataset_id: int, count: int) -> list[int]:
                 source="linkedin",
                 dataset_id=dataset_id,
                 external_id=f"{dataset_id}-{index}",
-                submitted_at=T0 - timedelta(days=index + 1),
+                submitted_at=T0 - age,
                 campaign_id=campaign.id,
                 creative_id=None,
                 lead_form_urn="urn:li:leadGenForm:7",
@@ -385,7 +408,7 @@ async def _leads(sessions: Sessions, dataset_id: int, count: int) -> list[int]:
                     f"lead{dataset_id}.{index}@x.test".encode()
                 ).hexdigest(),
             )
-            for index in range(count)
+            for index, age in enumerate(ages)
         ]
         session.add_all(leads)
         await session.flush()
@@ -1485,3 +1508,47 @@ async def test_live_linkedin_build_without_leads_activates_without_a_hubspot_pri
         outcome.dataset_id,
     )
     assert matching_passes == []
+
+
+# ---------------------------------------------------------------------------------------
+# BD2-F02: a simulated LinkedIn build stages every lead in its companion
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_simulated_linkedin_build_stages_every_backfilled_lead_in_its_companion(
+    settings: Settings,
+    sessions: Sessions,
+    backfill: Backfill,
+    matching_passes: list[mode._MatchPass],
+) -> None:
+    # One lead inside the 90-day backfill range and one submitted before it, neither with a
+    # row in the companion after the backfill.
+    backfill.simulated_leads = [timedelta(days=1), timedelta(days=120)]
+    with anyio.fail_after(60):
+        outcome = await _controller(settings, sessions).build_dataset(
+            "linkedin", "simulated", reason="credentials not configured"
+        )
+
+    building = outcome.dataset_id
+    companion = outcome.companion_id
+    assert building is not None
+    assert companion is not None
+    assert (outcome.activated, outcome.mode, outcome.retired) == (True, "simulated", ())
+    assert await _state(sessions, building) == "active"
+    assert await _state(sessions, companion) == "active"
+    leads = await _lead_ids(sessions, building)
+    assert len(leads) == 2
+    # The settle staged both leads in the companion, the old one included; the companion's
+    # CRM backfill then reran and attempted them before the pair activated.
+    assert await _matches(sessions, companion, leads) == dict.fromkeys(leads, "no_match")
+    assert backfill.calls == [building, building]
+    assert await _freshness(sessions, companion) == dict.fromkeys(HUBSPOT_NAMES, ("complete", None))
+    assert matching_passes == []
+    connection = await _connection(sessions, "linkedin")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "simulated",
+        "ok",
+        building,
+    )

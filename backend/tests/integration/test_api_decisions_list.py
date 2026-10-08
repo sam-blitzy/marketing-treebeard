@@ -267,15 +267,19 @@ def _decision_row(
     subject: str,
     decided_at: datetime,
 ) -> Decision:
-    """Build the decision row of ``subject`` in ``dataset``, in the subject's own shape."""
+    """Build the decision row of ``subject`` in ``dataset``, in the subject's own shape.
+
+    Its ``patch`` is what a submission in that shape carries, amounts as submitted.
+    """
     source = "linkedin" if dataset == "linkedin" else "google"
+    patches = {"budget": {"daily_budget": "75.00"}, "member": {"status": "active"}}
     common = {
         "source": source,
         "dataset_id": datasets[dataset],
         "decided_at": decided_at,
         "decided_by": USER.email,
         "origin": "user",
-        "patch": {"note": subject},
+        "patch": patches.get(subject, {"daily_budget": "50.00"}),
     }
     if subject == "budget":
         return Decision(
@@ -558,5 +562,5 @@ async def test_each_row_carries_its_subjects_view(session: AsyncSession) -> None
         None,
         Decimal("75.000000"),
     )
-    assert budget.patch == {"note": "budget"}
+    assert budget.model_dump(mode="json")["patch"] == {"daily_budget": "75.00"}
     assert budget.decided_by == USER.email

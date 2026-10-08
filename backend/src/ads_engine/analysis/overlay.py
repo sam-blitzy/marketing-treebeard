@@ -152,6 +152,7 @@ __all__ = [
     "current_dataset_ids",
     "is_current",
     "item_is_current",
+    "item_provenance",
     "overlay",
 ]
 
@@ -707,8 +708,9 @@ async def item_is_current(session: AsyncSession, recommendation: Recommendation)
     """Return whether a stored item still rests on current data (AAP 0.3.2).
 
     ``POST /recommendations/{id}/feedback`` rejects a write on an item that is not current
-    with 409 ``subject_retired``, and decision routes use it for decisions recorded from an
-    item. Three statements at most, independent of the item.
+    with 409 ``subject_retired``. ``POST /decisions`` must also keep the item current until
+    its commit, so it locks the datasets :func:`item_provenance` names and re-checks them
+    with :func:`is_current` instead. Three statements at most, independent of the item.
 
     Args:
         session: The caller's session; only read.
@@ -721,6 +723,34 @@ async def item_is_current(session: AsyncSession, recommendation: Recommendation)
         malformed: an unverifiable item never permits a write.
     """
     return _recommendation_is_current(recommendation, await current_dataset_ids(session))
+
+
+def item_provenance(recommendation: Recommendation) -> tuple[ProvenanceEntry, ...] | None:
+    """Return a stored item's frozen provenance, decoded, or ``None`` when unverifiable.
+
+    Pure, no I/O: the atomic decode :func:`item_is_current` judges currentness with. A
+    write that must keep the item current until it commits locks the datasets these
+    entries name and then re-checks them with :func:`is_current` against
+    :func:`current_dataset_ids` (AAP 0.3.2: no write lands from an item whose data has
+    since been replaced).
+
+    Args:
+        recommendation: The stored item.
+
+    Returns:
+        One entry per dataset the item read, in stored order. ``None`` when the evidence
+        has no ``provenance`` list or any entry is not a complete ``{source, dataset_id,
+        mode, role}`` record; an empty tuple for an empty list. Neither ``None`` nor an
+        empty tuple is ever current.
+
+    Example:
+        >>> entry = {"source": "google", "dataset_id": 3, "mode": "live", "role": "primary"}
+        >>> item_provenance(Recommendation(evidence={"provenance": [entry]}))
+        (ProvenanceEntry(source='google', dataset_id=3, mode='live', role='primary'),)
+        >>> item_provenance(Recommendation(evidence={"provenance": [{"dataset_id": 3}]})) is None
+        True
+    """
+    return _stored_provenance(recommendation.evidence)
 
 
 # ---------------------------------------------------------------------------

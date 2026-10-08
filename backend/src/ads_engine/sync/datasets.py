@@ -13,10 +13,11 @@ ids never join within one source. :class:`DatasetManager` owns every state chang
   and ``lead_match`` rows its leads are attributed through.
 * :meth:`DatasetManager.readiness` decides whether a backfilled dataset may activate: every
   required freshness row is recorded and ``complete``, or ``incomplete`` with a reason, and
-  never ``unknown``; every staged ``lead_match`` row has been attempted at least once; a
-  live LinkedIn dataset with leads has an effective CRM dataset in which every lead is
-  staged; a simulated LinkedIn dataset's companion is ready too. Staging the rows is the
-  job of ``sync/lead_match.py``; readiness only counts.
+  never ``unknown``; every staged ``lead_match`` row has been attempted at least once;
+  every lead of a LinkedIn dataset, live or simulated, has a ``lead_match`` row in its
+  effective CRM dataset (the companion of a simulated one), and a live one with leads has
+  such a dataset; a simulated LinkedIn dataset's companion is ready too. Staging the rows
+  is the job of ``sync/lead_match.py``; readiness only counts.
 * :meth:`DatasetManager.unhydrated_matches` counts a CRM dataset's matches whose contact's
   meeting or deal associations are not read yet: the debt a build's own CRM dataset must
   clear before it activates. It is not part of readiness.
@@ -277,13 +278,15 @@ class Readiness:
       ``pending``, so every staged row was attempted at least once. Rows of leads whose
       LinkedIn dataset has retired are not counted: matching never attempts them;
     * LinkedIn: no ``lead_match`` row of this dataset's leads is ``pending`` against its
-      effective CRM dataset (HubSpot's active primary for a live dataset), and a simulated
-      dataset has a companion that is itself ready;
+      effective CRM dataset (HubSpot's active primary for a live dataset, its companion for
+      a simulated one), and a simulated dataset has a companion that is itself ready;
+    * LinkedIn, live or simulated: every lead has a ``lead_match`` row in that effective
+      CRM dataset, because the pending counts see only rows that exist. So a lead the build
+      never staged is detected, as is a HubSpot primary replaced during a live build, and
+      LinkedIn-attributed CRM evidence is complete from the first run on the dataset;
     * live LinkedIn with at least one lead: an effective CRM dataset exists (HubSpot has
-      an active primary) and every lead has a ``lead_match`` row in it, so a HubSpot
-      primary replaced during the build is detected and LinkedIn-attributed CRM evidence
-      is complete from the first run on the dataset. A live dataset with no lead has
-      nothing to match and carries no CRM requirement;
+      an active primary). A dataset with no lead has nothing to match: a live one carries
+      no CRM requirement, and a simulated one needs only its ready companion;
     * Google: freshness only.
 
     Attributes:
@@ -299,8 +302,9 @@ class Readiness:
             one; ``None`` otherwise.
         reasons: Human-readable shortfalls, for logs and ``source_dataset.reason``; empty
             exactly when ``ready``.
-        unstaged_leads: Leads of a live LinkedIn dataset with no ``lead_match`` row in its
-            effective CRM dataset, or all its leads when it has none (HubSpot has no active
+        unstaged_leads: Leads of a LinkedIn dataset, live or simulated, with no
+            ``lead_match`` row in its effective CRM dataset (the companion of a simulated
+            one), or all the leads of a live dataset that has none (HubSpot has no active
             primary); always 0 for the other datasets.
     """
 
@@ -873,15 +877,16 @@ class DatasetManager:
                         f"{_plural(pending, 'lead match', 'lead matches')} of this dataset's "
                         f"leads not yet attempted in CRM dataset {crm_dataset_id}"
                     )
-                if dataset.mode == "live":
-                    # Rows staged against an earlier HubSpot primary do not count: a replaced
-                    # CRM dataset leaves the leads unstaged in the one in effect now.
-                    unstaged = await self._unstaged_leads(session, dataset.id, crm_dataset_id)
-                    if unstaged:
-                        reasons.append(
-                            f"{_plural(unstaged, 'lead', 'leads')} of this dataset not yet "
-                            f"staged in CRM dataset {crm_dataset_id}"
-                        )
+                # Live or simulated, every lead needs a row in the CRM dataset in effect now:
+                # the pending counts see only rows that exist, so a lead never staged there
+                # would pass them. Rows staged against an earlier HubSpot primary do not
+                # count either: a replaced CRM dataset leaves the leads unstaged in this one.
+                unstaged = await self._unstaged_leads(session, dataset.id, crm_dataset_id)
+                if unstaged:
+                    reasons.append(
+                        f"{_plural(unstaged, 'lead', 'leads')} of this dataset not yet "
+                        f"staged in CRM dataset {crm_dataset_id}"
+                    )
             elif dataset.mode == "live":
                 # HubSpot has no active primary, so the leads cannot have been matched
                 # anywhere. A dataset with no lead has nothing to match and is not held.
@@ -982,7 +987,8 @@ class DatasetManager:
         row matched after the dataset's CRM backfill, by a build or by any other matcher,
         leaves this debt behind. ``sync/mode.py`` reruns the backfill of a build's own CRM
         dataset until it is 0 before that dataset activates. The count is not part of
-        :meth:`readiness`, which counts attempted rows and freshness only.
+        :meth:`readiness`, which counts freshness, unattempted rows and unstaged leads, not
+        association reads.
 
         Args:
             crm_dataset_id: A HubSpot dataset, primary or companion.

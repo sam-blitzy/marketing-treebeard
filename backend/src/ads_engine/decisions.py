@@ -367,7 +367,8 @@ class PatchRejected(DecisionError):  # noqa: N818 - name fixed by the decisions 
 
     Codes: ``empty_patch``, ``no_change``, ``invalid_amount``, ``sub_minor_unit``,
     ``field_not_allowed``, ``shared_budget_amount``, ``untracked_subject``,
-    ``subject_removed``, ``shape_changed``, ``unknown_field`` and ``invalid_value``.
+    ``subject_removed``, ``shape_changed``, ``budget_changed``, ``unknown_field`` and
+    ``invalid_value``.
     """
 
     status_code: ClassVar[int] = 422
@@ -420,12 +421,13 @@ class PlatformStateUnknown(DecisionError):  # noqa: N818 - name fixed by the dec
     """The platform state cannot be materialised as an expected state (409).
 
     Raised when a snapshot lacks what its shape needs: a campaign status outside the
-    normalised set, a shared member without its budget, or a shared budget whose amount
-    Google omitted. Such an amount is unknown, never zero, so no ``budget`` decision can be
-    written for it until a later sync observes it (``Budget`` model contract). Also raised
-    when the snapshot a resolution would adopt was observed in another budget shape or
-    period than the subject has now; a later entity sync refreshes the comparison. Code
-    ``platform_state_unknown``.
+    normalised set, a shared member without its budget, a shared budget whose amount
+    Google omitted, or an own-budget Google campaign whose snapshot names its budget but
+    not that budget's amount or period. Such an amount is unknown, never zero, so no
+    ``budget`` or ``own_budget`` decision can be written for it until a later sync
+    observes it (``Budget`` model contract). Also raised when the snapshot a resolution
+    would adopt was observed in another budget shape or period than the subject has now;
+    a later entity sync refreshes the comparison. Code ``platform_state_unknown``.
     """
 
     status_code: ClassVar[int] = 409
@@ -1038,23 +1040,43 @@ def _google_amounts(
     )
 
 
+def _normalised_status(snapshot: EntitySnapshot) -> CampaignStatus:
+    """Return the normalised status a campaign snapshot observed.
+
+    Raises:
+        PlatformStateUnknown: If the snapshot's status is not ``active``, ``paused`` or
+            ``ended`` (including one the platform did not report).
+    """
+    status = snapshot.status
+    if not _is_campaign_status(status):
+        raise PlatformStateUnknown(
+            "platform_state_unknown",
+            "The campaign's platform status is not a normalised status.",
+            details={"snapshot_id": snapshot.id},
+        )
+    return status
+
+
 def expected_state_from_snapshot(
     snapshot: EntitySnapshot, *, shape: DecisionShape, budget_period: BudgetPeriod | None
 ) -> ExpectedState:
     """Materialise the platform state a snapshot observed, in a decision shape.
 
-    Used for baselines (:func:`write_baseline`), ``adopt_platform`` and
-    ``platform_correct``. A baseline materialises the snapshot of the sync that observed
-    the subject's current state; a resolution first checks that its older snapshot was
-    observed in ``shape`` and ``budget_period`` (:func:`_check_observed_shape`), so old
-    values are never combined with a new shape or period. Only the fields the shape owns
-    are filled:
+    Used for baselines (:func:`write_baseline`), ``adopt_platform``, ``platform_correct``
+    and the ``acknowledge_removal`` fallback. A baseline materialises the snapshot of the
+    sync that observed the subject's current state; a resolution first checks that its
+    older snapshot was observed in ``shape`` and ``budget_period``
+    (:func:`_check_observed_shape`), so old values are never combined with a new shape or
+    period. Only the fields the shape owns are filled:
 
     * ``own_budget``: the status plus the campaign's own amounts. LinkedIn takes
       ``budget_daily`` and ``budget_total`` as observed; Google takes
       ``budget_amount_micros / 1_000_000`` exactly, as ``daily_budget`` for ``DAILY`` or
-      ``total_budget`` for ``CUSTOM_PERIOD``. A Google amount the platform omitted stays
-      ``None`` (unknown).
+      ``total_budget`` for ``CUSTOM_PERIOD``. A Google snapshot that names a budget
+      (``budget_id``) but lacks its amount or period is refused: that amount is unknown,
+      never absent, and an expected state without it would raise a false ``budget``
+      discrepancy once the unchanged amount is reported. A Google campaign snapshot that
+      names no budget materialises with no amount.
     * ``shared_member``: the status and the snapshot's ``budget_id``; no amount.
     * ``budget``: the one amount its period allows; no status.
 
@@ -1069,8 +1091,9 @@ def expected_state_from_snapshot(
 
     Raises:
         PlatformStateUnknown: If the snapshot's campaign status is not a normalised
-            status, a shared member's snapshot has no ``budget_id``, or a budget's amount
-            or period is unknown.
+            status, a shared member's snapshot has no ``budget_id``, a shared budget's
+            amount or period is unknown, or a Google own-budget campaign's snapshot names
+            a budget whose amount or period is unknown.
         ValueError: If the snapshot's entity type does not match the shape.
     """
     if shape == "budget":
@@ -1088,13 +1111,7 @@ def expected_state_from_snapshot(
         return ExpectedState(shape="budget", daily_budget=daily, total_budget=total)
     if snapshot.entity_type != "campaign":
         raise ValueError(f"snapshot {snapshot.id} is not a campaign snapshot")
-    status = snapshot.status
-    if not _is_campaign_status(status):
-        raise PlatformStateUnknown(
-            "platform_state_unknown",
-            "The campaign's platform status is not a normalised status.",
-            details={"snapshot_id": snapshot.id},
-        )
+    status = _normalised_status(snapshot)
     if shape == "shared_member":
         if snapshot.budget_id is None:
             raise PlatformStateUnknown(
@@ -1104,6 +1121,15 @@ def expected_state_from_snapshot(
             )
         return ExpectedState(shape="shared_member", status=status, budget_id=snapshot.budget_id)
     if snapshot.source == "google":
+        if snapshot.budget_id is not None and (
+            snapshot.budget_amount_micros is None or budget_period is None
+        ):
+            raise PlatformStateUnknown(
+                "platform_state_unknown",
+                "Google did not report the amount or period of the campaign's budget; no "
+                "own_budget state can be materialised until a sync observes it.",
+                details={"snapshot_id": snapshot.id},
+            )
         daily, total = _google_amounts(snapshot.budget_amount_micros, budget_period)
     else:
         daily, total = snapshot.budget_daily, snapshot.budget_total
@@ -1468,6 +1494,88 @@ def _check_amount(amount: Decimal, *, field: str, state: SubjectState) -> None:
     raise PatchRejected(issue, message, details={"field": field})
 
 
+def _check_budget_ownership(state: SubjectState, result: ExpectedState) -> None:
+    """Refuse an ``own_budget`` result whose amounts are not the budget fields owned now.
+
+    A patch carries only the fields being decided, so every unsent decided amount is kept.
+    When the campaign's budget changed after that decision (a Google budget moved between
+    ``DAILY`` and ``CUSTOM_PERIOD``; a LinkedIn campaign gained or lost its daily or
+    lifetime budget), the kept amount can be a field the campaign no longer has, or the
+    result can lack one it now has. Writing it would record an expected state the
+    campaign's budget cannot have (AAP 0.5.2: ``own_budget`` holds the budget fields the
+    campaign has), and dropping the decided amount would silently discard the expectation
+    its open budget discrepancy still compares. The patch is refused instead: resolving
+    that discrepancy brings the decision to the new budget, and a field the decision lacks
+    can also be sent in the patch.
+
+    A Google campaign whose budget no entity sync reports (``budget_period`` is ``None``)
+    is not checked: its budget is unknown, not changed, so the result keeps the decided
+    amount. An amount sent for it is already refused by :func:`_check_shape_fields`.
+
+    Args:
+        state: The ``own_budget`` subject's current state.
+        result: The patched expected state.
+
+    Raises:
+        PatchRejected: ``budget_changed``, with details ``decided_fields`` (the budget
+            fields the patched decision would hold), ``current_fields`` (those the
+            campaign has now) and ``current_budget_period`` (``None`` on LinkedIn).
+    """
+    if state.source == "google" and state.budget_period is None:
+        # An unreported Google budget is unknown, never a change of budget: C0 does not
+        # compare its amount either, so no budget discrepancy can arise to resolve, and
+        # refusing here would leave the campaign with no way to be decided again.
+        return
+    decided = sorted(
+        field
+        for field, amount in (
+            ("daily_budget", result.daily_budget),
+            ("total_budget", result.total_budget),
+        )
+        if amount is not None
+    )
+    current = sorted(
+        field
+        for field, owned in (
+            ("daily_budget", state.has_daily_budget),
+            ("total_budget", state.has_total_budget),
+        )
+        if owned
+    )
+    if decided == current:
+        return
+    obsolete = [field for field in decided if field not in current]
+    missing = [field for field in current if field not in decided]
+    sentences = [f"{state.name}'s budget changed after it was decided"]
+    if state.source == "google":
+        sentences[0] += f": it now has a {state.budget_period} budget"
+    sentences[0] += "."
+    if obsolete:
+        sentences.append(
+            f"The decision still holds {' and '.join(obsolete)}, which the campaign no longer has."
+        )
+    if missing:
+        sentences.append(
+            f"The campaign now has {' and '.join(missing)}, which the decision does not hold."
+        )
+    if obsolete:
+        sentences.append("Resolve its budget discrepancy first.")
+    else:
+        sentences.append(
+            f"Resolve its budget discrepancy first, or include {' and '.join(missing)} in "
+            "the patch."
+        )
+    raise PatchRejected(
+        "budget_changed",
+        " ".join(sentences),
+        details={
+            "decided_fields": decided,
+            "current_fields": current,
+            "current_budget_period": state.budget_period,
+        },
+    )
+
+
 def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatch) -> ExpectedState:
     """Validate a patch and apply it over the current expected state (AAP 0.5.2).
 
@@ -1486,7 +1594,13 @@ def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatc
        (``invalid_amount``, ``sub_minor_unit``);
     6. the patch is applied: unsent fields keep their decided values, a member keeps its
        decided ``budget_id``;
-    7. a result equal to the current state is refused (``no_change``).
+    7. an ``own_budget`` result must hold exactly the budget fields the campaign has now
+       (``budget_changed``): after its budget changed kind or period, a kept decided
+       amount the campaign no longer has, or a budget field it now has that the result
+       lacks, is refused, never dropped, until its budget discrepancy is resolved (a
+       lacking field may also be sent in the patch); a Google budget no sync reports is
+       unknown, not changed, so its decided amount is kept;
+    8. a result equal to the current state is refused (``no_change``).
 
     Args:
         state: The subject's current state.
@@ -1533,6 +1647,7 @@ def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatc
             if patch.total_budget is not None
             else current.total_budget,
         )
+        _check_budget_ownership(state, result)
     elif state.shape == "shared_member":
         result = ExpectedState(
             shape="shared_member", status=patch.status, budget_id=current.budget_id
@@ -2561,7 +2676,8 @@ async def record_decision(
     2. the subject must have a decision (``untracked_subject``: resolve its ``untracked``
        discrepancy first) that is not a tombstone (``subject_removed``);
     3. then :func:`apply_patch`: shape still current, non-empty patch, per-shape field
-       rules, amount precision, materialisation and ``no_change``.
+       rules, amount precision, materialisation, the budget fields the campaign has now
+       (``budget_changed``) and ``no_change``.
 
     The row is flushed and one ``analysis_request`` (reason ``decision``) is queued in the
     same transaction (AAP 0.3.2). The signature is AAP 0.5.1's ``record_decision(subject,
@@ -2826,7 +2942,9 @@ async def resolve_discrepancy(
       member's new ``budget_id``), keeping the rest of the shape; closes at once. After a
       shape change the platform state is written in the new shape, with the platform
       status for ``status`` and the decided status for ``budget``
-      (:func:`_platform_correction`).
+      (:func:`_platform_correction`). A ``status`` correction in an unchanged shape reads
+      only the snapshot's status, so an amount Google did not report does not refuse it;
+      every other adoption of the platform state refuses an unknown amount.
     * ``decision_correct`` (``status``, ``budget``, ``missing``): writes nothing and moves
       the row to ``awaiting_platform``; :func:`auto_resolve` closes it once a later
       snapshot matches (for ``missing``, once a complete enumeration returns the entity).
@@ -2963,10 +3081,23 @@ async def _resolve_discrepancy(
 
     if resolution == "platform_correct":
         snapshot = await _comparison_snapshot(session, discrepancy, state)
-        platform = expected_state_from_snapshot(
-            snapshot, shape=state.shape, budget_period=state.budget_period
-        )
-        written = await write(_platform_correction(kind, platform, current))
+        if (
+            kind == "status"
+            and current is not None
+            and not current.tombstone
+            and current.shape == state.shape
+        ):
+            # Only the status is adopted and every other decided field is kept, as
+            # _platform_correction does for this case, so the snapshot's amount is not
+            # read: a status mismatch is raised from a snapshot whose own-budget amount
+            # Google did not report, and that unknown amount must not refuse it.
+            corrected = replace(current, status=_normalised_status(snapshot))
+        else:
+            platform = expected_state_from_snapshot(
+                snapshot, shape=state.shape, budget_period=state.budget_period
+            )
+            corrected = _platform_correction(kind, platform, current)
+        written = await write(corrected)
         _close(discrepancy, resolution, instant)
     elif resolution == "adopt_platform":
         snapshot = await _comparison_snapshot(session, discrepancy, state)
@@ -3068,7 +3199,8 @@ async def write_baseline(
         SubjectNotFound: If the subject does not exist or is not a decision subject.
         SubjectRetired: If its dataset is retired.
         PlatformStateUnknown: If the snapshot cannot be materialised, for example a
-            shared budget whose amount Google omitted; retry on a later sync.
+            shared budget, or an own-budget Google campaign's budget, whose amount Google
+            omitted; retry on a later sync.
         ValueError: If the snapshot describes another entity or dataset, ``state``
             describes another subject, or ``now`` is naive.
     """
@@ -3229,44 +3361,111 @@ async def _refresh_waiting(
     ref: SubjectRef,
     *,
     state: SubjectState | None,
-    platform_value: Mapping[str, Any] | None,
-    snapshot_id: int | None,
-    decision_id: int | None,
+    snapshot: EntitySnapshot,
+    decision: Decision,
 ) -> None:
     """Refresh an ``untracked`` row waiting after ``record_intended`` with a new comparison.
 
     Its values describe the whole subject, as the ``untracked`` item and ``record_intended``
     wrote them, never only the fields that differ: the platform side becomes the complete
-    state the compared snapshot observed, in the subject's shape
+    state the compared ``snapshot`` observed, in the subject's shape
     (:func:`describe_snapshot`), so a field that converged shows its new value; the decided
-    side becomes the compared decision (:func:`describe_decision`), so an ordinary decision
-    recorded after the intended state replaces it on the card. ``snapshot_id`` and
-    ``decision_id`` follow; ``detected_at``, the state and the resolution are kept. The
-    preloaded ``state`` normally holds that snapshot and decision, so nothing is read;
-    otherwise the subject is loaded here. Only without a snapshot is ``platform_value``
-    merged into the stored platform side.
+    side becomes the compared ``decision`` (:func:`describe_decision`), so an ordinary
+    decision recorded after the intended state replaces it on the card. Their ids follow;
+    ``detected_at``, the state and the resolution are kept. Both rows were resolved and
+    checked against the subject by :func:`_observation_links`, so neither is read here; the
+    subject's shape comes from the preloaded ``state``, or else from the subject loaded here.
     """
     subject = state if state is not None else await load_subject_state(session, ref)
+    waiting.platform_value = describe_snapshot(snapshot, state=subject)
+    waiting.snapshot_id = snapshot.id
+    waiting.decided_value = describe_decision(decision, state=subject)
+    waiting.decision_id = decision.id
+
+
+async def _observation_links(
+    session: AsyncSession,
+    ref: SubjectRef,
+    kind: DiscrepancyKind,
+    *,
+    source: str,
+    dataset_id: int,
+    snapshot_id: int | None,
+    decision_id: int | None,
+    state: SubjectState | None,
+) -> tuple[EntitySnapshot | None, Decision | None]:
+    """Resolve the snapshot and the decision a discrepancy's comparison read, and check them.
+
+    The ``discrepancy`` contract: ``snapshot_id`` is ``None`` exactly for ``missing``, whose
+    entity the platform no longer returns, and ``decision_id`` exactly for ``untracked``,
+    which has no decision. Every other link must name a row of the subject itself, of its
+    ``source`` and ``dataset_id``: the dataset-qualified foreign keys check only the dataset,
+    and a resolution adopts the snapshot the row names. Rows the caller preloaded are reused
+    (``state``'s newest snapshot and current decision, when their ids match); any other is
+    taken from the session, an identity-map hit when the caller already read it, as
+    detection reads every compared snapshot for its pass.
+
+    Returns:
+        The snapshot and the decision, each ``None`` where the kind names none.
+
+    Raises:
+        ValueError: If a link is present where the kind forbids it or absent where it
+            requires it, names no row, or names a row of another entity, subject, source or
+            dataset.
+    """
     snapshot: EntitySnapshot | None = None
-    if snapshot_id is not None:
-        latest = subject.latest_snapshot
+    if kind == "missing":
+        if snapshot_id is not None:
+            raise ValueError(
+                f"a missing discrepancy has no snapshot ({ref.type} {ref.id} is no longer "
+                f"returned); snapshot_id must be None, not {snapshot_id}"
+            )
+    elif snapshot_id is None:
+        raise ValueError(f"a {kind} discrepancy needs the snapshot it compared, not None")
+    else:
+        latest = None if state is None else state.latest_snapshot
         if latest is not None and latest.id == snapshot_id:
             snapshot = latest
         else:
             snapshot = await session.get(EntitySnapshot, snapshot_id)
-    decision = subject.current_decision
-    if decision_id is not None and (decision is None or decision.id != decision_id):
-        decision = await session.get(Decision, decision_id)
-    if snapshot is not None:
-        waiting.platform_value = describe_snapshot(snapshot, state=subject)
+        if snapshot is None:
+            raise ValueError(f"snapshot {snapshot_id} does not exist")
+        _check_snapshot_of(snapshot, ref)
+        if snapshot.source != source or snapshot.dataset_id != dataset_id:
+            raise ValueError(
+                f"snapshot {snapshot.id} belongs to {snapshot.source} dataset "
+                f"{snapshot.dataset_id}, not to the {source} dataset {dataset_id} of "
+                f"{ref.type} {ref.id}"
+            )
+    decision: Decision | None = None
+    if kind == "untracked":
+        if decision_id is not None:
+            raise ValueError(
+                f"an untracked discrepancy has no decision ({ref.type} {ref.id} is "
+                f"untracked); decision_id must be None, not {decision_id}"
+            )
+    elif decision_id is None:
+        raise ValueError(f"a {kind} discrepancy needs the decision it compared, not None")
     else:
-        merged = dict(waiting.platform_value or {})
-        merged.update(platform_value or {})
-        waiting.platform_value = merged
-    waiting.snapshot_id = snapshot_id
-    if decision is not None:
-        waiting.decided_value = describe_decision(decision, state=subject)
-        waiting.decision_id = decision.id
+        current = None if state is None else state.current_decision
+        if current is not None and current.id == decision_id:
+            decision = current
+        else:
+            decision = await session.get(Decision, decision_id)
+        if decision is None:
+            raise ValueError(f"decision {decision_id} does not exist")
+        if decision.subject_type != ref.type or decision.subject_id != ref.id:
+            raise ValueError(
+                f"decision {decision.id} belongs to {decision.subject_type} "
+                f"{decision.subject_id}, not {ref.type} {ref.id}"
+            )
+        if decision.source != source or decision.dataset_id != dataset_id:
+            raise ValueError(
+                f"decision {decision.id} belongs to {decision.source} dataset "
+                f"{decision.dataset_id}, not to the {source} dataset {dataset_id} of "
+                f"{ref.type} {ref.id}"
+            )
+    return snapshot, decision
 
 
 async def raise_discrepancy(
@@ -3311,6 +3510,12 @@ async def raise_discrepancy(
     any discrepancy row, in the order decision writers and resolutions use, and stay locked
     until the caller's transaction ends.
 
+    The snapshot and the decision the comparison names are checked against the subject
+    before any row is refreshed or inserted, on every path (the subject's row of the kind,
+    the waiting ``untracked`` row and the row a concurrent writer inserted first), so a
+    refused comparison changes nothing. Rows ``state`` preloaded are reused, so detection,
+    which passes its preloaded state, reads nothing more for the check.
+
     Args:
         session: The caller's session.
         ref: The subject.
@@ -3318,12 +3523,18 @@ async def raise_discrepancy(
             ``missing`` (decided by the sync).
         decided_value: The decided side; ``None`` for ``untracked``.
         platform_value: The platform side; ``None`` for ``missing``.
-        snapshot_id: The snapshot compared; ``None`` for ``missing``.
-        decision_id: The decision compared; ``None`` for ``untracked``.
+        snapshot_id: The snapshot compared: a snapshot of the subject itself (its entity
+            type and id) in the subject's source and dataset, required for ``status``,
+            ``budget`` and ``untracked``; ``None`` exactly for ``missing``, whose entity
+            the platform no longer returns.
+        decision_id: The decision compared: a decision of the subject itself in its
+            source and dataset, required for ``status``, ``budget`` and ``missing``;
+            ``None`` exactly for ``untracked``, which has no decision.
         detected_at: The detection instant (tz-aware).
         state: The subject's state when the caller already loaded it. Its source,
             dataset and dataset state are used only when ``locked``; they are read under
-            the locks here otherwise.
+            the locks here otherwise. Its newest snapshot and current decision serve the
+            link check when their ids match; any other compared row comes from the session.
         locked: Whether ``state`` was loaded with :func:`load_subject_states` and ``lock``
             in the caller's current transaction, whose dataset and subject locks it still
             holds, so its ``dataset_state`` is current and nothing is locked or read again
@@ -3343,7 +3554,12 @@ async def raise_discrepancy(
         SubjectNotFound: If the subject does not exist.
         SubjectRetired: If its dataset is retired.
         ValueError: If ``kind`` is unknown, ``detected_at`` is naive, ``state`` describes
-            another subject, or a preloaded discrepancy belongs to another subject.
+            another subject, or a preloaded discrepancy belongs to another subject. Also,
+            before any row changes, if the links do not fit the kind: ``snapshot_id`` is
+            given for ``missing`` or ``None`` for another kind; ``decision_id`` is given for
+            ``untracked`` or ``None`` for another kind; or a given id names no row, or a
+            snapshot of another entity type or id, or a decision of another subject, or a
+            row of another source or dataset than the subject's.
     """
     if not _is_kind(kind):
         raise ValueError(f"discrepancy kind must be one of {DISCREPANCY_KINDS}, not {kind!r}")
@@ -3365,6 +3581,18 @@ async def raise_discrepancy(
             details={"dataset_id": dataset_id},
         )
     pending = await _subject_unresolved(session, ref, unresolved)
+    # Checked before any row is refreshed or inserted, so a refused comparison leaves every
+    # stored row as it was.
+    snapshot, decision = await _observation_links(
+        session,
+        ref,
+        kind,
+        source=source,
+        dataset_id=dataset_id,
+        snapshot_id=snapshot_id,
+        decision_id=decision_id,
+        state=state,
+    )
     existing = next((row for row in pending if row.kind == kind), None)
     if existing is not None:
         _refresh(
@@ -3378,19 +3606,14 @@ async def raise_discrepancy(
         return existing
     if kind in ("status", "budget"):
         waiting = _awaiting_intended(pending)
-        if waiting is not None:
+        # A status or budget comparison always carries both rows (_observation_links).
+        if waiting is not None and snapshot is not None and decision is not None:
             # The intended state recorded for an untracked subject is the decision this
             # mismatch is measured against, and its untracked row already waits for the
             # platform to reach it; a second C0 item would ask the user to resolve the same
             # pending change twice. The waiting row takes the latest comparison instead.
             await _refresh_waiting(
-                session,
-                waiting,
-                ref,
-                state=state,
-                platform_value=platform_value,
-                snapshot_id=snapshot_id,
-                decision_id=decision_id,
+                session, waiting, ref, state=state, snapshot=snapshot, decision=decision
             )
             await session.flush()
             return waiting

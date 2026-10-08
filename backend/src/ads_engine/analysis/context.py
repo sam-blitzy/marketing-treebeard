@@ -2502,13 +2502,66 @@ class ConversionActionInfo:
 # ---------------------------------------------------------------------------
 
 
+_FLOOR_COUNTS: Final[tuple[str, ...]] = (
+    "form_opens",
+    "leads",
+    "landing_page_clicks",
+    "website_conversions",
+)
+"""The optional :class:`DayFact` counts a reported floor can stand for (whole numbers)."""
+
+_FLOOR_METRICS: Final[tuple[str, ...]] = ("conversions", "conversions_value", *_FLOOR_COUNTS)
+"""Every optional :class:`DayFact` metric summed across fact rows, in field order: the
+metrics :attr:`DayFact.reported_floors` can name."""
+
+
+def _day_floors(fact: DayFact) -> tuple[tuple[str, int | Decimal], ...]:
+    """Validate :attr:`DayFact.reported_floors` and return it in :data:`_FLOOR_METRICS` order.
+
+    Raises:
+        TypeError: When the floors are not a tuple or list of ``(name, value)`` pairs, or a
+            count's value is not an ``int`` or an amount's not a ``Decimal`` or ``int``.
+        ValueError: For a name outside :data:`_FLOOR_METRICS`, a name given twice, a floor on
+            a metric the day reports, or a negative or non-finite value.
+    """
+    floors: object = fact.reported_floors
+    if not isinstance(floors, tuple | list):
+        raise TypeError(f"DayFact.reported_floors must be a tuple of pairs, found {floors!r}")
+    found: dict[str, int | Decimal] = {}
+    for entry in floors:
+        if not isinstance(entry, tuple | list) or len(entry) != 2:
+            raise TypeError(f"DayFact.reported_floors holds {entry!r}, not a (name, value) pair")
+        name, value = entry
+        _require_in(name, _FLOOR_METRICS, "DayFact.reported_floors name")
+        what = f"DayFact.reported_floors[{name!r}]"
+        if name in found:
+            raise ValueError(f"{what} is given twice")
+        if getattr(fact, name) is not None:
+            raise ValueError(
+                f"{what}: a floor stands only for an unavailable metric, and {name} is reported"
+            )
+        if name in _FLOOR_COUNTS and (isinstance(value, bool) or not isinstance(value, int)):
+            raise TypeError(f"{what} must be an int count, found {value!r}")
+        _require_number(value, what)
+        if isinstance(value, Decimal) and not value.is_finite():
+            raise ValueError(f"{what} must be finite, found {value!r}")
+        if value < 0:
+            raise ValueError(f"{what} must not be negative, found {value!r}")
+        found[name] = value
+    return tuple((name, found[name]) for name in _FLOOR_METRICS if name in found)
+
+
 @dataclass(frozen=True, slots=True)
 class DayFact:
     """One campaign's facts on one native date.
 
     Google rows come from ``fact_campaign_daily`` (dates in the account's time zone); LinkedIn
     rows are ``fact_creative_daily`` summed per campaign per UTC date. Metrics a source does
-    not report are ``None``.
+    not report are ``None``. A LinkedIn optional metric (conversions, conversion value, form
+    opens, leads, landing-page clicks, website conversions) is ``None`` as soon as one
+    creative row of the day did not report it, so a partial sum never reads as the day's
+    count (AAP 0.11.1); the rows that did report it keep their sum in
+    :attr:`reported_floors`.
 
     Attributes:
         date: The source's native date.
@@ -2523,9 +2576,18 @@ class DayFact:
         website_conversions: LinkedIn ``externalWebsiteConversions``.
         budget_lost_is: Google ``search_budget_lost_impression_share`` (a share in [0, 1]).
         impression_share: Google ``search_impression_share``.
+        reported_floors: ``(metric, sum)`` pairs for optional metrics only some of the day's
+            fact rows reported: the metric's attribute stays ``None`` (unavailable, never a
+            count) and the sum of the rows that did report it is a lower bound of the day's
+            value. Stored in field order, at most once per metric; empty when each summed
+            metric was reported by every row or by none. Only :meth:`recorded_outcome` reads
+            it.
 
     Raises:
-        TypeError: On construction, when ``date`` is not a native date.
+        TypeError: On construction, when ``date`` is not a native date, or a reported floor
+            is not a ``(name, value)`` pair of its metric's number type.
+        ValueError: On construction, when a reported floor names an unknown or a reported
+            metric, repeats one, or is negative or non-finite.
     """
 
     date: date
@@ -2540,10 +2602,12 @@ class DayFact:
     website_conversions: int | None = None
     budget_lost_is: Decimal | None = None
     impression_share: Decimal | None = None
+    reported_floors: tuple[tuple[str, int | Decimal], ...] = ()
 
     def __post_init__(self) -> None:
-        """Require a native date: daily facts are never rebucketed."""
+        """Require a native date (daily facts are never rebucketed) and valid floors."""
         _require_native_date(self.date, "DayFact.date")
+        object.__setattr__(self, "reported_floors", _day_floors(self))
 
     def outcome(self, group: str) -> Decimal | None:
         """Return the day's outcome for an objective group (:data:`OUTCOME_FIELDS`).
@@ -2554,10 +2618,35 @@ class DayFact:
         value: Decimal | int | None = getattr(self, OUTCOME_FIELDS[group])
         return None if value is None else Decimal(value)
 
+    def recorded_outcome(self, group: str) -> Decimal | None:
+        """Return the outcome the day's fact rows recorded for an objective group.
+
+        The complete outcome (:meth:`outcome`) when every row reported it; otherwise the sum
+        of the rows that did (:attr:`reported_floors`), a lower bound of the day's outcome;
+        ``None`` when no row reported it. For P2's "was any outcome recorded" check only:
+        every count, rate and efficiency reads :meth:`outcome`, which keeps a partially
+        reported day unavailable.
+
+        Raises:
+            KeyError: For an unknown objective group.
+        """
+        value = self.outcome(group)
+        if value is not None:
+            return value
+        name = OUTCOME_FIELDS[group]
+        for metric, floor in self.reported_floors:
+            if metric == name:
+                return Decimal(floor)
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class CreativeTotals:
     """One LinkedIn creative's totals over the window (CR1-CR3, white papers).
+
+    An optional count is ``None`` unless every window day of the creative reported it: one
+    unreported day makes the total unavailable rather than a partial count (AAP 0.11.1), so a
+    stage whose numerator or denominator is ``None`` stays unmeasured.
 
     Attributes:
         creative_id: The creative.
@@ -2565,10 +2654,12 @@ class CreativeTotals:
         cost: Window spend.
         impressions: Window impressions.
         clicks: Window clicks.
-        form_opens: Window lead form opens; ``None`` when unreported.
-        leads: Window native leads; ``None`` when unreported.
-        landing_page_clicks: Window landing-page clicks; ``None`` when unreported.
-        website_conversions: Window website conversions; ``None`` when unreported.
+        form_opens: Window lead form opens; ``None`` when a window day did not report them.
+        leads: Window native leads; ``None`` when a window day did not report them.
+        landing_page_clicks: Window landing-page clicks; ``None`` when a window day did not
+            report them.
+        website_conversions: Window website conversions; ``None`` when a window day did not
+            report them.
         delivery_days: Native days with impressions > 0, for per-variant delivery projections.
     """
 

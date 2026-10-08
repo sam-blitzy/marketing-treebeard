@@ -27,8 +27,11 @@ Conventions:
 * Responses (:class:`ApiModel`) ignore unknown keys: frozen ``jsonb`` evidence may carry
   rule-specific keys, which travel in :attr:`Evidence.extra`. Requests (:class:`RequestModel`)
   forbid unknown keys, so a misspelt field is a 422 rather than a silent no-op.
-* A field typed ``X | None`` without a default is always present and may be ``null``; a field
-  with a ``None`` default is optional in requests and serialised as ``null`` when unset.
+* In a response every model field is always present: a field typed ``X | None``, with or
+  without a ``None`` default, may be ``null`` but is never omitted, and the published response
+  schema lists every model field as required. A typed-dict view of stored ``jsonb`` is the one
+  exception: it returns exactly the keys the stored object holds, each optional. In a request
+  a field with a default may be omitted.
 * A missing number is ``null`` ("unavailable"), never ``0`` (AAP 0.11.1).
 
 The ``Literal`` vocabularies duplicate the tuples the database ``CHECK`` constraints are built
@@ -45,9 +48,9 @@ Example:
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date
+from datetime import UTC, date
 from decimal import Decimal
-from typing import Annotated, Any, Final, Literal, Self, get_args
+from typing import Annotated, Any, Final, Literal, Self, TypedDict, get_args
 
 from pydantic import (
     AfterValidator,
@@ -57,10 +60,13 @@ from pydantic import (
     ConfigDict,
     Field,
     PlainSerializer,
+    WithJsonSchema,
     computed_field,
     field_validator,
     model_validator,
+    with_config,
 )
+from pydantic.config import JsonDict
 
 from ads_engine.analysis.context import (
     DATA_STATUS_VALUES,
@@ -69,7 +75,16 @@ from ads_engine.analysis.context import (
     SECTION_ORDER,
     TONES,
 )
-from ads_engine.analysis.thresholds import ContentAsset, Thresholds
+from ads_engine.analysis.thresholds import BindingMode as ConfigBindingMode
+from ads_engine.analysis.thresholds import (
+    ContentAsset,
+    CrmBindings,
+    GoogleCrmBinding,
+    HubSpotMapping,
+    ResolvedBinding,
+    StageBinding,
+    Thresholds,
+)
 from ads_engine.db.models.accounts import CAMPAIGN_STATUSES
 from ads_engine.db.models.analysis import (
     DATA_STATUSES,
@@ -115,12 +130,14 @@ __all__ = [
     "Banner",
     "BannerTone",
     "Baseline",
+    "BindingMode",
     "CampaignStatus",
     "Completeness",
     "ConfigView",
     "ConnectionStatus",
     "ContentAssetView",
     "CreateRunRequest",
+    "CrmBindingsView",
     "DataModes",
     "DataStatus",
     "DatasetCoverage",
@@ -131,12 +148,14 @@ __all__ = [
     "Decision",
     "DecisionOrigin",
     "DecisionPatchIn",
+    "DecisionPatchView",
     "DecisionRequest",
     "DecisionShape",
     "DecisionSubjectRef",
     "Discrepancy",
     "DiscrepancyKind",
     "DiscrepancyState",
+    "DiscrepancyValue",
     "EntityView",
     "ErrorDetail",
     "ErrorResponse",
@@ -149,8 +168,10 @@ __all__ = [
     "FindingCode",
     "Flag",
     "FlagCode",
+    "GoogleCrmBindingView",
     "Group",
     "Health",
+    "HubSpotMappingView",
     "IntendedStateIn",
     "Item",
     "ItemOverlay",
@@ -168,6 +189,7 @@ __all__ = [
     "RequestModel",
     "ResolutionKey",
     "ResolveRequest",
+    "ResolvedBindingView",
     "Run",
     "RunKind",
     "RunStatus",
@@ -179,6 +201,7 @@ __all__ = [
     "SourceDay",
     "SourceModes",
     "SourceName",
+    "StageBindingView",
     "StatTest",
     "StorableNote",
     "StorableText",
@@ -222,17 +245,42 @@ def _money_output(value: Decimal) -> str:
     return format(value, "f")
 
 
+_MONEY_INPUT_SCHEMA: Final[JsonDict] = {
+    "anyOf": [
+        {"type": "string", "pattern": r"^(?=.*[1-9])[0-9]{1,12}(?:\.[0-9]{1,6})?$"},
+        {"type": "integer", "minimum": 1, "maximum": 999_999_999_999},
+    ],
+    "description": (
+        'An exact amount: a decimal string such as "120.50", or a whole JSON integer. A JSON '
+        "number written with a fraction or a decimal point (120.5, 120.0) is refused. The "
+        "server checks that the amount is positive, below 10^12 and no finer than the "
+        "currency's minor unit (Google: a whole number of micros), and answers 422 otherwise."
+    ),
+}
+"""The request (validation-mode) JSON schema of :data:`Money`: what a client may send.
+
+Pydantic would publish an unrestricted JSON ``number`` that :func:`_money_input` refuses, plus
+the non-standard ``max_digits``/``decimal_places`` keys. This schema offers only the two forms
+that can succeed: a decimal string whose pattern requires a non-zero digit, at most 12 integer
+digits and at most 6 fraction digits, or a whole integer from 1 to 10^12 - 1. The validators
+still tolerate laxer strings (``" 12 "``, ``"1e2"``); the pattern advertises the canonical form
+only, never one they refuse.
+"""
+
+
 Money = Annotated[
     Decimal,
     BeforeValidator(_money_input),
     Field(max_digits=18, decimal_places=6, allow_inf_nan=False),
     PlainSerializer(_money_output, return_type=str, when_used="json"),
+    WithJsonSchema(_MONEY_INPUT_SCHEMA, mode="validation"),
 ]
 """An exact amount in one account's currency, matching the ``numeric(18,6)`` columns.
 
-Serialised as a fixed-point decimal string (``"120.500000"``), never in exponent notation.
+Serialised as a fixed-point decimal string (``"120.500000"``), never in exponent notation,
+and published as a string in response schemas.
 Clients send a decimal string or a whole integer; a JSON number with a fraction is refused,
-because it has already lost precision.
+because it has already lost precision. Request schemas publish :data:`_MONEY_INPUT_SCHEMA`.
 Validation to the currency's minor unit is ``ads_engine.decisions``' job (AAP 0.5.2).
 """
 
@@ -416,6 +464,10 @@ FindingCode = Literal[
 ]
 """Every AAP 0.5.3 ``Finding`` code (``analysis.context.FINDING_CODES``)."""
 
+BindingMode = Literal["stage_label", "property"]
+"""How a CRM count is bound in ``config/hubspot_mapping.yaml``: a lifecycle stage label, or a
+contact date property (AAP 0.5.4.7; ``analysis.thresholds.BindingMode``)."""
+
 NOTE_MAX_LENGTH: Final = 2000
 """The longest free-text note a decision, resolution or feedback request may carry."""
 
@@ -497,6 +549,12 @@ def _check_vocabularies() -> None:
         ("BannerTone", BannerTone, TONES, "analysis.context.TONES"),
         ("FlagCode", FlagCode, FLAG_CODES, "analysis.context.FLAG_CODES"),
         ("FindingCode", FindingCode, FINDING_CODES, "analysis.context.FINDING_CODES"),
+        (
+            "BindingMode",
+            BindingMode,
+            get_args(ConfigBindingMode.__value__),
+            "analysis.thresholds.BindingMode",
+        ),
     )
     for alias_name, alias, values, values_name in pairs:
         literal_values = get_args(alias)
@@ -526,9 +584,18 @@ class ApiModel(BaseModel):
     contract was written; rule-specific data travels in :attr:`Evidence.extra`.
     ``from_attributes`` lets a model validate straight from an ORM row whose attribute names
     match its fields.
+
+    Serialisation always emits every field, a ``None`` default as ``null``, because no route
+    excludes unset or default values. ``json_schema_serialization_defaults_required`` makes
+    the published response schema say so: every field, defaulted or not, is ``required``.
+    It changes the JSON schema only, never what is serialised or validated.
     """
 
-    model_config = ConfigDict(extra="ignore", from_attributes=True)
+    model_config = ConfigDict(
+        extra="ignore",
+        from_attributes=True,
+        json_schema_serialization_defaults_required=True,
+    )
 
 
 class RequestModel(BaseModel):
@@ -1301,6 +1368,30 @@ class SubjectIn(RequestModel):
     id: PositiveBigInt
 
 
+def _publish_without_null(schema: JsonDict) -> None:
+    """Publish an optional, never-``null`` request field as its non-null type alone.
+
+    Pydantic renders ``X | None = None`` as ``{"anyOf": [X, {"type": "null"}], "default":
+    null}``. The ``None`` only marks the field as absent and a client cannot send it, so the
+    ``null`` branch and the ``null`` default are dropped; a single remaining branch is merged
+    into the field schema, whose own keys (its ``title``) win.
+
+    Args:
+        schema: The field's generated JSON schema, updated in place.
+    """
+    schema.pop("default", None)
+    branches = schema.get("anyOf")
+    if not isinstance(branches, list):
+        return
+    kept = [branch for branch in branches if branch != {"type": "null"}]
+    if len(kept) == 1 and isinstance(kept[0], dict):
+        del schema["anyOf"]
+        for key, value in kept[0].items():
+            schema.setdefault(key, value)
+    else:
+        schema["anyOf"] = kept
+
+
 class _ExpectedFieldsIn(RequestModel):
     """The three decidable fields, every one optional and never ``null``.
 
@@ -1309,11 +1400,16 @@ class _ExpectedFieldsIn(RequestModel):
     and no-op submissions, and the currency's minor unit are judged by
     ``ads_engine.decisions`` against the subject's decision shape, so those 422 rules live
     in one place.
+
+    ``None`` stays in each annotation, so an absent field validates and a wrong value is
+    reported at the field itself; :func:`_publish_without_null` keeps it out of the JSON
+    schema, which therefore offers no ``null`` that :meth:`_no_explicit_null` would refuse.
+    These are request bodies only, never serialised to a client.
     """
 
-    status: CampaignStatus | None = None
-    daily_budget: Money | None = None
-    total_budget: Money | None = None
+    status: CampaignStatus | None = Field(default=None, json_schema_extra=_publish_without_null)
+    daily_budget: Money | None = Field(default=None, json_schema_extra=_publish_without_null)
+    total_budget: Money | None = Field(default=None, json_schema_extra=_publish_without_null)
 
     @model_validator(mode="after")
     def _no_explicit_null(self) -> Self:
@@ -1347,6 +1443,13 @@ class DecisionPatchIn(_ExpectedFieldsIn):
     its own budget fields, ``shared_member`` takes status only, ``budget`` takes exactly the
     one amount its period allows (AAP 0.5.2).
 
+    An ``own_budget`` patch is completed with the decided amounts it does not send. When that
+    result holds other budget fields than the campaign has now (its budget changed after the
+    last decision), it answers 422 ``budget_changed``: resolve the budget discrepancy first,
+    or, when the campaign only gained a budget field, send that field in the patch. A Google
+    campaign whose budget period no entity sync reports is not checked and keeps its decided
+    amount.
+
     Attributes:
         status: The decided campaign status.
         daily_budget: The decided daily budget, as a decimal string.
@@ -1361,7 +1464,11 @@ class DecisionRequest(RequestModel):
         subject: The decision subject.
         patch: The fields being decided.
         recommendation_id: The item the decision was recorded from, if any; 1 to
-            :data:`BIGINT_MAX`.
+            :data:`BIGINT_MAX`. An unknown item answers 404. The item must offer exactly
+            this subject: one with no ``decision_subject`` answers 422
+            ``decision_not_offered``, one naming another subject 422 ``subject_mismatch``.
+            Every dataset its provenance names, and the subject's, must stay current until
+            the decision commits, else 409 ``subject_retired``.
         note: An optional note (:data:`StorableNote`).
     """
 
@@ -1387,6 +1494,16 @@ class IntendedStateIn(_ExpectedFieldsIn):
 
 class ResolveRequest(RequestModel):
     """``POST /discrepancies/{id}/resolve`` body.
+
+    ``platform_correct`` and ``adopt_platform`` adopt the snapshot the discrepancy compared
+    (else the subject's newest), as does ``acknowledge_removal`` on a subject with no
+    decision. They answer 409 ``platform_state_unknown`` while that state is unknown: no
+    snapshot, a status outside the normalised set, a shared member without its budget, a
+    budget amount or period Google did not report (of a shared budget, or of the budget an
+    own-budget campaign's snapshot names), or a snapshot observed in another budget shape or
+    period than the subject has now. ``platform_correct`` of a ``status`` discrepancy in an
+    unchanged shape reads only the status, so an unreported amount does not refuse it. Retry
+    after the next entity sync.
 
     Attributes:
         resolution: The resolution; which ones apply depends on the discrepancy's kind and
@@ -1418,6 +1535,50 @@ class SubjectView(ApiModel):
     currency: str | None
 
 
+def _optional_keys_schema(schema: dict[str, Any]) -> None:
+    """Publish every key of a ``total=False`` view as optional in its JSON schema.
+
+    Pydantic decides which keys of a typed dict are ``required`` under the configuration of
+    the model that encloses it, so an enclosing model with
+    ``json_schema_serialization_defaults_required`` would publish every optional key as
+    required, and only where the view is inlined rather than shared through ``$defs``.
+    Dropping ``required`` publishes what the view serialises: only the keys the stored object
+    holds. It changes the JSON schema only, never validation or serialisation.
+    """
+    schema.pop("required", None)
+
+
+_VIEW_DICT_CONFIG: Final = ConfigDict(extra="ignore", json_schema_extra=_optional_keys_schema)
+"""Configuration of the stored-``jsonb`` views: unknown keys are ignored, as in
+:class:`ApiModel`, and no key is published as required (:func:`_optional_keys_schema`)."""
+
+
+@with_config(_VIEW_DICT_CONFIG)
+class DecisionPatchView(TypedDict, total=False):
+    """The ``patch`` of a :class:`Decision`: the fields the submission itself carried.
+
+    Every key is optional and appears only when the stored ``decision.patch`` holds it; a key
+    is never ``null``, because a decided field cannot be cleared. The stored object is
+    returned key for key, and an unknown key is ignored (dropped), as :class:`ApiModel` does.
+    The variants, by ``origin`` and the ``ads_engine.decisions`` writer:
+
+    * ``user`` and ``recommendation`` rows (``record_decision``, from
+      ``DecisionPatch.as_json``): exactly the fields the :class:`DecisionPatchIn` carried,
+      for example ``{"daily_budget": "120.50"}``, amounts as fixed-point decimal strings.
+    * ``baseline`` rows (``write_baseline``) and ``resolution`` rows
+      (``resolve_discrepancy``, the ``acknowledge_removal`` tombstone included): ``{}``.
+
+    Attributes:
+        status: The decided campaign status.
+        daily_budget: The decided daily budget.
+        total_budget: The decided lifetime or custom-period budget.
+    """
+
+    status: CampaignStatus
+    daily_budget: Money
+    total_budget: Money
+
+
 class Decision(ApiModel):
     """One decision log row: the complete materialised expected state for its shape.
 
@@ -1438,7 +1599,8 @@ class Decision(ApiModel):
         decided_by: Who recorded it; ``None`` for baseline and system rows.
         origin: ``baseline``, ``user``, ``recommendation`` or ``resolution``.
         recommendation_id: The item it was recorded from, if any.
-        patch: The fields the submission carried.
+        patch: The fields the submission carried (:class:`DecisionPatchView`); ``{}`` for
+            baseline and resolution rows.
         note: The note entered with it.
     """
 
@@ -1454,7 +1616,7 @@ class Decision(ApiModel):
     decided_by: str | None
     origin: DecisionOrigin
     recommendation_id: int | None
-    patch: dict[str, Any]
+    patch: DecisionPatchView
     note: str | None
 
     @classmethod
@@ -1491,6 +1653,56 @@ class Decision(ApiModel):
         )
 
 
+@with_config(_VIEW_DICT_CONFIG)
+class DiscrepancyValue(TypedDict, total=False):
+    """One side of a :class:`Discrepancy`: the compared fields ``ads_engine.decisions`` stored.
+
+    Every key is optional: a side holds only the keys its variant writes, and the response
+    returns exactly the stored keys, a stored ``null`` as ``null``. An unknown key is ignored
+    (dropped), as :class:`ApiModel` does. The variants, by writer:
+
+    * **Status** (``compare``): ``{"status"}`` on both sides of a ``status`` discrepancy.
+    * **Money** (``_money_value``; a ``budget`` discrepancy on an ``own_budget`` or ``budget``
+      subject): ``{"daily_budget", "total_budget", "currency"}``, an amount ``null`` where
+      the side has none, plus ``"amount_micros"`` on Google subjects only.
+    * **Assignment** (``_assignment_value``; a ``budget`` discrepancy on a shared member, or
+      on a campaign that moved onto a shared budget): ``{"budget_id", "budget_external_id"}``,
+      each ``null`` for no shared budget or one the subject does not know.
+    * **Tombstone reappearance** (``_compare_tombstone``): a campaign's decided side is
+      ``{"status", "tombstone": true}`` and its platform side ``{"status"}``, ``null`` when
+      unreported; a shared budget's sides are the money variant, the decided one with
+      ``"tombstone": true``.
+    * **Complete state** in the subject's shape (``describe_expected``: the decided side of a
+      ``missing`` row and of one waiting after ``record_intended``; ``describe_snapshot``: the
+      platform side of an ``untracked`` row): ``own_budget`` gives ``status`` plus the money
+      keys, ``shared_member`` ``status`` plus the assignment keys, ``budget`` the money keys
+      only; a tombstone decision adds ``"tombstone": true``, and a status or amount the
+      snapshot does not report is ``null``. A waiting row refreshed without a snapshot merges
+      the new platform keys into the stored ones (``_refresh_waiting``).
+
+    Attributes:
+        status: The normalised campaign status; ``None`` when the platform reported none.
+        daily_budget: The daily budget; ``None`` where the side has none.
+        total_budget: The lifetime or custom-period budget; ``None`` where the side has none.
+        currency: The ISO 4217 code of the subject account's currency.
+        amount_micros: Google only: the amount in micros, Google's native precision; ``None``
+            when the side has no amount.
+        budget_id: The internal id of the assigned shared budget; ``None`` for none.
+        budget_external_id: That shared budget's Google id; ``None`` when unknown.
+        tombstone: Present, and ``True``, only on a side describing an ``acknowledge_removal``
+            tombstone.
+    """
+
+    status: CampaignStatus | None
+    daily_budget: Money | None
+    total_budget: Money | None
+    currency: str | None
+    amount_micros: int | None
+    budget_id: int | None
+    budget_external_id: str | None
+    tombstone: bool
+
+
 class Discrepancy(ApiModel):
     """A mismatch between a subject's platform state and its last decision (rule C0).
 
@@ -1499,8 +1711,10 @@ class Discrepancy(ApiModel):
         subject: The subject.
         shape: The subject's current decision shape, which fixes the intended-state fields.
         kind: ``status``, ``budget``, ``untracked`` or ``missing``.
-        decided_value: The decided side; ``None`` for ``untracked``.
-        platform_value: The platform side; ``None`` for ``missing``.
+        decided_value: The decided side (:class:`DiscrepancyValue`); ``None`` for
+            ``untracked``.
+        platform_value: The platform side (:class:`DiscrepancyValue`); ``None`` for
+            ``missing``.
         detected_at: When it was detected; the oldest are shown first.
         state: ``open``, ``awaiting_platform`` or ``resolved``.
         resolved_at: When it was resolved.
@@ -1513,8 +1727,8 @@ class Discrepancy(ApiModel):
     subject: SubjectView
     shape: DecisionShape
     kind: DiscrepancyKind
-    decided_value: dict[str, Any] | None
-    platform_value: dict[str, Any] | None
+    decided_value: DiscrepancyValue | None
+    platform_value: DiscrepancyValue | None
     detected_at: AwareDatetime
     state: DiscrepancyState
     resolved_at: AwareDatetime | None
@@ -1854,6 +2068,160 @@ class ContentAssetView(ApiModel):
         )
 
 
+class StageBindingView(ApiModel):
+    """How one CRM count (MQL or Qualified Lead) is bound, as configured (AAP 0.5.4.7).
+
+    The ``mql`` or ``ql`` entry of ``config/hubspot_mapping.yaml``, key for key as
+    ``analysis.thresholds.StageBinding.to_json`` writes it. In ``stage_label`` mode the labels
+    are resolved in order among the portal's ``lifecyclestage`` options and the first match
+    wins; in ``property`` mode a contact date property records the event directly.
+
+    Attributes:
+        mode: ``stage_label`` or ``property``.
+        stage_labels: The labels to try, in order; MQL's single ``stage_label`` is a
+            one-element list.
+        property: The bound contact property in ``property`` mode; ``None`` in
+            ``stage_label`` mode.
+    """
+
+    mode: BindingMode
+    stage_labels: list[str]
+    property: str | None
+
+    @classmethod
+    def from_binding(cls, binding: StageBinding) -> Self:
+        """Build the view of a configured binding, with ``StageBinding.to_json``'s values."""
+        return cls(
+            mode=binding.mode,
+            stage_labels=list(binding.stage_labels),
+            property=binding.property,
+        )
+
+
+class HubSpotMappingView(ApiModel):
+    """``config/hubspot_mapping.yaml``: the MQL and QL bindings and the meeting rules.
+
+    Key for key as ``analysis.thresholds.HubSpotMapping.to_json`` writes it (AAP 0.5.4.7).
+    MQL and QL are bound independently and never blended.
+
+    Attributes:
+        mql: The MQL binding.
+        ql: The Qualified Lead binding.
+        booking_sources: ``hs_meeting_source`` values whose meetings can count as booked.
+        meeting_outcome_exclusions: ``hs_meeting_outcome`` values never counted.
+    """
+
+    mql: StageBindingView
+    ql: StageBindingView
+    booking_sources: list[str]
+    meeting_outcome_exclusions: list[str]
+
+    @classmethod
+    def from_mapping(cls, mapping: HubSpotMapping) -> Self:
+        """Build the view of the loaded mapping, with ``HubSpotMapping.to_json``'s values."""
+        return cls(
+            mql=StageBindingView.from_binding(mapping.mql),
+            ql=StageBindingView.from_binding(mapping.ql),
+            booking_sources=list(mapping.booking_sources),
+            meeting_outcome_exclusions=list(mapping.meeting_outcome_exclusions),
+        )
+
+
+class ResolvedBindingView(ApiModel):
+    """One CRM count's binding as verified against the portal (AAP 0.3.3, 0.5.4.7).
+
+    Key for key as ``analysis.thresholds.ResolvedBinding.to_json`` writes it: every key is
+    present and the four text keys may be ``None``. An unavailable binding makes its count
+    "unavailable", shown as such and never as 0.
+
+    Attributes:
+        available: Whether the count can be computed.
+        property: The contact date property the count reads; set when available.
+        stage_id: The lifecycle stage id the label resolved to, in ``stage_label`` mode.
+        label: The label that matched, which heads the white-paper MQL column.
+        reason: Why the binding is unavailable; set when unavailable.
+    """
+
+    available: bool
+    property: str | None
+    stage_id: str | None
+    label: str | None
+    reason: str | None
+
+    @classmethod
+    def from_binding(cls, binding: ResolvedBinding) -> Self:
+        """Build the view of a resolved binding, with ``ResolvedBinding.to_json``'s values."""
+        return cls(
+            available=binding.available,
+            property=binding.property,
+            stage_id=binding.stage_id,
+            label=binding.label,
+            reason=binding.reason,
+        )
+
+
+class GoogleCrmBindingView(ApiModel):
+    """The optional Google-to-CRM link as verified against the portal (AAP 0.3.3).
+
+    Key for key as ``analysis.thresholds.GoogleCrmBinding.to_json`` writes it: every key is
+    present and the three text keys may be ``None``. Without the link, Google items carry
+    ``no_crm_link`` and no Google QL count or pipeline veto is computed.
+
+    Attributes:
+        available: Whether the link can be used.
+        campaign_property: The contact property holding the Google campaign id.
+        touch_date_property: The datetime property holding when that touch happened.
+        reason: Why the link is unavailable; set when unavailable.
+    """
+
+    available: bool
+    campaign_property: str | None
+    touch_date_property: str | None
+    reason: str | None
+
+    @classmethod
+    def from_binding(cls, binding: GoogleCrmBinding) -> Self:
+        """Build the view of the Google link, with ``GoogleCrmBinding.to_json``'s values."""
+        return cls(
+            available=binding.available,
+            campaign_property=binding.campaign_property,
+            touch_date_property=binding.touch_date_property,
+            reason=binding.reason,
+        )
+
+
+class CrmBindingsView(ApiModel):
+    """Every CRM binding verified against one HubSpot portal (``source_dataset.crm_bindings``).
+
+    Key for key as ``analysis.thresholds.CrmBindings.to_json`` writes it (AAP 0.5.4.7).
+
+    Attributes:
+        mql: The resolved MQL binding.
+        ql: The resolved Qualified Lead binding, independent of MQL.
+        google: The Google-to-CRM link.
+        verified_at: When the portal was checked, in UTC.
+    """
+
+    mql: ResolvedBindingView
+    ql: ResolvedBindingView
+    google: GoogleCrmBindingView
+    verified_at: AwareDatetime
+
+    @classmethod
+    def from_bindings(cls, bindings: CrmBindings) -> Self:
+        """Build the view of decoded bindings, with ``CrmBindings.to_json``'s values.
+
+        ``verified_at`` is the same instant converted to UTC, as ``to_json`` stores it; it
+        serialises as ISO 8601 with a ``Z`` offset like every other response instant.
+        """
+        return cls(
+            mql=ResolvedBindingView.from_binding(bindings.mql),
+            ql=ResolvedBindingView.from_binding(bindings.ql),
+            google=GoogleCrmBindingView.from_binding(bindings.google),
+            verified_at=bindings.verified_at.astimezone(UTC),
+        )
+
+
 class ConfigView(ApiModel):
     """``GET /config``: the read-only configuration behind ``/settings`` and the picker.
 
@@ -1871,9 +2239,9 @@ class ConfigView(ApiModel):
 
     thresholds: dict[str, Any]
     window: WindowConfig
-    hubspot_mapping: dict[str, Any]
-    crm_bindings: dict[str, Any] | None
-    companion_crm_bindings: dict[str, Any] | None
+    hubspot_mapping: HubSpotMappingView
+    crm_bindings: CrmBindingsView | None
+    companion_crm_bindings: CrmBindingsView | None
     content_assets: list[ContentAssetView]
     config_hash: str
 

@@ -2,7 +2,8 @@
 
 Covered: building datasets for every source and mode; the companion CRM dataset of a
 simulated LinkedIn dataset; the freshness each dataset must record; the staged-matching
-readiness test (no ``pending`` ``lead_match`` row, no ``unknown`` or reason-less
+readiness test (no ``pending`` ``lead_match`` row, every lead of a live or simulated
+LinkedIn dataset staged in its effective CRM dataset, no ``unknown`` or reason-less
 ``incomplete`` freshness row); atomic activation that retires the previous active primary
 with its companions and points ``source_connection`` at the new dataset; discarding a
 failed build; the cascade purge of retired datasets after the retention period; the
@@ -936,6 +937,88 @@ async def test_simulated_linkedin_readiness_includes_its_companion(
     assert readiness.pending_matches == 0
     assert readiness.companion is not None
     assert readiness.companion.ready
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_simulated_linkedin_leads_unstaged_in_the_companion_hold_activation(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    parent = await manager.begin("linkedin", "simulated", reason="credentials not configured")
+    companion = await manager.begin("hubspot", "simulated", "companion", parent)
+    await _make_fresh(manager, sessions, parent)
+    leads = await _leads(sessions, parent, 3)
+    await _stage(sessions, leads[:2], companion)
+    await _attempt(sessions, companion, leads[:2])
+    unstaged = f"1 lead of this dataset not yet staged in CRM dataset {companion}"
+    # The companion's own shortfall comes first, then the lead it does not hold.
+    readiness = await manager.readiness(parent)
+    assert readiness.reasons == (
+        f"companion CRM dataset {companion} not ready: freshness not yet recorded: "
+        + ", ".join(HUBSPOT_NAMES),
+        unstaged,
+    )
+
+    # The companion is fresh and every row it holds was attempted, but one lead has no row
+    # there: no pending count can see it, so the unstaged count holds the parent.
+    await _make_fresh(manager, sessions, companion)
+    readiness = await manager.readiness(parent)
+    assert not readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads) == (0, 1)
+    assert readiness.companion is not None
+    assert readiness.companion.ready
+    assert readiness.reasons == (unstaged,)
+    with pytest.raises(DatasetStateError, match="not yet staged") as excinfo:
+        await manager.activate(parent)
+    refused = excinfo.value.readiness
+    assert refused is not None
+    assert (refused.unstaged_leads, refused.reasons) == (1, (unstaged,))
+    # The refusal changed nothing: both datasets are still building.
+    assert await _state(sessions, parent) == "building"
+    assert await _state(sessions, companion) == "building"
+
+    # Staged but not attempted: the companion reports the pending row, once.
+    await _stage(sessions, leads[2:], companion)
+    readiness = await manager.readiness(parent)
+    assert not readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads) == (1, 0)
+    companion_reasons = (f"1 lead match not yet attempted in CRM dataset {companion}",)
+    assert readiness.companion is not None
+    assert readiness.companion.reasons == companion_reasons
+    assert readiness.reasons == (
+        f"companion CRM dataset {companion} not ready: " + "; ".join(companion_reasons),
+    )
+
+    await _attempt(sessions, companion, leads[2:])
+    readiness = await manager.readiness(parent)
+    assert readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads, readiness.reasons) == (0, 0, ())
+    activation = await manager.activate(parent)
+    assert activation == Activation(
+        source="linkedin", activated=(parent, companion), retired=(), mode="simulated"
+    )
+    assert await _state(sessions, companion) == "active"
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_simulated_linkedin_without_leads_needs_only_its_ready_companion(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    parent = await manager.begin("linkedin", "simulated", reason="credentials not configured")
+    companion = await manager.begin("hubspot", "simulated", "companion", parent)
+    await _make_fresh(manager, sessions, parent)
+    await _make_fresh(manager, sessions, companion)
+    # No lead: nothing is to be staged in the companion, so its readiness alone decides.
+    readiness = await manager.readiness(parent)
+    assert readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads, readiness.reasons) == (0, 0, ())
+    assert readiness.companion is not None
+    assert readiness.companion.ready
+    activation = await manager.activate(parent)
+    assert activation == Activation(
+        source="linkedin", activated=(parent, companion), retired=(), mode="simulated"
+    )
 
 
 @pytest.mark.anyio

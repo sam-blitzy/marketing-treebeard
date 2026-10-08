@@ -1324,6 +1324,96 @@ def test_facts_observations_and_leads() -> None:
         LeadInfo(3, "x", 1, None, None, "urn", 1, NOW, "found")  # type: ignore[arg-type]
 
 
+def test_day_fact_reported_floors_stand_only_for_unavailable_metrics() -> None:
+    day = date(2026, 10, 1)
+    floors = (("leads", 3), ("conversions_value", Decimal("1.5")))
+    fact = DayFact(day, Decimal("5"), 100, 4, form_opens=12, reported_floors=floors)
+    # Stored in field order, so the same floors given in any order compare and hash equal.
+    assert fact.reported_floors == (("conversions_value", Decimal("1.5")), ("leads", 3))
+    same = DayFact(
+        day,
+        Decimal("5"),
+        100,
+        4,
+        form_opens=12,
+        reported_floors=[("conversions_value", Decimal("1.5")), ["leads", 3]],  # type: ignore[list-item]
+    )
+    assert (same, hash(same)) == (fact, hash(fact))
+    # Counts and rates read the metric itself: unavailable, never the floor.
+    assert (fact.leads, fact.outcome("linkedin_lead_gen")) == (None, None)
+    # P2 reads what was recorded: the complete value, else the floor, else nothing.
+    assert fact.recorded_outcome("linkedin_lead_gen") == Decimal(3)
+    assert fact.recorded_outcome("linkedin_other") is None
+    assert fact.recorded_outcome("google") is None
+    complete = DayFact(day, Decimal("5"), 100, 4, conversions=Decimal("0.5"), website_conversions=2)
+    assert complete.reported_floors == ()
+    assert complete.recorded_outcome("linkedin_other") == Decimal(2)
+    assert complete.recorded_outcome("google") == Decimal("0.5")
+    zero_floor = DayFact(day, Decimal("5"), 100, 4, reported_floors=(("leads", 0),))
+    assert zero_floor.recorded_outcome("linkedin_lead_gen") == Decimal(0)
+    with pytest.raises(KeyError):
+        fact.recorded_outcome("bing")
+    # Reporting the metric later leaves no room for its floor.
+    with pytest.raises(ValueError, match="leads is reported"):
+        dataclasses.replace(fact, leads=3)
+
+
+@pytest.mark.parametrize(
+    ("floors", "error", "match"),
+    [
+        pytest.param("leads", TypeError, "must be a tuple of pairs", id="not-a-sequence"),
+        pytest.param((("leads",),), TypeError, r"not a \(name, value\) pair", id="short-pair"),
+        pytest.param((("leads", 3, 4),), TypeError, r"not a \(name, value\) pair", id="triple"),
+        pytest.param(("leads",), TypeError, r"not a \(name, value\) pair", id="bare-name"),
+        pytest.param(
+            (("cost", Decimal(1)),), ValueError, "reported_floors name must be one of", id="cost"
+        ),
+        pytest.param(
+            (("budget_lost_is", Decimal("0.1")),),
+            ValueError,
+            "reported_floors name must be one of",
+            id="share",
+        ),
+        pytest.param((("leads", 1), ("leads", 2)), ValueError, "given twice", id="duplicate"),
+        pytest.param((("form_opens", 1),), ValueError, "form_opens is reported", id="reported"),
+        pytest.param((("leads", Decimal(3)),), TypeError, "must be an int count", id="decimal"),
+        pytest.param((("leads", True),), TypeError, "must be an int count", id="bool-count"),
+        pytest.param(
+            (("conversions", 1.5),), TypeError, "must be a Decimal or int", id="float-amount"
+        ),
+        pytest.param(
+            (("conversions", False),), TypeError, "must be a Decimal or int", id="bool-amount"
+        ),
+        pytest.param((("conversions", Decimal("NaN")),), ValueError, "must be finite", id="nan"),
+        pytest.param(
+            (("conversions_value", Decimal("Infinity")),),
+            ValueError,
+            "must be finite",
+            id="infinite",
+        ),
+        pytest.param((("leads", -1),), ValueError, "must not be negative", id="negative"),
+        pytest.param(
+            (("conversions_value", Decimal("-0.5")),),
+            ValueError,
+            "must not be negative",
+            id="negative-amount",
+        ),
+    ],
+)
+def test_day_fact_rejects_malformed_reported_floors(
+    floors: object, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        DayFact(
+            date(2026, 10, 1),
+            Decimal("5"),
+            100,
+            4,
+            form_opens=12,
+            reported_floors=floors,  # type: ignore[arg-type]
+        )
+
+
 def test_association_fetch_knowledge_and_crm_lookups() -> None:
     assert AssociationFetchInfo("contact", "1", "deal", "ok_empty").known
     assert AssociationFetchInfo("contact", "1", "deal", "ok", "ok").known

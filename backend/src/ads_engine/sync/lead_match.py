@@ -74,9 +74,13 @@ Restart safety:
     An exception or a cancellation between the claim and the persist hands the lease back
     (every row still under it gets its previous ``next_attempt_at`` again) and then
     propagates, so the batch's rows are due again unchanged; batches already committed
-    stand. A process that dies mid-batch leaves its lease to expire, after which the rows
-    are due again: no state is lost. ``AccessDenied`` and ``QueryDefect`` raised by a
-    connector call propagate, because ``sync/mode.py`` alone decides what follows from them.
+    stand. The hand-back first checks the CRM dataset under the same lifecycle lock as the
+    persist: when the dataset is missing or retired it writes nothing, because a retired
+    dataset is read-only and its rows are never claimed again, and the original exception
+    or cancellation still propagates. A process that dies mid-batch leaves its lease to
+    expire, after which the rows are due again: no state is lost. ``AccessDenied`` and
+    ``QueryDefect`` raised by a connector call propagate, because ``sync/mode.py`` alone
+    decides what follows from them.
 
 Example:
     The CRM job of a sync cycle::
@@ -577,7 +581,8 @@ async def stage_rows(
         session: The caller's session; the rows land in its transaction.
         crm_dataset_id: The HubSpot dataset (primary or companion) to stage in.
         lead_dataset_id: The LinkedIn dataset whose leads are staged.
-        since: The earliest ``submitted_at`` staged, normally the backfill start.
+        since: The earliest ``submitted_at`` staged: the backfill start for a HubSpot primary
+            build, a bound before every lead for a LinkedIn build, live or simulated.
         now: The staging instant, the rows' first due time. ``None`` leaves
             ``next_attempt_at`` empty, which the claim treats as due at once.
 
@@ -964,10 +969,22 @@ async def _release(
 ) -> int:
     """Hand a batch's lease back: each row still under it gets its previous due time.
 
+    The CRM dataset is checked first under the lifecycle lock the batch's write takes
+    (``repositories.ensure_writable``), before the rows are locked again, so the release
+    keeps the lock order ``source_dataset`` -> ``lead_match`` rows and cannot write into a
+    dataset retired meanwhile: a retirement still uncommitted is waited for and then
+    refused. A retired dataset is read-only (AAP 0.3.3) and its rows are never claimed
+    again, so nothing is written to them.
+
     Returns:
         The number of rows released; rows whose lease was already lost are left alone.
+
+    Raises:
+        DatasetNotWritable: If the CRM dataset is missing or retired; the transaction rolls
+            back with no row written.
     """
     async with factory() as session, session.begin():
+        await repositories.ensure_writable(session, crm_dataset_id)
         held = await _held(session, crm_dataset_id, claims, lease_until)
         for claim in claims:
             row = held.get(claim.lead_id)
@@ -985,10 +1002,20 @@ async def _release_quietly(
     """Release a failed batch's lease while the batch's exception propagates.
 
     A database error is logged (counts and the error type only) and never replaces that
-    exception: the lease then expires at ``lease_until`` and the rows are due again.
+    exception: the lease then expires at ``lease_until`` and the rows are due again. A CRM
+    dataset found missing or retired is not written to; the skip is logged (counts and the
+    dataset's state only) and never replaces that exception either.
     """
     try:
         released = await _release(factory, crm_dataset_id, claims, lease_until)
+    except repositories.DatasetNotWritable as exc:
+        _log.info(
+            "sync.lead_match.release_skipped",
+            crm_dataset_id=crm_dataset_id,
+            claimed=len(claims),
+            state=exc.state,
+        )
+        return
     except SQLAlchemyError as exc:
         _log.warning(
             "sync.lead_match.release_failed",
@@ -1407,9 +1434,13 @@ async def run_matching(
     An exception or a cancellation between the claim and the write releases the lease
     (each row still under it gets its previous ``next_attempt_at`` again) and propagates
     unchanged, so the batch's rows are due again exactly as before and committed batches
-    stand (AAP 0.3.3, "Restart safety"). A process that dies mid-batch leaves the lease to
-    expire, after which the rows are due again. Rows attempted or leased in this run are
-    not due again before ``now``, so the loop ends.
+    stand (AAP 0.3.3, "Restart safety"). The release first checks that the CRM dataset is
+    still writable, as the write does; when it is missing or retired, the release is
+    skipped and writes nothing, since a retired dataset is read-only and its rows are never
+    claimed again, and the exception or cancellation still propagates unchanged. A process
+    that dies mid-batch leaves the lease to expire, after which the rows are due again.
+    Rows attempted or leased in this run are not due again before ``now``, so the loop
+    ends.
 
     Args:
         sessionmaker: The session factory; ``None`` uses the process-wide one.

@@ -15,19 +15,24 @@
  * - **Dates** are source-native calendar dates ({@link IsoDate}), never re-bucketed into
  *   another source's day (AAP 0.5.4.1). **Instants** are ISO 8601 with an offset
  *   ({@link IsoDateTime}).
- * - **Nullability.** A Pydantic field typed `X | None` with no default is always present and
- *   may be `null`, so it is a required `field: X | null` here. A response field with a `None`
- *   default is serialised as `null` when unset; it is declared `field?: X | null`, which
- *   accepts both that and a route that omits unset values, and consumers treat a missing key
- *   and `null` alike. A missing number is `null` ("unavailable"), never `0` (AAP 0.11.1).
+ * - **Nullability.** Every field of a response model is always present: the API serialises a
+ *   `None` default as `null` and never omits the key, and its published response schema lists
+ *   every such field as required. A Pydantic field typed `X | None`, with or without a `None`
+ *   default, is therefore a required `field: X | null` here. `?` marks only a request field the
+ *   client may omit and a key of a stored-JSON view (see **Open JSON**), which appears only
+ *   when the stored object holds it. A missing number is `null` ("unavailable"), never `0`
+ *   (AAP 0.11.1).
  * - **Requests** are closed: the API answers an unknown field with 422. The decided fields of
  *   {@link DecisionPatchIn} and {@link IntendedStateIn} must be omitted rather than sent as
  *   `null`, because a decided field cannot be cleared.
  * - **Ids** carry exactly the type `schemas.py` gives them (`int` → `number`). Other modules
  *   refer to them as `Run['id']`, {@link RunId} and so on, so the choice stays local to this
  *   file.
- * - **Open JSON** (frozen evidence `extra`, thresholds, decision patches) is typed
- *   `Record<string, unknown>`; features narrow it where they read it. No `any` is used.
+ * - **Open JSON** (frozen evidence `extra`, thresholds) is typed `Record<string, unknown>`;
+ *   features narrow it where they read it. No `any` is used. Stored decision JSON is typed:
+ *   a decision's patch is a {@link DecisionPatchView} and each discrepancy side a
+ *   {@link DiscrepancyValue}, whose keys are optional because the API returns exactly the
+ *   keys the stored object holds.
  *
  * The module is type-only apart from {@link SECTION_ORDER}, and imports nothing.
  *
@@ -242,6 +247,12 @@ export type DatasetRole = 'primary' | 'companion';
 export type SyncRunStatus = 'running' | 'succeeded' | 'failed';
 
 /**
+ * How a CRM count is bound in `config/hubspot_mapping.yaml`: a lifecycle stage label, or a
+ * contact date property (`schemas.BindingMode`, `analysis.thresholds.BindingMode`; AAP 0.5.4.7).
+ */
+export type BindingMode = 'stage_label' | 'property';
+
+/**
  * The freshness-tracked dataset names (`db.models.ops.DATASETS`; AAP 0.3.2). Each rule declares
  * the datasets it reads, and an item's `stale` and `incomplete` flags derive from those only.
  * The API types every dataset field as a plain string, so fields here are `string`; this union
@@ -354,11 +365,11 @@ export interface SourceDay {
  */
 export interface DataModes {
   /** Google's mode at compute time. */
-  google?: DataMode | null;
+  google: DataMode | null;
   /** LinkedIn's mode at compute time. */
-  linkedin?: DataMode | null;
+  linkedin: DataMode | null;
   /** HubSpot's mode at compute time. */
-  hubspot?: DataMode | null;
+  hubspot: DataMode | null;
 }
 
 /**
@@ -367,11 +378,11 @@ export interface DataModes {
  */
 export interface SourceModes {
   /** Google's current mode. */
-  google?: DataMode | null;
+  google: DataMode | null;
   /** LinkedIn's current mode. */
-  linkedin?: DataMode | null;
+  linkedin: DataMode | null;
   /** HubSpot's current mode. */
-  hubspot?: DataMode | null;
+  hubspot: DataMode | null;
 }
 
 /**
@@ -484,11 +495,11 @@ export interface Metric {
   /** The unit, for example `currency`, `clicks`, `ratio` or `days`; `null` when unitless. */
   unit: string | null;
   /** ISO currency code for money values. */
-  currency?: string | null;
+  currency: string | null;
   /** Whether the value is an attribution floor. */
-  floor?: boolean | null;
+  floor: boolean | null;
   /** Whether the value is unavailable. */
-  unavailable?: boolean | null;
+  unavailable: boolean | null;
 }
 
 /** A value an item's metrics were compared against (`schemas.Baseline`). */
@@ -525,8 +536,8 @@ export interface Sample {
   required: MetricValue;
   /** The unit, for example `clicks`, `impressions`, `form opens` or `days`. */
   unit: string;
-  /** An optional labelled projection. */
-  projected?: Projection | null;
+  /** A labelled projection; `null` when there is none. */
+  projected: Projection | null;
 }
 
 /** The statistical test behind an item (`schemas.StatTest`; AAP 0.5.4.6). */
@@ -535,8 +546,8 @@ export interface StatTest {
   name: string;
   /** The raw p-value; `null` when it could not be computed. */
   p_value: MetricValue;
-  /** The Holm-adjusted p-value, when a correction applies. */
-  p_adjusted?: MetricValue;
+  /** The Holm-adjusted p-value when a correction applies; `null` otherwise. */
+  p_adjusted: MetricValue;
   /** The significance level the result is judged at. */
   alpha: MetricValue;
 }
@@ -591,9 +602,9 @@ export interface Evidence {
   /** The values those metrics were compared against. */
   baselines: Baseline[];
   /** The sample size against its minimum, when the rule is sample-gated. */
-  sample?: Sample | null;
+  sample: Sample | null;
   /** The statistical test, when one was used. */
-  test?: StatTest | null;
+  test: StatTest | null;
   /** `{dotted threshold key: configured value}` for every threshold applied. */
   thresholds: Record<string, unknown>;
   /** The datasets read, with completeness and coverage. */
@@ -601,7 +612,7 @@ export interface Evidence {
   /** Each dataset read, with its id, mode and role at compute time. */
   provenance: ProvenanceEntry[];
   /** Rule-specific detail. */
-  extra?: Record<string, unknown> | null;
+  extra: Record<string, unknown> | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -620,7 +631,7 @@ export interface ItemOverlay {
   /** Whether an open discrepancy holds the item now, including one detected after the run. */
   held_now: boolean;
   /** Why it is held now, for example "Resolve discrepancy first". */
-  held_reason_now?: string | null;
+  held_reason_now: string | null;
   /** Whether the item was computed from data that has since been replaced. */
   historical: boolean;
   /** The data status of the datasets the item reads, as they are now. */
@@ -628,7 +639,7 @@ export interface ItemOverlay {
   /** Flags that apply now, such as `unverified_discrepancies` or `stale`. */
   flags_now: Flag[];
   /** The active feedback hiding the item, if any. */
-  hidden_by?: FeedbackKind | null;
+  hidden_by: FeedbackKind | null;
 }
 
 /**
@@ -666,9 +677,9 @@ export interface Item {
   /** Whether the item was held at compute time. */
   held: boolean;
   /** Why it was held. */
-  held_reason?: string | null;
-  /** The subject a decision on it writes; absent or `null` when only "Mark done" is offered. */
-  decision_subject?: DecisionSubjectRef | null;
+  held_reason: string | null;
+  /** The subject a decision on it writes; `null` when only "Mark done" is offered. */
+  decision_subject: DecisionSubjectRef | null;
   /** The read-time overlay. */
   current: ItemOverlay;
 }
@@ -696,8 +707,8 @@ export interface Finding {
   code: FindingCode;
   /** The section the finding is shown in. */
   section: SectionKey;
-  /** The entity it is about; absent or `null` for a section- or account-wide finding. */
-  entity?: EntityView | null;
+  /** The entity it is about; `null` for a section- or account-wide finding. */
+  entity: EntityView | null;
   /** The rendered message. */
   message: string;
   /** The numbers behind the message. */
@@ -777,7 +788,7 @@ export interface Banner {
   /** The banner text. */
   message: string;
   /** The count it reports, such as open discrepancies. */
-  count?: number | null;
+  count: number | null;
 }
 
 /**
@@ -855,6 +866,12 @@ export interface SubjectIn {
  * its own budget fields, `shared_member` takes status only, `budget` takes exactly the one
  * amount its period allows. Those rules, empty or no-change patches and the currency's minor
  * unit are validated server-side, with a 422 on violation.
+ *
+ * An `own_budget` patch is completed with the decided amounts it does not send. When that result
+ * holds other budget fields than the campaign has now (its budget changed after the last
+ * decision), it answers 422 `budget_changed`: resolve the budget discrepancy first, or, when the
+ * campaign only gained a budget field, send that field in the patch. A Google campaign whose
+ * budget period no entity sync reports is not checked and keeps its decided amount.
  */
 export interface DecisionPatchIn {
   /** The decided campaign status. */
@@ -868,6 +885,11 @@ export interface DecisionPatchIn {
 /**
  * `POST /decisions` body (`schemas.DecisionRequest`): a patch on one campaign or shared budget.
  * A subject whose dataset is not active answers 409 `subject_retired`.
+ *
+ * With `recommendation_id`, an unknown item answers 404, and the item must offer exactly this
+ * subject: one with no `decision_subject` answers 422 `decision_not_offered`, one naming another
+ * subject 422 `subject_mismatch`. Every dataset its provenance names, and the subject's, must
+ * stay current until the decision commits, else 409 `subject_retired`.
  */
 export interface DecisionRequest {
   /** The decision subject. */
@@ -900,6 +922,15 @@ export interface IntendedStateIn {
  * `POST /discrepancies/{id}/resolve` body (`schemas.ResolveRequest`). Only a resolution listed
  * in {@link Discrepancy.resolutions} is valid; another answers 422, and so does a
  * `record_intended` whose intended state is incomplete or does not fit the shape.
+ *
+ * `platform_correct` and `adopt_platform` adopt the snapshot the discrepancy compared (else the
+ * subject's newest), as does `acknowledge_removal` on a subject with no decision. They answer 409
+ * `platform_state_unknown` while that state is unknown: no snapshot, a status outside the
+ * normalised set, a shared member without its budget, a budget amount or period Google did not
+ * report (of a shared budget, or of the budget an own-budget campaign's snapshot names), or a
+ * snapshot observed in another budget shape or period than the subject has now.
+ * `platform_correct` of a `status` discrepancy in an unchanged shape reads only the status, so an
+ * unreported amount does not refuse it. Retry after the next entity sync.
  */
 export interface ResolveRequest {
   /** The resolution. */
@@ -922,6 +953,62 @@ export interface SubjectView {
   source: SourceName | null;
   /** The account currency its amounts are in. */
   currency: string | null;
+}
+
+/**
+ * The `patch` of a {@link Decision} (`schemas.DecisionPatchView`): the fields the submission
+ * itself carried. A key is present only when the stored patch holds it, and is never `null`,
+ * because a decided field cannot be cleared.
+ *
+ * - `user` and `recommendation` rows: exactly the fields the {@link DecisionPatchIn} carried,
+ *   for example `{ daily_budget: "120.50" }`.
+ * - `baseline` and `resolution` rows, an `acknowledge_removal` tombstone included: `{}`.
+ */
+export interface DecisionPatchView {
+  /** The decided campaign status. */
+  status?: CampaignStatus;
+  /** The decided daily budget, as a decimal string. */
+  daily_budget?: Money;
+  /** The decided lifetime or custom-period budget, as a decimal string. */
+  total_budget?: Money;
+}
+
+/**
+ * One side of a {@link Discrepancy} (`schemas.DiscrepancyValue`): the compared fields as stored.
+ * A side holds only the keys its variant writes; a present key may still be `null`.
+ *
+ * - **Status**: `{ status }` on both sides of a `status` discrepancy.
+ * - **Money** (a `budget` discrepancy on an `own_budget` or `budget` subject):
+ *   `{ daily_budget, total_budget, currency }`, an amount `null` where the side has none, plus
+ *   `amount_micros` on Google subjects only.
+ * - **Assignment** (a `budget` discrepancy on a shared member, or on a campaign that moved onto
+ *   a shared budget): `{ budget_id, budget_external_id }`, each `null` for no shared budget or
+ *   one the subject does not know.
+ * - **Tombstone reappearance**: a campaign's decided side is `{ status, tombstone: true }` and
+ *   its platform side `{ status }`; a shared budget's sides are the money variant, the decided
+ *   one with `tombstone: true`.
+ * - **Complete state** in the subject's shape (the decided side of a `missing` discrepancy or
+ *   of one waiting after `record_intended`; the platform side of an `untracked` one):
+ *   `own_budget` gives `status` plus the money keys, `shared_member` `status` plus the
+ *   assignment keys, `budget` the money keys only; a tombstone decision adds `tombstone: true`.
+ */
+export interface DiscrepancyValue {
+  /** The normalised campaign status; `null` when the platform reported none. */
+  status?: CampaignStatus | null;
+  /** The daily budget; `null` where the side has none. */
+  daily_budget?: Money | null;
+  /** The lifetime or custom-period budget; `null` where the side has none. */
+  total_budget?: Money | null;
+  /** The ISO 4217 code of the subject account's currency. */
+  currency?: string | null;
+  /** Google only: the amount in micros, Google's native precision; `null` without an amount. */
+  amount_micros?: number | null;
+  /** The internal id of the assigned shared budget; `null` for none. */
+  budget_id?: number | null;
+  /** That shared budget's Google id; `null` when unknown. */
+  budget_external_id?: string | null;
+  /** Present, and `true`, only on a side describing an `acknowledge_removal` tombstone. */
+  tombstone?: boolean;
 }
 
 /**
@@ -954,8 +1041,8 @@ export interface Decision {
   origin: DecisionOrigin;
   /** The item it was recorded from, if any. */
   recommendation_id: number | null;
-  /** The fields the submission carried. */
-  patch: Record<string, unknown>;
+  /** The fields the submission carried; `{}` for baseline and resolution rows. */
+  patch: DecisionPatchView;
   /** The note entered with it. */
   note: string | null;
 }
@@ -977,9 +1064,9 @@ export interface Discrepancy {
   /** `status`, `budget`, `untracked` or `missing`. */
   kind: DiscrepancyKind;
   /** The decided side; `null` for `untracked`. */
-  decided_value: Record<string, unknown> | null;
+  decided_value: DiscrepancyValue | null;
   /** The platform side; `null` for `missing`. */
-  platform_value: Record<string, unknown> | null;
+  platform_value: DiscrepancyValue | null;
   /** When it was detected; the oldest are shown first. */
   detected_at: IsoDateTime;
   /** `open`, `awaiting_platform` or `resolved`. */
@@ -1114,7 +1201,7 @@ export interface SyncRequestView {
   /** When it was requested. */
   requested_at: IsoDateTime;
   /** When the worker picked it up; `null` while pending. */
-  picked_at?: IsoDateTime | null;
+  picked_at: IsoDateTime | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1154,6 +1241,86 @@ export interface ContentAssetView {
 }
 
 /**
+ * How one CRM count (MQL or Qualified Lead) is bound, as configured: the `mql` or `ql` entry
+ * of `config/hubspot_mapping.yaml` (`schemas.StageBindingView`; AAP 0.5.4.7). In `stage_label`
+ * mode the labels are resolved in order among the portal's `lifecyclestage` options and the
+ * first match wins; in `property` mode a contact date property records the event directly.
+ */
+export interface StageBindingView {
+  /** `stage_label` or `property`. */
+  mode: BindingMode;
+  /** The labels to try, in order; MQL's single `stage_label` is a one-element list. */
+  stage_labels: string[];
+  /** The bound contact property in `property` mode; `null` in `stage_label` mode. */
+  property: string | null;
+}
+
+/**
+ * `config/hubspot_mapping.yaml`: the MQL and QL bindings and the meeting rules
+ * (`schemas.HubSpotMappingView`; AAP 0.5.4.7). MQL and QL are bound independently and never
+ * blended.
+ */
+export interface HubSpotMappingView {
+  /** The MQL binding. */
+  mql: StageBindingView;
+  /** The Qualified Lead binding. */
+  ql: StageBindingView;
+  /** `hs_meeting_source` values whose meetings can count as booked. */
+  booking_sources: string[];
+  /** `hs_meeting_outcome` values never counted. */
+  meeting_outcome_exclusions: string[];
+}
+
+/**
+ * One CRM count's binding as verified against the portal (`schemas.ResolvedBindingView`;
+ * AAP 0.3.3, 0.5.4.7). Every key is present. An unavailable binding makes its count
+ * "unavailable", shown as such and never as `0`.
+ */
+export interface ResolvedBindingView {
+  /** Whether the count can be computed. */
+  available: boolean;
+  /** The contact date property the count reads; set when available. */
+  property: string | null;
+  /** The lifecycle stage id the label resolved to, in `stage_label` mode. */
+  stage_id: string | null;
+  /** The label that matched, which heads the white-paper MQL column. */
+  label: string | null;
+  /** Why the binding is unavailable; set when unavailable. */
+  reason: string | null;
+}
+
+/**
+ * The optional Google-to-CRM link as verified against the portal
+ * (`schemas.GoogleCrmBindingView`; AAP 0.3.3). Every key is present. Without the link, Google
+ * items carry `no_crm_link` and no Google QL count or pipeline veto is computed.
+ */
+export interface GoogleCrmBindingView {
+  /** Whether the link can be used. */
+  available: boolean;
+  /** The contact property holding the Google campaign id. */
+  campaign_property: string | null;
+  /** The datetime property holding when that touch happened. */
+  touch_date_property: string | null;
+  /** Why the link is unavailable; set when unavailable. */
+  reason: string | null;
+}
+
+/**
+ * Every CRM binding verified against one HubSpot portal, as stored on its dataset
+ * (`schemas.CrmBindingsView`; AAP 0.5.4.7).
+ */
+export interface CrmBindingsView {
+  /** The resolved MQL binding. */
+  mql: ResolvedBindingView;
+  /** The resolved Qualified Lead binding, independent of MQL. */
+  ql: ResolvedBindingView;
+  /** The Google-to-CRM link. */
+  google: GoogleCrmBindingView;
+  /** When the portal was checked, in UTC. */
+  verified_at: IsoDateTime;
+}
+
+/**
  * `GET /config` (`schemas.ConfigView`): the read-only configuration behind `/settings` and the
  * window picker.
  */
@@ -1163,11 +1330,11 @@ export interface ConfigView {
   /** The window settings. */
   window: WindowConfig;
   /** The MQL and Qualified Lead bindings and meeting rules as configured. */
-  hubspot_mapping: Record<string, unknown>;
+  hubspot_mapping: HubSpotMappingView;
   /** The bindings as resolved against HubSpot's active primary portal; `null` until verified. */
-  crm_bindings: Record<string, unknown> | null;
+  crm_bindings: CrmBindingsView | null;
   /** The bindings of the active companion CRM dataset; `null` when there is none. */
-  companion_crm_bindings: Record<string, unknown> | null;
+  companion_crm_bindings: CrmBindingsView | null;
   /** The white paper registry, in file order. */
   content_assets: ContentAssetView[];
   /** Hash of the three configuration files. */

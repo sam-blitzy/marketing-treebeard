@@ -204,8 +204,9 @@ bound keeps a build from chasing a dependency that keeps changing (every round m
 CRM backfill), and a build that exhausts it is discarded like any build that is not ready."""
 
 _EVERY_LEAD_SINCE: Final = datetime(1970, 1, 1, tzinfo=UTC)
-"""Staging bound of a live LinkedIn build: before any lead, so every lead the backfill stored,
-however near its window's edge, is staged and attempted before the dataset activates."""
+"""Staging bound of a LinkedIn build, live or simulated: before any lead, so every lead the
+backfill stored, however near its window's edge, is staged and attempted before the dataset
+activates, as the readiness test, which counts every lead, requires."""
 
 _RESTAGED_CRM_FRESHNESS: Final = ("hubspot.contacts", "hubspot.associations")
 """Freshness rows of a building CRM dataset that rows staged after its backfill invalidate:
@@ -2059,7 +2060,9 @@ class SourceModeController:
 
         Rows are staged after the backfill's own CRM passes when the effective pair changed
         meanwhile: LinkedIn activated a new dataset (a HubSpot build), or HubSpot replaced
-        its primary (a live LinkedIn build). How they are attempted depends on whose CRM
+        its primary (a live LinkedIn build). A LinkedIn build, live or simulated, also stages
+        every lead its backfill stored with no row in the pair's CRM dataset, whenever
+        submitted (:data:`_EVERY_LEAD_SINCE`). How they are attempted depends on whose CRM
         dataset holds them:
 
         * The build's own CRM dataset (a HubSpot primary build, or a simulated LinkedIn
@@ -2175,8 +2178,8 @@ class SourceModeController:
           active primary, matching the readiness test, which counts every lead. With no
           HubSpot primary, ``sync.build.no_crm`` is logged and nothing is staged; readiness
           then holds a build that has leads.
-        * Simulated LinkedIn: every lead of the build in the backfill range against its
-          companion.
+        * Simulated LinkedIn: every lead of the build, whenever submitted, against its
+          companion, matching the readiness test.
 
         Staging is idempotent: a lead with a row in the CRM dataset is skipped. Nothing is
         committed here.
@@ -2208,6 +2211,7 @@ class SourceModeController:
             match_pass = _MatchPass(crm.id, crm.mode, "live", dataset_id)
         elif source == "linkedin" and companion_id is not None:
             lead_dataset_id = dataset_id
+            since = _EVERY_LEAD_SINCE
             match_pass = _MatchPass(companion_id, "simulated", "simulated", dataset_id)
         else:
             return None

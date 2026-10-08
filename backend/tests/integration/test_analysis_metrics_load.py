@@ -39,7 +39,7 @@ import hashlib
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -59,7 +59,10 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from ads_engine.analysis import metrics
+from ads_engine.analysis.campaigns import evaluate as evaluate_campaigns
 from ads_engine.analysis.context import (
+    C1,
+    CR3,
     AccountInfo,
     AdGroupInfo,
     AnalysisContext,
@@ -90,6 +93,7 @@ from ads_engine.analysis.context import (
     Source,
     objective_group,
 )
+from ads_engine.analysis.creative import evaluate as evaluate_creative
 from ads_engine.analysis.metrics import (
     GRAINS,
     CampaignDay,
@@ -2051,6 +2055,8 @@ async def test_aggregate_campaign_day_linkedin_sums_creatives_per_utc_date(
             _scope(session, window, thresholds, _main_refs(world)), "campaign_day_linkedin"
         )
     assert rows == [
+        # cr2 reported no leads on START: the day's leads are unavailable, never cr1's 5 as
+        # a complete count; the 5 stays a reported floor. Both creatives reported form opens.
         CampaignDay(
             world.camp_l1,
             DayFact(
@@ -2059,7 +2065,7 @@ async def test_aggregate_campaign_day_linkedin_sums_creatives_per_utc_date(
                 impressions=1500,
                 clicks=30,
                 form_opens=70,
-                leads=5,
+                reported_floors=(("leads", 5),),
             ),
         ),
         CampaignDay(
@@ -2080,8 +2086,13 @@ async def test_aggregate_campaign_day_linkedin_sums_creatives_per_utc_date(
             ),
         ),
     ]
-    end_day = rows[2].fact
+    start_day, end_day = rows[0].fact, rows[2].fact
+    assert (start_day.leads, start_day.outcome("linkedin_lead_gen")) == (None, None)
+    assert start_day.recorded_outcome("linkedin_lead_gen") == Decimal(5)
     assert (end_day.leads, end_day.form_opens, end_day.website_conversions) == (None, None, None)
+    # Nothing was reported on END, so nothing was recorded either: no floor.
+    assert end_day.reported_floors == ()
+    assert end_day.recorded_outcome("linkedin_lead_gen") is None
 
 
 @pytest.mark.anyio
@@ -2092,9 +2103,12 @@ async def test_aggregate_creative_window_totals_and_delivery_days(
         rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "creative_window"
         )
+    # An optional count is a window total only when every window day of the creative reported
+    # it: cr1's END row reported nothing, so its form opens and leads are unavailable; cr2
+    # reported form opens on both its days (20 + 0) but leads on MID only.
     assert rows == [
-        CreativeTotals(world.cr1, world.camp_l1, _d(10), 1000, 20, 50, 5, None, None, 1),
-        CreativeTotals(world.cr2, world.camp_l1, _d(5), 500, 10, 20, 0, None, None, 1),
+        CreativeTotals(world.cr1, world.camp_l1, _d(10), 1000, 20, None, None, None, None, 1),
+        CreativeTotals(world.cr2, world.camp_l1, _d(5), 500, 10, 20, None, None, None, 1),
         CreativeTotals(world.cr3, world.camp_l2, _d(8), 400, 4, None, None, 6, 2, 1),
     ]
 
@@ -2471,8 +2485,11 @@ async def test_load_context_facts_are_the_aggregated_grains(
     assert [day.date for day in context.campaign_days[world.camp_l1]] == [START, MID, END]
     assert context.campaign_days[world.camp_l2][0].website_conversions == 2
     assert set(context.creative_totals) == {world.cr1, world.cr2, world.cr3}
-    assert context.creative_totals[world.cr2].leads == 0
+    # cr2's leads are NULL on START and 0 on MID: unavailable over the window, never 0.
+    cr2 = context.creative_totals[world.cr2]
+    assert (cr2.form_opens, cr2.leads) == (20, None)
     assert context.creative_totals[world.cr3].leads is None
+    assert context.campaign_days[world.camp_l1][0].reported_floors == (("leads", 5),)
     assert dict(context.keyword_days) == {
         world.kw1: (
             KeywordDay(world.kw1, START, _d(2), 2, 20, _d(1), 7, _d(1)),
@@ -3386,6 +3403,229 @@ async def test_a_stored_value_outside_its_enumeration_fails_the_load(
     async with sessions() as session:
         with pytest.raises(ValueError, match=r"ad_account\.source must be one of"):
             await load_context(session, window, thresholds, kind="default", now=NOW)
+
+
+# ---------------------------------------------------------------------------------------
+# load_context(): optional LinkedIn metrics that only some fact rows reported (AAP 0.11.1)
+# ---------------------------------------------------------------------------------------
+
+URN_A1 = "urn:li:sponsoredCreative:8101"
+URN_A2 = "urn:li:sponsoredCreative:8102"
+URN_B1 = "urn:li:sponsoredCreative:8103"
+
+
+@dataclass(slots=True)
+class _MixedWorld:
+    """The ids of the world :func:`_seed_mixed_leads` seeds."""
+
+    zero: int = 0
+    reference: int = 0
+    a1: int = 0
+    a2: int = 0
+    b1: int = 0
+
+
+async def _seed_mixed_leads(sessions: Sessions) -> _MixedWorld:
+    """Seed two active lead-gen campaigns of one live LinkedIn account on every window day.
+
+    Campaign ``zero`` spends 100 a day through creatives ``a1`` and ``a2``, each reporting
+    20 form opens and 0 leads, except that ``a2`` reports neither on :data:`END`: that day
+    mixes a known zero with an unavailable value. Campaign ``reference`` spends 10 a day
+    through ``b1`` for 1 lead. Read with a plain ``SUM``, ``zero`` would show 0 leads on 2,800
+    spent, 25.5 expected at the account's 110 per lead: a C1 pause, B2's zero-outcome branch,
+    and a complete funnel for ``a2``.
+    """
+    w = _MixedWorld()
+    async with sessions.begin() as session:
+        dataset = await _dataset(session, "linkedin", "live", "active")
+        account = await _put(
+            session,
+            AdAccount(source="linkedin", dataset_id=dataset, external_id="52", currency="USD"),
+        )
+        campaign_ids: list[int] = []
+        for external_id, name in (("761", "Zero or unknown"), ("762", "Reference")):
+            campaign = await _put(
+                session,
+                Campaign(
+                    source="linkedin",
+                    dataset_id=dataset,
+                    account_id=account.id,
+                    external_id=external_id,
+                    name=name,
+                    status="active",
+                    raw_status="ACTIVE",
+                    objective_or_channel="LEAD_GENERATION",
+                    daily_budget=_d(150),
+                ),
+            )
+            campaign_ids.append(campaign.id)
+        w.zero, w.reference = campaign_ids
+        creative_ids: list[int] = []
+        for campaign_id, urn in ((w.zero, URN_A1), (w.zero, URN_A2), (w.reference, URN_B1)):
+            creative = await _put(
+                session,
+                Creative(
+                    source="linkedin",
+                    dataset_id=dataset,
+                    campaign_id=campaign_id,
+                    urn=urn,
+                    lead_form_urn=FORM_A,
+                ),
+            )
+            creative_ids.append(creative.id)
+        w.a1, w.a2, w.b1 = creative_ids
+        day = START
+        while day <= END:
+            await _creative_day(
+                session,
+                dataset,
+                w.a1,
+                day,
+                cost="50",
+                impressions=1000,
+                clicks=10,
+                form_opens=20,
+                leads=0,
+            )
+            if day == END:
+                await _creative_day(
+                    session, dataset, w.a2, day, cost="50", impressions=1000, clicks=10
+                )
+            else:
+                await _creative_day(
+                    session,
+                    dataset,
+                    w.a2,
+                    day,
+                    cost="50",
+                    impressions=1000,
+                    clicks=10,
+                    form_opens=20,
+                    leads=0,
+                )
+            await _creative_day(
+                session,
+                dataset,
+                w.b1,
+                day,
+                cost="10",
+                impressions=500,
+                clicks=5,
+                form_opens=4,
+                leads=1,
+            )
+            day += timedelta(days=1)
+    return w
+
+
+def _c1_pauses(ctx: AnalysisContext) -> list[int | None]:
+    """The campaign ids of the C1 pause items a context produces."""
+    return [item.entity_ref.id for item in evaluate_campaigns(ctx).candidates if item.rule_id == C1]
+
+
+def _unmeasured_stages(ctx: AnalysisContext, campaign_id: int) -> dict[str, str | None]:
+    """Each funnel stage of a campaign's CR2/CR3 item, with why it is unmeasured, if it is."""
+    [item] = [
+        candidate
+        for candidate in evaluate_creative(ctx).candidates
+        if candidate.rule_id == CR3 and candidate.entity_ref.id == campaign_id
+    ]
+    return {stage["stage"]: stage["unmeasured"] for stage in item.evidence.extra["stages"]}
+
+
+@pytest.mark.anyio
+async def test_a_zero_beside_an_unavailable_value_never_loads_as_a_genuine_zero(
+    sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> None:
+    w = await _seed_mixed_leads(sessions)
+    async with sessions() as session:
+        context = await load_context(session, window, thresholds, kind="default", now=NOW)
+    days = context.campaign_days[w.zero]
+    assert len(days) == window.days
+    # END: a1's 0 leads and 20 form opens beside a2's NULLs. Both metrics are unavailable,
+    # never a count; the reporting row's sums stay as floors.
+    assert days[-1] == DayFact(
+        date=END,
+        cost=_d(100),
+        impressions=2000,
+        clicks=20,
+        reported_floors=(("form_opens", 20), ("leads", 0)),
+    )
+    assert all((d.form_opens, d.leads, d.reported_floors) == (40, 0, ()) for d in days[:-1])
+    totals = metrics.window_totals(context, (w.zero,))
+    assert (totals.spend, totals.outcomes, totals.spend_days, totals.unreported_days) == (
+        _d(2800),
+        None,
+        window.days,
+        1,
+    )
+    a1, a2 = context.creative_totals[w.a1], context.creative_totals[w.a2]
+    assert (a1.impressions, a1.form_opens, a1.leads) == (28_000, 560, 0)
+    assert (a2.impressions, a2.form_opens, a2.leads) == (28_000, None, None)
+
+    # The context a plain SUM loaded: END as a genuine zero and a2 with 540 opens, 0 leads.
+    summed = replace(
+        context,
+        cache={},
+        campaign_days={
+            **context.campaign_days,
+            w.zero: (*days[:-1], replace(days[-1], form_opens=40, leads=0, reported_floors=())),
+        },
+        creative_totals={**context.creative_totals, w.a2: replace(a2, form_opens=540, leads=0)},
+    )
+    # C1: unavailable outcomes are not zero outcomes, so nothing pauses; the summed zero would.
+    assert _c1_pauses(context) == []
+    assert _c1_pauses(summed) == [w.zero]
+    # B2 / G1: the zero-outcome branch needs a genuine zero.
+    unknown = metrics.assess_b2(context, ("campaign", w.zero))
+    assert (unknown.outcomes, unknown.branch) == (None, None)
+    assert metrics.assess_b2(summed, ("campaign", w.zero)).branch == "zero_outcomes"
+    # CR2/CR3: a2's opens and leads are unavailable, so the stages they feed are unmeasured.
+    assert _unmeasured_stages(context, w.zero) == {
+        "click_rate": None,
+        "open_rate": "form opens or impressions not reported for every variant",
+        "completion_rate": "leads or form opens not reported for every variant",
+    }
+    assert _unmeasured_stages(summed, w.zero) == {
+        "click_rate": None,
+        "open_rate": None,
+        "completion_rate": None,
+    }
+    # P2 reads what was recorded: the reference campaign's 28 leads plus END's floor of 0.
+    assert metrics.source_totals(context) == {"linkedin": (_d(3080), _d(28))}
+
+
+@pytest.mark.anyio
+async def test_p2_counts_the_leads_a_partially_reported_day_recorded(
+    sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> None:
+    async with sessions.begin() as session:
+        dataset, campaign, reporting = await _linkedin_world(session, "live")
+        silent = await _put(
+            session,
+            Creative(
+                source="linkedin",
+                dataset_id=dataset,
+                campaign_id=campaign,
+                urn=URN_2,
+                lead_form_urn=FORM_A,
+            ),
+        )
+        await _creative_day(
+            session, dataset, reporting, MID, cost="30", impressions=600, clicks=6, leads=3
+        )
+        await _creative_day(session, dataset, silent.id, MID, cost="20", impressions=400, clicks=4)
+    async with sessions() as session:
+        context = await load_context(session, window, thresholds, kind="default", now=NOW)
+    [day] = context.campaign_days[campaign]
+    # The day's leads are unavailable to every count and rate ...
+    assert (day.leads, day.outcome("linkedin_lead_gen")) == (None, None)
+    totals = metrics.window_totals(context, (campaign,))
+    assert (totals.spend, totals.outcomes, totals.unreported_days) == (_d(50), None, 1)
+    # ... yet 3 leads were recorded, so P2 never reads the source as tracking nothing.
+    assert day.reported_floors == (("leads", 3),)
+    assert day.recorded_outcome("linkedin_lead_gen") == Decimal(3)
+    assert metrics.source_totals(context) == {"linkedin": (_d(50), _d(3))}
 
 
 # ---------------------------------------------------------------------------------------

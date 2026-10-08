@@ -7,6 +7,13 @@ Covered (AAP 0.5.4.4 "C0 resolutions by kind and subject type", AAP 0.5.2 shapes
   ``status`` discrepancy records the platform status in the new shape and closes it, and
   the next entity sync raises no new ``status`` discrepancy; on the ``budget``
   discrepancy it records the new assignment or amount with the decided status.
+* **An own-budget amount Google omitted**: ``adopt_platform`` refuses it with 409
+  ``platform_state_unknown`` and writes nothing until a sync reports the amount, while a
+  ``status`` ``platform_correct`` adopts only the platform status and keeps the decided
+  amount.
+* **An own budget whose period changed**: a patch over a decided daily budget of a
+  campaign whose budget is now ``CUSTOM_PERIOD`` is refused with 422 ``budget_changed``
+  and writes nothing; resolving the budget discrepancy makes it decidable again.
 
 The database tests run against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``). The module creates a private
@@ -39,6 +46,7 @@ from ads_engine.db.models.decisions import Decision, Discrepancy
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.decisions import (
     DecisionPatch,
+    PatchRejected,
     PlatformStateUnknown,
     Resolution,
     SubjectRef,
@@ -260,9 +268,16 @@ async def _google_world(sessions: Sessions) -> GoogleWorld:
 
 
 def _rows(
-    campaigns: Mapping[int, tuple[str, Funding]], budgets: Sequence[Funding]
+    campaigns: Mapping[int, tuple[str, Funding]],
+    budgets: Sequence[Funding],
+    *,
+    unreported: frozenset[int] = frozenset(),
 ) -> list[SnapshotRow]:
-    """Return one sync's snapshot rows: each campaign's status and budget, then each budget."""
+    """Return one sync's snapshot rows: each campaign's status and budget, then each budget.
+
+    Google omits the amount of every budget whose id is in ``unreported``, on the budget's
+    own row and on the row of each campaign drawing from it.
+    """
     rows = [
         SnapshotRow.campaign(
             source="google",
@@ -271,7 +286,7 @@ def _rows(
             raw_status=RAW_STATUS[status],
             budget_id=funding.id,
             budget_period=funding.period,
-            budget_amount_micros=funding.micros,
+            budget_amount_micros=None if funding.id in unreported else funding.micros,
             explicitly_shared=funding.shared,
         )
         for campaign_id, (status, funding) in sorted(campaigns.items())
@@ -280,7 +295,7 @@ def _rows(
         SnapshotRow.budget(
             entity_id=funding.id,
             period=funding.period,
-            amount_micros=funding.micros,
+            amount_micros=None if funding.id in unreported else funding.micros,
             explicitly_shared=funding.shared,
         )
         for funding in budgets
@@ -305,19 +320,21 @@ async def _sync(
     budgets: Sequence[Funding] | None = None,
     before_writes: Step | None = None,
     detected_at: datetime | None = None,
+    unreported: frozenset[int] = frozenset(),
 ) -> SyncResult:
     """Run one complete entity sync that read the platform at ``at``.
 
     ``before_writes`` runs in the sync's transaction before its snapshots are written: a
     decision recorded while the sync was reading the platform, and the sync's upsert of
-    the entity rows. Detection runs at ``detected_at`` (default ``at``).
+    the entity rows. Detection runs at ``detected_at`` (default ``at``). Google omits the
+    amount of every budget in ``unreported`` (budget ids).
     """
     async with sessions() as session, session.begin():
         sealed = await baseline_sealed(session, world.dataset_id)
         if before_writes is not None:
             await before_writes(session)
         observed = world.budgets if budgets is None else budgets
-        rows = _rows(campaigns, observed)
+        rows = _rows(campaigns, observed, unreported=unreported)
         ids = await write_snapshots(session, world.dataset_id, rows, captured_at=at)
         await ensure_baseline(session, world.dataset_id, captured_at=at, sealed=sealed)
         enumeration = EnumerationResult(
@@ -843,3 +860,166 @@ async def test_acknowledging_removal_without_a_decision_refuses_a_stale_snapshot
         "shared_member",
     )
     assert await _decisions(sessions, newcomer) == []
+
+
+# ---------------------------------------------------------------------------------------
+# An own-budget amount Google omitted
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_adopting_an_own_budget_whose_amount_google_omitted_is_refused(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    await _sync(sessions, world, _placements(world), at=_at(0))
+    async with sessions() as session, session.begin():
+        newcomer = await _campaign(
+            session, world.dataset_id, world.account_id, "13", world.spare_budget
+        )
+    on_spare = {**_placements(world), newcomer: ("active", world.spare_budget)}
+    seen = await _sync(
+        sessions, world, on_spare, at=_at(3), unreported=frozenset({world.spare_budget.id})
+    )
+    assert seen.report.raised["untracked"] == 1
+    untracked = (await _open(sessions, newcomer))["untracked"]
+    compared = seen.snapshot_ids[("campaign", newcomer)]
+    assert untracked.snapshot_id == compared
+
+    with pytest.raises(PlatformStateUnknown) as refused:
+        await _resolve(sessions, untracked.id, "adopt_platform", _at(4))
+
+    error = refused.value
+    assert (error.status_code, error.code) == (409, "platform_state_unknown")
+    assert error.details == {"snapshot_id": compared}
+    assert "did not report the amount or period of the campaign's budget" in error.message
+    # Nothing was written: the unknown amount was not recorded as no budget.
+    assert await _decisions(sessions, newcomer) == []
+    assert (await _open(sessions, newcomer))["untracked"].state == "open"
+
+    # The next sync reports the amount and refreshes the row, which then adopts it.
+    known = await _sync(sessions, world, on_spare, at=_at(6))
+    assert (await _open(sessions, newcomer))["untracked"].snapshot_id == known.snapshot_ids[
+        ("campaign", newcomer)
+    ]
+    adopted = await _resolve(sessions, untracked.id, "adopt_platform", _at(7))
+    assert (adopted.state, adopted.resolution) == ("resolved", "adopt_platform")
+    written = (await _decisions(sessions, newcomer))[-1]
+    assert (written.shape, written.status, written.daily_budget, written.total_budget) == (
+        "own_budget",
+        "active",
+        Decimal(80),
+        None,
+    )
+    final = await _sync(sessions, world, on_spare, at=_at(9))
+    assert final.report.total_raised == 0
+    assert await _open(sessions, newcomer) == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_status_correction_needs_no_own_budget_amount_google_omitted(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    own = SubjectRef(type="campaign", id=world.own)
+    await _sync(sessions, world, _placements(world), at=_at(0))
+    await _decide(sessions, own, DecisionPatch(daily_budget=Decimal(120)), _at(1))
+    paused = {**_placements(world), world.own: ("paused", world.own_budget)}
+    blind = await _sync(
+        sessions, world, paused, at=_at(3), unreported=frozenset({world.own_budget.id})
+    )
+    # The status differs; the amount is unknown, so no budget discrepancy is raised.
+    assert dict(blind.report.raised) == {"status": 1, "budget": 0, "untracked": 0, "missing": 0}
+    status = (await _open(sessions, world.own))["status"]
+    assert status.snapshot_id == blind.snapshot_ids[("campaign", world.own)]
+
+    closed = await _platform_correct(sessions, status.id, _at(4))
+
+    assert (closed.state, closed.resolution) == ("resolved", "platform_correct")
+    written = (await _decisions(sessions, world.own))[-1]
+    assert (
+        written.origin,
+        written.shape,
+        written.status,
+        written.daily_budget,
+        written.total_budget,
+    ) == ("resolution", "own_budget", "paused", Decimal(120), None)
+    # The decided 120 is still the expectation: the platform reporting it raises nothing.
+    applied = replace(world.own_budget, micros=120_000_000)
+    after = await _sync(
+        sessions,
+        world,
+        {**_placements(world), world.own: ("paused", applied)},
+        at=_at(6),
+        budgets=(applied, world.shared_budget, world.spare_budget),
+    )
+    assert after.report.total_raised == 0
+    assert await _open(sessions, world.own) == {}
+
+
+# ---------------------------------------------------------------------------------------
+# A patch over an own budget whose period changed
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_patch_over_a_daily_decision_of_a_now_custom_period_budget_is_refused(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    own = SubjectRef(type="campaign", id=world.own)
+    await _sync(sessions, world, _placements(world), at=_at(0))
+    # Budget A becomes a custom-period budget of 900; the decision still holds daily 100.
+    custom_a = Funding(
+        id=world.own_budget.id, period="CUSTOM_PERIOD", micros=900_000_000, shared=False
+    )
+    custom = {**_placements(world), world.own: ("active", custom_a)}
+    moved = await _sync(
+        sessions,
+        world,
+        custom,
+        at=_at(3),
+        budgets=(custom_a, world.shared_budget, world.spare_budget),
+        before_writes=_steps(_upsert_budget(custom_a), _move(world.own, custom_a)),
+    )
+    assert dict(moved.report.raised) == {"status": 0, "budget": 1, "untracked": 0, "missing": 0}
+    decided = [row.id for row in await _decisions(sessions, world.own)]
+
+    for patch, decided_fields in (
+        (DecisionPatch(total_budget=Decimal(200)), ["daily_budget", "total_budget"]),
+        (DecisionPatch(status="paused"), ["daily_budget"]),
+    ):
+        with pytest.raises(PatchRejected) as refused:
+            await _decide(sessions, own, patch, _at(4))
+        error = refused.value
+        assert (error.status_code, error.code) == (422, "budget_changed")
+        assert error.details == {
+            "decided_fields": decided_fields,
+            "current_fields": ["total_budget"],
+            "current_budget_period": "CUSTOM_PERIOD",
+        }
+        assert "Resolve its budget discrepancy first." in error.message
+
+    # Nothing was written: no row holds the obsolete daily 100, alone or beside a total.
+    assert [row.id for row in await _decisions(sessions, world.own)] == decided
+    # Resolving the budget discrepancy brings the decision to the new period, after which
+    # the total budget is decided as usual.
+    budget = (await _open(sessions, world.own))["budget"]
+    await _platform_correct(sessions, budget.id, _at(5))
+    corrected = (await _decisions(sessions, world.own))[-1]
+    assert (corrected.status, corrected.daily_budget, corrected.total_budget) == (
+        "active",
+        None,
+        Decimal(900),
+    )
+    await _decide(sessions, own, DecisionPatch(total_budget=Decimal(200)), _at(6))
+    latest = (await _decisions(sessions, world.own))[-1]
+    assert (latest.origin, latest.status, latest.daily_budget, latest.total_budget) == (
+        "user",
+        "active",
+        None,
+        Decimal(200),
+    )

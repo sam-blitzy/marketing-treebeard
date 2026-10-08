@@ -22,7 +22,12 @@ Covered:
   and the batch log warns; a batch left with no held row writes no contact, so the newer
   contact and match another run stored meanwhile stand;
 * a lease abandoned without release (the release's database error is tolerated) keeps its
-  rows from being claimed until ``now`` reaches the lease instant.
+  rows from being claimed until ``now`` reaches the lease instant;
+* a CRM dataset retired (or purged) while its batch is in flight is never written by the
+  release, whether the batch then fails its write with ``DatasetNotWritable``, is cancelled
+  or crashes: the original exception or cancellation propagates unmasked, the rows stay
+  exactly as the lease left them, and the skip is logged instead of a release; a release
+  that meets an uncommitted retirement waits for it and then skips.
 
 No network: both platforms answer through ``httpx.MockTransport`` handlers whose requests and
 responses are validated against ``tests/contracts/linkedin/lead_form_responses_batch.json``
@@ -55,10 +60,11 @@ from urllib.parse import unquote
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import create_engine, insert, select, text, update
+from sqlalchemy import create_engine, delete, insert, select, text, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -75,6 +81,7 @@ from ads_engine.connectors.hubspot.client import HubSpotClient, RateLimiter
 from ads_engine.connectors.hubspot.parser import ContactPropertyMap
 from ads_engine.connectors.linkedin.auth import SIMULATED_TOKEN, StaticTokenProvider
 from ads_engine.connectors.linkedin.client import LinkedInClient
+from ads_engine.db import repositories
 from ads_engine.db.base import Base
 from ads_engine.db.models.accounts import AdAccount, Campaign
 from ads_engine.db.models.crm import CrmContact, Lead, LeadMatch
@@ -1095,6 +1102,217 @@ async def test_an_abandoned_lease_is_due_again_only_once_it_has_passed(
         ("matched", 1, lease)
     }
     assert sorted(platforms.hubspot_calls[1]) == sorted(world.lead_of_email)
+
+
+# ---------------------------------------------------------------------------------------
+# (f) The release never writes into a CRM dataset retired or purged mid-batch
+# ---------------------------------------------------------------------------------------
+
+RETIRED_AT = T0 + timedelta(minutes=5)
+"""When a test's CRM dataset is retired, while its batch is in flight."""
+
+
+async def _retire(connection: AsyncConnection, crm_dataset_id: int) -> None:
+    """Retire a dataset as ``DatasetManager.activate`` does: lock its row, then update it.
+
+    The caller's transaction decides when the retirement commits.
+    """
+    await connection.execute(
+        select(SourceDataset.id).where(SourceDataset.id == crm_dataset_id).with_for_update()
+    )
+    await connection.execute(
+        update(SourceDataset)
+        .where(SourceDataset.id == crm_dataset_id)
+        .values(state="retired", retired_at=RETIRED_AT)
+    )
+
+
+async def _lease_in_flight(env: Env, world: World, emails: list[str]) -> datetime:
+    """Return the lease instant the rows behind a HubSpot call carry while it is in flight."""
+    leased = await _snapshot(env, world, "hubspot", world.leads_for_emails(emails))
+    assert leased.unlocked
+    return _lease_of(leased.claimed_rows.values())
+
+
+def _assert_leased(rows: dict[int, Row], world: World, lease: datetime) -> None:
+    """Every row of the world is exactly as its claim's lease left it."""
+    assert set(rows) == set(world.lead_ids)
+    for lead_id, row in rows.items():
+        assert row == Row("pending", 0, lease, None, None, None), lead_id
+
+
+def _assert_release_skipped(
+    logs: Sequence[dict[str, Any]], world: World, claimed: int, state: str | None
+) -> None:
+    """The release was skipped and logged as such, with counts and the state only."""
+    assert _events(logs, "sync.lead_match.released") == []
+    assert _events(logs, "sync.lead_match.release_failed") == []
+    assert _events(logs, "sync.lead_match.release_skipped") == [
+        {
+            "event": "sync.lead_match.release_skipped",
+            "log_level": "info",
+            "crm_dataset_id": world.crm_dataset_id,
+            "claimed": claimed,
+            "state": state,
+        }
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ending", ["retired", "purged"])
+async def test_a_crm_dataset_ended_mid_batch_is_not_written_by_the_release(
+    env: Env, ending: str
+) -> None:
+    world = await _seed(env, 5)
+    leases: list[datetime] = []
+
+    async def end_in_flight(emails: list[str]) -> None:
+        leases.append(await _lease_in_flight(env, world, emails))
+        async with env.probe.begin() as connection:
+            if ending == "retired":
+                await _retire(connection, world.crm_dataset_id)
+            else:
+                await connection.execute(
+                    delete(SourceDataset).where(SourceDataset.id == world.crm_dataset_id)
+                )
+
+    platforms = Platforms(world, hubspot_hook=end_in_flight)
+    async with _clients(platforms) as clients:
+        with capture_logs() as logs, pytest.raises(repositories.DatasetNotWritable) as raised:
+            await lead_match.run_matching(env.sessions, world.crm_dataset_id, clients, now=T0)
+
+    state = "retired" if ending == "retired" else None
+    assert (raised.value.dataset_id, raised.value.state) == (world.crm_dataset_id, state)
+    assert len(platforms.hubspot_calls) == 1
+    rows = await _rows(env, world)
+    if ending == "retired":
+        # The read-only dataset's rows keep the lease: neither the batch's outcomes nor the
+        # release's previous due times were written, and no contact was stored.
+        (lease,) = leases
+        _assert_leased(rows, world, lease)
+        assert await _contacts(env, world) == {}
+    else:
+        assert rows == {}
+    assert _events(logs, "sync.lead_match.batch") == []
+    _assert_release_skipped(logs, world, 5, state)
+
+
+@pytest.mark.anyio
+async def test_a_batch_cancelled_after_its_crm_dataset_retired_keeps_the_lease(
+    env: Env,
+) -> None:
+    world = await _seed(env, 5)
+    leases: list[datetime] = []
+    in_flight = asyncio.Event()
+    never = asyncio.Event()
+
+    async def retire_then_hang(emails: list[str]) -> None:
+        leases.append(await _lease_in_flight(env, world, emails))
+        async with env.probe.begin() as connection:
+            await _retire(connection, world.crm_dataset_id)
+        in_flight.set()
+        await never.wait()
+
+    platforms = Platforms(world, hubspot_hook=retire_then_hang)
+    async with _clients(platforms) as clients:
+        task = asyncio.create_task(
+            lead_match.run_matching(env.sessions, world.crm_dataset_id, clients, now=T0)
+        )
+        await asyncio.wait_for(in_flight.wait(), timeout=60)
+        with capture_logs() as logs:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    (lease,) = leases
+    _assert_leased(await _rows(env, world), world, lease)
+    _assert_release_skipped(logs, world, 5, "retired")
+
+
+@pytest.mark.anyio
+async def test_a_crash_after_the_crm_dataset_retired_propagates_unmasked(env: Env) -> None:
+    world = await _seed(env, 5)
+    leases: list[datetime] = []
+    crash = HandlerCrashError("the HubSpot handler crashed after the retirement")
+
+    async def retire_then_crash(emails: list[str]) -> None:
+        leases.append(await _lease_in_flight(env, world, emails))
+        async with env.probe.begin() as connection:
+            await _retire(connection, world.crm_dataset_id)
+        raise crash
+
+    platforms = Platforms(world, hubspot_hook=retire_then_crash)
+    async with _clients(platforms) as clients:
+        with capture_logs() as logs, pytest.raises(HandlerCrashError) as raised:
+            await lead_match.run_matching(env.sessions, world.crm_dataset_id, clients, now=T0)
+
+    assert raised.value is crash
+    (lease,) = leases
+    _assert_leased(await _rows(env, world), world, lease)
+    _assert_release_skipped(logs, world, 5, "retired")
+
+
+async def _wait_until_the_matcher_waits_on_a_lock(env: Env, task: asyncio.Task[Any]) -> None:
+    """Return once a matcher backend waits on a lock; fail if the run ends first or never does."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 60
+    while True:
+        async with env.probe.connect() as connection:
+            waiting = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE application_name = :app AND wait_event_type = 'Lock'"
+                ),
+                {"app": env.app},
+            )
+        if waiting:
+            return
+        assert not task.done(), "the release ran without waiting for the uncommitted retirement"
+        assert loop.time() < deadline, "the release never waited for the uncommitted retirement"
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.anyio
+async def test_a_release_waits_for_an_uncommitted_retirement_and_then_skips(env: Env) -> None:
+    world = await _seed(env, 5)
+    leases: list[datetime] = []
+    retirements: list[AsyncConnection] = []
+    crash = HandlerCrashError("the HubSpot handler crashed during a retirement")
+
+    async def begin_retirement_then_crash(emails: list[str]) -> None:
+        # The retirement locks the dataset row and updates it, but does not commit yet.
+        leases.append(await _lease_in_flight(env, world, emails))
+        connection = await env.probe.connect()
+        retirements.append(connection)
+        await _retire(connection, world.crm_dataset_id)
+        raise crash
+
+    platforms = Platforms(world, hubspot_hook=begin_retirement_then_crash)
+    async with _clients(platforms) as clients:
+        with capture_logs() as logs:
+            task = asyncio.create_task(
+                lead_match.run_matching(env.sessions, world.crm_dataset_id, clients, now=T0)
+            )
+            try:
+                await _wait_until_the_matcher_waits_on_a_lock(env, task)
+                # The release waits on the dataset's lifecycle lock before it locks any row.
+                _assert_leased(await _rows(env, world), world, leases[0])
+                (retirement,) = retirements
+                await retirement.commit()
+            finally:
+                # Closing rolls back a retirement a failed assertion left uncommitted, so the
+                # run always ends and is waited for here.
+                for connection in retirements:
+                    await connection.close()
+                done, _pending = await asyncio.wait([task], timeout=60)
+            assert task in done
+            with pytest.raises(HandlerCrashError) as raised:
+                task.result()
+
+    assert raised.value is crash
+    (lease,) = leases
+    _assert_leased(await _rows(env, world), world, lease)
+    _assert_release_skipped(logs, world, 5, "retired")
 
 
 # ---------------------------------------------------------------------------------------

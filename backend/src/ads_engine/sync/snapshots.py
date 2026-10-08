@@ -28,16 +28,25 @@ worker coalesces requests within 60 s anyway). ``analysis/discrepancy.py`` only 
 stored rows as C0 items.
 
 **Set-based.** Baseline and detection read a number of statements that does not grow with
-the number of subjects: subject states come from
-:func:`~ads_engine.decisions.load_subject_states`, detection row-locks the dataset's
-non-resolved discrepancies in one statement, and subjects are judged in memory. Writes are
-proportional to the rows created or changed; baselines are inserted with one flush.
+the number of subjects: each pass locks the dataset's subjects in three statements,
+subject states come from :func:`~ads_engine.decisions.load_subject_states`, detection
+row-locks the dataset's non-resolved discrepancies in one statement, and subjects are
+judged in memory. Writes are proportional to the rows created or changed; baselines are
+inserted with one flush.
 
-**Locks.** Both passes load their subjects with ``lock``, in the order every decision
-writer uses: the dataset ``FOR SHARE`` (so no activation retires it until the sync
-commits), then the subject rows ``FOR NO KEY UPDATE``, then (detection) the discrepancy
-rows. The :mod:`ads_engine.decisions` writers are told they hold those locks
-(``locked``), so they neither lock nor read anything again.
+**Locks.** Each pass starts by locking the dataset's complete subject set, once, in the
+order every decision writer uses: the dataset ``FOR SHARE`` (so no activation retires it
+until the sync commits), then every campaign and then every explicitly shared budget of
+the dataset ``FOR NO KEY UPDATE``, each in ``id`` order; detection then locks the
+discrepancy rows. The two passes judge different subjects within one transaction, so
+locking only the subjects each judges would let two concurrent entity syncs of the
+dataset lock in a cycle across the passes (A's baseline holds a new campaign, B's
+detection holds an existing one and waits for the new one, A's detection waits for the
+existing one), which PostgreSQL aborts as a deadlock. With the whole set taken first,
+detection re-locks rows its sync already holds and a concurrent sync waits at its first
+subject lock while it holds none. Both passes then load their subjects with ``lock``,
+which re-locks those rows, and the :mod:`ads_engine.decisions` writers are told they hold
+the locks (``locked``), so they neither lock nor read anything again.
 
 **Decision subjects** are campaigns of both sources and Google explicitly shared budgets
 (AAP 0.5.2). Campaign groups, ad groups, keywords, creatives and conversion actions are
@@ -92,7 +101,7 @@ from ads_engine.db.models.accounts import (
 from ads_engine.db.models.decisions import DISCREPANCY_KINDS, Decision, Discrepancy
 from ads_engine.db.models.ops import SOURCES, SourceDataset
 from ads_engine.db.models.snapshots import ENTITY_TYPES, EntitySnapshot
-from ads_engine.db.repositories import append_snapshots, enqueue_analysis_request
+from ads_engine.db.repositories import append_snapshots, enqueue_analysis_request, lock_dataset
 from ads_engine.decisions import (
     DiscrepancyKind,
     PlatformStateUnknown,
@@ -181,6 +190,17 @@ _ID_CHUNK: Final[int] = 5_000
 
 _QUALITY_SCORE_RANGE: Final[range] = range(1, 11)
 
+# What the ``entity_snapshot`` columns store exactly (``db/base.py`` type map, migration
+# 0001): ``budget_daily`` and ``budget_total`` are money, ``numeric(18, 6)`` (twelve integer
+# and six fractional digits); ``entity_id``, ``budget_id``, ``dataset_id`` and
+# ``budget_amount_micros`` are ``bigint``. PostgreSQL silently rounds a seventh fractional
+# digit and refuses an out-of-range value only at write time, so rows are held to these
+# bounds on construction and an observation is never rounded.
+_BIGINT_MAX: Final[int] = 2**63 - 1
+_MONEY_PLACES: Final[int] = 6
+_MONEY_LIMIT: Final[Decimal] = Decimal(10**12)
+_MICROS_LIMIT: Final[int] = 10**18
+
 
 def _check_tables() -> None:
     """Fail the import when the per-entity-type maps and ``ENTITY_TYPES`` disagree.
@@ -215,40 +235,92 @@ def _is_int(value: object) -> bool:
 
 
 def _check_id(value: object, name: str) -> None:
-    """Refuse an internal row id that is not a positive integer.
+    """Refuse an internal row id that is not a positive integer ``bigint`` can hold.
 
     Raises:
-        ValueError: If ``value`` is not a positive ``int``.
+        ValueError: If ``value`` is not a positive ``int``, or is beyond ``bigint``
+            (greater than ``2**63 - 1``).
     """
     if not _is_int(value) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer id, not {value!r}")
+    if value > _BIGINT_MAX:
+        raise ValueError(f"{name} {value!r} is beyond bigint; ids are at most 2**63 - 1")
+
+
+def _within_money_scale(amount: Decimal) -> bool:
+    """Return whether ``amount`` has no non-zero digit past the sixth decimal place.
+
+    Reads the exact digits and exponent, so no context precision can round a fine digit
+    away: ``Decimal("1.2345670000")`` qualifies (its trailing zeros are exact), while
+    ``Decimal("12.3456780000000000000000000001")`` does not.
+
+    Args:
+        amount: A finite amount.
+
+    Returns:
+        Whether ``numeric(18, 6)``'s scale holds ``amount`` without rounding.
+    """
+    _, digits, exponent = amount.as_tuple()
+    if not isinstance(exponent, int):
+        return False
+    if exponent >= -_MONEY_PLACES:
+        return True
+    finer = -_MONEY_PLACES - exponent  # the trailing digits that lie past the sixth place
+    return all(digit == 0 for digit in digits[-finer:])
 
 
 def _check_amount(value: object, name: str) -> None:
-    """Refuse a money value that is not an exact, finite, non-negative ``Decimal``.
+    """Refuse a money value ``numeric(18, 6)`` cannot store exactly.
 
     Money travels as ``Decimal`` (decision 6); a ``float`` would be rounded on its way into
-    ``numeric``, so it is refused rather than coerced.
+    ``numeric``, so it is refused rather than coerced. The value must also be one the
+    column stores as observed, because C0 compares at native precision with no tolerance:
+    no non-zero digit finer than six decimal places, which PostgreSQL would silently round
+    (trailing zeros past six places are exact and accepted), and below ``10**12``, which
+    PostgreSQL refuses as a numeric overflow. The value is never quantized or rounded here.
 
     Raises:
-        ValueError: If ``value`` is neither ``None`` nor such a ``Decimal``.
+        ValueError: If ``value`` is neither ``None`` nor a finite, non-negative ``Decimal``,
+            has a non-zero digit finer than six decimal places, or is at least ``10**12``.
     """
     if value is None:
         return
     if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
         raise ValueError(f"{name} must be a finite, non-negative Decimal or None, not {value!r}")
+    if not _within_money_scale(value):
+        raise ValueError(
+            f"{name} {value!r} has a digit finer than six decimal places, which numeric(18, 6) "
+            "would round; an observation is never rounded"
+        )
+    if value >= _MONEY_LIMIT:
+        raise ValueError(
+            f"{name} {value!r} is at least 10**12, beyond numeric(18, 6)'s twelve integer digits"
+        )
 
 
 def _check_micros(value: object, name: str) -> None:
-    """Refuse a Google amount in micros that is not a non-negative ``int``.
+    """Refuse a Google amount in micros that is not a non-negative ``int`` below ``10**18``.
+
+    ``10**18`` micros is ``10**12`` in the currency unit, the first amount
+    ``numeric(18, 6)`` cannot hold. Below it, the exact conversion
+    (:func:`~ads_engine.decisions.from_micros`) always yields a ``budget_daily`` or
+    ``budget_total`` :func:`_check_amount` accepts, so the micros and the ``Decimal`` amount
+    of one row describe the same storable value. The bound is also inside ``bigint``
+    (``2**63 - 1`` is about ``9.2 * 10**18``), the type of ``budget_amount_micros``.
 
     Raises:
-        ValueError: If ``value`` is neither ``None`` nor a non-negative ``int``.
+        ValueError: If ``value`` is neither ``None`` nor a non-negative ``int``, or is at
+            least ``10**18``.
     """
     if value is None:
         return
     if not _is_int(value) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer number of micros, not {value!r}")
+    if value >= _MICROS_LIMIT:
+        raise ValueError(
+            f"{name} must be below 10**18 micros, not {value!r}: its amount would be at least "
+            "10**12, beyond numeric(18, 6)"
+        )
 
 
 def _check_text(value: object, name: str, *, nullable: bool) -> None:
@@ -366,9 +438,12 @@ class SnapshotRow:
     * a campaign's ``status`` is a normalised status (``active``, ``paused``, ``ended``);
       every other type keeps the raw platform status;
     * money is a finite, non-negative ``Decimal`` and micros a non-negative ``int``
-      (decision 6); ``budget_amount_micros`` exists only on Google campaign and budget rows,
-      ``budget_id`` only on Google campaign rows and ``quality_score`` (1 to 10) only on
-      keyword rows;
+      (decision 6), each one its column stores exactly and never rounded: money below
+      ``10**12`` with no non-zero digit past the sixth decimal place (``numeric(18, 6)``),
+      micros below ``10**18`` (the micros of that range, inside ``bigint``), and ids
+      positive and at most ``2**63 - 1`` (``bigint``); ``budget_amount_micros`` exists only
+      on Google campaign and budget rows, ``budget_id`` only on Google campaign rows and
+      ``quality_score`` (1 to 10) only on keyword rows;
     * ``payload`` is JSON-compatible (Decimals and instants as text, never ``float``) and is
       frozen on construction; a ``conversion_action`` payload holds every key of
       :data:`CONVERSION_ACTION_PAYLOAD_KEYS`.
@@ -469,8 +544,8 @@ class SnapshotRow:
             Column name to value, with the payload as a plain JSON object.
 
         Raises:
-            ValueError: If ``dataset_id`` is not a positive integer or ``captured_at`` is
-                naive.
+            ValueError: If ``dataset_id`` is not a positive integer within ``bigint`` or
+                ``captured_at`` is naive.
         """
         _check_id(dataset_id, "dataset_id")
         return {
@@ -914,8 +989,9 @@ async def write_snapshots(
         :func:`detect_discrepancies` takes as ``snapshot_ids``; ``{}`` for no rows.
 
     Raises:
-        ValueError: If ``captured_at`` is naive, an entity appears twice, a row names an
-            entity outside the dataset, or a row's source is not the dataset's.
+        ValueError: If ``captured_at`` is naive, ``dataset_id`` is not a positive integer
+            within ``bigint``, an entity appears twice, a row names an entity outside the
+            dataset, or a row's source is not the dataset's.
         DatasetNotWritable: If the dataset does not exist or is retired.
     """
     instant = _check_instant(captured_at, "captured_at")
@@ -961,6 +1037,40 @@ async def _subject_source(session: AsyncSession, dataset_id: int) -> str:
             "sync and no decision subjects"
         )
     return dataset.source
+
+
+async def _lock_subjects(session: AsyncSession, dataset_id: int) -> None:
+    """Lock the dataset and every decision subject of it, in the order every writer uses.
+
+    The dataset ``FOR SHARE`` (:func:`~ads_engine.db.repositories.lock_dataset`), then
+    every campaign and then every explicitly shared budget of the dataset ``FOR NO KEY
+    UPDATE`` (the mode of the :mod:`ads_engine.decisions` subject locks), each in
+    ascending ``id`` order, held until the caller's transaction ends.
+    :func:`ensure_baseline` and :func:`detect_discrepancies` call this before any other
+    read, so an entity sync takes its complete subject lock set in its first pass and its
+    second pass re-locks rows it already holds, which never waits. Two concurrent syncs of
+    the dataset then queue at their first subject lock instead of each locking the subset
+    one pass judges and meeting in a cycle across the passes (module **Locks.**).
+
+    Three statements, whatever the number of subjects.
+
+    Raises:
+        ValueError: If the dataset no longer exists.
+    """
+    if await lock_dataset(session, dataset_id) is None:
+        raise ValueError(f"source dataset {dataset_id} does not exist")
+    await session.execute(
+        select(Campaign.id)
+        .where(Campaign.dataset_id == dataset_id)
+        .order_by(Campaign.id)
+        .with_for_update(key_share=True)
+    )
+    await session.execute(
+        select(Budget.id)
+        .where(Budget.dataset_id == dataset_id, Budget.explicitly_shared.is_(True))
+        .order_by(Budget.id)
+        .with_for_update(key_share=True)
+    )
 
 
 async def baseline_sealed(session: AsyncSession, dataset_id: int) -> bool:
@@ -1062,11 +1172,12 @@ async def _deferred_baselines(
     snapshot; a budget snapshot that marks it explicitly shared) and it has never had an
     ``untracked`` discrepancy. No stored marker is needed: while the baseline is open a
     decision-less subject is baselined unless its platform state cannot be materialised
-    (:class:`~ads_engine.decisions.PlatformStateUnknown`, for example a shared budget
-    whose amount Google omitted), and detection raises nothing for it; once sealed, every
-    decision-less subject a sync observes gets its ``untracked`` discrepancy in that same
-    sync, and that row closes only with a decision (``adopt_platform``, ``record_intended``
-    or a match against one). Every other subject here is first seen after the baseline.
+    (:class:`~ads_engine.decisions.PlatformStateUnknown`, for example a shared budget, or
+    an own-budget campaign's budget, whose amount Google omitted), and detection raises
+    nothing for it; once sealed, every decision-less subject a sync observes gets its
+    ``untracked`` discrepancy in that same sync, and that row closes only with a decision
+    (``adopt_platform``, ``record_intended`` or a match against one). Every other subject
+    here is first seen after the baseline.
 
     One statement per subject type and :data:`_ID_CHUNK` subjects.
 
@@ -1134,19 +1245,32 @@ async def ensure_baseline(
     and HubSpot has none.
 
     Idempotent: a subject that already has a decision keeps it, so calling this again
-    writes nothing. A subject whose observed state cannot be materialised (a shared budget
-    whose amount Google omitted, :class:`~ads_engine.decisions.PlatformStateUnknown`) is
-    skipped and logged as ``sync.baseline_deferred``; a later sync retries it. That retry
-    continues after the baseline seals: such a subject was observed with the baseline
-    population, not first seen after it (AAP 0.5.4.4 ``untracked``), so once sealed this
+    writes nothing. A subject whose observed state cannot be materialised (a shared budget,
+    or an own-budget campaign's budget, whose amount Google omitted,
+    :class:`~ads_engine.decisions.PlatformStateUnknown`) is skipped and logged as
+    ``sync.baseline_deferred``; a later sync retries it. That retry continues after the
+    baseline seals: such a subject was observed with the baseline population, not first
+    seen after it (AAP 0.5.4.4 ``untracked``), so once sealed this
     still baselines every decision-less subject first observed before this sync and never
     raised as ``untracked`` (identified from snapshot and discrepancy history, see
     :func:`_deferred_baselines`), as soon as its state can be materialised. A subject
     first seen after the seal gets no baseline; detection raises it as ``untracked``.
 
-    The states of every subject come from one
-    :func:`~ads_engine.decisions.load_subject_states` call and the new rows are inserted
-    with one flush, so the statements sent do not grow with the number of subjects.
+    **Locks.** Before anything else is read, the dataset and every one of its decision
+    subjects are locked (:func:`_lock_subjects`), also when nothing is baselined (the
+    baseline sealed, or no subject without a decision): the dataset ``FOR SHARE``, then
+    every campaign and every explicitly shared budget ``FOR NO KEY UPDATE`` in ``id``
+    order, held until the sync commits. Locking only the subjects baselined here would let
+    a concurrent sync of the dataset lock the others in its detection pass and then wait
+    for one baselined here, while this sync's :func:`detect_discrepancies` waits for one of
+    the others: a deadlock across the two passes. A concurrent sync instead waits at its
+    first subject lock, holding none, and reads the baselines written here once this sync
+    commits.
+
+    The subjects are locked in three statements, the states of every subject come from
+    one :func:`~ads_engine.decisions.load_subject_states` call and the new rows are
+    inserted with one flush, so the statements sent do not grow with the number of
+    subjects.
 
     Args:
         session: The entity sync's session; nothing is committed here.
@@ -1164,6 +1288,7 @@ async def ensure_baseline(
     """
     instant = _check_instant(captured_at, "captured_at")
     await _subject_source(session, dataset_id)
+    await _lock_subjects(session, dataset_id)
     candidates = await _unbaselined(session, dataset_id, instant)
     if sealed:
         waiting = await _deferred_baselines(
@@ -1173,8 +1298,9 @@ async def ensure_baseline(
         if not candidates:
             _log.debug("sync.baseline_sealed", dataset_id=dataset_id)
             return 0
-    # Locked like every decision writer, so a decision a concurrent writer committed is
-    # seen and kept, and the dataset cannot retire before this sync commits.
+    # The candidates are already locked (_lock_subjects), so a decision a concurrent writer
+    # committed first was seen above and is kept; the locked load re-locks them for the
+    # writers told ``locked``.
     loaded = await load_subject_states(session, [ref for ref, _ in candidates], lock=True)
     written: Counter[str] = Counter()
     deferred: list[dict[str, object]] = []
@@ -1215,10 +1341,10 @@ async def ensure_baseline(
 
 
 def _id_set(value: object, name: str) -> frozenset[int]:
-    """Return ``value`` as a ``frozenset`` of positive ids.
+    """Return ``value`` as a ``frozenset`` of positive ``bigint`` ids.
 
     Raises:
-        ValueError: If it is not an iterable of positive integers.
+        ValueError: If it is not an iterable of positive integers of at most ``2**63 - 1``.
     """
     if isinstance(value, str | bytes) or not isinstance(value, Iterable):
         raise ValueError(f"{name} must be a collection of ids, not {value!r}")
@@ -1256,9 +1382,9 @@ class EnumerationResult:
         reason: Why the enumeration is incomplete; ``None`` when complete.
 
     Raises:
-        ValueError: If the source has no subjects, an id is not a positive integer, a
-            missing set is non-empty while incomplete, LinkedIn names budgets or removed
-            campaigns, or one id is both present (or removed) and missing.
+        ValueError: If the source has no subjects, an id is not a positive integer within
+            ``bigint``, a missing set is non-empty while incomplete, LinkedIn names budgets or
+            removed campaigns, or one id is both present (or removed) and missing.
     """
 
     source: str
@@ -1720,12 +1846,23 @@ async def detect_discrepancies(
       back in between). An incomplete enumeration infers no removal or disappearance: the
       previous snapshot stands (AAP 0.3.3 safe absence).
 
+    **Locks.** Before anything else is read, the dataset and every one of its decision
+    subjects are locked (:func:`_lock_subjects`), whichever subjects this pass judges: the
+    dataset ``FOR SHARE``, then every campaign and every explicitly shared budget ``FOR NO
+    KEY UPDATE`` in ``id`` order, then (after the subjects' states are loaded) the
+    discrepancy rows. :func:`ensure_baseline` took the same set first in this sync's
+    transaction, so this pass re-locks rows the sync already holds, while a concurrent sync
+    of the dataset waits at its first subject lock holding none: locking only the subjects
+    judged here would let the two syncs deadlock across their baseline and detection
+    passes.
+
     **Set-based.** The pass reads a number of statements that does not grow with the
-    number of subjects: :func:`~ads_engine.decisions.load_subject_states` locks the
-    dataset and every subject (``lock``) and loads each subject's state with its newest
-    snapshot and current decision, one statement then row-locks every non-resolved
-    discrepancy of the dataset (in ``id`` order), and the subjects are judged in
-    memory. Writes are proportional to the rows created or changed. One
+    number of subjects: three statements lock the dataset and its subjects,
+    :func:`~ads_engine.decisions.load_subject_states` re-locks the subjects judged
+    (``lock``) and loads each subject's state with its newest snapshot and current
+    decision, one statement then row-locks every non-resolved discrepancy of the dataset
+    (in ``id`` order), and the subjects are judged in memory. Writes are proportional to
+    the rows created or changed. One
     ``analysis_request`` ``discrepancy_created`` is queued when the pass created any
     discrepancy and one ``discrepancy_resolved`` when it closed any (AAP 0.3.2), instead
     of one per row.
@@ -1761,6 +1898,7 @@ async def detect_discrepancies(
             f"the enumeration describes {enumeration.source}, but dataset {dataset_id} "
             f"belongs to {source}"
         )
+    await _lock_subjects(session, dataset_id)
     present = [
         SubjectRef(type="campaign", id=campaign_id)
         for campaign_id in sorted(
@@ -1794,8 +1932,9 @@ async def detect_discrepancies(
         )
 
     subjects = [*present, *missing]
-    # Lock order of every decision writer: the dataset, then the subject rows (both taken
-    # by the locked load), then the discrepancy rows.
+    # Lock order of every decision writer: the dataset, then the subject rows (both held
+    # since _lock_subjects; the locked load re-locks them for the writers told
+    # ``locked``), then the discrepancy rows.
     states = _dataset_states(
         await load_subject_states(session, subjects, lock=True), subjects, dataset_id
     )
