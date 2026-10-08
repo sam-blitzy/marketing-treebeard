@@ -23,8 +23,12 @@ Covers every call :class:`HubSpotClient` makes and the cross-module contracts it
 * the bound contact property map: one-argument contact reads after ``verify_bindings``,
   ``bind_contact_properties`` or the constructor argument, an explicit ``props`` overriding
   it, and an unbound read refused before any call;
-* the recovery probe; the 4 req/s throttle on every attempt; a 429 ``Retry-After`` retried
-  after the platform's wait; no token or email in any captured log event.
+* the recovery probe; the 4 req/s throttle on every attempt, with actual starts at least
+  0.25 s apart and at most four in any one-second window under late and early wakes and after
+  an event-loop stall, any five starts at least 1.05 s apart under the default window guard
+  so a request reaching the transport 49 ms after its grant still leaves four, and invalid
+  guards refused; a 429 ``Retry-After`` retried after the platform's wait; no token or email
+  in any captured log event.
 
 Every success body is rendered from ``backend/tests/contracts/hubspot/*.json``: it is the
 contract's ``documented_sample`` verbatim where a test serves one, or uses only fields the
@@ -39,10 +43,13 @@ Every call goes through ``build_client("hubspot", httpx.MockTransport(...))`` an
 clock. No test touches the network, the database or a real token.
 """
 
+import asyncio
 import copy
 import functools
+import itertools
 import json
 import re
+from bisect import bisect_left
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -77,6 +84,7 @@ from ads_engine.connectors.hubspot.client import (
     SEARCH_RESULT_CEILING,
     SHARED_LIMITER,
     STAGE_DATE_PROPERTY_PREFIX,
+    WINDOW_GUARD_SECONDS,
     ContactBatch,
     EmailLookup,
     HubSpotClient,
@@ -807,6 +815,16 @@ def test_rate_limiter_rejects_invalid_rates() -> None:
     assert RateLimiter(2).rate_per_second == 2.0
 
 
+def test_rate_limiter_rejects_invalid_window_guards() -> None:
+    for guard in (-0.01, float("-inf"), float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite number of at least 0"):
+            RateLimiter(4.0, window_guard=guard)
+    for wrong in (True, "0.05"):
+        with pytest.raises(ValueError, match="window_guard must be a number"):
+            RateLimiter(4.0, window_guard=wrong)  # type: ignore[arg-type]
+    assert RateLimiter(4.0, window_guard=0).rate_per_second == 4.0
+
+
 @pytest.mark.anyio
 async def test_rate_limiter_spaces_requests_and_skips_waits_after_idle() -> None:
     now = [10.0]
@@ -843,6 +861,185 @@ async def test_every_attempt_awaits_the_4_per_second_throttle() -> None:
     # Four attempts, the retry included, each reserve the next 0.25 s slot.
     assert server.throttle_waits == [0.25, 0.25, 0.25]
     assert client.calls == 3
+
+
+class _VirtualTime:
+    """A fake monotonic clock whose sleeps end in deadline order, as asyncio's timers do.
+
+    A sleeper yields to the event loop until its deadline is the earliest pending one (ties
+    in the order they slept), then moves the clock to that deadline plus the next
+    ``lateness`` value, never back: a positive value wakes it late, a negative one early.
+    Every task that can run therefore reaches its next ``await`` before the clock moves.
+    ``sleeps`` records every requested sleep.
+    """
+
+    def __init__(self, lateness: Sequence[float] = (0.0,)) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self._lateness = itertools.cycle(lateness)
+        self._order = itertools.count()
+        self._pending: list[tuple[float, int]] = []
+
+    def clock(self) -> float:
+        """Return the fake monotonic time."""
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        """Wait, with no real time passing, until this deadline is the earliest pending one."""
+        self.sleeps.append(seconds)
+        sleeper = (self.now + seconds, next(self._order))
+        self._pending.append(sleeper)
+        try:
+            while True:
+                await asyncio.sleep(0)
+                if min(self._pending) == sleeper:
+                    break
+        finally:
+            self._pending.remove(sleeper)
+        self.now = max(self.now, sleeper[0] + next(self._lateness))
+
+
+def _max_starts_per_second(starts: Sequence[float]) -> int:
+    """Return the most starts any half-open one-second window ``[t, t + 1)`` holds.
+
+    A window can slide right until it opens on its first start without losing a start, so
+    the windows opening on each start include a fullest one.
+    """
+    ordered = sorted(starts)
+    return max(
+        (bisect_left(ordered, first + 1.0) - index for index, first in enumerate(ordered)),
+        default=0,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tasks", [1, 4])
+async def test_rate_limiter_spaces_actual_starts_when_wakes_come_late_or_early(tasks: int) -> None:
+    # Wakes cycle 1/32 s late, 1/64 s early and on time. With no window guard the spacing
+    # rule acts alone, and binary fractions keep every reading exact.
+    fake = _VirtualTime(lateness=(0.03125, -0.015625, 0.0))
+    limiter = RateLimiter(4.0, clock=fake.clock, sleep=fake.sleep, window_guard=0.0)
+    tickets = itertools.count()
+    called: list[int] = []
+    started: list[int] = []
+    starts: list[float] = []
+
+    async def caller() -> None:
+        for _ in range(20 // tasks):
+            ticket = next(tickets)
+            called.append(ticket)
+            await limiter.acquire()
+            started.append(ticket)
+            starts.append(fake.now)
+
+    await asyncio.gather(*(caller() for _ in range(tasks)))
+    assert len(starts) == 20
+    assert started == called
+    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.25
+    assert _max_starts_per_second(starts) == 4
+
+
+@pytest.mark.anyio
+async def test_rate_limiter_releases_waiters_overdue_after_a_stall_one_interval_apart() -> None:
+    # With no window guard the spacing rule acts alone, so every gap is exactly 0.25 s.
+    fake = _VirtualTime()
+    limiter = RateLimiter(4.0, clock=fake.clock, sleep=fake.sleep, window_guard=0.0)
+    started: list[int] = []
+    starts: list[float] = []
+
+    async def request(number: int) -> None:
+        await limiter.acquire()
+        started.append(number)
+        starts.append(fake.now)
+        if number == 3:
+            # Handling this response blocks the event loop for 1.1875 s, past the slots of
+            # requests 4 to 7.
+            fake.now += 1.1875
+
+    await asyncio.gather(*(request(number) for number in range(20)))
+    assert started == list(range(20))
+    assert starts[:5] == [0.0, 0.25, 0.5, 0.75, 1.9375]
+    assert [later - earlier for earlier, later in itertools.pairwise(starts[4:])] == [0.25] * 15
+    assert _max_starts_per_second(starts) == 4
+    # After an idle spell the shifted reservations cost no wait.
+    fake.now += 5.0
+    sleeps = len(fake.sleeps)
+    await limiter.acquire()
+    assert len(fake.sleeps) == sleeps
+
+
+async def _sequential_starts(count: int, window_guard: float | None = None) -> list[float]:
+    """Return the fake-clock readings at which ``count`` sequential 4 req/s acquires start.
+
+    A ``window_guard`` of ``None`` builds the limiter without the argument.
+    """
+    fake = _VirtualTime()
+    limiter = (
+        RateLimiter(4.0, clock=fake.clock, sleep=fake.sleep)
+        if window_guard is None
+        else RateLimiter(4.0, clock=fake.clock, sleep=fake.sleep, window_guard=window_guard)
+    )
+    starts: list[float] = []
+    for _ in range(count):
+        await limiter.acquire()
+        starts.append(fake.now)
+    return starts
+
+
+def _each_delayed(starts: Sequence[float], delay: float) -> Iterator[list[float]]:
+    """Yield ``starts`` once per start, with that one start moved ``delay`` seconds later."""
+    for index, start in enumerate(starts):
+        yield [*starts[:index], start + delay, *starts[index + 1 :]]
+
+
+@pytest.mark.anyio
+async def test_rate_limiter_window_guard_keeps_any_five_starts_1_05_s_apart() -> None:
+    assert WINDOW_GUARD_SECONDS == 0.05
+    starts = await _sequential_starts(20)
+    # The default limiter applies WINDOW_GUARD_SECONDS.
+    assert starts == await _sequential_starts(20, WINDOW_GUARD_SECONDS)
+    assert starts[:5] == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.05])
+    gaps = [later - earlier for earlier, later in itertools.pairwise(starts)]
+    assert gaps == pytest.approx([0.25, 0.25, 0.25, 0.30] * 4 + [0.25] * 3)
+    spans = [later - earlier for earlier, later in zip(starts, starts[4:], strict=False)]
+    assert spans == pytest.approx([1.05] * 16)
+    # A request reaching the transport up to 49 ms after its grant still leaves at most
+    # four requests in every [t, t + 1) window.
+    for delayed in _each_delayed(starts, 0.049):
+        assert _max_starts_per_second(delayed) <= 4
+    # Without the guard, five starts span exactly one second, and the same delay on the
+    # first of them puts all five inside one window.
+    bare = await _sequential_starts(20, 0)
+    assert bare[:5] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert max(map(_max_starts_per_second, _each_delayed(bare, 0.049))) == 5
+
+
+@pytest.mark.anyio
+async def test_rate_limiter_window_guard_holds_under_late_wakes_and_a_stall() -> None:
+    # Wakes cycle 1/32 s late, 1/64 s early and on time, under the default guard.
+    fake = _VirtualTime(lateness=(0.03125, -0.015625, 0.0))
+    limiter = RateLimiter(4.0, clock=fake.clock, sleep=fake.sleep)
+    started: list[int] = []
+    starts: list[float] = []
+
+    async def request(number: int) -> None:
+        await limiter.acquire()
+        started.append(number)
+        starts.append(fake.now)
+        if number == 3:
+            # Handling this response blocks the event loop for 1.1875 s, past the slots of
+            # requests 4 to 7.
+            fake.now += 1.1875
+
+    await asyncio.gather(*(request(number) for number in range(20)))
+    assert started == list(range(20))
+    slack = 1e-9
+    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) > 0.25 - slack
+    spans = [later - earlier for earlier, later in zip(starts, starts[4:], strict=False)]
+    assert min(spans) > 1.05 - slack
+    assert _max_starts_per_second(starts) <= 4
+    for delayed in _each_delayed(starts, 0.049):
+        assert _max_starts_per_second(delayed) <= 4
 
 
 @pytest.mark.anyio

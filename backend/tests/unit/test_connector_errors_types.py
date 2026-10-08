@@ -40,6 +40,8 @@ from ads_engine.settings import ConfigurationError, Settings, get_settings
 WEBHOOK_URL = "https://n8n.example.test/webhook/test-google-ads"
 WEBHOOK_PATH = "/webhook/test-google-ads"
 N8N_SECRET = "test-n8n-secret"
+# A 7-character n8n secret, as a webhook echoed it back in a 403 body.
+SHORT_N8N_SECRET = "Zq7#k2p"
 LINKEDIN_TOKEN = "test-linkedin-access-token"
 HUBSPOT_TOKEN = "test-hubspot-token"
 DEFAULT_DATABASE_URL = "postgresql+psycopg://ads:ads@db:5432/ads_engine"
@@ -842,12 +844,58 @@ def test_sanitize_message_leaves_no_deeply_encoded_email_or_secret(
     assert N8N_SECRET not in decoded
 
 
-def test_sanitize_message_ignores_secrets_shorter_than_8_characters(
+def test_sanitize_message_redacts_secrets_shorter_than_8_characters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A secret under 8 characters is not matched inside text."""
+    """A configured secret is matched inside text whatever its length."""
     _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": "short7x"})
-    assert sanitize_message("value short7x sent") == "value short7x sent"
+    assert sanitize_message("value short7x sent") == "value [REDACTED] sent"
+
+
+def test_access_denied_never_carries_a_short_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 7-character n8n secret echoed in a 403 body leaves neither message nor reason."""
+    _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": SHORT_N8N_SECRET})
+    error = AccessDenied(
+        f"wrong secret {SHORT_N8N_SECRET}",
+        source="google",
+        endpoint="search Q-G1",
+        http_status=403,
+    )
+    assert error.message == "wrong secret [REDACTED]"
+    assert error.reason == "google search Q-G1: HTTP 403: wrong secret [REDACTED]"
+    for text in (error.message, error.reason, str(error), repr(error), str(error.log_fields)):
+        assert SHORT_N8N_SECRET not in text
+
+
+@pytest.mark.parametrize("secret", ["3D", "3A"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("access_token%3Dtest-refreshed-token", id="encoded-assignment"),
+        pytest.param("Authorization%3A%20test-refreshed-token", id="encoded-authorization"),
+        pytest.param(
+            "Authorization%3A%20Bearer%20test-refreshed-token", id="encoded-authorization-bearer"
+        ),
+    ],
+)
+def test_sanitize_message_never_lets_a_short_secret_break_an_encoded_credential(
+    monkeypatch: pytest.MonkeyPatch, secret: str, text: str
+) -> None:
+    """A short secret inside a ``%XX`` escape takes the whole encoded run with it.
+
+    Replacing ``3D`` alone would leave ``access_token%[REDACTED]test-refreshed-token``,
+    which no longer decodes to an assignment, so the token would stay in the reason.
+    """
+    _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": secret})
+    message = f"HTTP 403: {text} rejected"
+    sanitized = sanitize_message(message)
+    for fragment in ("test-refreshed-token", "%[REDACTED]"):
+        assert fragment not in sanitized
+    assert "test-refreshed-token" not in _fully_decoded(sanitized)
+    assert sanitized.startswith("HTTP 403: ")
+    assert sanitized.endswith(" rejected")
 
 
 def test_sanitize_message_still_redacts_emails_and_url_passwords_without_settings(

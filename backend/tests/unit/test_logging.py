@@ -15,6 +15,7 @@ import json
 import logging
 import numbers
 import os
+import re
 import sys
 import threading
 import time
@@ -24,7 +25,7 @@ from collections.abc import Iterator, Mapping
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, cast
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import pytest
 import structlog
@@ -41,10 +42,13 @@ from ads_engine.logging import (
     get_logger,
     redact,
     redact_processor,
+    redact_secret_matches,
 )
 from ads_engine.settings import Settings, get_settings
 
 N8N_SECRET = "test-n8n-secret-value"
+# A 7-character n8n secret, as a webhook echoed it back in a 403 body.
+SHORT_N8N_SECRET = "Zq7#k2p"
 SESSION_SECRET = "test-session-secret-value"
 BEARER = "Bearer test-bearer-token-value"
 HEADER_VALUE = "test-header-value"
@@ -401,9 +405,181 @@ def test_configured_secrets_are_replaced_inside_strings() -> None:
     }
 
 
-def test_secrets_shorter_than_eight_characters_are_ignored() -> None:
-    secrets = ("short7c", "eight8ch", "ads")
-    assert redact("short7c eight8ch ads_engine", secrets=secrets) == "short7c [REDACTED] ads_engine"
+def test_secrets_of_any_length_are_redacted() -> None:
+    secrets = (SHORT_N8N_SECRET, "eight8ch", "ads")
+    assert (
+        redact(f"{SHORT_N8N_SECRET} eight8ch ads_engine", secrets=secrets)
+        == "[REDACTED] [REDACTED] [REDACTED]_engine"
+    )
+    assert redact("wrong secret Zq7%23k2p", secrets=secrets) == "wrong secret [REDACTED]"
+
+
+def test_an_empty_secret_matches_nothing() -> None:
+    assert redact("nothing to hide", secrets=("",)) == "nothing to hide"
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets", "expected"),
+    [
+        pytest.param("[REDACTED] ACT", ("ACT",), "[REDACTED] [REDACTED]", id="inside-a-marker"),
+        pytest.param("[REDACTED] D] end", ("D]",), "[REDACTED] [REDACTED] end", id="marker-tail"),
+        pytest.param(
+            "[REDACTED_EMAIL] [UNRENDERABLE] EMAIL ]",
+            ("EMAIL", "[", "]"),
+            "[REDACTED_EMAIL] [UNRENDERABLE] [REDACTED] [REDACTED]",
+            id="every-marker",
+        ),
+        pytest.param(
+            "Authorization: Bearer test-a", ("ACT", "ED]"), "Authorization: [REDACTED]", id="key"
+        ),
+        pytest.param("to lead@example.com", ("EMAIL",), "to [REDACTED_EMAIL]", id="email"),
+        pytest.param("[REDACTED]x and ]x", ("]x",), "[REDACTED] and [REDACTED]", id="straddle"),
+    ],
+)
+def test_short_secrets_never_match_inside_a_redaction_marker(
+    text: str, secrets: tuple[str, ...], expected: str
+) -> None:
+    once = redact(text, secrets=secrets)
+    assert once == expected
+    assert redact(once, secrets=secrets) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        pytest.param("[REDACTED]x", "]x", id="last-character"),
+        pytest.param("seen [REDACTED]abc", "D]abc", id="longer-tail"),
+        pytest.param("lead [REDACTED]]x", "]]x", id="doubled-bracket"),
+        pytest.param("[REDACTED_EMAIL]abc", "L]abc", id="email-marker"),
+        pytest.param("[UNRENDERABLE]!", "ABLE]!", id="unrenderable-marker"),
+        pytest.param("[REDACTED]x", "[REDACTED]x", id="whole-marker"),
+    ],
+)
+def test_a_secret_running_past_a_marker_end_is_redacted_with_it(text: str, secret: str) -> None:
+    once = redact(text, secrets=[secret])
+    assert secret not in once
+    assert once.endswith(REDACTED)
+    assert redact(once, secrets=[secret]) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets", "expected"),
+    [
+        pytest.param("contact jane2024@example.com", ("2024",), "contact [REDACTED]", id="inside"),
+        pytest.param(
+            "to 2024ann@example.com, 2024", ("2024",), "to [REDACTED], [REDACTED]", id="start"
+        ),
+        pytest.param(
+            "email jane%402024x.io sent", ("2024",), "email [REDACTED] sent", id="encoded"
+        ),
+        pytest.param("e jane%25402024x.io", ("2024",), "e [REDACTED]", id="double-encoded"),
+        pytest.param(
+            "2024 and lead@example.com", ("2024",), "[REDACTED] and [REDACTED_EMAIL]", id="apart"
+        ),
+        pytest.param(
+            "x!abc@def.gh then abc@def.gh!x",
+            ("x!abc@def.gh", "abc@def.gh!x"),
+            "[REDACTED] then [REDACTED]",
+            id="secret-holding-an-address",
+        ),
+    ],
+)
+def test_a_secret_takes_every_email_address_it_overlaps_with_it(
+    text: str, secrets: tuple[str, ...], expected: str
+) -> None:
+    once = redact(text, secrets=secrets)
+    assert once == expected
+    for fragment in ("jane", "ann", "lead@", "example.com", "x.io", "def.gh"):
+        assert fragment not in once
+    assert redact(once, secrets=secrets) == once
+
+
+def test_redact_secret_matches_keeps_marker_matches_and_widens_over_addresses() -> None:
+    assert (
+        redact_secret_matches("jane2024@x.io and 2024", re.compile("2024"))
+        == "[REDACTED] and [REDACTED]"
+    )
+    pattern = re.compile(r"(?P<marker>\[REDACTED\])|ACT")
+    assert redact_secret_matches("[REDACTED] ACT", pattern) == "[REDACTED] [REDACTED]"
+    assert redact_secret_matches("nothing here", pattern) == "nothing here"
+
+
+def test_redact_secret_matches_widens_over_encoded_runs_with_a_valid_escape() -> None:
+    assert (
+        redact_secret_matches("GET access_token%3Dtok 100% 3D", re.compile("3D"))
+        == "GET [REDACTED] 100% [REDACTED]"
+    )
+    assert redact_secret_matches("x%ZZ y", re.compile("ZZ")) == "x%[REDACTED] y"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "expected", "credential"),
+    [
+        pytest.param(
+            "sent access_token%3Dtest-refreshed-token now",
+            "3D",
+            "sent [REDACTED] now",
+            "test-refreshed-token",
+            id="inside-an-escape",
+        ),
+        pytest.param(
+            "sent access_token%3Dtok now", "%", "sent [REDACTED] now", "tok", id="percent-sign"
+        ),
+        pytest.param("auth Bearer%20tok end", "%", "auth [REDACTED] end", "tok", id="bearer"),
+        pytest.param(
+            "url postgresql%3A%2F%2Fu%3Apw%40db end",
+            "%",
+            "url [REDACTED] end",
+            "pw",
+            id="url-password",
+        ),
+        pytest.param(
+            "auth Bearer%20test-bearer end", "20", "auth [REDACTED] end", "test-bearer", id="space"
+        ),
+        pytest.param(
+            "h Authorization%3A%20Bearer%20test-a end",
+            "3A",
+            "h [REDACTED] end",
+            "test-a",
+            id="authorization",
+        ),
+        pytest.param(
+            "sent access_token%3Dabc now", "token", "sent [REDACTED] now", "abc", id="encoded-key"
+        ),
+        pytest.param(
+            "x access_token%253Dtest-refreshed-token y",
+            "3D",
+            "x [REDACTED] y",
+            "test-refreshed-token",
+            id="double-encoded",
+        ),
+    ],
+)
+def test_a_secret_takes_every_encoded_run_it_overlaps_with_it(
+    text: str, secret: str, expected: str, credential: str
+) -> None:
+    once = redact(text, secrets=[secret])
+    assert once == expected
+    assert credential not in once
+    assert secret not in once
+    assert "%[REDACTED]" not in once
+    assert redact(once, secrets=[secret]) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "expected"),
+    [
+        pytest.param("100% done", "100", "[REDACTED]% done", id="dangling-percent"),
+        pytest.param("100% done", "%", "100[REDACTED] done", id="percent-sign"),
+        pytest.param("got %ZZ here", "ZZ", "got %[REDACTED] here", id="invalid-escape"),
+    ],
+)
+def test_a_run_without_a_valid_escape_keeps_its_other_text(
+    text: str, secret: str, expected: str
+) -> None:
+    once = redact(text, secrets=[secret])
+    assert once == expected
+    assert redact(once, secrets=[secret]) == once
 
 
 def test_longest_secret_is_redacted_first() -> None:
@@ -1136,6 +1312,52 @@ def test_default_database_url_keeps_its_readable_form() -> None:
     # The default password `ads` is too short to be a substring rule; the URL rule covers it.
     assert record["event"] == "ads_engine_started"
     assert record["url"] == DEFAULT_DB_URL_REDACTED
+
+
+def test_a_short_configured_secret_is_redacted_plain_and_percent_encoded() -> None:
+    stream = _configure(Settings(n8n_webhook_secret=SecretStr(SHORT_N8N_SECRET)))
+    log = get_logger("tests.logging.short_secret")
+    head = "google search Q-G1: HTTP 403: wrong secret"
+    log.warning("connector.error", reason=f"{head} {SHORT_N8N_SECRET}")
+    log.warning("connector.error", reason=f"{head} {quote(SHORT_N8N_SECRET, safe='')}")
+
+    output = stream.getvalue()
+    assert SHORT_N8N_SECRET not in output
+    assert "Zq7%23k2p" not in output
+    assert [record["reason"] for record in _lines(stream)] == [f"{head} [REDACTED]"] * 2
+
+
+def test_a_short_configured_secret_never_breaks_an_encoded_credential_apart() -> None:
+    # Replacing `3D` alone would log `access_token%[REDACTED]test-refreshed-token`, which no
+    # longer decodes to an assignment, so the token would be written in plaintext.
+    stream = _configure(Settings(n8n_webhook_secret=SecretStr("3D")))
+    log = get_logger("tests.logging.short_secret")
+    head = "google search Q-G1: HTTP 403:"
+    log.warning("connector.error", reason=f"{head} access_token%3Dtest-refreshed-token")
+
+    output = stream.getvalue()
+    for fragment in ("test-refreshed-token", "%[REDACTED]", "3D"):
+        assert fragment not in output
+    (record,) = _lines(stream)
+    assert record["reason"] == f"{head} [REDACTED]"
+
+
+def test_short_url_passwords_are_not_substring_rules_but_short_secrets_are() -> None:
+    webhook_url = "https://n8n.example.test/w"
+    settings = Settings(
+        n8n_webhook_secret=SecretStr(SHORT_N8N_SECRET), n8n_google_ads_webhook_url=webhook_url
+    )
+    secrets = ads_logging._settings_secrets(settings)
+    assert {SHORT_N8N_SECRET, webhook_url, "/w", DEFAULT_DB_URL} <= set(secrets)
+    assert "ads" not in secrets
+
+    stream = _configure(settings)
+    get_logger("ads_engine.sync").info("ads_engine_started", url=DEFAULT_DB_URL, note="ads up")
+    (record,) = _lines(stream)
+    assert record["logger"] == "ads_engine.sync"
+    assert record["event"] == "ads_engine_started"
+    assert record["url"] == DEFAULT_DB_URL_REDACTED
+    assert record["note"] == "ads up"
 
 
 def test_secret_that_is_not_a_parseable_url_is_still_redacted() -> None:

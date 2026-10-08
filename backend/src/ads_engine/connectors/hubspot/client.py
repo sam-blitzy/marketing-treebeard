@@ -34,7 +34,10 @@ Throttle:
     Every attempt, retries included, first awaits :meth:`RateLimiter.acquire` of the
     client's limiter. :data:`SHARED_LIMITER` is the default of every client in the process,
     so total HubSpot traffic stays at 4 requests per second, below CRM Search's 5 per
-    second per account and the private-app burst of 100 to 190 per 10 s.
+    second per account and the private-app burst of 100 to 190 per 10 s. Starts are at
+    least 0.25 s apart and any five span at least 1.05 s, so no one-second window holds
+    more than four requests, even when a request reaches the transport up to 50 ms
+    (:data:`WINDOW_GUARD_SECONDS`) after its start is granted.
 
 Errors:
     Every call goes through :func:`ads_engine.connectors.http.send_json`, which retries
@@ -82,6 +85,7 @@ import json
 import math
 import re
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -149,6 +153,7 @@ __all__ = [
     "SEARCH_RESULT_CEILING",
     "SHARED_LIMITER",
     "STAGE_DATE_PROPERTY_PREFIX",
+    "WINDOW_GUARD_SECONDS",
     "AssociationFetch",
     "AssociationStatus",
     "ContactBatch",
@@ -310,16 +315,58 @@ def _is_simulated_email(normalised: str) -> bool:
 # Throttle
 # ---------------------------------------------------------------------------
 
+WINDOW_GUARD_SECONDS: Final = 0.05
+"""Seconds :class:`RateLimiter` adds to the window its last starts must span.
+
+The limiter times each start by the clock reading at which it grants it, but the request
+reaches the transport later: a garbage-collection pause or OS preemption between the grant
+and the send can take tens of milliseconds. If five grants spanned exactly one second, such
+a delay on the first would put all five requests inside one second at the transport, where
+HubSpot's CRM Search limit is 5 per second. With this guard any five starts are at least
+1.05 s apart at 4 per second, so a request that reaches the transport up to 50 ms after its
+grant still leaves at most four in every one-second window.
+"""
+
 
 class RateLimiter:
-    """Spaces request starts at least ``1 / rate_per_second`` seconds apart.
+    """Spaces request starts one interval apart and guards every one-second window.
 
-    Each request starts at least ``1 / rate_per_second`` seconds after the previous reserved
-    slot (0.25 s at the default 4 per second), across every client that shares the limiter.
-    Each :meth:`acquire` reserves the next free slot and sleeps until it. The reservation
-    reads and advances the slot with no ``await`` in between, so concurrent callers on one
-    event loop each get their own slot, and no ``asyncio.Lock`` is held, so one instance is
-    safe to share across event loops (tests run each in its own).
+    Two rules hold across every client that shares the limiter, measured by the clock
+    reading at which :meth:`acquire` grants each start, with ``N`` the rate rounded down
+    (at least 1):
+
+    * consecutive starts are at least one interval (``1 / rate_per_second``) apart, 0.25 s
+      at the default 4 per second;
+    * once ``N`` starts are recorded, the next waits until the oldest of the last ``N`` is
+      at least the window, ``N / rate_per_second + window_guard`` seconds, old.
+
+    At the defaults (4 per second, :data:`WINDOW_GUARD_SECONDS`) any five starts are
+    therefore at least 1.05 s apart. A back-to-back stream runs three 0.25 s gaps and then
+    one 0.30 s gap, about 3.81 starts per second, and a request that reaches the transport
+    up to 50 ms after its grant, delayed by a garbage-collection pause or OS preemption,
+    still leaves at most four requests in every one-second window.
+
+    Each :meth:`acquire` reserves the next slot when it is called, reading and advancing the
+    reservation with no ``await`` in between. A waiter re-reads the clock after every wake
+    and sleeps again until its slot, one interval after the previous start and the window
+    over the last ``N`` starts have all passed, so a wake that comes early or late never
+    shortens a gap or a window. A start granted after its slot, because a wake was late,
+    the window held it or the event loop was blocked, shifts every outstanding reservation
+    by that lateness: waiters whose slots came due during a stall are released one interval
+    apart under the same window, never together. A call made once every reserved slot has
+    passed and the latest start is at least the window old (1.05 s at the defaults) starts
+    without sleeping. A waiter cancelled before its start leaves its slot unused, so the
+    waiters behind it keep their own slots and the stream has one longer gap.
+
+    Callers start in the order they reserved, except right after a stall: a call made when
+    every outstanding reservation is already overdue can start before the overdue waiters,
+    which then start in no guaranteed order among themselves. The order also relies on a
+    ``window_guard`` shorter than one interval, as at the defaults; a longer guard can hold
+    several waiters until the same instant and release them in any order. Spacing and the
+    window hold regardless.
+
+    No ``asyncio`` lock, event or future is held, so one instance is safe to share across
+    event loops (tests run each in its own).
 
     Example:
         Tests drive a fake clock instead of sleeping::
@@ -334,17 +381,33 @@ class RateLimiter:
             limiter = RateLimiter(4.0, clock=lambda: now[0], sleep=advance)
 
     Args:
-        rate_per_second: Request starts allowed per second; reserved slots are
+        rate_per_second: Request starts allowed per second; consecutive starts are at least
             ``1 / rate_per_second`` seconds apart, so 4.0 (0.25 s) keeps HubSpot traffic
             below CRM Search's 5 per second.
-        clock: Monotonic clock in seconds.
-        sleep: Awaitable sleep used to wait for a slot.
+        clock: Monotonic clock in seconds, read when a call reserves its slot and after
+            every wake.
+        sleep: Awaitable sleep used to wait for a slot; it may return early or late.
+        window_guard: Seconds added to the ``N / rate_per_second`` window the last ``N``
+            starts must span before the next (:data:`WINDOW_GUARD_SECONDS`): the longest
+            delay between a grant and its request reaching the transport that still leaves
+            at most ``N`` requests in every such window there. 0 keeps the bare window.
 
     Raises:
-        ValueError: When ``rate_per_second`` is not a finite number above 0.
+        ValueError: When ``rate_per_second`` is not a finite number above 0, or
+            ``window_guard`` is not a finite number of at least 0.
     """
 
-    __slots__ = ("_clock", "_interval", "_next_slot", "_rate", "_sleep")
+    __slots__ = (
+        "_clock",
+        "_interval",
+        "_last_start",
+        "_next_slot",
+        "_offset",
+        "_rate",
+        "_recent",
+        "_sleep",
+        "_window",
+    )
 
     def __init__(
         self,
@@ -352,17 +415,32 @@ class RateLimiter:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        window_guard: float = WINDOW_GUARD_SECONDS,
     ) -> None:
         rate: object = rate_per_second
         if isinstance(rate, bool) or not isinstance(rate, int | float):
             raise ValueError("rate_per_second must be a number")
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError("rate_per_second must be a finite number above 0")
+        guard: object = window_guard
+        if isinstance(guard, bool) or not isinstance(guard, int | float):
+            raise ValueError("window_guard must be a number")
+        if not math.isfinite(guard) or guard < 0:
+            raise ValueError("window_guard must be a finite number of at least 0")
         self._rate = float(rate)
         self._interval = 1.0 / self._rate
+        window_starts = max(1, math.floor(self._rate))
+        self._window = window_starts / self._rate + float(guard)
         self._clock = clock
         self._sleep = sleep
+        # Reservations are kept in virtual time: the clock minus ``_offset``, the lateness
+        # accumulated by starts granted after their slot. ``_last_start`` is the clock
+        # reading of the latest granted start, and ``_recent`` holds the readings of up to
+        # the last ``window_starts`` granted starts, oldest first.
         self._next_slot = -math.inf
+        self._offset = 0.0
+        self._last_start = -math.inf
+        self._recent: deque[float] = deque(maxlen=window_starts)
 
     @property
     def rate_per_second(self) -> float:
@@ -370,17 +448,33 @@ class RateLimiter:
         return self._rate
 
     async def acquire(self) -> None:
-        """Reserve the next request slot and wait until it starts.
+        """Reserve the next request slot and wait until this request may start.
 
-        The first call, and any call after an idle spell of at least one interval, returns
-        without sleeping.
+        The slot is reserved before the first ``await``. The call then sleeps until its slot,
+        shifted by the lateness of earlier late starts, one interval after the previous start
+        and, once ``N`` starts are recorded, ``N / rate_per_second + window_guard`` after the
+        oldest of the last ``N`` have all passed, re-reading the clock after every wake.
+        Granting the start and recording its clock reading happen with no ``await`` in
+        between, and the call returns at once. The first call, and a call made once every
+        reserved slot has passed and the latest start is at least that window old (1.05 s at
+        the defaults), return without sleeping. Callers start in reservation order except in
+        the cases the class docstring names.
         """
         now = self._clock()
-        slot = max(now, self._next_slot)
+        slot = max(now - self._offset, self._next_slot)
         self._next_slot = slot + self._interval
-        wait = slot - now
-        if wait > 0:
-            await self._sleep(wait)
+        recent = self._recent
+        while True:
+            due = max(slot + self._offset, self._last_start + self._interval)
+            if len(recent) == recent.maxlen:
+                due = max(due, recent[0] + self._window)
+            if now >= due:
+                self._offset = max(self._offset, now - slot)
+                self._last_start = now
+                recent.append(now)
+                return
+            await self._sleep(due - now)
+            now = self._clock()
 
 
 SHARED_LIMITER: Final = RateLimiter(4.0)

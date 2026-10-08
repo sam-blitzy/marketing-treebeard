@@ -26,6 +26,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from email.utils import format_datetime
 from types import MappingProxyType
 from typing import Any, cast
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -43,6 +44,7 @@ from ads_engine.connectors.errors import (
     TransientError,
     sanitize_message,
 )
+from ads_engine.connectors.google_n8n.client import UNMETERED, GoogleAdsWebhookClient
 from ads_engine.connectors.http import (
     _ERROR_TEXT_SCAN_MAX,
     CONNECT_TIMEOUT_SECONDS,
@@ -709,7 +711,7 @@ async def test_hubspot_logs_strip_configured_secrets_longest_first(
     captured: list[EventDict],
 ) -> None:
     # HUBSPOT_TOKEN is a prefix of the session secret, so only longest-first leaves nothing
-    # of the longer one; the 5-character n8n secret is below the 8-character floor and kept.
+    # of the longer one; the 5-character n8n secret is stripped too, whatever its length.
     settings = Settings(
         hubspot_access_token=SecretStr(HUBSPOT_TOKEN),
         session_secret=SecretStr(f"{HUBSPOT_TOKEN}-extended"),
@@ -718,8 +720,37 @@ async def test_hubspot_logs_strip_configured_secrets_longest_first(
     target = f"/crm/{HUBSPOT_TOKEN}-extended/{HUBSPOT_TOKEN}/short?properties={HUBSPOT_TOKEN}"
     await _send_one("hubspot", target, settings=settings)
     (logged_request,) = _events(captured, "http.request")
-    assert logged_request["url"] == f"/crm/{REDACTED}/{REDACTED}/short?properties={REDACTED}"
-    _assert_logs_exclude(captured, HUBSPOT_TOKEN, "extended")
+    assert logged_request["url"] == f"/crm/{REDACTED}/{REDACTED}/{REDACTED}?properties={REDACTED}"
+    _assert_logs_exclude(captured, HUBSPOT_TOKEN, "extended", "short")
+
+
+async def test_configured_secrets_are_stripped_in_one_pass(captured: list[EventDict]) -> None:
+    # `ACT` occurs inside `[REDACTED]`: replacing the longer token first and then `ACT` in
+    # what remains would break the marker into `[RED[REDACTED]ED]`.
+    settings = Settings(
+        hubspot_access_token=SecretStr(HUBSPOT_TOKEN), n8n_webhook_secret=SecretStr("ACT")
+    )
+    target = f"/crm/{HUBSPOT_TOKEN}/ACT?properties={HUBSPOT_TOKEN}ACT"
+    expected = f"/crm/{REDACTED}/{REDACTED}?properties={REDACTED}{REDACTED}"
+    await _send_one("hubspot", target, settings=settings)
+    (logged_request,) = _events(captured, "http.request")
+    assert logged_request["url"] == expected
+    url = httpx.URL(f"https://api.hubapi.com{target}")
+    for secrets in ((HUBSPOT_TOKEN, "ACT"), ("ACT", HUBSPOT_TOKEN), {"ACT", HUBSPOT_TOKEN}):
+        assert redact_url(url, source="hubspot", secrets=secrets) == expected
+
+
+async def test_a_short_secret_inside_an_address_takes_the_address_with_it(
+    captured: list[EventDict],
+) -> None:
+    # Replacing `2024` alone would leave `jane[REDACTED]@example.com`, which no longer
+    # reads as an address, so the rest of it would be logged.
+    settings = Settings(n8n_webhook_secret=SecretStr("2024"))
+    target = "/crm/jane2024@example.com/2024?email=jane2024%40example.com"
+    await _send_one("hubspot", target, settings=settings)
+    (logged_request,) = _events(captured, "http.request")
+    assert logged_request["url"] == f"/crm/{REDACTED}/{REDACTED}?email={REDACTED}"
+    _assert_logs_exclude(captured, "jane", "example.com")
 
 
 async def test_hooks_default_to_the_settings_loaded_from_the_environment(
@@ -1274,6 +1305,75 @@ async def test_google_permission_denied_in_http_200_is_access_denied(
     )
     assert logged_error["retry_after"] is None
     assert logged_error["query_id"] is None
+
+
+async def test_google_403_echoing_a_short_secret_keeps_it_out_of_the_reason_and_logs(
+    monkeypatch: pytest.MonkeyPatch, captured: list[EventDict]
+) -> None:
+    # A 7-character N8N_WEBHOOK_SECRET that the webhook echoes back in its 403 body.
+    short_secret = "Zq7#k2p"
+    environment = {
+        "N8N_GOOGLE_ADS_WEBHOOK_URL": WEBHOOK_URL,
+        "N8N_WEBHOOK_SECRET": short_secret,
+        "GOOGLE_ADS_CUSTOMER_ID": CUSTOMER_ID,
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    settings = get_settings()
+    harness = Harness(_json(403, {"message": f"wrong secret {short_secret}"}))
+    async with build_client("google", harness.transport(), settings=settings) as http:
+        client = GoogleAdsWebhookClient.from_settings(
+            settings, http, UNMETERED, retry=harness.policy()
+        )
+        with pytest.raises(AccessDenied) as excinfo:
+            await client.run_query("Q-G1")
+    (request,) = harness.sent
+    assert request.headers["X-Webhook-Secret"] == short_secret
+    assert harness.waits == []
+    denial = excinfo.value
+    assert denial.http_status == 403
+    assert denial.reason == "google search Q-G1: HTTP 403: wrong secret [REDACTED]"
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == denial.reason
+    _assert_logs_exclude(captured, short_secret, quote(short_secret, safe=""))
+
+
+async def test_google_403_with_a_short_secret_inside_an_escape_keeps_the_token_out(
+    monkeypatch: pytest.MonkeyPatch, captured: list[EventDict]
+) -> None:
+    # The secret `3D` matches inside the `%3D` of an echoed encoded assignment. Replacing it
+    # alone would leave `access_token%[REDACTED]test-refreshed-token`, which no longer
+    # decodes to an assignment, so the token would reach the reason and the log.
+    short_secret = "3D"
+    environment = {
+        "N8N_GOOGLE_ADS_WEBHOOK_URL": WEBHOOK_URL,
+        "N8N_WEBHOOK_SECRET": short_secret,
+        "GOOGLE_ADS_CUSTOMER_ID": CUSTOMER_ID,
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    settings = get_settings()
+    harness = Harness(_json(403, {"message": "access_token%3Dtest-refreshed-token"}))
+    async with build_client("google", harness.transport(), settings=settings) as http:
+        client = GoogleAdsWebhookClient.from_settings(
+            settings, http, UNMETERED, retry=harness.policy()
+        )
+        with pytest.raises(AccessDenied) as excinfo:
+            await client.run_query("Q-G1")
+    (request,) = harness.sent
+    assert request.headers["X-Webhook-Secret"] == short_secret
+    assert harness.waits == []
+    denial = excinfo.value
+    assert denial.http_status == 403
+    assert denial.reason == f"google search Q-G1: HTTP 403: {REDACTED}"
+    for text in (denial.message, denial.reason, str(denial), repr(denial)):
+        assert "test-refreshed-token" not in text
+        assert f"%{REDACTED}" not in text
+    (logged_error,) = _events(captured, "connector.error")
+    assert logged_error["reason"] == denial.reason
+    _assert_logs_exclude(captured, "test-refreshed-token", f"%{REDACTED}")
 
 
 async def test_google_query_error_in_http_200_is_a_defect() -> None:

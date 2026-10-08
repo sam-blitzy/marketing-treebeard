@@ -476,7 +476,7 @@ def sanitize_message(text: str) -> str:
     r"""Make platform or exception text safe to persist and log.
 
     Email addresses become ``[REDACTED_EMAIL]``; URL passwords, every configured secret
-    (of at least 8 characters), values assigned to sensitive keys (``access_token=...``,
+    (whatever its length), values assigned to sensitive keys (``access_token=...``,
     ``Authorization: ...``, ``{"refresh_token": "..."}``) and ``Bearer`` tokens become
     ``[REDACTED]``, exactly as :func:`ads_engine.logging.redact` does for log lines; the
     n8n webhook URL is removed too. Percent-encoded forms are covered as well, also when

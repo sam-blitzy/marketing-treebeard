@@ -47,6 +47,7 @@ Example:
 """
 
 import asyncio
+import functools
 import json
 import math
 import re
@@ -79,7 +80,13 @@ from ads_engine.connectors.errors import (
     sanitize_message,
 )
 from ads_engine.db.models.ops import SOURCES
-from ads_engine.logging import EMAIL_RE, REDACTED, REDACTED_EMAIL, get_logger
+from ads_engine.logging import (
+    EMAIL_RE,
+    REDACTED,
+    REDACTED_EMAIL,
+    get_logger,
+    redact_secret_matches,
+)
 from ads_engine.settings import Settings, Source, get_settings
 
 __all__ = [
@@ -157,10 +164,6 @@ _SEPARATOR_FREE_QUERY_SUFFIXES: Final[tuple[str, ...]] = tuple(
     suffix.replace("_", "") for suffix in _SENSITIVE_QUERY_SUFFIXES
 )
 _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-
-# Configured secrets shorter than this would mangle ordinary URL text (the local database
-# password `ads` appears in `ads_engine`); ads_engine.logging applies the same floor.
-_MIN_SECRET_LENGTH: Final = 8
 
 # Longest non-JSON error body, in characters, that is sanitised whole and then used for
 # classification and the error message. Redaction runs on the complete text before any
@@ -250,8 +253,9 @@ def _require_source(source: object) -> None:
 def _url_secrets(settings: Settings | None) -> tuple[str, ...]:
     """Collect the configured secret plaintexts to strip from logged URLs, longest first.
 
-    Connectors never put a credential in a URL; this guards against one that arrives
-    there anyway, for example a token pasted into a configured URL.
+    Every non-empty secret is collected, whatever its length. Connectors never put a
+    credential in a URL; this guards against one that arrives there anyway, for example a
+    token pasted into a configured URL.
     """
     if settings is None:
         try:
@@ -260,9 +264,7 @@ def _url_secrets(settings: Settings | None) -> tuple[str, ...]:
             # pydantic's ValidationError is a ValueError. The client still works; its hooks
             # keep the key and email rules, and the logging processors keep theirs.
             return ()
-    plaintexts = {
-        plaintext for plaintext in settings.secret_values() if len(plaintext) >= _MIN_SECRET_LENGTH
-    }
+    plaintexts = {plaintext for plaintext in settings.secret_values() if plaintext}
     return tuple(sorted(plaintexts, key=lambda plaintext: (-len(plaintext), plaintext)))
 
 
@@ -307,8 +309,9 @@ def redact_url(url: httpx.URL, *, source: Source, secrets: Collection[str] = ())
     Args:
         url: The request URL.
         source: The source the request goes to.
-        secrets: Plaintext secrets to strip from path segments and query values, longest
-            first; :func:`build_client` passes the configured secrets.
+        secrets: Plaintext secrets to strip from path segments and query values, whatever
+            their length, all in one pass and longest first, in any order given;
+            :func:`build_client` passes the configured secrets.
 
     Returns:
         The loggable form of the URL.
@@ -375,11 +378,36 @@ def _redact_query(query: str, secrets: Collection[str]) -> str:
     return "&".join(pairs)
 
 
+@functools.lru_cache(maxsize=32)
+def _secrets_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
+    """Compile one alternation of the non-empty ``secrets``, longest first.
+
+    Alternatives are tried in order, so a secret that contains another one is replaced
+    whole. Every alternative is an escaped literal, so matching stays linear.
+
+    Returns:
+        The pattern, or ``None`` when no secret is set.
+    """
+    plaintexts = sorted(
+        {secret for secret in secrets if secret}, key=lambda secret: (-len(secret), secret)
+    )
+    if not plaintexts:
+        return None
+    return re.compile("|".join(re.escape(secret) for secret in plaintexts))
+
+
 def _scrub_text(text: str, secrets: Collection[str]) -> str:
-    """Replace each secret, then each email address, inside ``text``."""
-    for secret in secrets:
-        if secret in text:
-            text = text.replace(secret, REDACTED)
+    """Replace every secret, then each email address, inside ``text``.
+
+    All secrets are replaced in one pass, so a short secret is never matched inside the
+    ``[REDACTED]`` that took a longer one's place, and each takes every email address and
+    every percent-encoded run holding a ``%XX`` escape that it overlaps with it
+    (:func:`ads_engine.logging.redact_secret_matches`), so no part of an address, and no
+    broken escape or encoded credential, that holds a secret is left behind.
+    """
+    pattern = _secrets_pattern(tuple(secrets))
+    if pattern is not None:
+        text = redact_secret_matches(text, pattern)
     if "@" in text:
         text = EMAIL_RE.sub(REDACTED_EMAIL, text)
     return text

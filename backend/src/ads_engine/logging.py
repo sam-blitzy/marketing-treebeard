@@ -17,8 +17,12 @@ through the same redaction before it is rendered:
   and of sensitive pair reprs, and standalone ``Bearer`` tokens, become ``[REDACTED]``,
   each value whole: a header's to the end of its line (``Cookie: a="b"; c=d``), a
   container member's up to the next member (``{'token': {'value': '...'}, 'n': 1}``);
-* the plaintext of every configured secret of at least 8 characters is replaced inside
-  any string, longest first;
+* the plaintext of every configured secret, whatever its length, is replaced inside any
+  string, longest first, together with any email address and any percent-encoded run
+  holding a ``%XX`` escape that it overlaps, so a short secret never breaks an address,
+  an escape or an encoded key apart (``3D`` in ``access_token%3Dtok``); a secret is
+  never matched inside a redaction marker, and one that overlaps a marker's end (``]x``
+  in ``[REDACTED]x``) is replaced together with it;
 * email addresses become ``[REDACTED_EMAIL]``;
 * the same rules apply to percent-encoded text (``lead%40example.com``, encoded up to
   four times or in mixed case), so foreign records and exception text are covered too;
@@ -83,6 +87,7 @@ __all__ = [
     "get_logger",
     "redact",
     "redact_processor",
+    "redact_secret_matches",
 ]
 
 REDACTED: Final = "[REDACTED]"
@@ -174,8 +179,10 @@ _SEPARATOR_FREE_KEY_SUFFIXES: Final[tuple[str, ...]] = tuple(
     suffix.replace("_", "") for suffix in _SENSITIVE_KEY_SUFFIXES
 )
 
-# Shorter secrets (the local default database password `ads`) would mangle ordinary text
-# such as `ads_engine`; they stay covered by the key and URL-credential rules.
+# A URL password taken out of a URL-shaped secret becomes a substring rule of its own only
+# from this length: a shorter one (the local default database password `ads`) would mangle
+# ordinary text such as `ads_engine`, and the URL-credential rule already removes it from
+# its URL. A configured secret itself is always a substring rule, whatever its length.
 _MIN_SECRET_LENGTH: Final = 8
 
 # Containers nested deeper than this are replaced wholesale rather than walked.
@@ -188,6 +195,9 @@ _UNRENDERABLE: Final = "[UNRENDERABLE]"
 # A value that an earlier pass already replaced; it is left as it is, so redacting
 # redacted text changes nothing.
 _REDACTION_MARKER_RE: Final = re.compile(r"\[(?:REDACTED|REDACTED_EMAIL|UNRENDERABLE)\]")
+# The texts `_REDACTION_MARKER_RE` matches. A configured secret can overlap one of them, so
+# the secret pattern is built around them (see `_compile_secret_pattern`).
+_REDACTION_MARKERS: Final[tuple[str, ...]] = (REDACTED, REDACTED_EMAIL, _UNRENDERABLE)
 
 _URL_REPLACEMENT: Final = r"\g<prefix>" + REDACTED + "@"
 _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -458,6 +468,130 @@ def _escape_controls(text: str) -> str:
     )
 
 
+def _compile_secret_pattern(plaintexts: Sequence[str]) -> re.Pattern[str]:
+    """Compile the one pattern that finds every secret in ``plaintexts`` and no marker.
+
+    Secrets of any length are matched, so a short one can occur inside a redaction marker
+    (``ACT`` or ``D]`` in ``[REDACTED]``). Alternatives are tried in order at each position,
+    and every one is a literal text, so matching stays linear:
+
+    1. a marker run on by a secret that starts with the marker's tail, or with the whole
+       marker, and extends past it (``[REDACTED]x`` for the secret ``]x``): marker and
+       secret are replaced together, since keeping the marker would leave the secret
+       behind;
+    2. a bare marker, named ``marker``, which :func:`redact_secret_matches` keeps as it
+       is, so no secret is ever matched inside one;
+    3. the secrets themselves.
+
+    Each group is ordered longest first, so a secret that contains another secret is
+    redacted as a whole.
+
+    Args:
+        plaintexts: Non-empty secrets, longest first.
+
+    Returns:
+        The compiled pattern, applied through :func:`redact_secret_matches`.
+    """
+    straddles = sorted(
+        {
+            marker[:cut] + secret
+            for marker in _REDACTION_MARKERS
+            for secret in plaintexts
+            for cut in range(len(marker))
+            if len(secret) > len(marker) - cut and secret.startswith(marker[cut:])
+        },
+        key=lambda text: (-len(text), text),
+    )
+    alternatives = [re.escape(text) for text in straddles]
+    alternatives.append(f"(?P<marker>{_REDACTION_MARKER_RE.pattern})")
+    alternatives.extend(re.escape(secret) for secret in plaintexts)
+    return re.compile("|".join(alternatives))
+
+
+def redact_secret_matches(text: str, pattern: re.Pattern[str]) -> str:
+    """Replace each secret ``pattern`` finds in ``text``, with every whole span it overlaps.
+
+    A secret replaced on its own would cut what contains it, or what it runs into, into
+    pieces the later rules no longer recognise, and the rest would stay behind: an email
+    address :data:`EMAIL_RE` no longer matches (``jane[REDACTED]@x.io`` for the secret
+    ``2024`` in ``jane2024@x.io``), or a percent-encoded run whose escape or key the
+    decode pass can no longer read (``access_token%[REDACTED]tok`` for the secret ``3D``
+    in ``access_token%3Dtok``). So each match, widened over every email address and every
+    percent-encoded run holding a ``%XX`` escape that it overlaps (see
+    :func:`_whole_spans`), becomes one ``[REDACTED]``, and matches joined by such a span
+    become one too. Spans that overlap no secret are left for the email rule and the
+    decode pass, which run afterwards. A match of a group named ``marker`` (see
+    :func:`_compile_secret_pattern`) is kept as it is. ``pattern``, :data:`EMAIL_RE` and
+    :data:`_ENCODED_RUN_RE` each scan ``text`` once, so the work stays linear.
+
+    Example::
+
+        >>> redact_secret_matches("jane2024@x.io and 2024", re.compile("2024"))
+        '[REDACTED] and [REDACTED]'
+        >>> redact_secret_matches("GET access_token%3Dtok 100% 3D", re.compile("3D"))
+        'GET [REDACTED] 100% [REDACTED]'
+
+    Args:
+        text: The text to redact.
+        pattern: An alternation of escaped secrets, optionally with a ``marker`` group.
+
+    Returns:
+        ``text`` with every secret, and every email address and encoded run one overlaps,
+        replaced.
+    """
+    secrets = [match.span() for match in pattern.finditer(text) if match.lastgroup != "marker"]
+    if not secrets:
+        return text
+    wholes = _whole_spans(text)
+    pieces: list[str] = []
+    cursor = 0
+    region_start = region_end = -1
+    whole = 0
+    for start, end in secrets:
+        while whole < len(wholes) and wholes[whole][1] <= start:
+            whole += 1
+        while whole < len(wholes) and wholes[whole][0] < end:
+            start = min(start, wholes[whole][0])
+            end = max(end, wholes[whole][1])
+            whole += 1
+        if start < region_end:
+            region_end = max(region_end, end)
+            continue
+        if region_end >= 0:
+            pieces.extend((text[cursor:region_start], REDACTED))
+            cursor = region_end
+        region_start, region_end = start, end
+    pieces.extend((text[cursor:region_start], REDACTED, text[region_end:]))
+    return "".join(pieces)
+
+
+def _whole_spans(text: str) -> list[tuple[int, int]]:
+    """Return the sorted, disjoint spans of ``text`` that a secret match takes whole.
+
+    That is every :data:`EMAIL_RE` match, and every percent-encoded run
+    (:data:`_ENCODED_RUN_RE`) holding at least one valid ``%XX`` escape
+    (:data:`_PERCENT_ESCAPE_RE`): exactly the runs the decode pass of
+    :meth:`_Redactor.text` decodes, whatever they decode to. A run without a valid escape
+    (``100%``, ``%ZZ``) is never decoded, so it is not included. Overlapping spans are
+    joined.
+    """
+    spans = [match.span() for match in EMAIL_RE.finditer(text)] if "@" in text else []
+    if "%" in text:
+        spans.extend(
+            run.span()
+            for run in _ENCODED_RUN_RE.finditer(text)
+            if _PERCENT_ESCAPE_RE.search(text, run.start(), run.end()) is not None
+        )
+        spans.sort()
+    joined: list[tuple[int, int]] = []
+    for start, end in spans:
+        if joined and start < joined[-1][1]:
+            joined[-1] = (joined[-1][0], max(joined[-1][1], end))
+        else:
+            joined.append((start, end))
+    return joined
+
+
 class _Redactor:
     """Compiled redaction rules: the secret pattern plus the sensitive key names.
 
@@ -468,14 +602,12 @@ class _Redactor:
     __slots__ = ("_secret_pattern", "_sensitive_keys", "_separator_free_keys")
 
     def __init__(self, secrets: Sequence[str], header_names: Collection[str]) -> None:
+        # Every secret counts whatever its length; an empty one would match everywhere.
         plaintexts = sorted(
-            {secret for secret in secrets if len(secret) >= _MIN_SECRET_LENGTH},
-            key=lambda secret: (-len(secret), secret),
+            {secret for secret in secrets if secret}, key=lambda secret: (-len(secret), secret)
         )
-        # Alternatives are tried in order, so sorting longest first makes a secret that
-        # contains another secret redact as a whole.
         self._secret_pattern: re.Pattern[str] | None = (
-            re.compile("|".join(re.escape(secret) for secret in plaintexts)) if plaintexts else None
+            _compile_secret_pattern(plaintexts) if plaintexts else None
         )
         # Each configured header name is added in all three forms of `_key_forms`: its raw
         # and camelCase forms beside SENSITIVE_KEYS, its separator-free form beside theirs,
@@ -585,7 +717,7 @@ class _Redactor:
             redacted = self._assigned_values(redacted, _PAIR_RE)
         redacted = _BEARER_RE.sub(_BEARER_REPLACEMENT, redacted)
         if self._secret_pattern is not None:
-            redacted = self._secret_pattern.sub(REDACTED, redacted)
+            redacted = redact_secret_matches(redacted, self._secret_pattern)
         return EMAIL_RE.sub(REDACTED_EMAIL, redacted) if has_at else redacted
 
     def _assigned_values(self, text: str, head: re.Pattern[str]) -> str:
@@ -789,8 +921,9 @@ def redact(
     plus ``header_names``, compared after normalisation in any letter case) and sensitive
     ``(name, value)`` pairs lose their values; ``SecretStr`` values are replaced; inside
     every string, plain or percent-encoded, URL passwords, values assigned to sensitive
-    keys, sensitive pair reprs and ``Bearer`` tokens, each secret of at least 8
-    characters (longest first) and email addresses are replaced. NaN and infinite floats
+    keys, sensitive pair reprs and ``Bearer`` tokens, each secret whatever its length
+    (longest first, with any email address and any percent-encoded run holding a ``%XX``
+    escape that it overlaps) and email addresses are replaced. NaN and infinite floats
     become ``None``, and a value that cannot be rendered becomes ``[UNRENDERABLE]``.
     Containers are walked to a depth of 8. Redacting the result again changes nothing.
 
@@ -805,8 +938,8 @@ def redact(
 
     Args:
         value: Any value: a string, a container, a secret or another object.
-        secrets: Plaintext secrets to remove from strings; those shorter than 8
-            characters are ignored.
+        secrets: Plaintext secrets to remove from strings, whatever their length; empty
+            strings are ignored. A secret is never matched inside a redaction marker.
         header_names: Extra key or header names whose values are redacted, for example
             the configured ``N8N_WEBHOOK_SECRET_HEADER``; compared case-insensitively.
 
@@ -1341,14 +1474,19 @@ def _url_secret_parts(value: str) -> tuple[str, ...]:
 def _settings_secrets(settings: Settings) -> tuple[str, ...]:
     """Collect every plaintext to remove from log strings for ``settings``.
 
-    That is :meth:`Settings.secret_values`, the password of each URL-shaped secret, and
-    the n8n webhook URL with its path: the webhook URL is not a ``SecretStr``, but it is
-    a capability URL that is never logged.
+    That is every value of :meth:`Settings.secret_values` and the n8n webhook URL with its
+    path, whatever their length: the webhook URL is not a ``SecretStr``, but it is a
+    capability URL that is never logged. The password of each URL-shaped secret, raw and
+    percent-decoded, is added too when it has at least :data:`_MIN_SECRET_LENGTH`
+    characters; a shorter one, such as the local default database password ``ads``, is
+    left to the URL-credential rule, which removes it from its URL.
     """
     values: list[str] = []
     for plaintext in settings.secret_values():
         values.append(plaintext)
-        values.extend(_url_secret_parts(plaintext))
+        values.extend(
+            part for part in _url_secret_parts(plaintext) if len(part) >= _MIN_SECRET_LENGTH
+        )
     webhook_url = settings.n8n_google_ads_webhook_url
     if webhook_url:
         values.append(webhook_url)
