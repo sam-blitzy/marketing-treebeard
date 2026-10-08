@@ -39,13 +39,44 @@ from ads_engine.db.base import Base, DatasetScopedMixin, IdPkMixin, NativeDate, 
 
 __all__ = [
     "COMPLETENESS",
+    "COMPLETENESS_COMPLETE",
+    "COMPLETENESS_INCOMPLETE",
+    "COMPLETENESS_UNKNOWN",
     "CONNECTION_STATUSES",
+    "CONNECTION_STATUS_DENIED",
+    "CONNECTION_STATUS_ERROR",
+    "CONNECTION_STATUS_OK",
+    "CONNECTION_STATUS_STALE",
     "DATASETS",
+    "DATASET_GOOGLE_ENTITIES",
+    "DATASET_GOOGLE_METRICS_DAILY",
+    "DATASET_GOOGLE_SEARCH_TERMS",
+    "DATASET_HUBSPOT_ASSOCIATIONS",
+    "DATASET_HUBSPOT_CONTACTS",
+    "DATASET_HUBSPOT_DEAL_SEARCH",
+    "DATASET_HUBSPOT_GOOGLE_CONTACTS",
+    "DATASET_LINKEDIN_ANALYTICS_DAILY",
+    "DATASET_LINKEDIN_ENTITIES",
+    "DATASET_LINKEDIN_LEADS",
+    "DATASET_LINKEDIN_SEGMENTS",
     "DATASET_ROLES",
+    "DATASET_ROLE_COMPANION",
+    "DATASET_ROLE_PRIMARY",
     "DATASET_STATES",
+    "DATASET_STATE_ACTIVE",
+    "DATASET_STATE_BUILDING",
+    "DATASET_STATE_RETIRED",
     "MODES",
+    "MODE_LIVE",
+    "MODE_SIMULATED",
     "SOURCES",
+    "SOURCE_GOOGLE",
+    "SOURCE_HUBSPOT",
+    "SOURCE_LINKEDIN",
+    "SYNC_RUN_FAILED",
+    "SYNC_RUN_RUNNING",
     "SYNC_RUN_STATUSES",
+    "SYNC_RUN_SUCCEEDED",
     "AppUser",
     "DatasetFreshness",
     "SourceConnection",
@@ -54,40 +85,127 @@ __all__ = [
     "SyncRun",
 ]
 
-SOURCES: Final[tuple[str, ...]] = ("google", "linkedin", "hubspot")
+SOURCE_GOOGLE: Final = "google"
+"""The Google Ads source (through the n8n webhook)."""
+SOURCE_LINKEDIN: Final = "linkedin"
+"""The LinkedIn Ads source."""
+SOURCE_HUBSPOT: Final = "hubspot"
+"""The HubSpot CRM source."""
+
+SOURCES: Final[tuple[str, ...]] = (SOURCE_GOOGLE, SOURCE_LINKEDIN, SOURCE_HUBSPOT)
 """The external data sources, in display order: the allowed values of every ``source``."""
 
-MODES: Final[tuple[str, ...]] = ("live", "simulated")
+MODE_LIVE: Final = "live"
+"""A dataset of real platform data."""
+MODE_SIMULATED: Final = "simulated"
+"""A dataset of seeded mock data in the live wire shape."""
+
+MODES: Final[tuple[str, ...]] = (MODE_LIVE, MODE_SIMULATED)
 """Whether a dataset holds real platform data or seeded mock data in the live wire shape."""
 
-DATASET_STATES: Final[tuple[str, ...]] = ("building", "active", "retired")
+DATASET_STATE_BUILDING: Final = "building"
+"""A dataset being backfilled; nothing reads it until it is activated."""
+DATASET_STATE_ACTIVE: Final = "active"
+"""The dataset analysis and the UI read."""
+DATASET_STATE_RETIRED: Final = "retired"
+"""A replaced dataset: read-only history until it is purged."""
+
+DATASET_STATES: Final[tuple[str, ...]] = (
+    DATASET_STATE_BUILDING,
+    DATASET_STATE_ACTIVE,
+    DATASET_STATE_RETIRED,
+)
 """Dataset lifecycle: backfilled while ``building``, read while ``active``, purged later."""
 
-DATASET_ROLES: Final[tuple[str, ...]] = ("primary", "companion")
+DATASET_ROLE_PRIMARY: Final = "primary"
+"""A source's own dataset."""
+DATASET_ROLE_COMPANION: Final = "companion"
+"""The simulated HubSpot dataset built alongside a simulated LinkedIn one."""
+
+DATASET_ROLES: Final[tuple[str, ...]] = (DATASET_ROLE_PRIMARY, DATASET_ROLE_COMPANION)
 """``primary`` is a source's own dataset; ``companion`` is the simulated CRM of a LinkedIn one."""
 
+DATASET_GOOGLE_ENTITIES: Final = "google.entities"
+"""Google customer, campaigns, budgets, conversion actions, ad groups and keywords."""
+DATASET_GOOGLE_METRICS_DAILY: Final = "google.metrics_daily"
+"""Google campaign and keyword daily facts (Q-G3, Q-G5)."""
+DATASET_GOOGLE_SEARCH_TERMS: Final = "google.search_terms"
+"""Google search-term daily facts (Q-G6)."""
+DATASET_LINKEDIN_ENTITIES: Final = "linkedin.entities"
+"""LinkedIn accounts, campaign groups, campaigns, creatives and lead forms."""
+DATASET_LINKEDIN_ANALYTICS_DAILY: Final = "linkedin.analytics_daily"
+"""LinkedIn creative daily facts."""
+DATASET_LINKEDIN_SEGMENTS: Final = "linkedin.segments"
+"""LinkedIn demographic aggregates per exact preset window."""
+DATASET_LINKEDIN_LEADS: Final = "linkedin.leads"
+"""LinkedIn lead form responses."""
+DATASET_HUBSPOT_CONTACTS: Final = "hubspot.contacts"
+"""HubSpot contacts matched to leads, refreshed by id."""
+DATASET_HUBSPOT_ASSOCIATIONS: Final = "hubspot.associations"
+"""HubSpot associations with their target reads."""
+DATASET_HUBSPOT_DEAL_SEARCH: Final = "hubspot.deal_search"
+"""HubSpot deals created in the search range."""
+DATASET_HUBSPOT_GOOGLE_CONTACTS: Final = "hubspot.google_contacts"
+"""HubSpot contacts with a Google campaign touch."""
+
 DATASETS: Final[tuple[str, ...]] = (
-    "google.entities",
-    "google.metrics_daily",
-    "google.search_terms",
-    "linkedin.entities",
-    "linkedin.analytics_daily",
-    "linkedin.segments",
-    "linkedin.leads",
-    "hubspot.contacts",
-    "hubspot.associations",
-    "hubspot.deal_search",
-    "hubspot.google_contacts",
+    DATASET_GOOGLE_ENTITIES,
+    DATASET_GOOGLE_METRICS_DAILY,
+    DATASET_GOOGLE_SEARCH_TERMS,
+    DATASET_LINKEDIN_ENTITIES,
+    DATASET_LINKEDIN_ANALYTICS_DAILY,
+    DATASET_LINKEDIN_SEGMENTS,
+    DATASET_LINKEDIN_LEADS,
+    DATASET_HUBSPOT_CONTACTS,
+    DATASET_HUBSPOT_ASSOCIATIONS,
+    DATASET_HUBSPOT_DEAL_SEARCH,
+    DATASET_HUBSPOT_GOOGLE_CONTACTS,
 )
 """The freshness-tracked dataset names; each rule declares which of them it reads."""
 
-COMPLETENESS: Final[tuple[str, ...]] = ("complete", "incomplete", "unknown")
+COMPLETENESS_COMPLETE: Final = "complete"
+"""Every row of the covered range was read."""
+COMPLETENESS_INCOMPLETE: Final = "incomplete"
+"""Part of the covered range was not read in full; the reason says what."""
+COMPLETENESS_UNKNOWN: Final = "unknown"
+"""Nothing has been established yet (before the first successful read)."""
+
+COMPLETENESS: Final[tuple[str, ...]] = (
+    COMPLETENESS_COMPLETE,
+    COMPLETENESS_INCOMPLETE,
+    COMPLETENESS_UNKNOWN,
+)
 """Completeness of a dataset over its covered range (``unknown`` before the first read)."""
 
-CONNECTION_STATUSES: Final[tuple[str, ...]] = ("ok", "stale", "denied", "error")
+CONNECTION_STATUS_OK: Final = "ok"
+"""The source answered its last call."""
+CONNECTION_STATUS_STALE: Final = "stale"
+"""Transient failures outlived their retries; the last good data stands."""
+CONNECTION_STATUS_DENIED: Final = "denied"
+"""The platform refused access."""
+CONNECTION_STATUS_ERROR: Final = "error"
+"""A defect (a query or contract error) stopped the source."""
+
+CONNECTION_STATUSES: Final[tuple[str, ...]] = (
+    CONNECTION_STATUS_OK,
+    CONNECTION_STATUS_STALE,
+    CONNECTION_STATUS_DENIED,
+    CONNECTION_STATUS_ERROR,
+)
 """Health of a source connection as shown on ``/sources``."""
 
-SYNC_RUN_STATUSES: Final[tuple[str, ...]] = ("running", "succeeded", "failed")
+SYNC_RUN_RUNNING: Final = "running"
+"""A sync job run that has started and not finished."""
+SYNC_RUN_SUCCEEDED: Final = "succeeded"
+"""A sync job run that recorded its dataset's success."""
+SYNC_RUN_FAILED: Final = "failed"
+"""A sync job run that failed, was cancelled or was interrupted."""
+
+SYNC_RUN_STATUSES: Final[tuple[str, ...]] = (
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCEEDED,
+    SYNC_RUN_FAILED,
+)
 """Outcome of one sync job run."""
 
 # The CHECK text the migration repeats verbatim. A primary dataset has no parent; a companion

@@ -549,15 +549,20 @@ async def _sync(source: Source) -> int:
     mode and reason, never a credential.
 
     Returns:
-        :data:`EXIT_FAILURE` when a job failed on a ``QueryDefect``; :data:`EXIT_OK`
-        otherwise, including when transient errors left datasets stale (the report says so).
+        :data:`EXIT_FAILURE` when a job failed on a defect: a ``QueryDefect``, or a database
+        integrity violation (the job's ``integrity`` in the report names its kind, SQLSTATE,
+        table and constraint); :data:`EXIT_OK` otherwise, including when transient errors
+        left datasets stale (the report says so).
     """
     from ads_engine.sync.jobs import run_source_jobs
 
     report = await run_source_jobs(source, trigger="manual")
     _emit_json(report.to_json())
     if report.has_defect:
-        _error(f"sync {source}: a job failed on a query defect; see the report and the log")
+        _error(
+            f"sync {source}: a job failed on a defect (query or data integrity); "
+            "see the report and the log"
+        )
         return EXIT_FAILURE
     return EXIT_OK
 

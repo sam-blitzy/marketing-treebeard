@@ -46,11 +46,24 @@ retired mid-job ends the job quietly as failed); and error hand-off. Only
 :meth:`~ads_engine.sync.mode.SourceModeController.on_error`, which alone decides what it means
 (AAP 0.3.3 fallback table). ``on_error`` is never called while a transaction of this module is
 open, because it takes the ``source_connection`` lock that a concurrent activation takes before
-the dataset guard this module holds. For an **active** dataset, every transaction that records
-a success queues one ``analysis_request`` with its freshness write, so the job's last write is
-always followed by a pending request (AAP 0.3.2; the worker coalesces requests within 60 s),
-and a stand-alone matching pass that attempted rows queues one after it; a building dataset
-queues nothing, its activation does.
+the dataset guard this module holds. A database integrity violation (``IntegrityError``) is no
+connector error and is never handed off, retried or simulated: the job records it as a failed
+attempt with sanitized diagnostics (:class:`IntegrityFailure`) on its unsettled freshness rows
+and ``sync_run`` rows, and returns a failed result. Every other non-connector error propagates.
+For an **active** dataset, every transaction that records
+a success, or a failed attempt together with data it wrote or deleted, queues one
+``analysis_request`` with its freshness write, so the job's last write is always followed by a
+pending request (AAP 0.3.2; the worker coalesces requests within 60 s), and a stand-alone
+matching pass that attempted rows queues one after it; a building dataset queues nothing, its
+activation does.
+
+Publication. A job reads a dataset's whole scope first and then publishes it in one
+transaction: its fact or CRM rows with their complete-scope deletions, a Google dataset's
+checkpoint, the freshness outcome, the ``sync_run`` close and the ``analysis_request``. No
+transaction is held open across a connector call, and a cancellation, a database error or a
+bug before that commit leaves the dataset's stored rows and its checkpoint as they were and
+queues no request; its freshness stands too, but for the failed attempt an integrity
+violation records (above).
 
 Interruptions. Connectors return what they read when a ``TransientError`` survives their
 retries, with the error in the result's ``interrupted_by``. A Google call-budget deferral is
@@ -62,8 +75,11 @@ calls beyond the cap therefore move to a later 24 h window instead of re-reading
 prefix. Any other interruption of a dated dataset or of a CRM dataset (search, contact
 refresh, associations, target reads) is recorded as a failed attempt, so the dataset keeps
 its last good data and turns stale (AAP 0.3.3 transient row); what was read is still
-written, with its per-object unknown state, and a Google dataset's unread scopes are kept
-the same way. An interrupted matching pass is handed over with no dataset, its rows already
+written, with its per-object unknown state, in the transaction that records the failed
+attempt and queues the rerun, and a Google dataset's unread scopes are kept the same way.
+The error is then handed to ``on_error``, which folds the same failure into those rows
+(only ``last_attempt_at`` and the reason can move) and decides its consequence. An
+interrupted matching pass is handed over with no dataset, its rows already
 retried ``error``, also when a later batch of the pass raises (before the raised error,
 whose consequence stands). An interrupted full-state entity read is ``incomplete`` with its
 reason: no removal or disappearance is inferred from it (AAP 0.3.3 "Safe absence"), and
@@ -131,6 +147,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import psycopg
 from sqlalchemy import (
     ARRAY,
     BigInteger,
@@ -146,7 +163,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import values as sql_values
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import InstrumentedAttribute, Session, SessionTransaction
 
@@ -239,6 +256,22 @@ from ads_engine.db.models.accounts import (
     LeadFormVersion,
 )
 from ads_engine.db.models.crm import (
+    ASSOCIATION_FETCH_ERROR,
+    ASSOCIATION_FETCH_OK,
+    ASSOCIATION_FETCH_OK_EMPTY,
+    ASSOCIATION_FETCH_PARTIAL,
+    CONTACT_READ_ERROR,
+    CONTACT_READ_OK,
+    CRM_OBJECT_CONTACT,
+    CRM_OBJECT_DEAL,
+    CRM_OBJECT_MEETING,
+    LEAD_MATCH_ERROR,
+    LEAD_MATCH_MATCHED,
+    LEAD_MATCH_NO_MATCH,
+    LEAD_MATCH_PENDING,
+    TARGET_READ_ERROR,
+    TARGET_READ_OK,
+    TARGET_READ_PARTIAL,
     CrmAssociation,
     CrmAssociationFetch,
     CrmContact,
@@ -254,7 +287,33 @@ from ads_engine.db.models.facts import (
     FactSearchTermDaily,
     FactSegmentWindow,
 )
-from ads_engine.db.models.ops import DatasetFreshness, SourceDataset, SyncRun
+from ads_engine.db.models.ops import (
+    COMPLETENESS_COMPLETE,
+    COMPLETENESS_INCOMPLETE,
+    DATASET_GOOGLE_ENTITIES,
+    DATASET_GOOGLE_METRICS_DAILY,
+    DATASET_GOOGLE_SEARCH_TERMS,
+    DATASET_HUBSPOT_ASSOCIATIONS,
+    DATASET_HUBSPOT_CONTACTS,
+    DATASET_HUBSPOT_DEAL_SEARCH,
+    DATASET_HUBSPOT_GOOGLE_CONTACTS,
+    DATASET_LINKEDIN_ANALYTICS_DAILY,
+    DATASET_LINKEDIN_ENTITIES,
+    DATASET_LINKEDIN_LEADS,
+    DATASET_LINKEDIN_SEGMENTS,
+    DATASET_ROLE_PRIMARY,
+    DATASET_STATE_ACTIVE,
+    DATASET_STATE_BUILDING,
+    DATASET_STATE_RETIRED,
+    MODE_LIVE,
+    SOURCE_HUBSPOT,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCEEDED,
+    DatasetFreshness,
+    SourceDataset,
+    SyncRun,
+)
 from ads_engine.db.models.snapshots import EntitySnapshot
 from ads_engine.logging import get_logger
 from ads_engine.settings import SOURCES, Settings, Source
@@ -286,6 +345,8 @@ __all__ = [
     "SOURCE_JOBS",
     "CrmSyncJob",
     "EntitySyncJob",
+    "IntegrityFailure",
+    "IntegrityKind",
     "JobContext",
     "JobResult",
     "LeadMatchJob",
@@ -420,7 +481,7 @@ _CONTACTS: Final = "contacts"
 _MEETINGS: Final = "meetings"
 _DEALS: Final = "deals"
 _SINGULAR: Final[Mapping[str, str]] = MappingProxyType(
-    {_CONTACTS: "contact", _MEETINGS: "meeting", _DEALS: "deal"}
+    {_CONTACTS: CRM_OBJECT_CONTACT, _MEETINGS: CRM_OBJECT_MEETING, _DEALS: CRM_OBJECT_DEAL}
 )
 
 _SEGMENT_REASON_RE: Final = re.compile(
@@ -520,13 +581,115 @@ class JobContext:
             dataset_id=dataset.id,
             mode=_as_mode(dataset.mode),
             role=_as_role(dataset.role),
-            active=dataset.state == "active",
+            active=dataset.state == DATASET_STATE_ACTIVE,
             clients=clients,
             settings=controller.settings,
             thresholds=thresholds if thresholds is not None else controller.thresholds,
             now=now if now is not None else controller.now(),
             sessionmaker=controller.sessionmaker,
         )
+
+
+IntegrityKind = Literal[
+    "foreign_key_violation",
+    "check_violation",
+    "unique_violation",
+    "not_null_violation",
+    "exclusion_violation",
+    "integrity_violation",
+]
+"""The class of a database integrity violation, from its SQLSTATE (:class:`IntegrityFailure`)."""
+
+# PostgreSQL's integrity-constraint SQLSTATEs (class 23); any other is ``integrity_violation``.
+_INTEGRITY_KINDS: Final[Mapping[str, IntegrityKind]] = MappingProxyType(
+    {
+        "23503": "foreign_key_violation",
+        "23514": "check_violation",
+        "23505": "unique_violation",
+        "23502": "not_null_violation",
+        "23P01": "exclusion_violation",
+    }
+)
+_INTEGRITY_OTHER: Final[IntegrityKind] = "integrity_violation"
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityFailure:
+    """A database integrity violation that ended a job, as sanitized diagnostics only.
+
+    A write the schema refused (a foreign-key, ``CHECK``, unique, not-null or exclusion
+    constraint) is a defect of the job's own data, not a platform error: the job records it
+    as a failed attempt and returns a failed :class:`JobResult` instead of raising, and it is
+    never handed to ``on_error``, retried or simulated (:meth:`_JobBase.run`). Only the
+    violation's class, its SQLSTATE and the names of the table and constraint are kept. The
+    driver's message and detail, the statement and its parameters can carry key values, so
+    none of them is ever read.
+
+    Attributes:
+        kind: The violation's class: ``foreign_key_violation`` (SQLSTATE 23503),
+            ``check_violation`` (23514), ``unique_violation`` (23505), ``not_null_violation``
+            (23502), ``exclusion_violation`` (23P01), or ``integrity_violation`` for any other
+            or unreported SQLSTATE.
+        sqlstate: The SQLSTATE PostgreSQL reported, or ``None`` when the driver gave none.
+        table: The table whose constraint refused the write, or ``None`` when not reported.
+        constraint: The refusing constraint's name, or ``None`` when not reported.
+    """
+
+    kind: IntegrityKind
+    sqlstate: str | None
+    table: str | None
+    constraint: str | None
+
+    @classmethod
+    def from_error(cls, error: IntegrityError) -> IntegrityFailure:
+        """Read the sanitized diagnostics of a violation; never its text or parameters.
+
+        Args:
+            error: The violation SQLAlchemy raised; its ``orig`` is the driver's error, a
+                :class:`psycopg.Error` whose diagnostics name the table and constraint.
+
+        Returns:
+            The diagnostics; a name the driver did not report is ``None``, and an error from
+            another driver yields ``integrity_violation`` with no names.
+        """
+        orig = error.orig
+        if not isinstance(orig, psycopg.Error):
+            return cls(kind=_INTEGRITY_OTHER, sqlstate=None, table=None, constraint=None)
+        diag = orig.diag
+        sqlstate = orig.sqlstate or diag.sqlstate
+        kind = _INTEGRITY_KINDS.get(sqlstate, _INTEGRITY_OTHER) if sqlstate else _INTEGRITY_OTHER
+        return cls(
+            kind=kind,
+            sqlstate=sqlstate,
+            table=diag.table_name,
+            constraint=diag.constraint_name,
+        )
+
+    @property
+    def reason(self) -> str:
+        """The one-line reason a failed job records (``sync_run.error``, the freshness reason).
+
+        For example ``database integrity violation (foreign_key_violation) on
+        fact_campaign_daily: constraint fk_fact_campaign_daily_campaign_id_campaign (SQLSTATE
+        23503)``; the parts the driver did not report are left out.
+        """
+        text = f"database integrity violation ({self.kind})"
+        if self.table:
+            text += f" on {self.table}"
+        if self.constraint:
+            text += f": constraint {self.constraint}"
+        if self.sqlstate:
+            text += f" (SQLSTATE {self.sqlstate})"
+        return text
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the diagnostics as plain JSON; names and codes only, never a value."""
+        return {
+            "kind": self.kind,
+            "sqlstate": self.sqlstate,
+            "table": self.table,
+            "constraint": self.constraint,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,17 +702,21 @@ class JobResult:
         source: The source of the dataset written.
         dataset_id: The dataset written.
         status: ``succeeded`` when every freshness dataset of the job recorded a success
-            (complete or incomplete); ``failed`` when the job raised, or a dataset's refresh
-            failed and kept its last good data.
+            (complete or incomplete); ``failed`` when the job raised, a dataset's refresh
+            failed and kept its last good data, or a database integrity violation ended it.
         rows: Rows written (entities, facts, leads, contacts, associations, …).
         calls: Connector calls made.
         freshness: The outcome recorded per freshness dataset name; a dataset whose refresh
-            failed carries the failure outcome ``on_error`` recorded for it.
+            failed carries the failure outcome recorded for it (by ``on_error`` for a
+            transient error, by the job otherwise).
         disposition: What ``on_error`` decided for the last connector error the job handed
             over, or ``None`` when there was none.
-        error: The connector error's reason, or why the job could not write; ``None`` when
+        error: The connector error's reason, the integrity violation's sanitized reason
+            (:attr:`IntegrityFailure.reason`), or why the job could not write; ``None`` when
             nothing failed.
         duration_ms: Wall-clock duration.
+        integrity: The sanitized diagnostics of the database integrity violation that ended
+            the job, or ``None`` when none did.
     """
 
     job: str
@@ -562,6 +729,7 @@ class JobResult:
     disposition: ErrorDisposition | None
     error: str | None
     duration_ms: int
+    integrity: IntegrityFailure | None = None
 
     @property
     def completeness(self) -> str:
@@ -603,6 +771,7 @@ class JobResult:
             "disposition": self.disposition,
             "error": self.error,
             "duration_ms": self.duration_ms,
+            "integrity": None if self.integrity is None else self.integrity.to_json(),
         }
 
 
@@ -635,8 +804,15 @@ class SourceSyncReport:
 
     @property
     def has_defect(self) -> bool:
-        """Whether a job failed on a ``QueryDefect`` (the CLI's non-zero exit)."""
-        return any(result.disposition == "defect" for result in self.results)
+        """Whether a job failed on a defect (the CLI's non-zero exit).
+
+        A defect is a ``QueryDefect`` the connectors raised, or a database integrity
+        violation that ended the job (:attr:`JobResult.integrity`); neither is retried.
+        """
+        return any(
+            result.disposition == "defect" or result.integrity is not None
+            for result in self.results
+        )
 
     def to_json(self) -> dict[str, Any]:
         """Return the report as plain JSON for ``ads-engine sync``; no credentials included."""
@@ -891,7 +1067,7 @@ async def segments_due(
     dataset_id = await repositories.active_dataset_id(session, "linkedin")
     if dataset_id is None:
         return False
-    row = (await freshness.load_freshness(session, dataset_id)).get("linkedin.segments")
+    row = (await freshness.load_freshness(session, dataset_id)).get(DATASET_LINKEDIN_SEGMENTS)
     if row is None:
         return True
     last_attempt_failed = row.last_attempt_at is not None and (
@@ -937,10 +1113,12 @@ class _JobBase(ABC):
     """The plumbing every job shares (module docstring, "Shared plumbing").
 
     Subclasses implement :meth:`freshness_datasets` and :meth:`_execute`. Inside
-    ``_execute`` they write in short transactions of their own and record outcomes with
-    :meth:`_complete` in the transaction that writes the data those outcomes describe.
-    Transient interruptions are noted with :meth:`_interrupted` and handed to
-    :meth:`SourceModeController.on_error` once no transaction is open.
+    ``_execute`` they read a dataset's scope with no transaction open, then write it in one
+    short transaction that records its outcome with :meth:`_complete`: a success, or the
+    failed attempt of an interrupted read together with the rows it did read (module
+    docstring, "Publication"). Transient interruptions are noted with :meth:`_interrupted`
+    once that transaction committed and handed to :meth:`SourceModeController.on_error` once
+    no transaction is open.
     """
 
     job: str = ""
@@ -958,6 +1136,7 @@ class _JobBase(ABC):
         self._closed: set[str | None] = set()
         self._disposition: ErrorDisposition | None = None
         self._error: str | None = None
+        self._integrity: IntegrityFailure | None = None
 
     # -- what subclasses declare ---------------------------------------------------------
 
@@ -981,19 +1160,26 @@ class _JobBase(ABC):
         Every run logs one ``sync.job.start`` and exactly one ``sync.job.finish``, whether it
         returns, raises or is cancelled (:meth:`_result`). Every interruption noted while the
         job ran is handed to ``on_error`` on every exit but a cancellation: after a normal
-        finish, before a raised connector error, on a retired dataset, and on a best-effort
-        basis before a non-connector error propagates.
+        finish, before a raised connector error, on a retired dataset, before a database
+        integrity violation is recorded, and on a best-effort basis before any other
+        non-connector error propagates.
 
         Returns:
             The result. A ``ConnectorError`` the connectors raise is handed to ``on_error``
             after the interruptions noted before it, and returned as a failed result with its
             disposition; a dataset retired while the job ran ends it as failed with that
             reason, its noted interruptions handed over first (the disposition is the last
-            hand-over's).
+            hand-over's). A database integrity violation (``IntegrityError``: a foreign-key,
+            ``CHECK``, unique, not-null or exclusion constraint refused a write, whose
+            transaction rolled back) is a defect of the job's data: it is never handed to
+            ``on_error``, retried or simulated. It is returned as a failed result whose
+            :attr:`~JobResult.integrity` carries the sanitized diagnostics, after
+            :meth:`_attempt` recorded the failed attempt (:meth:`_settle_integrity`).
 
         Raises:
-            Exception: Any non-connector error (a database error, a bug), unchanged, after
-                the noted interruptions were handed to ``on_error`` (best effort: a database
+            Exception: Any other non-connector error (a database error, a bug), unchanged,
+                or one raised while an integrity violation was being recorded, after the
+                noted interruptions were handed to ``on_error`` (best effort: a database
                 error doing so is logged, never raised in its place), the job's still-open
                 ``sync_run`` rows were closed as failed (best effort) and ``sync.job.finish``
                 was logged ``failed`` with the error's class name; the scheduler logs its
@@ -1080,8 +1266,10 @@ class _JobBase(ABC):
     async def _attempt(self) -> None:
         """Open the ``sync_run`` rows, execute, and settle what the run may return (:meth:`run`).
 
-        A ``ConnectorError`` is handed to ``on_error`` and a retired dataset ends the job;
-        both close the rows here. Anything else propagates to :meth:`run`.
+        A ``ConnectorError`` is handed to ``on_error``, a retired dataset ends the job, and a
+        database integrity violation is recorded as a failed attempt
+        (:meth:`_settle_integrity`); all three close the rows here and return. Anything else
+        propagates to :meth:`run`, and so does an error raised while settling one of them.
         """
         ctx = self.ctx
         try:
@@ -1118,6 +1306,9 @@ class _JobBase(ABC):
             # connection's health and skips the read-only dataset's freshness rows.
             await self._report_interruptions()
             await self._close_remaining(self._error)
+        except IntegrityError as exc:
+            # The refused write's transaction rolled back as its ``session.begin()`` exited.
+            await self._settle_integrity(exc)
         except Exception:
             # Best effort; the original error then propagates to :meth:`run`, which closes
             # the still-open rows as failed and logs the one ``sync.job.finish``.
@@ -1126,6 +1317,58 @@ class _JobBase(ABC):
         else:
             await self._report_interruptions()
             await self._close_remaining(None)
+
+    async def _settle_integrity(self, error: IntegrityError) -> None:
+        """Record a database integrity violation as the job's failed attempt.
+
+        A constraint refused one of the job's writes, so the job's own data is defective: no
+        connector raised it, so it is never handed to ``on_error`` (which decides only what a
+        connector error means), never retried and never answered with simulated data. Only
+        sanitized diagnostics are kept (:class:`IntegrityFailure`). In order:
+
+        1. ``sync.job.integrity_failed`` is logged at error level with the source, job,
+           dataset, the freshness datasets the violation fails, and the violation's kind,
+           SQLSTATE, table and constraint; never a value, the driver's text or the statement.
+        2. The interruptions noted before it are handed over, so their failed attempts are
+           recorded first.
+        3. Every freshness dataset of the job with no outcome yet records a failed attempt in
+           a fresh transaction (:meth:`_record_failures`): ``last_attempt_at`` moves and the
+           reason is the violation's, while coverage, completeness and ``last_success_at``
+           stand, so the last good data keeps its standing until it turns stale (AAP 0.5.2,
+           freshness updated on every attempt). A first-ever attempt records ``unknown``.
+        4. The still-open ``sync_run`` rows are closed ``failed`` with that reason.
+
+        An error raised by any step propagates to :meth:`run`, which closes the rows still
+        open and re-raises it.
+
+        Args:
+            error: The violation, raised after its transaction rolled back.
+        """
+        ctx = self.ctx
+        failure = IntegrityFailure.from_error(error)
+        reason = failure.reason
+        pending = tuple(name for name in self.freshness_datasets() if name not in self._freshness)
+        _log.error(
+            "sync.job.integrity_failed",
+            source=ctx.source,
+            job=self.job,
+            dataset_id=ctx.dataset_id,
+            datasets=list(pending),
+            kind=failure.kind,
+            sqlstate=failure.sqlstate,
+            table=failure.table,
+            constraint=failure.constraint,
+        )
+        await self._report_interruptions()
+        failures = {name: FreshnessOutcome.failure(ctx.now, reason=reason) for name in pending}
+        await self._record_failures(failures)
+        # Published once recorded, as completions are once committed.
+        for name, outcome in failures.items():
+            self._failed[name] = reason
+            self._freshness[name] = outcome
+        self._error = reason
+        self._integrity = failure
+        await self._close_remaining(reason)
 
     def _result(self, started: float, *, raised: BaseException | None = None) -> JobResult:
         """Build the result and log the run's one ``sync.job.finish``.
@@ -1162,6 +1405,7 @@ class _JobBase(ABC):
             disposition=self._disposition,
             error=self._error if self._error is not None else _join_reasons(self._failed.values()),
             duration_ms=int((time.perf_counter() - started) * 1000),
+            integrity=self._integrity,
         )
         log = _log.warning if status == "failed" else _log.info
         log(
@@ -1211,26 +1455,45 @@ class _JobBase(ABC):
             self._freshness[name] = FreshnessOutcome.failure(self.ctx.now, reason=error.reason)
 
     async def _complete(
-        self, session: AsyncSession, outcomes: Mapping[str, FreshnessOutcome]
+        self,
+        session: AsyncSession,
+        outcomes: Mapping[str, FreshnessOutcome],
+        *,
+        changed: bool = False,
+        rows: Mapping[str, int] | None = None,
     ) -> None:
         """Record freshness outcomes in the transaction that wrote their data.
 
-        Closes the outcomes' ``sync_run`` rows and, when at least one outcome is a success,
-        queues an ``analysis_request`` in the same transaction (:meth:`_queue_analysis`; AAP
-        0.3.2 "a completed entity, metrics, segment, lead or CRM sync"). Every such
-        transaction queues its own request, so data a later transaction of the job writes is
-        never left behind by a run that served an earlier request; the worker coalesces the
-        requests that arrive within 60 s into one run.
+        Closes the outcomes' ``sync_run`` rows and, when at least one outcome is a success or
+        ``changed`` says the transaction wrote or deleted data, queues an ``analysis_request``
+        in the same transaction (:meth:`_queue_analysis`; AAP 0.3.2 "a completed entity,
+        metrics, segment, lead or CRM sync"). A failed attempt that still stored what its
+        interrupted read returned therefore queues the rerun its data needs, while a failed
+        attempt that changed nothing queues none. Every such transaction queues its own
+        request, so data a later transaction of the job writes is never left behind by a run
+        that served an earlier request; the worker coalesces the requests that arrive within
+        60 s into one run.
 
         The job's own bookkeeping learns of the completion only when the transaction commits
         (:meth:`_publish_on_commit`): a completion rolled back by a later failure of its
-        transaction is neither reported nor logged, and its ``sync_run`` rows stay open, so
-        :meth:`run` closes them as failed in a fresh transaction.
+        transaction is neither reported nor logged, its rows are not counted, and its
+        ``sync_run`` rows stay open, so :meth:`run` closes them as failed in a fresh
+        transaction.
+
+        Args:
+            session: The transaction that wrote the data the outcomes describe.
+            outcomes: The outcome per freshness dataset: a success, or a failed attempt.
+            changed: Whether the transaction wrote or deleted data; a failed attempt with
+                changed data queues the analysis request too.
+            rows: Rows the transaction wrote per freshness dataset that the job has not
+                counted yet. They are included in the closed ``sync_run`` rows and added to
+                the job's counts once the transaction commits.
 
         Raises:
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
         """
         ctx = self.ctx
+        uncounted = dict(rows) if rows is not None else {}
         dataset = await repositories.ensure_writable(session, ctx.dataset_id)
         for name, outcome in outcomes.items():
             await freshness.record_freshness(session, ctx.dataset_id, name, outcome)
@@ -1239,36 +1502,41 @@ class _JobBase(ABC):
             if await self._close(
                 session,
                 name,
-                status="succeeded" if outcome.succeeded else "failed",
+                status=SYNC_RUN_SUCCEEDED if outcome.succeeded else SYNC_RUN_FAILED,
                 completeness=outcome.completeness,
                 error=None if outcome.succeeded else outcome.reason,
+                uncounted=uncounted.get(name, 0),
             ):
                 closed.append(name)
-        if any(outcome.succeeded for outcome in outcomes.values()):
+        if changed or any(outcome.succeeded for outcome in outcomes.values()):
             await self._queue_analysis(session, dataset)
-        self._publish_on_commit(session, outcomes, closed)
+        self._publish_on_commit(session, outcomes, closed, uncounted)
 
     def _publish_on_commit(
         self,
         session: AsyncSession,
         outcomes: Mapping[str, FreshnessOutcome],
         closed: Sequence[str | None],
+        rows: Mapping[str, int] | None = None,
     ) -> None:
         """Publish a completion to the job's bookkeeping once ``session``'s transaction commits.
 
-        The outcomes join the ones :meth:`run` reports and logs, and the closed datasets the
-        ones :meth:`_close_remaining` skips, only after the commit. A rollback of the
-        transaction (a failed statement after the completion, a failed enqueue or commit)
-        discards them, and a later transaction of the same session never publishes them. A
-        savepoint released inside the transaction is not its commit.
+        The outcomes join the ones :meth:`run` reports and logs, the closed datasets the ones
+        :meth:`_close_remaining` skips, and the rows the job's counts (:meth:`_count`), only
+        after the commit. A rollback of the transaction (a failed statement after the
+        completion, a failed enqueue or commit) discards them, and a later transaction of the
+        same session never publishes them. A savepoint released inside the transaction is not
+        its commit.
 
         Args:
             session: The transaction the completion was written in.
             outcomes: The freshness outcomes it recorded.
             closed: The datasets whose ``sync_run`` rows it closed.
+            rows: Rows it wrote per freshness dataset that are not counted yet.
         """
         published = dict(outcomes)
         names = tuple(closed)
+        counts = dict(rows) if rows is not None else {}
         settled = False
 
         def on_commit(committed: Session) -> None:
@@ -1278,6 +1546,8 @@ class _JobBase(ABC):
             settled = True
             self._freshness.update(published)
             self._closed.update(names)
+            for name, count in counts.items():
+                self._count(name, count)
 
         def on_rollback(_session: Session, previous: SessionTransaction) -> None:
             nonlocal settled
@@ -1301,7 +1571,7 @@ class _JobBase(ABC):
             dataset: The job's dataset, as :func:`repositories.ensure_writable` locked it in
                 this transaction.
         """
-        if self.ctx.active and dataset.state == "active":
+        if self.ctx.active and dataset.state == DATASET_STATE_ACTIVE:
             await repositories.enqueue_analysis_request(
                 session, reason=f"sync:{self.ctx.source}.{self.job}"
             )
@@ -1389,7 +1659,7 @@ class _JobBase(ABC):
                         job=job,
                         dataset=name,
                         started_at=ctx.now,
-                        status="running",
+                        status=SYNC_RUN_RUNNING,
                     )
                     for job in self.sync_run_jobs()
                 ]
@@ -1405,11 +1675,21 @@ class _JobBase(ABC):
         status: Literal["succeeded", "failed"],
         completeness: str | None,
         error: str | None,
+        uncounted: int = 0,
     ) -> bool:
         """Close one dataset's still-``running`` ``sync_run`` rows in ``session``.
 
         Only the UPDATE is issued: the caller marks the dataset closed once its transaction
         commits. A row a committed transaction already closed is never overwritten.
+
+        Args:
+            session: The transaction to close the rows in.
+            name: The freshness dataset, or ``None`` for a job that writes none.
+            status: The terminal status.
+            completeness: The completeness recorded, or ``None``.
+            error: The failure reason, or ``None``.
+            uncounted: Rows ``session``'s transaction wrote that the job counts only once it
+                commits; recorded in ``rows`` together with those already counted.
 
         Returns:
             Whether the dataset had rows of this job left to close.
@@ -1417,10 +1697,11 @@ class _JobBase(ABC):
         ids = self._runs.get(name)
         if not ids or name in self._closed:
             return False
-        rows = self._total_rows if name is None else self._rows.get(name, 0)
+        counted = self._total_rows if name is None else self._rows.get(name, 0)
+        rows = counted + uncounted
         await session.execute(
             update(SyncRun)
-            .where(SyncRun.id.in_(ids), SyncRun.status == "running")
+            .where(SyncRun.id.in_(ids), SyncRun.status == SYNC_RUN_RUNNING)
             .values(
                 finished_at=self.ctx.controller.now(),
                 status=status,
@@ -1463,8 +1744,8 @@ class _JobBase(ABC):
                     await self._close(
                         session,
                         name,
-                        status="failed" if failed else "succeeded",
-                        completeness=None if failed else "complete",
+                        status=SYNC_RUN_FAILED if failed else SYNC_RUN_SUCCEEDED,
+                        completeness=None if failed else COMPLETENESS_COMPLETE,
                         error=reason if reason is not None else error,
                     )
             self._closed.update(open_names)
@@ -1784,7 +2065,7 @@ _SINGLE_SCOPE: Final[tuple[Mapping[str, object], ...]] = (MappingProxyType({}),)
 
 # The Google metrics datasets and the dated queries each reads, in reading order.
 _GOOGLE_METRICS_QUERIES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
-    {"google.metrics_daily": ("Q-G3", "Q-G5"), "google.search_terms": ("Q-G6",)}
+    {DATASET_GOOGLE_METRICS_DAILY: ("Q-G3", "Q-G5"), DATASET_GOOGLE_SEARCH_TERMS: ("Q-G6",)}
 )
 _METRICS_CHECKPOINT_KEYS: Final = frozenset({"version", "pending", "covered_from", "reasons"})
 # One unread metrics scope: the scope and when its work was first deferred.
@@ -2205,7 +2486,7 @@ class EntitySyncJob(_JobBase):
     async def _google(self) -> None:
         """Read Google's current entity state and write it with its checks (class docstring)."""
         ctx = self.ctx
-        name = "google.entities"
+        name = DATASET_GOOGLE_ENTITIES
         client = ctx.clients.require_google()
         fetcher = PartitionedFetcher(client)
         calls_before = client.calls_made
@@ -2406,7 +2687,7 @@ class EntitySyncJob(_JobBase):
         """
         ctx = self.ctx
         dataset_id = ctx.dataset_id
-        name = "google.entities"
+        name = DATASET_GOOGLE_ENTITIES
         campaign_rows = list({row.campaign_id: row for row in (*present, *removed)}.values())
 
         # Budgets first: campaigns reference them.
@@ -2796,7 +3077,7 @@ class EntitySyncJob(_JobBase):
         """Upsert one account's entities; return its id, its snapshots and present campaigns."""
         ctx = self.ctx
         dataset_id = ctx.dataset_id
-        name = "linkedin.entities"
+        name = DATASET_LINKEDIN_ENTITIES
         stored = await repositories.upsert_entities(
             session,
             AdAccount,
@@ -3398,8 +3679,56 @@ class _GooglePlan:
         return _MetricsCheckpoint.parse(data, self.queries)
 
 
-# Writes one fetch's rows; the range is the scope's :func:`_date_range`.
-type _FetchStore = Callable[[FetchOutcome, tuple[date, date] | None], Awaitable[None]]
+@dataclass(frozen=True, slots=True)
+class _Written:
+    """What writing one fetch or listing changed inside its dataset's transaction.
+
+    Attributes:
+        rows: Fact rows upserted.
+        removed: Stored rows deleted because the proven-complete fetch no longer returned them
+            (:func:`_remove_absent`).
+        skipped: Rows read but not stored, because the entity they name is not stored.
+    """
+
+    rows: int = 0
+    removed: int = 0
+    skipped: int = 0
+
+    @property
+    def changed(self) -> bool:
+        """Whether anything was written or deleted."""
+        return bool(self.rows or self.removed)
+
+    def __add__(self, other: _Written) -> _Written:
+        """Add two writes' counts."""
+        return _Written(
+            rows=self.rows + other.rows,
+            removed=self.removed + other.removed,
+            skipped=self.skipped + other.skipped,
+        )
+
+
+# Writes one fetch's rows in the dataset's transaction; the range is the scope's
+# :func:`_date_range`.
+type _FetchWrite = Callable[
+    [AsyncSession, FetchOutcome, tuple[date, date] | None], Awaitable[_Written]
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _Fetched:
+    """One fetch of a metrics run, kept until the transaction that records its dataset.
+
+    Attributes:
+        query_id: The query the fetch read.
+        outcome: What the fetch returned.
+        covered: The scope's :func:`_date_range`: the native days it read in full, or
+            ``None`` for a scope narrowed inside its days.
+    """
+
+    query_id: str
+    outcome: FetchOutcome
+    covered: tuple[date, date] | None
 
 
 def _date_range(scope: Mapping[str, object]) -> tuple[date, date] | None:
@@ -3426,18 +3755,31 @@ class _QueryReads:
     instant of the scope they came from.
 
     Attributes:
+        query_id: The query read.
+        write: Writes one of the query's fetches in its dataset's transaction.
+        fetched: The run's fetches of every query, in reading order, shared by the run's
+            reads; each read appends its own.
         pending: The query's unread scopes, in reading order.
         interrupted_by: The transient error that stopped the query, or ``None``.
         shortfalls: Permanent shortfalls (result limits) of the fetches read.
         calls: POST attempts the fetches made, retries and next pages included.
     """
 
-    __slots__ = ("calls", "interrupted_by", "pending", "query_id", "shortfalls", "store")
+    __slots__ = (
+        "calls",
+        "fetched",
+        "interrupted_by",
+        "pending",
+        "query_id",
+        "shortfalls",
+        "write",
+    )
 
-    def __init__(self, query_id: str, store: _FetchStore) -> None:
-        """Start with nothing read; ``store`` writes each fetch's rows as soon as it returns."""
+    def __init__(self, query_id: str, write: _FetchWrite, fetched: list[_Fetched]) -> None:
+        """Start with nothing read; each fetch is kept in ``fetched`` for ``write`` later."""
         self.query_id = query_id
-        self.store = store
+        self.write = write
+        self.fetched = fetched
         self.pending: list[_Deferred] = []
         self.interrupted_by: TransientError | None = None
         self.shortfalls: list[str] = []
@@ -3448,16 +3790,18 @@ class _QueryReads:
     ) -> None:
         """Read one scope, or keep it unread with ``deferred_at`` once the query is interrupted.
 
-        The rows go to ``store`` at once, with the scope's :func:`_date_range`, so rows read
-        before an interruption are kept; upserts are idempotent, so re-reading a scope later
-        changes no row count.
+        The fetch is kept in :attr:`fetched` with the scope's :func:`_date_range`, and nothing
+        is written yet: the transaction that records the query's dataset writes every kept
+        fetch in reading order (:meth:`MetricsSyncJob._record_google`), so rows read before an
+        interruption are stored with that dataset's outcome; upserts are idempotent, so
+        re-reading a scope later changes no row count.
         """
         if self.interrupted_by is not None:
             self.pending.append(_Deferred(scope, deferred_at))
             return
         outcome = await fetcher.partitioned_fetch(self.query_id, scope)
         self.calls += outcome.calls
-        await self.store(outcome, _date_range(scope))
+        self.fetched.append(_Fetched(self.query_id, outcome, _date_range(scope)))
         self.shortfalls.extend(_shortfall_reasons(outcome))
         if outcome.interrupted_by is not None:
             self.interrupted_by = outcome.interrupted_by
@@ -3591,7 +3935,9 @@ class MetricsSyncJob(_JobBase):
 
     * **Google**: Q-G3 to ``fact_campaign_daily`` and Q-G5 to ``fact_keyword_daily``
       (``google.metrics_daily``), Q-G6 to ``fact_search_term_daily``
-      (``google.search_terms``), each fetch committed on its own. A campaign or ad group no
+      (``google.search_terms``). Every fetch is kept until its dataset's last read is done,
+      then the dataset's fetches are written in reading order in the one transaction that
+      records its checkpoint and freshness (:meth:`_record_google`). A campaign or ad group no
       entity sync stored (removed before tracking) gets a stand-in so its spend counts; a
       keyword row of an unknown keyword is skipped and counted (campaign spend is covered
       by Q-G3, and K3 reviews current keywords only). The unread scopes both datasets'
@@ -3614,7 +3960,9 @@ class MetricsSyncJob(_JobBase):
       ``NULL`` (LinkedIn reports leads and website conversions instead). Rows of creatives
       the dataset does not know are counted and make the dataset ``incomplete``. An
       account's reconcile scope is the creatives of its campaigns over the fetched
-      ``[start, end]``. The creatives are read once per job, not once per account.
+      ``[start, end]``. The creatives are read once per job, not once per account. Every
+      account's listing is read first; one transaction then writes them all with the
+      dataset's outcome.
 
     Args of the constructor: ``kind`` selects the range (:func:`_metrics_range`); a
     ``restatement`` run records ``sync_run`` rows under :data:`JOB_RESTATEMENT`, a
@@ -3639,8 +3987,8 @@ class MetricsSyncJob(_JobBase):
     def freshness_datasets(self) -> tuple[str, ...]:
         """Google: ``google.metrics_daily`` and ``google.search_terms``; LinkedIn analytics."""
         if self.ctx.source == "google":
-            return ("google.metrics_daily", "google.search_terms")
-        return ("linkedin.analytics_daily",)
+            return (DATASET_GOOGLE_METRICS_DAILY, DATASET_GOOGLE_SEARCH_TERMS)
+        return (DATASET_LINKEDIN_ANALYTICS_DAILY,)
 
     def sync_run_jobs(self) -> tuple[str, ...]:
         """A backfill satisfies both the incremental and the restatement slot."""
@@ -3682,8 +4030,10 @@ class MetricsSyncJob(_JobBase):
         3. The own ranges are read in the order Q-G3, Q-G5, Q-G6, each without the days a
            stored scope of its query covers (:func:`_own_segments`).
         4. Each dataset is recorded (:meth:`_record_google`) as soon as its last read is
-           done, so a defect raised by a later dataset's own range leaves the outcome of
-           ``google.metrics_daily`` recorded.
+           done: one transaction writes its fetches in reading order with its checkpoint and
+           outcome, so a defect raised by a later dataset's own range leaves
+           ``google.metrics_daily`` recorded, and an error or a cancellation before a
+           dataset's transaction commits leaves that dataset as it was.
 
         Each query stops at its first interruption; its later scopes stay unread.
         """
@@ -3695,20 +4045,25 @@ class MetricsSyncJob(_JobBase):
         account_id = None if account is None else account.id
         today = ctx.now.astimezone(_zone(None if account is None else account.timezone)).date()
 
-        async def campaign_daily(outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
-            await self._store_campaign_daily(outcome, account_id, covered)
+        async def campaign_daily(
+            session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
+        ) -> _Written:
+            return await self._store_campaign_daily(session, outcome, account_id, covered)
 
-        async def search_terms(outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
-            await self._store_search_terms(outcome, account_id, covered)
+        async def search_terms(
+            session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
+        ) -> _Written:
+            return await self._store_search_terms(session, outcome, account_id, covered)
 
-        stores: Mapping[str, _FetchStore] = {
+        writes: Mapping[str, _FetchWrite] = {
             "Q-G3": campaign_daily,
             "Q-G5": self._store_keyword_daily,
             "Q-G6": search_terms,
         }
         plans = [self._google_plan(name, today, rows.get(name)) for name in _GOOGLE_METRICS_QUERIES]
+        fetched: list[_Fetched] = []
         reads = {
-            query_id: _QueryReads(query_id, stores[query_id])
+            query_id: _QueryReads(query_id, writes[query_id], fetched)
             for plan in plans
             for query_id in plan.queries
         }
@@ -3718,7 +4073,10 @@ class MetricsSyncJob(_JobBase):
             for query_id in plan.queries:
                 for segment in plan.segments[query_id]:
                     await reads[query_id].read(fetcher, segment, ctx.now)
-            await self._record_google(plan, [reads[query_id] for query_id in plan.queries])
+            mine = [entry for entry in fetched if entry.query_id in plan.queries]
+            await self._record_google(plan, [reads[query_id] for query_id in plan.queries], mine)
+            # Recorded: the dataset's fetches are no longer needed.
+            fetched[:] = [entry for entry in fetched if entry.query_id not in plan.queries]
 
     def _google_plan(self, name: str, today: date, row: DatasetFreshness | None) -> _GooglePlan:
         """Decide what this run reads for one Google metrics dataset (:class:`_GooglePlan`)."""
@@ -3749,11 +4107,16 @@ class MetricsSyncJob(_JobBase):
             },
         )
 
-    async def _record_google(self, plan: _GooglePlan, reads: Sequence[_QueryReads]) -> None:
-        """Record one Google metrics dataset after its reads: a success, a deferral, or a failure.
+    async def _record_google(
+        self, plan: _GooglePlan, reads: Sequence[_QueryReads], fetched: Sequence[_Fetched]
+    ) -> None:
+        """Write and record one Google metrics dataset after its reads, in one transaction.
 
-        Under the freshness row's lock, what stays unread is merged with what another run
-        stored meanwhile and written back (or the checkpoint cleared), and in the same
+        The freshness row is locked first, so two runs publishing the same dataset queue
+        rather than interleave their fact writes. ``fetched`` (the dataset's fetches, in
+        reading order) is then written with each query's write, upserts and complete-scope
+        deletions in the order they were read. What stays unread is merged with what another
+        run stored meanwhile and written back (or the checkpoint cleared), and in the same
         transaction:
 
         * nothing pending: a success, ``complete`` unless a result limit was met;
@@ -3761,10 +4124,17 @@ class MetricsSyncJob(_JobBase):
           its reason (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` prefix) counting
           every pending scope, followed by the permanent shortfalls;
         * any other transient interruption fails the refresh instead: the checkpoint is
-          still written, and the dataset keeps its last good data and turns stale.
+          still written, the failed attempt is recorded with the rows read, so the dataset
+          keeps its last good standing and turns stale, and the rerun is queued when those
+          rows changed anything.
 
         The recorded range is the full own range (or the resumed cycle's), whatever days the
         own read left to stored scopes: those days are vouched for once nothing is pending.
+
+        Args:
+            plan: What the run read for the dataset.
+            reads: The reads of the dataset's queries.
+            fetched: The dataset's fetches, in reading order.
 
         Raises:
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
@@ -3799,9 +4169,13 @@ class MetricsSyncJob(_JobBase):
             ),
         )
         self._calls += sum(read.calls for read in reads)
+        writes = {read.query_id: read.write for read in reads}
 
         async with ctx.sessionmaker() as session, session.begin():
             now_stored = await freshness.lock_checkpoint(session, ctx.dataset_id, name)
+            written = _Written()
+            for entry in fetched:
+                written += await writes[entry.query_id](session, entry.outcome, entry.covered)
             current = (
                 loaded
                 if now_stored == stored
@@ -3820,7 +4194,11 @@ class MetricsSyncJob(_JobBase):
                     else None
                 )
                 outcome = _success(ctx.now, covered=recorded, reasons=(deferred, *merged.reasons))
-                await self._complete(session, {name: outcome})
+            else:
+                outcome = FreshnessOutcome.failure(ctx.now, reason=failure.reason)
+            await self._complete(
+                session, {name: outcome}, changed=written.changed, rows={name: written.rows}
+            )
         _log.info(
             "sync.metrics.google_checkpoint",
             source="google",
@@ -3835,234 +4213,255 @@ class MetricsSyncJob(_JobBase):
             self._interrupted(interruptions[0], dataset=None)
 
     async def _store_campaign_daily(
-        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date] | None
-    ) -> None:
+        self,
+        session: AsyncSession,
+        outcome: FetchOutcome,
+        account_id: int | None,
+        covered: tuple[date, date] | None,
+    ) -> _Written:
         """Store Q-G3 over ``covered`` in ``fact_campaign_daily``, stubbing unknown campaigns.
 
-        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
-        dated inside ``covered`` whose (campaign, day) it did not return are deleted in the
-        same transaction (:func:`_remove_absent`), also when it returned no row at all.
-        ``covered`` is ``None`` for a scope narrowed inside its days (campaign bounds), which
-        reads only part of each day, so its rows are only upserted.
+        The rows are upserted in ``session``'s transaction, the one that records
+        ``google.metrics_daily`` (:meth:`_record_google`); nothing is committed here. When
+        the fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered``
+        whose (campaign, day) it did not return are deleted in the same transaction
+        (:func:`_remove_absent`), also when it returned no row at all. ``covered`` is
+        ``None`` for a scope narrowed inside its days (campaign bounds), which reads only
+        part of each day, so its rows are only upserted.
+
+        Returns:
+            The facts upserted, the rows removed and the rows skipped for want of an account.
         """
         ctx = self.ctx
         rows = [parse_campaign_daily(row) for row in outcome.rows]
         reconciled = covered if covered is not None and _proven_complete(outcome) else None
         if not rows and reconciled is None:
-            return
-        async with ctx.sessionmaker() as session, session.begin():
-            campaigns = await _campaign_ids(session, ctx.dataset_id)
-            unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
-            if unknown and account_id is not None:
-                await _stub_campaigns(session, ctx.dataset_id, account_id, unknown, campaigns)
-            facts = [
-                {
-                    "campaign_id": campaigns[str(row.campaign_id)],
-                    "date": row.date,
-                    "cost": row.cost,
-                    "impressions": row.impressions,
-                    "clicks": row.clicks,
-                    "conversions": row.conversions,
-                    "conversions_value": row.conversions_value,
-                    "budget_lost_is": row.search_budget_lost_impression_share,
-                    "impression_share": row.search_impression_share,
-                }
-                for row in rows
-                if str(row.campaign_id) in campaigns
-            ]
-            written = await repositories.upsert_facts(
-                FactCampaignDaily, facts, ctx.dataset_id, session=session
+            return _Written()
+        campaigns = await _campaign_ids(session, ctx.dataset_id)
+        unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
+        if unknown and account_id is not None:
+            await _stub_campaigns(session, ctx.dataset_id, account_id, unknown, campaigns)
+        facts = [
+            {
+                "campaign_id": campaigns[str(row.campaign_id)],
+                "date": row.date,
+                "cost": row.cost,
+                "impressions": row.impressions,
+                "clicks": row.clicks,
+                "conversions": row.conversions,
+                "conversions_value": row.conversions_value,
+                "budget_lost_is": row.search_budget_lost_impression_share,
+                "impression_share": row.search_impression_share,
+            }
+            for row in rows
+            if str(row.campaign_id) in campaigns
+        ]
+        written = await repositories.upsert_facts(
+            FactCampaignDaily, facts, ctx.dataset_id, session=session
+        )
+        removed = 0
+        if reconciled is not None:
+            removed = await _remove_absent(
+                session,
+                FactCampaignDaily,
+                ctx.dataset_id,
+                scope=(FactCampaignDaily.date.between(*reconciled),),
+                key=(FactCampaignDaily.campaign_id, FactCampaignDaily.date),
+                returned={(fact["campaign_id"], fact["date"]) for fact in facts},
+                guarded=bool(facts),
+                event="sync.metrics.rows_removed",
+                fields={"source": "google", "query_id": "Q-G3"},
             )
-            if reconciled is not None:
-                await _remove_absent(
-                    session,
-                    FactCampaignDaily,
-                    ctx.dataset_id,
-                    scope=(FactCampaignDaily.date.between(*reconciled),),
-                    key=(FactCampaignDaily.campaign_id, FactCampaignDaily.date),
-                    returned={(fact["campaign_id"], fact["date"]) for fact in facts},
-                    guarded=bool(facts),
-                    event="sync.metrics.rows_removed",
-                    fields={"source": "google", "query_id": "Q-G3"},
-                )
-        self._count("google.metrics_daily", written)
-        if len(facts) < len(rows):
+        skipped = len(rows) - len(facts)
+        if skipped:
             _log.warning(
                 "sync.metrics.rows_skipped",
                 source="google",
                 query_id="Q-G3",
-                rows=len(rows) - len(facts),
+                rows=skipped,
                 reason="no Google account stored to attach stand-in campaigns to",
             )
+        return _Written(rows=written, removed=removed, skipped=skipped)
 
     async def _store_keyword_daily(
-        self, outcome: FetchOutcome, covered: tuple[date, date] | None
-    ) -> None:
+        self, session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
+    ) -> _Written:
         """Store Q-G5 over ``covered`` in ``fact_keyword_daily``; unknown keywords are skipped.
 
-        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
-        dated inside ``covered`` whose (keyword, day) it did not return are deleted in the
-        same transaction (:func:`_remove_absent`), also when it returned no row at all.
-        ``covered`` is ``None`` for a scope narrowed inside its days (campaign or ad-group
-        bounds, a criterion keyset), which reads only part of each day, so its rows are only
-        upserted.
+        The rows are upserted in ``session``'s transaction, the one that records
+        ``google.metrics_daily`` (:meth:`_record_google`); nothing is committed here. When
+        the fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered``
+        whose (keyword, day) it did not return are deleted in the same transaction
+        (:func:`_remove_absent`), also when it returned no row at all. ``covered`` is
+        ``None`` for a scope narrowed inside its days (campaign or ad-group bounds, a
+        criterion keyset), which reads only part of each day, so its rows are only upserted.
+
+        Returns:
+            The facts upserted, the rows removed and the rows of unknown keywords skipped.
         """
         ctx = self.ctx
         rows = [parse_keyword_view(row) for row in outcome.rows]
         reconciled = covered if covered is not None and _proven_complete(outcome) else None
         if not rows and reconciled is None:
-            return
-        async with ctx.sessionmaker() as session, session.begin():
-            groups = _by_last_key(
-                await repositories.entity_id_map(session, AdGroup, ctx.dataset_id)
+            return _Written()
+        groups = _by_last_key(await repositories.entity_id_map(session, AdGroup, ctx.dataset_id))
+        keywords = {
+            (key[1], str(key[2])): keyword_id
+            for key, keyword_id in (
+                await repositories.entity_id_map(session, Keyword, ctx.dataset_id)
+            ).items()
+        }
+        facts: list[dict[str, Any]] = []
+        for row in rows:
+            group_id = groups.get(str(row.ad_group_id))
+            keyword_id = (
+                None if group_id is None else keywords.get((group_id, str(row.criterion_id)))
             )
-            keywords = {
-                (key[1], str(key[2])): keyword_id
-                for key, keyword_id in (
-                    await repositories.entity_id_map(session, Keyword, ctx.dataset_id)
-                ).items()
-            }
-            facts: list[dict[str, Any]] = []
-            for row in rows:
-                group_id = groups.get(str(row.ad_group_id))
-                keyword_id = (
-                    None if group_id is None else keywords.get((group_id, str(row.criterion_id)))
-                )
-                if keyword_id is None:
-                    continue
-                facts.append(
-                    {
-                        "keyword_id": keyword_id,
-                        "date": row.date,
-                        "cost": row.cost,
-                        "impressions": row.impressions,
-                        "clicks": row.clicks,
-                        "conversions": row.conversions,
-                        "historical_quality_score": row.historical_quality_score,
-                        "average_cpc": row.average_cpc,
-                    }
-                )
-            written = await repositories.upsert_facts(
-                FactKeywordDaily, facts, ctx.dataset_id, session=session
+            if keyword_id is None:
+                continue
+            facts.append(
+                {
+                    "keyword_id": keyword_id,
+                    "date": row.date,
+                    "cost": row.cost,
+                    "impressions": row.impressions,
+                    "clicks": row.clicks,
+                    "conversions": row.conversions,
+                    "historical_quality_score": row.historical_quality_score,
+                    "average_cpc": row.average_cpc,
+                }
             )
-            if reconciled is not None:
-                await _remove_absent(
-                    session,
-                    FactKeywordDaily,
-                    ctx.dataset_id,
-                    scope=(FactKeywordDaily.date.between(*reconciled),),
-                    key=(FactKeywordDaily.keyword_id, FactKeywordDaily.date),
-                    returned={(fact["keyword_id"], fact["date"]) for fact in facts},
-                    guarded=bool(facts),
-                    event="sync.metrics.rows_removed",
-                    fields={"source": "google", "query_id": "Q-G5"},
-                )
-        self._count("google.metrics_daily", written)
-        if len(facts) < len(rows):
+        written = await repositories.upsert_facts(
+            FactKeywordDaily, facts, ctx.dataset_id, session=session
+        )
+        removed = 0
+        if reconciled is not None:
+            removed = await _remove_absent(
+                session,
+                FactKeywordDaily,
+                ctx.dataset_id,
+                scope=(FactKeywordDaily.date.between(*reconciled),),
+                key=(FactKeywordDaily.keyword_id, FactKeywordDaily.date),
+                returned={(fact["keyword_id"], fact["date"]) for fact in facts},
+                guarded=bool(facts),
+                event="sync.metrics.rows_removed",
+                fields={"source": "google", "query_id": "Q-G5"},
+            )
+        skipped = len(rows) - len(facts)
+        if skipped:
             # Campaign spend is complete through Q-G3; K3 reviews current keywords only.
             _log.info(
                 "sync.metrics.rows_skipped",
                 source="google",
                 query_id="Q-G5",
-                rows=len(rows) - len(facts),
+                rows=skipped,
                 reason="keyword not in the current keyword list",
             )
+        return _Written(rows=written, removed=removed, skipped=skipped)
 
     async def _store_search_terms(
-        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date] | None
-    ) -> None:
+        self,
+        session: AsyncSession,
+        outcome: FetchOutcome,
+        account_id: int | None,
+        covered: tuple[date, date] | None,
+    ) -> _Written:
         """Store Q-G6 over ``covered`` in ``fact_search_term_daily``, stubbing unknown parents.
 
-        The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
-        dated inside ``covered`` whose (ad group, matched criterion, term, day) it did not
-        return are deleted in the same transaction (:func:`_remove_absent`), also when it
-        returned no row at all. A finest (day, ad group) partition at the result limit makes
-        the fetch incomplete, so its rows are stored as returned and nothing is deleted.
-        ``covered`` is ``None`` for a scope narrowed inside its days (campaign or ad-group
-        bounds), which reads only part of each day, so its rows are only upserted.
+        The rows are upserted in ``session``'s transaction, the one that records
+        ``google.search_terms`` (:meth:`_record_google`); nothing is committed here. When the
+        fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered`` whose
+        (ad group, matched criterion, term, day) it did not return are deleted in the same
+        transaction (:func:`_remove_absent`), also when it returned no row at all. A finest
+        (day, ad group) partition at the result limit makes the fetch incomplete, so its rows
+        are stored as returned and nothing is deleted. ``covered`` is ``None`` for a scope
+        narrowed inside its days (campaign or ad-group bounds), which reads only part of each
+        day, so its rows are only upserted.
+
+        Returns:
+            The facts upserted, the rows removed and the rows skipped for want of an account.
         """
         ctx = self.ctx
         rows = [parse_search_term(row) for row in outcome.rows]
         reconciled = covered if covered is not None and _proven_complete(outcome) else None
         if not rows and reconciled is None:
-            return
-        async with ctx.sessionmaker() as session, session.begin():
-            campaigns = await _campaign_ids(session, ctx.dataset_id)
-            unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
-            if unknown and account_id is not None:
-                await _stub_campaigns(session, ctx.dataset_id, account_id, unknown, campaigns)
-            groups = _by_last_key(
-                await repositories.entity_id_map(session, AdGroup, ctx.dataset_id)
-            )
-            await _stub_ad_groups(
-                session,
-                ctx.dataset_id,
-                {
-                    str(row.ad_group_id): campaigns[str(row.campaign_id)]
-                    for row in rows
-                    if str(row.campaign_id) in campaigns
-                },
-                groups,
-            )
-            facts = [
-                {
-                    "ad_group_id": groups[str(row.ad_group_id)],
-                    "campaign_id": campaigns[str(row.campaign_id)],
-                    "date": row.date,
-                    "search_term": row.search_term,
-                    "term_status": row.term_status,
-                    "matched_criterion_id": row.matched_criterion_id,
-                    "matched_keyword_text": row.matched_keyword_text,
-                    "matched_match_type": row.matched_match_type,
-                    "cost": row.cost,
-                    "impressions": row.impressions,
-                    "clicks": row.clicks,
-                    "conversions": row.conversions,
-                    "conversions_value": row.conversions_value,
-                }
+            return _Written()
+        campaigns = await _campaign_ids(session, ctx.dataset_id)
+        unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
+        if unknown and account_id is not None:
+            await _stub_campaigns(session, ctx.dataset_id, account_id, unknown, campaigns)
+        groups = _by_last_key(await repositories.entity_id_map(session, AdGroup, ctx.dataset_id))
+        await _stub_ad_groups(
+            session,
+            ctx.dataset_id,
+            {
+                str(row.ad_group_id): campaigns[str(row.campaign_id)]
                 for row in rows
-                if str(row.campaign_id) in campaigns and str(row.ad_group_id) in groups
-            ]
-            written = await repositories.upsert_facts(
-                FactSearchTermDaily, facts, ctx.dataset_id, session=session
+                if str(row.campaign_id) in campaigns
+            },
+            groups,
+        )
+        facts = [
+            {
+                "ad_group_id": groups[str(row.ad_group_id)],
+                "campaign_id": campaigns[str(row.campaign_id)],
+                "date": row.date,
+                "search_term": row.search_term,
+                "term_status": row.term_status,
+                "matched_criterion_id": row.matched_criterion_id,
+                "matched_keyword_text": row.matched_keyword_text,
+                "matched_match_type": row.matched_match_type,
+                "cost": row.cost,
+                "impressions": row.impressions,
+                "clicks": row.clicks,
+                "conversions": row.conversions,
+                "conversions_value": row.conversions_value,
+            }
+            for row in rows
+            if str(row.campaign_id) in campaigns and str(row.ad_group_id) in groups
+        ]
+        written = await repositories.upsert_facts(
+            FactSearchTermDaily, facts, ctx.dataset_id, session=session
+        )
+        removed = 0
+        if reconciled is not None:
+            # Keyed on every returned row whose ad group is stored, even one skipped for an
+            # unattachable campaign, so a returned key is never taken for an absent one.
+            removed = await _remove_absent(
+                session,
+                FactSearchTermDaily,
+                ctx.dataset_id,
+                scope=(FactSearchTermDaily.date.between(*reconciled),),
+                key=(
+                    FactSearchTermDaily.ad_group_id,
+                    FactSearchTermDaily.matched_criterion_id,
+                    FactSearchTermDaily.search_term,
+                    FactSearchTermDaily.date,
+                ),
+                returned={
+                    (
+                        groups[str(row.ad_group_id)],
+                        row.matched_criterion_id,
+                        row.search_term,
+                        row.date,
+                    )
+                    for row in rows
+                    if str(row.ad_group_id) in groups
+                },
+                guarded=bool(facts),
+                event="sync.metrics.rows_removed",
+                fields={"source": "google", "query_id": "Q-G6"},
             )
-            if reconciled is not None:
-                # Keyed on every returned row whose ad group is stored, even one skipped for an
-                # unattachable campaign, so a returned key is never taken for an absent one.
-                await _remove_absent(
-                    session,
-                    FactSearchTermDaily,
-                    ctx.dataset_id,
-                    scope=(FactSearchTermDaily.date.between(*reconciled),),
-                    key=(
-                        FactSearchTermDaily.ad_group_id,
-                        FactSearchTermDaily.matched_criterion_id,
-                        FactSearchTermDaily.search_term,
-                        FactSearchTermDaily.date,
-                    ),
-                    returned={
-                        (
-                            groups[str(row.ad_group_id)],
-                            row.matched_criterion_id,
-                            row.search_term,
-                            row.date,
-                        )
-                        for row in rows
-                        if str(row.ad_group_id) in groups
-                    },
-                    guarded=bool(facts),
-                    event="sync.metrics.rows_removed",
-                    fields={"source": "google", "query_id": "Q-G6"},
-                )
-        self._count("google.search_terms", written)
-        if len(facts) < len(rows):
+        skipped = len(rows) - len(facts)
+        if skipped:
             _log.warning(
                 "sync.metrics.rows_skipped",
                 source="google",
                 query_id="Q-G6",
-                rows=len(rows) - len(facts),
+                rows=skipped,
                 reason="no Google account stored to attach stand-in campaigns to",
             )
+        return _Written(rows=written, removed=removed, skipped=skipped)
 
     # -- LinkedIn --------------------------------------------------------------------------
 
@@ -4073,9 +4472,14 @@ class MetricsSyncJob(_JobBase):
         URN map every account's rows resolve through, and each account's creative ids, which
         size its date chunks and bound its reconcile scope. The job stores no creative, so the
         map stays exact for its whole run.
+
+        Every account's listing is read first, with no transaction open. One transaction then
+        writes every listing and records the dataset: a success, or, when a transient error
+        interrupted a listing, the failed attempt together with the rows read (and the rerun
+        they need); the error is handed over once it committed.
         """
         ctx = self.ctx
-        name = "linkedin.analytics_daily"
+        name = DATASET_LINKEDIN_ANALYTICS_DAILY
         client = ctx.clients.require_linkedin()
         today = ctx.now.astimezone(UTC).date()
         start, end = (await self._ranges(today))[name]
@@ -4083,94 +4487,105 @@ class MetricsSyncJob(_JobBase):
             creatives = await _linkedin_creatives(session, ctx.dataset_id)
         reasons: list[str | None] = []
         failure: TransientError | None = None
-        unknown_rows = 0
+        listings: list[tuple[Listing[CreativeDailyRow], frozenset[int]]] = []
         for account_id in ctx.clients.linkedin_account_ids:
             scope = creatives.of(account_id)
             listing = await client.analytics_daily(
                 account_id, (start, end), expected_creatives=len(scope) or None
             )
             self._calls += listing.calls
-            unknown_rows += await self._store_creative_daily(
-                listing, (start, end), creatives.by_key, scope
-            )
+            listings.append((listing, scope))
             if listing.interrupted_by is not None and failure is None:
                 failure = listing.interrupted_by
             if not listing.complete:
                 reasons.append(listing.reason or "analytics listing incomplete")
+        async with ctx.sessionmaker() as session, session.begin():
+            written = _Written()
+            for listing, scope in listings:
+                written += await self._store_creative_daily(
+                    session, listing, (start, end), creatives.by_key, scope
+                )
+            if failure is not None:
+                outcome = FreshnessOutcome.failure(ctx.now, reason=failure.reason)
+            else:
+                if written.skipped:
+                    noun = _plural(written.skipped, "row", "rows")
+                    reasons.append(f"{noun} for unknown creatives")
+                outcome = _success(ctx.now, covered=(start, end), reasons=reasons)
+            await self._complete(
+                session, {name: outcome}, changed=written.changed, rows={name: written.rows}
+            )
         if failure is not None:
             self._interrupted(failure, dataset=name)
-            return
-        if unknown_rows:
-            reasons.append(f"{_plural(unknown_rows, 'row', 'rows')} for unknown creatives")
-        outcome = _success(ctx.now, covered=(start, end), reasons=reasons)
-        async with ctx.sessionmaker() as session, session.begin():
-            await self._complete(session, {name: outcome})
 
     async def _store_creative_daily(
         self,
+        session: AsyncSession,
         listing: Listing[CreativeDailyRow],
         covered: tuple[date, date],
         creatives: Mapping[str, int],
         scope: frozenset[int],
-    ) -> int:
-        """Store one account's creative-day rows; return how many named an unknown creative.
+    ) -> _Written:
+        """Store one account's creative-day rows in the dataset's transaction.
 
-        The rows are upserted. When the account's listing is :func:`_proven_complete`, the
-        rows of the account's creatives (``scope``) dated inside ``covered`` whose (creative,
-        day) it did not return are deleted in the same transaction (:func:`_remove_absent`),
-        also when it returned no row at all.
+        The rows are upserted in ``session``'s transaction, the one that records
+        ``linkedin.analytics_daily``; nothing is committed here. When the account's listing
+        is :func:`_proven_complete`, the rows of the account's creatives (``scope``) dated
+        inside ``covered`` whose (creative, day) it did not return are deleted in the same
+        transaction (:func:`_remove_absent`), also when it returned no row at all.
 
         Args:
+            session: The transaction that records the dataset.
             listing: The account's daily analytics listing.
             covered: The UTC ``[start, end]`` the listing read.
             creatives: The dataset's creative ids by URN, read once per job.
             scope: The ids of the account's creatives, read once per job.
 
         Returns:
-            The number of rows whose creative the dataset does not store.
+            The facts upserted, the rows removed and the rows whose creative the dataset
+            does not store.
         """
         ctx = self.ctx
         rows = listing.rows
         reconcile = _proven_complete(listing) and bool(scope)
         if not rows and not reconcile:
-            return 0
-        async with ctx.sessionmaker() as session, session.begin():
-            facts = [
-                {
-                    "creative_id": creatives[row.creative_urn],
-                    "date": row.date,
-                    "cost": row.cost,
-                    "impressions": row.impressions,
-                    "clicks": row.clicks,
-                    "conversions": None,
-                    "conversions_value": None,
-                    "form_opens": row.form_opens,
-                    "leads": row.leads,
-                    "landing_page_clicks": row.landing_page_clicks,
-                    "website_conversions": row.website_conversions,
-                }
-                for row in rows
-                if row.creative_urn in creatives
-            ]
-            written = await repositories.upsert_facts(
-                FactCreativeDaily, facts, ctx.dataset_id, session=session
+            return _Written()
+        facts = [
+            {
+                "creative_id": creatives[row.creative_urn],
+                "date": row.date,
+                "cost": row.cost,
+                "impressions": row.impressions,
+                "clicks": row.clicks,
+                "conversions": None,
+                "conversions_value": None,
+                "form_opens": row.form_opens,
+                "leads": row.leads,
+                "landing_page_clicks": row.landing_page_clicks,
+                "website_conversions": row.website_conversions,
+            }
+            for row in rows
+            if row.creative_urn in creatives
+        ]
+        written = await repositories.upsert_facts(
+            FactCreativeDaily, facts, ctx.dataset_id, session=session
+        )
+        removed = 0
+        if reconcile:
+            removed = await _remove_absent(
+                session,
+                FactCreativeDaily,
+                ctx.dataset_id,
+                scope=(
+                    _any_id(FactCreativeDaily.creative_id, scope),
+                    FactCreativeDaily.date.between(*covered),
+                ),
+                key=(FactCreativeDaily.creative_id, FactCreativeDaily.date),
+                returned={(fact["creative_id"], fact["date"]) for fact in facts},
+                guarded=bool(facts),
+                event="sync.metrics.rows_removed",
+                fields={"source": "linkedin", "surface": "ad_analytics"},
             )
-            if reconcile:
-                await _remove_absent(
-                    session,
-                    FactCreativeDaily,
-                    ctx.dataset_id,
-                    scope=(
-                        _any_id(FactCreativeDaily.creative_id, scope),
-                        FactCreativeDaily.date.between(*covered),
-                    ),
-                    key=(FactCreativeDaily.creative_id, FactCreativeDaily.date),
-                    returned={(fact["creative_id"], fact["date"]) for fact in facts},
-                    guarded=bool(facts),
-                    event="sync.metrics.rows_removed",
-                    fields={"source": "linkedin", "surface": "ad_analytics"},
-                )
-        self._count("linkedin.analytics_daily", written)
         unknown = len(rows) - len(facts)
         if unknown:
             _log.warning(
@@ -4179,7 +4594,7 @@ class MetricsSyncJob(_JobBase):
                 rows=unknown,
                 reason="creative not stored in the dataset",
             )
-        return unknown
+        return _Written(rows=written, removed=removed, skipped=unknown)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4272,6 +4687,11 @@ class SegmentSyncJob(_JobBase):
     a withdrawn segment as current evidence. An incomplete or interrupted listing only
     upserts. Rows of other windows (earlier end dates included), facets, accounts and
     datasets are never touched. The campaigns are read once per job.
+
+    Every listing is read first, with no transaction open; one transaction then writes them
+    all and records ``linkedin.segments``. A transient interruption stops the reads, and that
+    transaction records the failed attempt with the listings read before it (and the rerun
+    they need) instead of a success.
     """
 
     job = JOB_SEGMENTS
@@ -4288,7 +4708,7 @@ class SegmentSyncJob(_JobBase):
 
     def freshness_datasets(self) -> tuple[str, ...]:
         """``linkedin.segments``."""
-        return ("linkedin.segments",)
+        return (DATASET_LINKEDIN_SEGMENTS,)
 
     async def _execute(self) -> None:
         """Fetch every (account, pivot, preset) window and store it.
@@ -4297,7 +4717,7 @@ class SegmentSyncJob(_JobBase):
         once per batch: the job stores no campaign, so the map stays exact for its whole run.
         """
         ctx = self.ctx
-        name = "linkedin.segments"
+        name = DATASET_LINKEDIN_SEGMENTS
         client = ctx.clients.require_linkedin()
         presets = ctx.thresholds.presets
         async with ctx.sessionmaker() as session:
@@ -4306,16 +4726,14 @@ class SegmentSyncJob(_JobBase):
         windows = [(end - timedelta(days=days - 1), end) for days in presets]
         reasons: list[str | None] = []
         failure: TransientError | None = None
-        unknown_rows = 0
+        listings: list[tuple[Listing[SegmentRow], tuple[date, date], str, frozenset[int]]] = []
         for account_id in ctx.clients.linkedin_account_ids:
             scope = campaigns.of(account_id)
             for pivot in SEGMENT_PIVOTS:
                 for window in windows:
                     listing = await client.analytics_segments(account_id, pivot, window)
                     self._calls += listing.calls
-                    unknown_rows += await self._store(
-                        listing, window, SEGMENT_FACETS[pivot], campaigns.by_key, scope
-                    )
+                    listings.append((listing, window, SEGMENT_FACETS[pivot], scope))
                     if listing.interrupted_by is not None:
                         failure = failure or listing.interrupted_by
                     if not listing.complete:
@@ -4326,39 +4744,57 @@ class SegmentSyncJob(_JobBase):
                     break
             if failure is not None:
                 break
+        async with ctx.sessionmaker() as session, session.begin():
+            written = _Written()
+            for listing, window, facet, scope in listings:
+                written += await self._store(
+                    session, listing, window, facet, campaigns.by_key, scope
+                )
+            if failure is not None:
+                outcome = FreshnessOutcome.failure(ctx.now, reason=failure.reason)
+            else:
+                if written.skipped:
+                    noun = _plural(written.skipped, "row", "rows")
+                    reasons.append(f"{noun} for unknown campaigns")
+                shortfall = _join_reasons(reasons)
+                recorded = segment_reason(presets, end)
+                outcome = FreshnessOutcome.success(
+                    ctx.now,
+                    covered_from=end - timedelta(days=max(presets) - 1),
+                    covered_through=end,
+                    complete=shortfall is None,
+                    reason=(
+                        recorded
+                        if shortfall is None
+                        else f"{recorded}{_REASON_SEPARATOR}{shortfall}"
+                    ),
+                )
+            await self._complete(
+                session, {name: outcome}, changed=written.changed, rows={name: written.rows}
+            )
         if failure is not None:
             self._interrupted(failure, dataset=name)
-            return
-        if unknown_rows:
-            reasons.append(f"{_plural(unknown_rows, 'row', 'rows')} for unknown campaigns")
-        shortfall = _join_reasons(reasons)
-        recorded = segment_reason(presets, end)
-        outcome = FreshnessOutcome.success(
-            ctx.now,
-            covered_from=end - timedelta(days=max(presets) - 1),
-            covered_through=end,
-            complete=shortfall is None,
-            reason=recorded if shortfall is None else f"{recorded}{_REASON_SEPARATOR}{shortfall}",
-        )
-        async with ctx.sessionmaker() as session, session.begin():
-            await self._complete(session, {name: outcome})
 
     async def _store(
         self,
+        session: AsyncSession,
         listing: Listing[SegmentRow],
         window: tuple[date, date],
         facet: str,
         campaigns: Mapping[str, int],
         scope: frozenset[int],
-    ) -> int:
-        """Store one (account, pivot, window) listing; return how many named an unknown campaign.
+    ) -> _Written:
+        """Store one (account, pivot, window) listing in the dataset's transaction.
 
-        The rows are upserted. When the listing is :func:`_proven_complete`, the rows of the
-        account's campaigns (``scope``) for ``facet`` and exactly ``window`` whose (campaign,
-        value) it did not return are deleted in the same transaction (:func:`_remove_absent`),
-        also when it returned no row at all.
+        The rows are upserted in ``session``'s transaction, the one that records
+        ``linkedin.segments``; nothing is committed here. When the listing is
+        :func:`_proven_complete`, the rows of the account's campaigns (``scope``) for
+        ``facet`` and exactly ``window`` whose (campaign, value) it did not return are
+        deleted in the same transaction (:func:`_remove_absent`), also when it returned no
+        row at all.
 
         Args:
+            session: The transaction that records the dataset.
             listing: The listing of one account, pivot and window.
             window: The exact ``(window_start, window_end)`` the listing read.
             facet: The pivot's facet (``SEGMENT_FACETS[pivot]``).
@@ -4366,64 +4802,62 @@ class SegmentSyncJob(_JobBase):
             scope: The ids of the account's campaigns, read once per job.
 
         Returns:
-            The number of rows whose campaign the dataset does not store.
+            The facts upserted, the rows removed and the rows whose campaign the dataset
+            does not store.
         """
         ctx = self.ctx
         rows = listing.rows
         reconcile = _proven_complete(listing) and bool(scope)
         if not rows and not reconcile:
-            return 0
+            return _Written()
         start, end = window
-        async with ctx.sessionmaker() as session, session.begin():
-            facts: list[dict[str, Any]] = []
-            for row in rows:
-                external = _urn_tail(row.campaign_urn, PREFIX_CAMPAIGN)
-                campaign_id = None if external is None else campaigns.get(external)
-                if campaign_id is None:
-                    continue
-                facts.append(
-                    {
-                        "campaign_id": campaign_id,
-                        "facet": row.facet,
-                        "value": row.value,
-                        "window_start": start,
-                        "window_end": end,
-                        "impressions": row.impressions,
-                        "clicks": row.clicks,
-                        "cost": row.cost,
-                        "leads": row.leads,
-                    }
-                )
-            written = await repositories.upsert_facts(
-                FactSegmentWindow, facts, ctx.dataset_id, session=session
+        facts: list[dict[str, Any]] = []
+        for row in rows:
+            external = _urn_tail(row.campaign_urn, PREFIX_CAMPAIGN)
+            campaign_id = None if external is None else campaigns.get(external)
+            if campaign_id is None:
+                continue
+            facts.append(
+                {
+                    "campaign_id": campaign_id,
+                    "facet": row.facet,
+                    "value": row.value,
+                    "window_start": start,
+                    "window_end": end,
+                    "impressions": row.impressions,
+                    "clicks": row.clicks,
+                    "cost": row.cost,
+                    "leads": row.leads,
+                }
             )
-            if reconcile:
-                await _remove_absent(
-                    session,
-                    FactSegmentWindow,
-                    ctx.dataset_id,
-                    scope=(
-                        _any_id(FactSegmentWindow.campaign_id, scope),
-                        FactSegmentWindow.facet == facet,
-                        FactSegmentWindow.window_start == start,
-                        FactSegmentWindow.window_end == end,
-                    ),
-                    key=(FactSegmentWindow.campaign_id, FactSegmentWindow.value),
-                    returned={
-                        (fact["campaign_id"], fact["value"])
-                        for fact in facts
-                        if fact["facet"] == facet
-                    },
-                    guarded=bool(facts),
-                    event="sync.segments.rows_removed",
-                    fields={
-                        "source": "linkedin",
-                        "facet": facet,
-                        "window_start": start.isoformat(),
-                        "window_end": end.isoformat(),
-                    },
-                )
-        self._count("linkedin.segments", written)
+        written = await repositories.upsert_facts(
+            FactSegmentWindow, facts, ctx.dataset_id, session=session
+        )
+        removed = 0
+        if reconcile:
+            removed = await _remove_absent(
+                session,
+                FactSegmentWindow,
+                ctx.dataset_id,
+                scope=(
+                    _any_id(FactSegmentWindow.campaign_id, scope),
+                    FactSegmentWindow.facet == facet,
+                    FactSegmentWindow.window_start == start,
+                    FactSegmentWindow.window_end == end,
+                ),
+                key=(FactSegmentWindow.campaign_id, FactSegmentWindow.value),
+                returned={
+                    (fact["campaign_id"], fact["value"]) for fact in facts if fact["facet"] == facet
+                },
+                guarded=bool(facts),
+                event="sync.segments.rows_removed",
+                fields={
+                    "source": "linkedin",
+                    "facet": facet,
+                    "window_start": start.isoformat(),
+                    "window_end": end.isoformat(),
+                },
+            )
         unknown = len(rows) - len(facts)
         if unknown:
             _log.warning(
@@ -4432,7 +4866,7 @@ class SegmentSyncJob(_JobBase):
                 rows=unknown,
                 reason="campaign not stored in the dataset",
             )
-        return unknown
+        return _Written(rows=written, removed=removed, skipped=unknown)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -4466,8 +4900,10 @@ class LeadSyncJob(_JobBase):
     attempt naming the count, which keeps ``last_success_at`` (the cursor), its coverage
     and its completeness, so every later run re-reads the range until the account is
     stored and the lead with it. The attempt's placed leads are stored and staged all the
-    same. A transient interruption fails the attempt the same way (``on_error``), keeping
-    the cursor.
+    same. A transient interruption fails the attempt the same way, keeping the cursor: the
+    leads read before it are stored and staged in the transaction that records the failed
+    attempt, and the error then goes to ``on_error``. Either failed attempt queues the
+    ``analysis_request`` the leads it stored or staged need.
     """
 
     job = JOB_LEADS
@@ -4489,12 +4925,12 @@ class LeadSyncJob(_JobBase):
 
     def freshness_datasets(self) -> tuple[str, ...]:
         """``linkedin.leads``."""
-        return ("linkedin.leads",)
+        return (DATASET_LINKEDIN_LEADS,)
 
     async def _execute(self) -> None:
         """List, store and stage the range's leads (class docstring)."""
         ctx = self.ctx
-        name = "linkedin.leads"
+        name = DATASET_LINKEDIN_LEADS
         client = ctx.clients.require_linkedin()
         async with ctx.sessionmaker() as session:
             row = (await freshness.load_freshness(session, ctx.dataset_id)).get(name)
@@ -4529,20 +4965,23 @@ class LeadSyncJob(_JobBase):
         async with ctx.sessionmaker() as session, session.begin():
             await repositories.ensure_writable(session, ctx.dataset_id)
             await _store_form_versions(session, ctx.dataset_id, versions, now=ctx.now)
-            staged, unplaced = await self._store_leads(session, reads)
-            if failure is None:
-                if unplaced:
-                    # A success would move the cursor past the leads left unstored; a failed
-                    # attempt keeps it, so the next run re-reads them (class docstring).
-                    reason = (
-                        f"{_plural(unplaced, 'lead', 'leads')} not stored: campaign and ad "
-                        "account not stored yet"
-                    )
-                    outcome = FreshnessOutcome.failure(ctx.now, reason=reason)
-                    self._failed[name] = reason
-                else:
-                    outcome = _success(ctx.now, covered=covered, reasons=reasons)
-                await self._complete(session, {name: outcome})
+            stored, staged, unplaced = await self._store_leads(session, reads)
+            if failure is not None:
+                # The leads read are stored and staged, but the listing did not finish: a
+                # failed attempt keeps the cursor, and on_error then decides the rest.
+                outcome = FreshnessOutcome.failure(ctx.now, reason=failure.reason)
+            elif unplaced:
+                # A success would move the cursor past the leads left unstored; a failed
+                # attempt keeps it, so the next run re-reads them (class docstring).
+                reason = (
+                    f"{_plural(unplaced, 'lead', 'leads')} not stored: campaign and ad "
+                    "account not stored yet"
+                )
+                outcome = FreshnessOutcome.failure(ctx.now, reason=reason)
+                self._failed[name] = reason
+            else:
+                outcome = _success(ctx.now, covered=covered, reasons=reasons)
+            await self._complete(session, {name: outcome}, changed=bool(stored or staged))
         _log.info(
             "sync.leads.stored",
             dataset_id=ctx.dataset_id,
@@ -4557,7 +4996,7 @@ class LeadSyncJob(_JobBase):
 
     async def _store_leads(
         self, session: AsyncSession, reads: Sequence[tuple[str, Sequence[ParsedLead]]]
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """Upsert the leads (stubbing unknown campaigns and creatives) and stage them.
 
         A lead whose campaign is not stored and whose ad account is not stored either (an
@@ -4566,8 +5005,8 @@ class LeadSyncJob(_JobBase):
         Such a lead is left unstored, and counted, for the caller to fail the attempt.
 
         Returns:
-            The ``lead_match`` rows inserted across the CRM datasets staged in, and the
-            number of leads left unstored for want of a campaign.
+            The leads stored, the ``lead_match`` rows inserted across the CRM datasets staged
+            in, and the number of leads left unstored for want of a campaign.
         """
         ctx = self.ctx
         dataset_id = ctx.dataset_id
@@ -4654,7 +5093,7 @@ class LeadSyncJob(_JobBase):
                 reason="campaign and ad account not stored",
             )
         stored = _by_last_key(await repositories.upsert_entities(session, Lead, values, dataset_id))
-        self._count("linkedin.leads", len(stored))
+        self._count(DATASET_LINKEDIN_LEADS, len(stored))
         lead_ids = sorted(stored.values())
         reasons = {stored[external]: reason for external, reason in no_email.items()}
         staged = 0
@@ -4662,7 +5101,7 @@ class LeadSyncJob(_JobBase):
             staged += await lead_match.create_pending(
                 session, lead_ids, crm_dataset_id, now=ctx.now, no_email_reasons=reasons
             )
-        return staged, len(unplaced)
+        return len(stored), staged, len(unplaced)
 
     async def _staging_targets(self, session: AsyncSession) -> list[int]:
         """The CRM datasets new leads are staged in (module docstring of ``lead_match``)."""
@@ -4677,13 +5116,13 @@ class LeadSyncJob(_JobBase):
                 dataset_id=ctx.dataset_id,
                 reason="no effective CRM dataset to stage lead matches in yet",
             )
-        if ctx.mode == "live":
+        if ctx.mode == MODE_LIVE:
             building = await session.scalars(
                 select(SourceDataset.id)
                 .where(
-                    SourceDataset.source == "hubspot",
-                    SourceDataset.role == "primary",
-                    SourceDataset.state == "building",
+                    SourceDataset.source == SOURCE_HUBSPOT,
+                    SourceDataset.role == DATASET_ROLE_PRIMARY,
+                    SourceDataset.state == DATASET_STATE_BUILDING,
                 )
                 .order_by(SourceDataset.id)
             )
@@ -4697,9 +5136,9 @@ async def _due_matches(session: AsyncSession, crm_dataset_id: int, now: datetime
         select(
             exists().where(
                 LeadMatch.crm_dataset_id == crm_dataset_id,
-                (LeadMatch.status == "pending")
+                (LeadMatch.status == LEAD_MATCH_PENDING)
                 | (
-                    LeadMatch.status.in_(("no_match", "error"))
+                    LeadMatch.status.in_((LEAD_MATCH_NO_MATCH, LEAD_MATCH_ERROR))
                     & LeadMatch.next_attempt_at.is_not(None)
                     & (LeadMatch.next_attempt_at <= now)
                 ),
@@ -4951,7 +5390,7 @@ def _discovery_shortfall(row: DatasetFreshness | None) -> bool:
     a repairable shortfall, whose range :func:`_widened` already re-reads. A shortfall of the
     refresh by id alone is not one: every run re-reads every stored contact.
     """
-    if row is None or row.completeness != "incomplete" or row.reason is None:
+    if row is None or row.completeness != COMPLETENESS_INCOMPLETE or row.reason is None:
         return False
     reason = row.reason
     return (
@@ -4963,22 +5402,32 @@ def _discovery_shortfall(row: DatasetFreshness | None) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class _Discovery:
-    """What one Google-touch discovery search read, for the refresh that records it.
+    """What one Google-touch discovery search read, for the refresh that stores and records it.
 
     Attributes:
         covered: The UTC dates the search covered, from its (widened) start to today.
         reason: The completed search's shortfall in the freshness vocabulary
             (:func:`_search_reason`), or ``None``.
-        found: HubSpot ids of the contacts the search returned; their properties were read
-            this run.
-        interrupted: Whether a transient failure stopped the search; the dataset then records
-            no success this run.
+        contacts: The contacts the search returned, parsed and not stored yet: the contact
+            refresh's transaction stores them (:meth:`CrmSyncJob._refresh_contacts`).
+        interrupted_by: The transient error that stopped the search, or ``None``; the dataset
+            then records a failed attempt this run.
     """
 
     covered: tuple[date, date]
     reason: str | None
-    found: frozenset[str]
-    interrupted: bool
+    contacts: tuple[ContactRow, ...]
+    interrupted_by: TransientError | None
+
+    @property
+    def found(self) -> frozenset[str]:
+        """HubSpot ids of the contacts the search returned; their properties were read."""
+        return frozenset(row.hs_id for row in self.contacts)
+
+    @property
+    def interrupted(self) -> bool:
+        """Whether a transient failure stopped the search."""
+        return self.interrupted_by is not None
 
 
 class CrmSyncJob(_JobBase):
@@ -4992,9 +5441,9 @@ class CrmSyncJob(_JobBase):
     1. **Google-touch discovery** (primary only, and only when the stored bindings verify
        both ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`` and ``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY``
        and the settings still name them): contacts whose touch date falls in the sync range
-       and whose campaign property is set are stored. Without the configuration nothing is
-       called and no row is written; Google items then carry ``no_crm_link`` and no
-       LinkedIn-derived subset stands in.
+       and whose campaign property is set are read; step 3's transaction stores them with the
+       dataset's outcome. Without the configuration nothing is called and no row is written;
+       Google items then carry ``no_crm_link`` and no LinkedIn-derived subset stands in.
     2. **Matching**: the due ``lead_match`` rows (:class:`LeadMatchJob`'s pass).
     3. **Contact refresh** by id of every matched contact and, when discovery runs, every
        stored Google-touch contact whatever its touch date (a Google-only contact touched
@@ -5003,7 +5452,8 @@ class CrmSyncJob(_JobBase):
        date properties and the Google properties; ``lead_match.contact_read_status`` records
        ``ok`` or ``error`` per matched contact, and a failed read keeps the previous stage
        values (``hubspot.contacts``, counting every contact not read). The same transaction
-       records ``hubspot.google_contacts``: the discovery's outcome, ``incomplete`` while any
+       stores the contacts discovery read, before the newer reads by id, and records
+       ``hubspot.google_contacts``: the discovery's outcome, ``incomplete`` while any
        Google-touch contact was not refreshed (:meth:`_google_outcome`).
     4. **Deal search**: every deal created from the default window start (or the backfill
        start) to now, partitioned below the 10,000-result ceiling (``hubspot.deal_search``).
@@ -5015,11 +5465,13 @@ class CrmSyncJob(_JobBase):
 
     Transient failures (AAP 0.3.3 transient row): a search, contact read, association read or
     target read whose call still fails after its retries returns what it read with the error
-    in ``interrupted_by``. The step stores what was read with its per-object unknown state
-    (``contact_read_status`` ``error``, fetch rows ``error``/``partial``, missing targets),
-    records no success for its dataset and hands the error to ``on_error``, which records the
-    failed attempt: ``last_success_at`` and the coverage stand, the dataset turns stale and the
-    connection ``stale``. A matching interruption is handed over with no dataset. A one-hour
+    in ``interrupted_by``. The step's transaction stores what was read with its per-object
+    unknown state (``contact_read_status`` ``error``, fetch rows ``error``/``partial``, missing
+    targets) together with its dataset's failed attempt, and queues the rerun when that
+    changed data: ``last_success_at`` and the coverage stand and the dataset turns stale. The
+    error is then handed to ``on_error``, which turns the connection ``stale``. An interrupted
+    discovery fails ``hubspot.google_contacts`` in step 3's transaction, which stores the
+    contacts it read. A matching interruption is handed over with no dataset. A one-hour
     partition above the search ceiling, or a short read, is a completed read and stays an
     ``incomplete`` success.
 
@@ -5045,8 +5497,12 @@ class CrmSyncJob(_JobBase):
 
     def freshness_datasets(self) -> tuple[str, ...]:
         """Contacts, associations and the deal search; Google contacts when discovery runs."""
-        names = ("hubspot.contacts", "hubspot.associations", "hubspot.deal_search")
-        return (*names, "hubspot.google_contacts") if self._discovery else names
+        names = (
+            DATASET_HUBSPOT_CONTACTS,
+            DATASET_HUBSPOT_ASSOCIATIONS,
+            DATASET_HUBSPOT_DEAL_SEARCH,
+        )
+        return (*names, DATASET_HUBSPOT_GOOGLE_CONTACTS) if self._discovery else names
 
     async def _execute(self) -> None:
         """Run the five steps of the class docstring."""
@@ -5075,18 +5531,18 @@ class CrmSyncJob(_JobBase):
                 and touch_property is not None
             ):
                 self._discovery = True
-                await self._open_runs(("hubspot.google_contacts",))
+                await self._open_runs((DATASET_HUBSPOT_GOOGLE_CONTACTS,))
                 discovery = await self._discover(
                     client,
                     props,
                     (campaign_property, touch_property),
-                    _widened(search_start, rows.get("hubspot.google_contacts")),
+                    _widened(search_start, rows.get(DATASET_HUBSPOT_GOOGLE_CONTACTS)),
                 )
 
             await self._match(props)
             refreshed = await self._refresh_contacts(client, props, rows, scope_start, discovery)
             deal_ids = await self._search_deals(
-                client, _widened(search_start, rows.get("hubspot.deal_search"))
+                client, _widened(search_start, rows.get(DATASET_HUBSPOT_DEAL_SEARCH))
             )
             await self._associations(
                 client, props, rows, scope_start, refreshed, discovery, deal_ids
@@ -5103,14 +5559,15 @@ class CrmSyncJob(_JobBase):
         properties: tuple[str, str],
         start: datetime,
     ) -> _Discovery:
-        """Step 1: store the Google-touch contacts of the sync range.
+        """Step 1: read the Google-touch contacts of the sync range; nothing is written.
 
-        ``properties`` are the verified campaign and touch-date properties. The outcome of
-        ``hubspot.google_contacts`` is recorded after the refresh by id (step 3), because the
-        dataset is the stored contacts, which that refresh re-reads.
+        ``properties`` are the verified campaign and touch-date properties. The contacts read
+        are stored, and the outcome of ``hubspot.google_contacts`` recorded, in the refresh by
+        id's transaction (step 3), because the dataset is the stored contacts, which that
+        refresh re-reads: a failure before it commits leaves the dataset as it was.
         """
         ctx = self.ctx
-        name = "hubspot.google_contacts"
+        name = DATASET_HUBSPOT_GOOGLE_CONTACTS
         campaign_property, touch_property = properties
         outcome = await client.search_partitioned(
             _CONTACTS,
@@ -5119,24 +5576,16 @@ class CrmSyncJob(_JobBase):
         )
         contacts = {row.hs_id: row for row in (parse_contact(r, props) for r in outcome.rows)}
         failure = outcome.interrupted_by
-        async with ctx.sessionmaker() as session, session.begin():
-            await repositories.ensure_writable(session, ctx.dataset_id)
-            stored = await repositories.upsert_entities(
-                session,
-                CrmContact,
-                [_contact_values(row) for row in contacts.values()],
-                ctx.dataset_id,
-            )
-            self._count(name, len(stored))
         if failure is not None:
-            # Retries are exhausted: the contacts read are kept, but the search did not
-            # finish, so the dataset records no success and on_error turns it stale.
+            # Retries are exhausted: the contacts read are still stored by step 3, which
+            # records the failed attempt with them; noted now, so the interruption is handed
+            # over even when a later step raises first.
             self._interrupted(failure, dataset=name)
         return _Discovery(
             covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
             reason=None if failure is not None else _search_reason(outcome),
-            found=frozenset(contacts),
-            interrupted=failure is not None,
+            contacts=tuple(contacts.values()),
+            interrupted_by=failure,
         )
 
     async def _match(self, props: ContactPropertyMap) -> None:
@@ -5198,8 +5647,8 @@ class CrmSyncJob(_JobBase):
             .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
             .where(
                 LeadMatch.crm_dataset_id == ctx.dataset_id,
-                LeadMatch.status == "matched",
-                SourceDataset.state != "retired",
+                LeadMatch.status == LEAD_MATCH_MATCHED,
+                SourceDataset.state != DATASET_STATE_RETIRED,
             )
             .distinct()
         )
@@ -5228,47 +5677,64 @@ class CrmSyncJob(_JobBase):
         scope_start: datetime,
         discovery: _Discovery | None,
     ) -> ContactBatch:
-        """Step 3: refresh by id every matched and stored Google-touch contact.
+        """Step 3: refresh by id every matched and Google-touch contact; store and record them.
 
-        Records ``hubspot.contacts`` and, when discovery ran, ``hubspot.google_contacts``
-        (:meth:`_google_outcome`) in the transaction that stores the contacts read.
+        The Google-touch contacts are the stored ones as this run's discovery leaves them:
+        the stored ids, less those discovery read with no touch date, plus those it read with
+        one. One transaction stores the contacts discovery read, then the newer reads by id,
+        updates the matched leads' ``contact_read_status`` and records ``hubspot.contacts``
+        and, when discovery ran, ``hubspot.google_contacts`` (:meth:`_google_outcome`). An
+        interrupted refresh fails ``hubspot.contacts`` there, and ``hubspot.google_contacts``
+        too when it cost a Google-touch read; an interrupted discovery fails
+        ``hubspot.google_contacts`` with its own reason. A failed attempt that wrote data
+        queues the rerun (:meth:`_complete`).
         """
         ctx = self.ctx
-        name = "hubspot.contacts"
-        google_name = "hubspot.google_contacts"
+        name = DATASET_HUBSPOT_CONTACTS
+        google_name = DATASET_HUBSPOT_GOOGLE_CONTACTS
         async with ctx.sessionmaker() as session:
             matched = await self._matched_contacts(session)
             google = await self._google_contacts(session) if discovery is not None else []
+        discovered = discovery.contacts if discovery is not None else ()
+        if discovered:
+            # Storing the discovery (below) sets each contact's touch date as read.
+            untouched = {row.hs_id for row in discovered if row.google_touch_at is None}
+            touched = {row.hs_id for row in discovered if row.google_touch_at is not None}
+            google = sorted((set(google) - untouched) | touched)
         ids = sorted({*matched, *google})
         batch = (
             await client.contacts_by_id(ids, props)
             if ids
             else ContactBatch(records=MappingProxyType({}), read_status={})
         )
-        failed = sorted(hs_id for hs_id, status in batch.read_status.items() if status != "ok")
-        read = sorted(hs_id for hs_id, status in batch.read_status.items() if status == "ok")
-        google_unread = sum(1 for hs_id in google if batch.read_status.get(hs_id) != "ok")
+        statuses = batch.read_status
+        failed = sorted(hs_id for hs_id, status in statuses.items() if status != CONTACT_READ_OK)
+        read = sorted(hs_id for hs_id, status in statuses.items() if status == CONTACT_READ_OK)
+        google_unread = sum(1 for hs_id in google if statuses.get(hs_id) != CONTACT_READ_OK)
         interruption = batch.interrupted_by
         # A refresh interruption fails the Google dataset too when it cost a Google-touch
         # read; an interrupted discovery has failed it already.
         google_interrupted = interruption is not None and google_unread > 0
         discovery_interrupted = discovery is not None and discovery.interrupted
+        refreshed = [hs_id for hs_id in read if hs_id in batch.records]
+        # One statement, so the rows are locked in natural-key order; a read by id is newer
+        # than discovery's read of the same contact and replaces it.
+        values = {row.hs_id: _contact_values(row) for row in discovered}
+        values.update((hs_id, _contact_values(batch.records[hs_id])) for hs_id in refreshed)
         async with ctx.sessionmaker() as session, session.begin():
             await repositories.ensure_writable(session, ctx.dataset_id)
             stored = await repositories.upsert_entities(
-                session,
-                CrmContact,
-                [_contact_values(batch.records[hs_id]) for hs_id in read if hs_id in batch.records],
-                ctx.dataset_id,
+                session, CrmContact, list(values.values()), ctx.dataset_id
             )
-            self._count(name, len(stored))
-            for status, hs_ids in (("ok", read), ("error", failed)):
+            stored_ids = {str(key[-1]) for key in stored}
+            updated = 0
+            for status, hs_ids in ((CONTACT_READ_OK, read), (CONTACT_READ_ERROR, failed)):
                 for chunk in _chunks(hs_ids):
-                    await session.execute(
+                    result = await session.execute(
                         update(LeadMatch)
                         .where(
                             LeadMatch.crm_dataset_id == ctx.dataset_id,
-                            LeadMatch.status == "matched",
+                            LeadMatch.status == LEAD_MATCH_MATCHED,
                             LeadMatch.contact_id.in_(
                                 select(CrmContact.id).where(
                                     CrmContact.dataset_id == ctx.dataset_id,
@@ -5277,24 +5743,40 @@ class CrmSyncJob(_JobBase):
                             ),
                         )
                         .values(contact_read_status=status)
+                        .returning(LeadMatch.lead_id)
                     )
+                    updated += len(result.all())
             reason = f"{_plural(len(failed), 'contact', 'contacts')} not read" if failed else None
             outcomes: dict[str, FreshnessOutcome] = {}
+            counts = {name: sum(1 for hs_id in refreshed if hs_id in stored_ids)}
             if interruption is None:
                 outcomes[name] = _success(
                     ctx.now,
                     covered=self._state_range(rows.get(name), scope_start),
                     reasons=[reason],
                 )
-            if discovery is not None and not discovery_interrupted and not google_interrupted:
-                outcomes[google_name] = self._google_outcome(
-                    rows.get(google_name), discovery, google_unread
-                )
-            if outcomes:
-                await self._complete(session, outcomes)
+            else:
+                outcomes[name] = FreshnessOutcome.failure(ctx.now, reason=interruption.reason)
+            if discovery is not None:
+                counts[google_name] = sum(1 for row in discovered if row.hs_id in stored_ids)
+                if discovery.interrupted_by is not None:
+                    outcomes[google_name] = FreshnessOutcome.failure(
+                        ctx.now, reason=discovery.interrupted_by.reason
+                    )
+                elif google_interrupted and interruption is not None:
+                    outcomes[google_name] = FreshnessOutcome.failure(
+                        ctx.now, reason=interruption.reason
+                    )
+                else:
+                    outcomes[google_name] = self._google_outcome(
+                        rows.get(google_name), discovery, google_unread
+                    )
+            await self._complete(
+                session, outcomes, changed=bool(stored) or updated > 0, rows=counts
+            )
         if interruption is not None:
             # The contacts read are stored and every unread one keeps its previous stage
-            # values marked ``error``, but the refresh did not finish: no success, stale.
+            # values marked ``error``, with the failed attempt; on_error decides the rest.
             also = (google_name,) if google_interrupted and not discovery_interrupted else ()
             self._interrupted(interruption, dataset=name, datasets=also)
         return batch
@@ -5350,11 +5832,13 @@ class CrmSyncJob(_JobBase):
     async def _search_deals(self, client: HubSpotClient, start: datetime) -> list[str]:
         """Step 4: every deal created from ``start`` to now (``hubspot.deal_search``).
 
-        Returns the ids of the deals read, also when a transient failure stopped the search,
-        so their deal-to-contact associations are still read.
+        One transaction stores the deals read and records the outcome: a success, or, when a
+        transient failure stopped the search, the failed attempt, which queues the rerun when
+        it stored deals (:meth:`_complete`). Returns the ids of the deals read, also when the
+        search was interrupted, so their deal-to-contact associations are still read.
         """
         ctx = self.ctx
-        name = "hubspot.deal_search"
+        name = DATASET_HUBSPOT_DEAL_SEARCH
         outcome = await client.search_partitioned(_DEALS, deal_search_filter(), (start, ctx.now))
         deals = list(
             {row.hs_id: row for row in (parse_deal(record) for record in outcome.rows)}.values()
@@ -5377,21 +5861,21 @@ class CrmSyncJob(_JobBase):
                 ],
                 ctx.dataset_id,
             )
-            self._count(name, len(stored))
-            if failure is None:
-                await self._complete(
-                    session,
-                    {
-                        name: _success(
-                            ctx.now,
-                            covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
-                            reasons=[_search_reason(outcome)],
-                        )
-                    },
+            recorded = (
+                FreshnessOutcome.failure(ctx.now, reason=failure.reason)
+                if failure is not None
+                else _success(
+                    ctx.now,
+                    covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
+                    reasons=[_search_reason(outcome)],
                 )
+            )
+            await self._complete(
+                session, {name: recorded}, changed=bool(stored), rows={name: len(stored)}
+            )
         if failure is not None:
-            # The deals read are kept, but the search did not finish: no success, so the
-            # dataset keeps its last good standing and on_error turns it stale.
+            # The deals read are stored with the failed attempt: the dataset keeps its last
+            # good standing, and on_error decides the rest.
             self._interrupted(failure, dataset=name)
         return sorted(row.hs_id for row in deals)
 
@@ -5410,10 +5894,13 @@ class CrmSyncJob(_JobBase):
         The contacts are step 3's population, read again after it: every matched contact
         and, when discovery ran, every stored Google-touch contact, whatever its touch date.
         A contact is a known deal-to-contact target, not read again, when step 3 read it or
-        this run's discovery returned it.
+        this run's discovery returned it. Every read happens first; one transaction then
+        stores what was read and records the outcome: a success, or, when a call failed after
+        its retries, the failed attempt, which queues the rerun when it wrote rows
+        (:meth:`_complete`).
         """
         ctx = self.ctx
-        name = "hubspot.associations"
+        name = DATASET_HUBSPOT_ASSOCIATIONS
         async with ctx.sessionmaker() as session:
             matched = await self._matched_contacts(session)
             google = await self._google_contacts(session) if discovery is not None else []
@@ -5436,7 +5923,7 @@ class CrmSyncJob(_JobBase):
             else TargetRead[DealRow](MappingProxyType({}), frozenset(), "ok")
         )
         known_contacts = {
-            hs_id for hs_id, status in refreshed.read_status.items() if status == "ok"
+            hs_id for hs_id, status in refreshed.read_status.items() if status == CONTACT_READ_OK
         } | (discovery.found if discovery is not None else frozenset())
         contact_targets = [
             target for target in deal_contacts_fetch.all_targets if target not in known_contacts
@@ -5490,7 +5977,9 @@ class CrmSyncJob(_JobBase):
             ]
             await repositories.upsert_entities(session, CrmDeal, deals, ctx.dataset_id)
             contacts_read = [
-                hs_id for hs_id, status in contact_read.read_status.items() if status == "ok"
+                hs_id
+                for hs_id, status in contact_read.read_status.items()
+                if status == CONTACT_READ_OK
             ]
             await repositories.upsert_entities(
                 session,
@@ -5502,7 +5991,7 @@ class CrmSyncJob(_JobBase):
                 ],
                 ctx.dataset_id,
             )
-            self._count(name, len(meetings) + len(deals) + len(contacts_read))
+            written = len(meetings) + len(deals) + len(contacts_read)
             known: dict[str, set[str]] = {
                 _MEETINGS: set(meeting_read.records),
                 _DEALS: searched | set(deal_read.records),
@@ -5510,27 +5999,34 @@ class CrmSyncJob(_JobBase):
             }
             unknown = 0
             for fetch in (meetings_fetch, deals_fetch, deal_contacts_fetch):
-                unknown += await self._write_fetch(session, fetch, known[fetch.to_type])
+                fetch_unknown, fetch_written = await self._write_fetch(
+                    session, fetch, known[fetch.to_type]
+                )
+                unknown += fetch_unknown
+                written += fetch_written
             reason = (
                 f"{_plural(unknown, 'association read', 'association reads')} unknown: the "
                 "fetch or a target read failed"
                 if unknown
                 else None
             )
-            if interruption is None:
-                await self._complete(
-                    session,
-                    {
-                        name: _success(
-                            ctx.now,
-                            covered=self._state_range(rows.get(name), scope_start),
-                            reasons=[reason],
-                        )
-                    },
+            recorded = (
+                FreshnessOutcome.failure(ctx.now, reason=interruption.reason)
+                if interruption is not None
+                else _success(
+                    ctx.now,
+                    covered=self._state_range(rows.get(name), scope_start),
+                    reasons=[reason],
                 )
+            )
+            # Every replaced association belongs to an input whose fetch row was written, so
+            # the rows written alone tell whether the transaction changed data.
+            await self._complete(
+                session, {name: recorded}, changed=written > 0, rows={name: written}
+            )
         if interruption is not None:
-            # Every fetch row keeps its unknown state, but the read did not finish: no
-            # success, so the dataset keeps its last good standing and on_error turns it stale.
+            # Every fetch row keeps its unknown state and is stored with the failed attempt:
+            # the dataset keeps its last good standing, and on_error decides the rest.
             self._interrupted(interruption, dataset=name)
 
     async def _fetch(
@@ -5543,8 +6039,11 @@ class CrmSyncJob(_JobBase):
 
     async def _write_fetch(
         self, session: AsyncSession, fetch: AssociationFetch, known: set[str]
-    ) -> int:
-        """Store one association read and its fetch rows; return the inputs left unknown.
+    ) -> tuple[int, int]:
+        """Store one association read and its fetch rows in ``session``'s transaction.
+
+        Returns the inputs left unknown and the rows written (associations and fetch rows),
+        which the caller counts once its transaction commits.
 
         On ``ok`` or ``ok_empty`` an input's stored associations of the target type are
         replaced by what was read; on ``partial`` or ``error`` the stored rows stay (they are
@@ -5559,7 +6058,7 @@ class CrmSyncJob(_JobBase):
         replaced = sorted(
             input_id
             for input_id, read in fetch.per_input.items()
-            if read.status in ("ok", "ok_empty")
+            if read.status in (ASSOCIATION_FETCH_OK, ASSOCIATION_FETCH_OK_EMPTY)
         )
         for chunk in _chunks(replaced):
             await session.execute(
@@ -5580,7 +6079,7 @@ class CrmSyncJob(_JobBase):
                 "to_id": target,
             }
             for input_id, read in fetch.per_input.items()
-            if read.status in ("ok", "partial")
+            if read.status in (ASSOCIATION_FETCH_OK, ASSOCIATION_FETCH_PARTIAL)
             for target in read.targets
         }
         await repositories.upsert_entities(
@@ -5592,20 +6091,20 @@ class CrmSyncJob(_JobBase):
             target_status: str | None
             missing: list[str] = []
             targets = set(read.targets)
-            if read.status == "ok_empty":
+            if read.status == ASSOCIATION_FETCH_OK_EMPTY:
                 target_status = None
             elif not targets:
-                target_status = "ok" if read.status == "ok" else None
+                target_status = TARGET_READ_OK if read.status == ASSOCIATION_FETCH_OK else None
             else:
                 missing = sorted(targets - known)
                 if not missing:
-                    target_status = "ok"
+                    target_status = TARGET_READ_OK
                 elif len(missing) == len(targets):
-                    target_status = "error"
+                    target_status = TARGET_READ_ERROR
                 else:
-                    target_status = "partial"
-            if read.status in ("partial", "error") or (
-                read.status == "ok" and target_status != "ok"
+                    target_status = TARGET_READ_PARTIAL
+            if read.status in (ASSOCIATION_FETCH_PARTIAL, ASSOCIATION_FETCH_ERROR) or (
+                read.status == ASSOCIATION_FETCH_OK and target_status != TARGET_READ_OK
             ):
                 unknown += 1
             fetch_rows.append(
@@ -5620,7 +6119,6 @@ class CrmSyncJob(_JobBase):
                 }
             )
         await repositories.upsert_entities(session, CrmAssociationFetch, fetch_rows, ctx.dataset_id)
-        self._count("hubspot.associations", len(links) + len(fetch_rows))
         if unknown:
             _log.warning(
                 "sync.crm.associations_unknown",
@@ -5631,7 +6129,7 @@ class CrmSyncJob(_JobBase):
                 unknown=unknown,
                 statuses=dict(fetch.status_counts()),
             )
-        return unknown
+        return unknown, len(links) + len(fetch_rows)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -5871,7 +6369,7 @@ async def backfill_dataset(
     dataset = await controller.datasets.get(dataset_id)
     source = _as_source(dataset.source)
     mode = _as_mode(dataset.mode)
-    if dataset.role != "primary":
+    if dataset.role != DATASET_ROLE_PRIMARY:
         raise ValueError(
             f"dataset {dataset_id} is a {dataset.role}; it is backfilled with its parent"
         )
@@ -5996,7 +6494,7 @@ async def refresh_crm_dataset(
     """
     instant = now if now is not None else controller.now()
     dataset = await controller.datasets.get(crm_dataset_id)
-    if dataset.source != "hubspot":
+    if dataset.source != SOURCE_HUBSPOT:
         raise ValueError(
             f"dataset {crm_dataset_id} is a {dataset.source} dataset; the CRM sync runs in a "
             "HubSpot dataset"

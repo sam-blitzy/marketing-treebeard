@@ -1348,10 +1348,11 @@ async def test_interruption_before_a_retired_dataset_is_still_handed_over(
 ) -> None:
     """An interruption noted before the dataset is retired mid-job is still handed over.
 
-    The deal search is interrupted (503), then the dataset is retired before the associations
-    step writes: the job ends failed with the not-writable reason, ``on_error`` still turns the
-    connection ``stale`` (disposition ``stale``), and the retired dataset's freshness rows of
-    the unfinished steps are not touched, as its rows are read-only history.
+    The deal search is interrupted (503) and records its failed attempt with the deals it read
+    in one transaction; then the dataset is retired before the associations step writes: the
+    job ends failed with the not-writable reason, ``on_error`` still turns the connection
+    ``stale`` (disposition ``stale``), and the retired dataset's freshness row of the
+    unfinished step is not touched, as its rows are read-only history.
     """
     before = await good_first_sync(rig)
     rig.portal.overrides.append(
@@ -1377,16 +1378,20 @@ async def test_interruption_before_a_retired_dataset_is_still_handed_over(
     connection = await rig.connection("hubspot")
     assert (connection.status, connection.last_attempt_at) == ("stale", T2)
     after = await rig.freshness()
-    for name in ("hubspot.deal_search", "hubspot.associations"):
-        assert (after[name].last_success_at, after[name].last_attempt_at) == (T1, T1), name
-        assert (after[name].covered_from, after[name].covered_through) == (
-            before[name].covered_from,
-            before[name].covered_through,
-        ), name
-        assert (after[name].completeness, after[name].reason) == (
-            before[name].completeness,
-            before[name].reason,
-        ), name
+    # Recorded while the dataset was still writable, with the deals the search read.
+    assert_failed_attempt(
+        before["hubspot.deal_search"], after["hubspot.deal_search"], attempted_at=T2
+    )
+    name = "hubspot.associations"
+    assert (after[name].last_success_at, after[name].last_attempt_at) == (T1, T1), name
+    assert (after[name].covered_from, after[name].covered_through) == (
+        before[name].covered_from,
+        before[name].covered_through,
+    ), name
+    assert (after[name].completeness, after[name].reason) == (
+        before[name].completeness,
+        before[name].reason,
+    ), name
     for name in ("hubspot.contacts", "hubspot.google_contacts"):
         assert_succeeded(after[name], at=T2)
     runs = await _sync_runs(rig, T2)

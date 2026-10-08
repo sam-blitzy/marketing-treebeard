@@ -140,7 +140,17 @@ from ads_engine.analysis.lock import ANALYSIS_LOCK_KEY, RunInProgress
 from ads_engine.analysis.thresholds import ConfigError, Thresholds
 from ads_engine.connectors.errors import ConnectorError
 from ads_engine.db import repositories
-from ads_engine.db.models.ops import SourceDataset, SyncRequest, SyncRun
+from ads_engine.db.models.ops import (
+    DATASET_ROLE_PRIMARY,
+    DATASET_STATE_RETIRED,
+    SOURCE_GOOGLE,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCEEDED,
+    SourceDataset,
+    SyncRequest,
+    SyncRun,
+)
 from ads_engine.db.session import dedicated_connection
 from ads_engine.logging import get_logger, logged_as
 from ads_engine.settings import SOURCES, Settings, Source, get_settings
@@ -1667,12 +1677,14 @@ class Scheduler:
                 await self._close_run_quietly(run_id, error=type(exc).__name__)
                 raise
             if outcome is None:
-                await self._close_run(run_id, "failed", error="recovery probe did not pass")
+                await self._close_run(run_id, SYNC_RUN_FAILED, error="recovery probe did not pass")
             elif outcome.activated and outcome.mode == "live":
-                await self._close_run(run_id, "succeeded")
+                await self._close_run(run_id, SYNC_RUN_SUCCEEDED)
             else:
                 await self._close_run(
-                    run_id, "failed", error=outcome.reason or "live dataset was not activated"
+                    run_id,
+                    SYNC_RUN_FAILED,
+                    error=outcome.reason or "live dataset was not activated",
                 )
         except asyncio.CancelledError:
             # Also a cancellation that lands in a close above, whose transaction rolled back.
@@ -1890,7 +1902,8 @@ class Scheduler:
             rows = (
                 await session.execute(
                     select(SourceDataset.id, SourceDataset.source).where(
-                        SourceDataset.state == "retired", SourceDataset.role == "primary"
+                        SourceDataset.state == DATASET_STATE_RETIRED,
+                        SourceDataset.role == DATASET_ROLE_PRIMARY,
                     )
                 )
             ).all()
@@ -1911,7 +1924,7 @@ class Scheduler:
         at the next slot rather than on every wake.
         """
         finished = self._now()
-        rows = dict(counts) if counts and error is None else {"google": 0}
+        rows = dict(counts) if counts and error is None else {SOURCE_GOOGLE: 0}
         async with self._sessions()() as session, session.begin():
             session.add_all(
                 SyncRun(
@@ -1920,7 +1933,7 @@ class Scheduler:
                     dataset=None,
                     started_at=started,
                     finished_at=finished,
-                    status="failed" if error is not None else "succeeded",
+                    status=SYNC_RUN_FAILED if error is not None else SYNC_RUN_SUCCEEDED,
                     rows=count if error is None else None,
                     error=error,
                 )
@@ -2063,7 +2076,11 @@ class Scheduler:
         try:
             async with self._sessions()() as session, session.begin():
                 row = SyncRun(
-                    source=source, job=job, dataset=None, started_at=started, status="running"
+                    source=source,
+                    job=job,
+                    dataset=None,
+                    started_at=started,
+                    status=SYNC_RUN_RUNNING,
                 )
                 session.add(row)
                 await session.flush()
@@ -2083,7 +2100,7 @@ class Scheduler:
         async with self._sessions()() as session, session.begin():
             await session.execute(
                 update(SyncRun)
-                .where(SyncRun.id == run_id, SyncRun.status == "running")
+                .where(SyncRun.id == run_id, SyncRun.status == SYNC_RUN_RUNNING)
                 .values(
                     status=status,
                     finished_at=self._now(),
@@ -2095,7 +2112,7 @@ class Scheduler:
     async def _close_run_quietly(self, run_id: int, *, error: str) -> None:
         """Mark a row failed while another error propagates; a database error is only logged."""
         try:
-            await self._close_run(run_id, "failed", error=error)
+            await self._close_run(run_id, SYNC_RUN_FAILED, error=error)
         except SQLAlchemyError as exc:
             _log.error("scheduler.sync_run_close_failed", run_id=run_id, error=type(exc).__name__)
 

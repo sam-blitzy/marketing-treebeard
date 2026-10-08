@@ -325,7 +325,12 @@ class _ServedBetween(jobs.MetricsSyncJob):
     """
 
     async def _complete(
-        self, session: AsyncSession, outcomes: Mapping[str, FreshnessOutcome]
+        self,
+        session: AsyncSession,
+        outcomes: Mapping[str, FreshnessOutcome],
+        *,
+        changed: bool = False,
+        rows: Mapping[str, int] | None = None,
     ) -> None:
         """Serve every pending request, then complete as the real job does."""
         async with self.ctx.sessionmaker() as worker, worker.begin():
@@ -334,7 +339,7 @@ class _ServedBetween(jobs.MetricsSyncJob):
                 .where(AnalysisRequest.picked_at.is_(None))
                 .values(picked_at=self.ctx.now)
             )
-        await super()._complete(session, outcomes)
+        await super()._complete(session, outcomes, changed=changed, rows=rows)
 
 
 def _commit_refused(_session: Session) -> None:

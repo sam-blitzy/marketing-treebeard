@@ -2883,18 +2883,25 @@ async def test_metrics_deferral_instants_survive_interruption_merging_and_storag
     def days(first: int, last: int) -> dict[str, date]:
         return {START: day + timedelta(days=first), END: day + timedelta(days=last)}
 
-    stored_ranges: list[tuple[date, date] | None] = []
+    written: list[tuple[date, date] | None] = []
 
-    async def store(_outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
-        stored_ranges.append(covered)
+    async def write(
+        _session: AsyncSession, _outcome: FetchOutcome, covered: tuple[date, date] | None
+    ) -> jobs._Written:
+        written.append(covered)
+        return jobs._Written()
 
     stored_scope, own_scope = days(0, 3), days(10, 12)
     fetcher = _InterruptedFetcher(deferred=(days(0, 1), days(2, 3)))
-    reads = jobs._QueryReads("Q-G5", store)
+    fetched: list[jobs._Fetched] = []
+    reads = jobs._QueryReads("Q-G5", write, fetched)
     await reads.read(fetcher, stored_scope, T0)  # type: ignore[arg-type]
     await reads.read(fetcher, own_scope, T2)  # type: ignore[arg-type]
     assert fetcher.fetched == [("Q-G5", stored_scope)], "an interrupted query reads no more"
-    assert stored_ranges == [(day, day + timedelta(days=3))], "the read's rows went to store"
+    assert [(entry.query_id, entry.covered) for entry in fetched] == [
+        ("Q-G5", (day, day + timedelta(days=3)))
+    ], "the read's rows are kept for the dataset's transaction"
+    assert written == [], "reading writes nothing; the dataset's transaction does"
     assert [(dict(entry.scope), entry.deferred_at) for entry in reads.pending] == [
         (days(0, 1), T0),
         (days(2, 3), T0),

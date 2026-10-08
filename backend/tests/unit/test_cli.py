@@ -912,6 +912,43 @@ def test_sync_prints_the_report(
     assert report["jobs"][0]["job"] == "entities"
 
 
+def test_sync_exits_failure_on_a_data_integrity_defect(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    violation = jobs.IntegrityFailure(
+        kind="foreign_key_violation",
+        sqlstate="23503",
+        table="fact_campaign_daily",
+        constraint="fk_fact_campaign_daily_campaign_id_campaign",
+    )
+    failed = jobs.JobResult(
+        job="metrics",
+        source="google",
+        dataset_id=1,
+        status="failed",
+        rows=0,
+        calls=3,
+        freshness={},
+        disposition=None,
+        error=violation.reason,
+        duration_ms=5,
+        integrity=violation,
+    )
+
+    async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
+        return jobs.SourceSyncReport(
+            source="google", trigger="manual", results=(failed,), dataset_id=1, mode="simulated"
+        )
+
+    monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
+    assert cli.main(["sync", "--source", "google"]) == cli.EXIT_FAILURE
+    captured = capsys.readouterr()
+    (job,) = json.loads(captured.out)["jobs"]
+    assert job["integrity"] == violation.to_json()
+    assert job["error"] == violation.reason
+    assert "a job failed on a defect (query or data integrity)" in captured.err
+
+
 def _fake_run(kind: str) -> SimpleNamespace:
     return SimpleNamespace(
         id=41,

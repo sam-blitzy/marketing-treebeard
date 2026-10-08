@@ -70,11 +70,28 @@ from ads_engine.db.base import Base, DatasetScopedMixin, IdPkMixin, check_in
 from ads_engine.db.models.ops import SOURCES
 
 __all__ = [
+    "ASSOCIATION_FETCH_ERROR",
+    "ASSOCIATION_FETCH_OK",
+    "ASSOCIATION_FETCH_OK_EMPTY",
+    "ASSOCIATION_FETCH_PARTIAL",
     "ASSOCIATION_FETCH_STATUSES",
+    "CONTACT_READ_ERROR",
+    "CONTACT_READ_OK",
     "CONTACT_READ_STATUSES",
+    "CRM_OBJECT_CONTACT",
+    "CRM_OBJECT_DEAL",
+    "CRM_OBJECT_MEETING",
     "CRM_OBJECT_TYPES",
     "LEAD_MATCH_CLAIMABLE_SQL",
+    "LEAD_MATCH_ERROR",
+    "LEAD_MATCH_MATCHED",
+    "LEAD_MATCH_NO_EMAIL",
+    "LEAD_MATCH_NO_MATCH",
+    "LEAD_MATCH_PENDING",
     "LEAD_MATCH_STATUSES",
+    "TARGET_READ_ERROR",
+    "TARGET_READ_OK",
+    "TARGET_READ_PARTIAL",
     "TARGET_READ_STATUSES",
     "CrmAssociation",
     "CrmAssociationFetch",
@@ -85,12 +102,23 @@ __all__ = [
     "LeadMatch",
 ]
 
+LEAD_MATCH_PENDING: Final = "pending"
+"""A lead match not attempted yet."""
+LEAD_MATCH_MATCHED: Final = "matched"
+"""A lead match that found its contact."""
+LEAD_MATCH_NO_MATCH: Final = "no_match"
+"""A lead match that found no contact; retried on the :class:`LeadMatch` schedule."""
+LEAD_MATCH_NO_EMAIL: Final = "no_email"
+"""A lead with no decodable email; terminal."""
+LEAD_MATCH_ERROR: Final = "error"
+"""A lead match whose lookup failed; retried on the :class:`LeadMatch` schedule."""
+
 LEAD_MATCH_STATUSES: Final[tuple[str, ...]] = (
-    "pending",
-    "matched",
-    "no_match",
-    "no_email",
-    "error",
+    LEAD_MATCH_PENDING,
+    LEAD_MATCH_MATCHED,
+    LEAD_MATCH_NO_MATCH,
+    LEAD_MATCH_NO_EMAIL,
+    LEAD_MATCH_ERROR,
 )
 """State of one lead's match against one CRM dataset (AAP 0.3.3).
 
@@ -99,11 +127,30 @@ LEAD_MATCH_STATUSES: Final[tuple[str, ...]] = (
 status other than ``matched`` counts as unresolved in attribution shares (AAP 0.5.4.1).
 """
 
-CONTACT_READ_STATUSES: Final[tuple[str, ...]] = ("ok", "error")
+CONTACT_READ_OK: Final = "ok"
+"""The matched contact's latest refresh by id read it."""
+CONTACT_READ_ERROR: Final = "error"
+"""The matched contact's latest refresh by id did not read it: its stage dates are unknown."""
+
+CONTACT_READ_STATUSES: Final[tuple[str, ...]] = (CONTACT_READ_OK, CONTACT_READ_ERROR)
 """Outcome of the latest refresh of a matched contact by id: ``error`` makes its stage dates
 unknown for the window rather than zero (AAP 0.3.3, 0.5.4.7)."""
 
-ASSOCIATION_FETCH_STATUSES: Final[tuple[str, ...]] = ("ok", "ok_empty", "partial", "error")
+ASSOCIATION_FETCH_OK: Final = "ok"
+"""The association read returned associations."""
+ASSOCIATION_FETCH_OK_EMPTY: Final = "ok_empty"
+"""The association read succeeded with none: a genuine zero."""
+ASSOCIATION_FETCH_PARTIAL: Final = "partial"
+"""A continuation page of the association read failed."""
+ASSOCIATION_FETCH_ERROR: Final = "error"
+"""The association read of the input failed."""
+
+ASSOCIATION_FETCH_STATUSES: Final[tuple[str, ...]] = (
+    ASSOCIATION_FETCH_OK,
+    ASSOCIATION_FETCH_OK_EMPTY,
+    ASSOCIATION_FETCH_PARTIAL,
+    ASSOCIATION_FETCH_ERROR,
+)
 """Outcome of one association batch read for one (object, target type) pair (AAP 0.3.3).
 
 ``ok`` returned associations; ``ok_empty`` succeeded with none, a genuine zero (HubSpot
@@ -111,12 +158,34 @@ reports it as a 207 ``NO_ASSOCIATIONS_FOUND`` error, which the parser maps here)
 ``partial`` means a continuation page failed; ``error`` means the input failed.
 """
 
-TARGET_READ_STATUSES: Final[tuple[str, ...]] = ("ok", "partial", "error")
+TARGET_READ_OK: Final = "ok"
+"""Every associated id was read."""
+TARGET_READ_PARTIAL: Final = "partial"
+"""Some associated ids were not read."""
+TARGET_READ_ERROR: Final = "error"
+"""No associated id was read."""
+
+TARGET_READ_STATUSES: Final[tuple[str, ...]] = (
+    TARGET_READ_OK,
+    TARGET_READ_PARTIAL,
+    TARGET_READ_ERROR,
+)
 """Outcome of batch-reading the associated meetings or deals by id (AAP 0.3.3): ``ok`` when
 every associated id was returned, ``partial`` when some were missing or a call failed,
 ``error`` when none were read."""
 
-CRM_OBJECT_TYPES: Final[tuple[str, ...]] = ("contact", "meeting", "deal")
+CRM_OBJECT_CONTACT: Final = "contact"
+"""A HubSpot contact."""
+CRM_OBJECT_MEETING: Final = "meeting"
+"""A HubSpot meeting."""
+CRM_OBJECT_DEAL: Final = "deal"
+"""A HubSpot deal."""
+
+CRM_OBJECT_TYPES: Final[tuple[str, ...]] = (
+    CRM_OBJECT_CONTACT,
+    CRM_OBJECT_MEETING,
+    CRM_OBJECT_DEAL,
+)
 """HubSpot object types, singular; the parsers map HubSpot's plural path names to these."""
 
 # The CHECK text the migration repeats verbatim: a stored hash is exactly 64 lower-case hex
