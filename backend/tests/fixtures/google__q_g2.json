@@ -1,0 +1,166 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.status != 'REMOVED' AND campaign.id > 0 ORDER BY campaign.id LIMIT 9999"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "campaign.id,campaign.name,campaign.status,campaign.advertisingChannelType,campaignBudget.id,campaignBudget.amountMicros,campaignBudget.totalAmountMicros,campaignBudget.period,campaignBudget.explicitlyShared",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000000",
+            "name": "Brand - Search",
+            "resourceName": "customers/9900000001/campaigns/990000000000",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "200000000",
+            "id": "990100000000",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000000"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000001",
+            "name": "Generic - Attribution software",
+            "resourceName": "customers/9900000001/campaigns/990000000001",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "400000000",
+            "id": "990100000001",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000001"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000002",
+            "name": "Competitor - Conquest",
+            "resourceName": "customers/9900000001/campaigns/990000000002",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "150000000",
+            "id": "990100000002",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000002"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000003",
+            "name": "Retargeting - Broad",
+            "resourceName": "customers/9900000001/campaigns/990000000003",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "120000000",
+            "id": "990100000003",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000003"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "DISPLAY",
+            "id": "990000000004",
+            "name": "Display - Awareness",
+            "resourceName": "customers/9900000001/campaigns/990000000004",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "300000000",
+            "id": "990100000004",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000004"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000005",
+            "name": "Product - Analytics platform",
+            "resourceName": "customers/9900000001/campaigns/990000000005",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "250000000",
+            "explicitlyShared": true,
+            "id": "990100000005",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000005"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000006",
+            "name": "Product - Reporting tool",
+            "resourceName": "customers/9900000001/campaigns/990000000006",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "amountMicros": "250000000",
+            "explicitlyShared": true,
+            "id": "990100000005",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000005"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000007",
+            "name": "Launch - Webinar series",
+            "resourceName": "customers/9900000001/campaigns/990000000007",
+            "status": "ENABLED"
+          },
+          "campaignBudget": {
+            "id": "990100000006",
+            "period": "CUSTOM_PERIOD",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000006",
+            "totalAmountMicros": "9000000000"
+          }
+        },
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000008",
+            "name": "Seasonal - Q4 promo",
+            "resourceName": "customers/9900000001/campaigns/990000000008",
+            "status": "PAUSED"
+          },
+          "campaignBudget": {
+            "amountMicros": "60000000",
+            "id": "990100000007",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000007"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

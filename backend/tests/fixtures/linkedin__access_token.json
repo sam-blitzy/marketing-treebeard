@@ -1,0 +1,30 @@
+{
+  "request": {
+    "body": {
+      "client_id": "<redacted>",
+      "client_secret": "<redacted>",
+      "grant_type": "refresh_token",
+      "refresh_token": "<redacted>"
+    },
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://www.linkedin.com/oauth/v2/accessToken"
+  },
+  "response": {
+    "body": {
+      "access_token": "sim-token-841eb2f965f45808d069660857ed6a27",
+      "expires_in": 5184000,
+      "refresh_token": "sim-refresh-eef5c544fb601cb7cb2a0b2c6ac60f1d",
+      "refresh_token_expires_in": 31536000,
+      "scope": "r_ads,r_ads_reporting,r_marketing_leadgen_automation"
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.access_token"
+}

@@ -1,0 +1,222 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "analytics"
+      ],
+      [
+        "pivot",
+        "CREATIVE"
+      ],
+      [
+        "timeGranularity",
+        "DAILY"
+      ],
+      [
+        "dateRange",
+        "(start:(year:2026,month:10,day:1),end:(year:2026,month:10,day:1))"
+      ],
+      [
+        "accounts",
+        "List(urn%3Ali%3AsponsoredAccount%3A990000001)"
+      ],
+      [
+        "fields",
+        "pivotValues,dateRange,costInLocalCurrency,impressions,clicks,landingPageClicks,oneClickLeadFormOpens,oneClickLeads,externalWebsiteConversions"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/adAnalytics"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "clicks": 26,
+          "costInLocalCurrency": "84.90",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 2852,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 17,
+          "oneClickLeads": 2,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001000"
+          ]
+        },
+        {
+          "clicks": 17,
+          "costInLocalCurrency": "54.73",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 2897,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 6,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001001"
+          ]
+        },
+        {
+          "clicks": 36,
+          "costInLocalCurrency": "55.56",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 3589,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 29,
+          "oneClickLeads": 5,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001002"
+          ]
+        },
+        {
+          "clicks": 24,
+          "costInLocalCurrency": "40.14",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 2669,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 19,
+          "oneClickLeads": 3,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001003"
+          ]
+        },
+        {
+          "clicks": 18,
+          "costInLocalCurrency": "62.39",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 2600,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 13,
+          "oneClickLeads": 1,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001004"
+          ]
+        },
+        {
+          "clicks": 14,
+          "costInLocalCurrency": "49.46",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 0,
+          "impressions": 2096,
+          "landingPageClicks": 0,
+          "oneClickLeadFormOpens": 9,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001005"
+          ]
+        },
+        {
+          "clicks": 25,
+          "costInLocalCurrency": "65.21",
+          "dateRange": {
+            "end": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            },
+            "start": {
+              "day": 1,
+              "month": 10,
+              "year": 2026
+            }
+          },
+          "externalWebsiteConversions": 1,
+          "impressions": 4143,
+          "landingPageClicks": 22,
+          "oneClickLeadFormOpens": 0,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCreative:990001301"
+          ]
+        }
+      ],
+      "paging": {
+        "count": 15000,
+        "links": [],
+        "start": 0
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.ad_analytics"
+}

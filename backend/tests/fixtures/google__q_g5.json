@@ -1,0 +1,197 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT ad_group_criterion.criterion_id, ad_group.id, segments.date, metrics.historical_quality_score, metrics.average_cpc, metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions FROM keyword_view WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "adGroupCriterion.criterionId,adGroup.id,segments.date,metrics.historicalQualityScore,metrics.averageCpc,metrics.costMicros,metrics.clicks,metrics.impressions,metrics.conversions",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "adGroup": {
+            "id": "990200000000",
+            "resourceName": "customers/9900000001/adGroups/990200000000"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000000",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000000~990300000000"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000000~990300000000"
+          },
+          "metrics": {
+            "averageCpc": 1200789.0,
+            "clicks": "38",
+            "conversions": 5.0,
+            "costMicros": "45630000",
+            "historicalQualityScore": "9",
+            "impressions": "379"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000001",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000001"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000001~990300000001"
+          },
+          "metrics": {
+            "averageCpc": 3034285.0,
+            "clicks": "21",
+            "conversions": 1.0,
+            "costMicros": "63720000",
+            "historicalQualityScore": "7",
+            "impressions": "493"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000002",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000002"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000001~990300000002"
+          },
+          "metrics": {
+            "averageCpc": 3143333.0,
+            "clicks": "3",
+            "conversions": 0.0,
+            "costMicros": "9430000",
+            "historicalQualityScore": "6",
+            "impressions": "107"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000003",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000003"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000001~990300000003"
+          },
+          "metrics": {
+            "averageCpc": 3196666.0,
+            "clicks": "6",
+            "conversions": 0.0,
+            "costMicros": "19180000",
+            "historicalQualityScore": "5",
+            "impressions": "129"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000004",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000004"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000001~990300000004"
+          },
+          "metrics": {
+            "averageCpc": 6626000.0,
+            "clicks": "20",
+            "conversions": 2.0,
+            "costMicros": "132520000",
+            "historicalQualityScore": "6",
+            "impressions": "390"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000002",
+            "resourceName": "customers/9900000001/adGroups/990200000002"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000006",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000002~990300000006"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000002~990300000006"
+          },
+          "metrics": {
+            "averageCpc": 2539000.0,
+            "clicks": "10",
+            "conversions": 2.0,
+            "costMicros": "25390000",
+            "historicalQualityScore": "6",
+            "impressions": "240"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000003",
+            "resourceName": "customers/9900000001/adGroups/990200000003"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000007",
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000003~990300000007"
+          },
+          "keywordView": {
+            "resourceName": "customers/9900000001/keywordViews/990200000003~990300000007"
+          },
+          "metrics": {
+            "averageCpc": 2526000.0,
+            "clicks": "5",
+            "conversions": 0.0,
+            "costMicros": "12630000",
+            "historicalQualityScore": "5",
+            "impressions": "146"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

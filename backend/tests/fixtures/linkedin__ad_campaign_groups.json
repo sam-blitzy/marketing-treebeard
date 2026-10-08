@@ -1,0 +1,113 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "search"
+      ],
+      [
+        "search",
+        "(status:(values:List(ACTIVE,PAUSED,ARCHIVED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))"
+      ],
+      [
+        "pageSize",
+        "100"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/adAccounts/990000001/adCampaignGroups"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772787600000
+            },
+            "lastModified": {
+              "time": 1772787600000
+            }
+          },
+          "id": 990020000,
+          "name": "NA - Always-on lead gen",
+          "runSchedule": {
+            "start": 1772755200000
+          },
+          "status": "ACTIVE",
+          "test": false
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772787660000
+            },
+            "lastModified": {
+              "time": 1772787660000
+            }
+          },
+          "id": 990020001,
+          "name": "NA - Webinars 2026",
+          "runSchedule": {
+            "end": 1783123200000,
+            "start": 1772755200000
+          },
+          "status": "ARCHIVED",
+          "test": false
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772787720000
+            },
+            "lastModified": {
+              "time": 1772787720000
+            }
+          },
+          "id": 990020002,
+          "name": "NA - Brand",
+          "runSchedule": {
+            "start": 1772755200000
+          },
+          "status": "PAUSED",
+          "test": false
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772787780000
+            },
+            "lastModified": {
+              "time": 1772787780000
+            }
+          },
+          "id": 990020003,
+          "name": "NA - Q1 2027 planning",
+          "runSchedule": {
+            "start": 1796083200000
+          },
+          "status": "DRAFT",
+          "test": false
+        }
+      ],
+      "metadata": {
+        "nextPageToken": null
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.ad_campaign_groups"
+}

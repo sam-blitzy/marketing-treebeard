@@ -1,0 +1,605 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT search_term_view.search_term, search_term_view.status, segments.keyword.ad_group_criterion, segments.keyword.info.text, segments.keyword.info.match_type, ad_group.id, campaign.id, segments.date, metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions, metrics.conversions_value FROM search_term_view WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "searchTermView.searchTerm,searchTermView.status,segments.keyword.adGroupCriterion,segments.keyword.info.text,segments.keyword.info.matchType,adGroup.id,campaign.id,segments.date,metrics.costMicros,metrics.clicks,metrics.impressions,metrics.conversions,metrics.conversionsValue",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "adGroup": {
+            "id": "990200000000",
+            "resourceName": "customers/9900000001/adGroups/990200000000"
+          },
+          "campaign": {
+            "id": "990000000000",
+            "resourceName": "customers/9900000001/campaigns/990000000000"
+          },
+          "metrics": {
+            "clicks": "32",
+            "conversions": 4.0,
+            "conversionsValue": 361.25,
+            "costMicros": "38460000",
+            "impressions": "317"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000000~990200000000~YWNtZSBhbmFseXRpY3M",
+            "searchTerm": "acme analytics",
+            "status": "ADDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000000~990300000000",
+              "info": {
+                "matchType": "EXACT",
+                "text": "acme analytics"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "3",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "9430000",
+            "impressions": "97"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YXR0cmlidXRpb24gbW9kZWxpbmc",
+            "searchTerm": "attribution modeling",
+            "status": "ADDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000002",
+              "info": {
+                "matchType": "EXACT",
+                "text": "attribution modeling"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "18",
+            "conversions": 1.0,
+            "conversionsValue": 91.66,
+            "costMicros": "119940000",
+            "impressions": "353"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YXR0cmlidXRpb24gcGxhdGZvcm0gY29zdA",
+            "searchTerm": "attribution platform cost",
+            "status": "ADDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000004",
+              "info": {
+                "matchType": "EXACT",
+                "text": "attribution platform cost"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "3070000",
+            "impressions": "24"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YXR0cmlidXRpb24gc29mdHdhcmUgY29tcGFyaXNvbg",
+            "searchTerm": "attribution software comparison",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "2",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "6200000",
+            "impressions": "52"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YXR0cmlidXRpb24gc29mdHdhcmUgam9icw",
+            "searchTerm": "attribution software jobs",
+            "status": "EXCLUDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "2",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "5970000",
+            "impressions": "39"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YXR0cmlidXRpb24gc29mdHdhcmUgc2FsYXJ5",
+            "searchTerm": "attribution software salary",
+            "status": "ADDED_EXCLUDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "2940000",
+            "impressions": "26"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~YjJiIG1hcmtldGluZyBhdHRyaWJ1dGlvbg",
+            "searchTerm": "b2b marketing attribution",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "6",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "18520000",
+            "impressions": "137"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~ZnJlZSBhdHRyaWJ1dGlvbiBzb2Z0d2FyZSBkb3dubG9hZA",
+            "searchTerm": "free attribution software download",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "3010000",
+            "impressions": "27"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bWFya2V0aW5nIGF0dHJpYnV0aW9uIHBsYXRmb3Jt",
+            "searchTerm": "marketing attribution platform",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "3",
+            "conversions": 1.0,
+            "conversionsValue": 91.0,
+            "costMicros": "9080000",
+            "impressions": "76"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bWFya2V0aW5nIGF0dHJpYnV0aW9uIHNvZnR3YXJl",
+            "searchTerm": "marketing attribution software",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "2990000",
+            "impressions": "25"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bWFya2V0aW5nIGF0dHJpYnV0aW9uIHNvZnR3YXJlIGZyZWU",
+            "searchTerm": "marketing attribution software free",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "2850000",
+            "impressions": "26"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bWFya2V0aW5nIGF0dHJpYnV0aW9uIHNvZnR3YXJlIHByaWNpbmc",
+            "searchTerm": "marketing attribution software pricing",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "1",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "2910000",
+            "impressions": "23"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bWFya2V0aW5nIGF0dHJpYnV0aW9uIHRvb2w",
+            "searchTerm": "marketing attribution tool",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "attribution software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "5",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "16100000",
+            "impressions": "113"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000001~bXVsdGkgdG91Y2ggYXR0cmlidXRpb24",
+            "searchTerm": "multi touch attribution",
+            "status": "ADDED"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000001~990300000003",
+              "info": {
+                "matchType": "PHRASE",
+                "text": "multi touch attribution"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000002",
+            "resourceName": "customers/9900000001/adGroups/990200000002"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "3",
+            "conversions": 1.0,
+            "conversionsValue": 95.7,
+            "costMicros": "7220000",
+            "impressions": "82"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000002~YjJiIHJldmVudWUgZm9yZWNhc3Rpbmc",
+            "searchTerm": "b2b revenue forecasting",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000002~990300000006",
+              "info": {
+                "matchType": "BROAD",
+                "text": "sales analytics software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000002",
+            "resourceName": "customers/9900000001/adGroups/990200000002"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "3",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "7850000",
+            "impressions": "69"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000002~cmV2ZW51ZSBmb3JlY2FzdGluZyBzb2Z0d2FyZQ",
+            "searchTerm": "revenue forecasting software",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000002~990300000006",
+              "info": {
+                "matchType": "BROAD",
+                "text": "sales analytics software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000002",
+            "resourceName": "customers/9900000001/adGroups/990200000002"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "3",
+            "conversions": 1.0,
+            "conversionsValue": 94.57,
+            "costMicros": "7750000",
+            "impressions": "68"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000001~990200000002~cmV2ZW51ZSBmb3JlY2FzdGluZyB0b29s",
+            "searchTerm": "revenue forecasting tool",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000002~990300000006",
+              "info": {
+                "matchType": "BROAD",
+                "text": "sales analytics software"
+              }
+            }
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000003",
+            "resourceName": "customers/9900000001/adGroups/990200000003"
+          },
+          "campaign": {
+            "id": "990000000002",
+            "resourceName": "customers/9900000001/campaigns/990000000002"
+          },
+          "metrics": {
+            "clicks": "4",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "10090000",
+            "impressions": "125"
+          },
+          "searchTermView": {
+            "resourceName": "customers/9900000001/searchTermViews/990000000002~990200000003~cml2YWwgYXR0cmlidXRpb24gc3VpdGUgYWx0ZXJuYXRpdmU",
+            "searchTerm": "rival attribution suite alternative",
+            "status": "NONE"
+          },
+          "segments": {
+            "date": "2026-10-01",
+            "keyword": {
+              "adGroupCriterion": "customers/9900000001/adGroupCriteria/990200000003~990300000007",
+              "info": {
+                "matchType": "BROAD",
+                "text": "rival attribution suite"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}
