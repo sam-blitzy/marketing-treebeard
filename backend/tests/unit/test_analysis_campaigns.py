@@ -15,6 +15,8 @@ memoised table of the original leaks in) or tune its thresholds with ``threshold
 Pure: no database and no network.
 """
 
+from collections import Counter
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -78,11 +80,12 @@ from ads_engine.analysis.context import (
     DatasetRef,
     DecisionSubject,
     EntityRef,
+    LeadInfo,
     RuleResult,
     Source,
     Withheld,
 )
-from ads_engine.analysis.text import cluster_terms, contains_tokens
+from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
 from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, ResolvedBinding
 from ads_engine.simulation.scenarios import (
     FIXED_NOW,
@@ -990,6 +993,76 @@ def test_young_leads_reach_ql_only_through_contacts_not_already_judged() -> None
     assert (_metrics(item)["young_leads"], _metrics(item)["young_ql"]) == (2, 0)
 
 
+class _CountingLeads(tuple[LeadInfo, ...]):
+    """``ctx.leads`` that counts the passes made over it, to prove a single scan per run."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[LeadInfo]:
+        self.passes += 1
+        return super().__iter__()
+
+
+def test_the_young_cohort_scans_the_window_leads_once_per_run() -> None:
+    _, built = _built("veto.cohort.case")
+    (campaign_id,) = {lead.campaign_id for lead in built.leads}
+    # Spread the leads over three campaigns, so the cohort reads several groups of one run.
+    ids = (campaign_id, campaign_id + 1000, campaign_id + 2000)
+    spread = tuple(
+        replace(lead, campaign_id=ids[index % len(ids)]) for index, lead in enumerate(built.leads)
+    )
+    leads = _CountingLeads(spread)
+    ctx = _fresh(built, leads=leads)
+    settings = campaigns._Settings.of(ctx)
+    absent = campaign_id + 3000
+    cohorts = [campaigns._young_cohort(ctx, settings, cid) for cid in (*ids, absent, *ids)]
+    assert leads.passes == 1
+    by_campaign = ctx.cache["campaigns.leads_by_campaign"]
+    for cid in ids:
+        own = [lead for lead in spread if lead.campaign_id == cid]
+        assert by_campaign[cid] == tuple(own)
+        assert campaigns._young_cohort(ctx, settings, cid) == (
+            campaigns._young_cohort_counts(ctx, settings, own)
+        )
+    assert cohorts[3] == (0, 0)
+    assert cohorts[4:] == cohorts[:3]
+    assert leads.passes == 1
+
+
+def test_every_veto_card_of_a_run_shares_one_scan_of_the_window_leads() -> None:
+    _, built = _built("veto.cohort.case")
+    leads = _CountingLeads(built.leads)
+    ctx = _fresh(built, leads=leads)
+    attribution_for(ctx)
+    leads.passes = 0  # the attribution table's own passes are not the young cohort's
+    result = campaigns.evaluate(ctx)
+    cards = [item for item in result.candidates if "young_leads" in _metrics(item)]
+    assert sorted(item.rule_id for item in cards) == [C1B, C2]
+    assert {(_metrics(item)["young_leads"], _metrics(item)["young_ql"]) for item in cards} == {
+        (2, 2)
+    }
+    assert leads.passes == 1
+
+
+def test_repeated_young_cohort_reads_of_a_campaign_reuse_one_memoised_result() -> None:
+    _, ctx = _built("veto.cohort.case")
+    (campaign_id,) = {lead.campaign_id for lead in ctx.leads}
+    settings = campaigns._Settings.of(ctx)
+    first = campaigns._young_cohort(ctx, settings, campaign_id)
+    assert first == (2, 2)
+    assert campaigns._young_cohort(ctx, settings, campaign_id) is first
+    assert ctx.cache["campaigns.young_cohort"] == {(campaign_id, 14): first}
+    fresh = _fresh(ctx)
+    assert campaigns._young_cohort(fresh, campaigns._Settings.of(fresh), campaign_id) == first
+    # The memo is keyed by the maturity too, so other settings never read the 14-day cohort.
+    wider = replace(settings, maturity_days=28)
+    assert campaigns._young_cohort(ctx, wider, campaign_id) == (22, 2)
+    assert campaigns._young_cohort(_fresh(ctx), wider, campaign_id) == (22, 2)
+    assert campaigns._young_cohort(ctx, settings, campaign_id) is first
+    no_crm = _fresh(ctx, linkedin_crm=None)
+    assert campaigns._young_cohort(no_crm, settings, campaign_id) == (2, None)
+
+
 def test_a_subject_without_a_latest_daily_budget_proposes_no_amount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1353,7 +1426,11 @@ def test_c3a_launches_an_underused_proven_segment() -> None:
         ("max_segment_cpl", Decimal("40.000000")),
     ]
     assert set(item.evidence.thresholds) == set(C3A_THRESHOLD_KEYS)
-    assert item.required_datasets == ("linkedin.segments", "linkedin.analytics_daily")
+    assert item.required_datasets == (
+        "linkedin.segments",
+        "linkedin.analytics_daily",
+        "linkedin.entities",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1472,6 +1549,85 @@ def test_c3a_needs_an_active_linkedin_campaign() -> None:
     assert result == RuleResult()
 
 
+def _without_campaign_spend(
+    scenario: Scenario, ctx: AnalysisContext, *, segment_cost: Decimal | None
+) -> AnalysisContext:
+    """``ctx`` with zero spend on every day of ``li-seg``, its leads and impressions kept.
+
+    With ``segment_cost``, the proven segment (seniority 6) costs that instead of its own cost.
+    """
+    campaign_id = _campaign_id(scenario, "linkedin", "li-seg")
+    days = tuple(replace(day, cost=Decimal(0)) for day in ctx.campaign_days[campaign_id])
+    segments = tuple(
+        replace(row, cost=segment_cost)
+        if segment_cost is not None and row.value == "urn:li:seniority:6"
+        else row
+        for row in ctx.segments
+    )
+    unspent = _fresh(ctx, campaign_days={**ctx.campaign_days, campaign_id: days}, segments=segments)
+    window_days = unspent.campaign_days[campaign_id]
+    assert sum(day.cost for day in window_days) == 0
+    assert sum(day.leads or 0 for day in window_days) > 0
+    assert sum(day.impressions for day in window_days) > 0
+    return unspent
+
+
+def test_c3a_withholds_a_zero_cost_segment_when_the_campaign_has_no_spend() -> None:
+    """A zero cost per lead gives no baseline: no 0/0 ratio and no item, a "no exposure" line."""
+    scenario, ctx = _built("c3a.preset.case")
+    unspent = _without_campaign_spend(scenario, ctx, segment_cost=Decimal(0))
+    result = campaigns.evaluate(unspent)
+    assert _items(result, C3A) == []
+    (line,) = _withheld(result, C3A)
+    assert (line.reason, line.observed, line.required, line.unit) == (
+        "no exposure: zero campaign spend in the window, so segment cost per lead cannot be "
+        "compared",
+        0,
+        1,
+        "campaign days with spend",
+    )
+    assert line.entity is not None
+    assert line.entity.type == ENTITY_SEGMENT
+    assert line.entity.name == "Pipeline Report - Lead gen: seniority urn:li:seniority:6"
+    fewer = campaigns.evaluate(_tuned(scenario, unspent, {"c3a.min_leads": 21}))
+    assert _items(fewer, C3A) == []
+    assert [line.reason for line in _withheld(fewer, C3A)] == ["segment leads 20 of 21 required"]
+
+
+def test_c3a_stays_silent_on_a_costly_segment_when_the_campaign_has_no_spend() -> None:
+    scenario, ctx = _built("c3a.preset.case")
+    assert all(row.cost is not None and row.cost > 0 for row in ctx.segments)
+    result = campaigns.evaluate(_without_campaign_spend(scenario, ctx, segment_cost=None))
+    assert _items(result, C3A) == []
+    assert _withheld(result, C3A) == []
+
+
+def test_c3a_declares_the_entities_it_reads_so_their_freshness_reaches_the_item() -> None:
+    """Fresh segments and analytics never hide a stale, incomplete ``linkedin.entities`` (P4)."""
+    _, ctx = _built("c3a.preset.case")
+    dataset_id = ctx.dataset_id_for("linkedin.entities", crm_scope=None)
+    assert dataset_id is not None
+    key = (dataset_id, "linkedin.entities")
+    behind = ctx.window.end - timedelta(days=3)
+    lagging = replace(
+        ctx.freshness[key],
+        completeness="incomplete",
+        covered_through=behind,
+        reason="campaign search cut short",
+    )
+    item = _only(campaigns.evaluate(_fresh(ctx, freshness={**ctx.freshness, key: lagging})), C3A)
+    assert "linkedin.entities" in item.required_datasets
+    statuses = {status.dataset: status for status in item.evidence.datasets}
+    assert set(statuses) == set(item.required_datasets)
+    entities = statuses["linkedin.entities"]
+    assert (entities.completeness, entities.covered_through) == ("incomplete", behind)
+    for name in ("linkedin.segments", "linkedin.analytics_daily"):
+        assert (statuses[name].completeness, statuses[name].covered_through) == (
+            "complete",
+            ctx.window.end,
+        )
+
+
 # ---------------------------------------------------------------------------
 # C3b Launch: keyword cluster without a campaign
 # ---------------------------------------------------------------------------
@@ -1585,6 +1741,91 @@ def test_c3b_currency_falls_back_to_the_google_account_then_to_none() -> None:
     assert item.evidence.metric("spend").currency is None
     assert "at 10.00 per conversion" in item.reason
     assert item.depends_on == (DecisionSubject("campaign", 1),)
+
+
+_C3B_EXTRA_THEMES: Final = (("pipedrive", "pricing"), ("salesforce", "migration"))
+"""Two more themes, each copied from the 'hubspot alternative' terms into its own cluster."""
+
+
+def _with_extra_clusters(
+    ctx: AnalysisContext, themes: tuple[tuple[str, str], ...]
+) -> AnalysisContext:
+    """Copy ``ctx`` with the 'hubspot alternative' search terms repeated once per theme."""
+    cluster_rows = [row for row in ctx.search_terms if "hubspot" in row.search_term]
+    extra = tuple(
+        replace(
+            row, search_term=row.search_term.replace("hubspot", head).replace("alternative", tail)
+        )
+        for head, tail in themes
+        for row in cluster_rows
+    )
+    return _fresh(ctx, search_terms=(*ctx.search_terms, *extra))
+
+
+@pytest.mark.parametrize("name", ["c3b.cluster.fires", "c3b.cluster.does_not_fire"])
+def test_c3b_coverage_tokens_are_the_union_of_the_coverage_text_tokens(name: str) -> None:
+    _, ctx = _built(name)
+    texts = campaigns._coverage_texts(ctx)
+    expected: set[str] = set()
+    for text in texts:
+        expected |= tokenize(text)
+    covered = campaigns._coverage_tokens(ctx)
+    assert covered == frozenset(expected)
+    assert texts
+    assert covered
+    converting = sorted(
+        {" ".join(row.search_term.lower().split()) for row in ctx.search_terms if row.conversions}
+    )
+    clusters = cluster_terms(converting, threshold=Decimal("0.5"), min_head_share=Decimal("0.5"))
+    for cluster in clusters:
+        assert (not covered.isdisjoint(cluster.head_tokens)) == contains_tokens(
+            texts, cluster.head_tokens
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "themes", "launched"),
+    [
+        ("c3b.cluster.fires", (), ["alternative hubspot"]),
+        ("c3b.cluster.does_not_fire", (), []),
+        (
+            "c3b.cluster.fires",
+            _C3B_EXTRA_THEMES,
+            ["alternative hubspot", "migration salesforce", "pipedrive pricing"],
+        ),
+        (
+            "c3b.cluster.does_not_fire",
+            _C3B_EXTRA_THEMES,
+            ["migration salesforce", "pipedrive pricing"],
+        ),
+    ],
+)
+def test_c3b_tokenizes_each_coverage_text_once_whatever_the_cluster_count(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    themes: tuple[tuple[str, str], ...],
+    launched: list[str],
+) -> None:
+    _, built = _built(name)
+    ctx = _with_extra_clusters(built, themes)
+    converting = sorted(
+        {" ".join(row.search_term.lower().split()) for row in ctx.search_terms if row.conversions}
+    )
+    clusters = cluster_terms(converting, threshold=Decimal("0.5"), min_head_share=Decimal("0.5"))
+    assert len([c for c in clusters if c.size >= 2 and c.head_tokens]) == 1 + len(themes)
+    calls: list[str] = []
+
+    def counting_tokenize(text: str) -> frozenset[str]:
+        calls.append(text)
+        return tokenize(text)
+
+    monkeypatch.setattr(campaigns, "tokenize", counting_tokenize)
+    result = campaigns.evaluate(ctx)
+    assert Counter(calls) == Counter(campaigns._coverage_texts(ctx))
+    assert sorted(item.action for item in _items(result, C3B)) == [
+        f"Create ad group or campaign for '{label}'" for label in launched
+    ]
+    assert _withheld(result, C3B) == []
 
 
 # ---------------------------------------------------------------------------

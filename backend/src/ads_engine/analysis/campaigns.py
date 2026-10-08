@@ -76,6 +76,7 @@ from ads_engine.analysis.context import (
     Evidence,
     Finding,
     Flag,
+    LeadInfo,
     Metric,
     Number,
     RuleResult,
@@ -104,7 +105,7 @@ from ads_engine.analysis.metrics import (
     subject_totals,
     window_totals,
 )
-from ads_engine.analysis.text import TermCluster, cluster_terms, contains_tokens
+from ads_engine.analysis.text import TermCluster, cluster_terms, tokenize
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
 
@@ -195,6 +196,12 @@ SCALE_CACHE_KEY: Final = "scale_outcomes"
 
 _SETTINGS_CACHE_KEY: Final = "campaigns.settings"
 """``ctx.cache`` key of the run's :class:`_Settings`."""
+
+_LEADS_BY_CAMPAIGN_CACHE_KEY: Final = "campaigns.leads_by_campaign"
+"""``ctx.cache`` key of the run's window leads grouped by campaign (:func:`_leads_by_campaign`)."""
+
+_YOUNG_COHORT_CACHE_KEY: Final = "campaigns.young_cohort"
+"""``ctx.cache`` key of the run's :func:`_young_cohort` results, by campaign and maturity days."""
 
 _EXACT: Final = Context(prec=60)
 """Arithmetic context for quantizing evidence values without overflow or rounding surprises."""
@@ -605,6 +612,23 @@ def _subject_crm(
     return _CrmView(veto, "google", () if veto is None else _veto_flags(veto))
 
 
+def _leads_by_campaign(ctx: AnalysisContext) -> Mapping[int, tuple[LeadInfo, ...]]:
+    """The run's window leads grouped by campaign id, each group in ``ctx.leads`` order.
+
+    Built in one pass over ``ctx.leads`` and memoised in ``ctx.cache``, so reading one
+    campaign's leads is a lookup rather than a scan of the whole window population.
+    """
+    cached = ctx.cache.get(_LEADS_BY_CAMPAIGN_CACHE_KEY)
+    if isinstance(cached, Mapping):
+        return cached
+    grouped: dict[int, list[LeadInfo]] = {}
+    for lead in ctx.leads:
+        grouped.setdefault(lead.campaign_id, []).append(lead)
+    by_campaign = {campaign_id: tuple(leads) for campaign_id, leads in grouped.items()}
+    ctx.cache[_LEADS_BY_CAMPAIGN_CACHE_KEY] = by_campaign
+    return by_campaign
+
+
 def _young_cohort(
     ctx: AnalysisContext, settings: _Settings, campaign_id: int
 ) -> tuple[int, int | None]:
@@ -615,12 +639,33 @@ def _young_cohort(
     newer leads may already be converting. QL counts only contacts that are not already
     eligible through a matured lead, at or after their earliest young touch and by the run.
 
+    The campaign's leads come from :func:`_leads_by_campaign`, one grouping of ``ctx.leads``
+    per run. The result is memoised in ``ctx.cache`` per campaign id and
+    ``crm.lead_maturity_days``, so every item of one campaign reuses one evaluation.
+
     Returns:
         ``(young leads, their contacts' QL)``; QL is ``None`` without a CRM dataset or a
         resolved Qualified Lead stage, never 0.
     """
+    key = (campaign_id, settings.maturity_days)
+    cached = ctx.cache.get(_YOUNG_COHORT_CACHE_KEY)
+    if isinstance(cached, dict):
+        memo: dict[tuple[int, int], tuple[int, int | None]] = cached
+    else:
+        memo = {}
+        ctx.cache[_YOUNG_COHORT_CACHE_KEY] = memo
+    cohort = memo.get(key)
+    if cohort is None:
+        cohort = _young_cohort_counts(ctx, settings, _leads_by_campaign(ctx).get(campaign_id, ()))
+        memo[key] = cohort
+    return cohort
+
+
+def _young_cohort_counts(
+    ctx: AnalysisContext, settings: _Settings, leads: Sequence[LeadInfo]
+) -> tuple[int, int | None]:
+    """Compute :func:`_young_cohort` from one campaign's window leads, without the memo."""
     cutoff = ctx.window.utc_bounds()[1] - timedelta(days=settings.maturity_days)
-    leads = [lead for lead in ctx.leads if lead.campaign_id == campaign_id]
     young = [lead for lead in leads if lead.submitted_at > cutoff]
     crm = ctx.linkedin_crm
     if crm is None or not crm.bindings.ql.available:
@@ -1746,8 +1791,16 @@ def _c1b_candidate(
 # C3a Launch: underused proven segment, LinkedIn (AAP 0.5.4.4, 0.3.2)
 # ---------------------------------------------------------------------------
 
-_C3A_DATASETS: Final[tuple[str, ...]] = ("linkedin.segments", "linkedin.analytics_daily")
-"""C3a's datasets: the preset-window segment aggregates and the campaign's daily facts."""
+_C3A_DATASETS: Final[tuple[str, ...]] = (
+    "linkedin.segments",
+    "linkedin.analytics_daily",
+    "linkedin.entities",
+)
+"""C3a's datasets: the preset-window segment aggregates and the campaign's daily facts.
+
+``linkedin.entities`` is read too, for the campaign's status (it must be active), objective
+group, name and external id.
+"""
 
 
 def _segment_window_gap(ctx: AnalysisContext) -> tuple[str, str] | None:
@@ -1795,6 +1848,12 @@ def _c3a(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
     Rationale: "an underused but proven-good segment" is the data gap the user named; the
     cost and share minimums keep it to segments that convert clearly better and receive
     little delivery. A segment meeting both but below the lead minimum is withheld.
+
+    A campaign with zero window spend but leads has a zero cost per lead, so it gives no cost
+    baseline: the segment-to-campaign ratio is undefined and never fabricated. A zero-cost
+    segment that meets the share and lead minimums is then withheld as "no exposure" (0 of 1
+    campaign days with spend); a segment with any cost is dearer than the campaign and does
+    not fire.
     """
     campaigns = {campaign.id: campaign for campaign in _active_campaigns(ctx, "linkedin")}
     if not campaigns:
@@ -1858,6 +1917,20 @@ def _c3a(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
                 )
             )
             continue
+        if campaign_cpl <= 0:
+            withheld_lines.append(
+                Withheld(
+                    C3A,
+                    CAMPAIGNS,
+                    entity,
+                    "no exposure: zero campaign spend in the window, so segment cost per lead "
+                    "cannot be compared",
+                    0,
+                    1,
+                    "campaign days with spend",
+                )
+            )
+            continue
         candidates.append(
             _c3a_candidate(ctx, campaign, row, entity, spend, leads, impressions, campaign_cpl)
         )
@@ -1886,7 +1959,11 @@ def _c3a_candidate(
     impressions: int,
     campaign_cpl: Decimal,
 ) -> Candidate:
-    """The C3a launch idea of one segment."""
+    """The C3a launch idea of one segment.
+
+    ``campaign_cpl`` must be positive: it divides the segment's cost per lead, so
+    :func:`_c3a` withholds a zero-spend campaign's segments before calling this.
+    """
     settings = _Settings.of(ctx)
     currency = ctx.account_currency(campaign.id)
     facet = _FACET_LABELS.get(row.facet, row.facet)
@@ -1997,6 +2074,18 @@ def _coverage_texts(ctx: AnalysisContext) -> list[str]:
     return texts
 
 
+def _coverage_tokens(ctx: AnalysisContext) -> frozenset[str]:
+    """The union of the tokens of every coverage text, each text tokenised exactly once.
+
+    A cluster is covered when any of its head tokens is in this union, which is the
+    any-token-in-any-text test of :func:`~ads_engine.analysis.text.contains_tokens`: head
+    tokens come from the same :func:`~ads_engine.analysis.text.tokenize`, so they are already
+    caseless, stopword-free whole tokens. Building the union once keeps the check linear in
+    the texts instead of re-tokenising every text for every cluster.
+    """
+    return frozenset(token for text in _coverage_texts(ctx) for token in tokenize(text))
+
+
 def _google_currency(ctx: AnalysisContext, campaign_ids: Sequence[int]) -> str:
     """The currency of a cluster's spend.
 
@@ -2020,7 +2109,9 @@ def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
     lowercased with stopwords removed. A cluster's head tokens are those present in at least
     ``c3b.head_token_share`` (50%) of its members. It fires for a cluster of at least
     ``c3b.min_terms`` (3) terms with at least ``c3b.min_conversions`` (5) conversions in total
-    whose head tokens appear in no keyword text, ad group name or campaign name.
+    whose head tokens appear in no keyword text, ad group name or campaign name. Those texts
+    are tokenised once per evaluation into one token union (:func:`_coverage_tokens`), and
+    each cluster's head tokens are tested against that union.
 
     Rationale: "a keyword cluster with no matching campaign" is the data gap the user named.
     Several converting queries sharing words the account never targets is demand the account
@@ -2042,13 +2133,13 @@ def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
     clusters = cluster_terms(
         converting, threshold=settings.c3b_jaccard, min_head_share=settings.c3b_head_share
     )
-    texts = _coverage_texts(ctx)
+    covered = _coverage_tokens(ctx)
     candidates: list[Candidate] = []
     withheld: list[Withheld] = []
     for cluster in clusters:
         if cluster.size < 2 or not cluster.head_tokens:
             continue
-        if contains_tokens(texts, cluster.head_tokens):
+        if not covered.isdisjoint(cluster.head_tokens):
             continue
         conversions = sum((by_term[term].conversions for term in cluster.members), _ZERO)
         entity = EntityRef(
