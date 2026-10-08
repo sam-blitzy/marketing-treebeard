@@ -14,10 +14,10 @@ This document names no Blitzy OS component, prop or token value. Where the Blitz
 | Package | None found on npm or other public registries |
 | Source | The design frames named in the product brief were not provided. Public sources describe Blitzy OS only as Blitzy's proprietary component library and publish no components, props or token values. |
 
-Decision: the UI is built now, through this indirection layer, instead of waiting for the source.
+Decision: while the source is unavailable, the UI is built through this indirection layer instead of waiting for it.
 
-- Feature code (`src/features/**`) and the app shell import UI building blocks only from `index.ts`. `web/eslint.config.js` rejects every other import into the design system.
-- Each wrapper exposes a product-level props interface. It renders semantic HTML styled solely by the semantic tokens in `tokens.css`.
+- Feature code (`src/features/**`) and the app shell import UI building blocks only from `index.ts`. `web/eslint.config.js` enforces this for production feature source (`src/features/**/*.{ts,tsx}`) alone: it rejects a static import, re-export or `import()` that reaches past `index.ts` into the design system, and an `import()` by computed specifier or `import.meta.glob`, which it cannot check. Feature unit tests (`*.test.{ts,tsx}`) are exempt. Outside `src/features/**`, the app shell included, the index-only rule is a convention no lint rule checks.
+- Each wrapper exposes a product-level props interface. It renders semantic HTML styled by the semantic tokens in `tokens.css`, except for these literals: structural layout values (flex factors, `fr` grid tracks, Grid's column-count fallback of `1` and the page frame's `100vh` minimum height), the placeholder-text `opacity: 1` reset, Grid's `min(100%, …)` track cap and the visually hidden utility's `1px` box and `inset(50%)` clip (see Token gaps), and the motion literals in `Button.css` and `Spinner.css` and the `48rem` breakpoint (see Other gaps).
 - Binding Blitzy OS later changes only wrapper internals and token values. Feature code and the names exported by `index.ts` stay as they are.
 
 ## Component gaps
@@ -48,7 +48,7 @@ Decision: the UI is built now, through this indirection layer, instead of waitin
 
 ## Token gaps
 
-Four categories, 38 tokens, all gaps. They are declared as CSS custom properties on `:root` in `tokens.css`, and every value carries the comment `GAP: placeholder, not Blitzy OS`. The opacity and size tokens extend the AAP 0.4.3 token mapping, so component CSS holds no opacity or percentage literal.
+Four categories, 38 tokens, all gaps. They are declared as CSS custom properties on `:root` in `tokens.css`, and every value carries the comment `GAP: placeholder, not Blitzy OS`. The opacity and size tokens extend the AAP 0.4.3 token mapping: `--opacity-disabled` dims disabled controls in `Button.css` and `TextField.css`, `--opacity-backdrop` dims the modal backdrop in `Dialog.css`, and `--size-full` carries the full-extent sizes in `DataTable.css`, `Dialog.css` and `TextField.css` and the hover-bridge offsets in `Tooltip.css`. The opacity and percentage literals left in component CSS are not design values: `opacity: 1` in `TextField.css` resets the dimming some engines apply to placeholder text, so the muted placeholder keeps its contrast; `min(100%, …)` in `Grid.css` caps the auto-fit track minimum at the container width, so a single track never overflows a container narrower than that minimum; and `inset(50%)` in `shared.css` clips the visually hidden utility's `1px` box to nothing while keeping its text in the accessibility tree.
 
 | Category | Semantic tokens | Placeholder value policy | Resolution |
 | --- | --- | --- | --- |
@@ -60,7 +60,7 @@ Four categories, 38 tokens, all gaps. They are declared as CSS custom properties
 Binding the tokens:
 
 1. The names are the stable contract. `TOKEN_NAMES` in `tokens.ts` mirrors them one-to-one in `tokens.css` order, and `tokens.test.ts` holds both files to that list. Never rename a token in feature code or in the wrappers.
-2. Keep each name and replace its value. If Blitzy OS exposes its own custom properties under other names, map them inside `tokens.css`: the product token's value becomes `var()` of the Blitzy OS property, for example `--color-text: var(<Blitzy OS property>);`.
+2. Keep each name and replace its value. If Blitzy OS exposes its own custom properties under other names, map them inside `tokens.css`: keep the product token's declaration and set its value to the `var()` function with the Blitzy OS custom property's own name, which starts with `--`, as its only argument. Add no fallback value, because a fallback would be a second, hardcoded design value.
 3. If Blitzy OS has no counterpart for a token, keep its placeholder and marker, and keep the token listed here.
 4. After replacing colour values, re-check WCAG 2.2 AA contrast on both `--color-surface` and `--color-bg`: at least 4.5:1 for every text and tone colour and for surface text on `--color-accent`, and at least 3:1 for `--color-border` and the `--color-accent` focus ring.
 
@@ -70,7 +70,7 @@ Binding the tokens:
 | --- | --- | --- |
 | Layout primitives | `Stack`, `Inline` and `Grid` are product primitives. Blitzy OS primitives: Unknown | Map them to Blitzy OS primitives, keeping their props |
 | Iconography | Text labels only; no icon set is shipped | Add icons only from the Blitzy OS icon source, once it is available |
-| Package name, version and installation | Unknown; no dependency is added now | Add the package on arrival (binding procedure, step 2) |
+| Package name, version and installation | Unknown; no Blitzy OS dependency is added while the source is unavailable | Add the package on arrival (binding procedure, step 2) |
 | Grid breakpoint | CSS custom properties cannot be used in `@media` conditions, so no token can carry it. The literal `@media (max-width: 48rem)` is written out in `components/Grid.css` (single-column collapse) and `components/PageShell.css` (the side navigation stacks above main). These two stylesheets hold the only literal breakpoint outside `tokens.css`. `web/.stylelintrc.json` allows a width condition only in these two files and only at `48rem`, and `web/src/stylelint-config.test.ts` asserts that pin | Replace it with the Blitzy OS breakpoint in both stylesheets, and change the stylelint pin and its test in the same change |
 | Motion | No motion tokens exist. `components/Button.css` uses a literal `150ms ease-out` shadow transition, and `components/Spinner.css` a literal `1s linear` rotation | Add motion tokens once Blitzy OS supplies them, and replace both literals |
 | Line widths | No border-width token exists. Hairlines are `calc(var(--space-1) / 4)` and focus rings `calc(var(--space-1) / 2)`, which is 1 px and 2 px at a 16 px root | Rebind to Blitzy OS border and focus values, or keep the derivation |
@@ -87,7 +87,7 @@ Each UI element is bound at the first viable option, in this order:
 3. A generic Blitzy OS container styled with Blitzy OS tokens.
 4. The product wrapper with a gap flag.
 
-Today all 19 elements sit at step 4.
+While the source is unavailable, all 19 elements sit at step 4.
 
 ## Compliance rules
 

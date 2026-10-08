@@ -31,8 +31,9 @@
  *   `getByRole('button', { name: 'Sign in' })` therefore match in both states.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
- * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
- * binding Blitzy OS later changes only this file and `Button.css` (AAP 0.4.5, `../GAPS.md`).
+ * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
+ * `150ms ease-out` shadow transition that `../GAPS.md` lists, and binding Blitzy OS later
+ * changes only this file and `Button.css` (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *

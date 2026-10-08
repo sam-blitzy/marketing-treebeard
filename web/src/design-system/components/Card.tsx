@@ -17,8 +17,10 @@
  * uses `ds-visually-hidden` from `shared.css`.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
- * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
- * binding Blitzy OS later changes only this file and `Card.css` (AAP 0.4.5, `../GAPS.md`).
+ * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
+ * headline's `flex: 1 1 auto` factor and the rank prefix's visually hidden `1px` box and
+ * `inset(50%)` clip that `../GAPS.md` lists, and binding Blitzy OS later changes only this file
+ * and `Card.css` (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *

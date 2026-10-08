@@ -75,9 +75,10 @@
  * implemented in jsdom). Component tests therefore need no visibility mocks.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
- * graceful-degradation step: semantic HTML styled solely by semantic tokens. Binding Blitzy OS
- * later changes only this file, `./focusable.ts` and `Dialog.css`, never the feature code that
- * uses it (AAP 0.4.5, `../GAPS.md`).
+ * graceful-degradation step: semantic HTML styled by semantic tokens, except for the title's
+ * `flex: 1 1 auto` factor and the sentinels' visually hidden `1px` box and `inset(50%)` clip
+ * that `../GAPS.md` lists. Binding Blitzy OS later changes only this file, `./focusable.ts` and
+ * `Dialog.css`, never the feature code that uses it (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *

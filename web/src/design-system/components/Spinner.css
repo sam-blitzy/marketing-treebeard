@@ -34,8 +34,8 @@
  * - Size: --space-4 in both dimensions, so the ring scales with the user's text size.
  * - Border width: half of --space-1 (2px at a 16px root), the same derivation as the base
  *   :focus-visible ring in ../tokens.css. It is derived rather than a literal 2px because
- *   design values outside tokens.css come only from tokens, so rebinding the spacing scale
- *   rebinds the ring as well.
+ *   every size in this file comes from a token, so rebinding the spacing scale rebinds the
+ *   ring as well.
  * - Colours: the track uses --color-border and the arc --color-accent, both at least 3:1 on the
  *   surface and page backgrounds (WCAG 2.2 SC 1.4.11 Non-text Contrast, per ../tokens.css).
  * - Radius: a percentage (50%) is not a token, and web/.stylelintrc.json allows only tokens for

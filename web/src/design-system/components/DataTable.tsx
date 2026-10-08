@@ -45,8 +45,10 @@
  * the analysis run (AAP 0.5.4), and no screen in AAP 0.5.5 asks for any of the three.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
- * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
- * binding Blitzy OS later changes only this file and `DataTable.css` (AAP 0.4.5, `../GAPS.md`).
+ * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
+ * "Details" header's visually hidden `1px` box and `inset(50%)` clip that `../GAPS.md` lists,
+ * and binding Blitzy OS later changes only this file and `DataTable.css` (AAP 0.4.5,
+ * `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *

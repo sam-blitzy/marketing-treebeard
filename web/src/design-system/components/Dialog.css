@@ -19,7 +19,8 @@
  *
  * Every colour, spacing, typography, radius, shadow, z-index, opacity and size value is a token
  * from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The only literals are layout
- * keywords. The full-extent sizes are --size-full and the backdrop opacity is --opacity-backdrop.
+ * keywords and the title's flex: 1 1 auto factor (see ../GAPS.md). The full-extent sizes are
+ * --size-full and the backdrop opacity is --opacity-backdrop.
  * The border and focus-ring widths derive from --space-1, the same way the base focus ring in
  * tokens.css and the hairline border in shared.css do, so no px literal appears here either.
  *

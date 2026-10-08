@@ -5,13 +5,15 @@
  * Every screen and component under `src/features/**`, and the app shell in `src/router.tsx`,
  * imports wrappers, their props types and the token constants from here, for example
  * `import { Button, Card, Stack, type ButtonProps } from '../../design-system';`.
- * `web/eslint.config.js` rejects any feature import of `design-system/components/*`,
- * `design-system/tokens` or `tokens.css`, so this export list is the stable contract between
- * feature code and the design system.
+ * `web/eslint.config.js` rejects any import of `design-system/components/*`,
+ * `design-system/tokens` or `tokens.css` from production feature source (feature unit tests
+ * are exempt), so this export list is the stable contract between feature code and the design
+ * system.
  *
  * The Blitzy OS source is unavailable (AAP 0.4.1), so all 19 wrappers below are product
- * wrappers at the last graceful-degradation step (AAP 0.4.4): semantic HTML styled solely by
- * the semantic tokens in `tokens.css`. Binding Blitzy OS later changes only the wrapper
+ * wrappers at the last graceful-degradation step (AAP 0.4.4): semantic HTML styled by the
+ * semantic tokens in `tokens.css`, except for the few structural, reset, accessibility, motion
+ * and breakpoint literals that `GAPS.md` lists. Binding Blitzy OS later changes only the wrapper
  * internals under `components/`, the token values in `tokens.css`, `web/package.json` and
  * `web/package-lock.json` (AAP 0.4.6); the names exported here stay as they are. Every
  * component and token is listed as a gap in `GAPS.md`.

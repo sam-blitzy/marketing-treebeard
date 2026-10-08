@@ -23,7 +23,9 @@
  * The styling lives in `PageShell.css`, whose class names are the contract this file renders,
  * and the skip link's hide-until-focused behaviour in `shared.css`. The Blitzy OS source is not
  * available, so this is a product wrapper at the last graceful-degradation step: semantic HTML
- * styled solely by semantic tokens. Binding Blitzy OS later changes only this file and its
+ * styled by semantic tokens, except for the frame's `100vh` minimum height, its `flex: 1 1 auto`
+ * factors, the `48rem` breakpoint and the skip link's visually hidden `1px` box and `inset(50%)`
+ * clip, which `../GAPS.md` lists. Binding Blitzy OS later changes only this file and its
  * stylesheet, never the feature code that uses it (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.

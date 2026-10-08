@@ -37,7 +37,8 @@
  * ```
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
- * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
+ * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
+ * placeholder-text `opacity: 1` reset in the shared `TextField.css` that `../GAPS.md` lists, and
  * binding Blitzy OS later changes only this file, `Select.css` and the shared `TextField.css`
  * (AAP 0.4.5, `../GAPS.md`).
  *

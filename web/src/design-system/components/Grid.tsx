@@ -3,9 +3,11 @@
  *
  * Feature code lays out tiles, cards and evidence blocks in columns only through this component
  * (AAP 0.4.4: layout through primitives, never custom grid CSS on a raw `div`). Columns and gaps
- * come from the class contract in `Grid.css`, whose values are spacing tokens. Every grid stacks
- * to a single column below the `Grid` breakpoint (AAP 0.5.5); that collapse lives in `Grid.css`,
- * so no column count set here can defeat it.
+ * come from the class contract in `Grid.css`, whose values are spacing tokens except for the
+ * `fr` tracks, the column-count fallback of `1`, the `min(100%, …)` track cap and the `48rem`
+ * breakpoint, which `../GAPS.md` lists. Every grid stacks to a single column below the `Grid`
+ * breakpoint (AAP 0.5.5); that collapse lives in `Grid.css`, so no column count set here can
+ * defeat it.
  *
  * The Blitzy OS source is unavailable, so this is a product wrapper rendering semantic HTML at
  * the last graceful-degradation step (AAP 0.4.4). Binding Blitzy OS later changes only this

@@ -63,8 +63,9 @@
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it composes the product `Button`, `TextField` and `Banner` wrappers
- * styled solely by semantic tokens, and binding Blitzy OS later changes only this file and
- * `DateRangePicker.css` (AAP 0.4.5, `../GAPS.md`).
+ * styled by semantic tokens, except for the literals that `../GAPS.md` lists, such as the status
+ * region's visually hidden `1px` box and `inset(50%)` clip, and binding Blitzy OS later changes
+ * only this file and `DateRangePicker.css` (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *

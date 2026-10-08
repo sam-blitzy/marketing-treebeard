@@ -18,9 +18,9 @@
  * places content only inside the slots and adds no CSS to the card itself.
  *
  * Hairlines: the card outline and the footer divider are a quarter of --space-1 (1px at the
- * 16px root), the same derivation as the skip-link border in shared.css. Every value in this
- * layer resolves to a token, and the hairline follows the spacing scale when Blitzy OS rebinds
- * it, so this file uses no literal px border width.
+ * 16px root), the same derivation as the skip-link border in shared.css. Every hairline width
+ * resolves to a token, and the hairline follows the spacing scale when Blitzy OS rebinds it, so
+ * this file uses no literal px border width.
  *
  * Reflow (WCAG 2.2 SC 1.4.10): the header and footer wrap onto further lines instead of
  * overflowing a narrow viewport, and overflow-wrap lets long unbroken strings such as search

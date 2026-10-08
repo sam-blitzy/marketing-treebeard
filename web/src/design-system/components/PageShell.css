@@ -20,10 +20,10 @@
  *   .ds-pageshell__actions        action slot of the title bar and of each section header
  *
  * Every colour, spacing and typography value is a token from ../tokens.css, so binding Blitzy OS
- * touches tokens.css alone (web/.stylelintrc.json enforces this). The two literals are the
- * viewport-height unit on the frame and the documented Grid breakpoint at the end of this file,
- * which Grid.css holds in identical form, so the page frame and Grid stack to one column at
- * the same width.
+ * touches tokens.css alone (web/.stylelintrc.json enforces this). The literals, each listed in
+ * ../GAPS.md, are the body row's and main's flex: 1 1 auto factors, the viewport-height unit on
+ * the frame and the documented Grid breakpoint at the end of this file, which Grid.css holds in
+ * identical form, so the page frame and Grid stack to one column at the same width.
  */
 
 /*
