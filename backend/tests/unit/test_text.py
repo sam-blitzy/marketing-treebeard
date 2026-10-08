@@ -63,6 +63,17 @@ def test_tokenize_lowercases_and_removes_stopwords() -> None:
     )
 
 
+def test_tokenize_drops_best_and_for_as_stopwords_and_strips_trailing_punctuation() -> None:
+    # "best" is in STOPWORDS on purpose: it is a search-intent modifier with no topic, and
+    # kept it would give unrelated terms ("best crm", "best laptop") a shared token. The
+    # module's documented stopword list is the contract, so the expected set leaves "best"
+    # out, although a generic stopword list (as a looser reading of K2's "lowercased,
+    # stopwords removed" might assume) would keep it.
+    assert tokenize("Best CRM Software for Small Business!") == frozenset(
+        {"crm", "software", "small", "business"}
+    )
+
+
 def test_tokenize_splits_on_every_punctuation_and_underscore_run_and_keeps_digits() -> None:
     assert tokenize("CRM-tool_pricing (2026)!") == frozenset({"2026", "crm", "pricing", "tool"})
     assert tokenize("crm/tool,pricing;guide\tdemo\nfree...") == frozenset(
@@ -478,6 +489,11 @@ def test_contains_tokens_is_false_when_no_token_appears_in_any_text() -> None:
 
 
 def test_contains_tokens_needs_only_one_token_in_one_text() -> None:
+    """C3b: any head token in any keyword, ad group or campaign name means the theme is covered.
+
+    The semantics are *any token in any text*, not all tokens: one head token found in one
+    name is enough for ``contains_tokens`` to return True, and C3b fires only on False.
+    """
     texts = ["Brand", "Competitors", "Pricing page visitors"]
 
     assert contains_tokens(texts, frozenset({"crm", "pricing", "guide"})) is True
