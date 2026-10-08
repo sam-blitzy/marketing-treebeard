@@ -55,9 +55,13 @@ Job                Sources                 Slots
 ``purge``          all                     05:00 (see below)
 =================  ======================  ==================================================
 
-The AAP asks for a "nightly cleanup" without naming a time. The purge runs at 05:00, after the
-03:00 restatement and the 04:00 segment fetch, so the night's heaviest reads never contend with
-the cascade deletes of retired datasets.
+The AAP asks for a "nightly cleanup" without naming a time. The purge's 05:00 slot follows the
+03:00 restatement and 04:00 segment-fetch slots, so it usually runs after those jobs, but lanes
+do not wait for one another: the purge's cascade deletes may overlap any job still running,
+such as a long restatement, segment fetch or dataset backfill. That is safe, because the purge
+deletes only datasets retired more than :data:`~ads_engine.sync.datasets.RETENTION` (30 days)
+ago, and no job writes a retired dataset (:func:`~ads_engine.db.repositories.ensure_writable`
+refuses one).
 
 Due-ness. A job is due when its latest slot (:func:`latest_slot`) is later than the
 ``started_at`` of the most recent ``sync_run`` of that (source, job), whatever its status. The
@@ -218,13 +222,13 @@ LOCK_LOST_STOP_TIMEOUT: Final = timedelta(seconds=5)
 """The most time the scheduler waits for its cancelled tasks to end after losing its lock.
 
 Cancelled work can still write while it unwinds: a cancelled dataset build discards its
-building dataset (a cascade ``DELETE``), a cancelled sync job records its own ``sync_run``
-rows as failed (bounded by ``jobs.CANCEL_CLOSE_TIMEOUT``, checked at import to be shorter),
-a cancelled analysis run records its failure. A task still running after this long is not
-waited for: the scheduler logs ``scheduler.fence_stop_timeout`` and aborts the process
-(exit code 1), so the unwind of the lost holder always ends inside the next holder's
-:data:`LOCK_TAKEOVER_GRACE`. Only a lost lock is bounded this way: on SIGTERM or a defect the
-lock is still held, so every task is awaited however long it takes.
+building dataset (a cascade ``DELETE``), a cancelled sync job or recovery probe records its
+own ``sync_run`` rows as failed (bounded by ``jobs.CANCEL_CLOSE_TIMEOUT``, checked at import
+to be shorter), a cancelled analysis run records its failure. A task still running after
+this long is not waited for: the scheduler logs ``scheduler.fence_stop_timeout`` and aborts
+the process (exit code 1), so the unwind of the lost holder always ends inside the next
+holder's :data:`LOCK_TAKEOVER_GRACE`. Only a lost lock is bounded this way: on SIGTERM or a
+defect the lock is still held, so every task is awaited however long it takes.
 """
 
 LOCK_TAKEOVER_GRACE: Final = timedelta(seconds=20)
@@ -363,8 +367,8 @@ SCHEDULE: Final[tuple[ScheduleEntry, ...]] = (
 
 The first five are sync jobs the due-jobs step runs, in the order entities, metrics,
 restatement, leads, crm. ``segments`` also runs on the window trigger, and ``purge`` is the
-nightly cleanup at 05:00, after the restatement and the segment fetch; both have steps of
-their own.
+nightly cleanup, whose 05:00 slot follows the restatement and segment-fetch slots but does not
+wait for those jobs to end; both have steps of their own.
 """
 
 _ENTRIES: Final[Mapping[str, ScheduleEntry]] = MappingProxyType(
@@ -1638,23 +1642,42 @@ class Scheduler:
         The row is inserted (and committed) before the probe, so probes stay spaced even when
         one fails. It ends ``succeeded`` when the probe passed and the live dataset built
         from it was activated, ``failed`` otherwise, with the reason.
+
+        Raises:
+            Exception: Any error of ``recover``, unchanged, once the row was closed as failed
+                with the error's class name (best effort: a database error doing so is
+                logged as ``scheduler.sync_run_close_failed``, never raised in its place).
+            asyncio.CancelledError: Unchanged, when the task running the probe is cancelled
+                (a lost scheduler lock, the worker's graceful shutdown) once the row has an
+                id, wherever the probe then was, the row's own close included
+                (:meth:`_close_cancelled_probe`). It is logged as
+                ``scheduler.probe_cancelled`` and, within ``jobs.CANCEL_CLOSE_TIMEOUT``, the
+                row is closed ``failed`` with ``recovery probe cancelled`` if it is still
+                ``running``; a close committed before the cancellation stands. Bookkeeping
+                that times out or fails is logged as ``scheduler.sync_run_close_failed`` and
+                abandoned, and a further cancellation while it runs propagates at once.
         """
         run_id = await self._open_run(source, JOB_PROBE, tick.now)
         tick.probed.append(source)
         tick.acted("probes")
         try:
-            outcome = await self._controller.recover(source)
-        except Exception as exc:
-            await self._close_run_quietly(run_id, error=type(exc).__name__)
+            try:
+                outcome = await self._controller.recover(source)
+            except Exception as exc:
+                await self._close_run_quietly(run_id, error=type(exc).__name__)
+                raise
+            if outcome is None:
+                await self._close_run(run_id, "failed", error="recovery probe did not pass")
+            elif outcome.activated and outcome.mode == "live":
+                await self._close_run(run_id, "succeeded")
+            else:
+                await self._close_run(
+                    run_id, "failed", error=outcome.reason or "live dataset was not activated"
+                )
+        except asyncio.CancelledError:
+            # Also a cancellation that lands in a close above, whose transaction rolled back.
+            await self._close_cancelled_probe(source, run_id)
             raise
-        if outcome is None:
-            await self._close_run(run_id, "failed", error="recovery probe did not pass")
-        elif outcome.activated and outcome.mode == "live":
-            await self._close_run(run_id, "succeeded")
-        else:
-            await self._close_run(
-                run_id, "failed", error=outcome.reason or "live dataset was not activated"
-            )
 
     # step 3 ----------------------------------------------------------------------------------
 
@@ -2029,21 +2052,38 @@ class Scheduler:
         return {(str(source), str(job)): started for source, job, started in rows}
 
     async def _open_run(self, source: Source, job: str, started: datetime) -> int:
-        """Insert and commit a ``running`` ``sync_run`` row; return its id."""
-        async with self._sessions()() as session, session.begin():
-            row = SyncRun(
-                source=source, job=job, dataset=None, started_at=started, status="running"
-            )
-            session.add(row)
-            await session.flush()
-            return row.id
+        """Insert and commit a ``running`` ``sync_run`` row; return its id.
+
+        Only recovery probes open their row this way. A cancellation that lands once the row
+        has its id (in the commit, which may or may not have reached the server) closes it
+        as a cancelled probe (:meth:`_close_cancelled_probe`) before it propagates; one that
+        lands earlier rolls the insert back.
+        """
+        run_id: int | None = None
+        try:
+            async with self._sessions()() as session, session.begin():
+                row = SyncRun(
+                    source=source, job=job, dataset=None, started_at=started, status="running"
+                )
+                session.add(row)
+                await session.flush()
+                run_id = row.id
+                return run_id
+        except asyncio.CancelledError:
+            if run_id is not None:
+                await self._close_cancelled_probe(source, run_id)
+            raise
 
     async def _close_run(self, run_id: int, status: str, *, error: str | None = None) -> None:
-        """Close a ``sync_run`` row the scheduler opened."""
+        """Close a still-``running`` ``sync_run`` row the scheduler opened.
+
+        A row a committed close already ended is left as it was, so a late close (a
+        cancellation's) never overwrites the outcome recorded before it.
+        """
         async with self._sessions()() as session, session.begin():
             await session.execute(
                 update(SyncRun)
-                .where(SyncRun.id == run_id)
+                .where(SyncRun.id == run_id, SyncRun.status == "running")
                 .values(
                     status=status,
                     finished_at=self._now(),
@@ -2057,4 +2097,26 @@ class Scheduler:
         try:
             await self._close_run(run_id, "failed", error=error)
         except SQLAlchemyError as exc:
+            _log.error("scheduler.sync_run_close_failed", run_id=run_id, error=type(exc).__name__)
+
+    async def _close_cancelled_probe(self, source: Source, run_id: int) -> None:
+        """Log ``scheduler.probe_cancelled`` and close the probe's row as cancelled, bounded.
+
+        A lost lock cancels and awaits the lanes for at most :data:`LOCK_LOST_STOP_TIMEOUT`,
+        so this bookkeeping is abandoned after ``jobs.CANCEL_CLOSE_TIMEOUT`` (checked at
+        import to be shorter), or at once when it fails, and logged as
+        ``scheduler.sync_run_close_failed``; a further cancellation propagates at once. Only a
+        row still ``running`` is closed: ``failed`` with ``recovery probe cancelled``, a fixed
+        reason that carries no error text. Nothing else is written.
+
+        Args:
+            source: The probed source.
+            run_id: The probe's ``sync_run`` row.
+        """
+        _log.warning("scheduler.probe_cancelled", source=source, run_id=run_id)
+        try:
+            async with asyncio.timeout(jobs.CANCEL_CLOSE_TIMEOUT.total_seconds()):
+                await self._close_run_quietly(run_id, error="recovery probe cancelled")
+        except TimeoutError as exc:
+            # Best effort: the cancellation must end the probe within the lock-loss bound.
             _log.error("scheduler.sync_run_close_failed", run_id=run_id, error=type(exc).__name__)

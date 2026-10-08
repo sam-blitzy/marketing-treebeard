@@ -36,6 +36,14 @@ drives ``Scheduler.run_forever`` itself, as ``worker/main.py`` does:
   a lost lock.
 * **Cancellation**: SIGTERM while ``on_start`` runs cancels and awaits it before propagating.
 * **Per-lane claims**: the google lane claims only Google's ``sync_request`` rows.
+* **Recovery-probe cancellation** (driving ``tick`` or ``run_forever``): a probe cancelled in
+  ``recover`` (directly, by SIGTERM or by a lost lock) logs ``scheduler.probe_cancelled``,
+  closes its ``probe`` row ``failed`` with ``recovery probe cancelled`` and re-raises; a
+  close the cancellation rolled back ends the same way, a close committed before it stands;
+  a cancellation before the row's insert is flushed writes nothing, one after its commit
+  closes it; bookkeeping that fails or outlasts ``jobs.CANCEL_CLOSE_TIMEOUT`` is logged as
+  ``scheduler.sync_run_close_failed`` and abandoned, and a second cancellation during it
+  propagates at once.
 
 How. Real PostgreSQL 18 through ``conftest.db`` (emptied before each test). The schedulers of
 a test share a :class:`VirtualTime`: their monotonic clock (and, when a test asks, their wall
@@ -43,10 +51,12 @@ clock) moves only when an injected sleep completes, to that sleep's start plus i
 and each sleep really waits one millisecond per virtual second, so 30 s wakes take
 milliseconds and concurrent sleeps finish in virtual-time order. Source work that would reach
 the simulator is replaced: ``SourceModeController.ensure_dataset`` builds nothing (or blocks
-for chosen sources), ``in_fallback`` is false, and ``jobs.run_source_jobs`` is a recording
-fake that can block until released or cancelled. A lock session dies the way a crashed or
-disconnected one would: ``pg_terminate_backend`` of the backend that holds the scheduler lock
-in ``pg_locks``. The injected abort records its code and raises :class:`AbortCalledError`.
+for chosen sources), ``in_fallback`` is false (in the probe tests, true for Google alone,
+whose ``recover`` blocks until cancelled or returns a chosen outcome), and
+``jobs.run_source_jobs`` is a recording fake that can block until released or cancelled. A
+lock session dies the way a crashed or disconnected one would: ``pg_terminate_backend`` of
+the backend that holds the scheduler lock in ``pg_locks``. The injected abort records its
+code and raises :class:`AbortCalledError`.
 """
 
 import asyncio
@@ -57,13 +67,18 @@ from itertools import pairwise
 from typing import Any, Final, NoReturn
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    AsyncSessionTransaction,
+    async_sessionmaker,
+)
 
 from ads_engine.db import repositories
 from ads_engine.db.models.analysis import AnalysisRequest, AnalysisRun
-from ads_engine.db.models.ops import SyncRequest
+from ads_engine.db.models.ops import SyncRequest, SyncRun
 from ads_engine.settings import Source, get_settings
 from ads_engine.sync import jobs
 from ads_engine.sync import scheduler as scheduler_module
@@ -71,6 +86,7 @@ from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.mode import BuildOutcome, SourceModeController
 from ads_engine.sync.scheduler import (
     COALESCE_WINDOW,
+    JOB_PROBE,
     LOCK_CHECK_INTERVAL,
     LOCK_CHECK_TIMEOUT,
     LOCK_LOST_STOP_TIMEOUT,
@@ -101,6 +117,7 @@ _CHECK_LATENCY_S: Final = 4.0
 """The virtual time each lock check takes in the slow-check test."""
 
 _LOCK_LOST: Final = "scheduler_lock_lost"
+_PROBE_CANCELLED: Final = "recovery probe cancelled"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -258,6 +275,34 @@ class Datasets:
         return None
 
 
+class Recovery:
+    """Stands in for ``SourceModeController.recover``: blocks until cancelled, or returns.
+
+    While :attr:`block` is set (the default) a call sets :attr:`entered` and waits until it is
+    cancelled, then sets :attr:`cancelled` and re-raises the cancellation. Otherwise it
+    returns :attr:`outcome` at once.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[Source] = []
+        self.block = True
+        self.outcome: BuildOutcome | None = None
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def __call__(self, source: Source) -> BuildOutcome | None:
+        """Record the call; block until cancelled, or return :attr:`outcome`."""
+        self.calls.append(source)
+        if self.block:
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return self.outcome
+
+
 class Startup:
     """An ``on_start`` whose first call blocks until cancelled; later calls return at once."""
 
@@ -401,7 +446,7 @@ async def _wait_event(event: asyncio.Event, what: str) -> None:
         pytest.fail(f"timed out after {_WAIT_S}s waiting until {what}")
 
 
-async def _cancel(task: asyncio.Task[None]) -> None:
+async def _cancel(task: asyncio.Task[Any]) -> None:
     """Cancel a scheduler as the worker's SIGTERM handler does; it must end cancelled."""
     task.cancel()
     await asyncio.wait((task,))
@@ -489,6 +534,25 @@ async def _lock_lost_requests(db: Sessions) -> int:
         return len(list(found))
 
 
+async def _probe_rows(db: Sessions) -> list[SyncRun]:
+    """Every ``probe`` ``sync_run`` row, oldest first."""
+    async with db() as session:
+        found = await session.scalars(
+            select(SyncRun).where(SyncRun.job == JOB_PROBE).order_by(SyncRun.id)
+        )
+        return list(found)
+
+
+def _tick_task(scheduler: Scheduler, now: datetime) -> asyncio.Task[Any]:
+    """Run one ``tick`` as a task named like a lane, so the harness cancels it at teardown."""
+    return asyncio.create_task(scheduler.tick(now), name="scheduler.tick")
+
+
+def _logged(captured_logs: Any, event: str) -> list[dict[str, Any]]:
+    """The captured log records of ``event``, in order."""
+    return [record for record in captured_logs() if record.get("event") == event]
+
+
 # ---------------------------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------------------------
@@ -525,6 +589,25 @@ def datasets(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> Datasets:
 
     monkeypatch.setattr(SourceModeController, "ensure_dataset", ensure_dataset)
     monkeypatch.setattr(SourceModeController, "in_fallback", in_fallback)
+    return fake
+
+
+@pytest.fixture
+def recovery(monkeypatch: pytest.MonkeyPatch, datasets: Datasets) -> Recovery:
+    """Google alone is in automatic fallback, and ``recover`` is a :class:`Recovery` fake."""
+    del datasets  # Requested so its ``in_fallback`` patch is applied first, then replaced.
+    fake = Recovery()
+
+    async def google_in_fallback(self: SourceModeController, source: Source) -> bool:
+        del self  # Only the source decides here.
+        return source == "google"
+
+    async def recover(self: SourceModeController, source: Source) -> BuildOutcome | None:
+        del self  # The fake decides alone.
+        return await fake(source)
+
+    monkeypatch.setattr(SourceModeController, "in_fallback", google_in_fallback)
+    monkeypatch.setattr(SourceModeController, "recover", recover)
     return fake
 
 
@@ -1350,3 +1433,274 @@ async def test_lane_check_reads_segment_and_probe_triggers_and_isolates_failures
     assert pending["lane"] == "linkedin_hubspot"
     assert pending["triggers"] == ["segments", "probes"]
     assert await scheduler._check_lane("google") == ()
+
+
+async def test_cancelled_probe_closes_its_row_failed_and_propagates(
+    harness: Harness, db: Sessions, recovery: Recovery, captured_logs: Any
+) -> None:
+    """A probe cancelled in ``recover`` ends its row ``failed``; the cancellation propagates."""
+    task = _tick_task(harness.scheduler("A"), harness.now)
+    await _wait_event(recovery.entered, "the google recovery probe started")
+    (opened,) = await _probe_rows(db)
+    assert (opened.source, opened.status, opened.finished_at) == ("google", "running", None)
+
+    await _cancel(task)
+
+    assert recovery.cancelled.is_set()
+    assert recovery.calls == ["google"]
+    (row,) = await _probe_rows(db)
+    assert row.id == opened.id
+    assert (row.status, row.error) == ("failed", _PROBE_CANCELLED)
+    assert row.finished_at == harness.now
+    (cancelled,) = _logged(captured_logs, "scheduler.probe_cancelled")
+    assert (cancelled["level"], cancelled["source"], cancelled["run_id"]) == (
+        "warning",
+        "google",
+        row.id,
+    )
+    assert _logged(captured_logs, "scheduler.sync_run_close_failed") == []
+
+
+async def test_sigterm_during_a_recovery_probe_closes_its_row_failed(
+    harness: Harness, db: Sessions, recovery: Recovery
+) -> None:
+    """SIGTERM while the google lane probes cancels it; the probe row ends ``failed``."""
+    task = harness.start(harness.scheduler("A"))
+    await _wait_event(recovery.entered, "the google lane's recovery probe started")
+
+    await _cancel(task)
+
+    assert recovery.cancelled.is_set()
+    (row,) = await _probe_rows(db)
+    assert (row.status, row.error) == ("failed", _PROBE_CANCELLED)
+    assert row.finished_at is not None
+    assert harness.aborts == []
+    assert await _lock_holder(db) is None
+
+
+async def test_lock_lost_during_a_recovery_probe_closes_its_row_failed(
+    harness: Harness, db: Sessions, recovery: Recovery
+) -> None:
+    """A lock lost while the google lane probes cancels it; its row ends ``failed`` in time."""
+    task = harness.start(harness.scheduler("A"))
+    await _wait_event(recovery.entered, "the google lane's recovery probe started")
+
+    await _kill_lock_session(db)
+
+    await _wait_event(recovery.cancelled, "the lock loss cancelled the recovery probe")
+
+    async def requeued() -> bool:
+        return await _lock_lost_requests(db) == 1
+
+    await _eventually(requeued, "the scheduler re-acquired and queued scheduler_lock_lost")
+    (row,) = await _probe_rows(db)
+    assert (row.status, row.error) == ("failed", _PROBE_CANCELLED)
+    assert row.finished_at is not None
+    # The cancelled probe's start still spaces the probes: it is not due again yet.
+    assert recovery.calls == ["google"]
+    assert harness.aborts == []
+    assert not task.done()
+    await _cancel(task)
+
+
+@pytest.mark.parametrize(
+    ("committed", "activated", "expected"),
+    [
+        (False, False, ("failed", _PROBE_CANCELLED)),
+        (True, False, ("failed", "recovery probe did not pass")),
+        (True, True, ("succeeded", None)),
+    ],
+    ids=["rolled_back_close", "committed_failure", "committed_success"],
+)
+async def test_cancellation_in_the_probe_close_keeps_a_committed_outcome(
+    harness: Harness,
+    db: Sessions,
+    recovery: Recovery,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_logs: Any,
+    committed: bool,
+    activated: bool,
+    expected: tuple[str, str | None],
+) -> None:
+    """A close the cancellation rolled back ends ``failed``; a committed one stands."""
+    recovery.block = False
+    if activated:
+        recovery.outcome = BuildOutcome(
+            source="google", mode="live", dataset_id=1, activated=True, reason="recovered"
+        )
+    close_run = Scheduler._close_run
+    closing = asyncio.Event()
+
+    async def close_then_hang(
+        self: Scheduler, run_id: int, status: str, *, error: str | None = None
+    ) -> None:
+        if closing.is_set():
+            # The cancellation's own close.
+            await close_run(self, run_id, status, error=error)
+            return
+        if committed:
+            await close_run(self, run_id, status, error=error)
+            closing.set()
+            await asyncio.Event().wait()
+        else:
+            # The close's UPDATE ran; the cancellation lands before its commit.
+            async with db() as session, session.begin():
+                await session.execute(
+                    update(SyncRun)
+                    .where(SyncRun.id == run_id)
+                    .values(status=status, error=error, finished_at=harness.now)
+                )
+                closing.set()
+                await asyncio.Event().wait()
+
+    monkeypatch.setattr(Scheduler, "_close_run", close_then_hang)
+    task = _tick_task(harness.scheduler("A"), harness.now)
+    await _wait_event(closing, "the probe's own close began")
+
+    await _cancel(task)
+
+    (row,) = await _probe_rows(db)
+    assert (row.status, row.error) == expected
+    assert row.finished_at == harness.now
+    assert len(_logged(captured_logs, "scheduler.probe_cancelled")) == 1
+    assert _logged(captured_logs, "scheduler.sync_run_close_failed") == []
+
+
+@pytest.mark.parametrize("where", ["flush", "commit"])
+async def test_cancellation_while_the_probe_row_opens_leaves_no_running_row(
+    harness: Harness,
+    db: Sessions,
+    recovery: Recovery,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_logs: Any,
+    where: str,
+) -> None:
+    """Cancelled before the insert is flushed, nothing is written; after its commit, the row
+    is closed ``failed``; ``recover`` never runs."""
+    hung = asyncio.Event()
+    armed = False
+    open_run = Scheduler._open_run
+    flush = AsyncSession.flush
+    exit_transaction = AsyncSessionTransaction.__aexit__
+
+    async def armed_open_run(self: Scheduler, source: Source, job: str, started: datetime) -> int:
+        nonlocal armed
+        armed = True
+        return await open_run(self, source, job, started)
+
+    async def hang() -> None:
+        nonlocal armed
+        armed = False
+        hung.set()
+        await asyncio.Event().wait()
+
+    async def hanging_flush(self: AsyncSession, objects: Any = None) -> None:
+        if armed:
+            await hang()
+        await flush(self, objects)
+
+    async def hanging_exit(
+        self: AsyncSessionTransaction, type_: Any, value: Any, traceback: Any
+    ) -> None:
+        await exit_transaction(self, type_, value, traceback)
+        if armed and type_ is None:
+            await hang()
+
+    monkeypatch.setattr(Scheduler, "_open_run", armed_open_run)
+    if where == "flush":
+        monkeypatch.setattr(AsyncSession, "flush", hanging_flush)
+    else:
+        monkeypatch.setattr(AsyncSessionTransaction, "__aexit__", hanging_exit)
+    task = _tick_task(harness.scheduler("A"), harness.now)
+    await _wait_event(hung, f"the probe row's {where} began")
+
+    await _cancel(task)
+
+    assert recovery.calls == []
+    rows = await _probe_rows(db)
+    cancelled = _logged(captured_logs, "scheduler.probe_cancelled")
+    if where == "flush":
+        assert rows == []
+        assert cancelled == []
+    else:
+        (row,) = rows
+        assert (row.status, row.error) == ("failed", _PROBE_CANCELLED)
+        assert row.finished_at == harness.now
+        assert [record["run_id"] for record in cancelled] == [row.id]
+
+
+@pytest.mark.parametrize("failure", ["fails", "hangs"])
+async def test_failed_probe_bookkeeping_is_logged_and_the_cancellation_still_wins(
+    harness: Harness,
+    db: Sessions,
+    recovery: Recovery,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_logs: Any,
+    failure: str,
+) -> None:
+    """A cancelled probe's close that fails, or outlasts ``CANCEL_CLOSE_TIMEOUT``, is logged
+    and abandoned; the cancellation still propagates."""
+    bound = jobs.CANCEL_CLOSE_TIMEOUT.total_seconds()
+    monkeypatch.setattr(jobs, "CANCEL_CLOSE_TIMEOUT", timedelta(milliseconds=50))
+    close_run = Scheduler._close_run
+
+    async def broken_close_run(
+        self: Scheduler, run_id: int, status: str, *, error: str | None = None
+    ) -> None:
+        if error == _PROBE_CANCELLED:
+            if failure == "fails":
+                raise OperationalError("UPDATE", {}, ConnectionError("database restarting"))
+            await asyncio.Event().wait()
+        await close_run(self, run_id, status, error=error)
+
+    monkeypatch.setattr(Scheduler, "_close_run", broken_close_run)
+    task = _tick_task(harness.scheduler("A"), harness.now)
+    await _wait_event(recovery.entered, "the google recovery probe started")
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    await _cancel(task)
+
+    assert loop.time() - began < bound
+    (row,) = await _probe_rows(db)
+    assert (row.status, row.finished_at, row.error) == ("running", None, None)
+    assert len(_logged(captured_logs, "scheduler.probe_cancelled")) == 1
+    (close_failed,) = _logged(captured_logs, "scheduler.sync_run_close_failed")
+    assert close_failed["level"] == "error"
+    assert close_failed["run_id"] == row.id
+    assert close_failed["error"] == ("OperationalError" if failure == "fails" else "TimeoutError")
+
+
+async def test_second_cancellation_during_probe_bookkeeping_propagates_at_once(
+    harness: Harness,
+    db: Sessions,
+    recovery: Recovery,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_logs: Any,
+) -> None:
+    """A further cancellation while a cancelled probe closes its row ends the task at once."""
+    hung = asyncio.Event()
+    close_run = Scheduler._close_run
+
+    async def hanging_close_run(
+        self: Scheduler, run_id: int, status: str, *, error: str | None = None
+    ) -> None:
+        if error == _PROBE_CANCELLED:
+            hung.set()
+            await asyncio.Event().wait()
+        await close_run(self, run_id, status, error=error)
+
+    monkeypatch.setattr(Scheduler, "_close_run", hanging_close_run)
+    task = _tick_task(harness.scheduler("A"), harness.now)
+    await _wait_event(recovery.entered, "the google recovery probe started")
+    task.cancel()
+    await _wait_event(hung, "the cancelled probe's close began")
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    await _cancel(task)
+
+    assert loop.time() - began < jobs.CANCEL_CLOSE_TIMEOUT.total_seconds() / 2
+    (row,) = await _probe_rows(db)
+    assert row.status == "running"
+    assert _logged(captured_logs, "scheduler.sync_run_close_failed") == []
