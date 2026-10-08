@@ -1,0 +1,86 @@
+{
+  "request": {
+    "body": {
+      "inputs": [
+        {
+          "id": "9900002069505001"
+        },
+        {
+          "id": "9900002070001501"
+        },
+        {
+          "id": "9900002070002000"
+        }
+      ]
+    },
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://api.hubapi.com/crm/associations/2026-09/contacts/meetings/batch/read"
+  },
+  "response": {
+    "body": {
+      "completedAt": "2026-10-02T12:00:00.000Z",
+      "errors": [
+        {
+          "category": "OBJECT_NOT_FOUND",
+          "context": {
+            "fromObjectId": [
+              "9900002069505001"
+            ]
+          },
+          "message": "No meetings is associated with contacts 9900002069505001.",
+          "status": "error",
+          "subCategory": "crm.associations.NO_ASSOCIATIONS_FOUND"
+        },
+        {
+          "category": "OBJECT_NOT_FOUND",
+          "context": {
+            "fromObjectId": [
+              "9900002070002000"
+            ]
+          },
+          "message": "No meetings is associated with contacts 9900002070002000.",
+          "status": "error",
+          "subCategory": "crm.associations.NO_ASSOCIATIONS_FOUND"
+        }
+      ],
+      "numErrors": 2,
+      "results": [
+        {
+          "from": {
+            "id": "9900002070001501"
+          },
+          "paging": {
+            "next": {
+              "after": "aHNhfGNvbnRhY3RzfG1lZXRpbmdzfDk5MDAwMDIwNzAwMDE1MDF8MQ",
+              "link": "?after=aHNhfGNvbnRhY3RzfG1lZXRpbmdzfDk5MDAwMDIwNzAwMDE1MDF8MQ"
+            }
+          },
+          "to": [
+            {
+              "associationTypes": [
+                {
+                  "category": "HUBSPOT_DEFINED",
+                  "label": null,
+                  "typeId": 199
+                }
+              ],
+              "toObjectId": "9900204140003002"
+            }
+          ]
+        }
+      ],
+      "startedAt": "2026-10-02T12:00:00.000Z",
+      "status": "COMPLETE"
+    },
+    "status": 207
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "hubspot",
+  "surface": "hubspot.associations_batch_read"
+}
