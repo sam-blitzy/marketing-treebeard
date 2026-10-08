@@ -80,7 +80,11 @@ Restart safety:
     or cancellation still propagates. A process that dies mid-batch leaves its lease to
     expire, after which the rows are due again: no state is lost. ``AccessDenied`` and
     ``QueryDefect`` raised by a connector call propagate, because ``sync/mode.py`` alone
-    decides what follows from them.
+    decides what follows from them. A ``TransientError`` that outlives its retries ends its
+    rows as retried ``error`` and is returned in :attr:`MatchReport.interrupted_by`, so the
+    calling job hands it to ``sync/mode.py`` too. A caller that passes ``interruptions``
+    receives each one as soon as it is observed, so it still has them when a later call of
+    the run raises.
 
 Example:
     The CRM job of a sync cycle::
@@ -107,7 +111,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from ads_engine.connectors.errors import QueryDefect
+from ads_engine.connectors.errors import QueryDefect, TransientError
 from ads_engine.connectors.hubspot.client import EmailLookup, HubSpotClient
 from ads_engine.connectors.hubspot.parser import ContactPropertyMap, ContactRow
 from ads_engine.connectors.linkedin.client import LEAD_BATCH_SIZE, LinkedInClient
@@ -698,6 +702,11 @@ class MatchReport:
         batches: Batches committed.
         pending_left: Rows of the CRM dataset (restricted to ``lead_dataset_id`` when given)
             still ``pending`` after the run, which the readiness test counts.
+        interrupted_by: The first ``TransientError`` per source that outlived its retries:
+            a LinkedIn re-fetch and a HubSpot lookup, in the order they occurred. Their rows
+            already ended ``error`` and are retried; the caller hands each error to
+            ``SourceModeController.on_error``, which alone decides what follows (the
+            connection turns ``stale``). Empty when every call was answered.
     """
 
     attempted: int = 0
@@ -708,6 +717,7 @@ class MatchReport:
     skipped: int = 0
     batches: int = 0
     pending_left: int = 0
+    interrupted_by: tuple[TransientError, ...] = ()
 
 
 async def known_versions(session: AsyncSession, linkedin_dataset_id: int) -> KnownVersions:
@@ -810,6 +820,10 @@ class _BatchCounts:
     defects: int = 0
     hash_mismatches: int = 0
     leases_lost: int = 0
+
+
+type _Note = Callable[[TransientError], None]
+"""Receives a ``TransientError`` that outlived its retries, as soon as it is observed."""
 
 
 @dataclass(slots=True)
@@ -1071,6 +1085,7 @@ async def _refetch(
     claims: Sequence[_Claim],
     clients: MatchClients,
     versions: Mapping[int, KnownVersions],
+    note: _Note,
 ) -> _Refetch:
     """Re-fetch the claimed leads from LinkedIn and decode their emails transiently.
 
@@ -1078,7 +1093,8 @@ async def _refetch(
     with no decodable email and rows whose response breaks the contract get their outcome
     here; every decoded email is returned for the single HubSpot lookup of the batch. Runs
     with no session open: ``versions`` already holds the stored form-version maps of every
-    claimed lead's dataset (:func:`_claim_batch`).
+    claimed lead's dataset (:func:`_claim_batch`). A re-fetch a transient failure ended
+    early is passed to ``note`` at once, so it is kept when a later re-fetch raises.
 
     Raises:
         AccessDenied: When LinkedIn refuses the credentials; the batch's lease is released.
@@ -1107,6 +1123,8 @@ async def _refetch(
                 account_id, [claim.external_id for claim in chunk]
             )
             interrupted = batch.interrupted_by
+            if interrupted is not None:
+                note(interrupted)
             for claim in chunk:
                 lead_id = claim.lead_id
                 element = batch.found.get(claim.external_id)
@@ -1315,16 +1333,21 @@ async def _attempt_batch(
     now: datetime,
     lease_until: datetime,
     versions: Mapping[int, KnownVersions],
+    note: _Note,
 ) -> _BatchCounts:
     """Attempt one leased batch, then write its outcomes in a short transaction.
 
     The re-fetch and the lookup run with no session open. The write first checks that the
     CRM dataset is still writable and locks the claimed rows again; only rows still under
     ``lease_until`` are written, with only the contacts the lookup found for them, and the
-    rest are counted as lost leases. A batch that holds no row writes nothing.
+    rest are counted as lost leases. A batch that holds no row writes nothing. Every
+    re-fetch or lookup a transient failure ended early is passed to ``note`` before the
+    write, so it is kept when the batch then raises.
     """
-    refetch = await _refetch(crm, claims, clients, versions)
+    refetch = await _refetch(crm, claims, clients, versions, note)
     lookup = await _lookup(clients, refetch.emails)
+    if lookup is not None and lookup.interrupted_by is not None:
+        note(lookup.interrupted_by)
     async with factory() as session, session.begin():
         await _crm_dataset(session, crm.id)
         held = await _held(session, crm.id, claims, lease_until)
@@ -1402,6 +1425,7 @@ async def run_matching(
     now: datetime,
     lead_dataset_id: int | None = None,
     max_batches: int | None = None,
+    interruptions: list[TransientError] | None = None,
 ) -> MatchReport:
     """Attempt every due ``lead_match`` row of one CRM dataset, one batch at a time.
 
@@ -1451,9 +1475,16 @@ async def run_matching(
             ``last_checked_at``.
         lead_dataset_id: Restrict the run to the leads of one LinkedIn dataset.
         max_batches: Stop after this many batches; ``None`` runs until nothing is due.
+        interruptions: A list to which the run appends the first ``TransientError`` per
+            source that outlived its retries as soon as it is observed: right after the
+            LinkedIn re-fetch or the HubSpot lookup it ended, before that batch writes. When
+            the run raises, the list therefore still holds the interruptions of the
+            committed batches and of the failing batch up to its raise; on a normal return
+            it holds exactly ``interrupted_by``. ``None`` collects nothing beyond the report.
 
     Returns:
-        The run's counts.
+        The run's counts, and in ``interrupted_by`` the first transient error per source
+        that outlived its retries, for the caller to hand to ``on_error``.
 
     Raises:
         ValueError: If ``now`` is naive, ``max_batches`` is not a positive integer, the CRM
@@ -1483,6 +1514,17 @@ async def run_matching(
     totals = _BatchCounts()
     batches = 0
     versions: dict[int, KnownVersions] = {}
+    # The first interruption per source (LinkedIn re-fetch, HubSpot lookup), in order.
+    interrupted: dict[str, TransientError] = {}
+
+    def note(error: TransientError) -> None:
+        """Keep a source's first interruption and hand it to the caller's list at once."""
+        if error.source in interrupted:
+            return
+        interrupted[error.source] = error
+        if interruptions is not None:
+            interruptions.append(error)
+
     started = time.monotonic()
     while max_batches is None or batches < max_batches:
         # ``now`` is fixed for the whole run, so the time spent so far keeps a later batch's
@@ -1495,7 +1537,7 @@ async def run_matching(
             break
         try:
             counts = await _attempt_batch(
-                factory, claimed_in, claims, clients, now, lease_until, versions
+                factory, claimed_in, claims, clients, now, lease_until, versions, note
             )
         except BaseException:
             # The claim has committed: hand the lease back so the rows are due again
@@ -1520,6 +1562,7 @@ async def run_matching(
         skipped=totals.skipped,
         batches=batches,
         pending_left=await _pending_left(factory, crm_dataset_id, lead_dataset_id),
+        interrupted_by=tuple(interrupted.values()),
     )
     _log.info(
         "sync.lead_match.run",

@@ -133,7 +133,7 @@ Slots are wall-clock times in `DISPLAY_TIMEZONE`. Daily facts are upserted per n
 | Initial backfill | Every new dataset, including the first start | Entity sync, then Q-G3, Q-G5, Q-G6 | `BACKFILL_DAYS` (default 180) | As above |
 | Recovery probe | Every 30 min while Google is in automatic fallback | Q-G1 | — | — |
 
-When a dataset still has deferred pages from an earlier run, the next metrics run widens its start back to the dataset's `covered_from`, so the shortfall is re-read.
+When a run is interrupted, the scopes it did not read are kept as the dataset's checkpoint (`dataset_freshness.checkpoint`), in the transaction that records its freshness. Each scope is stored with `deferred_at`, the instant of the run that first deferred that work; a partition later deferred out of a stored scope, or merged in from a concurrent run, keeps that instant. The next metrics run reads the stored scopes of both `google.metrics_daily` and `google.search_terms` first, as stored (a narrowed campaign or ad-group range or a criterion keyset keeps its progress), oldest `deferred_at` first and then in dataset and query order, so neither dataset's fresh range spends a small window's calls before the other's older work. Then it reads its own ranges, Q-G3, Q-G5 and Q-G6, each without the native days a stored scope of the same query covers; the dataset turns `complete` only once nothing is pending. The next entity sync reads only the queries and enumeration scopes still outstanding. A checkpoint that cannot be read is logged and ignored, and a metrics run then widens its start back to the dataset's `covered_from`, so the shortfall is re-read.
 
 ## Completeness
 
@@ -180,12 +180,14 @@ Partitioning is deterministic: depth first, dates ascending, then ranges ascendi
 
 ## Safe absence
 
-A tracked campaign is marked `ended`, or raises a `missing` discrepancy, only from complete reads. Both of these checks must pass in the same entity sync:
+A tracked campaign is marked `ended`, or raises a `missing` discrepancy, only from complete reads. Both of these checks must pass:
 
 1. The Q-G2 keyset scan ended on a short page, with no failed or deferred page.
 2. Every Q-G2b chunk for the tracked campaigns the scan no longer returned succeeded.
 
-Then a campaign that Q-G2b returns as `REMOVED` is snapshotted as `ended`, and one that neither query returned raises a `missing` discrepancy. If either check fails, `google.entities` is `incomplete` for that sync, Q-G2b is not run after an incomplete scan, nothing is inferred, and the previous snapshot stands. Ad groups (Q-G4) and keywords (Q-G7, keyed by ad group and criterion id) follow the same rule. The discrepancy check (C0) is described in [the recommendation rules](../recommendation-rules.md).
+Then a campaign that Q-G2b returns as `REMOVED` is snapshotted as `ended`, and one that neither query returned raises a `missing` discrepancy. If either check fails, `google.entities` is `incomplete` for that sync, Q-G2b is not run after an incomplete scan, nothing is inferred, and the previous snapshot stands. Ad groups (Q-G4) and keywords (Q-G7, keyed by ad group and criterion id) follow the same rule.
+
+An interrupted scan resumes in the next entity sync from its unread scopes instead of restarting. The tracked ids that lie inside the scopes already read and were not returned are kept as candidates, and the verdict waits until the scan finishes: Q-G2b then starts, in the entity sync in which the scan completes, over every candidate of the cycle. An interrupted re-read resumes too: the checkpoint keeps the chunks not re-read yet, the rows the chunks already re-read returned and every candidate, and the next entity sync reads only the pending chunks. Removals and `missing` discrepancies are decided once every chunk has succeeded, from the rows of all of them, exactly as one uninterrupted re-read would decide them. Ad groups and keywords resume the same way, and their removals are marked in the sync in which their enumeration finishes. The discrepancy check (C0) is described in [the recommendation rules](../recommendation-rules.md).
 
 ## Call budget and quotas
 
@@ -193,7 +195,7 @@ Then a campaign that Q-G2b returns as `REMOVED` is snapshotted as `ended`, and o
 
 - **Every POST attempt counts**: first pages, next-page calls, partition calls and retries. The client asks the budget before each attempt, and a refused attempt sends nothing.
 - **One cap for every process**: the count lives on the `google` row of `source_connection` (`calls_by_minute` in UTC minute buckets, summed into `calls_24h`). The worker, `ads-engine sync` and `ads-engine capture-fixtures` all share it, and `/sources` shows `calls_24h` against the cap.
-- **Exhaustion is a deferral, never a retry.** The remaining pages are deferred to a later window, with the reason "call budget exhausted; N partitions deferred". The affected datasets keep their last good data and stay `incomplete` until the deferred pages finish, so items reading them carry the `incomplete` flag. The entity sync infers no removal meanwhile, and the next metrics run widens its range to re-read the shortfall. A dataset whose coverage stops short of the window end, or whose last success is older than `sources.stale_after_hours` (24) in `config/thresholds.yaml`, also makes those items `stale` (see [the architecture overview](../architecture.md)).
+- **Exhaustion is a deferral, never a retry.** The remaining pages are deferred to a later window, with the reason "call budget exhausted; N partitions deferred". The affected datasets keep their last good data and stay `incomplete` until the deferred pages finish, so items reading them carry the `incomplete` flag. The unread scopes are stored as the dataset's checkpoint and read first by the next run, so a workload above the cap advances through its partitions window by window instead of restarting from the same prefix. The entity sync infers no removal meanwhile, and its next runs read only the outstanding work. A dataset whose coverage stops short of the window end, or whose last success is older than `sources.stale_after_hours` (24) in `config/thresholds.yaml`, also makes those items `stale` (see [the architecture overview](../architecture.md)).
 - **Simulated calls are unmetered.** When Google is simulated, the client is given an unmetered budget (`UNMETERED`), so a simulated n8n call never counts as a live Google call.
 
 The real quota is not the product's. The Google Ads access level and its daily operation limit belong to the developer token inside n8n's Google Ads credential, set through that token's Google Cloud project. The product cannot see it, and every other n8n workflow using the same credential draws on it.

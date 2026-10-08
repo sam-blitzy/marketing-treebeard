@@ -31,6 +31,7 @@ from starlette.requests import Request
 from structlog.testing import capture_logs
 from structlog.typing import EventDict
 
+from ads_engine.analysis.runner import PendingRequests
 from ads_engine.analysis.thresholds import ConfigError, Thresholds
 from ads_engine.api import app as api_app
 from ads_engine.logging import get_logger, logged_as, mark_logged
@@ -135,8 +136,10 @@ def _startup_with(monkeypatch: pytest.MonkeyPatch, error: Exception) -> list[str
     async def no_session() -> AsyncIterator[None]:
         yield None
 
-    async def pending(_session: object) -> tuple[int, ...]:
-        return (41, 42)
+    async def pending(_session: object) -> PendingRequests:
+        return PendingRequests(
+            count=2, oldest_requested_at=NOW, through_id=42, reasons=(worker_main.REASON_STARTUP,)
+        )
 
     async def window(**_kwargs: Any) -> object:
         return SimpleNamespace(start=NOW.date(), end=NOW.date(), days=1)
@@ -148,7 +151,7 @@ def _startup_with(monkeypatch: pytest.MonkeyPatch, error: Exception) -> list[str
         requeued.append(worker_main.REASON_STARTUP)
 
     monkeypatch.setattr(worker_main, "session_scope", no_session)
-    monkeypatch.setattr(worker_main, "_pending_request_ids", pending)
+    monkeypatch.setattr(worker_main, "pending_requests", pending)
     monkeypatch.setattr(worker_main, "default_window", window)
     monkeypatch.setattr(worker_main, "run_analysis", failing_run)
     monkeypatch.setattr(worker_main, "_requeue_startup_analysis", requeue)

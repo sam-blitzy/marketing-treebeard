@@ -18,7 +18,10 @@ reads:
 * page tokens followed at once, call-budget interruption with deferred scopes, and
   ``AccessDenied`` and ``QueryDefect`` propagating unchanged;
 * safe absence: :func:`enumerate_campaigns` and :func:`enumerate_entities` report ``removed``,
-  ``missing`` and absent keys only after complete reads.
+  ``missing`` and absent keys only after complete reads;
+* resumption across syncs: scopes stored as JSON and validated on the way back, the shared
+  interruption reason, and enumerations resumed from :class:`EnumerationProgress` that read
+  only their pending scopes and decide absence once they finish.
 
 Every request goes through the production ``GoogleAdsWebhookClient`` and ``send_json`` on the
 root fixture ``contract_checked_transport("google", ...)``, which validates each request against
@@ -41,10 +44,12 @@ the client at construction instead, so the tests call
 """
 
 import json
+import re
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -67,10 +72,15 @@ from ads_engine.connectors.google_n8n.partition import (
     REASON_BUDGET,
     REASON_FINEST_PARTITION,
     REASON_INTERRUPTED,
+    EnumerationProgress,
     FetchOutcome,
     PartitionedFetcher,
+    _scope_holds,
     enumerate_campaigns,
     enumerate_entities,
+    interruption_reason,
+    scope_from_json,
+    scope_to_json,
 )
 from ads_engine.connectors.google_n8n.queries import (
     AD_GROUP_HI,
@@ -1382,3 +1392,583 @@ async def test_enumerate_entities_keys_keywords_by_ad_group_and_criterion(
     assert enumeration.complete is True
     assert keyword_pairs(enumeration.rows) == [(30, 1), (31, 1), (31, 3)]
     assert enumeration.absent_keys == frozenset({(31, 9), (30, 3)})
+
+
+# --- Resumption across syncs (AAP 0.3.3 "Budget") -------------------------------------------------
+
+Q_G5_KEYSET = {CAMPAIGN_LO: 51, CAMPAIGN_HI: 51, AD_GROUP_ID: 52, LAST_ID: 7}
+
+SCOPE_FORMS = [
+    pytest.param(
+        "Q-G6", day_scope(DAY1, DAY2), {START: "2026-09-14", END: "2026-09-15"}, id="dated"
+    ),
+    pytest.param(
+        "Q-G5",
+        day_scope(DAY1, DAY1, Q_G5_KEYSET),
+        {START: "2026-09-14", END: "2026-09-14", **Q_G5_KEYSET},
+        id="Q-G5 criterion keyset",
+    ),
+    pytest.param("Q-G2", {LAST_ID: 9_998}, {LAST_ID: 9_998}, id="keyset"),
+    pytest.param(
+        "Q-G7",
+        {AD_GROUP_LO: 3, AD_GROUP_HI: 9},
+        {AD_GROUP_LO: 3, AD_GROUP_HI: 9},
+        id="Q-G7 ad group range",
+    ),
+    pytest.param(
+        "Q-G7",
+        {AD_GROUP_ID: 31, LAST_ID: 4},
+        {AD_GROUP_ID: 31, LAST_ID: 4},
+        id="Q-G7 criterion keyset",
+    ),
+    pytest.param("Q-G2b", {IDS: (9, 10)}, {IDS: [9, 10]}, id="by ids"),
+    pytest.param("Q-G1", {}, {}, id="single"),
+]
+
+
+@pytest.mark.parametrize(("query_id", "scope", "stored"), SCOPE_FORMS)
+def test_a_deferred_scope_survives_json_and_comes_back_immutable(
+    query_id: str, scope: dict[str, object], stored: dict[str, object]
+) -> None:
+    """Every scope form a fetch defers is stored as plain JSON and rebuilt to the same scope."""
+    data = scope_to_json(scope)
+
+    assert data == stored
+    rebuilt = scope_from_json(query_id, json.loads(json.dumps(data)))
+    assert dict(rebuilt) == scope
+    with pytest.raises(TypeError):
+        rebuilt[LAST_ID] = 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("query_id", "data", "error"),
+    [
+        pytest.param("Q-G6", {START: "2026-09-14"}, "needs scope keys", id="end missing"),
+        pytest.param(
+            "Q-G6", {START: "2026-09-15", END: "2026-09-14"}, "must not follow", id="reversed"
+        ),
+        pytest.param("Q-G6", {START: "2026-9-14", END: "2026-09-14"}, "YYYY-MM-DD", id="date form"),
+        pytest.param(
+            "Q-G6", {START: "2026-02-30", END: "2026-03-01"}, "YYYY-MM-DD", id="no such date"
+        ),
+        pytest.param("Q-G2", {LAST_ID: True}, "not bool", id="bool id"),
+        pytest.param("Q-G2", {LAST_ID: 1.0}, "not float", id="float id"),
+        pytest.param("Q-G2", {LAST_ID: -1}, "between 0 and INT64_MAX", id="negative id"),
+        pytest.param("Q-G2", {"cursor": 5}, "unknown stored scope key", id="unknown key"),
+        pytest.param(
+            "Q-G2", {START: "2026-09-14", END: "2026-09-14"}, "not accepted", id="Q-G2 dates"
+        ),
+        pytest.param("Q-G2b", {IDS: "9,10"}, "list of int ids", id="ids not a list"),
+        pytest.param(
+            "Q-G5",
+            {START: "2026-09-14", END: "2026-09-15", **Q_G5_KEYSET},
+            "needs a single day",
+            id="criterion keyset over two days",
+        ),
+        pytest.param("Q-G99", {}, "unknown Google Ads query id", id="unknown query"),
+        pytest.param("Q-G6", ["2026-09-14"], "must be a JSON object", id="not an object"),
+    ],
+)
+def test_a_stored_scope_the_template_would_reject_is_refused_before_any_call(
+    query_id: str, data: object, error: str
+) -> None:
+    """``scope_from_json`` validates exactly as ``partitioned_fetch`` does, so nothing is sent."""
+    with pytest.raises(ValueError, match=re.escape(error)):
+        scope_from_json(query_id, data)
+
+
+@pytest.mark.parametrize(
+    ("scope", "error"),
+    [
+        pytest.param(
+            {START: datetime(2026, 9, 14, tzinfo=UTC), END: DAY1},
+            "must be a datetime.date",
+            id="datetime",
+        ),
+        pytest.param({LAST_ID: True}, "not bool", id="bool id"),
+        pytest.param({"cursor": 1}, "unknown scope key", id="unknown key"),
+        pytest.param({IDS: "9"}, "collection of int ids", id="ids as text"),
+        pytest.param({LAST_ID: INT64_MAX + 1}, "between 0 and INT64_MAX", id="beyond INT64"),
+    ],
+)
+def test_a_scope_json_cannot_restore_exactly_is_refused(
+    scope: dict[str, object], error: str
+) -> None:
+    """``scope_to_json`` refuses a value whose JSON form would come back as something else."""
+    with pytest.raises(ValueError, match=re.escape(error)):
+        scope_to_json(scope)
+
+
+def test_the_interruption_reason_states_the_total_still_deferred() -> None:
+    """One reason format for a fetch, an enumeration and a dataset's total pending work."""
+    transient = TransientError("relay unavailable", source="google", endpoint="search")
+
+    assert interruption_reason(CallBudgetExhausted(), 1) == f"{REASON_BUDGET}; 1 partition deferred"
+    assert (
+        interruption_reason(CallBudgetExhausted(), 7) == f"{REASON_BUDGET}; 7 partitions deferred"
+    )
+    assert interruption_reason(transient, 2) == (
+        f"{REASON_INTERRUPTED}: {transient.reason}; 2 partitions deferred"
+    )
+    for count in (0, -1, True):
+        with pytest.raises(ValueError, match="at least one scope"):
+            interruption_reason(CallBudgetExhausted(), count)
+
+
+@pytest.mark.parametrize(
+    ("scope", "key", "held"),
+    [
+        pytest.param({LAST_ID: 10}, 11, True, id="keyset holds ids above last_id"),
+        pytest.param({LAST_ID: 10}, 10, False, id="keyset excludes last_id itself"),
+        pytest.param({}, 1, True, id="no last_id starts after 0"),
+        pytest.param({IDS: (9, 10)}, 9, True, id="IN list holds its ids"),
+        pytest.param({IDS: (9, 10)}, 11, False, id="IN list holds nothing else"),
+        pytest.param({AD_GROUP_LO: 5, AD_GROUP_HI: 9}, (5, 1), True, id="range low end"),
+        pytest.param({AD_GROUP_LO: 5, AD_GROUP_HI: 9}, (9, 99), True, id="range high end"),
+        pytest.param({AD_GROUP_LO: 5, AD_GROUP_HI: 9}, (10, 1), False, id="above the range"),
+        pytest.param({}, (INT64_MAX, 1), True, id="no range is the full range"),
+        pytest.param({AD_GROUP_ID: 31, LAST_ID: 4}, (31, 5), True, id="criterion keyset"),
+        pytest.param({AD_GROUP_ID: 31, LAST_ID: 4}, (31, 4), False, id="criterion at last_id"),
+        pytest.param({AD_GROUP_ID: 31, LAST_ID: 4}, (30, 5), False, id="another ad group"),
+    ],
+)
+def test_scope_membership_decides_which_tracked_keys_a_read_scope_vouches_for(
+    scope: dict[str, object], key: int | tuple[int, int], held: bool
+) -> None:
+    """A tracked key is an absence candidate only once a scope that holds it has been read."""
+    assert _scope_holds(scope, key) is held
+
+
+def test_enumeration_progress_round_trips_through_json() -> None:
+    """Progress is stored as plain JSON and rebuilt equal, its outstanding count included.
+
+    A Q-G2b re-read keeps its two unread chunks, every candidate and the raw rows of the
+    chunk already re-read; a ``Decimal`` the relay sent is stored as its JSON number.
+    """
+    campaigns = EnumerationProgress("Q-G2", ({LAST_ID: 9_998},), frozenset({3, 1}))
+    keywords = EnumerationProgress(
+        "Q-G7",
+        ({AD_GROUP_LO: 5, AD_GROUP_HI: 9}, {AD_GROUP_ID: 31, LAST_ID: 4}),
+        frozenset({(31, 2), (30, 1)}),
+    )
+    budgeted = {**campaign_row(7, REMOVED), "campaignBudget": {"amountMicros": Decimal("1E+6")}}
+    rereading = EnumerationProgress(
+        "Q-G2",
+        ({IDS: tuple(range(1_001, 2_001))}, {IDS: tuple(range(2_001, 2_502))}),
+        frozenset(range(1, 2_502)),
+        rereading=True,
+        reread_rows=(campaign_row(3, REMOVED), budgeted),
+    )
+
+    assert campaigns.to_json() == {
+        "query_id": "Q-G2",
+        "pending": [{LAST_ID: 9_998}],
+        "absent": [1, 3],
+        "rereading": False,
+        "reread_rows": [],
+    }
+    assert keywords.to_json()["absent"] == [[30, 1], [31, 2]]
+    assert rereading.to_json()["pending"] == [
+        {IDS: list(range(1_001, 2_001))},
+        {IDS: list(range(2_001, 2_502))},
+    ]
+    assert rereading.to_json()["reread_rows"] == [
+        campaign_row(3, REMOVED),
+        {**campaign_row(7, REMOVED), "campaignBudget": {"amountMicros": 1_000_000}},
+    ]
+    assert (campaigns.outstanding, keywords.outstanding, rereading.outstanding) == (1, 2, 2)
+    for progress in (campaigns, keywords, rereading):
+        stored = json.loads(json.dumps(progress.to_json()))
+        assert EnumerationProgress.from_json(stored) == progress
+
+
+def stored_progress(**fields: object) -> dict[str, object]:
+    """A stored :class:`EnumerationProgress` object: an unread Q-G2 scan unless overridden."""
+    return {
+        "query_id": "Q-G2",
+        "pending": [{LAST_ID: 5}],
+        "absent": [],
+        "rereading": False,
+        "reread_rows": [],
+        **fields,
+    }
+
+
+def stored_reread(**fields: object) -> dict[str, object]:
+    """A stored Q-G2b re-read: chunk ``[6]`` pending, candidates 5 and 6, 5 re-read as removed."""
+    reread: dict[str, object] = {
+        "pending": [{IDS: [6]}],
+        "absent": [5, 6],
+        "rereading": True,
+        "reread_rows": [campaign_row(5, REMOVED)],
+    }
+    return stored_progress(**{**reread, **fields})
+
+
+@pytest.mark.parametrize(
+    ("data", "error"),
+    [
+        pytest.param(
+            stored_progress(query_id="Q-G4", pending=[], absent=[5], rereading=True),
+            "only Q-G2 has a Q-G2b re-read",
+            id="re-read for Q-G4",
+        ),
+        pytest.param(
+            stored_reread(pending=[{LAST_ID: 5}]),
+            "is not accepted here",
+            id="re-read with a scan scope pending",
+        ),
+        pytest.param(
+            stored_reread(pending=[]),
+            "a Q-G2b re-read has a chunk pending",
+            id="re-read without a pending chunk",
+        ),
+        pytest.param(
+            stored_reread(pending=[{IDS: []}]),
+            "holds 1 to 1000 ids",
+            id="empty re-read chunk",
+        ),
+        pytest.param(
+            stored_reread(
+                pending=[{IDS: list(range(7, 7 + MAX_IDS_PER_IN + 1))}],
+                absent=[5, *range(7, 7 + MAX_IDS_PER_IN + 1)],
+            ),
+            "holds 1 to 1000 ids",
+            id="re-read chunk over 1,000 ids",
+        ),
+        pytest.param(
+            stored_reread(pending=[{IDS: [6]}, {IDS: [6]}]),
+            "pending twice",
+            id="re-read id in two chunks",
+        ),
+        pytest.param(
+            stored_reread(pending=[{IDS: [8]}]),
+            "names an id that is not a candidate",
+            id="re-read chunk outside the candidates",
+        ),
+        pytest.param(
+            stored_reread(reread_rows=["not a row"]),
+            "must be a JSON object",
+            id="re-read row not an object",
+        ),
+        pytest.param(
+            stored_reread(reread_rows=[{"campaign": {"status": REMOVED}}]),
+            "needs an INT64 campaign.id",
+            id="re-read row without a campaign id",
+        ),
+        pytest.param(
+            stored_reread(reread_rows=[campaign_row(9, REMOVED)]),
+            "not a candidate",
+            id="re-read row of a non-candidate",
+        ),
+        pytest.param(
+            stored_reread(reread_rows=[campaign_row(5, REMOVED), campaign_row(5, REMOVED)]),
+            "repeats a campaign",
+            id="re-read row repeated",
+        ),
+        pytest.param(
+            stored_reread(reread_rows=[campaign_row(6, REMOVED)]),
+            "whose chunk is still pending",
+            id="re-read row of a pending chunk",
+        ),
+        pytest.param(
+            stored_reread(reread_rows={}),
+            "stored re-read rows must be a list",
+            id="re-read rows not a list",
+        ),
+        pytest.param(
+            stored_progress(reread_rows=[campaign_row(5, REMOVED)]),
+            "only a Q-G2b re-read keeps re-read rows",
+            id="rows outside a re-read",
+        ),
+        pytest.param(
+            stored_progress(query_id="Q-G4", pending=[]),
+            "an unfinished enumeration has a pending scope",
+            id="unfinished without a pending scope",
+        ),
+        pytest.param(
+            stored_progress(query_id="Q-G6", pending=[{}]),
+            "is for 'Q-G2', 'Q-G4' or 'Q-G7' only",
+            id="not an enumeration",
+        ),
+        pytest.param(
+            stored_progress(query_id="Q-G7", pending=[{}], absent=[5]),
+            "(ad_group_id, criterion_id) tuples",
+            id="Q-G7 key not a pair",
+        ),
+        pytest.param(
+            stored_progress(absent=[True]),
+            "not bool",
+            id="bool key",
+        ),
+        pytest.param(
+            stored_progress(pending=[{START: "2026-09-14", END: "2026-09-14"}]),
+            "is not accepted here",
+            id="scope the template rejects",
+        ),
+        pytest.param(
+            stored_progress(rereading="no"),
+            "stored rereading must be a bool",
+            id="rereading not a bool",
+        ),
+        pytest.param(
+            {"query_id": "Q-G2", "pending": [{LAST_ID: 5}], "absent": [], "rereading": False},
+            "must hold exactly",
+            id="key missing",
+        ),
+    ],
+)
+def test_stored_enumeration_progress_that_does_not_validate_is_refused(
+    data: object, error: str
+) -> None:
+    """``from_json`` accepts exactly what ``to_json`` writes, validated scope by scope."""
+    with pytest.raises(ValueError, match=re.escape(error)):
+        EnumerationProgress.from_json(data)
+
+
+async def test_progress_of_another_enumeration_is_refused_before_any_call(
+    connect: Connect,
+) -> None:
+    """Resuming Q-G4 with Q-G7 progress (or campaigns with Q-G4's) sends nothing."""
+    fake = FakeGoogle({AD_GROUPS: [ad_group_fact(5)]})
+    keywords = EnumerationProgress("Q-G7", ({},), frozenset())
+    ad_groups = EnumerationProgress("Q-G4", ({LAST_ID: 1},), frozenset())
+
+    async with connect(fake) as client:
+        with pytest.raises(ValueError, match="cannot resume"):
+            await enumerate_entities(client, "Q-G4", {5}, resume=keywords)
+        with pytest.raises(ValueError, match="cannot resume"):
+            await enumerate_campaigns(client, {5}, resume=ad_groups)
+
+    assert fake.calls == []
+
+
+async def test_a_resumed_campaign_scan_starts_at_the_deferred_keyset_and_decides_once_finished(
+    connect: Connect,
+) -> None:
+    """AAP 0.3.3: a scan deferred by the budget resumes where it stopped, in a later sync.
+
+    The first call reads page 1 and stops at the refused page 2: nothing is removed or
+    missing and Q-G2b does not run, although 3 (``REMOVED``) and 5 (gone) are tracked and
+    absent from page 1. The progress keeps them as candidates and the deferred keyset as the
+    only pending scope. Resumed from its JSON form, the next call reads only that keyset
+    page, then re-reads every candidate of both parts with one Q-G2b chunk: 3 comes back
+    removed, 5 and the never-returned id above page 1 are missing.
+    """
+    ids = list(range(2, 2 + 2 * (KEYSET_LIMIT + 3), 2))
+    last_of_page_one = ids[KEYSET_LIMIT - 1]
+    gone_above = last_of_page_one + 1
+    world = {CAMPAIGNS: [*(campaign_fact(key) for key in ids), campaign_fact(3, REMOVED)]}
+    tracked = {ids[0], ids[-1], 3, 5, gone_above}
+    first_fake = FakeGoogle(world)
+
+    async with connect(first_fake, CountingBudget(allowed=1)) as client:
+        first = await enumerate_campaigns(client, tracked)
+
+    assert [call.query_id for call in first_fake.calls] == ["Q-G2"]
+    assert (first.complete, first.removed, first.missing_ids) == (False, (), frozenset())
+    assert first.reason == f"{REASON_BUDGET}; 1 partition deferred"
+    assert first.progress is not None
+    assert [dict(scope) for scope in first.progress.pending] == [{LAST_ID: last_of_page_one}]
+    assert first.progress.absent == frozenset({3, 5})
+    assert first.progress.rereading is False
+    assert ids_of(first.present, "campaign.id") == ids[:KEYSET_LIMIT]
+
+    stored = json.loads(json.dumps(first.progress.to_json()))
+    second_fake = FakeGoogle(world)
+    async with connect(second_fake) as client:
+        second = await enumerate_campaigns(
+            client, tracked, resume=EnumerationProgress.from_json(stored)
+        )
+
+    assert [(call.query_id, call.scope) for call in second_fake.calls] == [
+        ("Q-G2", {LAST_ID: last_of_page_one}),
+        ("Q-G2b", {IDS: (3, 5, gone_above)}),
+    ]
+    assert f"campaign.id > {last_of_page_one} ORDER BY" in second_fake.calls[0].query
+    assert second.complete is True
+    assert (second.reason, second.interrupted_by, second.progress) == (None, None, None)
+    assert ids_of(second.present, "campaign.id") == ids[KEYSET_LIMIT:]
+    assert ids_of(second.removed, "campaign.id") == [3]
+    assert second.missing_ids == frozenset({5, gone_above})
+    assert second.calls == 2
+
+
+async def test_a_resumed_scan_drops_candidates_that_are_no_longer_tracked(
+    connect: Connect,
+) -> None:
+    """Candidates of earlier syncs count only while still tracked when the scan finishes."""
+    ids = list(range(2, 2 + 2 * (KEYSET_LIMIT + 3), 2))
+    world = {CAMPAIGNS: [campaign_fact(key) for key in ids]}
+    progress = EnumerationProgress("Q-G2", ({LAST_ID: ids[KEYSET_LIMIT - 1]},), frozenset({3, 5}))
+    fake = FakeGoogle(world)
+
+    async with connect(fake) as client:
+        enumeration = await enumerate_campaigns(client, {ids[0], 5}, resume=progress)
+
+    assert [(call.query_id, call.scope) for call in fake.calls] == [
+        ("Q-G2", {LAST_ID: ids[KEYSET_LIMIT - 1]}),
+        ("Q-G2b", {IDS: (5,)}),
+    ]
+    assert enumeration.complete is True
+    assert enumeration.missing_ids == frozenset({5})
+
+
+async def test_a_failed_q_g2b_chunk_is_resumed_alone_without_scanning_again(
+    connect: Connect,
+) -> None:
+    """A Q-G2b chunk that keeps failing leaves progress that re-runs only that chunk.
+
+    The scan finished, so the progress has ``rereading`` set, the failed chunk as its only
+    pending scope, no re-read rows and every candidate. The next call sends no Q-G2 page,
+    re-reads 9 and 10 in that chunk and decides: 9 removed, 10 missing.
+    """
+    fault = answer_with(503, UNAVAILABLE, when=lambda call, ordinal: call.query_id == "Q-G2b")
+    failing = FakeGoogle(tracked_campaign_world(), fault=fault)
+
+    async with connect(failing) as client:
+        first = await enumerate_campaigns(client, tracked_ids={1, 2, 9, 10})
+
+    assert (first.complete, first.removed, first.missing_ids) == (False, (), frozenset())
+    assert first.progress == EnumerationProgress(
+        "Q-G2", ({IDS: (9, 10)},), frozenset({9, 10}), rereading=True
+    )
+    assert first.reason is not None
+    assert first.reason.startswith(REASON_INTERRUPTED)
+    assert first.reason.endswith("; 1 partition deferred")
+
+    stored = json.loads(json.dumps(first.progress.to_json()))
+    healthy = FakeGoogle(tracked_campaign_world())
+    async with connect(healthy) as client:
+        second = await enumerate_campaigns(
+            client, {1, 2, 9, 10}, resume=EnumerationProgress.from_json(stored)
+        )
+
+    assert [(call.query_id, call.scope) for call in healthy.calls] == [("Q-G2b", {IDS: (9, 10)})]
+    assert second.complete is True
+    assert second.present == ()
+    assert ids_of(second.removed, "campaign.id") == [9]
+    assert second.missing_ids == frozenset({10})
+    assert (second.calls, second.progress) == (1, None)
+
+
+@pytest.mark.parametrize("allowed", [1, 2], ids=["one call a window", "two calls a window"])
+async def test_a_q_g2b_re_read_above_the_budget_advances_chunk_by_chunk_to_one_verdict(
+    connect: Connect, allowed: int
+) -> None:
+    """AAP 0.3.3 "Budget" and "Safe absence": a re-read larger than a window still finishes.
+
+    2,001 tracked campaigns are ``REMOVED`` and two more no longer exist, so a complete Q-G2
+    scan leaves 2,003 candidates: three Q-G2b chunks of 1,000, 1,000 and 3 ids, more than a
+    window of one or two calls reads. Each window resumes from the stored progress (through
+    JSON), spends at most its calls, reads only chunks not read before, and infers nothing
+    until the last chunk succeeds. That window reports the verdict of one uninterrupted
+    pass: every ``REMOVED`` row of all three chunks, and the two vanished ids missing.
+    """
+    removed_ids = range(1, 2_002)
+    vanished = {2_002, 2_003}
+    tracked = {*removed_ids, *vanished}
+    world = {CAMPAIGNS: [campaign_fact(key, REMOVED) for key in removed_ids]}
+
+    single = FakeGoogle(world)
+    async with connect(single) as client:
+        one_pass = await enumerate_campaigns(client, tracked)
+    assert len(single.calls_for("Q-G2b")) == 3
+
+    progress: EnumerationProgress | None = None
+    chunks_read: list[tuple[int, ...]] = []
+    windows = 0
+    while True:
+        assert windows < 4, "the re-read did not finish"
+        fake = FakeGoogle(world)
+        budget = CountingBudget(allowed=allowed)
+        async with connect(fake, budget) as client:
+            result = await enumerate_campaigns(client, tracked, resume=progress)
+        windows += 1
+        assert budget.admitted <= allowed
+        chunks_read.extend(in_list(call) for call in fake.calls_for("Q-G2b"))
+        if result.complete:
+            break
+        assert (result.removed, result.missing_ids) == ((), frozenset()), "nothing inferred yet"
+        assert result.progress is not None
+        assert result.progress.rereading, "the scan finished in the first window"
+        progress = EnumerationProgress.from_json(json.loads(json.dumps(result.progress.to_json())))
+
+    assert windows == -(-4 // allowed), "one Q-G2 page and three chunks, at most `allowed` a window"
+    assert chunks_read == [
+        tuple(range(1, 1_001)),
+        tuple(range(1_001, 2_001)),
+        (2_001, 2_002, 2_003),
+    ], "every chunk is read once, in order; none restarts"
+    assert result.progress is None
+    assert ids_of(result.removed, "campaign.id") == ids_of(one_pass.removed, "campaign.id")
+    assert ids_of(result.removed, "campaign.id") == list(removed_ids)
+    assert result.missing_ids == one_pass.missing_ids == frozenset(vanished)
+    assert result.present == one_pass.present == ()
+
+
+async def test_a_resumed_ad_group_scan_reports_absent_keys_of_both_parts_once_finished(
+    connect: Connect,
+) -> None:
+    """Q-G4: absent keys accumulate across syncs and are reported only by the finished scan."""
+    ids = [key for key in range(1, KEYSET_LIMIT + 4) if key != 7]
+    world = {AD_GROUPS: [ad_group_fact(key) for key in ids]}
+    tracked = {1, 7, ids[-1], 1_000_000}
+    first_fake = FakeGoogle(world)
+
+    async with connect(first_fake, CountingBudget(allowed=1)) as client:
+        first = await enumerate_entities(client, "Q-G4", tracked)
+
+    assert (first.complete, first.absent_keys) == (False, frozenset())
+    assert first.progress is not None
+    assert [dict(scope) for scope in first.progress.pending] == [{LAST_ID: ids[KEYSET_LIMIT - 1]}]
+    assert first.progress.absent == frozenset({7})
+
+    second_fake = FakeGoogle(world)
+    async with connect(second_fake) as client:
+        second = await enumerate_entities(client, "Q-G4", tracked, resume=first.progress)
+
+    assert second_fake.scopes == [{LAST_ID: ids[KEYSET_LIMIT - 1]}]
+    assert second.complete is True
+    assert ids_of(second.rows, "ad_group.id") == ids[KEYSET_LIMIT:]
+    assert second.absent_keys == frozenset({7, 1_000_000})
+    assert (second.reason, second.progress) == (None, None)
+
+
+async def test_a_resumed_keyword_enumeration_reads_only_its_deferred_ad_group_range(
+    connect: Connect,
+) -> None:
+    """Q-G7: a deferred half of the ad-group range is all the next sync reads.
+
+    The capped full range splits in two halves; the budget admits the low half and refuses
+    the high one. The low half's tracked ``REMOVED`` keyword is a candidate at once, the
+    high half's gone keyword only after the resumed call reads that half.
+    """
+    low_ad_group, high_ad_group = 81, INT64_MAX - 81
+    low = [(low_ad_group, key) for key in range(1, PAGE_SIZE // 2 + 2)]
+    high = [(high_ad_group, key) for key in range(1, PAGE_SIZE // 2 + 1)]
+    world = {
+        KEYWORDS: [
+            *(keyword_fact(key, ad_group) for ad_group, key in (*low, *high)),
+            keyword_fact(PAGE_SIZE, low_ad_group, status=REMOVED),
+        ]
+    }
+    tracked = {low[0], (low_ad_group, PAGE_SIZE), high[0], (high_ad_group, PAGE_SIZE)}
+    first_fake = FakeGoogle(world)
+
+    async with connect(first_fake, CountingBudget(allowed=2)) as client:
+        first = await enumerate_entities(client, "Q-G7", tracked)
+
+    assert (first.complete, first.absent_keys) == (False, frozenset())
+    assert first.progress is not None
+    assert [dict(scope) for scope in first.progress.pending] == [AD_GROUP_HIGH_HALF]
+    assert first.progress.absent == frozenset({(low_ad_group, PAGE_SIZE)})
+
+    second_fake = FakeGoogle(world)
+    async with connect(second_fake) as client:
+        second = await enumerate_entities(client, "Q-G7", tracked, resume=first.progress)
+
+    assert second_fake.scopes == [AD_GROUP_HIGH_HALF]
+    assert second.complete is True
+    assert keyword_pairs(second.rows) == high
+    assert second.absent_keys == frozenset({(low_ad_group, PAGE_SIZE), (high_ad_group, PAGE_SIZE)})

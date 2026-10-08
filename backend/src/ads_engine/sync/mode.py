@@ -2350,7 +2350,13 @@ class SourceModeController:
         return _Staging(match_pass, staged)
 
     async def _matching_pass(self, match_pass: _MatchPass) -> None:
-        """Attempt the pending ``lead_match`` rows of one CRM dataset once."""
+        """Attempt the pending ``lead_match`` rows of one CRM dataset once.
+
+        Every exhausted ``TransientError`` the pass met goes to :meth:`on_error` with no
+        freshness dataset (:meth:`_matching_interrupted`): on a normal return, and before
+        an error the pass raises propagates, so the build's own classification of that
+        error (:meth:`_settle_failure`) is the consequence that stands.
+        """
         if not (
             self._can_open("linkedin", match_pass.lead_mode)
             and self._can_open("hubspot", match_pass.crm_mode)
@@ -2377,13 +2383,22 @@ class SourceModeController:
                 hubspot=crm_clients.require_hubspot(),
                 contact_properties=properties,
             )
-            report = await lead_match.run_matching(
-                self._sessionmaker,
-                match_pass.crm_dataset_id,
-                clients,
-                now=self.now(),
-                lead_dataset_id=match_pass.lead_dataset_id,
-            )
+            interruptions: list[TransientError] = []
+            try:
+                report = await lead_match.run_matching(
+                    self._sessionmaker,
+                    match_pass.crm_dataset_id,
+                    clients,
+                    now=self.now(),
+                    lead_dataset_id=match_pass.lead_dataset_id,
+                    interruptions=interruptions,
+                )
+            except Exception:
+                # The interruptions met before the raise go first; the raised error is the
+                # build's to classify.
+                await self._matching_interrupted(match_pass, interruptions)
+                raise
+        await self._matching_interrupted(match_pass, report.interrupted_by)
         _log.info(
             "sync.build.matching",
             crm_dataset_id=match_pass.crm_dataset_id,
@@ -2423,6 +2438,24 @@ class SourceModeController:
             unhydrated=unhydrated,
             status=status,
         )
+
+    async def _matching_interrupted(
+        self, match_pass: _MatchPass, interruptions: Sequence[TransientError]
+    ) -> None:
+        """Hand a build's matching interruptions to :meth:`on_error`, with no dataset name.
+
+        Matching state lives in ``lead_match``, where the interrupted rows already ended
+        retried ``error``, so no freshness row records the failure: only the source's
+        connection turns ``stale`` (a ``denied`` fallback marker stays). Each error names
+        the dataset its source served in the pass: the CRM dataset for HubSpot, the leads'
+        dataset for LinkedIn (the source's active primary when the pass names none).
+        """
+        served: dict[Source, int | None] = {
+            "hubspot": match_pass.crm_dataset_id,
+            "linkedin": match_pass.lead_dataset_id,
+        }
+        for error in interruptions:
+            await self.on_error(error.source, error, dataset_id=served.get(error.source))
 
     async def _discard_quietly(self, dataset_id: int, *, best_effort: bool = False) -> None:
         """Discard a building dataset, tolerating one already gone or activated elsewhere.

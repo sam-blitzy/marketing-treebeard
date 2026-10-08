@@ -45,9 +45,12 @@ client (the client imports this module), ``sync``, ``simulation`` or ``api``.
 Errors:
     A :class:`~ads_engine.connectors.errors.TransientError` that survived the pager's retries
     stops the search without raising: the rows already read are kept, the current and every
-    remaining partition are listed as incomplete, and the outcome is ``incomplete`` with the
-    error's :attr:`~ads_engine.connectors.errors.ConnectorError.reason`, so the dataset turns
-    incomplete and keeps its last good data. ``AccessDenied`` and ``QueryDefect`` propagate
+    remaining partition are listed as incomplete, the outcome is ``incomplete`` with the
+    error's :attr:`~ads_engine.connectors.errors.ConnectorError.reason`, and the error itself
+    is returned as :attr:`SearchOutcome.interrupted_by`. The caller hands that error to
+    ``ads_engine.sync.mode``, which records the failed attempt, so the dataset keeps its last
+    good data and turns stale; only a completed read short of the ceiling or of its reported
+    total is an ``incomplete`` success. ``AccessDenied`` and ``QueryDefect`` propagate
     unchanged, for ``ads_engine.sync.mode`` to decide. A response that breaks the paging
     contract is a ``QueryDefect``, raised before another request: a record without a usable
     ``id``, a cursor on an empty page, a cursor that repeats any cursor the partition already
@@ -71,7 +74,12 @@ Example:
             client, "deals", deal_search_filter(), (window_start, run_time)
         )
         deals = [parse_deal(record) for record in outcome.rows]
-        record_freshness("hubspot.deal_search", outcome.completeness, outcome.reason)
+        if outcome.interrupted_by is not None:
+            await controller.on_error(
+                "hubspot", outcome.interrupted_by, datasets=("hubspot.deal_search",)
+            )
+        else:
+            record_freshness("hubspot.deal_search", outcome.completeness, outcome.reason)
 """
 
 import re
@@ -475,6 +483,10 @@ class SearchOutcome:
         partitions_incomplete: The UTC ``[lo, hi)`` partitions not read in full, ascending.
         calls: Every ``search_page`` call made, including discarded overflow pages and the
             call that failed.
+        interrupted_by: The ``TransientError`` that outlived the pager's retries and stopped
+            the search, or ``None`` when every partition was read (in full or to a stated
+            floor). An interrupted outcome is not a completed read: the caller hands this
+            error to ``ads_engine.sync.mode`` instead of recording the rows as a success.
     """
 
     rows: tuple[HubSpotRecord, ...]
@@ -482,6 +494,7 @@ class SearchOutcome:
     reason: str | None
     partitions_incomplete: tuple[tuple[datetime, datetime], ...]
     calls: int
+    interrupted_by: TransientError | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -673,7 +686,8 @@ async def search_partitioned(
 
     Returns:
         The de-duplicated records, the completeness with its reason, the partitions not read
-        in full and the number of calls made.
+        in full, the number of calls made and, when a transient failure stopped the search,
+        that error (:attr:`SearchOutcome.interrupted_by`).
 
     Raises:
         ValueError: When ``object_type`` is not a path segment, a bound is naive, or the range
@@ -708,7 +722,8 @@ async def search_partitioned(
             result = await search.read(lo, hi, partial)
         except TransientError as error:
             # Retries are exhausted: keep what was read, list the current partition and every
-            # partition not yet read, and let the dataset turn incomplete rather than fail.
+            # partition not yet read, and return the error so the caller hands it to
+            # sync/mode.py, which fails the refresh rather than recording a success.
             search.keep(partial)
             incomplete.append((lo, hi))
             incomplete.extend(queue)
@@ -752,6 +767,7 @@ async def search_partitioned(
         reason="; ".join(dict.fromkeys(reasons)) if reasons else None,
         partitions_incomplete=tuple(incomplete),
         calls=search.calls,
+        interrupted_by=failure,
     )
     fields: dict[str, object] = {
         "object_type": object_type,

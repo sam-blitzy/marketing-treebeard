@@ -188,6 +188,10 @@ class DatasetFreshness(IdPkMixin, DatasetScopedMixin, Base):
     the caller's transaction, atomically with the data it describes. A row may be created as
     ``unknown`` before its first attempt, so every timestamp and coverage date is nullable.
 
+    :attr:`checkpoint` is written only by
+    :func:`ads_engine.sync.freshness.write_checkpoint`, never by ``record_freshness``, in the
+    transaction of the Google job whose fetch it describes.
+
     Attributes:
         dataset: The dataset name (:data:`DATASETS`).
         last_attempt_at: When a job last tried to refresh the dataset.
@@ -197,6 +201,11 @@ class DatasetFreshness(IdPkMixin, DatasetScopedMixin, Base):
         completeness: ``complete``, ``incomplete`` or ``unknown`` (:data:`COMPLETENESS`).
         reason: Why the dataset is not complete, for example "result limit reached at
             finest partition" or a call-budget deferral.
+        checkpoint: The unread work of an interrupted Google fetch that the next run of the
+            dataset's job resumes before anything else: the deferred partition scopes per
+            query and, for ``google.entities``, the progress of each unfinished safe-absence
+            enumeration (``sync/jobs.py`` documents the JSON shapes). ``None`` when nothing
+            is outstanding, and always for LinkedIn and HubSpot datasets.
     """
 
     __tablename__ = "dataset_freshness"
@@ -209,6 +218,10 @@ class DatasetFreshness(IdPkMixin, DatasetScopedMixin, Base):
     covered_through: Mapped[NativeDate | None]
     completeness: Mapped[str]
     reason: Mapped[str | None]
+    # Beyond the planned freshness columns: pages the Google call budget defers must finish in
+    # a later 24 h window, across worker restarts and CLI runs, so the unread scopes are kept
+    # durably on the row whose completeness they decide, and retire with its dataset.
+    checkpoint: Mapped[dict[str, Any] | None]
 
     __table_args__ = (
         check_in("source", SOURCES),

@@ -1548,7 +1548,12 @@ async def test_enumerate_campaigns_infers_nothing_when_a_q_g2b_chunk_fails() -> 
 
     sent = [call.parsed.query_id for call in fake.calls]
     assert sent == ["Q-G2", "Q-G2b", *["Q-G2b"] * RETRY.attempts]
-    assert _ids(enumeration.present, "campaign.id") == [1, 4]
+    # The first chunk's rows (2 and 3 removed, 4 paused) wait in the progress for the
+    # verdict, which only a re-read whose every chunk succeeded draws.
+    assert _ids(enumeration.present, "campaign.id") == [1]
+    assert enumeration.progress is not None
+    assert [dict(scope) for scope in enumeration.progress.pending] == [{IDS: (absent[-1],)}]
+    assert _ids(enumeration.progress.reread_rows, "campaign.id") == [2, 3, 4]
     assert (enumeration.removed, enumeration.missing_ids) == ((), frozenset())
     assert not enumeration.complete
     assert isinstance(enumeration.interrupted_by, TransientError)

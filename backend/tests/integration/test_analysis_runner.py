@@ -39,8 +39,8 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, func, select, text
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy import Executable, Update, create_engine, func, select, text
+from sqlalchemy.engine import URL, Result, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
@@ -492,7 +492,7 @@ async def test_run_reads_one_snapshot_and_records_what_it_read(
 
     assert seen == {"isolation": "repeatable read", "read_only": "on"}
     async with session_scope() as session:
-        restored = (await session.execute(text("SHOW transaction_isolation"))).scalar_one()
+        restored: str = (await session.execute(text("SHOW transaction_isolation"))).scalar_one()
     assert restored == "read committed"
     assert (run.status, run.kind, run.trigger) == ("succeeded", "default", "event")
     assert run.started_at == NOW
@@ -1141,6 +1141,19 @@ async def _served_by() -> list[int | None]:
         return [row.run_id for row in rows.scalars()]
 
 
+def _marks_the_run_failed(statement: object) -> bool:
+    """Whether ``statement`` is the failure record's ``UPDATE analysis_run`` to ``failed``.
+
+    The runner issues that update on its session; the request claim (``analysis_request``)
+    and the lock's crash recovery (on the lock connection) never match.
+    """
+    return (
+        isinstance(statement, Update)
+        and statement.entity_description["type"] is AnalysisRun
+        and statement.compile().params.get("status") == "failed"
+    )
+
+
 @pytest.mark.anyio
 async def test_a_cancellation_as_the_running_row_commits_fails_that_row(
     app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
@@ -1153,7 +1166,8 @@ async def test_a_cancellation_as_the_running_row_commits_fails_that_row(
 
     async def closing(self: AsyncSession) -> None:
         # The insert's session closes after its commit, still holding the run row: the run
-        # is cancelled there, as a caller giving up at that instant would cancel it.
+        # is cancelled there, before it claims its requests, as a caller giving up at that
+        # instant would cancel it.
         task = target.get("run")
         if task is not None and any(
             isinstance(item, AnalysisRun) for item in self.identity_map.values()
@@ -1175,7 +1189,9 @@ async def test_a_cancellation_as_the_running_row_commits_fails_that_row(
     (run,) = await _runs()
     assert run.status == "failed"
     assert run.finished_at is not None
-    assert await _served_by() == [run.id, run.id]
+    # The run stopped before it claimed any request, so both stay pending and the next run
+    # serves them: no refresh is lost.
+    assert await _served_by() == [None, None]
     assert log.named("analysis_run_started") == []
     (failed,) = log.named("analysis_run_failed")
     assert (failed["run_id"], failed["stage"], failed["error"]) == (
@@ -1213,22 +1229,27 @@ async def test_repeated_cancellation_while_the_failure_is_recorded_still_fails_t
     monkeypatch.setattr(runner, "_RULES", _wrapped_rules(wrap))
     target: dict[str, asyncio.Task[AnalysisRun]] = {}
     cancels: list[int] = []
-    original_serve = runner._serve_requests
+    original_execute = AsyncSession.execute
 
-    async def serving(
-        session: AsyncSession, run_id: int, request_ids: Any, picked_at: datetime
-    ) -> list[int]:
-        # Only the failure record stamps requests here. Its update of the run row has run in
-        # this transaction: cancel the run again and again, as a level-triggered cancel
-        # scope would, before the requests are stamped and the transaction commits.
+    async def executing(
+        self: AsyncSession, statement: Executable, *args: Any, **kwargs: Any
+    ) -> Result[Any]:
+        result = await original_execute(self, statement, *args, **kwargs)
+        if not _marks_the_run_failed(statement):
+            return result
+        # The failure record's update of the run row has run in this transaction: cancel
+        # the run again and again, as a level-triggered cancel scope would, before the
+        # transaction commits.
+        frozen = result.freeze()
+        run_id: int = frozen().scalar_one()  # the row the update marked failed
         task = target["run"]
         for _ in range(3):
             task.cancel()
             cancels.append(run_id)
             await asyncio.sleep(0)
-        return await original_serve(session, run_id, request_ids, picked_at)
+        return frozen()
 
-    monkeypatch.setattr(runner, "_serve_requests", serving)
+    monkeypatch.setattr(AsyncSession, "execute", executing)
     window = await runner.default_window(now=NOW)
     task = asyncio.create_task(
         runner.run_analysis(window, "default", "event", request_ids=pending, now=NOW)
@@ -1247,6 +1268,7 @@ async def test_repeated_cancellation_while_the_failure_is_recorded_still_fails_t
     assert cancels == [run.id] * 3
     assert run.status == "failed"
     assert run.finished_at is not None
+    # Claimed when the run started, the requests stay stamped with the failed run.
     assert await _served_by() == [run.id, run.id]
     assert log.named("analysis_run_mark_failed_error") == []
     (failed,) = log.named("analysis_run_failed")
@@ -1269,17 +1291,25 @@ async def test_a_failure_to_record_the_failure_keeps_the_run_error(
     def exploding(_ctx: AnalysisContext) -> Any:
         raise RuntimeError("rule exploded")
 
-    async def unavailable(*_args: Any, **_kwargs: Any) -> list[int]:
+    original_execute = AsyncSession.execute
+
+    async def unavailable(
+        self: AsyncSession, statement: Executable, *args: Any, **kwargs: Any
+    ) -> Result[Any]:
+        # Only the failure record's update of the run row fails: it hangs past the record's
+        # timeout, or the server closes the connection under it.
+        if not _marks_the_run_failed(statement):
+            return await original_execute(self, statement, *args, **kwargs)
         if failure == "timeout":
             await asyncio.sleep(_WAIT_S)
-        raise OperationalError("UPDATE analysis_request", {}, ConnectionError("server closed"))
+        raise OperationalError("UPDATE analysis_run", {}, ConnectionError("server closed"))
 
     monkeypatch.setattr(
         runner,
         "_RULES",
         _wrapped_rules(lambda name, evaluate: exploding if name == "keywords" else evaluate),
     )
-    monkeypatch.setattr(runner, "_serve_requests", unavailable)
+    monkeypatch.setattr(AsyncSession, "execute", unavailable)
     monkeypatch.setattr(runner, "_FAILURE_RECORD_TIMEOUT_S", 0.2)
     started = time.perf_counter()
     with pytest.raises(RuntimeError, match="rule exploded"):
@@ -1292,11 +1322,12 @@ async def test_a_failure_to_record_the_failure_keeps_the_run_error(
     assert error["error"] == ("OperationalError" if failure == "database_error" else "TimeoutError")
     (failed,) = log.named("analysis_run_failed")
     assert (failed["stage"], failed["error"]) == ("rules", "RuntimeError")
-    # The failure record rolled back whole: the row stays running and the request pending
-    # until the next process to take the lock marks the row failed (crash recovery).
+    # The failure record rolled back whole: the row stays running until the next process to
+    # take the lock marks it failed (crash recovery). The request was claimed when the run
+    # started, so it stays stamped with the run.
     (run,) = await _runs()
     assert run.status == "running"
-    assert await _served_by() == [None]
+    assert await _served_by() == [run.id]
     async with analysis_lock():
         pass
     assert [row.status for row in await _runs()] == ["failed"]

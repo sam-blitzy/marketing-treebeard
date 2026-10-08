@@ -1,4 +1,4 @@
-"""The worker's scheduler: one active worker, a 30 s wake loop, due jobs and analysis coalescing.
+"""The worker's scheduler: one active worker, 30 s wakes, lanes of due jobs and analysis coalescing.
 
 AAP 0.5.1 ("Scheduler and call budget": ``Scheduler.run_forever()``, a 30 s loop holding the
 scheduler advisory lock, due-job calculation, ``sync_request`` polling and ``analysis_request``
@@ -11,12 +11,32 @@ connection (:func:`ads_engine.db.session.dedicated_connection`) and takes the se
 ``pg_try_advisory_lock(SCHEDULER_LOCK_KEY)`` on it. A second worker finds the lock taken, logs
 ``scheduler.standby`` once and retries every :data:`STANDBY_RETRY`; it takes over the moment
 the first worker's database session ends (graceful exit, crash or lost connection), because a
-session-level advisory lock dies with its session. Every tick first proves the lock session is
-alive (``SELECT 1`` on that connection); when it is not, the scheduler stops work, logs
-``scheduler.lock_lost``, returns the connection (which runs ``pg_advisory_unlock_all()`` or
-discards it) and reconnects and re-acquires before the next tick, so no tick ever runs without
-the lock. The scheduler never takes the ``analysis`` lock: ``analysis.runner.run_analysis``
-takes it itself, the one convention the API, the worker and the CLI share.
+session-level advisory lock dies with its session. Work is fenced by that lock:
+
+* after every acquisition the scheduler waits :data:`LOCK_TAKEOVER_GRACE` (20 s) and proves
+  the lock again before any work (``scheduler.lock_fence_wait``);
+* while it holds the lock, everything it runs is a task watched by lock checks: the startup
+  (``on_start``) and, after a re-acquisition, the ``scheduler_lock_lost`` requeue run under
+  one guard, then the lanes and their trigger checks; the lock session is proved alive
+  (``SELECT 1`` on that connection, within :data:`LOCK_CHECK_TIMEOUT`) on absolute deadlines
+  every :data:`LOCK_CHECK_INTERVAL` (5 s), and again immediately before every lane dispatch,
+  the first one included;
+* when a check fails or times out, the scheduler logs ``scheduler.lock_lost``, cancels every
+  task and waits for them at most :data:`LOCK_LOST_STOP_TIMEOUT` (5 s), because cancelled
+  work still writes while it unwinds (a cancelled build discards its dataset, a cancelled
+  job closes its ``sync_run`` rows). Once they have ended (``scheduler.lanes_cancelled``) it
+  returns the connection (which runs ``pg_advisory_unlock_all()`` or discards it) and
+  reconnects and re-acquires. An interrupted startup runs again on the next acquisition;
+  otherwise one ``scheduler_lock_lost`` ``analysis_request`` is queued. A task still running
+  after the timeout makes it log ``scheduler.fence_stop_timeout`` and abort the process with
+  exit code 1; the container restarts the worker, exactly as after a defect.
+
+A holder whose session died thus has stopped all its work, or its process, within 15 s,
+before any other worker's 20 s grace has passed, so two workers never run work at the same
+time (both bounds are checked at import). The scheduler never takes the ``analysis`` lock:
+``analysis.runner.run_analysis`` takes it itself, the one convention the API, the worker and
+the CLI share, and it additionally fences an analysis run's own writes: the run's dedicated
+connection keeps that lock until the run's unwind has ended.
 
 Schedule (:data:`SCHEDULE`), wall-clock times in ``DISPLAY_TIMEZONE``:
 
@@ -48,12 +68,42 @@ satisfy their slots, so a fresh start does not repeat them on its first tick. Re
 and the purge keep their own ``sync_run`` rows (jobs ``probe`` and ``purge``) for the same
 reason.
 
-Tick order (:meth:`Scheduler.tick`): datasets (``ensure_dataset`` per source), recovery probes,
-``sync_request`` claims, due jobs, segments, purge, the Google call-budget refresh, and
-analysis coalescing. Each step, and each source within a per-source step, is isolated: a
-failure in :data:`JOB_FAILURES` is logged as ``scheduler.step_failed`` and the tick continues;
-anything else (a defect) propagates, ends the worker and lets the container restart it.
-Cancellation is never caught.
+Wakes and lanes. The worker wakes at once after the grace and the startup, then every
+:data:`WAKE_INTERVAL` (30 s) from that first wake on absolute deadlines of a monotonic clock,
+however long any work or lock check runs. Each wake dispatches every idle lane as a task; a
+lane whose previous pass is still running is not dispatched again (``scheduler.lane_busy``),
+so at most one task per lane runs and no job ever runs twice at once. A long Google request or
+backfill therefore delays only its own lane, never request pickup elsewhere or the 60 s
+analysis coalescing. A busy lane is still looked into at every wake: a busy source lane gets
+one short trigger check at a time (unclaimed ``sync_request`` rows, due jobs, LinkedIn's
+segment trigger, due recovery probes, all only read), and when any fired
+(``scheduler.lane_work_pending``) the lane is dispatched again the moment its pass ends
+(``scheduler.lane_rerun``) instead of at the next wake; a busy ``analysis`` lane is rerun
+the same way. The ``analysis`` lane waits, once a wake has seen a request, until the oldest
+pending request is :data:`COALESCE_WINDOW` old, so a default run starts about 60 s after the
+first request. The lanes:
+
+=====================  ==========================================================================
+Lane                   One pass
+=====================  ==========================================================================
+``google``             Google's datasets, recovery probe, ``sync_request``, due jobs
+``linkedin_hubspot``   the same for HubSpot and LinkedIn, then LinkedIn's segments; one lane, so
+                       every HubSpot dataset has one CRM writer, HubSpot's primary is ensured
+                       before a LinkedIn build stages leads against it, and LinkedIn's leads run
+                       before HubSpot's ``crm`` job
+``purge``              the 05:00 purge
+``budget``             the Google call-budget refresh
+``analysis``           the wait until the oldest request is 60 s old, then analysis coalescing
+=====================  ==========================================================================
+
+Each pass is logged as ``scheduler.lane``. :meth:`Scheduler.tick` runs the same steps for
+every source sequentially, in the order datasets (``ensure_dataset`` per source), recovery
+probes, ``sync_request`` claims, due jobs, segments, purge, the Google call-budget refresh,
+and analysis coalescing, and never waits. Each step, and each source within a per-source
+step, is isolated: a failure in :data:`JOB_FAILURES` is logged as ``scheduler.step_failed``
+and the pass continues; anything else (a defect) cancels and awaits the other lanes,
+propagates, ends the worker and lets the container restart it. Cancellation is never
+swallowed: every lane is cancelled and awaited, then it propagates.
 
 Example::
 
@@ -65,12 +115,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import os
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from time import monotonic as system_monotonic
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, NoReturn
 
 import httpx
 from sqlalchemy import func, select, text, update
@@ -82,7 +136,6 @@ from ads_engine.analysis.lock import ANALYSIS_LOCK_KEY, RunInProgress
 from ads_engine.analysis.thresholds import ConfigError, Thresholds
 from ads_engine.connectors.errors import ConnectorError
 from ads_engine.db import repositories
-from ads_engine.db.models.analysis import AnalysisRequest
 from ads_engine.db.models.ops import SourceDataset, SyncRequest, SyncRun
 from ads_engine.db.session import dedicated_connection
 from ads_engine.logging import get_logger, logged_as
@@ -97,6 +150,10 @@ __all__ = [
     "JOB_FAILURES",
     "JOB_PROBE",
     "JOB_PURGE",
+    "LOCK_CHECK_INTERVAL",
+    "LOCK_CHECK_TIMEOUT",
+    "LOCK_LOST_STOP_TIMEOUT",
+    "LOCK_TAKEOVER_GRACE",
     "PROBE_INTERVAL",
     "SCHEDULE",
     "SCHEDULER_LOCK_KEY",
@@ -131,10 +188,66 @@ if SCHEDULER_LOCK_KEY == ANALYSIS_LOCK_KEY:  # pragma: no cover - distinct SHA-2
     raise RuntimeError("SCHEDULER_LOCK_KEY must differ from analysis.lock.ANALYSIS_LOCK_KEY")
 
 WAKE_INTERVAL: Final = timedelta(seconds=30)
-"""How long the scheduler sleeps after each tick (AAP 0.3.2: the worker wakes every 30 s)."""
+"""The spacing of the scheduler's wakes (AAP 0.3.2: the worker wakes every 30 s).
+
+Wakes fall on absolute deadlines of the scheduler's monotonic clock: the first one follows
+the takeover grace and the startup at once, then one every 30 s from it, however long a lock
+check or any lane takes. A deadline already passed when the loop gets to it (an event loop
+held by CPU-bound work) fires once, late, and the next wake is the next future point of the
+same grid, never a burst of catch-up wakes. A wake never waits for a lane: it dispatches
+every lane that is idle, however long another lane is still running.
+"""
+
+LOCK_CHECK_INTERVAL: Final = timedelta(seconds=5)
+"""How often the active worker proves its scheduler-lock session alive while work runs.
+
+Checked on absolute deadlines of the monotonic clock, during the startup, the lock-loss
+requeue and between wakes alike, so a lost lock is noticed within this interval (plus
+:data:`LOCK_CHECK_TIMEOUT`), not only at the next wake. It divides :data:`WAKE_INTERVAL`, so
+every wake falls on a check deadline and one check serves both.
+"""
+
+LOCK_CHECK_TIMEOUT: Final = timedelta(seconds=5)
+"""How long one lock check may take before the lock counts as lost.
+
+A check that does not answer in time (a hung or partitioned connection) is treated exactly as
+a failed one: every lane is cancelled and awaited, and the scheduler reconnects.
+"""
+
+LOCK_LOST_STOP_TIMEOUT: Final = timedelta(seconds=5)
+"""The most time the scheduler waits for its cancelled tasks to end after losing its lock.
+
+Cancelled work can still write while it unwinds: a cancelled dataset build discards its
+building dataset (a cascade ``DELETE``), a cancelled sync job records its own ``sync_run``
+rows as failed (bounded by ``jobs.CANCEL_CLOSE_TIMEOUT``, checked at import to be shorter),
+a cancelled analysis run records its failure. A task still running after this long is not
+waited for: the scheduler logs ``scheduler.fence_stop_timeout`` and aborts the process
+(exit code 1), so the unwind of the lost holder always ends inside the next holder's
+:data:`LOCK_TAKEOVER_GRACE`. Only a lost lock is bounded this way: on SIGTERM or a defect the
+lock is still held, so every task is awaited however long it takes.
+"""
+
+LOCK_TAKEOVER_GRACE: Final = timedelta(seconds=20)
+"""How long a worker waits after every lock acquisition before it runs any work.
+
+A previous holder whose lock session died notices the loss within
+:data:`LOCK_CHECK_INTERVAL` plus :data:`LOCK_CHECK_TIMEOUT`, cancels its work and waits at
+most :data:`LOCK_LOST_STOP_TIMEOUT` for it to end, or aborts its process. Waiting longer than
+all three before the startup or the first wake (checked at import) means two workers never
+run work at the same time. The lock is proved alive again once the grace has passed. The
+bound assumes a responsive event loop: CPU-bound work that does not yield (an analysis run's
+rule evaluation) delays the checks for its duration. An analysis run's own writes are
+additionally fenced by the ``analysis`` advisory lock, which its dedicated connection keeps
+until the run's unwind has ended.
+"""
 
 COALESCE_WINDOW: Final = timedelta(seconds=60)
-"""Pending ``analysis_request`` rows run once the oldest is this old, all in one run."""
+"""Pending ``analysis_request`` rows run once the oldest is this old, all in one run.
+
+The running scheduler's analysis lane sleeps until that moment once a wake has seen the
+request, so the run starts about 60 s after the first request (AAP 0.3.2: "coalesced within
+60 s"); :meth:`Scheduler.tick` never waits and serves the backlog at a tick once it is due.
+"""
 
 PROBE_INTERVAL: Final = timedelta(minutes=30)
 """The least time between two recovery probes of a source in automatic fallback."""
@@ -148,6 +261,24 @@ JOB_PROBE: Final = "probe"
 JOB_PURGE: Final = "purge"
 """The ``sync_run.job`` of the nightly purge of retired datasets."""
 
+if (  # pragma: no cover - the constants above satisfy it
+    LOCK_CHECK_INTERVAL + LOCK_CHECK_TIMEOUT + LOCK_LOST_STOP_TIMEOUT >= LOCK_TAKEOVER_GRACE
+):
+    # A shorter grace would let a new holder start while the previous one, whose lock session
+    # died, has not yet noticed the loss, or is still waiting for its cancelled work to end.
+    raise RuntimeError(
+        "LOCK_CHECK_INTERVAL + LOCK_CHECK_TIMEOUT + LOCK_LOST_STOP_TIMEOUT must be less than "
+        "LOCK_TAKEOVER_GRACE"
+    )
+
+if jobs.CANCEL_CLOSE_TIMEOUT >= LOCK_LOST_STOP_TIMEOUT:  # pragma: no cover
+    # A job cancelled by a lost lock records its own sync_run rows as failed before it ends;
+    # bookkeeping outlasting the stop timeout would abort the worker on every lost lock.
+    raise RuntimeError("jobs.CANCEL_CLOSE_TIMEOUT must be less than LOCK_LOST_STOP_TIMEOUT")
+
+if WAKE_INTERVAL < LOCK_CHECK_INTERVAL or WAKE_INTERVAL % LOCK_CHECK_INTERVAL:  # pragma: no cover
+    raise RuntimeError("WAKE_INTERVAL must be a whole multiple of LOCK_CHECK_INTERVAL")
+
 _TRY_LOCK: Final = text("SELECT pg_try_advisory_lock(:key)")
 _ALIVE: Final = text("SELECT 1")
 
@@ -160,6 +291,7 @@ _HISTORY_HORIZON: Final = timedelta(days=2)
 _ANALYSIS_REASON_LIMIT: Final = 500
 _ERROR_LIMIT: Final = 500
 _RERUN_REASON: Final = "analysis_lock_lost"
+_LOCK_LOST_REASON: Final = "scheduler_lock_lost"
 
 # ---------------------------------------------------------------------------------------------
 # Schedule model
@@ -247,6 +379,36 @@ _SYNC_JOBS: Final[tuple[str, ...]] = (
 )
 if len(_ENTRIES) != len(SCHEDULE) or not set(_SYNC_JOBS) <= set(_ENTRIES):  # pragma: no cover
     raise RuntimeError("SCHEDULE must name each job once, the sync jobs included")
+
+# ---------------------------------------------------------------------------------------------
+# Lanes
+# ---------------------------------------------------------------------------------------------
+
+_LANE_PURGE: Final = "purge"
+_LANE_BUDGET: Final = "budget"
+_LANE_ANALYSIS: Final = "analysis"
+
+_SOURCE_LANES: Final[Mapping[str, tuple[Source, ...]]] = MappingProxyType(
+    {
+        "google": ("google",),
+        # HubSpot and LinkedIn share one lane, so their work is serialized. A LinkedIn build
+        # runs LeadMatchJob and CrmSyncJob on HubSpot's active primary, and a simulated
+        # LinkedIn's leads job syncs its companion CRM dataset, so every HubSpot dataset keeps
+        # a single CRM writer. Within the lane, datasets are ensured in BOOTSTRAP_ORDER (the
+        # HubSpot primary before the LinkedIn build stages its leads against it) and due jobs
+        # run in SOURCES order (LinkedIn's leads before HubSpot's crm job matches them).
+        "linkedin_hubspot": ("hubspot", "linkedin"),
+    }
+)
+"""Each source lane and the sources whose steps it runs (datasets to segments)."""
+
+_LANES: Final[tuple[str, ...]] = (*_SOURCE_LANES, _LANE_PURGE, _LANE_BUDGET, _LANE_ANALYSIS)
+"""Every lane, in dispatch order; each runs as at most one task at a time."""
+
+if sorted(source for group in _SOURCE_LANES.values() for source in group) != sorted(
+    SOURCES
+):  # pragma: no cover - the source lanes are literals above
+    raise RuntimeError("the source lanes must cover every source exactly once")
 
 
 def _aware(value: datetime, what: str) -> datetime:
@@ -387,7 +549,9 @@ preset, and presets may not exceed ``window.max_days``), so it is unreachable he
 
 @dataclass(frozen=True, slots=True)
 class TickReport:
-    """What one :meth:`Scheduler.tick` did.
+    """What one :meth:`Scheduler.tick`, or one lane pass of the running scheduler, did.
+
+    A lane pass fills in only its own steps' fields.
 
     Attributes:
         now: The tick's instant: every scheduling decision and job of the tick used it.
@@ -542,6 +706,211 @@ def _truncate(value: str, limit: int = _ERROR_LIMIT) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
+def _next_deadline(deadline: float, interval: float, now: float) -> float:
+    """Return the deadline that follows ``deadline`` on its grid, skipping points before ``now``.
+
+    The grid is ``deadline + k * interval`` for ``k >= 1``, in seconds of the monotonic clock.
+    The result is its first point at or after ``now``, so a deadline handled late (after a
+    slow lock check, or an event loop held by CPU-bound work) never shifts the grid, and
+    points missed meanwhile fire once at the next one rather than as a burst.
+
+    Example::
+
+        >>> _next_deadline(0.0, 30.0, 4.0), _next_deadline(30.0, 30.0, 100.0)
+        (30.0, 120.0)
+    """
+    following = deadline + interval
+    if following >= now:
+        return following
+    return following + math.ceil((now - following) / interval) * interval
+
+
+# ---------------------------------------------------------------------------------------------
+# Lane and startup tasks
+# ---------------------------------------------------------------------------------------------
+
+_LANES_CANCELLED: Final = "scheduler.lanes_cancelled"
+_START_CANCELLED: Final = "scheduler.start_cancelled"
+_REQUEUE_CANCELLED: Final = "scheduler.lock_lost_requeue_cancelled"
+
+
+async def _invoke(factory: Callable[[], Awaitable[None]]) -> None:
+    """Await ``factory()``; a task needs a coroutine, and guarded work returns any awaitable."""
+    await factory()
+
+
+class _Lanes:
+    """The running scheduler's tasks: at most one pass and one trigger check per lane.
+
+    Attributes:
+        passes: The lane passes still tracked, by lane.
+        checks: The trigger checks still tracked (:meth:`Scheduler._check_lane`), by
+            source lane.
+        watched: The pass each tracked check was dispatched against, by source lane.
+        rerun: The lanes to dispatch again as soon as they are idle, without waiting for the
+            next wake.
+    """
+
+    __slots__ = ("checks", "passes", "rerun", "watched")
+
+    def __init__(self) -> None:
+        """Start with no task tracked and no lane marked."""
+        self.passes: dict[str, asyncio.Task[TickReport]] = {}
+        self.checks: dict[str, asyncio.Task[tuple[str, ...]]] = {}
+        self.watched: dict[str, asyncio.Task[TickReport]] = {}
+        self.rerun: set[str] = set()
+
+    def tasks(self) -> list[asyncio.Task[Any]]:
+        """Every pass and check still tracked."""
+        return [*self.passes.values(), *self.checks.values()]
+
+    def ready(self) -> list[str]:
+        """The lanes marked for a rerun that no pass occupies, in dispatch order."""
+        return [lane for lane in _LANES if lane in self.rerun and lane not in self.passes]
+
+    def reap(self) -> None:
+        """Forget every pass and check that has ended; mark reruns; re-raise a defect.
+
+        A pass ending normally, or cancelled by something other than the scheduler (logged
+        as ``scheduler.lane_cancelled``), is simply forgotten, so the next wake dispatches it
+        again, or at once when it is marked for a rerun. A check that found work pending
+        marks its lane for a rerun while the pass it watched still runs or has ended; a
+        newer pass already started after it, so its result is then dropped.
+
+        Raises:
+            BaseException: The exception a pass or check ended with (a defect:
+                :data:`JOB_FAILURES` are isolated inside the steps and the trigger reads),
+                logged as ``scheduler.lane_failed`` or ``scheduler.lane_check_failed``. That
+                task is forgotten; the tasks still running stay tracked for the caller to
+                stop.
+        """
+        for lane, task in tuple(self.passes.items()):
+            if not task.done():
+                continue
+            del self.passes[lane]
+            if task.cancelled():
+                _log.warning("scheduler.lane_cancelled", lane=lane)
+                continue
+            error = task.exception()
+            if error is not None:
+                _log.error("scheduler.lane_failed", lane=lane, error=type(error).__name__)
+                raise error
+        for lane, check in tuple(self.checks.items()):
+            if not check.done():
+                continue
+            del self.checks[lane]
+            watched = self.watched.pop(lane, None)
+            if check.cancelled():
+                _log.warning("scheduler.lane_check_cancelled", lane=lane)
+                continue
+            failure = check.exception()
+            if failure is not None:
+                _log.error("scheduler.lane_check_failed", lane=lane, error=type(failure).__name__)
+                raise failure
+            current = self.passes.get(lane)
+            if check.result() and (current is None or current is watched):
+                self.rerun.add(lane)
+
+    def take(self) -> dict[str, asyncio.Task[Any]]:
+        """Return every tracked task by name (a check as ``<lane>.check``), then forget all."""
+        tasks: dict[str, asyncio.Task[Any]] = dict(self.passes)
+        tasks.update({f"{lane}.check": check for lane, check in self.checks.items()})
+        self.passes.clear()
+        self.checks.clear()
+        self.watched.clear()
+        self.rerun.clear()
+        return tasks
+
+
+def _flush_streams() -> None:
+    """Flush stdout and stderr before the process aborts, so its last log lines are kept.
+
+    A stream that is missing, closed or broken cannot be flushed; the abort goes ahead
+    regardless, so those errors are suppressed here deliberately.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(AttributeError, OSError, ValueError):
+            stream.flush()
+
+
+async def _stop(
+    tasks: dict[str, asyncio.Task[Any]],
+    *,
+    reason: str,
+    event: str = _LANES_CANCELLED,
+    abort: Callable[[int], NoReturn] | None = None,
+) -> None:
+    """Cancel every task of ``tasks`` and wait until each has ended; ``tasks`` is emptied.
+
+    Without ``abort`` (SIGTERM or a defect: the lock is still held until every task has
+    ended) the wait is unbounded, so nothing outlives this call and no cancelled work can
+    write after the lock connection is released. With ``abort`` (a lost lock: another worker
+    may take over) cancelled work could still write while it unwinds, so the wait is bounded
+    by :data:`LOCK_LOST_STOP_TIMEOUT`: a task still running then is logged as
+    ``scheduler.fence_stop_timeout`` (critical, with the task names), stdout and stderr are
+    flushed and ``abort(1)`` ends the process before the next holder's
+    :data:`LOCK_TAKEOVER_GRACE` has passed. The container restarts the worker, exactly as
+    after a defect, and a dataset left ``building`` is discarded by ``sync/mode.py``'s
+    abandoned-build sweep.
+
+    A cancellation of the caller while it waits is held back until the wait ends and is then
+    re-raised, as :class:`asyncio.TaskGroup` does. Every ended task's outcome is retrieved:
+    an exception other than the cancellation (a task that was already done with a defect, or
+    one raised while unwinding) is logged as ``scheduler.lane_failed``. The tasks actually
+    cancelled are logged as ``event`` with their names and ``reason``.
+
+    Args:
+        tasks: The running tasks by name (a lane, ``<lane>.check``, ``on_start`` or
+            ``lock_lost_requeue``).
+        reason: Why they stop: ``lock_lost``, ``cancelled`` or ``defect``.
+        event: The log event naming the cancelled tasks.
+        abort: Ends the process with the given exit code; given only when the lock was
+            lost, which bounds the wait.
+
+    Raises:
+        asyncio.CancelledError: When the caller was cancelled while waiting, once the wait
+            has ended.
+    """
+    stopping = dict(tasks)
+    tasks.clear()
+    cancelled = [name for name, task in stopping.items() if not task.done()]
+    for name in cancelled:
+        stopping[name].cancel()
+    loop = asyncio.get_running_loop()
+    deadline = None if abort is None else loop.time() + LOCK_LOST_STOP_TIMEOUT.total_seconds()
+    interrupted: asyncio.CancelledError | None = None
+    while pending := [task for task in stopping.values() if not task.done()]:
+        timeout = None if deadline is None else deadline - loop.time()
+        if timeout is not None and timeout <= 0:
+            break
+        try:
+            await asyncio.wait(pending, timeout=timeout)
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+    for name, task in stopping.items():
+        if not task.done() or task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            _log.error(
+                "scheduler.lane_failed", lane=name, error=type(error).__name__, exc_info=error
+            )
+    if cancelled:
+        _log.warning(event, lanes=cancelled, reason=reason)
+    stuck = [name for name, task in stopping.items() if not task.done()]
+    if stuck and abort is not None:
+        _log.critical(
+            "scheduler.fence_stop_timeout",
+            lanes=stuck,
+            reason=reason,
+            timeout_s=LOCK_LOST_STOP_TIMEOUT.total_seconds(),
+        )
+        _flush_streams()
+        abort(1)
+    if interrupted is not None:
+        raise interrupted
+
+
 # ---------------------------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------------------------
@@ -563,7 +932,17 @@ class Scheduler:
             assert report.jobs.get("google") is None  # the backfill satisfied every slot
     """
 
-    __slots__ = ("_budget", "_clock", "_controller", "_datasets", "_settings", "_sleep", "_tz")
+    __slots__ = (
+        "_abort",
+        "_budget",
+        "_clock",
+        "_controller",
+        "_datasets",
+        "_monotonic",
+        "_settings",
+        "_sleep",
+        "_tz",
+    )
 
     def __init__(
         self,
@@ -574,6 +953,8 @@ class Scheduler:
         datasets: DatasetManager | None = None,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        abort: Callable[[int], NoReturn] | None = None,
     ) -> None:
         """Configure the scheduler; nothing is read, locked or sent until it runs.
 
@@ -589,7 +970,21 @@ class Scheduler:
             clock: Returns the current instant, timezone-aware; the controller's clock when
                 omitted.
             sleep: Awaits the given number of seconds; :func:`asyncio.sleep` when omitted.
-                Tests inject both to run the loop without waiting.
+                It times the standby retries, the takeover grace, the waits until the next
+                lock-check or wake deadline, and the analysis lane's coalescing wait.
+            monotonic: Returns seconds on a monotonic clock; :func:`time.monotonic` when
+                omitted. The wakes and the lock checks fall on absolute deadlines of this
+                clock (the injected ``sleep`` only waits until the next one), so wakes stay
+                :data:`WAKE_INTERVAL` apart however long a check takes. Tests inject it
+                with ``clock`` and ``sleep``, advancing with their sleep, to run the loop
+                without waiting.
+            abort: Ends the process with the given exit code; :func:`os._exit` when
+                omitted. Called with ``1`` only when, after a lost lock, a cancelled task is
+                still running after :data:`LOCK_LOST_STOP_TIMEOUT`: the container restarts
+                the worker, exactly as after a defect, and a dataset build left ``building``
+                is discarded by ``sync/mode.py``'s abandoned-build sweep. Never called on
+                SIGTERM or a defect, where the lock is still held until every task has
+                ended. Tests inject one that records the code and raises.
         """
         resolved = settings
         if resolved is None:
@@ -613,6 +1008,10 @@ class Scheduler:
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
         )
+        self._monotonic: Callable[[], float] = (
+            monotonic if monotonic is not None else system_monotonic
+        )
+        self._abort: Callable[[int], NoReturn] = abort if abort is not None else os._exit
         # Validated by Settings (an IANA zone the tz database loads); slots follow it only.
         self._tz: tzinfo = resolved.display_tz
 
@@ -640,37 +1039,57 @@ class Scheduler:
     # -- the loop ----------------------------------------------------------------------------
 
     async def run_forever(self, on_start: Callable[[], Awaitable[None]] | None = None) -> None:
-        """Hold the scheduler lock and tick every :data:`WAKE_INTERVAL` until cancelled.
+        """Hold the scheduler lock and run the lanes, waking every :data:`WAKE_INTERVAL`.
 
         1. Check out a dedicated connection and take ``pg_try_advisory_lock`` with
            :data:`SCHEDULER_LOCK_KEY`. While another session holds it, log
            ``scheduler.standby`` once and retry every :data:`STANDBY_RETRY`: this worker is a
            standby until the active one's session ends.
-        2. Once the lock is held, log ``scheduler.lock_acquired`` and await ``on_start``
-           (``worker/main.py``'s startup: content assets, the config-change check, source
-           bootstrap and the first default analysis). It runs once per call, on the first
-           acquisition only, so it always precedes the first tick and runs only on the
-           single active worker.
-        3. Loop: prove the lock session alive (``SELECT 1``), :meth:`tick`, sleep. When the
-           check fails, log ``scheduler.lock_lost``, return the connection (its exit runs
-           ``pg_advisory_unlock_all()``, or discards a broken connection) and go back to
-           step 1, so a tick never runs without the lock.
+        2. Once the lock is held (``scheduler.lock_acquired``), wait
+           :data:`LOCK_TAKEOVER_GRACE` (``scheduler.lock_fence_wait``) and prove the lock alive
+           again before any work. This happens after every acquisition: a previous holder
+           whose lock session died has by then noticed the loss and cancelled its own work,
+           so two workers never run work at the same time.
+        3. Run ``on_start`` (``worker/main.py``'s startup: content assets, the config-change
+           check, source bootstrap and the first default analysis) under :meth:`_guard`,
+           which proves the lock alive every :data:`LOCK_CHECK_INTERVAL`. This refines
+           "``on_start`` runs once, on the first acquisition": it still completes exactly
+           once per call, always before the first wake and only on the single active worker,
+           but when the lock is lost while it runs it is cancelled and awaited, stays
+           pending, and runs again from the start after the next acquisition. It counts as
+           done only once it returns normally.
+        4. Supervise the lanes (:meth:`_supervise`): the first wake follows at once, then one
+           every :data:`WAKE_INTERVAL` on absolute deadlines, each dispatching every idle
+           lane, while the lock is proved alive every :data:`LOCK_CHECK_INTERVAL` and
+           immediately before every dispatch, the first one included. When the lock is lost
+           (a failed check, or one taking longer than :data:`LOCK_CHECK_TIMEOUT`), every task
+           is cancelled and awaited (at most :data:`LOCK_LOST_STOP_TIMEOUT`, else the process
+           aborts), the connection is returned (its exit runs ``pg_advisory_unlock_all()``,
+           or discards a broken connection) and the loop goes back to step 1 at once, so no
+           work ever runs without the lock.
+        5. After a re-acquisition once ``on_start`` has completed, one ``analysis_request``
+           with reason ``scheduler_lock_lost`` is queued, under :meth:`_guard` like the
+           startup, before the lanes start again, so the work the loss cancelled (an
+           analysis run, a sync's completion request) is followed by a default run.
 
         A database error while connecting or taking the lock is logged as
         ``scheduler.lock_unavailable`` and retried after :data:`STANDBY_RETRY`, so a
         database restart never ends the worker. Cancellation (the worker's SIGTERM or SIGINT
-        handler) is never caught: it propagates from the current await, and the dedicated
-        connection's exit releases the lock.
+        handler) is never swallowed: ``on_start`` or every lane is cancelled and awaited
+        first, then the cancellation propagates and the dedicated connection's exit releases
+        the lock.
 
         Args:
-            on_start: Awaited once, holding the lock, before the first tick.
+            on_start: Completed once, holding the lock, before the first wake.
 
         Raises:
             asyncio.CancelledError: When the task running the loop is cancelled.
-            Exception: Whatever ``on_start`` raises, or a defect a tick does not isolate;
-                the lock is released on the way out.
+            Exception: Whatever ``on_start`` raises, or a defect a lane does not isolate
+                (the other lanes are cancelled and awaited first); the lock is released on
+                the way out.
         """
         start = on_start
+        started = False
         while True:
             async with AsyncExitStack() as stack:
                 try:
@@ -683,10 +1102,22 @@ class Scheduler:
                         retry_in_s=STANDBY_RETRY.total_seconds(),
                     )
                 else:
-                    if start is not None:
-                        pending, start = start, None
-                        await pending()
-                    await self._hold(conn)
+                    if await self._fence(conn):
+                        if started:
+                            ready = await self._guard(
+                                conn,
+                                self._requeue_after_loss,
+                                name="lock_lost_requeue",
+                                event=_REQUEUE_CANCELLED,
+                            )
+                        else:
+                            ready = start is None or await self._guard(
+                                conn, start, name="on_start", event=_START_CANCELLED
+                            )
+                            if ready:
+                                start, started = None, True
+                        if ready:
+                            await self._supervise(conn)
                     # The lock was lost: reconnect at once rather than after a pause.
                     continue
             await self._sleep(STANDBY_RETRY.total_seconds())
@@ -712,11 +1143,244 @@ class Scheduler:
                 announced = True
             await self._sleep(STANDBY_RETRY.total_seconds())
 
-    async def _hold(self, conn: AsyncConnection) -> None:
-        """Tick while the lock session on ``conn`` stays alive; return once it is lost."""
-        while await self._lock_alive(conn):
-            await self.tick()
-            await self._sleep(WAKE_INTERVAL.total_seconds())
+    async def _fence(self, conn: AsyncConnection) -> bool:
+        """Wait :data:`LOCK_TAKEOVER_GRACE` after an acquisition, then prove the lock alive.
+
+        Returns:
+            Whether the lock is still held, so work may start.
+        """
+        _log.info("scheduler.lock_fence_wait", grace_s=LOCK_TAKEOVER_GRACE.total_seconds())
+        await self._sleep(LOCK_TAKEOVER_GRACE.total_seconds())
+        return await self._check_lock(conn)
+
+    async def _guard(
+        self,
+        conn: AsyncConnection,
+        work: Callable[[], Awaitable[None]],
+        *,
+        name: str,
+        event: str,
+    ) -> bool:
+        """Run ``work`` as a task while proving the lock on ``conn`` alive throughout.
+
+        The guard of the work :meth:`run_forever` runs outside the lanes: ``on_start`` and
+        the lock-loss requeue (:meth:`_requeue_after_loss`), so neither can keep writing
+        unmonitored after the lock session died. The lock is proved (:meth:`_check_lock`)
+        on absolute deadlines every :data:`LOCK_CHECK_INTERVAL` of the monotonic clock, and
+        the wait ends as soon as ``work`` does, so what follows it (the first wake) starts
+        at once.
+
+        Args:
+            conn: The lock connection.
+            work: Returns the awaitable to run.
+            name: The task's name in logs, ``on_start`` or ``lock_lost_requeue``.
+            event: The log event naming the task when it is cancelled.
+
+        Returns:
+            ``True`` once ``work`` returned normally; ``False`` when the lock was lost while
+            it ran, after it was cancelled and awaited (``event``), so it is still pending
+            for the next acquisition.
+
+        Raises:
+            asyncio.CancelledError: When the scheduler is cancelled, once ``work`` has been
+                cancelled and awaited.
+            Exception: Whatever ``work`` raised, or the injected sleep raised (once ``work``
+                has been cancelled and awaited).
+        """
+        task = asyncio.create_task(_invoke(work), name=f"scheduler.{name}")
+        tracked: dict[str, asyncio.Task[Any]] = {name: task}
+        check_every = LOCK_CHECK_INTERVAL.total_seconds()
+        try:
+            check_at = self._monotonic() + check_every
+            while not task.done():
+                delay = check_at - self._monotonic()
+                if delay > 0:
+                    sleeper = asyncio.ensure_future(self._sleep(delay))
+                    try:
+                        await asyncio.wait((sleeper, task), return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        if not sleeper.done():
+                            sleeper.cancel()
+                    if sleeper.done() and not sleeper.cancelled():
+                        sleeper.result()  # An error of the injected sleep propagates.
+                    continue
+                if not await self._check_lock(conn):
+                    await _stop(tracked, reason="lock_lost", event=event, abort=self._abort)
+                    return False
+                check_at = _next_deadline(check_at, check_every, self._monotonic())
+        finally:
+            if tracked and not task.done():
+                await _stop(tracked, reason="cancelled", event=event)
+        task.result()
+        return True
+
+    async def _supervise(self, conn: AsyncConnection) -> None:
+        """Run the lanes while the lock on ``conn`` holds; return once it is lost.
+
+        Wakes and lock checks fall on absolute deadlines of the monotonic clock: the first
+        wake at once, then one every :data:`WAKE_INTERVAL` from it, and a lock check
+        (:meth:`_check_lock`) every :data:`LOCK_CHECK_INTERVAL`. Between them the injected
+        sleep waits only until the earliest pending deadline, and returns early when a lane
+        ends, so neither a slow check nor a lane that runs for minutes ever moves a wake.
+        Each wake dispatches every idle lane (:data:`_LANES`) as a task; a lane whose
+        previous pass is still running is not dispatched again (``scheduler.lane_busy``), so
+        at most one task per lane runs and no job is ever run twice at once. A busy lane is
+        still looked into at every wake (:meth:`_wake`): a source lane's triggers are read
+        by a check task, and a lane with work pending is dispatched again
+        (``scheduler.lane_rerun``) the moment its pass ends, without waiting for the next
+        wake.
+
+        Every task (lane passes and trigger checks) ends before this method does, whatever
+        ends it, so no cancelled work can write once the lock connection is released
+        (``scheduler.lanes_cancelled`` names the tasks cancelled and why):
+
+        * the lock is lost: every task is cancelled and awaited for at most
+          :data:`LOCK_LOST_STOP_TIMEOUT`, then this method returns; a task still unwinding
+          after that aborts the process (``scheduler.fence_stop_timeout``, :func:`_stop`);
+        * the scheduler is cancelled (SIGTERM): every task is cancelled and awaited however
+          long it takes (the lock is still held), then the cancellation propagates;
+        * a pass or check ends with a defect (an exception its steps do not isolate): the
+          other tasks are cancelled and awaited the same way, then the defect propagates out
+          of :meth:`run_forever`.
+
+        Raises:
+            asyncio.CancelledError: When the scheduler is cancelled.
+            Exception: The first lane defect.
+        """
+        lanes = _Lanes()
+        reason = "lock_lost"
+        lost = False
+        check_every = LOCK_CHECK_INTERVAL.total_seconds()
+        wake_every = WAKE_INTERVAL.total_seconds()
+        try:
+            wake_at = self._monotonic()
+            check_at = wake_at + check_every
+            while True:
+                now = self._monotonic()
+                wake_due, check_due = now >= wake_at, now >= check_at
+                rerun_due = bool(lanes.ready())
+                if wake_due or check_due or rerun_due:
+                    if not await self._check_lock(conn):
+                        lost = True
+                        # A lane that ended with a defect meanwhile still ends the worker.
+                        lanes.reap()
+                        return
+                    checked = self._monotonic()
+                    if check_due:
+                        check_at = _next_deadline(check_at, check_every, checked)
+                    if wake_due:
+                        wake_at = _next_deadline(wake_at, wake_every, checked)
+                        self._wake(lanes)
+                    elif rerun_due:
+                        self._rerun(lanes)
+                await self._pause(lanes, min(wake_at, check_at))
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
+        except Exception:
+            reason = "defect"
+            raise
+        finally:
+            # Once the lock is lost, a defect found while reaping must not unbound the wait.
+            await _stop(
+                lanes.take(),
+                reason="lock_lost" if lost else reason,
+                abort=self._abort if lost else None,
+            )
+
+    def _wake(self, lanes: _Lanes) -> None:
+        """Dispatch every idle lane; look into each busy one so its pending work is not missed.
+
+        An idle lane (a lane marked for a rerun included) is dispatched as a task. A busy
+        lane is left running (``scheduler.lane_busy``), and unless it is already marked for
+        a rerun:
+
+        * a busy source lane gets one trigger check (:meth:`_check_lane`) at a time, which
+          reads its cheap triggers while its pass runs and marks it for a rerun when any
+          fired, so the segment window and the other triggers are checked on every wake;
+        * a busy ``analysis`` lane is marked for a rerun, so a request queued while it runs
+          is coalesced right after it.
+
+        Raises:
+            Exception: The defect of a pass or check that ended since the last look.
+        """
+        lanes.reap()
+        for lane in _LANES:
+            if lane not in lanes.passes:
+                self._dispatch(lanes, lane)
+                continue
+            _log.debug("scheduler.lane_busy", lane=lane)
+            if lane in lanes.rerun:
+                continue
+            if lane == _LANE_ANALYSIS:
+                lanes.rerun.add(lane)
+            elif lane in _SOURCE_LANES and lane not in lanes.checks:
+                lanes.watched[lane] = lanes.passes[lane]
+                lanes.checks[lane] = asyncio.create_task(
+                    self._check_lane(lane), name=f"scheduler.check.{lane}"
+                )
+
+    def _rerun(self, lanes: _Lanes) -> None:
+        """Dispatch at once every lane marked for a rerun whose pass has ended.
+
+        Called only right after a lock check passed, like every dispatch. The rerun keeps
+        the lane's serialization: it is dispatched only once no pass of that lane runs.
+
+        Raises:
+            Exception: The defect of a pass or check that ended since the last look.
+        """
+        lanes.reap()
+        for lane in lanes.ready():
+            _log.info("scheduler.lane_rerun", lane=lane)
+            self._dispatch(lanes, lane)
+
+    def _dispatch(self, lanes: _Lanes, lane: str) -> None:
+        """Start one pass of the idle ``lane`` as a task; it is no longer marked for a rerun."""
+        lanes.rerun.discard(lane)
+        lanes.passes[lane] = asyncio.create_task(self._lane(lane), name=f"scheduler.lane.{lane}")
+
+    async def _pause(self, lanes: _Lanes, until: float) -> None:
+        """Wait until the monotonic deadline ``until``, returning early when a task ends.
+
+        The injected sleep waits only the time left until ``until``, nothing when it has
+        passed. A pass or check ending wakes the wait at once, and every task that ended
+        meanwhile is reaped before this returns, so the caller sees only tasks still running
+        and can rerun a marked lane immediately.
+
+        Raises:
+            Exception: A pass's or check's defect, as soon as it ends with it, or whatever
+                the injected sleep raised.
+        """
+        delay = until - self._monotonic()
+        if delay <= 0:
+            lanes.reap()
+            return
+        sleeper = asyncio.ensure_future(self._sleep(delay))
+        try:
+            await asyncio.wait((sleeper, *lanes.tasks()), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not sleeper.done():
+                sleeper.cancel()
+        lanes.reap()
+        if sleeper.done() and not sleeper.cancelled():
+            sleeper.result()  # An error of the injected sleep propagates.
+
+    async def _check_lock(self, conn: AsyncConnection) -> bool:
+        """Prove the lock session alive within :data:`LOCK_CHECK_TIMEOUT`.
+
+        A check that does not answer in time counts as a lost lock and is logged as
+        ``scheduler.lock_lost`` too, with ``error`` ``TimeoutError``.
+        """
+        try:
+            async with asyncio.timeout(LOCK_CHECK_TIMEOUT.total_seconds()):
+                return await self._lock_alive(conn)
+        except TimeoutError as exc:
+            _log.error(
+                "scheduler.lock_lost",
+                error=type(exc).__name__,
+                timeout_s=LOCK_CHECK_TIMEOUT.total_seconds(),
+            )
+            return False
 
     @staticmethod
     async def _lock_alive(conn: AsyncConnection) -> bool:
@@ -732,10 +1396,120 @@ class Scheduler:
             return False
         return True
 
+    async def _requeue_after_loss(self) -> None:
+        """Queue one default run after a re-acquisition, for the work the lost lock cancelled.
+
+        A lane cancelled by the loss may have been an analysis run, or a sync whose
+        completion request was never written, so a ``scheduler_lock_lost`` request makes a
+        default run follow. It commits in a transaction of its own and runs under
+        :meth:`_guard`, so the lock is proved alive while it waits (a blocked ``INSERT``):
+        when the lock is lost meanwhile, it is cancelled and awaited
+        (``scheduler.lock_lost_requeue_cancelled``) and runs again after the next
+        acquisition, before any lane. A :data:`JOB_FAILURES` error is logged as
+        ``scheduler.lock_lost_requeue_failed``, never raised: the lock check reconnects, and
+        the next sync or activation queues a request of its own.
+        """
+        try:
+            async with self._sessions()() as session, session.begin():
+                await repositories.enqueue_analysis_request(session, _LOCK_LOST_REASON)
+        except JOB_FAILURES as exc:
+            _log.error("scheduler.lock_lost_requeue_failed", error=type(exc).__name__)
+            return
+        _log.info("scheduler.lock_lost_requeued", reason=_LOCK_LOST_REASON)
+
+    async def _lane(self, lane: str) -> TickReport:
+        """Run one pass of ``lane`` under a tick record of its own; log it as ``scheduler.lane``.
+
+        A source lane runs, for its sources only, the steps datasets, recovery probes, sync
+        requests, due jobs and segments, in that order; the ``purge`` and ``budget`` lanes
+        run that one step. The ``analysis`` lane first waits, when a request is pending,
+        until its oldest is :data:`COALESCE_WINDOW` old (:meth:`_await_coalescing`), then
+        runs the coalescing step, so a default run starts about 60 s after the first request
+        rather than at the first wake after that. Every step is isolated exactly as in
+        :meth:`tick`. The pass is logged at info level when it did work, at debug level
+        otherwise.
+
+        Raises:
+            ValueError: When ``lane`` is not one of :data:`_LANES`, or the clock is naive.
+        """
+        tick = _Tick(self._now())
+        sources = _SOURCE_LANES.get(lane)
+        if sources is not None:
+            await self._source_steps(tick, sources)
+        elif lane == _LANE_PURGE:
+            await self._purge(tick)
+        elif lane == _LANE_BUDGET:
+            await self._refresh_budget(tick)
+        elif lane == _LANE_ANALYSIS:
+            if await self._await_coalescing(tick):
+                await self._coalesce_analysis(tick)
+        else:
+            raise ValueError(f"unknown scheduler lane {lane!r}")
+        report = tick.freeze()
+        if report.did_work:
+            _log.info("scheduler.lane", lane=lane, **report.to_log())
+        else:
+            _log.debug("scheduler.lane", lane=lane, **report.to_log())
+        return report
+
+    async def _check_lane(self, lane: str) -> tuple[str, ...]:
+        """Read the cheap triggers of a busy source lane; return those that fired.
+
+        Dispatched by a wake that finds ``lane`` still running, at most one at a time per
+        lane, so what a wake must pick up (AAP 0.3.2: due jobs, ``sync_request`` rows and the
+        segment trigger "checked on every worker wake") is read on every wake even while a
+        long job holds the lane. It only reads, independent of the busy pass; the fetch
+        itself stays inside the lane, which is marked to run again the moment its pass ends
+        when any trigger fired (logged as ``scheduler.lane_work_pending``). The triggers, in
+        this order:
+
+        * ``sync_requests``: an unclaimed ``sync_request`` of the lane's sources;
+        * ``due_jobs``: a due sync job (:meth:`due_jobs`) of the lane's sources;
+        * ``segments``: when LinkedIn is in the lane, its 04:00 slot is due or
+          ``jobs.segments_due`` reports the window end or the presets moved;
+        * ``probes``: a lane source in automatic fallback is due its recovery probe.
+
+        Each read is isolated like a step: a :data:`JOB_FAILURES` error is logged as
+        ``scheduler.step_failed`` (step ``lane_check:<lane>:<trigger>``) and the other reads
+        still run.
+
+        Raises:
+            KeyError: When ``lane`` is not a source lane.
+        """
+        sources = _SOURCE_LANES[lane]
+        tick = _Tick(self._now())
+        fired: list[str] = []
+        async with self._step(tick, f"lane_check:{lane}:sync_requests"):
+            if await self._sync_requests_pending(sources):
+                fired.append("sync_requests")
+        async with self._step(tick, f"lane_check:{lane}:due_jobs"):
+            due = await self.due_jobs(tick.now)
+            if any(source in due for source in sources):
+                fired.append("due_jobs")
+        if "linkedin" in sources:
+            async with self._step(tick, f"lane_check:{lane}:segments"):
+                _, segments_due, _ = await self._segments_due(tick.now)
+                if segments_due:
+                    fired.append("segments")
+        for source in BOOTSTRAP_ORDER:
+            if source not in sources or "probes" in fired:
+                continue
+            async with self._step(tick, f"lane_check:{lane}:probes:{source}"):
+                if await self._probe_due(source, tick.now):
+                    fired.append("probes")
+        if fired:
+            _log.info("scheduler.lane_work_pending", lane=lane, triggers=fired)
+        return tuple(fired)
+
     # -- one tick ----------------------------------------------------------------------------
 
     async def tick(self, now: datetime | None = None) -> TickReport:
-        """Run one wake of the scheduler: every step below, in order, each isolated.
+        """Run every step of one wake below, in order, each isolated, for every source.
+
+        The sequential form of one wake, for tests and callers that need a single pass; the
+        running worker does not call it. :meth:`run_forever` runs the same steps split into
+        lanes instead (steps 1 to 5 per source lane, then a lane each for the purge, the
+        budget and the analysis), so a long job delays only its own lane.
 
         1. **Datasets**: ``ensure_dataset`` per source, in ``BOOTSTRAP_ORDER`` (pending
            live-to-simulated switches after a denial, first builds, a first live build once
@@ -776,11 +1550,7 @@ class Scheduler:
         """
         instant = self._now() if now is None else _aware(now, "now")
         tick = _Tick(instant)
-        await self._ensure_datasets(tick)
-        await self._probe_fallbacks(tick)
-        await self._serve_sync_requests(tick)
-        await self._run_due_jobs(tick)
-        await self._run_segments(tick)
+        await self._source_steps(tick, SOURCES)
         await self._purge(tick)
         await self._refresh_budget(tick)
         await self._coalesce_analysis(tick)
@@ -814,11 +1584,24 @@ class Scheduler:
                     "scheduler.step_failed", step=name, error=type(exc).__name__, logged_as=owner
                 )
 
+    async def _source_steps(self, tick: _Tick, sources: tuple[Source, ...]) -> None:
+        """Run steps 1 to 5 for ``sources``: datasets, probes, sync requests, due jobs, segments.
+
+        :meth:`tick` passes every source; a source lane passes its own.
+        """
+        await self._ensure_datasets(tick, sources)
+        await self._probe_fallbacks(tick, sources)
+        await self._serve_sync_requests(tick, sources)
+        await self._run_due_jobs(tick, sources)
+        await self._run_segments(tick, sources)
+
     # step 1 ----------------------------------------------------------------------------------
 
-    async def _ensure_datasets(self, tick: _Tick) -> None:
-        """Give each source an active primary dataset of the mode it resolves to."""
+    async def _ensure_datasets(self, tick: _Tick, sources: tuple[Source, ...] = SOURCES) -> None:
+        """Give each of ``sources`` an active primary dataset of its mode, in bootstrap order."""
         for source in BOOTSTRAP_ORDER:
+            if source not in sources:
+                continue
             async with self._step(tick, f"datasets:{source}"):
                 outcome = await self._controller.ensure_dataset(source)
                 if outcome is not None:
@@ -827,17 +1610,27 @@ class Scheduler:
 
     # step 2 ----------------------------------------------------------------------------------
 
-    async def _probe_fallbacks(self, tick: _Tick) -> None:
-        """Probe each source in automatic fallback, at most every :data:`PROBE_INTERVAL`."""
+    async def _probe_fallbacks(self, tick: _Tick, sources: tuple[Source, ...] = SOURCES) -> None:
+        """Probe each of ``sources`` in automatic fallback, at most every :data:`PROBE_INTERVAL`."""
         for source in BOOTSTRAP_ORDER:
+            if source not in sources:
+                continue
             async with self._step(tick, f"probes:{source}"):
-                if not await self._controller.in_fallback(source):
-                    continue
-                history = await self._history(tick.now, (JOB_PROBE,))
-                last = history.get((source, JOB_PROBE))
-                if last is not None and tick.now - last < PROBE_INTERVAL:
+                if not await self._probe_due(source, tick.now):
                     continue
                 await self._probe(tick, source)
+
+    async def _probe_due(self, source: Source, now: datetime) -> bool:
+        """Whether ``source`` is in automatic fallback and its last probe is old enough.
+
+        Due when no ``probe`` ``sync_run`` of the source started within
+        :data:`PROBE_INTERVAL` of ``now``. Only reads.
+        """
+        if not await self._controller.in_fallback(source):
+            return False
+        history = await self._history(now, (JOB_PROBE,))
+        last = history.get((source, JOB_PROBE))
+        return last is None or now - last >= PROBE_INTERVAL
 
     async def _probe(self, tick: _Tick, source: Source) -> None:
         """Run one recovery probe of ``source`` under a ``probe`` ``sync_run`` row.
@@ -865,11 +1658,13 @@ class Scheduler:
 
     # step 3 ----------------------------------------------------------------------------------
 
-    async def _serve_sync_requests(self, tick: _Tick) -> None:
-        """Claim the pending "Sync now" requests and run each source's jobs."""
+    async def _serve_sync_requests(
+        self, tick: _Tick, sources: tuple[Source, ...] = SOURCES
+    ) -> None:
+        """Claim the pending "Sync now" requests of ``sources`` and run each source's jobs."""
         claimed: tuple[Source, ...] = ()
         async with self._step(tick, "sync_requests"):
-            claimed = await self._claim_sync_requests(tick.now)
+            claimed = await self._claim_sync_requests(tick.now, sources)
         for source in claimed:
             tick.sync_requests.append(source)
             tick.acted("sync_requests")
@@ -879,15 +1674,18 @@ class Scheduler:
                 )
                 tick.ran("sync_requests", report)
 
-    async def _claim_sync_requests(self, now: datetime) -> tuple[Source, ...]:
-        """Stamp ``picked_at`` on every pending ``sync_request`` and return their sources.
+    async def _claim_sync_requests(
+        self, now: datetime, sources: tuple[Source, ...] = SOURCES
+    ) -> tuple[Source, ...]:
+        """Stamp ``picked_at`` on the pending ``sync_request`` rows of ``sources``.
 
-        ``FOR UPDATE SKIP LOCKED`` keeps a row being claimed elsewhere out of this claim. The
-        sources come back in request order.
+        ``FOR UPDATE SKIP LOCKED`` keeps a row being claimed elsewhere out of this claim, and
+        a lane claims only its own sources' rows, so another lane's requests stay pending for
+        that lane. The sources come back in request order.
         """
         pending = (
             select(SyncRequest.id)
-            .where(SyncRequest.picked_at.is_(None))
+            .where(SyncRequest.picked_at.is_(None), SyncRequest.source.in_(sources))
             .order_by(SyncRequest.requested_at)
             .with_for_update(skip_locked=True)
         )
@@ -910,6 +1708,16 @@ class Scheduler:
             if source not in ordered:
                 ordered.append(source)
         return tuple(ordered)
+
+    async def _sync_requests_pending(self, sources: tuple[Source, ...]) -> bool:
+        """Whether any of ``sources`` has an unclaimed ``sync_request``; reads, never claims."""
+        async with self._sessions()() as session:
+            found = await session.scalar(
+                select(SyncRequest.id)
+                .where(SyncRequest.picked_at.is_(None), SyncRequest.source.in_(sources))
+                .limit(1)
+            )
+        return found is not None
 
     # step 4 ----------------------------------------------------------------------------------
 
@@ -950,12 +1758,18 @@ class Scheduler:
                 due[source] = names
         return MappingProxyType(due)
 
-    async def _run_due_jobs(self, tick: _Tick) -> None:
-        """Run each source's due sync jobs in one ``run_source_jobs`` call."""
+    async def _run_due_jobs(self, tick: _Tick, sources: tuple[Source, ...] = SOURCES) -> None:
+        """Run the due sync jobs of each of ``sources`` in one ``run_source_jobs`` call each.
+
+        The sources run in :data:`~ads_engine.settings.SOURCES` order (the order
+        :meth:`due_jobs` returns), so LinkedIn's leads always precede HubSpot's ``crm`` job.
+        """
         due: Mapping[Source, tuple[str, ...]] = MappingProxyType({})
         async with self._step(tick, "due_jobs"):
             due = await self.due_jobs(tick.now)
         for source, names in due.items():
+            if source not in sources:
+                continue
             async with self._step(tick, f"due_jobs:{source}"):
                 report = await jobs.run_source_jobs(
                     source,
@@ -968,28 +1782,23 @@ class Scheduler:
 
     # step 5 ----------------------------------------------------------------------------------
 
-    async def _run_segments(self, tick: _Tick) -> None:
+    async def _run_segments(self, tick: _Tick, sources: tuple[Source, ...] = SOURCES) -> None:
         """Fetch LinkedIn's segments at 04:00 or when the window trigger fires (AAP 0.3.2).
 
         The trigger (``jobs.segments_due``) fires when the default window end has passed the
         latest fetched segment end or ``window.presets`` changed; it backs off a failed fetch
         itself. Without an active LinkedIn dataset nothing runs: the dataset's backfill
-        fetches its segments. Detection and execution share one configuration snapshot, read
-        from the controller once per step, so the presets judged due are the presets fetched
-        and recorded, and a fetch satisfies the trigger instead of repeating on every wake.
+        fetches its segments. Nothing runs either when ``sources`` leaves LinkedIn out (a lane
+        of other sources). Detection and execution share one configuration snapshot, read
+        from the controller once per step (:meth:`_segments_due`), so the presets judged due
+        are the presets fetched and recorded, and a fetch satisfies the trigger instead of
+        repeating on every wake.
         """
-        entry = _ENTRIES[jobs.JOB_SEGMENTS]
+        if "linkedin" not in sources:
+            return
         async with self._step(tick, "segments"):
-            async with self._sessions()() as session:
-                if await repositories.active_dataset_id(session, "linkedin") is None:
-                    return
-                config = self._controller.thresholds
-                history = await self._read_history(session, tick.now, (jobs.JOB_SEGMENTS,))
-                slot_due = is_due(entry, tick.now, self._tz, history.get(("linkedin", entry.job)))
-                run_now = slot_due or await jobs.segments_due(
-                    session, now=tick.now, thresholds=config
-                )
-            if not run_now:
+            slot_due, run_now, config = await self._segments_due(tick.now)
+            if not run_now or config is None:
                 return
             _log.info("scheduler.segments_due", slot=slot_due, window_changed=not slot_due)
             report = await jobs.run_source_jobs(
@@ -1001,6 +1810,30 @@ class Scheduler:
                 thresholds=config,
             )
             tick.ran("segments", report)
+
+    async def _segments_due(self, now: datetime) -> tuple[bool, bool, Thresholds | None]:
+        """Whether LinkedIn's 04:00 segment slot is due, whether a fetch is due at all, and why.
+
+        Returns ``(slot_due, due, config)``: ``due`` holds when the slot is due or
+        ``jobs.segments_due`` reports the window end or ``window.presets`` moved, judged on
+        ``config``, the configuration snapshot read from the controller once here, which the
+        segment step then hands to the fetch so detection and execution agree. Without an
+        active LinkedIn dataset nothing is read further and the result is
+        ``(False, False, None)``. Only reads.
+
+        Raises:
+            ConfigError: When the configuration cannot be loaded.
+            sqlalchemy.exc.SQLAlchemyError: When the history or freshness cannot be read.
+        """
+        entry = _ENTRIES[jobs.JOB_SEGMENTS]
+        async with self._sessions()() as session:
+            if await repositories.active_dataset_id(session, "linkedin") is None:
+                return False, False, None
+            config = self._controller.thresholds
+            history = await self._read_history(session, now, (jobs.JOB_SEGMENTS,))
+            slot_due = is_due(entry, now, self._tz, history.get(("linkedin", entry.job)))
+            due = slot_due or await jobs.segments_due(session, now=now, thresholds=config)
+            return slot_due, due, config
 
     # step 6 ----------------------------------------------------------------------------------
 
@@ -1087,38 +1920,58 @@ class Scheduler:
 
     # step 8 ----------------------------------------------------------------------------------
 
-    async def _coalesce_analysis(self, tick: _Tick) -> None:
-        """Serve the pending ``analysis_request`` rows with one default run, once coalesced.
+    async def _await_coalescing(self, tick: _Tick) -> bool:
+        """In the analysis lane, wait until the oldest pending request is coalesced.
 
-        Every request pending when the step reads them is served by the run (its ids are
-        passed to ``run_analysis``, which stamps them with the run); a request arriving
-        meanwhile stays pending for the next tick. Behind another holder of the ``analysis``
-        lock (``RunInProgress``) the requests stay pending and ``scheduler.analysis_deferred``
-        is logged. A run that lost its lock to another process (``RunNoLongerRunning``) had
-        its requests stamped by the runner as served by the failed run, so a fresh request is
-        queued for the default run to catch up.
+        Reads the backlog once (``runner.pending_requests``). When the oldest request is
+        younger than :data:`COALESCE_WINDOW` by the scheduler clock, sleeps (the injected
+        sleep) until it is that old, at most :data:`COALESCE_WINDOW`, so a clock skewed
+        against the database's ``requested_at`` never holds the lane longer. Every wake is at
+        most :data:`WAKE_INTERVAL` apart, so a new request is seen well before its 60 s
+        deadline and the run starts at about that deadline instead of at the first wake
+        after it. Requests queued meanwhile join the same run. :meth:`tick` never waits: it
+        calls :meth:`_coalesce_analysis` directly.
+
+        Returns:
+            Whether a request is pending, so the coalescing step should run; ``False`` too
+            when the read failed (a :data:`JOB_FAILURES` error, logged and recorded on
+            ``tick`` as the ``analysis`` step).
+        """
+        pending = False
+        async with self._step(tick, "analysis"):
+            async with self._sessions()() as session:
+                backlog = await runner.pending_requests(session)
+            if backlog is not None:
+                left = backlog.oldest_requested_at + COALESCE_WINDOW - self._now()
+                if left > timedelta(0):
+                    wait_s = min(left, COALESCE_WINDOW).total_seconds()
+                    _log.debug(
+                        "scheduler.analysis_coalescing", wait_s=wait_s, requests=backlog.count
+                    )
+                    await self._sleep(wait_s)
+                pending = True
+        return pending
+
+    async def _coalesce_analysis(self, tick: _Tick) -> None:
+        """Serve the pending ``analysis_request`` backlog with one default run, once coalesced.
+
+        The backlog is read as one bounded summary (``runner.pending_requests``: the count,
+        the oldest request, the highest id and a few reasons), however many requests piled up.
+        Once the oldest is :data:`COALESCE_WINDOW` old, one default run serves every request
+        pending up to that highest id (``serve_through``): the runner claims them all with one
+        set-based update before it loads its context, and a request queued after the read
+        stays pending for the next tick. Behind another holder of the ``analysis`` lock
+        (``RunInProgress``) nothing is claimed, the requests stay pending and
+        ``scheduler.analysis_deferred`` is logged. A run that lost its lock to another process
+        (``RunNoLongerRunning``) keeps the requests it claimed stamped as served by the failed
+        run, so a fresh request is queued for the default run to catch up.
         """
         async with self._step(tick, "analysis"):
             at = self._now()
             async with self._sessions()() as session:
-                pending = (
-                    await session.execute(
-                        select(
-                            AnalysisRequest.id,
-                            AnalysisRequest.requested_at,
-                            AnalysisRequest.reason,
-                        )
-                        .where(AnalysisRequest.picked_at.is_(None))
-                        .order_by(AnalysisRequest.requested_at, AnalysisRequest.id)
-                    )
-                ).all()
-            if not pending:
+                backlog = await runner.pending_requests(session)
+            if backlog is None or at - backlog.oldest_requested_at < COALESCE_WINDOW:
                 return
-            oldest: datetime = pending[0][1]
-            if at - oldest < COALESCE_WINDOW:
-                return
-            request_ids = tuple(int(row[0]) for row in pending)
-            reason = _join_reasons(str(row[2]) for row in pending)
             tick.acted("analysis")
             thresholds = Thresholds.load()
             window = await runner.default_window(now=at, thresholds=thresholds)
@@ -1127,8 +1980,8 @@ class Scheduler:
                     window,
                     "default",
                     "event",
-                    reason=reason,
-                    request_ids=request_ids,
+                    reason=_join_reasons(backlog.reasons),
+                    serve_through=backlog.through_id,
                     thresholds=thresholds,
                     now=at,
                 )
@@ -1137,7 +1990,7 @@ class Scheduler:
                 _log.info(
                     "scheduler.analysis_deferred",
                     reason="run_in_progress",
-                    requests=len(request_ids),
+                    requests=backlog.count,
                 )
                 return
             except runner.RunNoLongerRunning as exc:

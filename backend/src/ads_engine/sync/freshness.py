@@ -35,8 +35,14 @@ one row, so a successful sync of one dataset never hides a failed refresh of ano
 :func:`record_freshness` never commits: the caller owns the transaction, so the freshness
 row lands atomically with the data it describes.
 
+A Google job also keeps the unread work of an interrupted fetch on the row
+(``dataset_freshness.checkpoint``): :func:`lock_checkpoint` reads it under the row lock and
+:func:`write_checkpoint` replaces or clears it, in the caller's transaction as well.
+:func:`record_freshness` never touches that column.
+
 Example:
-    A metrics job that ran out of Google call budget mid-partition::
+    A metrics job that ran out of Google call budget mid-partition records the shortfall and
+    keeps the deferred scopes in the same transaction::
 
         outcome = FreshnessOutcome.success(
             utcnow(),
@@ -46,19 +52,23 @@ Example:
             reason=f"{REASON_DEFERRED}; 3 partitions deferred",
             repairable=True,
         )
+        await write_checkpoint(session, dataset_id, "google.metrics_daily", checkpoint)
         await record_freshness(session, dataset_id, "google.metrics_daily", outcome)
 
-    On its next run the job checks :func:`needs_repair` and widens its fetch to the
-    whole recorded range, so the deferred pages finish in a later 24 h window.
+    Its next run reads the stored scopes first, so the deferred pages finish in a later 24 h
+    window, and the row turns ``complete`` once nothing is left. A dataset with no usable
+    checkpoint falls back to :func:`needs_repair` and re-reads its whole recorded range.
 """
 
+import copy
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
-from typing import Final, Literal, Self, get_args
+from typing import Any, Final, Literal, Self, get_args
 
-from sqlalchemy import select
+from sqlalchemy import null, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,10 +89,13 @@ __all__ = [
     "FreshnessOutcome",
     "is_repairable_reason",
     "load_freshness",
+    "lock_checkpoint",
     "mark_unknown",
     "needs_repair",
     "record_freshness",
+    "recorded_shortfall",
     "source_of",
+    "write_checkpoint",
 ]
 
 _log = get_logger(__name__)
@@ -779,6 +792,160 @@ async def mark_unknown(
     return row
 
 
+async def _locked_row(session: AsyncSession, dataset_id: int, dataset: str) -> DatasetFreshness:
+    """Lock one ``dataset_freshness`` row ``FOR UPDATE``, seeding it first when it is missing.
+
+    The order is :func:`record_freshness`'s: the dataset name and source are checked, the
+    source dataset is locked with :func:`~ads_engine.db.repositories.ensure_writable` (a
+    retired one is refused), an absent row is inserted ``unknown`` with ``ON CONFLICT DO
+    NOTHING`` so the lock always has a row, and the row is read back under the lock.
+
+    Raises:
+        ValueError: If ``dataset`` is unknown, ``dataset_id`` does not exist, or the source
+            dataset belongs to a different source than ``dataset``.
+        ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired.
+    """
+    source = await _checked_source(session, dataset_id, dataset)
+    await repositories.ensure_writable(session, dataset_id)
+    await session.execute(
+        insert(DatasetFreshness)
+        .values(source=source, dataset_id=dataset_id, dataset=dataset, completeness="unknown")
+        .on_conflict_do_nothing(index_elements=["dataset_id", "dataset"])
+    )
+    locked = await session.scalars(
+        select(DatasetFreshness)
+        .where(DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == dataset)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return locked.one()
+
+
+def _plain_checkpoint(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a checkpoint as a plain JSON object, rejecting anything JSON cannot store.
+
+    Raises:
+        ValueError: If ``checkpoint`` is not a mapping with string keys, or holds a value
+            JSON cannot represent (a ``date``, a set, a non-finite float).
+    """
+    if not isinstance(checkpoint, Mapping) or not all(isinstance(key, str) for key in checkpoint):
+        raise ValueError("a checkpoint must be a JSON object with string keys")
+    try:
+        text = json.dumps(dict(checkpoint), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"a checkpoint must hold JSON values only: {exc}") from None
+    plain: dict[str, Any] = json.loads(text)
+    return plain
+
+
+async def lock_checkpoint(
+    session: AsyncSession, dataset_id: int, dataset: str
+) -> dict[str, Any] | None:
+    """Lock one ``dataset_freshness`` row and return the checkpoint it currently stores.
+
+    For a job that merges its own unread work with what another run stored meanwhile: the
+    row stays locked ``FOR UPDATE`` until the caller's transaction ends, so no other writer
+    can change the checkpoint between this read and :func:`write_checkpoint`. A missing row
+    is seeded ``unknown`` first, exactly as :func:`record_freshness` seeds it. Nothing is
+    committed.
+
+    Args:
+        session: The caller's session, inside its transaction.
+        dataset_id: The ``source_dataset`` the row belongs to.
+        dataset: The dataset name, one of :data:`ops.DATASETS`.
+
+    Returns:
+        A copy of the stored checkpoint, or ``None`` when none is stored.
+
+    Raises:
+        ValueError: If ``dataset`` is unknown, ``dataset_id`` does not exist, or the source
+            dataset belongs to a different source than ``dataset``.
+        ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired.
+    """
+    row = await _locked_row(session, dataset_id, dataset)
+    return None if row.checkpoint is None else copy.deepcopy(row.checkpoint)
+
+
+async def write_checkpoint(
+    session: AsyncSession,
+    dataset_id: int,
+    dataset: str,
+    checkpoint: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Store, replace or clear the checkpoint of one ``dataset_freshness`` row.
+
+    The row is locked as :func:`lock_checkpoint` locks it (seeded ``unknown`` when missing,
+    the source dataset checked writable first), the previously stored value is read under
+    that lock, and only the ``checkpoint`` column is updated: the attempt timestamps,
+    coverage, completeness and reason stand, because :func:`record_freshness` owns them. The
+    function flushes but never commits, so the checkpoint lands in the caller's transaction,
+    atomically with the freshness outcome and the data it describes.
+
+    Example::
+
+        previous = await write_checkpoint(
+            session, dataset_id, "google.search_terms", {"version": 1, "pending": {...}}
+        )
+        await write_checkpoint(session, dataset_id, "google.search_terms", None)  # drained
+
+    Args:
+        session: The caller's session, inside its transaction.
+        dataset_id: The ``source_dataset`` the row belongs to.
+        dataset: The dataset name, one of :data:`ops.DATASETS`.
+        checkpoint: The JSON object to store, or ``None`` to clear it: the column is then
+            SQL ``NULL`` (never the JSON value ``null``) and the row's attribute reads ``None``.
+
+    Returns:
+        A copy of the checkpoint stored before this call, or ``None`` when none was.
+
+    Raises:
+        ValueError: If ``checkpoint`` is not a JSON object, ``dataset`` is unknown,
+            ``dataset_id`` does not exist, or the source dataset belongs to a different
+            source than ``dataset``; nothing is written.
+        ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired.
+    """
+    value = None if checkpoint is None else _plain_checkpoint(checkpoint)
+    row = await _locked_row(session, dataset_id, dataset)
+    previous = None if row.checkpoint is None else copy.deepcopy(row.checkpoint)
+    if value is None:
+        # A ``jsonb`` column binds Python ``None`` as the JSON value ``null``, so clearing
+        # assigns SQL ``NULL`` explicitly: "nothing outstanding" is ``checkpoint IS NULL``.
+        # The ORM expires an attribute assigned a SQL expression, so it is read back here.
+        row.checkpoint = null()
+        await session.flush()
+        await session.refresh(row, ["checkpoint"])
+    else:
+        row.checkpoint = value
+        await session.flush()
+    _log.info(
+        "sync.freshness.checkpoint",
+        dataset_id=dataset_id,
+        dataset=dataset,
+        stored=value is not None,
+        replaced=previous is not None,
+    )
+    return previous
+
+
+def recorded_shortfall(row: DatasetFreshness | None) -> str | None:
+    """Return the shortfall an ``incomplete`` row records, without a failed attempt's note.
+
+    A failure on an incomplete row appends its own reason after the shortfall (see
+    :func:`record_freshness`); this returns the shortfall alone, for example
+    ``"result limit reached at finest partition (2026-09-14, ad group 123)"``.
+
+    Args:
+        row: The stored freshness row, or ``None``.
+
+    Returns:
+        The shortfall reason, or ``None`` when the row is absent, not ``incomplete``, or
+        records no reason.
+    """
+    if row is None or row.completeness != "incomplete":
+        return None
+    return _without_failure_note(row.reason)
+
+
 async def load_freshness(session: AsyncSession, dataset_id: int) -> dict[str, DatasetFreshness]:
     """Return every freshness row of one source dataset, keyed by dataset name.
 
@@ -811,7 +978,8 @@ def needs_repair(row: DatasetFreshness | None) -> bool:
     the usual trailing days to ``[covered_from, today]``. That fetch re-covers the whole
     stored range, so its own completeness replaces the stored one in
     :func:`record_freshness`, and the dataset stays ``incomplete`` until the deferred
-    pages finish (AAP 0.3.3).
+    pages finish (AAP 0.3.3). A Google dataset whose row holds a usable ``checkpoint``
+    resumes the stored scopes instead and widens nothing; the widening is its fallback.
 
     Permanent shortfalls (:data:`REASON_FINEST_PARTITION`,
     :data:`REASON_SEARCH_CEILING`) come from the platform's own result limits, so

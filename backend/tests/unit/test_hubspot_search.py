@@ -1217,6 +1217,8 @@ async def test_search_reads_a_one_hour_partition_to_exactly_the_ceiling() -> Non
     assert outcome.reason == CEILING_REASON
     assert outcome.partitions_incomplete == ((DAY0, DAY0 + HOUR),)
     assert outcome.calls == 67
+    # A ceiling is a completed read short of a platform limit, never an interruption.
+    assert outcome.interrupted_by is None
 
 
 @pytest.mark.anyio
@@ -1468,6 +1470,8 @@ async def test_transient_failure_keeps_rows_and_lists_current_and_remaining_part
     assert _ids(outcome) == [deal["id"] for deal in deals[: 250 + 200]]
     assert outcome.completeness == "incomplete"
     assert outcome.reason == error.reason
+    # The exhausted error itself is returned, for the job to hand to sync/mode.py.
+    assert outcome.interrupted_by is error
     assert outcome.partitions_incomplete == (
         (DAY0 + DAY, DAY0 + 2 * DAY),
         (DAY0 + 2 * DAY, DAY0 + 3 * DAY),
@@ -1519,6 +1523,7 @@ async def test_transient_failure_on_a_first_page_keeps_earlier_partitions_only()
     assert _ids(outcome) == [str(DEAL_ID_BASE + 1)]
     assert outcome.partitions_incomplete == ((DAY0 + DAY, DAY0 + 2 * DAY),)
     assert outcome.calls == 2
+    assert outcome.interrupted_by is error
 
 
 @pytest.mark.anyio
@@ -1532,6 +1537,7 @@ async def test_transient_failure_after_a_ceiling_joins_both_reasons_in_order() -
     pager = ContractPager(deals, fail_on=fail_on)
     outcome = await search_partitioned(pager, "deals", deal_search_filter(), (_at(0), _at(1.5)))
     assert outcome.reason == f"{CEILING_REASON}; {error.reason}"
+    assert outcome.interrupted_by is error
     assert outcome.partitions_incomplete == ((_at(0), _at(1)), (_at(1), _at(1.5)))
     assert len(outcome.rows) == RESULT_CEILING
 

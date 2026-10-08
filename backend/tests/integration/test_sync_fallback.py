@@ -22,7 +22,8 @@ guarantee of that row it proves:
 * **Isolation**: simulated HubSpot contacts never collide with live ids and leave every
   computation when the live dataset activates.
 * **Transient and defects**: 429/5xx/timeout retry three times, then stale, never mock; a 400
-  fails the job; the Google call budget defers what it cannot pay for.
+  fails the job; the Google call budget defers what it cannot pay for, and the next runs read
+  the deferred scopes first (metrics) or only the outstanding reads (entities).
 
 How "live" is exercised without a network (AAP 0.3.3 "Contract fidelity"): each source's live
 client is built exactly as in production, through
@@ -42,18 +43,21 @@ rows and on the report objects the product returns (``BootstrapReport``, ``Probe
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
 import httpx
 import pytest
-from sqlalchemy import Table, delete, func, select
+from sqlalchemy import Table, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.analysis import metrics, runner
-from ads_engine.connectors.errors import AccessDenied
+from ads_engine.connectors.errors import AccessDenied, CallBudgetExhausted
+from ads_engine.connectors.google_n8n.partition import FetchOutcome, scope_from_json
+from ads_engine.connectors.google_n8n.queries import END, INT64_MAX, START, parse_query
 from ads_engine.connectors.http import RetryPolicy
 from ads_engine.db import repositories
 from ads_engine.db.models import (
@@ -64,8 +68,11 @@ from ads_engine.db.models import (
     CrmContact,
     DatasetFreshness,
     Decision,
+    Discrepancy,
+    EntitySnapshot,
     FactCampaignDaily,
     FactCreativeDaily,
+    Keyword,
     Lead,
     LeadMatch,
     Recommendation,
@@ -149,6 +156,9 @@ T1: Final = FIXED_NOW + timedelta(hours=1)
 
 T2: Final = FIXED_NOW + timedelta(hours=2)
 """A third step's instant."""
+
+T3: Final = FIXED_NOW + timedelta(hours=3)
+"""A fourth step's instant."""
 
 BACKFILL_DAYS: Final = 35
 """``BACKFILL_DAYS`` of every test: covers the default 28-day window and every lead of the
@@ -2184,7 +2194,8 @@ async def test_call_budget_deferral(rig: Rig) -> None:
         assert row.completeness == "incomplete"
         assert row.reason is not None
         assert row.reason.startswith(freshness.REASON_DEFERRED)
-        assert freshness.needs_repair(row), "the next run widens to finish the deferred pages"
+        assert freshness.needs_repair(row), "the shortfall is repairable by a later read"
+        assert row.checkpoint is not None, "the deferred scopes are kept for the next run"
     connection = await rig.connection("google")
     assert (connection.mode, connection.active_dataset_id) == ("live", dataset_id)
     assert connection.calls_24h == cap
@@ -2200,3 +2211,749 @@ async def test_call_budget_deferral(rig: Rig) -> None:
         "stale",
         "stale",
     )
+
+
+async def _cap_google_calls(rig: Rig, at: datetime, allowed: int) -> None:
+    """Set ``GOOGLE_DAILY_CALL_BUDGET`` to admit ``allowed`` more webhook calls at ``at``."""
+    spent = await GoogleCallBudget(
+        get_settings(), sessionmaker=rig.sessions, clock=_Clock(at)
+    ).used_24h()
+    rig.set_env(GOOGLE_DAILY_CALL_BUDGET=str(spent + allowed))
+
+
+def _google_reads(recorder: Any) -> list[tuple[str, dict[str, object]]]:
+    """The template id and scope of every first-page webhook request, decoded from its GAQL."""
+    reads: list[tuple[str, dict[str, object]]] = []
+    for request in recorder.requests:
+        body = json.loads(request.content)
+        if body["page_token"] is None:
+            parsed = parse_query(body["query"])
+            reads.append((parsed.query_id, dict(parsed.scope)))
+    return reads
+
+
+async def _checkpoint_is_sql_null(rig: Rig, dataset_id: int, name: str) -> bool:
+    """Whether a freshness row's checkpoint ``IS NULL`` in SQL, not merely the JSON ``null``."""
+    async with rig.sessions() as session:
+        is_null = await session.scalar(
+            select(DatasetFreshness.checkpoint.is_(None)).where(
+                DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == name
+            )
+        )
+    assert is_null is not None, f"no dataset_freshness row for {name}"
+    return bool(is_null)
+
+
+async def _snapshots_at(rig: Rig, dataset_id: int, entity_type: str, at: datetime) -> int:
+    """How many snapshots of one entity type the sync at ``at`` wrote."""
+    return await rig.count(
+        EntitySnapshot,
+        EntitySnapshot.dataset_id == dataset_id,
+        EntitySnapshot.entity_type == entity_type,
+        EntitySnapshot.captured_at == at,
+    )
+
+
+async def test_call_budget_deferral_is_read_first_by_the_next_metrics_run(rig: Rig) -> None:
+    """Transient: the scopes the cap deferred are the next metrics run's first requests.
+
+    AAP 0.3.3 "Budget": calls beyond the cap move to a later 24 h window and the dataset stays
+    ``incomplete`` until they finish. A 30-day restatement with the cap one call above what
+    the build spent reads Q-G3 and keeps Q-G5 and Q-G6 as unread scopes in each dataset's
+    checkpoint, tagged with the run's instant, so nothing restarts from the same prefix. The
+    next incremental run, under a raised cap, first reads both stored scopes as stored
+    (``google.metrics_daily``'s before ``google.search_terms``', both deferred at T1), then
+    its own range without the native days a stored scope of the same query covered: Q-G3 in
+    full, nothing more of Q-G5 or Q-G6. Both datasets end ``complete`` with the checkpoint
+    cleared, over the stored range.
+    """
+    dataset_id = await _live_google(rig)
+    built = {
+        name: await rig.freshness_row(dataset_id, name)
+        for name in ("google.metrics_daily", "google.search_terms")
+    }
+    await _cap_google_calls(rig, T1, allowed=1)
+    capped = rig.recording(rig.live("google"))
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_RESTATEMENT],
+        controller=rig.controller({"google": capped}, at=T1),
+    )
+
+    (deferral,) = report.results
+    assert (deferral.status, deferral.completeness) == ("succeeded", "incomplete")
+    assert [query_id for query_id, _scope in _google_reads(capped)] == ["Q-G3"]
+    daily = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    terms = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert daily is not None
+    assert terms is not None
+    assert daily.covered_through is not None
+    today = daily.covered_through
+    first_day = today - timedelta(days=jobs.RESTATEMENT_DAYS["google"] - 1)
+    restated = {"start": first_day.isoformat(), "end": today.isoformat()}
+    for row, query_id in ((daily, "Q-G5"), (terms, "Q-G6")):
+        assert row.checkpoint == {
+            "version": 1,
+            "pending": {query_id: [{"scope": restated, "deferred_at": T1.isoformat()}]},
+            "covered_from": first_day.isoformat(),
+            "reasons": [],
+        }
+        assert row.completeness == "incomplete"
+        assert row.reason == f"{freshness.REASON_DEFERRED}; 1 partition deferred"
+
+    await _cap_google_calls(rig, T2, allowed=100)
+    resumed = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_METRICS],
+        controller=rig.controller({"google": resumed}, at=T2),
+    )
+
+    (result,) = report.results
+    assert (result.status, result.completeness) == ("succeeded", "complete")
+    daily = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    assert daily is not None
+    assert daily.covered_through == today, "T1 and T2 share the account's native day"
+    own_start = daily.covered_through - timedelta(days=jobs.INCREMENTAL_DAYS - 1)
+    own = {START: own_start, END: daily.covered_through}
+    stored = {START: first_day, END: today}
+    assert _google_reads(resumed) == [
+        ("Q-G5", stored),
+        ("Q-G6", stored),
+        ("Q-G3", own),
+    ], "the stored scopes come first as stored; the own range skips the days they cover"
+    for name, before in built.items():
+        row = await rig.freshness_row(dataset_id, name)
+        assert row is not None
+        assert before is not None
+        assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
+        assert await _checkpoint_is_sql_null(rig, dataset_id, name), "drained to SQL NULL"
+        assert (row.covered_from, row.covered_through) == (
+            before.covered_from,
+            daily.covered_through,
+        ), "the drained checkpoint vouches for the whole stored range"
+        assert not freshness.needs_repair(row)
+
+
+async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstanding_reads(
+    rig: Rig,
+) -> None:
+    """Transient: an entity sync the cap interrupts is finished by later syncs, read by read.
+
+    AAP 0.3.3 "Budget" and "Safe absence": the first sync can pay for Q-G1 only, so the
+    campaign, ad-group and keyword enumerations and Q-G8 stay outstanding in the
+    ``google.entities`` checkpoint. The second reads only Q-G2 and Q-G4, the third only Q-G7
+    and Q-G8; nothing is read twice, and no snapshot, removal or ``missing`` discrepancy is
+    inferred from a read that did not happen. The dataset stays ``incomplete`` with the total
+    still outstanding, and turns ``complete`` with the checkpoint cleared once the cycle drains.
+    """
+    dataset_id = await _live_google(rig)
+    discrepancies_before = await rig.count(Discrepancy)
+    removed_keywords = await rig.count(
+        Keyword, Keyword.dataset_id == dataset_id, Keyword.status == "REMOVED"
+    )
+    await _cap_google_calls(rig, T1, allowed=1)
+    first_sync = rig.recording(rig.live("google"))
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"google": first_sync}, at=T1),
+    )
+
+    (first,) = report.results
+    assert (first.status, first.completeness) == ("succeeded", "incomplete")
+    assert [query_id for query_id, _scope in _google_reads(first_sync)] == ["Q-G1"]
+    row = await rig.freshness_row(dataset_id, "google.entities")
+    assert row is not None
+    assert (row.completeness, row.reason) == (
+        "incomplete",
+        f"{freshness.REASON_DEFERRED}; 4 partitions deferred",
+    )
+
+    def unread(query_id: str, scope: dict[str, int]) -> dict[str, object]:
+        return {
+            "query_id": query_id,
+            "pending": [scope],
+            "absent": [],
+            "rereading": False,
+            "reread_rows": [],
+        }
+
+    keywords_unread = unread("Q-G7", {"ad_group_lo": 0, "ad_group_hi": INT64_MAX})
+    assert row.checkpoint == {
+        "version": 1,
+        "started_at": T1.isoformat(),
+        "pending": {"Q-G8": [{}]},
+        "enumerations": {
+            "Q-G2": unread("Q-G2", {"last_id": 0}),
+            "Q-G4": unread("Q-G4", {"last_id": 0}),
+            "Q-G7": keywords_unread,
+        },
+        "reasons": [],
+    }
+    assert await _snapshots_at(rig, dataset_id, "campaign", T1) == 0
+
+    await _cap_google_calls(rig, T2, allowed=2)
+    second_sync = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"google": second_sync}, at=T2),
+    )
+
+    (second,) = report.results
+    assert (second.status, second.completeness) == ("succeeded", "incomplete")
+    assert _google_reads(second_sync) == [("Q-G2", {"last_id": 0}), ("Q-G4", {"last_id": 0})]
+    row = await rig.freshness_row(dataset_id, "google.entities")
+    assert row is not None
+    assert (row.completeness, row.reason) == (
+        "incomplete",
+        f"{freshness.REASON_DEFERRED}; 2 partitions deferred",
+    )
+    assert row.checkpoint == {
+        "version": 1,
+        "started_at": T1.isoformat(),
+        "pending": {"Q-G8": [{}]},
+        "enumerations": {"Q-G7": keywords_unread},
+        "reasons": [],
+    }
+    assert await _snapshots_at(rig, dataset_id, "campaign", T2) > 0
+    assert await _snapshots_at(rig, dataset_id, "keyword", T2) == 0
+    assert (
+        await rig.count(Keyword, Keyword.dataset_id == dataset_id, Keyword.status == "REMOVED")
+        == removed_keywords
+    ), "no keyword is removed while Q-G7 is outstanding"
+
+    await _cap_google_calls(rig, T3, allowed=100)
+    third_sync = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"google": third_sync}, at=T3),
+    )
+
+    (third,) = report.results
+    assert (third.status, third.completeness) == ("succeeded", "complete")
+    assert [query_id for query_id, _scope in _google_reads(third_sync)] == ["Q-G7", "Q-G8"]
+    row = await rig.freshness_row(dataset_id, "google.entities")
+    assert row is not None
+    assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
+    assert await _checkpoint_is_sql_null(rig, dataset_id, "google.entities"), "drained to SQL NULL"
+    assert await _snapshots_at(rig, dataset_id, "keyword", T3) > 0
+    assert await _snapshots_at(rig, dataset_id, "campaign", T3) == 0
+    assert await rig.count(Discrepancy) == discrepancies_before, "nothing was inferred"
+
+
+async def test_a_transient_failure_keeps_its_unread_scopes_for_the_next_run(rig: Rig) -> None:
+    """Transient: a refresh a 503 fails is stale now and resumed from its unread scopes next.
+
+    AAP 0.3.3 fallback table row 3: Q-G6 answering 503 on every retry fails the
+    ``google.search_terms`` refresh, which keeps its last good data and turns stale, while
+    ``google.metrics_daily`` completes. The unread restatement scope is still kept in the
+    checkpoint, so the next run reads it as stored before any own range, and its own Q-G6
+    range, wholly inside the stored scope's days, adds no read; the dataset completes.
+    """
+    dataset_id = await _live_google(rig)
+    built = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert built is not None
+    q_g6_down = Fault(
+        source="google",
+        surface="search",
+        kind="http_status",
+        status=503,
+        match={"query_id": "Q-G6"},
+    )
+    failing = rig.recording(rig.live("google", rig.world(faults=(q_g6_down,))))
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_RESTATEMENT],
+        controller=rig.controller({"google": failing}, at=T1),
+    )
+
+    (failed,) = report.results
+    assert (failed.status, failed.disposition) == ("failed", "stale")
+    daily = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    terms = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert daily is not None
+    assert terms is not None
+    assert (daily.completeness, daily.checkpoint) == ("complete", None)
+    assert daily.covered_through is not None
+    first_day = daily.covered_through - timedelta(days=jobs.RESTATEMENT_DAYS["google"] - 1)
+    restated = {"start": first_day.isoformat(), "end": daily.covered_through.isoformat()}
+    assert terms.checkpoint == {
+        "version": 1,
+        "pending": {"Q-G6": [{"scope": restated, "deferred_at": T1.isoformat()}]},
+        "covered_from": first_day.isoformat(),
+        "reasons": [],
+    }
+    assert (terms.last_success_at, terms.completeness) == (built.last_success_at, "complete")
+    assert terms.last_attempt_at == T1
+    assert terms.reason is not None
+
+    healthy = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_METRICS],
+        controller=rig.controller({"google": healthy}, at=T2),
+    )
+
+    (result,) = report.results
+    assert (result.status, result.completeness) == ("succeeded", "complete")
+    terms = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert terms is not None
+    assert terms.covered_through == daily.covered_through, "T1 and T2 share the native day"
+    search_reads = [scope for query_id, scope in _google_reads(healthy) if query_id == "Q-G6"]
+    assert search_reads == [{START: first_day, END: terms.covered_through}]
+    assert _google_reads(healthy)[0][0] == "Q-G6", "the stored scope is read before any own range"
+    assert (terms.completeness, terms.checkpoint, terms.last_success_at) == ("complete", None, T2)
+
+
+async def test_an_unusable_checkpoint_is_ignored_and_the_run_falls_back_to_the_wide_read(
+    rig: Rig,
+) -> None:
+    """A checkpoint the job cannot read is never trusted: the deferred row is re-read whole.
+
+    The row records a call-budget deferral, but its checkpoint is of an unknown version, so
+    the run widens to the recorded range (``needs_repair``), completes the dataset and
+    replaces the unusable checkpoint with none.
+    """
+    dataset_id = await _live_google(rig)
+    async with rig.sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(
+                DatasetFreshness.dataset_id == dataset_id,
+                DatasetFreshness.dataset == "google.metrics_daily",
+            )
+            .values(
+                completeness="incomplete",
+                reason=f"{freshness.REASON_DEFERRED}; 1 partition deferred",
+                checkpoint={"version": 99, "pending": {"Q-G5": [{"start": "x"}]}},
+            )
+        )
+    stored = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    assert stored is not None
+    assert freshness.needs_repair(stored)
+    recorder = rig.recording(rig.live("google"))
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_METRICS],
+        controller=rig.controller({"google": recorder}, at=T1),
+    )
+
+    (result,) = report.results
+    assert (result.status, result.completeness) == ("succeeded", "complete")
+    row = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    assert row is not None
+    assert row.covered_through is not None
+    widened = {START: stored.covered_from, END: row.covered_through}
+    daily_reads = [
+        (query_id, scope)
+        for query_id, scope in _google_reads(recorder)
+        if query_id in {"Q-G3", "Q-G5"}
+    ]
+    assert daily_reads == [("Q-G3", widened), ("Q-G5", widened)]
+    assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
+
+
+async def test_a_drained_checkpoint_still_reports_a_permanent_shortfall(rig: Rig) -> None:
+    """A result-limit shortfall of a deferred cycle survives the drain of its checkpoint.
+
+    AAP 0.3.3: a Q-G6 (day, ad group) kept at the result limit leaves ``google.search_terms``
+    ``incomplete``, and re-reading cannot remove it. Draining a checkpoint lets the run vouch
+    for the whole stored range, so the shortfall must outlive the deferral: whether the
+    checkpoint carries it (met earlier in the cycle) or the stored row does (met before the
+    deferral), the drained dataset stays ``incomplete`` with that reason, not ``complete``.
+    """
+    dataset_id = await _live_google(rig)
+    built = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert built is not None
+    assert built.covered_from is not None
+    first_day = built.covered_from
+    shortfall = f"{freshness.REASON_FINEST_PARTITION} ({first_day.isoformat()}, ad group 1)"
+    unread_day = {"start": first_day.isoformat(), "end": first_day.isoformat()}
+
+    async def store(reason: str, reasons: list[str]) -> None:
+        async with rig.sessions() as session, session.begin():
+            await session.execute(
+                update(DatasetFreshness)
+                .where(
+                    DatasetFreshness.dataset_id == dataset_id,
+                    DatasetFreshness.dataset == "google.search_terms",
+                )
+                .values(
+                    completeness="incomplete",
+                    reason=reason,
+                    checkpoint={
+                        "version": 1,
+                        "pending": {"Q-G6": [{"scope": unread_day, "deferred_at": T0.isoformat()}]},
+                        "covered_from": first_day.isoformat(),
+                        "reasons": reasons,
+                    },
+                )
+            )
+
+    async def drain(at: datetime) -> DatasetFreshness:
+        report = await jobs.run_source_jobs(
+            "google",
+            trigger="manual",
+            jobs=[jobs.JOB_METRICS],
+            controller=rig.controller({"google": rig.live("google")}, at=at),
+        )
+        (result,) = report.results
+        assert result.status == "succeeded"
+        row = await rig.freshness_row(dataset_id, "google.search_terms")
+        assert row is not None
+        return row
+
+    await store(f"{freshness.REASON_DEFERRED}; 1 partition deferred", [shortfall])
+    carried_by_checkpoint = await drain(T1)
+    assert (
+        carried_by_checkpoint.completeness,
+        carried_by_checkpoint.reason,
+        carried_by_checkpoint.checkpoint,
+    ) == ("incomplete", shortfall, None)
+    assert carried_by_checkpoint.covered_from == first_day
+
+    await store(shortfall, [])
+    carried_by_row = await drain(T2)
+    assert (carried_by_row.completeness, carried_by_row.reason, carried_by_row.checkpoint) == (
+        "incomplete",
+        shortfall,
+        None,
+    )
+    assert carried_by_row.covered_from == first_day
+
+
+_METRICS_QUERIES: Final[Mapping[str, tuple[str, ...]]] = {
+    "google.metrics_daily": ("Q-G3", "Q-G5"),
+    "google.search_terms": ("Q-G6",),
+}
+"""The Google metrics datasets and their dated queries, in the job's dataset and query order."""
+
+
+def _stored_reading_order(
+    checkpoints: Mapping[str, Mapping[str, Any] | None],
+) -> list[tuple[str, dict[str, object]]]:
+    """Every pending metrics scope of both checkpoints, in the order the next run reads them.
+
+    Oldest ``deferred_at`` first; ties by dataset (``google.metrics_daily``, then
+    ``google.search_terms``), then query (Q-G3, Q-G5; Q-G6), then position in the stored list.
+    """
+    ordered: list[tuple[tuple[datetime, int, int, int], str, dict[str, object]]] = []
+    for dataset_index, (name, queries) in enumerate(_METRICS_QUERIES.items()):
+        checkpoint = checkpoints.get(name)
+        if checkpoint is None:
+            continue
+        for query_index, query_id in enumerate(queries):
+            for position, entry in enumerate(checkpoint["pending"].get(query_id, ())):
+                key = (
+                    datetime.fromisoformat(entry["deferred_at"]),
+                    dataset_index,
+                    query_index,
+                    position,
+                )
+                ordered.append((key, query_id, dict(scope_from_json(query_id, entry["scope"]))))
+    ordered.sort(key=lambda item: item[0])
+    return [(query_id, scope) for _key, query_id, scope in ordered]
+
+
+async def _metrics_window(
+    rig: Rig, dataset_id: int, at: datetime, *, allowed: int
+) -> tuple[list[tuple[str, dict[str, object]]], dict[str, DatasetFreshness]]:
+    """Run one incremental Google metrics job at ``at`` with ``allowed`` webhook calls left.
+
+    Returns the first-page reads in the order they were sent and both freshness rows after.
+    """
+    await _cap_google_calls(rig, at, allowed=allowed)
+    recorder = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_METRICS],
+        controller=rig.controller({"google": recorder}, at=at),
+    )
+    (result,) = report.results
+    assert result.status == "succeeded", "a call-budget deferral is an incomplete success"
+    rows: dict[str, DatasetFreshness] = {}
+    for name in _METRICS_QUERIES:
+        row = await rig.freshness_row(dataset_id, name)
+        assert row is not None
+        rows[name] = row
+    return _google_reads(recorder), rows
+
+
+def _pending_total(checkpoints: Mapping[str, Mapping[str, Any] | None]) -> int:
+    """The number of scopes both metrics checkpoints still hold."""
+    return sum(
+        len(entries)
+        for checkpoint in checkpoints.values()
+        if checkpoint is not None
+        for entries in checkpoint["pending"].values()
+    )
+
+
+async def test_small_replenished_windows_read_the_oldest_deferred_work_first_and_drain(
+    rig: Rig,
+) -> None:
+    """Budget: no metrics dataset's stored work starves behind another's fresh range.
+
+    AAP 0.3.3 "Budget": deferred pages are read in later windows and the dataset stays
+    ``incomplete`` until they finish. Three daily windows of two calls each, while each run's
+    own ranges need three (Q-G3, Q-G5, Q-G6): every window starts with the oldest stored
+    scopes, whichever dataset holds them, so ``google.search_terms``' Q-G6, deferred in the
+    first window, is the first read of the second instead of waiting behind
+    ``google.metrics_daily``'s fresh ranges. Then, within one native day, repeated windows
+    of five calls, fewer than the stored and own work together: each window still starts
+    with the oldest stored work and stays within its calls, and the backlog drains over
+    several windows until both datasets are ``complete`` with no checkpoint left.
+    """
+    dataset_id = await _live_google(rig)
+    checkpoints: dict[str, Mapping[str, Any] | None] = dict.fromkeys(_METRICS_QUERIES)
+    for step in range(3):
+        at = T1 + timedelta(days=step)
+        expected = _stored_reading_order(checkpoints)
+        reads, rows = await _metrics_window(rig, dataset_id, at, allowed=2)
+        first = min(len(expected), 2)
+        assert len(reads) == 2, f"window {step} spends exactly its two calls"
+        assert reads[:first] == expected[:first], f"window {step} starts with the oldest work"
+        checkpoints = {name: row.checkpoint for name, row in rows.items()}
+        if step == 0:
+            assert [query_id for query_id, _scope in reads] == ["Q-G3", "Q-G5"]
+            terms = checkpoints["google.search_terms"]
+            assert terms is not None
+            assert [entry["deferred_at"] for entry in terms["pending"]["Q-G6"]] == [at.isoformat()]
+        elif step == 1:
+            assert reads[0][0] == "Q-G6", "the first window's deferred Q-G6 is read first"
+        for name, row in rows.items():
+            if row.checkpoint is None:
+                assert (row.completeness, row.reason) == ("complete", None), name
+            else:
+                assert row.completeness == "incomplete", name
+                assert row.reason is not None
+                assert row.reason.startswith(freshness.REASON_DEFERRED), name
+
+    allowed = 5
+    day = T1 + timedelta(days=3)
+    windows = 0
+    while _pending_total(checkpoints):
+        assert windows < 6, f"the backlog did not drain: {checkpoints}"
+        expected = _stored_reading_order(checkpoints)
+        reads, rows = await _metrics_window(
+            rig, dataset_id, day + timedelta(minutes=windows), allowed=allowed
+        )
+        first = min(len(expected), allowed)
+        assert len(reads) <= allowed
+        assert reads[:first] == expected[:first], f"drain window {windows} starts oldest first"
+        checkpoints = {name: row.checkpoint for name, row in rows.items()}
+        windows += 1
+    assert windows > 1, "the backlog took more than one window"
+    for name, row in rows.items():
+        assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None), name
+        assert await _checkpoint_is_sql_null(rig, dataset_id, name), name
+
+
+async def test_a_stored_criterion_keyset_is_read_as_stored_before_any_own_range(
+    rig: Rig,
+) -> None:
+    """Budget: a stored Q-G5 keyset keeps its progress and is never re-partitioned from its day.
+
+    A narrowed scope that lies inside the run's own range is neither dropped nor trimmed:
+    the checkpoint holds a Q-G5 criterion keyset (ad group 123 from criterion 9,999) on the
+    last native day of the own range, deferred at T0, and a window of one call reads exactly
+    that keyset. That run's own Q-G5 range leaves the keyset's day out instead of
+    re-partitioning it from scratch, and the own ranges it deferred carry its instant.
+    Repeated windows of three calls (the own ranges alone need three) then read the oldest
+    stored work first, never the keyset again, until both datasets are ``complete`` with no
+    checkpoint left.
+    """
+    dataset_id = await _live_google(rig)
+    before = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    assert before is not None
+    assert before.covered_from is not None
+    assert before.covered_through is not None
+    day = before.covered_through
+    keyset = {"start": day.isoformat(), "end": day.isoformat(), "ad_group_id": 123, "last_id": 9999}
+    async with rig.sessions() as session, session.begin():
+        await freshness.write_checkpoint(
+            session,
+            dataset_id,
+            "google.metrics_daily",
+            {
+                "version": 1,
+                "pending": {"Q-G5": [{"scope": keyset, "deferred_at": T0.isoformat()}]},
+                "covered_from": day.isoformat(),
+                "reasons": [],
+            },
+        )
+
+    reads, rows = await _metrics_window(rig, dataset_id, T1, allowed=1)
+
+    keyset_read = ("Q-G5", {START: day, END: day, "ad_group_id": 123, "last_id": 9999})
+    assert reads == [keyset_read], "the stored keyset is the one call, read as stored"
+    own_start = day - timedelta(days=jobs.INCREMENTAL_DAYS - 1)
+    own = {"start": own_start.isoformat(), "end": day.isoformat()}
+    before_day = {"start": own_start.isoformat(), "end": (day - timedelta(days=1)).isoformat()}
+    assert rows["google.metrics_daily"].checkpoint == {
+        "version": 1,
+        "pending": {
+            "Q-G3": [{"scope": own, "deferred_at": T1.isoformat()}],
+            "Q-G5": [{"scope": before_day, "deferred_at": T1.isoformat()}],
+        },
+        "covered_from": before.covered_from.isoformat(),
+        "reasons": [],
+    }, "the keyset is done; the own Q-G5 range left its day out"
+    assert rows["google.search_terms"].checkpoint == {
+        "version": 1,
+        "pending": {"Q-G6": [{"scope": own, "deferred_at": T1.isoformat()}]},
+        "covered_from": own_start.isoformat(),
+        "reasons": [],
+    }
+
+    checkpoints = {name: row.checkpoint for name, row in rows.items()}
+    windows = 0
+    while _pending_total(checkpoints):
+        assert windows < 6, f"the backlog did not drain: {checkpoints}"
+        expected = _stored_reading_order(checkpoints)
+        reads, rows = await _metrics_window(
+            rig, dataset_id, T1 + timedelta(minutes=1 + windows), allowed=3
+        )
+        first = min(len(expected), 3)
+        assert len(reads) <= 3
+        assert reads[:first] == expected[:first], f"window {windows} starts oldest first"
+        assert keyset_read not in reads, "the keyset is never read again"
+        checkpoints = {name: row.checkpoint for name, row in rows.items()}
+        windows += 1
+    for name, row in rows.items():
+        assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None), name
+
+
+class _InterruptedFetcher:
+    """A fetcher whose one fetch is cut short by the call budget after reading nothing.
+
+    Attributes:
+        deferred: The partitions the interrupted fetch leaves unread.
+        fetched: Every ``(query_id, scope)`` fetched, in order.
+    """
+
+    def __init__(self, deferred: tuple[Mapping[str, object], ...]) -> None:
+        self.deferred = deferred
+        self.fetched: list[tuple[str, Mapping[str, object]]] = []
+
+    async def partitioned_fetch(self, query_id: str, scope: Mapping[str, object]) -> FetchOutcome:
+        """Return an interrupted outcome that defers :attr:`deferred`."""
+        self.fetched.append((query_id, scope))
+        return FetchOutcome(
+            query_id=query_id,
+            rows=(),
+            completeness="incomplete",
+            reason=f"{freshness.REASON_DEFERRED}; {len(self.deferred)} partitions deferred",
+            calls=1,
+            partitions_read=0,
+            deferred=self.deferred,
+            interrupted_by=CallBudgetExhausted(),
+        )
+
+
+async def test_metrics_deferral_instants_survive_interruption_merging_and_storage() -> None:
+    """Deferral instants are kept by the partitions, merges and JSON that carry the work on.
+
+    A stored scope deferred at T0 whose fetch the budget interrupts leaves its two unread
+    partitions tagged T0, and the own range the run did not reach is tagged with the run's
+    instant. A concurrent run's checkpoint is merged by scope identity alone (query id and
+    scope, whatever the instant): a scope this run loaded and read is not brought back, one
+    both hold keeps the earlier instant, and the result is ordered by instant. The JSON form
+    rebuilds equal, and a stored entry of another shape is refused.
+    """
+    queries = _METRICS_QUERIES["google.metrics_daily"]
+    day = date(2026, 9, 14)
+
+    def days(first: int, last: int) -> dict[str, date]:
+        return {START: day + timedelta(days=first), END: day + timedelta(days=last)}
+
+    stored_ranges: list[tuple[date, date] | None] = []
+
+    async def store(_outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
+        stored_ranges.append(covered)
+
+    stored_scope, own_scope = days(0, 3), days(10, 12)
+    fetcher = _InterruptedFetcher(deferred=(days(0, 1), days(2, 3)))
+    reads = jobs._QueryReads("Q-G5", store)
+    await reads.read(fetcher, stored_scope, T0)  # type: ignore[arg-type]
+    await reads.read(fetcher, own_scope, T2)  # type: ignore[arg-type]
+    assert fetcher.fetched == [("Q-G5", stored_scope)], "an interrupted query reads no more"
+    assert stored_ranges == [(day, day + timedelta(days=3))], "the read's rows went to store"
+    assert [(dict(entry.scope), entry.deferred_at) for entry in reads.pending] == [
+        (days(0, 1), T0),
+        (days(2, 3), T0),
+        (own_scope, T2),
+    ]
+
+    def entry(scope: Mapping[str, date], at: datetime) -> dict[str, object]:
+        return {
+            "scope": {key: value.isoformat() for key, value in scope.items()},
+            "deferred_at": at.isoformat(),
+        }
+
+    def checkpoint(pending: Mapping[str, list[dict[str, object]]]) -> dict[str, object]:
+        return {"version": 1, "pending": pending, "covered_from": "2026-09-14", "reasons": []}
+
+    loaded = jobs._MetricsCheckpoint.parse(checkpoint({"Q-G5": [entry(days(0, 0), T0)]}), queries)
+    current = jobs._MetricsCheckpoint.parse(
+        checkpoint(
+            {
+                "Q-G3": [entry(days(5, 5), T0)],
+                "Q-G5": [entry(days(0, 0), T0), entry(days(1, 1), T1)],
+            }
+        ),
+        queries,
+    )
+    mine = jobs._MetricsCheckpoint.parse(
+        checkpoint({"Q-G5": [entry(days(2, 2), T2), entry(days(1, 1), T3)]}), queries
+    )
+    merged = mine.merged_with(current, loaded)
+    assert merged.to_json()["pending"] == {
+        "Q-G5": [entry(days(1, 1), T1), entry(days(2, 2), T2)],
+        "Q-G3": [entry(days(5, 5), T0)],
+    }
+    assert jobs._MetricsCheckpoint.parse(merged.to_json(), queries) == merged
+
+    one_day = {START: "2026-09-14", END: "2026-09-14"}
+    refused: list[tuple[dict[str, list[dict[str, object]]], str]] = [
+        ({"Q-G5": [one_day]}, "must hold exactly"),  # a bare scope, without its instant
+        ({"Q-G5": [{"scope": one_day}]}, "must hold exactly"),
+        ({"Q-G5": [{"scope": one_day, "deferred_at": "2026-09-14T06:00:00"}]}, "UTC offset"),
+        ({"Q-G5": [entry(days(0, 0), T0), entry(days(0, 0), T1)]}, "pending twice"),
+        (
+            {
+                "Q-G5": [
+                    {
+                        "scope": {
+                            START: "2026-09-14",
+                            END: "2026-09-15",
+                            "campaign_lo": 0,
+                            "campaign_hi": 7,
+                        },
+                        "deferred_at": T0.isoformat(),
+                    }
+                ]
+            },
+            "narrowed stored scope covers a single day",
+        ),
+        ({"Q-G6": [entry(days(0, 0), T0)]}, "does not read"),
+    ]
+    for pending, error in refused:
+        with pytest.raises(ValueError, match=error):
+            jobs._MetricsCheckpoint.parse(checkpoint(pending), queries)

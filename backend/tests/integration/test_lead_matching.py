@@ -69,6 +69,7 @@ import structlog
 from sqlalchemy import Connection, Engine, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ads_engine.connectors.errors import TransientError
 from ads_engine.connectors.hubspot.client import RateLimiter
 from ads_engine.connectors.hubspot.parser import ContactPropertyMap
 from ads_engine.connectors.linkedin.parser import (
@@ -1083,7 +1084,9 @@ async def test_hubspot_5xx_marks_error_then_matches(harness: Harness) -> None:
 
     HubSpot answers 503 to every attempt the retry policy makes, so the lookup fails: the
     row ends ``error`` with its reason and is due again one hour later, never simulated and
-    with neither source's mode touched. The next due run reaches a healthy portal and matches.
+    with neither source's mode touched, and the exhausted error is returned in
+    ``MatchReport.interrupted_by`` for the calling job to hand to ``on_error``. The next due
+    run reaches a healthy portal and matches.
     """
     pair = await _live_pair(harness)
     email = "transient@example.com"
@@ -1104,7 +1107,14 @@ async def test_hubspot_5xx_marks_error_then_matches(harness: Harness) -> None:
     before = await connections()
     harness.platforms.hubspot_status = 503
     report = await harness.match(pair.hubspot, now=T0)
-    assert report == MatchReport(attempted=1, errors=1, batches=1)
+    # The exhausted lookup is returned, not swallowed, for the calling job to hand to
+    # ``on_error``; ``run_matching`` itself never touches a connection.
+    (interruption,) = report.interrupted_by
+    assert isinstance(interruption, TransientError)
+    assert (interruption.source, interruption.http_status) == ("hubspot", 503)
+    assert dataclasses.replace(report, interrupted_by=()) == MatchReport(
+        attempted=1, errors=1, batches=1
+    )
     row = (await _rows(harness.sessions, pair.hubspot))[lead_id]
     assert row == MatchRow(
         "error", 1, T0 + timedelta(hours=1), T0, None, None, REASON_LOOKUP_FAILED

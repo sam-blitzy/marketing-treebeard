@@ -1991,13 +1991,15 @@ def _google_refresh_problem(ctx: AnalysisContext, crm: CrmData) -> str | None:
     """Return why the Google-touch contacts' refresh is unknown, or ``None`` when it is known.
 
     AAP 0.5.4.1 judges the pipeline only when every eligible contact's refresh succeeded.
-    Google-touch contacts carry no per-contact refresh status: they are refreshed by the
-    touch-date discovery search (AAP 0.3.3), whose outcome ``crm``'s own
-    ``hubspot.google_contacts`` freshness row records; a failed attempt moves only
-    ``last_attempt_at`` and the reason, so the stored contacts and stage dates stand as they
-    were. The refresh is known only when that row exists, has succeeded, did not fail on a
-    later attempt, is ``complete`` and covers every window date. No other dataset's row
-    stands in, so a LinkedIn (companion) dataset never vouches for the Google population.
+    Google-touch contacts carry no per-contact refresh status: the touch-date discovery search
+    finds them and the CRM sync re-reads every stored one by id with the matched contacts
+    (AAP 0.3.3). ``crm``'s own ``hubspot.google_contacts`` freshness row records both, and a
+    contact not read makes it ``incomplete``. A failed attempt (such as a transient error that
+    stopped the discovery or cost a Google-touch read) moves only ``last_attempt_at`` and the
+    reason, so a contact it did not read keeps its stored stage dates. The refresh is known
+    only when that row exists, has succeeded, did not fail on a later attempt, is ``complete``
+    and covers every window date. No other dataset's row stands in, so a LinkedIn (companion)
+    dataset never vouches for the Google population.
     """
     row = ctx.freshness_for(_GOOGLE_CONTACTS_DATASET, crm.dataset.dataset_id)
     prefix = f"Google contact refresh unknown: {_GOOGLE_CONTACTS_DATASET}"
@@ -2039,10 +2041,12 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
     Google account's day, and matured when it is at least ``crm.lead_maturity_days`` before
     that upper instant.
 
-    When the discovery refresh is unknown (:func:`_google_refresh_problem`), every Google
-    population is unavailable with that reason and its eligible contacts count as unknown
-    evidence. Otherwise each eligible contact is judged on its own reads (contact record,
-    associations, target reads); discovered contacts have no per-contact refresh status.
+    The ``hubspot.google_contacts`` row records the discovery and the by-id refresh of every
+    stored Google-touch contact; a contact not read makes it ``incomplete``. When that refresh
+    is unknown (:func:`_google_refresh_problem`), every Google population is unavailable with
+    that reason and its eligible contacts count as unknown evidence. Otherwise each eligible
+    contact is judged on its own reads (contact record, associations, target reads);
+    discovered contacts carry no per-contact refresh status.
     """
     crm = ctx.google_crm
     if crm is None or not crm.bindings.google.available:
@@ -2110,12 +2114,13 @@ def shared_budget_veto(
     follow the per-campaign population.
 
     The population comes from the same touch-date discovery as the per-campaign Google veto
-    (:func:`_google_veto`), so its refresh is judged the same way: when the
-    ``hubspot.google_contacts`` refresh is unknown (:func:`_google_refresh_problem`), the
-    population is unavailable with that reason and its eligible contacts count as unknown
-    evidence, even with none admitted, because the refresh may have missed some. Otherwise
-    each eligible contact is judged on its own reads; discovered contacts have no per-contact
-    refresh status.
+    (:func:`_google_veto`), so its refresh is judged the same way. The
+    ``hubspot.google_contacts`` row records the discovery and the by-id refresh of every
+    stored Google-touch contact, and a contact not read makes it ``incomplete``. When that
+    refresh is unknown (:func:`_google_refresh_problem`), the population is unavailable with
+    that reason and its eligible contacts count as unknown evidence, even with none admitted,
+    because the refresh may have missed some. Otherwise each eligible contact is judged on its
+    own reads; discovered contacts carry no per-contact refresh status.
 
     Args:
         ctx: The run's analysis context.

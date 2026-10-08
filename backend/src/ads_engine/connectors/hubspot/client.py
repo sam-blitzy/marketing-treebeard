@@ -46,9 +46,11 @@ Errors:
     raises ``QueryDefect``. Batch methods record, per input or per id (``failed``, ``error``,
     ``partial``), a ``TransientError`` that outlasts its retries, a batch status other than
     ``COMPLETE`` and a per-input failure instead of raising them, so a sync keeps what it
-    read and marks the rest unknown; ``AccessDenied`` and ``QueryDefect`` always propagate, and
-    ``ads_engine.sync.mode`` alone decides what follows. Invalid arguments raise
-    ``ValueError`` before any call.
+    read and marks the rest unknown. The first such ``TransientError`` of a method call is
+    also returned in its result's ``interrupted_by``, so the sync hands it to
+    ``ads_engine.sync.mode`` and records the refresh as failed rather than successful;
+    ``AccessDenied`` and ``QueryDefect`` always propagate, and ``ads_engine.sync.mode`` alone
+    decides what follows. Invalid arguments raise ``ValueError`` before any call.
 
 Personal data and isolation:
     Emails exist in memory only for the batch read that looks them up. Results are keyed
@@ -512,12 +514,16 @@ class EmailLookup:
             ``COMPLETE``, an input neither returned nor listed, or a call that still failed
             after its retries (``error``, retried).
         skipped: Simulated ``@sim.invalid`` addresses a live client never sends.
+        interrupted_by: The first ``TransientError`` a call still raised after its retries,
+            for ``ads_engine.sync.mode`` to decide on; ``None`` when every call was answered.
+            Its inputs are in ``failed`` either way.
     """
 
     found: Mapping[str, ContactRow]
     not_found: frozenset[str]
     failed: frozenset[str]
     skipped: frozenset[str]
+    interrupted_by: TransientError | None = None
 
     def __repr__(self) -> str:
         """Return the field counts, never a digest."""
@@ -537,6 +543,9 @@ class ContactBatch:
             was absent, listed in ``errors[]``, or in a call that failed. It becomes
             ``lead_match.contact_read_status``; an ``error`` keeps the previous stage values
             and marks them unknown for the window.
+        interrupted_by: The first ``TransientError`` a call still raised after its retries,
+            for ``ads_engine.sync.mode`` to decide on; ``None`` when every call was answered.
+            The ids of a failed call read ``error`` either way.
 
     Raises:
         ValueError: On construction, when a status is not one the database accepts.
@@ -544,6 +553,7 @@ class ContactBatch:
 
     records: Mapping[str, ContactRow]
     read_status: Mapping[str, ContactReadStatus]
+    interrupted_by: TransientError | None = None
 
     def __post_init__(self) -> None:
         """Check every status against ``crm.CONTACT_READ_STATUSES``."""
@@ -595,11 +605,17 @@ class AssociationFetch:
         from_type: The source object type, for example ``contacts``.
         to_type: The target object type, for example ``meetings``.
         per_input: Each requested input id's read, in request order.
+        interrupted_by: The first ``TransientError`` an initial or continuation call still
+            raised after its retries, for ``ads_engine.sync.mode`` to decide on; ``None``
+            when every call was answered. The affected inputs are ``error`` or ``partial``
+            either way; a 207 ``errors[]`` entry or a batch status other than ``COMPLETE`` is
+            a per-input outcome only and never sets it.
     """
 
     from_type: str
     to_type: str
     per_input: Mapping[str, InputAssociations]
+    interrupted_by: TransientError | None = None
 
     @builtins.property
     def all_targets(self) -> tuple[str, ...]:
@@ -631,6 +647,9 @@ class TargetRead[RowT]:
             call failed.
         status: ``ok`` when every requested id was read (also for an empty request),
             ``partial`` when some were not, ``error`` when none were.
+        interrupted_by: The first ``TransientError`` a call still raised after its retries,
+            for ``ads_engine.sync.mode`` to decide on; ``None`` when every call was answered.
+            The ids of a failed call are in ``missing_ids`` either way.
 
     Raises:
         ValueError: On construction, when the status is not one the database accepts.
@@ -639,6 +658,7 @@ class TargetRead[RowT]:
     records: Mapping[str, RowT]
     missing_ids: frozenset[str]
     status: TargetReadStatus
+    interrupted_by: TransientError | None = None
 
     def __post_init__(self) -> None:
         """Check the status against ``crm.TARGET_READ_STATUSES``."""
@@ -726,10 +746,15 @@ def _labels_not_found(labels: Sequence[str]) -> str:
     return f"{noun} {_quoted(labels)} not found in {_LIFECYCLE_STAGE} options"
 
 
-def _target_read[RowT](requested: Sequence[str], records: Mapping[str, RowT]) -> TargetRead[RowT]:
+def _target_read[RowT](
+    requested: Sequence[str],
+    records: Mapping[str, RowT],
+    interrupted_by: TransientError | None = None,
+) -> TargetRead[RowT]:
     """Summarise a by-id target read: ``ok`` all read, ``partial`` some, ``error`` none.
 
-    An empty request is ``ok``: there was nothing to read.
+    An empty request is ``ok``: there was nothing to read. ``interrupted_by`` is the first
+    transient error a call of the read still raised after its retries.
     """
     missing = frozenset(hs_id for hs_id in requested if hs_id not in records)
     status: TargetReadStatus
@@ -739,7 +764,12 @@ def _target_read[RowT](requested: Sequence[str], records: Mapping[str, RowT]) ->
         status = "error"
     else:
         status = "partial"
-    return TargetRead(records=MappingProxyType(dict(records)), missing_ids=missing, status=status)
+    return TargetRead(
+        records=MappingProxyType(dict(records)),
+        missing_ids=missing,
+        status=status,
+        interrupted_by=interrupted_by,
+    )
 
 
 def _require_complete(status: str, *, endpoint: str) -> None:
@@ -1329,7 +1359,8 @@ class HubSpotClient:
 
         Returns:
             Every input's digest in exactly one of ``found``, ``not_found``, ``failed`` or
-            ``skipped``.
+            ``skipped``, and in ``interrupted_by`` the first ``TransientError`` a call still
+            raised after its retries, if any.
 
         Raises:
             ValueError: When ``emails`` is one string or holds a blank or non-string entry;
@@ -1365,6 +1396,7 @@ class HubSpotClient:
         found: dict[str, ContactRow] = {}
         not_found: set[str] = set()
         failed: set[str] = set()
+        interrupted: TransientError | None = None
         calls = 0
         path = _objects_batch_read(_CONTACTS)
         endpoint = f"{_SURFACE_OBJECTS} {_CONTACTS}"
@@ -1383,6 +1415,8 @@ class HubSpotClient:
                 )
             except TransientError as error:
                 failed |= digests
+                if interrupted is None:
+                    interrupted = error
                 self._log.warning(
                     "hubspot.batch_read.call_failed",
                     object_type=_CONTACTS,
@@ -1426,6 +1460,7 @@ class HubSpotClient:
             not_found=frozenset(not_found),
             failed=frozenset(failed),
             skipped=frozenset(skipped),
+            interrupted_by=interrupted,
         )
         self._log.info(
             "hubspot.batch_read",
@@ -1455,7 +1490,9 @@ class HubSpotClient:
                 (:attr:`contact_properties`); ``None`` uses the bound map.
 
         Returns:
-            The returned contacts and every requested id's read status.
+            The returned contacts, every requested id's read status and, in
+            ``interrupted_by``, the first ``TransientError`` a call still raised after its
+            retries, if any.
 
         Raises:
             ValueError: When ``ids`` is one string or holds a blank id; before any call.
@@ -1466,7 +1503,7 @@ class HubSpotClient:
         """
         props = self._contact_properties_for(props)
         requested = _normalise_ids(ids, "ids")
-        records = await self._read_by_id(
+        records, interrupted = await self._read_by_id(
             _CONTACTS,
             requested,
             props.request_properties(),
@@ -1475,7 +1512,9 @@ class HubSpotClient:
         read_status: dict[str, ContactReadStatus] = {
             hs_id: "ok" if hs_id in records else "error" for hs_id in requested
         }
-        return ContactBatch(records=MappingProxyType(records), read_status=read_status)
+        return ContactBatch(
+            records=MappingProxyType(records), read_status=read_status, interrupted_by=interrupted
+        )
 
     # ------------------------------------------------------------------
     # Target reads (objects_batch_read; AAP 0.3.3 "Target reads")
@@ -1492,7 +1531,8 @@ class HubSpotClient:
             ids: The meeting ids an association read returned.
 
         Returns:
-            The meetings read, the ids not read and the read status.
+            The meetings read, the ids not read, the read status and the first
+            ``TransientError`` a call still raised after its retries, if any.
 
         Raises:
             ValueError: When ``ids`` is one string or holds a blank id.
@@ -1500,8 +1540,10 @@ class HubSpotClient:
             QueryDefect: When a request or a response breaks the contract.
         """
         requested = _normalise_ids(ids, "ids")
-        records = await self._read_by_id("meetings", requested, MEETING_PROPERTIES, parse_meeting)
-        return _target_read(requested, records)
+        records, interrupted = await self._read_by_id(
+            "meetings", requested, MEETING_PROPERTIES, parse_meeting
+        )
+        return _target_read(requested, records, interrupted)
 
     async def deals(self, ids: Iterable[str]) -> TargetRead[DealRow]:
         """Read associated deals by id, at most 100 per batch read.
@@ -1513,7 +1555,8 @@ class HubSpotClient:
             ids: The deal ids an association read returned.
 
         Returns:
-            The deals read, the ids not read and the read status.
+            The deals read, the ids not read, the read status and the first
+            ``TransientError`` a call still raised after its retries, if any.
 
         Raises:
             ValueError: When ``ids`` is one string or holds a blank id.
@@ -1521,8 +1564,10 @@ class HubSpotClient:
             QueryDefect: When a request or a response breaks the contract.
         """
         requested = _normalise_ids(ids, "ids")
-        records = await self._read_by_id("deals", requested, DEAL_PROPERTIES, parse_deal)
-        return _target_read(requested, records)
+        records, interrupted = await self._read_by_id(
+            "deals", requested, DEAL_PROPERTIES, parse_deal
+        )
+        return _target_read(requested, records, interrupted)
 
     async def _read_by_id[RowT: _Identified](
         self,
@@ -1530,17 +1575,23 @@ class HubSpotClient:
         ids: Sequence[str],
         properties: Sequence[str],
         parse: Callable[[HubSpotRecord], RowT],
-    ) -> dict[str, RowT]:
-        """Batch-read records by id and return the requested ones that came back.
+    ) -> tuple[dict[str, RowT], TransientError | None]:
+        """Batch-read records by id; return the requested ones that came back.
 
         A call that fails after its retries, or whose batch status is not ``COMPLETE``,
         reads none of its ids; ids HubSpot omits or lists in ``errors[]`` are not read.
         Records HubSpot returns under an id that was not requested (a merged contact's new
         id) are ignored, so the caller sees the requested id as not read.
+
+        Returns:
+            The records read, keyed by id, and the first ``TransientError`` a call still
+            raised after its retries (``None`` when every call was answered; a batch status
+            other than ``COMPLETE`` is not one).
         """
         path = _objects_batch_read(object_type)
         endpoint = f"{_SURFACE_OBJECTS} {object_type}"
         records: dict[str, RowT] = {}
+        interrupted: TransientError | None = None
         calls = failed_calls = 0
         for chunk in _chunks(ids, MAX_BATCH_READ_INPUTS):
             body: dict[str, object] = {
@@ -1554,6 +1605,8 @@ class HubSpotClient:
                 )
             except TransientError as error:
                 failed_calls += 1
+                if interrupted is None:
+                    interrupted = error
                 self._log.warning(
                     "hubspot.batch_read.call_failed",
                     object_type=object_type,
@@ -1582,7 +1635,7 @@ class HubSpotClient:
             read=len(records),
             missing=missing,
         )
-        return records
+        return records, interrupted
 
     # ------------------------------------------------------------------
     # Associations (associations_batch_read; AAP 0.2.4 exact contract)
@@ -1633,8 +1686,10 @@ class HubSpotClient:
         other than ``COMPLETE``, a per-input ``errors[]`` entry other than
         ``NO_ASSOCIATIONS_FOUND``, an input missing from the response and a repeated cursor
         are recorded per input (``error`` or ``partial``) rather than raised, so the caller
-        keeps what was read. ``AccessDenied`` and ``QueryDefect`` propagate unchanged for
-        ``ads_engine.sync.mode`` to decide.
+        keeps what was read; the first such ``TransientError`` is also returned as
+        ``interrupted_by`` for the caller to hand to ``ads_engine.sync.mode``.
+        ``AccessDenied`` and ``QueryDefect`` propagate unchanged for ``ads_engine.sync.mode``
+        to decide.
 
         Args:
             from_type: The input records' object type, for example ``contacts``.
@@ -1648,7 +1703,8 @@ class HubSpotClient:
                 ``capture-fixtures`` sends ``0``.
 
         Returns:
-            Every requested input's targets and status, in request order.
+            Every requested input's targets and status, in request order, and the first
+            ``TransientError`` a call still raised after its retries, if any.
 
         Raises:
             ValueError: When an object type is not a path segment, ``ids`` is one string or
@@ -1669,12 +1725,15 @@ class HubSpotClient:
         states = {input_id: _InputState() for input_id in requested}
         calls = 0
         rounds = 0
+        interrupted: TransientError | None = None
 
         for chunk in _chunks(requested, MAX_ASSOCIATION_INPUTS):
             calls += 1
-            batch, failure = await self._association_call(
+            batch, failure, error = await self._association_call(
                 path, endpoint, [{"id": input_id} for input_id in chunk]
             )
+            if interrupted is None:
+                interrupted = error
             for input_id in chunk:
                 if batch is None:
                     states[input_id].fail(failure)
@@ -1696,9 +1755,11 @@ class HubSpotClient:
             rounds += 1
             for page in _chunks(cursors, MAX_ASSOCIATION_INPUTS):
                 calls += 1
-                batch, failure = await self._association_call(
+                batch, failure, error = await self._association_call(
                     path, endpoint, [{"id": input_id, "after": after} for input_id, after in page]
                 )
+                if interrupted is None:
+                    interrupted = error
                 for input_id, _after in page:
                     state = states[input_id]
                     state.after = None
@@ -1713,6 +1774,7 @@ class HubSpotClient:
             per_input=MappingProxyType(
                 {input_id: state.outcome() for input_id, state in states.items()}
             ),
+            interrupted_by=interrupted,
         )
         counts = fetch.status_counts()
         unknown = counts.get("partial", 0) + counts.get("error", 0)
@@ -1732,11 +1794,13 @@ class HubSpotClient:
 
     async def _association_call(
         self, path: str, endpoint: str, inputs: list[dict[str, str]]
-    ) -> tuple[AssociationBatch | None, str]:
+    ) -> tuple[AssociationBatch | None, str, TransientError | None]:
         """Send one associations batch read; a failed call returns ``None`` and its reason.
 
-        A call fails when it still raises ``TransientError`` after its retries or its batch
-        status is not ``COMPLETE``. ``AccessDenied`` and ``QueryDefect`` propagate.
+        A call fails when it still raises ``TransientError`` after its retries, which is
+        returned as the third element, or when its batch status is not ``COMPLETE`` (a
+        per-input outcome, no error returned). ``AccessDenied`` and ``QueryDefect``
+        propagate.
         """
         try:
             response = await self._send(
@@ -1750,11 +1814,11 @@ class HubSpotClient:
             self._log.warning(
                 "hubspot.associations.call_failed", inputs=len(inputs), **error.log_fields
             )
-            return None, error.reason
+            return None, error.reason, error
         batch = parse_association_batch(response.body)
         if not batch.is_complete:
-            return None, f"{endpoint}: batch status {batch.status}"
-        return batch, ""
+            return None, f"{endpoint}: batch status {batch.status}", None
+        return batch, "", None
 
     # ------------------------------------------------------------------
     # CRM Search (crm_search)
@@ -1817,7 +1881,8 @@ class HubSpotClient:
             time_range: ``(start, end)``, timezone-aware, start inclusive, end exclusive.
 
         Returns:
-            The de-duplicated records with their completeness.
+            The de-duplicated records with their completeness, and in ``interrupted_by`` the
+            ``TransientError`` that stopped the search after its retries, if one did.
 
         Raises:
             ValueError: On an invalid object type or range, before any call.

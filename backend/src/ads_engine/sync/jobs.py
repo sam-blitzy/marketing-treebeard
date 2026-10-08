@@ -53,12 +53,57 @@ and a stand-alone matching pass that attempted rows queues one after it; a build
 queues nothing, its activation does.
 
 Interruptions. Connectors return what they read when a ``TransientError`` survives their
-retries. A Google call-budget deferral is recorded as an ``incomplete`` success whose reason
-starts with :data:`~ads_engine.sync.freshness.REASON_DEFERRED`, so the next run widens its
-range and finishes the deferred pages (AAP 0.3.3 "Budget"). Any other interruption of a dated
-dataset is recorded as a failed attempt, so the dataset keeps its last good data and turns
-stale (AAP 0.3.3 transient row). An interrupted full-state entity read is ``incomplete`` with
-its reason: no removal or disappearance is inferred from it (AAP 0.3.3 "Safe absence").
+retries, with the error in the result's ``interrupted_by``. A Google call-budget deferral is
+recorded as an ``incomplete`` success whose reason starts with
+:data:`~ads_engine.sync.freshness.REASON_DEFERRED`, and the unread work is kept as the
+freshness row's checkpoint in the same transaction, so the dataset's next run reads those
+scopes first and the dataset stays ``incomplete`` until they finish (AAP 0.3.3 "Budget");
+calls beyond the cap therefore move to a later 24 h window instead of re-reading the same
+prefix. Any other interruption of a dated dataset or of a CRM dataset (search, contact
+refresh, associations, target reads) is recorded as a failed attempt, so the dataset keeps
+its last good data and turns stale (AAP 0.3.3 transient row); what was read is still
+written, with its per-object unknown state, and a Google dataset's unread scopes are kept
+the same way. An interrupted matching pass is handed over with no dataset, its rows already
+retried ``error``, also when a later batch of the pass raises (before the raised error,
+whose consequence stands). An interrupted full-state entity read is ``incomplete`` with its
+reason: no removal or disappearance is inferred from it (AAP 0.3.3 "Safe absence"), and
+the next entity sync reads only what is still outstanding.
+
+Google checkpoints (``dataset_freshness.checkpoint``, version 1; scopes are
+:func:`~ads_engine.connectors.google_n8n.partition.scope_to_json` objects)::
+
+    google.metrics_daily, google.search_terms:
+        {"version": 1,
+         "pending": {"Q-G5": [{"scope": {"start": "2026-09-01", "end": "2026-09-14"},
+                               "deferred_at": "2026-09-14T06:00:00+00:00"},
+                              {"scope": {"start": "2026-09-15", "end": "2026-09-15",
+                                         "ad_group_id": 123, "last_id": 9999},
+                               "deferred_at": "2026-09-15T00:00:00+00:00"}]},
+         "covered_from": "2026-09-01", "reasons": []}
+    google.entities:
+        {"version": 1, "started_at": "2026-10-01T06:00:00+00:00",
+         "pending": {"Q-G8": [{}]},
+         "enumerations": {
+             "Q-G2": {"query_id": "Q-G2", "pending": [{"ids": [1001, 1002]}],
+                      "absent": [7, 1001, 1002], "rereading": true,
+                      "reread_rows": [{"campaign": {"id": "7", "status": "REMOVED", ...}}]},
+             "Q-G4": {"query_id": "Q-G4", "pending": [{"last_id": 9999}],
+                      "absent": [12], "rereading": false, "reread_rows": []}},
+         "reasons": []}
+
+``pending`` holds unread scopes per query in reading order. A metrics entry pairs its scope
+with ``deferred_at``, the ``now`` of the run that first deferred that work; a partition later
+deferred out of a stored scope keeps the stored scope's instant, and so does a scope merged in
+from a concurrent run. The next metrics run reads every stored scope of both datasets as
+stored, oldest deferral first, before any own range. ``covered_from`` is the first native
+date the interrupted metrics cycle vouches for, ``started_at`` when the entity cycle began,
+``enumerations`` each unfinished safe-absence enumeration
+(:class:`~ads_engine.connectors.google_n8n.partition.EnumerationProgress`; an interrupted
+Q-G2b re-read keeps its unread chunks, the raw rows of the chunks already re-read and every
+candidate, so the next sync reads only those chunks), and ``reasons``
+the permanent shortfalls (result limits) met so far, which a drained checkpoint still
+reports. A checkpoint that cannot be read is logged and ignored: the job then falls back to
+a full read (metrics widen to the recorded range when it needs repair).
 
 Entry points: :func:`run_source_jobs` (the scheduler's due jobs and ``sync_request`` rows, and
 ``ads-engine sync``), :func:`backfill_dataset` (the build in ``sync/mode.py``) and
@@ -74,10 +119,11 @@ tools can run one job directly on injected clients through :meth:`JobContext.for
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -117,6 +163,7 @@ from ads_engine.connectors.google_n8n.parser import (
     AdGroupRow,
     CampaignRow,
     ConversionActionRow,
+    GoogleAdsRow,
     KeywordRow,
     parse_ad_group,
     parse_campaign,
@@ -128,10 +175,14 @@ from ads_engine.connectors.google_n8n.parser import (
     parse_search_term,
 )
 from ads_engine.connectors.google_n8n.partition import (
+    EnumerationProgress,
     FetchOutcome,
     PartitionedFetcher,
     enumerate_campaigns,
     enumerate_entities,
+    interruption_reason,
+    scope_from_json,
+    scope_to_json,
 )
 from ads_engine.connectors.hubspot.client import (
     AssociationFetch,
@@ -219,6 +270,7 @@ from ads_engine.sync.mode import (
 from ads_engine.sync.snapshots import EnumerationResult, SnapshotRow
 
 __all__ = [
+    "CANCEL_CLOSE_TIMEOUT",
     "INCREMENTAL_DAYS",
     "JOB_CRM",
     "JOB_CRM_COMPANION",
@@ -330,6 +382,17 @@ LEAD_OVERLAP: Final = timedelta(hours=1)
 
 SEGMENT_RETRY_AFTER: Final = timedelta(minutes=30)
 """A failed segment fetch is not due again until this long after its attempt."""
+
+CANCEL_CLOSE_TIMEOUT: Final = timedelta(seconds=2)
+"""The most time a cancelled job spends recording its own ``sync_run`` rows as failed.
+
+Kept short so a job cancelled by a lost scheduler lock ends within the time the scheduler
+waits for its cancelled work, ``LOCK_LOST_STOP_TIMEOUT``, before it aborts the process.
+``sync.scheduler`` checks at import that this bound is shorter than that timeout, and that
+its lock check interval, check timeout and that timeout together end inside the next holder's
+``LOCK_TAKEOVER_GRACE``. Bookkeeping that does not finish in time is abandoned and its rows
+stay ``running``.
+"""
 
 # Google partition scope keys, as connectors/google_n8n/queries.py names them ("start", "end"
 # of a dated template). queries.py is not imported here; the values are the wire contract of
@@ -663,8 +726,9 @@ def _success(
     """Build a success outcome: complete without reasons, else incomplete with them joined.
 
     ``repairable`` is set exactly when the joined reason starts with a repairable prefix
-    (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` or ``REASON_INTERRUPTED``), so the
-    next run widens its range (:func:`~ads_engine.sync.freshness.needs_repair`).
+    (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` or ``REASON_INTERRUPTED``): the
+    shortfall is unread work a later run can still read (a Google checkpoint's scopes, or the
+    recorded range :func:`~ads_engine.sync.freshness.needs_repair` re-reads otherwise).
     """
     reason = _join_reasons(reasons)
     covered_from, covered_through = covered if covered is not None else (None, None)
@@ -915,21 +979,34 @@ class _JobBase(ABC):
         """Run the job once and return what it did.
 
         Every run logs one ``sync.job.start`` and exactly one ``sync.job.finish``, whether it
-        returns, raises or is cancelled (:meth:`_result`).
+        returns, raises or is cancelled (:meth:`_result`). Every interruption noted while the
+        job ran is handed to ``on_error`` on every exit but a cancellation: after a normal
+        finish, before a raised connector error, on a retired dataset, and on a best-effort
+        basis before a non-connector error propagates.
 
         Returns:
             The result. A ``ConnectorError`` the connectors raise is handed to ``on_error``
-            and returned as a failed result with its disposition; a dataset retired while
-            the job ran ends it as failed with that reason.
+            after the interruptions noted before it, and returned as a failed result with its
+            disposition; a dataset retired while the job ran ends it as failed with that
+            reason, its noted interruptions handed over first (the disposition is the last
+            hand-over's).
 
         Raises:
             Exception: Any non-connector error (a database error, a bug), unchanged, after
-                the job's still-open ``sync_run`` rows were closed as failed (best effort)
-                and ``sync.job.finish`` was logged ``failed`` with the error's class name;
-                the scheduler logs its traceback and the next slot retries.
-            asyncio.CancelledError: When the run is cancelled (the worker's graceful
-                shutdown), after the still-open rows were closed as failed, ``job
-                cancelled`` (best effort), and ``sync.job.finish`` was logged ``cancelled``.
+                the noted interruptions were handed to ``on_error`` (best effort: a database
+                error doing so is logged, never raised in its place), the job's still-open
+                ``sync_run`` rows were closed as failed (best effort) and ``sync.job.finish``
+                was logged ``failed`` with the error's class name; the scheduler logs its
+                traceback and the next slot retries.
+            asyncio.CancelledError: Unchanged, when the task running the job is cancelled (a
+                lost scheduler lock, the worker's graceful shutdown), wherever the job then
+                was (:meth:`_close_cancelled`). It is logged as ``sync.job.cancelled``, and
+                within :data:`CANCEL_CLOSE_TIMEOUT` the job's still-open ``sync_run`` rows,
+                including rows whose close the cancellation rolled back, are closed as failed
+                with ``job cancelled``; nothing else is written. Bookkeeping that times out or
+                fails is logged as ``sync.job.close_failed`` and abandoned, and a further
+                cancellation while it runs propagates at once. ``sync.job.finish`` is then
+                logged ``cancelled``.
         """
         ctx = self.ctx
         started = time.perf_counter()
@@ -947,17 +1024,58 @@ class _JobBase(ABC):
         )
         try:
             await self._attempt()
-        except (Exception, asyncio.CancelledError) as exc:
-            reason = (
-                _REASON_CANCELLED if isinstance(exc, asyncio.CancelledError) else _REASON_UNEXPECTED
-            )
+        except asyncio.CancelledError as exc:
+            # Also a cancellation that lands in a handler of :meth:`_attempt`.
             try:
-                await self._close_remaining(reason, quiet=True)
+                await self._close_cancelled(started)
+            finally:
+                # Logged even when the cleanup is itself cancelled.
+                self._result(started, raised=exc)
+            raise
+        except Exception as exc:
+            try:
+                await self._close_remaining(_REASON_UNEXPECTED, quiet=True)
             finally:
                 # Logged even when the cleanup is itself cancelled or fails.
                 self._result(started, raised=exc)
             raise
         return self._result(started)
+
+    async def _close_cancelled(self, started: float) -> None:
+        """Log ``sync.job.cancelled`` and close the still-open rows ``job cancelled``, bounded.
+
+        The scheduler cancels and awaits its lane tasks when its lock is lost and must stop
+        them inside its own bound, so this bookkeeping is abandoned after
+        :data:`CANCEL_CLOSE_TIMEOUT`, or at once when it fails, and logged as
+        ``sync.job.close_failed``; a further cancellation propagates at once. A row whose
+        close the cancellation rolled back is still open (a dataset counts as closed only
+        once its transaction commits), so it is closed here too. Nothing else is written.
+
+        Args:
+            started: ``time.perf_counter()`` when the run started.
+        """
+        ctx = self.ctx
+        _log.warning(
+            "sync.job.cancelled",
+            source=ctx.source,
+            job=self.job,
+            dataset_id=ctx.dataset_id,
+            rows=self._total_rows,
+            calls=self._calls,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        try:
+            async with asyncio.timeout(CANCEL_CLOSE_TIMEOUT.total_seconds()):
+                await self._close_remaining(_REASON_CANCELLED, quiet=True)
+        except (TimeoutError, SQLAlchemyError) as exc:
+            # Best effort: the cancellation must end the job within its bound.
+            _log.warning(
+                "sync.job.close_failed",
+                source=ctx.source,
+                job=self.job,
+                dataset_id=ctx.dataset_id,
+                error=type(exc).__name__,
+            )
 
     async def _attempt(self) -> None:
         """Open the ``sync_run`` rows, execute, and settle what the run may return (:meth:`run`).
@@ -973,6 +1091,10 @@ class _JobBase(ABC):
             pending = tuple(
                 name for name in self.freshness_datasets() if name not in self._freshness
             )
+            # Interruptions noted before the raise failed their own datasets (which is why
+            # those are not pending); hand them over first, so their failed attempts are
+            # recorded and the raised error's consequence is the one that stands.
+            await self._report_interruptions()
             self._disposition = await self._hand_over(exc, pending)
             text = _failure_text(exc)
             self._error = text
@@ -992,7 +1114,15 @@ class _JobBase(ABC):
             # Retired (or discarded) while the job ran: its rows are read-only history now.
             self._error = str(exc)
             _log.info("sync.job.not_writable", source=ctx.source, job=self.job, reason=self._error)
+            # The interruptions noted before still happened: ``on_error`` records the
+            # connection's health and skips the read-only dataset's freshness rows.
+            await self._report_interruptions()
             await self._close_remaining(self._error)
+        except Exception:
+            # Best effort; the original error then propagates to :meth:`run`, which closes
+            # the still-open rows as failed and logs the one ``sync.job.finish``.
+            await self._report_interruptions(quiet=True)
+            raise
         else:
             await self._report_interruptions()
             await self._close_remaining(None)
@@ -1058,7 +1188,9 @@ class _JobBase(ABC):
         if dataset is not None:
             self._rows[dataset] = self._rows.get(dataset, 0) + rows
 
-    def _interrupted(self, error: TransientError, *, dataset: str | None) -> None:
+    def _interrupted(
+        self, error: TransientError, *, dataset: str | None, datasets: Sequence[str] = ()
+    ) -> None:
         """Note a transient interruption a connector returned instead of raising.
 
         Args:
@@ -1066,14 +1198,17 @@ class _JobBase(ABC):
             dataset: The freshness dataset whose refresh it failed, so ``on_error`` records
                 the failure and the dataset keeps its last good data and turns stale; or
                 ``None`` when the shortfall is recorded as an ``incomplete`` success (a
-                call-budget deferral, an incomplete full-state read) and only the
-                connection's health is reported.
+                call-budget deferral, an incomplete full-state read) or lives outside
+                ``dataset_freshness`` (lead matching's retried ``lead_match`` rows), and only
+                the connection's health is reported.
+            datasets: Further freshness datasets the same interruption failed; all of them
+                are handed to ``on_error`` together, in one call.
         """
-        names = (dataset,) if dataset is not None else ()
+        names = tuple(dict.fromkeys(name for name in (dataset, *datasets) if name is not None))
         self._interruptions.append(_Interruption(error, names))
-        if dataset is not None:
-            self._failed[dataset] = error.reason
-            self._freshness[dataset] = FreshnessOutcome.failure(self.ctx.now, reason=error.reason)
+        for name in names:
+            self._failed[name] = error.reason
+            self._freshness[name] = FreshnessOutcome.failure(self.ctx.now, reason=error.reason)
 
     async def _complete(
         self, session: AsyncSession, outcomes: Mapping[str, FreshnessOutcome]
@@ -1213,10 +1348,27 @@ class _JobBase(ABC):
                 reason="dataset no longer writable; failure not recorded",
             )
 
-    async def _report_interruptions(self) -> None:
-        """Hand every noted interruption to ``on_error``, outside any transaction."""
-        for interruption in self._interruptions:
-            self._disposition = await self._hand_over(interruption.error, interruption.datasets)
+    async def _report_interruptions(self, *, quiet: bool = False) -> None:
+        """Hand every noted interruption to ``on_error``, outside any transaction.
+
+        Args:
+            quiet: Swallow a database error while handing over (the job is already raising
+                its own error, which must propagate unchanged).
+        """
+
+        async def hand_over_all() -> None:
+            for interruption in self._interruptions:
+                self._disposition = await self._hand_over(interruption.error, interruption.datasets)
+
+        if not quiet:
+            await hand_over_all()
+            return
+        try:
+            await hand_over_all()
+        except SQLAlchemyError as exc:
+            # Best effort: an interruption not handed over leaves the connection's health
+            # as it was, and the next run meets the platform again.
+            _log.warning("sync.job.report_failed", job=self.job, error=type(exc).__name__)
 
     # -- sync_run rows -----------------------------------------------------------------
 
@@ -1412,13 +1564,20 @@ async def _lock_subjects(session: AsyncSession, dataset_id: int) -> SourceDatase
     return dataset
 
 
-async def _snapshotted_ids(session: AsyncSession, dataset_id: int, entity_type: str) -> set[int]:
-    """Ids of a dataset's entities of one type that have at least one snapshot (tracked)."""
-    result = await session.scalars(
-        select(EntitySnapshot.entity_id)
-        .where(EntitySnapshot.dataset_id == dataset_id, EntitySnapshot.entity_type == entity_type)
-        .distinct()
+async def _snapshotted_ids(
+    session: AsyncSession, dataset_id: int, entity_type: str, *, since: datetime | None = None
+) -> set[int]:
+    """Ids of a dataset's entities of one type that have at least one snapshot (tracked).
+
+    With ``since``, only snapshots captured at or after that instant count: the entities an
+    entity cycle that began then has already returned.
+    """
+    statement = select(EntitySnapshot.entity_id).where(
+        EntitySnapshot.dataset_id == dataset_id, EntitySnapshot.entity_type == entity_type
     )
+    if since is not None:
+        statement = statement.where(EntitySnapshot.captured_at >= since)
+    result = await session.scalars(statement.distinct())
     return set(result)
 
 
@@ -1615,6 +1774,315 @@ async def _store_form_versions(
 
 
 # ---------------------------------------------------------------------------------------------
+# Google deferred work: checkpoints (AAP 0.3.3 "Budget"; module docstring)
+# ---------------------------------------------------------------------------------------------
+
+_CHECKPOINT_VERSION: Final = 1
+
+# The one scope of a ``single`` query (Q-G1, Q-G8), which has nothing to narrow.
+_SINGLE_SCOPE: Final[tuple[Mapping[str, object], ...]] = (MappingProxyType({}),)
+
+# The Google metrics datasets and the dated queries each reads, in reading order.
+_GOOGLE_METRICS_QUERIES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {"google.metrics_daily": ("Q-G3", "Q-G5"), "google.search_terms": ("Q-G6",)}
+)
+_METRICS_CHECKPOINT_KEYS: Final = frozenset({"version", "pending", "covered_from", "reasons"})
+# One unread metrics scope: the scope and when its work was first deferred.
+_METRICS_ENTRY_KEYS: Final = frozenset({"scope", "deferred_at"})
+
+# The entity cycle's single queries and safe-absence enumerations, in reading order.
+_ENTITY_SINGLE_QUERIES: Final = ("Q-G1", "Q-G8")
+_ENTITY_ENUMERATIONS: Final = ("Q-G2", "Q-G4", "Q-G7")
+_ENTITY_CHECKPOINT_KEYS: Final = frozenset(
+    {"version", "started_at", "pending", "enumerations", "reasons"}
+)
+# The safe-absence verdict of a resumed entity sync that did not read campaigns: no absence
+# is inferred and nothing is present.
+_CAMPAIGNS_READ_EARLIER: Final = "campaign enumeration finished earlier in this entity cycle"
+
+_CHECKPOINT_DATE_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _checkpoint_object(data: object, keys: frozenset[str]) -> Mapping[str, object]:
+    """Return a stored checkpoint object holding exactly ``keys`` at the current version.
+
+    Raises:
+        ValueError: When it is not such an object.
+    """
+    if not isinstance(data, Mapping) or set(data) != keys:
+        raise ValueError(f"a checkpoint must hold exactly {sorted(keys)}")
+    version = data["version"]
+    if isinstance(version, bool) or version != _CHECKPOINT_VERSION:
+        raise ValueError("unsupported checkpoint version")
+    return data
+
+
+def _checkpoint_pending(
+    value: object, queries: Sequence[str]
+) -> dict[str, tuple[Mapping[str, object], ...]]:
+    """Rebuild the stored unread scopes per query id, each validated for its template.
+
+    Raises:
+        ValueError: When ``value`` is not an object of non-empty scope lists keyed by the
+            given query ids, or a scope is invalid for its template.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("checkpoint pending must be an object keyed by query id")
+    pending: dict[str, tuple[Mapping[str, object], ...]] = {}
+    for query_id in queries:
+        scopes = value.get(query_id)
+        if scopes is None:
+            continue
+        if not isinstance(scopes, list) or not scopes:
+            raise ValueError(f"{query_id}: checkpoint pending scopes must be a non-empty list")
+        pending[query_id] = tuple(scope_from_json(query_id, scope) for scope in scopes)
+    if set(value) - set(pending):
+        raise ValueError("checkpoint pending names a query this dataset does not read")
+    return pending
+
+
+def _checkpoint_reasons(value: object) -> tuple[str, ...]:
+    """Rebuild the stored permanent reasons, without repeats.
+
+    Raises:
+        ValueError: When ``value`` is not a list of non-blank strings.
+    """
+    if not isinstance(value, list) or not all(
+        isinstance(reason, str) and reason.strip() for reason in value
+    ):
+        raise ValueError("checkpoint reasons must be a list of non-blank strings")
+    return tuple(dict.fromkeys(value))
+
+
+def _checkpoint_date(value: object) -> date:
+    """Read a stored ``YYYY-MM-DD`` native date.
+
+    Raises:
+        ValueError: When it is not text of that exact form or not a valid date.
+    """
+    if not isinstance(value, str) or _CHECKPOINT_DATE_RE.fullmatch(value) is None:
+        raise ValueError("a checkpoint date must be YYYY-MM-DD text")
+    return date.fromisoformat(value)
+
+
+def _checkpoint_instant(value: object) -> datetime:
+    """Read a stored timezone-aware ISO instant.
+
+    Raises:
+        ValueError: When it is not ISO text or carries no UTC offset.
+    """
+    if not isinstance(value, str):
+        raise ValueError("a checkpoint instant must be ISO text")
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("a checkpoint instant must carry its UTC offset")
+    return instant
+
+
+def _pending_json(
+    pending: Mapping[str, Sequence[Mapping[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    """Return unread scopes per query id as JSON, leaving out queries with none."""
+    return {
+        query_id: [scope_to_json(scope) for scope in scopes]
+        for query_id, scopes in pending.items()
+        if scopes
+    }
+
+
+def _scope_key(query_id: str, scope: Mapping[str, object]) -> str:
+    """Return one partition's identity: its query id and its canonical JSON scope."""
+    return json.dumps([query_id, scope_to_json(scope)], sort_keys=True)
+
+
+def _usable_checkpoint[T](
+    parse: Callable[[object], T],
+    stored: object | None,
+    *,
+    job: str,
+    dataset_id: int,
+    dataset: str,
+) -> T | None:
+    """Parse a stored checkpoint, or return ``None`` (logged) when it cannot be used.
+
+    An unreadable checkpoint (written by another version, or edited by hand) must neither
+    fail the job nor be trusted: the job runs as if none were stored, so it reads its full
+    scope (a metrics dataset that needs repair widens to its recorded range). The warning
+    carries the error's type only, never scope values.
+    """
+    if stored is None:
+        return None
+    try:
+        return parse(stored)
+    except ValueError as exc:
+        _log.warning(
+            "sync.google.checkpoint_unusable",
+            source="google",
+            job=job,
+            dataset_id=dataset_id,
+            dataset=dataset,
+            error=type(exc).__name__,
+        )
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _GoogleRead:
+    """What one query's scopes, read in order, established (:func:`_read_google_scopes`).
+
+    Attributes:
+        rows: The rows read.
+        pending: The scopes still unread: the interrupted fetch's deferred partitions, then
+            every scope not started; empty when every scope was read.
+        interrupted_by: The transient error that stopped the reads, or ``None``.
+        shortfalls: Permanent shortfalls (result limits) of the fetches read.
+        calls: POST attempts the fetches made, retries and next pages included.
+    """
+
+    rows: tuple[GoogleAdsRow, ...]
+    pending: tuple[Mapping[str, object], ...]
+    interrupted_by: TransientError | None
+    shortfalls: tuple[str, ...]
+    calls: int
+
+
+async def _read_google_scopes(
+    fetcher: PartitionedFetcher,
+    query_id: str,
+    scopes: Sequence[Mapping[str, object]],
+) -> _GoogleRead:
+    """Read ``scopes`` of one query in order, keeping their rows, until the first interruption.
+
+    The entity cycle reads its single queries (Q-G1, Q-G8) this way.
+    """
+    rows: list[GoogleAdsRow] = []
+    shortfalls: list[str] = []
+    calls = 0
+    for index, scope in enumerate(scopes):
+        outcome = await fetcher.partitioned_fetch(query_id, scope)
+        calls += outcome.calls
+        rows.extend(outcome.rows)
+        shortfalls.extend(_shortfall_reasons(outcome))
+        if outcome.interrupted_by is not None:
+            return _GoogleRead(
+                rows=tuple(rows),
+                pending=(*outcome.deferred, *scopes[index + 1 :]),
+                interrupted_by=outcome.interrupted_by,
+                shortfalls=tuple(shortfalls),
+                calls=calls,
+            )
+    return _GoogleRead(
+        rows=tuple(rows),
+        pending=(),
+        interrupted_by=None,
+        shortfalls=tuple(shortfalls),
+        calls=calls,
+    )
+
+
+def _shortfall_reasons(outcome: FetchOutcome) -> tuple[str, ...]:
+    """Return the permanent shortfall of one fetch (a result limit), without its interruption.
+
+    ``partition.py`` puts the interruption's reason first; what follows it is a result limit
+    that re-reading cannot remove, so it outlives the deferral.
+    """
+    reason = outcome.reason
+    if reason is None:
+        return ()
+    if outcome.interrupted_by is None:
+        return (reason,)
+    head = interruption_reason(outcome.interrupted_by, len(outcome.deferred))
+    rest = reason.removeprefix(head).removeprefix(_REASON_SEPARATOR)
+    return (rest,) if rest else ()
+
+
+def _deferred_reason(error: TransientError | None, total: int) -> str:
+    """Return the repairable reason of a dataset with ``total`` scopes still unread.
+
+    ``error`` is this run's first interruption. Without one, the unread work was deferred by
+    another run that stored it meanwhile; it is stated as a call-budget deferral, the
+    shortfall an incomplete success records.
+    """
+    return interruption_reason(error if error is not None else CallBudgetExhausted(), total)
+
+
+@dataclass(frozen=True, slots=True)
+class _EntityCheckpoint:
+    """The outstanding work of one ``google.entities`` cycle (module docstring).
+
+    A cycle is the set of reads one uninterrupted entity sync makes: Q-G1, the Q-G2 scan
+    with its Q-G2b re-read, Q-G4, Q-G7 and Q-G8. After an interruption, the following syncs
+    read only what is still outstanding until the cycle drains.
+
+    Attributes:
+        started_at: When the cycle's first sync started.
+        pending: The unread scope of each single query (Q-G1, Q-G8) still outstanding.
+        enumerations: Each unfinished safe-absence enumeration's progress; an enumeration
+            missing here finished earlier in the cycle.
+        reasons: Permanent shortfalls (a Q-G1 or Q-G8 response at the result limit) met so
+            far in the cycle.
+    """
+
+    started_at: datetime
+    pending: Mapping[str, tuple[Mapping[str, object], ...]]
+    enumerations: Mapping[str, EnumerationProgress]
+    reasons: tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        """The number of scopes (Q-G2b re-read chunks included) still outstanding."""
+        return sum(len(scopes) for scopes in self.pending.values()) + sum(
+            progress.outstanding for progress in self.enumerations.values()
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the stored JSON object."""
+        return {
+            "version": _CHECKPOINT_VERSION,
+            "started_at": self.started_at.isoformat(),
+            "pending": _pending_json(self.pending),
+            "enumerations": {
+                query_id: progress.to_json() for query_id, progress in self.enumerations.items()
+            },
+            "reasons": list(self.reasons),
+        }
+
+    @classmethod
+    def parse(cls, data: object) -> _EntityCheckpoint:
+        """Rebuild a stored entity checkpoint.
+
+        Raises:
+            ValueError: When it is not exactly the object :meth:`to_json` writes, a scope or a
+                progress fails its validation, or nothing is outstanding.
+        """
+        stored = _checkpoint_object(data, _ENTITY_CHECKPOINT_KEYS)
+        pending = _checkpoint_pending(stored["pending"], _ENTITY_SINGLE_QUERIES)
+        if any(len(scopes) != 1 for scopes in pending.values()):
+            raise ValueError("a single query has exactly one scope")
+        stored_enumerations = stored["enumerations"]
+        if not isinstance(stored_enumerations, Mapping) or set(stored_enumerations) - set(
+            _ENTITY_ENUMERATIONS
+        ):
+            raise ValueError("checkpoint enumerations must be keyed by Q-G2, Q-G4 or Q-G7")
+        enumerations: dict[str, EnumerationProgress] = {}
+        for query_id in _ENTITY_ENUMERATIONS:
+            if query_id in stored_enumerations:
+                progress = EnumerationProgress.from_json(stored_enumerations[query_id])
+                if progress.query_id != query_id:
+                    raise ValueError("a stored progress is filed under another query id")
+                enumerations[query_id] = progress
+        checkpoint = cls(
+            started_at=_checkpoint_instant(stored["started_at"]),
+            pending=pending,
+            enumerations=enumerations,
+            reasons=_checkpoint_reasons(stored["reasons"]),
+        )
+        if not checkpoint.total:
+            raise ValueError("a stored checkpoint holds unread work")
+        return checkpoint
+
+
+# ---------------------------------------------------------------------------------------------
 # Entity sync (AAP 0.3.2 "Entity sync, all sources"; AAP 0.3.3 "Safe absence")
 # ---------------------------------------------------------------------------------------------
 
@@ -1696,6 +2164,17 @@ class EntitySyncJob(_JobBase):
     (AAP 0.3.3). An incomplete one records ``incomplete`` with its reason (a call-budget
     deferral starts with :data:`~ads_engine.sync.freshness.REASON_DEFERRED`), raises no
     ``missing`` discrepancy and leaves the previous snapshots standing.
+
+    Google cycles: an interrupted sync stores its outstanding work as the
+    ``google.entities`` checkpoint (module docstring) in the entity transaction, and the
+    following syncs read only that work, in the order Q-G1, Q-G2 (with Q-G2b), Q-G4, Q-G7,
+    Q-G8, each enumeration resuming from its stored progress
+    (:class:`~ads_engine.connectors.google_n8n.partition.EnumerationProgress`). Each sync
+    snapshots what it read. A missing campaign or a removed ad group or keyword is inferred
+    in the sync in which its enumeration finishes, from the absences accumulated over the
+    cycle; a shared budget snapshotted earlier in the cycle counts as returned. The dataset
+    stays ``incomplete`` while any work is outstanding and turns ``complete`` once the cycle
+    drains without a permanent shortfall.
     """
 
     job = JOB_ENTITIES
@@ -1734,36 +2213,114 @@ class EntitySyncJob(_JobBase):
             tracked = await _google_tracked(session, ctx.dataset_id)
             stored_account = await _account_row(session, ctx.dataset_id, "google")
             stored_account_id = None if stored_account is None else stored_account.id
-        customer = await fetcher.partitioned_fetch("Q-G1")
-        campaigns = await enumerate_campaigns(client, tracked.campaigns)
-        ad_groups = await enumerate_entities(client, "Q-G4", tracked.ad_groups)
-        keywords = await enumerate_entities(client, "Q-G7", tracked.keywords)
-        actions = await fetcher.partitioned_fetch("Q-G8")
+            freshness_row = (await freshness.load_freshness(session, ctx.dataset_id)).get(name)
+        loaded = _usable_checkpoint(
+            _EntityCheckpoint.parse,
+            None if freshness_row is None else freshness_row.checkpoint,
+            job=self.job,
+            dataset_id=ctx.dataset_id,
+            dataset=name,
+        )
+        # Without a usable checkpoint a new cycle starts: every read is outstanding, and each
+        # enumeration starts from its full scope.
+        singles: Mapping[str, Sequence[Mapping[str, object]]] = (
+            dict.fromkeys(_ENTITY_SINGLE_QUERIES, _SINGLE_SCOPE)
+            if loaded is None
+            else loaded.pending
+        )
+        resumes: Mapping[str, EnumerationProgress | None] = (
+            dict.fromkeys(_ENTITY_ENUMERATIONS) if loaded is None else loaded.enumerations
+        )
+        # Q-G1 is also read while no account is stored, since campaigns attach to it.
+        customer_scopes = singles.get("Q-G1") or (
+            () if stored_account_id is not None else _SINGLE_SCOPE
+        )
+        customer = (
+            await _read_google_scopes(fetcher, "Q-G1", customer_scopes) if customer_scopes else None
+        )
+        campaigns = (
+            await enumerate_campaigns(client, tracked.campaigns, resume=resumes["Q-G2"])
+            if "Q-G2" in resumes
+            else None
+        )
+        ad_groups = (
+            await enumerate_entities(client, "Q-G4", tracked.ad_groups, resume=resumes["Q-G4"])
+            if "Q-G4" in resumes
+            else None
+        )
+        keywords = (
+            await enumerate_entities(client, "Q-G7", tracked.keywords, resume=resumes["Q-G7"])
+            if "Q-G7" in resumes
+            else None
+        )
+        action_scopes = singles.get("Q-G8", ())
+        actions = (
+            await _read_google_scopes(fetcher, "Q-G8", action_scopes) if action_scopes else None
+        )
         self._calls += client.calls_made - calls_before
 
-        customer_rows = [parse_customer(row) for row in customer.rows]
+        customer_rows = [] if customer is None else [parse_customer(row) for row in customer.rows]
         if not customer_rows and stored_account_id is None:
             # Without the customer row there is no account to attach campaigns to.
-            if customer.interrupted_by is not None:
+            if customer is not None and customer.interrupted_by is not None:
                 raise customer.interrupted_by
             raise _google_defect("Q-G1 returned no customer row")
         interruptions = [
-            outcome.interrupted_by
-            for outcome in (customer, campaigns, ad_groups, keywords, actions)
-            if outcome.interrupted_by is not None
+            error
+            for error in (
+                None if customer is None else customer.interrupted_by,
+                None if campaigns is None else campaigns.interrupted_by,
+                None if ad_groups is None else ad_groups.interrupted_by,
+                None if keywords is None else keywords.interrupted_by,
+                None if actions is None else actions.interrupted_by,
+            )
+            if error is not None
         ]
+        enumerations: dict[str, EnumerationProgress] = {}
+        if campaigns is not None and campaigns.progress is not None:
+            enumerations["Q-G2"] = campaigns.progress
+        for query_id, entities in (("Q-G4", ad_groups), ("Q-G7", keywords)):
+            if entities is not None and entities.progress is not None:
+                enumerations[query_id] = entities.progress
+        cycle = _EntityCheckpoint(
+            started_at=ctx.now if loaded is None else loaded.started_at,
+            pending={
+                query_id: read.pending
+                for query_id, read in (("Q-G1", customer), ("Q-G8", actions))
+                if read is not None and read.pending
+            },
+            enumerations=enumerations,
+            reasons=tuple(
+                dict.fromkeys(
+                    (
+                        *(() if loaded is None else loaded.reasons),
+                        *(() if customer is None else customer.shortfalls),
+                        *(() if actions is None else actions.shortfalls),
+                    )
+                )
+            ),
+        )
+        outstanding = cycle.total
         reasons = [
-            None if customer.complete else customer.reason,
-            campaigns.reason if not campaigns.complete else None,
-            ad_groups.reason if not ad_groups.complete else None,
-            keywords.reason if not keywords.complete else None,
-            None if actions.complete else actions.reason,
+            _deferred_reason(interruptions[0] if interruptions else None, outstanding)
+            if outstanding
+            else None,
+            *cycle.reasons,
         ]
-        present = [parse_campaign(row) for row in campaigns.present]
-        removed = [parse_campaign(row) for row in campaigns.removed]
-        group_rows = [parse_ad_group(row) for row in ad_groups.rows]
-        keyword_rows = [parse_keyword(row) for row in keywords.rows]
-        action_rows = [parse_conversion_action(row) for row in actions.rows]
+        present = [] if campaigns is None else [parse_campaign(row) for row in campaigns.present]
+        removed = [] if campaigns is None else [parse_campaign(row) for row in campaigns.removed]
+        group_rows = [] if ad_groups is None else [parse_ad_group(row) for row in ad_groups.rows]
+        keyword_rows = [] if keywords is None else [parse_keyword(row) for row in keywords.rows]
+        action_rows = (
+            [] if actions is None else [parse_conversion_action(row) for row in actions.rows]
+        )
+        _log.info(
+            "sync.entities.google_cycle",
+            source="google",
+            dataset_id=ctx.dataset_id,
+            resumed=loaded is not None,
+            outstanding=outstanding,
+        )
 
         async with ctx.sessionmaker() as session, session.begin():
             await _lock_subjects(session, ctx.dataset_id)
@@ -1793,16 +2350,33 @@ class EntitySyncJob(_JobBase):
                 account_id,
                 present=present,
                 removed=removed,
-                missing=campaigns.missing_ids if campaigns.complete else frozenset(),
-                complete=campaigns.complete,
-                reason=campaigns.reason,
+                missing=(
+                    campaigns.missing_ids
+                    if campaigns is not None and campaigns.complete
+                    else frozenset()
+                ),
+                complete=campaigns is not None and campaigns.complete,
+                reason=(_CAMPAIGNS_READ_EARLIER if campaigns is None else campaigns.reason),
+                cycle_started=None if loaded is None else loaded.started_at,
                 ad_groups=group_rows,
-                absent_ad_groups=ad_groups.absent_keys if ad_groups.complete else frozenset(),
+                absent_ad_groups=(
+                    ad_groups.absent_keys
+                    if ad_groups is not None and ad_groups.complete
+                    else frozenset()
+                ),
                 keywords=keyword_rows,
-                absent_keywords=keywords.absent_keys if keywords.complete else frozenset(),
+                absent_keywords=(
+                    keywords.absent_keys
+                    if keywords is not None and keywords.complete
+                    else frozenset()
+                ),
                 actions=action_rows,
             )
             await self._finish_entities(session, rows, enumeration, sealed=sealed, reasons=reasons)
+            # After the freshness write, so the row is locked in record_freshness's order.
+            await freshness.write_checkpoint(
+                session, ctx.dataset_id, name, cycle.to_json() if outstanding else None
+            )
         if interruptions:
             self._interrupted(interruptions[0], dataset=None)
 
@@ -1816,13 +2390,20 @@ class EntitySyncJob(_JobBase):
         missing: frozenset[int],
         complete: bool,
         reason: str | None,
+        cycle_started: datetime | None,
         ad_groups: Sequence[AdGroupRow],
         absent_ad_groups: frozenset[int] | frozenset[tuple[int, int]],
         keywords: Sequence[KeywordRow],
         absent_keywords: frozenset[int] | frozenset[tuple[int, int]],
         actions: Sequence[ConversionActionRow],
     ) -> tuple[list[SnapshotRow], EnumerationResult]:
-        """Upsert Google entities and build their snapshots and the safe-absence verdict."""
+        """Upsert Google entities and build their snapshots and the safe-absence verdict.
+
+        ``cycle_started`` is when the resumed entity cycle this sync continues began, or
+        ``None`` when the cycle began in this sync: a shared budget snapshotted since then was
+        returned by a campaign read earlier in the cycle, so a campaign enumeration that
+        finishes in this sync does not report it missing.
+        """
         ctx = self.ctx
         dataset_id = ctx.dataset_id
         name = "google.entities"
@@ -2008,7 +2589,14 @@ class EntitySyncJob(_JobBase):
                     Budget.dataset_id == dataset_id, Budget.explicitly_shared.is_(True)
                 )
             )
-            missing_budgets = frozenset((set(shared) & tracked_budgets) - present_budgets)
+            returned = (
+                set()
+                if cycle_started is None
+                else await _snapshotted_ids(session, dataset_id, "budget", since=cycle_started)
+            )
+            missing_budgets = frozenset(
+                (set(shared) & tracked_budgets) - present_budgets - returned
+            )
         enumeration = EnumerationResult(
             source="google",
             complete=complete,
@@ -2448,14 +3036,19 @@ def _metrics_range(
     today: date,
     settings: Settings,
     row: DatasetFreshness | None,
+    *,
+    repair: bool = True,
 ) -> tuple[date, date]:
     """Return the native ``[start, end]`` a metrics run reads for one freshness dataset.
 
     ``incremental``: the trailing :data:`INCREMENTAL_DAYS` days ending native today;
     ``restatement``: :data:`RESTATEMENT_DAYS`; ``backfill``: ``BACKFILL_DAYS`` (LinkedIn capped
-    at its 180-day daily retention). When the dataset's stored row needs repair (deferred or
-    interrupted pages), the start widens to the row's ``covered_from`` so the shortfall is
-    re-read and the row can turn complete (:func:`~ads_engine.sync.freshness.needs_repair`).
+    at its 180-day daily retention). With ``repair``, when the dataset's stored row needs
+    repair (deferred or interrupted pages), the start widens to the row's ``covered_from`` so
+    the shortfall is re-read and the row can turn complete
+    (:func:`~ads_engine.sync.freshness.needs_repair`). LinkedIn always repairs this way; a
+    Google dataset does only when its row holds no usable checkpoint, because a checkpoint's
+    unread scopes are read first instead (:class:`MetricsSyncJob`).
     """
     match kind:
         case "incremental":
@@ -2465,16 +3058,429 @@ def _metrics_range(
         case "backfill":
             days = _span_days(settings, source)
     start = today - timedelta(days=days - 1)
-    if freshness.needs_repair(row) and row is not None and row.covered_from is not None:
+    if repair and freshness.needs_repair(row) and row is not None and row.covered_from is not None:
         start = min(start, row.covered_from)
     if source == "linkedin":
         start = max(start, today - timedelta(days=LINKEDIN_RETENTION_DAYS - 1))
     return start, today
 
 
-def _fetch_reason(outcome: FetchOutcome) -> str | None:
-    """The shortfall of a Google fetch, ``None`` when it read everything."""
-    return None if outcome.complete else (outcome.reason or "result limit reached")
+def _scope_day(scope: Mapping[str, object], key: str) -> date:
+    """Return the native date of a dated scope's ``start`` or ``end``.
+
+    Raises:
+        ValueError: When the scope holds no native date there (stored scopes are validated
+            by :func:`~ads_engine.connectors.google_n8n.partition.scope_from_json`).
+    """
+    value = scope.get(key)
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise ValueError(f"a dated scope needs a native {key!r} date")
+    return value
+
+
+def _date_scope(start: date, end: date) -> Mapping[str, object]:
+    """Return the immutable dated scope ``{start, end}``."""
+    return MappingProxyType({_SCOPE_START: start, _SCOPE_END: end})
+
+
+def _touches(first: tuple[date, date], second: tuple[date, date]) -> bool:
+    """Return whether two closed date ranges overlap or are adjacent (no day between)."""
+    one_day = timedelta(days=1)
+    return first[0] <= second[1] + one_day and second[0] <= first[1] + one_day
+
+
+def _own_segments(
+    own: tuple[date, date], stored: Sequence[_Deferred]
+) -> tuple[Mapping[str, object], ...]:
+    """Return the dated scopes of ``own`` that no stored scope of the same query covers.
+
+    Stored scopes are read as stored, before any own range (:class:`MetricsSyncJob`), and
+    are never trimmed or dropped, so a stored criterion keyset or campaign range keeps its
+    narrowed progress. The own range leaves out every native day a stored scope spans: a
+    plain ``{start, end}`` scope its whole span, a narrowed one (always a single day) its
+    day; the days a narrowed scope does not reach on that day were read by the run that
+    deferred it. What remains is zero or more contiguous ``{start, end}`` segments in
+    ascending order.
+    """
+    low, high = own
+    one_day = timedelta(days=1)
+    segments: list[Mapping[str, object]] = []
+    cursor: date | None = low  # the first own day not yet accounted for
+    spans = sorted(
+        (_scope_day(entry.scope, _SCOPE_START), _scope_day(entry.scope, _SCOPE_END))
+        for entry in stored
+    )
+    for start, end in spans:
+        if cursor is None or start > high:
+            break
+        if end < cursor:
+            continue
+        if start > cursor:
+            segments.append(_date_scope(cursor, start - one_day))
+        cursor = None if end >= high else end + one_day
+    if cursor is not None:
+        segments.append(_date_scope(cursor, high))
+    return tuple(segments)
+
+
+@dataclass(frozen=True, slots=True)
+class _Deferred:
+    """One unread scope of a Google metrics dataset and when its work was first deferred.
+
+    Attributes:
+        scope: A dated scope ``partitioned_fetch`` accepts.
+        deferred_at: The ``now`` of the run that first deferred the work: the run whose own
+            range (a fresh fetch) was deferred. A partition deferred out of an interrupted
+            stored scope keeps that scope's instant, and so does a scope merged in from a
+            concurrent run, so stored work is read oldest deferral first.
+    """
+
+    scope: Mapping[str, object]
+    deferred_at: datetime
+
+
+def _normalized_pending(query_id: str, entries: Iterable[_Deferred]) -> tuple[_Deferred, ...]:
+    """Return one query's unread scopes once each, ordered by their deferral instant.
+
+    A scope held twice (the same partition deferred again, or stored by two runs) is kept
+    at its first position with the earlier of its instants, since that is when its work was
+    first deferred. The sort is stable, so scopes of one instant keep their reading order.
+    """
+    unique: dict[str, _Deferred] = {}
+    for entry in entries:
+        key = _scope_key(query_id, entry.scope)
+        held = unique.get(key)
+        if held is None:
+            unique[key] = entry
+        elif entry.deferred_at < held.deferred_at:
+            unique[key] = _Deferred(held.scope, entry.deferred_at)
+    return tuple(sorted(unique.values(), key=lambda entry: entry.deferred_at))
+
+
+def _metrics_pending(value: object, queries: Sequence[str]) -> dict[str, tuple[_Deferred, ...]]:
+    """Rebuild a metrics checkpoint's unread scopes per query id, with their deferral instants.
+
+    Raises:
+        ValueError: When ``value`` is not an object of non-empty lists keyed by the given
+            query ids, an entry is not exactly ``{"scope", "deferred_at"}``, a scope is
+            invalid for its template, ends before it starts, is narrowed (a campaign or
+            ad-group range, a criterion keyset) over more than one day, which the connector
+            never defers, or repeats a scope of its query, or an instant carries no UTC
+            offset.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("checkpoint pending must be an object keyed by query id")
+    if set(value) - set(queries):
+        raise ValueError("checkpoint pending names a query this dataset does not read")
+    pending: dict[str, tuple[_Deferred, ...]] = {}
+    for query_id in queries:
+        entries = value.get(query_id)
+        if entries is None:
+            continue
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"{query_id}: checkpoint pending scopes must be a non-empty list")
+        rebuilt: list[_Deferred] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != _METRICS_ENTRY_KEYS:
+                raise ValueError(
+                    f"{query_id}: a pending entry must hold exactly {sorted(_METRICS_ENTRY_KEYS)}"
+                )
+            scope = scope_from_json(query_id, entry["scope"])
+            start, end = _scope_day(scope, _SCOPE_START), _scope_day(scope, _SCOPE_END)
+            if start > end:
+                raise ValueError("a stored scope ends before it starts")
+            if start != end and set(scope) != {_SCOPE_START, _SCOPE_END}:
+                raise ValueError("a narrowed stored scope covers a single day")
+            key = _scope_key(query_id, scope)
+            if key in seen:
+                raise ValueError(f"{query_id}: a stored scope is pending twice")
+            seen.add(key)
+            rebuilt.append(_Deferred(scope, _checkpoint_instant(entry["deferred_at"])))
+        pending[query_id] = tuple(rebuilt)
+    return pending
+
+
+@dataclass(frozen=True, slots=True)
+class _MetricsCheckpoint:
+    """The unread work of one Google metrics dataset (module docstring, "Google checkpoints").
+
+    Attributes:
+        pending: Unread dated scopes per query id, each with its deferral instant, in
+            reading order; empty once drained.
+        covered_from: The first native date the interrupted cycle vouches for once its
+            scopes are read.
+        reasons: Permanent shortfalls (result limits) met during the cycle.
+    """
+
+    pending: Mapping[str, tuple[_Deferred, ...]]
+    covered_from: date
+    reasons: tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        """The number of scopes still unread."""
+        return sum(len(entries) for entries in self.pending.values())
+
+    @property
+    def latest_end(self) -> date:
+        """The last native date any unread scope reaches; ``covered_from`` when none does."""
+        return max(
+            (
+                _scope_day(entry.scope, _SCOPE_END)
+                for entries in self.pending.values()
+                for entry in entries
+            ),
+            default=self.covered_from,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the stored JSON object (module docstring, "Google checkpoints")."""
+        return {
+            "version": _CHECKPOINT_VERSION,
+            "pending": {
+                query_id: [
+                    {
+                        "scope": scope_to_json(entry.scope),
+                        "deferred_at": entry.deferred_at.isoformat(),
+                    }
+                    for entry in entries
+                ]
+                for query_id, entries in self.pending.items()
+                if entries
+            },
+            "covered_from": self.covered_from.isoformat(),
+            "reasons": list(self.reasons),
+        }
+
+    @classmethod
+    def parse(cls, data: object, queries: Sequence[str]) -> _MetricsCheckpoint:
+        """Rebuild a stored checkpoint of a dataset that reads ``queries``.
+
+        Raises:
+            ValueError: When it is not exactly the object :meth:`to_json` writes, an entry
+                fails :func:`_metrics_pending`, or nothing is pending.
+        """
+        stored = _checkpoint_object(data, _METRICS_CHECKPOINT_KEYS)
+        checkpoint = cls(
+            pending=_metrics_pending(stored["pending"], queries),
+            covered_from=_checkpoint_date(stored["covered_from"]),
+            reasons=_checkpoint_reasons(stored["reasons"]),
+        )
+        if not checkpoint.total:
+            raise ValueError("a stored checkpoint holds unread work")
+        return checkpoint
+
+    def merged_with(
+        self, current: _MetricsCheckpoint | None, loaded: _MetricsCheckpoint | None
+    ) -> _MetricsCheckpoint:
+        """Add what another run stored meanwhile, so no deferred scope is ever lost.
+
+        ``current`` is the checkpoint stored now, read under the row lock; ``loaded`` the one
+        this run started from. When they differ, another run wrote in between: its scopes
+        that this run did not load are added with their own deferral instants (a scope is
+        identified by its query id and scope, whatever its instant; one this run still
+        holds keeps the earlier instant) and its reasons are merged in. The later of the two
+        start dates is kept, because each run vouches only for the days from its own start,
+        and the two cycles may leave a gap between them. Scopes this run read in the
+        meantime may be read again later, which the idempotent upserts make harmless.
+        """
+        if current is None or (loaded is not None and current.to_json() == loaded.to_json()):
+            return self
+        known = {
+            _scope_key(query_id, entry.scope)
+            for query_id, entries in (loaded.pending.items() if loaded is not None else ())
+            for entry in entries
+        }
+        pending = {query_id: list(entries) for query_id, entries in self.pending.items()}
+        for query_id, entries in current.pending.items():
+            pending.setdefault(query_id, []).extend(
+                entry for entry in entries if _scope_key(query_id, entry.scope) not in known
+            )
+        return _MetricsCheckpoint(
+            pending={
+                query_id: _normalized_pending(query_id, entries)
+                for query_id, entries in pending.items()
+                if entries
+            },
+            covered_from=max(self.covered_from, current.covered_from),
+            reasons=tuple(dict.fromkeys((*self.reasons, *current.reasons))),
+        )
+
+
+def _resumed_coverage(
+    own: tuple[date, date], checkpoint: _MetricsCheckpoint, row: DatasetFreshness | None
+) -> tuple[date, date] | None:
+    """Return the range a run resuming ``checkpoint`` vouches for, or ``None`` past a gap.
+
+    The interrupted cycle spans ``covered_from`` to the last date of its unread scopes,
+    joined with the stored coverage when that touches it. A run whose own range touches
+    the cycle continues it: once nothing is pending it has read everything the cycle left
+    unread, so it vouches for the cycle and its own range together, and
+    ``record_freshness``'s whole-range rule can turn the row complete. A run whose own range
+    leaves a gap of unread days to the cycle (the worker was down longer than the range)
+    vouches for its own range only, so no unread day is ever claimed.
+    """
+    low, high = checkpoint.covered_from, max(checkpoint.latest_end, checkpoint.covered_from)
+    if (
+        row is not None
+        and row.covered_from is not None
+        and row.covered_through is not None
+        and _touches((row.covered_from, row.covered_through), (low, high))
+    ):
+        low, high = min(low, row.covered_from), max(high, row.covered_through)
+    if not _touches(own, (low, high)):
+        return None
+    return min(low, own[0]), max(high, own[1])
+
+
+def _carried_shortfall(
+    row: DatasetFreshness | None, own: tuple[date, date], recorded: tuple[date, date]
+) -> tuple[str, ...]:
+    """Return the stored permanent shortfall a checkpointed run must keep reporting.
+
+    A run that defers work records a repairable reason, which replaces a permanent one the
+    stored row holds (a repairable shortfall is never masked), and once its checkpoint
+    drains, the range it vouches for (``recorded``) can span the stored range, so the row
+    would read complete although the permanent shortfall (a Q-G6 day at the result limit)
+    was never re-read. The shortfall is kept when ``recorded`` merges into the stored range
+    and the run's ``own`` read did not re-read all of it; otherwise nothing is carried,
+    because the run either replaces the stored range or meets the limit again itself.
+    """
+    shortfall = freshness.recorded_shortfall(row)
+    if (
+        shortfall is None
+        or freshness.is_repairable_reason(shortfall)
+        or row is None
+        or row.covered_from is None
+        or row.covered_through is None
+    ):
+        return ()
+    stored = (row.covered_from, row.covered_through)
+    if not _touches(recorded, stored) or (own[0] <= stored[0] and own[1] >= stored[1]):
+        return ()
+    return (shortfall,)
+
+
+@dataclass(frozen=True, slots=True)
+class _GooglePlan:
+    """What one Google metrics run reads for one freshness dataset, decided before any call.
+
+    Attributes:
+        name: The freshness dataset.
+        queries: Its dated queries, in reading order.
+        row: Its freshness row as loaded, or ``None``.
+        stored: The checkpoint JSON the row held when loaded, to detect a concurrent writer.
+        loaded: That checkpoint parsed, or ``None`` when none is stored or it is unusable.
+        own: The run's own native range (:func:`_metrics_range`).
+        resumed: The range the run vouches for when it continues ``loaded``
+            (:func:`_resumed_coverage`), or ``None``.
+        segments: Per query, the parts of ``own`` no stored scope of that query covers
+            (:func:`_own_segments`).
+    """
+
+    name: str
+    queries: tuple[str, ...]
+    row: DatasetFreshness | None
+    stored: object | None
+    loaded: _MetricsCheckpoint | None
+    own: tuple[date, date]
+    resumed: tuple[date, date] | None
+    segments: Mapping[str, tuple[Mapping[str, object], ...]]
+
+    @property
+    def recorded(self) -> tuple[date, date]:
+        """The range the dataset's freshness records: ``resumed``, else the full own range."""
+        return self.own if self.resumed is None else self.resumed
+
+    def parse(self, data: object) -> _MetricsCheckpoint:
+        """Parse a checkpoint of this dataset (:meth:`_MetricsCheckpoint.parse`)."""
+        return _MetricsCheckpoint.parse(data, self.queries)
+
+
+# Writes one fetch's rows; the range is the scope's :func:`_date_range`.
+type _FetchStore = Callable[[FetchOutcome, tuple[date, date] | None], Awaitable[None]]
+
+
+def _date_range(scope: Mapping[str, object]) -> tuple[date, date] | None:
+    """Return the native ``[start, end]`` a scope reads in full, or ``None`` if it narrows.
+
+    Only a scope that is a date range alone (an own segment, a stored date range) asks for
+    every row of its days. One with campaign or ad-group bounds or a criterion keyset asks
+    for part of its day, so even a complete fetch of it says nothing about the rest of that
+    day, and the rows stored there must not be reconciled against it.
+    """
+    start, end = scope.get(_SCOPE_START), scope.get(_SCOPE_END)
+    if set(scope) != {_SCOPE_START, _SCOPE_END}:
+        return None
+    if not isinstance(start, date) or not isinstance(end, date):
+        return None
+    return (start, end)
+
+
+class _QueryReads:
+    """What one query's fetches in one metrics run established, in reading order.
+
+    The first interruption stops the query: every later scope of it is kept unread, with
+    its deferral instant, behind the interrupted fetch's deferred partitions, which keep the
+    instant of the scope they came from.
+
+    Attributes:
+        pending: The query's unread scopes, in reading order.
+        interrupted_by: The transient error that stopped the query, or ``None``.
+        shortfalls: Permanent shortfalls (result limits) of the fetches read.
+        calls: POST attempts the fetches made, retries and next pages included.
+    """
+
+    __slots__ = ("calls", "interrupted_by", "pending", "query_id", "shortfalls", "store")
+
+    def __init__(self, query_id: str, store: _FetchStore) -> None:
+        """Start with nothing read; ``store`` writes each fetch's rows as soon as it returns."""
+        self.query_id = query_id
+        self.store = store
+        self.pending: list[_Deferred] = []
+        self.interrupted_by: TransientError | None = None
+        self.shortfalls: list[str] = []
+        self.calls = 0
+
+    async def read(
+        self, fetcher: PartitionedFetcher, scope: Mapping[str, object], deferred_at: datetime
+    ) -> None:
+        """Read one scope, or keep it unread with ``deferred_at`` once the query is interrupted.
+
+        The rows go to ``store`` at once, with the scope's :func:`_date_range`, so rows read
+        before an interruption are kept; upserts are idempotent, so re-reading a scope later
+        changes no row count.
+        """
+        if self.interrupted_by is not None:
+            self.pending.append(_Deferred(scope, deferred_at))
+            return
+        outcome = await fetcher.partitioned_fetch(self.query_id, scope)
+        self.calls += outcome.calls
+        await self.store(outcome, _date_range(scope))
+        self.shortfalls.extend(_shortfall_reasons(outcome))
+        if outcome.interrupted_by is not None:
+            self.interrupted_by = outcome.interrupted_by
+            self.pending.extend(_Deferred(part, deferred_at) for part in outcome.deferred)
+
+
+def _stored_reading_order(plans: Sequence[_GooglePlan]) -> list[tuple[str, _Deferred]]:
+    """Return every stored scope of the datasets' checkpoints, oldest deferral first.
+
+    Ties go by dataset order (``google.metrics_daily``, then ``google.search_terms``), then
+    query order (Q-G3, Q-G5; Q-G6), then position in the stored list, so no dataset's or
+    query's older work waits behind another's newer work.
+    """
+    ordered: list[tuple[tuple[datetime, int, int, int], str, _Deferred]] = []
+    for dataset_index, plan in enumerate(plans):
+        if plan.loaded is None:
+            continue
+        for query_index, query_id in enumerate(plan.queries):
+            for position, entry in enumerate(plan.loaded.pending.get(query_id, ())):
+                key = (entry.deferred_at, dataset_index, query_index, position)
+                ordered.append((key, query_id, entry))
+    ordered.sort(key=lambda item: item[0])
+    return [(query_id, entry) for _key, query_id, entry in ordered]
 
 
 # The fact tables whose fetch scopes :func:`_remove_absent` reconciles.
@@ -2585,12 +3591,24 @@ class MetricsSyncJob(_JobBase):
 
     * **Google**: Q-G3 to ``fact_campaign_daily`` and Q-G5 to ``fact_keyword_daily``
       (``google.metrics_daily``), Q-G6 to ``fact_search_term_daily``
-      (``google.search_terms``), each query committed on its own. A campaign or ad group no
+      (``google.search_terms``), each fetch committed on its own. A campaign or ad group no
       entity sync stored (removed before tracking) gets a stand-in so its spend counts; a
       keyword row of an unknown keyword is skipped and counted (campaign spend is covered
-      by Q-G3, and K3 reviews current keywords only). A query's reconcile scope is the
-      dataset (one customer) over the native ``[start, end]`` that query fetched, stand-in
-      campaigns included.
+      by Q-G3, and K3 reviews current keywords only). The unread scopes both datasets'
+      checkpoints hold (module docstring, "Google checkpoints") are read first, as stored
+      and oldest deferral first across datasets and queries, so one dataset's fresh range
+      never spends a small window's budget before another's older work. Then come the own
+      ranges, Q-G3, Q-G5, Q-G6, each without the native days a stored scope of its query
+      covers (those days are read by the stored scopes, a narrowed keyset or id range
+      keeping its progress). Whatever stays unread, this run's and any another run stored
+      meanwhile, is written back as the checkpoint in the transaction that records the
+      dataset's freshness, so a workload above the daily call cap advances through its
+      partitions run by run instead of restarting from the same prefix, and the dataset
+      turns ``complete`` only once nothing is pending. A fetch's reconcile scope is the
+      dataset (one customer) over the native ``[start, end]`` of the scope it read, stand-in
+      campaigns included, when that scope is a date range alone (an own segment or a stored
+      date range). A stored scope narrowed inside its day (campaign or ad-group bounds, a
+      criterion keyset) reads only part of that day, so its rows are only upserted.
     * **LinkedIn**: per account, daily creative analytics to ``fact_creative_daily``
       (``linkedin.analytics_daily``); ``conversions`` and ``conversions_value`` stay
       ``NULL`` (LinkedIn reports leads and website conversions instead). Rows of creatives
@@ -2656,82 +3674,181 @@ class MetricsSyncJob(_JobBase):
     # -- Google ----------------------------------------------------------------------------
 
     async def _google(self) -> None:
-        """Fetch and store Q-G3, Q-G5 and Q-G6 (class docstring)."""
-        ctx = self.ctx
-        client = ctx.clients.require_google()
-        fetcher = PartitionedFetcher(client)
-        async with ctx.sessionmaker() as session:
-            account = await _account_row(session, ctx.dataset_id, "google")
-        account_id = None if account is None else account.id
-        today = ctx.now.astimezone(_zone(None if account is None else account.timezone)).date()
-        ranges = await self._ranges(today)
+        """Fetch and store Q-G3, Q-G5 and Q-G6, stored work first (class docstring).
 
-        start, end = ranges["google.metrics_daily"]
-        scope = {_SCOPE_START: start, _SCOPE_END: end}
-        calls_before = client.calls_made
-        daily = await fetcher.partitioned_fetch("Q-G3", scope)
-        self._calls += client.calls_made - calls_before
-        await self._store_campaign_daily(daily, account_id, (start, end))
-        calls_before = client.calls_made
-        keyword_view = await fetcher.partitioned_fetch("Q-G5", scope)
-        self._calls += client.calls_made - calls_before
-        await self._store_keyword_daily(keyword_view, (start, end))
-        await self._record_google("google.metrics_daily", (start, end), (daily, keyword_view))
+        1. Both datasets' checkpoints are loaded and each dataset's own range is decided.
+        2. Every stored scope of both datasets is read, as stored, before any own range,
+           oldest deferral first (:func:`_stored_reading_order`).
+        3. The own ranges are read in the order Q-G3, Q-G5, Q-G6, each without the days a
+           stored scope of its query covers (:func:`_own_segments`).
+        4. Each dataset is recorded (:meth:`_record_google`) as soon as its last read is
+           done, so a defect raised by a later dataset's own range leaves the outcome of
+           ``google.metrics_daily`` recorded.
 
-        start, end = ranges["google.search_terms"]
-        calls_before = client.calls_made
-        terms = await fetcher.partitioned_fetch("Q-G6", {_SCOPE_START: start, _SCOPE_END: end})
-        self._calls += client.calls_made - calls_before
-        await self._store_search_terms(terms, account_id, (start, end))
-        await self._record_google("google.search_terms", (start, end), (terms,))
-
-    async def _record_google(
-        self, name: str, covered: tuple[date, date], outcomes: Sequence[FetchOutcome]
-    ) -> None:
-        """Record one Google dataset: a success, a deferral, or a failed refresh.
-
-        A call-budget deferral is an ``incomplete`` success (repairable, reason prefixed
-        :data:`~ads_engine.sync.freshness.REASON_DEFERRED`); any other transient interruption
-        fails the refresh, so the dataset keeps its last good data and turns stale.
+        Each query stops at its first interruption; its later scopes stay unread.
         """
         ctx = self.ctx
+        fetcher = PartitionedFetcher(ctx.clients.require_google())
+        async with ctx.sessionmaker() as session:
+            account = await _account_row(session, ctx.dataset_id, "google")
+            rows = await freshness.load_freshness(session, ctx.dataset_id)
+        account_id = None if account is None else account.id
+        today = ctx.now.astimezone(_zone(None if account is None else account.timezone)).date()
+
+        async def campaign_daily(outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
+            await self._store_campaign_daily(outcome, account_id, covered)
+
+        async def search_terms(outcome: FetchOutcome, covered: tuple[date, date] | None) -> None:
+            await self._store_search_terms(outcome, account_id, covered)
+
+        stores: Mapping[str, _FetchStore] = {
+            "Q-G3": campaign_daily,
+            "Q-G5": self._store_keyword_daily,
+            "Q-G6": search_terms,
+        }
+        plans = [self._google_plan(name, today, rows.get(name)) for name in _GOOGLE_METRICS_QUERIES]
+        reads = {
+            query_id: _QueryReads(query_id, stores[query_id])
+            for plan in plans
+            for query_id in plan.queries
+        }
+        for query_id, entry in _stored_reading_order(plans):
+            await reads[query_id].read(fetcher, entry.scope, entry.deferred_at)
+        for plan in plans:
+            for query_id in plan.queries:
+                for segment in plan.segments[query_id]:
+                    await reads[query_id].read(fetcher, segment, ctx.now)
+            await self._record_google(plan, [reads[query_id] for query_id in plan.queries])
+
+    def _google_plan(self, name: str, today: date, row: DatasetFreshness | None) -> _GooglePlan:
+        """Decide what this run reads for one Google metrics dataset (:class:`_GooglePlan`)."""
+        ctx = self.ctx
+        queries = _GOOGLE_METRICS_QUERIES[name]
+        stored = None if row is None else row.checkpoint
+
+        def parse(data: object) -> _MetricsCheckpoint:
+            return _MetricsCheckpoint.parse(data, queries)
+
+        loaded = _usable_checkpoint(
+            parse, stored, job=self.job, dataset_id=ctx.dataset_id, dataset=name
+        )
+        own = _metrics_range(self.kind, "google", today, ctx.settings, row, repair=loaded is None)
+        return _GooglePlan(
+            name=name,
+            queries=queries,
+            row=row,
+            stored=stored,
+            loaded=loaded,
+            own=own,
+            resumed=None if loaded is None else _resumed_coverage(own, loaded, row),
+            segments={
+                query_id: _own_segments(
+                    own, () if loaded is None else loaded.pending.get(query_id, ())
+                )
+                for query_id in queries
+            },
+        )
+
+    async def _record_google(self, plan: _GooglePlan, reads: Sequence[_QueryReads]) -> None:
+        """Record one Google metrics dataset after its reads: a success, a deferral, or a failure.
+
+        Under the freshness row's lock, what stays unread is merged with what another run
+        stored meanwhile and written back (or the checkpoint cleared), and in the same
+        transaction:
+
+        * nothing pending: a success, ``complete`` unless a result limit was met;
+        * work pending after a call-budget deferral: an ``incomplete`` success, repairable,
+          its reason (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` prefix) counting
+          every pending scope, followed by the permanent shortfalls;
+        * any other transient interruption fails the refresh instead: the checkpoint is
+          still written, and the dataset keeps its last good data and turns stale.
+
+        The recorded range is the full own range (or the resumed cycle's), whatever days the
+        own read left to stored scopes: those days are vouched for once nothing is pending.
+
+        Raises:
+            repositories.DatasetNotWritable: If the dataset was retired meanwhile.
+        """
+        ctx = self.ctx
+        name, row, stored, loaded = plan.name, plan.row, plan.stored, plan.loaded
+        recorded = plan.recorded
+        interruptions = [error for read in reads if (error := read.interrupted_by) is not None]
         failure = next(
-            (
-                outcome.interrupted_by
-                for outcome in outcomes
-                if outcome.interrupted_by is not None
-                and not isinstance(outcome.interrupted_by, CallBudgetExhausted)
+            (error for error in interruptions if not isinstance(error, CallBudgetExhausted)), None
+        )
+        pending = {
+            read.query_id: _normalized_pending(read.query_id, read.pending)
+            for read in reads
+            if read.pending
+        }
+        carried = (
+            _carried_shortfall(row, plan.own, recorded) if pending or loaded is not None else ()
+        )
+        inherited = () if loaded is None or plan.resumed is None else loaded.reasons
+        mine = _MetricsCheckpoint(
+            pending=pending,
+            covered_from=recorded[0],
+            reasons=tuple(
+                dict.fromkeys(
+                    (
+                        *(reason for read in reads for reason in read.shortfalls),
+                        *inherited,
+                        *carried,
+                    )
+                )
             ),
-            None,
+        )
+        self._calls += sum(read.calls for read in reads)
+
+        async with ctx.sessionmaker() as session, session.begin():
+            now_stored = await freshness.lock_checkpoint(session, ctx.dataset_id, name)
+            current = (
+                loaded
+                if now_stored == stored
+                else _usable_checkpoint(
+                    plan.parse, now_stored, job=self.job, dataset_id=ctx.dataset_id, dataset=name
+                )
+            )
+            merged = mine.merged_with(current, loaded)
+            await freshness.write_checkpoint(
+                session, ctx.dataset_id, name, merged.to_json() if merged.total else None
+            )
+            if failure is None:
+                deferred = (
+                    _deferred_reason(interruptions[0] if interruptions else None, merged.total)
+                    if merged.total
+                    else None
+                )
+                outcome = _success(ctx.now, covered=recorded, reasons=(deferred, *merged.reasons))
+                await self._complete(session, {name: outcome})
+        _log.info(
+            "sync.metrics.google_checkpoint",
+            source="google",
+            dataset_id=ctx.dataset_id,
+            dataset=name,
+            resumed=loaded is not None,
+            pending=merged.total,
         )
         if failure is not None:
             self._interrupted(failure, dataset=name)
-            return
-        deferral = next(
-            (outcome.interrupted_by for outcome in outcomes if outcome.interrupted_by is not None),
-            None,
-        )
-        outcome = _success(
-            ctx.now, covered=covered, reasons=[_fetch_reason(outcome) for outcome in outcomes]
-        )
-        async with ctx.sessionmaker() as session, session.begin():
-            await self._complete(session, {name: outcome})
-        if deferral is not None:
-            self._interrupted(deferral, dataset=None)
+        elif interruptions:
+            self._interrupted(interruptions[0], dataset=None)
 
     async def _store_campaign_daily(
-        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date]
+        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date] | None
     ) -> None:
         """Store Q-G3 over ``covered`` in ``fact_campaign_daily``, stubbing unknown campaigns.
 
         The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
         dated inside ``covered`` whose (campaign, day) it did not return are deleted in the
         same transaction (:func:`_remove_absent`), also when it returned no row at all.
+        ``covered`` is ``None`` for a scope narrowed inside its days (campaign bounds), which
+        reads only part of each day, so its rows are only upserted.
         """
         ctx = self.ctx
         rows = [parse_campaign_daily(row) for row in outcome.rows]
-        reconcile = _proven_complete(outcome)
-        if not rows and not reconcile:
+        reconciled = covered if covered is not None and _proven_complete(outcome) else None
+        if not rows and reconciled is None:
             return
         async with ctx.sessionmaker() as session, session.begin():
             campaigns = await _campaign_ids(session, ctx.dataset_id)
@@ -2756,12 +3873,12 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactCampaignDaily, facts, ctx.dataset_id, session=session
             )
-            if reconcile:
+            if reconciled is not None:
                 await _remove_absent(
                     session,
                     FactCampaignDaily,
                     ctx.dataset_id,
-                    scope=(FactCampaignDaily.date.between(*covered),),
+                    scope=(FactCampaignDaily.date.between(*reconciled),),
                     key=(FactCampaignDaily.campaign_id, FactCampaignDaily.date),
                     returned={(fact["campaign_id"], fact["date"]) for fact in facts},
                     guarded=bool(facts),
@@ -2778,17 +3895,22 @@ class MetricsSyncJob(_JobBase):
                 reason="no Google account stored to attach stand-in campaigns to",
             )
 
-    async def _store_keyword_daily(self, outcome: FetchOutcome, covered: tuple[date, date]) -> None:
+    async def _store_keyword_daily(
+        self, outcome: FetchOutcome, covered: tuple[date, date] | None
+    ) -> None:
         """Store Q-G5 over ``covered`` in ``fact_keyword_daily``; unknown keywords are skipped.
 
         The rows are upserted. When the fetch is :func:`_proven_complete`, the dataset's rows
         dated inside ``covered`` whose (keyword, day) it did not return are deleted in the
         same transaction (:func:`_remove_absent`), also when it returned no row at all.
+        ``covered`` is ``None`` for a scope narrowed inside its days (campaign or ad-group
+        bounds, a criterion keyset), which reads only part of each day, so its rows are only
+        upserted.
         """
         ctx = self.ctx
         rows = [parse_keyword_view(row) for row in outcome.rows]
-        reconcile = _proven_complete(outcome)
-        if not rows and not reconcile:
+        reconciled = covered if covered is not None and _proven_complete(outcome) else None
+        if not rows and reconciled is None:
             return
         async with ctx.sessionmaker() as session, session.begin():
             groups = _by_last_key(
@@ -2823,12 +3945,12 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactKeywordDaily, facts, ctx.dataset_id, session=session
             )
-            if reconcile:
+            if reconciled is not None:
                 await _remove_absent(
                     session,
                     FactKeywordDaily,
                     ctx.dataset_id,
-                    scope=(FactKeywordDaily.date.between(*covered),),
+                    scope=(FactKeywordDaily.date.between(*reconciled),),
                     key=(FactKeywordDaily.keyword_id, FactKeywordDaily.date),
                     returned={(fact["keyword_id"], fact["date"]) for fact in facts},
                     guarded=bool(facts),
@@ -2847,7 +3969,7 @@ class MetricsSyncJob(_JobBase):
             )
 
     async def _store_search_terms(
-        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date]
+        self, outcome: FetchOutcome, account_id: int | None, covered: tuple[date, date] | None
     ) -> None:
         """Store Q-G6 over ``covered`` in ``fact_search_term_daily``, stubbing unknown parents.
 
@@ -2856,11 +3978,13 @@ class MetricsSyncJob(_JobBase):
         return are deleted in the same transaction (:func:`_remove_absent`), also when it
         returned no row at all. A finest (day, ad group) partition at the result limit makes
         the fetch incomplete, so its rows are stored as returned and nothing is deleted.
+        ``covered`` is ``None`` for a scope narrowed inside its days (campaign or ad-group
+        bounds), which reads only part of each day, so its rows are only upserted.
         """
         ctx = self.ctx
         rows = [parse_search_term(row) for row in outcome.rows]
-        reconcile = _proven_complete(outcome)
-        if not rows and not reconcile:
+        reconciled = covered if covered is not None and _proven_complete(outcome) else None
+        if not rows and reconciled is None:
             return
         async with ctx.sessionmaker() as session, session.begin():
             campaigns = await _campaign_ids(session, ctx.dataset_id)
@@ -2902,14 +4026,14 @@ class MetricsSyncJob(_JobBase):
             written = await repositories.upsert_facts(
                 FactSearchTermDaily, facts, ctx.dataset_id, session=session
             )
-            if reconcile:
+            if reconciled is not None:
                 # Keyed on every returned row whose ad group is stored, even one skipped for an
                 # unattachable campaign, so a returned key is never taken for an absent one.
                 await _remove_absent(
                     session,
                     FactSearchTermDaily,
                     ctx.dataset_id,
-                    scope=(FactSearchTermDaily.date.between(*covered),),
+                    scope=(FactSearchTermDaily.date.between(*reconciled),),
                     key=(
                         FactSearchTermDaily.ad_group_id,
                         FactSearchTermDaily.matched_criterion_id,
@@ -3603,6 +4727,7 @@ async def _match_leads(
     lead_dataset_id: int | None,
     lead_client: LinkedInClient | None,
     props: ContactPropertyMap,
+    interruptions: list[TransientError],
 ) -> lead_match.MatchReport | None:
     """Attempt the due ``lead_match`` rows of the job's CRM dataset.
 
@@ -3611,6 +4736,10 @@ async def _match_leads(
     ever holds live leads (``sync/lead_match.py`` isolation rule). A live re-fetch needs
     LinkedIn credentials under ``DATA_MODE=auto``; without them no live lead can exist, and
     the pass is skipped.
+
+    ``interruptions`` receives the pass's first exhausted ``TransientError`` per source as
+    soon as it is observed (``run_matching``), so the caller still has them when the pass
+    raises.
 
     Returns:
         The matching report, or ``None`` when the pass was skipped.
@@ -3639,6 +4768,7 @@ async def _match_leads(
             clients,
             now=ctx.now,
             lead_dataset_id=lead_dataset_id,
+            interruptions=interruptions,
         )
 
     if lead_client is not None:
@@ -3656,6 +4786,21 @@ async def _match_leads(
         return await run(lead_clients.require_linkedin())
 
 
+def _matching_interruptions(
+    collected: Sequence[TransientError], report: lead_match.MatchReport | None
+) -> list[TransientError]:
+    """The first exhausted ``TransientError`` per source a matching pass met, in order.
+
+    ``collected`` is what the pass handed over as it went (``run_matching``'s
+    ``interruptions``), complete also when the pass raised; ``report.interrupted_by``
+    repeats it on a normal return, so each source is listed once.
+    """
+    first: dict[str, TransientError] = {}
+    for error in (*collected, *(() if report is None else report.interrupted_by)):
+        first.setdefault(error.source, error)
+    return list(first.values())
+
+
 class LeadMatchJob(_JobBase):
     """One matching pass over a CRM dataset's due ``lead_match`` rows.
 
@@ -3664,7 +4809,10 @@ class LeadMatchJob(_JobBase):
     by a live LinkedIn backfill, so every row staged against HubSpot's active primary is
     attempted before the LinkedIn dataset activates; :class:`CrmSyncJob` runs the same pass
     as its matching step. ``AccessDenied`` from LinkedIn is handed to
-    ``on_error("linkedin", …)``, from HubSpot to ``on_error("hubspot", …)``. A pass that
+    ``on_error("linkedin", …)``, from HubSpot to ``on_error("hubspot", …)``; so is a transient
+    re-fetch or lookup failure the pass met (``MatchReport.interrupted_by``), with no
+    freshness dataset, as its rows were already left ``error`` and due for a retry. One met
+    before a later batch raised is handed over too, ahead of the raised error. A pass that
     attempted rows in an active context queues one ``analysis_request``; the backfill's
     inactive context queues none.
     """
@@ -3713,15 +4861,23 @@ class LeadMatchJob(_JobBase):
         calls_before = hubspot.calls
         bindings = await _crm_bindings(self.ctx)
         props = hubspot.bind_contact_properties(bindings, self.ctx.settings)
+        interruptions: list[TransientError] = []
+        report: lead_match.MatchReport | None = None
         try:
             report = await _match_leads(
                 self,
                 lead_dataset_id=self.lead_dataset_id,
                 lead_client=self.lead_client,
                 props=props,
+                interruptions=interruptions,
             )
         finally:
             self._calls += hubspot.calls - calls_before
+            for error in _matching_interruptions(interruptions, report):
+                # The rows already ended retried ``error``; the source's mode decides the
+                # rest. Noted on every exit: when a later batch raised, ``run`` hands these
+                # over first, so the raised error's consequence is the one that stands.
+                self._interrupted(error, dataset=None)
         if report is not None:
             self._count(None, report.attempted)
             _log.info(
@@ -3743,29 +4899,26 @@ class LeadMatchJob(_JobBase):
 
 
 def _search_reason(outcome: SearchOutcome) -> str | None:
-    """Map a partitioned search's shortfall onto the freshness reason vocabulary.
+    """Map a completed partitioned search's shortfall onto the freshness reason vocabulary.
 
-    A transient failure that stopped the search is repairable (prefixed
-    :data:`~ads_engine.sync.freshness.REASON_INTERRUPTED`, so the next run widens back to the
-    stored range); a one-hour partition above the 10,000-result ceiling is permanent
-    (prefixed :data:`~ads_engine.sync.freshness.REASON_SEARCH_CEILING`); a short read keeps
-    the search module's text.
+    Only a search that read every partition reaches this: one a transient failure stopped
+    (``outcome.interrupted_by``) records no success at all, its error going to ``on_error``.
+    A one-hour partition above the 10,000-result ceiling is permanent (prefixed
+    :data:`~ads_engine.sync.freshness.REASON_SEARCH_CEILING`); a short read keeps the search
+    module's text (:data:`SHORT_READ_REASON`), as does any other reason part.
     """
     if outcome.is_complete:
         return None
-    interrupted: list[str] = []
-    permanent: list[str] = []
+    parts: list[str] = []
     for part in (outcome.reason or "search incomplete").split(_REASON_SEPARATOR):
         if part == CEILING_REASON:
-            permanent.append(f"{freshness.REASON_SEARCH_CEILING}: {part}")
-        elif part == SHORT_READ_REASON:
-            permanent.append(part)
+            parts.append(f"{freshness.REASON_SEARCH_CEILING}: {part}")
         else:
-            interrupted.append(f"{freshness.REASON_INTERRUPTED}: {part}")
+            parts.append(part)
     if outcome.partitions_incomplete:
         noun = _plural(len(outcome.partitions_incomplete), "partition", "partitions")
-        permanent.append(f"{noun} not read in full")
-    return _REASON_SEPARATOR.join((*interrupted, *permanent))
+        parts.append(f"{noun} not read in full")
+    return _REASON_SEPARATOR.join(parts)
 
 
 def _widened(start: datetime, row: DatasetFreshness | None) -> datetime:
@@ -3789,6 +4942,45 @@ def _contact_values(row: ContactRow) -> dict[str, Any]:
     }
 
 
+def _discovery_shortfall(row: DatasetFreshness | None) -> bool:
+    """Whether a stored ``hubspot.google_contacts`` row is incomplete for a discovery shortfall.
+
+    That is a search short of the ceiling
+    (:data:`~ads_engine.sync.freshness.REASON_SEARCH_CEILING`) or of its reported total
+    (:data:`SHORT_READ_REASON`), which the next discovery re-reads only over its own range, or
+    a repairable shortfall, whose range :func:`_widened` already re-reads. A shortfall of the
+    refresh by id alone is not one: every run re-reads every stored contact.
+    """
+    if row is None or row.completeness != "incomplete" or row.reason is None:
+        return False
+    reason = row.reason
+    return (
+        freshness.REASON_SEARCH_CEILING in reason
+        or SHORT_READ_REASON in reason
+        or freshness.is_repairable_reason(reason)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Discovery:
+    """What one Google-touch discovery search read, for the refresh that records it.
+
+    Attributes:
+        covered: The UTC dates the search covered, from its (widened) start to today.
+        reason: The completed search's shortfall in the freshness vocabulary
+            (:func:`_search_reason`), or ``None``.
+        found: HubSpot ids of the contacts the search returned; their properties were read
+            this run.
+        interrupted: Whether a transient failure stopped the search; the dataset then records
+            no success this run.
+    """
+
+    covered: tuple[date, date]
+    reason: str | None
+    found: frozenset[str]
+    interrupted: bool
+
+
 class CrmSyncJob(_JobBase):
     """The CRM sync of one HubSpot dataset, primary or companion, every 3 h.
 
@@ -3800,21 +4992,36 @@ class CrmSyncJob(_JobBase):
     1. **Google-touch discovery** (primary only, and only when the stored bindings verify
        both ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`` and ``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY``
        and the settings still name them): contacts whose touch date falls in the sync range
-       and whose campaign property is set (``hubspot.google_contacts``). Without the
-       configuration nothing is called and no row is written; Google items then carry
-       ``no_crm_link`` and no LinkedIn-derived subset stands in.
+       and whose campaign property is set are stored. Without the configuration nothing is
+       called and no row is written; Google items then carry ``no_crm_link`` and no
+       LinkedIn-derived subset stands in.
     2. **Matching**: the due ``lead_match`` rows (:class:`LeadMatchJob`'s pass).
-    3. **Contact refresh** by id of every matched contact, reading the email (hashed), the
-       lifecycle stage, the bound MQL and QL date properties and the Google properties;
-       ``lead_match.contact_read_status`` records ``ok`` or ``error`` per contact, and a
-       failed refresh keeps the previous stage values (``hubspot.contacts``).
+    3. **Contact refresh** by id of every matched contact and, when discovery runs, every
+       stored Google-touch contact whatever its touch date (a Google-only contact touched
+       before the current range is no longer rediscovered, so only this read keeps its stage
+       dates current). It reads the email (hashed), the lifecycle stage, the bound MQL and QL
+       date properties and the Google properties; ``lead_match.contact_read_status`` records
+       ``ok`` or ``error`` per matched contact, and a failed read keeps the previous stage
+       values (``hubspot.contacts``, counting every contact not read). The same transaction
+       records ``hubspot.google_contacts``: the discovery's outcome, ``incomplete`` while any
+       Google-touch contact was not refreshed (:meth:`_google_outcome`).
     4. **Deal search**: every deal created from the default window start (or the backfill
        start) to now, partitioned below the 10,000-result ceiling (``hubspot.deal_search``).
-    5. **Associations**: contacts to meetings and deals for the matched and Google-touch
-       contacts, deals to contacts for every searched deal, each input followed through its
-       own cursor, then **target reads** of the associated meetings, deals and contacts. An
-       associated but unread target is never treated as absent: the fetch's
-       ``target_read_status`` and ``missing_target_ids`` say so (``hubspot.associations``).
+    5. **Associations**: contacts to meetings and deals for the contacts step 3 refreshes,
+       deals to contacts for every searched deal, each input followed through its own cursor,
+       then **target reads** of the associated meetings, deals and contacts. An associated
+       but unread target is never treated as absent: the fetch's ``target_read_status`` and
+       ``missing_target_ids`` say so (``hubspot.associations``).
+
+    Transient failures (AAP 0.3.3 transient row): a search, contact read, association read or
+    target read whose call still fails after its retries returns what it read with the error
+    in ``interrupted_by``. The step stores what was read with its per-object unknown state
+    (``contact_read_status`` ``error``, fetch rows ``error``/``partial``, missing targets),
+    records no success for its dataset and hands the error to ``on_error``, which records the
+    failed attempt: ``last_success_at`` and the coverage stand, the dataset turns stale and the
+    connection ``stale``. A matching interruption is handed over with no dataset. A one-hour
+    partition above the search ceiling, or a short read, is a completed read and stays an
+    ``incomplete`` success.
 
     The HubSpot client throttles itself to 4 requests per second; nothing here sleeps.
     """
@@ -3859,24 +5066,30 @@ class CrmSyncJob(_JobBase):
                 search_start = _utc_midnight(end - timedelta(days=ctx.thresholds.default_days - 1))
             search_start = min(search_start, ctx.now)
 
+            discovery: _Discovery | None = None
+            campaign_property = props.google_campaign_property
+            touch_property = props.google_touch_property
             if (
                 ctx.role == "primary"
-                and props.google_campaign_property is not None
-                and props.google_touch_property is not None
+                and campaign_property is not None
+                and touch_property is not None
             ):
                 self._discovery = True
                 await self._open_runs(("hubspot.google_contacts",))
-                await self._discover(
-                    client, props, _widened(search_start, rows.get("hubspot.google_contacts"))
+                discovery = await self._discover(
+                    client,
+                    props,
+                    (campaign_property, touch_property),
+                    _widened(search_start, rows.get("hubspot.google_contacts")),
                 )
 
             await self._match(props)
-            refreshed = await self._refresh_contacts(client, props, rows, scope_start)
+            refreshed = await self._refresh_contacts(client, props, rows, scope_start, discovery)
             deal_ids = await self._search_deals(
                 client, _widened(search_start, rows.get("hubspot.deal_search"))
             )
             await self._associations(
-                client, props, rows, scope_start, search_start, refreshed, deal_ids
+                client, props, rows, scope_start, refreshed, discovery, deal_ids
             )
         finally:
             self._calls += client.calls - calls_before
@@ -3884,52 +5097,84 @@ class CrmSyncJob(_JobBase):
     # -- steps -----------------------------------------------------------------------------
 
     async def _discover(
-        self, client: HubSpotClient, props: ContactPropertyMap, start: datetime
-    ) -> None:
-        """Step 1: Google-touch contacts of the sync range (``hubspot.google_contacts``)."""
+        self,
+        client: HubSpotClient,
+        props: ContactPropertyMap,
+        properties: tuple[str, str],
+        start: datetime,
+    ) -> _Discovery:
+        """Step 1: store the Google-touch contacts of the sync range.
+
+        ``properties`` are the verified campaign and touch-date properties. The outcome of
+        ``hubspot.google_contacts`` is recorded after the refresh by id (step 3), because the
+        dataset is the stored contacts, which that refresh re-reads.
+        """
         ctx = self.ctx
         name = "hubspot.google_contacts"
-        campaign_property = props.google_campaign_property
-        touch_property = props.google_touch_property
-        if campaign_property is None or touch_property is None:  # pragma: no cover - guarded
-            return
+        campaign_property, touch_property = properties
         outcome = await client.search_partitioned(
             _CONTACTS,
             google_contacts_filter(campaign_property, touch_property, props.request_properties()),
             (start, ctx.now),
         )
-        contacts = [parse_contact(record, props) for record in outcome.rows]
-        reason = _search_reason(outcome)
+        contacts = {row.hs_id: row for row in (parse_contact(r, props) for r in outcome.rows)}
+        failure = outcome.interrupted_by
         async with ctx.sessionmaker() as session, session.begin():
+            await repositories.ensure_writable(session, ctx.dataset_id)
             stored = await repositories.upsert_entities(
                 session,
                 CrmContact,
-                [_contact_values(row) for row in {row.hs_id: row for row in contacts}.values()],
+                [_contact_values(row) for row in contacts.values()],
                 ctx.dataset_id,
             )
             self._count(name, len(stored))
-            await self._complete(
-                session,
-                {
-                    name: _success(
-                        ctx.now,
-                        covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
-                        reasons=[reason],
-                    )
-                },
-            )
+        if failure is not None:
+            # Retries are exhausted: the contacts read are kept, but the search did not
+            # finish, so the dataset records no success and on_error turns it stale.
+            self._interrupted(failure, dataset=name)
+        return _Discovery(
+            covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
+            reason=None if failure is not None else _search_reason(outcome),
+            found=frozenset(contacts),
+            interrupted=failure is not None,
+        )
 
     async def _match(self, props: ContactPropertyMap) -> None:
-        """Step 2: the matching pass; a LinkedIn error is LinkedIn's and the sync goes on."""
+        """Step 2: the matching pass; a LinkedIn error is LinkedIn's and the sync goes on.
+
+        Every exhausted transient error the pass met reaches ``on_error`` with no dataset (its
+        rows already ended retried ``error``), also when a later batch raised: ahead of that
+        error, so the raised error's consequence is the one that stands.
+        """
+        interruptions: list[TransientError] = []
+        report: lead_match.MatchReport | None = None
+        handed_over = False
         try:
-            report = await _match_leads(self, lead_dataset_id=None, lead_client=None, props=props)
+            report = await _match_leads(
+                self,
+                lead_dataset_id=None,
+                lead_client=None,
+                props=props,
+                interruptions=interruptions,
+            )
         except ConnectorError as exc:
             if exc.source != "linkedin":
                 raise
             # Re-fetching leads failed on LinkedIn's side: LinkedIn's source mode decides
-            # what follows; the CRM refresh of contacts already matched still runs.
+            # what follows; the CRM refresh of contacts already matched still runs. The error
+            # is handed over now, so the pass's interruptions are handed over first, here.
+            handed_over = True
+            for error in _matching_interruptions(interruptions, None):
+                self._disposition = await self._hand_over(error, ())
             self._disposition = await self._hand_over(exc, ())
             return
+        finally:
+            if not handed_over:
+                for error in _matching_interruptions(interruptions, report):
+                    # The rows already ended retried ``error``; the source's mode decides the
+                    # rest (a LinkedIn re-fetch error is LinkedIn's). When a later batch
+                    # raised, ``run`` hands these over first, then the raised error.
+                    self._interrupted(error, dataset=None)
         if report is not None:
             _log.info(
                 "sync.lead_match.pass",
@@ -3960,18 +5205,41 @@ class CrmSyncJob(_JobBase):
         )
         return sorted(result)
 
+    async def _google_contacts(self, session: AsyncSession) -> list[str]:
+        """HubSpot ids of every stored Google-touch contact here, whatever its touch date.
+
+        Selected on the touch date alone: a contact whose campaign property a refresh cleared
+        is still re-read, so a campaign set again in HubSpot is seen even after its touch has
+        left the discovery range.
+        """
+        result = await session.scalars(
+            select(CrmContact.hs_id).where(
+                CrmContact.dataset_id == self.ctx.dataset_id,
+                CrmContact.google_touch_at.is_not(None),
+            )
+        )
+        return sorted(result)
+
     async def _refresh_contacts(
         self,
         client: HubSpotClient,
         props: ContactPropertyMap,
         rows: Mapping[str, DatasetFreshness],
         scope_start: datetime,
+        discovery: _Discovery | None,
     ) -> ContactBatch:
-        """Step 3: refresh every matched contact by id (``hubspot.contacts``)."""
+        """Step 3: refresh by id every matched and stored Google-touch contact.
+
+        Records ``hubspot.contacts`` and, when discovery ran, ``hubspot.google_contacts``
+        (:meth:`_google_outcome`) in the transaction that stores the contacts read.
+        """
         ctx = self.ctx
         name = "hubspot.contacts"
+        google_name = "hubspot.google_contacts"
         async with ctx.sessionmaker() as session:
-            ids = await self._matched_contacts(session)
+            matched = await self._matched_contacts(session)
+            google = await self._google_contacts(session) if discovery is not None else []
+        ids = sorted({*matched, *google})
         batch = (
             await client.contacts_by_id(ids, props)
             if ids
@@ -3979,7 +5247,14 @@ class CrmSyncJob(_JobBase):
         )
         failed = sorted(hs_id for hs_id, status in batch.read_status.items() if status != "ok")
         read = sorted(hs_id for hs_id, status in batch.read_status.items() if status == "ok")
+        google_unread = sum(1 for hs_id in google if batch.read_status.get(hs_id) != "ok")
+        interruption = batch.interrupted_by
+        # A refresh interruption fails the Google dataset too when it cost a Google-touch
+        # read; an interrupted discovery has failed it already.
+        google_interrupted = interruption is not None and google_unread > 0
+        discovery_interrupted = discovery is not None and discovery.interrupted
         async with ctx.sessionmaker() as session, session.begin():
+            await repositories.ensure_writable(session, ctx.dataset_id)
             stored = await repositories.upsert_entities(
                 session,
                 CrmContact,
@@ -4004,17 +5279,57 @@ class CrmSyncJob(_JobBase):
                         .values(contact_read_status=status)
                     )
             reason = f"{_plural(len(failed), 'contact', 'contacts')} not read" if failed else None
-            await self._complete(
-                session,
-                {
-                    name: _success(
-                        ctx.now,
-                        covered=self._state_range(rows.get(name), scope_start),
-                        reasons=[reason],
-                    )
-                },
-            )
+            outcomes: dict[str, FreshnessOutcome] = {}
+            if interruption is None:
+                outcomes[name] = _success(
+                    ctx.now,
+                    covered=self._state_range(rows.get(name), scope_start),
+                    reasons=[reason],
+                )
+            if discovery is not None and not discovery_interrupted and not google_interrupted:
+                outcomes[google_name] = self._google_outcome(
+                    rows.get(google_name), discovery, google_unread
+                )
+            if outcomes:
+                await self._complete(session, outcomes)
+        if interruption is not None:
+            # The contacts read are stored and every unread one keeps its previous stage
+            # values marked ``error``, but the refresh did not finish: no success, stale.
+            also = (google_name,) if google_interrupted and not discovery_interrupted else ()
+            self._interrupted(interruption, dataset=name, datasets=also)
         return batch
+
+    def _google_outcome(
+        self, row: DatasetFreshness | None, discovery: _Discovery, unread: int
+    ) -> FreshnessOutcome:
+        """The ``hubspot.google_contacts`` outcome once its stored contacts were refreshed.
+
+        Args:
+            row: The stored row, as the job found it before this run.
+            discovery: This run's discovery, which was not interrupted.
+            unread: Stored Google-touch contacts the refresh by id did not read.
+
+        Returns:
+            A success: the discovery's shortfall plus ``"N Google-touch contacts not
+            refreshed"`` when any was not read (their stage dates and evidence are unknown),
+            else complete.
+        """
+        # The dataset is the stored Google-touch contacts. Discovery adds the ones touched in
+        # its range; the refresh by id re-read every stored one, whatever its touch date. The
+        # run therefore vouches for the whole stored range, so the coverage reaches back to
+        # the stored start and this run's completeness replaces the stored one (no sticky
+        # shortfall, no widened search). A stored discovery shortfall (ceiling, short read)
+        # lies in a range this discovery may not re-read: the coverage is then the discovery
+        # range alone, so the merge keeps the worse of the two. A repairable one was widened
+        # over its whole range already, so both rules agree there.
+        start, today = discovery.covered
+        if row is not None and row.covered_from is not None and not _discovery_shortfall(row):
+            start = min(start, row.covered_from)
+        reasons = [discovery.reason]
+        if unread:
+            noun = _plural(unread, "Google-touch contact", "Google-touch contacts")
+            reasons.append(f"{noun} not refreshed")
+        return _success(self.ctx.now, covered=(start, max(start, today)), reasons=reasons)
 
     def _state_range(
         self, row: DatasetFreshness | None, scope_start: datetime
@@ -4022,7 +5337,8 @@ class CrmSyncJob(_JobBase):
         """The coverage of a current-state CRM read: the whole lead range up to today.
 
         Contacts and associations are re-read for every matched contact, whatever its lead's
-        date, so each run re-covers the stored range and its completeness replaces the
+        date, and, when discovery runs, for every stored Google-touch contact, whatever its
+        touch date, so each run re-covers the stored range and its completeness replaces the
         stored one (``record_freshness``): the range starts at the earlier of the stored
         start and the staging range's start (``BACKFILL_DAYS``, at most 180 days).
         """
@@ -4032,14 +5348,20 @@ class CrmSyncJob(_JobBase):
         return start, max(start, self.ctx.now.astimezone(UTC).date())
 
     async def _search_deals(self, client: HubSpotClient, start: datetime) -> list[str]:
-        """Step 4: every deal created from ``start`` to now (``hubspot.deal_search``)."""
+        """Step 4: every deal created from ``start`` to now (``hubspot.deal_search``).
+
+        Returns the ids of the deals read, also when a transient failure stopped the search,
+        so their deal-to-contact associations are still read.
+        """
         ctx = self.ctx
         name = "hubspot.deal_search"
         outcome = await client.search_partitioned(_DEALS, deal_search_filter(), (start, ctx.now))
         deals = list(
             {row.hs_id: row for row in (parse_deal(record) for record in outcome.rows)}.values()
         )
+        failure = outcome.interrupted_by
         async with ctx.sessionmaker() as session, session.begin():
+            await repositories.ensure_writable(session, ctx.dataset_id)
             stored = await repositories.upsert_entities(
                 session,
                 CrmDeal,
@@ -4056,16 +5378,21 @@ class CrmSyncJob(_JobBase):
                 ctx.dataset_id,
             )
             self._count(name, len(stored))
-            await self._complete(
-                session,
-                {
-                    name: _success(
-                        ctx.now,
-                        covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
-                        reasons=[_search_reason(outcome)],
-                    )
-                },
-            )
+            if failure is None:
+                await self._complete(
+                    session,
+                    {
+                        name: _success(
+                            ctx.now,
+                            covered=(start.astimezone(UTC).date(), ctx.now.astimezone(UTC).date()),
+                            reasons=[_search_reason(outcome)],
+                        )
+                    },
+                )
+        if failure is not None:
+            # The deals read are kept, but the search did not finish: no success, so the
+            # dataset keeps its last good standing and on_error turns it stale.
+            self._interrupted(failure, dataset=name)
         return sorted(row.hs_id for row in deals)
 
     async def _associations(
@@ -4074,24 +5401,23 @@ class CrmSyncJob(_JobBase):
         props: ContactPropertyMap,
         rows: Mapping[str, DatasetFreshness],
         scope_start: datetime,
-        search_start: datetime,
         refreshed: ContactBatch,
+        discovery: _Discovery | None,
         deal_ids: Sequence[str],
     ) -> None:
-        """Step 5: associations with their target reads (``hubspot.associations``)."""
+        """Step 5: associations with their target reads (``hubspot.associations``).
+
+        The contacts are step 3's population, read again after it: every matched contact
+        and, when discovery ran, every stored Google-touch contact, whatever its touch date.
+        A contact is a known deal-to-contact target, not read again, when step 3 read it or
+        this run's discovery returned it.
+        """
         ctx = self.ctx
         name = "hubspot.associations"
         async with ctx.sessionmaker() as session:
             matched = await self._matched_contacts(session)
-            touched = await session.scalars(
-                select(CrmContact.hs_id).where(
-                    CrmContact.dataset_id == ctx.dataset_id,
-                    CrmContact.google_touch_at.is_not(None),
-                    CrmContact.google_touch_at >= search_start,
-                )
-            )
-            google = set(touched)
-        contact_ids = sorted(set(matched) | google)
+            google = await self._google_contacts(session) if discovery is not None else []
+        contact_ids = sorted({*matched, *google})
         searched = set(deal_ids)
         meetings_fetch = await self._fetch(client, _CONTACTS, _MEETINGS, contact_ids)
         deals_fetch = await self._fetch(client, _CONTACTS, _DEALS, contact_ids)
@@ -4111,7 +5437,7 @@ class CrmSyncJob(_JobBase):
         )
         known_contacts = {
             hs_id for hs_id, status in refreshed.read_status.items() if status == "ok"
-        } | google
+        } | (discovery.found if discovery is not None else frozenset())
         contact_targets = [
             target for target in deal_contacts_fetch.all_targets if target not in known_contacts
         ]
@@ -4119,6 +5445,23 @@ class CrmSyncJob(_JobBase):
             await client.contacts_by_id(contact_targets, props)
             if contact_targets
             else ContactBatch(records=MappingProxyType({}), read_status={})
+        )
+        # The first call that still failed after its retries, in step order. Its inputs and
+        # targets are already ``error``/``partial`` or missing, and are stored as such below.
+        interruption = next(
+            (
+                error
+                for error in (
+                    meetings_fetch.interrupted_by,
+                    deals_fetch.interrupted_by,
+                    deal_contacts_fetch.interrupted_by,
+                    meeting_read.interrupted_by,
+                    deal_read.interrupted_by,
+                    contact_read.interrupted_by,
+                )
+                if error is not None
+            ),
+            None,
         )
 
         async with ctx.sessionmaker() as session, session.begin():
@@ -4174,16 +5517,21 @@ class CrmSyncJob(_JobBase):
                 if unknown
                 else None
             )
-            await self._complete(
-                session,
-                {
-                    name: _success(
-                        ctx.now,
-                        covered=self._state_range(rows.get(name), scope_start),
-                        reasons=[reason],
-                    )
-                },
-            )
+            if interruption is None:
+                await self._complete(
+                    session,
+                    {
+                        name: _success(
+                            ctx.now,
+                            covered=self._state_range(rows.get(name), scope_start),
+                            reasons=[reason],
+                        )
+                    },
+                )
+        if interruption is not None:
+            # Every fetch row keeps its unknown state, but the read did not finish: no
+            # success, so the dataset keeps its last good standing and on_error turns it stale.
+            self._interrupted(interruption, dataset=name)
 
     async def _fetch(
         self, client: HubSpotClient, from_type: str, to_type: str, ids: Sequence[str]

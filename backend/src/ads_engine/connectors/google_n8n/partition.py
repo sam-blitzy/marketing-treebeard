@@ -62,7 +62,10 @@ Interruption:
     stack are returned in :attr:`FetchOutcome.deferred`, in the order they would have been read.
     Each entry is a scope :meth:`PartitionedFetcher.partitioned_fetch` accepts, so ``sync``
     resumes them in a later 24 h window; the dataset stays ``incomplete`` until they finish,
-    which ``sync`` records.
+    which ``sync`` records. :func:`scope_to_json` and :func:`scope_from_json` turn a scope
+    into plain JSON and back, validated as ``partitioned_fetch`` validates it, so ``sync`` can
+    keep deferred scopes across worker restarts and CLI runs, and
+    :func:`interruption_reason` states the total of what is still deferred.
     ``AccessDenied`` and ``QueryDefect`` propagate unchanged: ``sync.mode`` switches the source
     to simulated data or fails the job.
 
@@ -72,6 +75,18 @@ Safe absence:
     reported ``removed`` or ``missing`` only when both steps completed; otherwise nothing is
     inferred and the previous snapshot stands. :func:`enumerate_entities` applies the same rule to
     ad groups (Q-G4) and keywords (Q-G7).
+
+    An interrupted enumeration returns its :class:`EnumerationProgress`: the scopes still
+    unread and the tracked keys already known absent from the scopes read. ``sync`` stores it
+    and passes it back as ``resume`` in a later entity sync, which reads only the unread
+    scopes, so a scan larger than one day's call budget still finishes. The verdict is never
+    drawn from an unfinished scan: absence is reported only by the call in which the
+    enumeration finishes, from the keys accumulated over every part, and the second check
+    (Q-G2b) starts in the entity sync in which the scan completes, over every accumulated
+    candidate. An interrupted re-read resumes the same way: its progress keeps the chunks
+    not re-read yet and the rows the others returned, the next sync reads only those
+    chunks, and ``removed`` and ``missing`` are reported once every chunk has succeeded,
+    from the rows of all of them.
 
 Reason strings:
     Every ``reason`` begins with a stable prefix that ``ads_engine.sync.freshness`` recognises by
@@ -103,10 +118,10 @@ this package's ``queries``, ``parser`` and ``client`` are imported. Nothing here
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Final, Literal, overload
+from typing import Any, Final, Literal, overload
 
 from ads_engine.connectors.errors import (
     AccessDenied,
@@ -135,6 +150,7 @@ from ads_engine.connectors.google_n8n.queries import (
     MAX_IDS_PER_IN,
     PAGE_SIZE,
     QUERIES,
+    SCOPE_KEYS,
     START,
     QueryTemplate,
 )
@@ -149,10 +165,15 @@ __all__ = [
     "Completeness",
     "EntityEnumeration",
     "EntityQueryId",
+    "EnumerationProgress",
+    "EnumerationQueryId",
     "FetchOutcome",
     "PartitionedFetcher",
     "enumerate_campaigns",
     "enumerate_entities",
+    "interruption_reason",
+    "scope_from_json",
+    "scope_to_json",
 ]
 
 log = get_logger(__name__)
@@ -201,6 +222,16 @@ _BY_IDS_QUERY: Final = "Q-G2b"
 _ID_LIST_FIELD: Final = _CAMPAIGN_FIELD
 
 _ENTITY_QUERY_IDS: Final[frozenset[str]] = frozenset({"Q-G4", "Q-G7"})
+_KEYWORD_QUERY: Final = "Q-G7"
+
+# Scope keys whose values are native dates; every other scope key holds an int id, except
+# ``ids``, which holds a collection of them.
+_DATE_KEYS: Final[frozenset[str]] = frozenset({START, END})
+
+# The fields of EnumerationProgress.to_json, exactly.
+_PROGRESS_KEYS: Final[frozenset[str]] = frozenset(
+    {"query_id", "pending", "absent", "rereading", "reread_rows"}
+)
 
 # A finest-partition reason names at most this many (day, ad group) partitions, then a count.
 _MAX_NAMED_PARTITIONS: Final = 3
@@ -220,6 +251,179 @@ Completeness = Literal["complete", "incomplete"]
 
 EntityQueryId = Literal["Q-G4", "Q-G7"]
 """The entity enumerations :func:`enumerate_entities` runs: ad groups and keywords."""
+
+EnumerationQueryId = Literal["Q-G2", "Q-G4", "Q-G7"]
+"""The safe-absence enumerations an :class:`EnumerationProgress` resumes."""
+
+
+@dataclass(frozen=True, slots=True)
+class EnumerationProgress:
+    """Where an unfinished safe-absence enumeration stands, so a later sync resumes it.
+
+    :func:`enumerate_campaigns` and :func:`enumerate_entities` return one in ``progress``
+    when an interruption stops them, and read only :attr:`pending` when it is passed back as
+    ``resume``. Construction validates every field and normalises :attr:`pending` to
+    immutable scopes, :attr:`absent` to a ``frozenset`` and :attr:`reread_rows` to a tuple.
+
+    Example::
+
+        first = await enumerate_entities(client, "Q-G4", tracked)  # budget runs out
+        stored = first.progress.to_json()  # kept by sync until the next entity sync
+        later = await enumerate_entities(
+            client, "Q-G4", tracked, resume=EnumerationProgress.from_json(stored)
+        )
+
+    Attributes:
+        query_id: ``"Q-G2"`` (campaigns, with the Q-G2b re-read), ``"Q-G4"`` (ad groups) or
+            ``"Q-G7"`` (keywords).
+        pending: The scopes not read yet, in reading order; never empty. Each is a scope
+            ``partitioned_fetch(query_id, scope)`` accepts, or, while :attr:`rereading`, a
+            Q-G2b chunk ``{"ids": ...}`` of at most 1,000 candidate ids not re-read yet.
+        absent: Tracked keys that lie inside scopes already read but were not returned:
+            campaign ids (Q-G2), ad-group ids (Q-G4) or ``(ad_group_id, criterion_id)``
+            pairs (Q-G7). They are the absence candidates of the verdict once the
+            enumeration finishes; nothing is inferred from them before. While
+            :attr:`rereading`, every candidate of the re-read, re-read or not.
+        rereading: Q-G2 only: the scan has finished and the Q-G2b re-read of the
+            :attr:`pending` chunks is outstanding.
+        reread_rows: While :attr:`rereading`, the raw Q-G2b rows, ``REMOVED`` or not, that
+            the chunks already re-read returned; each is a JSON object whose ``campaign.id``
+            is a candidate, lies in no pending chunk and appears once. They join the verdict
+            once every chunk has succeeded, so it is the one a single pass would draw.
+            Empty otherwise.
+
+    Raises:
+        ValueError: If the query id is not an enumeration, ``rereading`` is set for Q-G4 or
+            Q-G7, nothing is pending, a scope is invalid for its template, a key has the
+            wrong shape, a pending Q-G2b chunk is empty, holds more than 1,000 ids, repeats
+            an id or names one that is not a candidate, or a re-read row is not a JSON
+            object, has no INT64 ``campaign.id``, names no candidate, repeats a campaign or
+            names a campaign still pending, or rows are kept outside a re-read.
+    """
+
+    query_id: EnumerationQueryId
+    pending: tuple[Mapping[str, object], ...]
+    absent: frozenset[int] | frozenset[tuple[int, int]]
+    rereading: bool = False
+    reread_rows: tuple[GoogleAdsRow, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate the fields and normalise the scopes, keys and rows (class docstring)."""
+        _enumeration_query_id(self.query_id)
+        if not isinstance(self.rereading, bool):
+            raise ValueError("rereading must be a bool")
+        if self.rereading and self.query_id != _SCAN_QUERY:
+            raise ValueError(f"{self.query_id}: only Q-G2 has a Q-G2b re-read to resume")
+        if not self.pending:
+            raise ValueError(
+                "Q-G2: a Q-G2b re-read has a chunk pending"
+                if self.rereading
+                else f"{self.query_id}: an unfinished enumeration has a pending scope"
+            )
+        scope_query = _BY_IDS_QUERY if self.rereading else self.query_id
+        pending = tuple(
+            scope_from_json(scope_query, scope_to_json(scope)) for scope in self.pending
+        )
+        absent: frozenset[int] | frozenset[tuple[int, int]] = (
+            _tracked_pairs(self.query_id, self.absent)
+            if self.query_id == _KEYWORD_QUERY
+            else _tracked_ids(self.query_id, self.absent)
+        )
+        rows = tuple(self.reread_rows)
+        if self.rereading:
+            _check_reread(pending, _tracked_ids(self.query_id, absent), rows)
+        elif rows:
+            raise ValueError(f"{self.query_id}: only a Q-G2b re-read keeps re-read rows")
+        object.__setattr__(self, "pending", pending)
+        object.__setattr__(self, "absent", absent)
+        object.__setattr__(self, "reread_rows", rows)
+
+    @property
+    def outstanding(self) -> int:
+        """Scopes still to read: the pending scan scopes, or the Q-G2b chunks of a re-read."""
+        return len(self.pending)
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the progress as plain JSON; :meth:`from_json` is its inverse.
+
+        A re-read row keeps its JSON values; a ``Decimal`` the relay sent becomes an int
+        when integral and a float otherwise, which the row parsers treat alike.
+
+        Example::
+
+            EnumerationProgress("Q-G4", ({"last_id": 9999},), frozenset({5})).to_json()
+            # {"query_id": "Q-G4", "pending": [{"last_id": 9999}], "absent": [5],
+            #  "rereading": False, "reread_rows": []}
+            EnumerationProgress(
+                "Q-G2",
+                ({"ids": (7,)},),
+                frozenset({5, 7}),
+                rereading=True,
+                reread_rows=({"campaign": {"id": "5", "status": "REMOVED"}},),
+            ).to_json()
+            # {"query_id": "Q-G2", "pending": [{"ids": [7]}], "absent": [5, 7],
+            #  "rereading": True,
+            #  "reread_rows": [{"campaign": {"id": "5", "status": "REMOVED"}}]}
+        """
+        absent: list[object]
+        if self.query_id == _KEYWORD_QUERY:
+            # JSON has no tuples: a (ad_group_id, criterion_id) pair is stored as a 2-list.
+            absent = [list(pair) for pair in sorted(_tracked_pairs(self.query_id, self.absent))]
+        else:
+            absent = [*sorted(_tracked_ids(self.query_id, self.absent))]
+        return {
+            "query_id": self.query_id,
+            "pending": [scope_to_json(scope) for scope in self.pending],
+            "absent": absent,
+            "rereading": self.rereading,
+            "reread_rows": [_json_value(row) for row in self.reread_rows],
+        }
+
+    @classmethod
+    def from_json(cls, data: object) -> EnumerationProgress:
+        """Rebuild progress stored by :meth:`to_json`, validated before anything is sent.
+
+        Args:
+            data: The decoded JSON object.
+
+        Returns:
+            The progress.
+
+        Raises:
+            ValueError: When ``data`` is not exactly the object :meth:`to_json` writes, or
+                any field fails the class's validation.
+        """
+        if not isinstance(data, Mapping) or set(data) != _PROGRESS_KEYS:
+            raise ValueError(
+                f"stored enumeration progress must hold exactly {sorted(_PROGRESS_KEYS)}"
+            )
+        query_id = _enumeration_query_id(data["query_id"])
+        pending, absent, rereading = data["pending"], data["absent"], data["rereading"]
+        rows = data["reread_rows"]
+        if not isinstance(pending, list | tuple) or not isinstance(absent, list | tuple):
+            raise ValueError(f"{query_id}: stored pending scopes and absent keys must be lists")
+        if not isinstance(rows, list | tuple):
+            raise ValueError(f"{query_id}: stored re-read rows must be a list")
+        if not isinstance(rereading, bool):
+            raise ValueError(f"{query_id}: stored rereading must be a bool")
+        # A re-read's pending scopes are Q-G2b chunks; __post_init__ refuses a re-read of
+        # another enumeration.
+        scope_query = _BY_IDS_QUERY if rereading and query_id == _SCAN_QUERY else query_id
+        keys: frozenset[int] | frozenset[tuple[int, int]]
+        if query_id == _KEYWORD_QUERY:
+            # JSON has no tuples: a stored (ad_group_id, criterion_id) pair is a 2-list.
+            keys = _tracked_pairs(
+                query_id, [tuple(key) if isinstance(key, list) else key for key in absent]
+            )
+        else:
+            keys = _tracked_ids(query_id, absent)
+        return cls(
+            query_id=query_id,
+            pending=tuple(scope_from_json(scope_query, scope) for scope in pending),
+            absent=keys,
+            rereading=rereading,
+            reread_rows=tuple(rows),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,18 +479,24 @@ class CampaignEnumeration:
     budget ``missing`` inference as well.
 
     Attributes:
-        present: Q-G2 rows of every non-removed campaign, followed by Q-G2b rows of re-read
-            tracked campaigns whose status is not ``REMOVED``.
-        removed: Q-G2b rows whose raw ``campaign.status`` is ``REMOVED``; ``sync`` snapshots them
-            as ``ended``. Empty unless :attr:`complete`.
+        present: Q-G2 rows of every non-removed campaign this call scanned, followed, once the
+            re-read is complete, by the Q-G2b rows of every re-read tracked campaign whose
+            status is not ``REMOVED``, from every call of the re-read.
+        removed: Q-G2b rows whose raw ``campaign.status`` is ``REMOVED``, from every call of
+            the re-read; ``sync`` snapshots them as ``ended``. Empty unless :attr:`complete`.
         missing_ids: Tracked campaign ids that neither the complete Q-G2 scan nor Q-G2b
             returned. Empty unless :attr:`complete`.
         complete: Whether the Q-G2 scan ended on a short page with no failed or deferred page
-            and every Q-G2b chunk succeeded. When ``False`` no removal or disappearance may be
-            inferred: the previous snapshot stands and ``google.entities`` is incomplete.
-        reason: The failing step's reason; ``None`` when complete.
-        calls: POST attempts made by both steps.
+            and every Q-G2b chunk succeeded, the scan's earlier parts read by earlier calls
+            included. When ``False`` no removal or disappearance may be inferred: the previous
+            snapshot stands and ``google.entities`` is incomplete.
+        reason: The failing step's reason, naming every scope still deferred; ``None`` when
+            complete.
+        calls: POST attempts made by both steps in this call.
         interrupted_by: The transient error that stopped the failing step, or ``None``.
+        progress: What a later call must still read (``resume``): the unread scan scopes, or
+            the Q-G2b chunks not re-read yet with the rows of those already re-read; ``None``
+            once the enumeration finished.
     """
 
     present: tuple[GoogleAdsRow, ...]
@@ -296,6 +506,7 @@ class CampaignEnumeration:
     reason: str | None
     calls: int
     interrupted_by: TransientError | None
+    progress: EnumerationProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,11 +518,16 @@ class EntityEnumeration:
             rows included, so ``sync`` writes keyword rows and quality-score snapshots for them.
         absent_keys: Tracked keys the complete enumeration did not return: ``ad_group.id``
             values for Q-G4, ``(ad_group.id, ad_group_criterion.criterion_id)`` pairs for Q-G7
-            (criterion ids are unique only within an ad group). Empty unless :attr:`complete`.
+            (criterion ids are unique only within an ad group). They are accumulated over
+            every call that read part of a resumed enumeration. Empty unless
+            :attr:`complete`.
         complete: Whether the enumeration read every row; when ``False`` nothing is inferred.
-        reason: Why the enumeration is incomplete; ``None`` when complete.
-        calls: POST attempts made.
+        reason: Why the enumeration is incomplete, naming every scope still deferred; ``None``
+            when complete.
+        calls: POST attempts made in this call.
         interrupted_by: The transient error that stopped the enumeration, or ``None``.
+        progress: The unread scopes and the absence candidates found so far, for ``resume``
+            in a later call; ``None`` once the enumeration finished.
     """
 
     rows: tuple[GoogleAdsRow, ...]
@@ -320,6 +536,7 @@ class EntityEnumeration:
     reason: str | None
     calls: int
     interrupted_by: TransientError | None
+    progress: EnumerationProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,7 +706,7 @@ async def _partitioned_fetch(
 
     reasons: list[str] = []
     if interrupted_by is not None:
-        reasons.append(_interruption_reason(interrupted_by, len(deferred)))
+        reasons.append(interruption_reason(interrupted_by, len(deferred)))
     if capped_kept:
         reasons.append(REASON_RESULT_LIMIT)
     if finest_overflows:
@@ -622,6 +839,123 @@ def _checked_id(label: str, key: str, value: object) -> int:
 def _frozen(scope: Mapping[str, object]) -> Mapping[str, object]:
     """Return an immutable copy of a partition scope, for :attr:`FetchOutcome.deferred`."""
     return MappingProxyType(dict(scope))
+
+
+# ---------------------------------------------------------------------------------------------
+# Scopes as JSON, for deferred work kept across syncs
+# ---------------------------------------------------------------------------------------------
+
+
+def scope_to_json(scope: Mapping[str, object]) -> dict[str, object]:
+    """Return a partition scope as plain JSON values; :func:`scope_from_json` is its inverse.
+
+    ``start`` and ``end`` become ``YYYY-MM-DD`` text, ``ids`` a list of ints in the given
+    order, and every other key keeps its int id. ``sync`` stores the result for deferred
+    scopes, and two scopes are the same partition exactly when their JSON forms are equal.
+
+    Example::
+
+        scope_to_json(
+            {
+                "start": date(2026, 9, 1),
+                "end": date(2026, 9, 3),
+                "campaign_lo": 0,
+                "campaign_hi": 4611686018427387903,
+            }
+        )
+        # {"start": "2026-09-01", "end": "2026-09-03", "campaign_lo": 0,
+        #  "campaign_hi": 4611686018427387903}
+
+    Args:
+        scope: A scope :meth:`PartitionedFetcher.partitioned_fetch` accepts, such as an entry
+            of :attr:`FetchOutcome.deferred`.
+
+    Returns:
+        A new dict of JSON values.
+
+    Raises:
+        ValueError: When a key is not a scope key of ``queries.py``, a date key holds
+            anything but a ``datetime.date`` (a ``datetime`` included), ``ids`` is not a
+            collection of int ids, or another key holds anything but an int id in
+            ``0 .. INT64_MAX`` (``bool`` included).
+    """
+    data: dict[str, object] = {}
+    for key, value in scope.items():
+        if key not in SCOPE_KEYS:
+            raise ValueError(f"unknown scope key {key!r}")
+        if key in _DATE_KEYS:
+            if isinstance(value, datetime) or not isinstance(value, date):
+                raise ValueError(f"scope key {key!r} must be a datetime.date")
+            data[key] = value.isoformat()
+        elif key == IDS:
+            if isinstance(value, str | bytes | bytearray | Mapping) or not isinstance(
+                value, Collection
+            ):
+                raise ValueError(f"scope key {IDS!r} must be a collection of int ids")
+            data[key] = [_checked_id("scope", IDS, item) for item in value]
+        else:
+            data[key] = _checked_id("scope", key, value)
+    return data
+
+
+def scope_from_json(query_id: str, data: object) -> Mapping[str, object]:
+    """Rebuild a scope :func:`scope_to_json` stored for ``query_id``, validated before use.
+
+    Types are rebuilt by key: ``start`` and ``end`` from ``YYYY-MM-DD`` text, ``ids`` from a
+    list of ints, every other key from an int. The scope is then checked exactly as
+    :meth:`PartitionedFetcher.partitioned_fetch` checks a scope (the template's keys,
+    required keys, value ranges and pairings, and a Q-G5 criterion keyset on one day), so a
+    stored scope that the template would reject is refused here and nothing is ever sent
+    for it.
+
+    Example::
+
+        scope_from_json("Q-G6", {"start": "2026-09-01", "end": "2026-09-03"})
+        # mappingproxy({"start": date(2026, 9, 1), "end": date(2026, 9, 3)})
+
+    Args:
+        query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`.
+        data: The decoded JSON object.
+
+    Returns:
+        The immutable scope.
+
+    Raises:
+        ValueError: When ``query_id`` is unknown, ``data`` is not an object of scope keys, a
+            value has the wrong JSON type (``bool`` and floats included), a date is not a
+            valid ``YYYY-MM-DD`` date, or the template rejects the scope.
+    """
+    template = _template(query_id)
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{template.query_id}: a stored scope must be a JSON object")
+    scope: dict[str, object] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or key not in SCOPE_KEYS:
+            raise ValueError(f"{template.query_id}: unknown stored scope key")
+        if key in _DATE_KEYS:
+            scope[key] = _stored_date(template.query_id, key, value)
+        elif key == IDS:
+            if not isinstance(value, list | tuple):
+                raise ValueError(f"{template.query_id}: stored {IDS!r} must be a list of int ids")
+            scope[key] = tuple(_checked_id(template.query_id, IDS, item) for item in value)
+        else:
+            scope[key] = _checked_id(template.query_id, key, value)
+    _initial_partitions(template, scope)
+    return _frozen(scope)
+
+
+def _stored_date(query_id: str, key: str, value: object) -> date:
+    """Read one stored ``YYYY-MM-DD`` scope date.
+
+    Raises:
+        ValueError: When the value is not text of that exact form or not a valid date.
+    """
+    if isinstance(value, str) and _DATE_TEXT_RE.fullmatch(value) is not None:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise ValueError(f"{query_id}: stored scope key {key!r} must be a YYYY-MM-DD date")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -921,18 +1255,33 @@ def _outside(template: QueryTemplate, gaql_field: str) -> QueryDefect:
 # ---------------------------------------------------------------------------------------------
 
 
-def _interruption_reason(exc: TransientError, deferred: int) -> str:
-    """Return the repairable reason of an interrupted fetch.
+def interruption_reason(exc: TransientError, deferred: int) -> str:
+    """Return the repairable reason of interrupted work with ``deferred`` scopes unread.
+
+    Every interrupted fetch and enumeration states its reason with this function, and
+    ``sync`` uses it to state the total still deferred for a dataset when that work spans
+    several queries or earlier runs.
+
+    Example::
+
+        interruption_reason(CallBudgetExhausted(), 3)
+        # "call budget exhausted; 3 partitions deferred"
 
     Args:
-        exc: The transient error that stopped the fetch.
-        deferred: Partitions deferred, the interrupted one included (at least 1).
+        exc: The transient error that stopped the work.
+        deferred: Partitions or scopes still unread, the interrupted one included.
 
     Returns:
         ``"call budget exhausted; N partitions deferred"`` for the call budget, otherwise
         ``"interrupted: {exc.reason}; N partitions deferred"``. Both start with a prefix that
         ``sync.freshness`` treats as repairable.
+
+    Raises:
+        ValueError: When ``deferred`` is not a positive int: interrupted work always leaves
+            the interrupted scope unread.
     """
+    if isinstance(deferred, bool) or not isinstance(deferred, int) or deferred < 1:
+        raise ValueError("an interruption defers at least one scope")
     count = f"{deferred} partition{'' if deferred == 1 else 's'} deferred"
     if isinstance(exc, CallBudgetExhausted):
         return f"{REASON_BUDGET}; {count}"
@@ -984,95 +1333,263 @@ def _log_outcome(outcome: FetchOutcome, *, finest_overflows: int) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _ScopesRead:
+    """What reading an enumeration's scopes in order established, up to an interruption.
+
+    Attributes:
+        rows: The rows of every scope read, in reading order.
+        started: The scopes this call began to read, the interrupted one included.
+        pending: The scopes still unread: the interrupted fetch's deferred partitions, then
+            every scope not started; empty when every scope was read.
+        calls: POST attempts made.
+        interrupted_by: The transient error that stopped the reads, or ``None``.
+    """
+
+    rows: tuple[GoogleAdsRow, ...]
+    started: tuple[Mapping[str, object], ...]
+    pending: tuple[Mapping[str, object], ...]
+    calls: int
+    interrupted_by: TransientError | None
+
+
+async def _read_in_order(
+    client: GoogleAdsWebhookClient, query_id: str, scopes: Sequence[Mapping[str, object]]
+) -> _ScopesRead:
+    """Read ``scopes`` of one enumeration in order, stopping at the first interruption.
+
+    Keyset (Q-G2, Q-G4) and ad-group range (Q-G7) fetches have no capped form they keep as
+    returned, so each one is complete exactly when no interruption stopped it.
+    """
+    rows: list[GoogleAdsRow] = []
+    calls = 0
+    for index, scope in enumerate(scopes):
+        outcome = await _partitioned_fetch(client, query_id, scope)
+        rows.extend(outcome.rows)
+        calls += outcome.calls
+        if outcome.interrupted_by is not None:
+            return _ScopesRead(
+                rows=tuple(rows),
+                started=tuple(scopes[: index + 1]),
+                pending=(*outcome.deferred, *(_frozen(rest) for rest in scopes[index + 1 :])),
+                calls=calls,
+                interrupted_by=outcome.interrupted_by,
+            )
+    return _ScopesRead(
+        rows=tuple(rows), started=tuple(scopes), pending=(), calls=calls, interrupted_by=None
+    )
+
+
+def _scope_holds(scope: Mapping[str, object], key: int | tuple[int, int]) -> bool:
+    """Return whether a tracked key lies inside a scope of a safe-absence enumeration.
+
+    * A keyset scope ``{last_id: L}`` (Q-G2, Q-G4) holds every id above ``L``; a scope with
+      no ``last_id`` starts after 0, as :meth:`PartitionedFetcher.partitioned_fetch` does.
+    * A Q-G7 range ``{ad_group_lo, ad_group_hi}`` holds every keyword of an ad group in the
+      range (the full range when the scope has none); a criterion keyset
+      ``{ad_group_id: A, last_id: L}`` holds the keywords of ad group ``A`` above ``L``.
+    * A Q-G2b chunk ``{ids}`` holds exactly its ids.
+    """
+    if isinstance(key, tuple):
+        ad_group_id, criterion_id = key
+        if AD_GROUP_ID in scope:
+            return ad_group_id == _scope_id(scope, AD_GROUP_ID) and criterion_id > _scope_id(
+                scope, LAST_ID
+            )
+        lo, hi = _scope_range(scope, AD_GROUP_LO, AD_GROUP_HI) or _FULL_RANGE
+        return lo <= ad_group_id <= hi
+    if IDS in scope:
+        return key in _scope_ids(scope)
+    last_id = _scope_id(scope, LAST_ID) if LAST_ID in scope else INT64_MIN_ID
+    return key > last_id
+
+
+def _absent_after[K: (int, tuple[int, int])](
+    tracked: frozenset[K],
+    returned: Collection[K],
+    read: _ScopesRead,
+    prior: frozenset[K],
+) -> frozenset[K]:
+    """Return the absence candidates known after one call of a (resumed) enumeration.
+
+    A tracked key is a new candidate when it lies inside a scope this call began to read,
+    inside none of the scopes still pending, and was not returned. Candidates of earlier
+    calls (``prior``) stay candidates while they are still tracked: the scopes they lie in
+    were read in full and are disjoint from everything read later.
+    """
+    found = {
+        key
+        for key in tracked
+        if key not in returned
+        and any(_scope_holds(scope, key) for scope in read.started)
+        and not any(_scope_holds(scope, key) for scope in read.pending)
+    }
+    return frozenset(found) | ((prior & tracked) - frozenset(returned))
+
+
+def _enumeration_query_id(value: object) -> EnumerationQueryId:
+    """Narrow a query id to :data:`EnumerationQueryId`.
+
+    Raises:
+        ValueError: When it is not ``"Q-G2"``, ``"Q-G4"`` or ``"Q-G7"``.
+    """
+    if value == "Q-G2":
+        return "Q-G2"
+    if value == "Q-G4":
+        return "Q-G4"
+    if value == "Q-G7":
+        return "Q-G7"
+    raise ValueError("enumeration progress is for 'Q-G2', 'Q-G4' or 'Q-G7' only")
+
+
+def _check_resume(query_id: str, resume: EnumerationProgress | None) -> None:
+    """Refuse progress of another enumeration before anything is sent.
+
+    Raises:
+        ValueError: When ``resume`` belongs to another query id.
+    """
+    if resume is not None and resume.query_id != query_id:
+        raise ValueError(f"progress of {resume.query_id} cannot resume {query_id}")
+
+
 async def enumerate_campaigns(
-    client: GoogleAdsWebhookClient, tracked_ids: Collection[int]
+    client: GoogleAdsWebhookClient,
+    tracked_ids: Collection[int],
+    *,
+    resume: EnumerationProgress | None = None,
 ) -> CampaignEnumeration:
     """Enumerate every campaign and decide, from complete reads only, which tracked ones left.
 
-    1. Run the Q-G2 keyset scan from ``last_id`` 0. It is complete only when it ended on a
-       short page with no failed or deferred page.
-    2. Take the tracked ids the scan did not return. When there are none, the result is
-       complete with nothing removed or missing.
-    3. Re-read those ids with Q-G2b, at most 1,000 per ``IN`` list and with no status filter;
-       every chunk must succeed.
-    4. Both steps complete: Q-G2b rows with raw status ``REMOVED`` are :attr:`removed`, its
-       other rows join :attr:`present`, and ids neither step returned are :attr:`missing_ids`.
+    1. Run the Q-G2 keyset scan: from ``last_id`` 0, or with ``resume`` only over its
+       pending scopes, in order. An interruption stops it at once: the unread scopes and the
+       candidates found so far are returned in :attr:`CampaignEnumeration.progress`, and
+       nothing is inferred.
+    2. Once the scan has finished, the candidates are the tracked ids that lie inside a scope
+       read by this call or an earlier one and were never returned. When there are none, the
+       result is complete with nothing removed or missing.
+    3. Re-read every candidate with Q-G2b, at most 1,000 per ``IN`` list and with no status
+       filter; every chunk must succeed. An interrupted chunk returns progress
+       (``rereading``) holding the chunks not re-read yet, the rows the chunks already
+       re-read returned and every candidate, and nothing is inferred. With that progress as
+       ``resume`` only the pending chunks are read, so a re-read larger than one day's call
+       budget still finishes.
+    4. Both steps complete, every chunk of the re-read succeeded, in this call or an earlier
+       one: the Q-G2b rows of every chunk with raw status ``REMOVED`` are :attr:`removed`,
+       its other rows join :attr:`present`, and candidates no chunk returned are
+       :attr:`missing_ids`: the verdict of one uninterrupted pass.
     5. Either step incomplete: ``complete=False`` with nothing removed or missing, so no
-       removal or disappearance is inferred and the previous snapshot stands. Q-G2b is not run
-       after an incomplete scan, whose absent ids cannot be known.
+       removal or disappearance is inferred and the previous snapshot stands; the rows of
+       an unfinished re-read wait in the progress. Q-G2b never runs after an unfinished
+       scan, whose absent ids cannot be known yet.
 
     Args:
         client: The webhook client.
         tracked_ids: External ids of the dataset's tracked campaigns.
+        resume: Progress an earlier call returned for this dataset, or ``None`` to start a
+            new scan.
 
     Returns:
-        The campaign rows and the safe-absence verdict.
+        The campaign rows read by this call and the safe-absence verdict.
 
     Raises:
         AccessDenied: Propagated unchanged.
         QueryDefect: Propagated unchanged.
-        ValueError: When a tracked id is not an ``int`` in ``0 .. INT64_MAX``; nothing is sent.
+        ValueError: When a tracked id is not an ``int`` in ``0 .. INT64_MAX`` or ``resume``
+            belongs to another enumeration; nothing is sent.
     """
     tracked = _tracked_ids(_SCAN_QUERY, tracked_ids)
+    _check_resume(_SCAN_QUERY, resume)
     scan_template = QUERIES[_SCAN_QUERY]
-    scan = await _partitioned_fetch(client, _SCAN_QUERY, {LAST_ID: INT64_MIN_ID})
-    if not scan.complete:
-        return _log_campaigns(
-            CampaignEnumeration(
-                present=scan.rows,
-                removed=(),
-                missing_ids=frozenset(),
-                complete=False,
-                reason=scan.reason,
-                calls=scan.calls,
-                interrupted_by=scan.interrupted_by,
-            ),
-            tracked=len(tracked),
+    reread_template = QUERIES[_BY_IDS_QUERY]
+    present: tuple[GoogleAdsRow, ...] = ()
+    calls = 0
+    reread_earlier: tuple[GoogleAdsRow, ...] = ()
+    if resume is not None and resume.rereading:
+        # Candidates count only while still tracked, with the rows and chunks they lie in.
+        candidates = _tracked_ids(_SCAN_QUERY, resume.absent) & tracked
+        unread = sorted(
+            campaign_id
+            for chunk in resume.pending
+            for campaign_id in _scope_ids(chunk)
+            if campaign_id in candidates
         )
-    seen = {_row_id(scan_template, row, _CAMPAIGN_FIELD) for row in scan.rows}
-    absent = sorted(tracked - seen)
-    if not absent:
+        reread_earlier = tuple(
+            row
+            for row in resume.reread_rows
+            if _row_id(reread_template, row, _CAMPAIGN_FIELD) in candidates
+        )
+    else:
+        prior = frozenset() if resume is None else _tracked_ids(_SCAN_QUERY, resume.absent)
+        scopes = (_frozen({LAST_ID: INT64_MIN_ID}),) if resume is None else resume.pending
+        scan = await _read_in_order(client, _SCAN_QUERY, scopes)
+        present, calls = scan.rows, scan.calls
+        seen = {_row_id(scan_template, row, _CAMPAIGN_FIELD) for row in scan.rows}
+        candidates = _absent_after(tracked, seen, scan, prior)
+        if scan.interrupted_by is not None:
+            progress = EnumerationProgress(_SCAN_QUERY, scan.pending, candidates)
+            return _log_campaigns(
+                CampaignEnumeration(
+                    present=present,
+                    removed=(),
+                    missing_ids=frozenset(),
+                    complete=False,
+                    reason=interruption_reason(scan.interrupted_by, progress.outstanding),
+                    calls=calls,
+                    interrupted_by=scan.interrupted_by,
+                    progress=progress,
+                ),
+                tracked=len(tracked),
+            )
+        unread = sorted(candidates)
+    if not candidates:
         return _log_campaigns(
             CampaignEnumeration(
-                present=scan.rows,
+                present=present,
                 removed=(),
                 missing_ids=frozenset(),
                 complete=True,
                 reason=None,
-                calls=scan.calls,
+                calls=calls,
                 interrupted_by=None,
             ),
             tracked=len(tracked),
         )
-    reread_template = QUERIES[_BY_IDS_QUERY]
-    reread = await _partitioned_fetch(client, _BY_IDS_QUERY, {IDS: absent})
-    removed: list[GoogleAdsRow] = []
-    still_present: list[GoogleAdsRow] = []
-    returned: set[int] = set()
-    for row in reread.rows:
-        returned.add(_row_id(reread_template, row, _CAMPAIGN_FIELD))
-        status = get_field(row, _CAMPAIGN_STATUS_FIELD, surface=reread_template.row_surface)
-        (removed if status == _REMOVED else still_present).append(row)
-    present = scan.rows + tuple(still_present)
-    calls = scan.calls + reread.calls
-    if not reread.complete:
+    # An empty id list reads nothing and sends no call: every chunk was re-read earlier.
+    reread = await _partitioned_fetch(client, _BY_IDS_QUERY, {IDS: unread})
+    reread_rows = (*reread_earlier, *reread.rows)
+    calls += reread.calls
+    if reread.interrupted_by is not None:
+        # A capped Q-G2b chunk is a QueryDefect, so a chunk falls short only when interrupted.
+        # The chunks read so far keep their rows, and the next call reads only the chunks
+        # still deferred, so the verdict rests on one complete pass over every candidate.
+        progress = EnumerationProgress(
+            _SCAN_QUERY, reread.deferred, candidates, rereading=True, reread_rows=reread_rows
+        )
         return _log_campaigns(
             CampaignEnumeration(
                 present=present,
                 removed=(),
                 missing_ids=frozenset(),
                 complete=False,
-                reason=reread.reason,
+                reason=interruption_reason(reread.interrupted_by, progress.outstanding),
                 calls=calls,
                 interrupted_by=reread.interrupted_by,
+                progress=progress,
             ),
             tracked=len(tracked),
         )
+    removed: list[GoogleAdsRow] = []
+    still_present: list[GoogleAdsRow] = []
+    returned: set[int] = set()
+    for row in reread_rows:
+        returned.add(_row_id(reread_template, row, _CAMPAIGN_FIELD))
+        status = get_field(row, _CAMPAIGN_STATUS_FIELD, surface=reread_template.row_surface)
+        (removed if status == _REMOVED else still_present).append(row)
     return _log_campaigns(
         CampaignEnumeration(
-            present=present,
+            present=(*present, *still_present),
             removed=tuple(removed),
-            missing_ids=frozenset(absent) - returned,
+            missing_ids=candidates - returned,
             complete=True,
             reason=None,
             calls=calls,
@@ -1087,6 +1604,8 @@ async def enumerate_entities(
     client: GoogleAdsWebhookClient,
     query_id: Literal["Q-G4"],
     tracked_keys: Collection[int],
+    *,
+    resume: EnumerationProgress | None = None,
 ) -> EntityEnumeration: ...
 
 
@@ -1095,6 +1614,8 @@ async def enumerate_entities(
     client: GoogleAdsWebhookClient,
     query_id: Literal["Q-G7"],
     tracked_keys: Collection[tuple[int, int]],
+    *,
+    resume: EnumerationProgress | None = None,
 ) -> EntityEnumeration: ...
 
 
@@ -1102,54 +1623,73 @@ async def enumerate_entities(
     client: GoogleAdsWebhookClient,
     query_id: EntityQueryId,
     tracked_keys: Collection[int] | Collection[tuple[int, int]],
+    *,
+    resume: EnumerationProgress | None = None,
 ) -> EntityEnumeration:
     """Enumerate every ad group (Q-G4) or keyword (Q-G7) and the tracked keys no longer returned.
 
-    Q-G4 runs the full ``ad_group.id`` keyset scan and keys rows by ``ad_group.id``. Q-G7 runs
-    the full ``ad_group.id`` range partitioning, with a criterion keyset for any single capped
-    ad group, and keys rows by ``(ad_group.id, ad_group_criterion.criterion_id)``, because
-    criterion ids are unique only within an ad group. :attr:`EntityEnumeration.absent_keys` is
-    computed only from a complete enumeration; otherwise it is empty and nothing is inferred.
+    Q-G4 runs the ``ad_group.id`` keyset scan and keys rows by ``ad_group.id``. Q-G7 runs the
+    ``ad_group.id`` range partitioning from the full range, with a criterion keyset for any
+    single capped ad group, and keys rows by ``(ad_group.id, ad_group_criterion.criterion_id)``,
+    because criterion ids are unique only within an ad group. With ``resume`` only its pending
+    scopes are read, in order. An interruption stops the reads at once and returns
+    :attr:`EntityEnumeration.progress`. :attr:`EntityEnumeration.absent_keys` is reported only
+    by the call in which the enumeration finishes, from the candidates of every call; until
+    then it is empty and nothing is inferred.
 
     Args:
         client: The webhook client.
         query_id: ``"Q-G4"`` or ``"Q-G7"``.
         tracked_keys: The dataset's tracked keys: ``int`` ad-group ids for Q-G4,
             ``(ad_group_id, criterion_id)`` tuples for Q-G7.
+        resume: Progress an earlier call returned for this enumeration, or ``None`` to start
+            a new one.
 
     Returns:
-        The rows and the absent tracked keys.
+        The rows read by this call and the absent tracked keys.
 
     Raises:
         AccessDenied: Propagated unchanged.
         QueryDefect: Propagated unchanged.
-        ValueError: When ``query_id`` is neither ``"Q-G4"`` nor ``"Q-G7"`` or a tracked key has
-            the wrong shape; nothing is sent.
+        ValueError: When ``query_id`` is neither ``"Q-G4"`` nor ``"Q-G7"``, a tracked key has
+            the wrong shape, or ``resume`` belongs to another enumeration; nothing is sent.
     """
     if query_id not in _ENTITY_QUERY_IDS:
         raise ValueError("enumerate_entities reads 'Q-G4' or 'Q-G7' only")
+    _check_resume(query_id, resume)
     template = QUERIES[query_id]
-    absent_keys: frozenset[int] | frozenset[tuple[int, int]]
+    absent: frozenset[int] | frozenset[tuple[int, int]]
     if query_id == "Q-G4":
         tracked_ad_groups = _tracked_ids(query_id, tracked_keys)
-        outcome = await _partitioned_fetch(client, query_id, {LAST_ID: INT64_MIN_ID})
-        ad_groups = {_row_id(template, row, _AD_GROUP_FIELD) for row in outcome.rows}
-        absent_keys = frozenset(tracked_ad_groups - ad_groups if outcome.complete else ())
+        scopes = (_frozen({LAST_ID: INT64_MIN_ID}),) if resume is None else resume.pending
+        read = await _read_in_order(client, query_id, scopes)
+        ad_groups = {_row_id(template, row, _AD_GROUP_FIELD) for row in read.rows}
+        prior_ids = frozenset() if resume is None else _tracked_ids(query_id, resume.absent)
+        absent = _absent_after(tracked_ad_groups, ad_groups, read, prior_ids)
     else:
         tracked_keywords = _tracked_pairs(query_id, tracked_keys)
-        outcome = await _partitioned_fetch(client, query_id)
+        full = {AD_GROUP_LO: _FULL_RANGE[0], AD_GROUP_HI: _FULL_RANGE[1]}
+        scopes = (_frozen(full),) if resume is None else resume.pending
+        read = await _read_in_order(client, query_id, scopes)
         keywords = {
             (_row_id(template, row, _AD_GROUP_FIELD), _row_id(template, row, _CRITERION_FIELD))
-            for row in outcome.rows
+            for row in read.rows
         }
-        absent_keys = frozenset(tracked_keywords - keywords if outcome.complete else ())
+        prior_pairs = frozenset() if resume is None else _tracked_pairs(query_id, resume.absent)
+        absent = _absent_after(tracked_keywords, keywords, read, prior_pairs)
+    progress: EnumerationProgress | None = None
+    reason: str | None = None
+    if read.interrupted_by is not None:
+        progress = EnumerationProgress(query_id, read.pending, absent)
+        reason = interruption_reason(read.interrupted_by, progress.outstanding)
     enumeration = EntityEnumeration(
-        rows=outcome.rows,
-        absent_keys=absent_keys,
-        complete=outcome.complete,
-        reason=outcome.reason,
-        calls=outcome.calls,
-        interrupted_by=outcome.interrupted_by,
+        rows=read.rows,
+        absent_keys=absent if progress is None else frozenset(),
+        complete=progress is None,
+        reason=reason,
+        calls=read.calls,
+        interrupted_by=read.interrupted_by,
+        progress=progress,
     )
     log.info(
         "google.enumerate_entities",
@@ -1160,6 +1700,8 @@ async def enumerate_entities(
         absent=len(enumeration.absent_keys),
         complete=enumeration.complete,
         calls=enumeration.calls,
+        resumed=resume is not None,
+        pending=0 if progress is None else progress.outstanding,
     )
     return enumeration
 
@@ -1196,6 +1738,70 @@ def _tracked_pairs(query_id: str, values: Collection[object]) -> frozenset[tuple
     return frozenset(pairs)
 
 
+def _check_reread(
+    chunks: Sequence[Mapping[str, object]], candidates: frozenset[int], rows: Sequence[object]
+) -> None:
+    """Validate the state of an unfinished Q-G2b re-read (:class:`EnumerationProgress`).
+
+    Args:
+        chunks: The pending Q-G2b scopes, already checked against the template.
+        candidates: Every candidate id of the re-read.
+        rows: The raw rows the chunks already re-read returned.
+
+    Raises:
+        ValueError: When a chunk is empty, holds more than ``MAX_IDS_PER_IN`` ids, repeats
+            an id (within it or across chunks) or names a non-candidate; or a row is not a
+            JSON object, has no INT64 ``campaign.id`` or no readable ``campaign.status``,
+            names a non-candidate, repeats a campaign or names a campaign still pending.
+            Messages never carry ids.
+    """
+    unread: set[int] = set()
+    for chunk in chunks:
+        ids = _scope_ids(chunk)
+        if not ids or len(ids) > MAX_IDS_PER_IN:
+            raise ValueError(f"Q-G2: a pending Q-G2b chunk holds 1 to {MAX_IDS_PER_IN} ids")
+        distinct = set(ids)
+        if len(distinct) != len(ids) or unread & distinct:
+            raise ValueError("Q-G2: a candidate id is pending twice")
+        if not candidates.issuperset(distinct):
+            raise ValueError("Q-G2: a pending Q-G2b chunk names an id that is not a candidate")
+        unread |= distinct
+    template = QUERIES[_BY_IDS_QUERY]
+    reread: set[int] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("Q-G2: a re-read row must be a JSON object")
+        try:
+            campaign_id = _row_id(template, row, _CAMPAIGN_FIELD)
+            get_field(row, _CAMPAIGN_STATUS_FIELD, surface=template.row_surface)
+        except QueryDefect:
+            raise ValueError(
+                "Q-G2: a re-read row needs an INT64 campaign.id and a readable campaign.status"
+            ) from None
+        if campaign_id not in candidates:
+            raise ValueError("Q-G2: a re-read row names a campaign that is not a candidate")
+        if campaign_id in reread:
+            raise ValueError("Q-G2: a re-read row repeats a campaign")
+        if campaign_id in unread:
+            raise ValueError("Q-G2: a re-read row names a campaign whose chunk is still pending")
+        reread.add(campaign_id)
+
+
+def _json_value(value: object) -> object:
+    """Return a raw row value as plain JSON, for a stored re-read row.
+
+    Objects and arrays are copied. A ``Decimal`` (how the HTTP layer decodes a JSON number
+    with a fraction or exponent) becomes an ``int`` when integral and a ``float`` otherwise.
+    """
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
 def _log_campaigns(enumeration: CampaignEnumeration, *, tracked: int) -> CampaignEnumeration:
     """Log one ``google.enumerate_campaigns`` event (counts only) and return the enumeration."""
     log.info(
@@ -1207,5 +1813,7 @@ def _log_campaigns(enumeration: CampaignEnumeration, *, tracked: int) -> Campaig
         missing=len(enumeration.missing_ids),
         complete=enumeration.complete,
         calls=enumeration.calls,
+        pending=0 if enumeration.progress is None else enumeration.progress.outstanding,
+        rereading=enumeration.progress is not None and enumeration.progress.rereading,
     )
     return enumeration

@@ -423,8 +423,11 @@ throughout.
 
 ## Contact refresh
 
-Each CRM sync re-reads every matched contact of its dataset by id, with
-`POST /crm/objects/2026-09/contacts/batch/read` (no `idProperty`, at most 100 per call).
+Each CRM sync re-reads by id every matched contact of its dataset and, when Google-touch
+discovery runs, every stored Google-touch contact whatever its touch date, with
+`POST /crm/objects/2026-09/contacts/batch/read` (no `idProperty`, at most 100 per call). A
+Google-only contact touched before the current discovery range is no longer rediscovered, so
+only this read keeps its stage dates current.
 
 - **Properties requested**: `email`, `hs_additional_emails`, `lifecyclestage`,
   `lastmodifieddate`, the stage-date properties of the available MQL and QL bindings, and
@@ -435,10 +438,17 @@ Each CRM sync re-reads every matched contact of its dataset by id, with
 - **Read status**: each matched row's `contact_read_status` becomes `ok`, or `error` when the
   contact was absent from the response, listed in `errors[]`, or in a call that still failed
   after its retries. A record returned under an id that was not requested, such as a merged
-  contact's new id, counts as not read.
+  contact's new id, counts as not read. A Google-only contact has no `lead_match` row and
+  carries no per-contact status; one not read makes `hubspot.google_contacts` incomplete
+  ([Google-to-CRM link](#optional-google-to-crm-link)).
 - **On `error`**: the previous stage values are kept but treated as unknown for the window.
   The contact's CRM evidence is then unknown, never zero, and `hubspot.contacts` is recorded
-  `incomplete` with the reason "N contacts not read".
+  `incomplete` with the reason "N contacts not read", counting matched and Google-touch
+  contacts alike.
+- **Interrupted refresh**: when a call still failed after its retries, the contacts read are
+  stored and the others keep their previous values, but `hubspot.contacts` records a failed
+  attempt instead of a success, and so does `hubspot.google_contacts` when a Google-touch
+  contact went unread ([Errors, fallback and recovery](#errors-fallback-and-recovery)).
 - A contact read requires a bound property map. Without one the client raises a defect
   (`CONTACT_PROPERTIES_UNBOUND`) before any call, because an empty map would read every bound
   date as absent and count the stage as skipped instead of unavailable.
@@ -672,8 +682,10 @@ the range as a sequence of narrower queries whose union is the range.
 
 - **Range**: `createdate` from the default window start to the run time. During a dataset's
   backfill the start is the backfill start (`BACKFILL_DAYS`, at most 180 days). When the
-  stored `hubspot.deal_search` read was cut short by a deferral or a transient failure, the
-  start widens back to that read's coverage start, so the gap is read again.
+  stored `hubspot.deal_search` row is `incomplete` for a repairable reason
+  (`freshness.needs_repair`), the start widens back to that row's coverage start, so the gap
+  is read again. A transient failure records a failed attempt instead (step 6), which leaves
+  the stored row's coverage and completeness as they were, so it never widens the range.
 - **Order and paging**: sorted by `createdate` ascending, 200 results per page, following
   `paging.next.after`. `after` is omitted on a partition's first page.
 - **Partitions**:
@@ -691,12 +703,17 @@ the range as a sequence of narrower queries whose union is the range.
   5. A partition whose paging ends with fewer distinct records than its `total` keeps its
      rows and is `incomplete` with "search paging ended before its reported total". Totals
      can race deletions, so this is an incomplete read, not a defect.
-  6. A transient failure that outlasts its retries keeps the rows already read. The current
-     and every remaining partition are listed as incomplete, with the failure's reason.
+  6. A transient failure that outlasts its retries stops the search and keeps the rows
+     already read. The current and every remaining partition are listed as incomplete, with
+     the failure's reason, and the error is returned as `SearchOutcome.interrupted_by`.
 - **De-duplication**: records are de-duplicated by `id`, keeping the first occurrence.
-- **Consequence**: an `incomplete` search marks `hubspot.deal_search` `incomplete` with its
-  reason. The orphan-deal share then displays as "unknown (N deals not assessed)" and deal
-  counts carry `deal_floor`.
+- **Consequence**: a search cut short by the ceiling or a short read (steps 4 and 5) is a
+  completed read and marks `hubspot.deal_search` `incomplete` with its reason. The orphan-deal
+  share then displays as "unknown (N deals not assessed)" and deal counts carry `deal_floor`.
+  An interrupted search (step 6) is a failed attempt: the deals read are stored and their
+  deals-to-contacts associations still read, but no success is recorded, and the error is
+  handed to `sync/mode.py`. The dataset keeps its last good data (`last_success_at` and its
+  coverage stand) and turns stale, and the connection becomes `stale`.
 - **Defects**: a page that breaks the paging contract raises a defect before another request:
   a record without a usable `id`, a cursor on an empty page, a cursor that repeats an earlier
   one, or a numeric cursor that does not advance.
@@ -740,11 +757,17 @@ pass the causal check. When a check fails, the link is unavailable, with a reaso
 
 - **Discovery** (HubSpot primary dataset only): CRM Search on `contacts` filters the
   touch-date property over the sync range, partitioned exactly like the deal search, with
-  `HAS_PROPERTY` on the campaign property and results sorted by the touch date. It finds
-  Google-only contacts that never submitted a LinkedIn form, and records
-  `hubspot.google_contacts`.
-- **Associations**: discovered contacts get the same contacts-to-meetings and
-  contacts-to-deals reads as matched contacts.
+  `HAS_PROPERTY` on the campaign property and results sorted by the touch date. It finds and
+  stores Google-only contacts that never submitted a LinkedIn form.
+- **Refresh and freshness**: the [contact refresh](#contact-refresh) then re-reads every
+  stored Google-touch contact by id, whatever its touch date. `hubspot.google_contacts` is
+  recorded after that refresh: `incomplete` with "N Google-touch contacts not refreshed" when
+  any was not read, and covering the whole stored range, unless a stored ceiling or short-read
+  discovery shortfall keeps the coverage to this discovery's range. An interrupted discovery,
+  or an interrupted refresh that left a Google-touch contact unread, records a failed attempt
+  instead.
+- **Associations**: every stored Google-touch contact, whatever its touch date, gets the same
+  contacts-to-meetings and contacts-to-deals reads as matched contacts.
 - **Anchor**: the touch date anchors the causal check and lead maturity for Google
   (`crm.lead_maturity_days`, default 14). Each discovered contact counts as one matched lead
   at its touch date.
@@ -795,7 +818,16 @@ platform-wide table is in [architecture.md](../architecture.md); for HubSpot:
   transient failure that outlasted its retries, a batch status other than `COMPLETE`, and
   each 207 error entry. The sync keeps what it read and marks the rest unknown (`failed` in
   a lookup, `contact_read_status = error`, a `partial` or `error` fetch, missing target
-  ids). Access denied and defects always propagate.
+  ids). Access denied and defects always propagate. The first transient failure of a batch
+  method call, or the one that stopped a partitioned search, is also returned in the result's
+  `interrupted_by`, and the sync hands it to `sync/mode.py`, which fails that dataset's
+  refresh: a failed attempt is recorded, `last_success_at` and the coverage stand, the dataset
+  turns stale and the connection becomes `stale`. A batch status other than `COMPLETE` and a
+  207 error entry stay per-input outcomes only. A matching re-fetch or lookup failure
+  (`MatchReport.interrupted_by`) is handed over with no dataset, its rows already `error` and
+  due for a retry: by the CRM sync, the matching job and a build's own matching pass alike.
+  `run_matching` hands each one to its caller as soon as it is observed, so one met before a
+  later batch raises is handed over too, ahead of the raised error, whose consequence stands.
 - **Stale**: an item is flagged stale when a dataset it reads last succeeded more than
   `sources.stale_after_hours` (24) ago or covers less than the window end.
 

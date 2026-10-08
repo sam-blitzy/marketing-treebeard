@@ -31,7 +31,7 @@ and :meth:`JobContext.for_dataset`), each re-fetch edited at the connector seam:
 """
 
 import re
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -45,10 +45,10 @@ from structlog.testing import capture_logs
 
 from ads_engine.connectors.errors import CallBudgetExhausted, TransientError
 from ads_engine.connectors.google_n8n.partition import (
-    REASON_BUDGET,
     REASON_FINEST_PARTITION,
     FetchOutcome,
     PartitionedFetcher,
+    interruption_reason,
 )
 from ads_engine.connectors.linkedin.client import LinkedInClient, Listing
 from ads_engine.connectors.linkedin.parser import (
@@ -86,7 +86,7 @@ type SegmentKey = tuple[int, str, str, date, date]
 """``(campaign_id, facet, value, window_start, window_end)``."""
 type SegmentEdit = Callable[[str, str, tuple[date, date], Listing[SegmentRow]], Listing[SegmentRow]]
 type DailyEdit = Callable[[str, Listing[CreativeDailyRow]], Listing[CreativeDailyRow]]
-type FetchEdit = Callable[[str, FetchOutcome], FetchOutcome]
+type FetchEdit = Callable[[str, Mapping[str, object], FetchOutcome], FetchOutcome]
 
 NOW: Final = datetime(2026, 10, 2, 9, 0, tzinfo=UTC)
 """The instant of every job run: one clock, so every run reads the same native days."""
@@ -869,11 +869,11 @@ async def _inject_google(world: World) -> dict[str, set[tuple[Any, ...]]]:
 
 
 def _patch_fetch(monkeypatch: pytest.MonkeyPatch, edit: FetchEdit) -> None:
-    """Pass every Google partitioned fetch through ``edit(query_id, outcome)``."""
+    """Pass every Google partitioned fetch through ``edit(query_id, scope, outcome)``."""
     original = PartitionedFetcher.partitioned_fetch
 
     async def edited(self: PartitionedFetcher, query_id: str, scope: Any = None) -> FetchOutcome:
-        return edit(query_id, await original(self, query_id, scope))
+        return edit(query_id, scope, await original(self, query_id, scope))
 
     monkeypatch.setattr(PartitionedFetcher, "partitioned_fetch", edited)
 
@@ -918,7 +918,7 @@ async def test_google_empty_complete_answer_empties_the_range(
     before = await _google_facts(google_synced.db, google_synced.dataset_id)
     keys = await _inject_google(google_synced)
 
-    def empty(fetched: str, outcome: FetchOutcome) -> FetchOutcome:
+    def empty(fetched: str, _scope: Mapping[str, object], outcome: FetchOutcome) -> FetchOutcome:
         return replace(outcome, rows=()) if fetched == query_id else outcome
 
     _patch_fetch(monkeypatch, empty)
@@ -944,22 +944,28 @@ async def test_google_empty_complete_answer_empties_the_range(
 async def test_google_incomplete_fetch_keeps_absent_keys(
     google_synced: World, monkeypatch: pytest.MonkeyPatch, query_id: str, shortfall: str
 ) -> None:
-    """A deferred, interrupted or capped fetch deletes nothing; complete queries still do."""
+    """A deferred, interrupted or capped fetch deletes nothing; complete queries still do.
+
+    An interrupted fetch leaves its scope deferred with the reason ``partition.py`` states,
+    as :meth:`PartitionedFetcher.partitioned_fetch` does.
+    """
     before = await _google_facts(google_synced.db, google_synced.dataset_id)
     keys = await _inject_google(google_synced)
 
-    def short(fetched: str, outcome: FetchOutcome) -> FetchOutcome:
+    def short(fetched: str, scope: Mapping[str, object], outcome: FetchOutcome) -> FetchOutcome:
         if fetched != query_id:
             return outcome
         rows = outcome.rows[1:]
         match shortfall:
             case "deferred":
+                budget = CallBudgetExhausted()
                 return replace(
                     outcome,
                     rows=rows,
                     completeness="incomplete",
-                    reason=REASON_BUDGET,
-                    interrupted_by=CallBudgetExhausted(),
+                    reason=interruption_reason(budget, 1),
+                    deferred=(scope,),
+                    interrupted_by=budget,
                 )
             case "finest_partition":
                 return replace(
@@ -973,7 +979,8 @@ async def test_google_incomplete_fetch_keeps_absent_keys(
                     outcome,
                     rows=rows,
                     completeness="incomplete",
-                    reason=error.reason,
+                    reason=interruption_reason(error, 1),
+                    deferred=(scope,),
                     interrupted_by=error,
                 )
 
@@ -984,3 +991,50 @@ async def test_google_incomplete_fetch_keeps_absent_keys(
     assert after[query_id] == before[query_id] | keys[f"{query_id}:in"] | keys[f"{query_id}:out"]
     for other in {"Q-G3", "Q-G5", "Q-G6"} - {query_id}:
         assert after[other] == before[other] | keys[f"{other}:out"], other
+
+
+async def test_google_stored_scopes_reconcile_only_a_whole_date_range(
+    google_synced: World,
+) -> None:
+    """A stored date range is reconciled when read in full; a stored narrowed scope is not.
+
+    The ``google.metrics_daily`` checkpoint holds Q-G3 over the range's end alone and a Q-G5
+    criterion keyset (ad group 123 from criterion 9,999) on that day, which the account
+    answers with no row. Both are read complete. Q-G3's absent key inside its stored range
+    goes. The keyset asked for one ad group's criteria, not for the day, so its empty answer
+    deletes nothing, and the own Q-G5 range leaves the day the keyset covers out: that day's
+    absent key stands until a run reads the day whole. Q-G6, read over its own range, is
+    reconciled as before.
+    """
+    before = await _google_facts(google_synced.db, google_synced.dataset_id)
+    keys = await _inject_google(google_synced)
+    _, day = await _covered(google_synced, "google.metrics_daily")
+    whole = {"start": day.isoformat(), "end": day.isoformat()}
+    keyset = {**whole, "ad_group_id": 123, "last_id": 9999}
+    async with google_synced.db() as session, session.begin():
+        await freshness.write_checkpoint(
+            session,
+            google_synced.dataset_id,
+            "google.metrics_daily",
+            {
+                "version": 1,
+                "pending": {
+                    "Q-G3": [{"scope": whole, "deferred_at": NOW.isoformat()}],
+                    "Q-G5": [{"scope": keyset, "deferred_at": NOW.isoformat()}],
+                },
+                "covered_from": day.isoformat(),
+                "reasons": [],
+            },
+        )
+
+    result = await _run(google_synced, _incremental)
+
+    assert result.status == "succeeded", result.error
+    assert result.completeness == "complete"
+    after = await _google_facts(google_synced.db, google_synced.dataset_id)
+    assert after["Q-G3"] == before["Q-G3"] | keys["Q-G3:out"]
+    assert after["Q-G5"] == before["Q-G5"] | keys["Q-G5:in"] | keys["Q-G5:out"]
+    assert after["Q-G6"] == before["Q-G6"] | keys["Q-G6:out"]
+    async with google_synced.db() as session:
+        rows = await freshness.load_freshness(session, google_synced.dataset_id)
+    assert rows["google.metrics_daily"].checkpoint is None, "the stored work is drained"

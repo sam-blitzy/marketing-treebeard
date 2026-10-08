@@ -4,7 +4,8 @@ The pure parts need no database: the dataset names per source, the reason prefix
 validation of :class:`FreshnessOutcome`, the merge rules that fold an outcome into a stored
 row, and :func:`needs_repair`.
 
-:func:`record_freshness`, :func:`mark_unknown` and :func:`load_freshness` run against the
+:func:`record_freshness`, :func:`mark_unknown`, :func:`load_freshness` and the checkpoint
+helpers (:func:`lock_checkpoint`, :func:`write_checkpoint`) run against the
 PostgreSQL 18 test database named by ``TEST_DATABASE_URL`` (falling back to
 ``DATABASE_URL``). The module
 creates a private schema, builds only ``source_dataset`` and ``dataset_freshness`` in it,
@@ -22,7 +23,7 @@ from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 
 import anyio
 import pytest
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import JSON, create_engine, func, inspect, select, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -44,10 +45,13 @@ from ads_engine.sync.freshness import (
     FreshnessOutcome,
     is_repairable_reason,
     load_freshness,
+    lock_checkpoint,
     mark_unknown,
     needs_repair,
     record_freshness,
+    recorded_shortfall,
     source_of,
+    write_checkpoint,
 )
 
 type Span = tuple[int, int] | None
@@ -1748,3 +1752,195 @@ async def test_mark_unknown_never_commits(sessions: Sessions) -> None:
 
     loaded = await _load(sessions, dataset_id)
     assert _state(loaded[CONTACTS]) == _expected(0, 0, (1, 28), "complete")
+
+
+SEARCH_TERMS = "google.search_terms"
+CHECKPOINT = {
+    "version": 1,
+    "pending": {"Q-G6": [{"start": "2026-09-01", "end": "2026-09-14"}]},
+    "covered_from": "2026-09-01",
+    "reasons": [],
+}
+
+
+async def _stored_checkpoint(
+    sessions: Sessions, dataset_id: int, dataset: str
+) -> tuple[bool, str | None]:
+    """Read in SQL whether the stored checkpoint ``IS NULL``, and its ``jsonb_typeof``."""
+    async with sessions() as session:
+        is_null, json_type = (
+            await session.execute(
+                select(
+                    DatasetFreshness.checkpoint.is_(None),
+                    func.jsonb_typeof(DatasetFreshness.checkpoint),
+                ).where(
+                    DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == dataset
+                )
+            )
+        ).one()
+    return bool(is_null), json_type
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_checkpoint_is_stored_replaced_and_cleared_in_the_callers_transaction(
+    sessions: Sessions,
+) -> None:
+    """``write_checkpoint`` returns what it replaces, commits nothing, and touches only its column.
+
+    The first write seeds the missing row ``unknown`` (as ``record_freshness`` would), the
+    second returns the first value under the row lock, a rolled-back write leaves the stored
+    one, and clearing returns it once more. The coverage, completeness and reason that
+    ``record_freshness`` wrote stand throughout, and ``record_freshness`` keeps the checkpoint.
+    """
+    dataset_id = await _create_dataset(sessions)
+    async with sessions() as session, session.begin():
+        assert await lock_checkpoint(session, dataset_id, SEARCH_TERMS) is None
+        assert await write_checkpoint(session, dataset_id, SEARCH_TERMS, CHECKPOINT) is None
+    seeded = (await _load(sessions, dataset_id))[SEARCH_TERMS]
+    assert (seeded.completeness, seeded.last_attempt_at, seeded.checkpoint) == (
+        "unknown",
+        None,
+        CHECKPOINT,
+    )
+    assert await _stored_checkpoint(sessions, dataset_id, SEARCH_TERMS) == (False, "object")
+
+    await _record(sessions, dataset_id, SEARCH_TERMS, _deferred(0, (1, 14)))
+    recorded = (await _load(sessions, dataset_id))[SEARCH_TERMS]
+    assert recorded.checkpoint == CHECKPOINT, "record_freshness never touches the checkpoint"
+    assert _state(recorded) == _expected(0, 0, (1, 14), "incomplete", DEFERRED)
+
+    later = {**CHECKPOINT, "pending": {"Q-G6": [{"start": "2026-09-10", "end": "2026-09-14"}]}}
+    async with sessions() as session, session.begin():
+        current = await lock_checkpoint(session, dataset_id, SEARCH_TERMS)
+        assert current == CHECKPOINT
+        assert current is not None
+        current["reasons"].append("edited copy")
+        assert await write_checkpoint(session, dataset_id, SEARCH_TERMS, later) == CHECKPOINT
+
+    async with sessions() as session:
+        assert await write_checkpoint(session, dataset_id, SEARCH_TERMS, None) == later
+        await session.rollback()
+    assert (await _load(sessions, dataset_id))[SEARCH_TERMS].checkpoint == later
+    assert await _stored_checkpoint(sessions, dataset_id, SEARCH_TERMS) == (False, "object")
+
+    async with sessions() as session, session.begin():
+        assert await write_checkpoint(session, dataset_id, SEARCH_TERMS, None) == later
+    cleared = (await _load(sessions, dataset_id))[SEARCH_TERMS]
+    assert cleared.checkpoint is None
+    assert await _stored_checkpoint(sessions, dataset_id, SEARCH_TERMS) == (True, None), (
+        "a cleared checkpoint is SQL NULL, not the JSON value null"
+    )
+    assert _state(cleared) == _expected(0, 0, (1, 14), "incomplete", DEFERRED)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_clearing_a_checkpoint_stores_sql_null_and_reads_back_none_in_the_session(
+    sessions: Sessions,
+) -> None:
+    """Clearing writes SQL ``NULL``, even over a JSON ``null``, and the row reads ``None`` at once.
+
+    The cleared attribute is loaded again in the writer's session, so reading it needs no
+    lazy load; a row seeded by a clear, or one holding the JSON value ``null`` (as a clear
+    stored before), ends ``checkpoint IS NULL``, and a later write stores a JSON object again.
+    """
+    dataset_id = await _create_dataset(sessions)
+    async with sessions() as session, session.begin():
+        assert await write_checkpoint(session, dataset_id, METRICS, None) is None
+    assert await _stored_checkpoint(sessions, dataset_id, METRICS) == (True, None)
+
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == METRICS)
+            .values(checkpoint=JSON.NULL)
+        )
+    assert await _stored_checkpoint(sessions, dataset_id, METRICS) == (False, "null")
+
+    async with sessions() as session, session.begin():
+        assert await write_checkpoint(session, dataset_id, METRICS, CHECKPOINT) is None
+        assert await write_checkpoint(session, dataset_id, METRICS, None) == CHECKPOINT
+        row = await session.scalar(
+            select(DatasetFreshness).where(
+                DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == METRICS
+            )
+        )
+        assert row is not None
+        assert "checkpoint" not in inspect(row).unloaded, "no lazy load is left pending"
+        assert row.checkpoint is None
+        assert not session.dirty
+    assert await _stored_checkpoint(sessions, dataset_id, METRICS) == (True, None)
+
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == METRICS)
+            .values(checkpoint=JSON.NULL)
+        )
+    async with sessions() as session, session.begin():
+        assert await write_checkpoint(session, dataset_id, METRICS, None) is None
+    assert await _stored_checkpoint(sessions, dataset_id, METRICS) == (True, None), (
+        "a JSON null left by an earlier clear is turned into SQL NULL"
+    )
+
+    async with sessions() as session, session.begin():
+        assert await write_checkpoint(session, dataset_id, METRICS, CHECKPOINT) is None
+    assert await _stored_checkpoint(sessions, dataset_id, METRICS) == (False, "object")
+    assert (await _load(sessions, dataset_id))[METRICS].checkpoint == CHECKPOINT
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_write_checkpoint_refuses_what_json_cannot_store_and_a_retired_dataset(
+    sessions: Sessions,
+) -> None:
+    """A value JSON cannot hold, a foreign dataset name or a retired dataset writes nothing."""
+    dataset_id = await _create_dataset(sessions)
+    async with sessions() as session:
+        with pytest.raises(ValueError, match="JSON values only"):
+            await write_checkpoint(session, dataset_id, METRICS, {"covered_from": date(2026, 9, 1)})
+        with pytest.raises(ValueError, match="JSON values only"):
+            await write_checkpoint(session, dataset_id, METRICS, {"ratio": float("nan")})
+        with pytest.raises(ValueError, match="string keys"):
+            await write_checkpoint(session, dataset_id, METRICS, {1: "x"})  # type: ignore[dict-item]
+        with pytest.raises(ValueError, match="belongs to hubspot"):
+            await write_checkpoint(session, dataset_id, "hubspot.google_contacts", CHECKPOINT)
+    assert await _count(sessions, dataset_id) == 0, "nothing was seeded for a refused write"
+
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(SourceDataset)
+            .where(SourceDataset.id == dataset_id)
+            .values(state="retired", retired_at=_at(1))
+        )
+    async with sessions() as session:
+        with pytest.raises(DatasetNotWritable):
+            await write_checkpoint(session, dataset_id, METRICS, CHECKPOINT)
+        with pytest.raises(DatasetNotWritable):
+            await lock_checkpoint(session, dataset_id, METRICS)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_recorded_shortfall_is_the_incomplete_reason_without_a_failure_note(
+    sessions: Sessions,
+) -> None:
+    """The stored shortfall a checkpointed run carries forward, with no failure note appended."""
+    dataset_id = await _create_dataset(sessions)
+    assert recorded_shortfall(None) is None
+    complete = await _record(sessions, dataset_id, METRICS, _success(0, (1, 28)))
+    assert recorded_shortfall(complete) is None
+
+    capped = await _record(
+        sessions,
+        dataset_id,
+        METRICS,
+        _success(1, (1, 28), complete=False, reason=REASON_FINEST_PARTITION),
+    )
+    assert recorded_shortfall(capped) == REASON_FINEST_PARTITION
+    failed = await _record(
+        sessions, dataset_id, METRICS, FreshnessOutcome.failure(_at(2), reason="timeout")
+    )
+    assert failed.reason == f"{REASON_FINEST_PARTITION}{FAILURE_MARKER}timeout"
+    assert recorded_shortfall(failed) == REASON_FINEST_PARTITION

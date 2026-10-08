@@ -17,15 +17,24 @@ Lifecycle:
    variables but never their values), configures redacted JSON logging on stdout and runs
    the event loop.
 2. The scheduler (:class:`~ads_engine.sync.scheduler.Scheduler`) takes the scheduler
-   advisory lock. A second worker waits as a standby and takes over when the active one's
-   database session ends.
-3. Holding the lock and before its first tick, the scheduler awaits :func:`startup`:
-   content assets from ``config/content_assets.yaml``, the changed-configuration check, the
-   source bootstrap (every source live or simulated, with an active dataset; with no
-   credentials, all simulated with the reason ``credentials not configured``) and the
-   default-window analysis, so the first default run exists before the first scheduled
-   cycle.
-4. The scheduler then ticks every 30 s until SIGTERM or SIGINT cancels it.
+   advisory lock on a dedicated connection. A second worker waits as a standby and takes
+   over when the active one's database session ends. After every acquisition the scheduler
+   waits 20 s and proves the lock again before any work, and while work runs it proves the
+   lock alive every 5 s, so two workers never run work at the same time.
+3. Holding the lock, the scheduler runs :func:`startup` as a task: content assets from
+   ``config/content_assets.yaml``, the changed-configuration check, the source bootstrap
+   (every source live or simulated, with an active dataset; with no credentials, all
+   simulated with the reason ``credentials not configured``) and the default-window
+   analysis. When the lock is lost meanwhile, startup is cancelled and awaited and runs
+   again from the start after the next acquisition. It completes once, before the first
+   wake, so the first default run exists before the first scheduled cycle.
+4. The scheduler then wakes at once, and every 30 s from that first wake, until SIGTERM or
+   SIGINT cancels it. Each wake dispatches every idle lane as a task (``google``,
+   ``linkedin_hubspot``, ``purge``, ``budget`` and ``analysis``, which coalesces pending
+   ``analysis_request`` rows within 60 s), at most one task per lane, so a long job delays
+   only its own lane. On a lost lock every lane task is cancelled and awaited before the
+   connection is returned; after the next acquisition one ``scheduler_lock_lost``
+   ``analysis_request`` is queued and the wakes resume.
 
 Boundaries: the worker never serves HTTP and exposes no health endpoint (the API's
 ``/healthz`` and the structured logs are the monitoring surface), and it never writes to
@@ -47,20 +56,19 @@ from datetime import UTC, datetime
 from typing import Final
 
 from pydantic import ValidationError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine import __version__
 from ads_engine.analysis.lock import RunInProgress
 from ads_engine.analysis.runner import (
+    PendingRequests,
     RunNoLongerRunning,
     default_window,
     latest_default_run,
+    pending_requests,
     run_analysis,
 )
 from ads_engine.analysis.thresholds import ConfigError, Thresholds
 from ads_engine.analysis.window import AnalysisWindow
-from ads_engine.db.models.analysis import AnalysisRequest
 from ads_engine.db.repositories import enqueue_analysis_request, sync_content_assets
 from ads_engine.db.session import dispose_engine, session_scope
 from ads_engine.logging import configure_logging, get_logger, logged_as
@@ -103,16 +111,19 @@ _STOP_SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGTERM, signal.SIGIN
 
 
 # ---------------------------------------------------------------------------------------------
-# Startup: run once by the scheduler, holding its lock, before the first tick
+# Startup: completed once by the scheduler, holding its lock, before the first wake
 # ---------------------------------------------------------------------------------------------
 
 
 async def startup(settings: Settings | None = None) -> None:
     """Prepare the active worker before its first scheduled cycle.
 
-    :meth:`Scheduler.run_forever` awaits this once it holds the scheduler advisory lock and
-    before its first tick, so it runs only on the single active worker (AAP 0.2.2) and the
-    first default run always precedes the first scheduled cycle (AAP 0.11.2). In order:
+    :meth:`Scheduler.run_forever` runs this as a task once it holds the scheduler advisory
+    lock and its takeover grace has passed, proving the lock alive while it runs, and starts
+    its first wake only after this returns, so it runs only on the single active worker
+    (AAP 0.2.2) and the first default run always precedes the first scheduled cycle
+    (AAP 0.11.2). When the lock is lost while it runs, it is cancelled and awaited and runs
+    again from the start after the next acquisition. In order:
 
     1. Load ``config/`` and replace the content-asset tables with the white paper registry.
     2. Compare the configuration hash with the latest succeeded default run's and enqueue a
@@ -122,9 +133,10 @@ async def startup(settings: Settings | None = None) -> None:
        live or simulated and build, backfill and activate a dataset where none of that mode
        is active, with the companion CRM dataset of a simulated LinkedIn and the baseline
        decisions of the first entity sync. A failure in
-       :data:`~ads_engine.sync.scheduler.JOB_FAILURES` is logged and startup continues:
-       every scheduler tick re-runs ``ensure_dataset``, so the build is retried rather than
-       crash-looping the worker.
+       :data:`~ads_engine.sync.scheduler.JOB_FAILURES` is logged and startup continues: the
+       datasets step of the scheduler's ``google`` and ``linkedin_hubspot`` lanes re-runs
+       ``ensure_dataset`` on every wake that finds its lane idle, so the build is retried
+       rather than crash-looping the worker.
     4. Compute the default-window analysis, serving every pending ``analysis_request``.
        Behind another holder of the ``analysis`` lock, after a
        :data:`~ads_engine.sync.scheduler.JOB_FAILURES` error, or when the run lost its lock,
@@ -234,7 +246,8 @@ async def _bootstrap(settings: Settings) -> None:
 
     ``bootstrap_sources`` already isolates each source's failure. What still escapes it, a
     database outage included, is in :data:`JOB_FAILURES` and is logged here: the scheduler's
-    ticks retry ``ensure_dataset`` and reconnect, so the worker keeps running.
+    source lanes retry ``ensure_dataset`` on their wakes and its lock check reconnects, so
+    the worker keeps running.
 
     Args:
         settings: The process settings.
@@ -252,21 +265,17 @@ async def _bootstrap(settings: Settings) -> None:
         _log.info("sources_bootstrapped", sources=summary, failed=failed)
 
 
-async def _pending_request_ids(session: AsyncSession) -> tuple[int, ...]:
-    """Return the ids of every pending ``analysis_request`` (``picked_at IS NULL``), by id.
+def _backlog_size(backlog: PendingRequests | None) -> int:
+    """How many requests were pending at startup; 0 when none were, or before the read.
 
     Args:
-        session: The caller's session; only read.
+        backlog: What :func:`~ads_engine.analysis.runner.pending_requests` returned, or
+            ``None``.
 
     Returns:
-        The pending ids, ascending.
+        The pending count for the startup log lines.
     """
-    result = await session.scalars(
-        select(AnalysisRequest.id)
-        .where(AnalysisRequest.picked_at.is_(None))
-        .order_by(AnalysisRequest.id)
-    )
-    return tuple(int(request_id) for request_id in result)
+    return 0 if backlog is None else backlog.count
 
 
 async def _requeue_startup_analysis() -> None:
@@ -286,42 +295,48 @@ async def _requeue_startup_analysis() -> None:
 
 
 async def _startup_analysis(thresholds: Thresholds) -> None:
-    """Compute the default-window run before the first tick, serving every pending request.
+    """Compute the default-window run before the first wake, serving every pending request.
 
     The window comes from :func:`~ads_engine.analysis.runner.default_window`, the helper the
     scheduler uses, so startup and event-driven default runs compute identical windows. The
-    pending request ids are passed to ``run_analysis``, which stamps them with the run in its
-    own transaction, so the scheduler does not recompute the same run on its first tick.
-    ``run_analysis`` takes the shared ``analysis`` lock itself; this function never does.
+    backlog is read as the same bounded summary the scheduler reads
+    (:func:`~ads_engine.analysis.runner.pending_requests`), with no coalescing wait, and its
+    highest id is passed as ``serve_through``: ``run_analysis`` claims every pending request
+    up to it in its own transaction before it loads its context, so the scheduler's
+    ``analysis`` lane does not recompute the same run on the first wake, however long the
+    backlog grew while the worker was down. ``run_analysis`` takes the shared ``analysis``
+    lock itself; this function never does.
 
     Args:
         thresholds: The configuration loaded at this startup; the run records its hash.
     """
     at = datetime.now(UTC)
-    request_ids: tuple[int, ...] = ()
+    backlog: PendingRequests | None = None
     try:
         async with session_scope() as session:
-            request_ids = await _pending_request_ids(session)
+            backlog = await pending_requests(session)
         window: AnalysisWindow = await default_window(now=at, thresholds=thresholds)
         run = await run_analysis(
             window,
             "default",
             "scheduled",
             reason=REASON_STARTUP,
-            request_ids=request_ids,
+            serve_through=None if backlog is None else backlog.through_id,
             thresholds=thresholds,
             now=at,
         )
     except RunInProgress:
         # The API (POST /runs) or the CLI (analyze) holds the analysis lock. The pending
         # requests were not touched; the queued one guarantees a default run once it frees.
-        _log.info("startup_analysis_skipped", reason="run_in_progress", requests=len(request_ids))
+        _log.info(
+            "startup_analysis_skipped", reason="run_in_progress", requests=_backlog_size(backlog)
+        )
         await _requeue_startup_analysis()
         return
     except RunNoLongerRunning as exc:
         # The run's lock connection was lost and another process marked the row failed; the
-        # runner stamped the requests as served by that failed run, so queue a fresh one, as
-        # the scheduler's own coalescing step does.
+        # requests the run claimed stay stamped as served by that failed run, so queue a
+        # fresh one, as the scheduler's own coalescing step does.
         _log.error("startup_analysis_lock_lost", run_id=exc.run_id, status=exc.status)
         await _requeue_startup_analysis()
         return
@@ -329,14 +344,16 @@ async def _startup_analysis(thresholds: Thresholds) -> None:
         owner = logged_as(exc)
         if owner is None:
             _log.exception(
-                "startup_analysis_failed", error=type(exc).__name__, requests=len(request_ids)
+                "startup_analysis_failed",
+                error=type(exc).__name__,
+                requests=_backlog_size(backlog),
             )
         else:
             # The runner logged the failure with its traceback (analysis_run_failed).
             _log.warning(
                 "startup_analysis_failed",
                 error=type(exc).__name__,
-                requests=len(request_ids),
+                requests=_backlog_size(backlog),
                 logged_as=owner,
             )
         await _requeue_startup_analysis()
@@ -350,7 +367,7 @@ async def _startup_analysis(thresholds: Thresholds) -> None:
         window_end=window.end.isoformat(),
         days=window.days,
         config_hash=run.config_hash,
-        requests=len(request_ids),
+        requests=_backlog_size(backlog),
     )
 
 
@@ -407,12 +424,15 @@ async def _run(settings: Settings) -> int:
     ``on_start``. SIGTERM or SIGINT logs ``worker_stopping`` and cancels that task; a second
     signal while stopping only logs ``worker_stop_already_requested``.
 
-    Graceful shutdown: the cancellation interrupts the scheduler at its next await. An
-    in-flight ``session_scope()`` rolls back, so at most the current batch is redone, and no
-    state is lost: lead matching commits per batch and claims rows ``FOR UPDATE SKIP
-    LOCKED``, upserts are idempotent and snapshots are append-only (AAP 0.3.2, 0.3.3). The
-    scheduler's dedicated connection runs ``pg_advisory_unlock_all()`` on exit, and the lock
-    dies with its database session in any case, so a standby worker takes over at once.
+    Graceful shutdown: the cancellation reaches the scheduler at its next await, and the
+    scheduler cancels and awaits the startup task or every lane task, whichever are running,
+    before its dedicated connection releases the lock, so no cancelled work writes after the
+    release. An in-flight ``session_scope()`` rolls back, so at most the current batch is
+    redone, and no state is lost: lead matching commits per batch and claims rows ``FOR
+    UPDATE SKIP LOCKED``, upserts are idempotent and snapshots are append-only (AAP 0.3.2,
+    0.3.3). The scheduler's dedicated connection runs ``pg_advisory_unlock_all()`` on exit,
+    and the lock dies with its database session in any case, so a standby worker takes it on
+    its next retry and starts work once its takeover grace has passed.
 
     Args:
         settings: The process settings.

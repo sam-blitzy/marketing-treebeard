@@ -538,6 +538,8 @@ def _create_ops_tables() -> None:
         sa.Column("covered_through", sa.Date(), nullable=True),
         sa.Column("completeness", sa.Text(), nullable=False),
         sa.Column("reason", sa.Text(), nullable=True),
+        # The unread work of an interrupted Google fetch, resumed by the dataset's next run.
+        sa.Column("checkpoint", postgresql.JSONB(), nullable=True),
         _pk("dataset_freshness"),
         _source_check("dataset_freshness"),
         _in_check("dataset_freshness", "dataset", DATASETS),

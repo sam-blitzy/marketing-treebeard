@@ -1039,6 +1039,8 @@ async def test_status_not_complete_fails_call(
         assert read.error is not None
         assert f"batch status {batch_status}" in read.error
     assert fetch.all_targets == ()
+    # An unfinished batch is a per-input outcome, never a transient interruption.
+    assert fetch.interrupted_by is None
 
 
 @pytest.mark.parametrize("failure", ["http_500", "processing"])
@@ -1074,9 +1076,13 @@ async def test_failed_continuation_is_partial(
     if failure == "http_500":
         assert len(continuations) == 3
         assert len(portal.retry_waits) == 2
+        # The exhausted 500 is returned for sync/mode.py, besides the per-input outcome.
+        assert isinstance(fetch.interrupted_by, TransientError)
+        assert fetch.interrupted_by.http_status == 500
     else:
         assert len(continuations) == 1
         assert portal.retry_waits == []
+        assert fetch.interrupted_by is None
 
     paged = fetch.per_input["801"]
     assert paged.status == "partial"
@@ -1200,6 +1206,12 @@ async def test_target_read_omitting_an_id_is_partial(
     assert none_read.missing_ids == {f"{prefix}8", f"{prefix}9"}
     assert dict(none_read.records) == {}
     assert (all_read.status, all_read.missing_ids) == ("ok", frozenset())
+    # A missing id is a per-object outcome, never a transient interruption.
+    assert (partial.interrupted_by, none_read.interrupted_by, all_read.interrupted_by) == (
+        None,
+        None,
+        None,
+    )
 
     expected = MEETING_PROPERTIES if object_type == "meetings" else DEAL_PROPERTIES
     assert tuple(properties) == tuple(expected)
@@ -1219,8 +1231,9 @@ async def test_contact_refresh_missing_contact_is_error(
 
     ``contacts_by_id(["c1", "c2"])`` with only ``c1`` in the portal gives
     ``{"c1": "ok", "c2": "error"}`` (``lead_match.contact_read_status``), whether ``c2`` is
-    omitted or listed; a call still failing after its retries makes every id ``error`` and
-    reads nothing, so previous stage values are kept as unknown, never zeroed.
+    omitted or listed; a call still failing after its retries makes every id ``error``, reads
+    nothing, so previous stage values are kept as unknown, never zeroed, and returns the
+    exhausted error in ``interrupted_by``.
     """
     portal.add_object(
         "contacts",
@@ -1249,8 +1262,11 @@ async def test_contact_refresh_missing_contact_is_error(
         assert row.email_sha256 == email_sha256("c1@example.com")
         assert row.mql_at == datetime(2026, 9, 10, 10, tzinfo=UTC)
         assert row.ql_at is None
+        assert batch.interrupted_by is None
     assert dict(failed.read_status) == {"c1": "error", "c2": "error"}
     assert dict(failed.records) == {}
+    assert isinstance(failed.interrupted_by, TransientError)
+    assert failed.interrupted_by.http_status == 503
     assert len(portal.retry_waits) == 2
     for call in portal.calls:
         assert call.body["properties"] == list(PROPS.request_properties())
@@ -1697,7 +1713,7 @@ async def test_google_contact_discovery_only_when_configured_and_verified(
     than a ``datetime`` one (its midnight would anchor the causal check before a same-day
     touch), the Google link is unavailable and no ``contacts/search`` request is sent. With
     both set and confirmed, the job searches contacts by touch date with ``HAS_PROPERTY`` on
-    the campaign property, stores the Google-only contact and writes
+    the campaign property, stores the Google-only contact, refreshes it by id and writes
     ``hubspot.google_contacts`` freshness.
     """
     live_credentials(SOURCE)
@@ -1708,16 +1724,16 @@ async def test_google_contact_discovery_only_when_configured_and_verified(
     for name, data_type in portal_properties:
         portal.add_property(name, data_type)
     touch = NOW - timedelta(days=3)
-    portal.index(
-        "contacts",
-        "7001",
-        {
-            "email": "google.lead@example.com",
-            "lifecyclestage": "lead",
-            CAMPAIGN_PROPERTY: "123456789",
-            TOUCH_PROPERTY: iso_ms(ms(touch)),
-        },
-    )
+    google_lead: dict[str, str | None] = {
+        "email": "google.lead@example.com",
+        "lifecyclestage": "lead",
+        CAMPAIGN_PROPERTY: "123456789",
+        TOUCH_PROPERTY: iso_ms(ms(touch)),
+    }
+    portal.index("contacts", "7001", google_lead)
+    # As in HubSpot, a contact the search finds is also readable by id: the job refreshes
+    # every stored Google-touch contact by id after discovery.
+    portal.add_object("contacts", "7001", google_lead)
     # Touched but without a Google campaign: HAS_PROPERTY must exclude it.
     portal.index(
         "contacts",
@@ -1803,6 +1819,12 @@ async def test_google_contact_discovery_only_when_configured_and_verified(
     discovered = rows["hubspot.google_contacts"]
     assert discovered.completeness == "complete"
     assert discovered.last_success_at is not None
+    refreshes = [
+        call
+        for call in portal.calls_to("objects_batch_read", "contacts")
+        if "idProperty" not in call.body
+    ]
+    assert [entry["id"] for call in refreshes for entry in call.body["inputs"]] == ["7001"]
     assert [contact.hs_id for contact in stored] == ["7001"]
     (contact,) = stored
     assert contact.google_campaign_ref == "123456789"
@@ -1922,6 +1944,8 @@ async def test_429_retried_with_retry_after(portal: FakePortal, hubspot: ClientO
         lookup = await client.contacts_by_email(["someone@example.com"])
     assert len(portal.calls) == 3
     assert lookup.failed == {email_sha256("someone@example.com")}
+    assert isinstance(lookup.interrupted_by, TransientError)
+    assert lookup.interrupted_by.http_status == 429
 
 
 async def test_token_and_emails_never_logged(
