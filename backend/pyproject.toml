@@ -5,7 +5,8 @@
 #   It is never edited by hand.
 # - Every change to a dependency below regenerates and commits uv.lock in the same change.
 # - CI and `make test` install with `uv sync --frozen`; the Docker image installs with
-#   `uv sync --frozen --no-dev`, so a stale lock fails the build instead of drifting.
+#   `uv sync --locked --no-dev`, which checks the lock against this file, so a stale lock
+#   fails the image build instead of drifting.
 #
 # Version policy
 # - `~=X.Y.Z` admits patch releases only. Bounded ranges (`>=A,<B`) are used where a
