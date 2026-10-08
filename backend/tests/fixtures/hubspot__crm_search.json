@@ -1,0 +1,53 @@
+{
+  "request": {
+    "body": {
+      "filterGroups": [
+        {
+          "filters": [
+            {
+              "operator": "GTE",
+              "propertyName": "createdate",
+              "value": "1790812800000"
+            },
+            {
+              "operator": "LT",
+              "propertyName": "createdate",
+              "value": "1790899200000"
+            }
+          ]
+        }
+      ],
+      "limit": 200,
+      "properties": [
+        "createdate",
+        "dealstage",
+        "pipeline",
+        "amount"
+      ],
+      "sorts": [
+        {
+          "direction": "ASCENDING",
+          "propertyName": "createdate"
+        }
+      ]
+    },
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://api.hubapi.com/crm/objects/2026-09/deals/search"
+  },
+  "response": {
+    "body": {
+      "results": [],
+      "total": 0
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "hubspot",
+  "surface": "hubspot.crm_search"
+}
