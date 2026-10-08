@@ -13,12 +13,18 @@ test database; nothing reaches the network. The guarantees proven here:
   ``GET /healthz`` needs the session (401); every error status renders ``{"error": {"code",
   "message"}}`` and nothing else.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
-  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET``.
+  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET``. Each refusal, and an
+  environment value that fails validation, is logged once as ``api.startup_failed`` with the
+  error class and the fields at fault, never their values, before the error propagates.
 * **Every route returns its schema** (AAP 0.5.3 endpoint table), on simulated data seeded the
   way the worker seeds a first start.
 * **Boundaries and redaction** (AAP 0.3.2, 0.11.1): a failed login is logged without the email,
   the password or the session secret, and the API process never imports the connectors, the sync
   jobs or the simulator.
+* **Configuration errors** (AAP 0.5.3 error envelope; CWE-209): a broken config file, a missing
+  config directory or a corrupt stored CRM binding is 500 ``config_error`` whose message names at
+  most the logical file and dotted key, never a disk path, a YAML diagnostic or the detail, which
+  are logged as ``api.config_error`` instead.
 
 Run selection, the analysis lock and the decision-patch rules are proven by the run and decision
 route tests; here each route gets one schema check.
@@ -32,6 +38,7 @@ pausing an active Google campaign, the ``status`` discrepancy the next entity sy
 would open for it, and one default-window run.
 """
 
+import functools
 import json
 import logging
 import os
@@ -51,11 +58,12 @@ import pytest
 import structlog
 import yaml
 from fastapi import FastAPI
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import Engine, inspect, text
 
 from ads_engine import logging as ads_logging
 from ads_engine.analysis import runner
+from ads_engine.analysis.thresholds import CONFIG_FILES, ConfigError, Thresholds
 from ads_engine.api import app as api_app
 from ads_engine.api import deps, schemas, security
 from ads_engine.api.app import API_PREFIX, create_app
@@ -1013,6 +1021,54 @@ async def test_healthz_without_auth(api_client: httpx.AsyncClient) -> None:
     assert response.headers.get_list("set-cookie") == []
 
 
+async def test_openapi_document_401_without_session(
+    api_client: httpx.AsyncClient, test_identity: AdminIdentity
+) -> None:
+    """AAP 0.5.3: ``/openapi.json`` is not one of the two endpoints that need no session.
+
+    FastAPI's own schema route would answer anonymously, so ``create_app`` serves the document
+    from a route behind the session check. An anonymous ``GET`` is 401 ``unauthenticated``; an
+    anonymous ``HEAD`` is the same 401 with no body and the envelope's length, never the
+    document's.
+    """
+    anonymous_get = await api_client.get(api("/openapi.json"))
+    assert_error(anonymous_get, 401, "unauthenticated")
+
+    anonymous_head = await api_client.head(api("/openapi.json"))
+    assert anonymous_head.status_code == 401, anonymous_head.headers
+    assert anonymous_head.headers["content-type"].startswith("application/json")
+    assert anonymous_head.content == b""
+    assert anonymous_head.headers["content-length"] == str(len(anonymous_get.content))
+    assert test_identity.session_cookie not in api_client.cookies
+
+
+async def test_openapi_document_served_to_signed_in_session(
+    authed_client: httpx.AsyncClient,
+) -> None:
+    """AAP 0.3.1: a signed-in session reads the OpenAPI document FastAPI generates.
+
+    ``GET`` answers 200 with exactly ``app.openapi()``, whose paths are the endpoint table and
+    nothing else: the schema route leaves itself out. ``HEAD`` answers 200 with the document's
+    length and no body.
+    """
+    response = await authed_client.get(api("/openapi.json"))
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("application/json")
+    document = response.json()
+    assert document == create_app().openapi()
+    published = {
+        (method, path.removeprefix(API_PREFIX))
+        for path, operations in document["paths"].items()
+        for method in operations
+    }
+    assert published == AAP_ROUTES
+
+    head = await authed_client.head(api("/openapi.json"))
+    assert head.status_code == 200, head.headers
+    assert head.content == b""
+    assert head.headers["content-length"] == str(len(response.content))
+
+
 # ---------------------------------------------------------------------------------------------
 # Startup guard (AAP 0.3.2 "Plain HTTP is accepted only when ...")
 # ---------------------------------------------------------------------------------------------
@@ -1053,6 +1109,124 @@ def test_create_app_requires_session_secret(
     set_env(SESSION_SECRET=secret)
     with pytest.raises(ConfigurationError, match="SESSION_SECRET"):
         create_app()
+
+
+# ---------------------------------------------------------------------------------------------
+# Startup failure logging (the refusals above as structured logs, AAP 0.11.1)
+# ---------------------------------------------------------------------------------------------
+
+STARTUP_FAILED_EVENT: Final = "api.startup_failed"
+"""The ERROR event ``create_app()`` logs before a startup refusal propagates."""
+
+
+def startup_failures(output: str) -> list[dict[str, Any]]:
+    """Return the ``api.startup_failed`` events among the JSON log lines in ``output``.
+
+    ``create_app()`` configures logging onto ``sys.stdout``, which ``capsys`` captures.
+
+    Raises:
+        AssertionError: When a line is not a JSON object.
+    """
+    events: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        assert isinstance(record, dict), f"log line is not a JSON object: {line!r}"
+        if record.get("event") == STARTUP_FAILED_EVENT:
+            events.append(record)
+    return events
+
+
+def assert_one_startup_failure(output: str, *, error_type: str, fields: list[str]) -> None:
+    """Assert ``output`` holds exactly one ``api.startup_failed`` ERROR event, as given."""
+    failures = startup_failures(output)
+    assert len(failures) == 1, failures
+    failure = failures[0]
+    assert failure["level"] == "error"
+    assert failure["logger"] == "ads_engine.api.app"
+    assert failure["error_type"] == error_type
+    assert failure["fields"] == fields
+
+
+def test_unsafe_base_url_logs_startup_failed(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The base-URL refusal is logged once, naming its field and class but neither value.
+
+    ``ConfigurationError`` still propagates, so uvicorn refuses to start (AAP 0.3.2).
+    """
+    host = "ads-startup.example.com"
+    set_env(APP_BASE_URL=f"http://{host}")
+    secret = get_settings().session_secret
+    assert secret is not None
+    capsys.readouterr()
+
+    with pytest.raises(ConfigurationError, match="APP_BASE_URL must use https://"):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(output, error_type="ConfigurationError", fields=["app_base_url"])
+    assert host not in output
+    assert secret.get_secret_value() not in output
+
+
+@pytest.mark.parametrize("secret", [None, "", "   "], ids=["unset", "empty", "blank"])
+def test_missing_session_secret_logs_startup_failed(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str], secret: str | None
+) -> None:
+    """A missing ``SESSION_SECRET`` is logged once, naming its field and class, then raised."""
+    host = "ads-startup.example.com"
+    set_env(SESSION_SECRET=secret, APP_BASE_URL=f"https://{host}")
+    capsys.readouterr()
+
+    with pytest.raises(ConfigurationError, match="SESSION_SECRET is not set"):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(output, error_type="ConfigurationError", fields=["session_secret"])
+    assert host not in output
+
+
+def test_session_secret_recheck_logs_startup_failed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The factory's own ``SESSION_SECRET`` check logs the same event when it is the one to refuse.
+
+    ``check_api_startup`` is neutralised, so the refusal comes from ``create_app()`` itself.
+    """
+    monkeypatch.setattr(Settings, "check_api_startup", lambda self: None)
+    settings = Settings(session_secret=None)
+    capsys.readouterr()
+
+    with pytest.raises(ConfigurationError, match="SESSION_SECRET is not set"):
+        create_app(settings)
+
+    assert_one_startup_failure(
+        capsys.readouterr().out, error_type="ConfigurationError", fields=["session_secret"]
+    )
+
+
+def test_unparseable_environment_logs_startup_failed(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An environment value that fails validation is logged once by field name, then raised.
+
+    Neither input reaches the log, although a validation message may quote its input.
+    """
+    seed, budget = "seed-not-a-number-0451", "budget-not-a-number-0451"
+    set_env(MOCK_SEED=seed, GOOGLE_DAILY_CALL_BUDGET=budget)
+    capsys.readouterr()
+
+    with pytest.raises(ValidationError):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(
+        output, error_type="ValidationError", fields=["google_daily_call_budget", "mock_seed"]
+    )
+    assert seed not in output
+    assert budget not in output
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1541,3 +1715,270 @@ def test_api_never_loads_connectors_or_simulation() -> None:
             "health",
         )
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Configuration errors (AAP 0.5.3 error envelope; CWE-209: no internals in a response)
+# ---------------------------------------------------------------------------------------------
+
+CONFIG_ERROR_HINT: Final = "Check the API logs for details."
+"""The fixed sentence that ends every ``config_error`` message."""
+
+YAML_LEAK_MARKER: Final = "leaky_marker_9f3"
+"""A key on the broken line of an invalid ``thresholds.yaml``; PyYAML quotes that line."""
+
+INVALID_THRESHOLDS_YAML: Final = f"window:\n  default_days: 28\n{YAML_LEAK_MARKER}: value: other\n"
+"""A ``thresholds.yaml`` PyYAML rejects on its third line ("mapping values are not allowed")."""
+
+CONFIG_ERROR_ROUTE: Final = "/test/config-error"
+"""A route the focused message tests add to the real application; it raises the case's error."""
+
+
+@pytest.fixture
+def config_root(tmp_path: Path) -> Path:
+    """``tmp_path`` with symlinks resolved, as ``Path.cwd()`` reports it after a chdir there."""
+    return tmp_path.resolve()
+
+
+def make_working_directory(root: Path) -> Path:
+    """Create and return ``root/empty/nested``, which has no ``config/`` beside or above it."""
+    directory = root / "empty" / "nested"
+    directory.mkdir(parents=True)
+    return directory
+
+
+def write_config_dir(root: Path, thresholds_text: str | None) -> Path:
+    """Write ``root/config``: the repository's other config files, and ``thresholds_text``.
+
+    Args:
+        root: The directory to create ``config/`` in.
+        thresholds_text: The content of ``thresholds.yaml``; ``None`` leaves the file out.
+
+    Returns:
+        The written config directory.
+    """
+    directory = root / "config"
+    directory.mkdir()
+    for name in CONFIG_FILES:
+        if name != "thresholds.yaml":
+            source = (CONFIG_DIR / name).read_text(encoding="utf-8")
+            (directory / name).write_text(source, encoding="utf-8")
+    if thresholds_text is not None:
+        (directory / "thresholds.yaml").write_text(thresholds_text, encoding="utf-8")
+    return directory
+
+
+async def get_config_error(
+    client: httpx.AsyncClient, captured_logs: CapturedLogs, path: str = "/config"
+) -> tuple[str, dict[str, Any]]:
+    """Request ``GET path`` expecting 500 ``config_error``; return its message and its log line.
+
+    Logging is pointed at ``captured_logs`` first, because building the application
+    reconfigured it to stdout.
+
+    Returns:
+        The response's message and the one ``api.config_error`` record the request logged,
+        after checking that record names the request's path and method.
+    """
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    response = await client.get(api(path))
+    message = assert_error(response, 500, "config_error").error.message
+    records = [record for record in captured_logs() if record.get("event") == "api.config_error"]
+    assert len(records) == 1, records
+    record = records[0]
+    assert (record["path"], record["method"]) == (api(path), "GET"), record
+    return message, record
+
+
+@pytest.mark.parametrize(
+    ("thresholds_text", "logged_detail"),
+    [
+        pytest.param(INVALID_THRESHOLDS_YAML, YAML_LEAK_MARKER, id="invalid-yaml"),
+        pytest.param(None, "file not found", id="missing-file"),
+    ],
+)
+async def test_config_error_from_a_config_file_names_only_the_file(
+    authed_client: httpx.AsyncClient,
+    captured_logs: CapturedLogs,
+    monkeypatch: pytest.MonkeyPatch,
+    config_root: Path,
+    thresholds_text: str | None,
+    logged_detail: str,
+) -> None:
+    """CWE-209: a broken ``thresholds.yaml`` is 500 ``config_error`` naming only the file.
+
+    The working directory holds a ``config/`` whose ``thresholds.yaml`` is invalid YAML or
+    missing; nothing is stored on ``app.state.thresholds``, so ``GET /config`` loads the files
+    on first use. The message names ``thresholds.yaml`` and points at the logs: neither the
+    directory's disk path nor PyYAML's diagnostic and quoted source line reach the client. The
+    ``api.config_error`` line carries the full detail.
+    """
+    directory = write_config_dir(config_root, thresholds_text)
+    monkeypatch.chdir(config_root)
+
+    message, record = await get_config_error(authed_client, captured_logs)
+
+    assert message == f"Configuration error in thresholds.yaml. {CONFIG_ERROR_HINT}"
+    internals = (str(config_root), YAML_LEAK_MARKER, "invalid YAML", "line 3", "file not found")
+    for internal in internals:
+        assert internal not in message
+    assert (record["file"], record["key"]) == ("thresholds.yaml", None)
+    assert logged_detail in record["error"]
+    if thresholds_text is None:
+        assert str(directory / "thresholds.yaml") in record["error"]
+    else:
+        assert "invalid YAML" in record["error"]
+
+
+@pytest.mark.parametrize(
+    "explicit_directory",
+    [False, True],
+    ids=["no-candidate-directory", "missing-explicit-directory"],
+)
+async def test_config_error_for_a_missing_config_directory_names_no_path(
+    authed_client: httpx.AsyncClient,
+    captured_logs: CapturedLogs,
+    monkeypatch: pytest.MonkeyPatch,
+    config_root: Path,
+    explicit_directory: bool,
+) -> None:
+    """CWE-209: a missing config directory is 500 ``config_error`` naming no file and no path.
+
+    Two loader failures: no ``config/`` beside or above the working directory (the error's
+    file is ``config`` and its detail names both candidate paths), and a load from an explicit
+    directory that does not exist (the error's file is that directory's disk path). Either
+    way the message is the generic one, and the path is only in the ``api.config_error`` line.
+    """
+    if explicit_directory:
+        missing = config_root / "missing-config"
+        monkeypatch.setattr(Thresholds, "load", functools.partial(Thresholds.load, missing))
+        expected_file = str(missing)
+    else:
+        monkeypatch.chdir(make_working_directory(config_root))
+        expected_file = "config"
+
+    message, record = await get_config_error(authed_client, captured_logs)
+
+    assert message == f"Configuration error. {CONFIG_ERROR_HINT}"
+    assert str(config_root) not in message
+    assert record["file"] == expected_file
+    assert str(config_root) in record["error"]
+
+
+async def test_config_error_for_a_corrupt_stored_binding_names_document_and_key(
+    seeded: Seeded, sync_engine: Engine, captured_logs: CapturedLogs
+) -> None:
+    """CWE-209: a corrupt ``source_dataset.crm_bindings`` names the document and key only.
+
+    The active HubSpot dataset's stored ``mql`` binding loses its required keys. ``GET
+    /config`` is 500 ``config_error`` naming ``source_dataset.crm_bindings`` and ``mql``; the
+    decoder's detail, which lists the missing keys, is only in the ``api.config_error`` line.
+    """
+    with sync_engine.begin() as connection:
+        corrupted = connection.execute(
+            text(
+                "UPDATE source_dataset "
+                "SET crm_bindings = jsonb_set(crm_bindings, '{mql}', '{\"available\": true}') "
+                "WHERE source = 'hubspot' AND role = 'primary' AND state = 'active' "
+                "AND crm_bindings IS NOT NULL"
+            )
+        ).rowcount
+    assert corrupted == 1
+
+    message, record = await get_config_error(seeded.client, captured_logs)
+
+    assert message == (
+        f"Configuration error in source_dataset.crm_bindings at mql. {CONFIG_ERROR_HINT}"
+    )
+    assert (record["file"], record["key"]) == ("source_dataset.crm_bindings", "mql")
+    assert record["error"].startswith("source_dataset.crm_bindings: mql: ")
+    detail = record["error"].removeprefix("source_dataset.crm_bindings: mql: ")
+    assert detail
+    assert detail not in message
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(
+            ConfigError("hubspot_mapping.yaml", "ql.stage_labels[0]", "'Lead' is listed twice"),
+            "Configuration error in hubspot_mapping.yaml at ql.stage_labels[0].",
+            id="logical-file-and-key",
+        ),
+        pytest.param(
+            ConfigError(
+                "content_assets.yaml", "assets[1].lead_forms[0]", "listed under two assets"
+            ),
+            "Configuration error in content_assets.yaml at assets[1].lead_forms[0].",
+            id="indexed-key",
+        ),
+        pytest.param(
+            ConfigError("/srv/ads/config", None, "config directory not found"),
+            "Configuration error.",
+            id="disk-path-file",
+        ),
+        pytest.param(
+            ConfigError("../config/thresholds.yaml", "window.presets", "unreadable /srv/ads"),
+            "Configuration error at window.presets.",
+            id="path-shaped-file",
+        ),
+        pytest.param(
+            ConfigError(
+                "config", None, "cannot compute config_hash: Permission denied: '/srv/ads'"
+            ),
+            "Configuration error.",
+            id="generic-file",
+        ),
+        pytest.param(
+            ConfigError("thresholds.yaml", "k1./srv/ads/data", "unknown key below /srv"),
+            "Configuration error in thresholds.yaml.",
+            id="key-with-a-path",
+        ),
+        pytest.param(
+            ConfigError("thresholds.yaml", "window.presets: [14, 28", "unexpected end at /srv"),
+            "Configuration error in thresholds.yaml.",
+            id="key-with-yaml-text",
+        ),
+        pytest.param(
+            ConfigError("thresholds.yaml", "window.presets\n", "trailing newline below /srv"),
+            "Configuration error in thresholds.yaml.",
+            id="key-with-a-newline",
+        ),
+        pytest.param(
+            ConfigError("thresholds.yaml", "k" * 121, "overlong key below /srv"),
+            "Configuration error in thresholds.yaml.",
+            id="overlong-key",
+        ),
+        pytest.param(
+            ConfigError("thresholds.yaml", "k1.r\u00e9gle", "non-ASCII key below /srv"),
+            "Configuration error in thresholds.yaml.",
+            id="non-ascii-key",
+        ),
+    ],
+)
+async def test_config_error_message_names_only_logical_parts(
+    captured_logs: CapturedLogs, error: ConfigError, expected: str
+) -> None:
+    """CWE-209: the ``config_error`` message is built from logical parts, never the detail.
+
+    The real application, with one extra route raising the case's :class:`ConfigError`,
+    answers 500 ``config_error``. The file is named only when it is one of the three config
+    files or ``source_dataset.crm_bindings``; the key only when it is a short run of ASCII
+    identifiers and ``[n]`` indexes; the detail never. The log line keeps the error's full text.
+    """
+    app = create_app()
+
+    async def raise_config_error() -> None:
+        """Fail the request with the case's error, as a loader or decoder would."""
+        raise error
+
+    app.add_api_route(api(CONFIG_ERROR_ROUTE), raise_config_error, methods=["GET"])
+    async with serve(app) as client:
+        message, record = await get_config_error(client, captured_logs, CONFIG_ERROR_ROUTE)
+
+    assert message == f"{expected} {CONFIG_ERROR_HINT}"
+    assert error.detail not in message
+    assert "/srv" not in message
+    assert record["error"] == str(error)
+    assert (record["file"], record["key"]) == (error.file, error.key)

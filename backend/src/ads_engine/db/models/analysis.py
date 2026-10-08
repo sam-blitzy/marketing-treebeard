@@ -158,7 +158,9 @@ class AnalysisRun(IdPkMixin, Base):
     inserting a ``running`` row; the partial unique index ``uq_analysis_run_single_running``
     is the second, database-enforced guard that allows only one ``running`` row at a time.
     ``ix_analysis_run_kind_status_finished`` serves ``/runs/latest`` (the latest succeeded
-    ``default`` run) and ``GET /runs?kind=custom``.
+    ``default`` run). ``ix_analysis_run_kind_id`` on (``kind``, ``id DESC``) serves
+    ``GET /runs?kind=custom``: the newest runs of one kind are one bounded index range read
+    in order, however many runs of the other kind lie between them.
 
     ``data_modes`` and ``dataset_ids`` record the mode and the dataset id of each source as
     the run read them. They are ``jsonb`` with no foreign key, so run history survives the
@@ -209,6 +211,9 @@ class AnalysisRun(IdPkMixin, Base):
             postgresql_where=sa.text("status = 'running'"),
         ),
         sa.Index("ix_analysis_run_kind_status_finished", "kind", "status", "finished_at"),
+        # The newest runs of one kind, newest first (GET /runs, runner.list_runs).
+        # ``id`` comes from IdPkMixin, so the class body names it rather than binding it.
+        sa.Index("ix_analysis_run_kind_id", "kind", sa.desc("id")),
     )
 
 

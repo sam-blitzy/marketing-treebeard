@@ -1472,9 +1472,19 @@ class PropertyDefinition:
     def is_datetime(self) -> bool:
         """Whether the property holds a date or an instant (``type`` ``datetime`` or ``date``).
 
-        A property-mode MQL or QL binding and the Google touch-date property must be one.
+        A property-mode MQL or QL binding must be one.
         """
         return self.type in {"datetime", "date"}
+
+    @property
+    def is_instant(self) -> bool:
+        """Whether the property holds an instant, a date with a time (``type`` ``datetime``).
+
+        The Google touch-date property must be one (AAP 0.3.3): a ``date`` property holds a
+        day without a time, which reads as midnight UTC and would anchor the causal check
+        before a touch later that day.
+        """
+        return self.type == "datetime"
 
 
 def _parse_option(item: object, surface: str) -> PropertyOption:

@@ -1669,6 +1669,12 @@ BOTH_CONFIGURED: Final = {
             False,
             id="touch_property_missing_404",
         ),
+        pytest.param(
+            BOTH_CONFIGURED,
+            ((CAMPAIGN_PROPERTY, "string"), (TOUCH_PROPERTY, "date")),
+            False,
+            id="touch_property_date_only",
+        ),
     ],
 )
 async def test_google_contact_discovery_only_when_configured_and_verified(
@@ -1687,10 +1693,12 @@ async def test_google_contact_discovery_only_when_configured_and_verified(
     The real ``CrmSyncJob`` runs on a live HubSpot dataset of the test database, its client
     injected through ``SourceModeController(transports=...)``. With neither or only one of
     ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`` and ``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`` set, or
-    with the touch-date property missing from the portal (404), the Google link is unavailable
-    and no ``contacts/search`` request is sent. With both set and confirmed, the job searches
-    contacts by touch date with ``HAS_PROPERTY`` on the campaign property, stores the Google-only
-    contact and writes ``hubspot.google_contacts`` freshness.
+    with the touch-date property missing from the portal (404) or a ``date`` property rather
+    than a ``datetime`` one (its midnight would anchor the causal check before a same-day
+    touch), the Google link is unavailable and no ``contacts/search`` request is sent. With
+    both set and confirmed, the job searches contacts by touch date with ``HAS_PROPERTY`` on
+    the campaign property, stores the Google-only contact and writes
+    ``hubspot.google_contacts`` freshness.
     """
     live_credentials(SOURCE)
     set_env(
@@ -1756,8 +1764,15 @@ async def test_google_contact_discovery_only_when_configured_and_verified(
         assert google["available"] is False
         assert google["reason"]
         if configured == BOTH_CONFIGURED:
-            assert "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY" in google["reason"]
-            assert "not found on contacts" in google["reason"]
+            touch_type = dict(portal_properties).get(TOUCH_PROPERTY)
+            problem = (
+                "not found on contacts"
+                if touch_type is None
+                else f"has type '{touch_type}', not a datetime property"
+            )
+            assert google["reason"] == (
+                f"HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '{TOUCH_PROPERTY}' {problem}"
+            )
             assert TOUCH_PROPERTY in property_reads(portal)
         else:
             assert "not configured" in google["reason"]

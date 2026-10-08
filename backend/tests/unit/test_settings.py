@@ -113,6 +113,14 @@ def test_configuration_error_is_a_runtime_error() -> None:
     assert issubclass(ConfigurationError, RuntimeError)
 
 
+def test_configuration_error_names_its_fields_only_when_given() -> None:
+    plain = ConfigurationError("refused")
+    named = ConfigurationError("refused", fields=("app_base_url",))
+
+    assert (str(plain), plain.fields) == ("refused", ())
+    assert (str(named), named.fields) == ("refused", ("app_base_url",))
+
+
 # ---------------------------------------------------------------------------
 # Defaults and environment reading
 # ---------------------------------------------------------------------------
@@ -690,6 +698,32 @@ def test_api_startup_reports_the_base_url_before_the_session_secret(
 
     with pytest.raises(ConfigurationError, match="APP_BASE_URL"):
         settings.check_api_startup()
+
+
+@pytest.mark.parametrize(
+    ("base_url", "session_secret", "fields"),
+    [
+        ("http://ads.example.test", SESSION_SECRET, ("app_base_url",)),
+        ("http://ads.example.test", None, ("app_base_url",)),
+        ("https://ads.example.test", None, ("session_secret",)),
+    ],
+    ids=["unsafe-base-url", "both-base-url-first", "no-session-secret"],
+)
+def test_api_startup_refusal_names_the_field_at_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    session_secret: str | None,
+    fields: tuple[str, ...],
+) -> None:
+    monkeypatch.setenv("APP_BASE_URL", base_url)
+    if session_secret is not None:
+        monkeypatch.setenv("SESSION_SECRET", session_secret)
+    settings = Settings()
+
+    with pytest.raises(ConfigurationError) as refused:
+        settings.check_api_startup()
+
+    assert refused.value.fields == fields
 
 
 # ---------------------------------------------------------------------------

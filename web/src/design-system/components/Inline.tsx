@@ -21,8 +21,8 @@ import type { SpaceStep } from '../tokens';
  * Props of {@link Inline}.
  *
  * The prop set is closed on purpose: there is no `className` or `style`, so a caller cannot
- * add literal styles or custom flex rules around the primitive (AAP 0.4.4). Spacing, wrapping
- * and alignment are chosen only through the props below.
+ * add literal styles or custom flex rules around the primitive (AAP 0.4.4). Spacing, wrapping,
+ * alignment and long-word wrapping are chosen only through the props below.
  *
  * GAP: bind to Blitzy OS on source arrival.
  */
@@ -47,6 +47,14 @@ export interface InlineProps {
    * children are packed at the start; `between` pushes the first and last child to the ends.
    */
   justify?: 'start' | 'center' | 'end' | 'between';
+  /**
+   * Whether long unbroken text, such as URNs, search terms, dataset names and threshold keys,
+   * may break at any point, so a child wraps inside its line instead of widening the row past a
+   * narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). The treatment is inherited by every descendant.
+   * Defaults to `false`. Leave it off on a row that holds a `DataTable`, whose cells keep their
+   * own sizing.
+   */
+  breakLongWords?: boolean;
   /**
    * The element to render. Defaults to `div`. Use `ul` or `ol` when the children form a list,
    * for example a row of flags or source chips; every child must then be an `<li>`, because
@@ -74,7 +82,8 @@ export interface InlineProps {
  * Classes set, all defined in `Inline.css`:
  * - `ds-inline` and `ds-inline--gap-{gap}`, always;
  * - `ds-inline--nowrap` when `wrap` is `false`;
- * - `ds-inline--align-{align}` and `ds-inline--justify-{justify}` when those props are set.
+ * - `ds-inline--align-{align}` and `ds-inline--justify-{justify}` when those props are set;
+ * - `ds-inline--break-long-words` when `breakLongWords` is `true`.
  *
  * When `as` is `ul` or `ol`, every child must be an `<li>`, and the list carries `role="list"`.
  * A `div` given a non-empty `aria-label` carries `role="group"`; without one it has no role.
@@ -103,6 +112,7 @@ export function Inline({
   wrap = true,
   align,
   justify,
+  breakLongWords = false,
   as = 'div',
   id,
   'aria-label': ariaLabel,
@@ -117,6 +127,9 @@ export function Inline({
   }
   if (justify !== undefined) {
     classes.push(`ds-inline--justify-${justify}`);
+  }
+  if (breakLongWords) {
+    classes.push('ds-inline--break-long-words');
   }
 
   // `as` is a closed union of intrinsic tags, so the JSX below renders exactly one of them.

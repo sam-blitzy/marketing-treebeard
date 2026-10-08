@@ -962,16 +962,21 @@ class Scheduler:
         The trigger (``jobs.segments_due``) fires when the default window end has passed the
         latest fetched segment end or ``window.presets`` changed; it backs off a failed fetch
         itself. Without an active LinkedIn dataset nothing runs: the dataset's backfill
-        fetches its segments.
+        fetches its segments. Detection and execution share one configuration snapshot, read
+        from the controller once per step, so the presets judged due are the presets fetched
+        and recorded, and a fetch satisfies the trigger instead of repeating on every wake.
         """
         entry = _ENTRIES[jobs.JOB_SEGMENTS]
         async with self._step(tick, "segments"):
             async with self._sessions()() as session:
                 if await repositories.active_dataset_id(session, "linkedin") is None:
                     return
+                config = self._controller.thresholds
                 history = await self._read_history(session, tick.now, (jobs.JOB_SEGMENTS,))
                 slot_due = is_due(entry, tick.now, self._tz, history.get(("linkedin", entry.job)))
-                run_now = slot_due or await jobs.segments_due(session, now=tick.now)
+                run_now = slot_due or await jobs.segments_due(
+                    session, now=tick.now, thresholds=config
+                )
             if not run_now:
                 return
             _log.info("scheduler.segments_due", slot=slot_due, window_changed=not slot_due)
@@ -981,6 +986,7 @@ class Scheduler:
                 jobs=(jobs.JOB_SEGMENTS,),
                 controller=self._controller,
                 now=tick.now,
+                thresholds=config,
             )
             tick.ran("segments", report)
 

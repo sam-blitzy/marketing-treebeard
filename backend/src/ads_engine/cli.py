@@ -29,7 +29,9 @@ holds the shared ``analysis`` lock.
 
 Streams: structured JSON logs go to **stderr** (``configure_logging(stream=sys.stderr)``), so
 stdout carries only command output: the password hash, JSON reports and written file paths.
-Neither stream ever carries a secret, a token or an email address.
+Neither stream ever carries a secret, a token or an email address. Usage errors are written
+before logging is configured, so they never repeat the supplied text: they name only the
+arguments, commands and choices the parser defines.
 
 Imports: the analysis, sync, connector, simulation and Alembic modules are imported inside the
 command that needs them, so ``hash-password`` runs in a minimal environment and ``--help``
@@ -51,18 +53,19 @@ import dataclasses
 import getpass
 import json
 import re
+import secrets
 import sys
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, NoReturn, Protocol, cast, overload
 from urllib.parse import parse_qsl, unquote, urlencode
 
 import httpx
-from argon2 import PasswordHasher, extract_parameters
-from argon2.exceptions import InvalidHashError
+from argon2 import Parameters, PasswordHasher, extract_parameters
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from pydantic import ValidationError
 
 from ads_engine import __version__
@@ -100,8 +103,8 @@ EXIT_FAILURE: Final = 1
 (logged as ``cli_failed`` with its traceback, redacted)."""
 
 EXIT_USAGE: Final = 2
-"""A usage error: argparse's own, or a bad date, an out-of-range window, or a missing
-``alembic.ini`` or contracts directory."""
+"""A usage error: argparse's own (its diagnostic names the argument, never the supplied value),
+or a bad date, an out-of-range window, or a missing ``alembic.ini`` or contracts directory."""
 
 EXIT_LOCK_HELD: Final = 3
 """Another process holds the shared ``analysis`` lock (AAP 0.5.3: the CLI exits with 3)."""
@@ -265,17 +268,22 @@ def _as_source(value: str) -> Source:
     raise _UsageError(f"unknown source {value!r}; expected one of {', '.join(SETTINGS_SOURCES)}")
 
 
+_DATE_FORMAT_REASON: Final = "not a date in YYYY-MM-DD form"
+"""Why :func:`_iso_date` rejected a value; argparse prefixes the argument name."""
+
+
 def _iso_date(text: str) -> date:
     """Parse an argparse ``YYYY-MM-DD`` value with :meth:`datetime.date.fromisoformat`.
 
     Raises:
         argparse.ArgumentTypeError: When the text is not an ISO calendar date; argparse then
-            exits with :data:`EXIT_USAGE`.
+            exits with :data:`EXIT_USAGE`. The message is :data:`_DATE_FORMAT_REASON` and never
+            repeats the text, which may be an email address or a pasted credential.
     """
     try:
         return date.fromisoformat(text.strip())
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a date in YYYY-MM-DD form") from None
+        raise argparse.ArgumentTypeError(_DATE_FORMAT_REASON) from None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -358,11 +366,88 @@ def _cmd_migrate(_args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------------------------
 
 
-def _admin_hash(settings: Settings) -> str | None:
-    """Return the configured admin hash once it is a well-formed argon2 hash.
+# The argon2 parameters ensure-admin accepts. The minimums are libargon2's own (argon2.h), and
+# argon2 refuses a hash below any of them at every sign-in. The caps bound the cost of every login
+# verification, which recomputes the hash with its stored parameters, and of the verification
+# ensure-admin runs to prove the hash readable: at most 10 passes over 2 GiB (2_097_152 KiB,
+# RFC 9106's high-memory profile) in 16 lanes. `ads-engine hash-password` writes t=3, m=65536
+# (64 MiB), p=4, a 16-byte salt and a 32-byte digest, well inside them.
+_ARGON2_MIN_SALT_BYTES: Final = 8
+_ARGON2_MIN_HASH_BYTES: Final = 4
+_ARGON2_MIN_MEMORY_KIB_PER_LANE: Final = 8
+_ARGON2_MAX_TIME_COST: Final = 10
+_ARGON2_MAX_PARALLELISM: Final = 16
+_ARGON2_MAX_MEMORY_KIB: Final = 2_097_152
+_ARGON2_PROBE_SECRET_BYTES: Final = 32
 
-    The hash is checked, never shown: a missing, non-argon2 or malformed value prints why to
-    stderr and yields ``None``, so a truncated value can never lock the admin out.
+
+def _argon2_parameter_problem(parameters: Parameters) -> str | None:
+    """Name the first parameter of a parsed argon2 hash outside the range ensure-admin accepts.
+
+    Args:
+        parameters: What :func:`argon2.extract_parameters` read from the hash; it derives the
+            salt and digest lengths from the length of their base64 text.
+
+    Returns:
+        The parameter and its accepted range, never its value, or ``None`` when every
+        parameter is in range.
+    """
+    lanes = parameters.parallelism
+    if parameters.salt_len < _ARGON2_MIN_SALT_BYTES:
+        return f"the salt must be at least {_ARGON2_MIN_SALT_BYTES} bytes"
+    if parameters.hash_len < _ARGON2_MIN_HASH_BYTES:
+        return f"the digest must be at least {_ARGON2_MIN_HASH_BYTES} bytes"
+    if not 1 <= parameters.time_cost <= _ARGON2_MAX_TIME_COST:
+        return f"the time cost must be 1 to {_ARGON2_MAX_TIME_COST}"
+    if not 1 <= lanes <= _ARGON2_MAX_PARALLELISM:
+        return f"the parallelism must be 1 to {_ARGON2_MAX_PARALLELISM}"
+    if parameters.memory_cost < _ARGON2_MIN_MEMORY_KIB_PER_LANE * lanes:
+        return f"the memory cost must be at least {_ARGON2_MIN_MEMORY_KIB_PER_LANE} KiB per lane"
+    if parameters.memory_cost > _ARGON2_MAX_MEMORY_KIB:
+        return f"the memory cost must be at most {_ARGON2_MAX_MEMORY_KIB} KiB (2 GiB)"
+    return None
+
+
+def _argon2_verification_problem(value: str) -> str | None:
+    """Verify a random secret against the hash ``value`` and return why argon2 could not.
+
+    A password mismatch means libargon2 decoded the salt and digest and recomputed the hash
+    with its parameters, which is what every sign-in does, so some password verifies against
+    it. A decoding or parameter error, or a failed memory allocation, means none can. The
+    secret is random, so a match is all but impossible; it proves the same and is accepted.
+
+    Args:
+        value: A printable-ASCII argon2 hash whose parameters are within the accepted range,
+            so the verification's cost is bounded.
+
+    Returns:
+        libargon2's reason, a fixed message that never quotes the hash, or ``None`` when the
+        hash verified.
+    """
+    try:
+        PasswordHasher().verify(value, secrets.token_bytes(_ARGON2_PROBE_SECRET_BYTES))
+    except VerifyMismatchError:
+        return None
+    except (InvalidHashError, VerificationError) as exc:
+        return _redacted(str(exc)) or type(exc).__name__
+    return None
+
+
+def _admin_hash(settings: Settings) -> str | None:
+    """Return the configured admin hash once argon2 can verify a password against it.
+
+    The hash is checked, never shown: each failed check prints one line to stderr naming what
+    is wrong, never any part of the value, and yields ``None``, so :func:`_ensure_admin` exits
+    before it opens its transaction and the stored admin stays as it was. The checks, in
+    order: the value is set; it starts with ``$argon2``; it is printable ASCII (argon2 reads a
+    hash as an ASCII C string) and parses as an argon2 PHC string; its salt and digest lengths,
+    time cost, parallelism and memory cost are within libargon2's minimums and the caps above;
+    and verifying a random secret against it ends in a password mismatch, not in a decoding or
+    parameter error.
+
+    A value that passes is a hash some password verifies against. Whether that password is the
+    admin's cannot be known without it, so a well-formed hash of any other password is accepted
+    as a password change.
     """
     secret = settings.app_admin_password_hash
     if secret is None:
@@ -375,12 +460,30 @@ def _admin_hash(settings: Settings) -> str | None:
             "write it with `ads-engine hash-password` or `make init ADMIN_PASSWORD=…`"
         )
         return None
-    try:
-        extract_parameters(value)
-    except InvalidHashError:
+    parameters: Parameters | None = None
+    if value.isascii() and value.isprintable():
+        try:
+            parameters = extract_parameters(value)
+        except InvalidHashError:
+            parameters = None
+    if parameters is None:
         _error(
-            "APP_ADMIN_PASSWORD_HASH is not a valid argon2 hash; write it again with "
-            "`ads-engine hash-password`"
+            "APP_ADMIN_PASSWORD_HASH is not a valid argon2 hash (it cannot be read as an argon2 "
+            "PHC string); write it again with `ads-engine hash-password`"
+        )
+        return None
+    problem = _argon2_parameter_problem(parameters)
+    if problem is not None:
+        _error(
+            "APP_ADMIN_PASSWORD_HASH has argon2 parameters outside the supported range: "
+            f"{problem}; write it again with `ads-engine hash-password`"
+        )
+        return None
+    reason = _argon2_verification_problem(value)
+    if reason is not None:
+        _error(
+            f"APP_ADMIN_PASSWORD_HASH cannot be verified by argon2 ({reason}); write it again "
+            "with `ads-engine hash-password`"
         )
         return None
     return value
@@ -394,6 +497,8 @@ async def _ensure_admin() -> int:
     email (an admin whose ``APP_ADMIN_EMAIL`` was changed) are deleted in the same unit of
     work: the replaced login can no longer sign in, and its sessions stop validating because
     their user no longer exists (``api/deps.py``). No other table references ``app_user``.
+    The hash is validated by :func:`_admin_hash` before the transaction opens, so an invalid
+    one exits with :data:`EXIT_FAILURE` and changes nothing.
     """
     from sqlalchemy import delete
     from sqlalchemy.dialects.postgresql import insert
@@ -1597,16 +1702,170 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
 # Parser and entry point
 # ---------------------------------------------------------------------------------------------
 
+# argparse reasons that carry no user input, passed through unchanged after the argument name.
+_VALUE_FREE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        _DATE_FORMAT_REASON,
+        "expected one argument",
+        "expected at most one argument",
+        "expected at least one argument",
+    }
+)
+_EXPECTED_ARGUMENTS_RE: Final = re.compile(r"expected [0-9]+ arguments?")
+_UNRECOGNIZED_COUNT_RE: Final = re.compile(r"unrecognized arguments \([0-9]+\)")
+_REQUIRED_PREFIX: Final = "the following arguments are required: "
+
+
+def _action_name(action: argparse.Action) -> str | None:
+    """Name an argument as argparse's diagnostics do: ``-h/--help``, ``--start``, ``COMMAND``.
+
+    Returns:
+        The joined option strings, else a string metavar, else the destination; ``None`` for
+        a suppressed one. A name that differs from argparse's own only makes
+        :meth:`_RedactingArgumentParser.error` fall back to its generic message.
+    """
+    if action.option_strings:
+        return "/".join(action.option_strings)
+    if isinstance(action.metavar, str) and action.metavar != argparse.SUPPRESS:
+        return action.metavar
+    if action.dest != argparse.SUPPRESS:
+        return action.dest
+    return None
+
+
+def _argument_reason(action: argparse.Action, reason: str) -> str | None:
+    """Rewrite argparse's reason for rejecting one argument without the text it rejected.
+
+    Args:
+        action: The argument the reason concerns.
+        reason: argparse's reason, which may quote the supplied value.
+
+    Returns:
+        A value-free reason that keeps the useful part (the choices, the expected type), or
+        ``None`` when the reason is in no recognised form.
+    """
+    if reason in _VALUE_FREE_REASONS or _EXPECTED_ARGUMENTS_RE.fullmatch(reason):
+        return reason
+    if reason.startswith(("invalid choice: ", "unknown parser ")):
+        choices = () if action.choices is None else tuple(str(choice) for choice in action.choices)
+        return f"invalid choice (choose from {', '.join(choices)})" if choices else "invalid choice"
+    if reason.startswith("ignored explicit argument "):
+        return "ignored explicit argument"
+    if reason.startswith("invalid ") and " value: " in reason:
+        type_name = getattr(action.type, "__name__", None)
+        if isinstance(type_name, str) and type_name.isidentifier():
+            return f"invalid {type_name} value"
+        return "invalid value"
+    return None
+
+
+class _RedactingArgumentParser(argparse.ArgumentParser):
+    """An argument parser whose usage errors never repeat what was typed on the command line.
+
+    argparse's diagnostics quote the offending text: an unparsable value, an invalid choice or
+    command, unrecognized arguments, an option's ``=value``. The CLI parses before logging and
+    its redaction are configured, so a pasted email address or credential would reach stderr
+    verbatim, control characters included. :meth:`error` therefore rebuilds every diagnostic
+    from the parser's own vocabulary (argument and command names, choices, the names of missing
+    required arguments) and fails closed to a generic message for any form it does not
+    recognise. Sub-parsers inherit the class, because :meth:`add_subparsers` defaults
+    ``parser_class`` to the parent's type. Redaction covers the exiting path, ``exit_on_error``
+    (the default, which :func:`build_parser` keeps).
+    """
+
+    @overload
+    def parse_args(
+        self, args: Iterable[str] | None = None, namespace: None = None
+    ) -> argparse.Namespace: ...
+
+    @overload
+    def parse_args[N](self, args: Iterable[str] | None, namespace: N) -> N: ...
+
+    @overload
+    def parse_args[N](self, *, namespace: N) -> N: ...
+
+    def parse_args(self, args: Iterable[str] | None = None, namespace: object = None) -> object:
+        """Parse as :meth:`argparse.ArgumentParser.parse_args` does, counting unrecognized input.
+
+        argparse quotes every unrecognized argument; this reports only how many there were.
+
+        Args:
+            args: The arguments; ``sys.argv[1:]`` when ``None``.
+            namespace: The object to fill; a new :class:`argparse.Namespace` when ``None``.
+
+        Returns:
+            The filled namespace.
+
+        Raises:
+            argparse.ArgumentError: With ``exit_on_error`` off, when an argument is
+                unrecognized.
+        """
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            message = f"unrecognized arguments ({len(extras)})"
+            if not self.exit_on_error:
+                raise argparse.ArgumentError(None, message)
+            self.error(message)
+        return parsed
+
+    def error(self, message: str) -> NoReturn:
+        """Print the usage and a diagnostic free of user input to stderr; exit with ``2``.
+
+        Args:
+            message: argparse's diagnostic, which may quote what was typed; only its rewrite by
+                :meth:`_diagnostic` is written.
+        """
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {self._diagnostic(message)}\n")
+
+    def _diagnostic(self, message: str) -> str:
+        """Rewrite one argparse diagnostic so it names only this parser's own vocabulary.
+
+        Args:
+            message: argparse's diagnostic.
+
+        Returns:
+            ``argument NAME: REASON`` for one of this parser's arguments; a value-free
+            message for missing required arguments, an ambiguous option or unrecognized
+            arguments; and otherwise a generic message pointing at ``--help``.
+        """
+        generic = f"invalid usage; run '{self.prog} --help'"
+        names = {
+            name: action for action in self._actions if (name := _action_name(action)) is not None
+        }
+        for name in sorted(names, key=len, reverse=True):
+            prefix = f"argument {name}: "
+            if message.startswith(prefix):
+                reason = _argument_reason(names[name], message.removeprefix(prefix))
+                return prefix + (generic if reason is None else reason)
+        if message.startswith(_REQUIRED_PREFIX):
+            required = message.removeprefix(_REQUIRED_PREFIX).split(", ")
+            return message if all(name in names for name in required) else generic
+        if message.startswith("ambiguous option: "):
+            _, separator, matches = message.rpartition(" could match ")
+            options = matches.split(", ")
+            known = {option for action in self._actions for option in action.option_strings}
+            if separator and all(option in known for option in options):
+                return f"ambiguous option (could match {', '.join(options)})"
+            return "ambiguous option"
+        if message.startswith("unrecognized arguments: "):
+            return "unrecognized arguments"
+        if _UNRECOGNIZED_COUNT_RE.fullmatch(message):
+            return message
+        return generic
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``ads-engine`` argument parser: global options and the seven commands.
 
-    Each sub-parser stores its handler in ``handler``; :func:`main` dispatches on it.
+    Each sub-parser stores its handler in ``handler``; :func:`main` dispatches on it. Usage
+    errors name arguments, commands and choices but never the supplied text
+    (:class:`_RedactingArgumentParser`), and exit with :data:`EXIT_USAGE`.
 
     Returns:
         The parser.
     """
-    parser = argparse.ArgumentParser(
+    parser = _RedactingArgumentParser(
         prog=_PROG,
         description=(
             "Ads Action Engine administration: password hashing, migrations, the admin login, "

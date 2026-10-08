@@ -680,8 +680,11 @@ class SourceModeController:
             retry: The retry policy of every client, live and simulated.
             hubspot_limiter: The HubSpot throttle; the process-wide 4 req/s limiter when
                 omitted.
-            thresholds: The configuration whose HubSpot mapping bindings are verified
-                against; ``Thresholds.load()`` on first use when omitted.
+            thresholds: A fixed configuration that :attr:`thresholds` returns unchanged (tests
+                inject one); it supplies the jobs' window presets and the HubSpot mapping the
+                bindings are verified against. When omitted, every access of :attr:`thresholds`
+                runs ``Thresholds.load()``, so an edited file applies without a restart;
+                callers needing one coherent snapshot read it once and pass it on.
         """
         self._settings: Settings = settings if settings is not None else get_settings()
         self._sessionmaker = sessionmaker
@@ -733,14 +736,19 @@ class SourceModeController:
 
     @property
     def thresholds(self) -> Thresholds:
-        """The configuration, loaded on first use.
+        """The configuration: the injected one, else ``config/`` read again on every access.
+
+        Nothing is cached, so a controller kept for the whole worker process sees an edited
+        file (a changed ``window.presets``, for example) on its next access. A caller that
+        needs one coherent configuration across several steps reads this once and passes that
+        snapshot on, as the scheduler's segment step does from due detection to the fetch.
 
         Raises:
             ConfigError: When a configuration file is missing or invalid.
         """
-        if self._thresholds is None:
-            self._thresholds = Thresholds.load()
-        return self._thresholds
+        if self._thresholds is not None:
+            return self._thresholds
+        return Thresholds.load()
 
     @property
     def budget(self) -> CallBudget:

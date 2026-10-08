@@ -4,8 +4,9 @@
  *
  * AAP 0.11.1 routes all server state through this module: components, `src/router.tsx` and
  * `src/main.tsx` call the hooks and helpers below and never fetch. Network access comes only
- * from {@link apiFetch} in `./client`, which adds the session cookie, the CSRF header on every
- * mutation and the error mapping. ESLint keeps `fetch` out of every other module and the
+ * from {@link apiFetch} and its paged form {@link apiFetchPage} in `./client`, which add the
+ * session cookie, the CSRF header on every mutation and the error mapping. ESLint keeps
+ * `fetch` out of every other module and the
  * client out of feature code. Consumers import {@link ApiError}, {@link isApiError} and
  * {@link ApiErrorCode} from here, never from `./client`.
  *
@@ -14,19 +15,24 @@
  * - **Keys.** Each query uses a key from {@link queryKeys}. Keys are plain, serialisable
  *   tuples, so a root such as `queryKeys.decisionsAll` prefix-matches every filtered variant
  *   below it.
- * - **Cancellation.** Every `queryFn` passes TanStack's `signal` to `apiFetch`, so an
- *   unmounted screen or a superseded key aborts its request.
- * - **Errors.** {@link apiFetch} rejects only with {@link ApiError}, so every hook's `error`
- *   is `ApiError | null` (see the `Register` augmentation below).
+ * - **Cancellation.** Every `queryFn` passes TanStack's `signal` to `apiFetch` or
+ *   `apiFetchPage`, so an unmounted screen or a superseded key aborts its request.
+ * - **Errors.** {@link apiFetch} and {@link apiFetchPage} reject only with {@link ApiError}, so
+ *   every hook's `error` is `ApiError | null` (see the `Register` augmentation below).
  * - **Invalidation.** After a successful write, a mutation invalidates the `*All` roots of
  *   everything the write can change. Its `onSuccess` returns that promise, so `mutateAsync`
  *   resolves only after the refetch has started. Mutations set no `retry`. The app's
  *   `QueryClient` (`src/main.tsx`) does not retry them, because a POST is not idempotent from
  *   the UI's point of view.
- * - **Polling.** {@link useDefaultRun} and {@link useRecommendations} without a run id poll
- *   every {@link FIRST_RUN_POLL_MS} while no default run has succeeded yet. That lets the
- *   first-start screen fill in by itself. {@link useSources} polls every
- *   {@link SOURCES_POLL_MS}.
+ * - **Polling.** {@link useDefaultRun} and {@link useRecommendations}, with or without a run
+ *   id, refetch every {@link CURRENT_STATE_POLL_MS} while they are shown, so a new default
+ *   run and the live overlay (holds, discrepancy count, source modes, freshness, feedback and
+ *   historical marking) appear without a reload or a refocus. Without a run id they poll
+ *   every {@link FIRST_RUN_POLL_MS} instead while no default run has succeeded yet, so the
+ *   first-start screen fills in by itself. A transient failure keeps polling; an expired
+ *   session (401) or any other error stops it. {@link useSources} polls every
+ *   {@link SOURCES_POLL_MS}. Polling runs only while the page is visible and stops when the
+ *   last component using the query unmounts.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -67,8 +73,7 @@ import {
 } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 
-import { apiFetch, isApiError } from './client';
-import type { ApiError } from './client';
+import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
 import type {
   ConfigView,
   CreateRunRequest,
@@ -130,10 +135,26 @@ declare module '@tanstack/react-query' {
  * How often, in milliseconds, {@link useDefaultRun} and {@link useRecommendations} without a
  * run id poll while no default run has succeeded yet ({@link isAwaitingFirstRun}). At first
  * start the worker backfills simulated or live data and then runs the default analysis
- * (AAP 0.11.2 "First start"). Polling shows that run without a reload. It stops once the run
- * arrives.
+ * (AAP 0.11.2 "First start"). Polling shows that run without a reload. Once the run arrives,
+ * both reads switch to {@link CURRENT_STATE_POLL_MS}.
  */
 export const FIRST_RUN_POLL_MS = 15_000;
+
+/**
+ * How often, in milliseconds, a shown {@link useRecommendations} page (default or custom run)
+ * and {@link useDefaultRun}'s metadata refetch, so the screen does not go stale after a change
+ * it did not make itself (AAP 0.3.2 "Refresh after change").
+ *
+ * The worker wakes every 30 s. A sync, a dataset activation, a decision or feedback write, or
+ * a discrepancy being opened or resolved queues a default-window rerun, and the worker
+ * coalesces the requests that arrive within 60 s into one run. Meanwhile
+ * `GET /recommendations` reads open discrepancies, source modes, active datasets, freshness
+ * and feedback live, and marks items from replaced data historical, indefinitely for an older
+ * custom run. Refetching at the worker's own cadence shows a new hold, label or default run
+ * within about one wake after it exists, including after a mutation's own invalidation
+ * fetched the old run before its coalesced replacement finished.
+ */
+export const CURRENT_STATE_POLL_MS = 30_000;
 
 /**
  * How often, in milliseconds, {@link useSources} refetches `GET /sources`. Source modes,
@@ -163,9 +184,12 @@ const LONG_STALE_MS = 5 * 60_000;
 const DEFAULT_CUSTOM_RUNS_LIMIT = 20;
 
 /**
- * The page size {@link useDiscrepancies} requests: the largest `limit` that
- * `GET /discrepancies` accepts (`MAX_LIMIT` in
- * `backend/src/ads_engine/api/routes/discrepancies.py`).
+ * The `limit` the first `GET /discrepancies` page of {@link useDiscrepancies} asks for: the
+ * largest that the API accepts (`MAX_LIMIT` in
+ * `backend/src/ads_engine/api/routes/discrepancies.py`), so a long list takes the fewest pages.
+ * Later pages carry it in the `Link` header's next target. It bounds the rows the API reads for
+ * a page, not the discrepancies the page returns: a page can hold fewer while more follow, so a
+ * page's length never decides whether the list is complete.
  */
 const DISCREPANCY_PAGE_LIMIT = 500;
 
@@ -188,16 +212,48 @@ export function isAwaitingFirstRun(error: unknown): boolean {
 }
 
 /**
- * The `refetchInterval` of the default-run reads, from the query's last error:
- * {@link FIRST_RUN_POLL_MS} while it says no default run exists yet, and no polling
- * otherwise. After the run arrives, `error` is `null` and polling stops.
+ * Whether a failed read may succeed if simply repeated: the server could not be reached
+ * (status 0 `network_error`), it rate-limited the request (429), or it failed on its own side
+ * (5xx, including nginx's 502 while the API restarts).
+ */
+function isTransientError(error: unknown): boolean {
+  return (
+    isApiError(error) &&
+    ((error.status === 0 && error.code === 'network_error') ||
+      error.status === 429 ||
+      error.status >= 500)
+  );
+}
+
+/**
+ * The `refetchInterval` of the run and recommendations reads that show current state, from
+ * the query's last error. TanStack re-evaluates it after every fetch.
+ *
+ * - No error (the last fetch succeeded, or the first is still pending):
+ *   {@link CURRENT_STATE_POLL_MS}.
+ * - With `awaitsFirstRun`, for the default-run reads only, an error saying no default run
+ *   exists yet ({@link isAwaitingFirstRun}): {@link FIRST_RUN_POLL_MS}. For a custom run the
+ *   same `not_found` or `run_not_ready` is final, so it stops polling.
+ * - A transient failure ({@link isTransientError}): {@link CURRENT_STATE_POLL_MS}, so the
+ *   screen recovers by itself once the API answers again.
+ * - Any other error stops polling, because repeating the request cannot change its answer: a
+ *   401 `unauthenticated` (the session is gone), a 404 for an unknown run, a 422, and so on.
  *
  * It takes the error rather than the query, and each hook calls it from an inline
  * `(query) => …` callback. A standalone callback with its own parameter type would become an
  * inference site for `useQuery`'s error type and widen every hook's `error` to `unknown`.
+ *
+ * @param error - The query's `state.error`: `null` after a success or before any result.
+ * @param awaitsFirstRun - `true` for the reads of the latest default run.
  */
-function firstRunPollInterval(error: unknown): number | false {
-  return isAwaitingFirstRun(error) ? FIRST_RUN_POLL_MS : false;
+function currentStatePollInterval(error: unknown, awaitsFirstRun: boolean): number | false {
+  if (error === null) {
+    return CURRENT_STATE_POLL_MS;
+  }
+  if (awaitsFirstRun && isAwaitingFirstRun(error)) {
+    return FIRST_RUN_POLL_MS;
+  }
+  return isTransientError(error) ? CURRENT_STATE_POLL_MS : false;
 }
 
 /**
@@ -347,13 +403,20 @@ export function useMe() {
  * succeeds. While that 404 persists the query refetches every {@link FIRST_RUN_POLL_MS}, so
  * the first-start screen fills in by itself (e2e `first-start.spec.ts`).
  *
+ * Once a run is shown it refetches every {@link CURRENT_STATE_POLL_MS}, so the worker's next
+ * default run, for example the coalesced rerun after a decision, replaces it without a
+ * reload. A transient failure (unreachable server, 429, 5xx) keeps that cadence; a 401 or any
+ * other error stops polling. Polling runs only while the page is visible
+ * (`refetchIntervalInBackground` stays `false`) and ends when the last component using it
+ * unmounts.
+ *
  * @returns The query result, keyed by `queryKeys.runs.latest`.
  */
 export function useDefaultRun() {
   return useQuery({
     queryKey: queryKeys.runs.latest,
     queryFn: ({ signal }) => apiFetch<Run>('/runs/latest', { signal }),
-    refetchInterval: (query) => firstRunPollInterval(query.state.error),
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, true),
   });
 }
 
@@ -405,13 +468,22 @@ export function useCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT) {
  * Without `runId` the request carries no `run_id`, and the API serves the latest succeeded
  * default run. That page polls every {@link FIRST_RUN_POLL_MS} while no default run exists
  * yet (404 `not_found`), like {@link useDefaultRun}. With `runId`, used for a custom window
- * at `/actions?run=<id>`, the request carries `run_id` and never polls.
+ * at `/actions?run=<id>`, the request carries `run_id`, and a 404 or a 409 `run_not_ready`
+ * for it is final.
  *
  * The page's order (five sections in `SECTION_ORDER`, ranked groups and items) comes from the
  * API exactly as the run stored it. Each item's `current` and the page's `overlay` and
  * `banners` are read-time state, computed when the API serves the request: live
  * discrepancies, source modes, freshness, feedback and historical-only marking (AAP 0.3.2).
  * Every write that changes them invalidates this key's root.
+ *
+ * The worker and other sessions change that state too, so a shown page, default or custom,
+ * refetches every {@link CURRENT_STATE_POLL_MS}. A new discrepancy then holds its dependent
+ * items, a replaced dataset turns items historical, and the default page moves to the
+ * worker's next default run, all without a reload or a refocus. A transient failure
+ * (unreachable server, 429, 5xx) keeps that cadence; a 401 or any other error stops polling.
+ * Polling runs only while the page is visible (`refetchIntervalInBackground` stays `false`)
+ * and ends when the last component using it unmounts.
  *
  * Status codes: 200; 404 `not_found` for an unknown run or before the first default run; 409
  * `run_not_ready` for a run that is still `running` or has `failed`.
@@ -427,8 +499,7 @@ export function useRecommendations(runId?: RunId) {
         query: runId === undefined ? undefined : { run_id: runId },
         signal,
       }),
-    refetchInterval: (query) =>
-      runId === undefined ? firstRunPollInterval(query.state.error) : false,
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, runId === undefined),
   });
 }
 
@@ -456,37 +527,61 @@ export function useDecisions(filter: DecisionsFilter = {}) {
   });
 }
 
+/** Message of the error a `GET /discrepancies` read rejects with when its paging loops. */
+const REPEATED_PAGE_MESSAGE = 'The server returned a link to a page it had already sent.';
+
 /**
- * Reads every discrepancy in `states`, oldest first, following the `after` keyset cursor
- * page by page.
+ * Reads every discrepancy in `states`, oldest first, by following the API's `Link` cursor.
  *
- * `GET /discrepancies` returns at most `limit` rows per page (200 by default) and names the
- * next page only in a `Link` response header, which `apiFetch` does not expose. A single
- * default page would silently truncate a long list, and discrepancies are resolved before
- * anything else is trusted (AAP 0.5.4.2 P1), so they must all be shown. Pages are therefore
- * requested at the API's maximum size, and while a page comes back full the next one starts
- * after its last discrepancy's id: the same cursor the `Link` header carries. A shorter page
- * ends the list. The API can leave out of a full page a discrepancy whose subject it cannot
- * load, so a page short for that reason also ends it. The cursor-progress check stops a
- * misbehaving server from looping the read forever.
+ * `GET /discrepancies` reads at most `limit` rows per page (200 by default) and, when it read
+ * that many, names the next page in a `Link: <…>; rel="next"` header. Discrepancies are
+ * resolved before anything else is trusted (AAP 0.5.4.2 P1), so every page is read: the first
+ * at {@link DISCREPANCY_PAGE_LIMIT}, then each `next` page from {@link apiFetchPage}, exactly
+ * as the API named it, until a page names none. A page's length never ends the list.
+ * The API leaves out a discrepancy whose subject it cannot load, so a page can hold fewer
+ * discrepancies than `limit`, or none, while a next page follows, and only the API's cursor,
+ * the id of the last row it read, steps past a row it left out.
+ *
+ * Two failures reject or restart the read rather than end the list short:
+ *
+ * - A next page this read has already followed means the paging loops. The read rejects with
+ *   an `invalid_response` {@link ApiError} instead of returning what it has.
+ * - A 422 `invalid_cursor` on a later page means the cursor's row was purged between pages,
+ *   and the API says to list again from the first page. The read restarts once from the
+ *   first page and discards the discrepancies collected so far. A second `invalid_cursor`
+ *   rejects the read.
+ *
+ * Every request carries `signal`, so cancelling the query aborts the page in flight.
  */
 async function fetchAllDiscrepancies(
   states: readonly DiscrepancyState[],
   signal: AbortSignal,
 ): Promise<Discrepancy[]> {
-  const all: Discrepancy[] = [];
-  let after: DiscrepancyId | undefined;
+  let restarted = false;
   for (;;) {
-    const page = await apiFetch<Discrepancy[]>('/discrepancies', {
-      query: { state: states, limit: DISCREPANCY_PAGE_LIMIT, after },
+    let page = await apiFetchPage<Discrepancy[]>('/discrepancies', {
+      query: { state: states, limit: DISCREPANCY_PAGE_LIMIT },
       signal,
     });
-    all.push(...page);
-    const last = page.at(-1);
-    if (page.length < DISCREPANCY_PAGE_LIMIT || last === undefined || last.id === after) {
+    const all: Discrepancy[] = [...page.data];
+    const followed = new Set<string>();
+    try {
+      while (page.next !== undefined) {
+        if (followed.has(page.next)) {
+          // GET /discrepancies answers every page with 200, the status this page came with.
+          throw new ApiError(200, 'invalid_response', REPEATED_PAGE_MESSAGE);
+        }
+        followed.add(page.next);
+        page = await apiFetchPage<Discrepancy[]>(page.next, { signal });
+        all.push(...page.data);
+      }
       return all;
+    } catch (error) {
+      if (restarted || !isApiError(error) || error.code !== 'invalid_cursor') {
+        throw error;
+      }
+      restarted = true;
     }
-    after = last.id;
   }
 }
 
@@ -495,11 +590,15 @@ async function fetchAllDiscrepancies(
  * order C0 items are pinned in: `GET /discrepancies?state=…` → {@link Discrepancy}[]
  * (AAP 0.5.5 `DiscrepancyResolver`). Each state is sent as its own repetition of the
  * parameter (`state=open&state=awaiting_platform`). An empty list sends no `state`, which the
- * API reads as its default unresolved states. Every page is read, so the list is never
- * truncated at the API's page size.
+ * API reads as its default unresolved states. Every page is read by following the API's
+ * `Link: rel="next"` cursor until a page names none ({@link fetchAllDiscrepancies}), so the list
+ * is never truncated at the API's page size. That includes a page holding fewer discrepancies
+ * than its `limit`, or none, because the API left out one whose subject it cannot load.
  *
- * Status codes: 200; 422 `validation_error` for an unknown state. Recording a decision or
- * resolving a discrepancy invalidates every variant.
+ * Status codes: 200; 422 `validation_error` for an unknown state; 422 `invalid_cursor` only
+ * when it recurs after the read restarted once from the first page; and `invalid_response`
+ * when the paging link cannot be parsed, leaves `/api/v1` or repeats a page already read.
+ * Recording a decision or resolving a discrepancy invalidates every variant.
  *
  * @param states - The states to list; `open` and `awaiting_platform` when omitted.
  * @returns The query result, keyed by `queryKeys.discrepancies(states)`.

@@ -13,8 +13,10 @@ Each test asserts behaviour that AAP 0.5.3 or the module's docstrings set:
   forbid unknown keys, and no field is aliased, so the wire names are the snake_case field
   names; a response emits every ``None`` default as ``null`` and publishes every field as
   required, while a defaulted request field stays optional;
-* requests: :class:`LoginRequest`, :class:`CreateRunRequest` (whose window bounds
-  ``AnalysisWindow.custom`` enforces), :class:`FeedbackRequest`, :class:`DecisionRequest`,
+* requests: :class:`LoginRequest`, :class:`CreateRunRequest` (whose dates are exactly
+  ``YYYY-MM-DD`` strings or plain ``date`` objects, :data:`CalendarDate`, never timestamps or
+  datetimes, and whose window bounds ``AnalysisWindow.custom`` enforces),
+  :class:`FeedbackRequest`, :class:`DecisionRequest`,
   :class:`DecisionPatchIn`, :class:`IntendedStateIn` and :class:`ResolveRequest`, whose ids
   stop at :data:`BIGINT_MAX` and whose email and notes refuse U+0000 and text UTF-8 cannot
   encode (:data:`StorableText`), while the memory-only password takes any character;
@@ -982,22 +984,130 @@ def test_create_run_request_parses_calendar_dates() -> None:
 @pytest.mark.parametrize(
     ("payload", "error_type"),
     [
-        ({"window_start": "2026-09-08T10:30:00", "window_end": "2026-10-05"}, None),
-        ({"window_start": "last month", "window_end": "2026-10-05"}, None),
+        ({"window_start": "2026-09-08T10:30:00", "window_end": "2026-10-05"}, "value_error"),
+        ({"window_start": "last month", "window_end": "2026-10-05"}, "value_error"),
         ({"window_start": "2026-09-08"}, "missing"),
     ],
 )
 def test_create_run_request_refuses_anything_but_two_calendar_dates(
-    payload: dict[str, Any], error_type: str | None
+    payload: dict[str, Any], error_type: str
 ) -> None:
     with pytest.raises(ValidationError) as error:
         CreateRunRequest.model_validate(payload)
-    types = _error_types(error)
-    assert len(types) == 1
-    if error_type is None:
-        assert types[0].startswith("date_")
-    else:
-        assert types == [error_type]
+    assert _error_types(error) == [error_type]
+
+
+_REFUSED_DATE_FORMS: list[object] = [
+    1679616000,
+    1679616000.0,
+    True,
+    "1679616000",
+    "2023-03-24T00:00:00",
+    "2023-03-24T00:00:00Z",
+    "2023-03-24T00:00:00+00:00",
+    " 2023-03-24",
+    "2023-03-24 ",
+    "2023-03-24\n",
+    "2023-3-24",
+    "20230324",
+    "\uff12\uff10\uff12\uff13-\uff10\uff13-\uff12\uff14",
+    b"2023-03-24",
+    None,
+    datetime(2023, 3, 24, tzinfo=UTC).replace(tzinfo=None),
+    datetime(2023, 3, 24, tzinfo=UTC),
+]
+"""Request dates the API refuses: UNIX timestamps (number, float, numeric string), a boolean,
+datetime strings and objects (an instant, even at midnight), whitespace, a trailing newline,
+unpadded, undelimited or non-ASCII digits, bytes and ``null``. Lax Pydantic ``date``
+validation turns the timestamps and the midnight datetimes into 2023-03-24."""
+
+
+@pytest.mark.parametrize("value", ["2026-09-01", date(2026, 9, 1)])
+def test_calendar_date_input_admits_a_yyyy_mm_dd_string_and_a_plain_date(value: object) -> None:
+    assert schemas._calendar_date_input(value) is value
+
+
+@pytest.mark.parametrize("value", _REFUSED_DATE_FORMS)
+def test_calendar_date_input_refuses_every_other_form_without_echoing_it(value: object) -> None:
+    with pytest.raises(ValueError, match=r'send a calendar date as a "YYYY-MM-DD" string') as error:
+        schemas._calendar_date_input(value)
+    message = str(error.value)
+    assert repr(value) not in message
+    assert str(value).strip() not in message
+
+
+def test_calendar_date_input_leaves_an_impossible_date_to_the_date_parser() -> None:
+    assert schemas._calendar_date_input("2026-02-30") == "2026-02-30"
+
+
+def test_create_run_request_accepts_a_yyyy_mm_dd_string_and_a_date() -> None:
+    from_json = CreateRunRequest.model_validate_json(
+        '{"window_start": "2026-09-01", "window_end": "2026-09-30"}'
+    )
+    from_python = CreateRunRequest.model_validate(
+        {"window_start": "2026-09-01", "window_end": date(2026, 9, 30)}
+    )
+    built = CreateRunRequest(window_start=date(2026, 9, 1), window_end=date(2026, 9, 30))
+    for request in (from_json, from_python, built):
+        assert (request.window_start, request.window_end) == (date(2026, 9, 1), date(2026, 9, 30))
+        assert type(request.window_start) is date
+        assert type(request.window_end) is date
+
+
+@pytest.mark.parametrize("field", ["window_start", "window_end"])
+@pytest.mark.parametrize("value", _REFUSED_DATE_FORMS)
+def test_create_run_request_refuses_timestamps_datetimes_and_loose_strings(
+    field: str, value: object
+) -> None:
+    payload: dict[str, object] = {"window_start": "2026-09-01", "window_end": "2026-09-30"}
+    payload[field] = value
+    with pytest.raises(ValidationError) as error:
+        CreateRunRequest.model_validate(payload)
+    errors = error.value.errors()
+    assert [(item["type"], item["loc"]) for item in errors] == [("value_error", (field,))]
+    assert 'send a calendar date as a "YYYY-MM-DD" string' in errors[0]["msg"]
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "1679616000",
+        "1679616000.0",
+        "true",
+        '"1679616000"',
+        '"2023-03-24T00:00:00"',
+        '"2023-03-24T00:00:00Z"',
+        '" 2023-03-24"',
+        '"2023-03-24\\n"',
+        '"2023-3-24"',
+        '"20230324"',
+        "null",
+    ],
+)
+def test_create_run_request_refuses_them_on_the_json_wire_too(literal: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        CreateRunRequest.model_validate_json(
+            f'{{"window_start": {literal}, "window_end": "2026-09-30"}}'
+        )
+    errors = error.value.errors()
+    assert [(item["type"], item["loc"]) for item in errors] == [("value_error", ("window_start",))]
+
+
+@pytest.mark.parametrize("value", ["2026-02-30", "2026-13-01", "2026-00-10", "0000-01-01"])
+def test_create_run_request_refuses_an_impossible_yyyy_mm_dd_date(value: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        CreateRunRequest.model_validate({"window_start": value, "window_end": "2026-09-30"})
+    errors = error.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ("window_start",)
+    assert errors[0]["type"].startswith("date_")
+
+
+def test_create_run_request_publishes_both_dates_as_json_schema_date_strings() -> None:
+    properties = CreateRunRequest.model_json_schema(mode="validation")["properties"]
+    for field in ("window_start", "window_end"):
+        published = {key: value for key, value in properties[field].items() if key != "title"}
+        assert published == {"type": "string", "format": "date"}, field
 
 
 @pytest.mark.parametrize(

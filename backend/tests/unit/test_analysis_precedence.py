@@ -63,6 +63,7 @@ from ads_engine.analysis.context import (
     FLAG_SIMULATED,
     FLAG_STALE,
     FLAG_UNVERIFIED_DISCREPANCIES,
+    GROUP_CHANGES,
     HELD_DISCREPANCY_REASON,
     K1,
     KEYWORDS,
@@ -75,6 +76,7 @@ from ads_engine.analysis.context import (
     AnalysisContext,
     Candidate,
     DecisionSubject,
+    DiscrepancyInfo,
     EntityRef,
     Flag,
     Freshness,
@@ -94,6 +96,7 @@ from ads_engine.analysis.precedence import (
     allocate_b3,
     apply_precedence,
 )
+from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.simulation.scenarios import (
     MODULE_BUDGET,
     MODULE_CREATIVE,
@@ -105,6 +108,12 @@ PRECEDENCE_MODULES = frozenset({MODULE_BUDGET, MODULE_CREATIVE, MODULE_PRECEDENC
 """Catalogue modules whose scenarios exercise G1, the B3 allocation, P7 and precedence."""
 
 RULE_MODULES = (discrepancy, keywords, campaigns, budget, creative, white_papers)
+
+STALE_AFTER_KEY = "sources.stale_after_hours"
+"""The threshold P4 judges each required dataset's age against."""
+
+TRUSTED_MIN_DAYS_KEY = "window.trusted_min_days"
+"""The threshold P5 judges the window's length against."""
 
 
 def build(name: str) -> AnalysisContext:
@@ -578,6 +587,102 @@ def test_p1_member_items_do_not_depend_on_their_siblings() -> None:
     assert ("campaign", sibling) not in depends
 
 
+def funding_card(
+    ctx: AnalysisContext,
+    rule_id: str,
+    entity: EntityRef,
+    subject: DecisionSubject,
+    amount: Decimal,
+    currency: str,
+) -> Candidate:
+    """A B1 (``extra.increase``) or B3 (``extra.freed``) card deciding on ``subject``."""
+    datasets = ("google.entities", "google.metrics_daily")
+    key = "increase" if rule_id == B1 else "freed"
+    return Candidate(
+        rule_id=rule_id,
+        section=BUDGET,
+        group=GROUP_CHANGES,
+        entity_ref=entity,
+        action=f"{rule_id} on {entity.name}",
+        reason=f"{rule_id} proposed on {entity.name}.",
+        evidence=ctx.make_evidence(
+            required_datasets=datasets,
+            crm_scope=None,
+            metrics=(),
+            extra={key: amount, "currency": currency},
+        ),
+        rank_key=(Decimal(0),),
+        flags=(),
+        required_datasets=datasets,
+        increases_spend_on=(subject,) if rule_id == B1 else (),
+        decision_subject=subject,
+        depends_on=(subject,),
+    )
+
+
+@pytest.mark.parametrize("shared_role", ["receiver", "donor"])
+def test_p1_a_shared_budget_allocation_partner_brings_its_member_campaigns(
+    shared_role: str,
+) -> None:
+    ctx = build("shared.poor_member.does_not_fire")
+    shared = next(b for b in ctx.budgets.values() if b.explicitly_shared)
+    members = sorted(c.id for c in ctx.campaigns.values() if c.budget_id == shared.id)
+    outsider = next(c for c in ctx.campaigns.values() if c.budget_id != shared.id)
+    assert outsider.budget_id is not None
+    assert len(members) == 2
+    on_budget = (
+        EntityRef("google", ENTITY_BUDGET, shared.id, shared.external_id, shared.name),
+        DecisionSubject("budget", shared.id),
+    )
+    on_campaign = (
+        EntityRef("google", ENTITY_CAMPAIGN, outsider.id, outsider.external_id, outsider.name),
+        DecisionSubject("campaign", outsider.id),
+    )
+    if shared_role == "receiver":
+        receiver, donor = on_budget, on_campaign
+    else:
+        receiver, donor = on_campaign, on_budget
+    cards = (
+        funding_card(ctx, B1, *receiver, Decimal("50.00"), shared.currency),
+        funding_card(ctx, B3, *donor, Decimal("20.00"), shared.currency),
+    )
+    out = apply_precedence(RuleResult(candidates=cards), ctx)
+    assert [(a.donor, a.receiver, a.amount) for a in out.allocations] == [
+        (donor[1].key, receiver[1].key, Decimal("20.00"))
+    ]
+    by_entity = {c.entity_ref.type: c for c in of_rule(out, BUDGET)}
+    outsider_card = by_entity[ENTITY_CAMPAIGN]
+    depends = {s.key for s in outsider_card.depends_on}
+    assert {("budget", shared.id), *(("campaign", member) for member in members)} <= depends
+    assert {(s["type"], s["id"]) for s in outsider_card.evidence.extra["depends_on"]} == depends
+    shared_card = by_entity[ENTITY_BUDGET]
+    assert {("campaign", outsider.id), ("budget", outsider.budget_id)} <= {
+        s.key for s in shared_card.depends_on
+    }
+
+    member = ctx.campaigns[members[-1]]
+    info = DiscrepancyInfo(
+        id=7,
+        subject_type="campaign",
+        subject_id=member.id,
+        subject_name=member.name,
+        source="google",
+        shape="shared_member",
+        kind="status",
+        decided_value={"status": "active"},
+        platform_value={"status": "paused"},
+        detected_at=ctx.now - timedelta(hours=5),
+        state="open",
+    )
+    discrepant = replace(ctx, discrepancies=(info,), cache={})
+    held = apply_precedence(RuleResult(candidates=cards), discrepant)
+    assert held.allocations == out.allocations
+    for card in of_rule(held, BUDGET):
+        assert card.held, card.rule_id
+        assert card.held_reason == HELD_DISCREPANCY_REASON
+        assert card.evidence.extra["blocking_discrepancies"] == (info.id,)
+
+
 # ---------------------------------------------------------------------------
 # P2 conversion tracking absent
 # ---------------------------------------------------------------------------
@@ -877,8 +982,80 @@ def test_p5_configured_minimum_flags_a_20_day_window() -> None:
         assert flag_message(item.candidate, FLAG_SHORT_WINDOW) == (
             "Window of 20 days is below the 21-day trusted minimum"
         )
+        assert item.candidate.evidence.thresholds[TRUSTED_MIN_DAYS_KEY] == 21
     _, default = run("p3.simulated.case")
     assert all(not item.candidate.has_flag(FLAG_SHORT_WINDOW) for item in default.all_items())
+    assert all(
+        item.candidate.evidence.thresholds[TRUSTED_MIN_DAYS_KEY] == 14
+        for item in default.all_items()
+    )
+
+
+def test_p4_p5_freeze_the_applied_thresholds_into_the_evidence() -> None:
+    """AAP 0.5.4.8 "the thresholds applied": P4's hours and P5's minimum join the evidence.
+
+    They follow the rule's own thresholds, which keep their values and order, whatever the
+    verdict; an item without required datasets is judged by P5 only; a key the rule already
+    recorded with the same value stays where it is, and one with another value or type fails
+    the run rather than being overwritten. The input candidate is never changed.
+    """
+    ctx, candidate = sample_candidate()
+    own = candidate.evidence.thresholds
+    assert own
+    assert not {STALE_AFTER_KEY, TRUSTED_MIN_DAYS_KEY} & set(own)
+    hours = ctx.thresholds.int(STALE_AFTER_KEY)
+    minimum = ctx.window.trusted_min_days
+    assert (hours, minimum) == (24, 14)
+
+    (item,) = apply_precedence(RuleResult(candidates=(candidate,)), ctx).all_items()
+    assert tuple(item.candidate.evidence.thresholds.items()) == (
+        *own.items(),
+        (STALE_AFTER_KEY, hours),
+        (TRUSTED_MIN_DAYS_KEY, minimum),
+    )
+    rendered = item.candidate.evidence.to_json()["thresholds"]
+    assert (rendered[STALE_AFTER_KEY], rendered[TRUSTED_MIN_DAYS_KEY]) == (24, 14)
+    assert not {STALE_AFTER_KEY, TRUSTED_MIN_DAYS_KEY} & set(candidate.evidence.thresholds)
+
+    old = {
+        key: replace(row, last_success_at=ctx.now - timedelta(hours=30))
+        for key, row in ctx.freshness.items()
+    }
+    raised = Thresholds.load(overrides={STALE_AFTER_KEY: 36})
+    for config, stale in ((ctx.thresholds, True), (raised, False)):
+        variant = replace(ctx, freshness=old, thresholds=config, cache={})
+        (item,) = apply_precedence(RuleResult(candidates=(candidate,)), variant).all_items()
+        assert item.candidate.has_flag(FLAG_STALE) is stale
+        assert item.candidate.evidence.thresholds[STALE_AFTER_KEY] == config.int(STALE_AFTER_KEY)
+    assert raised.int(STALE_AFTER_KEY) == 36
+
+    bare = plain(candidate, required_datasets=())
+    (item,) = apply_precedence(RuleResult(candidates=(bare,)), ctx).all_items()
+    assert tuple(item.candidate.evidence.thresholds.items()) == (
+        *own.items(),
+        (TRUSTED_MIN_DAYS_KEY, minimum),
+    )
+
+    first = {STALE_AFTER_KEY: hours, **own}
+    same = replace(candidate, evidence=replace(candidate.evidence, thresholds=first))
+    (item,) = apply_precedence(RuleResult(candidates=(same,)), ctx).all_items()
+    assert tuple(item.candidate.evidence.thresholds.items()) == (
+        *first.items(),
+        (TRUSTED_MIN_DAYS_KEY, minimum),
+    )
+
+    clashes: tuple[tuple[str, object], ...] = (
+        (STALE_AFTER_KEY, hours + 1),
+        (STALE_AFTER_KEY, str(hours)),
+        (TRUSTED_MIN_DAYS_KEY, minimum - 1),
+        (TRUSTED_MIN_DAYS_KEY, float(minimum)),
+    )
+    for key, value in clashes:
+        conflicting = replace(candidate.evidence, thresholds={**own, key: value})
+        clash = replace(candidate, evidence=conflicting)
+        with pytest.raises(PrecedenceInvariantError, match=f"records {key} = ") as raised_error:
+            apply_precedence(RuleResult(candidates=(clash,)), ctx)
+        assert f"= {value!r} in evidence.thresholds" in str(raised_error.value)
 
 
 def test_p6_withheld_lines_carry_sizes_and_never_become_items() -> None:

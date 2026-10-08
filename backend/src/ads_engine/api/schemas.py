@@ -6,7 +6,8 @@ here are the wire contract. The groups are:
 
 * **Shared types**: :data:`Money`, :data:`MetricValue`, :data:`PositiveBigInt` (request ids
   bounded by :data:`BIGINT_MAX`), :data:`StorableText` and :data:`StorableNote` (request
-  text PostgreSQL can store) and the ``Literal`` vocabularies (:data:`SourceName`,
+  text PostgreSQL can store), :data:`CalendarDate` (a request date, exactly ``YYYY-MM-DD``)
+  and the ``Literal`` vocabularies (:data:`SourceName`,
   :data:`SectionKey`, :data:`FlagCode` …), each declared once.
 * **Errors**: :class:`ErrorResponse` (``{"error": {"code", "message"}}``) and
   :data:`ERROR_RESPONSES` for the routes' ``responses=``.
@@ -47,8 +48,9 @@ Example:
     {'daily_budget': Decimal('120.50')}
 """
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Final, Literal, Self, TypedDict, get_args
 
@@ -131,6 +133,7 @@ __all__ = [
     "BannerTone",
     "Baseline",
     "BindingMode",
+    "CalendarDate",
     "CampaignStatus",
     "Completeness",
     "ConfigView",
@@ -359,6 +362,47 @@ StorableText = Annotated[str, AfterValidator(_storable_text)]
 A value holding U+0000 or a code point UTF-8 cannot encode is refused with 422 before any
 SQL runs; every other value, non-ASCII included, passes unchanged. Length bounds stay on
 each field."""
+
+_CALENDAR_DATE_FORM: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+"""The one text form a request date may take, matched in full: ``YYYY-MM-DD`` in ASCII digits,
+with no whitespace, time or zone (RFC 3339 ``full-date``, the JSON schema ``date`` format)."""
+
+_CALENDAR_DATE_MESSAGE: Final = (
+    'send a calendar date as a "YYYY-MM-DD" string, such as "2026-09-01"'
+)
+"""The 422 message of a refused request date; it names the expected form, never the value."""
+
+
+def _calendar_date_input(value: object) -> object:
+    """Admit only a ``YYYY-MM-DD`` string, or a ``date`` that is not a ``datetime``.
+
+    Pydantic's lax ``date`` validation turns a UNIX timestamp (``1679616000``, as a number or
+    a numeric string) and a midnight datetime string (``"2023-03-24T00:00:00"``, with or
+    without a zone) into a date, so a client sending an instant would get a window over days
+    it never named. FastAPI validates a parsed JSON body in Python mode, where strict ``date``
+    validation would refuse every string, so the form is checked here instead: a string must
+    match :data:`_CALENDAR_DATE_FORM` in full and is then parsed by Pydantic, which still
+    refuses an impossible date such as ``"2026-02-30"``. A ``date`` passes for Python callers;
+    a ``datetime``, although a ``date`` subclass, is an instant and is refused.
+
+    Raises:
+        ValueError: When ``value`` is neither such a string nor a plain ``date``: a number, a
+            boolean, bytes, a ``datetime``, or a string in any other form.
+    """
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and _CALENDAR_DATE_FORM.fullmatch(value) is not None:
+        return value
+    raise ValueError(_CALENDAR_DATE_MESSAGE)
+
+
+CalendarDate = Annotated[date, BeforeValidator(_calendar_date_input)]
+"""A calendar date a request names: exactly ``YYYY-MM-DD`` on the wire.
+
+Published as ``{"type": "string", "format": "date"}``, the one form :func:`_calendar_date_input`
+admits. A timestamp, a datetime string or any other spelling is a 422 rather than being
+converted to a day the client never named. Response dates stay plain ``date``: they are
+outputs, always rendered in this form."""
 
 # ---------------------------------------------------------------------------
 # Vocabularies (each equal to its database tuple; checked at import)
@@ -805,17 +849,23 @@ class Run(ApiModel):
 class CreateRunRequest(RequestModel):
     """``POST /runs`` body: a custom window of calendar dates applied to each source's days.
 
+    Each date is a JSON string of exactly the form ``YYYY-MM-DD`` (:data:`CalendarDate`), for
+    example ``{"window_start": "2026-09-08", "window_end": "2026-10-05"}``. A UNIX timestamp
+    (number or numeric string), a datetime string with or without a zone, surrounding
+    whitespace, unpadded or undelimited digits, and an impossible date such as
+    ``"2026-02-30"`` are each a 422 ``validation_error`` naming the field.
+
     The span (1 day to ``window.max_days``) and the end (no later than the default window
     end) are validated by ``AnalysisWindow.custom``, whose ``InvalidWindow`` the app maps to
     422, so those rules live in one place.
 
     Attributes:
-        window_start: First calendar date, inclusive.
-        window_end: Last calendar date, inclusive.
+        window_start: First calendar date, inclusive, as ``YYYY-MM-DD``.
+        window_end: Last calendar date, inclusive, as ``YYYY-MM-DD``.
     """
 
-    window_start: date
-    window_end: date
+    window_start: CalendarDate
+    window_end: CalendarDate
 
 
 # ---------------------------------------------------------------------------

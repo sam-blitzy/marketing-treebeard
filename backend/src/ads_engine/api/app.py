@@ -8,8 +8,10 @@ uvicorn serves the factory, never a module-level application::
 
 * **Startup checks**: :meth:`Settings.check_api_startup` refuses a plain-``http``
   ``APP_BASE_URL`` on any host other than ``localhost`` or ``127.0.0.1``, and a missing
-  ``SESSION_SECRET``. The :class:`~ads_engine.settings.ConfigurationError` propagates, so
-  uvicorn exits before it binds a socket.
+  ``SESSION_SECRET``. That :class:`~ads_engine.settings.ConfigurationError`, or a
+  :class:`pydantic.ValidationError` from an unparseable environment value, is first logged
+  as one ``api.startup_failed`` ERROR event naming the error class and the settings at
+  fault, never their values. It then propagates, so uvicorn exits before it binds a socket.
 * **Session cookie**: Starlette's ``SessionMiddleware`` signs ``ads_engine_session`` with
   ``SESSION_SECRET``. The cookie is always HttpOnly, ``SameSite=Lax`` and lives 12 h; it is
   ``Secure`` exactly when ``APP_BASE_URL`` is ``https://``.
@@ -25,8 +27,9 @@ uvicorn serves the factory, never a module-level application::
 No other middleware is installed. The SPA is served same-origin by nginx, which also proxies
 ``/api``, so CORS and compression have no role here. Swagger UI and ReDoc are disabled: they
 load CDN assets that nginx's ``default-src 'self'`` Content-Security-Policy blocks. The
-OpenAPI document stays available at ``/api/v1/openapi.json``, the contract
-``web/src/api/types.ts`` is written against.
+OpenAPI document, the contract ``web/src/api/types.ts`` is written against, is served at
+``/api/v1/openapi.json`` to a signed-in session only. FastAPI's own schema route is
+disabled, because it sits outside the guarded routers and would answer without a session.
 
 The API reads stored results only. Neither this module nor any module it imports loads
 ``ads_engine.connectors``, ``ads_engine.sync`` or ``ads_engine.simulation``: all external I/O
@@ -35,6 +38,7 @@ creates no database engine.
 """
 
 import http
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Final
@@ -42,15 +46,21 @@ from typing import Any, Final
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from ads_engine import __version__
 from ads_engine.analysis.lock import RunInProgress
-from ads_engine.analysis.thresholds import ConfigError, Thresholds
+from ads_engine.analysis.thresholds import (
+    CONFIG_FILES,
+    CRM_BINDINGS_DOCUMENT,
+    ConfigError,
+    Thresholds,
+)
 from ads_engine.analysis.window import InvalidWindow
 from ads_engine.api import security
-from ads_engine.api.deps import ApiError, require_csrf
+from ads_engine.api.deps import ApiError, require_csrf, require_user
 from ads_engine.api.routes import (
     auth,
     config,
@@ -77,6 +87,9 @@ API_PREFIX: Final = "/api/v1"
 
 APP_TITLE: Final = "Ads Action Engine API"
 """Title of the OpenAPI document."""
+
+_OPENAPI_PATH: Final = f"{API_PREFIX}/openapi.json"
+"""Where :func:`_serve_openapi` serves the OpenAPI document to a signed-in session."""
 
 # Routers in the order of the endpoint table. The order fixes the order of the OpenAPI
 # paths, and no two modules share a path, so it never decides which route matches.
@@ -115,6 +128,21 @@ _HTTP_STATUS_CODES: Final[Mapping[int, str]] = {
 # produce an unbounded message; the remainder is counted, never listed.
 _MAX_VALIDATION_DETAILS: Final = 3
 _VALIDATION_FALLBACK_MESSAGE: Final = "Invalid request"
+
+# A config_error message is built from these parts only, never from the error's text: the
+# loader's details quote disk paths and YAML source lines, which stay in the server log.
+_CONFIG_ERROR_MESSAGE: Final = "Configuration error"
+_CONFIG_ERROR_HINT: Final = "Check the API logs for details."
+# The logical names a ConfigError's `file` may be named by in a response. Any other value,
+# such as the disk path of a missing config directory, is left out of the message.
+_PUBLIC_CONFIG_FILES: Final[frozenset[str]] = frozenset((*CONFIG_FILES, CRM_BINDINGS_DOCUMENT))
+# A dotted key is named only when it is short and made of ASCII identifiers and `[n]` indexes,
+# such as `window.presets` or `assets[1].lead_forms[0]`. A key echoing arbitrary YAML text is
+# left out of the message.
+_PUBLIC_CONFIG_KEY_MAX_LENGTH: Final = 120
+_PUBLIC_CONFIG_KEY_RE: Final = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*|\[[0-9]{1,9}\])(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]{1,9}\])*"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -273,25 +301,51 @@ async def _handle_dataset_not_writable(request: Request, exc: Exception) -> JSON
 async def _handle_config_error(request: Request, exc: Exception) -> JSONResponse:
     """Render an invalid ``config/*.yaml`` or stored CRM binding as 500 ``config_error``.
 
-    The message names the file, the dotted key and the problem, never a secret, so it is
-    both logged and returned to the signed-in operator who has to fix the file.
+    The error's full text, with its file, dotted key and detail, is logged as
+    ``api.config_error`` through the redacting log pipeline, and is never returned. The
+    detail can quote disk paths, YAML parser diagnostics and source lines, and the
+    ``file`` of a missing config directory is itself a disk path (CWE-209).
+
+    The response message is built from logical parts only: ``Configuration error``, then
+    ``in <file>`` when the file is one of the three config files or
+    ``source_dataset.crm_bindings``, then ``at <key>`` when the dotted key is a short run of
+    ASCII identifiers and ``[n]`` indexes, then a fixed pointer to the API logs. For
+    example: ``Configuration error in thresholds.yaml at window.presets. Check the API logs
+    for details.``
 
     Args:
         request: The failed request.
         exc: The raised :class:`~ads_engine.analysis.thresholds.ConfigError`.
 
     Returns:
-        500 with ``config_error`` and the error's message.
+        500 with ``config_error`` and the message built from the logical parts.
     """
     error = _expect(exc, ConfigError)
-    message = str(error)
+    # Read defensively: a ConfigError built without its attributes still renders.
+    raw_file: object = getattr(error, "file", None)
+    raw_key: object = getattr(error, "key", None)
     _log.error(
         "api.config_error",
-        error=message,
+        error=str(error),
+        file=raw_file,
+        key=raw_key,
         path=request.url.path,
         method=request.method,
     )
-    return _error_response(http.HTTPStatus.INTERNAL_SERVER_ERROR, _CONFIG_ERROR_CODE, message)
+    message = _CONFIG_ERROR_MESSAGE
+    if isinstance(raw_file, str) and raw_file in _PUBLIC_CONFIG_FILES:
+        message += f" in {raw_file}"
+    if (
+        isinstance(raw_key, str)
+        and len(raw_key) <= _PUBLIC_CONFIG_KEY_MAX_LENGTH
+        and _PUBLIC_CONFIG_KEY_RE.fullmatch(raw_key) is not None
+    ):
+        message += f" at {raw_key}"
+    return _error_response(
+        http.HTTPStatus.INTERNAL_SERVER_ERROR,
+        _CONFIG_ERROR_CODE,
+        f"{message}. {_CONFIG_ERROR_HINT}",
+    )
 
 
 def _validation_message(errors: Sequence[Any]) -> str:
@@ -464,6 +518,34 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------------------------
+# OpenAPI document
+# ---------------------------------------------------------------------------
+
+
+async def _serve_openapi(request: Request) -> JSONResponse:
+    """Serve the generated OpenAPI document at ``GET`` and ``HEAD /api/v1/openapi.json``.
+
+    The document is the contract ``web/src/api/types.ts`` is written against. FastAPI's own
+    schema route is disabled, because FastAPI registers it outside the routers, where it
+    would answer without a session (AAP 0.5.3 exempts only ``POST /auth/login`` and
+    ``GET /healthz``). :func:`create_app` registers this route instead, behind the routers'
+    CSRF guard and :func:`~ads_engine.api.deps.require_user`, and leaves it out of the
+    document, so the published paths stay exactly the endpoint table.
+
+    Args:
+        request: The current request; its application generates the document, which
+            FastAPI caches until the routes change.
+
+    Returns:
+        The OpenAPI document, the same one ``app.openapi()`` returns.
+
+    Raises:
+        ApiError: 401 ``unauthenticated`` without a valid session (from ``require_user``).
+    """
+    return JSONResponse(request.app.openapi())
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -480,9 +562,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     1. Configure JSON logging on stdout, redacting the secrets of ``settings`` (idempotent).
     2. Resolve the settings and run :meth:`Settings.check_api_startup`. A plain-``http``
        ``APP_BASE_URL`` on a host other than ``localhost`` or ``127.0.0.1``, or a missing
-       ``SESSION_SECRET``, raises here, so uvicorn refuses to start.
-    3. Create the application, with its OpenAPI document at ``/api/v1/openapi.json`` and
-       no Swagger UI or ReDoc.
+       ``SESSION_SECRET``, raises here, so uvicorn refuses to start. That error, or an
+       environment value that fails validation, is logged as one ``api.startup_failed``
+       ERROR event (``error_type`` and the names of the ``fields`` at fault, never their
+       values) before it propagates.
+    3. Create the application with no Swagger UI, no ReDoc and no FastAPI schema route,
+       which would answer without a session. The OpenAPI document is served at
+       ``/api/v1/openapi.json`` once the routers are included, behind their CSRF guard and
+       the session check, so only a signed-in session reads it.
     4. Install ``SessionMiddleware``: cookie ``ads_engine_session``, HttpOnly,
        ``SameSite=Lax``, ``Max-Age`` 12 h, path ``/``, and ``Secure`` exactly when
        ``APP_BASE_URL`` is ``https://``.
@@ -506,25 +593,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     Raises:
         ads_engine.settings.ConfigurationError: When the base URL is unsafe or
-            ``SESSION_SECRET`` is not set.
+            ``SESSION_SECRET`` is not set, after ``api.startup_failed`` is logged.
         pydantic.ValidationError: When ``settings`` is ``None`` and an environment value
-            cannot be parsed.
+            cannot be parsed, after ``api.startup_failed`` is logged.
     """
     configure_logging(settings=settings)
-    if settings is None:
-        settings = get_settings()
-    settings.check_api_startup()
-    session_secret = settings.session_secret
-    # check_api_startup has already refused a missing or blank SESSION_SECRET; this repeats
-    # it so the signing key is typed as present and can never be an empty string.
-    if session_secret is None or not session_secret.get_secret_value():
-        raise ConfigurationError("SESSION_SECRET is not set; run make init")
+    try:
+        if settings is None:
+            settings = get_settings()
+        settings.check_api_startup()
+        session_secret = settings.session_secret
+        # check_api_startup has already refused a missing or blank SESSION_SECRET; this
+        # repeats it so the signing key is typed as present and can never be an empty string.
+        if session_secret is None or not session_secret.get_secret_value():
+            raise ConfigurationError(
+                "SESSION_SECRET is not set; run make init", fields=("session_secret",)
+            )
+    except (ConfigurationError, ValidationError) as exc:
+        # uvicorn reports a factory failure only as a raw traceback, so the refusal is
+        # logged first. Field names only: a validation message can echo the input.
+        if isinstance(exc, ValidationError):
+            fields = sorted(
+                {
+                    ".".join(str(part) for part in error["loc"])
+                    for error in exc.errors(include_url=False, include_input=False)
+                }
+            )
+        else:
+            fields = sorted(exc.fields)
+        _log.error("api.startup_failed", error_type=type(exc).__name__, fields=fields)
+        raise
 
     app = FastAPI(
         title=APP_TITLE,
         version=__version__,
         lifespan=_lifespan,
-        openapi_url=f"{API_PREFIX}/openapi.json",
+        openapi_url=None,
         docs_url=None,
         redoc_url=None,
     )
@@ -543,6 +647,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     csrf_guard = [Depends(require_csrf)]
     for router in _ROUTERS:
         app.include_router(router, prefix=API_PREFIX, dependencies=csrf_guard)
+    app.add_api_route(
+        _OPENAPI_PATH,
+        _serve_openapi,
+        methods=["GET", "HEAD"],
+        dependencies=[*csrf_guard, Depends(require_user)],
+        include_in_schema=False,
+    )
 
     _register_error_handlers(app)
     # Counted on the routers themselves: FastAPI includes a router lazily, so `app.routes`

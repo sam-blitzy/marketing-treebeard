@@ -10,6 +10,7 @@
  *   ds-inline--nowrap                                     wrap={false}
  *   ds-inline--align-{start|center|end|baseline|stretch}  align prop: cross-axis alignment
  *   ds-inline--justify-{start|center|end|between}         justify prop: main-axis distribution
+ *   ds-inline--break-long-words                           breakLongWords: long words may break
  *
  * Every spacing value is a token from ../tokens.css, and the only literal is 0. The modifiers
  * share the base class's specificity and follow it in source order, so an align modifier always
@@ -103,6 +104,18 @@
 
 .ds-inline--justify-between {
   justify-content: space-between;
+}
+
+/*
+ * Long words (breakLongWords): long unbroken text such as URNs, search terms, dataset names or
+ * threshold keys breaks at any point, so a child wraps inside its line instead of widening the
+ * row past a narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). overflow-wrap is anywhere, not
+ * break-word, because only anywhere lowers a child's min-content size, which is what lets the
+ * flex row shrink that child to fit its line, as in Badge.css. overflow-wrap is inherited, so
+ * every descendant gets it.
+ */
+.ds-inline--break-long-words {
+  overflow-wrap: anywhere;
 }
 
 /*

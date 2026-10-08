@@ -76,7 +76,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Final, Literal, get_args
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
@@ -432,7 +432,13 @@ async def list_runs(session: AsyncSession, *, kind: str, limit: int) -> list[Ana
     """Return the newest runs of ``kind``, in every status, newest first (``GET /runs``).
 
     Newest is the highest id: ids follow insertion, while ``started_at`` is the run's
-    logical instant, which a caller may set (``now``).
+    logical instant, which a caller may set (``now``). ``ix_analysis_run_kind_id`` on
+    (``kind``, ``id DESC``) serves this read as one index range in the returned order, with
+    no sort, so sparse ``custom`` runs among many ``default`` runs cost only ``limit`` rows.
+    ``kind`` is rendered inline, so a server-side prepared statement's generic plan is also
+    costed on that kind's own statistics and keeps the index range; with ``kind = $1`` a
+    generic plan assumes half the runs match and walks the primary key backwards through
+    every newer ``default`` run instead.
 
     Args:
         session: The caller's session.
@@ -455,7 +461,8 @@ async def list_runs(session: AsyncSession, *, kind: str, limit: int) -> list[Ana
         raise ValueError(f"limit must be at least 1, found {count}")
     result = await session.execute(
         select(AnalysisRun)
-        .where(AnalysisRun.kind == kind)
+        # Inline only a value already checked against RUN_KINDS; the limit stays bound.
+        .where(AnalysisRun.kind == literal(kind, literal_execute=True))
         .order_by(AnalysisRun.id.desc())
         .limit(count)
     )

@@ -419,6 +419,11 @@ const COLUMNS: readonly DataTableColumn<MetricRow>[] = [
  * the evidence are three steps (`--space-3`) apart, the card body's own gap. A wrapped row of
  * thresholds therefore stays closer to its own list than to the next label.
  *
+ * The group's `Stack` sets `breakLongWords`, so a long unbroken dataset name, threshold key or
+ * baseline label wraps inside its entry instead of overflowing a narrow card (WCAG 2.2 SC
+ * 1.4.10 Reflow). The evidence block's outer `Stack` leaves it off, because it holds the
+ * `DataTable`, whose cells keep their own sizing.
+ *
  * BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive with a semibold weight,
  * and feature code carries no CSS (AAP 0.4.4), so the label is a `<b>` (user-agent bold) rather
  * than a semibold paragraph; bind it to the Blitzy OS label style when the source arrives. Text
@@ -436,7 +441,7 @@ function LabelledList({
   children: ReactNode;
 }): ReactElement {
   return (
-    <Stack gap={1}>
+    <Stack gap={1} breakLongWords>
       <div>
         <b>{label}</b>
       </div>

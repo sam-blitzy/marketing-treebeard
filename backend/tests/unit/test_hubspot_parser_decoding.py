@@ -1109,18 +1109,27 @@ def test_parse_property_reads_lifecycle_stage_options_in_order() -> None:
         ),
     )
     assert definition.is_datetime is False
+    assert definition.is_instant is False
 
 
 @pytest.mark.parametrize(
-    ("type_", "field_type", "is_datetime"),
-    [("datetime", "date", True), ("date", "date", True), ("string", "text", False)],
+    ("type_", "field_type", "is_datetime", "is_instant"),
+    [
+        ("datetime", "date", True, True),
+        # A day without a time: usable for a stage date, never as the Google touch instant.
+        ("date", "date", True, False),
+        ("string", "text", False, False),
+    ],
 )
-def test_parse_property_without_options(type_: str, field_type: str, is_datetime: bool) -> None:
+def test_parse_property_without_options(
+    type_: str, field_type: str, is_datetime: bool, is_instant: bool
+) -> None:
     definition = parse_property(_property_body(MQL_PROPERTY, type_, field_type, []))
     assert definition == PropertyDefinition(
         name=MQL_PROPERTY, type=type_, field_type=field_type, options=()
     )
     assert definition.is_datetime is is_datetime
+    assert definition.is_instant is is_instant
 
 
 def test_parse_property_blank_field_type_is_none() -> None:

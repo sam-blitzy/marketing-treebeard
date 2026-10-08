@@ -1458,7 +1458,7 @@ function keywordsSection(): Section {
         metric('term', 'Search term', 'free crm template', 'text'),
         metric('spend', 'Spend', '186.40', 'currency', USD),
         metric('conversions', 'Conversions', '0', 'conversions'),
-        metric('cost_per_conversion', 'Cost/conversion', null, 'currency', USD),
+        metric('cost_per_conversion', 'Cost/conversion', '—', 'currency', USD),
         metric('wasted_spend', 'Wasted spend', '186.40', 'currency', USD),
         metric('clicks', 'Clicks', 64, 'clicks'),
         metric('min_clicks', "Minimum clicks for the account's conversion rate", 37, 'clicks'),

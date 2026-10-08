@@ -131,8 +131,10 @@ export interface WithheldListProps {
  * Lists a section's withheld patterns under a title, one {@link withheldLine} per pattern, in
  * the order the API returned them.
  *
- * Renders a `Stack` (gap step 2) holding the title as bold text and a `Stack as="ul"` (gap step
- * 1, `role="list"`) with one `<li>` per pattern. The list is named by its `aria-label`, equal to
+ * Renders a `Stack` (gap step 2, `breakLongWords`) holding the title as bold text and a
+ * `Stack as="ul"` (gap step 1, `role="list"`) with one `<li>` per pattern. `breakLongWords` lets
+ * a long unbroken title, entity name or search term wrap inside a narrow section instead of
+ * overflowing it (WCAG 2.2 SC 1.4.10 Reflow). The list is named by its `aria-label`, equal to
  * the visible title, because `Stack` accepts no `aria-labelledby`. When there is nothing
  * withheld, nothing is rendered: no title and no empty list.
  *
@@ -153,7 +155,7 @@ export function WithheldList({ withheld, title }: WithheldListProps): ReactEleme
   const label = textOrNull(title) ?? DEFAULT_TITLE;
 
   return (
-    <Stack gap={2}>
+    <Stack gap={2} breakLongWords>
       {/*
         BLITZY [DESIGN_SYSTEM_GAP]: the title should be semibold body text, but no design-system
         wrapper renders text at --font-weight-semibold and feature code carries no CSS of its own

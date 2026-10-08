@@ -17,7 +17,9 @@ hashes. Each test names the AAP 0.11.2 guarantee it proves:
   decorated questions ends ``no_email`` "form map mismatch" and is never retried.
 * **Terminal cases**: an unknown form version ends ``no_email``; an email LinkedIn no longer
   returns ends ``error`` "email no longer retrievable" and counts as unresolved; test leads
-  are never stored.
+  are never stored; a lead whose ad account no entity sync has stored yet fails the lead
+  sync's attempt and keeps its cursor, so a later run stores and stages it, while the
+  attempt's placeable leads are stored and staged at once.
 * **Restart safety**: a crash mid-batch loses no row, and concurrent runs claim disjoint
   rows (``FOR UPDATE SKIP LOCKED``).
 * **No plaintext**: after a full simulated lead sync with matching, and after a live one,
@@ -75,13 +77,18 @@ from ads_engine.connectors.linkedin.parser import (
 )
 from ads_engine.db.models.accounts import AdAccount, Campaign, LeadForm, LeadFormVersion
 from ads_engine.db.models.crm import CrmContact, Lead, LeadMatch
-from ads_engine.db.models.ops import SourceConnection, SourceDataset
+from ads_engine.db.models.ops import DatasetFreshness, SourceConnection, SourceDataset, SyncRun
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import HUBSPOT_HASHED_CONTACT_IDS, SIM_EMAIL_DOMAIN
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.sync.datasets import DatasetManager, DatasetStateError
-from ads_engine.sync.freshness import FreshnessOutcome, mark_unknown, record_freshness
-from ads_engine.sync.jobs import JobContext, JobResult, LeadSyncJob
+from ads_engine.sync.freshness import (
+    FreshnessOutcome,
+    load_freshness,
+    mark_unknown,
+    record_freshness,
+)
+from ads_engine.sync.jobs import LEAD_OVERLAP, JobContext, JobResult, LeadSyncJob
 from ads_engine.sync.lead_match import (
     BATCH_SIZE,
     MATCH_HORIZON,
@@ -131,6 +138,12 @@ STAGED_RECOVERY_SCENARIO: Final = "leadmatch.staged_recovery.case"
 
 CAMPAIGN_ID: Final = "614000001"
 CAMPAIGN_URN: Final = f"urn:li:sponsoredCampaign:{CAMPAIGN_ID}"
+NEW_ACCOUNT_ID: Final = "990000002"
+NEW_CAMPAIGN_URN: Final = "urn:li:sponsoredCampaign:614000002"
+"""A second ad account, configured after the first, and its campaign: no entity sync of the
+account has succeeded yet, so nothing of it is stored."""
+LEAD_CURSOR: Final = T0 - timedelta(hours=6)
+"""The ``linkedin.leads`` cursor (``last_success_at``) the incremental lead-sync tests seed."""
 CREATIVE_URN: Final = "urn:li:sponsoredCreative:715000001"
 FORM_ID: Final = 7001
 FORM_URN: Final = f"urn:li:leadGenForm:{FORM_ID}"
@@ -204,6 +217,10 @@ class LeadSpec:
             ``mismatch``: the response also answers :data:`COMPANY_QID`, which its own
             decoration does not list; ``none``: no ``form`` decoration at all.
         test_lead: Whether LinkedIn flags the response as a test lead.
+        account_id: The ad account owning the response, ``None`` for the platform's
+            configured one (:attr:`Platforms.account_id`); a listing serves an account's own
+            responses only.
+        campaign_urn: The campaign that produced the response.
     """
 
     response_id: str
@@ -212,6 +229,8 @@ class LeadSpec:
     version: int = 1
     decoration: Decoration = "full"
     test_lead: bool = False
+    account_id: str | None = None
+    campaign_urn: str = CAMPAIGN_URN
 
 
 def _text_answer(question_id: int, answer: str) -> dict[str, Any]:
@@ -240,7 +259,7 @@ def _element(spec: LeadSpec, account_urn: str) -> dict[str, Any]:
         "leadMetadataInfo": {
             "sponsoredLeadMetadataInfo": {
                 "campaign": {
-                    "id": CAMPAIGN_URN,
+                    "id": spec.campaign_urn,
                     "name": "White paper - Lead gen",
                     "type": "SPONSORED_UPDATES",
                 }
@@ -348,6 +367,12 @@ class Platforms:
         self.leads[spec.response_id] = spec
         return spec
 
+    def owner_urn(self, spec: LeadSpec) -> str:
+        """The ``owner.sponsoredAccount`` URN of one response."""
+        if spec.account_id is None:
+            return self.account_urn
+        return f"urn:li:sponsoredAccount:{spec.account_id}"
+
     def add_contact(self, email: str, hs_id: str, *, created_at: datetime) -> None:
         """Give the portal a contact with ``email``, created at ``created_at``."""
         self.contacts[email.strip().lower()] = PortalContact(hs_id, created_at)
@@ -371,7 +396,7 @@ class Platforms:
         return self._listing(request)
 
     def _listing(self, request: httpx.Request) -> httpx.Response:
-        """One offset page of the responses submitted in ``submittedAtTimeRange``."""
+        """One offset page of the owner's responses submitted in ``submittedAtTimeRange``."""
         params = request.url.params
         assert params["q"] == "owner"
         assert params["limitedToTestLeads"] == "false"
@@ -379,14 +404,20 @@ class Platforms:
         assert bounds is not None, params["submittedAtTimeRange"]
         start_ms, end_ms = int(bounds["start"]), int(bounds["end"])
         start, count = int(params["start"]), int(params["count"])
+        owner = unquote(params["owner"])
         self.listing_calls += 1
         submitted = sorted(
-            (spec for spec in self.leads.values() if start_ms <= _ms(spec.submitted_at) < end_ms),
+            (
+                spec
+                for spec in self.leads.values()
+                if owner == f"(sponsoredAccount:{self.owner_urn(spec)})"
+                and start_ms <= _ms(spec.submitted_at) < end_ms
+            ),
             key=lambda spec: (spec.submitted_at, spec.response_id),
         )
         page = submitted[start : start + count]
         body = {
-            "elements": [_element(spec, self.account_urn) for spec in page],
+            "elements": [_element(spec, self.owner_urn(spec)) for spec in page],
             "paging": {"start": start, "count": count, "total": len(page), "links": []},
         }
         return httpx.Response(200, json=body)
@@ -404,7 +435,7 @@ class Platforms:
             if response_id in self.refetch_errors:
                 errors[response_id] = {"status": 404, "message": "Lead form response not found"}
             elif spec is not None and response_id not in self.refetch_omitted:
-                results[response_id] = _element(spec, self.account_urn)
+                results[response_id] = _element(spec, self.owner_urn(spec))
         return httpx.Response(200, json={"results": results, "statuses": {}, "errors": errors})
 
     # -- HubSpot ----------------------------------------------------------------------------
@@ -571,13 +602,34 @@ class Harness:
                 self.sessions, crm_dataset_id, clients, now=now, lead_dataset_id=lead_dataset_id
             )
 
-    async def lead_sync(self, linkedin_dataset_id: int, *, now: datetime = T0) -> JobResult:
-        """Run the backfill ``LeadSyncJob`` of a live LinkedIn dataset against the platforms."""
+    async def lead_sync(
+        self,
+        linkedin_dataset_id: int,
+        *,
+        now: datetime = T0,
+        backfill: bool = True,
+        extra_accounts: Sequence[str] = (),
+    ) -> JobResult:
+        """Run the ``LeadSyncJob`` of a live LinkedIn dataset against the platforms.
+
+        Args:
+            linkedin_dataset_id: The dataset written.
+            now: The run's instant.
+            backfill: Read the backfill range; ``False`` reads the incremental range from
+                the ``linkedin.leads`` cursor.
+            extra_accounts: Ad accounts read after the configured one, as further
+                ``LINKEDIN_AD_ACCOUNT_IDS`` entries would be.
+        """
         async with self.controller.open_clients("linkedin", "live") as clients:
+            if extra_accounts:
+                clients = dataclasses.replace(
+                    clients,
+                    linkedin_account_ids=(*clients.linkedin_account_ids, *extra_accounts),
+                )
             ctx = await JobContext.for_dataset(
                 self.controller, linkedin_dataset_id, clients, now=now
             )
-            return await LeadSyncJob(ctx, backfill=True).run()
+            return await LeadSyncJob(ctx, backfill=backfill).run()
 
 
 def _build_harness(
@@ -1643,6 +1695,231 @@ async def test_test_leads_never_stored(harness: Harness) -> None:
     async with harness.sessions() as session:
         assert await session.scalar(select(func.count()).select_from(Lead)) == len(real)
         assert await session.scalar(select(func.count()).select_from(LeadMatch)) == len(real)
+
+
+async def _ad_account(sessions: Sessions, dataset_id: int, account_id: str) -> int:
+    """Store a LinkedIn dataset's ad account alone, as its first successful entity sync would.
+
+    Leads of the account can then be placed: a campaign no entity sync stored yet gets a
+    stand-in under the account. Returns the account's id.
+    """
+    async with sessions() as session, session.begin():
+        account = AdAccount(
+            source="linkedin",
+            dataset_id=dataset_id,
+            external_id=account_id,
+            name=f"Acme LinkedIn {account_id}",
+            currency="USD",
+            timezone="UTC",
+        )
+        session.add(account)
+        await session.flush()
+        return account.id
+
+
+async def _seed_cursor(sessions: Sessions, dataset_id: int) -> None:
+    """Record a complete ``linkedin.leads`` success at :data:`LEAD_CURSOR`: the lead cursor."""
+    outcome = FreshnessOutcome.success(
+        LEAD_CURSOR,
+        covered_from=BACKFILL_START.date(),
+        covered_through=LEAD_CURSOR.date(),
+        complete=True,
+    )
+    async with sessions() as session, session.begin():
+        await record_freshness(session, dataset_id, "linkedin.leads", outcome)
+
+
+async def _leads_freshness(sessions: Sessions, dataset_id: int) -> DatasetFreshness:
+    """The committed ``linkedin.leads`` freshness row of one LinkedIn dataset."""
+    async with sessions() as session:
+        return (await load_freshness(session, dataset_id))["linkedin.leads"]
+
+
+async def _lead_runs(sessions: Sessions) -> list[tuple[str, str | None, datetime]]:
+    """The lead job's ``linkedin.leads`` ``sync_run`` rows as (status, error, start), in order."""
+    async with sessions() as session:
+        result = await session.execute(
+            select(SyncRun.status, SyncRun.error, SyncRun.started_at)
+            .where(
+                SyncRun.source == "linkedin",
+                SyncRun.job == "leads",
+                SyncRun.dataset == "linkedin.leads",
+            )
+            .order_by(SyncRun.id)
+        )
+        return [(status, error, started_at) for status, error, started_at in result]
+
+
+def _listing_starts(harness: Harness) -> list[int]:
+    """The ``submittedAtTimeRange`` start (epoch ms) of every lead listing, in call order."""
+    starts: list[int] = []
+    for request in harness.linkedin_requests:
+        value = request.url.params.get("submittedAtTimeRange")
+        if value is None:
+            continue
+        bounds = _TIME_RANGE.match(value)
+        assert bounds is not None, value
+        starts.append(int(bounds["start"]))
+    return starts
+
+
+async def test_unplaceable_leads_fail_the_attempt_and_keep_the_cursor(harness: Harness) -> None:
+    """Terminal cases: leads with no stored ad account fail the attempt and are not lost.
+
+    The live LinkedIn dataset's ``linkedin.leads`` cursor stands at :data:`LEAD_CURSOR`, and
+    no entity sync has stored its ad account or campaign yet. The incremental lead sync
+    reads the two leads submitted since the cursor and cannot place them, as a campaign
+    stand-in needs its account and no account is invented. It records a failed attempt
+    naming them: no ``lead`` and no ``lead_match`` row is written, ``last_success_at``, the
+    coverage and the completeness stand, and the ``sync_run`` row closes failed with the
+    reason. Once the account is stored, a later run re-reads the same range from the kept
+    cursor, stores both leads under a campaign stand-in, stages each in the HubSpot dataset
+    and records the success that moves the cursor on.
+    """
+    linkedin = await _dataset(harness.sessions, "linkedin", "live")
+    hubspot = await _dataset(harness.sessions, "hubspot", "live")
+    await _seed_cursor(harness.sessions, linkedin)
+    specs = [
+        harness.platforms.add_lead(
+            LeadSpec(
+                f"late-{index:04d}",
+                f"late.{index}@example.com",
+                LEAD_CURSOR + timedelta(hours=index),
+            )
+        )
+        for index in (1, 2)
+    ]
+    reason = "2 leads not stored: campaign and ad account not stored yet"
+    range_start = _ms(LEAD_CURSOR - LEAD_OVERLAP)
+
+    result = await harness.lead_sync(linkedin, backfill=False)
+    assert (result.status, result.error, result.rows) == ("failed", reason, 0)
+    assert result.freshness["linkedin.leads"] == FreshnessOutcome.failure(T0, reason=reason)
+    assert _listing_starts(harness) == [range_start]
+    assert await _leads(harness.sessions, linkedin) == {}
+    assert await _rows(harness.sessions, hubspot) == {}
+    row = await _leads_freshness(harness.sessions, linkedin)
+    assert (
+        row.last_attempt_at,
+        row.last_success_at,
+        row.covered_from,
+        row.covered_through,
+        row.completeness,
+        row.reason,
+    ) == (T0, LEAD_CURSOR, BACKFILL_START.date(), LEAD_CURSOR.date(), "complete", reason)
+    assert await _lead_runs(harness.sessions) == [("failed", reason, T0)]
+
+    await _ad_account(harness.sessions, linkedin, harness.platforms.account_id)
+    later = T0 + timedelta(hours=3)
+    result = await harness.lead_sync(linkedin, now=later, backfill=False)
+    assert (result.status, result.error, result.rows) == ("succeeded", None, len(specs))
+    assert _listing_starts(harness) == [range_start, range_start]
+    leads = await _leads(harness.sessions, linkedin)
+    assert set(leads) == {spec.response_id for spec in specs}
+    assert all(leads[spec.response_id].email_sha256 == _digest(spec.email) for spec in specs)
+    async with harness.sessions() as session:
+        placed = await session.scalars(
+            select(Campaign.external_id).where(
+                Campaign.id.in_({lead.campaign_id for lead in leads.values()})
+            )
+        )
+        assert set(placed) == {CAMPAIGN_ID}
+    pending = MatchRow("pending", 0, later, None, None, None, None)
+    assert await _rows(harness.sessions, hubspot) == {lead.id: pending for lead in leads.values()}
+    row = await _leads_freshness(harness.sessions, linkedin)
+    assert (
+        row.last_attempt_at,
+        row.last_success_at,
+        row.covered_through,
+        row.completeness,
+        row.reason,
+    ) == (later, later, later.date(), "complete", None)
+    assert await _lead_runs(harness.sessions) == [
+        ("failed", reason, T0),
+        ("succeeded", None, later),
+    ]
+
+
+async def test_placed_leads_stored_while_an_unplaceable_one_keeps_the_cursor(
+    harness: Harness,
+) -> None:
+    """Terminal cases: one run stores and stages the placeable leads and fails for the rest.
+
+    The configured account's entities are stored; a second, newly configured account has
+    had no successful entity sync. Its lead fails the attempt and keeps the cursor, while
+    the first account's two leads are stored and staged in the same run. Once the second
+    account is stored, the next run re-reads both accounts from the kept cursor, stores the
+    missing lead and stages it once; the first two keep their rows unchanged.
+    """
+    pair = await _live_pair(harness)
+    await _seed_cursor(harness.sessions, pair.linkedin)
+    placed = [
+        harness.platforms.add_lead(
+            LeadSpec(
+                f"placed-{index:04d}",
+                f"placed.{index}@example.com",
+                LEAD_CURSOR + timedelta(hours=index),
+            )
+        )
+        for index in (1, 2)
+    ]
+    unplaced = harness.platforms.add_lead(
+        LeadSpec(
+            "unplaced-0001",
+            "unplaced.1@example.com",
+            LEAD_CURSOR + timedelta(minutes=30),
+            account_id=NEW_ACCOUNT_ID,
+            campaign_urn=NEW_CAMPAIGN_URN,
+        )
+    )
+    reason = "1 lead not stored: campaign and ad account not stored yet"
+    range_start = _ms(LEAD_CURSOR - LEAD_OVERLAP)
+    accounts = (NEW_ACCOUNT_ID,)
+
+    result = await harness.lead_sync(pair.linkedin, backfill=False, extra_accounts=accounts)
+    assert (result.status, result.error, result.rows) == ("failed", reason, len(placed))
+    assert _listing_starts(harness) == [range_start, range_start]
+    leads = await _leads(harness.sessions, pair.linkedin)
+    assert set(leads) == {spec.response_id for spec in placed}
+    first = {lead.id: MatchRow("pending", 0, T0, None, None, None, None) for lead in leads.values()}
+    assert await _rows(harness.sessions, pair.hubspot) == first
+    row = await _leads_freshness(harness.sessions, pair.linkedin)
+    assert (row.last_attempt_at, row.last_success_at, row.completeness, row.reason) == (
+        T0,
+        LEAD_CURSOR,
+        "complete",
+        reason,
+    )
+    assert await _lead_runs(harness.sessions) == [("failed", reason, T0)]
+
+    await _ad_account(harness.sessions, pair.linkedin, NEW_ACCOUNT_ID)
+    later = T0 + timedelta(hours=3)
+    result = await harness.lead_sync(
+        pair.linkedin, now=later, backfill=False, extra_accounts=accounts
+    )
+    assert (result.status, result.error, result.rows) == ("succeeded", None, len(placed) + 1)
+    assert _listing_starts(harness) == [range_start] * 4
+    leads = await _leads(harness.sessions, pair.linkedin)
+    assert set(leads) == {spec.response_id for spec in (*placed, unplaced)}
+    async with harness.sessions() as session:
+        campaign = await session.scalar(
+            select(Campaign.external_id).where(
+                Campaign.id == leads[unplaced.response_id].campaign_id
+            )
+        )
+    assert campaign == NEW_CAMPAIGN_URN.rsplit(":", 1)[1]
+    staged = MatchRow("pending", 0, later, None, None, None, None)
+    assert await _rows(harness.sessions, pair.hubspot) == {
+        **first,
+        leads[unplaced.response_id].id: staged,
+    }
+    row = await _leads_freshness(harness.sessions, pair.linkedin)
+    assert (row.last_attempt_at, row.last_success_at, row.completeness, row.reason) == (
+        later,
+        later,
+        "complete",
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------------------------

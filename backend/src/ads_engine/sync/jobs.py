@@ -24,7 +24,8 @@ Job                      What it reads and writes                               
                          daily rows.
 :class:`LeadSyncJob`     LinkedIn lead responses since the last success minus 1 h;    3 h
                          test leads never stored, emails only as SHA-256; every lead
-                         staged for matching.
+                         staged for matching. A lead with no stored ad account fails
+                         the attempt, so the cursor stays before it.
 :class:`LeadMatchJob`    Due ``lead_match`` rows of one CRM dataset
                          (``sync/lead_match.run_matching``).
 :class:`CrmSyncJob`      Google-touch discovery (primary only, when configured),     3 h
@@ -359,7 +360,9 @@ class JobContext:
             active dataset's jobs queue an ``analysis_request``.
         clients: The connector client of ``source`` in ``mode``.
         settings: The process settings.
-        thresholds: The loaded configuration (window presets and default days).
+        thresholds: The configuration snapshot the job runs on (window presets and default
+            days); the entry points read it once per run and share it with every context the
+            run builds.
         now: The run's instant, timezone-aware; every attempt of the run is stamped with it.
         sessionmaker: The session factory every write goes through.
     """
@@ -394,15 +397,21 @@ class JobContext:
         clients: SourceClients,
         *,
         now: datetime | None = None,
+        thresholds: Thresholds | None = None,
     ) -> JobContext:
         """Build the context of one dataset from its stored row.
 
         Args:
-            controller: The controller whose settings, thresholds, sessions and clock apply.
+            controller: The controller whose settings, sessions and clock apply, and whose
+                configuration does when ``thresholds`` is omitted.
             dataset_id: The dataset the job writes.
             clients: Clients of the dataset's source and mode, normally from
                 :meth:`SourceModeController.open_clients`; tests inject their own.
             now: The run's instant; the controller's clock when omitted.
+            thresholds: The configuration snapshot the job runs on; one read of
+                :attr:`SourceModeController.thresholds` when omitted. A caller that decided
+                on a snapshot (the scheduler judging segments due) or builds several contexts
+                for one run passes it, so one run never mixes configuration generations.
 
         Returns:
             The context.
@@ -410,6 +419,8 @@ class JobContext:
         Raises:
             ads_engine.sync.datasets.DatasetNotFoundError: If the dataset does not exist.
             ValueError: If the clients do not match the dataset's source and mode.
+            ads_engine.analysis.thresholds.ConfigError: If ``thresholds`` is omitted and the
+                configuration fails to load.
         """
         dataset = await controller.datasets.get(dataset_id)
         return cls(
@@ -421,7 +432,7 @@ class JobContext:
             active=dataset.state == "active",
             clients=clients,
             settings=controller.settings,
-            thresholds=controller.thresholds,
+            thresholds=thresholds if thresholds is not None else controller.thresholds,
             now=now if now is not None else controller.now(),
             sessionmaker=controller.sessionmaker,
         )
@@ -2778,11 +2789,12 @@ class SegmentSyncJob(_JobBase):
 class LeadSyncJob(_JobBase):
     """LinkedIn lead responses since the last success minus 1 h (``linkedin.leads``).
 
-    The range is ``[last_success_at - LEAD_OVERLAP, now)`` from the dataset's
-    ``linkedin.leads`` row, or the backfill range (``BACKFILL_DAYS``, capped at 180 days)
-    when there is none or ``backfill`` is set. Responses are de-duplicated on their id, so
-    the overlap is harmless. Test leads were dropped by the connector and are never stored;
-    emails reach this job only as SHA-256 hashes (AAP 0.3.2 "Personal data").
+    The cursor is the ``last_success_at`` of the dataset's ``linkedin.leads`` row: the range
+    is ``[last_success_at - LEAD_OVERLAP, now)``, or the backfill range (``BACKFILL_DAYS``,
+    capped at 180 days) when there is none or ``backfill`` is set. Responses are
+    de-duplicated on their id, so the overlap and any re-read are harmless. Test leads were
+    dropped by the connector and are never stored; emails reach this job only as SHA-256
+    hashes (AAP 0.3.2 "Personal data").
 
     One transaction stores the form-version maps learned from the responses' decorations
     (keyed by the version parsed from each response's ``versionedLeadGenFormUrn``), the
@@ -2791,6 +2803,16 @@ class LeadSyncJob(_JobBase):
     while LinkedIn is simulated, HubSpot's active primary otherwise) and, for a live lead,
     in every ``building`` HubSpot primary (staged matching, AAP 0.3.3). A lead whose email
     could not be decoded is staged ``no_email`` with its reason (terminal).
+
+    A lead is stored under its campaign or, when no entity sync stored the campaign yet,
+    under a stand-in created beneath its ad account. A lead whose ad account is not stored
+    either (an account whose entity sync has not succeeded yet) cannot be placed, as no
+    account is invented, and it fails the attempt: ``linkedin.leads`` records a failed
+    attempt naming the count, which keeps ``last_success_at`` (the cursor), its coverage
+    and its completeness, so every later run re-reads the range until the account is
+    stored and the lead with it. The attempt's placed leads are stored and staged all the
+    same. A transient interruption fails the attempt the same way (``on_error``), keeping
+    the cursor.
     """
 
     job = JOB_LEADS
@@ -2852,15 +2874,26 @@ class LeadSyncJob(_JobBase):
         async with ctx.sessionmaker() as session, session.begin():
             await repositories.ensure_writable(session, ctx.dataset_id)
             await _store_form_versions(session, ctx.dataset_id, versions, now=ctx.now)
-            staged = await self._store_leads(session, reads)
+            staged, unplaced = await self._store_leads(session, reads)
             if failure is None:
-                outcome = _success(ctx.now, covered=covered, reasons=reasons)
+                if unplaced:
+                    # A success would move the cursor past the leads left unstored; a failed
+                    # attempt keeps it, so the next run re-reads them (class docstring).
+                    reason = (
+                        f"{_plural(unplaced, 'lead', 'leads')} not stored: campaign and ad "
+                        "account not stored yet"
+                    )
+                    outcome = FreshnessOutcome.failure(ctx.now, reason=reason)
+                    self._failed[name] = reason
+                else:
+                    outcome = _success(ctx.now, covered=covered, reasons=reasons)
                 await self._complete(session, {name: outcome})
         _log.info(
             "sync.leads.stored",
             dataset_id=ctx.dataset_id,
             leads=self._rows.get(name, 0),
             staged=staged,
+            unplaced=unplaced,
             test_leads_skipped=skipped_tests,
             form_versions=len({(item.canonical_urn, item.version) for item in versions}),
         )
@@ -2869,11 +2902,17 @@ class LeadSyncJob(_JobBase):
 
     async def _store_leads(
         self, session: AsyncSession, reads: Sequence[tuple[str, Sequence[ParsedLead]]]
-    ) -> int:
+    ) -> tuple[int, int]:
         """Upsert the leads (stubbing unknown campaigns and creatives) and stage them.
 
+        A lead whose campaign is not stored and whose ad account is not stored either (an
+        account whose entity sync has not succeeded yet) cannot be placed: a campaign stub
+        needs its account, and an account is never invented, as its currency is unknown.
+        Such a lead is left unstored, and counted, for the caller to fail the attempt.
+
         Returns:
-            The ``lead_match`` rows inserted across the CRM datasets staged in.
+            The ``lead_match`` rows inserted across the CRM datasets staged in, and the
+            number of leads left unstored for want of a campaign.
         """
         ctx = self.ctx
         dataset_id = ctx.dataset_id
@@ -2923,12 +2962,12 @@ class LeadSyncJob(_JobBase):
 
         values: list[dict[str, Any]] = []
         no_email: dict[str, str] = {}
-        unplaced = 0
-        for lead, _ in leads.values():
+        unplaced: list[tuple[ParsedLead, str]] = []
+        for lead, account_external in leads.values():
             external = _urn_tail(lead.campaign_urn, PREFIX_CAMPAIGN)
             campaign_id = None if external is None else campaigns.get(external)
             if campaign_id is None:
-                unplaced += 1
+                unplaced.append((lead, account_external))
                 continue
             values.append(
                 {
@@ -2949,7 +2988,14 @@ class LeadSyncJob(_JobBase):
             _log.warning(
                 "sync.leads.unplaced",
                 dataset_id=dataset_id,
-                leads=unplaced,
+                leads=len(unplaced),
+                accounts=sorted(
+                    {
+                        _urn_tail(lead.account_urn, PREFIX_ACCOUNT) or account_external
+                        for lead, account_external in unplaced
+                    }
+                ),
+                earliest_submitted_at=_iso(min(lead.submitted_at for lead, _ in unplaced)),
                 reason="campaign and ad account not stored",
             )
         stored = _by_last_key(await repositories.upsert_entities(session, Lead, values, dataset_id))
@@ -2961,7 +3007,7 @@ class LeadSyncJob(_JobBase):
             staged += await lead_match.create_pending(
                 session, lead_ids, crm_dataset_id, now=ctx.now, no_email_reasons=reasons
             )
-        return staged
+        return staged, len(unplaced)
 
     async def _staging_targets(self, session: AsyncSession) -> list[int]:
         """The CRM datasets new leads are staged in (module docstring of ``lead_match``)."""
@@ -3751,11 +3797,22 @@ def _job(ctx: JobContext, name: str, *, backfill: bool = False) -> _JobBase:
 
 
 async def _companion_crm(
-    controller: SourceModeController, companion_id: int, *, now: datetime, backfill: bool
+    controller: SourceModeController,
+    companion_id: int,
+    *,
+    now: datetime,
+    backfill: bool,
+    thresholds: Thresholds,
 ) -> JobResult:
-    """Run the companion CRM dataset's sync against the simulated HubSpot transport."""
+    """Run the companion CRM dataset's sync against the simulated HubSpot transport.
+
+    ``thresholds`` is the configuration snapshot of the run that owns the companion, so the
+    companion's deal search spans the same default window as its parent's jobs.
+    """
     async with controller.open_clients("hubspot", "simulated") as clients:
-        ctx = await JobContext.for_dataset(controller, companion_id, clients, now=now)
+        ctx = await JobContext.for_dataset(
+            controller, companion_id, clients, now=now, thresholds=thresholds
+        )
         if backfill:
             ctx = _inactive(ctx)
         return await CrmSyncJob(ctx, backfill=backfill).run()
@@ -3802,6 +3859,7 @@ async def run_source_jobs(
     jobs: Sequence[str] | None = None,
     controller: SourceModeController | None = None,
     now: datetime | None = None,
+    thresholds: Thresholds | None = None,
 ) -> SourceSyncReport:
     """Run a source's sync jobs now, against its active primary dataset.
 
@@ -3811,7 +3869,8 @@ async def run_source_jobs(
     by its companion CRM dataset's sync (:data:`JOB_CRM_COMPANION`), against the simulated
     HubSpot transport. HubSpot runs its primary's :class:`CrmSyncJob`. An ``AccessDenied``
     stops the source's remaining jobs: ``on_error`` has decided what follows, and the
-    scheduler's next ``ensure_dataset`` builds the simulated dataset.
+    scheduler's next ``ensure_dataset`` builds the simulated dataset. Every job of the call,
+    the companion's included, runs on one configuration snapshot.
 
     Args:
         source: ``google``, ``linkedin`` or ``hubspot``.
@@ -3821,6 +3880,10 @@ async def run_source_jobs(
             :data:`JOB_CRM`); :data:`SOURCE_JOBS` of the source when omitted.
         controller: The source-mode controller; one on the process settings when omitted.
         now: The run's instant; the controller's clock when omitted.
+        thresholds: The configuration snapshot the jobs run on; one read of the controller's
+            :attr:`~ads_engine.sync.mode.SourceModeController.thresholds` when omitted. The
+            scheduler passes the snapshot it judged the segments due with, so the presets
+            fetched and recorded are the presets it detected.
 
     Returns:
         The report. With no active dataset (the scheduler's ``ensure_dataset`` builds it), or
@@ -3828,6 +3891,8 @@ async def run_source_jobs(
 
     Raises:
         ValueError: If ``source`` or a job name is unknown.
+        ads_engine.analysis.thresholds.ConfigError: If ``thresholds`` is omitted and the
+            configuration fails to load.
     """
     checked = _as_source(source)
     requested = _ordered_jobs(checked, jobs)
@@ -3849,17 +3914,20 @@ async def run_source_jobs(
     companion_id: int | None = None
     if checked == "linkedin" and mode == "simulated":
         companion_id = await ctl.datasets.companion_of(dataset_id)
+    config = thresholds if thresholds is not None else ctl.thresholds
 
     results: list[JobResult] = []
     async with ctl.open_clients(checked, mode) as clients:
-        ctx = await JobContext.for_dataset(ctl, dataset_id, clients, now=instant)
+        ctx = await JobContext.for_dataset(ctl, dataset_id, clients, now=instant, thresholds=config)
         for name in requested:
             result = await _job(ctx, name).run()
             results.append(result)
             if result.access_denied:
                 break
             if name == JOB_LEADS and companion_id is not None:
-                companion = await _companion_crm(ctl, companion_id, now=instant, backfill=False)
+                companion = await _companion_crm(
+                    ctl, companion_id, now=instant, backfill=False, thresholds=config
+                )
                 results.append(companion)
                 if companion.access_denied:
                     break
@@ -3889,7 +3957,8 @@ async def backfill_dataset(
     An ``AccessDenied`` stops the backfill: ``on_error`` advanced the source's access
     generation, which voids a live build. Connector errors never propagate; the build reads
     readiness from the freshness rows the jobs recorded. A rerun (``sync/mode.py`` reruns
-    the backfill when matching added rows after it) is idempotent.
+    the backfill when matching added rows after it) is idempotent. Every job of the backfill,
+    its CRM step included, runs on one configuration snapshot read from the controller once.
 
     Args:
         controller: The controller running the build.
@@ -3902,6 +3971,7 @@ async def backfill_dataset(
     Raises:
         ValueError: If the dataset is a companion (it is backfilled with its parent).
         ads_engine.sync.datasets.DatasetNotFoundError: If the dataset does not exist.
+        ads_engine.analysis.thresholds.ConfigError: If the configuration fails to load.
     """
     instant = now if now is not None else controller.now()
     dataset = await controller.datasets.get(dataset_id)
@@ -3945,7 +4015,8 @@ async def _linkedin_crm_backfill(
     client; when it succeeds, a CRM sync of that primary follows, so the newly matched
     contacts get their contact refresh, associations and target reads now. LinkedIn-attributed
     CRM evidence is then known from the first run on the new dataset (AAP 0.3.3, staged
-    matching) instead of reading as unknown until the next three-hourly CRM sync.
+    matching) instead of reading as unknown until the next three-hourly CRM sync. Every CRM
+    context runs on the backfill's configuration snapshot (``ctx.thresholds``).
 
     Returns:
         The results of the jobs run, in order; empty when there is no CRM dataset to use.
@@ -3955,7 +4026,11 @@ async def _linkedin_crm_backfill(
         if companion_id is None:
             _log.warning("sync.backfill.no_companion", dataset_id=ctx.dataset_id)
             return ()
-        return (await _companion_crm(controller, companion_id, now=ctx.now, backfill=True),)
+        return (
+            await _companion_crm(
+                controller, companion_id, now=ctx.now, backfill=True, thresholds=ctx.thresholds
+            ),
+        )
     async with controller.sessionmaker() as session:
         crm_id = await repositories.active_dataset_id(session, "hubspot")
     if crm_id is None:
@@ -3975,7 +4050,9 @@ async def _linkedin_crm_backfill(
         # Inactive: the CRM dataset is active, but this runs inside another source's build,
         # whose activation queues the analysis request (no request per backfill job).
         crm_ctx = _inactive(
-            await JobContext.for_dataset(controller, crm_id, crm_clients, now=ctx.now)
+            await JobContext.for_dataset(
+                controller, crm_id, crm_clients, now=ctx.now, thresholds=ctx.thresholds
+            )
         )
         matched = await LeadMatchJob(
             crm_ctx, lead_dataset_id=ctx.dataset_id, lead_client=clients.require_linkedin()

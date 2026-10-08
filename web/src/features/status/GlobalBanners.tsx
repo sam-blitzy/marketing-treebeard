@@ -40,6 +40,7 @@ import type { ReactElement } from 'react';
 
 import type { Banner as ApiBanner, BannerCode, BannerTone, Overlay } from '../../api/types';
 import { Banner, Stack, TONES } from '../../design-system';
+import { formatCount } from '../../lib/format';
 
 /**
  * The fixed render order of the global banners (AAP 0.5.5), as the API's banner codes.
@@ -74,8 +75,12 @@ const DISCREPANCY_CODE: BannerCode = 'open_discrepancies';
 const DISCREPANCY_BANNER_ID = 'banner-discrepancies';
 
 /**
- * The Campaigns section's discrepancy group. The API always returns that static group, empty
- * or not, so the anchor resolves whatever the run produced (`api/routes/recommendations.py`).
+ * The Campaigns section's discrepancy group: `SectionFrame`'s `DISCREPANCY_GROUP_ANCHOR`
+ * (`group-campaigns-discrepancies`). The API returns that static group even when it is empty
+ * (`api/routes/recommendations.py`), but `SectionFrame` renders an empty group, and so its
+ * anchor, only when the section supplies content through `renderEmptyGroup`. The overlay can
+ * count a discrepancy detected after the run while the run's group is empty, so
+ * `CampaignsSection` must keep this anchor through `renderEmptyGroup`.
  */
 const DISCREPANCY_GROUP_HREF = '#group-campaigns-discrepancies';
 
@@ -89,9 +94,6 @@ const FALLBACK_TONE: BannerTone = 'neutral';
 const BANNER_RANK: ReadonlyMap<string, number> = new Map(
   BANNER_ORDER.map((code, index) => [code, index]),
 );
-
-/** Formats the discrepancy count in English, with grouping for large counts ("1,204"). */
-const COUNT_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
 
 /**
  * Returns a copy of `banners` in {@link BANNER_ORDER}.
@@ -150,11 +152,12 @@ function liveDiscrepancyCount(overlay: Overlay): number {
 
 /**
  * The open-discrepancies title for a live count: "1 open discrepancy to resolve first" or
- * "3 open discrepancies to resolve first".
+ * "1,204 open discrepancies to resolve first". The count is formatted by `formatCount` from
+ * `lib/format.ts`, which groups a whole number.
  */
 function discrepancyTitle(count: number): string {
   const noun = count === 1 ? 'discrepancy' : 'discrepancies';
-  return `${COUNT_FORMAT.format(count)} open ${noun} to resolve first`;
+  return `${formatCount(count)} open ${noun} to resolve first`;
 }
 
 /**

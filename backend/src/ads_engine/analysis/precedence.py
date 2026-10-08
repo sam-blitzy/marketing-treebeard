@@ -17,12 +17,13 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
    that survived G1 in the same source and currency, deterministically
    (:func:`allocate_b3`); no receiver is ever funded beyond its B1 increase (checked), and
    unallocated freed amount stays a plain decrease. B1 and B3 cards are re-rendered with
-   ``budget.render_b1_funding`` and ``budget.render_b3_allocation``.
-4. **P1 discrepancies first**: each candidate's ``depends_on`` is expanded and frozen in
-   ``evidence.extra.depends_on`` for the read-time overlay; every non-C0 item depending on a
-   discrepant campaign or budget is held ("Resolve discrepancy first"); C0 is exempt from
-   holds, feedback and ordinary ranking and is pinned first; every other item is flagged
-   "Unverified while N discrepancies are open".
+   ``budget.render_b1_funding`` and ``budget.render_b3_allocation``, and each depends on its
+   allocation partners: a donor on the receivers it funds, a receiver on its donors.
+4. **P1 discrepancies first**: each candidate's ``depends_on`` (allocation partners
+   included) is expanded and frozen in ``evidence.extra.depends_on`` for the read-time
+   overlay; every non-C0 item depending on a discrepant campaign or budget is held ("Resolve
+   discrepancy first"); C0 is exempt from holds, feedback and ordinary ranking and is pinned
+   first; every other item is flagged "Unverified while N discrepancies are open".
 5. **P2 tracking**: a source with window spend and zero recorded outcomes records
    ``conversion_tracking_absent`` in each affected section and suppresses that source's K1,
    C1, the zero-outcome branch of B2 and W2 (counted ``tracking_absent``).
@@ -31,9 +32,12 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
 7. **P4 stale / incomplete**: per item, from its own ``required_datasets`` only (AAP 0.3.2:
    "A successful sync of one dataset never hides a failed refresh of another"); a live item
    with a stale dataset gets ``data_status = "stale"``; one ``incomplete_dataset`` finding per
-   incomplete dataset per section.
+   incomplete dataset per section. The configured ``sources.stale_after_hours`` the datasets
+   were judged against is frozen into ``evidence.thresholds`` of every item with a required
+   dataset, stale or not (AAP 0.5.4.8 "the thresholds applied").
 8. **P5 short window**: the ``short_window`` flag on every item (the banner is the
-   overlay's, from ``Run.short_window``).
+   overlay's, from ``Run.short_window``). The ``window.trusted_min_days`` the window was
+   judged against is frozen into ``evidence.thresholds`` of every item, short window or not.
 9. **P6/P7/P8 checks**: no item carries a sample below its minimum (P6: such patterns are
    ``Withheld``), a CR1 pair that is not distinguishable carries ``not_distinguishable`` and
    no winner wording (P7), and the attribution floor flags set by the rules pass through
@@ -188,6 +192,12 @@ _LOOKBACK_DAYS_KEYS: Final[Mapping[str, str]] = MappingProxyType({K1: "k1.baseli
 _WINDOW_START_LABEL: Final = "window start"
 """How an incomplete reason names a required range that starts at the window start."""
 
+_STALE_AFTER_KEY: Final = "sources.stale_after_hours"
+"""The threshold P4 judges every required dataset's age against, frozen into the evidence."""
+
+_TRUSTED_MIN_DAYS_KEY: Final = "window.trusted_min_days"
+"""The threshold P5 judges the window's length against, frozen into the evidence."""
+
 _SOURCE_LABELS: Final[Mapping[str, str]] = MappingProxyType(
     {"google": "Google", "linkedin": "LinkedIn", "hubspot": "HubSpot"}
 )
@@ -224,8 +234,9 @@ class PrecedenceInvariantError(AssertionError):
     Raised explicitly (never with ``assert``, so it also holds under ``python -O``) when a
     spend increase survives on a G1-blocked target, a B3 allocation funds a receiver beyond
     its B1 increase or a donor beyond its freed amount, an item carries a sample below its
-    minimum (P6), or a CR1 pair that is not distinguishable lacks ``not_distinguishable`` or
-    uses winner wording (P7). Tests assert it trips when a guard step is bypassed.
+    minimum (P6), a CR1 pair that is not distinguishable lacks ``not_distinguishable`` or
+    uses winner wording (P7), or an item's ``evidence.thresholds`` records a threshold P4 or
+    P5 applied with another value. Tests assert it trips when a guard step is bypassed.
     """
 
 
@@ -656,12 +667,12 @@ def allocate_b3(
 
     AAP 0.5.4.2 "B3 reallocation, deterministic allocation", applied to one source and
     currency. Donors are taken in the order given (freed amount descending, then entity name,
-    then key) and receivers in B1 rank order (cost per outcome ascending, then name, then
-    key). Each donor gives ``min(its remaining freed amount, the receiver's remaining
-    headroom)`` to the first receiver with headroom left, then moves on to the next receiver
-    until its freed amount or all headroom is used up. The sum of all reallocations into a
-    receiver therefore never exceeds its B1 increase, and freed amount left over stays a
-    plain decrease.
+    then entity id) and receivers in B1 rank order (cost per outcome ascending, then name,
+    then id); the entity key breaks only a tie that name and id leave. Each donor gives
+    ``min(its remaining freed amount, the receiver's remaining headroom)`` to the first
+    receiver with headroom left, then moves on to the next receiver until its freed amount
+    or all headroom is used up. The sum of all reallocations into a receiver therefore never
+    exceeds its B1 increase, and freed amount left over stays a plain decrease.
 
     This is the step a test replaces to over-allocate: :func:`apply_precedence` resolves it
     at call time and checks the result (:func:`_check_allocations`).
@@ -800,9 +811,11 @@ def _parties(
 ) -> dict[tuple[str, str], list[_Party]]:
     """The B3 donors (``freed``) or B1 receivers (``increase``) per (source, currency).
 
-    Donors order by freed amount descending, then entity name, then key; receivers by cost
-    per outcome ascending (an unavailable cost last), then name, then key. A subject listed
-    twice keeps its first item, so no subject is funded or drawn on twice.
+    Donors order by freed amount descending, then entity name, then entity id; receivers by
+    cost per outcome ascending (an unavailable cost last), then name, then id (AAP 0.5.4.2).
+    Name, id and key are the tie-breaks of :attr:`Candidate.sort_key`: the numeric internal
+    id (entities with an id first), with the entity key only as the final fallback. A
+    subject listed twice keeps its first item, so no subject is funded or drawn on twice.
     """
     cohorts: dict[tuple[str, str], list[_Party]] = {}
     seen: set[SubjectKey] = set()
@@ -815,12 +828,12 @@ def _parties(
         if amount is None or currency is None or subject in seen:
             continue
         seen.add(subject)
-        ref = candidate.entity_ref
+        _, name, id_slot, key = candidate.sort_key
         if rule_id == B3:
-            order: tuple[Any, ...] = (_orderable(-amount), ref.name, ref.key)
+            order: tuple[Any, ...] = (_orderable(-amount), name, id_slot, key)
         else:
-            order = (_orderable(_cost_per_outcome(candidate)), ref.name, ref.key)
-        cohort = (ref.source, currency)
+            order = (_orderable(_cost_per_outcome(candidate)), name, id_slot, key)
+        cohort = (candidate.entity_ref.source, currency)
         cohorts.setdefault(cohort, []).append(_Party(subject, candidate, amount, order))
     for parties in cohorts.values():
         parties.sort(key=lambda party: party.order)
@@ -832,8 +845,33 @@ def _subject_json(key: SubjectKey) -> dict[str, Any]:
     return {"type": key[0], "id": key[1]}
 
 
+def _partner_subjects(
+    ctx: AnalysisContext, index: _EntityIndex, partners: Iterable[SubjectKey]
+) -> tuple[DecisionSubject, ...]:
+    """The subjects an item's allocation partners add to its ``depends_on`` (AAP 0.5.4.2 P1).
+
+    A B3 card tells the user to move money to its receivers and a B1 card counts on its
+    donors' money, so a discrepancy on a partner holds the card exactly as one on a subject
+    the card is itself about: each partner is listed, and a budget partner brings every
+    member campaign (:func:`_budget_members`); a campaign partner's own budget is added by
+    the P1 expansion (:func:`_expanded_depends_on`), as for every campaign listed. Partners
+    of the partner are not followed: a donor depends on its receiver, never on the
+    receiver's other donors.
+    """
+    ordered: dict[SubjectKey, None] = {}
+    for key in partners:
+        ordered.setdefault(key, None)
+        if key[0] == "budget":
+            for campaign_id in _budget_members(ctx, index, key[1]):
+                ordered.setdefault(("campaign", campaign_id), None)
+    return tuple(DecisionSubject.of(key) for key in ordered)
+
+
 def _with_b1_funding(
-    candidate: Candidate, funding: Sequence[tuple[Allocation, str]], currency: str
+    candidate: Candidate,
+    funding: Sequence[tuple[Allocation, str]],
+    currency: str,
+    partners: Sequence[DecisionSubject],
 ) -> Candidate:
     """Re-render a surviving B1 with how its increase is funded (AAP 0.5.4.2).
 
@@ -842,6 +880,8 @@ def _with_b1_funding(
     budget"), with ``allocations``, ``funded_by_reallocation`` and ``from_new_budget`` beside
     it; the reason gains the sentence when some of the increase is funded by reallocation.
     The action ("Raise daily budget from … to …") is unchanged: it prefills the decision.
+    ``partners`` (:func:`_partner_subjects` of the funding donors) are appended to
+    ``depends_on``, so a discrepancy on a donor holds the B1 it funds.
     """
     increase = candidate.evidence.extra["increase"]
     funded = sum((allocation.amount for allocation, _ in funding), Decimal(0))
@@ -862,11 +902,15 @@ def _with_b1_funding(
         funding=sentence,
     )
     reason = f"{candidate.reason} {sentence}." if funded > 0 else candidate.reason
-    return replace(candidate, evidence=evidence, reason=reason)
+    depends_on = (*candidate.depends_on, *partners)
+    return replace(candidate, evidence=evidence, reason=reason, depends_on=depends_on)
 
 
 def _with_b3_allocations(
-    candidate: Candidate, given: Sequence[tuple[Allocation, str]], currency: str
+    candidate: Candidate,
+    given: Sequence[tuple[Allocation, str]],
+    currency: str,
+    partners: Sequence[DecisionSubject],
 ) -> Candidate:
     """Re-render a B3 donor with each allocation as funding for a named B1 (AAP 0.5.4.2).
 
@@ -874,7 +918,9 @@ def _with_b3_allocations(
     each ``text`` from ``budget.render_b3_allocation`` ("Move {allocation} to fund
     {receiver}'s recommended increase (B1)"), and ``allocated`` / ``unallocated`` split the
     freed amount; the unallocated part stays a plain decrease. A donor with no allocation
-    keeps ``allocations`` empty and its reason unchanged.
+    keeps ``allocations`` empty and its reason unchanged. ``partners``
+    (:func:`_partner_subjects` of the funded receivers) are appended to ``depends_on``, so a
+    discrepancy on a receiver holds the whole card that moves money to it.
     """
     freed = candidate.evidence.extra["freed"]
     allocated = sum((allocation.amount for allocation, _ in given), freed - freed)
@@ -894,11 +940,15 @@ def _with_b3_allocations(
         )
     evidence = candidate.evidence.with_extra(**extra)
     reason = f"{candidate.reason} {'; '.join(lines)}." if lines else candidate.reason
-    return replace(candidate, evidence=evidence, reason=reason)
+    depends_on = (*candidate.depends_on, *partners)
+    return replace(candidate, evidence=evidence, reason=reason, depends_on=depends_on)
 
 
 def _reallocate(
-    ctx: AnalysisContext, candidates: Sequence[Candidate], blocked: frozenset[SubjectKey]
+    ctx: AnalysisContext,
+    candidates: Sequence[Candidate],
+    blocked: frozenset[SubjectKey],
+    index: _EntityIndex,
 ) -> tuple[list[Candidate], tuple[Allocation, ...]]:
     """Step 3: allocate B3 freed amounts to the B1 items that survived G1, then re-render.
 
@@ -906,6 +956,11 @@ def _reallocate(
     and currency as the donor, each with its B1 increase (``extra.increase``) as headroom;
     donors are the B3 items with their freed amount (``extra.freed``). Cohorts are visited in
     (source, currency) order, so the result never depends on the order of the rule results.
+
+    Each re-rendered card depends on its allocation partners (:func:`_partner_subjects`): a
+    donor on every receiver it funds, a receiver on every donor funding it. P1 (step 4) then
+    holds the whole card when a partner is discrepant, and freezes the partners in
+    ``extra.depends_on`` for the read-time overlay.
 
     A receiver held later by P1 (step 4) or hidden by feedback (step 10) keeps its
     allocation: AAP 0.5.4.2 defines receivers as the B1 items that survive G1 and runs holds
@@ -946,11 +1001,13 @@ def _reallocate(
         if id(candidate) in receiver_items:
             subject = receiver_items[id(candidate)]
             funding = [(a, names[a.donor]) for a in allocations if a.receiver == subject]
-            result.append(_with_b1_funding(candidate, funding, currencies[subject]))
+            donors_of = _partner_subjects(ctx, index, (a.donor for a, _ in funding))
+            result.append(_with_b1_funding(candidate, funding, currencies[subject], donors_of))
         elif id(candidate) in donor_items:
             subject = donor_items[id(candidate)]
             given = [(a, names[a.receiver]) for a in allocations if a.donor == subject]
-            result.append(_with_b3_allocations(candidate, given, currencies[subject]))
+            funded = _partner_subjects(ctx, index, (a.receiver for a, _ in given))
+            result.append(_with_b3_allocations(candidate, given, currencies[subject], funded))
         else:
             result.append(candidate)
     return result, tuple(allocations)
@@ -1062,12 +1119,15 @@ def _expanded_depends_on(
 ) -> tuple[SubjectKey, ...]:
     """Every subject whose unresolved discrepancy holds the item (AAP 0.5.4.2 P1).
 
-    Seeds, in order: the rule's own ``depends_on``, the item's ``decision_subject`` (a
-    decision on the item would write it), its ``increases_spend_on`` targets, its own budget
-    entity and the campaigns behind its entity (:func:`_entity_campaigns`). Then each seeded
-    campaign adds the budget it draws from, which for a shared-budget member is the shared
-    budget; and each budget the item is itself about (its entity, decision subject or spend
-    target) adds every member campaign (:func:`_budget_members`).
+    Seeds, in order: the item's ``depends_on`` (the rule's own, followed on a B1 or B3 card
+    by the allocation partners step 3 added: each donor funding a B1, each receiver a B3
+    funds, a budget partner with its member campaigns; :func:`_partner_subjects`), the
+    item's ``decision_subject`` (a decision on the item would write it), its
+    ``increases_spend_on`` targets, its own budget entity and the campaigns behind its
+    entity (:func:`_entity_campaigns`). Then each seeded campaign adds the budget it draws
+    from, which for a shared-budget member is the shared budget; and each budget the item is
+    itself about (its entity, decision subject or spend target) adds every member campaign
+    (:func:`_budget_members`).
 
     The member expansion is deliberately not transitive: a campaign's item depends on its
     shared budget, but not on the budget's other members, because a sibling's discrepancy
@@ -1120,12 +1180,17 @@ def _merge_flag(candidate: Candidate, flag: Flag) -> Candidate:
     return candidate.with_flags(flag)
 
 
-def _apply_p1(ctx: AnalysisContext, candidates: Sequence[Candidate]) -> list[Candidate]:
+def _apply_p1(
+    ctx: AnalysisContext, candidates: Sequence[Candidate], index: _EntityIndex
+) -> list[Candidate]:
     """Step 4: expand ``depends_on``, hold dependent items, pin C0, flag the rest.
 
     * Every item's expanded subjects (:func:`_expanded_depends_on`) are stored as
       ``Candidate.depends_on`` and frozen as ``evidence.extra.depends_on`` (``[{type, id}]``),
       which the read-time overlay reads to hold items on discrepancies raised after the run.
+      A B1 or B3 card's subjects include its allocation partners (step 3), so a discrepancy
+      on a receiver holds every donor card funding it and one on a donor holds the B1 it
+      funds, at compute time and at read time alike.
     * A non-C0 item depending on a subject with an unresolved discrepancy is held with
       ``"Resolve discrepancy first"`` and lists ``extra.blocking_discrepancies`` (ids
       ascending); a hold a rule set itself keeps its reason.
@@ -1134,7 +1199,6 @@ def _apply_p1(ctx: AnalysisContext, candidates: Sequence[Candidate]) -> list[Can
       ``unverified_discrepancies`` with the count of all of them, exactly as the overlay
       flags items at read time.
     """
-    index = _EntityIndex.of(ctx)
     by_subject: dict[SubjectKey, list[int]] = {}
     for item in ctx.discrepancies:
         by_subject.setdefault(item.key, []).append(item.id)
@@ -1537,6 +1601,37 @@ def _incomplete_finding(section: str, found: _IncompleteDataset) -> Finding:
     )
 
 
+def _with_applied_thresholds(candidate: Candidate, applied: Mapping[str, Any]) -> Candidate:
+    """Freeze the thresholds a precedence step applied into the item's evidence (AAP 0.5.4.8).
+
+    ``evidence.thresholds`` records every threshold the item's verdicts rest on, so the
+    configured value a P4 or P5 judgement used is stored with the run: the copy's evidence is
+    built anew (deep-frozen again) with each key of ``applied`` it lacks appended after the
+    keys already recorded, which keep their values and order. A key already recorded with the
+    same value is left as it is.
+
+    Raises:
+        PrecedenceInvariantError: When the evidence already records a key of ``applied`` with
+            another value or type; the conflict is never overwritten or hidden.
+    """
+    recorded = candidate.evidence.thresholds
+    added: dict[str, Any] = {}
+    for key, value in applied.items():
+        if key not in recorded:
+            added[key] = value
+            continue
+        existing = recorded[key]
+        if type(existing) is not type(value) or existing != value:
+            raise PrecedenceInvariantError(
+                f"{candidate.rule_id} {candidate.entity_ref.key} records {key} = {existing!r} "
+                f"in evidence.thresholds, but precedence applied {value!r}"
+            )
+    if not added:
+        return candidate
+    evidence = replace(candidate.evidence, thresholds={**recorded, **added})
+    return replace(candidate, evidence=evidence)
+
+
 def _apply_data_state(
     ctx: AnalysisContext, candidates: Sequence[Candidate]
 ) -> tuple[list[Candidate], dict[str, tuple[Finding, ...]]]:
@@ -1551,10 +1646,19 @@ def _apply_data_state(
     last succeeded more than ``sources.stale_after_hours`` before ``ctx.now`` or covers less
     than the window end, and ``incomplete`` when one is not ``complete`` over its required
     range (:func:`_required_start`). A ``live`` item with a stale dataset becomes ``stale``.
-    Each section gets one ``incomplete_dataset`` finding per incomplete dataset its items
-    read, naming every reason and how many items read it.
+    Every item with at least one required dataset, stale or not, has the configured
+    ``sources.stale_after_hours`` its datasets were judged against frozen into its
+    ``evidence.thresholds`` (:func:`_with_applied_thresholds`). Each section gets one
+    ``incomplete_dataset`` finding per incomplete dataset its items read, naming every reason
+    and how many items read it.
+
+    Raises:
+        ConfigError: When ``sources.stale_after_hours`` is missing or not an integer.
+        PrecedenceInvariantError: When an item's evidence records that key with another
+            value.
     """
     stale_after = ctx.stale_after
+    applied = {_STALE_AFTER_KEY: ctx.thresholds.int(_STALE_AFTER_KEY)}
     window_end = ctx.window.end
     per_section: dict[str, dict[tuple[str, int | None], _IncompleteDataset]] = {
         section: {} for section in SECTION_ORDER
@@ -1574,6 +1678,8 @@ def _apply_data_state(
         incomplete = [check for check in checks if check.incomplete]
         status = DATA_STALE if base == DATA_LIVE and stale else base
         updated = replace(candidate, data_status=status)
+        if checks:
+            updated = _with_applied_thresholds(updated, applied)
         if base in (DATA_SIMULATED, DATA_MIXED):
             updated = _merge_flag(updated, _simulated_flag(base, simulated_sources))
         if stale:
@@ -1614,16 +1720,24 @@ def _apply_short_window(ctx: AnalysisContext, candidates: Sequence[Candidate]) -
     """Step 8: the ``short_window`` flag on every item of a short window.
 
     A window is short below ``window.trusted_min_days``; the configured values, never
-    literals, fill the flag's message.
+    literals, fill the flag's message. Every item, short window or not, has the
+    ``window.trusted_min_days`` its window was judged against frozen into its
+    ``evidence.thresholds`` (:func:`_with_applied_thresholds`).
+
+    Raises:
+        PrecedenceInvariantError: When an item's evidence records that key with another
+            value.
     """
     window = ctx.window
+    applied = {_TRUSTED_MIN_DAYS_KEY: window.trusted_min_days}
+    frozen = [_with_applied_thresholds(candidate, applied) for candidate in candidates]
     if not window.short_window:
-        return list(candidates)
+        return frozen
     flag = Flag(
         FLAG_SHORT_WINDOW,
         f"Window of {window.days} days is below the {window.trusted_min_days}-day trusted minimum",
     )
-    return [_merge_flag(candidate, flag) for candidate in candidates]
+    return [_merge_flag(candidate, flag) for candidate in frozen]
 
 
 # ---------------------------------------------------------------------------
@@ -1835,8 +1949,10 @@ def apply_precedence(
             section.
         PrecedenceInvariantError: When a guarantee is broken: an increase survives on a
             G1-blocked target, a B3 allocation exceeds a receiver's increase or a donor's
-            freed amount, an item's sample is below its minimum (P6), or a CR1 pair that is
-            not distinguishable lacks its flag or calls a winner (P7).
+            freed amount, an item's sample is below its minimum (P6), a CR1 pair that is
+            not distinguishable lacks its flag or calls a winner (P7), or an item's evidence
+            records ``sources.stale_after_hours`` or ``window.trusted_min_days`` with a value
+            other than the one P4 or P5 applied.
         ConfigError: When a threshold key precedence reads is missing.
     """
     if not isinstance(ctx, AnalysisContext):
@@ -1854,11 +1970,12 @@ def apply_precedence(
         counts.add(candidate.section, SUPPRESS_G1_BLOCKED)
     _check_g1(kept, blocked)
 
-    # 3. B3 allocation to the B1 items that survived G1.
-    candidates, allocations = _reallocate(ctx, kept, blocked)
+    # 3. B3 allocation to the B1 items that survived G1. The entity index serves steps 3 and 4.
+    index = _EntityIndex.of(ctx)
+    candidates, allocations = _reallocate(ctx, kept, blocked, index)
 
     # 4. P1 discrepancies first.
-    candidates = _apply_p1(ctx, candidates)
+    candidates = _apply_p1(ctx, candidates, index)
 
     # 5. P2 conversion tracking absent.
     candidates, tracking = _apply_p2(ctx, candidates, counts)

@@ -25,9 +25,13 @@ What this module adds is only the arrangement of those rows into the page:
 * **Sections**: always all five, in ``SECTION_ORDER`` and titled from ``SECTION_TITLES``, an
   empty section included (the UI shows its ``EmptyState``).
 * **Groups**: every static group of the section (``GROUP_ORDER``, titled from
-  ``GROUP_TITLES``) is always present, empty or not, so in-page anchors such as
-  ``#group-campaigns-discrepancies`` (the discrepancy banner's link, which can count a
-  discrepancy detected after the run) and the Block / Expand / Review tabs always resolve.
+  ``GROUP_TITLES``) is always present, empty or not, so the UI has each group to render: the
+  Block / Expand / Review groups behind the Keywords tabs, and the discrepancy group
+  (``#group-campaigns-discrepancies``) the discrepancy banner links to. The banner counts
+  discrepancies at read time, so it can link there while the run left the group empty. Whether
+  an empty group, and so its anchor, is in the page is the web section's job: ``SectionFrame``
+  leaves it out unless its ``renderEmptyGroup`` hook supplies content, which
+  ``CampaignsSection`` must do for the discrepancy group.
   Dynamic groups follow: ``campaign:{id}`` (one creative block per campaign, titled with the
   campaign's name) and ``cohort:{CURRENCY}`` (one white-paper table per currency, titled with
   the currency), ordered by their lowest item rank, which is the order precedence ranked them
@@ -434,7 +438,7 @@ def _groups(
     """Arrange one section's stored items into its groups, in display order.
 
     Order: every static group of the section (``GROUP_ORDER``), present even when empty so
-    its anchor and tab always resolve; then the dynamic ``campaign:{id}`` and
+    the UI has it to render; then the dynamic ``campaign:{id}`` and
     ``cohort:{CURRENCY}`` groups by their lowest item rank (the order precedence ranked them
     in); then any other key, defensively, by lowest rank, so no stored item is dropped. Ties
     break by key. Items keep their stored rank order within each group.
@@ -464,8 +468,10 @@ def _groups(
     dynamic = sorted((key for key in extra_keys if _is_dynamic(key)), key=lowest_rank)
     unknown = sorted((key for key in extra_keys if not _is_dynamic(key)), key=lowest_rank)
     groups: list[dict[str, Any]] = []
-    # Static groups are emitted even when the run has no item in them: the discrepancy
-    # banner's anchor and the keyword tabs must resolve whatever the run produced.
+    # Static groups are emitted even when the run has no item in them, so the UI always has
+    # the groups behind the keyword tabs and the discrepancy group the banner links to. Whether
+    # an empty group's anchor is in the page is the web section's job: `SectionFrame` keeps an
+    # empty group only through `renderEmptyGroup`.
     for key in (*static, *dynamic, *unknown):
         members = by_key.get(key, [])
         title = titles.get(key) if key in static else None

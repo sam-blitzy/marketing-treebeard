@@ -102,6 +102,29 @@ a {
 }
 
 /*
+ * Link states for every anchor with an href, router links included. :where() adds no
+ * specificity, so these rules weigh the same as the type selector above: source order lets them
+ * refine it, and any component rule that styles its own anchors, such as the SideNav link or the
+ * skip link, wins wherever it sets the same property.
+ * - Hover thickens the underline to the focus-ring width, half of --space-1 (2px at the 16px
+ *   root), a cue that does not rely on colour. Only on devices whose primary pointer can hover,
+ *   so a tap leaves no sticky state.
+ * - Pressed takes --color-text, at least 4.5:1 on both backgrounds, with the same underline, so
+ *   touch input gets a cue that does not rely on colour either.
+ * No transition is declared: the token set has no motion token.
+ */
+@media (hover: hover) {
+  a:where(:any-link:hover) {
+    text-decoration-thickness: calc(var(--space-1) / 2);
+  }
+}
+
+a:where(:any-link:active) {
+  color: var(--color-text);
+  text-decoration-thickness: calc(var(--space-1) / 2);
+}
+
+/*
  * Visible focus for every focusable element. Components may refine this ring, never remove it.
  * The ring's width and offset are half of --space-1, so rebinding the spacing scale rebinds the
  * ring; its colour is --color-accent, which keeps it at least 3:1 on both backgrounds.

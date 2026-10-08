@@ -25,10 +25,19 @@
  * - **Money stays a decimal string.** Amounts are never converted to numbers: they are
  *   validated with patterns and compared as normalised decimal strings, so `"120"`, `"120.0"`
  *   and `"120.00"` are equal and no binary float ever touches an amount.
+ * - **Precision follows the source.** As the server's `sub_minor_unit` rule does (AAP 0.5.2),
+ *   a Google amount may carry a whole number of micros, six decimal places, whatever its
+ *   currency, and any other amount stops at the currency's minor unit. The input's step follows
+ *   the same rule. Amounts are shown padded to the currency's minor unit, and finer digits are
+ *   never rounded away, so an unchanged micro amount is posted exactly as the API sent it.
  * - **Errors are the API's.** 422 messages are shown as returned. A 409 `subject_retired`
- *   locks the form for the rest of its mount (AAP 0.3.2), and a 409 `discrepancy_resolved`
- *   reads "Already resolved". Error banners never take `role="alert"`, which AAP 0.5.5
- *   reserves for the discrepancy banner on `/actions`.
+ *   locks the form for as long as it records about that subject (AAP 0.3.2), and a 409
+ *   `discrepancy_resolved` reads "Already resolved". Error banners never take `role="alert"`,
+ *   which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
+ * - **One form per identity.** Edits, the note, the save outcome and those locks belong to
+ *   what the form records about and posts: the subject, the mode, the discrepancy and the
+ *   recommendation. A change to any of them starts a fresh form, so one subject's edits are
+ *   never posted for another and one subject's lock never disables another.
  *
  * Server state goes only through `../../api/queries` (AAP 0.11.1); the mutations there already
  * invalidate the recommendations, discrepancies and decision log, so nothing is invalidated
@@ -70,6 +79,7 @@ import type {
   Money,
   RecommendationId,
   ResolveRequest,
+  SourceName,
   SubjectIn,
 } from '../../api/types';
 import {
@@ -82,7 +92,7 @@ import {
   TextField,
   type SelectOption,
 } from '../../design-system';
-import { currencyMinorDigits, currencyStep, formatMoney } from '../../lib/format';
+import { currencyMinorDigits, currencyStep, formatCount, formatMoney } from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // Public API
@@ -178,6 +188,15 @@ const AMOUNT_PATTERN = /^\d+(\.\d+)?$/;
  */
 const NORMALISABLE_PATTERN = /^(\d+)(?:\.(\d*))?$/;
 
+/**
+ * The most decimal places a Google amount may carry: a whole number of micros, whatever the
+ * account currency (AAP 0.5.2). It mirrors `_MICRO_PLACES` in the backend's `decisions.py`.
+ */
+const GOOGLE_AMOUNT_PLACES = 6;
+
+/** The `step` of a Google amount input: one micro, {@link GOOGLE_AMOUNT_PLACES} places. */
+const GOOGLE_AMOUNT_STEP = '0.000001';
+
 // ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
@@ -225,6 +244,16 @@ interface ShapeFields {
   amounts: readonly AmountField[];
 }
 
+/** How finely the subject's amounts are accepted, shown and stepped (see `amountPolicy`). */
+interface AmountPolicy {
+  /** The most decimal places an amount may carry: 6 for Google, else the currency's minor unit. */
+  places: number;
+  /** The places an API amount is padded to for display: the currency's minor unit. */
+  padDigits: number;
+  /** The amount input's `step`: one unit of the last accepted place. */
+  step: string;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Decimal helpers (strings only; money never becomes a number)
 // ---------------------------------------------------------------------------------------------
@@ -256,12 +285,36 @@ function fractionDigits(value: string): number {
 }
 
 /**
+ * The amount precision of a subject, as the server's `sub_minor_unit` rule sets it
+ * (`_amount_issue` in the backend's `decisions.py`; AAP 0.5.2):
+ *
+ * - Google: a whole number of micros, {@link GOOGLE_AMOUNT_PLACES} places with a one-micro
+ *   step, whatever the currency, so `"210.000001"` USD is accepted;
+ * - any other source, or a source the API did not name: the currency's minor unit, so
+ *   `"10.005"` USD and `"1.5"` JPY are refused.
+ *
+ * Either way, API amounts are padded to the currency's minor unit for display. The decision
+ * shape, and so the fields offered, never depends on the source.
+ *
+ * @param source - The subject's source, or `null` when unknown.
+ * @param currency - The subject's ISO 4217 currency code, or `null` when unknown.
+ * @returns The accepted places, the display padding and the input step.
+ */
+function amountPolicy(source: SourceName | null, currency: string | null): AmountPolicy {
+  const minorDigits = currencyMinorDigits(currency);
+  return source === 'google'
+    ? { places: GOOGLE_AMOUNT_PLACES, padDigits: minorDigits, step: GOOGLE_AMOUNT_STEP }
+    : { places: minorDigits, padDigits: minorDigits, step: currencyStep(currency) };
+}
+
+/**
  * An API amount as the input shows it: canonical, then padded to the currency's minor unit,
  * so `"100.000000"` in EUR reads `"100.00"` and a value typed back unchanged compares equal.
- * An amount finer than the minor unit keeps its digits rather than being rounded.
+ * An amount finer than the minor unit keeps every digit rather than being rounded, so a Google
+ * micro amount such as `"210.000001"` reads, validates and posts exactly as the API sent it.
  *
  * @param value - The amount, as the API or a prefill sent it.
- * @param digits - The currency's minor-unit digits.
+ * @param digits - The places to pad to: the `padDigits` of the subject's {@link AmountPolicy}.
  * @returns The text for the input.
  */
 function toInputAmount(value: Money, digits: number): string {
@@ -283,13 +336,16 @@ function toInputAmount(value: Money, digits: number): string {
  * (AAP 0.5.2) still apply on top of these.
  *
  * The API requires a positive amount (`invalid_amount`), so zero is refused here as well, with
- * its own message, beyond the non-negative pattern.
+ * its own message, beyond the non-negative pattern. Digits beyond `places` are refused as the
+ * server's `sub_minor_unit` would refuse them: "Use at most 6 decimal places" for a Google
+ * amount finer than a micro, the currency's minor unit for any other.
  *
  * @param value - The amount as typed.
- * @param digits - The currency's minor-unit digits.
+ * @param places - The most decimal places accepted: the `places` of the subject's
+ *   {@link AmountPolicy}.
  * @returns The message for the field's `error`, or `null`.
  */
-function amountError(value: string, digits: number): string | null {
+function amountError(value: string, places: number): string | null {
   const trimmed = value.trim();
   if (trimmed === '') {
     return 'Enter an amount';
@@ -297,10 +353,10 @@ function amountError(value: string, digits: number): string | null {
   if (!AMOUNT_PATTERN.test(trimmed)) {
     return 'Enter a non-negative amount';
   }
-  if (fractionDigits(trimmed) > digits) {
-    return digits === 0
+  if (fractionDigits(trimmed) > places) {
+    return places === 0
       ? 'Use a whole amount, with no decimal places'
-      : `Use at most ${digits} decimal ${digits === 1 ? 'place' : 'places'}`;
+      : `Use at most ${places} decimal ${places === 1 ? 'place' : 'places'}`;
   }
   if (normaliseDecimal(trimmed) === '0') {
     return 'Enter an amount above zero';
@@ -320,7 +376,7 @@ function textOrNull(value: string | null | undefined): string | null {
 /** Why a note cannot be submitted, or `null`. The length is counted in characters. */
 function noteError(note: string): string | null {
   return Array.from(note).length > NOTE_MAX_LENGTH
-    ? `Use at most ${NOTE_MAX_LENGTH.toLocaleString('en')} characters`
+    ? `Use at most ${formatCount(NOTE_MAX_LENGTH)} characters`
     : null;
 }
 
@@ -489,14 +545,52 @@ function isResolvedError(error: unknown): boolean {
  * Decision mode posts `{ subject, patch, recommendation_id?, note? }` with only the changed
  * fields and is disabled while nothing changed. Intended-state mode posts
  * `{ resolution: 'record_intended', intended_state, note? }` with the complete state for the
- * shape. Success calls `onDone`. A 409 `subject_retired` disables every control for the rest of
- * the mount; the enclosing `Dialog` keeps its own Close button.
+ * shape. Success calls `onDone`. A 409 `subject_retired` disables every control while the form
+ * records about that subject; the enclosing `Dialog` keeps its own Close button.
+ *
+ * The form's edits, note, save outcome and locks belong to its identity: the subject's type
+ * and id, the mode, the discrepancy's id and `recommendationId`. When any of them changes, even
+ * on a mount the consumer reuses, a fresh form starts from the new subject's state. A new
+ * `prefill`, `currency`, `members` or callback, `disabled`, or a refetched discrepancy with the
+ * same id keeps the user's edits.
  *
  * States: a `Spinner` while the decision log loads; a critical `Banner` with the API message
  * when it fails; a warning `Banner` with no submit when the subject has no decided state and no
  * discrepancy to start from, or when its removal was acknowledged.
  */
 export function DecisionForm(props: DecisionFormProps) {
+  return <DecisionFormBody key={formIdentity(props)} {...props} />;
+}
+
+/**
+ * The identity of a form: what it records about and posts, which are the subject's type and
+ * id, the effective mode (`'decision'` when omitted), the discrepancy's id and the
+ * recommendation id. Props that only decorate or prefill the form are left out, so changing
+ * them keeps the user's edits.
+ *
+ * The parts are serialised as one JSON array, so no two different identities share a key.
+ *
+ * @param props - The form's props.
+ * @returns The React key of the form's body.
+ */
+function formIdentity(props: DecisionFormProps): string {
+  return JSON.stringify([
+    props.subject.type,
+    props.subject.id,
+    props.mode ?? 'decision',
+    props.discrepancy?.id ?? null,
+    props.recommendationId ?? null,
+  ]);
+}
+
+/**
+ * The body of {@link DecisionForm} for one form identity ({@link formIdentity}). Its state
+ * (drafts, note, the retired and closed locks) and its mutations live exactly as long as that
+ * identity, because `DecisionForm` keys it by the identity and React remounts it on a change.
+ *
+ * @param props - The props `DecisionForm` received, unchanged.
+ */
+function DecisionFormBody(props: DecisionFormProps) {
   const {
     subject,
     mode = 'decision',
@@ -513,12 +607,14 @@ export function DecisionForm(props: DecisionFormProps) {
   const recordDecision = useRecordDecision();
   const resolveDiscrepancy = useResolveDiscrepancy();
 
-  // Only the user's edits are state; untouched fields follow the base state and the prefill,
-  // so a refetched decision log after a save moves them along without a remount.
+  // Only the user's edits are state, and they last for this form identity; untouched fields
+  // follow the base state and the prefill, so a refetched decision log after a save moves them
+  // along while the identity stays the same.
   const [statusDraft, setStatusDraft] = useState<StatusChoice | undefined>(undefined);
   const [amountDrafts, setAmountDrafts] = useState<Partial<Record<AmountField, string>>>({});
   const [note, setNote] = useState('');
-  // A 409 subject_retired is final for this mount (AAP 0.3.2), and so is a closed discrepancy.
+  // A 409 subject_retired is final for this form identity (AAP 0.3.2), and so is a closed
+  // discrepancy.
   const [retired, setRetired] = useState(false);
   const [closed, setClosed] = useState(false);
   const submitHintId = useId();
@@ -575,7 +671,10 @@ export function DecisionForm(props: DecisionFormProps) {
     textOrNull(discrepancy?.subject.currency) ??
     textOrNull(discrepancy?.platform_value?.currency) ??
     textOrNull(discrepancy?.decided_value?.currency);
-  const digits = currencyMinorDigits(currency);
+  // One precision for validation, display padding and the input step, from the subject's
+  // source and currency: Google whole micros, else the currency's minor unit (AAP 0.5.2).
+  const source = latest?.subject.source ?? discrepancy?.subject.source ?? null;
+  const precision = amountPolicy(source, currency);
   const { base } = state;
 
   // Initial values: the base state overlaid with the prefill fields the shape owns. A prefill
@@ -586,7 +685,7 @@ export function DecisionForm(props: DecisionFormProps) {
   const initialAmount = (field: AmountField): string => {
     const proposed = prefill?.[field];
     const value = proposed ?? base[field];
-    return value === null ? '' : toInputAmount(value, digits);
+    return value === null ? '' : toInputAmount(value, precision.padDigits);
   };
 
   const statusValue: StatusChoice = statusDraft ?? initialStatus;
@@ -602,7 +701,7 @@ export function DecisionForm(props: DecisionFormProps) {
     mode === 'intended_state' || amountChanged(field);
   const amountErrors: Partial<Record<AmountField, string>> = {};
   for (const field of fields.amounts) {
-    const issue = isPosted(field) ? amountError(amountValue(field), digits) : null;
+    const issue = isPosted(field) ? amountError(amountValue(field), precision.places) : null;
     if (issue !== null) {
       amountErrors[field] = issue;
     }
@@ -713,7 +812,7 @@ export function DecisionForm(props: DecisionFormProps) {
         add space no spacing token sets, so the Stack gap tokens alone space every line. The
         error's wrapper is unstyled and exists only as the focus target after a failed save.
       */}
-      <Stack gap={4}>
+      <Stack gap={4} breakLongWords>
         {errorText === null ? null : (
           <div ref={errorRef} tabIndex={-1}>
             <Banner tone="critical" title={errorText} />
@@ -749,7 +848,7 @@ export function DecisionForm(props: DecisionFormProps) {
             type="number"
             inputMode="decimal"
             min="0"
-            step={currencyStep(currency)}
+            step={precision.step}
             hint={currency === null ? 'In the account currency' : `In ${currency}`}
             error={amountErrors[field]}
             value={amountValue(field)}

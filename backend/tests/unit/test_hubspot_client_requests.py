@@ -732,6 +732,7 @@ async def test_property_decodes_the_documented_sample() -> None:
         ("<string>", "<string>", True)
     ]
     assert definition.is_datetime is False
+    assert definition.is_instant is False
 
 
 @pytest.mark.anyio
@@ -2174,7 +2175,7 @@ async def test_verify_google_link_unavailable_reasons() -> None:
         touch_date_property=TOUCH_PROPERTY,
         reason="HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY property 'absent_id' not found on contacts; "
         "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_touch_date' has type 'string', "
-        "not a date or datetime property",
+        "not a datetime property",
     )
     assert missing_touch.google.reason == (
         "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'absent_touch' not found on contacts"
@@ -2187,6 +2188,36 @@ async def test_verify_google_link_unavailable_reasons() -> None:
     assert contact_property_map(wrong_type, _google_settings(campaign="absent_id")) == (
         ContactPropertyMap()
     )
+
+
+@pytest.mark.anyio
+async def test_verify_google_link_refuses_a_date_touch_property() -> None:
+    # A `date` value is a day without a time: read as midnight UTC, it would anchor the
+    # causal check before a touch later that day, so the link needs a `datetime` property.
+    definitions = {
+        "lifecyclestage": _lifecycle(),
+        QL_PROPERTY: _datetime_property(QL_PROPERTY),
+        CAMPAIGN_PROPERTY: _definition(CAMPAIGN_PROPERTY, "string", "text"),
+        TOUCH_PROPERTY: _datetime_property(TOUCH_PROPERTY, "date"),
+    }
+    settings = _google_settings()
+    server = Server(_properties_route(definitions))
+    async with _client(server) as client:
+        bindings = await client.verify_bindings(
+            _mapping(_stage("Qualified Lead"), _stage("Qualified Lead")), settings
+        )
+    assert bindings.google == GoogleCrmBinding(
+        available=False,
+        campaign_property=CAMPAIGN_PROPERTY,
+        touch_date_property=TOUCH_PROPERTY,
+        reason="HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_touch_date' has type "
+        "'date', not a datetime property",
+    )
+    assert TOUCH_PROPERTY in _property_names(server)
+    # The MQL and QL bindings still resolve; the bound map leaves the Google properties out.
+    expected = ContactPropertyMap(mql_property=QL_PROPERTY, ql_property=QL_PROPERTY)
+    assert contact_property_map(bindings, settings) == expected
+    assert client.contact_properties == expected
 
 
 @pytest.mark.anyio

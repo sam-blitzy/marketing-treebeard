@@ -61,7 +61,7 @@ Paths are relative to `backend/src/ads_engine/`.
 |----------|---------------------------|---------|
 | `HUBSPOT_ACCESS_TOKEN` | empty (secret) | A Service Key (account level) or legacy private-app token, sent as `Authorization: Bearer <token>`. Held as a `SecretStr`, so it never prints |
 | `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY` | empty | Optional contact property holding the Google campaign id ([Google-to-CRM link](#optional-google-to-crm-link)) |
-| `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | empty | Optional date or datetime contact property holding when that Google touch happened |
+| `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | empty | Optional `datetime` contact property holding when that Google touch happened; a `date` property leaves the link unavailable |
 | `DATA_MODE` | `auto` | `auto` uses live HubSpot when the token works and simulated data otherwise; `simulated` forces simulated data and never probes |
 | `MOCK_SEED` | `42` | Seed of the simulated portal |
 | `BACKFILL_DAYS` | `180` | CRM scope in days: the lead staging range and the backfill deal search, capped at 180 |
@@ -722,12 +722,15 @@ The product does not assume HubSpot links a contact to a Google Ads campaign. Th
 only when both properties are configured and confirmed:
 
 - `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`: a contact property holding the Google campaign id.
-- `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`: a `date` or `datetime` contact property holding when
+- `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`: a `datetime` contact property holding the instant
   that touch happened.
 
 Startup verification confirms through the properties API that both exist on contacts and that
-the touch-date property has a date type. Otherwise the link is unavailable, with a reason
-such as `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '<name>' not found on contacts`.
+the touch-date property has type `datetime`. A `date` property is refused: it holds a day
+without a time, which reads as midnight UTC and would let events earlier on the touch day
+pass the causal check. When a check fails, the link is unavailable, with a reason such as
+`HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '<name>' not found on contacts` or
+`HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '<name>' has type 'date', not a datetime property`.
 
 - **Discovery** (HubSpot primary dataset only): CRM Search on `contacts` filters the
   touch-date property over the sync range, partitioned exactly like the deal search, with
@@ -850,11 +853,24 @@ seeded simulated portal (`MOCK_SEED`, default `42`).
 
 ## Logging and personal data
 
-- Log events (`hubspot.verify`, `hubspot.batch_read`, `hubspot.associations`,
-  `hubspot.search`, `hubspot.probe` and the `sync.*` events) carry object types, property
-  names, counts and statuses only.
-- They never carry an email, a token, an `Authorization` value, a request body, a filter
-  value, a cursor or a HubSpot error message, which can echo the email that was looked up.
+- Log events (`hubspot.verify`, `hubspot.batch_read`,
+  `hubspot.batch_read.simulated_withheld`, `hubspot.associations`, `hubspot.search`,
+  `hubspot.probe` and the `sync.*` events) carry object types, property names, counts and
+  statuses. The HTTP layer's `http.request` and `http.response` add the method and the
+  request path and query as `redact_url` masks them, and `http.response` the HTTP status
+  and elapsed milliseconds; `http.retry` adds the endpoint label, the attempt number, the
+  wait in seconds and the error's kind, code, HTTP status and `Retry-After`.
+- A failed call is also logged with the error kind, code, HTTP status, endpoint and
+  `reason`: in `connector.error`, `hubspot.batch_read.call_failed`,
+  `hubspot.associations.call_failed`, `hubspot.search_failed`, a `hubspot.search` that a
+  transient error cut short, `sync.classification` and `sync.job.connector_error`.
+- `reason` holds HubSpot's error message only after `sanitize_message`: emails become
+  `[REDACTED_EMAIL]`; configured secrets, `Bearer` tokens and credential assignments become
+  `[REDACTED]`; the message is cut to 300 characters inside a `reason` of at most 500.
+- No event carries a raw response body, an unsanitised HubSpot error message (which can
+  echo the email that was looked up), an email, a token or an `Authorization` value. No
+  log call passes a request body, a filter value or a cursor: search events name only the
+  filter properties, and paging shows only as `more`.
 - Error messages are sanitised when the error is built, so a mode reason or a `sync_run`
   error never holds an email or a secret.
 - Emails are persisted only as SHA-256 hashes, in `lead.email_sha256` and

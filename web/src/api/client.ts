@@ -2,10 +2,12 @@
  * The one HTTP client of the SPA: a typed `fetch` wrapper for the `/api/v1` REST contract
  * (AAP 0.5.1, 0.5.3).
  *
- * Every request the web client makes goes through {@link apiFetch}. It is the only module
- * allowed to call `fetch` (`eslint.config.js`, block `web/api-client`), and feature code never
- * imports it: features use the TanStack Query hooks of `queries.ts`, which re-exports
- * {@link ApiError}, {@link isApiError} and {@link ApiErrorCode} (AAP 0.11.1).
+ * Every request the web client makes goes through {@link apiFetch}, or through
+ * {@link apiFetchPage} for a paged list, which sends the request the same way and also returns
+ * the next page the response's `Link` header names. This is the only module allowed to call
+ * `fetch` (`eslint.config.js`, block `web/api-client`), and feature code never imports it:
+ * features use the TanStack Query hooks of `queries.ts`, which re-exports {@link ApiError},
+ * {@link isApiError} and {@link ApiErrorCode} (AAP 0.11.1).
  *
  * What it does for every call:
  *
@@ -20,9 +22,15 @@
  * - **Errors.** Every failure becomes an {@link ApiError}: the API's
  *   `{"error": {"code", "message"}}` envelope keeps its code and message, a response without
  *   that envelope (an nginx 502 page, an empty body) gets `http_<status>`, an unreachable server
- *   gets status 0 and `network_error`, and an unreadable success body gets `invalid_response`.
- *   The one exception is a caller-initiated abort, which rejects with the original abort error
- *   so TanStack Query treats it as a cancellation rather than a failure.
+ *   gets status 0 and `network_error`, and an unreadable success body gets `invalid_response`,
+ *   as does a paged response whose `Link` header cannot be parsed or names a next page outside
+ *   {@link API_BASE}. The one exception is a caller-initiated abort, which rejects with the
+ *   original abort error so TanStack Query treats it as a cancellation rather than a failure.
+ * - **Paging.** A paged list such as `GET /discrepancies` names its next page in an RFC 8288
+ *   `Link: <…>; rel="next"` header. {@link apiFetchPage} returns that target as a path
+ *   relative to {@link API_BASE}, query included, which is passed back unchanged to read the
+ *   next page. A page can hold fewer rows than its `limit` while more follow, so only a
+ *   missing `rel="next"` ends a list.
  *
  * The module has no state and no side effects at load time. It calls the global `fetch` at
  * request time, so `vi.stubGlobal('fetch', impl)` replaces it in tests. It never logs: request
@@ -31,11 +39,11 @@
  * @example
  * ```ts
  * import { apiFetch, isApiError } from './client';
- * import type { Discrepancy } from './types';
+ * import type { Decision } from './types';
  *
- * async function openDiscrepancies(signal?: AbortSignal): Promise<Discrepancy[]> {
- *   return apiFetch<Discrepancy[]>('/discrepancies', {
- *     query: { state: ['open', 'awaiting_platform'] },
+ * async function campaignDecisions(id: number, signal?: AbortSignal): Promise<Decision[]> {
+ *   return apiFetch<Decision[]>('/decisions', {
+ *     query: { subject_type: 'campaign', subject_id: id },
  *     signal,
  *   });
  * }
@@ -57,8 +65,9 @@ import type { ErrorResponse } from './types';
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Base path of every API route (AAP 0.5.3), same origin as the SPA. {@link apiFetch} prefixes
- * it to the path it receives, so callers write `/runs/latest`, not `/api/v1/runs/latest`.
+ * Base path of every API route (AAP 0.5.3), same origin as the SPA. {@link apiFetch} and
+ * {@link apiFetchPage} prefix it to the path they receive, so callers write `/runs/latest`, not
+ * `/api/v1/runs/latest`, and {@link ApiPage.next} is relative to it in the same way.
  */
 export const API_BASE = '/api/v1';
 
@@ -81,6 +90,18 @@ const NETWORK_ERROR_MESSAGE =
 
 /** Fallback message for a 2xx response whose body is not JSON. */
 const INVALID_RESPONSE_MESSAGE = 'The server returned an unreadable response.';
+
+/** Message for a paged response whose `Link` header is malformed or names an invalid next page. */
+const INVALID_LINK_MESSAGE = 'The server returned an invalid link to the next page.';
+
+/**
+ * Origin used only to resolve a `Link` target and check that it stays on the SPA's origin. The
+ * `.invalid` top-level domain never resolves (RFC 6761), and no request is ever sent to it.
+ */
+const LINK_RESOLUTION_ORIGIN = 'http://link-target.invalid';
+
+/** RFC 9110 `tchar`: the characters of a token, such as a `Link` parameter name or value. */
+const TOKEN_CHAR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]$/;
 
 /** Fallback message for a request this client cannot encode, so never sends. */
 const INVALID_REQUEST_MESSAGE = 'The request could not be sent: its body cannot be encoded.';
@@ -117,7 +138,7 @@ export type QueryValue =
   | null
   | undefined;
 
-/** Options of one {@link apiFetch} call. Every field is optional. */
+/** Options of one {@link apiFetch} or {@link apiFetchPage} call. Every field is optional. */
 export interface ApiFetchInit {
   /** The HTTP method; `GET` when omitted. */
   method?: HttpMethod;
@@ -133,6 +154,24 @@ export interface ApiFetchInit {
   query?: Readonly<Record<string, QueryValue>>;
   /** Cancels the request; TanStack Query passes its own signal here. */
   signal?: AbortSignal;
+}
+
+/**
+ * One page of a paged list, as {@link apiFetchPage} resolves it.
+ *
+ * @typeParam T - The page's response type from `types.ts`, for example `Discrepancy[]`.
+ */
+export interface ApiPage<T> {
+  /** The parsed JSON body, exactly as {@link apiFetch} would resolve it. */
+  data: T;
+  /**
+   * The next page the response's `Link: <…>; rel="next"` header names, as a path relative to
+   * {@link API_BASE} with its query, for example
+   * `/discrepancies?state=open&state=awaiting_platform&limit=500&after=812`. Pass it back to
+   * {@link apiFetchPage} unchanged, with no `query`. `undefined` when the response has no
+   * `Link` header or names no next page, which means the list is complete.
+   */
+  next: string | undefined;
 }
 
 /**
@@ -201,7 +240,10 @@ export type ApiErrorCode =
   | 'validation_error'
   /** 422: feedback on a C0 discrepancy item, which is exempt from dismiss, snooze and done. */
   | 'feedback_not_allowed'
-  /** 422: `GET /discrepancies` with a paging cursor that does not decode. */
+  /**
+   * 422: `GET /discrepancies` with an `after` cursor that names no discrepancy, for example
+   * because its dataset was purged between pages; list again from the first page.
+   */
   | 'invalid_cursor'
   /** 422: `GET /decisions` with `subject_id` but no `subject_type`. */
   | 'invalid_query'
@@ -263,7 +305,11 @@ export type ApiErrorCode =
   // --- Client-side codes -------------------------------------------------------------------
   /** Status 0: the request never reached the server, or its response was lost. */
   | 'network_error'
-  /** A 2xx response whose body could not be read or is not JSON. */
+  /**
+   * A 2xx response whose body could not be read or is not JSON, or a paged response whose
+   * `Link` header cannot be parsed or names a `rel="next"` page that is not a path under
+   * {@link API_BASE}, or that repeats a page already read.
+   */
   | 'invalid_response'
   /** Status 0: the body cannot be encoded as JSON, or a `GET` was given one; nothing was sent. */
   | 'invalid_request'
@@ -286,8 +332,8 @@ export interface ApiErrorOptions {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * A failed API call. {@link apiFetch} rejects with this class for every failure except a
- * caller-initiated abort.
+ * A failed API call. {@link apiFetch} and {@link apiFetchPage} reject with this class for every
+ * failure except a caller-initiated abort.
  *
  * - {@link ApiError.status} is the HTTP status, or 0 when no response arrived.
  * - {@link ApiError.code} is the envelope's machine code, or a client-side code (see
@@ -514,6 +560,271 @@ function encodeBody(body: unknown): string {
   return encoded;
 }
 
+/** One link-value of a `Link` header. */
+interface LinkValue {
+  /** The URI-Reference between `<` and `>`, as sent. */
+  target: string;
+  /** The relation types of its first `rel` parameter, lowercased; empty without one. */
+  rels: readonly string[];
+}
+
+/**
+ * Parses a `Link` header field value (RFC 8288 §3) into its link-values.
+ *
+ * The value is a comma-separated list, in which empty elements are allowed (RFC 9110 §5.6.1),
+ * of `<URI-Reference>` followed by `;`-separated parameters with optional whitespace around
+ * each separator and `=`. A parameter name is a case-insensitive token. Its value, when it has
+ * one, is a quoted string with `\` escapes or, as Appendix B reads it, everything up to the
+ * next `;` or `,`. Only the first `rel` parameter of a link-value counts (§3.3). Its value is a
+ * space-separated list of relation types, which compare case-insensitively, so they are
+ * lowercased.
+ *
+ * Returns `undefined` for a value whose structure is broken (a link-value that does not start
+ * with `<`, an unterminated `<` or quoted string, a parameter without a name, or text between
+ * parameters that is not a `;` or `,`): a link this client cannot read could be the one that
+ * names the next page.
+ */
+function parseLinkHeader(value: string): LinkValue[] | undefined {
+  let at = 0;
+  const skipWhitespace = (): void => {
+    while (value.charAt(at) === ' ' || value.charAt(at) === '\t') {
+      at += 1;
+    }
+  };
+  const readToken = (): string => {
+    const start = at;
+    while (TOKEN_CHAR.test(value.charAt(at))) {
+      at += 1;
+    }
+    return value.slice(start, at);
+  };
+  // Reads a quoted string whose opening quote is at `at`; undefined when it is unterminated.
+  const readQuoted = (): string | undefined => {
+    let text = '';
+    at += 1;
+    while (at < value.length) {
+      const char = value.charAt(at);
+      if (char === '"') {
+        at += 1;
+        return text;
+      }
+      if (char === '\\') {
+        if (at + 1 >= value.length) {
+          return undefined;
+        }
+        text += value.charAt(at + 1);
+        at += 2;
+      } else {
+        text += char;
+        at += 1;
+      }
+    }
+    return undefined;
+  };
+
+  const links: LinkValue[] = [];
+  while (at < value.length) {
+    skipWhitespace();
+    if (at >= value.length) {
+      break;
+    }
+    if (value.charAt(at) === ',') {
+      at += 1;
+      continue;
+    }
+    if (value.charAt(at) !== '<') {
+      return undefined;
+    }
+    const close = value.indexOf('>', at + 1);
+    if (close === -1) {
+      return undefined;
+    }
+    const target = value.slice(at + 1, close);
+    at = close + 1;
+    let rel: string | undefined;
+    for (;;) {
+      skipWhitespace();
+      if (at >= value.length || value.charAt(at) === ',') {
+        break;
+      }
+      if (value.charAt(at) !== ';') {
+        return undefined;
+      }
+      at += 1;
+      skipWhitespace();
+      const name = readToken().toLowerCase();
+      if (name === '') {
+        return undefined;
+      }
+      skipWhitespace();
+      let parameter = '';
+      if (value.charAt(at) === '=') {
+        at += 1;
+        skipWhitespace();
+        if (value.charAt(at) === '"') {
+          const quoted = readQuoted();
+          if (quoted === undefined) {
+            return undefined;
+          }
+          parameter = quoted;
+        } else {
+          // RFC 8288 Appendix B reads an unquoted value up to the next ';' or ',', so legacy
+          // values such as `type=application/json`, which are not tokens, still parse.
+          const start = at;
+          while (at < value.length && value.charAt(at) !== ';' && value.charAt(at) !== ',') {
+            at += 1;
+          }
+          parameter = value.slice(start, at).trim();
+        }
+      }
+      if (name === 'rel' && rel === undefined) {
+        rel = parameter;
+      }
+    }
+    const rels = (rel ?? '')
+      .split(/[ \t]+/)
+      .filter((type) => type !== '')
+      .map((type) => type.toLowerCase());
+    links.push({ target, rels });
+  }
+  return links;
+}
+
+/**
+ * The path, relative to {@link API_BASE} and with its query, that a `Link` target names, or
+ * `undefined` when the target is not a path under {@link API_BASE} on the SPA's own origin.
+ *
+ * Only a path-absolute reference qualifies (`/api/v1/…`, as the API sends it). An absolute URL,
+ * a protocol-relative `//host/…` reference, a relative path or a backslash, which browsers
+ * read as a slash, is refused. The target is then resolved the way `fetch` will resolve it,
+ * dot segments included (`/api/v1/../x` is `/x`), and the resolved path must still start with
+ * `/api/v1/`. A fragment is dropped, because it is never sent.
+ */
+function pathUnderApiBase(target: string): string | undefined {
+  if (!target.startsWith('/') || target.startsWith('//') || target.includes('\\')) {
+    return undefined;
+  }
+  let resolved: URL;
+  try {
+    resolved = new URL(target, LINK_RESOLUTION_ORIGIN);
+  } catch {
+    return undefined;
+  }
+  if (resolved.origin !== LINK_RESOLUTION_ORIGIN || !resolved.pathname.startsWith(`${API_BASE}/`)) {
+    return undefined;
+  }
+  return `${resolved.pathname.slice(API_BASE.length)}${resolved.search}`;
+}
+
+/**
+ * The next page a paged response's `Link` header names, relative to {@link API_BASE}, or
+ * `undefined` when there is no `Link` header or no link-value with the `next` relation.
+ *
+ * Several `Link` headers arrive joined by `, `, which is the same list. Throws an
+ * `invalid_response` {@link ApiError} with the response's status when the header does not
+ * parse, when it names two different next pages, or when the next target is not a path under
+ * {@link API_BASE} ({@link pathUnderApiBase}).
+ */
+function nextPage(response: Response): string | undefined {
+  const header = response.headers.get('Link');
+  if (header === null) {
+    return undefined;
+  }
+  const invalid = (): ApiError =>
+    new ApiError(response.status, 'invalid_response', INVALID_LINK_MESSAGE);
+  const links = parseLinkHeader(header);
+  if (links === undefined) {
+    throw invalid();
+  }
+  let target: string | undefined;
+  for (const link of links) {
+    if (!link.rels.includes('next')) {
+      continue;
+    }
+    if (target !== undefined && target !== link.target) {
+      throw invalid();
+    }
+    target = link.target;
+  }
+  if (target === undefined) {
+    return undefined;
+  }
+  const next = pathUnderApiBase(target);
+  if (next === undefined) {
+    throw invalid();
+  }
+  return next;
+}
+
+/** A successful response and its parsed body, as {@link send} resolves them. */
+interface Received<T> {
+  /** The 2xx response. Its body has been read; its headers can still be read. */
+  response: Response;
+  /** The parsed JSON body, or `undefined` for a response without one. */
+  data: T;
+}
+
+/**
+ * Sends one request and reads its JSON body, rejecting exactly as {@link apiFetch} documents.
+ * {@link apiFetch} and {@link apiFetchPage} both call it, so they send, map errors and parse
+ * identically; it also resolves the response, whose headers {@link apiFetchPage} reads.
+ */
+async function send<T>(path: string, init: ApiFetchInit): Promise<Received<T>> {
+  const method: HttpMethod = init.method ?? 'GET';
+  const { signal } = init;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  const request: RequestInit = { method, credentials: 'same-origin', headers };
+
+  if (init.body !== undefined) {
+    if (method === 'GET') {
+      throw new ApiError(0, 'invalid_request', INVALID_REQUEST_MESSAGE);
+    }
+    request.body = encodeBody(init.body);
+    headers['Content-Type'] = 'application/json';
+  }
+  if (method !== 'GET') {
+    headers[CSRF_HEADER] = CSRF_VALUE;
+  }
+  if (signal !== undefined) {
+    request.signal = signal;
+  }
+
+  let response: Response;
+  try {
+    // The global fetch is looked up on every call, never captured at load time, so a test's
+    // vi.stubGlobal('fetch', …) takes effect.
+    response = await fetch(buildUrl(path, init.query), request);
+  } catch (cause) {
+    if (isAbort(cause, signal)) {
+      throw cause;
+    }
+    throw new ApiError(0, 'network_error', NETWORK_ERROR_MESSAGE, { cause });
+  }
+
+  if (!response.ok) {
+    throw await errorFromResponse(response, signal);
+  }
+  if (NO_CONTENT_STATUSES.has(response.status)) {
+    return { response, data: undefined as T };
+  }
+  const text = await readText(response, signal);
+  if (!text.ok) {
+    throw new ApiError(response.status, 'invalid_response', INVALID_RESPONSE_MESSAGE, {
+      cause: text.error,
+    });
+  }
+  if (text.value.trim() === '') {
+    return { response, data: undefined as T };
+  }
+  const parsed = parseJson(text.value);
+  if (!parsed.ok) {
+    throw new ApiError(response.status, 'invalid_response', INVALID_RESPONSE_MESSAGE, {
+      cause: parsed.error,
+    });
+  }
+  return { response, data: parsed.value as T };
+}
+
 // ---------------------------------------------------------------------------------------------
 // apiFetch
 // ---------------------------------------------------------------------------------------------
@@ -561,58 +872,59 @@ function encodeBody(body: unknown): string {
  * ```
  */
 export async function apiFetch<T>(path: string, init: ApiFetchInit = {}): Promise<T> {
-  const method: HttpMethod = init.method ?? 'GET';
-  const { signal } = init;
-  const headers: Record<string, string> = { Accept: 'application/json' };
-  const request: RequestInit = { method, credentials: 'same-origin', headers };
+  const { data } = await send<T>(path, init);
+  return data;
+}
 
-  if (init.body !== undefined) {
-    if (method === 'GET') {
-      throw new ApiError(0, 'invalid_request', INVALID_REQUEST_MESSAGE);
-    }
-    request.body = encodeBody(init.body);
-    headers['Content-Type'] = 'application/json';
-  }
-  if (method !== 'GET') {
-    headers[CSRF_HEADER] = CSRF_VALUE;
-  }
-  if (signal !== undefined) {
-    request.signal = signal;
-  }
-
-  let response: Response;
-  try {
-    // The global fetch is looked up on every call, never captured at load time, so a test's
-    // vi.stubGlobal('fetch', …) takes effect.
-    response = await fetch(buildUrl(path, init.query), request);
-  } catch (cause) {
-    if (isAbort(cause, signal)) {
-      throw cause;
-    }
-    throw new ApiError(0, 'network_error', NETWORK_ERROR_MESSAGE, { cause });
-  }
-
-  if (!response.ok) {
-    throw await errorFromResponse(response, signal);
-  }
-  if (NO_CONTENT_STATUSES.has(response.status)) {
-    return undefined as T;
-  }
-  const text = await readText(response, signal);
-  if (!text.ok) {
-    throw new ApiError(response.status, 'invalid_response', INVALID_RESPONSE_MESSAGE, {
-      cause: text.error,
-    });
-  }
-  if (text.value.trim() === '') {
-    return undefined as T;
-  }
-  const parsed = parseJson(text.value);
-  if (!parsed.ok) {
-    throw new ApiError(response.status, 'invalid_response', INVALID_RESPONSE_MESSAGE, {
-      cause: parsed.error,
-    });
-  }
-  return parsed.value as T;
+/**
+ * Calls one page of a paged `/api/v1` list and resolves its JSON body together with the next
+ * page the response names.
+ *
+ * The request is sent and its body read exactly as {@link apiFetch} does, with the same
+ * {@link ApiError} for every failure and the same exception for a caller-initiated abort. The
+ * response's RFC 8288 `Link` header is then read: comma-separated link-values, each a
+ * `<target>` followed by `;` parameters, whose `rel` is a space-separated, case-insensitive
+ * list of relation types, quoted or not. The target of the link-value whose relations include
+ * `next` must be a path under {@link API_BASE} on the SPA's own origin, as the API sends it
+ * (`</api/v1/discrepancies?state=open&limit=500&after=812>; rel="next"`).
+ * {@link ApiPage.next} holds it relative to {@link API_BASE}, query included.
+ *
+ * Also rejects with an `invalid_response` {@link ApiError}, carrying the response's status,
+ * when the `Link` header cannot be parsed, names two different next pages, or names a next
+ * page that is an absolute or protocol-relative URL, a relative path or a path outside
+ * {@link API_BASE}. Ending the list there would hide its remaining pages, and following such
+ * a target could leave the API.
+ *
+ * A page can hold fewer rows than the `limit` it asked for while a next page follows, for
+ * example when the API leaves out a discrepancy whose subject it cannot load, so only an
+ * `undefined` {@link ApiPage.next} ends a list.
+ *
+ * @typeParam T - The page's response type from `types.ts`, for example `Discrepancy[]`.
+ * @param path - For the first page, the route relative to {@link API_BASE}, starting with `/`.
+ *   For a later page, the previous page's {@link ApiPage.next}, unchanged.
+ * @param init - Method, JSON body, query parameters and abort signal; all optional. A later
+ *   page takes no `query`, because its `next` already carries it.
+ * @returns The page's parsed body and its next page, which is `undefined` when the list is
+ *   complete.
+ *
+ * @example
+ * ```ts
+ * let page = await apiFetchPage<Discrepancy[]>('/discrepancies', {
+ *   query: { state: ['open', 'awaiting_platform'], limit: 500 },
+ *   signal,
+ * });
+ * const all = [...page.data];
+ * while (page.next !== undefined) {
+ *   page = await apiFetchPage<Discrepancy[]>(page.next, { signal });
+ *   all.push(...page.data);
+ * }
+ * ```
+ */
+export async function apiFetchPage<T>(
+  path: string,
+  init: ApiFetchInit = {},
+): Promise<ApiPage<T>> {
+  const { response, data } = await send<T>(path, init);
+  return { data, next: nextPage(response) };
 }
 

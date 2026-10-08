@@ -1440,6 +1440,8 @@ def _create_analysis_tables() -> None:
         "analysis_run",
         ["kind", "status", "finished_at"],
     )
+    # The newest runs of one kind, newest first (GET /runs).
+    _create_index("ix_analysis_run_kind_id", "analysis_run", ["kind", sa.text("id DESC")])
     # The database-enforced second guard behind the ``analysis`` advisory lock: at most one
     # running run (AAP 0.5.3).
     _create_index(

@@ -381,6 +381,7 @@ def test_properties_reference_sample_decodes_every_required_field(
     assert definition.field_type == "<string>"
     assert definition.options == (PropertyOption(label="<string>", value="<string>", hidden=True),)
     assert not definition.is_datetime
+    assert not definition.is_instant
 
 
 def test_captured_live_payloads_decode_with_their_surface_decoder(
@@ -1006,6 +1007,7 @@ def test_parse_property_keeps_lifecycle_stage_labels_and_values(
     assert definition.type == "enumeration"
     assert definition.field_type == "radio"
     assert not definition.is_datetime
+    assert not definition.is_instant
     assert [(option.label, option.value) for option in definition.options] == [
         ("Subscriber", "subscriber"),
         ("Marketing Qualified Lead", "marketingqualifiedlead"),
@@ -1053,6 +1055,7 @@ def test_parse_property_of_a_stage_date_is_a_datetime_without_options(
         name=MQL_PROPERTY, type="datetime", field_type="calculation_read_time", options=()
     )
     assert definition.is_datetime
+    assert definition.is_instant
 
 
 # ---------------------------------------------------------------------------------------------

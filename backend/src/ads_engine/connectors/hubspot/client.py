@@ -1149,7 +1149,8 @@ class HubSpotClient:
           resolved on its own, never from MQL.
         * The Google link is available only when ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`` and
           ``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`` are both set, both exist on contacts, and
-          the touch-date property is a ``date`` or ``datetime`` property.
+          the touch-date property is a ``datetime`` property. A ``date`` property is
+          refused: its midnight would anchor the causal check before a same-day touch.
 
         Anything unresolved is unavailable with a reason naming the missing stage or
         property, never counted as 0, and each binding's availability is independent.
@@ -1261,7 +1262,11 @@ class HubSpotClient:
     async def _resolve_google(
         self, settings: Settings, cache: dict[str, PropertyDefinition | None]
     ) -> GoogleCrmBinding:
-        """Verify the optional Google-to-CRM link (``no_crm_link`` when unavailable)."""
+        """Verify the optional Google-to-CRM link (``no_crm_link`` when unavailable).
+
+        The touch-date property must be a ``datetime`` property, whose value is the touch
+        instant; a ``date`` property leaves the link unavailable.
+        """
         campaign = settings.hubspot_google_campaign_property
         touch = settings.hubspot_google_touch_date_property
         unset = [
@@ -1282,10 +1287,10 @@ class HubSpotClient:
         touch_definition = await self._contact_property(touch, cache)
         if touch_definition is None:
             problems.append(f"{_GOOGLE_TOUCH_ENV} property '{touch}' not found on contacts")
-        elif not touch_definition.is_datetime:
+        elif not touch_definition.is_instant:
             problems.append(
                 f"{_GOOGLE_TOUCH_ENV} property '{touch}' has type '{touch_definition.type}', "
-                "not a date or datetime property"
+                "not a datetime property"
             )
         if problems:
             return GoogleCrmBinding(

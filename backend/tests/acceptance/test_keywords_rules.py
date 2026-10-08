@@ -1015,7 +1015,7 @@ def test_k1_evidence_shows_wasted_spend_clicks_matched_keyword_and_n_star(
             assert _metric(item, "min_clicks") == sample.required == _n_star(run.ctx)
             assert sample.unit == "clicks"
             assert _metric(item, "conversions") == 0
-            assert _metric(item, "cost_per_conversion") is None
+            assert _metric(item, "cost_per_conversion") == "—"
             assert row.matched_keyword_text is not None
             assert str(_metric(item, "matched_keyword")).startswith(row.matched_keyword_text)
             assert item.rank_key == (-row.cost,)
@@ -1294,8 +1294,9 @@ def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: Contex
     """K3: CPC up 20% with second-half conversions 0 and first-half conversions >= 1 fires.
 
     No first-half conversion does not: the twin moves the first half's single conversion below
-    ``k3.min_first_half_conversions``, so conversions did not fall and cost/conversion is
-    unavailable in both halves.
+    ``k3.min_first_half_conversions``, so conversions did not fall. Both halves then have a
+    known 0 conversions, so cost/conversion shows "—" in each and there is no cost/conversion
+    ratio.
     """
     fires, held = _twin_runs(make_context, "k3.conversions_fell")
     item, keyword = _k3_target(fires)
@@ -1329,8 +1330,8 @@ def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: Contex
         first_cost / halves.first_conversions
     )
     second_cpa = item.evidence.metric("cost_per_conversion_second_half")
-    assert (second_cpa.value, second_cpa.unit) == (None, "currency")
-    assert second_cpa.to_json()["unavailable"] is True, "unavailable at 0 conversions, never 0"
+    assert (second_cpa.value, second_cpa.unit) == ("—", "currency")
+    assert "unavailable" not in second_cpa.to_json(), "a known 0 shows '—', never unavailable"
     assert _metric(item, "cpa_ratio") is None
     assert "CPC rose from" in item.reason
     fell = f"while conversions fell from {_metric(item, 'conversions_first_half')} to 0."
@@ -1368,9 +1369,20 @@ def test_k3_evidence_shows_quality_score_cpc_and_cost_per_conversion_by_half(
                 # Present on every item; known whenever the quality-score branch fired.
                 value = item.evidence.metric(key).value
                 assert value is not None or "quality_score" not in item.evidence.extra["triggers"]
-            for key in ("cost_per_conversion_first_half", "cost_per_conversion_second_half"):
-                # Shown even when unavailable ("—" at 0 conversions), never dropped.
-                assert item.evidence.metric(key).unit == "currency"
+            for key, conversions_key in (
+                ("cost_per_conversion_first_half", "conversions_first_half"),
+                ("cost_per_conversion_second_half", "conversions_second_half"),
+            ):
+                # Shown on every item, never dropped: "—" at a known 0 conversions, and
+                # unavailable only when the half's conversions are unreported.
+                cost = item.evidence.metric(key)
+                assert cost.unit == "currency"
+                half_conversions = _metric(item, conversions_key)
+                if half_conversions == 0:
+                    assert cost.value == "—", f"{name}: {key}"
+                    assert "unavailable" not in cost.to_json()
+                elif half_conversions is None:
+                    assert cost.to_json()["unavailable"] is True, f"{name}: {key}"
             assert _metric(item, "clicks_first_half") + _metric(item, "clicks_second_half") == (
                 _metric(item, "clicks")
             )
@@ -1466,10 +1478,14 @@ def test_every_keyword_item_shows_term_spend_conversions_cost_and_its_window(
             conversions = _metric(item, "conversions")
             cost = evidence.metric("cost_per_conversion")
             if conversions == 0:
-                assert cost.value is None
-                assert cost.to_json()["unavailable"] is True
+                # A known zero denominator renders "—", never "unavailable".
+                assert cost.value == "—"
+                assert "unavailable" not in cost.to_json()
             elif conversions is not None:
                 assert cost.value is not None
+            else:
+                # Unreported conversions alone leave the cost/conversion unavailable.
+                assert cost.to_json()["unavailable"] is True
             extra = evidence.extra
             assert extra["campaign"], f"{what}: campaign or ad group missing"
             assert extra["ad_group"], f"{what}: campaign or ad group missing"

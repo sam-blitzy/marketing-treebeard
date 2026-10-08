@@ -1563,6 +1563,107 @@ def test_b3_allocation_orders_donors_and_receivers_deterministically(
     assert seen[0][0] == [("campaign", 9_100), ("campaign", 9_101)]
 
 
+def _tied_party(
+    ctx: AnalysisContext, rule_id: str, entity_id: int, external_id: str, name: str, amount: str
+) -> Candidate:
+    """A B3 donor freeing ``amount`` or a B1 receiver of increase ``amount`` (cost/lead 20)."""
+    subject: SubjectKey = ("campaign", entity_id)
+    entity = EntityRef("linkedin", ENTITY_CAMPAIGN, entity_id, external_id, name)
+    if rule_id == B3:
+        return _candidate(
+            ctx,
+            B3,
+            BUDGET,
+            GROUP_CHANGES,
+            entity,
+            subject=subject,
+            extra={"freed": Decimal(amount), "currency": "USD"},
+        )
+    return _candidate(
+        ctx,
+        B1,
+        BUDGET,
+        GROUP_CHANGES,
+        entity,
+        targets=(subject,),
+        subject=subject,
+        extra={"increase": Decimal(amount), "currency": "USD"},
+        metrics_shown=(
+            Metric("cost_per_outcome", "Cost per lead", Decimal("20"), "currency", "USD"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [((2, "200"), (10, "100")), ((2, "2"), (10, "10"))],
+    ids=["reverse_correlated_external_ids", "different_length_ids"],
+)
+def test_b3_allocation_breaks_name_ties_by_numeric_entity_id_not_by_key(
+    ids: tuple[tuple[int, str], tuple[int, str]],
+    make_context: ContextFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B3 allocation order: after freed amount (or cost per outcome) and name, the numeric id.
+
+    Two donors freeing the same amount under the same name, and two receivers at the same
+    cost per outcome under the same name, have internal ids 2 and 10. Their external ids are
+    either "200" and "100" (reverse-correlated with the internal ids) or "2" and "10", whose
+    entity keys order ``…:10`` before ``…:2``; in both layouts the key alone would put id 10
+    first. Id 2 goes first, as in ranking (``Candidate.sort_key``), whatever order the rules
+    list them in: the first donor gives first and the first receiver is funded first.
+    """
+    ctx = make_context("b3.no_receiver.case")
+    (first, first_external), (second, second_external) = ids
+    keys = [
+        EntityRef("linkedin", ENTITY_CAMPAIGN, entity_id, external, "Same").key
+        for entity_id, external in ids
+    ]
+    assert keys[1] < keys[0], "the entity key alone must order the tie the wrong way"
+    assert not spend_increase_blocked(ctx)
+    seen: list[tuple[list[SubjectKey], list[SubjectKey]]] = []
+    allocate = precedence.allocate_b3
+
+    def spy(
+        donor_amounts: list[tuple[SubjectKey, Decimal]],
+        receiver_amounts: list[tuple[SubjectKey, Decimal]],
+    ) -> tuple[Allocation, ...]:
+        seen.append(([key for key, _ in donor_amounts], [key for key, _ in receiver_amounts]))
+        return allocate(donor_amounts, receiver_amounts)
+
+    monkeypatch.setattr(precedence, "allocate_b3", spy)
+    low, high = ("campaign", first), ("campaign", second)
+    tied_donors = [
+        _tied_party(ctx, B3, first, first_external, "Same", "50.00"),
+        _tied_party(ctx, B3, second, second_external, "Same", "50.00"),
+    ]
+    zeta = _tied_party(ctx, B1, 9_000, "9000", "Zeta", "80.00")
+    tied_receivers = [
+        _tied_party(ctx, B1, first, first_external, "Same", "50.00"),
+        _tied_party(ctx, B1, second, second_external, "Same", "50.00"),
+    ]
+    bee = _tied_party(ctx, B3, 9_100, "9100", "Bee", "80.00")
+    for donors, receivers in (
+        (tied_donors, tied_receivers),
+        (tied_donors[::-1], tied_receivers[::-1]),
+    ):
+        seen.clear()
+        out = precedence.apply_precedence(RuleResult(candidates=(*donors, zeta)), ctx)
+        assert seen == [([low, high], [("campaign", 9_000)])]
+        assert [(a.donor, a.receiver, a.amount) for a in out.allocations] == [
+            (low, ("campaign", 9_000), Decimal("50.00")),
+            (high, ("campaign", 9_000), Decimal("30.00")),
+        ]
+
+        seen.clear()
+        out = precedence.apply_precedence(RuleResult(candidates=(bee, *receivers)), ctx)
+        assert seen == [([("campaign", 9_100)], [low, high])]
+        assert [(a.donor, a.receiver, a.amount) for a in out.allocations] == [
+            (("campaign", 9_100), low, Decimal("50.00")),
+            (("campaign", 9_100), high, Decimal("30.00")),
+        ]
+
+
 def test_over_allocating_trips_the_runner_assertion(
     make_context: ContextFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

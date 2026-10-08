@@ -3,7 +3,8 @@
 AAP 0.5.1 ("Worker entry and CLI"), 0.3.3 ("Live captures"), 0.5.3 (exit code 3 while the
 analysis lock is held) and 0.11.2 ("First start"). Covered here:
 
-* the parser: seven commands, ``--help``/``--version`` exit 0, usage errors exit 2;
+* the parser: seven commands, ``--help``/``--version`` exit 0, usage errors exit 2 and never
+  repeat the supplied text;
 * ``hash-password``: only the argon2id hash on stdout, one trailing newline dropped, an empty
   password a usage error;
 * ``migrate``, ``ensure-admin``, ``sync``, ``analyze`` and ``seed-simulated`` with their
@@ -20,6 +21,7 @@ No test opens a network connection: live transports are replaced by the simulato
 ``httpx.MockTransport``, and the Google call budget's database is replaced.
 """
 
+import argparse
 import asyncio
 import io
 import json
@@ -35,7 +37,7 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from argon2 import PasswordHasher
+from argon2 import PasswordHasher, Type
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import OperationalError
@@ -212,6 +214,211 @@ def test_version_and_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
 )
 def test_usage_errors_exit_2(argv: list[str]) -> None:
     assert cli.main(argv) == cli.EXIT_USAGE
+
+
+# argparse writes usage errors before logging and its redaction are configured, so they must
+# never repeat what was typed. The credential-like value is assembled at run time so the secret
+# scan does not flag it.
+LEAKED_EMAIL = "admin-leak" + "@" + "example.com"
+PASTED_SECRET = "pasted-" + "secret-" + "value"
+CONTROL_TEXT = "\x1b[31m" + PASTED_SECRET + "\x07\r"
+COMMANDS_CHOICE = (
+    "argument COMMAND: invalid choice (choose from hash-password, migrate, ensure-admin, sync, "
+    "analyze, seed-simulated, capture-fixtures)"
+)
+SOURCE_CHOICE = "argument --source: invalid choice (choose from google, linkedin, hubspot)"
+
+
+def _assert_redacted(err: str, supplied: tuple[str, ...]) -> None:
+    """Assert stderr holds none of the supplied values, raw or quoted, and no control byte."""
+    folded = err.casefold()
+    for value in supplied:
+        assert value.casefold() not in folded
+        assert repr(value).casefold() not in folded
+    assert all(char == "\n" or char.isprintable() for char in err), repr(err)
+
+
+@pytest.mark.parametrize(
+    ("argv", "supplied", "diagnostic"),
+    [
+        pytest.param(
+            ["analyze", "--start", LEAKED_EMAIL, "--end", "2026-09-28"],
+            (LEAKED_EMAIL,),
+            "ads-engine analyze: error: argument --start: not a date in YYYY-MM-DD form",
+            id="date-email",
+        ),
+        pytest.param(
+            ["analyze", "--start", "2026-09-01", f"--end={PASTED_SECRET}"],
+            (PASTED_SECRET,),
+            "ads-engine analyze: error: argument --end: not a date in YYYY-MM-DD form",
+            id="date-credential",
+        ),
+        pytest.param(
+            ["sync", "--source", LEAKED_EMAIL],
+            (LEAKED_EMAIL,),
+            f"ads-engine sync: error: {SOURCE_CHOICE}",
+            id="source-email",
+        ),
+        pytest.param(
+            ["capture-fixtures", "--source", PASTED_SECRET],
+            (PASTED_SECRET,),
+            f"ads-engine capture-fixtures: error: {SOURCE_CHOICE}",
+            id="source-credential",
+        ),
+        pytest.param(
+            ["--log-level", PASTED_SECRET, "migrate"],
+            (PASTED_SECRET,),
+            "ads-engine: error: argument --log-level: invalid choice "
+            "(choose from DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+            id="log-level-choice",
+        ),
+        pytest.param(
+            ["migrate", f"--password={PASTED_SECRET}"],
+            (PASTED_SECRET, "--password"),
+            "ads-engine: error: unrecognized arguments (1)",
+            id="unknown-option-value",
+        ),
+        pytest.param(
+            ["migrate", CONTROL_TEXT, LEAKED_EMAIL],
+            (CONTROL_TEXT, PASTED_SECRET, LEAKED_EMAIL),
+            "ads-engine: error: unrecognized arguments (2)",
+            id="unknown-positional-controls",
+        ),
+        pytest.param(
+            [f"--help={PASTED_SECRET}"],
+            (PASTED_SECRET,),
+            "ads-engine: error: argument -h/--help: ignored explicit argument",
+            id="help-explicit-argument",
+        ),
+        pytest.param(
+            [f"--version={PASTED_SECRET}"],
+            (PASTED_SECRET,),
+            "ads-engine: error: argument --version: ignored explicit argument",
+            id="version-explicit-argument",
+        ),
+        pytest.param(
+            [LEAKED_EMAIL],
+            (LEAKED_EMAIL,),
+            f"ads-engine: error: {COMMANDS_CHOICE}",
+            id="unknown-command-email",
+        ),
+        pytest.param(
+            [f"--={PASTED_SECRET}", "migrate"],
+            (PASTED_SECRET,),
+            "ads-engine: error: ambiguous option (could match --help, --version, --log-level)",
+            id="ambiguous-option",
+        ),
+        pytest.param(
+            ["analyze", "--start", "2026-09-01"],
+            (),
+            "ads-engine analyze: error: the following arguments are required: --end",
+            id="required-passes-unchanged",
+        ),
+    ],
+)
+def test_usage_errors_never_repeat_supplied_text(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    supplied: tuple[str, ...],
+    diagnostic: str,
+) -> None:
+    # Usage colouring is argparse's own; keep it off so only the diagnostic's text is checked.
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+    assert cli.main(argv) == cli.EXIT_USAGE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("usage: ")
+    assert captured.err.endswith(f"\n{diagnostic}\n")
+    _assert_redacted(captured.err, supplied)
+
+
+@pytest.mark.parametrize(
+    ("message", "diagnostic"),
+    [
+        pytest.param(
+            f"can't open '{LEAKED_EMAIL}': [Errno 2] No such file or directory",
+            "invalid usage; run 'ads-engine --help'",
+            id="unknown-form",
+        ),
+        pytest.param(
+            f"argument --log-level: {LEAKED_EMAIL} is not acceptable",
+            "argument --log-level: invalid usage; run 'ads-engine --help'",
+            id="unknown-reason-keeps-argument-name",
+        ),
+        pytest.param(
+            f"argument --{PASTED_SECRET}: invalid choice: 'x' (choose from 'x')",
+            "invalid usage; run 'ads-engine --help'",
+            id="argument-name-not-vocabulary",
+        ),
+        pytest.param(
+            f"the following arguments are required: COMMAND, {LEAKED_EMAIL}",
+            "invalid usage; run 'ads-engine --help'",
+            id="required-name-not-vocabulary",
+        ),
+        pytest.param(
+            f"ambiguous option: --{PASTED_SECRET} could match --{PASTED_SECRET}",
+            "ambiguous option",
+            id="ambiguous-match-not-vocabulary",
+        ),
+        pytest.param(
+            f"unrecognized arguments: {PASTED_SECRET} {LEAKED_EMAIL}",
+            "unrecognized arguments",
+            id="uncounted-unrecognized",
+        ),
+        pytest.param(
+            f"argument COMMAND: unknown parser '{LEAKED_EMAIL}' (choices: migrate)",
+            COMMANDS_CHOICE,
+            id="unknown-parser",
+        ),
+        pytest.param(
+            f"argument --log-level: invalid choice: '{PASTED_SECRET}', maybe you meant 'DEBUG'? "
+            "(choose from 'DEBUG')",
+            "argument --log-level: invalid choice "
+            "(choose from DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+            id="invalid-choice-suggestion",
+        ),
+        pytest.param(
+            f"argument --log-level: invalid upper value: '{PASTED_SECRET}'",
+            "argument --log-level: invalid upper value",
+            id="invalid-type-value",
+        ),
+        pytest.param(
+            "argument --log-level: expected 2 arguments",
+            "argument --log-level: expected 2 arguments",
+            id="value-free-passes-unchanged",
+        ),
+    ],
+)
+def test_parser_error_rewrites_or_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    message: str,
+    diagnostic: str,
+) -> None:
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as exited:
+        parser.error(message)
+    assert exited.value.code == cli.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert err.endswith(f"\nads-engine: error: {diagnostic}\n")
+    _assert_redacted(err, (LEAKED_EMAIL, PASTED_SECRET))
+
+
+def test_sub_parsers_inherit_the_redacting_parser() -> None:
+    parser = cli.build_parser()
+    commands = next(action for action in parser._actions if action.dest == "command")
+    assert isinstance(commands.choices, dict)
+    assert len(commands.choices) == 7
+    assert {type(sub) for sub in commands.choices.values()} == {type(parser)}
+
+
+def test_unrecognized_arguments_raise_counted_without_exit_on_error() -> None:
+    parser = cli._RedactingArgumentParser(prog="ads-engine", exit_on_error=False)
+    with pytest.raises(argparse.ArgumentError) as raised:
+        parser.parse_args([LEAKED_EMAIL])
+    assert str(raised.value) == "unrecognized arguments (1)"
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +599,122 @@ def test_ensure_admin_rejects_a_missing_or_bad_hash(
         assert value not in err
 
 
+def _edited_hash(**fields: str) -> str:
+    """Return a fresh argon2id hash of a test password with some of its PHC fields replaced.
+
+    The fields are ``version`` (``v=19``), ``params`` (``m=…,t=…,p=…``), ``salt`` and
+    ``digest``. The hash is computed at run time, so no argon2 hash literal is committed (the
+    secret scan reports every one).
+    """
+    empty, kind, version, params, salt, digest = PasswordHasher().hash("pw").split("$")
+    parts = {"version": version, "params": params, "salt": salt, "digest": digest} | fields
+    return "$".join(
+        [empty, kind, parts["version"], parts["params"], parts["salt"], parts["digest"]]
+    )
+
+
+_OUT_OF_RANGE = "has argon2 parameters outside the supported range: "
+_UNREADABLE = "is not a valid argon2 hash (it cannot be read as an argon2 PHC string)"
+_UNDECODABLE = "cannot be verified by argon2 (Decoding failed)"
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        pytest.param(
+            "$argon2id$v=19$m=0,t=0,p=0$$",
+            f"{_OUT_OF_RANGE}the salt must be at least 8 bytes",
+            id="all-zero-empty-salt-and-digest",
+        ),
+        pytest.param({"salt": "!" * 22}, _UNDECODABLE, id="salt-not-base64"),
+        pytest.param(
+            {"salt": "A" * 10},
+            f"{_OUT_OF_RANGE}the salt must be at least 8 bytes",
+            id="salt-7-bytes",
+        ),
+        pytest.param(
+            {"digest": "A" * 4},
+            f"{_OUT_OF_RANGE}the digest must be at least 4 bytes",
+            id="digest-3-bytes",
+        ),
+        pytest.param(
+            {"params": "m=65536,t=0,p=4"},
+            f"{_OUT_OF_RANGE}the time cost must be 1 to 10",
+            id="time-cost-0",
+        ),
+        pytest.param(
+            {"params": "m=65536,t=11,p=4"},
+            f"{_OUT_OF_RANGE}the time cost must be 1 to 10",
+            id="time-cost-11",
+        ),
+        pytest.param(
+            {"params": "m=65536,t=3,p=0"},
+            f"{_OUT_OF_RANGE}the parallelism must be 1 to 16",
+            id="parallelism-0",
+        ),
+        pytest.param(
+            {"params": "m=65536,t=3,p=17"},
+            f"{_OUT_OF_RANGE}the parallelism must be 1 to 16",
+            id="parallelism-17",
+        ),
+        pytest.param(
+            {"params": "m=31,t=3,p=4"},
+            f"{_OUT_OF_RANGE}the memory cost must be at least 8 KiB per lane",
+            id="memory-below-8-kib-per-lane",
+        ),
+        pytest.param(
+            {"params": "m=-1,t=3,p=4"},
+            f"{_OUT_OF_RANGE}the memory cost must be at least 8 KiB per lane",
+            id="memory-negative",
+        ),
+        pytest.param(
+            {"params": "m=2097153,t=3,p=4"},
+            f"{_OUT_OF_RANGE}the memory cost must be at most 2097152 KiB (2 GiB)",
+            id="memory-above-2-gib",
+        ),
+        pytest.param({"params": "m=65536,t=\u0663,p=4"}, _UNREADABLE, id="non-ascii-digit"),
+        pytest.param({"salt": "A" * 11 + "\x1b" + "A" * 10}, _UNREADABLE, id="control-character"),
+        pytest.param({"params": "m=65_536,t=3,p=4"}, _UNDECODABLE, id="underscore-in-number"),
+        pytest.param({"version": "v=+19"}, _UNDECODABLE, id="signed-version"),
+    ],
+)
+def test_ensure_admin_rejects_a_hash_argon2_cannot_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    edit: str | dict[str, str],
+    message: str,
+) -> None:
+    """A hash argon2 parses but cannot verify fails before the transaction, never echoed.
+
+    ``argon2.extract_parameters`` accepts every one of these values; stored, each would make
+    every sign-in fail and lock the single admin out.
+    """
+    opened: list[str] = []
+
+    def session_scope() -> None:
+        opened.append("session_scope")
+        raise AssertionError("ensure-admin opened its transaction for an invalid hash")
+
+    monkeypatch.setattr(db_session, "session_scope", session_scope)
+    value = edit if isinstance(edit, str) else _edited_hash(**edit)
+    monkeypatch.setenv("APP_ADMIN_PASSWORD_HASH", value)
+    get_settings.cache_clear()
+
+    assert cli.main(["ensure-admin"]) == cli.EXIT_FAILURE
+    captured = capsys.readouterr()
+    assert opened == []
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert len(lines) == 1, captured.err
+    assert lines[0].startswith("ads-engine: APP_ADMIN_PASSWORD_HASH ")
+    assert message in lines[0]
+    assert lines[0].endswith("; write it again with `ads-engine hash-password`")
+    assert value not in captured.err
+    for part in value.split("$"):
+        if len(part) >= 8:
+            assert part not in captured.err
+
+
 class _Result:
     """A stand-in for a SQLAlchemy result with the two reads ensure-admin makes."""
 
@@ -433,6 +756,53 @@ def test_ensure_admin_upserts_by_email_and_removes_other_logins(
     assert "ON CONFLICT (email) DO UPDATE SET password_hash = excluded.password_hash" in upsert
     assert "RETURNING app_user.id" in upsert
     assert removal.startswith("DELETE FROM app_user WHERE app_user.email != ")
+
+
+@pytest.mark.parametrize(
+    "hasher",
+    [
+        pytest.param(PasswordHasher(), id="hash-password-defaults"),
+        pytest.param(
+            PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1),
+            id="argon2id-t2-m19456-p1",
+        ),
+        pytest.param(PasswordHasher(type=Type.I), id="argon2i"),
+        pytest.param(PasswordHasher(type=Type.D), id="argon2d"),
+        pytest.param(
+            PasswordHasher(time_cost=1, memory_cost=8, parallelism=1, hash_len=4, salt_len=8),
+            id="libargon2-minimums",
+        ),
+        pytest.param(
+            PasswordHasher(time_cost=10, memory_cost=128, parallelism=16), id="time-and-lane-caps"
+        ),
+    ],
+)
+def test_ensure_admin_accepts_every_hash_argon2_verifies(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], hasher: PasswordHasher
+) -> None:
+    """Any argon2id, argon2i or argon2d hash within the supported range reaches the upsert.
+
+    ``make init`` writes the ``hash-password`` defaults, and ``api/security.py`` verifies every
+    argon2 type, so none of these may be refused.
+    """
+    password_hash = hasher.hash("pw")
+    monkeypatch.setenv("APP_ADMIN_PASSWORD_HASH", password_hash)
+    get_settings.cache_clear()
+    written: list[dict[str, Any]] = []
+
+    class Session:
+        async def execute(self, statement: Any) -> _Result:
+            written.append(statement.compile(dialect=postgresql.dialect()).params)
+            return _Result([7] if len(written) == 1 else [])
+
+    @asynccontextmanager
+    async def scope() -> AsyncIterator[Session]:
+        yield Session()
+
+    monkeypatch.setattr(db_session, "session_scope", scope)
+    assert cli.main(["ensure-admin"]) == cli.EXIT_OK
+    assert written[0]["password_hash"] == password_hash
+    assert password_hash not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

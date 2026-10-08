@@ -445,6 +445,53 @@ async def test_ensure_admin_creates_then_updates(
     assert PasswordHasher().verify(users[0].password_hash, "a different password")
 
 
+@pytest.mark.parametrize("form", ["all-zero", "salt-not-base64", "memory-above-cap"])
+async def test_ensure_admin_keeps_the_admin_when_the_hash_cannot_be_verified(
+    db: Sessions,
+    run_cli: RunCli,
+    admin_password_hash: str,
+    api_client: httpx.AsyncClient,
+    login: Login,
+    test_identity: Identity,
+    form: str,
+) -> None:
+    """An argon2 hash that parses but cannot verify fails without touching the stored admin.
+
+    Each value passes ``argon2.extract_parameters``; stored, it would make every sign-in fail
+    and lock the single admin out. ``ensure-admin`` exits 1 before its transaction, names the
+    problem without echoing the value, and the admin keeps its row and can still sign in. The
+    invalid values are built at run time from the session's hash, so no argon2 hash literal
+    is committed.
+    """
+    created = run_cli("ensure-admin")
+    assert created.returncode == 0, created.stderr
+    before = [(user.id, user.email, user.password_hash) for user in await _all(db, select(AppUser))]
+    assert [(email, password_hash) for _id, email, password_hash in before] == [
+        ("admin@example.com", admin_password_hash)
+    ]
+
+    empty, kind, version, params, salt, digest = admin_password_hash.split("$")
+    invalid = {
+        "all-zero": "$argon2id$v=19$m=0,t=0,p=0$$",
+        "salt-not-base64": "$".join([empty, kind, version, params, "!" * len(salt), digest]),
+        "memory-above-cap": "$".join([empty, kind, version, "m=2097153,t=3,p=4", salt, digest]),
+    }[form]
+    rejected = run_cli("ensure-admin", env={"APP_ADMIN_PASSWORD_HASH": invalid})
+
+    assert rejected.returncode == 1, rejected.stdout
+    assert rejected.stdout == ""
+    assert "APP_ADMIN_PASSWORD_HASH" in rejected.stderr
+    assert "`ads-engine hash-password`" in rejected.stderr
+    assert invalid not in rejected.stderr
+    for part in (params, salt, digest, "m=0,t=0,p=0", "m=2097153"):
+        assert part not in rejected.stderr
+    after = [(user.id, user.email, user.password_hash) for user in await _all(db, select(AppUser))]
+    assert after == before
+    assert PasswordHasher().verify(after[0][2], test_identity.password)
+    signed_in = await login(api_client, email=test_identity.email, password=test_identity.password)
+    assert signed_in.status_code == 200, signed_in.text
+
+
 @pytest.mark.parametrize("value", ["", "   ", None], ids=["empty", "whitespace", "unset"])
 async def test_ensure_admin_without_hash_fails_clearly(
     db: Sessions, run_cli: RunCli, value: str | None

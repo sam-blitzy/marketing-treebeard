@@ -102,7 +102,29 @@ class ConfigurationError(RuntimeError):
     Raised by :meth:`Settings.assert_safe_base_url` and :meth:`Settings.check_api_startup`.
     Parse-level problems (a malformed customer id, an unknown time zone) surface earlier,
     as :class:`pydantic.ValidationError` from :class:`Settings`.
+
+    Example::
+
+        try:
+            settings.check_api_startup()
+        except ConfigurationError as exc:
+            exc.fields  # ("session_secret",) when SESSION_SECRET is unset
+
+    Attributes:
+        fields: The :class:`Settings` fields at fault, by name and never by value, in the
+            form of a :class:`pydantic.ValidationError` ``loc``; each field reads the
+            environment variable of its upper-case name. Empty when the raiser names none.
     """
+
+    def __init__(self, message: str, *, fields: tuple[str, ...] = ()) -> None:
+        """Create the error.
+
+        Args:
+            message: What is wrong and how to fix it.
+            fields: The names of the :class:`Settings` fields at fault.
+        """
+        super().__init__(message)
+        self.fields = fields
 
 
 def _split_http_url(value: str) -> SplitResult | None:
@@ -539,11 +561,12 @@ class Settings(BaseSettings):
         must terminate TLS in front of nginx.
 
         Raises:
-            ConfigurationError: When the URL is plain ``http`` on a non-local host.
+            ConfigurationError: When the URL is plain ``http`` on a non-local host, with
+                ``fields`` ``("app_base_url",)``.
         """
         parts = urlsplit(self.app_base_url)
         if parts.scheme == "http" and parts.hostname not in _LOCAL_HOSTS:
-            raise ConfigurationError(_UNSAFE_BASE_URL_MESSAGE)
+            raise ConfigurationError(_UNSAFE_BASE_URL_MESSAGE, fields=("app_base_url",))
 
     def check_api_startup(self) -> None:
         """Check what the API needs before it serves a request.
@@ -553,11 +576,11 @@ class Settings(BaseSettings):
 
         Raises:
             ConfigurationError: When :meth:`assert_safe_base_url` fails, or
-                ``SESSION_SECRET`` is not set.
+                ``SESSION_SECRET`` is not set (``fields`` ``("session_secret",)``).
         """
         self.assert_safe_base_url()
         if self._missing_env_names(("session_secret",)):
-            raise ConfigurationError(_SESSION_KEY_UNSET_MESSAGE)
+            raise ConfigurationError(_SESSION_KEY_UNSET_MESSAGE, fields=("session_secret",))
 
 
 @functools.lru_cache(maxsize=1)

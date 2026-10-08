@@ -214,6 +214,10 @@ _RATE_DIGITS: Final = 4
 _PERCENT_PLACES: Final = 1
 """Decimal places of a displayed percentage."""
 
+_DASH: Final = "—"
+"""A cost/conversion whose known conversion count is 0 (AAP 0.5.4.3, 0.5.5): a zero denominator,
+never a finite value and never "unavailable", which is reserved for unreported conversions."""
+
 # ISO 4217 minor units, mirrored from ``ads_engine.decisions`` (outside this module's
 # dependency set) so evidence and reasons show money at the precision the account bills in.
 _ZERO_DECIMAL_CURRENCIES: Final[frozenset[str]] = frozenset(
@@ -756,14 +760,16 @@ def _common_metrics(
     term: str,
     spend: Decimal,
     conversions: Decimal | None,
-    cost_per_conversion: Decimal | None,
+    cost_per_conversion: Decimal | str | None,
     currency: str,
 ) -> list[Metric]:
     """Return the four fields every keyword item shows first, in the user's order.
 
     Term (or keyword text), spend, conversions and cost/conversion (AAP 0.5.4.3, "Each item
-    shows: term, spend, conversions, cost/conversion"). A ``None`` cost/conversion (0
-    conversions) renders "—"; ``None`` conversions mean the platform did not report them.
+    shows: term, spend, conversions, cost/conversion"). The cost/conversion comes from
+    :func:`_cost_per_conversion_value`: "—" at a known 0 conversions, ``None`` ("unavailable")
+    only when the conversions are unreported. ``None`` conversions mean the platform did not
+    report them.
     """
     return [
         Metric("term", term_label, term, "text"),
@@ -777,6 +783,25 @@ def _common_metrics(
             currency=currency,
         ),
     ]
+
+
+def _cost_per_conversion_value(
+    cost_per: Fraction | None, conversions: Decimal | None, currency: str
+) -> Decimal | str | None:
+    """Return a cost/conversion for display (AAP 0.5.4.3 "—" when conversions are 0, 0.5.5).
+
+    ``cost_per`` is the exact ``cost ÷ conversions`` (:func:`_cost_per`) and ``conversions``
+    the count it divides by. A known count of 0 gives "—", a zero denominator rendered as such
+    and never flagged unavailable; an unreported count (``None``) gives ``None``, which
+    :meth:`Metric.to_json` marks unavailable (AAP 0.11.1: absent values are ``None``).
+    Otherwise the exact cost/conversion at the currency's minor unit. Only the displayed value
+    is built here: every comparison keeps its exact :class:`~fractions.Fraction`.
+    """
+    if conversions is None:
+        return None
+    if conversions == 0:
+        return _DASH
+    return _optional_money(cost_per, currency)
 
 
 def _campaign_extra(
@@ -1101,7 +1126,9 @@ def _k1_candidate(
         term=row.search_term,
         spend=spend,
         conversions=_count(row.conversions),
-        cost_per_conversion=None,
+        cost_per_conversion=_cost_per_conversion_value(
+            _cost_per(row.cost, row.conversions), row.conversions, currency
+        ),
         currency=currency,
     )
     metrics += [
@@ -1819,9 +1846,10 @@ class _CpcRise:
         cpc_second: Second-half spend ÷ clicks.
         cpc_ratio: ``cpc_second ÷ cpc_first``; ``None`` when the first-half CPC is 0.
         cpa_first: First-half cost/conversion; ``None`` at 0 conversions or when the half's
-            conversions are unknown (any day unreported).
+            conversions are unknown (any day unreported). The evidence tells the two apart:
+            "—" at a known 0, unavailable when unknown (:func:`_cost_per_conversion_value`).
         cpa_second: Second-half cost/conversion; ``None`` at 0 conversions or when the half's
-            conversions are unknown (any day unreported).
+            conversions are unknown (any day unreported), shown the same way as ``cpa_first``.
         cpa_ratio: ``cpa_second ÷ cpa_first`` when both exist and ``cpa_first`` is positive;
             otherwise ``None`` (unavailable), so a zero-spend first half never divides by 0.
         conversions_fell: Second-half conversions are known to be 0 while the first half's
@@ -1992,7 +2020,9 @@ def _k3_candidate(
         term=keyword.text,
         spend=_money(whole.cost, currency),
         conversions=_optional_count(whole.conversions),
-        cost_per_conversion=_optional_money(_cost_per(whole.cost, whole.conversions), currency),
+        cost_per_conversion=_cost_per_conversion_value(
+            _cost_per(whole.cost, whole.conversions), whole.conversions, currency
+        ),
         currency=currency,
     )
     metrics += [
@@ -2017,14 +2047,14 @@ def _k3_candidate(
         Metric(
             "cost_per_conversion_first_half",
             "Cost/conversion, first half",
-            _optional_money(cpc.cpa_first, currency),
+            _cost_per_conversion_value(cpc.cpa_first, first.conversions, currency),
             "currency",
             currency=currency,
         ),
         Metric(
             "cost_per_conversion_second_half",
             "Cost/conversion, second half",
-            _optional_money(cpc.cpa_second, currency),
+            _cost_per_conversion_value(cpc.cpa_second, second.conversions, currency),
             "currency",
             currency=currency,
         ),

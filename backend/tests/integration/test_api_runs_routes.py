@@ -12,6 +12,8 @@ AAP 0.5.3 (``GET /runs/latest``, ``GET /runs/{id}``, ``GET /runs?kind=custom&lim
   ``run_in_progress`` and writes no run;
 * an end after the default end, an end before the start or a span above ``window.max_days``
   is a 422 carrying ``InvalidWindow``'s code, and no run is written;
+* a window date sent as a UNIX timestamp or a datetime string is a 422 ``validation_error``
+  naming the field, and no run is written, while the same dates as ``YYYY-MM-DD`` compute it;
 * a changed ``window.default_days`` shows in ``Run.default_days`` and in the default run;
 * every route needs a session (401) and ``POST /runs`` the CSRF header (403).
 
@@ -512,6 +514,51 @@ async def test_window_bounds_are_unprocessable(
         await _sign_in(client, email)
         _assert_error(await client.post(f"{API}/runs", json=body, headers=CSRF), 422, code)
     assert await _run_count() == 0
+
+
+@pytest.mark.anyio
+async def test_a_timestamp_or_datetime_window_date_is_a_validation_error(
+    app_db: str, thresholds: Thresholds
+) -> None:
+    email = await _seed()
+    start = DEFAULT_END - timedelta(days=22)
+    midnight = datetime(start.year, start.month, start.day, tzinfo=UTC)
+    # Every value names the start's UTC midnight, which lax date parsing would turn into
+    # ``start`` and so into a valid 23-day window.
+    refused: list[tuple[str, object]] = [
+        ("window_start", int(midnight.timestamp())),
+        ("window_start", str(int(midnight.timestamp()))),
+        ("window_start", float(midnight.timestamp())),
+        ("window_start", f"{start.isoformat()}T00:00:00"),
+        ("window_start", f"{start.isoformat()}T00:00:00Z"),
+        ("window_end", f"{DEFAULT_END.isoformat()}T00:00:00"),
+    ]
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        for field, value in refused:
+            body: dict[str, object] = {
+                "window_start": start.isoformat(),
+                "window_end": DEFAULT_END.isoformat(),
+                field: value,
+            }
+            response = await client.post(f"{API}/runs", json=body, headers=CSRF)
+            error = _assert_error(response, 422, "validation_error")
+            assert error["message"].startswith(f"body.{field}: "), (value, error)
+            assert '"YYYY-MM-DD"' in error["message"], (value, error)
+            assert str(value) not in error["message"], (value, error)
+        assert await _run_count() == 0
+
+        # The same dates as YYYY-MM-DD strings are a valid window, computed as usual.
+        created = await client.post(
+            f"{API}/runs",
+            json={"window_start": start.isoformat(), "window_end": DEFAULT_END.isoformat()},
+            headers=CSRF,
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["window_start"] == start.isoformat()
+        assert created.json()["window_end"] == DEFAULT_END.isoformat()
+        assert created.json()["days"] == 23
+    assert await _run_count() == 1
 
 
 @pytest.mark.anyio

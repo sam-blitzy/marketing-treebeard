@@ -1166,6 +1166,7 @@ def thresholds_with(
 
 _STAGE_DATE_PREFIX: Final = "hs_v2_date_entered_"
 _DATE_TYPES: Final[frozenset[str]] = frozenset({"date", "datetime"})
+_INSTANT_TYPE: Final = "datetime"
 
 
 def _resolve_binding(world: SimulatedWorld, binding: StageBinding) -> ResolvedBinding:
@@ -1212,7 +1213,11 @@ def _resolve_binding(world: SimulatedWorld, binding: StageBinding) -> ResolvedBi
 
 
 def _resolve_google_link(world: SimulatedWorld) -> GoogleCrmBinding:
-    """Verify the optional Google-to-CRM link of the world's portal (AAP 0.3.3)."""
+    """Verify the optional Google-to-CRM link of the world's portal (AAP 0.3.3).
+
+    As the client does, the touch-date property must be a ``datetime`` property: a ``date``
+    property's midnight would anchor the causal check before a same-day touch.
+    """
     properties = world.google_crm_properties
     if properties is None:
         return GoogleCrmBinding(
@@ -1225,8 +1230,13 @@ def _resolve_google_link(world: SimulatedWorld) -> GoogleCrmBinding:
     if world.hubspot_property("contacts", campaign) is None:
         problems.append(f"HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY property '{campaign}' not found")
     definition = world.hubspot_property("contacts", touch)
-    if definition is None or definition.type not in _DATE_TYPES:
-        problems.append(f"HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '{touch}' not usable")
+    if definition is None:
+        problems.append(f"HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '{touch}' not found")
+    elif definition.type != _INSTANT_TYPE:
+        problems.append(
+            f"HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property '{touch}' has type "
+            f"'{definition.type}', not a datetime property"
+        )
     if problems:
         return GoogleCrmBinding(
             available=False,

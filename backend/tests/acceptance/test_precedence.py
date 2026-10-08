@@ -141,6 +141,7 @@ from ads_engine.db.models.analysis import (
     RecommendationFeedback,
     RunSuppression,
 )
+from ads_engine.db.models.decisions import Discrepancy
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.scenarios import (
@@ -199,6 +200,15 @@ WINNER_WORDS = frozenset(
 
 FEEDBACK_DAYS: dict[FeedbackKind, int] = {"dismiss": 30, "snooze": 7, "done": 30}
 """AAP 0.5.2 ``recommendation_feedback`` durations; ``feedback.*_days`` must configure them."""
+
+ALLOCATION_SCENARIO = "b3.allocation.case"
+"""Two B3 donors free 300 and 200 against one receiver's B1 increase of 400 (AAP 0.11.2)."""
+
+STALE_AFTER_KEY = "sources.stale_after_hours"
+"""The threshold P4 judges each required dataset's age against (AAP 0.5.4.2 P4)."""
+
+TRUSTED_MIN_DAYS_KEY = "window.trusted_min_days"
+"""The threshold P5 judges the window's length against (AAP 0.5.4.1, 0.5.4.2 P5)."""
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +308,12 @@ def _campaigns_behind(ctx: AnalysisContext, candidate: Candidate) -> frozenset[i
 
 
 def _subjects_behind(ctx: AnalysisContext, candidate: Candidate) -> frozenset[SubjectKey]:
-    """The decision subjects an item rests on: its campaigns, their budgets, its own budget."""
+    """The decision subjects an item rests on: its campaigns, their budgets, its own budget.
+
+    A B1 or B3 card also rests on the allocation partners its ``extra.allocations`` names
+    (each donor funding a B1, each receiver a B3 funds): a campaign partner with its budget,
+    a budget partner with its member campaigns.
+    """
     subjects: set[SubjectKey] = set()
     for campaign_id in _campaigns_behind(ctx, candidate):
         subjects.add(("campaign", campaign_id))
@@ -308,6 +323,16 @@ def _subjects_behind(ctx: AnalysisContext, candidate: Candidate) -> frozenset[Su
     ref = candidate.entity_ref
     if ref.type == ENTITY_BUDGET and ref.id is not None:
         subjects.add(("budget", ref.id))
+    role = {B1: "donor", B3: "receiver"}.get(candidate.rule_id)
+    for entry in candidate.evidence.extra.get("allocations", ()) if role else ():
+        partner_type, partner_id = entry[role]["type"], entry[role]["id"]
+        subjects.add((partner_type, partner_id))
+        if partner_type == "budget":
+            subjects.update(
+                ("campaign", c.id) for c in ctx.campaigns.values() if c.budget_id == partner_id
+            )
+        elif (partner_budget := ctx.campaigns[partner_id].budget_id) is not None:
+            subjects.add(("budget", partner_budget))
     return frozenset(subjects)
 
 
@@ -362,6 +387,40 @@ def _window_lines(out: PrecedenceOutput, rule_id: str) -> list[Withheld]:
     ]
 
 
+def _assert_policy_thresholds_frozen(
+    ctx: AnalysisContext, out: PrecedenceOutput, *, stale_after_hours: int, trusted_min_days: int
+) -> None:
+    """Every item's evidence froze the P4 and P5 thresholds it was judged against (0.5.4.8).
+
+    Each item keeps exactly the thresholds its rule recorded, with their values and order,
+    followed by ``sources.stale_after_hours`` (every item here reads a dataset) and
+    ``window.trusted_min_days``, with the values given: "the thresholds applied", whether or
+    not the item came out stale or short.
+    """
+    recorded = {
+        (candidate.rule_id, candidate.entity_ref.type, candidate.entity_ref.key): (
+            candidate.evidence.thresholds
+        )
+        for result in _evaluate(ctx)
+        for candidate in result.candidates
+    }
+    items = _candidates(out)
+    assert items
+    for candidate in items:
+        what = f"{candidate.rule_id} {candidate.entity_ref.key}"
+        assert candidate.required_datasets, what
+        own = recorded[(candidate.rule_id, candidate.entity_ref.type, candidate.entity_ref.key)]
+        assert not {STALE_AFTER_KEY, TRUSTED_MIN_DAYS_KEY} & set(own), what
+        assert tuple(candidate.evidence.thresholds.items()) == (
+            *own.items(),
+            (STALE_AFTER_KEY, stale_after_hours),
+            (TRUSTED_MIN_DAYS_KEY, trusted_min_days),
+        ), what
+        rendered = candidate.evidence.to_json()["thresholds"]
+        assert rendered[STALE_AFTER_KEY] == stale_after_hours, what
+        assert rendered[TRUSTED_MIN_DAYS_KEY] == trusted_min_days, what
+
+
 def _all_sources_scenario() -> Scenario:
     """The historical-only scenario's world with a Google part added beside LinkedIn.
 
@@ -374,6 +433,30 @@ def _all_sources_scenario() -> Scenario:
     historical = _scenario("historical.activation.case")
     google = SCENARIOS["p3.simulated.case"].spec.google
     return replace(historical, spec=historical.spec.with_(google=google))
+
+
+def _allocation_parties() -> tuple[int, int, int]:
+    """``(donor freeing 300, donor freeing 200, receiver)`` of :data:`ALLOCATION_SCENARIO`."""
+    ids = SCENARIOS[ALLOCATION_SCENARIO].ids
+    return (
+        ids.id("linkedin", "campaign", "donor-a"),
+        ids.id("linkedin", "campaign", "donor-b"),
+        ids.id("linkedin", "campaign", "receiver"),
+    )
+
+
+def _funding_cards(out: PrecedenceOutput) -> dict[tuple[str, int], Candidate]:
+    """The B1 and B3 cards of a run, keyed by ``(rule, campaign id)``."""
+    return {
+        (candidate.rule_id, candidate.entity_ref.id): candidate
+        for candidate in _candidates(out, BUDGET)
+        if candidate.rule_id in (B1, B3) and candidate.entity_ref.id is not None
+    }
+
+
+def _frozen_subjects(candidate: Candidate) -> list[SubjectKey]:
+    """The subjects frozen in a candidate's ``evidence.extra.depends_on``, in stored order."""
+    return [(entry["type"], entry["id"]) for entry in candidate.evidence.extra["depends_on"]]
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +777,82 @@ def test_p1_a_shared_budget_is_held_by_a_discrepancy_on_it_or_on_a_member(
     assert not c0.held
 
 
+def test_p1_funding_cards_freeze_their_allocation_partners_for_the_overlay(
+    make_context: ContextFactory,
+) -> None:
+    """P1: a B3 card depends on the receiver it funds and a B1 on every donor funding it.
+
+    ``evidence.extra.depends_on`` is what the read-time overlay holds an item on, so each
+    donor's frozen list names the receiver its money moves to and the receiver's names both
+    donors, after the card's own campaign. The relationship is not transitive: a donor does
+    not depend on the other donor of the same receiver.
+    """
+    donor_a, donor_b, receiver = _allocation_parties()
+    out = _precede(make_context(ALLOCATION_SCENARIO))
+    assert [(a.donor, a.receiver) for a in out.allocations] == [
+        (("campaign", donor_a), ("campaign", receiver)),
+        (("campaign", donor_b), ("campaign", receiver)),
+    ]
+    cards = _funding_cards(out)
+    assert set(cards) == {(B1, receiver), (B3, donor_a), (B3, donor_b)}
+    for card in cards.values():
+        assert not card.held
+        assert _frozen_subjects(card) == [subject.key for subject in card.depends_on]
+
+    b1 = _frozen_subjects(cards[(B1, receiver)])
+    assert b1[0] == ("campaign", receiver)
+    assert {("campaign", donor_a), ("campaign", donor_b)} <= set(b1)
+    for donor, other in ((donor_a, donor_b), (donor_b, donor_a)):
+        frozen = _frozen_subjects(cards[(B3, donor)])
+        assert frozen[0] == ("campaign", donor)
+        assert ("campaign", receiver) in frozen
+        assert ("campaign", other) not in frozen
+
+
+@pytest.mark.parametrize("discrepant", ["receiver", "donor"])
+def test_p1_a_discrepancy_on_an_allocation_partner_holds_the_cards_it_funds_or_draws_on(
+    discrepant: str, make_context: ContextFactory
+) -> None:
+    """P1: a discrepant receiver holds both donor cards; a discrepant donor holds the B1.
+
+    In ``b3.allocation.case`` a ``status`` discrepancy on the receiver holds its B1 and both
+    B3 cards telling the user to move money to it; one on the 300 donor holds that donor's
+    card and the B1 it funds, while the other donor, which depends only on the receiver,
+    stays actionable. Each held card is held whole, with "Resolve discrepancy first" and the
+    blocking discrepancy, and keeps the allocation, amounts and wording it has without the
+    discrepancy: the allocation precedes the holds.
+    """
+    donor_a, donor_b, receiver = _allocation_parties()
+    base = make_context(ALLOCATION_SCENARIO)
+    partner = _precede(base)
+    unheld = _funding_cards(partner)
+    assert not any(card.held for card in unheld.values())
+
+    target = receiver if discrepant == "receiver" else donor_a
+    info = _status_discrepancy(
+        base, target, number=7, detected_at=base.now - timedelta(hours=5), state="open"
+    )
+    out = _precede(replace(base, discrepancies=(info,), cache={}))
+    assert out.allocations == partner.allocations
+    held = {(B1, receiver), (B3, donor_a)}
+    if discrepant == "receiver":
+        held.add((B3, donor_b))
+    cards = _funding_cards(out)
+    assert set(cards) == set(unheld)
+    for key, card in cards.items():
+        if key in held:
+            assert card.held, key
+            assert card.held_reason == HELD_DISCREPANCY_REASON, key
+            assert list(card.evidence.extra["blocking_discrepancies"]) == [info.id], key
+        else:
+            assert not card.held, key
+            assert card.held_reason is None, key
+            assert "blocking_discrepancies" not in card.evidence.extra, key
+        assert card.reason == unheld[key].reason, key
+        assert card.evidence.extra["allocations"] == unheld[key].evidence.extra["allocations"]
+        assert _frozen_subjects(card) == _frozen_subjects(unheld[key]), key
+
+
 def test_p1_scenario_holds_the_dependent_item_and_pins_the_exempt_discrepancy(
     make_context: ContextFactory,
 ) -> None:
@@ -801,6 +960,110 @@ async def test_p1_a_discrepancy_detected_after_the_run_holds_items_at_read_time(
     stored_after = {row.id: _frozen(row.evidence) for row in await _stored(db, run.id)}
     assert stored_after == stored_before
     assert all(not row.held for row in await _stored(db, run.id))
+
+
+@pytest.mark.parametrize("discrepant", ["receiver", "donor"])
+async def test_p1_a_discrepancy_on_an_allocation_partner_after_the_run_holds_at_read_time(
+    discrepant: str, db: async_sessionmaker[AsyncSession], make_context: ContextFactory
+) -> None:
+    """P1 at read time: a post-run discrepancy on an allocation partner holds the partner card.
+
+    A world bootstrapped from scratch has no budget history yet, so every budget rule is
+    withheld in its first run. The stored run is therefore ``b3.allocation.case``'s
+    precedence output, computed with no discrepancy and written row by row as the runner
+    writes it, on active datasets carrying the ids its provenance names. A ``status``
+    discrepancy raised afterwards on the receiver makes its B1 and both B3 cards funding it
+    ``held_now``; one on the 300 donor makes that card and the B1 it funds ``held_now``,
+    while the other donor stays actionable. The overlay counts the discrepancy at once, and
+    every stored card stays unheld with byte-identical evidence.
+    """
+    ctx = make_context(ALLOCATION_SCENARIO)
+    out = _precede(ctx)
+    funding = [item for item in out.items[BUDGET] if item.candidate.rule_id in (B1, B3)]
+    assert not any(item.candidate.held for item in funding)
+    donor_a, donor_b, receiver = _allocation_parties()
+    target = receiver if discrepant == "receiver" else donor_a
+    held = {(B1, receiver), (B3, donor_a)}
+    if discrepant == "receiver":
+        held.add((B3, donor_b))
+    provenance = {
+        (entry.source, entry.dataset_id, entry.mode, entry.role)
+        for item in funding
+        for entry in item.candidate.evidence.provenance
+    }
+    assert {source for source, *_ in provenance} == {"linkedin"}
+
+    async with db() as session, session.begin():
+        for source, dataset_id, mode, role in sorted(provenance):
+            session.add(
+                SourceDataset(
+                    id=dataset_id,
+                    source=source,
+                    mode=mode,
+                    state="active",
+                    role=role,
+                    activated_at=ctx.now - timedelta(days=1),
+                )
+            )
+        await session.flush()
+        run = AnalysisRun(
+            kind="default",
+            window_start=ctx.window.start,
+            window_end=ctx.window.end,
+            source_day_boundaries=[],
+            trigger="manual",
+            data_modes={},
+            dataset_ids={},
+            config_hash=ctx.thresholds.config_hash,
+            status="succeeded",
+            started_at=ctx.now,
+            finished_at=ctx.now + timedelta(minutes=1),
+        )
+        session.add(run)
+        await session.flush()
+        rows = [Recommendation(**runner._recommendation_row(run.id, item, {})) for item in funding]
+        session.add_all(rows)
+        await session.flush()
+        subjects = {row.id: (row.rule_id, row.decision_subject["id"]) for row in rows}
+    assert set(subjects.values()) == {(B1, receiver), (B3, donor_a), (B3, donor_b)}
+    stored_before = {row.id: _frozen(row.evidence) for row in await _stored(db, run.id)}
+
+    _, before = await _overlay_at(db, run, READ_AT, ctx.thresholds)
+    assert before.overlay.open_discrepancies == 0
+    for item_id in subjects:
+        assert before.items[item_id].held_now is False, subjects[item_id]
+        assert before.items[item_id].historical is False, subjects[item_id]
+
+    (dataset_id,) = {dataset_id for _, dataset_id, *_ in provenance}
+    async with db() as session, session.begin():
+        session.add(
+            Discrepancy(
+                source="linkedin",
+                dataset_id=dataset_id,
+                subject_type="campaign",
+                subject_id=target,
+                kind="status",
+                decided_value={"status": "active"},
+                platform_value={"status": "paused"},
+                detected_at=ctx.now + timedelta(minutes=30),
+                state="open",
+            )
+        )
+
+    _, after = await _overlay_at(db, run, READ_AT, ctx.thresholds)
+    assert after.overlay.open_discrepancies == 1
+    for item_id, key in subjects.items():
+        view = after.items[item_id]
+        assert view.historical is False, key
+        if key in held:
+            assert view.held_now is True, key
+            assert view.held_reason_now == HELD_DISCREPANCY_REASON, key
+        else:
+            assert view.held_now is False, key
+            assert view.held_reason_now is None, key
+    stored_after = await _stored(db, run.id)
+    assert {row.id: _frozen(row.evidence) for row in stored_after} == stored_before
+    assert all(not row.held for row in stored_after)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,7 +1377,7 @@ def test_p4_a_stale_required_dataset_flags_exactly_the_items_that_read_it(
 
 
 def test_p4_staleness_uses_the_configured_hours_the_window_end_and_own_datasets(
-    make_context: ContextFactory,
+    make_context: ContextFactory, make_thresholds: ThresholdsFactory
 ) -> None:
     """P4: "more than ``sources.stale_after_hours`` ago" or coverage short of the window end.
 
@@ -1125,9 +1388,16 @@ def test_p4_staleness_uses_the_configured_hours_the_window_end_and_own_datasets(
       fresh, because B3 does not read them;
     * exactly at the limit nothing is stale ("more than", not "at least");
     * metrics covering through the day before the window end make both stale, with the
-      shortfall named.
+      shortfall named;
+    * with ``sources.stale_after_hours`` raised by 12, search terms one hour beyond the
+      default limit are fresh again.
+
+    In every case each item's frozen evidence records the configured hours it was judged
+    against (24 by default, the raised value under the edited configuration) and the
+    ``window.trusted_min_days`` (14), stale or not (AAP 0.5.4.8 "the thresholds applied").
     """
-    hours = make_context("p4.stale.case").thresholds.int("sources.stale_after_hours")
+    hours = make_context("p4.stale.case").thresholds.int(STALE_AFTER_KEY)
+    assert hours == 24
     cases: tuple[tuple[dict[str, FreshnessOverride], set[str]], ...] = (
         (
             {
@@ -1157,12 +1427,24 @@ def test_p4_staleness_uses_the_configured_hours_the_window_end_and_own_datasets(
         assert {K1, B3} <= rules, overrides
         stale = {c.rule_id for c in _candidates(out) if c.has_flag(FLAG_STALE)}
         assert stale == expected, overrides
+        assert ctx.window.trusted_min_days == 14
+        _assert_policy_thresholds_frozen(ctx, out, stale_after_hours=hours, trusted_min_days=14)
         if "google.metrics_daily" in overrides:
             for candidate in _candidates(out):
                 message = _flag_message(candidate, FLAG_STALE)
                 assert message is not None
                 end = ctx.window.end - timedelta(days=1)
                 assert f"google.metrics_daily covers through {end.isoformat()}" in message
+
+    raised = make_thresholds({STALE_AFTER_KEY: hours + 12})
+    assert raised.int(STALE_AFTER_KEY) == hours + 12
+    late = FreshnessOverride("complete", last_success_offset_hours=-(hours + 1))
+    world = _variant("p4.stale.case", freshness={"google.search_terms": late})
+    ctx = make_context(world, thresholds=raised)
+    out = _precede(ctx)
+    assert {K1, B3} <= {candidate.rule_id for candidate in _candidates(out)}
+    assert not any(candidate.has_flag(FLAG_STALE) for candidate in _candidates(out))
+    _assert_policy_thresholds_frozen(ctx, out, stale_after_hours=hours + 12, trusted_min_days=14)
 
 
 def test_p4_an_incomplete_required_dataset_flags_exactly_the_items_that_read_it(
@@ -1308,7 +1590,9 @@ def test_p5_the_short_window_flag_uses_the_configured_trusted_minimum(
     """P5: with ``window.trusted_min_days: 21`` a 20-day window is short and a 21-day one is not.
 
     Every item of the 20-day run carries ``short_window`` with the configured values in its
-    message, never literals; the 21-day twin under the same configuration flags nothing.
+    message, never literals; the 21-day twin under the same configuration flags nothing. Both
+    runs freeze the applied minimum, 21, into every item's evidence, short or not, beside the
+    default ``sources.stale_after_hours`` (24) of P4 (AAP 0.5.4.8 "the thresholds applied").
     """
     scenario = _scenario("p5.configured_min.case")
     values = scenario.expect.values
@@ -1324,6 +1608,8 @@ def test_p5_the_short_window_flag_uses_the_configured_trusted_minimum(
         assert _flag_message(item.candidate, FLAG_SHORT_WINDOW) == (
             "Window of 20 days is below the 21-day trusted minimum"
         )
+    assert config.int(STALE_AFTER_KEY) == 24
+    _assert_policy_thresholds_frozen(short, out, stale_after_hours=24, trusted_min_days=21)
 
     trusted = make_context(_variant(scenario.name, window=(-21, -1)), thresholds=config)
     assert trusted.window.days == 21
@@ -1331,6 +1617,7 @@ def test_p5_the_short_window_flag_uses_the_configured_trusted_minimum(
     out = _precede(trusted)
     assert _candidates(out, KEYWORDS, K1)
     assert not any(item.candidate.has_flag(FLAG_SHORT_WINDOW) for item in out.all_items())
+    _assert_policy_thresholds_frozen(trusted, out, stale_after_hours=24, trusted_min_days=21)
 
 
 async def test_p5_the_short_window_banner_uses_the_configured_trusted_minimum(
@@ -1344,7 +1631,8 @@ async def test_p5_the_short_window_banner_uses_the_configured_trusted_minimum(
     The banner is built at read time from the run and the configured minimum, never a
     literal: "Window of 20 days is below the 21-day trusted minimum", and every stored item of
     that run carries the ``short_window`` flag. The 21-day run under the same configuration
-    has neither banner nor flag.
+    has neither banner nor flag. Both runs store the applied minimum, 21, and P4's
+    ``sources.stale_after_hours`` (24) in every item's frozen evidence.
     """
     scenario = _scenario("p5.configured_min.case")
     config = make_thresholds({"window.trusted_min_days": 21})
@@ -1354,6 +1642,10 @@ async def test_p5_the_short_window_banner_uses_the_configured_trusted_minimum(
         run = await _custom_run(days, thresholds=config)
         rows, result = await _overlay_at(db, run, READ_AT, config)
         assert [row.rule_id for row in rows if row.rule_id == K1], days
+        for row in rows:
+            stored = row.evidence["thresholds"]
+            assert stored[TRUSTED_MIN_DAYS_KEY] == config.trusted_min_days == 21, row.rule_id
+            assert stored[STALE_AFTER_KEY] == config.int(STALE_AFTER_KEY) == 24, row.rule_id
         banner = next((b for b in result.banners if b.code == BANNER_SHORT_WINDOW), None)
         flagged = [FLAG_SHORT_WINDOW in row.flags for row in rows]
         if short:

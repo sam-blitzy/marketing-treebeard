@@ -15,7 +15,10 @@
  *    follow, collapsed behind a "Held until discrepancies are resolved" disclosure (AAP 0.5.5
  *    "Placement of items that must be resolved first"); cards hidden by feedback are counted,
  *    never rendered (AAP 0.3.2: `current.held_now` and `current.hidden_by` are read live);
- * 4. an `EmptyState` with its reason when no group has a card to show (AAP 0.5.5);
+ * 4. an `EmptyState` with its reason when no group has a card to show (AAP 0.5.5): the cards
+ *    feedback has hidden since the run, the run's suppression counts, the first withheld lines
+ *    and the finding messages, so a section emptied by feedback or suppression says so. "No rule
+ *    fired for this window" is reserved for a section with none of these;
  * 5. the patterns withheld for sample size, with observed and required sizes (AAP 0.5.4.2 P6);
  * 6. the counts of what the run did not show, by suppression reason (`run_suppression`,
  *    AAP 0.5.4.2), plus the cards hidden by feedback given since the run.
@@ -362,7 +365,9 @@ export function FieldList({ fields, label }: FieldListProps): ReactElement | nul
  * - `g1_blocked`: spend increases removed by the G1 guard;
  * - `tracking_absent`: zero-outcome rules suppressed by the P2 tracking finding.
  *
- * A line reads "{count} {label}", for example "2 dismissed".
+ * A line reads "{count} {label}", for example "2 dismissed". A label that names a plural noun
+ * has a singular form in {@link SUPPRESSION_SINGULAR_LABELS}, which a count of exactly 1 uses
+ * instead: "1 spend increase blocked by the high-utilization guard".
  */
 export const SUPPRESSION_LABELS: Readonly<Record<string, string>> = Object.freeze({
   feedback_dismiss: 'dismissed',
@@ -370,6 +375,15 @@ export const SUPPRESSION_LABELS: Readonly<Record<string, string>> = Object.freez
   feedback_done: 'marked done',
   g1_blocked: 'spend increases blocked by the high-utilization guard',
   tracking_absent: 'suppressed until tracking is verified',
+});
+
+/**
+ * The singular form of each {@link SUPPRESSION_LABELS} label that names a plural noun, used for
+ * a count of exactly 1. Only `g1_blocked` has one: every other label ("dismissed", "snoozed",
+ * "marked done", "suppressed until tracking is verified") reads correctly at any count.
+ */
+const SUPPRESSION_SINGULAR_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  g1_blocked: 'spend increase blocked by the high-utilization guard',
 });
 
 /**
@@ -385,6 +399,32 @@ export function suppressionLabel(reason: string): string {
   return Object.hasOwn(SUPPRESSION_LABELS, reason)
     ? (SUPPRESSION_LABELS[reason] ?? reason)
     : reason;
+}
+
+/**
+ * The suppression counts a section reports: each `[reason, count]` entry of `suppressed` whose
+ * count is finite and positive, in API order. The "Not shown" list and the empty-state reason
+ * both read this one result, so they never disagree.
+ */
+function reportedSuppressions(section: Section): [string, number][] {
+  return Object.entries(section.suppressed).filter(
+    ([, count]) => Number.isFinite(count) && count > 0,
+  );
+}
+
+/**
+ * One suppression count as a line, "{count} {label}", for example "2 dismissed". A count of
+ * exactly 1 takes the reason's singular label when {@link SUPPRESSION_SINGULAR_LABELS} has one
+ * ("1 spend increase blocked by the high-utilization guard"); every other count, and every
+ * reason without a singular form, takes {@link suppressionLabel}. Only the singular map's own
+ * keys match, so a key such as `constructor` is not read from the object prototype.
+ */
+function suppressionLine(reason: string, count: number): string {
+  const label =
+    count === 1 && Object.hasOwn(SUPPRESSION_SINGULAR_LABELS, reason)
+      ? (SUPPRESSION_SINGULAR_LABELS[reason] ?? suppressionLabel(reason))
+      : suppressionLabel(reason);
+  return `${formatCount(count)} ${label}`;
 }
 
 /**
@@ -460,8 +500,17 @@ const EMPTY_REASON_WITHHELD_LINES = 3;
 /** The empty-state title of a section with no card to show. */
 const EMPTY_TITLE = 'No actions in this section';
 
-/** The empty-state reason when nothing was withheld and no finding was recorded. */
+/**
+ * The empty-state reason of a genuinely empty section: no card hidden by feedback since the run,
+ * no suppression count, nothing withheld and no finding.
+ */
 const EMPTY_NO_REASON = 'No rule fired for this window';
+
+/**
+ * The empty-state reason for items feedback given since the run hides now, after their count:
+ * "{n} hidden by feedback since this run (dismissed, snoozed or done)".
+ */
+const EMPTY_HIDDEN_REASON = 'hidden by feedback since this run (dismissed, snoozed or done)';
 
 /** Returns `text` trimmed, or `fallback` when it is not a string or holds only whitespace. */
 function textOr(text: unknown, fallback: string): string {
@@ -506,15 +555,33 @@ function buildGroupParts(
 }
 
 /**
- * The reason lines of an empty section: the first withheld lines, then the finding messages,
- * all as the API wrote them. Empty when the section recorded neither.
+ * The reason lines of an empty section, in this order:
+ *
+ * 1. "{n} hidden by feedback since this run (dismissed, snoozed or done)", when `hiddenTotal`
+ *    is positive;
+ * 2. one "{count} {label}" line per entry of `suppressions`, in API order;
+ * 3. the first withheld lines, as the API wrote them;
+ * 4. the finding messages, as the API wrote them.
+ *
+ * Empty only when the section has none of these, which is when no rule fired for the window.
+ *
+ * @param section - the section, as the API returned it
+ * @param hiddenTotal - how many of the section's items feedback hides now
+ * @param suppressions - the section's {@link reportedSuppressions}
+ * @returns the lines, possibly none
  */
-function emptyReasonLines(section: Section): string[] {
+function emptyReasonLines(
+  section: Section,
+  hiddenTotal: number,
+  suppressions: readonly [string, number][],
+): string[] {
+  const hidden = hiddenTotal > 0 ? [`${formatCount(hiddenTotal)} ${EMPTY_HIDDEN_REASON}`] : [];
+  const suppressed = suppressions.map(([reason, count]) => suppressionLine(reason, count));
   const withheld = section.withheld.slice(0, EMPTY_REASON_WITHHELD_LINES).map(withheldLine);
   const findings = section.findings
     .map((finding) => textOr(finding.message, ''))
     .filter((message) => message !== '');
-  return [...withheld, ...findings];
+  return [...hidden, ...suppressed, ...withheld, ...findings];
 }
 
 /**
@@ -529,8 +596,10 @@ function emptyReasonLines(section: Section): string[] {
  *    ones). A group with neither is left out unless `renderEmptyGroup` supplies content for it.
  *    With `renderGroups`, its output replaces this whole step;
  * 4. when no group has a visible or held item, an `EmptyState` "No actions in this section"
- *    whose reason is the first three withheld lines and the finding messages, or "No rule fired
- *    for this window" when there are none;
+ *    whose reason states why: "{n} hidden by feedback since this run (dismissed, snoozed or
+ *    done)" when feedback hides items now, one "{count} {label}" line per suppression reason in
+ *    API order, the first three withheld lines and the finding messages. "No rule fired for
+ *    this window" appears only when there are none of these;
  * 5. the `WithheldList` of the section's withheld patterns;
  * 6. a list named "Not shown": one "{count} {label}" line per suppression reason, in API order,
  *    and "{n} hidden since this run" for items feedback hides now. Nothing when both are empty.
@@ -600,10 +669,8 @@ export function SectionFrame({
     });
   }
 
-  const reasonLines = anyShown ? [] : emptyReasonLines(section);
-  const suppressed = Object.entries(section.suppressed).filter(
-    ([, count]) => Number.isFinite(count) && count > 0,
-  );
+  const suppressed = reportedSuppressions(section);
+  const reasonLines = anyShown ? [] : emptyReasonLines(section, hiddenTotal, suppressed);
 
   return (
     <PageShell.Section id={sectionAnchorId(section.key)} title={textOr(section.title, section.key)}>
@@ -638,7 +705,7 @@ export function SectionFrame({
         {suppressed.length > 0 || hiddenTotal > 0 ? (
           <Stack as="ul" gap={1} aria-label="Not shown">
             {suppressed.map(([reason, count]) => (
-              <li key={reason}>{`${formatCount(count)} ${suppressionLabel(reason)}`}</li>
+              <li key={reason}>{suppressionLine(reason, count)}</li>
             ))}
             {hiddenTotal > 0 ? (
               <li key="hidden-since-run">{`${formatCount(hiddenTotal)} hidden since this run`}</li>

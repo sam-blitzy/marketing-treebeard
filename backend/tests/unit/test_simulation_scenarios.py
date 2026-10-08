@@ -1371,14 +1371,28 @@ def test_resolve_bindings_verifies_the_google_link() -> None:
     assert broken.campaign_property == "google_campaign_id"
     assert broken.reason == (
         "HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY property 'google_campaign_id' not found; "
-        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_ads_touch_at' not usable"
+        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_ads_touch_at' not found"
     )
     text_touch = PropertyRecord("contacts", "google_ads_touch_at", "Touch", "string", "text")
     typed = _HiddenPortal(
         spec, {"google_ads_touch_at": text_touch}, google_crm_properties=properties
     )
     assert resolve_bindings(typed, Thresholds.load(), FIXED_NOW).google.reason == (
-        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_ads_touch_at' not usable"
+        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_ads_touch_at' has type 'string', "
+        "not a datetime property"
+    )
+    # A day without a time reads as midnight UTC and would anchor the causal check before a
+    # same-day touch, so a `date` property leaves the link unavailable too.
+    date_touch = PropertyRecord("contacts", "google_ads_touch_at", "Touch", "date", "date")
+    dated = _HiddenPortal(
+        spec, {"google_ads_touch_at": date_touch}, google_crm_properties=properties
+    )
+    day_only = resolve_bindings(dated, Thresholds.load(), FIXED_NOW).google
+    assert not day_only.available
+    assert (day_only.campaign_property, day_only.touch_date_property) == properties
+    assert day_only.reason == (
+        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY property 'google_ads_touch_at' has type 'date', "
+        "not a datetime property"
     )
 
 

@@ -482,8 +482,9 @@ export interface KeywordFields {
   /** Window conversions (`conversions`), fractional under data-driven attribution. */
   readonly conversions: Metric | null;
   /**
-   * Cost per conversion (`cost_per_conversion`). Its value is `null` at 0 conversions; keep it a
-   * metric so the section renders "—" there.
+   * Cost per conversion (`cost_per_conversion`). Its value is "—" at a known 0 conversions (a
+   * zero denominator, not flagged unavailable) and `null` with `unavailable` set only when the
+   * conversions are unreported; keep it a metric so the section renders either as sent.
    */
   readonly costPerConversion: Metric | null;
 }
@@ -1294,9 +1295,18 @@ function countCell(key: WhitePaperMetricKey, label: string, raw: unknown): Metri
 }
 
 /**
- * A per-creative cost cell from a `CostValue` JSON (`{value, ceiling, note, unavailable}`):
- * "unavailable" for an unavailable denominator, "—" for a known zero denominator, else the
- * amount, marked as a ceiling ("≤ X") under a floor.
+ * A per-creative cost cell from a `CostValue` JSON (`{value, ceiling, note, unavailable}`).
+ * Only the backend's own shapes read as known, so unknown data never passes for a known zero
+ * (AAP 0.11.1):
+ *
+ * - an amount (`value` a decimal string, `unavailable` not `true`): the amount, marked as a
+ *   ceiling ("≤ X") when `ceiling` is `true`;
+ * - a known zero denominator (`value: null`, `unavailable: false`, `ceiling` not `true`): "—";
+ * - anything else is "unavailable": `unavailable: true`, a missing `value`, a value that is not
+ *   a decimal string, a ceiling without a value, or a `null` value without an explicit
+ *   `unavailable: false`.
+ *
+ * `null` when `raw` is not an object.
  */
 function costCell(
   key: WhitePaperMetricKey,
@@ -1311,11 +1321,14 @@ function costCell(
   if (raw.unavailable === true) {
     return { ...base, value: null, floor: null, unavailable: true };
   }
-  const amount = readMoney(raw.value);
-  if (amount === null) {
+  const amount = typeof raw.value === 'string' ? readMoney(raw.value) : null;
+  if (amount !== null) {
+    return { ...base, value: amount, floor: raw.ceiling === true, unavailable: false };
+  }
+  if (raw.value === null && raw.unavailable === false && raw.ceiling !== true) {
     return { ...base, value: EM_DASH, floor: false, unavailable: false };
   }
-  return { ...base, value: amount, floor: raw.ceiling === true, unavailable: false };
+  return { ...base, value: null, floor: null, unavailable: true };
 }
 
 /** A per-creative spend cell; spend is always an amount in the row's currency. */

@@ -2,9 +2,10 @@
 
 /*
  * Vertical layout primitive. Stack.tsx renders one element (div, ul, ol or section) carrying
- * ds-stack, exactly one ds-stack--gap-{1..8} modifier (default 4) and, when its align prop is
- * set, one ds-stack--align-{start|center|end|stretch} modifier. Feature code writes no flex or
- * grid CSS of its own: it spaces and aligns content only through Stack, Inline and Grid.
+ * ds-stack, exactly one ds-stack--gap-{1..8} modifier (default 4), when its align prop is set,
+ * one ds-stack--align-{start|center|end|stretch} modifier and, when its breakLongWords prop is
+ * true, the ds-stack--break-long-words modifier. Feature code writes no flex or grid CSS of its
+ * own: it spaces and aligns content only through Stack, Inline and Grid.
  *
  * Plain global CSS with the ds- prefix and BEM modifiers, like every stylesheet in this folder.
  * Every spacing value is a token from ../tokens.css, so binding Blitzy OS spacing touches
@@ -75,6 +76,18 @@
 
 .ds-stack--align-stretch {
   align-items: stretch;
+}
+
+/*
+ * Long words (breakLongWords): long unbroken text such as URNs, search terms, dataset names or
+ * threshold keys breaks at any point, so it wraps inside the column instead of widening the
+ * layout past a narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). overflow-wrap is anywhere, not
+ * break-word, because only anywhere lowers the min-content size of the text's box, which is what
+ * lets a flex item, such as an item of a nested Inline row, shrink to fit its line, as in
+ * Badge.css. overflow-wrap is inherited, so every descendant gets it.
+ */
+.ds-stack--break-long-words {
+  overflow-wrap: anywhere;
 }
 
 /*
