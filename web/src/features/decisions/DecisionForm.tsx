@@ -27,9 +27,12 @@
  *   and `"120.00"` are equal and no binary float ever touches an amount.
  * - **Precision follows the source.** As the server's `sub_minor_unit` rule does (AAP 0.5.2),
  *   a Google amount may carry a whole number of micros, six decimal places, whatever its
- *   currency, and any other amount stops at the currency's minor unit. The input's step follows
- *   the same rule. Amounts are shown padded to the currency's minor unit, and finer digits are
- *   never rounded away, so an unchanged micro amount is posted exactly as the API sent it.
+ *   currency, and any other amount stops at the currency's minor unit. Precision is judged on
+ *   the amount's value: trailing zeroes are accepted, so `"12.3400"` USD is cent precision and
+ *   is posted as typed, and only a non-zero digit beyond those places is refused. The input's
+ *   step follows the same rule. Amounts are shown padded to the currency's minor unit, and
+ *   finer digits are never rounded away, so an unchanged micro amount is posted exactly as the
+ *   API sent it.
  * - **Errors are the API's.** 422 messages are shown as returned. A 409 `subject_retired`
  *   locks the form for as long as it records about that subject (AAP 0.3.2), and a 409
  *   `discrepancy_resolved` reads "Already resolved". Error banners never take `role="alert"`,
@@ -336,9 +339,11 @@ function toInputAmount(value: Money, digits: number): string {
  * (AAP 0.5.2) still apply on top of these.
  *
  * The API requires a positive amount (`invalid_amount`), so zero is refused here as well, with
- * its own message, beyond the non-negative pattern. Digits beyond `places` are refused as the
- * server's `sub_minor_unit` would refuse them: "Use at most 6 decimal places" for a Google
- * amount finer than a micro, the currency's minor unit for any other.
+ * its own message, beyond the non-negative pattern. Precision is judged on the amount's value,
+ * its canonical digits ({@link normaliseDecimal}), as the server's `sub_minor_unit` rule judges
+ * it: trailing zeroes are accepted however many there are, so `"12.3400"` USD passes, and only a
+ * non-zero digit beyond `places` is refused, so `"12.3401"` USD reads "Use at most 2 decimal
+ * places" and a Google amount finer than a micro reads "Use at most 6 decimal places".
  *
  * @param value - The amount as typed.
  * @param places - The most decimal places accepted: the `places` of the subject's
@@ -353,7 +358,7 @@ function amountError(value: string, places: number): string | null {
   if (!AMOUNT_PATTERN.test(trimmed)) {
     return 'Enter a non-negative amount';
   }
-  if (fractionDigits(trimmed) > places) {
+  if (fractionDigits(normaliseDecimal(trimmed)) > places) {
     return places === 0
       ? 'Use a whole amount, with no decimal places'
       : `Use at most ${places} decimal ${places === 1 ? 'place' : 'places'}`;
