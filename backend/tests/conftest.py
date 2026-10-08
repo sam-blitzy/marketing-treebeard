@@ -44,12 +44,14 @@ import importlib
 import inspect
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tomllib
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -57,6 +59,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 import httpx
 import pytest
+import structlog
 import yaml
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import URL, make_url
@@ -695,16 +698,20 @@ async def api_client(
     A fresh ``create_app()`` per test means a fresh in-memory login rate limiter. The app is
     built after the environment baseline is in place, so it reads the test settings.
     ``ASGITransport`` runs no lifespan; the engine is disposed by :func:`db`. Tests of 401 and
-    403 responses use this client directly.
+    403 responses use this client directly. ``create_app()`` configures logging, so it runs
+    with structlog's logger caching switched off afterwards (:func:`_without_logger_caching`)
+    and logging is restored to its pre-test state on teardown (:func:`_restored_logging`).
     """
     del db  # Requested for the emptied database and the per-test engine lifecycle.
     from ads_engine.api.app import create_app
 
-    app = create_app()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://localhost"
-    ) as client:
-        yield client
+    with _restored_logging():
+        app = create_app()
+        _without_logger_caching()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+        ) as client:
+            yield client
 
 
 type LoginFunction = Callable[..., Awaitable[httpx.Response]]
@@ -1302,6 +1309,88 @@ def live_credentials(set_env: Callable[..., None]) -> Callable[[Source], Mapping
 # ---------------------------------------------------------------------------------------------
 
 
+@contextmanager
+def _restored_logging() -> Iterator[None]:
+    """Put back, on exit, the global logging state ``configure_logging`` replaces.
+
+    Saved on entry and restored on exit, whatever happens inside, with the same steps as the
+    autouse ``isolated_logging`` fixtures of ``tests/unit/test_logging.py`` and
+    ``tests/unit/test_cli.py``: the root handlers and level; the level, handlers and
+    propagation of the quiet and routed third-party loggers; the structlog configuration (or
+    its defaults, when it was never configured); the active redactor and installed handler,
+    and that handler's stream and formatter, which ``configure_logging`` swaps in place; and
+    ``logging.lastResort``. The structlog context is cleared, pytest's own root handlers are
+    re-attached, and a handler installed inside is removed and closed. Later tests therefore
+    log exactly as before, and no root handler is left writing to a stream pytest has closed.
+    """
+    import ads_engine.logging as ads_logging
+
+    root = logging.getLogger()
+    root_handlers = list(root.handlers)
+    root_level = root.level
+    named: dict[str, tuple[int, list[logging.Handler], bool]] = {}
+    for name in (*ads_logging._QUIET_LOGGERS, *ads_logging._ROUTED_LOGGERS):
+        logger = logging.getLogger(name)
+        named[name] = (logger.level, list(logger.handlers), logger.propagate)
+    structlog_was_configured = structlog.is_configured()
+    structlog_config = structlog.get_config()
+    state = ads_logging._STATE
+    saved_redactor, saved_handler = state.redactor, state.handler
+    saved_last_resort = logging.lastResort
+    saved_output = (
+        (saved_handler.stream, saved_handler.formatter) if saved_handler is not None else None
+    )
+    try:
+        yield
+    finally:
+        structlog.contextvars.clear_contextvars()
+        logging.lastResort = saved_last_resort
+        if saved_handler is not None and saved_output is not None:
+            saved_stream, saved_formatter = saved_output
+            try:
+                saved_handler.setStream(saved_stream)
+            except OSError, ValueError:
+                # The stream used meanwhile is closed and cannot be flushed; it is replaced
+                # anyway, as configure_logging itself does.
+                saved_handler.stream = saved_stream
+            saved_handler.setFormatter(saved_formatter)
+        installed = state.handler
+        if installed is not None and installed is not saved_handler:
+            root.removeHandler(installed)
+            installed.close()
+        for handler in root_handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(root_level)
+        for name, (level, handlers, propagate) in named.items():
+            logger = logging.getLogger(name)
+            for handler in list(logger.handlers):
+                if handler not in handlers:
+                    logger.removeHandler(handler)
+            for handler in handlers:
+                if handler not in logger.handlers:
+                    logger.addHandler(handler)
+            logger.setLevel(level)
+            logger.propagate = propagate
+        if structlog_was_configured:
+            structlog.configure(**structlog_config)
+        else:
+            structlog.reset_defaults()
+        state.redactor, state.handler = saved_redactor, saved_handler
+
+
+def _without_logger_caching() -> None:
+    """Switch structlog's logger caching off, keeping the rest of its configuration.
+
+    ``configure_logging`` turns caching on, so a module-level logger first used under it would
+    keep that configuration's processors for the rest of the session and bypass every later
+    configuration, including ``structlog.testing.capture_logs`` in other test modules, which
+    would then record nothing from it. Uncached, a logger reads the current configuration on
+    every call, so a configuration made for one test ends with :func:`_restored_logging`.
+    """
+    structlog.configure(cache_logger_on_first_use=False)
+
+
 class CapturedLogs:
     """The JSON log lines written while the fixture is active.
 
@@ -1309,7 +1398,8 @@ class CapturedLogs:
     installed and removes every other root handler), so pointing it at this buffer captures
     every structlog event and standard-library record, redacted exactly as in production.
     ``create_app()`` reconfigures logging to stdout; a test that builds an application after
-    this fixture calls :meth:`configure` again.
+    this fixture calls :meth:`configure` again. Each configuration leaves structlog's logger
+    caching off, so no module logger keeps this test's processors after the test.
 
     Example::
 
@@ -1322,10 +1412,15 @@ class CapturedLogs:
         self.stream = io.StringIO()
 
     def configure(self, *, settings: Settings | None = None, level: str = "INFO") -> None:
-        """(Re)configure logging onto the buffer; ``settings`` name the secrets to redact."""
+        """(Re)configure logging onto the buffer; ``settings`` name the secrets to redact.
+
+        structlog's logger caching is switched off right after (see
+        :func:`_without_logger_caching`), so the configuration ends with the fixture.
+        """
         from ads_engine.logging import configure_logging
 
         configure_logging(stream=self.stream, level=level, settings=settings)
+        _without_logger_caching()
 
     @property
     def text(self) -> str:
@@ -1359,19 +1454,19 @@ class CapturedLogs:
 
 @pytest.fixture
 def captured_logs() -> Iterator[CapturedLogs]:
-    """Capture the product's JSON log lines; logging is restored to stdout afterwards.
+    """Capture the product's JSON log lines; logging is restored to its pre-test state afterwards.
 
     Configured with the current (isolated) settings; call ``.configure(settings=...)`` to
     redact other secrets. Used by the redaction checks of the API and connector tests.
+    Every configuration runs with structlog's logger caching off, so no module logger first
+    used during the test keeps its processors; on teardown :func:`_restored_logging` puts the
+    previous handlers, levels, structlog configuration and redactor back, so later tests'
+    ``structlog.testing.capture_logs`` and logging fixtures see logging as it was.
     """
-    from ads_engine.logging import configure_logging
-
-    captured = CapturedLogs()
-    captured.configure()
-    try:
+    with _restored_logging():
+        captured = CapturedLogs()
+        captured.configure()
         yield captured
-    finally:
-        configure_logging()
 
 
 # ---------------------------------------------------------------------------------------------

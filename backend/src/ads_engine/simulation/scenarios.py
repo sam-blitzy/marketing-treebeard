@@ -5820,22 +5820,47 @@ def _funnel_days(
 _BASELINE_FUNNEL: Final = _funnel_days(100_000, 1_500, 1_000, 200)
 """The account-baseline campaign's single creative: click 1.5%, open 1%, completion 20%."""
 
+_LEAD_GEN_OBJECTIVE: Final = "LEAD_GENERATION"
+
+
+def _site_days(impressions: int, clicks: int, website_conversions: int) -> ExplicitDays:
+    """A landing-page creative's window totals (no lead form) spread over the default window."""
+    return _spread(
+        _WINDOW,
+        cost=str(Decimal(impressions) / 100),
+        impressions=impressions,
+        clicks=clicks,
+        website_conversions=website_conversions,
+    )
+
 
 def _creative_world(
     name: str,
     variants: Sequence[tuple[str, ExplicitDays]],
     *,
     baseline: ExplicitDays | None = _BASELINE_FUNNEL,
+    objective: str = _LEAD_GEN_OBJECTIVE,
 ) -> WorldSpec:
-    """A lead-gen campaign with the given variants, beside a one-creative baseline campaign."""
-    campaigns = [_li_campaign("li-copy", "Pipeline Report - Copy tests", daily="2000.00")]
+    """A campaign with the given variants, beside a one-creative baseline campaign.
+
+    Both campaigns share ``objective``, so the account baseline pools the same objective
+    group. Outside lead gen the creatives are landing-page creatives (no lead form).
+    """
+    lead_gen = objective == _LEAD_GEN_OBJECTIVE
+    form = _EMAIL_FORM_ID if lead_gen else None
+    base_name = "Benchmarks - Lead gen" if lead_gen else "Benchmarks - Website visits"
+    campaigns = [
+        _li_campaign(
+            "li-copy", "Pipeline Report - Copy tests", daily="2000.00", objective=objective
+        )
+    ]
     creatives = [
-        _li_creative(key, "li-copy", profile, headline=f"Headline {key}")
+        _li_creative(key, "li-copy", profile, headline=f"Headline {key}", form=form)
         for key, profile in variants
     ]
     if baseline is not None:
-        campaigns.append(_li_campaign("li-base", "Benchmarks - Lead gen", daily="2000.00"))
-        creatives.append(_li_creative("cr-base", "li-base", baseline))
+        campaigns.append(_li_campaign("li-base", base_name, daily="2000.00", objective=objective))
+        creatives.append(_li_creative("cr-base", "li-base", baseline, form=form))
     return _world(name, linkedin=_linkedin(campaigns, creatives))
 
 
@@ -5949,6 +5974,33 @@ def _creative_scenarios() -> Iterator[Scenario]:
                 "cr2.weak_stage", weak_click, baseline=_funnel_days(100_000, 200, 1_000, 200)
             ),
             Expectation(CR2, False, label="No stage measurably below baseline"),
+        ),
+    )
+    # Priority decision: AAP 0.5.4.6 says non-lead-gen campaigns use only click rate, and no
+    # other scenario analyses a non-lead-gen campaign (the default world's website campaign
+    # has one variant), so this case adds one for acceptance/test_creative_rules.py. Its
+    # variants differ only in clicks (120 vs 80) and have no leads, so CR1 can call the pair
+    # distinguishable only on clicks / impressions.
+    yield _case(
+        "cr2.click_only",
+        module,
+        "CR2: a non-lead-gen campaign measures the click rate only, and CR1 compares clicks / "
+        "impressions",
+        _creative_world(
+            "cr2.click_only",
+            (("cr-a", _site_days(20_000, 120, 12)), ("cr-b", _site_days(20_000, 80, 4))),
+            baseline=_site_days(100_000, 1_500, 30),
+            objective="WEBSITE_VISIT",
+        ),
+        Expectation(
+            CR2,
+            True,
+            {
+                "stage": "click_rate",
+                "stages": ("click_rate",),
+                "rate": "0.005",
+                "baseline": "0.0121",
+            },
         ),
     )
     yield _case(
