@@ -11,11 +11,15 @@ no network.
 
 import dataclasses
 import doctest
+import itertools
 import json
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, get_args, get_origin, get_type_hints
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -80,6 +84,7 @@ from ads_engine.analysis.context import (
     creative_group_campaign,
     creative_pair_external_id,
     json_value,
+    keyword_external_id,
     objective_group,
     search_term_external_id,
     segment_external_id,
@@ -229,6 +234,14 @@ def test_objective_groups() -> None:
 
 
 def test_composite_entity_keys() -> None:
+    assert keyword_external_id("55", "77") == "55|77"
+    assert keyword_external_id("55", 77) == "55|77"
+    # A criterion id is unique only within its ad group: the same criterion in two ad groups
+    # gives two keys, so feedback on one keyword never matches the other.
+    assert keyword_external_id("55", "77") != keyword_external_id("56", "77")
+    first = EntityRef("google", "keyword", 1, keyword_external_id("55", "77"), "crm demo")
+    second = EntityRef("google", "keyword", 2, keyword_external_id("56", "77"), "crm demo")
+    assert (first.key, second.key) == ("google:keyword:55|77", "google:keyword:56|77")
     assert search_term_external_id("55", "901", "crm software") == "55|901|crm software"
     assert search_term_external_id("55", None, "crm") == "55||crm"
     assert content_asset_external_id("my-paper", "eur") == "my-paper|EUR"
@@ -400,7 +413,7 @@ def test_evidence_lookup_copy_and_immutability() -> None:
     with pytest.raises(KeyError):
         evidence.metric("clicks")
     extended = evidence.with_extra(depends_on=[{"type": "campaign", "id": 7}])
-    assert extended.extra == {"a": 1, "depends_on": [{"type": "campaign", "id": 7}]}
+    assert extended.extra == {"a": 1, "depends_on": ({"type": "campaign", "id": 7},)}
     assert evidence.extra == {"a": 1}
     with pytest.raises(dataclasses.FrozenInstanceError):
         evidence.window = {}  # type: ignore[misc]
@@ -430,13 +443,100 @@ def test_candidate_normalises_and_exposes_keys() -> None:
         "simulated",
     )
     assert candidate.feedback_key == ("C1", "campaign", "google:campaign:123")
-    assert candidate.sort_key == ((Decimal("-5"),), "Brand", "google:campaign:123")
+    assert candidate.sort_key == (
+        (Decimal("-5"),),
+        "Brand",
+        (False, 7),
+        "google:campaign:123",
+    )
     assert candidate.spend_targets == frozenset({("campaign", 7), ("budget", 2)})
     assert not candidate.is_discrepancy
     held = dataclasses.replace(candidate, held=True, held_reason="Resolve discrepancy first")
     assert held.held
     with pytest.raises(dataclasses.FrozenInstanceError):
         candidate.held = True  # type: ignore[misc]
+
+
+def _ranked_keys(candidates: list[Candidate] | tuple[Candidate, ...]) -> list[str]:
+    """Sort ``candidates`` by :attr:`Candidate.sort_key` and return their entity keys."""
+    ranked = sorted(candidates, key=lambda candidate: candidate.sort_key)
+    return [candidate.entity_ref.key for candidate in ranked]
+
+
+def test_sort_key_breaks_name_ties_by_entity_id_not_external_id() -> None:
+    low = _candidate(entity_ref=EntityRef("google", "campaign", 2, "9", "Brand"))
+    high = _candidate(entity_ref=EntityRef("google", "campaign", 10, "10", "Brand"))
+    # As text the external ids sort the other way, so a key tie-break would reverse them.
+    assert high.entity_ref.key < low.entity_ref.key
+    assert low.sort_key[2] == (False, 2)
+    assert high.sort_key[2] == (False, 10)
+    expected = ["google:campaign:9", "google:campaign:10"]
+    assert _ranked_keys([high, low]) == expected
+    assert _ranked_keys([low, high]) == expected
+
+
+def test_sort_key_orders_id_less_entities_of_one_name_by_key() -> None:
+    def term(ad_group: str) -> Candidate:
+        external_id = search_term_external_id(ad_group, 7, "free crm")
+        ref = EntityRef("google", "search_term", None, external_id, "free crm")
+        return _candidate(rule_id=K1, section=KEYWORDS, group="block", entity_ref=ref)
+
+    first, second = term("200"), term("31")
+    assert first.sort_key[2] == second.sort_key[2] == (True, 0)
+    expected = ["google:search_term:200|7|free crm", "google:search_term:31|7|free crm"]
+    assert _ranked_keys([second, first]) == expected
+    assert _ranked_keys([first, second]) == expected
+
+
+def test_sort_key_puts_an_entity_with_an_id_before_an_id_less_one_of_the_same_name() -> None:
+    creative = EntityRef("linkedin", "creative", 4, "urn:li:sponsoredCreative:4", "Guide")
+    asset = EntityRef(
+        "linkedin", "content_asset", None, content_asset_external_id("guide", "usd"), "Guide"
+    )
+    with_id = _candidate(entity_ref=creative)
+    without_id = _candidate(entity_ref=asset)
+    # The id slot decides: the key alone would put the content asset first.
+    assert asset.key < creative.key
+    expected = [creative.key, asset.key]
+    assert _ranked_keys([without_id, with_id]) == expected
+    assert _ranked_keys([with_id, without_id]) == expected
+
+
+def test_sort_key_separates_entity_types_sharing_a_name_and_an_id_by_key() -> None:
+    campaign = _candidate(entity_ref=EntityRef("google", "campaign", 5, "5", "Brand"))
+    budget = _candidate(entity_ref=EntityRef("google", "budget", 5, "5", "Brand"))
+    assert campaign.sort_key[:3] == budget.sort_key[:3]
+    expected = ["google:budget:5", "google:campaign:5"]
+    assert _ranked_keys([campaign, budget]) == expected
+    assert _ranked_keys([budget, campaign]) == expected
+
+
+def test_sort_key_order_is_total_and_independent_of_input_order() -> None:
+    refs = [
+        EntityRef("google", "campaign", 10, "10", "Brand"),
+        EntityRef("google", "search_term", None, search_term_external_id("31", 7, "x"), "Brand"),
+        EntityRef("google", "campaign", 2, "9", "Brand"),
+        EntityRef("google", "search_term", None, search_term_external_id("200", 7, "x"), "Brand"),
+        EntityRef("google", "budget", 2, "9", "Brand"),
+        EntityRef("google", "campaign", 1, "1", "Alpha"),
+    ]
+    candidates = [_candidate(entity_ref=ref) for ref in refs]
+    candidates.append(
+        _candidate(
+            entity_ref=EntityRef("google", "campaign", 3, "3", "Zulu"), rank_key=(Decimal("-99"),)
+        )
+    )
+    expected = [
+        "google:campaign:3",
+        "google:campaign:1",
+        "google:budget:9",
+        "google:campaign:9",
+        "google:campaign:10",
+        "google:search_term:200|7|x",
+        "google:search_term:31|7|x",
+    ]
+    for permutation in itertools.permutations(candidates):
+        assert _ranked_keys(permutation) == expected
 
 
 @pytest.mark.parametrize(
@@ -518,6 +618,410 @@ def test_rule_result_merge_sums_suppressed_in_every_call_style() -> None:
         RuleResult(suppressed={"g1_blocked": -1})
 
 
+# -- immutability of frozen evidence (AAP 0.5.4.8) ----------------------------------------------
+
+
+def _source_days() -> list[dict[str, Any]]:
+    return [
+        {
+            "source": "google",
+            "start": "2026-09-07",
+            "end": "2026-10-04",
+            "boundary": "America/New_York",
+        }
+    ]
+
+
+@dataclasses.dataclass
+class _MutableRow:
+    spend: Decimal
+
+
+def test_evidence_keeps_its_values_when_the_caller_mutates_its_objects() -> None:
+    source_days = _source_days()
+    window: dict[str, Any] = {
+        "start": "2026-09-07",
+        "end": "2026-10-04",
+        "days": 28,
+        "source_days": source_days,
+    }
+    thresholds: dict[str, Any] = {"k2.adjacent_max_terms": 5, "window.presets": [14, 28]}
+    rows: list[dict[str, Any]] = [{"spend": Decimal("1.50"), "terms": ["crm"]}]
+    entity = _entity()
+    evidence = Evidence(
+        window=window,
+        thresholds=thresholds,
+        extra={"rows": rows, "tokens": {"crm"}, "entity": entity},
+    )
+    source_days[0]["boundary"] = "UTC"
+    window["days"] = 1
+    thresholds["window.presets"].append(90)
+    rows[0]["spend"] = Decimal("9")
+    rows[0]["terms"].append("erp")
+    rows.append({"spend": Decimal("2")})
+    assert evidence.window["days"] == 28
+    assert evidence.window["source_days"] == (
+        {
+            "source": "google",
+            "start": "2026-09-07",
+            "end": "2026-10-04",
+            "boundary": "America/New_York",
+        },
+    )
+    assert evidence.thresholds == {"k2.adjacent_max_terms": 5, "window.presets": (14, 28)}
+    assert evidence.extra["rows"] == ({"spend": Decimal("1.50"), "terms": ("crm",)},)
+    assert evidence.extra["tokens"] == frozenset({"crm"})
+    assert evidence.extra["entity"] is entity
+
+
+def test_evidence_nested_values_cannot_be_changed_after_construction() -> None:
+    evidence = Evidence(
+        window={
+            "start": "2026-09-07",
+            "end": "2026-10-04",
+            "days": 28,
+            "source_days": _source_days(),
+        },
+        thresholds={"c1.min_spend_day_share": 0.7},
+        extra={"rows": [{"spend": Decimal("1.50")}], "cohort": {"currency": "USD"}},
+    )
+    with pytest.raises(TypeError):
+        evidence.window["source_days"][0]["boundary"] = "x"
+    with pytest.raises(AttributeError):
+        evidence.extra["rows"].append({"spend": Decimal("2")})
+    with pytest.raises(TypeError):
+        evidence.extra["cohort"]["currency"] = "EUR"
+    with pytest.raises(TypeError):
+        evidence.extra["added"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        evidence.window["days"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        evidence.thresholds["c1.min_spend_day_share"] = 0.1  # type: ignore[index]
+    assert evidence.window["source_days"][0]["boundary"] == "America/New_York"
+    assert evidence.extra["rows"] == ({"spend": Decimal("1.50")},)
+    assert evidence.extra["cohort"] == {"currency": "USD"}
+
+
+def test_with_extra_returns_an_independent_frozen_tree() -> None:
+    evidence = _evidence(rows=[{"spend": Decimal("1.50")}])
+    depends_on: list[dict[str, Any]] = [{"type": "campaign", "id": 7}]
+    extended = evidence.with_extra(depends_on=depends_on)
+    depends_on[0]["id"] = 8
+    depends_on.append({"type": "budget", "id": 3})
+    assert extended.extra == {
+        "rows": ({"spend": Decimal("1.50")},),
+        "depends_on": ({"type": "campaign", "id": 7},),
+    }
+    assert evidence.extra == {"rows": ({"spend": Decimal("1.50")},)}
+    assert extended.extra is not evidence.extra
+    assert extended.extra["rows"][0] is not evidence.extra["rows"][0]
+    assert extended.window is not evidence.window
+    with pytest.raises(TypeError):
+        extended.extra["depends_on"][0]["id"] = 9
+    with pytest.raises(TypeError):
+        extended.extra["rows"][0]["spend"] = Decimal(0)
+    assert extended.to_json()["extra"] == {
+        "rows": [{"spend": "1.50"}],
+        "depends_on": [{"type": "campaign", "id": 7}],
+    }
+    assert evidence.to_json()["extra"] == {"rows": [{"spend": "1.50"}]}
+
+
+def test_frozen_evidence_renders_the_json_its_input_renders() -> None:
+    window: dict[str, Any] = {
+        "start": "2026-09-07",
+        "end": "2026-10-04",
+        "days": 28,
+        "source_days": _source_days(),
+    }
+    thresholds: dict[str, Any] = {"c1.min_spend_day_share": 0.7, "window.presets": [14, 28]}
+    extra: dict[str, Any] = {
+        "rows": [{"spend": Decimal("1.50"), "day": date(2026, 10, 1)}],
+        "head_tokens": ("alternative", "hubspot"),
+        "tokens": {"b", "a"},
+        "nested": {"k": [1, [2, 3]], "at": NOW},
+        "entity": _entity(),
+    }
+    evidence = Evidence(window=window, thresholds=thresholds, extra=extra)
+    rendered = evidence.to_json()
+    assert json.dumps(rendered["window"]) == json.dumps(json_value(window))
+    assert json.dumps(rendered["thresholds"]) == json.dumps(json_value(thresholds))
+    assert json.dumps(rendered["extra"]) == json.dumps(json_value(extra))
+    assert type(rendered["window"]) is dict
+    assert type(rendered["window"]["source_days"]) is list
+    assert type(rendered["window"]["source_days"][0]) is dict
+    assert type(rendered["extra"]["rows"]) is list
+    assert type(rendered["extra"]["head_tokens"]) is list
+    assert rendered["extra"]["tokens"] == ["a", "b"]
+    assert rendered["extra"]["nested"] == {"k": [1, [2, 3]], "at": "2026-10-06T02:00:00+00:00"}
+    assert json.loads(json.dumps(rendered)) == rendered
+
+
+def test_values_that_cannot_be_frozen_are_rejected_naming_the_field() -> None:
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['rows'\]\[0\]\['raw'\]"):
+        _evidence(rows=[{"raw": bytearray(b"x")}])
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\].*_MutableRow"):
+        _evidence(row=_MutableRow(Decimal(1)))
+    with pytest.raises(TypeError, match=r"Evidence\.window\['days'\]"):
+        Evidence(window={"days": object()})
+    with pytest.raises(TypeError, match=r"Evidence\.thresholds keys must be strings"):
+        Evidence(window={}, thresholds={1: 2})  # type: ignore[dict-item]
+    with pytest.raises(TypeError, match=r"Finding\.evidence\['blob'\]"):
+        Finding("k1_no_baseline", KEYWORDS, None, "x", {"blob": bytearray()})
+    with pytest.raises(TypeError, match=r"Observation\.payload\['x'\]"):
+        Observation(NOW, payload={"x": [bytearray()]})
+    with pytest.raises(TypeError, match=r"Observation\.payload must be a mapping"):
+        Observation(NOW, payload=["x"])  # type: ignore[arg-type]
+
+
+@dataclasses.dataclass(frozen=True)
+class _DictRecord:
+    data: dict[str, list[int]]
+
+    def to_json(self) -> dict[str, list[int]]:
+        return self.data
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListRecord:
+    values: list[int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProxyRecord:
+    data: Mapping[str, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _AnyTupleRecord:
+    values: tuple[Any, ...]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"values": self.values}
+
+
+@dataclasses.dataclass(frozen=True)
+class _AnySetRecord:
+    tags: frozenset[Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class _OuterRecord:
+    label: str
+    inner: _DictRecord
+
+
+@dataclasses.dataclass(frozen=True)
+class _MutableFieldRecord:
+    row: _MutableRow
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClassRecord:
+    kind: type
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImmutableRecord:
+    label: str
+    values: tuple[int, ...]
+    tags: frozenset[str]
+    entity: EntityRef
+    metric: Metric
+    day: date
+    at: datetime
+    spend: Decimal | None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "values": list(self.values),
+            "tags": sorted(self.tags),
+            "entity": self.entity.to_json(),
+            "metric": self.metric.to_json(),
+            "day": self.day,
+            "at": self.at,
+            "spend": self.spend,
+        }
+
+
+def _discrepancy(decided: Any, platform: Any) -> DiscrepancyInfo:
+    return DiscrepancyInfo(
+        1,
+        "budget",
+        3,
+        "Shared budget 777",
+        "google",
+        "budget",
+        "budget",
+        decided,
+        platform,
+        NOW,
+        "open",
+    )
+
+
+_DICT_FIELD = r"is a frozen dataclass whose field 'data' holds a dict, so it is not immutable"
+
+
+def test_frozen_record_holding_a_dict_is_rejected_wherever_it_is_stored() -> None:
+    payload: dict[str, list[int]] = {"values": [1]}
+    row = _DictRecord(payload)
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\] " + _DICT_FIELD):
+        _evidence(row=row)
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['rows'\]\[1\] " + _DICT_FIELD):
+        _evidence(rows=[_entity(), row])
+    with pytest.raises(TypeError, match=r"Finding\.evidence\['row'\] " + _DICT_FIELD):
+        Finding("pipeline_unavailable", CAMPAIGNS, None, "Pipeline unavailable", {"row": row})
+    with pytest.raises(TypeError, match=r"Observation\.payload\['row'\] " + _DICT_FIELD):
+        Observation(NOW, payload={"row": row})
+    with pytest.raises(TypeError, match=r"DiscrepancyInfo\.decided_value\['row'\] " + _DICT_FIELD):
+        _discrepancy({"row": row}, None)
+    with pytest.raises(TypeError, match=r"DiscrepancyInfo\.platform_value\['row'\] " + _DICT_FIELD):
+        _discrepancy(None, {"nested": [1], "row": row})
+    evidence = _evidence(note="kept", rows=[{"spend": Decimal("1.50")}])
+    before = evidence.to_json()
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\] " + _DICT_FIELD):
+        evidence.with_extra(row=row)
+    assert evidence.to_json() == before
+    assert evidence.extra == {"note": "kept", "rows": ({"spend": Decimal("1.50")},)}
+    payload["values"].append(2)
+    assert evidence.to_json() == before
+
+
+def test_frozen_records_with_mutable_fields_at_any_depth_are_rejected() -> None:
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"Evidence\.extra\['row'\] is a frozen dataclass whose field 'values' holds a list, "
+            r"so it is not immutable"
+        ),
+    ):
+        _evidence(row=_ListRecord([1]))
+    with pytest.raises(TypeError, match=r"whose field 'data' holds a mappingproxy"):
+        _evidence(row=_ProxyRecord(MappingProxyType({"a": 1})))
+    with pytest.raises(TypeError, match=r"whose field 'inner\.data' holds a dict"):
+        _evidence(row=_OuterRecord("outer", _DictRecord({"values": [1]})))
+    with pytest.raises(TypeError, match=r"whose field 'values\[1\]' holds a list"):
+        _evidence(row=_AnyTupleRecord((1, [2])))
+    with pytest.raises(TypeError, match=r"whose field 'values\[0\]\[0\]\.data' holds a dict"):
+        _evidence(row=_AnyTupleRecord(((_DictRecord({}),),)))
+    with pytest.raises(TypeError, match=r"whose field 'tags item' holds an object"):
+        _evidence(row=_AnySetRecord(frozenset({"a", object()})))
+    with pytest.raises(
+        TypeError,
+        match=r"whose field 'row' holds a _MutableRow \(a dataclass that is not frozen\)",
+    ):
+        Finding(
+            "pipeline_unavailable",
+            CAMPAIGNS,
+            None,
+            "Pipeline unavailable",
+            {"row": _MutableFieldRecord(_MutableRow(Decimal(1)))},
+        )
+    with pytest.raises(TypeError, match=r"whose field 'kind' holds a type"):
+        Observation(NOW, payload={"row": _AnyTupleRecord((1,)), "bad": _ClassRecord(dict)})
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\].*_MutableRow"):
+        _evidence(row=_MutableRow(Decimal(1)))
+
+
+def test_deeply_immutable_frozen_records_are_stored_as_the_same_object() -> None:
+    entity = _entity()
+    metric = Metric("spend", "Spend", Decimal("12.340000"), "currency", currency="USD")
+    record = _ImmutableRecord(
+        "row",
+        (1, 2),
+        frozenset({"b", "a"}),
+        entity,
+        metric,
+        date(2026, 10, 1),
+        NOW,
+        None,
+    )
+    nested = _AnyTupleRecord((record, (entity, None), frozenset({metric})))
+    evidence = _evidence(entity=entity, metric=metric, record=record, nested=nested)
+    assert evidence.extra["entity"] is entity
+    assert evidence.extra["metric"] is metric
+    assert evidence.extra["record"] is record
+    assert evidence.extra["nested"] is nested
+    assert evidence.with_extra(more=record).extra["more"] is record
+    assert evidence.to_json()["extra"]["record"] == {
+        "label": "row",
+        "values": [1, 2],
+        "tags": ["a", "b"],
+        "entity": entity.to_json(),
+        "metric": metric.to_json(),
+        "day": "2026-10-01",
+        "at": "2026-10-06T02:00:00+00:00",
+        "spend": None,
+    }
+    assert evidence.to_json()["extra"]["entity"] == entity.to_json()
+    assert evidence.to_json()["extra"]["metric"] == metric.to_json()
+    assert evidence.to_json()["extra"]["nested"] == {
+        "values": [
+            evidence.to_json()["extra"]["record"],
+            [entity.to_json(), None],
+            [metric.to_json()],
+        ]
+    }
+    finding = Finding(
+        "pipeline_unavailable", CAMPAIGNS, None, "Pipeline unavailable", {"r": record}
+    )
+    assert finding.evidence["r"] is record
+    assert finding.to_json()["evidence"]["r"]["values"] == [1, 2]
+    observation = Observation(NOW, payload={"entity": entity, "record": record})
+    assert observation.payload["record"] is record
+    assert json_value(observation.payload)["entity"] == entity.to_json()
+    discrepancy = _discrepancy({"entity": entity}, {"record": record})
+    assert discrepancy.decided_value is not None
+    assert discrepancy.decided_value["entity"] is entity
+    assert discrepancy.platform_value is not None
+    assert discrepancy.platform_value["record"] is record
+
+
+def test_finding_evidence_is_deep_copied_and_read_only() -> None:
+    flags = ["pipeline_unavailable"]
+    evidence: dict[str, Any] = {"flags": flags, "window": {"start": date(2026, 9, 7)}}
+    finding = Finding("pipeline_unavailable", CAMPAIGNS, None, "Pipeline unavailable", evidence)
+    flags.append("attribution_floor")
+    evidence["window"]["start"] = date(2026, 1, 1)
+    evidence["added"] = 1
+    assert finding.evidence == {
+        "flags": ("pipeline_unavailable",),
+        "window": {"start": date(2026, 9, 7)},
+    }
+    with pytest.raises(AttributeError):
+        finding.evidence["flags"].append("x")
+    with pytest.raises(TypeError):
+        finding.evidence["window"]["start"] = date(2026, 1, 2)
+    with pytest.raises(TypeError):
+        finding.evidence["added"] = 1  # type: ignore[index]
+    assert finding.to_json()["evidence"] == {
+        "flags": ["pipeline_unavailable"],
+        "window": {"start": "2026-09-07"},
+    }
+
+
+def test_rule_result_suppressed_is_read_only_and_merge_still_sums() -> None:
+    counts = {"g1_blocked": 1}
+    result = RuleResult(suppressed=counts)
+    counts["g1_blocked"] = 5
+    counts["tracking_absent"] = 1
+    assert result.suppressed == {"g1_blocked": 1}
+    with pytest.raises(TypeError):
+        result.suppressed["g1_blocked"] = 2  # type: ignore[index]
+    merged = result.merge(RuleResult(suppressed={"g1_blocked": 2, "tracking_absent": 1}))
+    assert merged.suppressed == {"g1_blocked": 3, "tracking_absent": 1}
+    with pytest.raises(TypeError):
+        merged.suppressed["g1_blocked"] = 0  # type: ignore[index]
+    assert result.suppressed == {"g1_blocked": 1}
+    assert RuleResult().merge(result, result).suppressed == {"g1_blocked": 2}
+    with pytest.raises(TypeError, match="keys must be strings"):
+        RuleResult(suppressed={1: 1})  # type: ignore[dict-item]
+    with pytest.raises(TypeError, match="must be a mapping"):
+        RuleResult(suppressed=[("g1_blocked", 1)])  # type: ignore[arg-type]
+
+
 # -- input types -----------------------------------------------------------------------------
 
 
@@ -558,6 +1062,95 @@ def test_freshness_staleness_and_status() -> None:
         Freshness(11, "google.facts", None, None, None, None, "unknown")
     with pytest.raises(TypeError):
         Freshness(11, "google.entities", None, None, None, NOW, "unknown")
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+@pytest.mark.parametrize(
+    ("success", "now", "stale_after_hours", "stale"),
+    [
+        # Fall back: Oct 31 noon EDT to Nov 1 noon EST is 25 real hours, 24 by the wall clock.
+        (
+            datetime(2026, 10, 31, 12, tzinfo=NEW_YORK),
+            datetime(2026, 11, 1, 12, tzinfo=NEW_YORK),
+            24,
+            True,
+        ),
+        # Exactly 25 elapsed hours is not more than 25.
+        (
+            datetime(2026, 10, 31, 12, tzinfo=NEW_YORK),
+            datetime(2026, 11, 1, 12, tzinfo=NEW_YORK),
+            25,
+            False,
+        ),
+        # Spring forward: Mar 7 noon EST to Mar 8 noon EDT is 23 real hours, 24 by the wall clock.
+        (
+            datetime(2026, 3, 7, 12, tzinfo=NEW_YORK),
+            datetime(2026, 3, 8, 12, tzinfo=NEW_YORK),
+            23,
+            False,
+        ),
+        (
+            datetime(2026, 3, 7, 12, tzinfo=NEW_YORK),
+            datetime(2026, 3, 8, 12, tzinfo=NEW_YORK),
+            22,
+            True,
+        ),
+    ],
+)
+def test_freshness_age_is_elapsed_time_across_dst(
+    success: datetime, now: datetime, stale_after_hours: int, stale: bool
+) -> None:
+    row = Freshness(11, "google.metrics_daily", success, success, None, now.date(), "complete")
+    stale_after = timedelta(hours=stale_after_hours)
+    assert row.is_stale(now=now, stale_after=stale_after, window_end=now.date()) is stale
+
+
+def test_freshness_stores_its_instants_in_utc() -> None:
+    attempt = datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=NEW_YORK)  # 06:30 UTC (EST)
+    success = datetime(2026, 11, 1, 1, 10, fold=0, tzinfo=NEW_YORK)  # 05:10 UTC (EDT)
+    row = Freshness(11, "google.entities", attempt, success, None, None, "unknown")
+    assert row.last_attempt_at == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    assert row.last_success_at == datetime(2026, 11, 1, 5, 10, tzinfo=UTC)
+    assert row.last_attempt_at is not None
+    assert row.last_success_at is not None
+    assert row.last_attempt_at.tzinfo is UTC
+    assert row.last_success_at.tzinfo is UTC
+    assert row.last_attempt_at.timestamp() == attempt.timestamp()
+    assert row.last_success_at.timestamp() == success.timestamp()
+    assert min(row.last_attempt_at, row.last_success_at) == row.last_success_at
+    plain = datetime(2026, 10, 31, 12, tzinfo=NEW_YORK)
+    moved = dataclasses.replace(row, last_attempt_at=plain, last_success_at=None)
+    assert moved.last_attempt_at == plain
+    assert moved.last_attempt_at is not None
+    assert moved.last_attempt_at.tzinfo is UTC
+    assert moved.last_success_at is None
+
+
+def test_freshness_and_feedback_require_an_aware_now() -> None:
+    naive = datetime(2026, 10, 6, 2, 0)  # noqa: DTZ001 - a naive instant is the point
+    day = timedelta(hours=24)
+    row = Freshness(11, "google.metrics_daily", NOW, NOW, None, date(2026, 10, 4), "complete")
+    never = dataclasses.replace(row, last_success_at=None)
+    for target in (row, never):
+        with pytest.raises(ValueError, match=r"Freshness\.is_stale now must be tz-aware"):
+            target.is_stale(now=naive, stale_after=day, window_end=date(2026, 10, 4))
+        with pytest.raises(TypeError, match=r"Freshness\.is_stale now must be a tz-aware"):
+            target.is_stale(
+                now=date(2026, 10, 6),  # type: ignore[arg-type]
+                stale_after=day,
+                window_end=date(2026, 10, 4),
+            )
+    feedback = FeedbackInfo("C1", "campaign", "google:campaign:123", "snooze", NOW)
+    with pytest.raises(ValueError, match=r"FeedbackInfo\.active_at now must be tz-aware"):
+        feedback.active_at(naive)
+    with pytest.raises(TypeError, match=r"FeedbackInfo\.active_at now must be a tz-aware"):
+        feedback.active_at("2026-10-06T02:00:00+00:00")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"FeedbackInfo\.until"):
+        FeedbackInfo("C1", "campaign", "k", "snooze", date(2026, 10, 6))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"FeedbackInfo\.until"):
+        FeedbackInfo("C1", "campaign", "k", "snooze", naive)
 
 
 def test_entity_infos_validate_and_default() -> None:
@@ -650,6 +1243,36 @@ def test_feedback_matches_candidates_but_never_c0() -> None:
     assert not feedback.active_at(NOW)
     with pytest.raises(ValueError, match="kind"):
         FeedbackInfo("C1", "campaign", "k", "hide", NOW)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("until_fold", "now_fold", "active"),
+    [
+        # until 01:10 EST (06:10 UTC) is 40 minutes after now 01:30 EDT (05:30 UTC).
+        (1, 0, True),
+        # until 01:10 EDT (05:10 UTC) is 80 minutes before now 01:30 EST (06:30 UTC).
+        (0, 1, False),
+    ],
+)
+def test_feedback_expiry_compares_instants_in_a_dst_fold(
+    until_fold: int, now_fold: int, active: bool
+) -> None:
+    until = datetime(2026, 11, 1, 1, 10, fold=until_fold, tzinfo=NEW_YORK)
+    now = datetime(2026, 11, 1, 1, 30, fold=now_fold, tzinfo=NEW_YORK)
+    feedback = FeedbackInfo("C1", "campaign", "google:campaign:123", "snooze", until)
+    assert feedback.active_at(now) is active
+    assert feedback.until.tzinfo is UTC
+    assert feedback.until.timestamp() == until.timestamp()
+
+
+def test_feedback_stores_until_in_utc() -> None:
+    until = datetime(2026, 11, 3, 9, 0, tzinfo=NEW_YORK)
+    feedback = FeedbackInfo("C1", "campaign", "google:campaign:123", "dismiss", until)
+    assert feedback.until == until
+    assert feedback.until == datetime(2026, 11, 3, 14, 0, tzinfo=UTC)
+    assert feedback.until.tzinfo is UTC
+    assert feedback.active_at(datetime(2026, 11, 3, 8, 59, tzinfo=NEW_YORK))
+    assert not feedback.active_at(datetime(2026, 11, 3, 14, 0, tzinfo=UTC))
 
 
 # -- the analysis context --------------------------------------------------------------------
@@ -745,6 +1368,194 @@ def test_context_enforces_dataset_isolation(thresholds: Thresholds, window: Anal
         _context(thresholds, None)  # type: ignore[arg-type]
 
 
+def test_observation_and_discrepancy_values_are_deep_copied_and_read_only() -> None:
+    payload: dict[str, Any] = {"attribution_model": "GOOGLE_ADS_LAST_CLICK", "labels": ["a"]}
+    observation = Observation(NOW, payload=payload)
+    payload["attribution_model"] = "DATA_DRIVEN"
+    payload["labels"].append("b")
+    assert observation.payload == {"attribution_model": "GOOGLE_ADS_LAST_CLICK", "labels": ("a",)}
+    with pytest.raises(TypeError):
+        observation.payload["counting_type"] = "ONE_PER_CLICK"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        observation.payload["labels"].append("c")
+    assert Observation(NOW).payload == {}
+    decided: dict[str, Any] = {"daily_budget": "50", "history": [{"at": "2026-10-01"}]}
+    item = DiscrepancyInfo(
+        1,
+        "budget",
+        3,
+        "Shared budget 777",
+        "google",
+        "budget",
+        "budget",
+        decided,
+        None,
+        NOW,
+        "open",
+    )
+    decided["daily_budget"] = "60"
+    decided["history"][0]["at"] = "2026-10-02"
+    assert item.decided_value == {"daily_budget": "50", "history": ({"at": "2026-10-01"},)}
+    assert item.platform_value is None
+    with pytest.raises(TypeError):
+        item.decided_value["daily_budget"] = "70"  # type: ignore[index]
+    with pytest.raises(TypeError, match=r"DiscrepancyInfo\.platform_value must be a mapping"):
+        dataclasses.replace(item, platform_value="60")  # type: ignore[arg-type]
+
+
+def test_crm_data_copies_its_collections_read_only() -> None:
+    contacts: dict[str, Any] = {"1": ContactInfo("1")}
+    associations: dict[Any, Any] = {("contact", "1", "deal"): ["9"]}
+    fetches: dict[Any, Any] = {
+        ("contact", "1", "deal"): AssociationFetchInfo("contact", "1", "deal", "ok", "ok")
+    }
+    deal_ids = ["9"]
+    crm = CrmData(
+        HUBSPOT,
+        _bindings(),
+        contacts=contacts,
+        associations=associations,
+        fetches=fetches,
+        window_deal_ids=tuple(deal_ids),
+    )
+    contacts["2"] = ContactInfo("2")
+    associations[("contact", "1", "deal")].append("10")
+    associations[("contact", "1", "meeting")] = ["5"]
+    fetches.clear()
+    assert set(crm.contacts) == {"1"}
+    assert crm.targets("contact", "1", "deal") == ("9",)
+    assert type(crm.targets("contact", "1", "deal")) is tuple
+    assert crm.targets("contact", "1", "meeting") == ()
+    assert crm.association_known("contact", "1", "deal")
+    with pytest.raises(TypeError):
+        crm.contacts["3"] = ContactInfo("3")  # type: ignore[index]
+    with pytest.raises(TypeError):
+        crm.associations[("contact", "1", "deal")] = ("x",)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        crm.fetches[("contact", "1", "deal")] = None  # type: ignore[index]
+    with pytest.raises(TypeError, match=r"CrmData\.associations\[\('contact', '1', 'deal'\)\]"):
+        CrmData(HUBSPOT, _bindings(), associations={("contact", "1", "deal"): "9"})  # type: ignore[dict-item]
+    with pytest.raises(TypeError, match=r"CrmData\.deals must be a mapping"):
+        CrmData(HUBSPOT, _bindings(), deals=["9"])  # type: ignore[arg-type]
+
+
+def test_context_copies_its_collections_read_only_but_keeps_the_cache_writable(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    account = AccountInfo(1, "google", "1234567890", "Main", "USD", "America/New_York")
+    first_day = DayFact(date(2026, 10, 1), Decimal("5"), 100, 4)
+    snapshot = Observation(NOW, status="active", payload={"labels": ["a"]})
+    lead = LeadInfo(1, "abc", 1, None, None, "urn:li:leadGenForm:1", 2, NOW, "matched", "901")
+    datasets: dict[str, Any] = {"google": GOOGLE, "linkedin": LINKEDIN_SIM, "hubspot": HUBSPOT}
+    accounts: dict[int, Any] = {1: account}
+    campaign_days: dict[int, Any] = {5: [first_day]}
+    observations: dict[Any, Any] = {("campaign", 5): [snapshot]}
+    leads = [lead]
+    segment_windows: list[Any] = [[date(2026, 9, 7), date(2026, 10, 4)]]
+    context = _context(
+        thresholds,
+        window,
+        datasets=datasets,
+        accounts=accounts,
+        campaign_days=campaign_days,
+        observations=observations,
+        leads=leads,
+        segment_windows=segment_windows,
+    )
+    datasets.pop("google")
+    accounts[2] = AccountInfo(2, "google", "2234567890", "Other", "EUR")
+    campaign_days[5].append(DayFact(date(2026, 10, 2), Decimal("6"), 90, 3))
+    campaign_days[6] = []
+    observations[("campaign", 5)].append(Observation(NOW))
+    leads.append(dataclasses.replace(lead, id=2))
+    segment_windows.append([date(2026, 9, 21), date(2026, 10, 4)])
+    assert context.dataset("google") == GOOGLE
+    assert context.accounts == {1: account}
+    assert context.campaign_days == {5: (first_day,)}
+    assert context.observations == {("campaign", 5): (snapshot,)}
+    assert context.leads == (lead,)
+    assert context.segment_windows == ((date(2026, 9, 7), date(2026, 10, 4)),)
+    assert (window.start, window.end) in context.segment_windows
+    for name in ("search_terms", "segments", "discrepancies", "feedback"):
+        assert getattr(context, name) == ()
+    with pytest.raises(TypeError):
+        context.accounts[3] = account  # type: ignore[index]
+    with pytest.raises(TypeError):
+        context.campaign_days[7] = ()  # type: ignore[index]
+    with pytest.raises(TypeError):
+        context.datasets["google"] = GOOGLE  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        context.campaign_days[5].append(first_day)  # type: ignore[attr-defined]
+    context.cache["memo"] = 1
+    assert context.cache == {"memo": 1}
+    assert type(context.cache) is dict
+    assert context == dataclasses.replace(context, cache={})
+    with pytest.raises(TypeError, match=r"AnalysisContext\.campaign_days\[5\] must be a tuple"):
+        _context(thresholds, window, campaign_days={5: first_day})
+    with pytest.raises(TypeError, match=r"AnalysisContext\.accounts must be a mapping"):
+        _context(thresholds, window, accounts=[account])
+    with pytest.raises(TypeError, match=r"AnalysisContext\.leads must be a tuple"):
+        _context(thresholds, window, leads=None)
+
+
+def test_context_copies_latest_observations_read_only(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # B1, B2 and B3 size their proposals from the newest stored snapshot, so a change to the
+    # caller's mapping after construction must not resize them.
+    current = Observation(NOW, status="active", budget_daily=Decimal("100.00"))
+    raised = dataclasses.replace(current, budget_daily=Decimal("200.00"))
+    latest: dict[Any, Any] = {("campaign", 5): current, ("budget", 9): current}
+    context = _context(thresholds, window, latest_observations=latest)
+    latest[("campaign", 5)] = raised
+    latest[("budget", 10)] = raised
+    del latest[("budget", 9)]
+    assert context.latest_observations == {("campaign", 5): current, ("budget", 9): current}
+    assert list(context.latest_observations) == [("campaign", 5), ("budget", 9)]
+    assert type(context.latest_observations) is MappingProxyType
+    with pytest.raises(TypeError):
+        context.latest_observations[("campaign", 5)] = raised  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del context.latest_observations[("budget", 9)]  # type: ignore[attr-defined]
+    # A read-only view over the caller's dict is copied too: the dict behind it stays theirs.
+    proxied = _context(thresholds, window, latest_observations=MappingProxyType(latest))
+    latest.clear()
+    assert proxied.latest_observations == {("campaign", 5): raised, ("budget", 10): raised}
+    replaced = dataclasses.replace(context, latest_observations=latest)
+    latest[("campaign", 5)] = current
+    assert replaced.latest_observations == {}
+    assert context.latest_observations[("campaign", 5)] is current
+    with pytest.raises(TypeError, match=r"AnalysisContext\.latest_observations must be a mapping"):
+        _context(thresholds, window, latest_observations=[current])
+
+
+def test_every_context_collection_except_the_cache_is_copied_on_construction(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # A collection field added to AnalysisContext must join one of the copy lists, or the
+    # caller's later changes would reach the run's inputs.
+    hints = get_type_hints(AnalysisContext)
+    mappings = {name for name, hint in hints.items() if get_origin(hint) is Mapping}
+    series = {name for name in mappings if get_origin(get_args(hints[name])[1]) is tuple}
+    sequences = {name for name, hint in hints.items() if get_origin(hint) is tuple}
+    records = ctx_module._CONTEXT_RECORD_MAPPINGS
+    assert len(set(records)) == len(records)
+    assert set(records) == mappings - series
+    assert sorted(ctx_module._CONTEXT_SEQUENCE_MAPPINGS) == sorted(series)
+    assert sorted((*ctx_module._CONTEXT_SEQUENCES, "segment_windows")) == sorted(sequences)
+    assert {name for name, hint in hints.items() if get_origin(hint) in (dict, list, set)} == {
+        "cache"
+    }
+    passed: dict[str, Any] = {name: {} for name in mappings}
+    passed.update({name: [] for name in sequences})
+    context = _context(thresholds, window, **passed)
+    for name in mappings:
+        assert type(getattr(context, name)) is MappingProxyType, name
+    for name in sequences:
+        assert type(getattr(context, name)) is tuple, name
+    assert type(context.cache) is dict
+
+
 def test_make_evidence_records_window_thresholds_datasets_and_provenance(
     thresholds: Thresholds, window: AnalysisWindow
 ) -> None:
@@ -772,7 +1583,7 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
         threshold_keys=("crm.veto_min_leads", "attribution.floor_share"),
         extra={"matured": 25},
     )
-    assert evidence.window == window.to_json()
+    assert json_value(evidence.window) == window.to_json()
     assert evidence.thresholds == {"crm.veto_min_leads": 20, "attribution.floor_share": 0.1}
     assert evidence.datasets == (
         DatasetStatus("linkedin.leads", "complete", covered),

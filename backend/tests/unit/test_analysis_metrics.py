@@ -1,7 +1,8 @@
 """Unit tests for the pure half of ``ads_engine.analysis.metrics`` (AAP 0.5.4.1, 0.5.4.2, 0.5.4.5).
 
-They pin outcome by source, window totals, efficiency and baselines; budget-day classification
-from observations (whole-day known, changed intraday, unobserved, at most
+They pin ``aggregate(ctx, grain)`` (AAP 0.5.1) reading every grain back from a context;
+outcome by source, window totals, efficiency and baselines; budget-day classification from
+observations (whole-day known, changed intraday, unobserved, at most
 ``budget.max_observation_gap_hours`` apart); own-budget and shared-budget histories with dated
 membership and budget-active days; the cap-constrained, high-utilization and under-utilized
 gates with their "observed of required" shortfalls; B2, the G1 member predicate and the G1
@@ -9,41 +10,55 @@ set; and the B4 Google counting contract.
 
 Contexts are built in memory, either by hand from ``analysis.context`` types or from the
 scenario catalogue (``SCENARIOS[name].build_context()``), whose expectations these tests hold
-the metrics predicates to. The SQL half (``QueryScope``, ``aggregate``, ``load_context``) is
-covered by ``tests/integration/test_analysis_metrics_load.py``. Pure: no database and no
+the metrics predicates to. The SQL half (``QueryScope``, ``aggregate_sql``, ``load_context``)
+is covered by ``tests/integration/test_analysis_metrics_load.py``. Pure: no database and no
 network.
 """
 
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from ads_engine.analysis.budget import evaluate as evaluate_budget
 from ads_engine.analysis.context import (
+    B3,
     AccountInfo,
     AnalysisContext,
     BudgetInfo,
     BudgetPeriod,
     CampaignInfo,
     CampaignStatus,
+    Completeness,
     ConversionActionInfo,
+    CreativeTotals,
     DatasetRef,
     DayFact,
     Freshness,
+    KeywordDay,
     Observation,
+    RateBaseline,
+    SearchTermRow,
+    SegmentRow,
     SubjectKey,
     objective_group,
 )
 from ads_engine.analysis.metrics import (
     B2_THRESHOLD_KEYS,
     BUDGET_THRESHOLD_KEYS,
+    GRAINS,
     LAST_CLICK_MODEL,
     BudgetHistory,
+    CampaignDay,
     GateConfig,
+    Grain,
     Totals,
+    aggregate,
     assess_b2,
     baseline_cpo,
     budget_amount_value,
@@ -265,19 +280,27 @@ def _google_day(
 
 
 def _coverage(
-    ref: DatasetRef, name: str, start: date | None, end: date | None
+    ref: DatasetRef,
+    name: str,
+    start: date | None,
+    end: date | None,
+    completeness: Completeness = "complete",
 ) -> dict[tuple[int, str], Freshness]:
     return {
-        (ref.dataset_id, name): Freshness(ref.dataset_id, name, NOW, NOW, start, end, "complete")
+        (ref.dataset_id, name): Freshness(ref.dataset_id, name, NOW, NOW, start, end, completeness)
     }
 
 
-def _li_coverage(start: date | None, end: date | None) -> dict[tuple[int, str], Freshness]:
-    return _coverage(LINKEDIN_DATASET, "linkedin.analytics_daily", start, end)
+def _li_coverage(
+    start: date | None, end: date | None, completeness: Completeness = "complete"
+) -> dict[tuple[int, str], Freshness]:
+    return _coverage(LINKEDIN_DATASET, "linkedin.analytics_daily", start, end, completeness)
 
 
-def _google_coverage(start: date | None, end: date | None) -> dict[tuple[int, str], Freshness]:
-    return _coverage(GOOGLE_DATASET, "google.metrics_daily", start, end)
+def _google_coverage(
+    start: date | None, end: date | None, completeness: Completeness = "complete"
+) -> dict[tuple[int, str], Freshness]:
+    return _coverage(GOOGLE_DATASET, "google.metrics_daily", start, end, completeness)
 
 
 # ---------------------------------------------------------------------------
@@ -342,20 +365,24 @@ def _totals_context(thresholds: Thresholds, **fields: Any) -> AnalysisContext:
 
 def test_window_totals_sum_only_window_days_and_ignore_repeats(thresholds: Thresholds) -> None:
     ctx = _totals_context(thresholds)
+    # Campaign 1's third window day spent 40 without reporting leads: spend counts, outcomes
+    # are unavailable rather than the 2 leads of the other days.
     assert window_totals(ctx, (1, 1)) == Totals(
         spend=Decimal("137"),
-        outcomes=Decimal(2),
+        outcomes=None,
         impressions=3_000,
         clicks=30,
         spend_days=2,
         days=3,
+        unreported_days=1,
     )
     both = window_totals(ctx, (2, 1))
-    assert (both.spend, both.outcomes, both.spend_days, both.days) == (
+    assert (both.spend, both.outcomes, both.spend_days, both.days, both.unreported_days) == (
         Decimal("140"),
-        Decimal(3),
+        None,
         2,
         3,
+        1,
     )
     first, second = _dates(TEN_DAYS)[:2]
     member_days = window_totals(ctx, (1,), dates={first, second})
@@ -365,13 +392,55 @@ def test_window_totals_sum_only_window_days_and_ignore_repeats(thresholds: Thres
         1,
         2,
     )
+    reported = window_totals(ctx, (2, 1), dates={first, second})
+    assert (reported.spend, reported.outcomes, reported.days, reported.unreported_days) == (
+        Decimal("100"),
+        Decimal(3),
+        2,
+        0,
+    )
 
 
 def test_window_totals_keep_unreported_outcomes_unavailable(thresholds: Thresholds) -> None:
     ctx = _totals_context(thresholds)
-    assert window_totals(ctx, (3,)).outcomes is None
+    assert (window_totals(ctx, (3,)).outcomes, window_totals(ctx, (3,)).unreported_days) == (
+        None,
+        1,
+    )
     assert window_totals(ctx, (4,)) == Totals(Decimal(0), None, 0, 0, 0, 0)
     assert window_totals(ctx, (5,)).outcomes == Decimal(0)
+
+
+def test_one_unreported_day_makes_totals_and_the_baseline_unavailable(
+    thresholds: Thresholds,
+) -> None:
+    # Spend 50 with 1 lead, then spend 50 with leads unreported: never 1 lead at 100 each.
+    first, second = _dates(TEN_DAYS)[:2]
+    ctx = _context(
+        thresholds,
+        _window(thresholds, TEN_DAYS, google_tz=None, sources=("linkedin",)),
+        accounts={LINKEDIN_ACCOUNT.id: LINKEDIN_ACCOUNT},
+        campaigns={1: _li_campaign(1), 2: _li_campaign(2)},
+        campaign_days={
+            1: (_li_day(first, "50", 1), _li_day(second, "50", None)),
+            2: (_li_day(first, "30", 3), _li_day(second, "30", 3)),
+        },
+    )
+    totals = window_totals(ctx, (1,))
+    assert (totals.spend, totals.outcomes, totals.days, totals.unreported_days) == (
+        Decimal(100),
+        None,
+        2,
+        1,
+    )
+    assert cost_per_outcome(totals.spend, totals.outcomes) is None
+    assert window_totals(ctx, (1,), dates={first}).outcomes == Decimal(1)
+    assert window_totals(ctx, (2,)).outcomes == Decimal(6)
+    # The account's lead-gen baseline sums campaign 1's unreported day too.
+    assert window_totals(ctx, (1, 2)).unreported_days == 1
+    assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") is None
+    assert subject_baseline(ctx, ("campaign", 2)) is None
+    assert subject_totals(ctx, ("campaign", 1)) == totals
 
 
 def test_window_totals_never_cross_groups_currencies_or_unknown_campaigns(
@@ -414,14 +483,37 @@ def test_expected_outcomes_need_a_positive_baseline(
 
 
 def test_baseline_cpo_is_the_account_group_average_and_memoised(thresholds: Thresholds) -> None:
-    ctx = _totals_context(thresholds)
-    # Campaigns 1-4 of account 2: spend 137 + 3 + 10 = 150 over 3 leads. Campaign 6 is in
-    # another account and campaign 5 in another objective group.
+    # Campaigns 1 and 3 of account 2 spent on days without reported leads: no baseline.
+    partial = _totals_context(thresholds)
+    assert baseline_cpo(partial, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") is None
+    eu_account = AccountInfo(3, "linkedin", "500000003", "LinkedIn EMEA", "EUR")
+    before, first, second = (date(2026, 9, 21), *_dates(TEN_DAYS)[:2])
+    ctx = _context(
+        thresholds,
+        _window(thresholds, TEN_DAYS, google_tz=None, sources=("linkedin",)),
+        accounts={2: LINKEDIN_ACCOUNT, 3: eu_account},
+        campaigns={
+            1: _li_campaign(1),
+            2: _li_campaign(2),
+            4: _li_campaign(4),
+            5: _li_campaign(5, objective="WEBSITE_CONVERSION"),
+            6: _li_campaign(6, account_id=eu_account.id),
+        },
+        campaign_days={
+            1: (_li_day(before, "500", None), _li_day(first, "97"), _li_day(second, "0", 0)),
+            2: (_li_day(first, "53", 1),),
+            6: (_li_day(first, "5", 1),),
+        },
+    )
+    # Campaigns 1, 2 and 4 of account 2: spend 97 + 53 = 150 over 3 leads; the unreported day
+    # before the window does not count. Campaign 6 is in another account and campaign 5 in
+    # another objective group, with no fact row.
     assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") == Decimal(50)
     assert ctx.cache[f"metrics.baseline_cpo:{LINKEDIN_ACCOUNT.id}:linkedin_lead_gen"] == 50
     ctx.cache[f"metrics.baseline_cpo:{LINKEDIN_ACCOUNT.id}:linkedin_lead_gen"] = Decimal(7)
     assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") == Decimal(7)
     assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_other") is None
+    assert baseline_cpo(ctx, eu_account.id, "linkedin_lead_gen") == Decimal(5)
     assert baseline_cpo(ctx, 999, "google") is None
 
 
@@ -435,6 +527,137 @@ def test_source_totals_list_sources_with_a_dataset_or_campaigns(thresholds: Thre
         "linkedin": (Decimal(175), Decimal(4)),
     }
     assert set(source_totals(_totals_context(thresholds))) == {"linkedin"}
+
+
+# ---------------------------------------------------------------------------
+# aggregate(ctx, grain): every grain read back from the context (AAP 0.5.1)
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_context(thresholds: Thresholds, **fields: Any) -> AnalysisContext:
+    """Google campaigns 12 and 3 and LinkedIn campaigns 7, 1 and 5, listed out of order.
+
+    Campaign days arrive out of campaign and date order; campaign 5 has no fact row.
+    """
+    first, second, third = _dates(TEN_DAYS)[:3]
+    return _context(
+        thresholds,
+        _window(thresholds, TEN_DAYS),
+        accounts={GOOGLE_ACCOUNT.id: GOOGLE_ACCOUNT, LINKEDIN_ACCOUNT.id: LINKEDIN_ACCOUNT},
+        campaigns={
+            12: _google_campaign(12, None),
+            7: _li_campaign(7),
+            3: _google_campaign(3, None),
+            1: _li_campaign(1),
+            5: _li_campaign(5),
+        },
+        campaign_days={
+            12: (_google_day(second, "4"), _google_day(first, "3")),
+            7: (_li_day(third, "9"),),
+            3: (_google_day(third, "2"), _google_day(first, "1")),
+            1: (_li_day(second, "8"), _li_day(first, "7")),
+        },
+        **fields,
+    )
+
+
+def test_aggregate_splits_campaign_days_by_source_in_campaign_then_date_order(
+    thresholds: Thresholds,
+) -> None:
+    ctx = _aggregate_context(thresholds)
+    first, second, third = _dates(TEN_DAYS)[:3]
+    assert aggregate(ctx, "campaign_day_google") == [
+        CampaignDay(3, _google_day(first, "1")),
+        CampaignDay(3, _google_day(third, "2")),
+        CampaignDay(12, _google_day(first, "3")),
+        CampaignDay(12, _google_day(second, "4")),
+    ]
+    # Campaign 5 has no day, so it adds no row; Google days never enter LinkedIn's grain.
+    assert aggregate(ctx, "campaign_day_linkedin") == [
+        CampaignDay(1, _li_day(first, "7")),
+        CampaignDay(1, _li_day(second, "8")),
+        CampaignDay(7, _li_day(third, "9")),
+    ]
+
+
+@pytest.mark.parametrize("grain", ["campaign_day_google", "campaign_day_linkedin"])
+def test_aggregate_campaign_day_grains_reject_a_campaign_missing_from_the_context(
+    thresholds: Thresholds, grain: Grain
+) -> None:
+    first = TEN_DAYS[0]
+    ctx = _context(
+        thresholds,
+        _window(thresholds, TEN_DAYS),
+        campaigns={3: _google_campaign(3, None)},
+        campaign_days={3: (_google_day(first, "1"),), 99: (_li_day(first, "5"),)},
+    )
+    # Campaign 99's source is unknown, so neither grain can claim or drop its days.
+    with pytest.raises(KeyError, match="campaign 99 is not in the analysis context"):
+        aggregate(ctx, grain)
+    # Grains that read no campaign stay readable.
+    assert aggregate(ctx, "creative_window") == []
+
+
+def test_aggregate_reads_totals_keyword_days_terms_baseline_and_segments(
+    thresholds: Thresholds,
+) -> None:
+    first, second = _dates(TEN_DAYS)[:2]
+    late_creative = CreativeTotals(41, 7, Decimal(6), 600, 6, None, 1, None, None, 2)
+    early_creative = CreativeTotals(40, 1, Decimal(5), 500, 5, 10, 2, None, None, 1)
+    other_keyword = KeywordDay(52, first, Decimal(2), 2, 20, None)
+    keyword_second = KeywordDay(51, second, Decimal(1), 1, 10, Decimal(1), 7, Decimal("0.5"))
+    keyword_first = KeywordDay(51, first, Decimal(3), 3, 30, Decimal(0))
+    terms = tuple(
+        SearchTermRow(
+            ad_group_id=group,
+            campaign_id=12,
+            search_term=term,
+            term_status="NONE",
+            matched_criterion_id=criterion,
+            matched_keyword_text=None,
+            matched_match_type=None,
+            cost=Decimal(1),
+            clicks=1,
+            impressions=10,
+            conversions=Decimal(0),
+        )
+        for group, criterion, term in ((2, None, "zeta"), (1, "7", "beta"), (1, None, "alpha"))
+    )
+    baseline = RateBaseline(Decimal("4.5"), 45, date(2026, 7, 4), TEN_DAYS[1])
+    segments = (
+        SegmentRow(7, "seniority", "urn:li:seniority:5", *TEN_DAYS),
+        SegmentRow(1, "job_function", "urn:li:function:1", *TEN_DAYS, 300, 6, Decimal(12), 3),
+    )
+    ctx = _aggregate_context(
+        thresholds,
+        creative_totals={41: late_creative, 40: early_creative},
+        keyword_days={52: (other_keyword,), 51: (keyword_second, keyword_first)},
+        search_terms=terms,
+        k1_baseline=baseline,
+        segments=segments,
+    )
+    assert aggregate(ctx, "creative_window") == [early_creative, late_creative]
+    assert aggregate(ctx, "keyword_day") == [keyword_first, keyword_second, other_keyword]
+    # Search terms and segments keep the context's order, which load_context reads in SQL.
+    assert aggregate(ctx, "search_term_window") == list(terms)
+    assert aggregate(ctx, "google_rate_baseline") == [baseline]
+    assert aggregate(ctx, "segment_window") == list(segments)
+    # Each call returns a new list, so a caller's edit never reaches the context.
+    aggregate(ctx, "search_term_window").clear()
+    assert aggregate(ctx, "search_term_window") == list(terms)
+
+
+def test_aggregate_of_an_empty_context_is_empty_for_every_grain(thresholds: Thresholds) -> None:
+    ctx = _context(thresholds, _window(thresholds, TEN_DAYS))
+    assert {grain: aggregate(ctx, grain) for grain in GRAINS} == {grain: [] for grain in GRAINS}
+    # A context without a K1 baseline has an empty baseline grain, never a zero rate.
+    assert aggregate(_aggregate_context(thresholds), "google_rate_baseline") == []
+
+
+def test_aggregate_rejects_an_unknown_grain(thresholds: Thresholds) -> None:
+    ctx = _aggregate_context(thresholds)
+    with pytest.raises(ValueError, match="grain must be one of"):
+        aggregate(ctx, "campaign_week")  # type: ignore[call-overload]
 
 
 # ---------------------------------------------------------------------------
@@ -688,12 +911,31 @@ def test_campaign_history_counts_spending_idle_and_predicate_days(
             id="covered-from-after-the-day",
         ),
         pytest.param(
-            _li_coverage(None, date(2026, 9, 30)), ("2026-10-01",), id="covered-through-before"
+            _li_coverage(date(2026, 9, 1), date(2026, 9, 30)),
+            ("2026-10-01",),
+            id="covered-through-before",
+        ),
+        # Without its start the range verifies no date, even one before its end.
+        pytest.param(
+            _li_coverage(None, date(2026, 9, 30)),
+            ("2026-09-30", "2026-10-01"),
+            id="no-coverage-start",
         ),
         pytest.param(
             _li_coverage(date(2026, 9, 1), None),
             ("2026-09-30", "2026-10-01"),
             id="no-coverage-end",
+        ),
+        # A range spanning both dates proves nothing about absent rows unless it is complete.
+        pytest.param(
+            _li_coverage(date(2026, 9, 1), TEN_DAYS[1], "incomplete"),
+            ("2026-09-30", "2026-10-01"),
+            id="incomplete-over-the-days",
+        ),
+        pytest.param(
+            _li_coverage(date(2026, 9, 1), TEN_DAYS[1], "unknown"),
+            ("2026-09-30", "2026-10-01"),
+            id="unknown-over-the-days",
         ),
     ],
 )
@@ -708,6 +950,72 @@ def test_a_missing_fact_row_outside_metrics_coverage_is_unobserved_never_idle(
     assert history.idle == 3 - len(unobserved)
     assert history.known_active == 10 - len(unobserved)
     assert all(not day.known_active for day in history.days if day.klass == "unobserved")
+
+
+_UNFETCHED = (date(2026, 9, 24), date(2026, 9, 26), date(2026, 9, 29), date(2026, 10, 1))
+"""Window dates whose deferred metrics partitions were never fetched: no fact row."""
+
+
+def _unfetched_context(thresholds: Thresholds, completeness: Completeness) -> AnalysisContext:
+    """Ten whole-day-active days at 100.00: six spend-40 facts and the four unfetched dates,
+    under a metrics freshness row spanning every window day with ``completeness``."""
+    facts = tuple(_li_day(day, "40") for day in _dates(TEN_DAYS) if day not in _UNFETCHED)
+    return _li_history_context(
+        thresholds,
+        freshness=_li_coverage(date(2026, 9, 1), TEN_DAYS[1], completeness),
+        days={1: facts},
+    )
+
+
+@pytest.mark.parametrize("completeness", ["incomplete", "unknown"])
+def test_unfetched_dates_under_coverage_not_complete_are_unobserved_so_b3_is_withheld(
+    thresholds: Thresholds, completeness: Completeness
+) -> None:
+    ctx = _unfetched_context(thresholds, completeness)
+    history = campaign_budget_history(ctx, 1)
+    assert _iso(day.date for day in history.days if day.klass == "unobserved") == _iso(_UNFETCHED)
+    assert history.counts() == {
+        "known_active": 6,
+        "spending": 6,
+        "idle": 0,
+        "changed_intraday": 0,
+        "unobserved": 4,
+        "capped": 0,
+        "high": 0,
+        "under": 6,
+    }
+    unfetched = [day for day in history.days if day.date in _UNFETCHED]
+    assert {(day.u_d, day.idle, day.under, day.known_active) for day in unfetched} == {
+        (None, False, False, False)
+    }
+    gate = under_utilized(history)
+    assert (gate.passed, gate.shortfalls) == (False, ("known-budget days 6 of 7 required",))
+    result = evaluate_budget(ctx)
+    assert [item for item in result.candidates if item.rule_id == B3] == []
+    withheld = [line for line in result.withheld if line.rule_id == B3]
+    assert [(line.reason, line.observed, line.required, line.unit) for line in withheld] == [
+        ("known-budget days 6 of 7 required", 6, 7, "known-budget days")
+    ]
+
+
+def test_unfetched_dates_under_complete_coverage_are_known_idle_so_b3_fires(
+    thresholds: Thresholds,
+) -> None:
+    ctx = _unfetched_context(thresholds, "complete")
+    history = campaign_budget_history(ctx, 1)
+    assert _iso(day.date for day in history.days if day.idle) == _iso(_UNFETCHED)
+    assert (history.known_active, history.spending, history.idle, history.unobserved) == (
+        10,
+        6,
+        4,
+        0,
+    )
+    assert under_utilized(history).passed
+    result = evaluate_budget(ctx)
+    b3 = [item for item in result.candidates if item.rule_id == B3]
+    # p90 of daily spend over the ten known days (40) x 1.1.
+    assert [item.action for item in b3] == ["Lower daily budget to USD 44.00"]
+    assert [line for line in result.withheld if line.rule_id == B3] == []
 
 
 def test_paused_zero_and_lifetime_budget_days_are_not_known_budget_active(
@@ -777,6 +1085,107 @@ def test_latest_daily_budget_falls_back_to_the_latest_observation(thresholds: Th
     never = campaign_budget_history(ctx, 7)
     assert (never.unobserved, never.latest_daily_budget) == (10, None)
     assert cap_constrained(never).shortfalls[0] == "known-budget days 0 of 7 required"
+
+
+WINDOW_CLOSED = _instant(date(2026, 10, 2))
+"""The first observation at or after the end of the ten-day window's last UTC day."""
+
+
+def test_latest_daily_budget_is_the_newest_observation_not_the_last_known_day(
+    thresholds: Thresholds,
+) -> None:
+    # Every window day is whole-day known at 100.00; the budget was raised to 200.00 after
+    # the window closed. History stays 100-based, the current amount is 200.00.
+    base = campaign_budget_history(_li_history_context(thresholds), 1)
+    raised = (
+        *_series(LI_START, WINDOW_CLOSED, **_li_state()),
+        *_series(WINDOW_CLOSED + CADENCE, NOW, **_li_state("200.00")),
+    )
+    history = campaign_budget_history(
+        _li_history_context(thresholds, observations={("campaign", 1): raised}), 1
+    )
+    assert history.days == base.days
+    assert {day.daily_budget for day in history.days} == {Decimal("100.00")}
+    assert (history.known_active, history.capped, history.observation_count) == (10, 5, 81)
+    assert history.window_utilization == base.window_utilization == Decimal("0.565")
+    assert base.latest_daily_budget == Decimal("100.00")
+    assert history.latest_daily_budget == Decimal("200.00")
+
+
+def test_latest_daily_budget_reads_the_stored_snapshot_beyond_the_window(
+    thresholds: Thresholds,
+) -> None:
+    # A custom window's series ends near the window (the observation margin); the newest
+    # stored snapshot at or before the run time is read independently of it.
+    window_series = _series(LI_START, WINDOW_CLOSED + 2 * CADENCE, **_li_state())
+    observations = {("campaign", 1): window_series}
+
+    def latest(stored: Mapping[tuple[str, int], Observation]) -> BudgetHistory:
+        ctx = replace(
+            _li_history_context(thresholds, observations=observations),
+            latest_observations=stored,
+        )
+        return campaign_budget_history(ctx, 1)
+
+    current = Observation(captured_at=NOW - CADENCE, **_li_state("250.00"))
+    history = latest({("campaign", 1): current})
+    assert history.latest_daily_budget == Decimal("250.00")
+    assert {day.daily_budget for day in history.days} == {Decimal("100.00")}
+    assert history.known_active == 10
+    # A stored snapshot older than the series' newest observation, or one captured after
+    # the run time, never replaces it.
+    older = Observation(captured_at=WINDOW_CLOSED, **_li_state("250.00"))
+    future = Observation(captured_at=NOW + CADENCE, **_li_state("300.00"))
+    assert latest({("campaign", 1): older}).latest_daily_budget == Decimal("100.00")
+    assert latest({("campaign", 1): future}).latest_daily_budget == Decimal("100.00")
+    # Another subject's snapshot is not this campaign's.
+    assert latest({("budget", 1): current}).latest_daily_budget == Decimal("100.00")
+    # Window observations after the run time are not current either.
+    after_now = (*window_series, Observation(captured_at=NOW + CADENCE, **_li_state("300.00")))
+    late = _li_history_context(thresholds, observations={("campaign", 1): after_now})
+    assert campaign_budget_history(late, 1).latest_daily_budget == Decimal("100.00")
+    # With no observation at or before the run time there is no current amount.
+    only_future = {("campaign", 1): (Observation(captured_at=NOW + CADENCE, **_li_state()),)}
+    nothing = _li_history_context(thresholds, observations=only_future)
+    assert campaign_budget_history(nothing, 1).latest_daily_budget is None
+
+
+def test_a_newest_observation_without_a_daily_amount_leaves_the_current_amount_unavailable(
+    thresholds: Thresholds,
+) -> None:
+    # No fallback to an older amount: a campaign whose newest observation shows no own daily
+    # budget has no current daily budget to size a proposal from. The stored snapshot ties
+    # with the series' newest instant here; the stored one wins a tie.
+    lifetime = Observation(captured_at=NOW, **_li_state(None))
+    ctx = replace(_li_history_context(thresholds), latest_observations={("campaign", 1): lifetime})
+    history = campaign_budget_history(ctx, 1)
+    assert history.known_active == 10
+    assert history.latest_daily_budget is None
+    moved_series = (
+        *_series(LI_START, WINDOW_CLOSED, **_li_state()),
+        Observation(captured_at=NOW, **_li_state(None)),
+    )
+    moved = _li_history_context(thresholds, observations={("campaign", 1): moved_series})
+    assert campaign_budget_history(moved, 1).latest_daily_budget is None
+
+    span = (date(2026, 9, 28), date(2026, 10, 1))
+    days = {1: tuple(_google_day(day, "50") for day in _dates(span))}
+    own = _google_own_context(thresholds, span, days)
+    assert campaign_budget_history(own, 1).latest_daily_budget == Decimal("100.00")
+    custom_period = Observation(
+        captured_at=NOW,
+        status="active",
+        budget_total=Decimal("5000.00"),
+        budget_amount_micros=5_000_000_000,
+        budget_id=11,
+        payload={"explicitly_shared": False, "budget_period": "CUSTOM_PERIOD"},
+    )
+    now_shared = Observation(captured_at=NOW, **_google_state(POOL, "1000.00", shared=True))
+    for newest in (custom_period, now_shared):
+        stored = replace(own, cache={}, latest_observations={("campaign", 1): newest})
+        history = campaign_budget_history(stored, 1)
+        assert history.known_active == 4
+        assert history.latest_daily_budget is None
 
 
 def test_campaign_history_rejects_unknown_and_shared_budget_campaigns(
@@ -904,6 +1313,7 @@ def _shared_context(
     budgets: dict[int, BudgetInfo] | None = None,
     accounts: dict[int, AccountInfo] | None = None,
     covered: bool = True,
+    completeness: Completeness = "complete",
 ) -> AnalysisContext:
     """Campaigns 1 and 2 draw from the pool all week; campaign 3 joins it on 2026-09-28."""
     default_observations = {
@@ -919,7 +1329,7 @@ def _shared_context(
         thresholds,
         _window(thresholds, WEEK),
         datasets={"google": GOOGLE_DATASET},
-        freshness=_google_coverage(date(2026, 9, 1), WEEK[1]) if covered else {},
+        freshness=_google_coverage(date(2026, 9, 1), WEEK[1], completeness) if covered else {},
         accounts={GOOGLE_ACCOUNT.id: GOOGLE_ACCOUNT} if accounts is None else accounts,
         budgets=(
             {POOL: _budget(POOL, "1000.00", shared=True), OWN: _budget(OWN, "150.00", shared=False)}
@@ -982,6 +1392,40 @@ def test_shared_history_sums_member_spend_on_member_days_only(thresholds: Thresh
     assert cap_constrained(history).shortfalls == ("budget-active days 6 of 7 required",)
     assert shared_budget_history(ctx, POOL) is history
     assert budget_history(ctx, ("budget", POOL)) is history
+
+
+def test_shared_latest_daily_budget_is_the_budgets_newest_observation(
+    thresholds: Thresholds,
+) -> None:
+    # The own-budget rule at budget level: the pool's window days stay 1,000-based while its
+    # newest observation, in the series or stored beyond the window, sets the current amount.
+    ctx = _shared_context(thresholds)
+    base = shared_budget_history(ctx, POOL)
+    # The first observation at or after the end of New York's 2026-10-01.
+    closed = _instant(date(2026, 10, 2), 6)
+    window_series = _series(OBS_START, closed, **_budget_state("1000.00"))
+    raised_series = (*window_series, *_series(closed + CADENCE, NOW, **_budget_state("1200.00")))
+
+    def history(
+        series: tuple[Observation, ...], stored: Mapping[tuple[str, int], Observation]
+    ) -> BudgetHistory:
+        observations = {**ctx.observations, ("budget", POOL): series}
+        changed = replace(ctx, cache={}, observations=observations, latest_observations=stored)
+        return shared_budget_history(changed, POOL)
+
+    raised = history(raised_series, {})
+    assert raised.days == base.days
+    assert (raised.known_active, raised.observation_count) == (6, base.observation_count)
+    assert base.latest_daily_budget == Decimal(1000)
+    assert raised.latest_daily_budget == Decimal(1200)
+    pool: SubjectKey = ("budget", POOL)
+    current = Observation(captured_at=NOW - timedelta(hours=1), **_budget_state("1500.00"))
+    stored = history(window_series, {pool: current})
+    assert stored.days == base.days
+    assert stored.latest_daily_budget == Decimal(1500)
+    custom = Observation(captured_at=NOW, **_budget_state("1500.00", period="CUSTOM_PERIOD"))
+    assert history(window_series, {pool: custom}).latest_daily_budget is None
+    assert history(window_series, {("campaign", POOL): current}).latest_daily_budget == 1000
 
 
 def test_shared_subject_totals_campaigns_and_baseline_follow_member_days(
@@ -1213,6 +1657,75 @@ def test_a_member_without_a_fact_row_counts_zero_only_while_covered(
     assert uncovered.unobserved == 1
 
 
+@pytest.mark.parametrize("completeness", ["incomplete", "unknown"])
+def test_a_member_without_a_fact_row_is_unobserved_while_coverage_is_not_complete(
+    thresholds: Thresholds, completeness: Completeness
+) -> None:
+    days = {cid: facts for cid, facts in _member_days().items() if cid != 3}
+    days[2] = tuple(fact for fact in days[2] if fact.date != date(2026, 9, 27))
+    ctx = _shared_context(
+        thresholds,
+        campaigns={cid: _google_campaign(cid, POOL) for cid in (1, 2)},
+        observations={
+            ("budget", POOL): _series(OBS_START, NOW, **_budget_state("1000.00")),
+            ("campaign", 1): _series(OBS_START, NOW, **_pool_state()),
+            ("campaign", 2): _series(OBS_START, NOW, **_pool_state()),
+        },
+        days=days,
+        completeness=completeness,
+    )
+    history = shared_budget_history(ctx, POOL)
+    # The coverage spans 2026-09-27, but campaign 2's missing row there may be unfetched.
+    assert [day.klass for day in history.days] == ["known", "known", "unobserved", *["known"] * 4]
+    assert (history.days[2].spend, history.days[2].u_d, history.days[2].idle) == (
+        Decimal(600),
+        None,
+        False,
+    )
+    assert (history.known_active, history.idle, history.unobserved) == (6, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("completeness", "classes"),
+    [
+        pytest.param("complete", ["known"] * 7, id="complete"),
+        pytest.param(
+            "incomplete", ["unobserved"] * 2 + ["known"] + ["unobserved"] * 4, id="incomplete"
+        ),
+        pytest.param("unknown", ["unobserved"] * 2 + ["known"] + ["unobserved"] * 4, id="unknown"),
+    ],
+)
+def test_a_former_member_without_a_fact_row_has_unknown_spend_unless_coverage_is_complete(
+    thresholds: Thresholds, completeness: Completeness, classes: list[str]
+) -> None:
+    ctx = _shared_context(
+        thresholds,
+        campaigns={
+            **{cid: _google_campaign(cid, POOL) for cid in (1, 2)},
+            5: _google_campaign(5, None, period=None, status="ended"),
+        },
+        observations={
+            ("budget", POOL): _series(OBS_START, NOW, **_budget_state("1000.00")),
+            ("campaign", 1): _series(OBS_START, NOW, **_pool_state()),
+            ("campaign", 2): _series(OBS_START, NOW, **_pool_state()),
+            # Last seen in the pool on 2026-09-20, so its membership is unknown all week.
+            ("campaign", 5): _series(
+                _instant(date(2026, 9, 15)), _instant(date(2026, 9, 20)), **_pool_state()
+            ),
+        },
+        # Its only fact row shows zero spend on 2026-09-27; every other day has none.
+        days={
+            **{cid: facts for cid, facts in _member_days().items() if cid != 3},
+            5: (_google_day(date(2026, 9, 27), "0"),),
+        },
+        completeness=completeness,
+    )
+    history = shared_budget_history(ctx, POOL)
+    assert [day.klass for day in history.days] == classes
+    assert history.unobserved == classes.count("unobserved")
+    assert 5 not in history.members
+
+
 def test_shared_lost_impression_share_is_spend_weighted_over_spending_members(
     thresholds: Thresholds,
 ) -> None:
@@ -1244,6 +1757,87 @@ def test_shared_lost_impression_share_is_spend_weighted_over_spending_members(
         (Decimal("0.4"), True),
         (Decimal("0.3"), False),
     ]
+
+
+SECOND_POOL = 12
+"""A second Google explicitly shared DAILY budget of 500.00."""
+
+
+def _two_pool_context(thresholds: Thresholds) -> AnalysisContext:
+    """The pool and a second pool, with campaign 3 moving between them on 2026-09-28.
+
+    Campaigns 1-2 draw from the pool and 4 from the second pool all week; campaign 5 keeps its
+    own budget, so it never shows a shared one.
+    """
+    return _shared_context(
+        thresholds,
+        budgets={
+            POOL: _budget(POOL, "1000.00", shared=True),
+            SECOND_POOL: _budget(SECOND_POOL, "500.00", shared=True),
+            OWN: _budget(OWN, "150.00", shared=False),
+        },
+        campaigns={
+            **{cid: _google_campaign(cid, POOL) for cid in (1, 2, 3)},
+            4: _google_campaign(4, SECOND_POOL),
+            5: _google_campaign(5, OWN),
+        },
+        observations={
+            ("budget", POOL): _series(OBS_START, NOW, **_budget_state("1000.00")),
+            ("budget", SECOND_POOL): _series(OBS_START, NOW, **_budget_state("500.00")),
+            ("campaign", 1): _series(OBS_START, NOW, **_pool_state()),
+            ("campaign", 2): _series(OBS_START, NOW, **_pool_state()),
+            ("campaign", 3): (
+                *_series(
+                    OBS_START, JOINED - CADENCE, **_google_state(SECOND_POOL, "500.00", shared=True)
+                ),
+                *_series(JOINED, NOW, **_pool_state()),
+            ),
+            ("campaign", 4): _series(
+                OBS_START, NOW, **_google_state(SECOND_POOL, "500.00", shared=True)
+            ),
+            ("campaign", 5): _series(OBS_START, NOW, **_google_state(OWN, "150.00", shared=False)),
+        },
+        days=_member_days({**_MEMBER_SPEND, 4: ("200", "8"), 5: ("90", "3")}),
+    )
+
+
+def test_shared_budgets_of_one_context_reuse_one_candidate_map(thresholds: Thresholds) -> None:
+    ctx = _two_pool_context(thresholds)
+    pool = shared_budget_history(ctx, POOL)
+    inverse = ctx.cache["metrics.budget_campaigns"]
+    moved = ctx.cache["metrics.shared_candidate:3"]
+    second = shared_budget_history(ctx, SECOND_POOL)
+    # Built once per context: the second budget reuses the map and campaign 3's spans.
+    assert ctx.cache["metrics.budget_campaigns"] is inverse
+    assert ctx.cache["metrics.shared_candidate:3"] is moved
+    assert dict(inverse) == {POOL: (1, 2, 3), SECOND_POOL: (3, 4), OWN: (5,)}
+    # Campaign 5 never showed a shared budget, so neither history classifies it.
+    candidates = sorted(key for key in ctx.cache if key.startswith("metrics.shared_candidate:"))
+    assert candidates == [f"metrics.shared_candidate:{cid}" for cid in (1, 2, 3, 4)]
+    # Each history equals the one computed alone in a fresh context.
+    assert shared_budget_history(_two_pool_context(thresholds), POOL) == pool
+    assert shared_budget_history(_two_pool_context(thresholds), SECOND_POOL) == second
+
+
+def test_a_campaign_that_moved_between_shared_budgets_counts_on_its_member_days_in_each(
+    thresholds: Thresholds,
+) -> None:
+    ctx = _two_pool_context(thresholds)
+    week = tuple(_dates(WEEK))
+    # Campaign 3 changed budgets during 2026-09-28 (New York), so that day is unknown in both.
+    moved_on = ["known"] * 3 + ["changed_intraday"] + ["known"] * 3
+    second = shared_budget_history(ctx, SECOND_POOL)
+    assert [day.klass for day in second.days] == moved_on
+    assert dict(second.members) == {3: week[:3], 4: week}
+    assert [day.spend for day in second.days] == [Decimal(300)] * 3 + [Decimal(200)] * 4
+    assert [day.u_d for day in second.days] == (
+        [Decimal("0.6")] * 3 + [None] + [Decimal("0.4")] * 3
+    )
+    pool = shared_budget_history(ctx, POOL)
+    assert [day.klass for day in pool.days] == moved_on
+    assert dict(pool.members) == {1: week, 2: week, 3: week[4:]}
+    # In the pool it counts exactly as when it joined from its own budget.
+    assert pool == shared_budget_history(_shared_context(thresholds), POOL)
 
 
 def test_shared_history_rejects_unknown_and_unshared_budgets(thresholds: Thresholds) -> None:
@@ -1435,10 +2029,16 @@ def test_gates_apply_the_given_configuration(thresholds: Thresholds) -> None:
 
 
 def _b2_context(
-    thresholds: Thresholds, hot_leads: int | None, control_leads: tuple[int, ...]
+    thresholds: Thresholds,
+    hot_leads: int | tuple[int | None, ...] | None,
+    control_leads: tuple[int | None, ...],
 ) -> AnalysisContext:
-    """LinkedIn: ``hot`` (1) spends 95.00 of 100.00 daily; ``control`` (2) 300.00 of 500.00."""
-    hot = tuple(_li_day(day, "95", hot_leads) for day in _dates(WEEK))
+    """LinkedIn: ``hot`` (1) spends 95.00 of 100.00 daily; ``control`` (2) 300.00 of 500.00.
+
+    ``hot_leads`` is one value for every day or one per day; ``control_leads`` one per day.
+    """
+    daily = hot_leads if isinstance(hot_leads, tuple) else (hot_leads,) * len(_dates(WEEK))
+    hot = tuple(_li_day(day, "95", leads) for day, leads in zip(_dates(WEEK), daily, strict=True))
     control = tuple(
         _li_day(day, "300", leads) for day, leads in zip(_dates(WEEK), control_leads, strict=True)
     )
@@ -1486,14 +2086,22 @@ def test_b2_zero_outcome_branch_needs_expected_outcomes_at_the_minimum(
     [
         pytest.param(None, (30,) * 7, id="outcomes-unavailable"),
         pytest.param(0, (0,) * 7, id="baseline-unavailable"),
+        # Six zero-lead days and one unreported day were "0 leads" before; now unknown.
+        pytest.param((0, 0, 0, 0, 0, 0, None), (30,) * 7, id="outcomes-partly-unreported"),
+        pytest.param(0, (30, 30, 30, 30, 30, 30, None), id="baseline-partly-unreported"),
     ],
 )
 def test_b2_needs_available_outcomes_and_baseline(
-    thresholds: Thresholds, hot_leads: int | None, control_leads: tuple[int, ...]
+    thresholds: Thresholds,
+    hot_leads: int | tuple[int | None, ...] | None,
+    control_leads: tuple[int | None, ...],
 ) -> None:
-    assessment = assess_b2(_b2_context(thresholds, hot_leads, control_leads), ("campaign", 1))
+    ctx = _b2_context(thresholds, hot_leads, control_leads)
+    assessment = assess_b2(ctx, ("campaign", 1))
     assert assessment.gate.passed is True
     assert (assessment.meets, assessment.branch) == (False, None)
+    assert assessment.baseline is None or assessment.outcomes is None
+    assert spend_increase_blocked(ctx) == frozenset()
 
 
 def test_b2_poor_efficiency_branch_and_the_own_google_budget_row(thresholds: Thresholds) -> None:
@@ -1509,6 +2117,93 @@ def test_b2_poor_efficiency_branch_and_the_own_google_budget_row(thresholds: Thr
     assert assess_b2(ctx, ("campaign", 2)).meets is False
     assert spend_increase_blocked(ctx) is blocked
     assert ctx.cache["metrics.spend_increase_blocked"] is blocked
+
+
+def _boundary_context(
+    thresholds: Thresholds,
+    hot: tuple[str, tuple[str, ...], tuple[int, ...]],
+    control: tuple[tuple[str, ...], tuple[int, ...]],
+) -> AnalysisContext:
+    """LinkedIn ``hot`` (1) with ``(daily budget, costs, leads)``; ``control`` (2) at 500.00."""
+    daily, hot_costs, hot_leads = hot
+    control_costs, control_leads = control
+    week = _dates(WEEK)
+    return _context(
+        thresholds,
+        _window(thresholds, WEEK, google_tz=None, sources=("linkedin",)),
+        datasets={"linkedin": LINKEDIN_DATASET},
+        freshness=_li_coverage(date(2026, 9, 1), WEEK[1]),
+        accounts={LINKEDIN_ACCOUNT.id: LINKEDIN_ACCOUNT},
+        campaigns={1: _li_campaign(1, daily=daily), 2: _li_campaign(2, daily="500.00")},
+        observations={
+            ("campaign", 1): _series(OBS_START, NOW, **_li_state(daily)),
+            ("campaign", 2): _series(OBS_START, NOW, **_li_state("500.00")),
+        },
+        campaign_days={
+            1: tuple(
+                _li_day(day, cost, leads)
+                for day, cost, leads in zip(week, hot_costs, hot_leads, strict=True)
+            ),
+            2: tuple(
+                _li_day(day, cost, leads)
+                for day, cost, leads in zip(week, control_costs, control_leads, strict=True)
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("last_day", "meets"),
+    [
+        # 0.71 x 6 + 0.74 = 5.00 of an account 50.00 over 30 leads: exactly 3 expected.
+        pytest.param("0.74", True, id="exactly-three-expected"),
+        # 4.99 x 30 / 49.99 = 2.995 expected.
+        pytest.param("0.73", False, id="just-below"),
+    ],
+)
+def test_b2_zero_outcome_branch_meets_exactly_the_minimum_expected(
+    thresholds: Thresholds, last_day: str, meets: bool
+) -> None:
+    # The rounded baseline 50 / 30 = 1.666…667 would put 5.00 at 2.999…999 expected leads.
+    ctx = _boundary_context(
+        thresholds,
+        ("0.75", ("0.71",) * 6 + (last_day,), (0,) * 7),
+        (("6.43",) * 6 + ("6.42",), (4, 4, 4, 4, 4, 5, 5)),
+    )
+    hot: SubjectKey = ("campaign", 1)
+    assessment = assess_b2(ctx, hot)
+    assert assessment.gate.passed is True
+    assert (assessment.meets, assessment.branch) == (meets, "zero_outcomes" if meets else None)
+    assert assessment.expected is not None
+    assert round(assessment.expected, 6) == (Decimal(3) if meets else Decimal("2.994599"))
+    assert spend_increase_blocked(ctx) == (frozenset({hot}) if meets else frozenset())
+
+
+@pytest.mark.parametrize(
+    ("last_day", "meets"),
+    [
+        # 3.00 over 14 leads = 3/14, exactly 1.5 x the account's 10.00 over 70 leads.
+        pytest.param("0.42", True, id="exactly-the-ratio"),
+        # 2.99 x 70 = 209.3 < 1.5 x 9.99 x 14 = 209.79.
+        pytest.param("0.41", False, id="just-below"),
+    ],
+)
+def test_b2_poor_efficiency_branch_meets_exactly_the_ratio(
+    thresholds: Thresholds, last_day: str, meets: bool
+) -> None:
+    # The rounded quotients put 3/14 = 0.…143 below 1.5 x 0.…429 = 0.…144.
+    ctx = _boundary_context(
+        thresholds,
+        ("0.45", ("0.43",) * 6 + (last_day,), (2,) * 7),
+        (("1",) * 7, (8,) * 7),
+    )
+    assessment = assess_b2(ctx, ("campaign", 1))
+    assert assessment.gate.passed is True
+    assert (assessment.meets, assessment.branch) == (meets, "poor_efficiency" if meets else None)
+    assert assessment.cpo is not None
+    assert assessment.baseline is not None
+    if meets:
+        assert assessment.cpo < Decimal("1.5") * assessment.baseline
 
 
 def _two_member_context(thresholds: Thresholds, member_two_conversions: str) -> AnalysisContext:
@@ -1550,6 +2245,77 @@ def test_a_poor_member_in_a_high_utilization_shared_budget_blocks_every_increase
     assert spend_increase_blocked(ctx) == frozenset(expected)
 
 
+@pytest.mark.parametrize(
+    ("last_day", "poor"),
+    [
+        # Member 2 spends 0.71 x 6 + 0.74 = 5.00 with 0 conversions; the account 50.00 over 30.
+        pytest.param("0.74", True, id="exactly-three-expected"),
+        pytest.param("0.73", False, id="just-below"),
+    ],
+)
+def test_the_member_predicate_meets_exactly_the_minimum_expected(
+    thresholds: Thresholds, last_day: str, poor: bool
+) -> None:
+    week = _dates(WEEK)
+    one = zip(("6.43",) * 6 + ("6.42",), ("4", "4", "4", "4", "4", "5", "5"), strict=True)
+    two = ("0.71",) * 6 + (last_day,)
+    pool_state = _google_state(POOL, "7.50", shared=True)
+    ctx = _shared_context(
+        thresholds,
+        campaigns={cid: _google_campaign(cid, POOL) for cid in (1, 2)},
+        budgets={POOL: _budget(POOL, "7.50", shared=True)},
+        observations={
+            ("budget", POOL): _series(OBS_START, NOW, **_budget_state("7.50")),
+            ("campaign", 1): _series(OBS_START, NOW, **pool_state),
+            ("campaign", 2): _series(OBS_START, NOW, **pool_state),
+        },
+        days={
+            1: tuple(
+                _google_day(day, cost, value) for day, (cost, value) in zip(week, one, strict=True)
+            ),
+            2: tuple(_google_day(day, cost, "0") for day, cost in zip(week, two, strict=True)),
+        },
+    )
+    pool: SubjectKey = ("budget", POOL)
+    assessment = assess_b2(ctx, pool)
+    assert (assessment.gate.passed, assessment.meets) == (True, False)
+    assert member_poor_efficiency(ctx, POOL, 1) is False
+    assert member_poor_efficiency(ctx, POOL, 2) is poor
+    expected = {pool, ("campaign", 1), ("campaign", 2)} if poor else set()
+    assert spend_increase_blocked(ctx) == frozenset(expected)
+
+
+@pytest.mark.parametrize("unreported", [2, 1], ids=["member-day", "other-member-day"])
+def test_an_unreported_member_day_leaves_the_member_predicate_unmet(
+    thresholds: Thresholds, unreported: int
+) -> None:
+    # Campaign 2 records 0 conversions on six days; one day of campaign ``unreported`` reports
+    # none. Its own count or the account baseline is then unknown, so it is not poor.
+    days = _member_days({1: ("600", "30"), 2: ("370", "0")})
+    facts = list(days[unreported])
+    facts[3] = _google_day(facts[3].date, str(facts[3].cost), None)
+    days[unreported] = tuple(facts)
+    ctx = _shared_context(
+        thresholds,
+        campaigns={cid: _google_campaign(cid, POOL) for cid in (1, 2)},
+        observations={
+            ("budget", POOL): _series(OBS_START, NOW, **_budget_state("1000.00")),
+            ("campaign", 1): _series(OBS_START, NOW, **_pool_state()),
+            ("campaign", 2): _series(OBS_START, NOW, **_pool_state()),
+        },
+        days=days,
+    )
+    pool: SubjectKey = ("budget", POOL)
+    assert baseline_cpo(ctx, GOOGLE_ACCOUNT.id, "google") is None
+    totals = subject_totals(ctx, pool)
+    assert totals is not None
+    assert (totals.outcomes, totals.unreported_days) == (None, 1)
+    assessment = assess_b2(ctx, pool)
+    assert (assessment.gate.passed, assessment.meets, assessment.branch) == (True, False, None)
+    assert member_poor_efficiency(ctx, POOL, 2) is False
+    assert spend_increase_blocked(ctx) == frozenset()
+
+
 def test_member_predicate_rejects_unknown_campaigns_and_unshared_budgets(
     thresholds: Thresholds,
 ) -> None:
@@ -1576,21 +2342,24 @@ def test_a_member_poor_shared_budget_is_not_blocked_while_its_gate_fails(
 # ---------------------------------------------------------------------------
 
 DATA_DRIVEN = "GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN"
+ABSENT = object()
+"""Leaves a key out of a conversion action's payload, as a snapshot that never reported it."""
 
 
 def _action(
     start: datetime = OBS_START,
     end: datetime = NOW,
     *,
-    include: bool = True,
-    model: str = LAST_CLICK_MODEL,
-    counting: str = "ONE_PER_CLICK",
+    include: object = True,
+    model: object = LAST_CLICK_MODEL,
+    counting: object = "ONE_PER_CLICK",
 ) -> tuple[Observation, ...]:
-    payload = {
+    settings = {
         "include_in_conversions_metric": include,
         "attribution_model": model,
         "counting_type": counting,
     }
+    payload = {key: value for key, value in settings.items() if value is not ABSENT}
     return _series(start, end, status="ENABLED", payload=payload)
 
 
@@ -1713,7 +2482,174 @@ def test_an_included_action_observed_weighted_during_a_day_makes_it_weighted(
         )
         for obs in one_day
     )
-    assert "weighted" not in _contract(thresholds, {1: excluded, 2: _action()})
+    assert _contract(thresholds, {1: excluded, 2: _action()}) == ["last_click"] * 7
+
+
+@pytest.mark.parametrize(
+    "model",
+    [None, "UNKNOWN", "UNSPECIFIED", "GOOGLE_ADS_FUTURE_MODEL", pytest.param(ABSENT, id="absent")],
+)
+def test_an_included_action_without_a_known_model_leaves_the_contract_unknown(
+    thresholds: Thresholds, model: object
+) -> None:
+    # A missing or unrecognised attribution model is unavailable: it is neither weighted
+    # evidence nor last click.
+    unverified = _action(model=model)
+    assert _contract(thresholds, {1: unverified}) == ["unknown"] * 7
+    assert _contract(thresholds, {1: unverified, 2: _action()}) == ["unknown"] * 7
+    # Affirmative weighted evidence on another included action still comes first.
+    assert _contract(thresholds, {1: unverified, 2: _action(model=DATA_DRIVEN)}) == ["weighted"] * 7
+
+
+@pytest.mark.parametrize(
+    "counting",
+    [None, "UNKNOWN", "UNSPECIFIED", "PER_IMPRESSION", pytest.param(ABSENT, id="absent")],
+)
+def test_last_click_without_a_known_counting_type_leaves_the_contract_unknown(
+    thresholds: Thresholds, counting: object
+) -> None:
+    # 3-hourly snapshots of {included, GOOGLE_ADS_LAST_CLICK, counting_type: null} verify no
+    # count: the counting type must be ONE_PER_CLICK or MANY_PER_CLICK.
+    assert _contract(thresholds, {1: _action(counting=counting)}) == ["unknown"] * 7
+    assert _contract(thresholds, {1: _action(counting="ONE_PER_CLICK")}) == ["last_click"] * 7
+    # A data-driven model weights the day whatever its counting type says.
+    assert (
+        _contract(thresholds, {1: _action(model=DATA_DRIVEN, counting=counting)})
+        == ["weighted"] * 7
+    )
+
+
+@pytest.mark.parametrize("include", [None, 1, pytest.param(ABSENT, id="absent")])
+def test_an_action_of_unreported_inclusion_leaves_the_contract_unknown(
+    thresholds: Thresholds, include: object
+) -> None:
+    # Without a boolean inclusion flag nothing shows whether the action counts in
+    # metrics.conversions, so it never drops out of the verified set unnoticed.
+    unreported = _action(include=include)
+    assert _contract(thresholds, {1: unreported, 2: _action()}) == ["unknown"] * 7
+    assert _contract(thresholds, {1: unreported}) == ["unknown"] * 7
+    assert (
+        _contract(thresholds, {1: _action(include=include, model=DATA_DRIVEN)}) == ["unknown"] * 7
+    )
+    assert _contract(thresholds, {1: _action(include=False), 2: _action()}) == ["last_click"] * 7
+
+
+def test_settings_of_an_action_excluded_all_day_never_unsettle_the_contract(
+    thresholds: Thresholds,
+) -> None:
+    # At 2026-09-27 15:00 UTC (11:00 New York) the excluded action moves from data-driven,
+    # many per click to last click, one per click. It never counts in metrics.conversions.
+    changed = _instant(date(2026, 9, 27), 15)
+    excluded = (
+        *_action(
+            end=changed - CADENCE, include=False, model=DATA_DRIVEN, counting="MANY_PER_CLICK"
+        ),
+        *_action(start=changed, include=False),
+    )
+    assert _contract(thresholds, {1: excluded, 2: _action()}) == ["last_click"] * 7
+    # The same counting-type change on an included action unsettles its day.
+    included = (*_action(end=changed - CADENCE, counting="MANY_PER_CLICK"), *_action(start=changed))
+    assert _contract(thresholds, {1: included, 2: _action()}) == [
+        "last_click",
+        "last_click",
+        "unknown",
+        *["last_click"] * 4,
+    ]
+
+
+def test_inclusion_not_whole_day_known_leaves_the_day_unknown(thresholds: Thresholds) -> None:
+    # Included from 2026-09-27 15:00 UTC: the day the inclusion flips is not whole-day known.
+    flipped = _instant(date(2026, 9, 27), 15)
+    joined = (*_action(end=flipped - CADENCE, include=False), *_action(start=flipped))
+    assert _contract(thresholds, {1: joined, 2: _action()}) == [
+        "last_click",
+        "last_click",
+        "unknown",
+        *["last_click"] * 4,
+    ]
+    # A 9 h gap on 2026-09-29 leaves even an excluded action's inclusion unobserved that day.
+    gap = _without(
+        _action(include=False), _instant(date(2026, 9, 29), 9), _instant(date(2026, 9, 29), 12)
+    )
+    assert _contract(thresholds, {1: gap, 2: _action()}) == [
+        *["last_click"] * 4,
+        "unknown",
+        *["last_click"] * 2,
+    ]
+
+
+def test_actions_all_excluded_all_day_verify_an_empty_included_set(
+    thresholds: Thresholds,
+) -> None:
+    # Every action is whole-day known excluded, so no included action can weight a count.
+    actions = {1: _action(include=False), 2: _action(include=False, model=DATA_DRIVEN)}
+    assert _contract(thresholds, actions, registered=actions) == ["last_click"] * 7
+
+
+SPARSE_CADENCE = timedelta(hours=48)
+"""A snapshot cadence wider than a day: ``budget.max_observation_gap_hours`` is any positive
+count, so a gap limit of 48 h leaves days with no snapshot inside them whole-day known."""
+
+
+def _sparse_action(model: object) -> tuple[Observation, ...]:
+    """Included, one-per-click :func:`_action` snapshots every :data:`SPARSE_CADENCE`.
+
+    From 2026-09-22 06:00 UTC (02:00 New York) through 2026-10-02 06:00 UTC, before
+    :data:`NOW`.
+    """
+    start = _instant(date(2026, 9, 22), 6)
+    return tuple(
+        obs
+        for obs in _action(start, model=model)
+        if (obs.captured_at - start) % SPARSE_CADENCE == timedelta(0)
+    )
+
+
+def _contract_at_gap(
+    thresholds: Thresholds, observations: tuple[Observation, ...], max_gap_hours: int
+) -> list[str]:
+    """:func:`_contract` of one action with ``budget.max_observation_gap_hours`` overridden."""
+    ctx = _context(
+        thresholds,
+        _window(thresholds, WEEK),
+        accounts={GOOGLE_ACCOUNT.id: GOOGLE_ACCOUNT},
+        observations={("conversion_action", 1): observations},
+    )
+    ctx.cache["metrics.gate_config"] = replace(
+        GateConfig.from_thresholds(thresholds), max_gap_hours=max_gap_hours
+    )
+    contract = counting_contract(ctx)
+    assert list(contract) == _dates(WEEK)
+    return list(contract.values())
+
+
+def test_whole_day_known_settings_classify_a_day_without_a_snapshot_inside(
+    thresholds: Thresholds,
+) -> None:
+    # Snapshots every 48 h at 02:00 New York fall inside 2026-09-26, 09-28 and 09-30 only. At
+    # a 48 h gap limit every window day is still whole-day known, so on the other four days
+    # no snapshot captured during the day can weight it: their whole-day-known settings
+    # alone classify them.
+    held = {
+        obs.captured_at.astimezone(ZoneInfo(NY)).date() for obs in _sparse_action(LAST_CLICK_MODEL)
+    }
+    assert [day for day in _dates(WEEK) if day not in held] == [
+        date(2026, 9, 25),
+        date(2026, 9, 27),
+        date(2026, 9, 29),
+        date(2026, 10, 1),
+    ]
+    weighted = _sparse_action(DATA_DRIVEN)
+    assert _contract_at_gap(thresholds, weighted, 48) == ["weighted"] * 7
+    assert _contract_at_gap(thresholds, _sparse_action(LAST_CLICK_MODEL), 48) == ["last_click"] * 7
+    assert _contract_at_gap(thresholds, _sparse_action(None), 48) == ["unknown"] * 7
+    # At the configured 6 h limit the four days without a snapshot are unobserved, and only
+    # the snapshots inside the other three weight them.
+    configured = thresholds.int("budget.max_observation_gap_hours")
+    assert _contract_at_gap(thresholds, weighted, configured) == [
+        *["unknown", "weighted"] * 3,
+        "unknown",
+    ]
 
 
 # ---------------------------------------------------------------------------

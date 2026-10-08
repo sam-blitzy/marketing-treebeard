@@ -7,9 +7,12 @@ fire and not fire. These tests hold the catalogue to that contract (names, twins
 differences, the module partition and rule coverage), build every scenario's context without a
 database, exercise every validation branch of the declarative specs, the configuration
 overrides and the CRM binding resolution, and cross-check the expectations the rule code that
-already exists can evaluate (C0 discrepancies and the pipeline veto).
+already exists can evaluate (C0 discrepancies, the pipeline veto and K3 keyword entity keys) and
+the keyset page sizes the Google keyset cases state, by scanning their worlds through the live
+webhook client on the simulated transport.
 
-No database, network or file writes: the shipped ``config/`` files are only read.
+No database or network, and the shipped ``config/`` files are only read: the tests of edited
+configurations work on copies under ``tmp_path``.
 """
 
 import dataclasses
@@ -18,14 +21,16 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import SecretStr
 
-from ads_engine.analysis import discrepancy
+from ads_engine.analysis import discrepancy, keywords
 from ads_engine.analysis.attribution import build_attribution
 from ads_engine.analysis.context import (
     B1,
@@ -40,24 +45,39 @@ from ads_engine.analysis.context import (
     FLAG_UNKNOWN_CRM_EVIDENCE,
     G1,
     K1,
+    K3,
     RULE_IDS,
     AnalysisContext,
     DatasetRef,
     DecisionInfo,
     DiscrepancyInfo,
     FeedbackInfo,
+    Observation,
+    keyword_external_id,
     search_term_external_id,
 )
 from ads_engine.analysis.thresholds import (
+    CONFIG_FILES,
     CONTENT_ASSETS_FILE,
     FORM_URN_PREFIX,
+    HUBSPOT_MAPPING_FILE,
     THRESHOLDS_FILE,
     ConfigError,
     CrmBindings,
     StageBinding,
     Thresholds,
 )
+from ads_engine.connectors.google_n8n.client import (
+    SIMULATED_SECRET,
+    SIMULATED_WEBHOOK_URL,
+    UNMETERED,
+    GoogleAdsWebhookClient,
+)
+from ads_engine.connectors.google_n8n.parser import get_field
+from ads_engine.connectors.google_n8n.queries import INT64_MIN_ID, KEYSET_LIMIT, LAST_ID, QUERIES
+from ads_engine.connectors.http import build_client
 from ads_engine.db.models.ops import DATASETS, SOURCES
+from ads_engine.settings import get_settings
 from ads_engine.simulation import (
     DEFAULT_SCENARIO,
     DEFAULT_SEED,
@@ -100,6 +120,7 @@ from ads_engine.simulation.scenarios import (
     thresholds_with,
     validate_catalogue,
 )
+from ads_engine.simulation.transport import mock_transport
 
 CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 MIDNIGHT = datetime.combine(FIXED_ANCHOR, time(0), tzinfo=UTC)
@@ -1115,17 +1136,85 @@ def test_thresholds_with_replaces_the_registry() -> None:
     assert thresholds_with({}, ()).content_assets == ()
 
 
-def test_config_documents_report_unreadable_and_non_mapping_files(
-    monkeypatch: pytest.MonkeyPatch,
+def _work_on_a_config_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Copy the shipped files to ``tmp_path/config`` and work from ``tmp_path``.
+
+    ``resolve_config_dir`` is relative to the working directory, so ``thresholds_with`` then
+    reads the copy, which a test may edit without touching the shipped ``config/``.
+    """
+    target = tmp_path / "config"
+    target.mkdir()
+    for name in CONFIG_FILES:
+        (target / name).write_bytes((CONFIG_DIR / name).read_bytes())
+    monkeypatch.chdir(tmp_path)
+    return target
+
+
+def test_thresholds_with_reads_the_files_with_the_strict_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(
-        ConfigError, match=r"cannot read /nonexistent-config/thresholds\.yaml"
-    ) as err:
-        scenarios._documents("/nonexistent-config")
+    path = _work_on_a_config_copy(tmp_path, monkeypatch) / THRESHOLDS_FILE
+    # A pasted second k1 block is a duplicate key, not a k1 missing its other thresholds.
+    path.write_text(path.read_text("utf-8") + "\nk1:\n  rule_of_three: 4\n", "utf-8")
+    for overrides in ({}, {"window.trusted_min_days": 21}):
+        with pytest.raises(ConfigError, match="duplicate key 'k1'") as caught:
+            thresholds_with(overrides)
+        assert (caught.value.file, caught.value.key) == (THRESHOLDS_FILE, None)
+
+
+def test_thresholds_with_reports_a_nul_byte_as_invalid_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _work_on_a_config_copy(tmp_path, monkeypatch) / THRESHOLDS_FILE
+    path.write_text(path.read_text("utf-8") + '\nextra: "a\x00b"\n', "utf-8")
+    with pytest.raises(ConfigError, match="invalid YAML: unacceptable character #x0000") as err:
+        thresholds_with({"window.trusted_min_days": 21})
     assert (err.value.file, err.value.key) == (THRESHOLDS_FILE, None)
-    monkeypatch.setattr(scenarios.yaml, "safe_load", lambda handle: ["not", "a", "mapping"])
-    with pytest.raises(ConfigError, match="top level must be a mapping"):
-        scenarios._documents(f"{CONFIG_DIR}/.")
+
+
+def test_thresholds_with_follows_every_edit_of_the_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _work_on_a_config_copy(tmp_path, monkeypatch)
+    path = config / THRESHOLDS_FILE
+    original = path.read_text("utf-8")
+    overrides = {"window.trusted_min_days": 21}
+    first = thresholds_with(overrides)
+    assert first.source_dir == config
+    assert thresholds_with(overrides) is first
+    assert first.int("k1.baseline_days") == 90
+
+    assert original.count("baseline_days: 90") == 1
+    path.write_text(original.replace("baseline_days: 90", "baseline_days: 91"), "utf-8")
+    edited = thresholds_with(overrides)
+    assert edited.int("k1.baseline_days") == 91
+    assert edited.config_hash != first.config_hash
+    assert thresholds_with({}).int("k1.baseline_days") == 91
+    assert thresholds_with(overrides) is edited
+
+    path.write_text(original + "\nk1:\n  rule_of_three: 4\n", "utf-8")
+    with pytest.raises(ConfigError, match="duplicate key 'k1'"):
+        thresholds_with(overrides)
+
+    path.write_text(original, "utf-8")
+    restored = thresholds_with(overrides)
+    assert restored.int("k1.baseline_days") == 90
+    assert restored.config_hash == first.config_hash
+    assert thresholds_with(overrides) is restored
+
+
+@pytest.mark.parametrize("name", [THRESHOLDS_FILE, CONTENT_ASSETS_FILE, HUBSPOT_MAPPING_FILE])
+def test_thresholds_with_names_a_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    config = _work_on_a_config_copy(tmp_path, monkeypatch)
+    # Memoised while the file exists; the memo never hides its removal.
+    thresholds_with({})
+    (config / name).unlink()
+    for overrides in ({}, {"window.trusted_min_days": 21}):
+        with pytest.raises(ConfigError, match="file not found") as caught:
+            thresholds_with(overrides)
+        assert (caught.value.file, caught.value.key) == (name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1459,30 @@ def test_feedback_specs_and_rows_key_entities_as_items_do() -> None:
     assert expired not in ctx.feedback
 
 
+def test_keyword_feedback_specs_key_keywords_as_k3_items_do() -> None:
+    base = _scenario("k3.qs_drop.fires")
+    google = base.spec.google
+    assert google is not None
+    keyword = google.keywords[0]
+    feedback = (FeedbackSpec(K3, "dismiss", "google", "keyword", keyword.key),)
+    scenario = _with_context(base, feedback=feedback)
+    ctx = scenario.build_context()
+    ids = scenario.ids
+    group = ids.external_id("google", "ad_group", keyword.ad_group_key)
+    criterion = ids.external_id("google", "keyword", keyword.key)
+    # A criterion id is unique only within its ad group, so the key names both platform ids.
+    expected = f"google:keyword:{keyword_external_id(group, criterion)}"
+    assert expected != ids.entity_key("google", "keyword", keyword.key)
+    assert [item.entity_key for item in ctx.feedback] == [expected]
+    (candidate,) = (item for item in keywords.evaluate(ctx).candidates if item.rule_id == K3)
+    assert candidate.entity_ref.key == expected
+    assert candidate.entity_ref.id == ids.id("google", "keyword", keyword.key)
+    assert ctx.feedback[0].matches(candidate)
+    unknown = (FeedbackSpec(K3, "dismiss", "google", "keyword", "kw-absent"),)
+    with pytest.raises(ValueError, match="no google keyword 'kw-absent'"):
+        _with_context(base, feedback=unknown).build_context()
+
+
 def test_an_incomplete_entity_enumeration_infers_no_removal() -> None:
     fires = _scenario("c0.missing.fires")
     assert {item.kind for item in fires.build_context().discrepancies} == {"missing"}
@@ -1390,6 +1503,40 @@ def test_no_snapshot_cadence_reads_no_snapshot_history() -> None:
     assert dict(ctx.observations) == {}
     assert dict(ctx.decisions) == {}
     assert ctx.discrepancies == ()
+
+
+def test_latest_observations_keep_the_last_snapshot_replayed_at_the_newest_instant() -> None:
+    # load_context probes ORDER BY captured_at DESC, id DESC LIMIT 1: among one entity's
+    # snapshots at the newest instant the last inserted is its current state.
+    scenario = _scenario("k1.gate.fires")
+    converter = scenarios._Converter(
+        scenario.world(), scenario.context, scenario.thresholds(), FIXED_NOW
+    )
+    newest = FIXED_NOW - timedelta(hours=3)
+
+    def snapshot(at: datetime, amount: str) -> Observation:
+        return Observation(at, status="active", budget_daily=Decimal(amount))
+
+    first, last = snapshot(newest, "100.00"), snapshot(newest, "200.00")
+    shared_first, shared_last = snapshot(newest, "50.00"), snapshot(newest, "60.00")
+    converter.observations = {
+        ("campaign", 1): [
+            snapshot(newest - timedelta(hours=3), "90.00"),
+            first,
+            last,
+            # Inserted later but captured earlier: the newest instant still wins.
+            snapshot(newest - timedelta(hours=1), "80.00"),
+            # After the run instant: never the current state.
+            snapshot(FIXED_NOW + timedelta(hours=1), "400.00"),
+        ],
+        ("budget", 2): [shared_first, shared_last],
+        ("campaign", 3): [snapshot(FIXED_NOW + timedelta(hours=1), "5.00")],
+        ("keyword", 4): [snapshot(newest, "1.00")],
+    }
+    latest = converter.read_latest_observations()
+    assert latest == {("campaign", 1): last, ("budget", 2): shared_last}
+    assert latest[("campaign", 1)] is last
+    assert latest[("budget", 2)] is shared_last
 
 
 def test_decision_patches_keep_the_fields_of_each_shape() -> None:
@@ -1577,12 +1724,25 @@ def test_pipeline_veto_expectations_hold_on_the_built_context(name: str) -> None
 
 _ROW_COUNTS = ("mql", "ql", "meetings_booked", "other_meetings")
 _ROW_COSTS = ("cost_per_ql", "cost_per_meeting")
+# Expectation keys naming asset-row values whose attribute has another name.
+_ROW_TOTALS: Mapping[str, str] = MappingProxyType(
+    {"leads": "linkedin_leads", "unmatched": "unmatched_leads"}
+)
+_ROW_KEYS = (
+    *_ROW_COUNTS,
+    *_ROW_COSTS,
+    *_ROW_TOTALS,
+    "deals",
+    "contact_share",
+    "spend",
+    "mql_label",
+)
 WHITE_PAPER_SCENARIOS = tuple(
     name
     for name, s in SCENARIOS.items()
     if name.startswith("wp.")
     and name != CONFLICT
-    and any(key in s.expect.values for key in (*_ROW_COUNTS, *_ROW_COSTS, "spend", "mql_label"))
+    and any(key in s.expect.values for key in _ROW_KEYS)
 )
 
 
@@ -1600,7 +1760,245 @@ def test_white_paper_expectations_hold_on_the_built_context(name: str) -> None:
     for key in _ROW_COSTS:
         if key in values:
             assert getattr(row, key).render() == values[key], key
+    if "deals" in values:
+        assert row.deals_after_touch.render() == str(values["deals"])
+    for key, attribute in _ROW_TOTALS.items():
+        if key in values:
+            assert getattr(row, attribute) == values[key], key
+    if "contact_share" in values:
+        assert row.contact_share == Decimal(cast(str, values["contact_share"]))
     if "spend" in values:
         assert row.spend == Decimal(cast(str, values["spend"]))
     if "mql_label" in values:
         assert row.mql_label == values["mql_label"]
+
+
+# ---------------------------------------------------------------------------
+# Keyset page sizes, read through the live client on the simulated webhook
+# ---------------------------------------------------------------------------
+
+# Each Google keyset case: the template its scan reads and the expectation key of its population.
+KEYSET_CASES = {
+    "google.keyset_25000.case": ("Q-G2", "campaigns"),
+    "google.keyset_ad_groups.case": ("Q-G4", "ad_groups"),
+}
+
+
+@pytest.fixture(scope="module")
+def anyio_backend() -> str:
+    """Run the async tests on asyncio only."""
+    return "asyncio"
+
+
+def _listed_ids(world: SimulatedWorld, query_id: str) -> frozenset[int]:
+    """The ids a complete keyset scan of ``query_id`` returns: every entity not ``REMOVED``."""
+    records = world.google_campaigns() if query_id == "Q-G2" else world.google_ad_groups()
+    return frozenset(record.id for record in records if record.status != "REMOVED")
+
+
+async def _keyset_scan(world: SimulatedWorld, query_id: str) -> tuple[tuple[int, ...], ...]:
+    """Each page's keyset ids, read by keyset scan of ``query_id`` on ``world``'s webhook.
+
+    One ``run_query`` per page of the template's keyset form, through the live client and the
+    strict simulated transport: a page of exactly ``KEYSET_LIMIT`` rows continues after its
+    largest id, and the first shorter page ends the scan (AAP 0.3.3).
+    """
+    keyset_field = QUERIES[query_id].keyset_field
+    assert keyset_field is not None
+    pages: list[tuple[int, ...]] = []
+    last_id = INT64_MIN_ID
+    async with build_client("google", mock_transport("google", world, strict=True)) as http:
+        client = GoogleAdsWebhookClient(
+            http=http,
+            budget=UNMETERED,
+            webhook_url=SIMULATED_WEBHOOK_URL,
+            secret_header=get_settings().n8n_webhook_secret_header,
+            secret=SecretStr(SIMULATED_SECRET),
+            customer_id=world.google_customer_id,
+        )
+        while True:
+            result = await client.run_query(query_id, {LAST_ID: last_id})
+            assert (result.pages, result.capped) == (1, False)
+            ids = tuple(int(cast(str, get_field(row, keyset_field))) for row in result.rows)
+            # Strictly increasing past the filter, so every scan terminates.
+            assert all(earlier < later for earlier, later in pairwise((last_id, *ids)))
+            pages.append(ids)
+            if len(ids) < KEYSET_LIMIT:
+                return tuple(pages)
+            last_id = ids[-1]
+
+
+def test_keyset_cases_are_every_case_that_states_keyset_pages() -> None:
+    stated = {name for name, scenario in SCENARIOS.items() if "pages" in scenario.expect.values}
+    assert stated == set(KEYSET_CASES)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", sorted(KEYSET_CASES))
+async def test_keyset_pages_are_what_a_scan_of_the_world_returns(name: str) -> None:
+    scenario = SCENARIOS[name]
+    query_id, population_key = KEYSET_CASES[name]
+    expected = cast(tuple[int, ...], scenario.expect.values["pages"])
+    population = scenario.expect.values[population_key]
+    # The stated pages are the keyset proof of the stated population.
+    assert sum(expected) == population
+    assert all(size == KEYSET_LIMIT for size in expected[:-1])
+    assert expected[-1] < KEYSET_LIMIT
+    # The world holds that population, and the scan reads all of it in exactly those pages.
+    world = scenario.world()
+    listed = _listed_ids(world, query_id)
+    assert len(listed) == population
+    pages = await _keyset_scan(world, query_id)
+    assert tuple(len(page) for page in pages) == expected
+    assert {key for page in pages for key in page} == listed
+
+
+def test_the_override_routes_the_overridden_creatives_spend_and_leads() -> None:
+    scenario = _scenario("wp.override_precedence.case")
+    values = scenario.expect.values
+    urn = cast(str, values["override_creative"])
+    ctx = scenario.build_context()
+    (creative,) = (info for info in ctx.creatives.values() if info.urn == urn)
+    # The creative's own lead form is listed under no asset: the override is valid, and it is
+    # the only route from the creative's spend and leads to the asset.
+    assert creative.lead_form_urn is not None
+    assert ctx.thresholds.asset_for_form(creative.lead_form_urn) is None
+    ctx.thresholds.check_overrides(
+        {info.urn: info.lead_form_urn for info in ctx.creatives.values()}
+    )
+    leads = [lead for lead in ctx.leads if lead.creative_id == creative.id]
+    assert {lead.lead_form_urn for lead in leads} == {creative.lead_form_urn}
+    assert len(leads) == values["override_leads"]
+
+    (row,) = (row for row in build_attribution(ctx).rows() if row.slug == values["asset"])
+    assert row.spend == Decimal(cast(str, values["spend"]))
+    assert row.linkedin_leads == values["leads"]
+    assert row.ql.render() == str(values["ql"])
+    credits = {credit.creative_urn: credit for credit in row.creative_rows}
+    override = credits[urn]
+    assert override.spend == Decimal(cast(str, values["override_spend"]))
+    assert override.leads == values["override_leads"]
+    assert override.ql.render() == str(values["override_ql"])
+    assert sum(credit.leads for credit in row.creative_rows) == row.linkedin_leads
+    assert sum(credit.spend for credit in row.creative_rows) == row.spend
+
+    # Without the override, neither the creative's spend nor its leads reach the asset.
+    assets = scenario.context.content_assets
+    assert assets is not None
+    (asset,) = assets
+    plain = _with_context(scenario, content_assets=(dataclasses.replace(asset, creative_urns=()),))
+    (row,) = build_attribution(plain.build_context()).rows()
+    assert urn not in {credit.creative_urn for credit in row.creative_rows}
+    assert row.spend == Decimal(cast(str, values["spend"])) - override.spend
+    assert row.linkedin_leads == cast(int, values["leads"]) - override.leads
+
+
+# (expectation key, asset-row attribute, per-creative attribute) of each credited event family.
+_CREDIT_FAMILIES = (
+    ("mql", "mql", "mql"),
+    ("ql", "ql", "ql"),
+    ("meetings_booked", "meetings_booked", "meetings_booked"),
+    ("deals", "deals_after_touch", "deals"),
+)
+
+
+@pytest.mark.parametrize("name", ["wp.credit_latest_touch.case", "wp.credit_between_touches.case"])
+def test_every_event_family_is_credited_to_the_latest_touch_at_or_before_it(name: str) -> None:
+    scenario = _scenario(name)
+    values = scenario.expect.values
+    ctx = scenario.build_context()
+    ids = scenario.ids
+    credited = ids.external_id("linkedin", "creative", cast(str, values["credited_creative"]))
+    # One contact touched the asset twice: cr-a1 first, cr-a2 last.
+    touches = sorted((lead.submitted_at, lead.creative_urn) for lead in ctx.leads)
+    assert [urn for _at, urn in touches] == [
+        ids.external_id("linkedin", "creative", key) for key in ("cr-a1", "cr-a2")
+    ]
+    assert len({lead.contact_hs_id for lead in ctx.leads}) == 1
+    if "last_touch_creative" in values:
+        last = ids.external_id("linkedin", "creative", cast(str, values["last_touch_creative"]))
+        assert touches[-1][1] == last != credited
+
+    # Every event falls at or after the credited creative's touch and before any later touch.
+    crm = ctx.linkedin_crm
+    assert crm is not None
+    (contact,) = crm.contacts.values()
+    events = [
+        contact.mql_at,
+        contact.ql_at,
+        *(meeting.created_at for meeting in crm.meetings.values()),
+        *(deal.created_at for deal in crm.deals.values()),
+    ]
+    credited_at = next(at for at, urn in touches if urn == credited)
+    later = [at for at, _urn in touches if at > credited_at]
+    for at in events:
+        assert at is not None
+        assert at >= credited_at
+        assert all(at < touch for touch in later)
+
+    (row,) = build_attribution(ctx).rows()
+    assert (row.matched_contacts, row.linkedin_leads) == (1, 2)
+    credits = {credit.creative_urn: credit for credit in row.creative_rows}
+    assert set(credits) == {urn for _at, urn in touches}
+    for key, asset_attribute, credit_attribute in _CREDIT_FAMILIES:
+        total = getattr(row, asset_attribute)
+        assert total.render() == str(values[key]), key
+        assert total.value > 0, key
+        assert getattr(credits[credited], credit_attribute).value == total.value, key
+        for urn, credit in credits.items():
+            if urn != credited:
+                assert getattr(credit, credit_attribute).value == 0, (key, urn)
+    # The per-creative rows partition the asset row: each column sums to the asset total.
+    assert values["rows_sum_to_total"] is True
+    assert sum(credit.spend for credit in row.creative_rows) == row.spend
+    assert sum(credit.leads for credit in row.creative_rows) == row.linkedin_leads
+    for _key, asset_attribute, credit_attribute in (
+        *_CREDIT_FAMILIES,
+        ("other_meetings", "other_meetings", "other_meetings"),
+    ):
+        summed = sum(getattr(credit, credit_attribute).value for credit in row.creative_rows)
+        assert summed == getattr(row, asset_attribute).value, asset_attribute
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "wp.contact_floor.fires",
+        "wp.contact_floor.does_not_fire",
+        "wp.contact_floor_no_outcomes.case",
+    ],
+)
+def test_the_contact_floor_bounds_counts_and_ceils_costs_only_over_known_denominators(
+    name: str,
+) -> None:
+    scenario = _scenario(name)
+    values = scenario.expect.values
+    ctx = scenario.build_context()
+    (row,) = build_attribution(ctx).rows()
+    floor = FLAG_ATTRIBUTION_FLOOR in scenario.expect.flags
+    assert row.has_flag(FLAG_ATTRIBUTION_FLOOR) is floor
+    assert row.contact_share is not None
+    assert (row.contact_share >= ctx.thresholds.ratio("attribution.floor_share")) is floor
+    (credit,) = row.creative_rows
+    assert credit.spend == row.spend
+    for key, asset_attribute, credit_attribute in _CREDIT_FAMILIES:
+        if key in values:
+            for count in (getattr(row, asset_attribute), getattr(credit, credit_attribute)):
+                assert count.render() == str(values[key]), key
+                assert count.floor is floor, key
+    for key, denominator in (("cost_per_ql", "ql"), ("cost_per_meeting", "meetings_booked")):
+        known = getattr(row, denominator).value
+        for cost in (getattr(row, key), getattr(credit, key)):
+            assert cost.render() == values[key], key
+            if known == 0:
+                # A zero known denominator is "—" with its note: no value and no ceiling.
+                assert (cost.value, cost.ceiling) == (None, False), key
+            else:
+                assert cost.value == row.spend / Decimal(known), key
+                # Under the floor the true denominator can only be larger: "≤ X".
+                assert cost.ceiling is floor, key
+    if "ql_cost_note" in values:
+        assert row.cost_per_ql.note == values["ql_cost_note"]
+        assert row.cost_per_meeting.note == values["meeting_cost_note"]
+        assert credit.cost_per_ql.note == values["ql_cost_note"]
+        assert credit.cost_per_meeting.note == values["meeting_cost_note"]

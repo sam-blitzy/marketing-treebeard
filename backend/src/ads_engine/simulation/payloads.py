@@ -40,21 +40,22 @@ simulator exists to test. There is no database I/O.
 
 Example::
 
-    world = SimulatedWorld(42)
     request = httpx.Request(
         "POST",
         "https://n8n.sim.invalid/webhook/google-ads",
         headers={"X-Webhook-Secret": "simulated", "Content-Type": "application/json"},
         json={"customer_id": "9900000001", "query": QUERIES["Q-G1"].render(), "page_token": None},
     )
-    response = render("google", request, world)
+    response = render("google", request)  # the product's world, seeded by MOCK_SEED
     assert response.status == 200 and response.surface == "search"
+    scenario = render("google", request, SimulatedWorld(7))  # an explicit world
 """
 
 import base64
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -87,7 +88,7 @@ from ads_engine.connectors.google_n8n.queries import (
 )
 from ads_engine.db.models.ops import SOURCES
 from ads_engine.logging import get_logger
-from ads_engine.settings import Source, get_settings
+from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import SIM_EMAIL_DOMAIN
 from ads_engine.simulation.generator import (
     FAULT_SURFACES,
@@ -759,8 +760,9 @@ class _Node:
         required: Required member names.
         extra: ``additionalProperties``: a boolean or a compiled schema.
         items: The compiled item schema, or ``None``.
-        leaves: The members that only a type constrains, with their allowed types (an empty
-            set allows any type); checked inline by :func:`_valid`.
+        leaves: The declared members whose schema is a :attr:`leaf`, with their allowed types
+            (an empty set allows any type); :func:`_valid` checks each with one type lookup
+            instead of a recursive call, which is exact because the type alone decides them.
     """
 
     types: frozenset[str] | None
@@ -773,8 +775,24 @@ class _Node:
 
     @property
     def leaf(self) -> bool:
-        """Whether only the type constrains a value (no enum, members or items)."""
-        return self.enum is None and not self.properties and self.items is None
+        """Whether the JSON type alone decides whether a value is valid.
+
+        That holds only when there is no enum; the types are unconstrained or name at least
+        one type (:attr:`leaves` reads an empty set as any type); an object the types allow
+        has no declared members, no required names and ``additionalProperties: true``; and an
+        array the types allow has no item schema. So a closed ``{"type": "object"}``
+        (``additionalProperties`` defaults to false), a member that only lists ``required``
+        and a map whose ``additionalProperties`` is a schema are never leaves: their values
+        are always descended. Scalar schemas such as ``{"type": "string"}`` are leaves.
+        """
+        types = self.types
+        if self.enum is not None or (types is not None and not types):
+            return False
+        if (types is None or "object" in types) and (
+            self.properties or self.required or self.extra is not True
+        ):
+            return False
+        return (types is not None and "array" not in types) or self.items is None
 
 
 _COMPILED: Final[dict[int, tuple[Mapping[str, JSONValue], _Node]]] = {}
@@ -1349,7 +1367,9 @@ class _Prepared:
     errors: tuple[str, ...]
 
 
-def validate_request(contract: Contract, request: RequestShape | httpx.Request) -> None:
+def validate_request(
+    contract: Contract, request: RequestShape | httpx.Request, *, settings: Settings | None = None
+) -> None:
     """Validate a request against its contract, collecting every violation.
 
     Checks, in one pass:
@@ -1360,10 +1380,11 @@ def validate_request(contract: Contract, request: RequestShape | httpx.Request) 
       whose scheme must be ``https`` (``http`` only on ``localhost``/``127.0.0.1``, as
       settings allow) and whose path never names ``searchStream``;
     * every required header, present and non-empty (case-insensitive). The webhook's
-      ``{N8N_WEBHOOK_SECRET_HEADER}`` resolves to ``get_settings().n8n_webhook_secret_header``.
-      ``Linkedin-Version`` must equal the contract's version, ``X-Restli-Protocol-Version``
-      ``2.0.0``, ``X-RestLi-Method`` ``BATCH_GET``, ``Authorization`` a Bearer credential and
-      ``Content-Type`` the body's media type. Header values are never echoed;
+      ``{N8N_WEBHOOK_SECRET_HEADER}`` resolves to ``settings.n8n_webhook_secret_header``
+      and no other name is accepted. ``Linkedin-Version`` must equal the contract's
+      version, ``X-Restli-Protocol-Version`` ``2.0.0``, ``X-RestLi-Method`` ``BATCH_GET``,
+      ``Authorization`` a Bearer credential and ``Content-Type`` the body's media type.
+      Header values are never echoed;
     * query names: every required name present, none repeated, none outside
       ``required_query`` plus ``optional_query``, no value percent-encoded twice (``%25``);
     * ``fields``: decoded once it must equal the contract's projection, and it must be sent
@@ -1380,23 +1401,26 @@ def validate_request(contract: Contract, request: RequestShape | httpx.Request) 
     Args:
         contract: The surface's contract.
         request: The request.
+        settings: The settings the client was built with, which name the webhook secret
+            header; :func:`~ads_engine.settings.get_settings` when ``None``, read only when
+            a contract names that header.
 
     Raises:
         ContractViolation: Listing every violation.
     """
-    prepared = _prepare(contract, _shape(request))
+    prepared = _prepare(contract, _shape(request), settings)
     if prepared.errors:
         raise ContractViolation(contract.surface, prepared.errors)
 
 
-def _prepare(contract: Contract, shape: RequestShape) -> _Prepared:
+def _prepare(contract: Contract, shape: RequestShape, settings: Settings | None) -> _Prepared:
     """Read ``shape`` against ``contract`` (see :func:`validate_request`)."""
     errors: list[str] = []
     spec = contract.request
     if shape.method != spec.method:
         errors.append(f"method: expected {spec.method}, got {shape.method}")
     url = _check_url(contract, shape.url, errors)
-    _check_headers(contract, shape, errors)
+    _check_headers(contract, shape, settings, errors)
     query = _split_query(url) if url is not None else _Query((), ())
     errors.extend(query.errors)
     _check_query_names(contract, query, errors)
@@ -1449,21 +1473,28 @@ def _check_url(contract: Contract, text: str, errors: list[str]) -> httpx.URL | 
     return url
 
 
-def _resolve_header(contract: Contract, name: str) -> str:
-    """Resolve a ``{PLACEHOLDER}`` header name from settings."""
+def _resolve_header(contract: Contract, name: str, settings: Settings | None) -> str:
+    """Resolve a ``{PLACEHOLDER}`` header name from ``settings`` (the process's when ``None``).
+
+    The process settings are read only when a placeholder is resolved, so surfaces whose
+    contracts name only literal headers never load them.
+    """
     if name.startswith("{") and name.endswith("}"):
         if name[1:-1] == _SECRET_HEADER_PLACEHOLDER:
-            return get_settings().n8n_webhook_secret_header
+            configured = settings if settings is not None else get_settings()
+            return configured.n8n_webhook_secret_header
         raise ContractViolation(
             contract.surface, (f"$.request.required_headers: unknown placeholder {name}",)
         )
     return name
 
 
-def _check_headers(contract: Contract, shape: RequestShape, errors: list[str]) -> None:
+def _check_headers(
+    contract: Contract, shape: RequestShape, settings: Settings | None, errors: list[str]
+) -> None:
     """Check required headers and the values the contracts fix (values are never echoed)."""
     for name in contract.request.required_headers:
-        resolved = _resolve_header(contract, name)
+        resolved = _resolve_header(contract, name, settings)
         value = shape.header(resolved)
         if value is None or not value.strip():
             errors.append(f"header {resolved}: missing or empty")
@@ -4415,8 +4446,34 @@ def _element_count(body: JSONValue | None) -> int:
     return 0
 
 
+# The world a two-argument render answers from, as one (settings, world) slot keyed on the
+# settings instance's identity; the lock makes the check and the build one step.
+_DEFAULT_WORLD: Final[list[tuple[Settings, SimulatedWorld]]] = []
+_DEFAULT_WORLD_LOCK: Final = threading.Lock()
+
+
+def _default_world(settings: Settings) -> SimulatedWorld:
+    """The product's world for ``settings``: built once per ``Settings`` instance, then reused.
+
+    ``SimulatedWorld.from_settings`` seeds it from ``MOCK_SEED``. Reuse keeps the world's
+    caches and fault counters across calls. The slot is keyed on identity, never equality,
+    and holds the instance itself, so an identity cannot be recycled while it is cached;
+    another instance (such as a new ``get_settings()`` after ``cache_clear``) replaces it.
+    """
+    with _DEFAULT_WORLD_LOCK:
+        if _DEFAULT_WORLD and _DEFAULT_WORLD[0][0] is settings:
+            return _DEFAULT_WORLD[0][1]
+        world = SimulatedWorld.from_settings(settings)
+        _DEFAULT_WORLD[:] = [(settings, world)]
+        return world
+
+
 def render(
-    source: Source, request: RequestShape | httpx.Request, world: SimulatedWorld
+    source: Source,
+    request: RequestShape | httpx.Request,
+    world: SimulatedWorld | None = None,
+    *,
+    settings: Settings | None = None,
 ) -> RenderedResponse:
     """Answer a request from the simulated world in the platform's live wire shape.
 
@@ -4437,10 +4494,18 @@ def render(
     ``object_type``, ``to_object_type`` (associations), ``property_name`` (properties) and
     ``page``. ``page`` is 1-based; a HubSpot association continuation call is page ``2``.
 
+    ``render(source, request)`` answers from the product's world; pass ``world`` to answer
+    from another, such as a scenario's.
+
     Args:
         source: The source the transport serves.
         request: The request.
-        world: The seeded simulated world.
+        world: The seeded simulated world. When ``None``, the product's world:
+            ``SimulatedWorld.from_settings(settings)``, seeded by ``MOCK_SEED``, built once
+            per ``Settings`` instance and reused by every later call with that instance.
+        settings: The settings the client was built with. They name the webhook secret
+            header the request must carry and, when ``world`` is ``None``, seed the world;
+            :func:`~ads_engine.settings.get_settings` when ``None``.
 
     Returns:
         The response to serialise, or one that must time out.
@@ -4448,11 +4513,17 @@ def render(
     Raises:
         UnknownSurface: When the request matches no surface of ``source``.
         ContractViolation: When a rendered 2xx body breaks its contract, a simulator bug.
+        ConfigError: When ``world`` is ``None`` and the config files the product's world
+            reads are missing or invalid.
     """
     shape = _shape(request)
     surface = identify_surface(source, shape)
     contract = load_contract(source, surface)
-    prepared = _prepare(contract, shape)
+    if world is None:
+        if settings is None:
+            settings = get_settings()
+        world = _default_world(settings)
+    prepared = _prepare(contract, shape, settings)
     fault_surfaces: tuple[str, ...] = (surface,)
     if source == "google" and isinstance(prepared.body, dict) and not prepared.errors:
         fault_surfaces = (surface, row_surface_for(cast(str, prepared.body["query"])))

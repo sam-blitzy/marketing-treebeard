@@ -50,7 +50,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -243,6 +243,7 @@ __all__ = [
     "creative_group_campaign",
     "creative_pair_external_id",
     "json_value",
+    "keyword_external_id",
     "objective_group",
     "search_term_external_id",
     "segment_external_id",
@@ -793,7 +794,7 @@ ENTITY_BUDGET: Final = "budget"
 ENTITY_AD_GROUP: Final = "ad_group"
 """A Google ad group."""
 ENTITY_KEYWORD: Final = "keyword"
-"""A Google keyword criterion."""
+"""A Google keyword criterion within its ad group (:func:`keyword_external_id`)."""
 ENTITY_SEARCH_TERM: Final = "search_term"
 """A search term within an ad group and matched criterion (:func:`search_term_external_id`)."""
 ENTITY_CREATIVE: Final = "creative"
@@ -823,6 +824,16 @@ ENTITY_TYPES: Final[tuple[str, ...]] = (
 """Every :attr:`EntityRef.type`."""
 
 _KEY_SEPARATOR: Final = "|"
+
+
+def keyword_external_id(ad_group_external_id: str, criterion_id: str | int) -> str:
+    """Return a keyword's stable key: ``{ad_group_external_id}|{criterion_id}``.
+
+    Google's ``ad_group_criterion.criterion_id`` is unique only within an ad group, so the
+    criterion alone would give keywords in different ad groups one key, and feedback on one
+    would suppress the other. The ad group's platform id makes the key account-wide unique.
+    """
+    return f"{ad_group_external_id}{_KEY_SEPARATOR}{criterion_id}"
 
 
 def search_term_external_id(
@@ -1038,11 +1049,11 @@ class EntityRef:
         id: The internal row id in the active dataset, when the entity has a row (campaign,
             budget, ad group, keyword, creative); ``None`` for composite entities.
         external_id: The platform id, or the composite key built by
-            :func:`search_term_external_id`, :func:`content_asset_external_id`,
-            :func:`segment_external_id`, :func:`term_cluster_external_id` or
-            :func:`creative_pair_external_id`.
+            :func:`keyword_external_id`, :func:`search_term_external_id`,
+            :func:`content_asset_external_id`, :func:`segment_external_id`,
+            :func:`term_cluster_external_id` or :func:`creative_pair_external_id`.
         name: The display name. A blank name falls back to ``external_id``, so ranking ties
-            (broken by name, then key) stay well defined.
+            (broken by name, then id, then key; :attr:`Candidate.sort_key`) stay well defined.
 
     Raises:
         ValueError: On construction, for an unknown source or type, or a blank external id.
@@ -1471,20 +1482,158 @@ def _tuple_of[T](value: object, kind: type[T], what: str) -> tuple[T, ...]:
     return tuple(items)
 
 
-def _dict_of(value: object, what: str) -> dict[str, Any]:
-    """Return a defensive ``dict`` copy of a string-keyed mapping.
+def _is_frozen_dataclass(value: object) -> bool:
+    """Whether ``value`` is an instance of a ``frozen=True`` dataclass, such as :class:`Metric`.
+
+    Only the flag is checked: the fields may still hold mutable values, so
+    :func:`_mutable_part` decides whether the instance is deeply immutable.
+    """
+    params = getattr(type(value), "__dataclass_params__", None)
+    return params is not None and getattr(params, "frozen", False) is True
+
+
+def _mutable_part(value: object, where: str) -> str | None:
+    """Describe the first value inside ``value`` that is not deeply immutable, if any.
+
+    ``value`` is deeply immutable when it is ``None``, a ``bool``, ``int``, ``float``,
+    ``str``, ``Decimal``, ``date`` or ``datetime``; a ``tuple`` or ``frozenset`` whose every
+    item is deeply immutable; or an instance of a ``frozen=True`` dataclass whose every field
+    (:func:`dataclasses.fields`) is deeply immutable. Nothing else is trusted: a ``dict``,
+    ``list`` or ``set``, a :class:`~types.MappingProxyType` (it can wrap a ``dict`` its
+    creator still holds), a dataclass that is not frozen, or any other object.
+
+    Args:
+        value: The value to inspect.
+        where: Its path inside the record being checked, for example ``data`` or
+            ``inner.rows[0]``; empty for the record itself.
+
+    Returns:
+        ``None`` when ``value`` is deeply immutable; otherwise where the first mutable value
+        sits and its type, for example ``"field 'data' holds a dict"`` or
+        ``"field 'inner.rows[0]' holds a list"``.
+    """
+    if value is None or isinstance(value, bool | int | float | str | Decimal | date):
+        return None
+    if isinstance(value, tuple):
+        parts = ((f"{where}[{index}]", item) for index, item in enumerate(value))
+    elif isinstance(value, frozenset):
+        parts = ((f"{where} item", item) for item in value)
+    elif _is_frozen_dataclass(value) and is_dataclass(value):
+        parts = (
+            # An ``init=False`` slot never assigned holds nothing, so it reads as ``None``.
+            (f"{where}.{part.name}" if where else part.name, getattr(value, part.name, None))
+            for part in fields(value)
+        )
+    else:
+        kind = type(value).__name__
+        article = "an" if kind[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        if is_dataclass(value) and not isinstance(value, type):
+            kind = f"{kind} (a dataclass that is not frozen)"
+        return f"field {where!r} holds {article} {kind}"
+    for path, item in parts:
+        found = _mutable_part(item, path)
+        if found is not None:
+            return found
+    return None
+
+
+def _frozen(value: object, what: str) -> object:
+    """Return a deep, read-only copy of a value stored in evidence or a context input.
+
+    As ``thresholds._freeze`` does for the configuration: a mapping becomes a
+    :class:`~types.MappingProxyType` over a fresh ``dict`` of frozen values, a list or tuple
+    a tuple of frozen items, and a set a ``frozenset`` of frozen items. ``None``, ``bool``,
+    ``int``, ``float``, ``str``, ``Decimal``, ``date`` and ``datetime`` are immutable and
+    returned unchanged. An instance of a ``frozen=True`` dataclass (:class:`EntityRef`,
+    :class:`Metric` …) is returned unchanged, the same object, only when it is deeply
+    immutable: every field, at any depth, holds a scalar of those types, a ``tuple`` or
+    ``frozenset`` of deeply immutable items, or another deeply immutable frozen dataclass
+    (:func:`_mutable_part`). The copy shares no mutable object with ``value``, and
+    :func:`json_value` renders it exactly as it renders ``value``: mappings as objects,
+    tuples as arrays.
+
+    Args:
+        value: The value to freeze.
+        what: Where the value sits, for example ``Evidence.extra['rows'][0]``, for errors.
 
     Raises:
-        TypeError: When ``value`` is not a mapping with string keys.
+        TypeError: On a frozen dataclass whose fields hold, at any depth, a ``dict``,
+            ``list``, ``set``, mapping proxy, non-frozen dataclass or any other object that
+            is not deeply immutable, naming the field; and on any other type, for example a
+            ``bytearray``, a non-frozen dataclass or another mutable object. Neither can be
+            frozen, so each is rejected rather than stored where a later change would alter
+            it.
+    """
+    if value is None or isinstance(value, bool | int | float | str | Decimal | date):
+        return value
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _frozen(item, f"{what}[{key!r}]") for key, item in value.items()}
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(item, f"{what}[{index}]") for index, item in enumerate(value))
+    if isinstance(value, set | frozenset):
+        return frozenset(_frozen(item, f"{what} item") for item in value)
+    if _is_frozen_dataclass(value):
+        mutable = _mutable_part(value, "")
+        if mutable is None:
+            return value
+        raise TypeError(
+            f"{what} is a frozen dataclass whose {mutable}, so it is not immutable and cannot "
+            f"be stored, found {type(value).__name__} {value!r}"
+        )
+    raise TypeError(
+        f"{what} must be a mapping, list, tuple, set, scalar or frozen dataclass so it can be "
+        f"frozen, found {type(value).__name__} {value!r}"
+    )
+
+
+def _frozen_mapping(value: object, what: str) -> Mapping[str, Any]:
+    """Return a deep, read-only copy (:func:`_frozen`) of a string-keyed mapping.
+
+    Raises:
+        TypeError: When ``value`` is not a mapping with string keys, or a nested value cannot
+            be frozen.
     """
     if not isinstance(value, Mapping):
         raise TypeError(f"{what} must be a mapping, found {value!r}")
-    copied: dict[str, Any] = {}
+    frozen: dict[str, Any] = {}
     for key, item in value.items():
         if not isinstance(key, str):
             raise TypeError(f"{what} keys must be strings, found {key!r}")
-        copied[key] = item
-    return copied
+        frozen[key] = _frozen(item, f"{what}[{key!r}]")
+    return MappingProxyType(frozen)
+
+
+def _read_only_mapping(value: object, what: str) -> Mapping[Any, Any]:
+    """Return a read-only copy of a mapping whose values are frozen records.
+
+    The values (frozen dataclasses such as :class:`CampaignInfo`) are immutable, so copying the
+    outer level keeps the caller's later changes to its own mapping out of the copy.
+
+    Raises:
+        TypeError: When ``value`` is not a mapping.
+    """
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{what} must be a mapping, found {value!r}")
+    return MappingProxyType(dict(value))
+
+
+def _read_only_sequences(value: object, what: str) -> Mapping[Any, tuple[Any, ...]]:
+    """Return a read-only copy of a mapping whose values are sequences, each made a tuple.
+
+    Raises:
+        TypeError: When ``value`` is not a mapping, or one of its values is not a list or
+            tuple.
+    """
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{what} must be a mapping, found {value!r}")
+    copied: dict[Any, tuple[Any, ...]] = {}
+    for key, items in value.items():
+        if not isinstance(items, list | tuple):
+            raise TypeError(f"{what}[{key!r}] must be a tuple, found {items!r}")
+        copied[key] = tuple(items)
+    return MappingProxyType(copied)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1492,24 +1641,33 @@ class Evidence:
     """Everything an item's conclusion rests on, frozen with the run (AAP 0.5.4.8).
 
     Build it with :meth:`AnalysisContext.make_evidence`, so the window, thresholds, dataset
-    statuses and provenance are recorded identically by every rule. Mappings are copied on
-    construction, so a later change to the caller's dict cannot alter frozen evidence.
+    statuses and provenance are recorded identically by every rule. ``window``, ``thresholds``
+    and ``extra`` are deep-copied on construction into read-only trees: every mapping, at any
+    depth, becomes a read-only mapping proxy, every list or tuple a tuple and every set a
+    ``frozenset``. Neither a later change to the caller's objects nor a write through the
+    stored values can therefore alter frozen evidence, and :meth:`to_json` still renders
+    plain JSON objects and arrays.
 
     Attributes:
         window: ``AnalysisWindow.to_json()``: ``{start, end, days, source_days}`` with each
-            source's native day boundary.
+            source's native day boundary; read-only, ``source_days`` a tuple.
         metrics: Every number the reason cites, with units and currency; keys are unique.
         baselines: The values those metrics were compared against.
         sample: The sample size against its minimum, when the rule is sample-gated.
         test: The statistical test, when one was used.
-        thresholds: ``{dotted key: configured value}`` for every threshold applied.
+        thresholds: ``{dotted key: configured value}`` for every threshold applied; read-only.
         datasets: The datasets read, with completeness and coverage.
         provenance: One entry per distinct dataset read, frozen at compute time.
         extra: Rule-specific detail, for example white-paper ``rows``, expansion
-            ``adjacent_terms``, B1/B3 allocation text or ``depends_on``.
+            ``adjacent_terms``, B1/B3 allocation text or ``depends_on``; read-only, with
+            nested lists as tuples.
 
     Raises:
-        TypeError: On construction, when a field has the wrong type.
+        TypeError: On construction, when a field has the wrong type, a mapping has a
+            non-string key, or a value nested in ``window``, ``thresholds`` or ``extra``
+            cannot be frozen: for example a ``bytearray``, a non-frozen dataclass, or a frozen
+            dataclass that is not deeply immutable because a field holds, at any depth, a
+            ``dict``, ``list``, ``set``, mapping proxy or other mutable object.
         ValueError: On construction, when two metrics share a key.
     """
 
@@ -1524,8 +1682,8 @@ class Evidence:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Copy the mappings, normalise the sequences and check element types."""
-        object.__setattr__(self, "window", _dict_of(self.window, "Evidence.window"))
+        """Deep-freeze the mappings, normalise the sequences and check element types."""
+        object.__setattr__(self, "window", _frozen_mapping(self.window, "Evidence.window"))
         metrics = _tuple_of(self.metrics, Metric, "Evidence.metrics")
         keys = [metric.key for metric in metrics]
         duplicates = sorted({key for key in keys if keys.count(key) > 1})
@@ -1539,7 +1697,9 @@ class Evidence:
             raise TypeError(f"Evidence.sample must be a Sample, found {self.sample!r}")
         if self.test is not None and not isinstance(self.test, TestResult):
             raise TypeError(f"Evidence.test must be a TestResult, found {self.test!r}")
-        object.__setattr__(self, "thresholds", _dict_of(self.thresholds, "Evidence.thresholds"))
+        object.__setattr__(
+            self, "thresholds", _frozen_mapping(self.thresholds, "Evidence.thresholds")
+        )
         object.__setattr__(
             self, "datasets", _tuple_of(self.datasets, DatasetStatus, "Evidence.datasets")
         )
@@ -1548,7 +1708,7 @@ class Evidence:
             "provenance",
             _tuple_of(self.provenance, ProvenanceEntry, "Evidence.provenance"),
         )
-        object.__setattr__(self, "extra", _dict_of(self.extra, "Evidence.extra"))
+        object.__setattr__(self, "extra", _frozen_mapping(self.extra, "Evidence.extra"))
 
     def metric(self, key: str) -> Metric:
         """Return the metric with ``key``.
@@ -1565,6 +1725,12 @@ class Evidence:
         """Return a copy with ``values`` merged into :attr:`extra`; this evidence is unchanged.
 
         ``precedence.py`` uses it for B1/B3 allocation text and the expanded ``depends_on``.
+        The copy is constructed anew, so its ``window``, ``thresholds`` and ``extra`` (the
+        added ``values`` included) are fresh read-only trees that share no mutable object
+        with this evidence or with ``values``.
+
+        Raises:
+            TypeError: When a value in ``values`` cannot be frozen (see :class:`Evidence`).
         """
         return replace(self, extra={**self.extra, **values})
 
@@ -1621,7 +1787,8 @@ class Candidate:
         reason: The reason sentence, rendered from this item's evidence only.
         evidence: The frozen evidence.
         rank_key: Sorts ascending within the group; rules negate values to rank descending.
-            Ties are broken by ``entity_ref.name``, then ``entity_ref.key`` (:attr:`sort_key`).
+            Ties are broken by ``entity_ref.name``, then ``entity_ref.id`` (entities with an id
+            first), then ``entity_ref.key`` (:attr:`sort_key`).
         flags: Badges set by the rule (floors, ``pipeline_unavailable``, ``shared_budget`` …);
             a repeated code keeps its first message.
         required_datasets: The dataset names the rule read, from which the item's ``stale``
@@ -1729,9 +1896,19 @@ class Candidate:
         return (self.rule_id, self.entity_ref.type, self.entity_ref.key)
 
     @property
-    def sort_key(self) -> tuple[tuple[Any, ...], str, str]:
-        """``(rank_key, entity name, entity key)``: deterministic order within a group."""
-        return (self.rank_key, self.entity_ref.name, self.entity_ref.key)
+    def sort_key(self) -> tuple[tuple[Any, ...], str, tuple[bool, int], str]:
+        """``(rank_key, entity name, entity id, entity key)``: deterministic order within a group.
+
+        Ranking ties are broken by entity name, then by :attr:`EntityRef.id`. The id slot is
+        ``(False, id)`` for an entity with an internal id and ``(True, 0)`` for a composite
+        entity without one, so entities with an id come first and ``int`` is never compared
+        with ``None``. :attr:`EntityRef.key` breaks any remaining tie, between id-less entities
+        of one name or entities of different types sharing a name and an id, so the order is
+        total and independent of input order.
+        """
+        ref = self.entity_ref
+        id_slot = (True, 0) if ref.id is None else (False, ref.id)
+        return (self.rank_key, ref.name, id_slot, ref.key)
 
     @property
     def spend_targets(self) -> frozenset[SubjectKey]:
@@ -1748,11 +1925,14 @@ class Finding:
         section: The section it is shown in (:data:`SECTION_ORDER`).
         entity: The entity it is about; ``None`` for a section- or account-wide finding.
         message: The rendered message.
-        evidence: The numbers behind the message.
+        evidence: The numbers behind the message, deep-copied on construction into a
+            read-only tree (as :class:`Evidence` does), so the stored finding never changes.
 
     Raises:
         ValueError: On construction, for an unknown code or section or a blank message.
-        TypeError: On construction, when ``entity`` or ``evidence`` has the wrong type.
+        TypeError: On construction, when ``entity`` or ``evidence`` has the wrong type,
+            ``evidence`` has a non-string key, or a value nested in it cannot be frozen,
+            including a frozen dataclass that is not deeply immutable (see :class:`Evidence`).
     """
 
     code: str
@@ -1762,13 +1942,13 @@ class Finding:
     evidence: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the fields and copy the evidence mapping."""
+        """Validate the fields and deep-freeze the evidence mapping."""
         _require_in(self.code, FINDING_CODES, "Finding.code")
         _require_in(self.section, SECTION_ORDER, "Finding.section")
         if self.entity is not None and not isinstance(self.entity, EntityRef):
             raise TypeError(f"Finding.entity must be an EntityRef, found {self.entity!r}")
         _require_text(self.message, "Finding.message")
-        object.__setattr__(self, "evidence", _dict_of(self.evidence, "Finding.evidence"))
+        object.__setattr__(self, "evidence", _frozen_mapping(self.evidence, "Finding.evidence"))
 
     def to_json(self) -> dict[str, Any]:
         """Return ``{code, section, entity?, message, evidence}``."""
@@ -1842,10 +2022,12 @@ class RuleResult:
         candidates: Proposed actions.
         findings: Non-action observations.
         withheld: Patterns below their minimums, with observed and required sizes.
-        suppressed: Items the rule itself suppressed, counted by reason.
+        suppressed: Items the rule itself suppressed, counted by reason; a read-only copy of
+            the mapping given, so a stored result's counts never change.
 
     Raises:
-        TypeError: On construction, when an element has the wrong type.
+        TypeError: On construction, when an element has the wrong type, ``suppressed`` is not
+            a mapping or one of its reasons is not a string.
         ValueError: On construction, for a blank reason or a negative count.
     """
 
@@ -1855,7 +2037,7 @@ class RuleResult:
     suppressed: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Normalise the sequences, copy ``suppressed`` and validate its counts."""
+        """Normalise the sequences, copy ``suppressed`` read-only and validate its counts."""
         object.__setattr__(
             self, "candidates", _tuple_of(self.candidates, Candidate, "RuleResult.candidates")
         )
@@ -1865,8 +2047,11 @@ class RuleResult:
         object.__setattr__(
             self, "withheld", _tuple_of(self.withheld, Withheld, "RuleResult.withheld")
         )
-        counts = _dict_of(self.suppressed, "RuleResult.suppressed")
+        # Every count is checked to be an int below, so the shallow copy is wholly immutable.
+        counts = _read_only_mapping(self.suppressed, "RuleResult.suppressed")
         for reason, count in counts.items():
+            if not isinstance(reason, str):
+                raise TypeError(f"RuleResult.suppressed keys must be strings, found {reason!r}")
             _require_text(reason, "RuleResult.suppressed reason")
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise ValueError(
@@ -1941,8 +2126,9 @@ class Freshness:
     Attributes:
         dataset_id: The ``source_dataset`` the row belongs to.
         dataset: The dataset name, one of ``db.models.ops.DATASETS``.
-        last_attempt_at: The last refresh attempt.
-        last_success_at: The last successful refresh; ``None`` before the first one.
+        last_attempt_at: The last refresh attempt, stored as the same instant in UTC.
+        last_success_at: The last successful refresh, stored as the same instant in UTC;
+            ``None`` before the first one.
         covered_from: The first native date covered.
         covered_through: The last native date covered.
         completeness: ``complete``, ``incomplete`` or ``unknown`` over the covered range.
@@ -1964,7 +2150,12 @@ class Freshness:
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate the fields."""
+        """Validate the fields and store both instants in UTC.
+
+        Two datetimes sharing one ``tzinfo`` compare and subtract by wall time, which is
+        wrong across a DST change; UTC storage makes every later comparison, subtraction
+        and ``min``/``max`` over these instants exact.
+        """
         _require_id(self.dataset_id, "Freshness.dataset_id")
         _require_in(self.dataset, DATASETS, "Freshness.dataset")
         _require_instant(self.last_attempt_at, "Freshness.last_attempt_at", optional=True)
@@ -1972,14 +2163,32 @@ class Freshness:
         _require_native_date(self.covered_from, "Freshness.covered_from", optional=True)
         _require_native_date(self.covered_through, "Freshness.covered_through", optional=True)
         _require_in(self.completeness, _COMPLETENESS_VALUES, "Freshness.completeness")
+        if self.last_attempt_at is not None:
+            object.__setattr__(self, "last_attempt_at", self.last_attempt_at.astimezone(UTC))
+        if self.last_success_at is not None:
+            object.__setattr__(self, "last_success_at", self.last_success_at.astimezone(UTC))
 
     def is_stale(self, *, now: datetime, stale_after: timedelta, window_end: date) -> bool:
         """Return whether the dataset is stale for a window ending on ``window_end`` (P4).
 
         Stale when it last succeeded more than ``stale_after`` (``sources.stale_after_hours``)
-        before ``now``, never succeeded, or covers less than the window end (AAP 0.3.2).
+        before ``now``, never succeeded, or covers less than the window end (AAP 0.3.2). The
+        age is the elapsed time between the two instants, taken on UTC operands, so it stays
+        exact when ``now`` and the last success straddle a DST change.
+
+        Args:
+            now: The tz-aware instant the age is judged at.
+            stale_after: ``sources.stale_after_hours`` as a duration.
+            window_end: The last native date of the window.
+
+        Raises:
+            TypeError: When ``now`` is not a ``datetime``.
+            ValueError: When ``now`` is naive.
         """
-        if self.last_success_at is None or now - self.last_success_at > stale_after:
+        _require_instant(now, "Freshness.is_stale now")
+        if self.last_success_at is None:
+            return True
+        if now.astimezone(UTC) - self.last_success_at.astimezone(UTC) > stale_after:
             return True
         return self.covered_through is None or self.covered_through < window_end
 
@@ -2477,10 +2686,13 @@ class Observation:
         budget_id: For campaign rows, the Google budget the campaign drew from.
         quality_score: For keyword rows, the Q-G7 quality score.
         payload: The full snapshot payload (for example a conversion action's
-            ``include_in_conversions_metric``, ``attribution_model`` and ``counting_type``).
+            ``include_in_conversions_metric``, ``attribution_model`` and ``counting_type``),
+            deep-copied on construction into a read-only tree (nested lists as tuples).
 
     Raises:
-        TypeError: On construction, when ``captured_at`` is not a ``datetime``.
+        TypeError: On construction, when ``captured_at`` is not a ``datetime``, ``payload``
+            is not a string-keyed mapping, or a value nested in it cannot be frozen,
+            including a frozen dataclass that is not deeply immutable (see :class:`Evidence`).
         ValueError: On construction, when ``captured_at`` is naive.
     """
 
@@ -2494,8 +2706,9 @@ class Observation:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Require a tz-aware instant."""
+        """Require a tz-aware instant and deep-freeze the payload."""
         _require_instant(self.captured_at, "Observation.captured_at")
+        object.__setattr__(self, "payload", _frozen_mapping(self.payload, "Observation.payload"))
 
 
 # ---------------------------------------------------------------------------
@@ -2694,15 +2907,20 @@ class AssociationFetchInfo:
 class CrmData:
     """Everything a context reads from one HubSpot dataset.
 
+    The mappings are copied on construction into read-only mappings and the sequences into
+    tuples, so a later change to the caller's collections cannot alter the CRM evidence a
+    run reads; their values are frozen records.
+
     Attributes:
         dataset: The CRM dataset (HubSpot primary, or a simulated companion).
         bindings: The MQL, QL and Google bindings verified against that dataset's portal.
         contacts: Contacts by HubSpot id: the matched leads' contacts and the Google-touch
-            contacts.
-        meetings: Associated meetings by HubSpot id.
-        deals: Associated and window deals by HubSpot id.
-        associations: ``(from_type, from_hs_id, to_type)`` to the associated HubSpot ids.
-        fetches: ``(object_type, object_hs_id, to_type)`` to the fetch outcome.
+            contacts; read-only.
+        meetings: Associated meetings by HubSpot id; read-only.
+        deals: Associated and window deals by HubSpot id; read-only.
+        associations: ``(from_type, from_hs_id, to_type)`` to the associated HubSpot ids;
+            read-only, each value a tuple.
+        fetches: ``(object_type, object_hs_id, to_type)`` to the fetch outcome; read-only.
         window_deal_ids: Portal deals created from window start to run time.
         deal_search_complete: Whether the deal search covered that range completely; when
             not, the orphan-deal share is unknown.
@@ -2710,7 +2928,8 @@ class CrmData:
 
     Raises:
         ValueError: On construction, when ``dataset`` is not a HubSpot dataset.
-        TypeError: On construction, when ``bindings`` is not :class:`CrmBindings`.
+        TypeError: On construction, when ``bindings`` is not :class:`CrmBindings`, a mapping
+            field is not a mapping, or an ``associations`` value is not a list or tuple.
     """
 
     dataset: DatasetRef
@@ -2725,11 +2944,19 @@ class CrmData:
     google_contacts: tuple[ContactInfo, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate the dataset and bindings."""
+        """Validate the dataset and bindings, and copy the collections read-only."""
         if not isinstance(self.dataset, DatasetRef) or self.dataset.source != "hubspot":
             raise ValueError(f"CrmData.dataset must be a HubSpot dataset, found {self.dataset!r}")
         if not isinstance(self.bindings, CrmBindings):
             raise TypeError(f"CrmData.bindings must be CrmBindings, found {self.bindings!r}")
+        for name in ("contacts", "meetings", "deals", "fetches"):
+            value = _read_only_mapping(getattr(self, name), f"CrmData.{name}")
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "associations",
+            _read_only_sequences(self.associations, "CrmData.associations"),
+        )
         object.__setattr__(self, "window_deal_ids", tuple(self.window_deal_ids))
         object.__setattr__(self, "google_contacts", tuple(self.google_contacts))
 
@@ -2804,13 +3031,18 @@ class DiscrepancyInfo:
         source: ``google`` or ``linkedin``.
         shape: The subject's decision shape, which fixes the offered resolutions.
         kind: ``status``, ``budget``, ``untracked`` or ``missing``.
-        decided_value: The decided state compared; ``None`` for ``untracked``.
-        platform_value: The platform state; ``None`` for ``missing``.
+        decided_value: The decided state compared; ``None`` for ``untracked``. Deep-copied on
+            construction into a read-only tree.
+        platform_value: The platform state; ``None`` for ``missing``. Deep-copied on
+            construction into a read-only tree.
         detected_at: When it was detected; C0 items are ordered oldest first.
         state: ``open`` or ``awaiting_platform``.
 
     Raises:
         ValueError: On construction, for an unknown subject type, kind or state.
+        TypeError: On construction, when a value is neither ``None`` nor a string-keyed
+            mapping, or a value nested in it cannot be frozen, including a frozen dataclass
+            that is not deeply immutable (see :class:`Evidence`).
     """
 
     id: int
@@ -2826,11 +3058,15 @@ class DiscrepancyInfo:
     state: OpenDiscrepancyState
 
     def __post_init__(self) -> None:
-        """Validate the enumerations and the detection instant."""
+        """Validate the enumerations and the detection instant; deep-freeze the two values."""
         _require_in(self.subject_type, _SUBJECT_TYPES, "DiscrepancyInfo.subject_type")
         _require_in(self.kind, _DISCREPANCY_KINDS, "DiscrepancyInfo.kind")
         _require_in(self.state, _OPEN_STATES, "DiscrepancyInfo.state")
         _require_instant(self.detected_at, "DiscrepancyInfo.detected_at")
+        for name in ("decided_value", "platform_value"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _frozen_mapping(value, f"DiscrepancyInfo.{name}"))
 
     @property
     def key(self) -> SubjectKey:
@@ -2847,10 +3083,11 @@ class FeedbackInfo:
         entity_type: The item's entity type.
         entity_key: The item's stable entity key (:attr:`EntityRef.key`).
         kind: ``dismiss``, ``snooze`` or ``done``.
-        until: When the suppression ends.
+        until: When the suppression ends, stored as the same instant in UTC.
 
     Raises:
         ValueError: On construction, for an unknown kind or a naive ``until``.
+        TypeError: On construction, when ``until`` is not a ``datetime``.
     """
 
     rule_id: str
@@ -2860,9 +3097,14 @@ class FeedbackInfo:
     until: datetime
 
     def __post_init__(self) -> None:
-        """Validate the kind and instant."""
+        """Validate the kind and instant, and store ``until`` in UTC.
+
+        Two datetimes sharing one ``tzinfo`` compare by wall time, ignoring a DST fold; UTC
+        storage makes every later comparison of ``until`` exact.
+        """
         _require_in(self.kind, FEEDBACK_KINDS, "FeedbackInfo.kind")
         _require_instant(self.until, "FeedbackInfo.until")
+        object.__setattr__(self, "until", self.until.astimezone(UTC))
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -2875,8 +3117,20 @@ class FeedbackInfo:
         return FEEDBACK_SUPPRESSION[self.kind]
 
     def active_at(self, now: datetime) -> bool:
-        """Whether the suppression is still in force at ``now``."""
-        return self.until > now
+        """Whether the suppression is still in force at ``now`` (``until`` is later).
+
+        Both instants are compared on UTC operands, so the answer stays exact in a DST
+        fold, where one wall time names two instants.
+
+        Args:
+            now: The tz-aware instant to judge at.
+
+        Raises:
+            TypeError: When ``now`` is not a ``datetime``.
+            ValueError: When ``now`` is naive.
+        """
+        _require_instant(now, "FeedbackInfo.active_at now")
+        return self.until.astimezone(UTC) > now.astimezone(UTC)
 
     def matches(self, candidate: Candidate) -> bool:
         """Whether this feedback suppresses ``candidate``; C0 items are never suppressed."""
@@ -2891,6 +3145,39 @@ _DATASET_SOURCE_PREFIXES: Final[Mapping[str, Source]] = MappingProxyType(
     {"google": "google", "linkedin": "linkedin", "hubspot": "hubspot"}
 )
 
+_CONTEXT_RECORD_MAPPINGS: Final[tuple[str, ...]] = (
+    "datasets",
+    "freshness",
+    "accounts",
+    "campaign_groups",
+    "campaigns",
+    "budgets",
+    "ad_groups",
+    "keywords",
+    "creatives",
+    "conversion_actions",
+    "creative_totals",
+    "latest_observations",
+    "decisions",
+)
+""":class:`AnalysisContext` mappings whose values are frozen records, copied read-only."""
+
+_CONTEXT_SEQUENCE_MAPPINGS: Final[tuple[str, ...]] = (
+    "campaign_days",
+    "keyword_days",
+    "observations",
+)
+""":class:`AnalysisContext` mappings whose values are sequences, copied read-only as tuples."""
+
+_CONTEXT_SEQUENCES: Final[tuple[str, ...]] = (
+    "search_terms",
+    "segments",
+    "leads",
+    "discrepancies",
+    "feedback",
+)
+""":class:`AnalysisContext` sequences of frozen records, copied as tuples."""
+
 
 @dataclass(frozen=True, slots=True)
 class AnalysisContext:
@@ -2899,6 +3186,11 @@ class AnalysisContext:
     ``metrics.load_context`` builds it from the database; ``simulation/scenarios.py`` and the
     acceptance tests build it directly, filling only what a rule reads, so every collection
     defaults to empty.
+
+    Every collection except :attr:`cache` is copied on construction: mappings into read-only
+    mappings (the per-key day, keyword-day and observation sequences into tuples) and
+    sequences into tuples. Their elements are frozen records, so a later change to the
+    caller's collections cannot alter the inputs a run reads.
 
     Dataset isolation (decision 8): every row belongs to its source's active primary dataset
     (:attr:`datasets`), except LinkedIn-attributed CRM evidence, which reads
@@ -2934,17 +3226,26 @@ class AnalysisContext:
         segment_windows: Every fetched segment window of the active LinkedIn dataset.
         observations: Snapshots keyed ``(entity_type, entity_id)``, ascending by
             ``captured_at``, covering the window plus bracketing observations.
+        latest_observations: Each campaign's and Google budget's newest stored snapshot
+            captured at or before :attr:`now`, keyed ``("campaign", id)`` or
+            ``("budget", id)`` and read independently of the window: the current state that
+            budget proposals (B1, B2, B3) are sized from, even for a custom window that ended
+            long before the run. Never merged into :attr:`observations`, whose span is what
+            budget-day classification and dated membership read.
         leads: LinkedIn leads submitted within ``window.utc_bounds()``, with their match state
             in :attr:`linkedin_crm`.
         discrepancies: Unresolved (``open`` or ``awaiting_platform``) discrepancies.
         decisions: The current (latest) decision per subject.
         feedback: Active feedback (``until`` after :attr:`now`).
         cache: Per-run memo for derived tables (budget histories, the attribution table), so
-            each is computed once; excluded from equality and ``repr``.
+            each is computed once; excluded from equality and ``repr``. The one mutable
+            field: the rules of a run write to it.
 
     Raises:
         TypeError: On construction, when ``window``, ``thresholds`` or a CRM dataset has the
-            wrong type, or ``now`` is not a ``datetime``.
+            wrong type, ``now`` is not a ``datetime``, a mapping field is not a mapping, or a
+            sequence field (or a ``campaign_days``, ``keyword_days`` or ``observations``
+            value) is not a list or tuple.
         ValueError: On construction, when ``now`` is naive, a dataset is filed under the wrong
             source or is not primary, or a CRM dataset breaks the isolation rule.
     """
@@ -2973,6 +3274,7 @@ class AnalysisContext:
     segments: tuple[SegmentRow, ...] = ()
     segment_windows: tuple[tuple[date, date], ...] = ()
     observations: Mapping[tuple[str, int], tuple[Observation, ...]] = field(default_factory=dict)
+    latest_observations: Mapping[tuple[str, int], Observation] = field(default_factory=dict)
     leads: tuple[LeadInfo, ...] = ()
     discrepancies: tuple[DiscrepancyInfo, ...] = ()
     decisions: Mapping[SubjectKey, DecisionInfo] = field(default_factory=dict)
@@ -2980,7 +3282,21 @@ class AnalysisContext:
     cache: dict[str, Any] = field(default_factory=dict, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Validate the run inputs and the dataset isolation rules (decision 8)."""
+        """Copy the collections read-only, then validate the run inputs and isolation rules."""
+        for name in _CONTEXT_RECORD_MAPPINGS:
+            records = _read_only_mapping(getattr(self, name), f"AnalysisContext.{name}")
+            object.__setattr__(self, name, records)
+        for name in _CONTEXT_SEQUENCE_MAPPINGS:
+            series = _read_only_sequences(getattr(self, name), f"AnalysisContext.{name}")
+            object.__setattr__(self, name, series)
+        for name in (*_CONTEXT_SEQUENCES, "segment_windows"):
+            items = getattr(self, name)
+            if not isinstance(items, list | tuple):
+                raise TypeError(f"AnalysisContext.{name} must be a tuple, found {items!r}")
+            object.__setattr__(self, name, tuple(items))
+        object.__setattr__(
+            self, "segment_windows", tuple(tuple(pair) for pair in self.segment_windows)
+        )
         if not isinstance(self.window, AnalysisWindow):
             raise TypeError(
                 f"AnalysisContext.window must be an AnalysisWindow, found {self.window!r}"

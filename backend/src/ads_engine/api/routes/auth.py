@@ -25,7 +25,7 @@ user id. No email, password, hash, cookie or client IP is ever logged or placed 
 message.
 
 Example:
-    The SPA signs in and reads the session like this::
+    The SPA signs in, reads the session and signs out like this::
 
         POST /api/v1/auth/login
         X-Requested-With: ads-engine
@@ -33,11 +33,15 @@ Example:
         -> 200 {"email": "admin@example.com"}, Set-Cookie: ads_engine_session=...
 
         GET /api/v1/auth/me  -> 200 {"email": "admin@example.com"} (401 when signed out)
+
+        POST /api/v1/auth/logout
+        X-Requested-With: ads-engine
+        -> 200 {"email": "admin@example.com"}, Set-Cookie: ads_engine_session=null; expires=...
 """
 
 from typing import Final
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Request
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -168,29 +172,30 @@ async def login(
 
 @router.post(
     "/auth/logout",
-    response_class=Response,
-    status_code=204,
+    response_model=schemas.Me,
+    status_code=200,
     responses=schemas.ERROR_RESPONSES,
 )
-async def logout(request: Request, user: UserDep) -> Response:
+async def logout(request: Request, user: UserDep) -> schemas.Me:
     """Sign out by clearing the session cookie.
 
     Requires a valid session. The session is cleared, so ``SessionMiddleware`` sends the
-    cookie back already expired, which removes it from the browser.
+    cookie back already expired, which removes it from the browser. The response names
+    the admin who signed out, the same ``{email}`` as login and ``/auth/me`` (AAP 0.5.3).
 
     Args:
         request: The current request; carries the session.
         user: The signed-in user, verified by ``require_user``.
 
     Returns:
-        An empty 204 response.
+        The signed-out admin's ``{email}``.
 
     Raises:
         ApiError: 401 ``unauthenticated`` without a valid session (from ``require_user``).
     """
     security.end_session(request)
     _log.info("auth.logged_out", user_id=user.id)
-    return Response(status_code=204)
+    return schemas.Me(email=user.email)
 
 
 @router.get(

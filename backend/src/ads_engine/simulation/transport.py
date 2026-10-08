@@ -73,7 +73,7 @@ from typing import Final
 import httpx
 
 from ads_engine.logging import get_logger
-from ads_engine.settings import SOURCES, Source
+from ads_engine.settings import SOURCES, Settings, Source
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.payloads import (
     ContractViolation,
@@ -292,6 +292,7 @@ def mock_transport(
     *,
     strict: bool = False,
     journal: list[JournalEntry] | None = None,
+    settings: Settings | None = None,
 ) -> httpx.MockTransport:
     """Build the transport that answers ``source``'s requests from ``world``.
 
@@ -311,13 +312,17 @@ def mock_transport(
             that breaks its contract raises ``ContractViolation`` in both modes.
         journal: When given, receives one :class:`JournalEntry` per request, in order. Only
             appended to; the caller owns the list.
+        settings: The settings the client was built with; their
+            ``N8N_WEBHOOK_SECRET_HEADER`` is the one webhook header name requests are
+            validated against. :func:`~ads_engine.settings.get_settings` when ``None``.
 
     Returns:
         An ``httpx.MockTransport`` for ``httpx.AsyncClient``.
 
     Raises:
         ValueError: When ``source`` is not a known source.
-        TypeError: When ``world`` is not a ``SimulatedWorld`` or ``journal`` is not a list.
+        TypeError: When ``world`` is not a ``SimulatedWorld``, ``journal`` is not a list or
+            ``settings`` is not a ``Settings``.
 
     Example::
 
@@ -331,6 +336,8 @@ def mock_transport(
         raise TypeError(f"world must be a SimulatedWorld, not {type(world).__name__}")
     if journal is not None and not isinstance(journal, list):
         raise TypeError(f"journal must be a list or None, not {type(journal).__name__}")
+    if settings is not None and not isinstance(settings, Settings):
+        raise TypeError(f"settings must be a Settings or None, not {type(settings).__name__}")
 
     def record(request: httpx.Request, surface: str, status: int | None, fault: str | None) -> None:
         """Journal and log one handled request: never headers, query strings or bodies."""
@@ -375,8 +382,8 @@ def mock_transport(
                 status = response.status_code
                 return response
             if strict:
-                validate_request(load_contract(source, surface), shape)
-            rendered = render(source, shape, world)
+                validate_request(load_contract(source, surface), shape, settings=settings)
+            rendered = render(source, shape, world, settings=settings)
             fault = rendered.fault
             if rendered.timeout:
                 raise httpx.ReadTimeout("simulated timeout", request=request)

@@ -4,7 +4,8 @@ They pin the matured population behind the C1b pause and the C2 pipeline veto (A
 "CRM pipeline link", 0.5.4.4 C1b and C2): one population per LinkedIn campaign, read from
 ``ctx.linkedin_crm`` (the effective CRM dataset), and one per Google campaign, read from
 ``ctx.google_crm`` only when the Google-to-CRM link is verified, so a LinkedIn-derived subset
-never stands in. Maturity is measured from the window end; unresolved leads stay in the
+never stands in. Maturity is measured from the window end (for Google, the end of the
+account's native day, which also bounds the touch-date population); unresolved leads stay in the
 share's denominator; eligible contacts are de-duplicated at their earliest matured touch; QL,
 MQL and meetings count only at or after that touch and never after the run. The pipeline is
 unavailable when the Qualified Lead stage is unbound, an eligible contact's refresh,
@@ -13,9 +14,10 @@ unbound MQL never blocks the veto. ``attribution_for`` memoises the table under
 ``CACHE_KEY``. Pure: no database and no network.
 """
 
+import dataclasses
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -46,6 +48,7 @@ from ads_engine.analysis.context import (
     CrmData,
     DatasetRef,
     DealInfo,
+    Freshness,
     LeadInfo,
     MatchStatus,
     MeetingInfo,
@@ -58,6 +61,7 @@ from ads_engine.analysis.thresholds import (
     Thresholds,
 )
 from ads_engine.analysis.window import AnalysisWindow, SourceDayInfo
+from ads_engine.simulation.scenarios import thresholds_with
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -71,6 +75,13 @@ WINDOW_END = datetime(2026, 10, 5, tzinfo=UTC)
 CUTOFF = datetime(2026, 9, 21, tzinfo=UTC)
 MATURED = datetime(2026, 9, 15, 10, 0, tzinfo=UTC)
 YOUNG = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
+# Google days are the account's (America/New_York, UTC-4 in this window): the window's Google
+# instant range is [2026-09-07 00:00, 2026-10-05 00:00) New York time, and a Google touch is
+# matured at or before New York's 2026-10-05 00:00 minus crm.lead_maturity_days (14).
+GOOGLE_TZ = "America/New_York"
+G_WINDOW_START = datetime(2026, 9, 7, 4, 0, tzinfo=UTC)
+G_WINDOW_END = datetime(2026, 10, 5, 4, 0, tzinfo=UTC)
+G_CUTOFF = datetime(2026, 9, 21, 4, 0, tzinfo=UTC)
 ONE_SECOND = timedelta(seconds=1)
 ONE_DAY = timedelta(days=1)
 
@@ -112,6 +123,8 @@ NO_GOOGLE_LINK = GoogleCrmBinding(
 )
 
 NO_CRM_REASON = "no CRM dataset for LinkedIn-attributed evidence"
+REFRESH_FAILED = "contact refresh failed; stage dates not current"
+REFRESH_NOT_RECORDED = "contact refresh not recorded; stage dates not current"
 UNRESOLVED_STATUSES: tuple[MatchStatus | None, ...] = (
     "pending",
     "no_match",
@@ -128,7 +141,7 @@ def thresholds() -> Thresholds:
 
 @pytest.fixture(scope="module")
 def window(thresholds: Thresholds) -> AnalysisWindow:
-    return AnalysisWindow.default(thresholds, SourceDayInfo("America/New_York"), now=NOW)
+    return AnalysisWindow.default(thresholds, SourceDayInfo(GOOGLE_TZ), now=NOW)
 
 
 # -- builders --------------------------------------------------------------------------------
@@ -195,7 +208,7 @@ def _matched(
     *,
     campaign_id: int = LI_A,
     at: datetime = MATURED,
-    read: ContactReadStatus = "ok",
+    read: ContactReadStatus | None = "ok",
     form: str = OTHER_FORM,
 ) -> LeadInfo:
     return LeadInfo(
@@ -275,6 +288,26 @@ CAMPAIGNS = {
 }
 
 
+def _google_contacts_freshness(**changes: Any) -> Freshness:
+    """The primary's ``hubspot.google_contacts`` row: complete, covering the window by default."""
+    attempt = NOW - timedelta(hours=1)
+    fields: dict[str, Any] = {
+        "dataset_id": HUBSPOT.dataset_id,
+        "dataset": "hubspot.google_contacts",
+        "last_attempt_at": attempt,
+        "last_success_at": attempt,
+        "covered_from": date(2026, 4, 10),
+        "covered_through": date(2026, 10, 4),
+        "completeness": "complete",
+        **changes,
+    }
+    return Freshness(**fields)
+
+
+GOOGLE_CONTACTS_FRESH = _google_contacts_freshness()
+"""A known Google touch-date refresh: the discovery search succeeded over every window date."""
+
+
 def _context(
     thresholds: Thresholds,
     window: AnalysisWindow,
@@ -283,6 +316,7 @@ def _context(
     leads: Iterable[LeadInfo] = (),
     google_crm: CrmData | None = None,
     campaigns: Mapping[int, CampaignInfo] | None = None,
+    freshness: Iterable[Freshness] = (GOOGLE_CONTACTS_FRESH,),
 ) -> AnalysisContext:
     return AnalysisContext(
         window=window,
@@ -291,6 +325,7 @@ def _context(
         datasets={"google": GOOGLE, "linkedin": LINKEDIN_SIM, "hubspot": HUBSPOT},
         linkedin_crm=linkedin_crm,
         google_crm=google_crm,
+        freshness={(row.dataset_id, row.dataset): row for row in freshness},
         accounts=ACCOUNTS,
         campaigns=CAMPAIGNS if campaigns is None else campaigns,
         leads=tuple(leads),
@@ -309,6 +344,9 @@ def test_settings_read_every_attribution_threshold_from_config(
 ) -> None:
     assert window.utc_bounds() == (WINDOW_START, WINDOW_END)
     assert window.utc_bounds()[1] - timedelta(days=14) == CUTOFF
+    assert AnalysisWindow.day_bounds(window.start, GOOGLE_TZ)[0] == G_WINDOW_START
+    assert AnalysisWindow.day_bounds(window.end, GOOGLE_TZ)[1] == G_WINDOW_END
+    assert G_WINDOW_END - timedelta(days=14) == G_CUTOFF
     settings = attribution_module._Settings.of(_context(thresholds, window, linkedin_crm=None))
     assert settings.floor_share == Decimal("0.10")
     assert settings.maturity == timedelta(days=14)
@@ -478,7 +516,7 @@ class _Breakage:
     """One failed read on the first eligible contact, and the reason it makes evidence unknown."""
 
     reason: str
-    read: ContactReadStatus = "ok"
+    read: ContactReadStatus | None = "ok"
     contact_read: bool = True
     fetch: tuple[str, AssociationFetchInfo | None] | None = None
     targets: tuple[str, tuple[str, ...]] | None = None
@@ -486,10 +524,8 @@ class _Breakage:
 
 BROKEN = _hs(1)
 BREAKAGES = [
-    pytest.param(
-        _Breakage("contact refresh failed; stage dates not current", read="error"),
-        id="contact-refresh-failed",
-    ),
+    pytest.param(_Breakage(REFRESH_FAILED, read="error"), id="contact-refresh-failed"),
+    pytest.param(_Breakage(REFRESH_NOT_RECORDED, read=None), id="contact-refresh-not-recorded"),
     pytest.param(
         _Breakage("contact record not read", contact_read=False), id="contact-record-not-read"
     ),
@@ -566,9 +602,9 @@ def test_unknown_contact_evidence_makes_the_pipeline_unavailable(
     crm = _crm(COMPANION, contacts, fetches=fetches, associations=associations)
     ctx = _context(thresholds, window, linkedin_crm=crm, leads=leads)
 
-    refresh_failed = attribution_module._refresh_failures(ctx.leads)
+    refresh_unknown = attribution_module._refresh_failures(ctx.leads)
     problem = attribution_module._read_evidence_problem(
-        crm, BROKEN, crm.contacts.get(BROKEN), refresh_failed=BROKEN in refresh_failed
+        crm, BROKEN, crm.contacts.get(BROKEN), refresh=refresh_unknown.get(BROKEN)
     )
     assert problem == breakage.reason
 
@@ -597,9 +633,7 @@ def test_known_evidence_includes_genuine_zeros_and_fully_read_associations(
     )
     ctx = _context(thresholds, window, linkedin_crm=crm, leads=leads)
     assert (
-        attribution_module._read_evidence_problem(
-            crm, _hs(1), crm.contacts[_hs(1)], refresh_failed=False
-        )
+        attribution_module._read_evidence_problem(crm, _hs(1), crm.contacts[_hs(1)], refresh=None)
         is None
     )
     population = _veto(ctx)
@@ -615,11 +649,60 @@ def test_a_failed_refresh_on_any_matched_lead_marks_the_contact_unknown(
     # the contact's stage dates are not current, so its evidence is unknown.
     leads = [*_cohort(20), _matched(21, _hs(1), at=YOUNG, read="error")]
     ctx = _context(thresholds, window, linkedin_crm=_crm(COMPANION, _contacts(leads)), leads=leads)
-    assert attribution_module._refresh_failures(ctx.leads) == frozenset({_hs(1)})
+    assert attribution_module._refresh_failures(ctx.leads) == {_hs(1): REFRESH_FAILED}
     population = _veto(ctx)
     assert population.unknown_evidence_contacts == 1
     assert not population.available
     assert not population.veto_fires
+
+
+def test_matched_leads_without_a_recorded_refresh_make_the_pipeline_unavailable(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # BE4-F03: 20 matched matured leads whose refresh was never recorded (status None), stored
+    # contacts with QL 0 and successful empty meeting and deal fetches. Only an explicit "ok"
+    # is a successful refresh, so every contact's evidence is unknown and no veto fires.
+    leads = [_matched(n, _hs(n), read=None) for n in range(1, 21)]
+    ctx = _context(thresholds, window, linkedin_crm=_crm(COMPANION, _contacts(leads)), leads=leads)
+    assert attribution_module._refresh_failures(ctx.leads) == {
+        _hs(n): REFRESH_NOT_RECORDED for n in range(1, 21)
+    }
+    population = _veto(ctx)
+    assert population.eligible_contacts == 20
+    assert population.ql == 0
+    assert population.unknown_evidence_contacts == 20
+    assert not population.available
+    assert population.reason == "CRM evidence unknown for 20 of 20 eligible contacts"
+    assert not population.veto_fires
+    crm = ctx.linkedin_crm
+    assert crm is not None
+    assert contact_evidence_known(crm, _hs(1), leads[0]) == (False, REFRESH_NOT_RECORDED)
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [("ok", None, "error"), ("error", None, "ok"), (None, "error"), ("error", None)],
+    ids=["ok-none-error", "error-none-ok", "none-then-error", "error-then-none"],
+)
+def test_a_failed_refresh_outranks_one_not_recorded_whatever_the_lead_order(
+    statuses: tuple[ContactReadStatus | None, ...],
+) -> None:
+    leads = [_matched(n, _hs(1), read=status) for n, status in enumerate(statuses, start=1)]
+    found = attribution_module._refresh_failures(leads)
+    assert dict(found) == {_hs(1): REFRESH_FAILED}
+    assert isinstance(found, MappingProxyType)
+
+
+def test_only_matched_leads_record_a_contact_refresh() -> None:
+    # An unresolved lead has no contact and so no refresh; contacts are listed in order.
+    leads = [
+        _unresolved(1, "no_match"),
+        _matched(2, _hs(3), read=None),
+        _matched(3, _hs(2), read="error"),
+        _matched(4, _hs(1)),
+    ]
+    found = attribution_module._refresh_failures(leads)
+    assert list(found.items()) == [(_hs(2), REFRESH_FAILED), (_hs(3), REFRESH_NOT_RECORDED)]
 
 
 def test_read_failures_outside_the_eligible_contacts_never_enter_the_veto(
@@ -721,7 +804,12 @@ def test_contact_evidence_known_reports_each_per_contact_failure() -> None:
     assert contact_evidence_known(known, _hs(1), lead) == (True, None)
     assert contact_evidence_known(known, _hs(1), _matched(1, _hs(1), read="error")) == (
         False,
-        "contact refresh failed; stage dates not current",
+        REFRESH_FAILED,
+    )
+    # Only an explicit "ok" records a successful refresh; a missing status is unknown too.
+    assert contact_evidence_known(known, _hs(1), _matched(1, _hs(1), read=None)) == (
+        False,
+        REFRESH_NOT_RECORDED,
     )
     unbound = _crm(COMPANION, [_contact(_hs(1))], bindings=_bindings(ql=QL_MISSING))
     assert contact_evidence_known(unbound, _hs(1), lead) == (
@@ -884,6 +972,75 @@ def test_veto_meetings_count_every_plausible_meeting_after_the_touch(
     assert population.veto_fires
 
 
+@pytest.mark.parametrize(
+    ("outcome", "meetings", "known"),
+    [
+        pytest.param(
+            AssociationFetchInfo("contact", BROKEN, "meeting", "error"), 0, False, id="fetch-error"
+        ),
+        pytest.param(
+            AssociationFetchInfo("contact", BROKEN, "meeting", "partial", "ok"),
+            0,
+            False,
+            id="fetch-partial",
+        ),
+        pytest.param(
+            AssociationFetchInfo("contact", BROKEN, "meeting", "ok", "partial"),
+            0,
+            False,
+            id="target-reads-partial",
+        ),
+        pytest.param(
+            AssociationFetchInfo("contact", BROKEN, "meeting", "ok_empty"),
+            0,
+            True,
+            id="ok-empty-edge-is-stale",
+        ),
+        pytest.param(
+            AssociationFetchInfo("contact", BROKEN, "meeting", "ok", "ok"),
+            1,
+            True,
+            id="verified-edge-counted",
+        ),
+    ],
+)
+def test_veto_meetings_count_only_associations_the_current_fetch_verified(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    outcome: AssociationFetchInfo,
+    meetings: int,
+    known: bool,
+) -> None:
+    # The stored edge and its booked, post-touch meeting are retained whatever the current
+    # fetch says; only a fetch that is ok with every target read lets the meeting count.
+    leads = _cohort(20)
+    crm = _crm(
+        COMPANION,
+        _contacts(leads),
+        fetches={("contact", BROKEN, "meeting"): outcome},
+        associations={("contact", BROKEN, "meeting"): ("m-1",)},
+        meetings=[
+            MeetingInfo(
+                "m-1",
+                created_at=MATURED + ONE_DAY,
+                start_at=MATURED + 2 * ONE_DAY,
+                meeting_source="MEETINGS_PUBLIC",
+            )
+        ],
+    )
+    population = _veto(_context(thresholds, window, linkedin_crm=crm, leads=leads))
+    assert population.eligible_contacts == 20
+    assert population.meetings == meetings
+    assert population.ql == 0
+    # The unverified contact still makes the pipeline unavailable, so its uncounted meeting
+    # can never let the veto fire or a pipeline pause rest on a zero.
+    assert population.unknown_evidence_contacts == (0 if known else 1)
+    assert population.available is known
+    assert population.veto_fires is known
+    if not known:
+        assert population.reason == "CRM evidence unknown for 1 of 20 eligible contacts"
+
+
 # -- no CRM dataset and the Google-to-CRM link (AAP 0.5.4.1, 0.3.3) --------------------------
 
 
@@ -954,9 +1111,11 @@ def test_google_population_is_the_matured_touch_date_contacts_of_the_primary_dat
         for n in range(1, 21)
     ]
     excluded = [
-        _contact("g-young", google_campaign_ref="20001", google_touch_at=CUTOFF + ONE_SECOND),
-        _contact("g-early", google_campaign_ref="20001", google_touch_at=WINDOW_START - ONE_SECOND),
-        _contact("g-at-end", google_campaign_ref="20001", google_touch_at=WINDOW_END),
+        _contact("g-young", google_campaign_ref="20001", google_touch_at=G_CUTOFF + ONE_SECOND),
+        _contact(
+            "g-early", google_campaign_ref="20001", google_touch_at=G_WINDOW_START - ONE_SECOND
+        ),
+        _contact("g-at-end", google_campaign_ref="20001", google_touch_at=G_WINDOW_END),
         _contact("g-no-ref", google_campaign_ref=None, google_touch_at=MATURED),
         _contact("g-blank-ref", google_campaign_ref="  ", google_touch_at=MATURED),
         _contact("g-no-touch", google_campaign_ref="20001", google_touch_at=None),
@@ -1064,6 +1223,210 @@ def test_google_evidence_and_bindings_come_from_the_primary_dataset(
     assert with_unbound.veto[LI_A].ql == 0
     assert with_unbound.veto[LI_A].veto_fires
     assert with_unbound.ql_available
+
+
+@pytest.mark.parametrize(
+    ("touch", "maturity_days", "counted"),
+    [
+        # 23:59:59 New York on the day before the window: inside the UTC bounds, but not a
+        # window day of the Google account.
+        pytest.param(G_WINDOW_START - ONE_SECOND, 0, False, id="before-start-local-midnight"),
+        pytest.param(G_WINDOW_START, 0, True, id="at-start-local-midnight"),
+        # 23:59:59 New York on the window's end date: after UTC midnight, still a window day.
+        pytest.param(G_WINDOW_END - ONE_SECOND, 0, True, id="before-end-local-midnight"),
+        pytest.param(G_WINDOW_END, 0, False, id="at-end-local-midnight"),
+        # Matured at or before the native upper instant minus crm.lead_maturity_days (14).
+        pytest.param(G_CUTOFF, None, True, id="matured-at-the-native-cutoff"),
+        pytest.param(G_CUTOFF + ONE_SECOND, None, False, id="young-after-the-native-cutoff"),
+    ],
+)
+def test_the_google_window_and_maturity_follow_the_account_day(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    touch: datetime,
+    maturity_days: int | None,
+    counted: bool,
+) -> None:
+    # A maturity of 0 days isolates the window bounds from the maturity cutoff.
+    tuned = (
+        thresholds
+        if maturity_days is None
+        else thresholds_with({"crm.lead_maturity_days": maturity_days})
+    )
+    google_crm = _crm(
+        HUBSPOT,
+        [],
+        bindings=_bindings(google=GOOGLE_LINK),
+        google_contacts=[_contact("g-1", google_campaign_ref="20001", google_touch_at=touch)],
+    )
+    ctx = _context(tuned, window, linkedin_crm=None, google_crm=google_crm)
+    assert attribution_module._google_window_instants(ctx) == (G_WINDOW_START, G_WINDOW_END)
+    population = build_attribution(ctx).veto[G_A]
+    expected = 1 if counted else 0
+    assert (population.matured_leads, population.eligible_contacts) == (expected, expected)
+
+
+def test_the_google_boundary_falls_back_to_the_account_zone_then_utc(
+    thresholds: Thresholds,
+) -> None:
+    # A window without Google days (LinkedIn alone) ends on yesterday in UTC, 2026-10-05.
+    linkedin_only = AnalysisWindow.default(thresholds, SourceDayInfo(None, ("linkedin",)), now=NOW)
+    ctx = _context(thresholds, linkedin_only, linkedin_crm=None)
+    assert attribution_module._google_window_instants(ctx) == (
+        datetime(2026, 9, 8, 4, 0, tzinfo=UTC),
+        datetime(2026, 10, 6, 4, 0, tzinfo=UTC),
+    )
+    without_google_account = dataclasses.replace(
+        ctx, accounts={2: ACCOUNTS[2]}, campaigns={LI_A: CAMPAIGNS[LI_A]}
+    )
+    assert attribution_module._google_window_instants(without_google_account) == (
+        linkedin_only.utc_bounds()
+    )
+
+
+GOOGLE_REFRESH_UNKNOWN = "Google contact refresh unknown: hubspot.google_contacts"
+WINDOW_DATES = "the window 2026-09-07 to 2026-10-04"
+
+
+@pytest.mark.parametrize(
+    ("freshness", "reason"),
+    [
+        pytest.param((), f"{GOOGLE_REFRESH_UNKNOWN} has no freshness record", id="missing"),
+        pytest.param(
+            (_google_contacts_freshness(last_success_at=None, reason="HTTP 503"),),
+            f"{GOOGLE_REFRESH_UNKNOWN} never succeeded: HTTP 503",
+            id="never-succeeded",
+        ),
+        pytest.param(
+            (
+                _google_contacts_freshness(
+                    last_success_at=NOW - timedelta(hours=4), reason="HTTP 429 after 3 attempts"
+                ),
+            ),
+            f"{GOOGLE_REFRESH_UNKNOWN} last attempt failed: HTTP 429 after 3 attempts",
+            id="last-attempt-failed",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(completeness="incomplete", reason="hour above 10,000"),),
+            f"{GOOGLE_REFRESH_UNKNOWN} incomplete: hour above 10,000",
+            id="incomplete",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(completeness="unknown"),),
+            f"{GOOGLE_REFRESH_UNKNOWN} unknown",
+            id="completeness-unknown",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(covered_through=date(2026, 10, 3)),),
+            f"{GOOGLE_REFRESH_UNKNOWN} covers 2026-04-10 to 2026-10-03, not {WINDOW_DATES}",
+            id="ends-before-the-window-end",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(covered_from=date(2026, 9, 8)),),
+            f"{GOOGLE_REFRESH_UNKNOWN} covers 2026-09-08 to 2026-10-04, not {WINDOW_DATES}",
+            id="starts-after-the-window-start",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(covered_from=None, covered_through=None),),
+            f"{GOOGLE_REFRESH_UNKNOWN} covers no dates, not {WINDOW_DATES}",
+            id="no-coverage",
+        ),
+        # Only the Google CRM dataset's own discovery row counts: neither the LinkedIn
+        # companion's row nor another HubSpot dataset name stands in.
+        pytest.param(
+            (_google_contacts_freshness(dataset_id=COMPANION.dataset_id),),
+            f"{GOOGLE_REFRESH_UNKNOWN} has no freshness record",
+            id="companion-row-never-stands-in",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(dataset="hubspot.contacts"),),
+            f"{GOOGLE_REFRESH_UNKNOWN} has no freshness record",
+            id="contacts-row-never-stands-in",
+        ),
+    ],
+)
+def test_an_unknown_google_contact_refresh_makes_every_google_pipeline_unavailable(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    freshness: tuple[Freshness, ...],
+    reason: str,
+) -> None:
+    # A1-F09: Google-touch contacts have no per-contact refresh status; their refresh is the
+    # touch-date discovery, so its freshness row decides whether their evidence is known.
+    discovered = [
+        _contact(f"g-{n}", google_campaign_ref="20001", google_touch_at=MATURED)
+        for n in range(1, 21)
+    ]
+    google_crm = _crm(
+        HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK), google_contacts=discovered
+    )
+    leads = _cohort(20)
+    ctx = _context(
+        thresholds,
+        window,
+        linkedin_crm=_crm(COMPANION, _contacts(leads)),
+        leads=leads,
+        google_crm=google_crm,
+        freshness=freshness,
+    )
+    assert attribution_module._google_refresh_problem(ctx, google_crm) == reason
+    table = build_attribution(ctx)
+    first, empty = table.veto[G_A], table.veto[G_B]
+    assert (first.eligible_contacts, first.ql) == (20, 0)
+    assert first.unknown_evidence_contacts == 20
+    assert first.unknown_evidence
+    assert (first.available, first.veto_fires, first.reason) == (False, False, reason)
+    # A campaign without eligible contacts is unavailable too: the refresh may have missed some.
+    assert (empty.eligible_contacts, empty.unknown_evidence_contacts) == (0, 0)
+    assert (empty.available, empty.veto_fires, empty.reason) == (False, False, reason)
+    # The LinkedIn population reads its own CRM dataset and keeps its veto.
+    assert table.veto[LI_A].veto_fires
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param(GOOGLE_CONTACTS_FRESH, id="covers-more-than-the-window"),
+        pytest.param(
+            _google_contacts_freshness(
+                covered_from=date(2026, 9, 7), covered_through=date(2026, 10, 4)
+            ),
+            id="covers-exactly-the-window",
+        ),
+    ],
+)
+def test_a_complete_covering_google_contact_refresh_is_known(
+    thresholds: Thresholds, window: AnalysisWindow, row: Freshness
+) -> None:
+    discovered = [
+        _contact(f"g-{n}", google_campaign_ref="20001", google_touch_at=MATURED)
+        for n in range(1, 21)
+    ]
+    google_crm = _crm(
+        HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK), google_contacts=discovered
+    )
+    ctx = _context(thresholds, window, linkedin_crm=None, google_crm=google_crm, freshness=(row,))
+    assert attribution_module._google_refresh_problem(ctx, google_crm) is None
+    table = build_attribution(ctx)
+    assert table.veto[G_A].unknown_evidence_contacts == 0
+    assert (table.veto[G_A].available, table.veto[G_A].veto_fires) == (True, True)
+    assert (table.veto[G_B].available, table.veto[G_B].reason) == (True, None)
+
+
+def test_an_unbound_ql_stage_is_named_before_an_unknown_google_refresh(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    google_crm = _crm(
+        HUBSPOT,
+        [],
+        bindings=_bindings(ql=QL_MISSING, google=GOOGLE_LINK),
+        google_contacts=[_contact("g-1", google_campaign_ref="20001", google_touch_at=MATURED)],
+    )
+    ctx = _context(thresholds, window, linkedin_crm=None, google_crm=google_crm, freshness=())
+    population = build_attribution(ctx).veto[G_A]
+    assert population.reason == f"Qualified Lead stage unavailable: {QL_MISSING.reason}"
+    assert population.unknown_evidence_contacts == 1
+    assert not population.available
 
 
 # -- the table, the population type and the helpers ------------------------------------------

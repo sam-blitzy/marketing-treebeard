@@ -13,7 +13,9 @@ Each test asserts behaviour that AAP 0.5.3 or the module's docstrings set:
   names;
 * requests: :class:`LoginRequest`, :class:`CreateRunRequest` (whose window bounds
   ``AnalysisWindow.custom`` enforces), :class:`FeedbackRequest`, :class:`DecisionRequest`,
-  :class:`DecisionPatchIn`, :class:`IntendedStateIn` and :class:`ResolveRequest`;
+  :class:`DecisionPatchIn`, :class:`IntendedStateIn` and :class:`ResolveRequest`, whose ids
+  stop at :data:`BIGINT_MAX` and whose email and notes refuse U+0000 and text UTF-8 cannot
+  encode (:data:`StorableText`), while the memory-only password takes any character;
 * responses: every ``from_row`` / ``from_thresholds`` / ``from_asset`` builder, the
   recommendations page with its five-section rule, evidence exactly as the runner freezes
   it, sources, configuration, health and the error shape, each against the AAP 0.5.3 keys.
@@ -24,7 +26,7 @@ the configuration is the shipped ``config/`` directory.
 
 import copy
 import doctest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1662,6 +1664,72 @@ def test_decision_request_refuses_bad_subjects_references_and_notes(
     assert [(item["loc"], item["type"]) for item in errors] == [(location, error_type)]
 
 
+def test_bigint_max_is_the_largest_postgresql_bigint() -> None:
+    assert schemas.BIGINT_MAX == 9_223_372_036_854_775_807 == 2**63 - 1
+    assert {"BIGINT_MAX", "PositiveBigInt"} <= set(schemas.__all__)
+
+
+def _decision_payload(
+    *, subject_id: int = 1, recommendation_id: int | None = None
+) -> dict[str, Any]:
+    """A minimal ``POST /decisions`` body naming ``subject_id`` and, if given, the item."""
+    payload: dict[str, Any] = {"subject": {"type": "campaign", "id": subject_id}, "patch": {}}
+    if recommendation_id is not None:
+        payload["recommendation_id"] = recommendation_id
+    return payload
+
+
+def test_decision_request_accepts_ids_up_to_the_largest_bigint() -> None:
+    request = DecisionRequest.model_validate(
+        _decision_payload(subject_id=schemas.BIGINT_MAX, recommendation_id=schemas.BIGINT_MAX)
+    )
+    assert (request.subject.id, request.recommendation_id) == (
+        schemas.BIGINT_MAX,
+        schemas.BIGINT_MAX,
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "location"),
+    [
+        (_decision_payload(subject_id=2**63), ("subject", "id")),
+        (_decision_payload(subject_id=10**30), ("subject", "id")),
+        (_decision_payload(recommendation_id=2**63), ("recommendation_id",)),
+    ],
+    ids=["subject-2**63", "subject-10**30", "recommendation-2**63"],
+)
+def test_decision_request_refuses_an_id_beyond_the_largest_bigint(
+    payload: dict[str, Any], location: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        DecisionRequest.model_validate(payload)
+    errors = error.value.errors()
+    assert [(item["loc"], item["type"]) for item in errors] == [(location, "less_than_equal")]
+    assert errors[0]["ctx"] == {"le": schemas.BIGINT_MAX}
+
+
+def test_decision_request_refuses_an_oversize_id_sent_on_the_json_wire() -> None:
+    with pytest.raises(ValidationError) as error:
+        DecisionRequest.model_validate_json(
+            '{"subject": {"type": "campaign", "id": 9223372036854775808}, "patch": {},'
+            ' "recommendation_id": 9223372036854775808}'
+        )
+    assert sorted(item["loc"] for item in error.value.errors()) == [
+        ("recommendation_id",),
+        ("subject", "id"),
+    ]
+    assert _error_types(error) == ["less_than_equal", "less_than_equal"]
+
+
+def test_request_ids_document_the_bigint_bounds_in_the_json_schema() -> None:
+    bounds = {"type": "integer", "exclusiveMinimum": 0, "maximum": schemas.BIGINT_MAX}
+    subject = schemas.SubjectIn.model_json_schema()["properties"]["id"]
+    assert bounds.items() <= subject.items()
+    reference = DecisionRequest.model_json_schema()["properties"]["recommendation_id"]
+    assert reference["default"] is None
+    assert reference["anyOf"] == [bounds, {"type": "null"}]
+
+
 def test_patch_present_fields_returns_only_the_sent_fields_in_declaration_order() -> None:
     patch = DecisionPatchIn.model_validate({"total_budget": "5000", "status": "active"})
     present = patch.present_fields()
@@ -1755,6 +1823,131 @@ def test_resolve_request_refuses_an_unknown_resolution_and_a_malformed_body(
     with pytest.raises(ValidationError) as error:
         ResolveRequest.model_validate(payload)
     assert _error_types(error) == [error_type]
+
+
+# ---------------------------------------------------------------------------
+# Storable text: no U+0000 and nothing UTF-8 cannot encode reaches SQL
+# ---------------------------------------------------------------------------
+
+STORABLE_FIELDS: list[tuple[type[BaseModel], str, Callable[[str], dict[str, Any]]]] = [
+    (LoginRequest, "email", lambda text: {"email": text, "password": "pw"}),
+    (FeedbackRequest, "note", lambda text: {"kind": "dismiss", "note": text}),
+    (
+        DecisionRequest,
+        "note",
+        lambda text: {"subject": {"type": "campaign", "id": 1}, "patch": {}, "note": text},
+    ),
+    (ResolveRequest, "note", lambda text: {"resolution": "platform_correct", "note": text}),
+]
+"""Every request field bound for a PostgreSQL ``text`` column or comparison, with a builder
+of a body that is valid apart from that field."""
+
+STORABLE_IDS = [f"{model.__name__}.{field}" for model, field, _ in STORABLE_FIELDS]
+
+
+@pytest.mark.parametrize(("model", "field", "build"), STORABLE_FIELDS, ids=STORABLE_IDS)
+@pytest.mark.parametrize("text", ["adm\x00in@example.com", "\x00", "trailing\x00"])
+def test_storable_text_refuses_a_nul_character_without_echoing_the_value(
+    model: type[BaseModel], field: str, build: Callable[[str], dict[str, Any]], text: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(build(text))
+    errors = error.value.errors()
+    assert [(item["loc"], item["type"]) for item in errors] == [((field,), "value_error")]
+    message = errors[0]["msg"]
+    assert message == "Value error, must not contain a NUL (U+0000) character"
+    assert text not in message
+    assert "\x00" not in message
+
+
+@pytest.mark.parametrize(("model", "field", "build"), STORABLE_FIELDS, ids=STORABLE_IDS)
+@pytest.mark.parametrize("text", ["\ud800", "note \udfff end", "\ud83d\ude00"])
+def test_storable_text_refuses_an_unpaired_surrogate_without_echoing_the_value(
+    model: type[BaseModel], field: str, build: Callable[[str], dict[str, Any]], text: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(build(text))
+    errors = error.value.errors()
+    assert [(item["loc"], item["type"]) for item in errors] == [((field,), "string_unicode")]
+    assert text not in errors[0]["msg"]
+
+
+@pytest.mark.parametrize(("model", "field", "build"), STORABLE_FIELDS, ids=STORABLE_IDS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "paused for review — café",
+        "café ✓",
+        "josé@exämple.com",
+        "日本語のメモ",
+        "launch 😀 next week",
+        "line one\nline two\ttabbed",
+    ],
+)
+def test_storable_text_passes_ordinary_and_non_ascii_text_unchanged(
+    model: type[BaseModel], field: str, build: Callable[[str], dict[str, Any]], text: str
+) -> None:
+    assert getattr(model.model_validate(build(text)), field) == text
+
+
+def test_storable_text_checks_the_email_after_trimming_and_lowercasing() -> None:
+    with pytest.raises(ValidationError) as error:
+        LoginRequest.model_validate({"email": "  ADM\x00IN@Example.com ", "password": "pw"})
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("email",), "value_error")
+    ]
+    request = LoginRequest.model_validate({"email": "  José@Exämple.COM ", "password": "pw"})
+    assert request.email == "josé@exämple.com"
+
+
+@pytest.mark.parametrize(("model", "field", "build"), STORABLE_FIELDS[1:], ids=STORABLE_IDS[1:])
+def test_an_overlong_note_is_too_long_whatever_it_contains(
+    model: type[BaseModel], field: str, build: Callable[[str], dict[str, Any]]
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(build("\x00" * (NOTE_MAX_LENGTH + 1)))
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        ((field,), "string_too_long")
+    ]
+    assert getattr(model.model_validate(build("n" * NOTE_MAX_LENGTH)), field) == (
+        "n" * NOTE_MAX_LENGTH
+    )
+
+
+def test_an_overlong_email_is_too_long_whatever_it_contains() -> None:
+    with pytest.raises(ValidationError) as error:
+        LoginRequest.model_validate({"email": "a\x00" * 161, "password": "pw"})
+    assert _error_types(error) == ["string_too_long"]
+
+
+@pytest.mark.parametrize(("model", "field", "build"), STORABLE_FIELDS[1:], ids=STORABLE_IDS[1:])
+def test_storable_notes_keep_their_optional_bounded_wire_contract(
+    model: type[BaseModel], field: str, build: Callable[[str], dict[str, Any]]
+) -> None:
+    note = model.model_json_schema()["properties"][field]
+    assert note["default"] is None
+    assert note["anyOf"] == [{"maxLength": NOTE_MAX_LENGTH, "type": "string"}, {"type": "null"}]
+    assert field not in model.model_json_schema().get("required", [])
+
+
+def test_the_login_password_is_memory_only_and_may_hold_any_character() -> None:
+    request = LoginRequest.model_validate({"email": "admin@example.com", "password": "pa\x00ss"})
+    assert request.password == "pa\x00ss"
+
+
+def test_storable_text_validator_refuses_unencodable_text_without_chaining_it() -> None:
+    assert schemas._storable_text("café ✓") == "café ✓"
+    with pytest.raises(ValueError, match=r"^must not contain a NUL \(U\+0000\) character$"):
+        schemas._storable_text("a\x00b")
+    with pytest.raises(ValueError, match=r"^must be valid Unicode text, without unpaired") as error:
+        schemas._storable_text("a\ud800b")
+    assert "a\ud800b" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_storable_aliases_are_exported() -> None:
+    assert {"StorableNote", "StorableText"} <= set(schemas.__all__)
 
 
 # ---------------------------------------------------------------------------

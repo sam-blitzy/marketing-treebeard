@@ -31,8 +31,9 @@ Every budget card shows, side by side (AAP 0.5.4.5): utilization (the window per
 every day count of 0.5.4.1 observed against required), efficiency (cost per outcome against
 the account baseline), outcomes and CRM Qualified Leads where linked, the daily budget and the
 proposed amount, and the exact window with each source's day boundary
-(:func:`budget_evidence`). Patterns below their minimums are withheld with observed against
-required and never become items (P6).
+(:func:`budget_evidence`; a B4 card shows the same utilization block beside its pattern).
+Patterns below their minimums are withheld with observed against required and never become
+items (P6).
 
 Purity: reads only the :class:`~ads_engine.analysis.context.AnalysisContext`; no database,
 network, settings or logging access. Never imports ``precedence`` or ``runner``, which import
@@ -49,7 +50,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal
 from typing import Any, Final
 
 # The CRM Qualified Lead count every budget card shows "where linked" (AAP 0.5.4.5) is the
@@ -181,8 +182,15 @@ B4_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "b4.min_outcomes",
     "b4.alpha",
     "window.sustained_min_days",
+    *BUDGET_THRESHOLD_KEYS,
 )
-"""Every key B4 applies."""
+"""Every key B4 applies, including the ``budget.*`` keys of the history its card shows.
+
+The ``b4.*`` keys gate and test the pattern. Every B4 card shows its budget history beside
+the pattern (AAP 0.5.4.5), classified and counted with the ``budget.*`` keys, and Google's
+counting contract judges each day whole-day known with ``budget.max_observation_gap_hours``,
+so changing any of them can change what the card shows or whether the test runs.
+"""
 
 B4_TEST_NAME: Final = "two-sample Poisson rate test"
 """``evidence.test.name`` of a B4 item."""
@@ -379,14 +387,33 @@ def _number(value: Decimal | int | str | None) -> str:
     return str(value)
 
 
-def _p_value(value: Decimal) -> str:
-    """Render ``p = 0.0123``, or ``p < 0.0001`` below the four places shown.
+def _p_value(value: Decimal, alpha: Decimal) -> str:
+    """Render a p-value judged against ``alpha``: ``p = 0.0123``, ``p = 0.04996``, ``p < 0.0001``.
 
-    Four places, rounded down, so a p-value judged against alpha never reads below it.
+    The bound is 0.0001, or the first smaller power of ten that does not exceed ``alpha``. A
+    p-value below it reads ``p < {bound}``, so the bound itself states that it is below
+    ``alpha``. Any other p-value is rounded half even to the bound's places (four for every
+    ``alpha`` of at least 0.0001), and to as many more as it takes for the shown number to lie
+    on the same side of ``alpha`` as the p-value: it reads below ``alpha`` exactly when the
+    p-value is below it. Against alpha 0.05, 0.04996 reads ``p = 0.04996`` (never
+    ``0.0500``) and 0.05 reads ``p = 0.0500``; against alpha 0.05005, 0.05006 reads
+    ``p = 0.0501`` (never ``0.0500``). ``value`` is a finite probability, as
+    ``analysis/stats.py`` returns.
     """
-    if value < _FOUR_PLACES:
-        return f"p < {format(_FOUR_PLACES, 'f')}"
-    return f"p = {format(value.quantize(_FOUR_PLACES, rounding=ROUND_FLOOR, context=_EXACT), 'f')}"
+    bound = _FOUR_PLACES
+    while bound > alpha:
+        bound = bound.scaleb(-1)
+    if value < bound:
+        return f"p < {format(bound, 'f')}"
+    below = value < alpha
+    places = bound
+    while True:
+        # Terminates: once ``places`` reaches the value's own exponent the quantize is exact,
+        # and the exact value lies on its own side of alpha.
+        shown = value.quantize(places, rounding=ROUND_HALF_EVEN, context=_EXACT)
+        if (shown < alpha) == below:
+            return f"p = {format(shown, 'f')}"
+        places = places.scaleb(-1)
 
 
 def _singular(label: str) -> str:
@@ -822,6 +849,83 @@ def _members_extra(ctx: AnalysisContext, subject: SubjectKey) -> list[dict[str, 
     ]
 
 
+def _history_metrics(history: BudgetHistory, gate: GateResult | None) -> list[Metric]:
+    """The utilization metrics every budget card shows, in card order (AAP 0.5.4.1 Evidence).
+
+    The window utilization ("n/a" without a known-budget active day, as for a lifetime or
+    custom-period budget), known-budget days (budget-active days for a shared budget),
+    spending days and their share, the days meeting ``gate``'s daily predicate and their
+    share when a gate names one, known idle days, changed-intraday days and unobserved days.
+    :func:`budget_evidence` (B1-B3) and the B4 card both take them from here, so no two budget
+    cards can show a count differently.
+    """
+    known = history.known_active
+
+    def share_of(count: int) -> Decimal | None:
+        return None if known == 0 else _share(Decimal(count) / Decimal(known))
+
+    utilization: Decimal | str = (
+        "n/a" if history.window_utilization is None else _share(history.window_utilization)
+    )
+    card: list[Metric] = [
+        Metric("window_utilization", "Window utilization (spend vs cap)", utilization, "ratio"),
+        Metric("known_days", history.known_label.capitalize(), known, "days"),
+        Metric("spending_days", "Spending days", history.spending, "days"),
+        Metric(
+            "spending_day_share",
+            f"Share of {history.known_label} with spend",
+            share_of(history.spending),
+            "ratio",
+        ),
+    ]
+    predicate = None if gate is None else _predicate(gate)
+    if predicate is not None:
+        _check, attribute, key, predicate_label = predicate
+        count = _predicate_count(history, attribute)
+        card.append(Metric(key, predicate_label, count, "days"))
+        card.append(
+            Metric(
+                f"{key}_share",
+                f"Share of {history.known_label} that are {predicate_label.lower()}",
+                share_of(count),
+                "ratio",
+            )
+        )
+    card.extend(
+        (
+            Metric("idle_days", "Known idle days", history.idle, "days"),
+            Metric(
+                "changed_intraday_days",
+                "Changed-intraday days (unknown budget)",
+                history.changed_intraday,
+                "days",
+            ),
+            Metric(
+                "unobserved_days", "Unobserved days (unknown budget)", history.unobserved, "days"
+            ),
+        )
+    )
+    return card
+
+
+def _history_extra(history: BudgetHistory) -> dict[str, Any]:
+    """What a budget card's day counts rest on, keyed for ``evidence.extra``.
+
+    ``day_counts`` (every count, including the capped, high-utilization and under-utilized
+    days), ``observation_assumption`` ("unchanged across N observations, at most 6 h apart")
+    and the ISO dates of the known idle, changed-intraday, unobserved and unknown days.
+    Shared by :func:`budget_evidence` and the B4 card.
+    """
+    return {
+        "day_counts": history.counts(),
+        "observation_assumption": history.assumption,
+        "idle_dates": tuple(day.date.isoformat() for day in history.days if day.idle),
+        "changed_intraday_dates": _dates(history, "changed_intraday"),
+        "unobserved_dates": _dates(history, "unobserved"),
+        "unknown_dates": _dates(history, "changed_intraday", "unobserved"),
+    }
+
+
 def budget_evidence(
     ctx: AnalysisContext,
     subject: SubjectKey,
@@ -895,14 +999,6 @@ def budget_evidence(
     members = subject_campaigns(ctx, subject)
     label = _outcome_label(ctx, members)
     view = budget_crm(ctx, subject) if crm is None else crm
-    known = history.known_active
-
-    def share_of(count: int) -> Decimal | None:
-        return None if known == 0 else _share(Decimal(count) / Decimal(known))
-
-    utilization: Decimal | str = (
-        "n/a" if history.window_utilization is None else _share(history.window_utilization)
-    )
     card: list[Metric] = [
         Metric(
             "spend",
@@ -932,46 +1028,7 @@ def budget_evidence(
         card.append(
             Metric("proposed_daily_budget", "Proposed daily budget", proposed, "currency", currency)
         )
-    card.extend(
-        (
-            Metric("window_utilization", "Window utilization (spend vs cap)", utilization, "ratio"),
-            Metric("known_days", history.known_label.capitalize(), known, "days"),
-            Metric("spending_days", "Spending days", history.spending, "days"),
-            Metric(
-                "spending_day_share",
-                f"Share of {history.known_label} with spend",
-                share_of(history.spending),
-                "ratio",
-            ),
-        )
-    )
-    predicate = _predicate(gate)
-    if predicate is not None:
-        _check, attribute, key, predicate_label = predicate
-        count = _predicate_count(history, attribute)
-        card.append(Metric(key, predicate_label, count, "days"))
-        card.append(
-            Metric(
-                f"{key}_share",
-                f"Share of {history.known_label} that are {predicate_label.lower()}",
-                share_of(count),
-                "ratio",
-            )
-        )
-    card.extend(
-        (
-            Metric("idle_days", "Known idle days", history.idle, "days"),
-            Metric(
-                "changed_intraday_days",
-                "Changed-intraday days (unknown budget)",
-                history.changed_intraday,
-                "days",
-            ),
-            Metric(
-                "unobserved_days", "Unobserved days (unknown budget)", history.unobserved, "days"
-            ),
-        )
-    )
+    card.extend(_history_metrics(history, gate))
     if view.linked:
         card.append(
             Metric(
@@ -995,12 +1052,7 @@ def budget_evidence(
             for check, (observed, required) in gate.counts.items()
         },
         "gate_shortfalls": gate.shortfalls,
-        "day_counts": history.counts(),
-        "observation_assumption": history.assumption,
-        "idle_dates": tuple(day.date.isoformat() for day in history.days if day.idle),
-        "changed_intraday_dates": _dates(history, "changed_intraday"),
-        "unobserved_dates": _dates(history, "unobserved"),
-        "unknown_dates": _dates(history, "changed_intraday", "unobserved"),
+        **_history_extra(history),
         "day_boundary": {"source": source, "boundary": _day_boundary(ctx, source)},
         "current": history.latest_daily_budget,
     }
@@ -1020,7 +1072,7 @@ def budget_evidence(
             ),
             *baselines,
         ),
-        sample=Sample(known, history.config.min_known_days, history.known_label),
+        sample=Sample(history.known_active, history.config.min_known_days, history.known_label),
         threshold_keys=_required(
             BUDGET_THRESHOLD_KEYS,
             threshold_keys,
@@ -1602,37 +1654,28 @@ def _counting_validity(
     Returns:
         The contract text for the evidence, or the withheld line naming why the rate test is
         not valid: weighted attribution first (it is definitive), then an unknown contract,
-        then fractional daily values.
+        then fractional daily values. Each line's reason is exactly the AAP's
+        (:data:`WEIGHTED_REASON`, :data:`CONTRACT_UNKNOWN_REASON`, :data:`FRACTIONAL_REASON`);
+        its sample counts the days that passed against the days checked: last-click days
+        (whole-day known and last-click, for an unknown contract) of the window's days, or
+        days with a whole-number value of the campaign's days.
     """
     label = OUTCOME_LABELS[campaign.objective_group]
     if campaign.source != "google":
         return f"LinkedIn {label} are unweighted event counts"
     contract = counting_contract(ctx)
     total = len(contract)
-    weighted = sorted(day for day, kind in contract.items() if kind == "weighted")
-    unknown = sorted(day for day, kind in contract.items() if kind == "unknown")
-    last_click = total - len(weighted) - len(unknown)
+    weighted = sum(1 for kind in contract.values() if kind == "weighted")
+    unknown = sum(1 for kind in contract.values() if kind == "unknown")
+    last_click = total - weighted - unknown
     if weighted:
-        return _b4_withheld(
-            entity,
-            f"{WEIGHTED_REASON} (data-driven or external attribution on {len(weighted)} of "
-            f"{total} days, first {weighted[0].isoformat()})",
-            last_click,
-            total,
-            "last-click days",
-        )
+        return _b4_withheld(entity, WEIGHTED_REASON, last_click, total, "last-click days")
     if unknown or total == 0:
-        first = f", first {unknown[0].isoformat()}" if unknown else ""
         return _b4_withheld(
-            entity,
-            f"{CONTRACT_UNKNOWN_REASON} ({len(unknown)} of {total} days not whole-day known"
-            f"{first})",
-            last_click,
-            total,
-            "last-click days",
+            entity, CONTRACT_UNKNOWN_REASON, last_click, total, "whole-day known last-click days"
         )
-    fractional = sorted(
-        day.date
+    fractional = sum(
+        1
         for day in days
         if (value := day.outcome(campaign.objective_group)) is not None
         and value != value.to_integral_value()
@@ -1640,11 +1683,10 @@ def _counting_validity(
     if fractional:
         return _b4_withheld(
             entity,
-            f"{FRACTIONAL_REASON} on {len(fractional)} of {len(days)} days (first "
-            f"{fractional[0].isoformat()}): rate test not valid",
-            len(days) - len(fractional),
+            FRACTIONAL_REASON,
+            len(days) - fractional,
             len(days),
-            "whole-number days",
+            "days with whole-number conversions",
         )
     return f"all included actions last-click on all {total} days"
 
@@ -1654,20 +1696,25 @@ def _b4(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
 
     AAP 0.5.4.5 B4. Each campaign's window days are split on its source's native dates
     (Google in the account's time zone, LinkedIn UTC; Saturday and Sunday are the weekend),
-    and the evidence names that boundary. In order:
+    and the evidence names that boundary. A campaign with no fact row in the window has
+    nothing to judge. Otherwise, in order:
 
-    1. **Exposure**: zero spend on either side is withheld "no exposure".
-    2. **Count validity** (:func:`_counting_validity`): "weighted attribution: rate test not
+    1. **Exposure**: zero spend on either side, or on both, is withheld "no exposure".
+    2. **Outcomes reported**: a campaign reporting no outcome on any window day has nothing
+       to compare; one reporting on only some days is withheld with the reported days.
+    3. **Count validity** (:func:`_counting_validity`): "weighted attribution: rate test not
        valid", "conversion counting contract unknown" or "fractional conversions".
-    3. **Sample minimums**: at least ``b4.min_weekend_days`` (4) weekend days and
+    4. **Sample minimums**: at least ``b4.min_weekend_days`` (4) weekend days and
        ``b4.min_weekdays`` (10) weekdays with spend, and ``b4.min_outcomes`` (10) outcomes in
        total; shortfalls are withheld with their sample sizes, for example "3 weekend days of
        4 required; 6 outcomes of 10 required".
-    4. **Test**: the two-sample Poisson rate test of outcomes per unit of spend
+    5. **Test**: the two-sample Poisson rate test of outcomes per unit of spend
        (:func:`~ads_engine.analysis.stats.poisson_rate_test`); the pattern is an item when
        p < ``b4.alpha`` (0.05), and otherwise withheld with its p-value and sample sizes.
 
-    Items offer only "Mark done" (no decision subject) and raise no spend.
+    Items offer only "Mark done" (no decision subject) and raise no spend. Their evidence
+    applies :data:`B4_THRESHOLD_KEYS`: the ``b4.*`` keys above, ``window.sustained_min_days``
+    and the ``budget.*`` keys of the budget history every budget card shows.
 
     Rationale: "Weekend/weekday or other time-based patterns surfaced only when there's enough
     sample size to trust them, with the sample size shown"; the Poisson test assumes whole,
@@ -1700,31 +1747,38 @@ def _b4(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
 def _b4_campaign(
     ctx: AnalysisContext, settings: _Settings, campaign: CampaignInfo
 ) -> Candidate | Withheld | None:
-    """Evaluate B4 for one campaign; ``None`` when it has no spend or reports no outcome."""
+    """Evaluate B4 for one campaign, in the order :func:`_b4` lists.
+
+    Returns ``None`` when the campaign has no fact row in the window (nothing was observed,
+    so there is no pattern to judge) or, once both sides had spend, reports no outcome on any
+    window day. Fact rows with zero spend on the weekend, on the weekdays or on both are a
+    known absence of exposure: withheld "no exposure", 0 days with spend of 1 required on the
+    side or sides named by the unit.
+    """
     window = ctx.window
     days = [
         day
         for day in ctx.campaign_days.get(campaign.id, ())
         if window.start <= day.date <= window.end
     ]
+    if not days:
+        return None
     group = campaign.objective_group
-    if not days or sum((day.cost for day in days), _ZERO) <= 0:
-        return None
-    reported = [day for day in days if day.outcome(group) is not None]
-    if not reported:
-        return None
     entity = _campaign_ref(campaign)
     weekend_days = [day for day in days if day.date.weekday() in _WEEKEND]
     weekday_days = [day for day in days if day.date.weekday() not in _WEEKEND]
-    for name, side_days in (("weekend", weekend_days), ("weekday", weekday_days)):
-        if sum((day.cost for day in side_days), _ZERO) <= 0:
-            return _b4_withheld(
-                entity,
-                f"{NO_EXPOSURE_REASON}: zero {name} spend in the window",
-                0,
-                1,
-                f"{name} days with spend",
-            )
+    unexposed = [
+        name
+        for name, side_days in (("weekend days", weekend_days), ("weekdays", weekday_days))
+        if sum((day.cost for day in side_days), _ZERO) <= 0
+    ]
+    if unexposed:
+        return _b4_withheld(
+            entity, NO_EXPOSURE_REASON, 0, 1, f"{' and '.join(unexposed)} with spend"
+        )
+    reported = [day for day in days if day.outcome(group) is not None]
+    if not reported:
+        return None
     label = OUTCOME_LABELS[group]
     if len(reported) < len(days):
         return _b4_withheld(
@@ -1768,7 +1822,7 @@ def _b4_campaign(
         return _b4_withheld(
             entity,
             f"weekend and weekday rates not distinguishable ({B4_TEST_NAME} "
-            f"{_p_value(test.p_value)}, alpha {_number(settings.b4_alpha)}): "
+            f"{_p_value(test.p_value, settings.b4_alpha)}, alpha {_number(settings.b4_alpha)}): "
             f"{weekend.spend_days} weekend days, {weekday.spend_days} weekdays, {total} outcomes",
             total,
             settings.b4_min_outcomes,
@@ -1777,29 +1831,58 @@ def _b4_campaign(
     return _b4_candidate(ctx, settings, campaign, entity, (weekend, weekday), test, validity)
 
 
-def _b4_budget_metrics(
-    ctx: AnalysisContext, campaign: CampaignInfo, currency: str
-) -> tuple[Metric, Metric]:
-    """The daily budget and window utilization shown beside a B4 pattern.
+def _b4_history_subject(ctx: AnalysisContext, campaign: CampaignInfo) -> SubjectKey:
+    """The budget subject whose history a campaign's B4 card shows (AAP 0.5.4.5).
 
-    A campaign with its own daily budget shows its budget history's latest effective budget
-    and utilization; a shared-budget member or a lifetime budget shows utilization "n/a",
-    because it has no daily cap of its own.
+    A Google campaign drawing from an explicitly shared budget has no cap of its own: the
+    shared budget is the subject, evaluated at budget level over its budget-active days, so
+    the card shows that budget's history. Every other campaign shows its own budget's
+    history; a lifetime or custom-period budget has no known-budget active day, so its
+    utilization reads "n/a".
     """
-    subject: SubjectKey = ("campaign", campaign.id)
-    if subject in budget_subjects(ctx):
-        history = budget_history(ctx, subject)
-        utilization: Decimal | str = (
-            "n/a" if history.window_utilization is None else _share(history.window_utilization)
-        )
-        daily = history.latest_daily_budget
-    else:
-        utilization = "n/a"
-        daily = campaign.daily_budget
-    return (
-        Metric("daily_budget", "Latest effective daily budget", daily, "currency", currency),
-        Metric("window_utilization", "Window utilization (spend vs cap)", utilization, "ratio"),
-    )
+    if campaign.source == "google" and campaign.budget_id is not None:
+        budget = ctx.budgets.get(campaign.budget_id)
+        if budget is not None and budget.explicitly_shared:
+            return ("budget", budget.id)
+    return ("campaign", campaign.id)
+
+
+def _b4_history_extra(
+    ctx: AnalysisContext, subject: SubjectKey, history: BudgetHistory
+) -> dict[str, Any]:
+    """The budget history beside a B4 pattern, for ``evidence.extra``.
+
+    ``budget_history`` names the subject the counts describe (the shared budget for a
+    member campaign) and shows its known-budget (or budget-active) days against
+    ``budget.min_known_days`` and its spending days against ``budget.min_spending_days``.
+    Those minimums are what the history gates of B1-B3 require; B4 is never gated on them,
+    and its own gate stays ``extra.gate``. The dated detail follows under the keys every
+    budget card uses (:func:`_history_extra`), plus ``members`` for a shared budget.
+    """
+    config = history.config
+    extra: dict[str, Any] = {
+        "budget_history": {
+            "subject": {"type": subject[0], "id": subject[1]},
+            "name": _subject_ref(ctx, subject).name,
+            "shared": history.shared,
+            "known_label": history.known_label,
+            "minimums": {
+                "known_budget_days": {
+                    "observed": history.known_active,
+                    "required": config.min_known_days,
+                },
+                "spending_days": {
+                    "observed": history.spending,
+                    "required": config.min_spending_days,
+                },
+            },
+            "note": "shown beside the pattern; B4 is not gated on budget history",
+        },
+        **_history_extra(history),
+    }
+    if history.shared:
+        extra["members"] = _members_extra(ctx, subject)
+    return extra
 
 
 def _b4_candidate(
@@ -1811,9 +1894,19 @@ def _b4_candidate(
     test: RateTest,
     contract: str,
 ) -> Candidate:
-    """The B4 item of one campaign whose weekend and weekday rates differ (p < alpha)."""
+    """The B4 item of one campaign whose weekend and weekday rates differ (p < alpha).
+
+    Beside the pattern's own numbers the card shows what every budget card shows (AAP
+    0.5.4.5): the window utilization and the day counts of the budget history of
+    :func:`_b4_history_subject` (:func:`_history_metrics`, :func:`_b4_history_extra`), the
+    latest effective daily budget from that history, efficiency against the account
+    baseline, outcomes and, where linked, CRM Qualified Leads. The sample is the outcome
+    total against ``b4.min_outcomes``; the item has no decision subject ("Mark done" only).
+    """
     weekend, weekday = sides
     currency = ctx.account_currency(campaign.id)
+    subject = _b4_history_subject(ctx, campaign)
+    history = budget_history(ctx, subject)
     label = OUTCOME_LABELS[campaign.objective_group]
     singular = _singular(label)
     totals = window_totals(ctx, (campaign.id,))
@@ -1857,7 +1950,14 @@ def _b4_candidate(
         ),
         Metric("weekend_rate", f"Weekend {label} per unit of spend", test.rate_a, "rate"),
         Metric("weekday_rate", f"Weekday {label} per unit of spend", test.rate_b, "rate"),
-        *_b4_budget_metrics(ctx, campaign, currency),
+        Metric(
+            "daily_budget",
+            "Latest effective daily budget",
+            history.latest_daily_budget,
+            "currency",
+            _subject_currency(ctx, subject),
+        ),
+        *_history_metrics(history, None),
     ]
     if view.linked:
         metrics.append(
@@ -1902,6 +2002,7 @@ def _b4_candidate(
                 },
                 "outcomes": {"observed": total, "required": settings.b4_min_outcomes},
             },
+            **_b4_history_extra(ctx, subject, history),
         },
     )
     weekend_text = _cost_of(evidence, "weekend_cpo")
@@ -1914,7 +2015,7 @@ def _b4_candidate(
         f"weekend days vs weekday {weekday_text} over {_value(evidence, 'weekdays')} weekdays "
         f"({_value(evidence, 'weekend_outcomes')} weekend and "
         f"{_value(evidence, 'weekday_outcomes')} weekday {label}; {B4_TEST_NAME} "
-        f"{_p_value(p_value)}, below alpha {_number(alpha)}); "
+        f"{_p_value(p_value, alpha)}, below alpha {_number(alpha)}); "
         f"{source_label} days end at midnight {boundary}; {evidence.extra['contract']}."
     )
     return Candidate(
@@ -1968,7 +2069,7 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     """Evaluate the "Budget changes" rules B1, B2, B3 and B4.
 
     AAP 0.5.4.5. Every item sits in the ``changes`` group and is ranked by window spend,
-    descending (``rank_key = (-window spend,)``; ties by entity name, then key, in
+    descending (``rank_key = (-window spend,)``; ties by entity name, then id, in
     ``precedence.py``); withheld patterns follow the items. Items come in rule order: B1 (one
     per C2 "Scale", carrying the amount and declaring its G1 targets), B2 (do not increase;
     prefilled 20% decrease), B3 (under-utilized; ``extra.freed`` for the allocation) and B4

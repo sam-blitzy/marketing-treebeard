@@ -3,13 +3,16 @@
 They pin the configuration contract every rule relies on: the shipped ``config/*.yaml`` load
 with the documented values; a missing or ill-typed key, a default window missing from the
 presets, a form or creative listed under two assets, and a contradicting creative override
-each fail with a ``ConfigError`` naming the file and key; ``config_hash`` ignores comments and
-follows values; and stored CRM bindings round-trip through JSON. Pure: files in ``tmp_path``
-only, no database and no network.
+each fail with a ``ConfigError`` naming the file and key, as do a NUL character and text UTF-8
+cannot encode; ``config_hash`` ignores comments and follows values; load-time overrides are
+read, validated and hashed exactly as files holding the same values; ``config_fingerprint``
+follows every byte; and stored CRM bindings round-trip through JSON. Pure: files in
+``tmp_path`` only, no database and no network.
 """
 
 import copy
 import json
+import math
 import pickle
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -34,6 +37,9 @@ from ads_engine.analysis.thresholds import (
     ResolvedBinding,
     StageBinding,
     Thresholds,
+    _config_hash,
+    config_fingerprint,
+    override_value,
     resolve_config_dir,
 )
 
@@ -841,6 +847,237 @@ def test_crm_bindings_part_types() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Load-time overrides and config_fingerprint
+# ---------------------------------------------------------------------------
+
+
+def test_load_without_overrides_is_the_plain_load(shipped: Thresholds) -> None:
+    assert Thresholds.load(CONFIG_DIR, overrides={}) == shipped
+    assert Thresholds.load(CONFIG_DIR, overrides=None, content_assets=None) == shipped
+
+
+def test_overrides_load_exactly_as_the_equivalent_yaml(tmp_path: Path) -> None:
+    overridden = Thresholds.load(
+        CONFIG_DIR,
+        overrides={
+            "window.default_days": Decimal("21"),
+            "window.presets": (14, 21, Decimal(28), 56, 90),
+            "budget.capped_day_ratio": Decimal("0.90"),
+            "crm.lead_maturity_days": 10,
+        },
+    )
+    directory = _copy_config(tmp_path / "config")
+    path = directory / THRESHOLDS_FILE
+    text = path.read_text("utf-8")
+    for old, new in (
+        ("default_days: 28", "default_days: 21"),
+        ("presets: [14, 28, 56, 90]", "presets: [14, 21, 28, 56, 90]"),
+        ("capped_day_ratio: 0.95", "capped_day_ratio: 0.90"),
+        ("lead_maturity_days: 14", "lead_maturity_days: 10"),
+    ):
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+    path.write_text(text, "utf-8")
+    assert overridden.config_hash == Thresholds.load(directory).config_hash
+    assert (overridden.default_days, overridden.presets) == (21, (14, 21, 28, 56, 90))
+    assert overridden.value("budget.capped_day_ratio") == 0.9
+    assert overridden.decimal("budget.capped_day_ratio") == Decimal("0.9")
+    assert overridden.int("crm.lead_maturity_days") == 10
+    assert overridden.source_dir == CONFIG_DIR
+
+
+def test_crm_list_overrides_go_to_the_mapping(shipped: Thresholds) -> None:
+    changed = Thresholds.load(
+        CONFIG_DIR,
+        overrides={
+            "crm.booking_sources": ("MEETINGS_PUBLIC", "CRM_UI"),
+            "crm.meeting_outcome_exclusions": [],
+        },
+    )
+    assert changed.mapping.booking_sources == ("MEETINGS_PUBLIC", "CRM_UI")
+    assert changed.strings("crm.booking_sources") == ("MEETINGS_PUBLIC", "CRM_UI")
+    assert changed.mapping.meeting_outcome_exclusions == ()
+    assert changed.config_hash != shipped.config_hash
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "window.nonexistent",
+        "nowhere.deeper.key",
+        "window.default_days.extra",
+        "window.default_days.extra.more",
+        "window..default_days",
+        "",
+        # Only the two merged crm lists route to the mapping; its other keys do not exist
+        # in thresholds.yaml.
+        "mql.mode",
+        "crm.booking_sources.deeper",
+    ],
+)
+def test_override_of_a_missing_key_fails(key: str) -> None:
+    with pytest.raises(ConfigError, match="threshold override names a missing key") as caught:
+        Thresholds.load(CONFIG_DIR, overrides={key: 1})
+    assert (caught.value.file, caught.value.key) == (THRESHOLDS_FILE, key)
+
+
+def test_override_of_a_crm_list_the_mapping_lacks_names_the_mapping(tmp_path: Path) -> None:
+    directory = _copy_config(tmp_path / "config")
+    path = directory / HUBSPOT_MAPPING_FILE
+    text = path.read_text("utf-8")
+    assert text.count("  booking_sources: [MEETINGS_PUBLIC]\n") == 1
+    path.write_text(text.replace("  booking_sources: [MEETINGS_PUBLIC]\n", ""), "utf-8")
+    with pytest.raises(ConfigError, match="threshold override names a missing key") as caught:
+        Thresholds.load(directory, overrides={"crm.booking_sources": ["CRM_UI"]})
+    assert (caught.value.file, caught.value.key) == (HUBSPOT_MAPPING_FILE, "crm.booking_sources")
+
+
+def test_override_keys_must_be_strings() -> None:
+    with pytest.raises(ConfigError, match="must be a dotted string, found 7") as caught:
+        Thresholds.load(CONFIG_DIR, overrides={7: 1})  # type: ignore[dict-item]
+    assert (caught.value.file, caught.value.key) == (THRESHOLDS_FILE, None)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "file", "key", "message"),
+    [
+        ({"window.default_days": 21}, THRESHOLDS_FILE, "window.presets", "window.default_days"),
+        ({"b1.step": Decimal("Infinity")}, THRESHOLDS_FILE, "b1.step", "finite number"),
+        ({"b1.step": Decimal("sNaN")}, THRESHOLDS_FILE, "b1.step", "finite number"),
+        ({"b1.step": "0.2"}, THRESHOLDS_FILE, "b1.step", "must be a number"),
+        (
+            {"crm.booking_sources": ["\ud800"]},
+            HUBSPOT_MAPPING_FILE,
+            "crm.booking_sources[0]",
+            "must be UTF-8 encodable text",
+        ),
+    ],
+)
+def test_overridden_configuration_is_validated(
+    overrides: dict[str, object], file: str, key: str, message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message) as caught:
+        Thresholds.load(CONFIG_DIR, overrides=overrides)
+    assert (caught.value.file, caught.value.key) == (file, key)
+
+
+def test_overrides_read_the_files_with_the_strict_loader(tmp_path: Path) -> None:
+    directory = _copy_config(tmp_path / "config")
+    path = directory / THRESHOLDS_FILE
+    path.write_text(path.read_text("utf-8") + "\nk1:\n  rule_of_three: 4\n", "utf-8")
+    with pytest.raises(ConfigError, match="duplicate key 'k1'") as caught:
+        Thresholds.load(directory, overrides={"window.trusted_min_days": 21})
+    assert (caught.value.file, caught.value.key) == (THRESHOLDS_FILE, None)
+
+
+def test_override_changes_exactly_one_key_of_an_aliased_node(tmp_path: Path) -> None:
+    directory = _copy_config(tmp_path / "config")
+    path = directory / THRESHOLDS_FILE
+    path.write_text(
+        path.read_text("utf-8") + "\nextra:\n  first: &shared {days: 1}\n  second: *shared\n",
+        "utf-8",
+    )
+    loaded = Thresholds.load(directory, overrides={"extra.second.days": 2})
+    assert (loaded.int("extra.first.days"), loaded.int("extra.second.days")) == (1, 2)
+    assert Thresholds.load(directory).int("extra.second.days") == 1
+
+
+def test_registry_override_replaces_the_file(shipped: Thresholds) -> None:
+    only = ContentAsset("only-paper", "Only Paper", (BENCHMARKS_FORM,), ())
+    replaced = Thresholds.load(CONFIG_DIR, content_assets=[only])
+    assert replaced.content_assets == (only,)
+    assert replaced.asset_for_form(BENCHMARKS_FORM) == only
+    assert replaced.asset_for_form(PLAYBOOK_FORM) is None
+    assert replaced.config_hash != shipped.config_hash
+    same = Thresholds.load(CONFIG_DIR, content_assets=shipped.content_assets)
+    assert same.config_hash == shipped.config_hash
+    assert Thresholds.load(CONFIG_DIR, content_assets=()).content_assets == ()
+    with pytest.raises(ConfigError, match="must be a ContentAsset") as caught:
+        Thresholds.load(CONFIG_DIR, content_assets=[only, "paper"])  # type: ignore[list-item]
+    assert (caught.value.file, caught.value.key) == (CONTENT_ASSETS_FILE, "assets[1]")
+    twin = ContentAsset("other-paper", "Other Paper", (BENCHMARKS_FORM,), ())
+    with pytest.raises(ConfigError, match="listed under two assets") as caught:
+        Thresholds.load(CONFIG_DIR, content_assets=[only, twin])
+    assert (caught.value.file, caught.value.key) == (CONTENT_ASSETS_FILE, "assets[1].lead_forms[0]")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("21"), 21),
+        (Decimal("21.00"), 21),
+        (Decimal("-0"), 0),
+        (Decimal("0.90"), 0.9),
+        ((Decimal(1), [Decimal("0.5"), "x"]), [1, [0.5, "x"]]),
+        ({"days": Decimal(7), "list": (1,)}, {"days": 7, "list": [1]}),
+        (Decimal("Infinity"), float("inf")),
+        (Decimal("-Infinity"), float("-inf")),
+        ("0.9", "0.9"),
+        (0.9, 0.9),
+        (7, 7),
+        (True, True),
+        (None, None),
+        (date(2026, 10, 1), date(2026, 10, 1)),
+    ],
+)
+def test_override_value_is_the_parsed_yaml_value(value: object, expected: object) -> None:
+    normalised = override_value(value)
+    assert normalised == expected
+    assert repr(normalised) == repr(expected)
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("sNaN")])
+def test_override_value_of_a_decimal_nan_is_a_float_nan(value: Decimal) -> None:
+    normalised = override_value(value)
+    assert isinstance(normalised, float)
+    assert math.isnan(normalised)
+
+
+def test_config_fingerprint_follows_every_byte(tmp_path: Path) -> None:
+    directory = _copy_config(tmp_path / "config")
+    first = config_fingerprint(directory)
+    assert len(first) == 64
+    assert config_fingerprint(directory) == config_fingerprint(str(directory)) == first
+    seen = {first}
+    for name in CONFIG_FILES:
+        path = directory / name
+        original = path.read_bytes()
+        # A comment-only edit keeps config_hash but is still a change of the files.
+        path.write_bytes(original + b"# a comment-only edit\n")
+        assert Thresholds.load(directory).config_hash == Thresholds.load(CONFIG_DIR).config_hash
+        changed = config_fingerprint(directory)
+        assert changed not in seen
+        seen.add(changed)
+        path.write_bytes(original)
+        assert config_fingerprint(directory) == first
+    path = directory / THRESHOLDS_FILE
+    original = path.read_bytes()
+    path.write_bytes(original.replace(b"capped_day_ratio: 0.95", b"capped_day_ratio: 0.96"))
+    assert config_fingerprint(directory) not in seen
+
+
+def test_config_fingerprint_defaults_to_the_resolved_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(REPO_ROOT / "backend")
+    assert config_fingerprint() == config_fingerprint(CONFIG_DIR)
+
+
+def test_config_fingerprint_names_a_missing_or_unreadable_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="config directory not found"):
+        config_fingerprint(tmp_path / "absent")
+    directory = _copy_config(tmp_path / "config")
+    (directory / CONTENT_ASSETS_FILE).unlink()
+    with pytest.raises(ConfigError, match="file not found") as caught:
+        config_fingerprint(directory)
+    assert (caught.value.file, caught.value.key) == (CONTENT_ASSETS_FILE, None)
+    (directory / CONTENT_ASSETS_FILE).mkdir()
+    with pytest.raises(ConfigError, match="cannot read") as caught:
+        config_fingerprint(directory)
+    assert (caught.value.file, caught.value.key) == (CONTENT_ASSETS_FILE, None)
+
+
+# ---------------------------------------------------------------------------
 # Files, directories and errors
 # ---------------------------------------------------------------------------
 
@@ -886,6 +1123,10 @@ def test_missing_directory_and_file(tmp_path: Path) -> None:
         (b"window: \xff\xfe\n", "not valid UTF-8"),
         (b"--- {a: 1}\n--- {b: 2}\n", "invalid YAML"),
         (b"? [a, b]\n: 1\n", "unhashable key"),
+        # The loader's reader rejects NUL while it is constructed, before parsing starts.
+        (b'window:\n  default_days: 28\nextra: "a\x00b"\n', "unacceptable character #x0000"),
+        (b"\x00", "unacceptable character #x0000"),
+        (b"extra: " + b"[" * 3000 + b"]" * 3000 + b"\n", "nesting is too deep to parse"),
     ],
 )
 def test_unreadable_yaml_fails_naming_the_file(
@@ -909,6 +1150,116 @@ def test_yaml_merge_keys_may_be_overridden(tmp_path: Path) -> None:
     )
     path.write_text(text, "utf-8")
     assert Thresholds.load(directory).int("extra.min_window_days") == 21
+
+
+def test_yaml_anchors_and_aliases_still_load(tmp_path: Path) -> None:
+    directory = _copy_config(tmp_path / "config")
+    path = directory / THRESHOLDS_FILE
+    path.write_text(
+        path.read_text("utf-8") + "\nextra:\n  first: &shared [1, 2]\n  second: *shared\n",
+        "utf-8",
+    )
+    loaded = Thresholds.load(directory)
+    assert loaded.value("extra.first") == loaded.value("extra.second") == (1, 2)
+
+
+def test_utf8_byte_order_marks_still_load_with_the_shipped_hash(
+    tmp_path: Path, shipped: Thresholds
+) -> None:
+    directory = _copy_config(tmp_path / "config")
+    for name in CONFIG_FILES:
+        path = directory / name
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    assert Thresholds.load(directory).config_hash == shipped.config_hash
+
+
+# A YAML "\u" escape of a surrogate parses to a lone surrogate, which UTF-8 cannot encode; a
+# surrogate pair written as two escapes stays two lone surrogates.
+SURROGATE_CASES = [
+    pytest.param(
+        THRESHOLDS_FILE, None, '\nextra: "\\uD800"\n', "extra", "in '\\ud800'", id="value"
+    ),
+    pytest.param(THRESHOLDS_FILE, None, '\n"\\uD800": 1\n', None, "key '\\ud800'", id="key"),
+    pytest.param(
+        THRESHOLDS_FILE, None, '\nextra:\n  "a\\uDFFF": 1\n', "extra", "key 'a\\udfff'", id="nested"
+    ),
+    pytest.param(
+        THRESHOLDS_FILE, None, '\nextra: [ok, "\\uDE00"]\n', "extra[1]", "'\\ude00'", id="list"
+    ),
+    pytest.param(
+        CONTENT_ASSETS_FILE,
+        ('title: "The Attribution Playbook"', 'title: "The \\uD83D\\uDE00 Playbook"'),
+        None,
+        "assets[2].title",
+        "lone surrogate '\\ud83d'",
+        id="registry-title",
+    ),
+    pytest.param(
+        HUBSPOT_MAPPING_FILE,
+        ('"Sales Qualified Lead"]', '"Sales \\uDC00 Lead"]'),
+        None,
+        "ql.stage_labels[1]",
+        "lone surrogate '\\udc00'",
+        id="mapping-label",
+    ),
+    pytest.param(
+        HUBSPOT_MAPPING_FILE,
+        (
+            "meeting_outcome_exclusions: [CANCELED]",
+            'meeting_outcome_exclusions: [CANCELED]\n  "\\uD800": []',
+        ),
+        None,
+        "crm",
+        "key '\\ud800'",
+        id="mapping-key",
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "replace", "append", "key", "fragment"), SURROGATE_CASES)
+def test_text_utf8_cannot_encode_fails_naming_file_and_key(
+    tmp_path: Path,
+    name: str,
+    replace: tuple[str, str] | None,
+    append: str | None,
+    key: str | None,
+    fragment: str,
+) -> None:
+    directory = _copy_config(tmp_path / "config")
+    path = directory / name
+    text = path.read_text("utf-8")
+    if replace is not None:
+        assert text.count(replace[0]) == 1
+        text = text.replace(*replace)
+    if append is not None:
+        text += append
+    path.write_text(text, "utf-8")
+    with pytest.raises(ConfigError) as caught:
+        Thresholds.load(directory)
+    assert (caught.value.file, caught.value.key) == (name, key)
+    assert "must be UTF-8 encodable text" in caught.value.detail
+    assert fragment in caught.value.detail
+    # The error itself can always be logged, printed and stored.
+    str(caught.value).encode("utf-8")
+
+
+def test_unencodable_text_is_rejected_before_other_validation() -> None:
+    # Without the encodability check first, the unknown-key message would quote the raw key.
+    def edit(trees: Trees) -> None:
+        trees[HUBSPOT_MAPPING_FILE]["\ud800"] = 1
+
+    with pytest.raises(ConfigError, match="must be UTF-8 encodable text") as caught:
+        _edited(edit)
+    assert (caught.value.file, caught.value.key) == (HUBSPOT_MAPPING_FILE, None)
+    str(caught.value).encode("utf-8")
+
+
+def test_config_hash_reports_json_utf8_cannot_encode() -> None:
+    with pytest.raises(ConfigError, match="cannot compute config_hash") as caught:
+        _config_hash({"extra": "\ud800"}, {"assets": []}, {})
+    assert (caught.value.file, caught.value.key) == ("config", None)
+    assert "surrogates not allowed" in caught.value.detail
+    str(caught.value).encode("utf-8")
 
 
 def test_unreadable_path_is_reported(tmp_path: Path) -> None:

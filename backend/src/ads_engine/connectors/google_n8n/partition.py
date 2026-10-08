@@ -7,7 +7,8 @@ cannot reveal the ids it omitted. **No step here relies on an id list read off a
 response.** Completeness comes only from narrowing forms whose completeness can be proven, using
 two GAQL features: numeric comparisons on INT64 ids, and ``ORDER BY ... LIMIT``.
 
-:func:`partitioned_fetch` reads one template of
+:class:`PartitionedFetcher` binds the webhook client ``sync`` owns, and so its call budget, at
+construction. Its ``partitioned_fetch(query_id, scope)`` reads one template of
 :data:`~ads_engine.connectors.google_n8n.queries.QUERIES` to completion by its ``strategy``:
 
 * ``single`` (Q-G1, Q-G8): one query. A capped result is kept and reported ``incomplete``
@@ -16,7 +17,7 @@ two GAQL features: numeric comparisons on INT64 ids, and ``ORDER BY ... LIMIT``.
   Every page stays below the page size, so no page can be silently truncated. A page of exactly
   :data:`~ads_engine.connectors.google_n8n.queries.KEYSET_LIMIT` (9,999) rows continues from its
   largest id; the first shorter page ends the scan. 25,000 campaigns read as pages of 9,999,
-  9,999 and 7,002 rows with strictly increasing ``campaign.id >`` filters.
+  9,999 and 5,002 rows with strictly increasing ``campaign.id >`` filters.
 * ``by_ids`` (Q-G2b): the sorted, de-duplicated ids in ``IN`` lists of at most
   :data:`~ads_engine.connectors.google_n8n.queries.MAX_IDS_PER_IN` (1,000). Q-G2b returns at
   most one row per campaign, so every successful chunk is complete.
@@ -59,8 +60,9 @@ Interruption:
     stops the fetch at once. Rows already accepted are kept; the interrupted partition, whose
     partial pages are discarded because page tokens expire, and every partition still on the
     stack are returned in :attr:`FetchOutcome.deferred`, in the order they would have been read.
-    Each entry is a scope :func:`partitioned_fetch` accepts, so ``sync`` resumes them in a later
-    24 h window; the dataset stays ``incomplete`` until they finish, which ``sync`` records.
+    Each entry is a scope :meth:`PartitionedFetcher.partitioned_fetch` accepts, so ``sync``
+    resumes them in a later 24 h window; the dataset stays ``incomplete`` until they finish,
+    which ``sync`` records.
     ``AccessDenied`` and ``QueryDefect`` propagate unchanged: ``sync.mode`` switches the source
     to simulated data or fails the job.
 
@@ -83,14 +85,15 @@ Reason strings:
 Example:
     ``sync`` reads a metrics range and records its completeness::
 
-        outcome = await partitioned_fetch(
-            client, "Q-G6", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
+        fetcher = PartitionedFetcher(client)
+        outcome = await fetcher.partitioned_fetch(
+            "Q-G6", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
         )
         rows = [PARSERS["row_search_term_view"](row) for row in outcome.rows]
         if not outcome.complete:
             ...  # google.search_terms is incomplete with outcome.reason
         for scope in outcome.deferred:
-            ...  # resumed later with partitioned_fetch(client, "Q-G6", scope)
+            ...  # resumed later with fetcher.partitioned_fetch("Q-G6", scope)
 
 Only the standard library, :mod:`ads_engine.logging`, :mod:`ads_engine.connectors.errors` and
 this package's ``queries``, ``parser`` and ``client`` are imported. Nothing here imports ``sync``,
@@ -147,9 +150,9 @@ __all__ = [
     "EntityEnumeration",
     "EntityQueryId",
     "FetchOutcome",
+    "PartitionedFetcher",
     "enumerate_campaigns",
     "enumerate_entities",
-    "partitioned_fetch",
 ]
 
 log = get_logger(__name__)
@@ -221,7 +224,7 @@ EntityQueryId = Literal["Q-G4", "Q-G7"]
 
 @dataclass(frozen=True, slots=True)
 class FetchOutcome:
-    """Every row :func:`partitioned_fetch` read for one query and scope, and its completeness.
+    """Every row one :meth:`PartitionedFetcher.partitioned_fetch` call read, and its completeness.
 
     Attributes:
         query_id: The template id, such as ``"Q-G6"``.
@@ -241,7 +244,8 @@ class FetchOutcome:
         partitions_read: Partition queries answered, capped responses that were split included.
         deferred: The unread partitions after an interruption, the interrupted one first and
             then in the order they would have been read. Each entry is an immutable scope that
-            ``partitioned_fetch(client, query_id, entry)`` accepts. Empty unless interrupted.
+            ``PartitionedFetcher(client).partitioned_fetch(query_id, entry)`` accepts. Empty
+            unless interrupted.
         interrupted_by: The ``TransientError`` (``CallBudgetExhausted`` included) that stopped
             the fetch, or ``None``.
     """
@@ -341,52 +345,105 @@ class _Step:
 # ---------------------------------------------------------------------------------------------
 
 
-async def partitioned_fetch(
+class PartitionedFetcher:
+    """The connector's ``partitioned_fetch(query_id, scope)`` entry point, bound to one client.
+
+    ``sync`` builds one fetcher per Google webhook client it owns. The client, and with it the
+    call budget ``sync`` injected into it (``GoogleCallBudget`` for live calls, ``UNMETERED``
+    for simulated ones), is bound at construction, so every fetch names only a template and its
+    scope. The fetcher holds no other state: it reads no settings and holds no credentials
+    beyond the client's, so one instance serves every fetch of a sync, and a deferred scope
+    resumes through the same instance.
+
+    Example:
+        ``sync`` reads the campaign list and a metrics range through one fetcher::
+
+            fetcher = PartitionedFetcher(client)
+            campaigns = await fetcher.partitioned_fetch("Q-G2")
+            daily = await fetcher.partitioned_fetch(
+                "Q-G3", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
+            )
+    """
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: GoogleAdsWebhookClient) -> None:
+        """Bind the webhook client every fetch sends through; nothing is sent.
+
+        Args:
+            client: The webhook client; ``sync`` owns it, its HTTP client and its call budget.
+        """
+        self._client: GoogleAdsWebhookClient = client
+
+    @property
+    def client(self) -> GoogleAdsWebhookClient:
+        """The bound webhook client, whose ``calls_made`` each outcome's ``calls`` comes from."""
+        return self._client
+
+    def __repr__(self) -> str:
+        """Return the class name and the client's repr; never the URL, secret or customer id."""
+        return f"{type(self).__name__}(client={self._client!r})"
+
+    async def partitioned_fetch(
+        self, query_id: str, scope: Mapping[str, object] | None = None
+    ) -> FetchOutcome:
+        """Read one GAQL template to completion, partitioning every capped response.
+
+        The template's ``strategy`` decides how the scope is narrowed (see the module
+        docstring). Every partition is one :meth:`GoogleAdsWebhookClient.run_query` on the
+        bound client, which follows a returned page token at once.
+
+        Example::
+
+            fetcher = PartitionedFetcher(client)
+            outcome = await fetcher.partitioned_fetch("Q-G2")  # starts at last_id 0
+            outcome = await fetcher.partitioned_fetch("Q-G2b", {"ids": tracked_absent_ids})
+            outcome = await fetcher.partitioned_fetch(
+                "Q-G3", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
+            )
+
+        Args:
+            query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`.
+            scope: Narrowing values keyed by the scope-key constants of ``queries.py``, or
+                ``None``:
+
+                * ``single`` (Q-G1, Q-G8): none.
+                * ``keyset`` (Q-G2, Q-G4): optional ``last_id`` to start after; 0 by default.
+                * ``by_ids`` (Q-G2b): ``ids``, any number of ids; duplicates are dropped, and an
+                  empty collection reads nothing and is complete with no call.
+                * ``ad_group_ranges`` (Q-G7): optional ``ad_group_lo``/``ad_group_hi`` (the
+                  full range by default), or ``ad_group_id`` with ``last_id`` to resume a
+                  keyset.
+                * ``dated`` (Q-G3, Q-G5, Q-G6): required ``start`` and ``end``; optional
+                  campaign and ad-group ranges; for Q-G5, ``ad_group_id`` with ``last_id`` on a
+                  single day.
+
+                Every :attr:`FetchOutcome.deferred` entry is a valid scope.
+
+        Returns:
+            The rows read and their completeness. An interruption by a ``TransientError``
+            returns an ``incomplete`` outcome rather than raising.
+
+        Raises:
+            AccessDenied: The webhook or Google refused the credentials; propagated unchanged.
+            QueryDefect: The request was rejected as malformed, or a response broke the
+                contract: a keyset that did not advance or exceeded its limit, a capped Q-G2b
+                chunk or Q-G3 campaign-day, or a row outside the partition it was read for.
+            ValueError: ``query_id`` is unknown or ``scope`` is invalid for its template;
+                nothing is sent.
+        """
+        return await _partitioned_fetch(self._client, query_id, scope)
+
+
+async def _partitioned_fetch(
     client: GoogleAdsWebhookClient,
     query_id: str,
     scope: Mapping[str, object] | None = None,
 ) -> FetchOutcome:
-    """Read one GAQL template to completion, partitioning every capped response.
+    """Run :meth:`PartitionedFetcher.partitioned_fetch` through an explicitly passed client.
 
-    The template's ``strategy`` decides how the scope is narrowed (see the module docstring).
-    Every partition is one :meth:`GoogleAdsWebhookClient.run_query`, which follows a returned
-    page token at once.
-
-    Example::
-
-        outcome = await partitioned_fetch(client, "Q-G2")  # starts at last_id 0
-        outcome = await partitioned_fetch(client, "Q-G2b", {"ids": tracked_absent_ids})
-        outcome = await partitioned_fetch(
-            client, "Q-G3", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
-        )
-
-    Args:
-        client: The webhook client; ``sync`` owns it and its call budget.
-        query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`.
-        scope: Narrowing values keyed by the scope-key constants of ``queries.py``, or ``None``:
-
-            * ``single`` (Q-G1, Q-G8): none.
-            * ``keyset`` (Q-G2, Q-G4): optional ``last_id`` to start after; 0 by default.
-            * ``by_ids`` (Q-G2b): ``ids``, any number of ids; duplicates are dropped, and an
-              empty collection reads nothing and is complete with no call.
-            * ``ad_group_ranges`` (Q-G7): optional ``ad_group_lo``/``ad_group_hi`` (the full
-              range by default), or ``ad_group_id`` with ``last_id`` to resume a keyset.
-            * ``dated`` (Q-G3, Q-G5, Q-G6): required ``start`` and ``end``; optional campaign and
-              ad-group ranges; for Q-G5, ``ad_group_id`` with ``last_id`` on a single day.
-
-            Every :attr:`FetchOutcome.deferred` entry is a valid scope.
-
-    Returns:
-        The rows read and their completeness. An interruption by a ``TransientError`` returns
-        an ``incomplete`` outcome rather than raising.
-
-    Raises:
-        AccessDenied: The webhook or Google refused the credentials; propagated unchanged.
-        QueryDefect: The request was rejected as malformed, or a response broke the contract:
-            a keyset that did not advance or exceeded its limit, a capped Q-G2b chunk or Q-G3
-            campaign-day, or a row outside the partition it was read for.
-        ValueError: ``query_id`` is unknown or ``scope`` is invalid for its template; nothing
-            is sent.
+    The safe-absence enumerations call it with the client they were given. Arguments, result,
+    logging and errors are those the method documents.
     """
     template = _template(query_id)
     initial = _initial_partitions(template, scope)
@@ -958,7 +1015,7 @@ async def enumerate_campaigns(
     """
     tracked = _tracked_ids(_SCAN_QUERY, tracked_ids)
     scan_template = QUERIES[_SCAN_QUERY]
-    scan = await partitioned_fetch(client, _SCAN_QUERY, {LAST_ID: INT64_MIN_ID})
+    scan = await _partitioned_fetch(client, _SCAN_QUERY, {LAST_ID: INT64_MIN_ID})
     if not scan.complete:
         return _log_campaigns(
             CampaignEnumeration(
@@ -988,7 +1045,7 @@ async def enumerate_campaigns(
             tracked=len(tracked),
         )
     reread_template = QUERIES[_BY_IDS_QUERY]
-    reread = await partitioned_fetch(client, _BY_IDS_QUERY, {IDS: absent})
+    reread = await _partitioned_fetch(client, _BY_IDS_QUERY, {IDS: absent})
     removed: list[GoogleAdsRow] = []
     still_present: list[GoogleAdsRow] = []
     returned: set[int] = set()
@@ -1075,12 +1132,12 @@ async def enumerate_entities(
     absent_keys: frozenset[int] | frozenset[tuple[int, int]]
     if query_id == "Q-G4":
         tracked_ad_groups = _tracked_ids(query_id, tracked_keys)
-        outcome = await partitioned_fetch(client, query_id, {LAST_ID: INT64_MIN_ID})
+        outcome = await _partitioned_fetch(client, query_id, {LAST_ID: INT64_MIN_ID})
         ad_groups = {_row_id(template, row, _AD_GROUP_FIELD) for row in outcome.rows}
         absent_keys = frozenset(tracked_ad_groups - ad_groups if outcome.complete else ())
     else:
         tracked_keywords = _tracked_pairs(query_id, tracked_keys)
-        outcome = await partitioned_fetch(client, query_id)
+        outcome = await _partitioned_fetch(client, query_id)
         keywords = {
             (_row_id(template, row, _AD_GROUP_FIELD), _row_id(template, row, _CRITERION_FIELD))
             for row in outcome.rows

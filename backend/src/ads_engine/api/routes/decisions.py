@@ -258,7 +258,7 @@ async def list_decisions(
     user: UserDep,
     session: SessionDep,
     subject_type: Annotated[schemas.SubjectType | None, Query()] = None,
-    subject_id: Annotated[int | None, Query(gt=0)] = None,
+    subject_id: Annotated[int | None, Query(gt=0, le=schemas.BIGINT_MAX)] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> list[schemas.Decision]:
     """List the decision log of the active datasets, newest first.
@@ -275,7 +275,9 @@ async def list_decisions(
         user: The signed-in user.
         session: The request's session; only read.
         subject_type: Restrict the log to ``campaign`` or ``budget`` subjects.
-        subject_id: Restrict the log to one subject; needs ``subject_type``.
+        subject_id: Restrict the log to one subject; needs ``subject_type``. 1 to
+            ``schemas.BIGINT_MAX``: a larger id is a 422 before any SQL, and an unknown id
+            in range lists nothing.
         limit: At most this many rows, 1 to 500 (default 200).
 
     Returns:

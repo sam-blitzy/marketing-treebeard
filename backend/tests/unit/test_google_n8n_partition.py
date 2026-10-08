@@ -1,12 +1,13 @@
 """Unit tests for ``ads_engine.connectors.google_n8n.partition``: completeness partitioning.
 
-Covers :func:`partitioned_fetch` for every template strategy: the Q-G2 and Q-G4 keyset scans
-(``id >`` the last id, ``ORDER BY id LIMIT 9999``, a full page costing one more call), the Q-G2b
-``IN`` chunks of at most 1,000 ids with no status filter, the dated partitions of Q-G3, Q-G5 and
-Q-G6 (date halving, then numeric ``campaign.id`` and ``ad_group.id`` ranges from
-``[0, INT64_MAX]``, then the Q-G5 criterion keyset or the Q-G6 finest partition), the Q-G7
+Covers :meth:`PartitionedFetcher.partitioned_fetch` for every template strategy: the Q-G2 and
+Q-G4 keyset scans (``id >`` the last id, ``ORDER BY id LIMIT 9999``, a full page costing one more
+call), the Q-G2b ``IN`` chunks of at most 1,000 ids with no status filter, the dated partitions
+of Q-G3, Q-G5 and Q-G6 (date halving, then numeric ``campaign.id`` and ``ad_group.id`` ranges
+from ``[0, INT64_MAX]``, then the Q-G5 criterion keyset or the Q-G6 finest partition), the Q-G7
 ad-group range halving with its criterion keyset, page tokens, call-budget and transient
 interruption with deferred scopes, the contract defects, and scope validation. It also covers
+the ``partitioned_fetch(query_id, scope)`` signature with the client bound at construction, and
 the safe-absence verdicts of :func:`enumerate_campaigns` and :func:`enumerate_entities`.
 
 Every call runs through the production ``GoogleAdsWebhookClient`` and ``send_json`` on an
@@ -25,6 +26,7 @@ are opt-in and named where used. No test touches the network, a database or a re
 """
 
 import functools
+import inspect
 import itertools
 import json
 import re
@@ -64,9 +66,9 @@ from ads_engine.connectors.google_n8n.partition import (
     CampaignEnumeration,
     EntityEnumeration,
     FetchOutcome,
+    PartitionedFetcher,
     enumerate_campaigns,
     enumerate_entities,
-    partitioned_fetch,
 )
 from ads_engine.connectors.google_n8n.queries import (
     AD_GROUP_HI,
@@ -600,9 +602,9 @@ async def _fetch(
     scope: Mapping[str, object] | None = None,
     budget: CallBudget = UNMETERED,
 ) -> FetchOutcome:
-    """Run one :func:`partitioned_fetch` against ``fake``."""
+    """Run one :meth:`PartitionedFetcher.partitioned_fetch` against ``fake``."""
     async with _client(fake, budget) as client:
-        return await partitioned_fetch(client, query_id, scope)
+        return await PartitionedFetcher(client).partitioned_fetch(query_id, scope)
 
 
 def _value(row: Mapping[str, Any], gaql_field: str) -> Any:
@@ -1665,6 +1667,93 @@ async def test_enumerate_entities_rejects_invalid_arguments_before_any_call(
     async with _client(fake) as client:
         with pytest.raises(ValueError, match=re.escape(message)):
             await enumerate_entities(client, query_id, tracked)
+
+    assert fake.calls == []
+
+
+# --- the bound fetcher: partitioned_fetch(query_id, scope) ------------------------------------
+
+
+@pytest.mark.anyio
+async def test_the_bound_fetcher_reads_a_query_id_and_scope_passed_positionally() -> None:
+    """``partitioned_fetch("Q-G2", scope)`` and ``partitioned_fetch("Q-G2")`` read in full."""
+    keys = range(1, 4)
+    fake = FakeGoogle({"Q-G2": [Cell(keys)]})
+
+    async with _client(fake) as client:
+        fetcher = PartitionedFetcher(client)
+        with_scope = await fetcher.partitioned_fetch("Q-G2", {"last_id": 0})
+        without_scope = await fetcher.partitioned_fetch("Q-G2")
+
+    assert fake.scopes == [{LAST_ID: INT64_MIN_ID}, {LAST_ID: INT64_MIN_ID}]
+    for outcome in (with_scope, without_scope):
+        assert isinstance(outcome, FetchOutcome)
+        assert outcome.query_id == "Q-G2"
+        assert _ids(outcome.rows, "campaign.id") == list(keys)
+        assert (outcome.completeness, outcome.reason) == ("complete", None)
+        assert (outcome.calls, outcome.partitions_read, outcome.deferred) == (1, 1, ())
+    assert client.calls_made == 2
+
+
+def test_partitioned_fetch_takes_exactly_a_query_id_and_an_optional_scope() -> None:
+    """The method's parameters are ``self``, ``query_id`` and ``scope=None``, in that order."""
+    parameters = inspect.signature(PartitionedFetcher.partitioned_fetch).parameters
+
+    assert list(parameters) == ["self", "query_id", "scope"]
+    assert all(
+        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for parameter in parameters.values()
+    )
+    assert parameters["query_id"].default is inspect.Parameter.empty
+    assert parameters["scope"].default is None
+    assert inspect.iscoroutinefunction(PartitionedFetcher.partitioned_fetch)
+
+
+@pytest.mark.anyio
+async def test_a_deferred_scope_resumes_through_the_same_bound_fetcher() -> None:
+    """Every deferred scope of an interrupted fetch completes on the fetcher that deferred it."""
+    fake = FakeGoogle(_four_day_world())
+    budget = _Budget(2)
+
+    async with _client(fake, budget) as client:
+        fetcher = PartitionedFetcher(client)
+        interrupted = await fetcher.partitioned_fetch("Q-G3", {START: DAY1, END: DAY4})
+        # A later 24 h window admits one call per deferred partition.
+        budget.allowed += len(interrupted.deferred)
+        resumed = [await fetcher.partitioned_fetch("Q-G3", scope) for scope in interrupted.deferred]
+
+    assert not interrupted.complete
+    assert interrupted.reason == f"{REASON_BUDGET}; 3 partitions deferred"
+    assert fake.scopes[2:] == [dict(scope) for scope in interrupted.deferred]
+    assert all(part.complete for part in resumed)
+    assert [part.calls for part in resumed] == [1, 1, 1]
+    read = [
+        (_value(row, "segments.date"), _value(row, "campaign.id"))
+        for part in resumed
+        for row in part.rows
+    ]
+    assert len(read) == len(set(read)) == PAGE_SIZE + 2
+    assert (client.calls_made, budget.refused) == (5, 1)
+
+
+@pytest.mark.anyio
+async def test_the_fetcher_exposes_its_bound_client_read_only_and_never_its_secrets() -> None:
+    """``client`` is the bound client itself; no other attribute exists and nothing is sent."""
+    fake = FakeGoogle({})
+
+    async with _client(fake) as client:
+        fetcher = PartitionedFetcher(client)
+
+        assert fetcher.client is client
+        with pytest.raises(AttributeError):
+            fetcher.client = client  # type: ignore[misc]
+        with pytest.raises(AttributeError):
+            fetcher.budget = UNMETERED  # type: ignore[attr-defined]
+        assert repr(fetcher) == f"PartitionedFetcher(client={client!r})"
+        assert all(
+            secret not in repr(fetcher) for secret in (SIMULATED_SECRET, SIMULATED_WEBHOOK_URL)
+        )
+        assert CUSTOMER not in repr(fetcher)
 
     assert fake.calls == []
 

@@ -14,22 +14,28 @@ The chain, one hop at a time (AAP 0.5.4.7):
   to the same asset.
 * **Cohorts**: rows are partitioned by the LinkedIn account currency. Every asset row,
   per-creative row, total and median sits within one currency; an asset whose creatives span
-  currencies gets one row per currency, and nothing is summed across currencies.
+  currencies gets one row per currency, and nothing is summed across currencies. Event
+  ownership is settled per asset before that partition, so each event of an asset sits in
+  exactly one of its currency rows (see **Credit**).
 * **Causal check**: the anchor of a (contact, asset) pair is the contact's earliest touch
-  (lead ``submittedAt``) with that asset in the window. MQL and QL count only when the bound
-  stage date is at or after the anchor; a meeting counts as booked only when its record
-  creation (``hs_createdate``, the booking proxy, labelled "booked (record created)") and its
-  start are both at or after the anchor, its outcome is not excluded and its source is a
-  booking source; a deal counts only when it was created at or after the anchor. Earlier
-  events are excluded and reported.
+  (lead ``submittedAt``) with that asset in the window, whatever the touch's currency. MQL
+  and QL count only when the bound stage date is at or after the anchor; a meeting counts as
+  booked only when its record creation (``hs_createdate``, the booking proxy, labelled
+  "booked (record created)") and its start are both at or after the anchor, its outcome is
+  not excluded and its source is a booking source; a deal counts only when it was created at
+  or after the anchor. Earlier events are excluded and reported.
 * **Credit**: every event is credited once per asset to the creative of the latest touch at
-  or before the event, across every contact the event is associated with; a touch without a
-  creative is credited to the "unknown creative" row. Per-creative rows partition the asset's
-  events, which :func:`build_attribution` verifies on every row.
+  or before the event, across every contact the event is associated with and every currency
+  row of the asset; that touch selects the currency row as well as the creative within it. A
+  touch without a creative is credited to the "unknown creative" row. An event excluded by the
+  causal check, and a contact that skipped a stage, is reported once per asset, in the row of
+  its anchor's currency (for a meeting or deal, the earliest anchor among its contacts).
+  Per-creative rows partition each row's events, which :func:`build_attribution` verifies on
+  every row.
 * **Floors**: the contact share (unmatched leads), the unknown CRM evidence share (matched
-  contacts whose refresh, associations or target reads failed), the creative share (leads
-  without a creative) and the portal-wide orphan-deal share, each over the scope actually
-  assessed, against ``attribution.floor_share``.
+  contacts whose refresh failed or was never recorded, or whose associations or target reads
+  failed), the creative share (leads without a creative) and the portal-wide orphan-deal
+  share, each over the scope actually assessed, against ``attribution.floor_share``.
 
 Never blended (FR-8): MQL and Qualified Lead are separate fields everywhere; no field, total
 or sort key combines them. LinkedIn platform leads are a separate platform count and are never
@@ -45,7 +51,8 @@ missing value is ``None`` and renders "unavailable", never 0. Downstream CRM eve
 of run time (``ctx.now``): an event instant after the run is not counted.
 
 Purity: imports only :mod:`ads_engine.analysis.context`, :mod:`ads_engine.analysis.thresholds`
-(types) and the standard library. No database, network, settings or logging access.
+(types), :mod:`ads_engine.analysis.window` (the UTC boundary name) and the standard library.
+No database, network, settings or logging access.
 
 Example:
     >>> table = attribution_for(ctx)  # doctest: +SKIP
@@ -89,6 +96,7 @@ from ads_engine.analysis.context import (
     json_value,
 )
 from ads_engine.analysis.thresholds import ContentAsset, ResolvedBinding, StageBinding
+from ads_engine.analysis.window import UTC_BOUNDARY
 
 __all__ = [
     "ATTRIBUTION_THRESHOLD_KEYS",
@@ -159,6 +167,9 @@ ATTRIBUTION_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
 """Every threshold key this module applies, for rules to copy into ``evidence.thresholds``."""
 
 _NO_CRM_REASON: Final = "no CRM dataset for LinkedIn-attributed evidence"
+_REFRESH_FAILED_REASON: Final = "contact refresh failed; stage dates not current"
+_REFRESH_NOT_RECORDED_REASON: Final = "contact refresh not recorded; stage dates not current"
+_GOOGLE_CONTACTS_DATASET: Final = "hubspot.google_contacts"
 _NO_SPEND_NOTE: Final = "spend is attributed only to known creatives"
 _QL_UNAVAILABLE_NOTE: Final = "Qualified Lead count unavailable"
 _MEETINGS_UNAVAILABLE_NOTE: Final = "meeting count unavailable"
@@ -367,6 +378,10 @@ class CreditRow:
 @dataclass(frozen=True, slots=True)
 class AssetRow:
     """One white paper within one currency cohort (AAP 0.5.4.7 "Metrics per asset").
+
+    The CRM counts (MQL, QL, meetings, deals, and the excluded and skipped counts) are this
+    row's share of the asset's events, each counted once per asset across its currency rows:
+    in the row of the touch it is credited to, or, when excluded or skipped, of its anchor.
 
     Attributes:
         slug: The asset's registry slug.
@@ -611,8 +626,10 @@ class VetoPopulation:
             without a match row.
         eligible_contacts: Distinct contacts behind the matched matured leads.
         unresolved_share: ``unresolved_leads / matured_leads``; ``None`` without matured leads.
-        unknown_evidence_contacts: Eligible contacts whose refresh, contact-to-meeting or
-            contact-to-deal fetch, or target reads failed.
+        unknown_evidence_contacts: Eligible contacts whose refresh is not a recorded success
+            (failed or never recorded), or whose contact-to-meeting or contact-to-deal fetch,
+            or target reads failed; every eligible contact when the population's refresh is
+            unknown (Google touch-date discovery).
         mql: MQL entries of eligible contacts after their touch; ``None`` when unavailable.
         ql: Qualified Lead entries likewise; ``None`` when unavailable.
         meetings: Meetings of eligible contacts after their touch, booked and ordering-
@@ -758,11 +775,17 @@ class _Settings:
 
 @dataclass(frozen=True, slots=True, order=True)
 class _Touch:
-    """One matched lead of a contact: its ``submittedAt`` and the creative it came from."""
+    """One matched lead of a contact: its ``submittedAt``, its creative and its row's currency.
+
+    Touches order by instant, then lead id. The currency names the (asset, currency) row the
+    lead belongs to, so the touch an event is credited to selects that row as well as the
+    creative within it.
+    """
 
     at: datetime
     lead_id: int
     creative: _CreativeKey = field(compare=False)
+    currency: str = field(compare=False)
 
 
 @dataclass(slots=True)
@@ -778,7 +801,11 @@ class _Tally:
 
 @dataclass(slots=True)
 class _RowInput:
-    """What resolves to one (asset, currency) row before any CRM evidence is read."""
+    """What resolves to one (asset, currency) row before any CRM evidence is read.
+
+    Spend and leads belong to exactly one row; CRM events are owned per asset, across all of
+    its rows (:func:`_asset_events`).
+    """
 
     asset: ContentAsset
     currency: str
@@ -789,7 +816,7 @@ class _RowInput:
 
 @dataclass(frozen=True, slots=True)
 class _StageCount:
-    """One stage's outcome over an asset row's contacts."""
+    """One stage's outcome within one currency row of an asset (see :func:`_count_stage`)."""
 
     counted: int
     before: int
@@ -840,17 +867,41 @@ def _meeting_start(meeting: MeetingInfo) -> datetime | None:
     return meeting.start_at if meeting.start_at is not None else meeting.meeting_timestamp
 
 
-def _refresh_failures(leads: Iterable[LeadInfo]) -> frozenset[str]:
-    """Return the contacts whose latest refresh failed on any of their matched leads."""
-    return frozenset(
-        lead.contact_hs_id
-        for lead in leads
-        if lead.matched and lead.contact_hs_id is not None and lead.contact_read_status == "error"
-    )
+def _refresh_problem(lead: LeadInfo) -> str | None:
+    """Return why a lead's record of its contact's latest refresh is not a success, if it is not.
+
+    AAP 0.5.4.1 counts a contact's evidence as known only when its refresh succeeded, and
+    AAP 0.3.3 records that success as ``contact_read_status = ok``. Only an explicit ``ok`` is
+    a success: ``error`` is a failed refresh and an absent status is a refresh never recorded;
+    in both cases the stored stage dates are not current.
+    """
+    if lead.contact_read_status == "ok":
+        return None
+    if lead.contact_read_status == "error":
+        return _REFRESH_FAILED_REASON
+    return _REFRESH_NOT_RECORDED_REASON
+
+
+def _refresh_failures(leads: Iterable[LeadInfo]) -> Mapping[str, str]:
+    """Return, by contact, why its refresh is unknown, over every matched lead of the contact.
+
+    A contact is listed when any of its matched leads records a refresh other than ``ok``
+    (:func:`_refresh_problem`). When its leads disagree, a failed refresh outranks one not
+    recorded, whatever the lead order, so the reason is deterministic. Contacts are listed in
+    sorted order.
+    """
+    reasons: dict[str, str] = {}
+    for lead in leads:
+        if not lead.matched or lead.contact_hs_id is None:
+            continue
+        problem = _refresh_problem(lead)
+        if problem is not None and reasons.get(lead.contact_hs_id) != _REFRESH_FAILED_REASON:
+            reasons[lead.contact_hs_id] = problem
+    return MappingProxyType(dict(sorted(reasons.items())))
 
 
 def _read_evidence_problem(
-    crm: CrmData, hs_id: str, contact: ContactInfo | None, *, refresh_failed: bool
+    crm: CrmData, hs_id: str, contact: ContactInfo | None, *, refresh: str | None
 ) -> str | None:
     """Return why a contact's CRM evidence is unknown, or ``None`` when it is known.
 
@@ -858,9 +909,16 @@ def _read_evidence_problem(
     contact-to-meeting and contact-to-deal fetches are ``ok`` or ``ok_empty``, and every
     associated meeting and deal was read. ``ok_empty`` is a genuine zero; an associated but
     unread meeting or deal is never treated as absent.
+
+    Args:
+        crm: The CRM dataset the evidence reads.
+        hs_id: The contact's HubSpot id.
+        contact: The contact's stored record; ``None`` when it was never read.
+        refresh: Why the contact's refresh is not a recorded success
+            (:func:`_refresh_failures`); ``None`` when it succeeded.
     """
-    if refresh_failed:
-        return "contact refresh failed; stage dates not current"
+    if refresh is not None:
+        return refresh
     if contact is None:
         return "contact record not read"
     readers: tuple[tuple[str, Mapping[str, object]], ...] = (
@@ -887,11 +945,12 @@ def contact_evidence_known(crm: CrmData, hs_id: str, lead: LeadInfo) -> tuple[bo
     """Return whether one matched contact's CRM evidence is known, with the reason when not.
 
     AAP 0.5.4.7 "Unknown CRM evidence share": a contact's evidence is unknown when its contact
-    refresh failed (``contact_read_status = error``, so its stage dates are not current); a
-    stage property (the MQL or Qualified Lead binding) is unavailable; its contact-to-meeting
-    or contact-to-deal fetch is missing, ``error`` or ``partial``; or that fetch is ``ok`` but
-    its target reads are ``partial`` or ``error``, so an associated meeting or deal was not
-    read. An ``ok_empty`` fetch is a genuine zero.
+    refresh is not a recorded success (``contact_read_status`` ``error``, or not recorded at
+    all, so its stage dates are not current; AAP 0.5.4.1 requires the refresh to have
+    succeeded); a stage property (the MQL or Qualified Lead binding) is unavailable; its
+    contact-to-meeting or contact-to-deal fetch is missing, ``error`` or ``partial``; or that
+    fetch is ``ok`` but its target reads are ``partial`` or ``error``, so an associated meeting
+    or deal was not read. An ``ok_empty`` fetch is a genuine zero.
 
     The asset rows and veto populations use the per-contact part of this check (refresh,
     associations, target reads); an unavailable binding is portal-wide and makes its count
@@ -905,12 +964,13 @@ def contact_evidence_known(crm: CrmData, hs_id: str, lead: LeadInfo) -> tuple[bo
     Returns:
         ``(True, None)`` when known, else ``(False, reason)``.
     """
-    if lead.contact_read_status == "error":
-        return False, "contact refresh failed; stage dates not current"
+    refresh = _refresh_problem(lead)
+    if refresh is not None:
+        return False, refresh
     for name, binding in (("MQL", crm.bindings.mql), ("Qualified Lead", crm.bindings.ql)):
         if not binding.available:
             return False, f"{name} stage unavailable: {binding.reason}"
-    problem = _read_evidence_problem(crm, hs_id, crm.contacts.get(hs_id), refresh_failed=False)
+    problem = _read_evidence_problem(crm, hs_id, crm.contacts.get(hs_id), refresh=None)
     return problem is None, problem
 
 
@@ -938,6 +998,11 @@ def _collect_rows(ctx: AnalysisContext) -> dict[tuple[str, str], _RowInput]:
     white paper. Spend is the window spend of each creative on LinkedIn UTC days
     (``ctx.creative_totals``); leads are the stored lead-form responses submitted within
     ``ctx.window.utc_bounds()`` (test leads are never stored).
+
+    The (asset, currency) rows partition spend and leads only. CRM events are not split here:
+    :func:`build_attribution` groups an asset's rows and counts its events once across them
+    (:func:`_asset_events`), so an event shared by touches in two currencies, or a contact
+    with leads in both, is never counted in both rows.
     """
     by_urn = {info.urn: info.id for info in ctx.creatives.values()}
     inputs: dict[tuple[str, str], _RowInput] = {}
@@ -1037,53 +1102,86 @@ def _skipped_stage(contact: ContactInfo) -> bool:
     return bool(stage) and stage not in ENTRY_LIFECYCLE_STAGES
 
 
+def _bump(counts: dict[str, int], currency: str) -> None:
+    """Add one to the count of ``currency``'s row."""
+    counts[currency] = counts.get(currency, 0) + 1
+
+
 def _count_stage(
     *,
     crm: CrmData,
     getter: Callable[[ContactInfo], datetime | None],
     touches: Mapping[str, Sequence[_Touch]],
-    refresh_failed: frozenset[str],
+    refresh_unknown: Mapping[str, str],
     now: datetime,
-    credit: Callable[[_CreativeKey], None],
-) -> _StageCount:
-    """Count one bound stage over a row's contacts, crediting each entry once.
+    credit: Callable[[_Touch], None],
+) -> dict[str, _StageCount]:
+    """Count one bound stage over an asset's contacts once per asset; return it by currency.
 
-    A contact counts once when its bound date is at or after its anchor (earliest touch) and
-    not after the run; the entry is credited to the creative of its latest touch at or before
-    the date. A date before the anchor is "already MQL/QL before this touch" (excluded,
-    reported). An empty date is never replaced by another date: it is not counted, and is
-    reported as skipped when the contact's current stage is past the entry stages. A contact
-    whose refresh failed keeps its previous stage dates, which still count (stage-entry dates
-    never move), but it is not reported as skipped because its current stage is not known.
+    ``touches`` holds each contact's touches with the asset across all of the asset's currency
+    rows, so a contact with leads in two currencies is still one contact of the asset. A
+    contact counts once when its bound date is at or after its anchor (earliest touch, whatever
+    its currency) and not after the run; the entry is credited to its latest touch at or before
+    the date, whose currency is the row it counts in and whose creative it is credited to. A
+    date before the anchor is "already MQL/QL before this touch" (excluded, reported). An empty
+    date is never replaced by another date: it is not counted, and is reported as skipped when
+    the contact's current stage is past the entry stages. Each excluded or skipped contact is
+    reported once, in the row of its anchor's currency. A contact whose refresh is not a
+    recorded success (``refresh_unknown``: failed or not recorded) keeps its previous stage
+    dates, which still count (stage-entry dates never move), as a floor through the
+    unknown-evidence share; it is not reported as skipped because its current stage is not
+    known.
     """
-    counted = before = skipped = 0
+    counted: dict[str, int] = {}
+    before: dict[str, int] = {}
+    skipped: dict[str, int] = {}
     for hs_id in sorted(touches):
         contact = crm.contacts.get(hs_id)
         if contact is None:
             continue
+        contact_touches = touches[hs_id]
+        anchor = contact_touches[0]
         at = getter(contact)
         if at is None:
-            if hs_id not in refresh_failed and _skipped_stage(contact):
-                skipped += 1
+            if hs_id not in refresh_unknown and _skipped_stage(contact):
+                _bump(skipped, anchor.currency)
             continue
-        contact_touches = touches[hs_id]
-        if at < contact_touches[0].at:
-            before += 1
+        if at < anchor.at:
+            _bump(before, anchor.currency)
             continue
         if at > now:
             # Downstream events count as of run time; a later instant is not yet an event.
             continue
         touch = _latest_touch(contact_touches, at)
         if touch is not None:
-            credit(touch.creative)
-            counted += 1
-    return _StageCount(counted, before, skipped)
+            credit(touch)
+            _bump(counted, touch.currency)
+    return {
+        currency: _StageCount(
+            counted.get(currency, 0), before.get(currency, 0), skipped.get(currency, 0)
+        )
+        for currency in sorted(counted.keys() | before.keys() | skipped.keys())
+    }
 
 
 def _associated(crm: CrmData, contacts: Iterable[str], to_type: str) -> dict[str, list[str]]:
-    """Return target id to the given contacts associated with it, both sorted."""
+    """Return target id to the given contacts associated with it, both sorted.
+
+    Only verified edges are returned (AAP 0.3.3, 0.5.4.7): a contact's stored edges to
+    ``to_type`` enter only when its current contact-to-``to_type`` fetch is known evidence
+    (:attr:`AssociationFetchInfo.known`), that is ``ok`` with every target read. A stored edge
+    whose fetch is missing, ``error`` or ``partial``, or ``ok`` with target reads ``partial``,
+    ``error`` or unrecorded, may no longer exist, so the event it links is never a proven lower
+    bound; an ``ok_empty`` fetch found no association, so an edge stored under it is stale.
+    A contact left out for an unknown fetch still counts as unknown evidence
+    (:func:`_read_evidence_problem`), which keeps its row's counts floors and its pipeline
+    unavailable.
+    """
     linked: dict[str, list[str]] = {}
     for hs_id in sorted(contacts):
+        outcome = crm.fetch("contact", hs_id, to_type)
+        if outcome is None or not outcome.known or outcome.is_empty:
+            continue
         for target in crm.targets("contact", hs_id, to_type):
             members = linked.setdefault(target, [])
             if hs_id not in members:
@@ -1106,9 +1204,9 @@ def _count_meetings(
     settings: _Settings,
     touches: Mapping[str, Sequence[_Touch]],
     now: datetime,
-    credit: Callable[[_CreativeKey, bool], None],
-) -> _MeetingCount:
-    """Count a row's meetings once per distinct meeting, with the causal check.
+    credit: Callable[[_Touch, bool], None],
+) -> dict[str, _MeetingCount]:
+    """Count an asset's meetings once per distinct meeting, with the causal check, by currency.
 
     HubSpot records no booking instant, so booking time is proxied by the record's creation
     (``hs_createdate``, "booked (record created)"). A meeting associated with a contact passes
@@ -1120,11 +1218,17 @@ def _count_meetings(
     booking, and is excluded from cost per meeting. A meeting without a creation or start
     instant cannot pass the check and is not counted.
 
-    Each meeting counts once per asset however many of the row's contacts it is associated
-    with, credited to the latest touch across the passing contacts at or before the meeting's
-    earlier instant (creation or start).
+    Each meeting counts once per asset however many of the asset's contacts it is associated
+    with, in whichever currencies they touched it: it is credited to the latest touch across
+    the passing contacts at or before the meeting's earlier instant (creation or start), and
+    counts in that touch's currency row, under its creative. A meeting that precedes every
+    associated contact's anchor is reported once, in the currency row of the earliest anchor
+    among those contacts. Only associations whose current fetch and target reads succeeded
+    are counted (:func:`_associated`).
     """
-    booked = other = before = 0
+    booked: dict[str, int] = {}
+    other: dict[str, int] = {}
+    before: dict[str, int] = {}
     for meeting_id, contacts in _associated(crm, touches, "meeting").items():
         meeting = crm.meetings.get(meeting_id)
         if meeting is None or _code(meeting.outcome) in settings.exclusions:
@@ -1134,18 +1238,20 @@ def _count_meetings(
             continue
         passing = [hs for hs in contacts if touches[hs][0].at <= min(created, start)]
         if not passing:
-            before += 1
+            _bump(before, min(touches[hs][0] for hs in contacts).currency)
             continue
         touch = _credit_touch(touches, passing, min(created, start))
         if touch is None:
             continue
         is_booked = _code(meeting.meeting_source) in settings.booking_sources
-        credit(touch.creative, is_booked)
-        if is_booked:
-            booked += 1
-        else:
-            other += 1
-    return _MeetingCount(booked, other, before)
+        credit(touch, is_booked)
+        _bump(booked if is_booked else other, touch.currency)
+    return {
+        currency: _MeetingCount(
+            booked.get(currency, 0), other.get(currency, 0), before.get(currency, 0)
+        )
+        for currency in sorted(booked.keys() | other.keys() | before.keys())
+    }
 
 
 def _count_deals(
@@ -1153,15 +1259,20 @@ def _count_deals(
     crm: CrmData,
     touches: Mapping[str, Sequence[_Touch]],
     now: datetime,
-    credit: Callable[[_CreativeKey], None],
-) -> tuple[int, int]:
-    """Count a row's deals created at or after the touch; return ``(counted, before)``.
+    credit: Callable[[_Touch], None],
+) -> dict[str, tuple[int, int]]:
+    """Count an asset's deals created at or after the touch; ``(counted, before)`` by currency.
 
     The user's causal check exactly: a deal counts only when its ``createdate`` is at or after
-    the anchor of a contact it is associated with. Each deal counts once per asset, credited
-    to the latest touch across those contacts at or before its creation.
+    the anchor of a contact it is associated with. Each deal counts once per asset, whatever
+    the currencies its contacts touched the asset in, credited to the latest touch across
+    those contacts at or before its creation; it counts in that touch's currency row, under
+    its creative. A deal created before every associated contact's anchor is reported once, in
+    the currency row of the earliest anchor among those contacts. Only associations whose
+    current fetch and target reads succeeded are counted (:func:`_associated`).
     """
-    counted = before = 0
+    counted: dict[str, int] = {}
+    before: dict[str, int] = {}
     for deal_id, contacts in _associated(crm, touches, "deal").items():
         deal = crm.deals.get(deal_id)
         if deal is None or deal.created_at is None or deal.created_at > now:
@@ -1169,14 +1280,124 @@ def _count_deals(
         created = deal.created_at
         passing = [hs for hs in contacts if touches[hs][0].at <= created]
         if not passing:
-            before += 1
+            _bump(before, min(touches[hs][0] for hs in contacts).currency)
             continue
         touch = _credit_touch(touches, passing, created)
         if touch is None:
             continue
-        credit(touch.creative)
-        counted += 1
-    return counted, before
+        credit(touch)
+        _bump(counted, touch.currency)
+    return {
+        currency: (counted.get(currency, 0), before.get(currency, 0))
+        for currency in sorted(counted.keys() | before.keys())
+    }
+
+
+@dataclass(slots=True)
+class _RowEvents:
+    """One (asset, currency) row's share of its asset's CRM events.
+
+    Filled by :func:`_asset_events`, which counts each event once per asset: a counted event
+    sits in the row of the touch it is credited to, under that touch's creative
+    (``tallies``); an excluded or skipped one sits in the row of its anchor's currency.
+    """
+
+    tallies: dict[_CreativeKey, _Tally] = field(default_factory=dict)
+    mql: _StageCount = field(default_factory=lambda: _StageCount(0, 0, 0))
+    ql: _StageCount = field(default_factory=lambda: _StageCount(0, 0, 0))
+    meetings: _MeetingCount = field(default_factory=lambda: _MeetingCount(0, 0, 0))
+    deals: int = 0
+    deals_before: int = 0
+
+
+def _asset_events(
+    *,
+    crm: CrmData | None,
+    settings: _Settings,
+    bindings: _Bindings,
+    refresh_unknown: Mapping[str, str],
+    now: datetime,
+    entries: Sequence[_RowInput],
+) -> dict[str, _RowEvents]:
+    """Count one asset's CRM events once across its currency rows; return them by currency.
+
+    AAP 0.5.4.7 "Credit and de-duplication": every event (MQL, QL, meeting, deal) is credited
+    once per asset to the creative of the latest touch at or before it, and a multi-contact
+    event to the latest qualifying touch across its contacts. ``entries`` are the asset's
+    (asset, currency) rows; each contact's touches are gathered across all of them, so its
+    anchor is its earliest touch with the asset whatever the currency, and it contributes at
+    most one MQL and one QL to the asset. The touch an event is credited to selects its
+    currency row and the creative within it, so no event is counted in two currency rows.
+    Excluded events and skipped-stage contacts are reported once, in the row of the anchor's
+    currency. Counts of an unavailable stage binding, and every count without a CRM dataset,
+    stay zero here; :func:`_build_row` renders them unavailable.
+    """
+    touches: dict[str, list[_Touch]] = {}
+    for entry in entries:
+        for lead, key in entry.leads:
+            if lead.matched and lead.contact_hs_id is not None:
+                touches.setdefault(lead.contact_hs_id, []).append(
+                    _Touch(lead.submitted_at, lead.id, key, entry.currency)
+                )
+    for contact_touches in touches.values():
+        contact_touches.sort()
+    rows = {entry.currency: _RowEvents() for entry in entries}
+    if crm is None:
+        return rows
+
+    def tally(touch: _Touch) -> _Tally:
+        tallies = rows[touch.currency].tallies
+        found = tallies.get(touch.creative)
+        if found is None:
+            found = tallies[touch.creative] = _Tally()
+        return found
+
+    def credit_mql(touch: _Touch) -> None:
+        tally(touch).mql += 1
+
+    def credit_ql(touch: _Touch) -> None:
+        tally(touch).ql += 1
+
+    def credit_meeting(touch: _Touch, booked: bool) -> None:
+        if booked:
+            tally(touch).booked += 1
+        else:
+            tally(touch).other += 1
+
+    def credit_deal(touch: _Touch) -> None:
+        tally(touch).deals += 1
+
+    if bindings.mql_available:
+        mql = _count_stage(
+            crm=crm,
+            getter=lambda contact: contact.mql_at,
+            touches=touches,
+            refresh_unknown=refresh_unknown,
+            now=now,
+            credit=credit_mql,
+        )
+        for currency, stage in mql.items():
+            rows[currency].mql = stage
+    if bindings.ql_available:
+        ql = _count_stage(
+            crm=crm,
+            getter=lambda contact: contact.ql_at,
+            touches=touches,
+            refresh_unknown=refresh_unknown,
+            now=now,
+            credit=credit_ql,
+        )
+        for currency, stage in ql.items():
+            rows[currency].ql = stage
+    meetings = _count_meetings(
+        crm=crm, settings=settings, touches=touches, now=now, credit=credit_meeting
+    )
+    for currency, meeting_count in meetings.items():
+        rows[currency].meetings = meeting_count
+    deals = _count_deals(crm=crm, touches=touches, now=now, credit=credit_deal)
+    for currency, (counted, before) in deals.items():
+        rows[currency].deals, rows[currency].deals_before = counted, before
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1321,90 +1542,48 @@ def _build_row(
     settings: _Settings,
     bindings: _Bindings,
     orphan: OrphanDealShare,
-    refresh_failed: frozenset[str],
+    refresh_unknown: Mapping[str, str],
     entry: _RowInput,
+    events: _RowEvents,
 ) -> tuple[AssetRow, list[Finding]]:
-    """Build one (asset, currency) row with its per-creative partition and findings."""
+    """Build one (asset, currency) row with its per-creative partition and findings.
+
+    The row's CRM counts are ``events``, its share of the asset's events as counted once per
+    asset across the asset's currency rows (:func:`_asset_events`), so no event of the asset
+    appears in two rows. Spend, LinkedIn leads, the contact, creative and unknown-evidence
+    shares and the matched contacts describe this row's own leads and their contacts.
+    """
     leads = entry.leads
     lead_counts: dict[_CreativeKey, int] = {}
-    touches: dict[str, list[_Touch]] = {}
+    contacts: set[str] = set()
     for lead, key in leads:
         lead_counts[key] = lead_counts.get(key, 0) + 1
         if lead.matched and lead.contact_hs_id is not None:
-            touches.setdefault(lead.contact_hs_id, []).append(
-                _Touch(lead.submitted_at, lead.id, key)
-            )
-    for contact_touches in touches.values():
-        contact_touches.sort()
+            contacts.add(lead.contact_hs_id)
 
     unmatched = sum(1 for lead, _key in leads if not lead.matched)
     no_creative = lead_counts.get(_UNKNOWN_CREATIVE, 0)
-    tallies: dict[_CreativeKey, _Tally] = {}
-
-    def tally(key: _CreativeKey) -> _Tally:
-        found = tallies.get(key)
-        if found is None:
-            found = tallies[key] = _Tally()
-        return found
-
-    def credit_mql(key: _CreativeKey) -> None:
-        tally(key).mql += 1
-
-    def credit_ql(key: _CreativeKey) -> None:
-        tally(key).ql += 1
-
-    def credit_meeting(key: _CreativeKey, booked: bool) -> None:
-        if booked:
-            tally(key).booked += 1
-        else:
-            tally(key).other += 1
-
-    def credit_deal(key: _CreativeKey) -> None:
-        tally(key).deals += 1
+    tallies = events.tallies
+    mql, ql, meetings = events.mql, events.ql, events.meetings
+    deals, deals_before = events.deals, events.deals_before
 
     unknown_contacts = 0
-    mql = ql = _StageCount(0, 0, 0)
-    meetings = _MeetingCount(0, 0, 0)
-    deals = deals_before = 0
     if crm is not None:
-        # The unknown-evidence share counts per-contact read failures (refresh, associations,
-        # target reads). An unresolved stage binding is portal-wide: its count is reported as
-        # unavailable instead, so it never turns a fully read count into a "≥ N" floor.
+        # The unknown-evidence share counts per-contact read failures (a refresh failed or not
+        # recorded, associations, target reads). An unresolved stage binding is portal-wide:
+        # its count is reported as unavailable instead, so it never turns a fully read count
+        # into a "≥ N" floor.
         unknown_contacts = sum(
             1
-            for hs_id in touches
+            for hs_id in sorted(contacts)
             if _read_evidence_problem(
-                crm, hs_id, crm.contacts.get(hs_id), refresh_failed=hs_id in refresh_failed
+                crm, hs_id, crm.contacts.get(hs_id), refresh=refresh_unknown.get(hs_id)
             )
             is not None
         )
-        if bindings.mql_available:
-            mql = _count_stage(
-                crm=crm,
-                getter=lambda contact: contact.mql_at,
-                touches=touches,
-                refresh_failed=refresh_failed,
-                now=ctx.now,
-                credit=credit_mql,
-            )
-        if bindings.ql_available:
-            ql = _count_stage(
-                crm=crm,
-                getter=lambda contact: contact.ql_at,
-                touches=touches,
-                refresh_failed=refresh_failed,
-                now=ctx.now,
-                credit=credit_ql,
-            )
-        meetings = _count_meetings(
-            crm=crm, settings=settings, touches=touches, now=ctx.now, credit=credit_meeting
-        )
-        deals, deals_before = _count_deals(
-            crm=crm, touches=touches, now=ctx.now, credit=credit_deal
-        )
 
     contact_share = _share(unmatched, len(leads))
-    unknown_share = _share(unknown_contacts, len(touches))
+    unknown_share = _share(unknown_contacts, len(contacts))
     creative_share = _share(no_creative, len(leads))
     contact_floor = contact_share is not None and contact_share >= settings.floor_share
     unknown_floor = unknown_share is not None and unknown_share >= settings.floor_share
@@ -1470,7 +1649,7 @@ def _build_row(
     if unknown_floor and unknown_share is not None:
         messages[FLAG_UNKNOWN_CRM_EVIDENCE] = (
             f"Floor: CRM evidence unknown for {_percent(unknown_share)}% of matched contacts "
-            f"({unknown_contacts} of {len(touches)})"
+            f"({unknown_contacts} of {len(contacts)})"
         )
     if creative_floor and creative_share is not None:
         messages[FLAG_CREATIVE_FLOOR] = (
@@ -1523,7 +1702,7 @@ def _build_row(
         mql_label=bindings.mql_label,
         ql_label=bindings.ql_label,
         unmatched_leads=unmatched,
-        matched_contacts=len(touches),
+        matched_contacts=len(contacts),
         unknown_evidence_contacts=unknown_contacts,
         leads_without_creative=no_creative,
         meetings_before_touch=meetings.before,
@@ -1605,6 +1784,9 @@ def _veto_meetings(
     applied, and a meeting counts unless its creation or start is provably before the touch.
     Counting every plausible meeting is the conservative reading for a pause: a pipeline pause
     (meetings = 0) must never rest on a meeting excluded only for want of booking evidence.
+    Only associations whose current fetch and target reads succeeded are counted
+    (:func:`_associated`); a contact whose fetch or target reads did not succeed makes the
+    pipeline unavailable instead, so no pause rests on the meetings that leaves out.
     """
     counted = 0
     for meeting_id, contacts in _associated(crm, touches, "meeting").items():
@@ -1629,22 +1811,29 @@ def _judge(
     crm: CrmData | None,
     contacts: Mapping[str, ContactInfo],
     touches: Mapping[str, datetime],
-    refresh_failed: frozenset[str],
+    refresh_unknown: Mapping[str, str],
     settings: _Settings,
     now: datetime,
     leads: int,
     matured: int,
     matched: int,
+    refresh_problem: str | None = None,
 ) -> VetoPopulation:
     """Evaluate one campaign's pipeline veto over its eligible contacts (AAP 0.5.4.1).
 
     The pipeline is unavailable when there is no CRM dataset, the Qualified Lead stage did not
     resolve, any eligible contact's evidence is unknown (its refresh, its contact-to-meeting
     and contact-to-deal fetches, and the target reads of those meetings and deals must all
-    have succeeded), or the unresolved share reaches ``attribution.floor_share``. The MQL
+    have succeeded; a contact in ``refresh_unknown``, whose refresh failed or was never
+    recorded, is unknown), or the unresolved share reaches ``attribution.floor_share``. The MQL
     binding does not enter the veto, which judges Qualified Leads and meetings only. The veto
     fires when the pipeline is available, eligible contacts reach ``crm.veto_min_leads``
     (counted in contacts after de-duplication) and their Qualified Lead count is 0.
+
+    ``refresh_problem`` names a refresh that is unknown for the whole population (Google
+    touch-date discovery, :func:`_google_refresh_problem`): every eligible contact's evidence
+    is then unknown, and the pipeline is unavailable with that reason even when it has no
+    eligible contact, because the refresh may have missed some.
     """
     unresolved = matured - matched
     share = _share(unresolved, matured)
@@ -1671,13 +1860,17 @@ def _judge(
         )
     # Veto evidence is the AAP 0.5.4.1 list (refresh, fetches, target reads); the MQL binding
     # is not part of it, because the veto judges Qualified Leads and meetings only.
-    unknown = sum(
-        1
-        for hs_id in touches
-        if _read_evidence_problem(
-            crm, hs_id, contacts.get(hs_id), refresh_failed=hs_id in refresh_failed
+    unknown = (
+        eligible
+        if refresh_problem is not None
+        else sum(
+            1
+            for hs_id in touches
+            if _read_evidence_problem(
+                crm, hs_id, contacts.get(hs_id), refresh=refresh_unknown.get(hs_id)
+            )
+            is not None
         )
-        is not None
     )
     mql_binding, ql_binding = crm.bindings.mql, crm.bindings.ql
     mql = (
@@ -1693,6 +1886,8 @@ def _judge(
     reason: str | None = None
     if not ql_binding.available:
         reason = f"Qualified Lead stage unavailable: {_binding_reason(ql_binding)}"
+    elif refresh_problem is not None:
+        reason = refresh_problem
     elif unknown:
         reason = f"CRM evidence unknown for {unknown} of {eligible} eligible contacts"
     elif floor and share is not None:
@@ -1722,7 +1917,7 @@ def _judge(
 
 
 def _linkedin_veto(
-    ctx: AnalysisContext, settings: _Settings, refresh_failed: frozenset[str]
+    ctx: AnalysisContext, settings: _Settings, refresh_unknown: Mapping[str, str]
 ) -> dict[int, VetoPopulation]:
     """Return the matured population of every LinkedIn campaign, from ``ctx.linkedin_crm``.
 
@@ -1732,7 +1927,8 @@ def _linkedin_veto(
     ``no_match``, ``no_email``, ``error`` or no row) stay in the population. Eligible contacts
     are the distinct contacts behind the matched matured leads, each at its earliest matured
     touch, so a contact with repeat leads counts once among contacts but once per lead in the
-    unresolved share's denominator.
+    unresolved share's denominator. A contact in ``refresh_unknown`` (any of its matched leads
+    records a refresh other than ``ok``) has unknown evidence.
     """
     crm = ctx.linkedin_crm
     cutoff = ctx.window.utc_bounds()[1] - settings.maturity
@@ -1759,7 +1955,7 @@ def _linkedin_veto(
             crm=crm,
             contacts=contacts,
             touches=dict(sorted(touches.items())),
-            refresh_failed=refresh_failed,
+            refresh_unknown=refresh_unknown,
             settings=settings,
             now=ctx.now,
             leads=len(leads),
@@ -1767,6 +1963,65 @@ def _linkedin_veto(
             matched=matched,
         )
     return populations
+
+
+def _google_window_instants(ctx: AnalysisContext) -> tuple[datetime, datetime]:
+    """Return the window's instant range in Google's native day: ``[start 00:00, end + 1)``.
+
+    AAP 0.5.4.1 applies the calendar window to each source's own days, and Google days end at
+    midnight in the account's time zone. The boundary is the window's Google boundary, else
+    the Google account's time zone, else UTC: the precedence ``metrics.load_context`` selects
+    the Google-touch contacts with, so the loaded and the judged populations agree.
+    """
+    window = ctx.window
+    boundary = next((item.boundary for item in window.source_days if item.source == "google"), None)
+    account_zone = next(
+        (account.timezone for account in ctx.accounts.values() if account.source == "google"),
+        None,
+    )
+    zone = boundary or account_zone or UTC_BOUNDARY
+    lower, _ = window.day_bounds(window.start, zone)
+    _, upper = window.day_bounds(window.end, zone)
+    return lower, upper
+
+
+def _google_refresh_problem(ctx: AnalysisContext, crm: CrmData) -> str | None:
+    """Return why the Google-touch contacts' refresh is unknown, or ``None`` when it is known.
+
+    AAP 0.5.4.1 judges the pipeline only when every eligible contact's refresh succeeded.
+    Google-touch contacts carry no per-contact refresh status: they are refreshed by the
+    touch-date discovery search (AAP 0.3.3), whose outcome ``crm``'s own
+    ``hubspot.google_contacts`` freshness row records; a failed attempt moves only
+    ``last_attempt_at`` and the reason, so the stored contacts and stage dates stand as they
+    were. The refresh is known only when that row exists, has succeeded, did not fail on a
+    later attempt, is ``complete`` and covers every window date. No other dataset's row
+    stands in, so a LinkedIn (companion) dataset never vouches for the Google population.
+    """
+    row = ctx.freshness_for(_GOOGLE_CONTACTS_DATASET, crm.dataset.dataset_id)
+    prefix = f"Google contact refresh unknown: {_GOOGLE_CONTACTS_DATASET}"
+    if row is None:
+        return f"{prefix} has no freshness record"
+    detail = f": {row.reason}" if row.reason else ""
+    if row.last_success_at is None:
+        return f"{prefix} never succeeded{detail}"
+    if row.last_attempt_at is not None and row.last_attempt_at > row.last_success_at:
+        return f"{prefix} last attempt failed{detail}"
+    if not row.is_complete:
+        return f"{prefix} {row.completeness}{detail}"
+    start, end = ctx.window.start, ctx.window.end
+    if (
+        row.covered_from is None
+        or row.covered_through is None
+        or row.covered_from > start
+        or row.covered_through < end
+    ):
+        covered = (
+            "no dates"
+            if row.covered_from is None or row.covered_through is None
+            else f"{row.covered_from.isoformat()} to {row.covered_through.isoformat()}"
+        )
+        return f"{prefix} covers {covered}, not the window {start.isoformat()} to {end.isoformat()}"
+    return None
 
 
 def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPopulation]:
@@ -1777,11 +2032,21 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
     LinkedIn-derived subset never stands in. The population is the contacts found by
     touch-date discovery whose campaign property equals the campaign's external id and whose
     touch date lies in the window and is matured; each counts as one matched lead at its touch.
+    The window and the maturity cutoff are Google-native (:func:`_google_window_instants`): a
+    touch is in the window when it falls in ``[start 00:00, end + 1 day 00:00)`` of the
+    Google account's day, and matured when it is at least ``crm.lead_maturity_days`` before
+    that upper instant.
+
+    When the discovery refresh is unknown (:func:`_google_refresh_problem`), every Google
+    population is unavailable with that reason and its eligible contacts count as unknown
+    evidence. Otherwise each eligible contact is judged on its own reads (contact record,
+    associations, target reads); discovered contacts have no per-contact refresh status.
     """
     crm = ctx.google_crm
     if crm is None or not crm.bindings.google.available:
         return {}
-    lower, upper = ctx.window.utc_bounds()
+    refresh_problem = _google_refresh_problem(ctx, crm)
+    lower, upper = _google_window_instants(ctx)
     cutoff = upper - settings.maturity
     by_ref: dict[str, dict[str, datetime]] = {}
     found: dict[str, ContactInfo] = {}
@@ -1804,12 +2069,13 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
             crm=crm,
             contacts=contacts,
             touches=touches,
-            refresh_failed=frozenset(),
+            refresh_unknown=MappingProxyType({}),
             settings=settings,
             now=ctx.now,
             leads=len(touches),
             matured=len(touches),
             matched=len(touches),
+            refresh_problem=refresh_problem,
         )
     return populations
 
@@ -1896,7 +2162,9 @@ def build_attribution(ctx: AnalysisContext) -> AttributionTable:
 
     AAP 0.5.4.7 and 0.5.4.1. Pure and deterministic: cohorts by currency, rows by slug,
     per-creative rows by URN with "unknown creative" last, findings in that order after the
-    stage-binding findings. LinkedIn-attributed evidence reads ``ctx.linkedin_crm`` (the
+    stage-binding findings. Each asset's CRM events are counted once across its currency rows
+    (:func:`_asset_events`) before the rows are built, so the currency partition never
+    duplicates an event. LinkedIn-attributed evidence reads ``ctx.linkedin_crm`` (the
     effective CRM dataset); the Google veto reads ``ctx.google_crm``.
 
     Args:
@@ -1914,15 +2182,36 @@ def build_attribution(ctx: AnalysisContext) -> AttributionTable:
     settings = _Settings.of(ctx)
     crm = ctx.linkedin_crm
     bindings = _Bindings.of(ctx, crm)
-    refresh_failed = _refresh_failures(ctx.leads)
+    refresh_unknown = _refresh_failures(ctx.leads)
     orphan = _orphan_deals(ctx, crm)
 
+    by_asset: dict[str, list[_RowInput]] = {}
+    for entry in _collect_rows(ctx).values():
+        by_asset.setdefault(entry.asset.slug, []).append(entry)
     by_currency: dict[str, list[AssetRow]] = {}
     row_findings: dict[tuple[str, str], list[Finding]] = {}
-    for key, entry in _collect_rows(ctx).items():
-        row, found = _build_row(ctx, crm, settings, bindings, orphan, refresh_failed, entry)
-        by_currency.setdefault(entry.currency, []).append(row)
-        row_findings[key] = found
+    for entries in by_asset.values():
+        events = _asset_events(
+            crm=crm,
+            settings=settings,
+            bindings=bindings,
+            refresh_unknown=refresh_unknown,
+            now=ctx.now,
+            entries=entries,
+        )
+        for entry in entries:
+            row, found = _build_row(
+                ctx,
+                crm,
+                settings,
+                bindings,
+                orphan,
+                refresh_unknown,
+                entry,
+                events[entry.currency],
+            )
+            by_currency.setdefault(entry.currency, []).append(row)
+            row_findings[(entry.asset.slug, entry.currency)] = found
     cohorts = tuple(
         _cohort(currency, rows, settings) for currency, rows in sorted(by_currency.items())
     )
@@ -1932,7 +2221,7 @@ def build_attribution(ctx: AnalysisContext) -> AttributionTable:
         for row in cohort.rows:
             findings.extend(row_findings[(row.slug, row.currency)])
 
-    veto = {**_linkedin_veto(ctx, settings, refresh_failed), **_google_veto(ctx, settings)}
+    veto = {**_linkedin_veto(ctx, settings, refresh_unknown), **_google_veto(ctx, settings)}
     return AttributionTable(
         cohorts=cohorts,
         orphan_deals=orphan,

@@ -16,6 +16,23 @@ Purity:
     contract raises ``QueryDefect(source="hubspot", endpoint="parse", code="validation")``
     whose message names the surface and the field, never a value that could be an email.
 
+Validation (``backend/tests/contracts/hubspot/``):
+    * Batch envelopes (objects and associations): ``status`` is read first and must be one of
+      ``CANCELED``, ``COMPLETE``, ``PENDING`` and ``PROCESSING``; ``results`` must be an
+      array. A status other than ``COMPLETE`` is a failed call (AAP 0.2.4), returned with no
+      usable data and with its ``results`` elements never validated.
+    * A ``COMPLETE`` envelope also needs ``startedAt`` and ``completedAt`` instants, error
+      entries with string ``status``, ``category`` and ``message``, and, when present, a
+      ``numErrors`` equal to the number of error entries. A failed input is absent from
+      ``results``, so an input both returned and named by an error entry is a defect.
+    * CRM objects (a ``COMPLETE`` batch read or any search page): a string ``id``, a
+      ``properties`` object, ``createdAt`` and ``updatedAt`` instants and a boolean
+      ``archived``. Every property a decoder reads must be a string or ``null``.
+    * Association targets: ``toObjectId`` (a string or an integer) and ``associationTypes``
+      entries with a contract ``category`` and an integer ``typeId``.
+    * Property definitions: every field the contract requires, and each option's ``hidden``,
+      ``label`` and ``value``; nothing is defaulted.
+
 Personal data (AAP 0.3.2):
     An email is normalised (trimmed, lowercased) and kept only as the SHA-256 hex digest of its
     UTF-8 bytes, the same digest the LinkedIn parser stores on ``lead.email_sha256``, so the two
@@ -99,6 +116,11 @@ archived}``, with every property value a string or ``null``."""
 BATCH_COMPLETE: Final = "COMPLETE"
 """The only batch ``status`` that is a successful call; ``CANCELED``, ``PENDING`` and
 ``PROCESSING`` are failed calls even when the body is otherwise valid."""
+
+# The batch `status` enum of the objects and associations contracts, in contract order.
+_BATCH_STATES: Final = ("CANCELED", BATCH_COMPLETE, "PENDING", "PROCESSING")
+# The `to[].associationTypes[].category` enum of the associations contract.
+_ASSOCIATION_CATEGORIES: Final = ("HUBSPOT_DEFINED", "INTEGRATOR_DEFINED", "USER_DEFINED", "WORK")
 
 NO_ASSOCIATIONS_FOUND: Final = "crm.associations.NO_ASSOCIATIONS_FOUND"
 """The 207 ``errors[].subCategory`` HubSpot uses for an input that has no associations."""
@@ -307,7 +329,9 @@ def _from_date(text: str) -> datetime | None:
     return datetime(day.year, day.month, day.day, tzinfo=UTC)
 
 
-def parse_instant(value: object, *, what: str = "instant") -> datetime | None:
+def parse_instant(
+    value: object, *, what: str = "instant", surface: str | None = None
+) -> datetime | None:
     """Parse a HubSpot date or datetime value into a timezone-aware UTC ``datetime``.
 
     Accepted forms:
@@ -324,6 +348,8 @@ def parse_instant(value: object, *, what: str = "instant") -> datetime | None:
         what: The field's name for the defect message, for example
             ``"contact property 'hs_v2_date_entered_1406943076'"``. The value itself is
             never put in the message, because it could be an email.
+        surface: The contract surface the value came from, which prefixes the defect message
+            when given.
 
     Returns:
         The instant in UTC, or ``None`` when the value is empty.
@@ -358,7 +384,7 @@ def parse_instant(value: object, *, what: str = "instant") -> datetime | None:
         elif _ISO_DATETIME_RE.match(text):
             parsed = _from_iso(text)
     if parsed is None:
-        raise _defect(f"{what}: {_INSTANT_EXPECTED}")
+        raise _defect(f"{what}: {_INSTANT_EXPECTED}", surface)
     return parsed
 
 
@@ -411,20 +437,18 @@ def parse_decimal(value: object) -> Decimal | None:
     return number
 
 
-def _text(value: object, *, what: str = "value", surface: str | None = None) -> str | None:
-    """Return a property value as stripped text; ``None`` when it is absent or empty.
+def _text(value: str | None, *, what: str = "value", surface: str | None = None) -> str | None:
+    """Return a wire string as stripped text; ``None`` when it is absent, empty or blank.
 
-    Strings are stripped; an ``int`` or ``Decimal`` is written in its canonical form.
+    Callers check the wire type first (:func:`_property` for record properties), so only a
+    string or ``None`` reaches this.
 
     Raises:
-        QueryDefect: When the value is any other type, or holds a NUL or a code point UTF-8
-            cannot encode.
+        QueryDefect: When the text holds a NUL or a code point UTF-8 cannot encode.
     """
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, str | int | Decimal):
-        raise _defect(f"{what} must be a string", surface)
-    text = value.strip() if isinstance(value, str) else str(value)
+    text = value.strip()
     if not text:
         return None
     return _check_storable(text, what, surface)
@@ -458,8 +482,67 @@ def _id_text(value: object, what: str, surface: str | None = None) -> str:
     return _check_storable(text, what, surface)
 
 
-def _record(record: object, kind: str, surface: str | None = None) -> tuple[str, Mapping[str, Any]]:
-    """Validate a raw CRM object and return its id and its ``properties`` map.
+def _string_id(value: object, what: str, surface: str | None = None) -> str:
+    """Return an id the contract types as a string, such as a CRM object's ``id``, as given.
+
+    Unlike :func:`_id_text`, a JSON number is a defect: only association ids are admitted as
+    numbers by their contract.
+    """
+    if value is None:
+        raise _defect(f"required field {what} is missing", surface)
+    if not isinstance(value, str):
+        raise _defect(f"{what} must be a string", surface)
+    if not value.strip():
+        raise _defect(f"{what} must not be blank", surface)
+    return _check_storable(value, what, surface)
+
+
+def _string_field(obj: Mapping[str, Any], key: str, what: str, surface: str | None) -> str:
+    """Read a required string field; only its presence and type are checked.
+
+    Args:
+        obj: The JSON object holding the field.
+        key: The field's key.
+        what: The quoted field name for defect messages, for example ``"'errors[].status'"``.
+        surface: The contract surface, when known.
+    """
+    value = obj.get(key)
+    if value is None:
+        raise _defect(f"required field {what} is missing", surface)
+    if not isinstance(value, str):
+        raise _defect(f"field {what} must be a string", surface)
+    return value
+
+
+def _required_instant(obj: Mapping[str, Any], key: str, what: str, surface: str | None) -> datetime:
+    """Read a required string field that must hold an instant, such as ``createdAt``.
+
+    Raises:
+        QueryDefect: When the field is missing, not a string, blank, or not an instant
+            :func:`parse_instant` accepts.
+    """
+    instant = parse_instant(_string_field(obj, key, what, surface), what=what, surface=surface)
+    if instant is None:
+        raise _defect(f"field {what} must not be blank", surface)
+    return instant
+
+
+@dataclass(frozen=True, slots=True)
+class _CrmObject:
+    """The validated parts of one raw CRM object (see :func:`_record`)."""
+
+    hs_id: str
+    properties: Mapping[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+def _record(record: object, kind: str, surface: str | None = None) -> _CrmObject:
+    """Validate a raw CRM object against the contract's required record fields.
+
+    The objects batch read and CRM Search contracts both require ``id`` (a string),
+    ``properties`` (an object), ``createdAt`` and ``updatedAt`` (instants) and ``archived``
+    (a boolean) on every returned record, so a record lacking any of them is never read.
 
     Args:
         record: One element of ``results[]``.
@@ -467,23 +550,65 @@ def _record(record: object, kind: str, surface: str | None = None) -> tuple[str,
         surface: The contract surface, when known.
 
     Returns:
-        ``(hs_id, properties)``. ``properties`` may be empty (``{}``), never absent.
+        The id, the ``properties`` map (possibly empty, never absent) and the record's
+        creation and last-update instants.
 
     Raises:
-        QueryDefect: When the record is not an object, has no usable ``id``, or its
-            ``properties`` is missing or not an object.
+        QueryDefect: When the record is not an object, its ``id`` is missing, not a string or
+            blank, its ``properties`` is missing or not an object, ``createdAt`` or
+            ``updatedAt`` is missing, not a string, blank or not an instant, or ``archived``
+            is missing or not a boolean.
     """
     obj = _as_mapping(record, f"{kind} record", surface)
-    hs_id = _id_text(obj.get("id"), f"'{kind}.id'", surface)
+    hs_id = _string_id(obj.get("id"), f"'{kind}.id'", surface)
     properties = obj.get("properties")
     if properties is None:
         raise _defect(f"required field '{kind}.properties' is missing", surface)
-    return hs_id, _as_mapping(properties, f"field '{kind}.properties'", surface)
+    properties_map = _as_mapping(properties, f"field '{kind}.properties'", surface)
+    created_at = _required_instant(obj, "createdAt", f"'{kind}.createdAt'", surface)
+    updated_at = _required_instant(obj, "updatedAt", f"'{kind}.updatedAt'", surface)
+    archived = obj.get("archived")
+    if archived is None:
+        raise _defect(f"required field '{kind}.archived' is missing", surface)
+    if not isinstance(archived, bool):
+        raise _defect(f"field '{kind}.archived' must be a boolean", surface)
+    return _CrmObject(
+        hs_id=hs_id, properties=properties_map, created_at=created_at, updated_at=updated_at
+    )
 
 
 def _property_label(kind: str, name: str) -> str:
     """Name a record property for defect messages, for example ``contact property 'email'``."""
     return f"{kind} property '{name}'"
+
+
+def _property(
+    properties: Mapping[str, Any], name: str, kind: str, surface: str | None = None
+) -> str | None:
+    """Read one property a decoder consumes; its contract value is a string or ``null``.
+
+    An absent property reads as ``None``, like ``null``. A string is returned as given, so an
+    empty or blank value reaches the caller, which treats it as unavailable.
+
+    Raises:
+        QueryDefect: When the value is any other JSON type; the message names the property.
+    """
+    value = properties.get(name)
+    if value is None or isinstance(value, str):
+        return value
+    raise _defect(f"{_property_label(kind, name)} must be a string", surface)
+
+
+def _text_property(properties: Mapping[str, Any], name: str, kind: str) -> str | None:
+    """Read a text property as stripped text; ``None`` when absent, ``null`` or blank."""
+    label = _property_label(kind, name)
+    return _text(_property(properties, name, kind), what=label)
+
+
+def _instant_property(properties: Mapping[str, Any], name: str, kind: str) -> datetime | None:
+    """Read a date or datetime property; ``None`` when absent, ``null`` or blank."""
+    label = _property_label(kind, name)
+    return parse_instant(_property(properties, name, kind), what=label)
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +689,7 @@ class ContactRow:
         ql_at: When the contact entered the bound QL stage, read from its own property.
         google_campaign_ref: The Google campaign id held in the configured property.
         google_touch_at: The instant held in the configured Google touch-date property.
-        updated_at: The record's ``updatedAt``, else its ``lastmodifieddate``.
+        updated_at: The record's ``updatedAt``, which the contracts require on every record.
     """
 
     hs_id: str
@@ -581,7 +706,7 @@ def _bound_instant(properties: Mapping[str, Any], name: str | None) -> datetime 
     """Read the instant of a bound contact property; ``None`` when it is unbound or empty."""
     if name is None:
         return None
-    return parse_instant(properties.get(name), what=_property_label("contact", name))
+    return _instant_property(properties, name, "contact")
 
 
 def parse_contact(record: HubSpotRecord, props: ContactPropertyMap) -> ContactRow:
@@ -600,33 +725,29 @@ def parse_contact(record: HubSpotRecord, props: ContactPropertyMap) -> ContactRo
         The contact row, holding the email only as its SHA-256 digest.
 
     Raises:
-        QueryDefect: When the record has no usable id or ``properties``, a date property is
-            malformed, or a text property cannot be stored.
+        QueryDefect: When the record lacks a string ``id``, a ``properties`` object,
+            ``createdAt`` or ``updatedAt`` instants or a boolean ``archived``, a property it
+            reads is neither a string nor ``null``, a date property is malformed, or a text
+            property cannot be stored.
     """
-    hs_id, properties = _record(record, "contact")
-    updated_raw = record.get("updatedAt") or properties.get("lastmodifieddate")
+    crm = _record(record, "contact")
+    properties = crm.properties
     google_campaign = props.google_campaign_property
     return ContactRow(
-        hs_id=hs_id,
+        hs_id=crm.hs_id,
         email_sha256=_optional_email_sha256(
-            properties.get("email"), _property_label("contact", "email")
+            _property(properties, "email", "contact"), _property_label("contact", "email")
         ),
-        lifecycle_stage=_text(
-            properties.get("lifecyclestage"),
-            what=_property_label("contact", "lifecyclestage"),
-        ),
+        lifecycle_stage=_text_property(properties, "lifecyclestage", "contact"),
         mql_at=_bound_instant(properties, props.mql_property),
         ql_at=_bound_instant(properties, props.ql_property),
         google_campaign_ref=(
             None
             if google_campaign is None
-            else _text(
-                properties.get(google_campaign),
-                what=_property_label("contact", google_campaign),
-            )
+            else _text_property(properties, google_campaign, "contact")
         ),
         google_touch_at=_bound_instant(properties, props.google_touch_property),
-        updated_at=parse_instant(updated_raw, what="'contact.updatedAt'"),
+        updated_at=crm.updated_at,
     )
 
 
@@ -645,21 +766,28 @@ def contact_emails_sha256(record: HubSpotRecord) -> frozenset[str]:
         The SHA-256 hex digests; empty when the contact has no usable email.
 
     Raises:
-        QueryDefect: When the record has no usable id or ``properties``, or an email property
-            is not a string.
+        QueryDefect: When the record lacks a string ``id``, a ``properties`` object,
+            ``createdAt`` or ``updatedAt`` instants or a boolean ``archived``, or an email
+            property is neither a string nor ``null``.
     """
-    _, properties = _record(record, "contact")
+    return _contact_digests(_record(record, "contact").properties)
+
+
+def _contact_digests(properties: Mapping[str, Any], surface: str | None = None) -> frozenset[str]:
+    """Hash ``email`` and each ``hs_additional_emails`` entry of a contact's properties."""
     hashes: set[str] = set()
-    primary = _optional_email_sha256(properties.get("email"), _property_label("contact", "email"))
+    primary = _optional_email_sha256(
+        _property(properties, "email", "contact", surface),
+        _property_label("contact", "email"),
+        surface,
+    )
     if primary is not None:
         hashes.add(primary)
-    additional = properties.get("hs_additional_emails")
+    additional = _property(properties, "hs_additional_emails", "contact", surface)
     what = _property_label("contact", "hs_additional_emails")
     if additional is not None:
-        if not isinstance(additional, str):
-            raise _defect(f"{what} must be a string")
         for entry in additional.split(";"):
-            digest = _optional_email_sha256(entry, what)
+            digest = _optional_email_sha256(entry, what, surface)
             if digest is not None:
                 hashes.add(digest)
     return frozenset(hashes)
@@ -704,34 +832,22 @@ def parse_meeting(record: HubSpotRecord) -> MeetingRow:
         The meeting row.
 
     Raises:
-        QueryDefect: When the record has no usable id or ``properties``, an instant is
-            malformed, or a text property cannot be stored.
+        QueryDefect: When the record lacks a string ``id``, a ``properties`` object,
+            ``createdAt`` or ``updatedAt`` instants or a boolean ``archived``, a property it
+            reads is neither a string nor ``null``, an instant is malformed, or a text
+            property cannot be stored.
     """
-    hs_id, properties = _record(record, "meeting")
-    created_at = parse_instant(
-        properties.get("hs_createdate"), what=_property_label("meeting", "hs_createdate")
-    )
-    if created_at is None:
-        created_at = parse_instant(record.get("createdAt"), what="'meeting.createdAt'")
-    outcome = _text(
-        properties.get("hs_meeting_outcome"),
-        what=_property_label("meeting", "hs_meeting_outcome"),
-    )
+    crm = _record(record, "meeting")
+    properties = crm.properties
+    created_at = _instant_property(properties, "hs_createdate", "meeting")
+    outcome = _text_property(properties, "hs_meeting_outcome", "meeting")
     return MeetingRow(
-        hs_id=hs_id,
-        created_at=created_at,
-        start_at=parse_instant(
-            properties.get("hs_meeting_start_time"),
-            what=_property_label("meeting", "hs_meeting_start_time"),
-        ),
-        meeting_timestamp=parse_instant(
-            properties.get("hs_timestamp"), what=_property_label("meeting", "hs_timestamp")
-        ),
+        hs_id=crm.hs_id,
+        created_at=crm.created_at if created_at is None else created_at,
+        start_at=_instant_property(properties, "hs_meeting_start_time", "meeting"),
+        meeting_timestamp=_instant_property(properties, "hs_timestamp", "meeting"),
         outcome=None if outcome is None else outcome.upper(),
-        meeting_source=_text(
-            properties.get("hs_meeting_source"),
-            what=_property_label("meeting", "hs_meeting_source"),
-        ),
+        meeting_source=_text_property(properties, "hs_meeting_source", "meeting"),
     )
 
 
@@ -780,21 +896,21 @@ def parse_deal(record: HubSpotRecord) -> DealRow:
         The deal row.
 
     Raises:
-        QueryDefect: When the record has no usable id or ``properties``, an instant is
-            malformed, or a text property cannot be stored.
+        QueryDefect: When the record lacks a string ``id``, a ``properties`` object,
+            ``createdAt`` or ``updatedAt`` instants or a boolean ``archived``, a property it
+            reads is neither a string nor ``null``, an instant is malformed, or a text
+            property cannot be stored. A non-numeric ``amount`` string is unavailable, not a
+            defect.
     """
-    hs_id, properties = _record(record, "deal")
-    created_at = parse_instant(
-        properties.get("createdate"), what=_property_label("deal", "createdate")
-    )
-    if created_at is None:
-        created_at = parse_instant(record.get("createdAt"), what="'deal.createdAt'")
+    crm = _record(record, "deal")
+    properties = crm.properties
+    created_at = _instant_property(properties, "createdate", "deal")
     return DealRow(
-        hs_id=hs_id,
-        created_at=created_at,
-        stage=_text(properties.get("dealstage"), what=_property_label("deal", "dealstage")),
-        pipeline=_text(properties.get("pipeline"), what=_property_label("deal", "pipeline")),
-        amount=_storable_amount(parse_decimal(properties.get("amount"))),
+        hs_id=crm.hs_id,
+        created_at=crm.created_at if created_at is None else created_at,
+        stage=_text_property(properties, "dealstage", "deal"),
+        pipeline=_text_property(properties, "pipeline", "deal"),
+        amount=_storable_amount(parse_decimal(_property(properties, "amount", "deal"))),
     )
 
 
@@ -805,12 +921,16 @@ def parse_deal(record: HubSpotRecord) -> DealRow:
 
 def _required_str(obj: Mapping[str, Any], key: str, surface: str) -> str:
     """Read a required string field of an envelope, checked for text storage."""
-    value = obj.get(key)
-    if value is None:
-        raise _defect(f"required field '{key}' is missing", surface)
-    if not isinstance(value, str):
-        raise _defect(f"field '{key}' must be a string", surface)
+    value = _string_field(obj, key, f"'{key}'", surface)
     return _check_storable(value, f"field '{key}'", surface)
+
+
+def _batch_status(obj: Mapping[str, Any], surface: str) -> str:
+    """Read a batch envelope's ``status``: a required string from the contract's enum."""
+    status = _required_str(obj, "status", surface)
+    if status not in _BATCH_STATES:
+        raise _defect(f"field 'status' must be one of {', '.join(_BATCH_STATES)}", surface)
+    return status
 
 
 def _array(obj: Mapping[str, Any], key: str, surface: str, *, required: bool) -> Sequence[object]:
@@ -826,7 +946,7 @@ def _array(obj: Mapping[str, Any], key: str, surface: str, *, required: bool) ->
 
 
 def _records(values: Sequence[object], surface: str) -> tuple[HubSpotRecord, ...]:
-    """Validate every element of ``results[]`` as a CRM object with an id and properties."""
+    """Validate every element of ``results[]`` as a CRM object (see :func:`_record`)."""
     records: list[HubSpotRecord] = []
     for value in values:
         _record(value, "record", surface)
@@ -919,7 +1039,7 @@ def _safe_message(message: str, context_ids: Sequence[str]) -> str:
 
 
 def _parse_batch_error(entry: object, surface: str) -> BatchError:
-    """Decode one ``errors[]`` entry; ``category`` and ``message`` are required strings."""
+    """Decode one ``errors[]`` entry; ``category``, ``message`` and ``status`` are required."""
     obj = _as_mapping(entry, "errors[] entry", surface)
     category = _required_str(obj, "category", surface).strip()
     if not category:
@@ -927,6 +1047,7 @@ def _parse_batch_error(entry: object, surface: str) -> BatchError:
     message = obj.get("message")
     if not isinstance(message, str):
         raise _defect("field 'errors[].message' must be a string", surface)
+    _string_field(obj, "status", "'errors[].status'", surface)
     raw_sub = obj.get("subCategory")
     sub_category = None
     if isinstance(raw_sub, str) and raw_sub.strip():
@@ -948,15 +1069,67 @@ def _parse_batch_error(entry: object, surface: str) -> BatchError:
     )
 
 
+def _check_completed_envelope(obj: Mapping[str, Any], surface: str) -> None:
+    """Require a ``COMPLETE`` batch envelope's ``startedAt`` and ``completedAt`` instants."""
+    _required_instant(obj, "startedAt", "'startedAt'", surface)
+    _required_instant(obj, "completedAt", "'completedAt'", surface)
+
+
+def _batch_errors(obj: Mapping[str, Any], surface: str) -> tuple[BatchError, ...]:
+    """Decode a ``COMPLETE`` envelope's ``errors[]`` and check ``numErrors`` against it.
+
+    ``numErrors`` is optional, but when present it must be a non-negative integer equal to
+    the number of ``errors[]`` entries (zero when ``errors`` is absent).
+    """
+    entries = _array(obj, "errors", surface, required=False)
+    errors = tuple(_parse_batch_error(entry, surface) for entry in entries)
+    count = obj.get("numErrors")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise _defect("field 'numErrors' must be a non-negative integer", surface)
+        if count != len(entries):
+            raise _defect("field 'numErrors' must equal the number of 'errors' entries", surface)
+    return errors
+
+
+def _check_records_not_failed(
+    records: Sequence[HubSpotRecord], errors: Sequence[BatchError], surface: str
+) -> None:
+    """Reject a returned record that an error entry also names as a failed input.
+
+    A failed input is absent from ``results`` (AAP 0.2.4), so a record whose ``id`` is in an
+    error's context ids, or a contact whose email digests (:func:`contact_emails_sha256`)
+    meet an error's :attr:`BatchError.email_sha256s` (a read by ``idProperty=email``), is
+    contradictory attribution, never a successful read.
+    """
+    failed_ids = {input_id for error in errors for input_id in error.ids}
+    failed_digests = {digest for error in errors for digest in error.email_sha256s}
+    if not failed_ids and not failed_digests:
+        return
+    for record in records:
+        if record["id"] in failed_ids:
+            raise _defect("a 'results' record is also named by an 'errors' entry", surface)
+        if failed_digests and _contact_digests(record["properties"], surface) & failed_digests:
+            raise _defect(
+                "a 'results' contact answers to an email an 'errors' entry names", surface
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class BatchReadResult:
     """A decoded objects batch read (``POST /crm/objects/2026-09/{type}/batch/read``).
 
+    A ``COMPLETE`` body is validated in full (see :func:`parse_batch_read`). Any other status
+    is a failed call, decoded with no records and no errors, because a failed call carries
+    no usable data.
+
     Attributes:
         status: The batch ``status``; only ``COMPLETE`` is a successful call.
-        records: The returned raw objects, in response order. An input that was not found is
-            absent here and may appear in :attr:`errors`.
-        errors: The 207 per-input failures; empty on a 200.
+        records: The returned raw objects, in response order, each with a string ``id``, a
+            ``properties`` object, ``createdAt`` and ``updatedAt`` instants and a boolean
+            ``archived``. An input that was not found is absent here and may appear in
+            :attr:`errors`; an input listed there is never also here. Empty for a failed call.
+        errors: The 207 per-input failures; empty on a 200 and for a failed call.
     """
 
     status: str
@@ -972,6 +1145,10 @@ class BatchReadResult:
 def parse_batch_read(body: object) -> BatchReadResult:
     """Decode an objects batch read body (200, or 207 with ``errors[]``).
 
+    ``status`` is read first. A status other than ``COMPLETE`` is a failed call (AAP 0.2.4):
+    it is returned with no records and no errors, and its ``results`` elements are never
+    validated, so the reference page's ``CANCELED`` sample decodes as a failed call.
+
     Args:
         body: The decoded JSON body ``{status, results[], numErrors?, errors?[…], startedAt,
             completedAt}``.
@@ -980,18 +1157,26 @@ def parse_batch_read(body: object) -> BatchReadResult:
         The status, the validated raw records and the per-input errors.
 
     Raises:
-        QueryDefect: When the body is not an object, lacks ``status`` or ``results``, a record
-            has no usable ``id`` or ``properties``, or an error entry lacks its category or
-            message.
+        QueryDefect: When the body is not an object, ``status`` is missing or outside the
+            contract's ``CANCELED``/``COMPLETE``/``PENDING``/``PROCESSING`` enum, or
+            ``results`` is missing or not an array. For a ``COMPLETE`` body also when
+            ``startedAt`` or ``completedAt`` is not an instant, a record lacks a string
+            ``id``, a ``properties`` object, ``createdAt`` or ``updatedAt`` instants or a
+            boolean ``archived``, an error entry lacks a string ``status``, ``category`` or
+            ``message``, ``numErrors`` differs from the number of error entries, or a
+            returned record is also named by an error entry.
     """
     surface = _SURFACE_OBJECTS
     obj = _as_mapping(body, "response body", surface)
-    status = _required_str(obj, "status", surface)
-    records = _records(_array(obj, "results", surface, required=True), surface)
-    errors = tuple(
-        _parse_batch_error(entry, surface)
-        for entry in _array(obj, "errors", surface, required=False)
-    )
+    status = _batch_status(obj, surface)
+    results = _array(obj, "results", surface, required=True)
+    if status != BATCH_COMPLETE:
+        # A failed call carries no usable data, so its results are never read as records.
+        return BatchReadResult(status=status, records=(), errors=())
+    _check_completed_envelope(obj, surface)
+    records = _records(results, surface)
+    errors = _batch_errors(obj, surface)
+    _check_records_not_failed(records, errors, surface)
     return BatchReadResult(status=status, records=records, errors=errors)
 
 
@@ -1006,8 +1191,9 @@ class AssociationResult:
 
     Attributes:
         from_id: ``from.id``, the input record's id.
-        targets: Each ``to[].toObjectId`` as a string, de-duplicated in order; association
-            types and labels are not read.
+        targets: Each ``to[].toObjectId`` as a string, de-duplicated in order. Each target's
+            ``associationTypes`` is validated (a ``category`` from the contract's enum and an
+            integer ``typeId`` per entry) but not kept; labels are not read.
         after: ``paging.next.after`` when this input has more pages, which the client re-sends
             as ``{"id": from_id, "after": after}``; ``None`` once the input is fully read.
     """
@@ -1032,12 +1218,16 @@ class AssociationBatch:
     C1b permanently, so only that subcategory (or a category of ``NO_ASSOCIATIONS_FOUND``) is
     empty; every other entry is an error.
 
+    A ``COMPLETE`` body is validated in full (see :func:`parse_association_batch`). Any other
+    status is a failed call, decoded with no results, no empty inputs and no failed inputs,
+    so the caller settles none of its inputs from it.
+
     Attributes:
         status: The batch ``status``; only ``COMPLETE`` is a successful call.
-        results: Each succeeded input's result, keyed by ``from.id``.
+        results: Each succeeded input's result, keyed by ``from.id``. A failed input is absent
+            from ``results`` (AAP 0.2.4), so no input here is named by any error entry.
         empty_ids: Inputs with no associations: a ``NO_ASSOCIATIONS_FOUND`` error entry, or a
-            result whose ``to`` is empty and that has no further page. An input with targets
-            in :attr:`results` is never listed here.
+            result whose ``to`` is empty and that has no further page.
         error_ids: Every other failed input, mapped to its error ``category`` or
             ``category/subCategory``.
     """
@@ -1061,6 +1251,37 @@ def _is_no_associations(error: BatchError) -> bool:
     return False
 
 
+def _check_association_types(target: Mapping[str, Any], surface: str) -> None:
+    """Validate one target's ``associationTypes``: a required array of type specs.
+
+    Each spec needs a ``category`` from the contract's enum and an integer ``typeId``. The
+    types are not kept, because any association to the target counts, but a target without
+    them breaks the contract and is never read as an association.
+    """
+    what = "'results[].to[].associationTypes'"
+    specs = target.get("associationTypes")
+    if specs is None:
+        raise _defect(f"required field {what} is missing", surface)
+    if not isinstance(specs, list | tuple):
+        raise _defect(f"field {what} must be a JSON array", surface)
+    for spec in specs:
+        spec_obj = _as_mapping(spec, "results[].to[].associationTypes[] entry", surface)
+        category_what = "'results[].to[].associationTypes[].category'"
+        category = _string_field(spec_obj, "category", category_what, surface)
+        if category not in _ASSOCIATION_CATEGORIES:
+            allowed = ", ".join(_ASSOCIATION_CATEGORIES)
+            raise _defect(f"field {category_what} must be one of {allowed}", surface)
+        type_id = spec_obj.get("typeId")
+        if type_id is None:
+            raise _defect(
+                "required field 'results[].to[].associationTypes[].typeId' is missing", surface
+            )
+        if isinstance(type_id, bool) or not isinstance(type_id, int):
+            raise _defect(
+                "field 'results[].to[].associationTypes[].typeId' must be an integer", surface
+            )
+
+
 def _parse_association_result(item: object, surface: str) -> AssociationResult:
     """Decode one ``results[]`` element ``{from{id}, to[{toObjectId, …}], paging?}``."""
     obj = _as_mapping(item, "results[] entry", surface)
@@ -1076,6 +1297,7 @@ def _parse_association_result(item: object, surface: str) -> AssociationResult:
     for target in _array(obj, "to", surface, required=True):
         target_obj = _as_mapping(target, "results[].to[] entry", surface)
         target_id = _id_text(target_obj.get("toObjectId"), "'results[].to[].toObjectId'", surface)
+        _check_association_types(target_obj, surface)
         if target_id not in targets:
             targets.append(target_id)
     return AssociationResult(
@@ -1088,6 +1310,11 @@ def _parse_association_result(item: object, surface: str) -> AssociationResult:
 def parse_association_batch(body: object) -> AssociationBatch:
     """Decode an associations batch read body (200, or 207 with ``errors[]``).
 
+    ``status`` is read first. A status other than ``COMPLETE`` is a failed call (AAP 0.2.4):
+    it is returned with no results, empty inputs or failed inputs, and its ``results``
+    elements are never validated, so the reference page's ``CANCELED`` sample decodes as a
+    failed call.
+
     Args:
         body: The decoded JSON body ``{status, results[], errors?[…], numErrors?, startedAt,
             completedAt}``.
@@ -1096,15 +1323,31 @@ def parse_association_batch(body: object) -> AssociationBatch:
         The per-input results, the inputs with no associations and the failed inputs.
 
     Raises:
-        QueryDefect: When the body is not an object, lacks ``status`` or ``results``, a
-            result lacks ``from.id`` or ``to``, a ``from.id`` repeats, or an error entry lacks
-            its category or message.
+        QueryDefect: When the body is not an object, ``status`` is missing or outside the
+            contract's ``CANCELED``/``COMPLETE``/``PENDING``/``PROCESSING`` enum, or
+            ``results`` is missing or not an array. For a ``COMPLETE`` body also when
+            ``startedAt`` or ``completedAt`` is not an instant, a result lacks ``from.id`` or
+            ``to``, a target lacks ``toObjectId`` or valid ``associationTypes``, a
+            ``from.id`` repeats, an error entry lacks a string ``status``, ``category`` or
+            ``message``, ``numErrors`` differs from the number of error entries, or an input
+            in ``results`` is also named by an error entry (``NO_ASSOCIATIONS_FOUND``
+            included).
     """
     surface = _SURFACE_ASSOCIATIONS
     obj = _as_mapping(body, "response body", surface)
-    status = _required_str(obj, "status", surface)
+    status = _batch_status(obj, surface)
+    items = _array(obj, "results", surface, required=True)
+    if status != BATCH_COMPLETE:
+        # A failed call carries no usable data, so no input is settled by it.
+        return AssociationBatch(
+            status=status,
+            results=MappingProxyType({}),
+            empty_ids=frozenset(),
+            error_ids=MappingProxyType({}),
+        )
+    _check_completed_envelope(obj, surface)
     results: dict[str, AssociationResult] = {}
-    for item in _array(obj, "results", surface, required=True):
+    for item in items:
         result = _parse_association_result(item, surface)
         if result.from_id in results:
             raise _defect("field 'results[].from.id' repeats an input", surface)
@@ -1115,18 +1358,19 @@ def parse_association_batch(body: object) -> AssociationBatch:
         if not result.targets and result.after is None
     }
     error_ids: dict[str, str] = {}
-    for entry in _array(obj, "errors", surface, required=False):
-        error = _parse_batch_error(entry, surface)
+    for error in _batch_errors(obj, surface):
+        if any(input_id in results for input_id in error.ids):
+            # A failed input is absent from results, so one in both is contradictory.
+            raise _defect("an input in 'results' is also named by an 'errors' entry", surface)
         if _is_no_associations(error):
             empty.update(error.ids)
             continue
         for input_id in error.ids:
             error_ids.setdefault(input_id, error.label)
-    with_targets = {from_id for from_id, result in results.items() if result.targets}
     return AssociationBatch(
         status=status,
         results=MappingProxyType(results),
-        empty_ids=frozenset(empty - with_targets),
+        empty_ids=frozenset(empty),
         error_ids=MappingProxyType(error_ids),
     )
 
@@ -1141,7 +1385,9 @@ class SearchPage:
     """One page of a CRM Search (``POST /crm/objects/2026-09/{type}/search``).
 
     Attributes:
-        results: The raw objects on this page, in response order.
+        results: The raw objects on this page, in response order, each with a string ``id``,
+            a ``properties`` object, ``createdAt`` and ``updatedAt`` instants and a boolean
+            ``archived``.
         total: Every match of the query, across all pages. ``search.py`` splits a partition
             whose ``total`` exceeds the 10,000-result ceiling.
         after: ``paging.next.after``, sent as ``after`` for the next page; ``None`` on the
@@ -1164,8 +1410,9 @@ def parse_search_page(body: object) -> SearchPage:
 
     Raises:
         QueryDefect: When the body is not an object, ``total`` is missing or not a
-            non-negative integer, ``results`` is missing, or a record has no usable ``id`` or
-            ``properties``.
+            non-negative integer, ``results`` is missing or not an array, a record lacks a
+            string ``id``, a ``properties`` object, ``createdAt`` or ``updatedAt`` instants or
+            a boolean ``archived``, or ``paging.next.after`` is malformed.
     """
     surface = _SURFACE_SEARCH
     obj = _as_mapping(body, "response body", surface)
@@ -1194,7 +1441,8 @@ class PropertyOption:
         label: The human-readable label configured stage labels are matched against.
         value: The internal value; custom lifecycle stages use numeric strings such as
             ``"1406943076"``, the suffix of ``hs_v2_date_entered_{value}``.
-        hidden: Whether HubSpot hides the option from its UI; ``False`` when not returned.
+        hidden: Whether HubSpot hides the option from its UI, as the required ``hidden``
+            field states it.
     """
 
     label: str
@@ -1209,8 +1457,10 @@ class PropertyDefinition:
     Attributes:
         name: The internal property name.
         type: The data type, for example ``enumeration``, ``datetime``, ``date`` or ``string``.
-        field_type: How HubSpot renders it (``select``, ``date``, …); ``None`` when absent.
-        options: The options of an enumerated property, in response order; empty otherwise.
+        field_type: How HubSpot renders it (``select``, ``date``, …), stripped; ``None`` when
+            the required ``fieldType`` string is blank.
+        options: The options of an enumerated property, in response order; empty, as the
+            required ``options`` array is, for other property types.
     """
 
     name: str
@@ -1228,18 +1478,33 @@ class PropertyDefinition:
 
 
 def _parse_option(item: object, surface: str) -> PropertyOption:
-    """Decode one ``options[]`` element ``{label, value, hidden?}``."""
+    """Decode one ``options[]`` element; ``label``, ``value`` and ``hidden`` are required."""
     obj = _as_mapping(item, "options[] entry", surface)
     label = _required_str(obj, "label", surface)
-    value = _id_text(obj.get("value"), "'options[].value'", surface)
+    value = _string_id(obj.get("value"), "'options[].value'", surface)
     hidden = obj.get("hidden")
-    if hidden is not None and not isinstance(hidden, bool):
+    if hidden is None:
+        raise _defect("required field 'options[].hidden' is missing", surface)
+    if not isinstance(hidden, bool):
         raise _defect("field 'options[].hidden' must be a boolean", surface)
-    return PropertyOption(label=label, value=value, hidden=bool(hidden))
+    return PropertyOption(label=label, value=value, hidden=hidden)
+
+
+def _required_name(obj: Mapping[str, Any], key: str, surface: str) -> str:
+    """Read a required, non-blank string field of a property definition."""
+    value = _required_str(obj, key, surface)
+    if not value.strip():
+        raise _defect(f"field '{key}' must not be blank", surface)
+    return value
 
 
 def parse_property(body: object) -> PropertyDefinition:
     """Decode a property definition, used by startup binding verification (AAP 0.3.3).
+
+    Every field the properties contract requires must be present: ``name`` and ``type`` as
+    non-blank strings; ``fieldType``, ``description`` (possibly empty), ``groupName`` and
+    ``label`` as strings; and ``options`` as an array whose every entry has a string
+    ``label``, a non-blank string ``value`` and a boolean ``hidden``. Nothing is defaulted.
 
     Args:
         body: The decoded JSON body of a 200 response. A 404 (no such property) is handled by
@@ -1249,19 +1514,22 @@ def parse_property(body: object) -> PropertyDefinition:
         The definition's name, type, field type and options.
 
     Raises:
-        QueryDefect: When the body is not an object, ``name`` or ``type`` is missing,
-            ``fieldType`` is not a string, or an option lacks its label or value.
+        QueryDefect: When the body is not an object, a required field is missing or of the
+            wrong type, ``name``, ``type`` or an option's ``value`` is blank, or a field read
+            for binding verification cannot be stored as text.
     """
     surface = _SURFACE_PROPERTIES
     obj = _as_mapping(body, "response body", surface)
-    field_type = obj.get("fieldType")
-    if field_type is not None and not isinstance(field_type, str):
-        raise _defect("field 'fieldType' must be a string", surface)
+    name = _required_name(obj, "name", surface)
+    data_type = _required_name(obj, "type", surface)
+    field_type = _string_field(obj, "fieldType", "'fieldType'", surface)
+    for key in ("description", "groupName", "label"):
+        _string_field(obj, key, f"'{key}'", surface)
     return PropertyDefinition(
-        name=_required_str(obj, "name", surface),
-        type=_required_str(obj, "type", surface),
+        name=name,
+        type=data_type,
         field_type=_text(field_type, what="field 'fieldType'", surface=surface),
         options=tuple(
-            _parse_option(item, surface) for item in _array(obj, "options", surface, required=False)
+            _parse_option(item, surface) for item in _array(obj, "options", surface, required=True)
         ),
     )

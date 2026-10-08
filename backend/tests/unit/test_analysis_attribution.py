@@ -801,6 +801,139 @@ def test_an_asset_spanning_currencies_gets_one_row_per_currency(make: MakeContex
     assert (entity.external_id, entity.name) == ("pipeline-report|EUR", "The Pipeline Report")
 
 
+# Two contacts of one asset in two currencies: c-usd touches in USD on day 10, c-eur in EUR on
+# day 12. Events after both touches go to c-eur's later touch; events between them qualify only
+# through c-usd; events before both are excluded once, in the row of the earliest anchor (USD).
+TWO_CURRENCY_LEADS = (
+    _lead(1, _t(10), contact="c-usd", creative=CR_A),
+    _lead(2, _t(12), contact="c-eur", creative=CR_EUR, campaign=CAMPAIGN_EUR),
+)
+TWO_CURRENCY_SPEND = (_spend(CR_A, "100.00"), _spend(CR_EUR, "80.00", CAMPAIGN_EUR))
+TWO_CURRENCY_CONTACTS = (ContactInfo("c-usd", "lead"), ContactInfo("c-eur", "lead"))
+
+
+def test_a_meeting_shared_across_currencies_counts_once_in_the_latest_touchs_row(
+    make: MakeContext,
+) -> None:
+    public = "MEETINGS_PUBLIC"
+    meetings = [
+        MeetingInfo("m-shared", _t(14), _t(15), meeting_source=public),
+        MeetingInfo("m-usd", _t(11), _t(16), meeting_source=public),
+        MeetingInfo("m-before", _t(9), _t(9, 13), meeting_source=public),
+    ]
+    shared = [meeting.hs_id for meeting in meetings]
+    crm = _crm(
+        TWO_CURRENCY_CONTACTS,
+        meetings=meetings,
+        contact_meetings={"c-usd": shared, "c-eur": shared},
+    )
+    table = build_attribution(make(crm=crm, leads=TWO_CURRENCY_LEADS, spend=TWO_CURRENCY_SPEND))
+
+    usd, eur = _row(table, REPORT, "USD"), _row(table, REPORT, "EUR")
+    # Three distinct meetings: two booked after a touch and one before, each in one row only.
+    assert (usd.meetings_booked.value, usd.meetings_before_touch) == (1, 1)
+    assert (eur.meetings_booked.value, eur.meetings_before_touch) == (1, 0)
+    # m-shared follows both touches: the latest (c-eur, EUR) owns it; m-usd precedes c-eur's.
+    assert _credit(eur, CR_EUR).meetings_booked.value == 1
+    assert _credit(usd, CR_A).meetings_booked.value == 1
+    # Costs stay within their row's currency.
+    assert (usd.cost_per_meeting.render(), eur.cost_per_meeting.render()) == ("100.00", "80.00")
+    for row in (usd, eur):
+        assert (row.matched_contacts, row.unknown_evidence_contacts) == (1, 0)
+        assert row.other_meetings.value == 0
+        _assert_partition(row)
+
+
+def test_a_deal_shared_across_currencies_counts_once_in_the_latest_touchs_row(
+    make: MakeContext,
+) -> None:
+    deals = [DealInfo("d-shared", _t(13)), DealInfo("d-usd", _t(11)), DealInfo("d-before", _t(9))]
+    shared = [deal.hs_id for deal in deals]
+    crm = _crm(TWO_CURRENCY_CONTACTS, deals=deals, contact_deals={"c-usd": shared, "c-eur": shared})
+    table = build_attribution(make(crm=crm, leads=TWO_CURRENCY_LEADS, spend=TWO_CURRENCY_SPEND))
+
+    usd, eur = _row(table, REPORT, "USD"), _row(table, REPORT, "EUR")
+    assert (usd.deals_after_touch.value, usd.deals_before_touch) == (1, 1)
+    assert (eur.deals_after_touch.value, eur.deals_before_touch) == (1, 0)
+    assert (_credit(usd, CR_A).deals.value, _credit(eur, CR_EUR).deals.value) == (1, 1)
+    for row in (usd, eur):
+        _assert_partition(row)
+
+
+def test_a_contact_touching_an_asset_in_two_currencies_enters_each_stage_once(
+    make: MakeContext,
+) -> None:
+    contacts = [
+        # Anchor EUR (day 10): MQL before it is reported once, in EUR; the QL (day 13) follows
+        # the USD touch (day 12) and counts there only.
+        ContactInfo("c1", "salesqualifiedlead", mql_at=_t(9), ql_at=_t(13)),
+        # Anchor USD (day 10): the QL (day 11) follows the USD touch, the MQL (day 14) the EUR
+        # touch (day 12); each counts once, in its own touch's row.
+        ContactInfo("c2", "salesqualifiedlead", mql_at=_t(14), ql_at=_t(11)),
+        # Skipped both stages: reported once, in the row of its anchor (USD, day 9).
+        ContactInfo("c3", "customer"),
+    ]
+    leads = [
+        _lead(1, _t(10), contact="c1", creative=CR_EUR, campaign=CAMPAIGN_EUR),
+        _lead(2, _t(12), contact="c1", creative=CR_A),
+        _lead(3, _t(10), contact="c2", creative=CR_A),
+        _lead(4, _t(12), contact="c2", creative=CR_EUR, campaign=CAMPAIGN_EUR),
+        _lead(5, _t(9), contact="c3", creative=CR_A),
+        _lead(6, _t(15), contact="c3", creative=CR_EUR, campaign=CAMPAIGN_EUR),
+    ]
+    table = build_attribution(make(crm=_crm(contacts), leads=leads, spend=TWO_CURRENCY_SPEND))
+
+    usd, eur = _row(table, REPORT, "USD"), _row(table, REPORT, "EUR")
+    assert (usd.mql.value, usd.already_mql_before, usd.skipped_mql) == (0, 0, 1)
+    assert (eur.mql.value, eur.already_mql_before, eur.skipped_mql) == (1, 1, 0)
+    assert (usd.ql.value, usd.already_ql_before, usd.skipped_ql) == (2, 0, 1)
+    assert (eur.ql.value, eur.already_ql_before, eur.skipped_ql) == (0, 0, 0)
+    # Across the asset: one MQL (c2), two QL (c1, c2), each counted in exactly one row.
+    assert (usd.mql.value + eur.mql.value, usd.ql.value + eur.ql.value) == (1, 2)
+    assert (_credit(usd, CR_A).mql.value, _credit(usd, CR_A).ql.value) == (0, 2)
+    assert (_credit(eur, CR_EUR).mql.value, _credit(eur, CR_EUR).ql.value) == (1, 0)
+    for row in (usd, eur):
+        # Leads, matched contacts and shares stay the row's own.
+        assert (row.linkedin_leads, row.matched_contacts, row.unknown_evidence_contacts) == (
+            3,
+            3,
+            0,
+        )
+        assert row.flags == ()
+        _assert_partition(row)
+    assert (usd.cost_per_ql.render(), eur.cost_per_ql.render()) == ("50.00", "—")
+    assert eur.cost_per_ql.note == NO_QL_NOTE
+
+    # The skipped contact is reported once, on the USD row only.
+    assert [
+        (finding.code, finding.entity.external_id if finding.entity else None)
+        for finding in table.findings
+    ] == [
+        (FINDING_SKIPPED_STAGE, "pipeline-report|USD"),
+        (FINDING_SKIPPED_STAGE, "pipeline-report|USD"),
+    ]
+
+    # Totals and medians stay within each currency; nothing combines the two cohorts.
+    assert [cohort.currency for cohort in table.cohorts] == ["EUR", "USD"]
+    summary = {
+        cohort.currency: (cohort.spend_total, cohort.total_ql, cohort.median_cost_per_ql)
+        for cohort in table.cohorts
+    }
+    assert summary == {
+        "EUR": (Decimal("80.00"), 0, None),
+        "USD": (Decimal("100.00"), 2, Decimal("50.00")),
+    }
+    for cohort in table.cohorts:
+        assert [row.currency for row in cohort.rows] == [cohort.currency]
+        assert set(cohort.to_json()) == {
+            "currency",
+            "spend_total",
+            "median_cost_per_ql",
+            "overlap_note",
+            "rows",
+        }
+
+
 def test_a_cohort_rejects_a_row_in_another_currency(make: MakeContext) -> None:
     table = build_attribution(make(crm=_crm(), spend=[_spend(CR_A, "10.00")]))
     row = _row(table)
@@ -932,6 +1065,34 @@ def test_a_failed_refresh_keeps_stage_dates_but_reports_no_skipped_stage(
     )
     assert (row.ql.render(), row.mql.render()) == ("≥ 2", "≥ 0")
     assert row.cost_per_ql.render() == "≤ 45.00"
+
+
+def test_a_refresh_never_recorded_is_unknown_evidence_and_a_floor(make: MakeContext) -> None:
+    # Only an explicit "ok" records a successful refresh: a matched lead without a refresh
+    # status leaves its contact's stage dates not current, exactly like a failed refresh.
+    contacts = [
+        ContactInfo("c-unrecorded", "customer", ql_at=_t(12)),
+        ContactInfo("c-fresh", "salesqualifiedlead", ql_at=_t(12)),
+    ]
+    unrecorded = dataclasses.replace(
+        _lead(1, _t(10), contact="c-unrecorded"), contact_read_status=None
+    )
+    leads = [unrecorded, _lead(2, _t(10), contact="c-fresh")]
+    crm = _crm(contacts)
+    table = build_attribution(make(crm=crm, leads=leads, spend=[_spend(CR_A, "90")]))
+
+    assert contact_evidence_known(crm, "c-unrecorded", unrecorded) == (
+        False,
+        "contact refresh not recorded; stage dates not current",
+    )
+    row = _row(table)
+    assert row.ql.value == 2
+    assert (row.mql.value, row.skipped_mql, row.skipped_ql) == (0, 1, 0)
+    assert (row.unknown_evidence_contacts, row.matched_contacts) == (1, 2)
+    assert row.flag_messages[FLAG_UNKNOWN_CRM_EVIDENCE] == (
+        "Floor: CRM evidence unknown for 50% of matched contacts (1 of 2)"
+    )
+    assert (row.ql.render(), row.cost_per_ql.render()) == ("≥ 2", "≤ 45.00")
 
 
 def test_repeat_touches_give_one_entry_credited_to_the_latest_prior_touch(
@@ -1312,6 +1473,161 @@ def test_a_fully_read_association_with_every_target_is_known(make: MakeContext) 
     assert contact_evidence_known(crm, "c1", lead) == (True, None)
     row = _row(build_attribution(make(crm=crm, leads=[lead])))
     assert (row.meetings_booked.render(), row.deals_after_touch.render()) == ("1", "1")
+
+
+# A stored edge outlives the fetch that verified it: each case fails the current fetch of one
+# target type while the edge and its read meeting or deal are retained.
+RETAINED_EDGE_CASES: list[tuple[str, AssociationFetchInfo, str]] = [
+    (
+        "meeting fetch error",
+        _fetch("contact", "c1", "meeting", "error"),
+        "contact-to-meeting association fetch error",
+    ),
+    (
+        "meeting fetch partial",
+        _fetch("contact", "c1", "meeting", "partial", "ok"),
+        "contact-to-meeting association fetch partial",
+    ),
+    (
+        "meeting target reads partial",
+        _fetch("contact", "c1", "meeting", "ok", "partial"),
+        "meeting target reads partial",
+    ),
+    (
+        "deal fetch error",
+        _fetch("contact", "c1", "deal", "error"),
+        "contact-to-deal association fetch error",
+    ),
+    (
+        "deal fetch partial",
+        _fetch("contact", "c1", "deal", "partial", "ok"),
+        "contact-to-deal association fetch partial",
+    ),
+    (
+        "deal target reads partial",
+        _fetch("contact", "c1", "deal", "ok", "partial"),
+        "deal target reads partial",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("failed", "reason"),
+    [case[1:] for case in RETAINED_EDGE_CASES],
+    ids=[case[0] for case in RETAINED_EDGE_CASES],
+)
+def test_a_retained_edge_under_an_unknown_fetch_is_never_credited(
+    make: MakeContext, failed: AssociationFetchInfo, reason: str
+) -> None:
+    crm = _crm(
+        [ContactInfo("c1", "lead")],
+        meetings=[MeetingInfo("m1", _t(11), _t(12), meeting_source="MEETINGS_PUBLIC")],
+        deals=[DealInfo("d1", _t(12))],
+        contact_meetings={"c1": ["m1"]},
+        contact_deals={"c1": ["d1"]},
+        fetches=[failed],
+    )
+    lead = _lead(1, _t(10), contact="c1")
+    table = build_attribution(make(crm=crm, leads=[lead], spend=[_spend(CR_A, "20.00")]))
+
+    assert contact_evidence_known(crm, "c1", lead) == (False, reason)
+    row = _row(table)
+    # The contact still counts as unknown evidence, so every count is a floor.
+    assert (row.unknown_evidence_contacts, row.unknown_evidence_share) == (1, Decimal(1))
+    assert FLAG_UNKNOWN_CRM_EVIDENCE in row.flags
+    # The edge under the failed fetch credits nothing; the other, verified edge still does.
+    meetings_failed = failed.to_type == "meeting"
+    assert row.meetings_booked.render() == ("≥ 0" if meetings_failed else "≥ 1")
+    assert row.deals_after_touch.render() == ("≥ 1" if meetings_failed else "≥ 0")
+    assert (row.meetings_before_touch, row.deals_before_touch) == (0, 0)
+    credit = _credit(row, CR_A)
+    assert (credit.meetings_booked.value, credit.deals.value) == (
+        (0, 1) if meetings_failed else (1, 0)
+    )
+    _assert_partition(row)
+
+
+@pytest.mark.parametrize(
+    ("meeting_fetch", "booked", "unknown"),
+    [
+        (_fetch("contact", "c-0", "meeting", "error"), "0", 1),
+        (_fetch("contact", "c-0", "meeting", "ok", "ok"), "1", 0),
+    ],
+    ids=["error-fetch-not-credited", "ok-fetch-credited"],
+)
+def test_one_unknown_contact_below_the_floor_share_credits_no_retained_meeting(
+    make: MakeContext, meeting_fetch: AssociationFetchInfo, booked: str, unknown: int
+) -> None:
+    # One contact of 20 (5%, below attribution.floor_share), so the count shows without a
+    # floor: a retained meeting under the failed fetch must not make it 1.
+    leads = [_lead(index + 1, _t(10), contact=f"c-{index}") for index in range(20)]
+    crm = _crm(
+        [ContactInfo(f"c-{index}", "lead") for index in range(20)],
+        meetings=[MeetingInfo("m1", _t(11), _t(12), meeting_source="MEETINGS_PUBLIC")],
+        contact_meetings={"c-0": ["m1"]},
+        fetches=[meeting_fetch],
+    )
+    row = _row(build_attribution(make(crm=crm, leads=leads, spend=[_spend(CR_A, "40.00")])))
+
+    assert (row.unknown_evidence_contacts, row.matched_contacts) == (unknown, 20)
+    assert row.unknown_evidence_share == Decimal(unknown) / Decimal(20)
+    assert FLAG_UNKNOWN_CRM_EVIDENCE not in row.flags
+    assert row.meetings_booked.render() == booked
+    assert row.meetings_booked.floor is False
+
+
+def test_an_event_shared_with_an_unknown_contact_is_credited_through_known_contacts_only(
+    make: MakeContext,
+) -> None:
+    # c2's later touch would win the credit, but c2's meeting and deal fetches failed, so the
+    # shared meeting and deal are credited once, through c1's verified edges, to creative A.
+    crm = _crm(
+        [ContactInfo("c1", "lead"), ContactInfo("c2", "lead")],
+        meetings=[MeetingInfo("m1", _t(14), _t(15), meeting_source="MEETINGS_PUBLIC")],
+        deals=[DealInfo("d1", _t(14))],
+        contact_meetings={"c1": ["m1"], "c2": ["m1"]},
+        contact_deals={"c1": ["d1"], "c2": ["d1"]},
+        fetches=[
+            _fetch("contact", "c2", "meeting", "error"),
+            _fetch("contact", "c2", "deal", "partial", "ok"),
+        ],
+    )
+    leads = [
+        _lead(1, _t(10), contact="c1", creative=CR_A),
+        _lead(2, _t(12), contact="c2", creative=CR_B, form=FORM_REPORT_2),
+    ]
+    row = _row(build_attribution(make(crm=crm, leads=leads, spend=[_spend(CR_A, "10.00")])))
+
+    assert (row.unknown_evidence_contacts, row.matched_contacts) == (1, 2)
+    assert (row.meetings_booked.render(), row.deals_after_touch.render()) == ("≥ 1", "≥ 1")
+    credit_a, credit_b = _credit(row, CR_A), _credit(row, CR_B)
+    assert (credit_a.meetings_booked.value, credit_a.deals.value) == (1, 1)
+    assert (credit_b.meetings_booked.value, credit_b.deals.value) == (0, 0)
+    _assert_partition(row)
+
+
+def test_an_edge_stored_under_an_ok_empty_fetch_is_stale_and_never_credited(
+    make: MakeContext,
+) -> None:
+    # The current fetch found no association: a genuine zero, whatever an older edge says.
+    crm = _crm(
+        [ContactInfo("c1", "lead")],
+        meetings=[MeetingInfo("m1", _t(11), _t(12), meeting_source="MEETINGS_PUBLIC")],
+        deals=[DealInfo("d1", _t(12))],
+        contact_meetings={"c1": ["m1"]},
+        contact_deals={"c1": ["d1"]},
+        fetches=[
+            _fetch("contact", "c1", "meeting", "ok_empty"),
+            _fetch("contact", "c1", "deal", "ok_empty"),
+        ],
+    )
+    lead = _lead(1, _t(10), contact="c1")
+    row = _row(build_attribution(make(crm=crm, leads=[lead])))
+
+    assert contact_evidence_known(crm, "c1", lead) == (True, None)
+    assert row.unknown_evidence_contacts == 0
+    assert (row.meetings_booked.render(), row.deals_after_touch.render()) == ("0", "0")
+    assert row.flags == ()
 
 
 def test_unknown_evidence_below_the_floor_share_is_counted_but_not_flagged(

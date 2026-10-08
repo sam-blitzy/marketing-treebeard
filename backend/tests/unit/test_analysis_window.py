@@ -9,6 +9,7 @@ boundary; and instant bounds are half-open and DST-true. Pure: no database and n
 """
 
 import copy
+import dataclasses
 import doctest
 import pickle
 import re
@@ -125,6 +126,7 @@ def _window_fields(**overrides: object) -> dict[str, Any]:
         "default_days": 28,
         "sustained_min_days": 7,
         "presets": (14, 28, 56, 90),
+        "max_days": 180,
     }
     fields.update(overrides)
     return fields
@@ -332,6 +334,7 @@ def test_default_window_spans_default_days_ending_on_the_default_end(
     assert window.default_days == 28
     assert window.sustained_min_days == shipped.sustained_min_days == 7
     assert window.presets == shipped.presets == (14, 28, 56, 90)
+    assert window.max_days == shipped.max_days == 180
     assert not window.short_window
     assert window.sustained_ok
     assert window.is_default_shape
@@ -526,6 +529,236 @@ def test_custom_defaults_now_to_the_current_instant(shipped: Thresholds) -> None
     assert window.default_end >= end
 
 
+@pytest.mark.parametrize(
+    ("given", "missing"),
+    [((), "config, sources"), (("config",), "sources"), (("sources",), "config")],
+    ids=["neither", "config-only", "sources-only"],
+)
+def test_class_level_custom_without_its_configuration_raises_a_clear_type_error(
+    shipped: Thresholds, given: tuple[str, ...], missing: str
+) -> None:
+    available: dict[str, Any] = {"config": shipped, "sources": NY_SOURCES}
+    arguments = {name: available[name] for name in given}
+    unconfigured: Any = AnalysisWindow.custom
+
+    with pytest.raises(TypeError) as caught:
+        unconfigured(DEFAULT_START, DEFAULT_END, now=NOW, **arguments)
+    assert str(caught.value) == (
+        "AnalysisWindow.custom(start, end) on the class needs the keyword arguments config "
+        f"and sources (missing: {missing}); to reuse a window's configuration call "
+        "custom(start, end) on that window, for example "
+        "AnalysisWindow.default(config, sources).custom(start, end)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# window.custom(start, end): the AAP 0.5.1 two-argument form on a configured window
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (DEFAULT_START, DEFAULT_END),
+        (DEFAULT_END, DEFAULT_END),
+        (DEFAULT_END - timedelta(days=179), DEFAULT_END),
+        (date(2026, 8, 1), date(2026, 8, 31)),
+    ],
+    ids=["default-span", "one-day", "max-days", "earlier-month"],
+)
+def test_bound_custom_equals_the_class_level_custom(
+    shipped: Thresholds, start: date, end: date
+) -> None:
+    configured = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    bound = configured.custom(start, end)
+
+    assert bound == AnalysisWindow.custom(start, end, config=shipped, sources=NY_SOURCES, now=NOW)
+    assert (bound.start, bound.end, bound.default_end) == (start, end, DEFAULT_END)
+    assert bound.to_json() == {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "days": (end - start).days + 1,
+        "source_days": [
+            {
+                "source": "google",
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "boundary": NEW_YORK,
+            },
+            {
+                "source": "linkedin",
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "boundary": UTC_BOUNDARY,
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "code", "message"),
+    [
+        (
+            DEFAULT_END,
+            DEFAULT_END - ONE_DAY,
+            "end_before_start",
+            "Window end 2026-10-03 is before its start 2026-10-04",
+        ),
+        (
+            DEFAULT_START,
+            DEFAULT_END + ONE_DAY,
+            "end_after_default_end",
+            "Window end 2026-10-05 is after the default window end 2026-10-04, the latest date "
+            "complete in every source's native day",
+        ),
+        (
+            DEFAULT_END - timedelta(days=180),
+            DEFAULT_END,
+            "too_long",
+            "Window of 181 days exceeds the 180-day maximum (window.max_days)",
+        ),
+    ],
+    ids=["end-before-start", "end-after-default-end", "too-long"],
+)
+def test_bound_custom_raises_the_class_level_codes_and_messages(
+    shipped: Thresholds, start: date, end: date, code: str, message: str
+) -> None:
+    # ``too_short`` cannot be reached through either form: a reversed range is reported as
+    # ``end_before_start`` first, and any other range spans at least 1 day.
+    configured = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    with pytest.raises(InvalidWindow) as bound:
+        configured.custom(start, end)
+    with pytest.raises(InvalidWindow) as explicit:
+        AnalysisWindow.custom(start, end, config=shipped, sources=NY_SOURCES, now=NOW)
+
+    assert (bound.value.code, bound.value.message) == (code, message)
+    assert (explicit.value.code, explicit.value.message) == (code, message)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        (datetime(2026, 9, 7, tzinfo=UTC), DEFAULT_END, "start must be a datetime.date"),
+        (DEFAULT_START, datetime(2026, 10, 4, tzinfo=UTC), "end must be a datetime.date"),
+        ("2026-09-07", DEFAULT_END, "start must be a datetime.date"),
+    ],
+    ids=["datetime-start", "datetime-end", "text-start"],
+)
+def test_bound_custom_rejects_non_native_dates(
+    shipped: Thresholds, start: Any, end: Any, message: str
+) -> None:
+    configured = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+    with pytest.raises(TypeError, match=re.escape(message)):
+        configured.custom(start, end)
+
+
+def test_bound_custom_takes_only_the_two_dates(shipped: Thresholds) -> None:
+    configured: Any = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'config'"):
+        configured.custom(DEFAULT_START, DEFAULT_END, config=shipped)
+    with pytest.raises(TypeError, match="missing 1 required positional argument: 'end'"):
+        configured.custom(DEFAULT_START)
+
+
+def test_bound_custom_keeps_the_configured_values_and_boundaries() -> None:
+    config = _thresholds(
+        default_days=21,
+        presets=[14, 21, 28, 56],
+        trusted_min_days=10,
+        sustained_min_days=5,
+        max_days=60,
+    )
+    configured = AnalysisWindow.default(config, NY_SOURCES, now=NOW)
+
+    bound = configured.custom(DEFAULT_END - timedelta(days=8), DEFAULT_END)
+
+    assert bound.days == 9
+    assert bound.default_end == DEFAULT_END
+    assert (
+        bound.trusted_min_days,
+        bound.default_days,
+        bound.sustained_min_days,
+        bound.presets,
+        bound.max_days,
+    ) == (10, 21, 5, (14, 21, 28, 56), 60)
+    assert [(item.source, item.boundary) for item in bound.source_days] == [
+        ("google", NEW_YORK),
+        ("linkedin", UTC_BOUNDARY),
+    ]
+    assert all(item.start == bound.start and item.end == bound.end for item in bound.source_days)
+    assert bound.boundaries_differ
+    assert bound.short_window
+    assert bound.sustained_ok
+    assert not bound.is_default_shape
+    assert configured.custom(DEFAULT_END - timedelta(days=20), DEFAULT_END).is_segment_window()
+
+    assert configured.custom(DEFAULT_END - timedelta(days=59), DEFAULT_END).days == 60
+    with pytest.raises(InvalidWindow) as caught:
+        configured.custom(DEFAULT_END - timedelta(days=60), DEFAULT_END)
+    assert caught.value.code == "too_long"
+    assert caught.value.message == "Window of 61 days exceeds the 60-day maximum (window.max_days)"
+
+
+@pytest.mark.parametrize(
+    ("sources", "source", "boundary", "latest"),
+    [
+        (SourceDayInfo(NEW_YORK, ("linkedin",)), "linkedin", UTC_BOUNDARY, date(2026, 10, 5)),
+        (SourceDayInfo(NEW_YORK, ("google",)), "google", NEW_YORK, DEFAULT_END),
+        (SourceDayInfo(None, ("google",)), "google", UTC_BOUNDARY, date(2026, 10, 5)),
+    ],
+    ids=["linkedin-only", "google-only", "google-without-zone"],
+)
+def test_bound_custom_on_a_single_source_window(
+    shipped: Thresholds, sources: SourceDayInfo, source: str, boundary: str, latest: date
+) -> None:
+    configured = AnalysisWindow.default(shipped, sources, now=NOW)
+
+    bound = configured.custom(latest - timedelta(days=6), latest)
+
+    assert bound == AnalysisWindow.custom(
+        latest - timedelta(days=6), latest, config=shipped, sources=sources, now=NOW
+    )
+    assert [(item.source, item.boundary) for item in bound.source_days] == [(source, boundary)]
+    assert not bound.boundaries_differ
+    with pytest.raises(InvalidWindow) as caught:
+        configured.custom(latest, latest + ONE_DAY)
+    assert caught.value.code == "end_after_default_end"
+    assert f"default window end {latest.isoformat()}" in caught.value.message
+
+
+def test_bound_custom_is_bounded_by_the_default_end_not_the_window_end(
+    shipped: Thresholds,
+) -> None:
+    earlier = _custom(shipped, 7, end=DEFAULT_END - timedelta(days=10))
+
+    assert earlier.end < earlier.default_end == DEFAULT_END
+    widened = earlier.custom(DEFAULT_START, DEFAULT_END)
+    assert widened == AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+    with pytest.raises(InvalidWindow) as caught:
+        earlier.custom(DEFAULT_START, DEFAULT_END + ONE_DAY)
+    assert caught.value.code == "end_after_default_end"
+
+
+def test_custom_is_a_descriptor_and_not_a_dataclass_field() -> None:
+    assert [field.name for field in dataclasses.fields(AnalysisWindow)] == [
+        "start",
+        "end",
+        "default_end",
+        "source_days",
+        "trusted_min_days",
+        "default_days",
+        "sustained_min_days",
+        "presets",
+        "max_days",
+    ]
+    descriptor = AnalysisWindow.__dict__["custom"]
+    with pytest.raises(TypeError, match="must be read from AnalysisWindow or a window"):
+        descriptor.__get__(None)
+
+
 def test_invalid_window_carries_code_and_message() -> None:
     error = InvalidWindow("too_long", "Window of 181 days exceeds the 180-day maximum")
 
@@ -598,6 +831,17 @@ def test_direct_construction_enforces_the_window_bounds() -> None:
     assert "default window end 2026-10-03" in late_window.value.message
 
 
+def test_direct_construction_enforces_max_days_with_the_custom_message() -> None:
+    assert AnalysisWindow(**_window_fields(max_days=28)).days == 28
+
+    with pytest.raises(InvalidWindow) as long_window:
+        AnalysisWindow(**_window_fields(max_days=27))
+    assert long_window.value.code == "too_long"
+    assert long_window.value.message == (
+        "Window of 28 days exceeds the 27-day maximum (window.max_days)"
+    )
+
+
 @pytest.mark.parametrize(
     ("source_days", "message"),
     [
@@ -639,8 +883,22 @@ def test_direct_construction_validates_source_days(source_days: object, message:
         ("presets", 28, "presets must be a non-empty tuple of day counts"),
         ("presets", (14, 0), "presets item must be a positive integer"),
         ("presets", (14, "28"), "presets item must be a positive integer"),
+        ("max_days", 0, "max_days must be a positive integer"),
+        ("max_days", True, "max_days must be a positive integer"),
+        ("max_days", "180", "max_days must be a positive integer"),
     ],
-    ids=["trusted-zero", "default-bool", "sustained-float", "no-presets", "bare", "zero", "text"],
+    ids=[
+        "trusted-zero",
+        "default-bool",
+        "sustained-float",
+        "no-presets",
+        "bare",
+        "zero",
+        "text",
+        "max-zero",
+        "max-bool",
+        "max-text",
+    ],
 )
 def test_direct_construction_validates_day_counts(field: str, value: object, message: str) -> None:
     with pytest.raises(ValueError, match=re.escape(message)):

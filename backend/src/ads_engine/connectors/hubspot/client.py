@@ -40,9 +40,10 @@ Errors:
     Every call goes through :func:`ads_engine.connectors.http.send_json`, which retries
     transient failures and classifies the rest. 401 and 403 (``MISSING_SCOPES`` included)
     raise ``AccessDenied``; 429 and 5xx raise ``TransientError`` after the retries; 400
-    raises ``QueryDefect``. Batch methods record a transient failure per input or per id
-    (``failed``, ``error``, ``partial``) instead of raising it, so a sync keeps what it read
-    and marks the rest unknown; ``AccessDenied`` and ``QueryDefect`` always propagate, and
+    raises ``QueryDefect``. Batch methods record, per input or per id (``failed``, ``error``,
+    ``partial``), a ``TransientError`` that outlasts its retries, a batch status other than
+    ``COMPLETE`` and a per-input failure instead of raising them, so a sync keeps what it
+    read and marks the rest unknown; ``AccessDenied`` and ``QueryDefect`` always propagate, and
     ``ads_engine.sync.mode`` alone decides what follows. Invalid arguments raise
     ``ValueError`` before any call.
 
@@ -54,13 +55,23 @@ Personal data and isolation:
     address on the reserved simulated domain ``sim.invalid``: simulated leads match only
     their simulated companion portal, never a live one.
 
+Contact properties:
+    The contact batch reads request and parse the properties the verified bindings resolve
+    (:func:`contact_property_map`). :meth:`HubSpotClient.verify_bindings` binds that map to
+    the client; :meth:`HubSpotClient.bind_contact_properties` binds it from bindings already
+    stored for a dataset, and the ``contact_properties`` constructor argument binds a map
+    built elsewhere. A map passed to a call overrides the bound one. A contact read with no
+    map raises ``QueryDefect`` (code ``CONTACT_PROPERTIES_UNBOUND``) before any call: an
+    empty map would read every bound MQL and QL date as absent, which counts the stage as
+    skipped instead of unavailable.
+
 Example:
     ``sync/jobs.py`` refreshes matched contacts and reads their meetings::
 
         async with build_client("hubspot") as http:
-            client = HubSpotClient.from_settings(get_settings(), http, live=True)
-            props = contact_property_map(bindings, settings)
-            batch = await client.contacts_by_id(contact_ids, props)
+            client = HubSpotClient.from_settings(settings, http, live=True)
+            client.bind_contact_properties(bindings, settings)
+            batch = await client.contacts_by_id(contact_ids)
             fetch = await client.associations("contacts", "meetings", batch.records)
             meetings = await client.meetings(fetch.all_targets)
 """
@@ -301,8 +312,10 @@ def _is_simulated_email(normalised: str) -> bool:
 
 
 class RateLimiter:
-    """Spaces requests at most ``rate_per_second`` apart, across every client that shares it.
+    """Spaces request starts at least ``1 / rate_per_second`` seconds apart.
 
+    Each request starts at least ``1 / rate_per_second`` seconds after the previous reserved
+    slot (0.25 s at the default 4 per second), across every client that shares the limiter.
     Each :meth:`acquire` reserves the next free slot and sleeps until it. The reservation
     reads and advances the slot with no ``await`` in between, so concurrent callers on one
     event loop each get their own slot, and no ``asyncio.Lock`` is held, so one instance is
@@ -321,8 +334,9 @@ class RateLimiter:
             limiter = RateLimiter(4.0, clock=lambda: now[0], sleep=advance)
 
     Args:
-        rate_per_second: Requests allowed per second; 4.0 keeps HubSpot traffic below CRM
-            Search's 5 per second.
+        rate_per_second: Request starts allowed per second; reserved slots are
+            ``1 / rate_per_second`` seconds apart, so 4.0 (0.25 s) keeps HubSpot traffic
+            below CRM Search's 5 per second.
         clock: Monotonic clock in seconds.
         sleep: Awaitable sleep used to wait for a slot.
 
@@ -563,8 +577,10 @@ def contact_property_map(bindings: CrmBindings, settings: Settings) -> ContactPr
         settings: The current settings.
 
     Returns:
-        The property map to pass to :meth:`HubSpotClient.contacts_by_email` and
-        :meth:`HubSpotClient.contacts_by_id`.
+        The property map :meth:`HubSpotClient.contacts_by_email` and
+        :meth:`HubSpotClient.contacts_by_id` request and parse: the one
+        :meth:`HubSpotClient.verify_bindings` and :meth:`HubSpotClient.bind_contact_properties`
+        bind to the client, or an explicit ``props`` override of a call.
     """
     google = bindings.google
     google_current = (
@@ -786,12 +802,24 @@ class HubSpotClient:
         retry: The retry policy of every call.
         limiter: The throttle every attempt awaits; :data:`SHARED_LIMITER` when ``None``.
         logger: The structured logger; this module's logger when ``None``.
+        contact_properties: The contact property map the contact batch reads use, built
+            from verified bindings (:func:`contact_property_map`); ``None`` leaves it unbound
+            until :meth:`verify_bindings` or :meth:`bind_contact_properties` binds one.
 
     Raises:
         ValueError: When ``token`` is blank.
     """
 
-    __slots__ = ("_calls", "_http", "_limiter", "_live", "_log", "_retry", "_token")
+    __slots__ = (
+        "_calls",
+        "_contact_properties",
+        "_http",
+        "_limiter",
+        "_live",
+        "_log",
+        "_retry",
+        "_token",
+    )
 
     def __init__(
         self,
@@ -802,6 +830,7 @@ class HubSpotClient:
         retry: RetryPolicy = DEFAULT_RETRY,
         limiter: RateLimiter | None = None,
         logger: BoundLogger | None = None,
+        contact_properties: ContactPropertyMap | None = None,
     ) -> None:
         if not token.get_secret_value().strip():
             raise ValueError("the HubSpot token must not be blank")
@@ -812,6 +841,7 @@ class HubSpotClient:
         self._limiter = limiter if limiter is not None else SHARED_LIMITER
         self._log: BoundLogger = logger if logger is not None else log
         self._calls = 0
+        self._contact_properties = contact_properties
 
     @classmethod
     def from_settings(
@@ -822,6 +852,7 @@ class HubSpotClient:
         live: bool = True,
         retry: RetryPolicy = DEFAULT_RETRY,
         limiter: RateLimiter | None = None,
+        contact_properties: ContactPropertyMap | None = None,
     ) -> HubSpotClient:
         """Build the client of the configured portal from ``HUBSPOT_ACCESS_TOKEN``.
 
@@ -831,6 +862,8 @@ class HubSpotClient:
             live: Whether the portal is a real one.
             retry: The retry policy of every call.
             limiter: The throttle; :data:`SHARED_LIMITER` when ``None``.
+            contact_properties: The contact property map to bind; ``None`` leaves it
+                unbound until :meth:`verify_bindings` or :meth:`bind_contact_properties`.
 
         Returns:
             The client.
@@ -842,7 +875,14 @@ class HubSpotClient:
         token = settings.hubspot_access_token
         if token is None or not token.get_secret_value().strip():
             raise ValueError("HUBSPOT_ACCESS_TOKEN is not configured")
-        return cls(http, token, live=live, retry=retry, limiter=limiter)
+        return cls(
+            http,
+            token,
+            live=live,
+            retry=retry,
+            limiter=limiter,
+            contact_properties=contact_properties,
+        )
 
     @staticmethod
     def contact_property_map(bindings: CrmBindings, settings: Settings) -> ContactPropertyMap:
@@ -856,6 +896,51 @@ class HubSpotClient:
             The property map for contact batch reads.
         """
         return contact_property_map(bindings, settings)
+
+    def bind_contact_properties(
+        self, bindings: CrmBindings, settings: Settings
+    ) -> ContactPropertyMap:
+        """Bind the contact property map of already verified ``bindings`` to this client.
+
+        For bindings a dataset already stores, so a client that did not run
+        :meth:`verify_bindings` reads contacts with the same properties. An unavailable
+        binding stays unbound in the map, so its metric reads unavailable, never 0.
+
+        Args:
+            bindings: The dataset's verified CRM bindings.
+            settings: The current settings.
+
+        Returns:
+            The bound map (:func:`contact_property_map`), which replaces any bound before.
+        """
+        props = contact_property_map(bindings, settings)
+        self._contact_properties = props
+        return props
+
+    def _contact_properties_for(self, props: ContactPropertyMap | None) -> ContactPropertyMap:
+        """Return the map a contact read uses: ``props`` when given, else the bound one.
+
+        Raises:
+            QueryDefect: When neither is set (code ``CONTACT_PROPERTIES_UNBOUND``), before
+                any call. No empty map stands in, because it would read every bound MQL and
+                QL date as absent, a skipped stage instead of an unavailable metric.
+        """
+        if props is not None:
+            return props
+        if self._contact_properties is not None:
+            return self._contact_properties
+        raise QueryDefect(
+            "contact properties are not bound: call verify_bindings or "
+            "bind_contact_properties first, or pass props",
+            source=_SOURCE,
+            endpoint=f"{_SURFACE_OBJECTS} {_CONTACTS}",
+            code="CONTACT_PROPERTIES_UNBOUND",
+        )
+
+    @builtins.property
+    def contact_properties(self) -> ContactPropertyMap | None:
+        """The bound contact property map; ``None`` until one is bound."""
+        return self._contact_properties
 
     @builtins.property
     def live(self) -> bool:
@@ -975,6 +1060,11 @@ class HubSpotClient:
         Anything unresolved is unavailable with a reason naming the missing stage or
         property, never counted as 0, and each binding's availability is independent.
 
+        On success the bindings' contact property map is bound to this client (as
+        :meth:`bind_contact_properties` binds it), so :meth:`contacts_by_email` and
+        :meth:`contacts_by_id` need no ``props``. A failed verification binds nothing and
+        keeps any map bound before.
+
         Args:
             mapping: The configured bindings from ``config/hubspot_mapping.yaml``.
             settings: The settings naming the Google link properties.
@@ -993,6 +1083,7 @@ class HubSpotClient:
         ql = await self._resolve_binding(mapping.ql, cache)
         google = await self._resolve_google(settings, cache)
         bindings = CrmBindings(mql=mql, ql=ql, google=google, verified_at=datetime.now(UTC))
+        self.bind_contact_properties(bindings, settings)
         self._log.info(
             "hubspot.verify",
             mql_mode=mapping.mql.mode,
@@ -1118,7 +1209,7 @@ class HubSpotClient:
     # ------------------------------------------------------------------
 
     async def contacts_by_email(
-        self, emails: Iterable[str], props: ContactPropertyMap
+        self, emails: Iterable[str], props: ContactPropertyMap | None = None
     ) -> EmailLookup:
         """Look contacts up by email, at most 100 addresses per batch read.
 
@@ -1131,18 +1222,22 @@ class HubSpotClient:
 
         Args:
             emails: The lead emails to look up.
-            props: The bound contact properties to request and parse
-                (:func:`contact_property_map`).
+            props: The contact properties to request and parse, overriding the bound map
+                (:attr:`contact_properties`); ``None`` uses the bound map.
 
         Returns:
             Every input's digest in exactly one of ``found``, ``not_found``, ``failed`` or
             ``skipped``.
 
         Raises:
-            ValueError: When ``emails`` is one string or holds a blank or non-string entry.
+            ValueError: When ``emails`` is one string or holds a blank or non-string entry;
+                before any call.
             AccessDenied: When the token or its scopes are refused.
-            QueryDefect: When a request or a response breaks the contract.
+            QueryDefect: When no ``props`` is given and none is bound (code
+                ``CONTACT_PROPERTIES_UNBOUND``, before any call), or a request or a
+                response breaks the contract.
         """
+        props = self._contact_properties_for(props)
         given: object = emails
         if isinstance(given, str):
             raise ValueError("emails must be an iterable of addresses, not one string")
@@ -1213,8 +1308,9 @@ class HubSpotClient:
                 else:
                     chunk_failed |= listed
             for digest in digests:
-                # Precedence: a returned contact, then an explicit failure, then an explicit
-                # "not found"; an input neither returned nor listed failed.
+                # A returned contact is never also listed (the parser rejects that
+                # contradiction); an explicit failure outranks an explicit "not found"; an
+                # input neither returned nor listed failed.
                 if digest in chunk_found:
                     found[digest] = chunk_found[digest]
                 elif digest in chunk_failed or digest not in chunk_not_found:
@@ -1241,7 +1337,9 @@ class HubSpotClient:
         )
         return lookup
 
-    async def contacts_by_id(self, ids: Iterable[str], props: ContactPropertyMap) -> ContactBatch:
+    async def contacts_by_id(
+        self, ids: Iterable[str], props: ContactPropertyMap | None = None
+    ) -> ContactBatch:
         """Refresh contacts by HubSpot id, at most 100 per batch read.
 
         ``POST /crm/objects/2026-09/contacts/batch/read`` without ``idProperty``. A requested
@@ -1251,16 +1349,20 @@ class HubSpotClient:
 
         Args:
             ids: The contact ids to refresh.
-            props: The bound contact properties to request and parse.
+            props: The contact properties to request and parse, overriding the bound map
+                (:attr:`contact_properties`); ``None`` uses the bound map.
 
         Returns:
             The returned contacts and every requested id's read status.
 
         Raises:
-            ValueError: When ``ids`` is one string or holds a blank id.
+            ValueError: When ``ids`` is one string or holds a blank id; before any call.
             AccessDenied: When the token or its scopes are refused.
-            QueryDefect: When a request or a response breaks the contract.
+            QueryDefect: When no ``props`` is given and none is bound (code
+                ``CONTACT_PROPERTIES_UNBOUND``, before any call), or a request or a
+                response breaks the contract.
         """
+        props = self._contact_properties_for(props)
         requested = _normalise_ids(ids, "ids")
         records = await self._read_by_id(
             _CONTACTS,
@@ -1420,7 +1522,12 @@ class HubSpotClient:
         withhold W2 and C1b permanently, while AAP 0.5.4.7 requires ``ok_empty`` to be the
         genuine zero. Only that subcategory is ``ok_empty``; every other entry is ``error``.
 
-        Failures are recorded per input, never raised, so the caller keeps what was read.
+        A call that still fails with ``TransientError`` after its retries, a batch status
+        other than ``COMPLETE``, a per-input ``errors[]`` entry other than
+        ``NO_ASSOCIATIONS_FOUND``, an input missing from the response and a repeated cursor
+        are recorded per input (``error`` or ``partial``) rather than raised, so the caller
+        keeps what was read. ``AccessDenied`` and ``QueryDefect`` propagate unchanged for
+        ``ads_engine.sync.mode`` to decide.
 
         Args:
             from_type: The input records' object type, for example ``contacts``.

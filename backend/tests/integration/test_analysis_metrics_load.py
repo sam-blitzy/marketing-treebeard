@@ -8,10 +8,12 @@ while LinkedIn is simulated; the Google-to-CRM link on HubSpot's active primary)
 from window start to run time) and 0.11.1 (absent values are ``None``, never 0).
 
 The tests drive :class:`~ads_engine.analysis.metrics.QueryScope`,
-:func:`~ads_engine.analysis.metrics.aggregate` for every grain and
+:func:`~ads_engine.analysis.metrics.aggregate_sql` for every grain and
 :func:`~ads_engine.analysis.metrics.load_context` with every loader it calls: each grain's
-rows, sums and order; dataset isolation (no row of a retired dataset, or of a dataset the
-context does not read, ever appears); the companion CRM dataset a simulated LinkedIn dataset
+rows, sums and order; the pure ``aggregate(ctx, grain)`` reading every grain of a loaded
+context back exactly as ``aggregate_sql`` returns it; dataset isolation (no row of a retired
+dataset, or of a dataset the context does not read, ever appears); the companion CRM dataset
+a simulated LinkedIn dataset
 reads; the Google-to-CRM link on HubSpot's primary; the shared CRM load while LinkedIn is
 live, whose Google discovery runs only under a verified Google link; stored CRM bindings that
 are valid, undecodable or never verified; unavailable values
@@ -88,7 +90,14 @@ from ads_engine.analysis.context import (
     Source,
     objective_group,
 )
-from ads_engine.analysis.metrics import GRAINS, CampaignDay, QueryScope, aggregate, load_context
+from ads_engine.analysis.metrics import (
+    GRAINS,
+    CampaignDay,
+    QueryScope,
+    aggregate,
+    aggregate_sql,
+    load_context,
+)
 from ads_engine.analysis.thresholds import (
     CrmBindings,
     GoogleCrmBinding,
@@ -153,11 +162,12 @@ BASELINE_START = END - timedelta(days=89)
 
 UTC_LOWER = datetime(2026, 9, 9, tzinfo=UTC)
 UTC_UPPER = datetime(2026, 10, 7, tzinfo=UTC)
-"""``window.utc_bounds()``: leads, Google-touch contacts and the window deals' start."""
+"""``window.utc_bounds()``: leads and the window deals' start."""
 
 NY_LOWER = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
 NY_UPPER = datetime(2026, 10, 7, 4, 0, tzinfo=UTC)
-"""The window's start and end + 1 day at midnight in :data:`GOOGLE_TZ`, as UTC instants."""
+"""The window's start and end + 1 day at midnight in :data:`GOOGLE_TZ`, as UTC instants:
+the Google-native range of keyword snapshots and Google-touch contacts."""
 
 OBS_LOWER = datetime(2026, 9, 7, tzinfo=UTC)
 OBS_UPPER = datetime(2026, 10, 9, tzinfo=UTC)
@@ -1933,7 +1943,7 @@ async def test_aggregate_rejects_an_unknown_grain(
     session = AsyncSession()
     try:
         with pytest.raises(ValueError, match="grain must be one of"):
-            await aggregate(_scope(session, window, thresholds, {}), "campaign_week")  # type: ignore[call-overload]
+            await aggregate_sql(_scope(session, window, thresholds, {}), "campaign_week")  # type: ignore[call-overload]
     finally:
         await session.close()
 
@@ -1984,7 +1994,7 @@ def test_bindings_of_a_dataset_never_verified_or_undecodable(log: _Log) -> None:
 
 
 # ---------------------------------------------------------------------------------------
-# aggregate(): every grain on the main world
+# aggregate_sql(): every grain on the main world
 # ---------------------------------------------------------------------------------------
 
 
@@ -1993,7 +2003,7 @@ async def test_aggregate_campaign_day_google_reads_native_dates_of_the_active_da
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "campaign_day_google"
         )
     assert rows == [
@@ -2037,7 +2047,7 @@ async def test_aggregate_campaign_day_linkedin_sums_creatives_per_utc_date(
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "campaign_day_linkedin"
         )
     assert rows == [
@@ -2079,7 +2089,7 @@ async def test_aggregate_creative_window_totals_and_delivery_days(
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "creative_window"
         )
     assert rows == [
@@ -2094,7 +2104,7 @@ async def test_aggregate_keyword_day(
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "keyword_day"
         )
     assert rows == [
@@ -2108,7 +2118,7 @@ async def test_aggregate_search_term_window_takes_status_and_keyword_of_the_late
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "search_term_window"
         )
     # ORDER BY ad group, criterion present first, criterion, term: the '' criterion (no
@@ -2165,7 +2175,7 @@ async def test_aggregate_google_rate_baseline_spans_k1_baseline_days(
 ) -> None:
     assert thresholds.int("k1.baseline_days") == 90
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "google_rate_baseline"
         )
     # START..END (1.5 + unreported + 0, 10 + 4 + 7 clicks), the day before the window
@@ -2181,7 +2191,7 @@ async def test_aggregate_segment_window_reads_only_this_exact_window(
     world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
 ) -> None:
     async with sessions() as session:
-        rows = await aggregate(
+        rows = await aggregate_sql(
             _scope(session, window, thresholds, _main_refs(world)), "segment_window"
         )
     assert rows == [
@@ -2200,7 +2210,7 @@ async def test_aggregate_returns_nothing_for_a_source_without_an_active_dataset(
     async with sessions() as session:
         scope = _scope(session, window, thresholds, {})
         for grain in GRAINS:
-            assert await aggregate(scope, grain) == [], grain
+            assert await aggregate_sql(scope, grain) == [], grain
 
 
 @pytest.mark.anyio
@@ -2212,8 +2222,41 @@ async def test_aggregate_google_rate_baseline_is_empty_without_any_fact(
     async with sessions() as session:
         refs: dict[Source, DatasetRef] = {"google": DatasetRef(google, "google", "live")}
         scope = _scope(session, window, thresholds, refs)
-        assert await aggregate(scope, "google_rate_baseline") == []
-        assert await aggregate(scope, "campaign_day_google") == []
+        assert await aggregate_sql(scope, "google_rate_baseline") == []
+        assert await aggregate_sql(scope, "campaign_day_google") == []
+
+
+async def _sql_and_context_grains(
+    sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> dict[str, tuple[list[Any], list[Any]]]:
+    """Per grain, ``(aggregate_sql rows, aggregate rows of the loaded context)``."""
+    async with sessions() as session:
+        context = await load_context(session, window, thresholds, kind="default", now=NOW)
+        scope = _scope(session, window, thresholds, context.datasets)
+        return {
+            grain: (await aggregate_sql(scope, grain), aggregate(context, grain))
+            for grain in GRAINS
+        }
+
+
+@pytest.mark.anyio
+async def test_aggregate_reads_every_sql_grain_back_from_the_loaded_context(
+    world: _World, sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> None:
+    grains = await _sql_and_context_grains(sessions, window, thresholds)
+    assert list(grains) == list(GRAINS)
+    for grain, (sql_rows, context_rows) in grains.items():
+        # Every grain of the main world has rows, so equality pins rows and their order.
+        assert sql_rows, grain
+        assert context_rows == sql_rows, grain
+
+
+@pytest.mark.anyio
+async def test_aggregate_of_an_empty_database_context_matches_the_empty_sql_grains(
+    sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> None:
+    grains = await _sql_and_context_grains(sessions, window, thresholds)
+    assert grains == {grain: ([], []) for grain in GRAINS}
 
 
 # ---------------------------------------------------------------------------------------
@@ -2509,6 +2552,74 @@ async def test_load_context_observations_bracket_the_window(
 
 
 @pytest.mark.anyio
+async def test_load_context_latest_observations_are_the_newest_snapshots_at_or_before_now(
+    world: _World, sessions: Sessions, thresholds: Thresholds
+) -> None:
+    budget_payload = {"period": "DAILY", "explicitly_shared": True}
+    async with sessions.begin() as session:
+        # The budget's newest snapshot is captured exactly at the run time. One a microsecond
+        # later is not read, nor the retired dataset's snapshot under the same internal id.
+        for dataset_id, instant, amount in (
+            (world.g, NOW, 60),
+            (world.g, NOW + MICRO, 80),
+            (world.g_old, NOW, 90),
+        ):
+            await _snapshot(
+                session,
+                "google",
+                dataset_id,
+                "budget",
+                world.b_shared,
+                instant,
+                budget_daily=_d(amount),
+                budget_amount_micros=amount * 1_000_000,
+                payload=budget_payload,
+            )
+    # A custom window that ended months before the run: even the earliest snapshot of the
+    # world lies beyond its observation margin, so its observation span holds nothing.
+    past = AnalysisWindow.custom(
+        date(2026, 6, 1),
+        date(2026, 6, 28),
+        config=thresholds,
+        sources=SourceDayInfo(GOOGLE_TZ),
+        now=NOW,
+    )
+    assert metrics._observation_bounds(past, 6)[1] < OBS_LOWER - SECOND
+    async with sessions() as session:
+        context = await load_context(session, past, thresholds, kind="custom", now=NOW)
+    assert dict(context.observations) == {}
+    assert dict(context.latest_observations) == {
+        ("budget", world.b_shared): Observation(
+            captured_at=NOW,
+            budget_daily=_d(60),
+            budget_amount_micros=60_000_000,
+            payload=budget_payload,
+        ),
+        # Snapshots after the run time (OBS_UPPER - 1 s, OBS_UPPER) are left out, and so is
+        # the retired dataset's "ended" snapshot at MID_NOON, although it was written later
+        # under the same internal id and would win the id tie-break.
+        ("campaign", world.camp_g1): Observation(
+            captured_at=MID_NOON,
+            status="paused",
+            budget_daily=_d(50),
+            budget_amount_micros=50_000_000,
+            budget_id=world.b_shared,
+            payload={"raw_status": "ENABLED", "explicitly_shared": True, "budget_period": "DAILY"},
+        ),
+        ("campaign", world.camp_l1): Observation(
+            captured_at=MID_06,
+            status="active",
+            budget_daily=_d(40),
+            payload={"raw_status": "ACTIVE"},
+        ),
+    }
+    assert list(context.latest_observations) == sorted(context.latest_observations)
+    payload = context.latest_observations[("campaign", world.camp_g1)].payload
+    with pytest.raises(TypeError):
+        payload["raw_status"] = "PAUSED"  # type: ignore[index]
+
+
+@pytest.mark.anyio
 async def test_load_context_leads_read_their_match_in_the_companion_only(
     context: AnalysisContext, world: _World
 ) -> None:
@@ -2657,11 +2768,13 @@ async def test_load_context_google_crm_reads_hubspot_primary(context: AnalysisCo
         "111",
         datetime(2026, 9, 15, tzinfo=UTC),
     )
-    discovered_823 = ContactInfo("823", "lead", None, None, "113", UTC_LOWER)
-    # Touch within [start 00:00 UTC, end + 1 day 00:00 UTC) with a campaign reference; the
-    # lead-matched live contact 809 and the retired dataset's contact 830 are not read.
-    assert crm.google_contacts == (discovered_823, discovered_820)
-    assert dict(crm.contacts) == {"820": discovered_820, "823": discovered_823}
+    discovered_821 = ContactInfo("821", "lead", None, None, "112", UTC_UPPER)
+    # Touch within the Google-native [start 00:00, end + 1 day 00:00) New York with a campaign
+    # reference: 821 at UTC midnight after the end is still the end date in New York, while
+    # 823 at UTC midnight of the start is the evening before it there. The lead-matched live
+    # contact 809 and the retired dataset's contact 830 are not read.
+    assert crm.google_contacts == (discovered_820, discovered_821)
+    assert dict(crm.contacts) == {"820": discovered_820, "821": discovered_821}
     assert dict(crm.associations) == {("contact", "820", "deal"): ("901",)}
     assert set(crm.fetches) == {
         ("contact", "820", "deal"),
@@ -2822,6 +2935,7 @@ async def test_load_context_logs_counts_without_personal_data(
         "search_terms": 3,
         "segments": 2,
         "observations": 9,
+        "latest_observations": 3,
         "leads": 4,
         "linkedin_crm_contacts": 2,
         "google_crm_contacts": 2,
@@ -3088,6 +3202,64 @@ async def test_hubspot_alone_loads_only_the_google_crm_link(
         assert dict(empty) == {}
     assert (context.leads, context.discrepancies, context.segments) == ((), (), ())
     assert (context.segment_windows, context.k1_baseline) == ((), None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "sources",
+    [
+        pytest.param(SourceDayInfo(GOOGLE_TZ), id="window-google-boundary"),
+        # Without Google days in the window, the Google account's time zone decides.
+        pytest.param(SourceDayInfo(None, ("linkedin",)), id="google-account-time-zone"),
+    ],
+)
+async def test_google_touch_contacts_are_selected_in_the_google_native_day(
+    sessions: Sessions, thresholds: Thresholds, sources: SourceDayInfo
+) -> None:
+    # AAP 0.5.4.1: the window is applied to Google's own days, [start 00:00, end + 1 day
+    # 00:00) in New York, never to UTC days (A1-F08).
+    touches = {
+        "e-ny-2300": NY_UPPER - timedelta(hours=1),  # 23:00 New York on the end date
+        "e-ny-midnight": NY_UPPER,  # the day after the end in New York
+        "s-ny-midnight": NY_LOWER,  # 00:00 New York on the start date
+        "s-ny-2300": NY_LOWER - timedelta(hours=1),  # 23:00 New York the day before the start
+    }
+    async with sessions.begin() as session:
+        google = await _dataset(session, "google", "live", "active")
+        await _put(
+            session,
+            AdAccount(
+                source="google",
+                dataset_id=google,
+                external_id="1234567890",
+                name=None,
+                currency="USD",
+                timezone=GOOGLE_TZ,
+            ),
+        )
+        hubspot = await _dataset(
+            session, "hubspot", "live", "active", bindings=VALID_BINDINGS.to_json()
+        )
+        for hs_id, touch in touches.items():
+            await _contact(
+                session, hubspot, hs_id, google_campaign_ref="111", google_touch_at=touch
+            )
+    window = AnalysisWindow.default(thresholds, sources, now=NOW)
+    assert (window.start, window.end) == (START, END)
+    async with sessions() as session:
+        context = await load_context(session, window, thresholds, kind="default", now=NOW)
+    crm = context.google_crm
+    assert crm is not None
+    # Both UTC instants differ from the native ones: e-ny-2300 is after UTC midnight following
+    # the end date (UTC bounds would drop it) and s-ny-2300 is after UTC midnight of the start
+    # date (UTC bounds would keep it).
+    assert touches["e-ny-2300"] >= UTC_UPPER
+    assert touches["s-ny-2300"] >= UTC_LOWER
+    assert [(contact.hs_id, contact.google_touch_at) for contact in crm.google_contacts] == [
+        ("s-ny-midnight", NY_LOWER),
+        ("e-ny-2300", NY_UPPER - timedelta(hours=1)),
+    ]
+    assert set(crm.contacts) == {"e-ny-2300", "s-ny-midnight"}
 
 
 @pytest.mark.anyio

@@ -15,9 +15,18 @@ whose union is the range:
    ``mid = lo + floor(hours / 2) hours`` with ``hours = ceil((hi - lo) / 1 h)``
    (24 → 12 → 6 → 3 → 1 + 2 → 1 + 1), and both halves are read in order.
 4. A partition of one hour or less is never split. When its ``total`` still exceeds
-   10,000, exactly 10,000 results are read (no request ever goes past the ceiling), the
+   10,000, it is read up to the ceiling (no request ever goes past 10,000 results), the
    partition is listed in :attr:`SearchOutcome.partitions_incomplete` and the outcome is
-   ``incomplete`` with the reason ``"result limit reached at one-hour partition"``.
+   ``incomplete`` with the reason ``"result limit reached at one-hour partition"``, whether
+   or not its last page carries a cursor.
+5. Otherwise a partition is complete only when it returned at least as many distinct record
+   ids as the ``total`` of its latest page; duplicated records never count twice. When its
+   paging ends (a page without a cursor) short of that, its rows are kept, it is listed as
+   incomplete and the outcome is ``incomplete`` with the reason
+   ``"search paging ended before its reported total"``. Totals can race deletions, so this
+   is an incomplete read rather than a defect. When the ceiling stops the paging short of
+   that instead, a partition longer than one hour is split and one of at most one hour is
+   incomplete with the ceiling reason above.
 
 Two searches use it (AAP 0.3.3):
 
@@ -40,8 +49,11 @@ Errors:
     error's :attr:`~ads_engine.connectors.errors.ConnectorError.reason`, so the dataset turns
     incomplete and keeps its last good data. ``AccessDenied`` and ``QueryDefect`` propagate
     unchanged, for ``ads_engine.sync.mode`` to decide. A response that breaks the paging
-    contract (a cursor that does not advance, or a cursor on an empty page) is a
-    ``QueryDefect``. Invalid arguments raise ``ValueError`` before any call.
+    contract is a ``QueryDefect``, raised before another request: a record without a usable
+    ``id``, a cursor on an empty page, a cursor that repeats any cursor the partition already
+    received (``A → B → A`` included), or a numeric cursor that does not exceed the previous
+    cursor when that one is numeric too. Invalid arguments raise ``ValueError`` before any
+    call.
 
 Instants (Decision 6):
     Every instant is timezone-aware; ranges are normalised to UTC, and filter values are
@@ -80,6 +92,7 @@ __all__ = [
     "MIN_PARTITION",
     "PAGE_SIZE",
     "RESULT_CEILING",
+    "SHORT_READ_REASON",
     "Completeness",
     "SearchFilter",
     "SearchOutcome",
@@ -112,6 +125,10 @@ DAY: Final = timedelta(days=1)
 
 CEILING_REASON: Final = "result limit reached at one-hour partition"
 """Reason recorded when a partition of at most one hour still holds over 10,000 results."""
+
+SHORT_READ_REASON: Final = "search paging ended before its reported total"
+"""Reason recorded when a partition's paging ends with fewer distinct records than its
+``total``, as when a last page without a cursor, or an empty one, arrives early."""
 
 _MAX_FILTERS_PER_GROUP: Final = 6
 _RANGE_FILTERS: Final = 2
@@ -448,11 +465,13 @@ class SearchOutcome:
         rows: The raw records, de-duplicated by ``id`` (first occurrence kept), in partition
             then page order. Callers parse them with ``parser.parse_deal`` or
             ``parser.parse_contact``.
-        completeness: ``complete`` when every partition was read to its last page;
-            ``incomplete`` when any partition hit the ceiling at one hour or was cut short by
-            a transient failure.
-        reason: Why the outcome is incomplete (distinct reasons joined by ``"; "``), or
-            ``None`` when it is complete.
+        completeness: ``complete`` when every partition was read to its last page and
+            returned at least its reported ``total`` of distinct records; ``incomplete`` when
+            any partition hit the ceiling at one hour, ended its paging short of its
+            ``total``, or was cut short by a transient failure.
+        reason: Why the outcome is incomplete (distinct reasons joined by ``"; "``, each
+            :data:`CEILING_REASON`, :data:`SHORT_READ_REASON` or a transient failure's
+            reason), or ``None`` when it is complete.
         partitions_incomplete: The UTC ``[lo, hi)`` partitions not read in full, ascending.
         calls: Every ``search_page`` call made, including discarded overflow pages and the
             call that failed.
@@ -475,7 +494,7 @@ class SearchOutcome:
 # ---------------------------------------------------------------------------
 
 _Partition = tuple[datetime, datetime]
-_ReadResult = Literal["done", "ceiling", "split"]
+_ReadResult = Literal["done", "ceiling", "short", "split"]
 
 
 def _defect(message: str) -> QueryDefect:
@@ -547,6 +566,10 @@ class _PartitionedSearch:
     async def read(self, lo: datetime, hi: datetime, partial: list[HubSpotRecord]) -> _ReadResult:
         """Read one partition into ``partial``, page by page.
 
+        Completeness is judged on the distinct record ids the partition returned, never on raw
+        page lengths, against the ``total`` of its latest page; raw page lengths only bound
+        each request's ``limit`` so that no request goes past the 10,000-result ceiling.
+
         Args:
             lo: The partition's inclusive lower bound.
             hi: The partition's exclusive upper bound.
@@ -554,19 +577,26 @@ class _PartitionedSearch:
                 them when a transient failure interrupts the partition. Cleared on a split.
 
         Returns:
-            ``done`` when the last page was read; ``split`` when the partition is longer than
-            one hour and holds over 10,000 results; ``ceiling`` when a partition of at most
-            one hour holds over 10,000 results and exactly the first 10,000 were read.
+            ``done`` when paging ended and the partition returned at least ``total`` distinct
+            records; ``split`` when the partition is longer than one hour and holds over
+            10,000 results; ``ceiling`` when a partition of at most one hour holds over 10,000
+            results and was read up to the ceiling, or when the ceiling stopped the read
+            before ``total`` distinct records arrived; ``short`` when paging ended (a page
+            without a cursor) with fewer than ``total`` distinct records.
 
         Raises:
             TransientError: When a page still fails after the pager's retries.
             AccessDenied: When HubSpot refuses the token.
-            QueryDefect: When a request or response breaks the contract, including a cursor
-                that does not advance or one returned with an empty page.
+            QueryDefect: When a request or response breaks the contract: a record without a
+                usable id, a cursor returned with an empty page, a cursor that repeats any
+                earlier cursor of the partition, or a numeric cursor that does not exceed a
+                numeric previous cursor. Raised before another request is made.
         """
         splittable = hi - lo > MIN_PARTITION
         after: str | None = None
         read = 0
+        unique: set[str] = set()
+        cursors: set[str] = set()
         while True:
             body = search_body(
                 self.search_filter,
@@ -580,20 +610,36 @@ class _PartitionedSearch:
             if page.total > RESULT_CEILING and splittable:
                 partial.clear()
                 return "split"
+            unique.update(_record_id(record) for record in page.results)
             partial.extend(page.results)
             read += len(page.results)
             next_after = page.after
             if next_after is None:
+                # Paging ended. A partition still above the ceiling here is at most one hour
+                # long (a longer one was split above), so it stays incomplete; otherwise the
+                # page must have delivered every match the query counts.
+                if page.total > RESULT_CEILING:
+                    return "ceiling"
+                if len(unique) < page.total:
+                    return "short"
                 return "done"
             if not page.results:
                 raise _defect("search page carried a paging cursor but no results")
-            if next_after == after:
-                raise _defect("search paging cursor did not advance")
+            if next_after in cursors:
+                raise _defect(
+                    "search paging cursor did not advance"
+                    if next_after == after
+                    else "search paging cursor repeated an earlier cursor"
+                )
             offset = _cursor_offset(next_after)
+            previous = None if after is None else _cursor_offset(after)
+            if offset is not None and previous is not None and offset <= previous:
+                raise _defect("search paging cursor did not advance")
+            cursors.add(next_after)
             if read >= RESULT_CEILING or (offset is not None and offset >= RESULT_CEILING):
                 # The next page would lie past the 10,000-result ceiling, which HubSpot rejects
                 # with HTTP 400, so it is never requested.
-                if read >= page.total:
+                if len(unique) >= page.total:
                     return "done"
                 if splittable:
                     partial.clear()
@@ -612,9 +658,10 @@ async def search_partitioned(
 
     The range is cut into one-day partitions read in ascending order. A partition whose
     ``total`` exceeds 10,000 is halved at a whole hour down to one hour; a one-hour partition
-    still above the ceiling is read to exactly 10,000 results and marked incomplete. Pages are
-    followed through ``paging.next.after`` at 200 records each. See the module docstring for
-    the full procedure.
+    still above the ceiling is read up to 10,000 results and marked incomplete. Pages are
+    followed through ``paging.next.after`` at 200 records each. A partition whose paging ends
+    with fewer distinct records than its ``total`` keeps its rows and is marked incomplete
+    with :data:`SHORT_READ_REASON`. See the module docstring for the full procedure.
 
     Args:
         pager: Sends each page request (``HubSpotClient``, or the simulator-backed client).
@@ -632,7 +679,10 @@ async def search_partitioned(
         ValueError: When ``object_type`` is not a path segment, a bound is naive, or the range
             is reversed. Raised before any call.
         AccessDenied: When HubSpot refuses the token or its scopes; propagated unchanged.
-        QueryDefect: When a request or response breaks the contract; propagated unchanged.
+        QueryDefect: When a request or response breaks the contract, propagated unchanged, or
+            when a page breaks the paging contract (a record without a usable ``id``, a
+            cursor on an empty page, a repeated cursor or a numeric cursor that does not
+            advance).
     """
     if not isinstance(object_type, str) or not _OBJECT_TYPE_RE.fullmatch(object_type):
         raise ValueError("object_type must be a CRM object type such as 'deals' or 'contacts'")
@@ -689,6 +739,11 @@ async def search_partitioned(
         if result == "ceiling":
             incomplete.append((lo, hi))
             reasons.append(CEILING_REASON)
+        elif result == "short":
+            # Totals can race deletions, so paging that ends early is an incomplete read of
+            # the rows it returned, not a defect that would fail the whole search.
+            incomplete.append((lo, hi))
+            reasons.append(SHORT_READ_REASON)
 
     completeness: Completeness = "incomplete" if incomplete else "complete"
     outcome = SearchOutcome(

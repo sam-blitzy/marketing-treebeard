@@ -80,6 +80,7 @@ from ads_engine.analysis.context import (
     DatasetRef,
     DecisionSubject,
     EntityRef,
+    Freshness,
     LeadInfo,
     RuleResult,
     Source,
@@ -265,6 +266,26 @@ def _google_crm(external_id: str, contacts: int, *, linked: bool = True) -> CrmD
         else replace(LINKED, google=GoogleCrmBinding(available=False, reason=UNLINKED_REASON))
     )
     return CrmData(GOOGLE_CRM, bindings, fetches=fetches, google_contacts=people)
+
+
+def _with_google_crm(ctx: AnalysisContext, crm: CrmData) -> AnalysisContext:
+    """Copy ``ctx`` with ``crm`` as its Google CRM dataset and that dataset's discovery row.
+
+    The ``hubspot.google_contacts`` row is complete and covers the window, so the Google
+    touch-date refresh is known (AAP 0.5.4.1 all-known evidence).
+    """
+    attempt = ctx.now - timedelta(hours=1)
+    row = Freshness(
+        dataset_id=crm.dataset.dataset_id,
+        dataset="hubspot.google_contacts",
+        last_attempt_at=attempt,
+        last_success_at=attempt,
+        covered_from=ctx.window.start - timedelta(days=90),
+        covered_through=ctx.window.end,
+        completeness="complete",
+    )
+    freshness = {**ctx.freshness, (crm.dataset.dataset_id, row.dataset): row}
+    return _fresh(ctx, google_crm=crm, freshness=freshness)
 
 
 def _population(
@@ -617,7 +638,7 @@ def test_google_items_read_a_verified_crm_link() -> None:
     scenario, ctx = _built("c1.expected.fires")
     dud = _campaign_id(scenario, "google", "dud")
     external = scenario.ids.external_id("google", "campaign", "dud")
-    linked = _fresh(ctx, google_crm=_google_crm(external, 20))
+    linked = _with_google_crm(ctx, _google_crm(external, 20))
     result = campaigns.evaluate(linked)
     item = _only(result, C1)
     assert FLAG_NO_CRM_LINK not in item.flag_codes
@@ -631,6 +652,24 @@ def test_google_items_read_a_verified_crm_link() -> None:
     )
     assert FINDING_NO_CRM_LINK not in _codes(result)
     assert attribution_for(linked).veto[dud].veto_fires
+
+
+def test_an_unknown_google_contact_refresh_makes_the_google_pipeline_unavailable() -> None:
+    # Without a hubspot.google_contacts row of the primary HubSpot dataset, the touch-date
+    # discovery refresh is unknown, so no Google population is judged (A1-F09).
+    scenario, ctx = _built("c1.expected.fires")
+    dud = _campaign_id(scenario, "google", "dud")
+    external = scenario.ids.external_id("google", "campaign", "dud")
+    unknown = _fresh(ctx, google_crm=_google_crm(external, 20))
+    reason = "Google contact refresh unknown: hubspot.google_contacts has no freshness record"
+    population = attribution_for(unknown).veto[dud]
+    assert (population.available, population.veto_fires) == (False, False)
+    assert (population.reason, population.unknown_evidence_contacts) == (reason, 20)
+    item = _only(campaigns.evaluate(unknown), C1)
+    flags = {flag.code: flag.message for flag in item.flags}
+    assert flags[FLAG_PIPELINE_UNAVAILABLE] == f"Pipeline unavailable: {reason}"
+    assert flags[FLAG_UNKNOWN_CRM_EVIDENCE] == "Unknown CRM evidence for 20 of 20 eligible contacts"
+    assert FLAG_NO_CRM_LINK not in flags
 
 
 def test_an_unverified_google_link_names_its_reason() -> None:
@@ -777,7 +816,7 @@ def test_a_pipeline_that_cannot_be_judged_is_named_in_one_finding(
     assert finding.entity is not None
     assert finding.entity.id == _campaign_id(scenario, "linkedin", "li-pipeline")
     assert finding.message.startswith("Pipeline unavailable for Pipeline Report - Lead gen: ")
-    assert finding.evidence["flags"] == flags
+    assert finding.evidence["flags"] == tuple(flags)
     assert len(finding.evidence["flag_messages"]) == len(flags)
     assert finding.evidence["unresolved_share"] == share
     assert finding.evidence["unknown_evidence_contacts"] == unknown
@@ -915,6 +954,34 @@ def test_c2_scale_links_its_b1_item_and_declares_its_g1_targets() -> None:
     )
 
 
+def test_c2_scale_sizes_b1_from_the_latest_budget_not_the_historical_one() -> None:
+    # The window was capped at 100.00 a day; the newest stored snapshot shows 200.00. The cap
+    # evidence stays historical, while the B1 step applies to the current 200.00.
+    scenario, ctx = _built("c2.outcome_scale.case")
+    campaign_id = _campaign_id(scenario, "linkedin", "li-pipeline")
+    key = ("campaign", campaign_id)
+    newest = ctx.latest_observations[key]
+    assert newest.budget_daily == Decimal("100.00")
+    raised = replace(newest, captured_at=ctx.now, budget_daily=Decimal("200.00"))
+    current = _fresh(ctx, latest_observations={**ctx.latest_observations, key: raised})
+    (entry,) = scale_outcomes(current)
+    assert isinstance(entry, ScaleOutcome)
+    assert {day.daily_budget for day in entry.history.days if day.known_active} == {
+        Decimal("100.00")
+    }
+    assert (entry.current_daily_budget, entry.proposed_daily_budget) == (
+        Decimal("200.00"),
+        Decimal("240.00"),
+    )
+    item = _only(campaigns.evaluate(current), C2)
+    assert item.action == SCALE_ACTION
+    assert item.evidence.extra["b1_link"]["current_daily_budget"] == Decimal("200.00")
+    assert item.evidence.extra["b1_link"]["proposed_daily_budget"] == Decimal("240.00")
+    assert item.evidence.extra["gate"]["known_budget_days"] == {"observed": 28, "required": 7}
+    assert _metrics(item)["daily_budget"] == Decimal("200.00")
+    assert item.reason.endswith("raise the daily budget from USD 200.00 to USD 240.00 (B1).")
+
+
 def test_c2_hold_under_the_veto_offers_no_b1_and_raises_no_spend() -> None:
     _, ctx = _built("c2.outcome_hold.case")
     item = _only(campaigns.evaluate(ctx), C2)
@@ -1003,6 +1070,20 @@ class _CountingLeads(tuple[LeadInfo, ...]):
         return super().__iter__()
 
 
+def _counting(ctx: AnalysisContext) -> _CountingLeads:
+    """Swap ``ctx.leads`` for an equal :class:`_CountingLeads` on the constructed ``ctx``.
+
+    Construction copies every sequence into a plain tuple, iterating it once, so a counting
+    tuple passed as ``leads=`` would count that copy and then never see a rule's pass. The
+    swap comes after construction validated and froze the inputs and keeps them equal, so
+    ``passes`` counts only the passes the run makes.
+    """
+    leads = _CountingLeads(ctx.leads)
+    object.__setattr__(ctx, "leads", leads)
+    assert ctx.leads is leads
+    return leads
+
+
 def test_the_young_cohort_scans_the_window_leads_once_per_run() -> None:
     _, built = _built("veto.cohort.case")
     (campaign_id,) = {lead.campaign_id for lead in built.leads}
@@ -1011,8 +1092,8 @@ def test_the_young_cohort_scans_the_window_leads_once_per_run() -> None:
     spread = tuple(
         replace(lead, campaign_id=ids[index % len(ids)]) for index, lead in enumerate(built.leads)
     )
-    leads = _CountingLeads(spread)
-    ctx = _fresh(built, leads=leads)
+    ctx = _fresh(built, leads=spread)
+    leads = _counting(ctx)
     settings = campaigns._Settings.of(ctx)
     absent = campaign_id + 3000
     cohorts = [campaigns._young_cohort(ctx, settings, cid) for cid in (*ids, absent, *ids)]
@@ -1031,8 +1112,8 @@ def test_the_young_cohort_scans_the_window_leads_once_per_run() -> None:
 
 def test_every_veto_card_of_a_run_shares_one_scan_of_the_window_leads() -> None:
     _, built = _built("veto.cohort.case")
-    leads = _CountingLeads(built.leads)
-    ctx = _fresh(built, leads=leads)
+    ctx = _fresh(built)
+    leads = _counting(ctx)
     attribution_for(ctx)
     leads.passes = 0  # the attribution table's own passes are not the young cohort's
     result = campaigns.evaluate(ctx)
@@ -1090,10 +1171,10 @@ def test_c2_scales_a_shared_budget_without_a_crm_link_at_budget_level() -> None:
     assert item.flags[1].message == "Shared budget across 2 campaigns: decided at budget level"
     assert item.decision_subject == budget
     assert item.increases_spend_on == (budget, *(DecisionSubject("campaign", m) for m in members))
-    assert item.evidence.extra["members"] == [
+    assert item.evidence.extra["members"] == (
         {"campaign_id": members[0], "name": "Generic - m1", "member_days": 28},
         {"campaign_id": members[1], "name": "Generic - m2", "member_days": 28},
-    ]
+    )
     assert "matured_ql" not in item.evidence.extra
     assert set(item.evidence.thresholds) == set(C2_THRESHOLD_KEYS)
     assert item.required_datasets == ("google.entities", "google.metrics_daily")
@@ -1137,7 +1218,7 @@ def test_a_shared_budget_holds_on_its_members_combined_google_veto() -> None:
     pool = scenario.ids.id("google", "budget", "pool")
     m1 = _campaign_id(scenario, "google", "m1")
     external = scenario.ids.external_id("google", "campaign", "m1")
-    linked = _fresh(ctx, google_crm=_google_crm(external, 20))
+    linked = _with_google_crm(ctx, _google_crm(external, 20))
     item = _only(campaigns.evaluate(linked), C2)
     assert (item.entity_ref.id, item.action) == (pool, HOLD_ACTION)
     assert item.flag_codes == (FLAG_SHARED_BUDGET,)
@@ -1170,7 +1251,7 @@ def test_a_shared_budget_holds_on_its_members_combined_google_veto() -> None:
 def test_a_hold_on_a_g1_blocked_subject_is_not_a_scale_candidate() -> None:
     scenario, ctx = _built("shared.poor_member.fires")
     external = scenario.ids.external_id("google", "campaign", "m1")
-    linked = _fresh(ctx, google_crm=_google_crm(external, 20))
+    linked = _with_google_crm(ctx, _google_crm(external, 20))
     assert scale_outcomes(linked) == ()
     assert _items(campaigns.evaluate(linked), C2) == []
 
@@ -1456,9 +1537,9 @@ def test_c3a_is_withheld_when_no_segment_window_matches_the_run(name: str, case:
         "days": ctx.window.days,
     }
     assert finding.evidence["presets"] == (14, 28, 56, 90)
-    assert finding.evidence["fetched_windows"] == [
+    assert finding.evidence["fetched_windows"] == tuple(
         {"start": start, "end": end} for start, end in sorted(ctx.segment_windows)
-    ]
+    )
     (line,) = _withheld(result, C3A)
     assert (line.entity, line.reason, line.observed, line.required, line.unit) == (
         None,
@@ -1651,7 +1732,7 @@ def test_c3b_launches_an_uncovered_converting_cluster() -> None:
         "hubspot alternative",
         "hubspot alternative free",
     ]
-    assert extra["campaign_ids"] == [search]
+    assert extra["campaign_ids"] == (search,)
     assert extra["source_label"] == "from your search-term report"
     assert _metrics(item) == {
         "members": 3,

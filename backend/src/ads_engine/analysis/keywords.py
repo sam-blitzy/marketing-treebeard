@@ -17,7 +17,7 @@ item's own evidence, so the text can never drift from the numbers (AAP 0.5.4).
 The section also carries one ``search_term_coverage`` finding per Google account: search-term
 spend divided by keyword spend over the window. Google withholds low-volume search terms for
 privacy, so search-term totals fall below keyword totals; below
-``keywords.min_search_term_coverage`` every K1 and K2 item carries the
+``keywords.min_search_term_coverage`` every K1, K2 and K3 item of the account carries the
 ``search_term_coverage`` flag.
 
 Adjacent terms (K2) come from the account's own search-term report, because Google's Keyword
@@ -47,7 +47,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 from fractions import Fraction
 from typing import Any, Final, Literal
@@ -58,6 +58,7 @@ from ads_engine.analysis.context import (
     ENTITY_SEARCH_TERM,
     FINDING_K1_NO_BASELINE,
     FINDING_SEARCH_TERM_COVERAGE,
+    FLAG_INCOMPLETE,
     FLAG_SEARCH_TERM_COVERAGE,
     GROUP_BLOCK,
     GROUP_EXPAND,
@@ -83,6 +84,7 @@ from ads_engine.analysis.context import (
     Sample,
     SearchTermRow,
     Withheld,
+    keyword_external_id,
     search_term_external_id,
 )
 from ads_engine.analysis.metrics import Totals, window_totals
@@ -138,14 +140,24 @@ _EXCLUDED_STATUSES: Final[frozenset[str]] = frozenset({"EXCLUDED", "ADDED_EXCLUD
 K1_DATASETS: Final[tuple[str, ...]] = ("google.search_terms", "google.metrics_daily")
 """The datasets K1 reads; its items' ``stale`` and ``incomplete`` flags derive from them."""
 
-K2_DATASETS: Final[tuple[str, ...]] = ("google.search_terms", "google.metrics_daily")
-"""The datasets K2 reads."""
+K2_DATASETS: Final[tuple[str, ...]] = (
+    "google.search_terms",
+    "google.metrics_daily",
+    "google.entities",
+)
+"""The datasets K2 reads: search terms and their adjacent terms, campaign daily facts for the
+campaign cost/conversion, and the Q-G7 keywords that adjacent terms must not already be."""
 
-K3_DATASETS: Final[tuple[str, ...]] = ("google.metrics_daily", "google.entities")
-"""The datasets K3 reads: keyword daily facts and the Q-G7 keyword snapshots."""
+K3_DATASETS: Final[tuple[str, ...]] = (
+    "google.metrics_daily",
+    "google.entities",
+    "google.search_terms",
+)
+"""The datasets K3 reads: keyword daily facts, the Q-G7 keyword snapshots, and search-term
+spend for the account's search-term coverage."""
 
 COVERAGE_THRESHOLD_KEY: Final = "keywords.min_search_term_coverage"
-"""The share of keyword spend below which K1 and K2 items carry ``search_term_coverage``."""
+"""The share of keyword spend below which every keyword item carries ``search_term_coverage``."""
 
 K1_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "k1.baseline_days",
@@ -176,6 +188,7 @@ K3_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "k3.qs_drop",
     "k3.rise_ratio",
     "k3.min_first_half_conversions",
+    COVERAGE_THRESHOLD_KEY,
 )
 """Every threshold K3 applies."""
 
@@ -575,7 +588,7 @@ class _Coverage:
     below_minimum: bool
 
     def flag(self) -> Flag | None:
-        """Return the ``search_term_coverage`` flag for this account's K1/K2 items, if low."""
+        """Return the ``search_term_coverage`` flag for this account's keyword items, if low."""
         if not self.below_minimum or self.share is None:
             return None
         percent = format(_percent(self.share), "f")
@@ -657,8 +670,8 @@ def _coverage_finding(ctx: AnalysisContext, cfg: _Config, item: _Coverage) -> Fi
         )
         if item.below_minimum:
             message += (
-                f" Coverage is below the {format(minimum, 'f')}% minimum, so block and "
-                "expansion candidates carry the low-coverage flag."
+                f" Coverage is below the {format(minimum, 'f')}% minimum, so every keyword "
+                "item carries the low-coverage flag."
             )
     return Finding(
         code=FINDING_SEARCH_TERM_COVERAGE,
@@ -709,13 +722,21 @@ def _search_term_ref(ctx: AnalysisContext, row: SearchTermRow) -> EntityRef:
     )
 
 
-def _keyword_ref(keyword: KeywordInfo) -> EntityRef:
-    """Return a keyword's entity, keyed by its Google criterion id."""
+def _keyword_ref(ctx: AnalysisContext, keyword: KeywordInfo) -> EntityRef:
+    """Return a keyword's entity: keyed by its ad group and Google criterion id.
+
+    A criterion id is unique only within its ad group, so the key is built from both platform
+    ids (:func:`keyword_external_id`): feedback on one keyword never matches a keyword with the
+    same criterion id in another ad group, and still matches it across runs and dataset
+    transitions.
+    """
+    group = ctx.ad_groups.get(keyword.ad_group_id)
+    group_external = str(keyword.ad_group_id) if group is None else group.external_id
     return EntityRef(
         source=_GOOGLE,
         type=ENTITY_KEYWORD,
         id=keyword.id,
-        external_id=keyword.criterion_id,
+        external_id=keyword_external_id(group_external, keyword.criterion_id),
         name=keyword.text,
     )
 
@@ -809,6 +830,162 @@ def _k1_unusable(baseline: RateBaseline, cfg: _Config) -> tuple[str, str] | None
     return None
 
 
+_K1_BASELINE_DATASET: Final = "google.metrics_daily"
+"""The dataset K1's account rate baseline is read from (Google daily campaign metrics)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineCoverage:
+    """How far ``google.metrics_daily`` covers K1's baseline span (AAP 0.3.2, 0.5.4.8).
+
+    The span runs ``k1.baseline_days`` back from the window end whether or not daily metrics
+    exist for all of it, so a window near the start of the backfill reads its rate from only
+    part of the span. The span is fully assessed only when the dataset's freshness row is
+    ``complete`` and its covered range holds every day of the span; anything else, a missing
+    row or an unknown covered date included, is reported as not assessed, never assumed.
+
+    Attributes:
+        start: First native date of the baseline span.
+        end: Last native date of the span (the window end).
+        days: ``k1.baseline_days``, the span's configured length.
+        recorded: Whether the dataset has a freshness row.
+        covered_from: The row's first covered date; ``None`` when unknown or without a row.
+        covered_through: The row's last covered date; ``None`` when unknown or without a row.
+        completeness: The row's completeness; ``None`` without a row.
+        reason: The row's reason for not being complete, when it records one.
+    """
+
+    start: date
+    end: date
+    days: int
+    recorded: bool
+    covered_from: date | None
+    covered_through: date | None
+    completeness: str | None
+    reason: str | None
+
+    @property
+    def span_days(self) -> int:
+        """Days in the baseline span, both ends included."""
+        return (self.end - self.start).days + 1
+
+    @property
+    def covered_days(self) -> int | None:
+        """Days of the span inside the covered range; ``None`` when a covered date is unknown."""
+        if self.covered_from is None or self.covered_through is None:
+            return None
+        first = max(self.start, self.covered_from)
+        last = min(self.end, self.covered_through)
+        return max((last - first).days + 1, 0)
+
+    @property
+    def complete(self) -> bool:
+        """Whether the span is fully assessed: a ``complete`` row covering start to end."""
+        return (
+            self.completeness == "complete"
+            and self.covered_from is not None
+            and self.covered_through is not None
+            and self.covered_from <= self.start
+            and self.covered_through >= self.end
+        )
+
+    def _state(self) -> str | None:
+        """Describe a recorded row that is not ``complete``, with its reason; else ``None``."""
+        if self.completeness is None or self.completeness == "complete":
+            return None
+        if self.completeness == "incomplete":
+            state = "the dataset is incomplete"
+        else:
+            state = f"the dataset's completeness is {self.completeness}"
+        return f"{state}: {self.reason}" if self.reason else state
+
+    def flag(self) -> Flag | None:
+        """Return the ``incomplete`` flag naming the actual coverage, or ``None`` when assessed."""
+        if self.complete:
+            return None
+        span = (
+            f"the {self.span_days}-day baseline {self.start.isoformat()} to {self.end.isoformat()}"
+        )
+        covered = self.covered_days
+        if not self.recorded:
+            detail = f"no Google daily metrics coverage is recorded for {span}"
+        elif self.covered_from is None or self.covered_through is None:
+            first = "unknown" if self.covered_from is None else self.covered_from.isoformat()
+            last = "unknown" if self.covered_through is None else self.covered_through.isoformat()
+            detail = (
+                f"Google daily metrics coverage of {span} is unknown (covered from {first} "
+                f"through {last})"
+            )
+        else:
+            detail = (
+                f"Google daily metrics cover {self.covered_from.isoformat()} to "
+                f"{self.covered_through.isoformat()} of {span} ({covered} of "
+                f"{self.span_days} days covered)"
+            )
+        state = self._state()
+        if state is not None:
+            detail = f"{detail}; {state}"
+        return Flag(FLAG_INCOMPLETE, f"Baseline incomplete: {detail}")
+
+    def label_note(self) -> str:
+        """Return the baseline label's suffix: ``""`` when assessed, else what the rate lacks."""
+        if self.complete:
+            return ""
+        notes: list[str] = []
+        if self.covered_from is None or self.covered_through is None:
+            notes.append("coverage unknown")
+        else:
+            first, last = self.covered_from.isoformat(), self.covered_through.isoformat()
+            short_start = self.covered_from > self.start
+            short_end = self.covered_through < self.end
+            if short_start and short_end:
+                notes.append(f"data {first} to {last}")
+            elif short_start:
+                notes.append(f"data from {first}")
+            elif short_end:
+                notes.append(f"data through {last}")
+        if self.completeness == "incomplete":
+            notes.append("daily metrics incomplete")
+        elif self.completeness is not None and self.completeness != "complete":
+            notes.append(f"daily metrics completeness {self.completeness}")
+        return f" (incomplete: {', '.join(notes)})"
+
+    def extra(self) -> dict[str, Any]:
+        """Return the baseline span with its assessed coverage, for ``evidence.extra``."""
+        covered = self.covered_days
+        return {
+            "start": self.start,
+            "end": self.end,
+            "days": self.days,
+            "covered_from": self.covered_from,
+            "covered_through": self.covered_through,
+            "completeness": self.completeness,
+            "coverage_reason": self.reason,
+            "complete": self.complete,
+            "covered_days": covered,
+            "uncovered_days": None if covered is None else self.span_days - covered,
+        }
+
+
+def _k1_baseline_coverage(
+    ctx: AnalysisContext, cfg: _Config, start: date, end: date
+) -> _BaselineCoverage:
+    """Assess ``google.metrics_daily`` over K1's baseline span ``[start, end]``, once per run."""
+    row = ctx.freshness_for(
+        _K1_BASELINE_DATASET, ctx.dataset_id_for(_K1_BASELINE_DATASET, crm_scope=None)
+    )
+    return _BaselineCoverage(
+        start=start,
+        end=end,
+        days=cfg.k1_baseline_days,
+        recorded=row is not None,
+        covered_from=None if row is None else row.covered_from,
+        covered_through=None if row is None else row.covered_through,
+        completeness=None if row is None else row.completeness,
+        reason=None if row is None else row.reason,
+    )
+
+
 def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]) -> RuleResult:
     """Withhold K1 account-wide: a ``k1_no_baseline`` finding and one withheld line, no items."""
     reason, detail = reasons
@@ -816,6 +993,12 @@ def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]
     rate = None
     if baseline is not None and baseline.clicks > 0:
         rate = _significant(_exact(baseline.conversions) / baseline.clicks)
+    if baseline is not None:
+        span = (baseline.start, baseline.end)
+    else:
+        # No facts at all: assess the span the baseline would have read.
+        span = (ctx.window.end - timedelta(days=cfg.k1_baseline_days - 1), ctx.window.end)
+    coverage = _k1_baseline_coverage(ctx, cfg, *span)
     finding = Finding(
         code=FINDING_K1_NO_BASELINE,
         section=KEYWORDS,
@@ -832,6 +1015,7 @@ def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]
             "baseline_rate": rate,
             "baseline_start": None if baseline is None else baseline.start,
             "baseline_end": None if baseline is None else baseline.end,
+            "baseline_coverage": coverage.extra(),
             "required": _plain(cfg.k1_min_baseline_conversions),
             "window": ctx.window.to_json(),
             "thresholds": ctx.thresholds.subset(*K1_THRESHOLD_KEYS),
@@ -850,7 +1034,13 @@ def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]
 
 
 def _k1_reason(evidence: Evidence) -> str:
-    """Render K1's reason from its evidence only (AAP 0.5.4: the text cannot drift)."""
+    """Render K1's reason from its evidence only (AAP 0.5.4: the text cannot drift).
+
+    An ``ADDED`` term always names its matched keyword criterion and warns that an exact-match
+    negative also blocks that keyword's exact-match traffic. Each part of the matched keyword
+    the evidence lacks (text, match type or criterion) is labelled unavailable, never dropped.
+    Any other term names its matched keyword when the evidence has one.
+    """
     days = evidence.window["days"]
     spend = _render(evidence.metric("wasted_spend"))
     clicks = _render(evidence.metric("clicks"))
@@ -865,12 +1055,19 @@ def _k1_reason(evidence: Evidence) -> str:
         f"{_number_text(rate)} (conversions ÷ clicks), and at least {_number_text(multiple)}x "
         f"the account cost/conversion of {_money_text(cpa, currency)}."
     )
-    matched = evidence.extra.get("matched_keyword_text")
-    if evidence.extra.get("term_status") == "ADDED" and matched:
-        match_type = evidence.extra.get("matched_match_type") or "unknown match type"
-        criterion = evidence.extra.get("matched_criterion_id") or "unknown"
+    if evidence.extra.get("term_status") == "ADDED":
+        # Q-G6 may omit any part of the matched keyword: the criterion is named whenever it is
+        # present, and the exact-match caution never depends on the keyword text.
+        text, match_type, criterion = (
+            str(evidence.extra.get(key) or "").strip() or unavailable
+            for key, unavailable in (
+                ("matched_keyword_text", "keyword text unavailable"),
+                ("matched_match_type", "match type unavailable"),
+                ("matched_criterion_id", "unavailable"),
+            )
+        )
         reason += (
-            f" The term is already a keyword: {matched} ({match_type}, criterion {criterion}). "
+            f" The term is already a keyword: {text} ({match_type}, criterion {criterion}). "
             "An exact-match negative also blocks that keyword's exact-match traffic."
         )
     elif "matched_keyword" in {metric.key for metric in evidence.metrics}:
@@ -887,8 +1084,13 @@ def _k1_candidate(
     baseline: RateBaseline,
     n_star: int,
     coverage: _Coverage,
+    baseline_coverage: _BaselineCoverage,
 ) -> Candidate:
-    """Build one K1 item: a zero-conversion term that cleared the click and spend gates."""
+    """Build one K1 item: a zero-conversion term that cleared the click and spend gates.
+
+    ``baseline_coverage`` is the run's assessment of the baseline span: when it is not fully
+    assessed the item carries the ``incomplete`` flag and the baseline label says so.
+    """
     currency = coverage.account.currency
     spend = _money(row.cost, currency)
     outcomes = account_totals.outcomes if account_totals.outcomes is not None else Decimal(0)
@@ -919,7 +1121,7 @@ def _k1_candidate(
         Baseline(
             "baseline_rate",
             f"Account conversions per click, {baseline.start.isoformat()} to "
-            f"{baseline.end.isoformat()}",
+            f"{baseline.end.isoformat()}{baseline_coverage.label_note()}",
             _significant(rate),
         ),
         Baseline("baseline_conversions", "Baseline conversions", _count(baseline.conversions)),
@@ -934,11 +1136,7 @@ def _k1_candidate(
         "negative_match_type": "EXACT",
         "min_spend_cpa_multiple": _plain(cfg.k1_spend_multiple),
         "min_clicks_label": MIN_CLICKS_LABEL,
-        "baseline_window": {
-            "start": baseline.start,
-            "end": baseline.end,
-            "days": cfg.k1_baseline_days,
-        },
+        "baseline_window": baseline_coverage.extra(),
         "search_term_coverage": coverage.extra(),
     }
     evidence = ctx.make_evidence(
@@ -959,7 +1157,7 @@ def _k1_candidate(
         reason=_k1_reason(evidence),
         evidence=evidence,
         rank_key=(-row.cost,),
-        flags=_flags(coverage.flag()),
+        flags=(*_flags(coverage.flag()), *_flags(baseline_coverage.flag())),
         required_datasets=K1_DATASETS,
         increases_spend_on=(),
         # Keyword items offer "Mark done", never "Record decision" (AAP 0.5.5).
@@ -977,6 +1175,60 @@ def _account_totals(
             window_totals(ctx, account.campaign_ids) if account.campaign_ids else None
         )
     return cache[account.id]
+
+
+def _k1_without_cpa(ctx: AnalysisContext, account: _Account, totals: Totals | None) -> Withheld:
+    """The account-wide K1 line when the account cost/conversion is unavailable.
+
+    Three states, each described as it is, never as a default zero (AAP 0.11.1):
+
+    - some campaign day did not report conversions, so the account total is unknown rather
+      than a partial count; the line shows the days with conversions reported against the
+      days with metrics;
+    - the window reported a known total of 0 conversions; the line shows that count;
+    - no conversion data was recorded at all, because the account has no Google campaign or
+      no campaign day fell in the window; the line says so and carries no sample.
+    """
+    if totals is not None and totals.unreported_days > 0:
+        return Withheld(
+            rule_id=K1,
+            section=KEYWORDS,
+            entity=account.ref,
+            reason=(
+                "account cost/conversion unavailable: conversions unavailable on "
+                f"{totals.unreported_days} of {totals.days} days in the "
+                f"{ctx.window.days}-day window"
+            ),
+            observed=totals.days - totals.unreported_days,
+            required=totals.days,
+            unit="days with conversions reported",
+        )
+    if totals is not None and totals.outcomes is not None:
+        return Withheld(
+            rule_id=K1,
+            section=KEYWORDS,
+            entity=account.ref,
+            reason=(
+                "account cost/conversion unavailable: "
+                f"{_number_text(_count(totals.outcomes))} conversions in the "
+                f"{ctx.window.days}-day window"
+            ),
+            observed=totals.outcomes,
+            required=None,
+            unit="conversions",
+        )
+    return Withheld(
+        rule_id=K1,
+        section=KEYWORDS,
+        entity=account.ref,
+        reason=(
+            "account cost/conversion unavailable: no conversion data recorded for the "
+            f"account in the {ctx.window.days}-day window"
+        ),
+        observed=None,
+        required=None,
+        unit="conversions",
+    )
 
 
 def _evaluate_k1(
@@ -1010,6 +1262,18 @@ def _evaluate_k1(
     typical conversion's cost to have been spent. A term at the spend floor but below n* is
     listed as withheld with its clicks observed and required.
 
+    Baseline coverage: the baseline spans ``k1.baseline_days`` whether or not
+    ``google.metrics_daily`` covers all of it, for example a custom window near the start of
+    the backfill. The span is assessed once per run and is fully assessed only when that
+    dataset's freshness row is ``complete`` and covers the span from start to end. Otherwise
+    K1 still evaluates, because only the conversion minimum and an unusable rate withhold it,
+    but every K1 item carries the ``incomplete`` flag naming the actual coverage, the baseline
+    label says the rate is partial, and ``evidence.extra["baseline_window"]`` records
+    ``covered_from``, ``covered_through``, ``completeness``, ``complete`` and the covered and
+    uncovered days. A missing freshness row or an unknown covered date counts as not assessed,
+    never as complete (AAP 0.3.2, 0.5.4.8). The ``k1_no_baseline`` finding carries the same
+    assessment as ``baseline_coverage``.
+
     Returns:
         Items in group ``block`` ranked by spend descending (``rank_key = (-spend,)``), the
         withheld lines, and the ``k1_no_baseline`` finding when the baseline is unusable.
@@ -1020,6 +1284,7 @@ def _evaluate_k1(
     unusable = _k1_unusable(baseline, cfg)
     if unusable is not None:
         return _k1_no_baseline(ctx, cfg, unusable)
+    baseline_coverage = _k1_baseline_coverage(ctx, cfg, baseline.start, baseline.end)
     rate = _exact(baseline.conversions) / baseline.clicks
     n_star = _min_clicks_exact(rate, cfg.k1_floor, _exact(cfg.k1_rule_of_three))
     multiple = _exact(cfg.k1_spend_multiple)
@@ -1039,20 +1304,7 @@ def _evaluate_k1(
         if totals is None or totals.outcomes is None or totals.outcomes <= 0:
             if account.id not in without_cpa:
                 without_cpa.add(account.id)
-                withheld.append(
-                    Withheld(
-                        rule_id=K1,
-                        section=KEYWORDS,
-                        entity=account.ref,
-                        reason=(
-                            "account cost/conversion unavailable: 0 conversions in the "
-                            f"{ctx.window.days}-day window"
-                        ),
-                        observed=None if totals is None else totals.outcomes,
-                        required=None,
-                        unit="conversions",
-                    )
-                )
+                withheld.append(_k1_without_cpa(ctx, account, totals))
             continue
         # spend ≥ multiple x (account spend ÷ account conversions), cross-multiplied exactly.
         if _exact(row.cost) * _exact(totals.outcomes) < multiple * _exact(totals.spend):
@@ -1071,7 +1323,17 @@ def _evaluate_k1(
             )
             continue
         candidates.append(
-            _k1_candidate(ctx, cfg, row, campaign, totals, baseline, n_star, coverage[account.id])
+            _k1_candidate(
+                ctx,
+                cfg,
+                row,
+                campaign,
+                totals,
+                baseline,
+                n_star,
+                coverage[account.id],
+                baseline_coverage,
+            )
         )
     return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
 
@@ -1309,17 +1571,22 @@ def _evaluate_k2(
     at or better than campaign efficiency. Adjacent terms come from the account's own report,
     because Keyword Planner is not reachable through the n8n webhook.
 
+    Sample withholding (P6): a ``NONE`` term with some conversions, at or better than campaign
+    efficiency, but below ``k2.min_conversions`` is listed as withheld with its conversions
+    observed and required, for example "conversions 2 of 3 required" (fractional conversions
+    shown exactly, such as 2.5). Terms above the campaign's cost/conversion, and terms with no
+    conversions, are not K2 patterns and are not listed.
+
     Returns:
         Items in group ``expand`` ranked by conversions descending, then cost/conversion
-        ascending (``rank_key = (-conversions, cost_per_conversion)``).
+        ascending (``rank_key = (-conversions, cost_per_conversion)``), and the withheld lines.
     """
     pools: dict[int, _AdjacentPool] = {}
     totals_cache: dict[int, Totals] = {}
     candidates: list[Candidate] = []
+    withheld: list[Withheld] = []
     for row in ctx.search_terms:
         if row.term_status not in _K2_STATUSES or row.conversions <= 0:
-            continue
-        if _exact(row.conversions) < cfg.k2_min_conversions:
             continue
         campaign = _google_campaign(ctx, row.campaign_id)
         account = None if campaign is None else accounts.get(campaign.account_id)
@@ -1335,13 +1602,30 @@ def _evaluate_k2(
             cfg.k2_max_cpa_ratio * _exact(totals.spend) * _exact(row.conversions)
         ):
             continue
+        if _exact(row.conversions) < cfg.k2_min_conversions:
+            observed = _count(row.conversions)
+            minimum = _plain(_to_decimal(cfg.k2_min_conversions))
+            withheld.append(
+                Withheld(
+                    rule_id=K2,
+                    section=KEYWORDS,
+                    entity=_search_term_ref(ctx, row),
+                    reason=(
+                        f"conversions {_number_text(observed)} of {_number_text(minimum)} required"
+                    ),
+                    observed=observed,
+                    required=minimum,
+                    unit="conversions",
+                )
+            )
+            continue
         if account.id not in pools:
             pools[account.id] = _adjacent_pool(ctx, cfg, account)
         adjacent = _adjacent(pools[account.id], cfg, row.search_term)
         candidates.append(
             _k2_candidate(ctx, cfg, row, campaign, totals, adjacent, coverage[account.id])
         )
-    return RuleResult(candidates=tuple(candidates))
+    return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
 
 
 # ---------------------------------------------------------------------------
@@ -1355,7 +1639,9 @@ type _QsBasis = Literal["daily", "snapshots"]
 class _Half:
     """One half of the window for one keyword: its dates and summed facts.
 
-    ``conversions`` is ``None`` when no day of the half reported conversions.
+    ``conversions`` is known only when every day of the half reported them. It is ``None``
+    (unavailable) when any day left conversions unreported, or no day falls in the half, so
+    an unknown day never turns into a zero or a partial sum.
     """
 
     start: date
@@ -1366,19 +1652,27 @@ class _Half:
 
 
 def _half(days: Sequence[KeywordDay], start: date, end: date) -> _Half:
-    """Sum a keyword's days from ``start`` to ``end`` inclusive."""
+    """Sum a keyword's days from ``start`` to ``end`` inclusive.
+
+    Cost and clicks sum over every included day. Conversions sum only when every included day
+    reported them; one unreported day makes the half's conversions ``None``.
+    """
     cost = Decimal(0)
     clicks = 0
     conversions = Decimal(0)
     reported = False
+    unreported = False
     for day in days:
         if start <= day.date <= end:
             cost += day.cost
             clicks += day.clicks
-            if day.conversions is not None:
+            if day.conversions is None:
+                unreported = True
+            else:
                 conversions += day.conversions
                 reported = True
-    return _Half(start, end, cost, clicks, conversions if reported else None)
+    known = reported and not unreported
+    return _Half(start, end, cost, clicks, conversions if known else None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1524,11 +1818,15 @@ class _CpcRise:
         cpc_first: First-half spend ÷ clicks.
         cpc_second: Second-half spend ÷ clicks.
         cpc_ratio: ``cpc_second ÷ cpc_first``; ``None`` when the first-half CPC is 0.
-        cpa_first: First-half cost/conversion; ``None`` at 0 or unreported conversions.
-        cpa_second: Second-half cost/conversion; ``None`` at 0 or unreported conversions.
-        cpa_ratio: ``cpa_second ÷ cpa_first`` when both exist.
-        conversions_fell: Second-half conversions are 0 while the first half had at least
-            ``k3.min_first_half_conversions``.
+        cpa_first: First-half cost/conversion; ``None`` at 0 conversions or when the half's
+            conversions are unknown (any day unreported).
+        cpa_second: Second-half cost/conversion; ``None`` at 0 conversions or when the half's
+            conversions are unknown (any day unreported).
+        cpa_ratio: ``cpa_second ÷ cpa_first`` when both exist and ``cpa_first`` is positive;
+            otherwise ``None`` (unavailable), so a zero-spend first half never divides by 0.
+        conversions_fell: Second-half conversions are known to be 0 while the first half's
+            known conversions are at least ``k3.min_first_half_conversions``; unknown
+            conversions in either half never count as a fall.
         fires: ``cpc_ratio ≥ k3.rise_ratio`` and either ``cpa_ratio ≥ k3.rise_ratio`` or
             ``conversions_fell``: CPC rose without a matching rise in conversion.
     """
@@ -1551,13 +1849,17 @@ def _cost_per(cost: Decimal, count: Decimal | int | None) -> Fraction | None:
 
 
 def _cpc_rise(cfg: _Config, first: _Half, second: _Half) -> _CpcRise:
-    """Evaluate K3 branch (b) on two halves that both cleared the click gate."""
+    """Evaluate K3 branch (b) on two halves that each have at least one click."""
     cpc_first = _exact(first.cost) / first.clicks
     cpc_second = _exact(second.cost) / second.clicks
     cpc_ratio = cpc_second / cpc_first if cpc_first > 0 else None
     cpa_first = _cost_per(first.cost, first.conversions)
     cpa_second = _cost_per(second.cost, second.conversions)
-    cpa_ratio = cpa_second / cpa_first if cpa_first is not None and cpa_second is not None else None
+    cpa_ratio = (
+        cpa_second / cpa_first
+        if cpa_first is not None and cpa_first > 0 and cpa_second is not None
+        else None
+    )
     conversions_fell = (
         second.conversions is not None
         and second.conversions == 0
@@ -1678,8 +1980,9 @@ def _k3_candidate(
     halves: tuple[_Half, _Half],
     quality: _QualityScore,
     cpc: _CpcRise,
+    coverage: _Coverage,
 ) -> Candidate:
-    """Build one K3 item from the branches that fired."""
+    """Build one K3 item from the branches that fired, with its account's coverage flag."""
     currency = ctx.account_currency(campaign.id)
     whole = _half(days, ctx.window.start, ctx.window.end)
     first, second = halves
@@ -1770,6 +2073,7 @@ def _k3_candidate(
             "second": _span_json(second.start, second.end),
         },
         "conversions_fell": cpc.conversions_fell,
+        "search_term_coverage": coverage.extra(),
     }
     evidence = ctx.make_evidence(
         required_datasets=K3_DATASETS,
@@ -1787,12 +2091,12 @@ def _k3_candidate(
         rule_id=K3,
         section=KEYWORDS,
         group=GROUP_REVIEW,
-        entity_ref=_keyword_ref(keyword),
+        entity_ref=_keyword_ref(ctx, keyword),
         action=K3_ACTION,
         reason=_k3_reason(evidence),
         evidence=evidence,
         rank_key=(-whole.cost,),
-        flags=(),
+        flags=_flags(coverage.flag()),
         required_datasets=K3_DATASETS,
         increases_spend_on=(),
         decision_subject=None,
@@ -1805,7 +2109,12 @@ def _k3_required_days(ctx: AnalysisContext, cfg: _Config) -> int:
     return max(cfg.k3_min_window_days, ctx.window.sustained_min_days, 2)
 
 
-def _evaluate_k3(ctx: AnalysisContext, cfg: _Config) -> RuleResult:
+def _evaluate_k3(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    accounts: Mapping[int, _Account],
+    coverage: Mapping[int, _Coverage],
+) -> RuleResult:
     """Rule K3 Review: declining quality score, or CPC rising without a matching conversion rise.
 
     AAP 0.5.4.3 K3, FR-4 (c). The window must reach ``k3.min_window_days`` and
@@ -1822,9 +2131,22 @@ def _evaluate_k3(ctx: AnalysisContext, cfg: _Config) -> RuleResult:
       second ÷ first half ≥ ``k3.rise_ratio``, or second-half conversions are 0 with at least
       ``k3.min_first_half_conversions`` in the first half.
 
+    Each item carries the ``search_term_coverage`` flag when its account's search-term coverage
+    is below ``keywords.min_search_term_coverage``.
+
+    Sample withholding (P6): a keyword with fewer than ``k3.min_clicks_per_half`` clicks in
+    either half is withheld when a branch would otherwise fire, with the smaller half's clicks
+    observed against the minimum in clicks per half. The reason names each short half with its
+    clicks and dates, for example "clicks 29 of 30 required in the first half (2026-09-04 to
+    2026-09-17)"; the CPC branch is evaluated only when both halves have a click. A keyword
+    showing no pattern is not listed. A keyword clearing the click gate whose daily quality
+    scores fall short of ``k3.min_qs_days_per_span`` is withheld with the quality-score days
+    observed and required, unless the CPC branch fires.
+
     Threshold keys: ``k3.min_window_days``, ``window.sustained_min_days``,
     ``k3.min_clicks_per_half``, ``k3.qs_span_days``, ``k3.min_qs_days_per_span``,
-    ``k3.qs_drop``, ``k3.rise_ratio`` and ``k3.min_first_half_conversions``.
+    ``k3.qs_drop``, ``k3.rise_ratio``, ``k3.min_first_half_conversions`` and
+    ``keywords.min_search_term_coverage``.
 
     Rationale: 30 clicks per half give a stable CPC; a one-point drop on the integer 1-10
     quality-score scale is material; 15% is above normal auction noise, and requiring
@@ -1855,23 +2177,57 @@ def _evaluate_k3(ctx: AnalysisContext, cfg: _Config) -> RuleResult:
     (first_start, first_end), (second_start, second_end) = window.halves()
     candidates: list[Candidate] = []
     withheld: list[Withheld] = []
+    minimum = cfg.k3_min_clicks_per_half
     for keyword_id in sorted(ctx.keyword_days):
         keyword = ctx.keywords.get(keyword_id)
         campaign = None if keyword is None else _google_campaign(ctx, keyword.campaign_id)
-        if keyword is None or campaign is None:
+        account = None if campaign is None else accounts.get(campaign.account_id)
+        if keyword is None or campaign is None or account is None:
             continue
         days = [
             day for day in ctx.keyword_days[keyword_id] if window.start <= day.date <= window.end
         ]
         first = _half(days, first_start, first_end)
         second = _half(days, second_start, second_end)
-        if min(first.clicks, second.clicks) < cfg.k3_min_clicks_per_half:
-            continue
         quality = _quality_score(ctx, cfg, keyword, campaign, days)
+        if min(first.clicks, second.clicks) < minimum:
+            # P6: a pattern below the click minimum is withheld, and a keyword showing no
+            # pattern is not listed. CPC needs a click in each half, so it never divides by 0.
+            cpc_fires = (
+                first.clicks > 0 and second.clicks > 0 and _cpc_rise(cfg, first, second).fires
+            )
+            if quality.fires or cpc_fires:
+                withheld.append(
+                    Withheld(
+                        rule_id=K3,
+                        section=KEYWORDS,
+                        entity=_keyword_ref(ctx, keyword),
+                        reason="; ".join(
+                            f"clicks {half.clicks} of {minimum} required in the {name} half "
+                            f"({half.start} to {half.end})"
+                            for name, half in (("first", first), ("second", second))
+                            if half.clicks < minimum
+                        ),
+                        observed=min(first.clicks, second.clicks),
+                        required=minimum,
+                        unit="clicks per half",
+                    )
+                )
+            continue
         cpc = _cpc_rise(cfg, first, second)
         if quality.fires or cpc.fires:
             candidates.append(
-                _k3_candidate(ctx, cfg, keyword, campaign, days, (first, second), quality, cpc)
+                _k3_candidate(
+                    ctx,
+                    cfg,
+                    keyword,
+                    campaign,
+                    days,
+                    (first, second),
+                    quality,
+                    cpc,
+                    coverage[account.id],
+                )
             )
         elif quality.shortfall is not None:
             span_name, observed = quality.shortfall
@@ -1879,7 +2235,7 @@ def _evaluate_k3(ctx: AnalysisContext, cfg: _Config) -> RuleResult:
                 Withheld(
                     rule_id=K3,
                     section=KEYWORDS,
-                    entity=_keyword_ref(keyword),
+                    entity=_keyword_ref(ctx, keyword),
                     reason=(
                         f"quality score on {observed} of {cfg.k3_min_qs_days} required days in "
                         f"the {span_name} {cfg.k3_span_days} days"
@@ -1925,5 +2281,5 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     return RuleResult(findings=findings).merge(
         _evaluate_k1(ctx, cfg, accounts, coverage),
         _evaluate_k2(ctx, cfg, accounts, coverage),
-        _evaluate_k3(ctx, cfg),
+        _evaluate_k3(ctx, cfg, accounts, coverage),
     )

@@ -1,9 +1,11 @@
 """``/discrepancies``: list C0 discrepancies and apply their resolutions.
 
-AAP 0.5.3 (``GET /discrepancies?state=open``, ``POST /discrepancies/{id}/resolve``), 0.5.4.4
-("C0 resolutions by kind and subject type") and 0.5.5 (the ``/decisions`` screen's
-``DiscrepancyResolver``, which lists open and awaiting-platform discrepancies and renders
-exactly the resolutions valid for each one's kind and subject type).
+AAP 0.5.3 (``GET /discrepancies?state=open``, paged oldest first by ``limit`` and the
+``after`` keyset cursor, with the next page named in a ``Link: rel="next"`` header;
+``POST /discrepancies/{id}/resolve``), 0.5.4.4 ("C0 resolutions by kind and subject type")
+and 0.5.5 (the ``/decisions`` screen's ``DiscrepancyResolver``, which lists open and
+awaiting-platform discrepancies and renders exactly the resolutions valid for each one's kind
+and subject type).
 
 Paths are relative to ``/api/v1``; ``api/app.py`` includes :data:`router` with that prefix and
 the CSRF dependency, so the ``POST`` also needs ``X-Requested-With: ads-engine``.
@@ -41,14 +43,15 @@ Example:
 """
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Annotated, Final, TypeIs, get_args
 
-from fastapi import APIRouter, Path, Query
-from sqlalchemy import select
+from fastapi import APIRouter, Path, Query, Request, Response
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine.api import schemas
-from ads_engine.api.deps import NowDep, SessionDep, UserDep
+from ads_engine.api.deps import ApiError, NowDep, SessionDep, UserDep
 from ads_engine.db.models import DISCREPANCY_RESOLUTIONS, Discrepancy
 from ads_engine.db.repositories import active_datasets
 from ads_engine.decisions import (
@@ -63,20 +66,31 @@ from ads_engine.decisions import (
 )
 from ads_engine.logging import get_logger
 
-__all__ = ["list_discrepancies", "resolve", "router"]
+__all__ = ["DEFAULT_LIMIT", "MAX_LIMIT", "list_discrepancies", "resolve", "router"]
 
 router = APIRouter(tags=["discrepancies"])
 """The discrepancy routes; ``api/app.py`` mounts them under ``/api/v1``."""
 
 _log = get_logger(__name__)
 
+DEFAULT_LIMIT: Final = 200
+"""Rows a ``GET /discrepancies`` page reads when the request names no ``limit``."""
+
+MAX_LIMIT: Final = 500
+"""The largest ``limit`` ``GET /discrepancies`` accepts."""
+
+_INVALID_CURSOR_MESSAGE: Final = (
+    "The after cursor names no discrepancy; list again from the first page"
+)
+"""The 422 ``invalid_cursor`` message; it names no user data."""
+
 _DEFAULT_STATES: Final[list[schemas.DiscrepancyState]] = ["open", "awaiting_platform"]
 """The states ``GET /discrepancies`` lists without ``?state=``: the unresolved ones the
 resolver shows (AAP 0.5.5). FastAPI copies a parameter default per request, and nothing
 here mutates it."""
 
-_MAX_ID: Final[int] = 2**63 - 1
-"""The largest ``bigint`` identity; a larger path id is a 422 rather than a database error."""
+_MAX_ID: Final[int] = schemas.BIGINT_MAX
+"""The largest ``bigint`` identity; a larger path or cursor id is a 422, not a database error."""
 
 _KINDS: Final[tuple[str, ...]] = get_args(DiscrepancyKind)
 _SUBJECT_TYPES: Final[tuple[str, ...]] = get_args(SubjectType)
@@ -187,6 +201,54 @@ async def _listed_subject_state(
 
 
 # ---------------------------------------------------------------------------------------
+# Paging
+# ---------------------------------------------------------------------------------------
+
+
+async def _cursor_position(session: AsyncSession, after: int) -> tuple[datetime, int]:
+    """Return the ``(detected_at, id)`` keyset position the ``after`` cursor names.
+
+    The cursor row is read by id whatever its state or dataset. ``detected_at`` is set once,
+    when the discrepancy is raised, and never changes afterwards, so the position still holds
+    when the row was resolved, or its dataset replaced, after the previous page was served.
+
+    Args:
+        session: The request's session.
+        after: The id of the last discrepancy of the previous page.
+
+    Returns:
+        The cursor row's ``detected_at`` and id.
+
+    Raises:
+        ApiError: 422 ``invalid_cursor`` when no discrepancy has that id, for example after
+            its dataset was purged.
+    """
+    detected_at = await session.scalar(
+        select(Discrepancy.detected_at).where(Discrepancy.id == after)
+    )
+    if detected_at is None:
+        raise ApiError(422, "invalid_cursor", _INVALID_CURSOR_MESSAGE)
+    return detected_at, after
+
+
+def _next_link(request: Request, after: int) -> str:
+    """Return the RFC 8288 ``Link`` header value that names the next page.
+
+    The target is a relative reference: the request's path and query with ``after`` set to
+    the given id and every other parameter, each repeated ``state`` included, kept as sent.
+
+    Args:
+        request: The current request.
+        after: The id of the last discrepancy row the current page read.
+
+    Returns:
+        ``<{path}?{query}>; rel="next"``.
+    """
+    url = request.url.include_query_params(after=after)
+    return f'<{url.path}?{url.query}>; rel="next"'
+
+
+# ---------------------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------------------
 
@@ -198,6 +260,8 @@ async def _listed_subject_state(
     responses=schemas.ERROR_RESPONSES,
 )
 async def list_discrepancies(
+    request: Request,
+    response: Response,
     user: UserDep,
     session: SessionDep,
     state: Annotated[
@@ -210,8 +274,31 @@ async def list_discrepancies(
             ),
         ),
     ] = _DEFAULT_STATES,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_LIMIT,
+            description=(
+                f"The most discrepancies the page reads, 1 to {MAX_LIMIT} "
+                f"(default {DEFAULT_LIMIT})."
+            ),
+        ),
+    ] = DEFAULT_LIMIT,
+    after: Annotated[
+        int | None,
+        Query(
+            gt=0,
+            le=_MAX_ID,
+            description=(
+                "Continue the list after this discrepancy: the id of the last discrepancy "
+                'of the previous page, as the ``Link: rel="next"`` header names it. Omit '
+                "it for the first page."
+            ),
+        ),
+    ] = None,
 ) -> list[schemas.Discrepancy]:
-    """List the discrepancies of the active datasets, oldest first.
+    """List the discrepancies of the active datasets, oldest first, one page at a time.
 
     Only discrepancies of each source's active primary dataset are listed, so a discrepancy
     about replaced data never reaches the resolver. They are ordered by ``detected_at``,
@@ -220,28 +307,58 @@ async def list_discrepancies(
     its (kind, shape) pair in their fixed display order, so the resolver renders exactly
     that row (AAP 0.5.5).
 
+    **Paging.** A page reads at most ``limit`` discrepancy rows (1 to 500, default 200).
+    ``after`` continues the list after the discrepancy with that id: the page holds the rows
+    whose ``(detected_at, id)`` sorts after the cursor row's. The cursor row is found
+    whatever its current state or dataset, because ``detected_at`` never changes, so a
+    cursor stays valid after its discrepancy is resolved. When the page read ``limit``
+    rows, more may follow, and the response carries an RFC 8288 ``Link`` header naming the
+    next page as a relative reference, for example
+    ``</api/v1/discrepancies?state=resolved&limit=50&after=812>; rel="next"``: the same
+    path and query, each repeated ``state`` included, with ``after`` set to the id of the
+    last row read. Without that header the list is complete, so following it until it no
+    longer comes back returns every row exactly once.
+
     A discrepancy whose subject the domain reports as not found is left out and logged as
-    ``discrepancies.subject_unavailable``: no resolution could be applied to it.
+    ``discrepancies.subject_unavailable``: no resolution could be applied to it. A page can
+    therefore hold fewer than ``limit`` discrepancies while its ``Link`` header still
+    announces more.
 
     Args:
+        request: The current request; its path and query build the ``Link`` header.
+        response: The response that carries the ``Link`` header.
         user: The signed-in user; the route requires a session and reads nothing else from it.
         session: The request's session.
         state: The states to list; ``open`` and ``awaiting_platform`` by default.
+        limit: At most this many rows are read for the page; a ``limit`` outside 1-500 is
+            a 422 validation error.
+        after: The id of the last discrepancy of the previous page, from the ``Link``
+            header; ``None`` for the first page. An id outside 1 to ``2**63 - 1`` is a 422
+            validation error.
 
     Returns:
-        The matching discrepancies, oldest first.
+        The page's discrepancies, oldest first.
+
+    Raises:
+        ApiError: 422 ``invalid_cursor`` when ``after`` names no discrepancy.
     """
+    cursor = None if after is None else await _cursor_position(session, after)
     dataset_ids = sorted(dataset.id for dataset in (await active_datasets(session)).values())
     if not dataset_ids:
         return []
+    statement = select(Discrepancy).where(
+        Discrepancy.dataset_id.in_(dataset_ids),
+        Discrepancy.state.in_(sorted(set(state))),
+    )
+    if cursor is not None:
+        # The row comparison is the keyset bound; PostgreSQL also derives its leading
+        # ``detected_at >=`` bound, so the (state, detected_at) index starts at the cursor.
+        statement = statement.where(
+            tuple_(Discrepancy.detected_at, Discrepancy.id) > tuple_(*cursor),
+        )
     rows: Sequence[Discrepancy] = (
         await session.scalars(
-            select(Discrepancy)
-            .where(
-                Discrepancy.dataset_id.in_(dataset_ids),
-                Discrepancy.state.in_(sorted(set(state))),
-            )
-            .order_by(Discrepancy.detected_at, Discrepancy.id)
+            statement.order_by(Discrepancy.detected_at, Discrepancy.id).limit(limit)
         )
     ).all()
     # The decision shape is a property of the subject, not of the discrepancy: it is loaded
@@ -255,6 +372,10 @@ async def list_discrepancies(
         subject_state = subjects[ref]
         if subject_state is not None:
             views.append(_view(row, subject_state))
+    if len(rows) == limit:
+        # A full read of rows may have more behind it; a page of fewer views does not end
+        # the list, because rows whose subject is unavailable are left out of the views.
+        response.headers["Link"] = _next_link(request, rows[-1].id)
     return views
 
 

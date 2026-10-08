@@ -1,4 +1,4 @@
-"""Configuration loader for ``config/*.yaml``: thresholds, ``config_hash`` and CRM bindings.
+r"""Configuration loader for ``config/*.yaml``: thresholds, ``config_hash`` and CRM bindings.
 
 AAP 0.6.2: ``config/thresholds.yaml``, ``config/content_assets.yaml`` and
 ``config/hubspot_mapping.yaml`` are loaded here, and their hash is stored on every analysis
@@ -19,9 +19,16 @@ run. :meth:`Thresholds.load` reads all three and returns one immutable :class:`T
 * **config_hash**: SHA-256 of the canonical JSON of the three *parsed* files, so editing a
   comment leaves it unchanged while any value change alters it (AAP 0.3.2: a changed hash at
   worker startup enqueues a default-window analysis).
+* **Overrides** (AAP 0.11.2 scenario fixtures): :meth:`Thresholds.load` also takes dotted-key
+  ``overrides`` and a replacement registry, applied to the parsed files before validation, so
+  no caller parses the YAML itself. :func:`config_fingerprint` hashes the files' raw bytes, a
+  cheap change detector for configurations memoised across calls.
 
 Load-time validation fails with :class:`ConfigError`, which names the file and dotted key:
 
+* a file that is not UTF-8 or not valid YAML (a NUL character included), holds a duplicate
+  key, or parses to a string key or value UTF-8 cannot encode (a lone surrogate from an
+  escape such as ``"\uD800"``) fails, naming the file and, for such text, its key;
 * every key ``config/thresholds.yaml`` ships is required, with its type and range checked;
 * ``window.presets`` must contain ``window.default_days`` (AAP 0.5.4.1), and every preset,
   the trusted minimum and the sustained minimum fit within ``window.max_days``, itself at most
@@ -89,6 +96,8 @@ __all__ = [
     "ResolvedBinding",
     "StageBinding",
     "Thresholds",
+    "config_fingerprint",
+    "override_value",
     "resolve_config_dir",
 ]
 
@@ -264,7 +273,8 @@ def _read_yaml(directory: Path, name: str) -> Mapping[str, Any]:
         The parsed top-level mapping.
 
     Raises:
-        ConfigError: When the file is missing or unreadable, is not UTF-8, is not valid YAML,
+        ConfigError: When the file is missing or unreadable, is not UTF-8, is not valid YAML
+            (including a character YAML forbids, such as NUL, or nesting too deep to parse),
             holds a duplicate key, or its top level is not a mapping.
     """
     path = directory / name
@@ -276,17 +286,134 @@ def _read_yaml(directory: Path, name: str) -> Mapping[str, Any]:
         raise ConfigError(name, None, f"not valid UTF-8: {exc.reason}") from None
     except OSError as exc:
         raise ConfigError(name, None, f"cannot read {path}: {exc.strerror or exc}") from None
-    loader = _StrictSafeLoader(text)
+    # The loader's reader rejects characters YAML forbids as it is constructed, so the
+    # construction belongs inside the same YAML-to-ConfigError boundary as the parse.
+    loader: _StrictSafeLoader | None = None
     try:
+        loader = _StrictSafeLoader(text)
         document: object = loader.get_single_data()
     except yaml.YAMLError as exc:
         raise ConfigError(name, None, f"invalid YAML: {exc}") from None
+    except RecursionError:
+        raise ConfigError(name, None, "invalid YAML: nesting is too deep to parse") from None
     finally:
-        loader.dispose()
+        if loader is not None:
+            loader.dispose()
     if not isinstance(document, Mapping):
         found = "an empty file" if document is None else type(document).__name__
         raise ConfigError(name, None, f"top level must be a mapping, found {found}")
     return document
+
+
+def _config_directory(path: Path | str | None) -> Path:
+    """Return the config directory to read: ``path``, else :func:`resolve_config_dir`.
+
+    Raises:
+        ConfigError: When the directory does not exist, naming it.
+    """
+    directory = resolve_config_dir() if path is None else Path(path)
+    if not directory.is_dir():
+        raise ConfigError(str(directory), None, "config directory not found")
+    return directory
+
+
+def config_fingerprint(path: Path | str | None = None) -> str:
+    """Return a SHA-256 hex digest of the raw bytes of the three config files.
+
+    AAP 0.6.2: the config files are read here, so a configuration memoised outside this
+    module (the scenario catalogue's ``thresholds_with``, AAP 0.11.2) needs a cheap change
+    detector that does not parse them again. It reads :data:`CONFIG_FILES` only, and
+    any byte edit to any of them, a comment included, changes it. It is not ``config_hash``,
+    which covers the parsed values and ignores comments.
+
+    Args:
+        path: The config directory; :func:`resolve_config_dir` when ``None``.
+
+    Returns:
+        The digest over each file's name, byte length and bytes, in :data:`CONFIG_FILES`
+        order.
+
+    Raises:
+        ConfigError: When the directory is missing (naming it), or a file is missing or
+            unreadable (naming the file).
+    """
+    directory = _config_directory(path)
+    digest = hashlib.sha256()
+    for name in CONFIG_FILES:
+        file_path = directory / name
+        try:
+            data = file_path.read_bytes()
+        except FileNotFoundError:
+            raise ConfigError(name, None, f"file not found: {file_path}") from None
+        except OSError as exc:
+            raise ConfigError(
+                name, None, f"cannot read {file_path}: {exc.strerror or exc}"
+            ) from None
+        digest.update(name.encode("utf-8"))
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def override_value(value: object) -> object:
+    """Return the parsed-YAML value a threshold override stands for.
+
+    The one conversion of override values (AAP 0.11.2 scenario fixtures override thresholds
+    with ``Decimal`` and tuple values), used by :meth:`Thresholds.load` and by memo keys. A
+    ``Decimal`` becomes the number YAML would parse from it: an integral one an ``int``
+    (``Decimal("21")`` is ``21``), any other a ``float`` (``Decimal("0.90")`` is ``0.9``), and a
+    non-finite one a non-finite ``float``, which validation rejects under its key. Tuples and
+    lists become lists, and mappings dicts, item by item; every other value is unchanged. Two
+    overrides that a YAML file would spell the same therefore normalise to equal values with
+    equal ``repr``.
+
+    Args:
+        value: An override value.
+
+    Returns:
+        The equivalent parsed-YAML value.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return math.nan if value.is_nan() else float(value)
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, Mapping):
+        return {child: override_value(item) for child, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [override_value(item) for item in value]
+    return value
+
+
+def _with_override(
+    tree: Mapping[str, Any], parts: Sequence[str], value: object, file: str, key: str
+) -> dict[str, Any]:
+    """Return a copy of a parsed document with the existing dotted key ``key`` set to ``value``.
+
+    Only the mappings along the key's path are copied, so the parsed document, and any node a
+    YAML alias shares with another key, is never mutated: exactly one key changes.
+
+    Args:
+        tree: The mapping ``parts`` is relative to.
+        parts: The remaining parts of ``key``.
+        value: The replacement, already passed through :func:`override_value`.
+        file: The file the key belongs to, for errors.
+        key: The full dotted key, for errors.
+
+    Raises:
+        ConfigError: When the key does not exist, so a misspelt override fails loudly.
+    """
+    head, rest = parts[0], parts[1:]
+    if head not in tree:
+        raise ConfigError(file, key, "threshold override names a missing key")
+    updated = dict(tree)
+    if not rest:
+        updated[head] = value
+        return updated
+    child: object = tree[head]
+    if not isinstance(child, Mapping):
+        raise ConfigError(file, key, "threshold override names a missing key")
+    updated[head] = _with_override(child, rest, value, file, key)
+    return updated
 
 
 def _join(parent: str, child: str) -> str:
@@ -300,6 +427,61 @@ def _describe(value: object) -> str:
     """Render a found value for an error message, bounded in length."""
     text = repr(value)
     return text if len(text) <= 60 else f"{text[:57]}..."
+
+
+def _lone_surrogate(text: str) -> str | None:
+    """Return the first character of ``text`` UTF-8 cannot encode (a lone surrogate), if any."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return text[exc.start]
+    return None
+
+
+def _check_encodable(value: object, file: str, key: str) -> None:
+    r"""Fail on any string key or string value of a parsed tree that UTF-8 cannot encode.
+
+    A YAML escape such as ``"\uD800"`` (or a ``\u`` surrogate pair, which PyYAML keeps as
+    two lone surrogates) parses to text that no UTF-8 file, JSON document or log line can
+    carry, so ``config_hash`` and any message quoting it would fail. Messages here quote such
+    text with ``repr``, which escapes surrogates, so the error itself is always encodable.
+
+    Args:
+        value: The parsed value.
+        file: The file it came from, for errors.
+        key: Its dotted key, ``""`` at the top level.
+
+    Raises:
+        ConfigError: On a string value that cannot be encoded, under its dotted key; on a
+            mapping key that cannot be encoded, under the mapping's dotted key (``None`` at
+            the top level), naming the key in escaped form.
+    """
+    if isinstance(value, str):
+        surrogate = _lone_surrogate(value)
+        if surrogate is not None:
+            raise ConfigError(
+                file,
+                key or None,
+                f"must be UTF-8 encodable text, found the lone surrogate {surrogate!r} in "
+                f"{_describe(value)}; write the character itself instead of a surrogate escape",
+            )
+        return
+    if isinstance(value, Mapping):
+        for child, item in value.items():
+            if isinstance(child, str):
+                surrogate = _lone_surrogate(child)
+                if surrogate is not None:
+                    raise ConfigError(
+                        file,
+                        key or None,
+                        f"key {child!r} must be UTF-8 encodable text, found the lone surrogate "
+                        f"{surrogate!r}; write the character itself instead of a surrogate escape",
+                    )
+            _check_encodable(item, file, _join(key, str(child)))
+        return
+    if isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _check_encodable(item, file, _join(key, f"[{index}]"))
 
 
 def _freeze(value: object, file: str, key: str) -> object:
@@ -369,7 +551,8 @@ def _config_hash(
     ``str``.
 
     Raises:
-        ConfigError: When a tree cannot be serialised, for example a non-string key.
+        ConfigError: When a tree cannot be serialised, for example a non-string key, or its
+            JSON cannot be encoded as UTF-8, for example a lone surrogate.
     """
     document = {
         "thresholds": _canonical(thresholds),
@@ -380,9 +563,10 @@ def _config_hash(
         canonical = json.dumps(
             document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
         )
-    except (TypeError, ValueError) as exc:
+        encoded = canonical.encode("utf-8")
+    except (TypeError, ValueError) as exc:  # UnicodeEncodeError is a ValueError
         raise ConfigError("config", None, f"cannot compute config_hash: {exc}") from None
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _lookup(tree: Mapping[str, object], key: str, file: str) -> object:
@@ -1478,26 +1662,71 @@ class Thresholds:
     # -- construction ------------------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path | str | None = None) -> Thresholds:
+    def load(
+        cls,
+        path: Path | str | None = None,
+        *,
+        overrides: Mapping[str, object] | None = None,
+        content_assets: Sequence[ContentAsset] | None = None,
+    ) -> Thresholds:
         """Read and validate ``thresholds.yaml``, ``content_assets.yaml``, ``hubspot_mapping.yaml``.
 
-        AAP 0.5.1 ("Window and thresholds"), 0.6.2. The files are parsed with PyYAML's safe
-        loader, extended only to reject a key repeated within one mapping.
+        AAP 0.5.1 ("Window and thresholds"), 0.6.2: the config files are loaded here and
+        nowhere else. They are parsed with PyYAML's safe loader, extended only to reject a key
+        repeated within one mapping.
+
+        ``overrides`` and ``content_assets`` load the configuration with some values changed
+        and no file written, as the scenario catalogue's fixtures need (AAP 0.11.2). Each
+        override replaces the value of a dotted key the file already defines:
+        ``crm.booking_sources`` and ``crm.meeting_outcome_exclusions`` in
+        ``hubspot_mapping.yaml``, every other key in ``thresholds.yaml``. Values pass through
+        :func:`override_value`, so ``Decimal("0.90")`` overrides exactly as ``0.9`` does. A
+        registry replaces the parsed ``content_assets.yaml``. The edited documents then go
+        through :meth:`from_trees`, so validation and ``config_hash`` are exactly those of
+        files holding the same values (``window.presets`` must still contain
+        ``window.default_days``).
 
         Args:
             path: The config directory; :func:`resolve_config_dir` when ``None``.
+            overrides: Dotted key to replacement value; ``None`` or empty changes nothing.
+            content_assets: A registry replacing ``content_assets.yaml``, in order; ``None``
+                keeps the file's.
 
         Returns:
             The validated configuration.
 
         Raises:
             ConfigError: Naming the file and key, when the directory or a file is missing, a
-                file is not valid YAML or not a mapping, or any validation fails.
+                file is not valid YAML or not a mapping, an override names a key its file
+                does not define, a registry entry is not a :class:`ContentAsset`, or any
+                validation fails.
         """
-        directory = resolve_config_dir() if path is None else Path(path)
-        if not directory.is_dir():
-            raise ConfigError(str(directory), None, "config directory not found")
-        trees = {name: _read_yaml(directory, name) for name in CONFIG_FILES}
+        directory = _config_directory(path)
+        trees: dict[str, Mapping[str, Any]] = {
+            name: _read_yaml(directory, name) for name in CONFIG_FILES
+        }
+        for key, value in (overrides or {}).items():
+            dotted: object = key
+            if not isinstance(dotted, str):
+                raise ConfigError(
+                    THRESHOLDS_FILE,
+                    None,
+                    f"threshold override key must be a dotted string, found {_describe(dotted)}",
+                )
+            file = HUBSPOT_MAPPING_FILE if key in _MERGED_CRM_DOTTED_KEYS else THRESHOLDS_FILE
+            trees[file] = _with_override(
+                trees[file], key.split("."), override_value(value), file, key
+            )
+        if content_assets is not None:
+            entries: list[dict[str, Any]] = []
+            for index, asset in enumerate(content_assets):
+                item: object = asset
+                if not isinstance(item, ContentAsset):
+                    raise ConfigError(
+                        CONTENT_ASSETS_FILE, f"assets[{index}]", "must be a ContentAsset"
+                    )
+                entries.append(item.to_json())
+            trees[CONTENT_ASSETS_FILE] = {"assets": entries}
         return cls.from_trees(
             thresholds=trees[THRESHOLDS_FILE],
             content_assets=trees[CONTENT_ASSETS_FILE],
@@ -1514,11 +1743,12 @@ class Thresholds:
         hubspot_mapping: Mapping[str, Any],
         source_dir: Path | str,
     ) -> Thresholds:
-        """Build the configuration from the three already-parsed documents.
+        r"""Build the configuration from the three already-parsed documents.
 
         :meth:`load` reads the files and calls this; tests call it with edited copies of the
         shipped trees. ``config_hash`` is computed from these trees exactly as :meth:`load`
-        computes it from the files.
+        computes it from the files. Every string key and value of all three trees is checked
+        to be UTF-8 encodable (a ``"\uD800"`` escape is not) before any other validation.
 
         Args:
             thresholds: The parsed ``thresholds.yaml``.
@@ -1542,6 +1772,9 @@ class Thresholds:
                 raise ConfigError(
                     name, None, f"top level must be a mapping, found {_describe(document)}"
                 )
+        # Before any other check, so no later message or the hash meets unencodable text.
+        for name, document in documents:
+            _check_encodable(document, name, "")
         frozen = _freeze(thresholds, THRESHOLDS_FILE, "")
         tree: Mapping[str, object] = frozen if isinstance(frozen, Mapping) else {}
         mapping = _parse_mapping(hubspot_mapping)

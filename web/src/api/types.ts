@@ -314,13 +314,16 @@ export interface ErrorResponse {
  * and uses `password` exactly as typed.
  */
 export interface LoginRequest {
-  /** The admin email (1–320 characters). */
+  /** The admin email (1–320 characters; no NUL character or unpaired surrogate). */
   email: string;
   /** The password (1–1024 characters), never trimmed. */
   password: string;
 }
 
-/** The signed-in user (`schemas.Me`): `GET /auth/me` and `POST /auth/login`. */
+/**
+ * The signed-in user (`schemas.Me`): `GET /auth/me`, `POST /auth/login` and
+ * `POST /auth/logout`.
+ */
 export interface Me {
   /** The admin email. */
   email: string;
@@ -800,7 +803,7 @@ export interface RecommendationsPage {
 export interface FeedbackRequest {
   /** `dismiss`, `snooze` or `done`. */
   kind: FeedbackKind;
-  /** An optional note (at most 2,000 characters). */
+  /** An optional note (at most 2,000 characters; no NUL character or unpaired surrogate). */
   note?: string | null;
 }
 
@@ -839,7 +842,7 @@ export interface Feedback {
 export interface SubjectIn {
   /** `campaign`, or `budget` for a Google explicitly shared budget. */
   type: SubjectType;
-  /** The subject's internal id, a positive integer. */
+  /** The subject's internal id, a positive integer of at most 2^63 − 1 (PostgreSQL `bigint`). */
   id: number;
 }
 
@@ -871,9 +874,9 @@ export interface DecisionRequest {
   subject: SubjectIn;
   /** The fields being decided. */
   patch: DecisionPatchIn;
-  /** The item the decision was recorded from, if any. */
+  /** The item the decision was recorded from, if any; at most 2^63 − 1 (PostgreSQL `bigint`). */
   recommendation_id?: number | null;
-  /** An optional note (at most 2,000 characters). */
+  /** An optional note (at most 2,000 characters; no NUL character or unpaired surrogate). */
   note?: string | null;
 }
 
@@ -903,7 +906,7 @@ export interface ResolveRequest {
   resolution: Resolution;
   /** Required by `record_intended` only. */
   intended_state?: IntendedStateIn | null;
-  /** An optional note (at most 2,000 characters). */
+  /** An optional note (at most 2,000 characters; no NUL character or unpaired surrogate). */
   note?: string | null;
 }
 
@@ -960,7 +963,9 @@ export interface Decision {
 /**
  * A mismatch between a subject's platform state and its last decision (`schemas.Discrepancy`;
  * rule C0, AAP 0.5.4.4). The resolver renders exactly `resolutions`, the keys valid for the
- * discrepancy's kind and subject shape.
+ * discrepancy's kind and subject shape. `GET /discrepancies` returns them oldest first, one
+ * page at a time by `limit` (1–500, default 200) and the `after` cursor, and names the next
+ * page in a `Link: <…>; rel="next"` response header, absent on the last page.
  */
 export interface Discrepancy {
   /** The discrepancy id. */

@@ -9,6 +9,9 @@ runs its live client unchanged, and only the transport differs. Each test sends 
   (``api.hubapi.com/crm``) are answered from the seeded world, with no network I/O;
 * contract violations and unknown surfaces get HTTP 400 in the platform's own error shape, and
   raise ``ContractViolation``, ``UnknownSurface`` or ``SimulatedTransportError`` when strict;
+* the webhook secret header is required under the name the transport's settings give (the
+  settings the client was built with), and ``render(source, request)`` answers from the
+  product's world, seeded by ``MOCK_SEED`` and built once per settings instance;
 * injected 429/5xx faults carry ``Retry-After`` when the fault sets one, and injected timeouts
   raise ``httpx.ReadTimeout``;
 * the journal records source, surface, method, path, status and the applied fault label, and
@@ -63,6 +66,7 @@ from ads_engine.simulation.payloads import (
     RenderedResponse,
     RequestShape,
     UnknownSurface,
+    render,
 )
 from ads_engine.simulation.transport import (
     UNKNOWN_SURFACE,
@@ -70,6 +74,7 @@ from ads_engine.simulation.transport import (
     SimulatedTransportError,
     mock_transport,
 )
+from ads_engine.sync.mode import SourceModeController
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 10, 2, 12, tzinfo=UTC)
@@ -79,6 +84,7 @@ CUSTOMER = SIM_GOOGLE_CUSTOMER_ID
 NA_ACCOUNT = "990000001"
 LIVE_WEBHOOK_URL = "https://n8n.example.com/webhook/ads-engine-live"
 LIVE_SECRET_HEADER = "X-Webhook-Token"
+CUSTOM_SECRET_HEADER = "X-Custom-Secret"
 LINKEDIN_REST = "https://api.linkedin.com/rest"
 HUBSPOT_CRM = "https://api.hubapi.com/crm"
 AD_ACCOUNT_URL = f"{LINKEDIN_REST}/adAccounts/{NA_ACCOUNT}"
@@ -214,8 +220,14 @@ def _patch_render(
     """
     real = transport_module.render
 
-    def changed(source: Source, request: RequestShape, world: SimulatedWorld) -> RenderedResponse:
-        return change(real(source, request, world))
+    def changed(
+        source: Source,
+        request: RequestShape,
+        world: SimulatedWorld | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> RenderedResponse:
+        return change(real(source, request, world, settings=settings))
 
     monkeypatch.setattr(transport_module, "render", changed)
 
@@ -286,6 +298,11 @@ def test_mock_transport_needs_a_simulated_world() -> None:
 def test_mock_transport_needs_a_list_journal() -> None:
     with pytest.raises(TypeError, match="journal must be a list or None, not tuple"):
         mock_transport("google", _world(), journal=cast(list[JournalEntry], ()))
+
+
+def test_mock_transport_needs_settings_or_none() -> None:
+    with pytest.raises(TypeError, match="settings must be a Settings or None, not dict"):
+        mock_transport("google", _world(), settings=cast(Settings, {}))
 
 
 def test_mock_transport_is_an_httpx_mock_transport() -> None:
@@ -546,6 +563,145 @@ async def test_the_live_client_treats_a_simulated_violation_as_a_defect_and_neve
     assert caught.value.http_status == 400
     assert waits == []
     assert journal == [JournalEntry("linkedin", "lead_forms", "GET", "/rest/leadForms", 400, None)]
+
+
+# ---------------------------------------------------------------------------------------------
+# The settings the client was built with name the webhook secret header
+# ---------------------------------------------------------------------------------------------
+
+
+def _custom_header_settings() -> Settings:
+    """Settings naming :data:`CUSTOM_SECRET_HEADER`, while the process keeps the default."""
+    settings = Settings(data_mode="simulated", n8n_webhook_secret_header=CUSTOM_SECRET_HEADER)
+    assert get_settings().n8n_webhook_secret_header == "X-Webhook-Secret"
+    return settings
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("strict", [False, True])
+async def test_a_transport_validates_the_secret_header_its_settings_name(strict: bool) -> None:
+    journal: list[JournalEntry] = []
+    transport = mock_transport(
+        "google", _world(), strict=strict, journal=journal, settings=_custom_header_settings()
+    )
+    async with httpx.AsyncClient(transport=transport) as http:
+        response = await http.post(
+            SIMULATED_WEBHOOK_URL,
+            headers={CUSTOM_SECRET_HEADER: SIMULATED_SECRET},
+            json=_google_body(),
+        )
+    assert response.status_code == 200
+    assert response.json()["results"][0]["customer"]["id"] == CUSTOMER
+    assert journal == [JournalEntry("google", "search", "POST", "/webhook/google-ads", 200, None)]
+
+
+@pytest.mark.anyio
+async def test_a_transport_rejects_the_process_header_when_its_settings_name_another() -> None:
+    settings = _custom_header_settings()
+    headers = {get_settings().n8n_webhook_secret_header: SIMULATED_SECRET}
+    journal: list[JournalEntry] = []
+    transport = mock_transport("google", _world(), journal=journal, settings=settings)
+    async with httpx.AsyncClient(transport=transport) as http:
+        response = await http.post(SIMULATED_WEBHOOK_URL, headers=headers, json=_google_body())
+    assert response.status_code == 400
+    message = _platform_error_message("google", SIMULATED_WEBHOOK_URL, response.json())
+    assert f"header {CUSTOM_SECRET_HEADER}: missing or empty" in message
+    assert journal == [JournalEntry("google", "search", "POST", "/webhook/google-ads", 400, None)]
+
+    strict = mock_transport("google", _world(), strict=True, settings=settings)
+    async with httpx.AsyncClient(transport=strict) as http:
+        with pytest.raises(ContractViolation) as caught:
+            await http.post(SIMULATED_WEBHOOK_URL, headers=headers, json=_google_body())
+    assert f"header {CUSTOM_SECRET_HEADER}: missing or empty" in caught.value.errors
+
+
+@pytest.mark.anyio
+async def test_a_controller_with_a_custom_secret_header_reads_simulated_google_rows() -> None:
+    controller = SourceModeController(_custom_header_settings())
+    async with controller.open_clients("google", "simulated") as clients:
+        google = clients.require_google()
+        rows = [row async for row in google.search("Q-G1")]
+    assert [row["customer"]["id"] for row in rows] == [controller.world.google_customer_id]
+    assert google.calls_made == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# render(source, request): the product's world
+# ---------------------------------------------------------------------------------------------
+
+
+def _webhook_request(header: str) -> httpx.Request:
+    """The first-page Q-G1 webhook request, carrying the secret under ``header``."""
+    return httpx.Request(
+        "POST", SIMULATED_WEBHOOK_URL, headers={header: SIMULATED_SECRET}, json=_google_body()
+    )
+
+
+def _record_world_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Settings, SimulatedWorld]]:
+    """Record every ``SimulatedWorld.from_settings`` call: its settings and the built world."""
+    built: list[tuple[Settings, SimulatedWorld]] = []
+    real = SimulatedWorld.from_settings
+
+    def recording(settings: Settings, *args: Any, **kwargs: Any) -> SimulatedWorld:
+        world = real(settings, *args, **kwargs)
+        built.append((settings, world))
+        return world
+
+    monkeypatch.setattr(SimulatedWorld, "from_settings", staticmethod(recording))
+    return built
+
+
+def test_two_argument_render_answers_from_the_world_mock_seed_seeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MOCK_SEED", "7")
+    get_settings.cache_clear()
+    built = _record_world_builds(monkeypatch)
+    request = _webhook_request(get_settings().n8n_webhook_secret_header)
+    rendered = render("google", request)
+    assert (rendered.status, rendered.surface) == (200, "search")
+    ((settings, world),) = built
+    assert settings is get_settings()
+    assert world.seed == 7
+    explicit = render("google", request, SimulatedWorld.from_settings(get_settings()))
+    assert rendered.body == explicit.body
+
+
+def test_two_argument_render_builds_one_world_per_settings_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built = _record_world_builds(monkeypatch)
+    request = _webhook_request(get_settings().n8n_webhook_secret_header)
+    process = get_settings()
+    assert render("google", request).status == 200
+    assert render("google", request).status == 200
+    first, second = Settings(data_mode="simulated"), Settings(data_mode="simulated")
+    answers = [render("google", request, settings=s) for s in (first, first, second, first)]
+    assert [answer.status for answer in answers] == [200] * 4
+    # One slot keyed on identity (equal settings are distinct instances): reused while the
+    # same instance asks, rebuilt for another.
+    expected = (process, first, second, first)
+    assert len(built) == len(expected)
+    assert all(settings is want for (settings, _), want in zip(built, expected, strict=True))
+    get_settings.cache_clear()
+    assert render("google", request).status == 200
+    assert len(built) == len(expected) + 1
+    assert built[-1][0] is get_settings()
+    assert built[-1][0] is not process
+
+
+def test_two_argument_render_validates_the_header_its_settings_name() -> None:
+    settings = _custom_header_settings()
+    accepted = render("google", _webhook_request(CUSTOM_SECRET_HEADER), settings=settings)
+    assert (accepted.status, accepted.surface) == (200, "search")
+    rejected = render(
+        "google", _webhook_request(get_settings().n8n_webhook_secret_header), settings=settings
+    )
+    assert rejected.status == 400
+    message = _platform_error_message("google", SIMULATED_WEBHOOK_URL, rejected.body)
+    assert f"header {CUSTOM_SECRET_HEADER}: missing or empty" in message
 
 
 # ---------------------------------------------------------------------------------------------
@@ -965,7 +1121,13 @@ async def test_a_rendered_contract_violation_is_raised_never_disguised_as_a_plat
 ) -> None:
     bug = ContractViolation("hubspot.properties", ("$.options[0].colour: unknown field",))
 
-    def broken(source: Source, request: RequestShape, world: SimulatedWorld) -> RenderedResponse:
+    def broken(
+        source: Source,
+        request: RequestShape,
+        world: SimulatedWorld | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> RenderedResponse:
         raise bug
 
     monkeypatch.setattr(transport_module, "render", broken)

@@ -4,28 +4,41 @@ AAP 0.5.1 ("Metrics and statistics": "Window aggregation; utilization, capped da
 efficiency"), 0.5.4.1 (outcome by source, efficiency, expected outcomes, budget history,
 utilization, daily predicates, history gates, shared and lifetime budgets), 0.5.4.5 (shared
 budgets: dated membership, budget-active days, aggregation, the member-level safety
-predicate; the B4 counting contract), 0.5.4.2 (G1 targets) and 0.3.2 (performance: "Window
-aggregation runs as SQL group-bys"; a custom 180-day run computes in under 30 s).
+predicate; the B4 counting contract), 0.5.4.2 (G1 targets) and 0.2.1 / 0.1.1 (performance:
+"Window aggregation runs as SQL group-bys"; a custom 180-day run computes in under 30 s).
 
 The module has two halves with a hard boundary between them:
 
-* **SQL half** (:class:`QueryScope`, :func:`aggregate`, :func:`load_context`). The only
+* **SQL half** (:class:`QueryScope`, :func:`aggregate_sql`, :func:`load_context`). The only
   database code in ``analysis/`` besides ``runner``, ``lock`` and ``overlay``. It runs async
   on SQLAlchemy 2.1 and psycopg 3, reads only, and never commits, rolls back or flushes.
   Every query filters to each source's **active primary** dataset (decision 8);
   LinkedIn-attributed CRM reads use the effective CRM dataset of the LinkedIn dataset (the
   companion while LinkedIn is simulated) and the Google-to-CRM link reads HubSpot's active
   primary dataset, so a simulated row never joins a live row within one source.
-* **Pure half** (everything else). Functions of an
+* **Pure half** (everything else, starting with :func:`aggregate`, the AAP 0.5.1
+  ``aggregate(ctx, grain)`` interface). Functions of an
   :class:`~ads_engine.analysis.context.AnalysisContext` with no I/O and no logging, so rule
-  modules, ``precedence.py`` and scenario tests use them on contexts built in memory. Derived
+  modules, ``precedence.py`` and scenario tests use them on contexts built in memory.
+  :func:`load_context` fills a context from :func:`aggregate_sql`, one query per grain, and
+  :func:`aggregate` reads each grain back from any context, loaded or built in memory. Derived
   tables (budget histories, baselines, the G1 set, the counting contract) are memoised in
   ``ctx.cache`` and are immutable, so every rule of one run reads the same values.
 
 Value conventions (decision 6): money, conversions, ratios and shares are ``Decimal``;
 instants are tz-aware; daily facts keep each source's native date (Google in the account's
 time zone, LinkedIn in UTC) and are never rebucketed. A value the platform did not report is
-``None`` ("unavailable"), never 0.
+``None`` ("unavailable"), never 0, with one exception: where a context type requires a number
+and every value an aggregate sums is ``NULL``, :func:`_as_int` and :func:`_as_decimal` read
+the sum as 0. That applies only to
+
+* LinkedIn ``cost``, ``impressions`` and ``clicks`` per campaign day (``DayFact``) and per
+  creative over the window (``CreativeTotals``);
+* ``conversions`` per search term over the window (``SearchTermRow``) and over K1's trailing
+  account baseline (``RateBaseline``).
+
+Every other unreported metric stays ``None``, outcomes included: Google campaign-day and
+keyword-day ``conversions``, LinkedIn ``leads`` and ``website_conversions``.
 
 Budget history (AAP 0.5.4.1) in one paragraph: snapshots are *observations*, never effective
 times. A native day is **whole-day known** only when an observation exists at or before the
@@ -53,6 +66,7 @@ from collections.abc import Callable, Collection, Hashable, Iterable, Mapping, S
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
+from fractions import Fraction
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Final, Literal, get_args, overload
@@ -145,6 +159,7 @@ from ads_engine.logging import get_logger
 __all__ = [
     "B2_THRESHOLD_KEYS",
     "BUDGET_THRESHOLD_KEYS",
+    "G1_THRESHOLD_KEYS",
     "GRAINS",
     "LAST_CLICK_MODEL",
     "B2Assessment",
@@ -160,6 +175,7 @@ __all__ = [
     "QueryScope",
     "Totals",
     "aggregate",
+    "aggregate_sql",
     "assess_b2",
     "baseline_cpo",
     "budget_amount_value",
@@ -269,9 +285,12 @@ def _optional_choice[T: str](value: object, allowed: tuple[T, ...], what: str) -
 
 
 def _as_int(value: object) -> int:
-    """Return a SQL integer or ``numeric`` aggregate as ``int``; ``None`` counts as 0.
+    """Return a SQL integer or ``numeric`` value as ``int``; ``NULL`` reads as 0.
 
-    Used only for ``SUM`` of non-null counters, where SQL returns ``NULL`` for an empty group.
+    Used for ``NOT NULL`` columns, ``COUNT`` results and ``SUM`` aggregates. A ``SUM`` is
+    ``NULL`` only when every summed value is ``NULL``; the 0 then stands in where the context
+    type requires a number (LinkedIn impressions and clicks per campaign day and per creative
+    over the window). Use :func:`_as_optional_int` where an unreported value stays ``None``.
     """
     if value is None:
         return 0
@@ -286,7 +305,14 @@ def _as_optional_int(value: object) -> int | None:
 
 
 def _as_decimal(value: object) -> Decimal:
-    """Return a SQL ``numeric`` value as ``Decimal``; ``None`` (an empty ``SUM``) counts as 0."""
+    """Return a SQL ``numeric`` value as ``Decimal``; ``NULL`` reads as 0.
+
+    Used for ``NOT NULL`` columns and ``SUM`` aggregates. A ``SUM`` is ``NULL`` only when every
+    summed value is ``NULL``; the 0 then stands in where the context type requires a number
+    (LinkedIn cost per campaign day and per creative over the window, and ``conversions`` per
+    search term and over K1's trailing baseline). Use :func:`_as_optional_decimal` where an
+    unreported value stays ``None``.
+    """
     if value is None:
         return _ZERO
     if isinstance(value, bool) or not isinstance(value, int | Decimal):
@@ -348,15 +374,19 @@ Grain = Literal[
     "google_rate_baseline",
     "segment_window",
 ]
-"""The aggregation grains :func:`aggregate` computes in SQL."""
+"""The aggregation grains: :func:`aggregate_sql` computes each in SQL and :func:`aggregate`
+reads each back from an :class:`AnalysisContext`."""
 
 GRAINS: Final[tuple[Grain, ...]] = get_args(Grain)
-"""Every :data:`Grain`, in the order :func:`load_context` reads them."""
+"""Every :data:`Grain`, in the order :func:`load_context` reads them from
+:func:`aggregate_sql`."""
 
 
 @dataclass(frozen=True, slots=True)
 class CampaignDay:
-    """One campaign's facts on one native date, as :func:`aggregate` returns them.
+    """One campaign's facts on one native date: a row of a ``campaign_day_*`` grain.
+
+    :func:`aggregate_sql` returns these rows from SQL and :func:`aggregate` from a context.
 
     Attributes:
         campaign_id: The campaign (of the grain's source dataset).
@@ -373,33 +403,37 @@ def _int_sum(column: Any) -> sa.Cast[int]:
 
 
 @overload
-async def aggregate(
+async def aggregate_sql(
     scope: QueryScope, grain: Literal["campaign_day_google", "campaign_day_linkedin"]
 ) -> list[CampaignDay]: ...
 @overload
-async def aggregate(
+async def aggregate_sql(
     scope: QueryScope, grain: Literal["creative_window"]
 ) -> list[CreativeTotals]: ...
 @overload
-async def aggregate(scope: QueryScope, grain: Literal["keyword_day"]) -> list[KeywordDay]: ...
+async def aggregate_sql(scope: QueryScope, grain: Literal["keyword_day"]) -> list[KeywordDay]: ...
 @overload
-async def aggregate(
+async def aggregate_sql(
     scope: QueryScope, grain: Literal["search_term_window"]
 ) -> list[SearchTermRow]: ...
 @overload
-async def aggregate(
+async def aggregate_sql(
     scope: QueryScope, grain: Literal["google_rate_baseline"]
 ) -> list[RateBaseline]: ...
 @overload
-async def aggregate(scope: QueryScope, grain: Literal["segment_window"]) -> list[SegmentRow]: ...
+async def aggregate_sql(
+    scope: QueryScope, grain: Literal["segment_window"]
+) -> list[SegmentRow]: ...
 @overload
-async def aggregate(scope: QueryScope, grain: Grain) -> list[Any]: ...
-async def aggregate(scope: QueryScope, grain: Grain) -> list[Any]:
+async def aggregate_sql(scope: QueryScope, grain: Grain) -> list[Any]: ...
+async def aggregate_sql(scope: QueryScope, grain: Grain) -> list[Any]:
     """Aggregate one grain of the active datasets over the window in SQL.
 
-    AAP 0.5.1 ``aggregate(ctx, grain)`` and 0.3.2 ("Window aggregation runs as SQL
-    group-bys"). Every daily grain is bounded by ``window.start`` to ``window.end`` on its
-    table's native ``date`` column; nothing is rebucketed.
+    AAP 0.2.1 ("Window aggregation runs as SQL group-bys"): the database source of every
+    grain. :func:`load_context` stores each grain's rows in the context it builds, and the
+    pure :func:`aggregate` (AAP 0.5.1 ``aggregate(ctx, grain)``) reads the same rows back
+    from that context in this order. Every daily grain is bounded by ``window.start`` to
+    ``window.end`` on its table's native ``date`` column; nothing is rebucketed.
 
     * ``campaign_day_google``: ``fact_campaign_daily`` rows, one per campaign per Google date
       (the natural key already makes each (campaign, date) a single row).
@@ -1271,6 +1305,49 @@ async def _load_observations(scope: QueryScope) -> dict[tuple[str, int], list[Ob
     return grouped
 
 
+async def _load_latest_observations(scope: QueryScope) -> dict[tuple[str, int], Observation]:
+    """Load each campaign's and budget's newest snapshot captured at or before ``scope.now``.
+
+    The current state budget proposals are sized from (AAP 0.5.4.5 B1: "the latest effective
+    daily budget"), read independently of the window: a custom run over a window that ended
+    long ago still finds today's amount, because active snapshots are never purged
+    (AAP 0.3.2). Each campaign and budget row of the active Google and LinkedIn datasets
+    drives one ``LATERAL`` probe ``ORDER BY captured_at DESC, id DESC LIMIT 1``, a bounded
+    scan of ``ix_entity_snapshot_entity_captured`` however long the history grows. The probe
+    also requires the entity's own ``dataset_id``, so a snapshot of a retired dataset that
+    reuses an internal id can never stand in, and a snapshot after the run time is never read.
+    An entity without such a snapshot is absent.
+    """
+    ad_ids = scope.ad_dataset_ids()
+    if not ad_ids:
+        return {}
+    snap = EntitySnapshot
+    latest: dict[tuple[str, int], Observation] = {}
+    for entity_type, entity in (("campaign", Campaign), ("budget", Budget)):
+        newest = (
+            sa.select(*_snapshot_columns())
+            .where(
+                snap.entity_type == entity_type,
+                snap.entity_id == entity.id,
+                snap.dataset_id == entity.dataset_id,
+                snap.captured_at <= scope.now,
+            )
+            .order_by(snap.captured_at.desc(), snap.id.desc())
+            .limit(1)
+            .lateral(f"newest_{entity_type}_snapshot")
+        )
+        stmt = (
+            sa.select(*newest.c)
+            .select_from(entity)
+            .join(newest, sa.true())
+            .where(entity.dataset_id.in_(ad_ids))
+            .order_by(entity.id)
+        )
+        for _entity_type, entity_id, *columns in (await scope.session.execute(stmt)).all():
+            latest[(entity_type, entity_id)] = _observation(*columns)
+    return latest
+
+
 def _window_boundary(window: AnalysisWindow, source: Literal["google", "linkedin"]) -> str | None:
     """The day boundary ``source`` uses in ``window``, or ``None`` when it is not a day source."""
     return next((item.boundary for item in window.source_days if item.source == source), None)
@@ -1485,18 +1562,21 @@ async def _load_crm(
     contact_ids: Collection[int],
     google_contacts: bool,
     freshness: Mapping[tuple[int, str], Freshness],
+    google_timezone: str | None,
 ) -> CrmData:
     """Load everything a context reads from one HubSpot dataset (AAP 0.3.3, 0.5.4.7).
 
     * contacts: the matched leads' contacts (``contact_ids``) and, when ``google_contacts``
       and the dataset's bindings verify the Google link, the Google-touch contacts:
-      ``google_campaign_ref`` set and ``google_touch_at`` within ``window.utc_bounds()``.
+      ``google_campaign_ref`` set and ``google_touch_at`` within the window's Google-native
+      instants (:func:`_google_window_instants`: ``[start 00:00, end + 1 day 00:00)`` at the
+      window's Google boundary, else ``google_timezone``, else UTC; AAP 0.5.4.1 native days).
       Bindings never verified, undecodable or with the link unavailable discover none, so
       Google refs stored under a link that is no longer verified never enter the load;
     * contact-to-meeting and contact-to-deal associations and fetch outcomes of those
       contacts, and the associated meetings and deals;
-    * window deals (``created_at`` from window start to ``now``), their deal-to-contact
-      associations and fetch outcomes;
+    * window deals (``created_at`` from window start, ``window.utc_bounds()[0]``, to ``now``),
+      their deal-to-contact associations and fetch outcomes;
     * ``deal_search_complete``: the dataset's ``hubspot.deal_search`` row is ``complete`` and
       covers the window's dates.
 
@@ -1511,7 +1591,7 @@ async def _load_crm(
     session = scope.session
     dataset_id = row.id
     bindings = _bindings(row, scope.now)
-    lower, upper = scope.window.utc_bounds()
+    lower = scope.window.utc_bounds()[0]
     contacts: dict[str, ContactInfo] = {}
     ct = CrmContact
     if contact_ids:
@@ -1525,13 +1605,14 @@ async def _load_crm(
             contacts[info.hs_id] = info
     discovered: list[ContactInfo] = []
     if google_contacts and bindings.google.available:
+        touch_lower, touch_upper = _google_window_instants(scope, google_timezone)
         result = await session.execute(
             sa.select(*_contact_columns())
             .where(
                 ct.dataset_id == dataset_id,
                 ct.google_campaign_ref.is_not(None),
-                ct.google_touch_at >= lower,
-                ct.google_touch_at < upper,
+                ct.google_touch_at >= touch_lower,
+                ct.google_touch_at < touch_upper,
             )
             .order_by(ct.google_touch_at, ct.hs_id.collate(_CODE_POINT))
         )
@@ -1886,14 +1967,19 @@ async def load_context(
        LinkedIn is simulated) and HubSpot's active primary for the Google-to-CRM link.
     2. ``dataset_freshness`` rows of every dataset read.
     3. Entities of the active Google and LinkedIn datasets.
-    4. Daily facts and window totals through :func:`aggregate`, one query per grain.
+    4. Daily facts and window totals through :func:`aggregate_sql`, one query per grain;
+       :func:`aggregate` reads each grain back from the returned context.
     5. ``entity_snapshot`` observations of campaigns, budgets and conversion actions over the
        window plus a bracketing margin (:func:`_observation_bounds`); for keywords only the
-       first and last observation within the window (:func:`_load_keyword_observations`).
+       first and last observation within the window (:func:`_load_keyword_observations`);
+       and, independently of the window, each campaign's and budget's newest snapshot at or
+       before ``now`` (:func:`_load_latest_observations`), the current state budget
+       proposals are sized from.
     6. LinkedIn leads submitted in ``window.utc_bounds()``, with their ``lead_match`` state in
        the effective CRM dataset.
     7. CRM data per CRM dataset, loaded once and shared when the LinkedIn-effective and the
-       Google CRM dataset are the same.
+       Google CRM dataset are the same; Google-touch contacts are selected in Google's native
+       day (:func:`_load_crm`).
     8. Unresolved discrepancies, with subject names and decision shapes.
     9. The latest decision per subject.
     10. Active feedback (``until`` after ``now``).
@@ -1956,17 +2042,19 @@ async def load_context(
     campaign_days = _group_days(
         (day.campaign_id, day.fact)
         for day in (
-            *await aggregate(scope, "campaign_day_google"),
-            *await aggregate(scope, "campaign_day_linkedin"),
+            *await aggregate_sql(scope, "campaign_day_google"),
+            *await aggregate_sql(scope, "campaign_day_linkedin"),
         )
     )
-    creative_totals = {row.creative_id: row for row in await aggregate(scope, "creative_window")}
+    creative_totals = {
+        row.creative_id: row for row in await aggregate_sql(scope, "creative_window")
+    }
     keyword_days = _group_days(
-        (day.keyword_id, day) for day in await aggregate(scope, "keyword_day")
+        (day.keyword_id, day) for day in await aggregate_sql(scope, "keyword_day")
     )
-    search_terms = tuple(await aggregate(scope, "search_term_window"))
-    baseline_rows = await aggregate(scope, "google_rate_baseline")
-    segments = tuple(await aggregate(scope, "segment_window"))
+    search_terms = tuple(await aggregate_sql(scope, "search_term_window"))
+    baseline_rows = await aggregate_sql(scope, "google_rate_baseline")
+    segments = tuple(await aggregate_sql(scope, "segment_window"))
 
     # 5. Observations.
     google_timezone = next(
@@ -1974,6 +2062,7 @@ async def load_context(
     )
     observations = await _load_observations(scope)
     observations.update(await _load_keyword_observations(scope, google_timezone))
+    latest_observations = await _load_latest_observations(scope)
 
     # 6. Leads; 7. CRM data.
     leads = await _load_leads(scope)
@@ -1986,6 +2075,7 @@ async def load_context(
             contact_ids=leads.matched_contact_ids,
             google_contacts=True,
             freshness=freshness,
+            google_timezone=google_timezone,
         )
         linkedin_crm = google_crm = shared
     else:
@@ -1996,6 +2086,7 @@ async def load_context(
                 contact_ids=leads.matched_contact_ids,
                 google_contacts=False,
                 freshness=freshness,
+                google_timezone=google_timezone,
             )
         if scope.google_crm_id is not None:
             google_crm = await _load_crm(
@@ -2004,6 +2095,7 @@ async def load_context(
                 contact_ids=(),
                 google_contacts=True,
                 freshness=freshness,
+                google_timezone=google_timezone,
             )
 
     # 8. Discrepancies; 9. decisions; 10. feedback; 11. segment windows.
@@ -2040,6 +2132,7 @@ async def load_context(
         observations=MappingProxyType(
             {key: tuple(items) for key, items in sorted(observations.items())}
         ),
+        latest_observations=MappingProxyType(dict(sorted(latest_observations.items()))),
         leads=tuple(leads.leads),
         discrepancies=tuple(discrepancies),
         decisions=MappingProxyType(decisions),
@@ -2070,6 +2163,7 @@ async def load_context(
             "search_terms": len(search_terms),
             "segments": len(segments),
             "observations": sum(len(items) for items in observations.values()),
+            "latest_observations": len(latest_observations),
             "leads": len(leads.leads),
             "linkedin_crm_contacts": 0 if linkedin_crm is None else len(linkedin_crm.contacts),
             "google_crm_contacts": 0 if google_crm is None else len(google_crm.google_contacts),
@@ -2082,6 +2176,104 @@ async def load_context(
         elapsed_ms=round((time.perf_counter() - started) * 1000),
     )
     return context
+
+
+# ---------------------------------------------------------------------------
+# Pure half: window aggregation read from the context (AAP 0.5.1)
+# ---------------------------------------------------------------------------
+
+
+@overload
+def aggregate(
+    ctx: AnalysisContext, grain: Literal["campaign_day_google", "campaign_day_linkedin"]
+) -> list[CampaignDay]: ...
+@overload
+def aggregate(ctx: AnalysisContext, grain: Literal["creative_window"]) -> list[CreativeTotals]: ...
+@overload
+def aggregate(ctx: AnalysisContext, grain: Literal["keyword_day"]) -> list[KeywordDay]: ...
+@overload
+def aggregate(
+    ctx: AnalysisContext, grain: Literal["search_term_window"]
+) -> list[SearchTermRow]: ...
+@overload
+def aggregate(
+    ctx: AnalysisContext, grain: Literal["google_rate_baseline"]
+) -> list[RateBaseline]: ...
+@overload
+def aggregate(ctx: AnalysisContext, grain: Literal["segment_window"]) -> list[SegmentRow]: ...
+@overload
+def aggregate(ctx: AnalysisContext, grain: Grain) -> list[Any]: ...
+def aggregate(ctx: AnalysisContext, grain: Grain) -> list[Any]:
+    """Return one grain's window rows from an analysis context, in :func:`aggregate_sql` order.
+
+    AAP 0.5.1 ``aggregate(ctx, grain)``. Pure: no I/O and no logging. :func:`load_context`
+    fills the context from :func:`aggregate_sql`, one query per grain; this reads the same
+    grain back from the context, so rules, ``precedence.py`` and scenario contexts built in
+    memory use one interface. For a context :func:`load_context` returned,
+    ``aggregate(ctx, grain)`` equals ``await aggregate_sql(scope, grain)`` over the same
+    datasets and window, for every grain. Rows are the context's own (immutable) rows, read
+    as stored and never re-filtered by the window.
+
+    * ``campaign_day_google`` and ``campaign_day_linkedin``: a :class:`CampaignDay` per day of
+      ``ctx.campaign_days`` whose campaign's ``source`` (``ctx.campaigns``) is the grain's,
+      ordered by campaign id, then date.
+    * ``creative_window``: the rows of ``ctx.creative_totals``, ordered by creative id.
+    * ``keyword_day``: the rows of ``ctx.keyword_days``, ordered by keyword id, then date.
+    * ``search_term_window``: ``ctx.search_terms``, in the context's order.
+    * ``google_rate_baseline``: ``[ctx.k1_baseline]``, or empty when it is ``None``.
+    * ``segment_window``: ``ctx.segments``, in the context's order.
+
+    Sorts are stable, so rows that tie on their sort key keep the context's order.
+
+    Args:
+        ctx: The analysis context.
+        grain: The grain to read.
+
+    Returns:
+        A new list of the grain's rows; empty when the context holds none.
+
+    Raises:
+        KeyError: For a campaign-day grain, when ``ctx.campaign_days`` holds a campaign that
+            ``ctx.campaigns`` lacks: its source, and so its grain, is unknown, and its days
+            are never silently dropped from either grain.
+        ValueError: For an unknown grain.
+    """
+    match grain:
+        case "campaign_day_google":
+            return _context_campaign_days(ctx, "google")
+        case "campaign_day_linkedin":
+            return _context_campaign_days(ctx, "linkedin")
+        case "creative_window":
+            return sorted(ctx.creative_totals.values(), key=lambda row: row.creative_id)
+        case "keyword_day":
+            return sorted(
+                (day for days in ctx.keyword_days.values() for day in days),
+                key=lambda day: (day.keyword_id, day.date),
+            )
+        case "search_term_window":
+            return list(ctx.search_terms)
+        case "google_rate_baseline":
+            return [] if ctx.k1_baseline is None else [ctx.k1_baseline]
+        case "segment_window":
+            return list(ctx.segments)
+    raise ValueError(f"grain must be one of {GRAINS}, found {grain!r}")
+
+
+def _context_campaign_days(
+    ctx: AnalysisContext, source: Literal["google", "linkedin"]
+) -> list[CampaignDay]:
+    """Return ``source``'s campaign days of the context, ordered by campaign id, then date.
+
+    Raises:
+        KeyError: When ``ctx.campaign_days`` holds a campaign that ``ctx.campaigns`` lacks.
+    """
+    rows: list[CampaignDay] = []
+    for campaign_id in sorted(ctx.campaign_days):
+        if _campaign(ctx, campaign_id).source != source:
+            continue
+        days = sorted(ctx.campaign_days[campaign_id], key=lambda day: day.date)
+        rows.extend(CampaignDay(campaign_id, day) for day in days)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -2110,12 +2302,16 @@ class Totals:
 
     Attributes:
         spend: Spend in the account currency.
-        outcomes: Outcomes of the objective group (:func:`outcome`); ``None`` when no day
-            reported them, which is "unavailable", never zero.
+        outcomes: Outcomes of the objective group (:func:`outcome`). ``None`` ("unavailable",
+            never zero) when there is no fact row, or when any fact row did not report its
+            outcome: its spend still counts, so a sum of the reported days alone would set
+            an incomplete count against the full spend (AAP 0.11.1).
         impressions: Impressions.
         clicks: Clicks.
         spend_days: Native dates with spend > 0 (summed across the campaigns).
         days: Native dates with any fact row.
+        unreported_days: Native dates on which some fact row did not report its outcome,
+            so evidence can say why ``outcomes`` is unavailable ("on 2 of 28 days").
     """
 
     spend: Decimal
@@ -2124,6 +2320,7 @@ class Totals:
     clicks: int
     spend_days: int
     days: int
+    unreported_days: int = 0
 
 
 def _campaign(ctx: AnalysisContext, campaign_id: int) -> CampaignInfo:
@@ -2139,6 +2336,10 @@ def _totals(
 ) -> Totals:
     """Sum window facts of ``(campaign, allowed dates or None for all)`` pairs.
 
+    Outcomes are summed only when every selected fact row reported its objective-group
+    outcome; one unreported row makes them ``None`` and is counted in
+    :attr:`Totals.unreported_days`, because its spend is in the total either way.
+
     Raises:
         ValueError: When the campaigns span more than one source, objective group or
             currency, which AAP 0.5.4.1 never compares or sums together.
@@ -2153,7 +2354,7 @@ def _totals(
         )
     spend = _ZERO
     outcomes = _ZERO
-    reported = False
+    unreported: set[date] = set()
     impressions = clicks = 0
     by_date: dict[date, Decimal] = {}
     window = ctx.window
@@ -2169,16 +2370,18 @@ def _totals(
             clicks += day.clicks
             by_date[day.date] = by_date.get(day.date, _ZERO) + day.cost
             value = day.outcome(campaign.objective_group)
-            if value is not None:
+            if value is None:
+                unreported.add(day.date)
+            else:
                 outcomes += value
-                reported = True
     return Totals(
         spend=spend,
-        outcomes=outcomes if reported else None,
+        outcomes=outcomes if by_date and not unreported else None,
         impressions=impressions,
         clicks=clicks,
         spend_days=sum(1 for cost in by_date.values() if cost > 0),
         days=len(by_date),
+        unreported_days=len(unreported),
     )
 
 
@@ -2188,7 +2391,8 @@ def window_totals(
     """Return window totals of campaigns of one source, objective group and currency.
 
     Only facts dated inside the window count, so a context carrying lookback days for other
-    purposes still totals the window alone.
+    purposes still totals the window alone. Outcomes are ``None`` unless every counted fact
+    row reported them (:class:`Totals`).
 
     Args:
         ctx: The analysis context.
@@ -2228,11 +2432,28 @@ def baseline_cpo(ctx: AnalysisContext, account_id: int, objective_group: str) ->
     baseline never crosses either. Memoised in ``ctx.cache``.
 
     Returns:
-        The baseline, or ``None`` when the group's outcomes are 0 or unavailable.
+        The baseline, or ``None`` when the group's outcomes are 0 or unavailable, including
+        when any of its campaigns did not report outcomes on a window day.
     """
     key = f"metrics.baseline_cpo:{account_id}:{objective_group}"
     if key in ctx.cache:
         cached: Decimal | None = ctx.cache[key]
+        return cached
+    totals = _baseline_totals(ctx, account_id, objective_group)
+    value = cost_per_outcome(totals.spend, totals.outcomes)
+    ctx.cache[key] = value
+    return value
+
+
+def _baseline_totals(ctx: AnalysisContext, account_id: int, objective_group: str) -> Totals:
+    """Return the account-group window totals :func:`baseline_cpo` divides; memoised.
+
+    The exact B2 and G1 comparisons (:func:`_poor_branch`) read the baseline as these totals'
+    spend and outcomes, so they and the displayed quotient describe the same average.
+    """
+    key = f"metrics.baseline_totals:{account_id}:{objective_group}"
+    cached = ctx.cache.get(key)
+    if isinstance(cached, Totals):
         return cached
     members = [
         campaign
@@ -2240,9 +2461,8 @@ def baseline_cpo(ctx: AnalysisContext, account_id: int, objective_group: str) ->
         if campaign.account_id == account_id and campaign.objective_group == objective_group
     ]
     totals = _totals(ctx, ((campaign, None) for campaign in members))
-    value = cost_per_outcome(totals.spend, totals.outcomes)
-    ctx.cache[key] = value
-    return value
+    ctx.cache[key] = totals
+    return totals
 
 
 def source_totals(ctx: AnalysisContext) -> dict[Source, tuple[Decimal, Decimal]]:
@@ -2640,14 +2860,19 @@ class BudgetHistory:
         idle: Known idle days.
         changed_intraday: Days whose observations disagree.
         unobserved: Days without bracketing observations, with an over-long gap, or with no
-            fact row while the metrics dataset does not cover the date.
+            fact row while the metrics dataset is not verified ``complete`` over the date.
         capped: Capped days.
         high: High-utilization days.
         under: Under-utilized days.
         window_utilization: Σ spend ÷ Σ daily budget over known-budget active days; ``None``
             without such a day.
-        latest_daily_budget: The latest effective daily budget: the value of the last known
-            day, else of the latest observation; ``None`` when neither shows one.
+        latest_daily_budget: The latest effective daily budget, the current amount B1, B2
+            and B3 are sized from: the daily amount of the subject's newest observation
+            captured at or before the run time, from its window series or
+            ``ctx.latest_observations``, whichever is newer. ``None`` when there is no such
+            observation or it shows no daily amount (for example the campaign now draws from
+            a shared or ``CUSTOM_PERIOD`` budget), never an older amount. The classified days
+            keep their own historical values.
         members: Shared budgets: each member campaign's member days; empty for a campaign.
         observation_count: Observations the known days were read from (the N of
             :attr:`assumption`).
@@ -2771,18 +2996,28 @@ def _facts_by_date(ctx: AnalysisContext, campaign_id: int) -> Mapping[date, DayF
 
 
 def _metrics_covered(ctx: AnalysisContext, source: Source, day: date) -> bool:
-    """Whether the source's daily metrics dataset covers ``day``.
+    """Whether the source's daily metrics dataset verifiably covers ``day`` completely.
 
-    Only then does a missing fact row mean zero spend; otherwise the day's spend is unknown
-    and the day counts as unobserved (AAP 0.5.4.1: unknown days are never counted idle).
+    Coverage is verified only when the dataset's freshness row exists, is ``complete``, and
+    has both ``covered_from`` and ``covered_through`` set with ``day`` between them.
+    Completeness is recorded over the whole covered range, so a ``complete`` range holding
+    ``day`` is the proof that every fact row of that date was fetched. Only then does a
+    missing fact row mean zero spend. An ``incomplete`` or ``unknown`` row (for example a
+    call-budget deferral leaving partitions unfetched), an open-ended range or a date outside
+    it leaves the day's spend unknown, and the day counts as unobserved (AAP 0.5.4.1: unknown
+    days are never assigned an observed value and never counted idle).
     """
     name = _METRICS_DATASETS.get(source)
     if name is None:
         return False
     row = ctx.freshness_for(name, ctx.dataset_id_for(name, crm_scope=None))
-    if row is None or row.covered_through is None or day > row.covered_through:
-        return False
-    return row.covered_from is None or row.covered_from <= day
+    return (
+        row is not None
+        and row.is_complete
+        and row.covered_from is not None
+        and row.covered_through is not None
+        and row.covered_from <= day <= row.covered_through
+    )
 
 
 def _draws_from_shared(ctx: AnalysisContext, campaign: CampaignInfo) -> int | None:
@@ -2812,19 +3047,37 @@ def _span_indices(spans: Iterable[_Span]) -> set[int]:
 
 
 def _latest_daily(
-    days: Sequence[BudgetDay],
+    ctx: AnalysisContext,
+    subject: SubjectKey,
     series: _Series,
+    value_of: Callable[[Observation], Hashable],
     daily_of: Callable[[Hashable], Decimal | None],
 ) -> Decimal | None:
-    """The latest effective daily budget: the last known day's, else the latest observation's."""
-    for day in reversed(days):
-        if day.klass == "known" and day.daily_budget is not None:
-            return day.daily_budget
-    for value in reversed(series.values):
-        amount = daily_of(value)
-        if amount is not None:
-            return amount
-    return None
+    """The latest effective daily budget (AAP 0.5.4.5 B1): the subject's current amount.
+
+    The candidates are the newest observation of the window series captured at or before
+    ``ctx.now`` and ``ctx.latest_observations[subject]``, the newest stored snapshot read
+    independently of the window; the newer one wins (the stored one on a tie, the same row
+    when both come from the database). Its daily amount is ``daily_of(value_of(obs))``, the
+    value function the history classifies with. Historical day values never stand in: a
+    window observed at 100 under a newer snapshot at 200 yields 200. When the newest
+    observation shows no daily amount, for example the campaign now draws from a shared or
+    ``CUSTOM_PERIOD`` budget, the current amount is unavailable (``None``) and no older
+    amount replaces it, so no proposal is sized from an obsolete budget.
+    """
+    newest: Observation | None = None
+    newest_value: Hashable = None
+    position = bisect_right(series.times, ctx.now)
+    if position > 0:
+        newest, newest_value = series.observations[position - 1], series.values[position - 1]
+    stored = ctx.latest_observations.get(subject)
+    if (
+        stored is not None
+        and stored.captured_at <= ctx.now
+        and (newest is None or stored.captured_at >= newest.captured_at)
+    ):
+        newest, newest_value = stored, value_of(stored)
+    return None if newest is None else daily_of(newest_value)
 
 
 def _campaign_daily(value: Hashable) -> Decimal | None:
@@ -2855,13 +3108,20 @@ def campaign_budget_history(ctx: AnalysisContext, campaign_id: int) -> BudgetHis
     campaign's observations with :func:`campaign_state_value` and
     ``budget.max_observation_gap_hours``. A whole-day-known day with status ``active`` and a
     daily budget above 0 is a known-budget active day: its spend is the day's fact, or 0 when
-    the source's metrics dataset covers the date and no fact row exists; with no fact row and
-    no coverage the day is unobserved instead. Changed-intraday and unobserved days are
-    excluded from utilization and cap counts and counted separately.
+    no fact row exists and the source's metrics dataset is ``complete`` over a covered range
+    holding the date; with no fact row and no such verified coverage (``incomplete`` or
+    ``unknown`` completeness, a missing bound, or a date outside the range) the day is
+    unobserved instead. Changed-intraday and unobserved days are excluded from utilization and
+    cap counts and counted separately.
 
     Utilization applies only to daily budgets: Google ``DAILY`` own budgets and LinkedIn
     campaigns with ``dailyBudget``. Otherwise ``utilization_applicable`` is false and no day
-    is a known-budget active day. Memoised in ``ctx.cache``.
+    is a known-budget active day.
+
+    ``latest_daily_budget`` is the current amount, not a historical one: the own daily budget
+    of the campaign's newest observation at or before ``ctx.now``, from its window series or
+    ``ctx.latest_observations``, whichever is newer; ``None`` when that observation shows no
+    own daily budget (:func:`_latest_daily`). Memoised in ``ctx.cache``.
 
     Raises:
         KeyError: When the campaign is not in the context.
@@ -2908,7 +3168,9 @@ def campaign_budget_history(ctx: AnalysisContext, campaign_id: int) -> BudgetHis
         shared=False,
         applicable=applicable,
         days=days,
-        latest=_latest_daily(days, series, _campaign_daily),
+        latest=_latest_daily(
+            ctx, ("campaign", campaign_id), series, campaign_state_value, _campaign_daily
+        ),
         members={},
         observation_count=len(_span_indices(spans.values())),
         config=config,
@@ -2943,7 +3205,9 @@ def _shows_budget(
     on the day: such an observation can never be part of a whole-day-known span, and a
     campaign with no observation near the day while the budget itself was whole-day known
     did not exist (or was not tracked) then, so it cannot unsettle the day. A campaign that
-    did spend is always considered, so its unknown membership makes the day unknown.
+    did spend is always considered, so its unknown membership makes the day unknown. So is a
+    campaign whose spend is unknown: it has no fact row for the day while the metrics dataset
+    is not verified complete over it, so the caller passes ``spent`` as true.
     """
     count = len(series.times)
     if count == 0:
@@ -2968,6 +3232,55 @@ def _member_status_label(spans: Sequence[_Span]) -> str | None:
     return None
 
 
+def _budget_campaigns(ctx: AnalysisContext) -> Mapping[int, tuple[int, ...]]:
+    """Per Google budget, the campaigns that showed it in any observation, ascending.
+
+    Built in one pass over the campaign entries of ``ctx.observations`` and memoised in
+    ``ctx.cache``, so each shared budget visits only its own candidates rather than scanning
+    every entity's observations once per budget.
+    """
+    key = "metrics.budget_campaigns"
+    cached = ctx.cache.get(key)
+    if isinstance(cached, Mapping):
+        return cached
+    shown: dict[int, set[int]] = defaultdict(set)
+    for (entity_type, entity_id), observations in ctx.observations.items():
+        if entity_type != "campaign":
+            continue
+        for budget_id in {obs.budget_id for obs in observations}:
+            if budget_id is not None:
+                shown[budget_id].add(entity_id)
+    inverse = MappingProxyType({bid: tuple(sorted(cids)) for bid, cids in shown.items()})
+    ctx.cache[key] = inverse
+    return inverse
+
+
+def _shared_candidate(ctx: AnalysisContext, campaign_id: int) -> _Candidate:
+    """A campaign's dated membership and status spans over the window (memoised).
+
+    Neither span map depends on the budget asked about: the window dates, the Google zone and
+    ``budget.max_observation_gap_hours`` are fixed per context, and the comparison with a
+    ``budget_id`` stays in :func:`shared_budget_history`'s day loop. A campaign that showed
+    several shared budgets is therefore classified once for all of them.
+    """
+    key = f"metrics.shared_candidate:{campaign_id}"
+    cached = ctx.cache.get(key)
+    if isinstance(cached, _Candidate):
+        return cached
+    gap = timedelta(hours=_gate_config(ctx).max_gap_hours)
+    tz = _source_tz(ctx, "google")
+    dates = ctx.window.dates()
+    observations = ctx.observations.get(("campaign", campaign_id), ())
+    membership_series = _Series.of(observations, membership_value)
+    candidate = _Candidate(
+        series=membership_series,
+        membership=MappingProxyType(_classify(membership_series, dates, tz, gap)),
+        status=MappingProxyType(_classify(_Series.of(observations, status_value), dates, tz, gap)),
+    )
+    ctx.cache[key] = candidate
+    return candidate
+
+
 def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory:
     """Return a Google explicitly shared budget's history over the window (AAP 0.5.4.5).
 
@@ -2983,8 +3296,9 @@ def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory
       days replace known-budget active days in every gate.
     * **Aggregation**: the day's spend is the sum over that day's members only; ``u_d`` is
       that sum ÷ the shared amount, the only cap the members have. A member without a fact row
-      counts 0 only while ``google.metrics_daily`` covers the date; otherwise the day is
-      unobserved.
+      counts 0 only while ``google.metrics_daily`` is ``complete`` over a covered range holding
+      the date; otherwise the day is unobserved. A non-member without a fact row under no such
+      coverage has unknown spend and is treated as having spent (:func:`_shows_budget`).
     * **Lost impression share** (the Google capped-day alternative): the spend-weighted mean
       of the members' ``search_budget_lost_impression_share`` that day, over members that
       spent and reported it. Spend weighting makes the share describe where the shared
@@ -2993,7 +3307,11 @@ def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory
     An unknown amount or membership makes the day ``unobserved`` (missing bracket or gap) or
     ``changed_intraday`` (a change during the day); with both known and no member known
     active, a member status that is itself unknown makes the day unknown the same way.
-    Memoised in ``ctx.cache``.
+
+    ``latest_daily_budget`` is the current shared amount, not a historical one: the daily
+    amount of the budget's newest observation at or before ``ctx.now``, from its window
+    series or ``ctx.latest_observations``, whichever is newer; ``None`` when that observation
+    shows no daily amount (:func:`_latest_daily`). Memoised in ``ctx.cache``.
 
     Raises:
         KeyError: When the budget is not in the context.
@@ -3018,16 +3336,10 @@ def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory
     amount_series = _Series.of(ctx.observations.get(("budget", budget_id), ()), budget_amount_value)
     amount_spans = _classify(amount_series, dates, tz, gap)
 
-    candidates: dict[int, _Candidate] = {}
-    for (entity_type, entity_id), observations in sorted(ctx.observations.items()):
-        if entity_type != "campaign" or not any(o.budget_id == budget_id for o in observations):
-            continue
-        membership_series = _Series.of(observations, membership_value)
-        candidates[entity_id] = _Candidate(
-            series=membership_series,
-            membership=_classify(membership_series, dates, tz, gap),
-            status=_classify(_Series.of(observations, status_value), dates, tz, gap),
-        )
+    candidates: dict[int, _Candidate] = {
+        campaign_id: _shared_candidate(ctx, campaign_id)
+        for campaign_id in _budget_campaigns(ctx).get(budget_id, ())
+    }
 
     applicable = budget.period == "DAILY"
     member_days: dict[int, list[date]] = defaultdict(list)
@@ -3044,7 +3356,7 @@ def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory
                 member_days[campaign_id].append(day)
                 continue
             fact = _facts_by_date(ctx, campaign_id).get(day)
-            spent = fact is not None and fact.cost > 0
+            spent = fact.cost > 0 if fact is not None else not _metrics_covered(ctx, "google", day)
             if _shows_budget(candidate.series, lower, upper, gap, budget_id, spent=spent):
                 relevant.append(campaign_id)
         member_facts = [_facts_by_date(ctx, cid).get(day) for cid in members]
@@ -3089,7 +3401,9 @@ def shared_budget_history(ctx: AnalysisContext, budget_id: int) -> BudgetHistory
         shared=True,
         applicable=applicable,
         days=days,
-        latest=_latest_daily(days, amount_series, _shared_daily),
+        latest=_latest_daily(
+            ctx, ("budget", budget_id), amount_series, budget_amount_value, _shared_daily
+        ),
         members={cid: tuple(member) for cid, member in member_days.items()},
         observation_count=len(_span_indices(amount_spans.values())),
         config=config,
@@ -3172,7 +3486,8 @@ def subject_totals(ctx: AnalysisContext, subject: SubjectKey) -> Totals | None:
 
     AAP 0.5.4.5: a shared budget's outcomes and cost per outcome are aggregated over member
     days only. Returns ``None`` when the members span more than one objective group or
-    currency, because those outcomes are never summed ("n/a").
+    currency, because those outcomes are never summed ("n/a"). Within one group, outcomes
+    are ``None`` when any counted day did not report them (:class:`Totals`).
 
     Raises:
         KeyError: When the subject is not in the context.
@@ -3200,6 +3515,12 @@ def subject_baseline(ctx: AnalysisContext, subject: SubjectKey) -> Decimal | Non
     shared budget: the same for its members' account and objective group; ``None`` when
     the members span accounts or objective groups, or the budget has no member days.
     """
+    group = _baseline_group(ctx, subject)
+    return None if group is None else baseline_cpo(ctx, *group)
+
+
+def _baseline_group(ctx: AnalysisContext, subject: SubjectKey) -> tuple[int, str] | None:
+    """Return the ``(account, objective group)`` of :func:`subject_baseline`, if exactly one."""
     campaign_ids = (
         subject_campaigns(ctx, subject)
         if subject[0] == "campaign"
@@ -3212,8 +3533,7 @@ def subject_baseline(ctx: AnalysisContext, subject: SubjectKey) -> Decimal | Non
     }
     if len(keys) != 1:
         return None
-    account_id, group = next(iter(keys))
-    return baseline_cpo(ctx, account_id, group)
+    return next(iter(keys))
 
 
 # ---------------------------------------------------------------------------
@@ -3380,6 +3700,8 @@ class B2Assessment:
         branch: ``poor_efficiency`` (cost/outcome ≥ ``b2.poor_efficiency_ratio`` x baseline)
             or ``zero_outcomes`` (0 outcomes with expected outcomes ≥
             ``b2.min_expected_outcomes``); ``None`` when efficiency is not poor or "n/a".
+            Decided exactly from the subject's and the account's totals, never from the
+            rounded ``cpo``, ``baseline`` and ``expected`` shown beside it.
         gate: The high-utilization gate (:func:`high_utilization`).
         spend: The subject's window spend (member days for a shared budget).
         outcomes: Its outcomes; ``None`` when unavailable or "n/a" (mixed objective groups).
@@ -3400,23 +3722,37 @@ class B2Assessment:
 
 
 def _poor_branch(
-    ctx: AnalysisContext, totals: Totals | None, baseline: Decimal | None
+    ctx: AnalysisContext, totals: Totals | None, account: Totals | None
 ) -> B2Branch | None:
-    """Return which poor-efficiency branch ``totals`` meets against ``baseline``, if any.
+    """Return which poor-efficiency branch ``totals`` meets against the baseline, if any.
 
-    The thresholds are ``b2.poor_efficiency_ratio`` (1.5) and ``b2.min_expected_outcomes``
-    (3). The configuration documents the latter for B2 and the G1 member predicate; it holds
-    the same value as ``c1.min_expected_outcomes`` but is tuned independently.
+    ``account`` holds the totals the baseline divides (:func:`_baseline_totals`). Both
+    branches are decided exactly, by cross-multiplying those totals, never by comparing
+    rounded quotients: with a baseline of 50 / 30, a spend of 5 is exactly 3 expected
+    outcomes, which 5 ÷ 1.666…667 would read as 2.999…999 and miss.
+
+    * ``poor_efficiency``: outcomes > 0 and spend ÷ outcomes ≥ ratio x account spend ÷
+      account outcomes, that is spend x account outcomes ≥ ratio x account spend x outcomes.
+    * ``zero_outcomes``: 0 outcomes and spend ÷ a positive baseline ≥ the minimum, that is
+      spend x account outcomes ≥ minimum x account spend.
+
+    Unavailable outcomes (``None``) on either side, or an account without outcomes, meet
+    neither branch. The thresholds are ``b2.poor_efficiency_ratio`` (1.5) and
+    ``b2.min_expected_outcomes`` (3). The configuration documents the latter for B2 and the
+    G1 member predicate; it holds the same value as ``c1.min_expected_outcomes`` but is tuned
+    independently.
     """
-    if totals is None or baseline is None:
+    if totals is None or totals.outcomes is None or account is None:
         return None
-    ratio = ctx.thresholds.ratio("b2.poor_efficiency_ratio")
-    cpo = cost_per_outcome(totals.spend, totals.outcomes)
-    if cpo is not None and cpo >= ratio * baseline:
+    if account.outcomes is None or account.outcomes <= 0:
+        return None
+    spend, outcomes = Fraction(totals.spend), Fraction(totals.outcomes)
+    account_spend, account_outcomes = Fraction(account.spend), Fraction(account.outcomes)
+    ratio = Fraction(ctx.thresholds.ratio("b2.poor_efficiency_ratio"))
+    if outcomes > 0 and spend * account_outcomes >= ratio * account_spend * outcomes:
         return "poor_efficiency"
-    expected = expected_outcomes(totals.spend, baseline)
-    minimum = ctx.thresholds.ratio("b2.min_expected_outcomes")
-    if totals.outcomes == 0 and expected is not None and expected >= minimum:
+    minimum = Fraction(ctx.thresholds.ratio("b2.min_expected_outcomes"))
+    if outcomes == 0 and account_spend > 0 and spend * account_outcomes >= minimum * account_spend:
         return "zero_outcomes"
     return None
 
@@ -3442,8 +3778,9 @@ def assess_b2(ctx: AnalysisContext, subject: SubjectKey) -> B2Assessment:
     history = budget_history(ctx, subject)
     gate = high_utilization(history)
     totals = subject_totals(ctx, subject)
-    baseline = None if totals is None else subject_baseline(ctx, subject)
-    branch = _poor_branch(ctx, totals, baseline)
+    group = None if totals is None else _baseline_group(ctx, subject)
+    baseline = None if group is None else baseline_cpo(ctx, *group)
+    branch = _poor_branch(ctx, totals, None if group is None else _baseline_totals(ctx, *group))
     spend = _ZERO if totals is None else totals.spend
     outcomes = None if totals is None else totals.outcomes
     assessment = B2Assessment(
@@ -3480,8 +3817,8 @@ def member_poor_efficiency(ctx: AnalysisContext, budget_id: int, campaign_id: in
     if not member_days:
         return False
     totals = _totals(ctx, [(campaign, member_days)])
-    baseline = baseline_cpo(ctx, campaign.account_id, campaign.objective_group)
-    return _poor_branch(ctx, totals, baseline) is not None
+    account = _baseline_totals(ctx, campaign.account_id, campaign.objective_group)
+    return _poor_branch(ctx, totals, account) is not None
 
 
 def spend_increase_blocked(ctx: AnalysisContext) -> frozenset[SubjectKey]:
@@ -3499,6 +3836,9 @@ def spend_increase_blocked(ctx: AnalysisContext) -> frozenset[SubjectKey]:
 
     G1 in ``precedence.py``, C2 eligibility in ``campaigns.py`` and W1 in
     ``white_papers.py`` read this one predicate. Memoised in ``ctx.cache``.
+
+    Threshold keys: :data:`G1_THRESHOLD_KEYS`, which a rule that selects or excludes spend
+    targets with this predicate copies into ``evidence.thresholds``.
     """
     key = "metrics.spend_increase_blocked"
     cached = ctx.cache.get(key)
@@ -3529,6 +3869,16 @@ def spend_increase_blocked(ctx: AnalysisContext) -> frozenset[SubjectKey]:
     return result
 
 
+G1_THRESHOLD_KEYS: Final[tuple[str, ...]] = (*BUDGET_THRESHOLD_KEYS, *B2_THRESHOLD_KEYS)
+"""Every key the G1 predicate (:func:`spend_increase_blocked`) applies, for ``evidence.thresholds``.
+
+The ``budget.*`` keys classify each subject's days and gate high utilization
+(:data:`BUDGET_THRESHOLD_KEYS`); the ``b2.*`` keys judge poor efficiency
+(:data:`B2_THRESHOLD_KEYS`). One shared contract, so every rule that names or leaves out a
+spend target by G1 records the same controls.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Pure half: the Google counting contract (AAP 0.5.4.5 B4)
 # ---------------------------------------------------------------------------
@@ -3536,15 +3886,48 @@ def spend_increase_blocked(ctx: AnalysisContext) -> frozenset[SubjectKey]:
 ContractDay = Literal["last_click", "weighted", "unknown"]
 """How Google counted ``metrics.conversions`` on one native day (B4).
 
-``last_click``: every included conversion action was whole-day known with
-``GOOGLE_ADS_LAST_CLICK``, so the day's conversions are unweighted event counts.
-``weighted``: some included action was data-driven or external that day, as an observation
-captured during the day or the day's whole-day-known settings show. ``unknown``: otherwise,
-some action's settings were not whole-day known ("conversion counting contract unknown").
+``last_click``: every conversion action's inclusion was whole-day known, and every included
+action was whole-day known with ``GOOGLE_ADS_LAST_CLICK`` and a ``ONE_PER_CLICK`` or
+``MANY_PER_CLICK`` counting type, so the day's conversions are unweighted event counts. An
+action excluded all day constrains nothing, whatever its model or counting type.
+``weighted``: some included action was data-driven or external that day (a retired rule-based
+model counts, Google having upgraded it to data-driven), as an observation captured during the
+day or the day's whole-day-known settings show. ``unknown``: otherwise, no conversion action
+exists, or some action's inclusion, or an included action's settings, was not whole-day known,
+or was known but missing or unrecognised, for example a null attribution model or counting
+type ("conversion counting contract unknown").
 """
 
 LAST_CLICK_MODEL: Final = "GOOGLE_ADS_LAST_CLICK"
 """The only attribution model under which Google conversions are whole, unweighted counts."""
+
+_WEIGHTED_MODELS: Final[frozenset[str]] = frozenset(
+    {
+        "EXTERNAL",
+        "GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN",
+        "GOOGLE_SEARCH_ATTRIBUTION_FIRST_CLICK",
+        "GOOGLE_SEARCH_ATTRIBUTION_LINEAR",
+        "GOOGLE_SEARCH_ATTRIBUTION_POSITION_BASED",
+        "GOOGLE_SEARCH_ATTRIBUTION_TIME_DECAY",
+    }
+)
+"""``AttributionModelEnum`` names that affirmatively weight conversions: data-driven, external
+and the retired rule-based models, which Google upgraded to data-driven. ``UNKNOWN``,
+``UNSPECIFIED``, a null model or any other name is unknown, never weighted."""
+
+_COUNTING_TYPES: Final[frozenset[str]] = frozenset({"MANY_PER_CLICK", "ONE_PER_CLICK"})
+"""``ConversionActionCountingTypeEnum`` names that count whole conversions; any other value,
+null, ``UNKNOWN`` and ``UNSPECIFIED`` included, leaves a last-click action's count unverified."""
+
+
+def _inclusion_value(obs: Observation) -> bool | None:
+    """Whether a conversion action counts in ``metrics.conversions`` at one observation.
+
+    ``None`` when the payload's ``include_in_conversions_metric`` is absent or not a ``bool``:
+    the inclusion is then unavailable, never assumed either way.
+    """
+    value = obs.payload.get("include_in_conversions_metric")
+    return value if isinstance(value, bool) else None
 
 
 def _contract_value(obs: Observation) -> tuple[object, object, object]:
@@ -3558,8 +3941,17 @@ def _contract_value(obs: Observation) -> tuple[object, object, object]:
 
 
 def _weighted(value: Hashable | None) -> bool:
-    """Whether a :func:`_contract_value` includes the action under a non-last-click model."""
-    return isinstance(value, tuple) and value[0] is True and value[1] != LAST_CLICK_MODEL
+    """Whether a :func:`_contract_value` includes the action under a weighted model.
+
+    Affirmative only: the inclusion is exactly ``True`` and the model is one of
+    :data:`_WEIGHTED_MODELS`. A missing or unrecognised model is never weighted evidence.
+    """
+    return (
+        isinstance(value, tuple)
+        and value[0] is True
+        and isinstance(value[1], str)
+        and value[1] in _WEIGHTED_MODELS
+    )
 
 
 def _weighted_during(series: _Series, lower: datetime, upper: datetime) -> bool:
@@ -3573,27 +3965,65 @@ def _weighted_during(series: _Series, lower: datetime, upper: datetime) -> bool:
     return any(_weighted(series.values[index]) for index in range(start, stop))
 
 
+def _action_day(inclusion: _Span, settings: _Span) -> ContractDay | None:
+    """One conversion action's contract on one native day; ``None`` when it is excluded.
+
+    ``inclusion`` classifies :func:`_inclusion_value` and ``settings`` the full
+    :func:`_contract_value` over the same observations. An inclusion not whole-day known, or
+    known but unavailable, is ``unknown``; known ``False`` proves the action excluded all day,
+    so its model and counting type never matter. An included action needs whole-day-known
+    settings: a weighted model is ``weighted``; :data:`LAST_CLICK_MODEL` with a counting type
+    in :data:`_COUNTING_TYPES` is ``last_click``; anything else is ``unknown``.
+    """
+    if inclusion.klass != "known" or inclusion.value is None:
+        return "unknown"
+    if inclusion.value is False:
+        return None
+    if settings.klass != "known" or not isinstance(settings.value, tuple):
+        return "unknown"
+    if _weighted(settings.value):
+        return "weighted"
+    model, counting = settings.value[1], settings.value[2]
+    if model == LAST_CLICK_MODEL and isinstance(counting, str) and counting in _COUNTING_TYPES:
+        return "last_click"
+    return "unknown"
+
+
 def counting_contract(ctx: AnalysisContext) -> dict[date, ContractDay]:
     """Return the counting contract of every window day in the Google account's zone.
 
-    AAP 0.5.4.5 B4: the Poisson rate test is valid only on unweighted event counts. Every
-    conversion action's ``(include_in_conversions_metric, attribution_model,
-    counting_type)`` is classified per day from its Q-G8 observations with
-    :func:`classify_days`. For day ``d``:
+    AAP 0.5.4.5 B4: the Poisson rate test is valid only on unweighted event counts. Each
+    conversion action is classified per day from its Q-G8 observations with
+    :func:`classify_days` twice: its ``include_in_conversions_metric`` alone (a ``bool``, else
+    unavailable), and its full ``(include_in_conversions_metric, attribution_model,
+    counting_type)``. Absent values are unavailable, never defaults. Per action and day
+    (:func:`_action_day`):
 
-    * an observation captured during ``d`` shows an action with
-      ``include_in_conversions_metric = true`` under a model other than
-      :data:`LAST_CLICK_MODEL` → ``weighted``, whole-day known or not: the snapshot
-      establishes that the action was data-driven or external on ``d`` (AAP 0.5.4.5 B4,
-      "data-driven or external on any day"). A one-day switch to data-driven in a zone the
-      snapshot cadence does not align with is therefore weighted, never merely unknown;
-    * else any action not whole-day known → ``unknown`` (for example before the first Q-G8
-      snapshot, or a setting changed during the day); a context without any conversion
-      action is ``unknown`` on every day, because nothing verifies the contract;
-    * else every action with ``include_in_conversions_metric = true`` uses
-      :data:`LAST_CLICK_MODEL` → ``last_click``. ``MANY_PER_CLICK`` keeps whole counts, so
-      counting type alone never weights a day; a change in it still unsettles the day;
-    * else → ``weighted`` (data-driven or external attribution splits credit).
+    * inclusion not whole-day known, or known but unavailable → ``unknown``: nothing shows
+      whether the action counts in ``metrics.conversions`` (for example before the first
+      Q-G8 snapshot, or an inclusion flipped during the day);
+    * inclusion known ``false`` → excluded all day: its model and counting type, and any
+      change in them, never matter;
+    * inclusion known ``true`` → its full settings must be whole-day known (a model or
+      counting-type change during the day unsettles it) and then give ``weighted`` for a
+      data-driven, external or retired rule-based model; ``last_click`` for
+      :data:`LAST_CLICK_MODEL` with ``ONE_PER_CLICK`` or ``MANY_PER_CLICK``, both of which
+      keep whole counts; and ``unknown`` otherwise, for example a null, ``UNKNOWN`` or
+      unrecognised model, or last click with a null or ``UNSPECIFIED`` counting type.
+
+    Day ``d`` is then, in order:
+
+    * ``weighted`` when an observation captured during ``d`` shows an action with
+      ``include_in_conversions_metric = true`` under a weighted model, whole-day known or not:
+      the snapshot establishes that the action was data-driven or external on ``d`` (AAP
+      0.5.4.5 B4, "data-driven or external on any day"), so a one-day switch to data-driven in
+      a zone the snapshot cadence does not align with is weighted, never merely unknown; or
+      when any action is ``weighted`` for the day;
+    * else ``unknown`` when any action is ``unknown``, or the context has no conversion action
+      at all, because nothing verifies the contract;
+    * else ``last_click``. When every action is whole-day known excluded, the verified
+      included set is empty and the day is ``last_click``: only included actions are
+      constrained.
 
     Integrality of the daily values is B4's additional check, never a substitute for this.
     Memoised in ``ctx.cache``; each call returns a fresh ``dict``.
@@ -3608,29 +4038,28 @@ def counting_contract(ctx: AnalysisContext) -> dict[date, ContractDay]:
             set(ctx.conversion_actions)
             | {eid for (etype, eid) in ctx.observations if etype == "conversion_action"}
         )
-        series = [
-            _Series.of(ctx.observations.get(("conversion_action", aid), ()), _contract_value)
-            for aid in action_ids
-        ]
+        observed = [ctx.observations.get(("conversion_action", aid), ()) for aid in action_ids]
+        series = [_Series.of(item, _contract_value) for item in observed]
         spans = [_classify(item, dates, tz, gap) for item in series]
+        inclusions = [
+            _classify(_Series.of(item, _inclusion_value), dates, tz, gap) for item in observed
+        ]
         contract: dict[date, ContractDay] = {}
         for day in dates:
             lower, upper = _day_bounds(day, tz)
             if any(_weighted_during(item, lower, upper) for item in series):
                 contract[day] = "weighted"
                 continue
-            day_spans = [by_day[day] for by_day in spans]
-            if not day_spans or any(span.klass != "known" for span in day_spans):
+            verdicts = {
+                _action_day(inclusion[day], settings[day])
+                for inclusion, settings in zip(inclusions, spans, strict=True)
+            }
+            if "weighted" in verdicts:
+                contract[day] = "weighted"
+            elif not action_ids or "unknown" in verdicts:
                 contract[day] = "unknown"
-                continue
-            models = [
-                value[1]
-                for value in (span.value for span in day_spans)
-                if isinstance(value, tuple) and value[0] is True
-            ]
-            contract[day] = (
-                "last_click" if all(m == LAST_CLICK_MODEL for m in models) else "weighted"
-            )
+            else:
+                contract[day] = "last_click"
         cached = MappingProxyType(contract)
         ctx.cache[key] = cached
     return dict(cached)

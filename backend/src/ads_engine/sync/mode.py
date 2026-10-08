@@ -537,7 +537,7 @@ class SourceModeController:
                 settings,
                 sessionmaker=sessionmaker,
                 clock=lambda: FIXED_CLOCK,
-                transports={"google": mock_transport("google", world)},
+                transports={"google": mock_transport("google", world, settings=settings)},
                 retry=RetryPolicy(sleep=no_sleep),
             )
             outcome = await controller.ensure_dataset("google")
@@ -1006,11 +1006,12 @@ class SourceModeController:
         """Open ``source``'s connector client in ``mode``; its HTTP client closes on exit.
 
         * **Simulated**: every request goes through the simulation's mock transport
-          (``mock_transport(source, self.world)``), so the live clients and parsers run
-          unchanged. Google gets :data:`SIMULATED_WEBHOOK_URL` with :data:`SIMULATED_SECRET`
-          and is never metered against the live call budget; LinkedIn a static simulated
-          token and the world's ad accounts; HubSpot a client marked not live, which never
-          sends simulated emails to a portal.
+          (``mock_transport(source, self.world, settings=self.settings)``), so the live clients
+          and parsers run unchanged. Google gets :data:`SIMULATED_WEBHOOK_URL` with
+          :data:`SIMULATED_SECRET` under the configured secret header name, which the
+          transport validates against the same settings, and is never metered against the
+          live call budget; LinkedIn a static simulated token and the world's ad accounts;
+          HubSpot a client marked not live, which never sends simulated emails to a portal.
         * **Live**: the network, or the transport injected for the source. Google reads the
           n8n webhook settings and draws on the product's call budget (no Google OAuth,
           client id, secret, refresh token or developer token exists here); LinkedIn
@@ -1032,7 +1033,7 @@ class SourceModeController:
         checked_mode = _as_mode(mode)
         transport: httpx.AsyncBaseTransport | None
         if checked_mode == "simulated":
-            transport = mock_transport(checked_source, self.world)
+            transport = mock_transport(checked_source, self.world, settings=self._settings)
         else:
             if not self._settings.has_credentials(checked_source):
                 missing = ", ".join(self._settings.missing_credentials(checked_source))

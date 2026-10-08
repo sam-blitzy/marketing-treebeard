@@ -38,6 +38,7 @@ from ads_engine.analysis.context import (
     RuleResult,
     Source,
     SubjectType,
+    json_value,
     objective_group,
 )
 from ads_engine.analysis.discrepancy import (
@@ -871,7 +872,7 @@ def test_one_pinned_item_per_unresolved_discrepancy_oldest_first(
         assert candidate.entity_ref.source == item.source
         assert candidate.entity_ref.type == item.subject_type
         assert candidate.entity_ref.id == item.subject_id
-        assert candidate.evidence.extra["resolutions"] == list(
+        assert candidate.evidence.extra["resolutions"] == tuple(
             offered_resolutions(item.kind, item.shape)
         )
         assert candidate.evidence.extra["kind"] == item.kind
@@ -1156,7 +1157,7 @@ def test_each_kind_and_subject_renders_its_item(
         == f"Resolve: platform shows {platform.value}, last decided {decided.value}"
     )
     assert tuple(candidate.evidence.extra["resolutions"]) == resolutions
-    assert candidate.evidence.extra["resolutions"] == list(
+    assert candidate.evidence.extra["resolutions"] == tuple(
         offered_resolutions(item.kind, item.shape)
     )
     assert candidate.evidence.extra["decided"] == (
@@ -1186,7 +1187,7 @@ def test_evidence_records_the_entity_dataset_and_frozen_values(
     candidate = _only(_context(thresholds, window, item))
     evidence = candidate.evidence
 
-    assert evidence.window == window.to_json()
+    assert json_value(evidence.window) == window.to_json()
     assert evidence.thresholds == {}
     assert evidence.datasets == (DatasetStatus("google.entities", "complete", COVERED_THROUGH),)
     assert evidence.provenance == (ProvenanceEntry("google", 11, "live", "primary"),)
@@ -1202,7 +1203,7 @@ def test_evidence_records_the_entity_dataset_and_frozen_values(
         "decided": {"budget_id": SHARED_BUDGET, "budget_external_id": "123"},
         # The stored value is kept as stored; only the display text is enriched.
         "platform": {"budget_id": OTHER_SHARED_BUDGET, "budget_external_id": None},
-        "resolutions": ["platform_correct", "decision_correct"],
+        "resolutions": ("platform_correct", "decision_correct"),
     }
     assert _platform_text(candidate) == "shared budget 789"
     assert platform_value == {"budget_id": OTHER_SHARED_BUDGET, "budget_external_id": None}

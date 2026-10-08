@@ -3,13 +3,20 @@
 Every payload is traceable to ``backend/tests/contracts/hubspot/*.json``. Each contract's
 documented sample runs through its decoder verbatim (AAP 0.11.2): the associations sample is
 the "Retrieve associations" reference page's rendered 207 example, placeholders included.
-Every hand-built body starts from the contract's own shapes, uses only fields its contract
-defines, and is checked against that contract's response schema before it is parsed, so a
-fixture carrying an undeclared field fails the test. Deliberately malformed inputs for the
-defect tests are the one exception.
+The objects and associations samples carry status ``CANCELED``, so each decodes as a failed
+call with no usable data; their result and error entries are also decoded inside a
+successful envelope. Every hand-built body starts from the contract's own shapes, uses only
+fields its contract defines, and is checked against that contract's response schema before
+it is parsed, so a fixture carrying an undeclared field fails the test. Deliberately
+malformed inputs for the defect tests, and the never-read results of a failed batch, are the
+only exceptions.
 
-Covered: the batch envelope (``status``, required ``results``, :data:`BATCH_COMPLETE`, 207
-``errors[]`` decoded into :class:`BatchError` with email inputs held only as digests), the
+Covered: the batch envelope (``status`` from the contract's enum read first, required
+``results``, :data:`BATCH_COMPLETE`, a failed call yielding no usable data, ``startedAt``,
+``completedAt`` and ``numErrors``, 207 ``errors[]`` decoded into :class:`BatchError` with
+email inputs held only as digests, an input both returned and failed rejected), every CRM
+object's required ``id``, ``properties``, ``createdAt``, ``updatedAt`` and ``archived``,
+string-or-null property values, association ``associationTypes``, the
 associations batch (``from.id`` to ``toObjectId`` pairs, per-input ``paging.next.after``,
 ``NO_ASSOCIATIONS_FOUND`` as a genuine zero, every other error as a failed input), contact,
 meeting and deal rows, instants, exact amounts, property definitions, email hashing, the
@@ -371,33 +378,48 @@ def test_documented_sample_conforms_and_decodes_verbatim(surface: str) -> None:
 
 
 def test_associations_documented_sample() -> None:
-    batch = parse_association_batch(_sample("associations_batch_read"))
+    sample = _sample("associations_batch_read")
+    batch = parse_association_batch(sample)
     assert isinstance(batch, AssociationBatch)
+    # Its CANCELED status makes the sample a failed call: no input is settled by it.
     assert batch.status == "CANCELED"
     assert batch.is_complete is False
-    assert dict(batch.results) == {
+    assert dict(batch.results) == {}
+    assert batch.empty_ids == frozenset()
+    assert dict(batch.error_ids) == {}
+
+    # The sample's result and error entries, verbatim inside a successful envelope.
+    complete = parse_association_batch(
+        _batch_body("associations_batch_read", sample["results"], errors=sample["errors"])
+    )
+    assert dict(complete.results) == {
         "<string>": AssociationResult(from_id="<string>", targets=("<string>",), after="<string>")
     }
-    assert batch.empty_ids == frozenset()
+    assert complete.empty_ids == frozenset()
     # The sample's error entry has an empty context, so it names no failed input.
-    assert dict(batch.error_ids) == {}
+    assert dict(complete.error_ids) == {}
 
 
 def test_objects_documented_sample() -> None:
     sample = _sample("objects_batch_read")
     result = parse_batch_read(sample)
     assert isinstance(result, BatchReadResult)
+    # Its CANCELED status makes the sample a failed call: it yields no usable record.
     assert result.status == "CANCELED"
     assert result.is_complete is False
-    assert result.records == (sample["results"][0],)
-    # The rendered subCategory is an object ({}), which is not a string subcategory.
-    assert result.errors == (
-        BatchError(category="<string>", sub_category=None, message="<string>", ids=()),
-    )
-    assert result.errors[0].label == "<string>"
-    assert result.errors[0].email_sha256s == ()
+    assert result.records == ()
+    assert result.errors == ()
 
-    record = result.records[0]
+    # The sample's error entry, verbatim inside a successful envelope. The rendered
+    # subCategory is an object ({}), which is not a string subcategory.
+    entries = sample["errors"]
+    (error,) = parse_batch_read(_batch_body("objects_batch_read", [], errors=entries)).errors
+    assert error == BatchError(category="<string>", sub_category=None, message="<string>", ids=())
+    assert error.label == "<string>"
+    assert error.email_sha256s == ()
+
+    # The sample's record decodes on its own as each object type.
+    record = sample["results"][0]
     created = datetime(2023, 11, 7, 5, 31, 56, tzinfo=UTC)
     assert parse_contact(record, PROPS_ALL) == ContactRow(
         hs_id="<string>",
@@ -481,6 +503,29 @@ def test_batch_status_other_than_complete_is_a_failed_call(status: str) -> None:
     )
     assert (objects.status, objects.is_complete) == (status, False)
     assert (associations.status, associations.is_complete) == (status, False)
+    assert (objects.records, objects.errors) == ((), ())
+    assert dict(associations.results) == {}
+    assert (associations.empty_ids, dict(associations.error_ids)) == (frozenset(), {})
+
+
+@pytest.mark.parametrize("status", ["CANCELED", "PENDING", "PROCESSING"])
+def test_failed_batch_is_recognised_before_any_result_is_validated(status: str) -> None:
+    # Deliberately non-conformant results: a failed call's results are never read, so
+    # elements a successful record would need (properties, createdAt, to) may be absent.
+    objects_body = {
+        "status": status,
+        "results": [{"id": CONTACT_ID}, "not a record"],
+        "startedAt": STARTED_AT,
+        "completedAt": COMPLETED_AT,
+    }
+    associations_body = {**objects_body, "results": [{"from": {"id": CONTACT_ID}}, 7]}
+    objects = parse_batch_read(objects_body)
+    associations = parse_association_batch(associations_body)
+    assert objects == BatchReadResult(status=status, records=(), errors=())
+    assert associations.status == status
+    assert associations.is_complete is False
+    assert dict(associations.results) == {}
+    assert (associations.empty_ids, dict(associations.error_ids)) == (frozenset(), {})
 
 
 def test_207_contacts_by_email_holds_email_inputs_only_as_digests() -> None:
@@ -504,6 +549,15 @@ def test_207_contacts_by_email_holds_email_inputs_only_as_digests() -> None:
     )
     for text in (error.message, repr(error), repr(result.errors)):
         assert "nobody@example.com" not in text.lower()
+
+
+def test_207_without_the_optional_num_errors_decodes_its_errors() -> None:
+    entry = _error_entry("OBJECT_NOT_FOUND", "Not found", context={"ids": [OTHER_CONTACT_ID]})
+    body = _batch_body("objects_batch_read", [_hs_record(CONTACT_ID, {})], errors=[entry])
+    del body["numErrors"]
+    result = parse_batch_read(_conforming("objects_batch_read", body))
+    assert [record["id"] for record in result.records] == [CONTACT_ID]
+    assert [error.ids for error in result.errors] == [(OTHER_CONTACT_ID,)]
 
 
 def test_batch_error_message_drops_email_ids_no_pattern_would_catch() -> None:
@@ -649,14 +703,53 @@ def test_association_207_other_errors_fail_their_inputs_with_the_first_label() -
     assert batch.empty_ids == frozenset()
 
 
-def test_association_input_with_targets_is_never_reported_empty() -> None:
+@pytest.mark.parametrize(
+    ("result", "entry"),
+    [
+        (
+            _association("11", [99100000009]),
+            _error_entry(
+                "OBJECT_NOT_FOUND",
+                "No associations found",
+                sub_category=NO_ASSOCIATIONS_FOUND,
+                context={"fromObjectId": ["11", "13"]},
+            ),
+        ),
+        (
+            _association("11", []),
+            _error_entry("VALIDATION_ERROR", "Invalid input", context={"fromObjectId": ["11"]}),
+        ),
+        (
+            _association("11", [99100000009], after="cursor-11"),
+            _error_entry("OBJECT_NOT_FOUND", "Unknown input", context={"fromObjectId": [11]}),
+        ),
+    ],
+    ids=["targets-and-no-associations", "empty-and-error", "paged-and-error"],
+)
+def test_association_input_returned_and_listed_as_an_error_is_a_defect(
+    result: Mapping[str, Any], entry: Mapping[str, Any]
+) -> None:
+    # A failed input is absent from results (AAP 0.2.4): one in both is contradictory, and
+    # is never read as associated, empty or failed.
+    body = _batch_body("associations_batch_read", [result], errors=[entry])
+    with pytest.raises(QueryDefect) as caught:
+        parse_association_batch(body)
+    _assert_defect(
+        caught.value,
+        "associations_batch_read: an input in 'results' is also named by an 'errors' entry",
+        forbidden="11",
+    )
+
+
+def test_association_inputs_named_only_by_errors_keep_their_own_outcome() -> None:
     errors = [
         _error_entry(
             "OBJECT_NOT_FOUND",
             "No associations found",
             sub_category=NO_ASSOCIATIONS_FOUND,
-            context={"fromObjectId": ["11", "13"]},
-        )
+            context={"fromObjectId": ["13"]},
+        ),
+        _error_entry("VALIDATION_ERROR", "Invalid input", context={"fromObjectId": ["14"]}),
     ]
     body = _batch_body(
         "associations_batch_read", [_association("11", [99100000009])], errors=errors
@@ -664,6 +757,7 @@ def test_association_input_with_targets_is_never_reported_empty() -> None:
     batch = parse_association_batch(body)
     assert batch.results["11"].targets == ("99100000009",)
     assert batch.empty_ids == frozenset({"13"})
+    assert dict(batch.error_ids) == {"14": "VALIDATION_ERROR"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -740,9 +834,8 @@ def test_parse_contact_unbound_or_skipped_stages_are_none() -> None:
             MQL_PROPERTY: "2026-09-03",
             QL_PROPERTY: "",
             CAMPAIGN_PROPERTY: None,
-            "lastmodifieddate": str(UPDATED_EPOCH_MS),
+            "lastmodifieddate": "2026-01-01T00:00:00Z",
         },
-        updated_at="",
     )
     # Nothing bound: no metric is read, whatever the record holds.
     unbound = parse_contact(record, ContactPropertyMap())
@@ -756,7 +849,7 @@ def test_parse_contact_unbound_or_skipped_stages_are_none() -> None:
     assert bound.google_touch_at is None
     assert bound.lifecycle_stage == "customer"
     assert bound.email_sha256 is None
-    # An empty updatedAt falls back to lastmodifieddate.
+    # updated_at is the record's required updatedAt, never the lastmodifieddate property.
     assert bound.updated_at == UPDATED
 
 
@@ -1031,8 +1124,18 @@ def test_parse_property_without_options(type_: str, field_type: str, is_datetime
 
 
 def test_parse_property_blank_field_type_is_none() -> None:
+    # fieldType is required and present, but blank: it holds no rendering, so it is None.
     body = _property_body(MQL_PROPERTY, "datetime", "  ", [])
     assert parse_property(body).field_type is None
+
+
+def test_parse_property_accepts_the_empty_strings_its_contract_allows() -> None:
+    body = _property_body(MQL_PROPERTY, "datetime", "date", [])
+    body.update(description="", groupName="", label="")
+    definition = parse_property(_conforming("properties", body))
+    assert definition == PropertyDefinition(
+        name=MQL_PROPERTY, type="datetime", field_type="date", options=()
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1109,17 +1212,53 @@ def test_contact_property_map_rejects_blank_or_padded_names(field: str, name: st
 # Every validation defect: source hubspot, endpoint parse, code validation, no values
 # ---------------------------------------------------------------------------------------------
 
-_BATCH = {"status": BATCH_COMPLETE, "results": []}
+_TIMES = {"startedAt": STARTED_AT, "completedAt": COMPLETED_AT}
+_BATCH = {"status": BATCH_COMPLETE, "results": [], **_TIMES}
 _ERROR = {"status": "error", "category": "OBJECT_NOT_FOUND", "message": "Not found"}
+_META = {"createdAt": INSTANT_ISO_Z, "updatedAt": UPDATED_ISO, "archived": False}
+_RECORD = {"id": "1", "properties": {}, **_META}
+_TYPE = {"category": "HUBSPOT_DEFINED", "typeId": 200}
+_TARGET = {"toObjectId": MEETING_ID, "associationTypes": [_TYPE]}
 _FROM = {"from": {"id": CONTACT_ID}, "to": []}
-_PROPERTY = {"name": "lifecyclestage", "type": "enumeration", "fieldType": "radio"}
+_PROPERTY = {
+    "name": "lifecyclestage",
+    "type": "enumeration",
+    "fieldType": "radio",
+    "description": "",
+    "groupName": "contactinformation",
+    "label": "Lifecycle Stage",
+    "options": [],
+}
 _OPTION = {"label": "Lead", "value": "lead", "hidden": False}
 _LEAKED = "lead.one@example.com"
+_STATUS_ENUM = "field 'status' must be one of CANCELED, COMPLETE, PENDING, PROCESSING"
+_CATEGORY_ENUM = (
+    "field 'results[].to[].associationTypes[].category' must be one of HUBSPOT_DEFINED, "
+    "INTEGRATOR_DEFINED, USER_DEFINED, WORK"
+)
+
+
+def _without(mapping: Mapping[str, object], key: str) -> dict[str, object]:
+    """Return a copy of ``mapping`` without ``key``."""
+    return {name: value for name, value in mapping.items() if name != key}
 
 
 def _contact(properties: Mapping[str, object], **record: object) -> Callable[[], object]:
     """Return a call parsing a contact whose properties are ``properties``."""
-    return lambda: parse_contact({"id": CONTACT_ID, "properties": properties, **record}, PROPS_ALL)
+    body = {"id": CONTACT_ID, "properties": properties, **_META, **record}
+    return lambda: parse_contact(body, PROPS_ALL)
+
+
+def _meeting(properties: Mapping[str, object], **record: object) -> Callable[[], object]:
+    """Return a call parsing a meeting whose properties are ``properties``."""
+    body = {"id": MEETING_ID, "properties": properties, **_META, **record}
+    return lambda: parse_meeting(body)
+
+
+def _deal(properties: Mapping[str, object], **record: object) -> Callable[[], object]:
+    """Return a call parsing a deal whose properties are ``properties``."""
+    body = {"id": DEAL_ID, "properties": properties, **_META, **record}
+    return lambda: parse_deal(body)
 
 
 DEFECT_CASES = [
@@ -1155,6 +1294,24 @@ DEFECT_CASES = [
         id="objects-status-unencodable",
     ),
     pytest.param(
+        lambda: parse_batch_read({"status": "DONE", "results": []}),
+        f"objects_batch_read: {_STATUS_ENUM}",
+        "DONE",
+        id="objects-status-unknown",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({"status": "CANCELED"}),
+        "objects_batch_read: required field 'results' is missing",
+        None,
+        id="objects-failed-results-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({"status": "PENDING", "results": {}}),
+        "objects_batch_read: field 'results' must be a JSON array",
+        None,
+        id="objects-failed-results-not-array",
+    ),
+    pytest.param(
         lambda: parse_batch_read({"status": BATCH_COMPLETE}),
         "objects_batch_read: required field 'results' is missing",
         None,
@@ -1173,46 +1330,126 @@ DEFECT_CASES = [
         id="objects-record-not-object",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"properties": {}}]}),
+        lambda: parse_batch_read({**_BATCH, "results": [_without(_RECORD, "id")]}),
         "objects_batch_read: required field 'record.id' is missing",
         None,
         id="objects-record-id-missing",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": True, "properties": {}}]}),
-        "objects_batch_read: 'record.id' must be a string or an integer",
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "id": True}]}),
+        "objects_batch_read: 'record.id' must be a string",
         None,
         id="objects-record-id-bool",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": Decimal("1.5"), "properties": {}}]}),
-        "objects_batch_read: 'record.id' must be a string or an integer",
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "id": Decimal("1.5")}]}),
+        "objects_batch_read: 'record.id' must be a string",
         None,
         id="objects-record-id-decimal",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": "  ", "properties": {}}]}),
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "id": 99200000001}]}),
+        "objects_batch_read: 'record.id' must be a string",
+        "99200000001",
+        id="objects-record-id-integer",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "id": "  "}]}),
         "objects_batch_read: 'record.id' must not be blank",
         None,
         id="objects-record-id-blank",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": "1\x00", "properties": {}}]}),
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "id": "1\x00"}]}),
         "objects_batch_read: 'record.id' must not contain a NUL character",
         None,
         id="objects-record-id-nul",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": "1"}]}),
+        lambda: parse_batch_read({**_BATCH, "results": [_without(_RECORD, "properties")]}),
         "objects_batch_read: required field 'record.properties' is missing",
         None,
         id="objects-record-properties-missing",
     ),
     pytest.param(
-        lambda: parse_batch_read({**_BATCH, "results": [{"id": "1", "properties": [_LEAKED]}]}),
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "properties": [_LEAKED]}]}),
         "objects_batch_read: field 'record.properties' must be a JSON object",
         _LEAKED,
         id="objects-record-properties-not-object",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [_without(_RECORD, "createdAt")]}),
+        "objects_batch_read: required field 'record.createdAt' is missing",
+        None,
+        id="objects-record-created-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(
+            {**_BATCH, "results": [{**_RECORD, "createdAt": INSTANT_EPOCH_MS}]}
+        ),
+        "objects_batch_read: field 'record.createdAt' must be a string",
+        str(INSTANT_EPOCH_MS),
+        id="objects-record-created-at-number",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "createdAt": " "}]}),
+        "objects_batch_read: field 'record.createdAt' must not be blank",
+        None,
+        id="objects-record-created-at-blank",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "createdAt": _LEAKED}]}),
+        f"objects_batch_read: 'record.createdAt': {INSTANT_EXPECTED}",
+        _LEAKED,
+        id="objects-record-created-at-malformed",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [_without(_RECORD, "updatedAt")]}),
+        "objects_batch_read: required field 'record.updatedAt' is missing",
+        None,
+        id="objects-record-updated-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "updatedAt": ""}]}),
+        "objects_batch_read: field 'record.updatedAt' must not be blank",
+        None,
+        id="objects-record-updated-at-empty",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [_without(_RECORD, "archived")]}),
+        "objects_batch_read: required field 'record.archived' is missing",
+        None,
+        id="objects-record-archived-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "results": [{**_RECORD, "archived": "false"}]}),
+        "objects_batch_read: field 'record.archived' must be a boolean",
+        None,
+        id="objects-record-archived-not-boolean",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({"status": BATCH_COMPLETE, "results": []}),
+        "objects_batch_read: required field 'startedAt' is missing",
+        None,
+        id="objects-started-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "startedAt": 1}),
+        "objects_batch_read: field 'startedAt' must be a string",
+        None,
+        id="objects-started-at-number",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(_without(_BATCH, "completedAt")),
+        "objects_batch_read: required field 'completedAt' is missing",
+        None,
+        id="objects-completed-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "completedAt": "soon"}),
+        f"objects_batch_read: 'completedAt': {INSTANT_EXPECTED}",
+        "soon",
+        id="objects-completed-at-malformed",
     ),
     pytest.param(
         lambda: parse_batch_read({**_BATCH, "errors": {}}),
@@ -1278,6 +1515,95 @@ DEFECT_CASES = [
         None,
         id="objects-error-context-id-blank",
     ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "errors": [_without(_ERROR, "status")]}),
+        "objects_batch_read: required field 'errors[].status' is missing",
+        None,
+        id="objects-error-status-missing",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "errors": [{**_ERROR, "status": 404}]}),
+        "objects_batch_read: field 'errors[].status' must be a string",
+        None,
+        id="objects-error-status-not-string",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "errors": [_ERROR], "numErrors": -1}),
+        "objects_batch_read: field 'numErrors' must be a non-negative integer",
+        None,
+        id="objects-num-errors-negative",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "errors": [_ERROR], "numErrors": True}),
+        "objects_batch_read: field 'numErrors' must be a non-negative integer",
+        None,
+        id="objects-num-errors-bool",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "errors": [_ERROR], "numErrors": 123}),
+        "objects_batch_read: field 'numErrors' must equal the number of 'errors' entries",
+        "123",
+        id="objects-num-errors-mismatch",
+    ),
+    pytest.param(
+        lambda: parse_batch_read({**_BATCH, "numErrors": 1}),
+        "objects_batch_read: field 'numErrors' must equal the number of 'errors' entries",
+        None,
+        id="objects-num-errors-without-errors",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(
+            {
+                **_BATCH,
+                "results": [{**_RECORD, "id": DEAL_ID}],
+                "errors": [{**_ERROR, "context": {"ids": ["99200000009", DEAL_ID]}}],
+                "numErrors": 1,
+            }
+        ),
+        "objects_batch_read: a 'results' record is also named by an 'errors' entry",
+        DEAL_ID,
+        id="objects-record-also-failed",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(
+            {
+                **_BATCH,
+                "results": [{**_RECORD, "properties": {"email": f" {_LEAKED.upper()} "}}],
+                "errors": [{**_ERROR, "context": {"ids": [_LEAKED]}}],
+            }
+        ),
+        "objects_batch_read: a 'results' contact answers to an email an 'errors' entry names",
+        _LEAKED,
+        id="objects-contact-email-also-failed",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(
+            {
+                **_BATCH,
+                "results": [
+                    {**_RECORD, "properties": {"hs_additional_emails": f"x@example.com;{_LEAKED}"}}
+                ],
+                "errors": [
+                    {**_ERROR, "category": "VALIDATION_ERROR", "context": {"ids": [_LEAKED]}}
+                ],
+            }
+        ),
+        "objects_batch_read: a 'results' contact answers to an email an 'errors' entry names",
+        _LEAKED,
+        id="objects-contact-additional-email-also-failed",
+    ),
+    pytest.param(
+        lambda: parse_batch_read(
+            {
+                **_BATCH,
+                "results": [{**_RECORD, "properties": {"email": [_LEAKED]}}],
+                "errors": [{**_ERROR, "context": {"ids": [_LEAKED]}}],
+            }
+        ),
+        "objects_batch_read: contact property 'email' must be a string",
+        _LEAKED,
+        id="objects-contradiction-check-email-not-string",
+    ),
     # associations_batch_read
     pytest.param(
         lambda: parse_association_batch([]),
@@ -1290,6 +1616,18 @@ DEFECT_CASES = [
         "associations_batch_read: required field 'status' is missing",
         None,
         id="associations-status-missing",
+    ),
+    pytest.param(
+        lambda: parse_association_batch({"status": "complete", "results": []}),
+        f"associations_batch_read: {_STATUS_ENUM}",
+        "complete",
+        id="associations-status-unknown",
+    ),
+    pytest.param(
+        lambda: parse_association_batch({"status": "PROCESSING", "results": "x"}),
+        "associations_batch_read: field 'results' must be a JSON array",
+        None,
+        id="associations-failed-results-not-array",
     ),
     pytest.param(
         lambda: parse_association_batch({"status": BATCH_COMPLETE}),
@@ -1393,6 +1731,122 @@ DEFECT_CASES = [
         None,
         id="associations-error-message-missing",
     ),
+    pytest.param(
+        lambda: parse_association_batch({**_BATCH, "errors": [{**_ERROR, "status": None}]}),
+        "associations_batch_read: required field 'errors[].status' is missing",
+        None,
+        id="associations-error-status-missing",
+    ),
+    pytest.param(
+        lambda: parse_association_batch({**_BATCH, "errors": [_ERROR, _ERROR], "numErrors": 1}),
+        "associations_batch_read: field 'numErrors' must equal the number of 'errors' entries",
+        None,
+        id="associations-num-errors-mismatch",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(_without(_BATCH, "startedAt")),
+        "associations_batch_read: required field 'startedAt' is missing",
+        None,
+        id="associations-started-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_association_batch({**_BATCH, "completedAt": "2026-13-01T00:00"}),
+        f"associations_batch_read: 'completedAt': {INSTANT_EXPECTED}",
+        "2026-13-01",
+        id="associations-completed-at-malformed",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {**_BATCH, "results": [{**_FROM, "to": [{"toObjectId": MEETING_ID}]}]}
+        ),
+        "associations_batch_read: required field 'results[].to[].associationTypes' is missing",
+        None,
+        id="associations-types-missing",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {**_BATCH, "results": [{**_FROM, "to": [{**_TARGET, "associationTypes": {}}]}]}
+        ),
+        "associations_batch_read: field 'results[].to[].associationTypes' must be a JSON array",
+        None,
+        id="associations-types-not-array",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {**_BATCH, "results": [{**_FROM, "to": [{**_TARGET, "associationTypes": ["x"]}]}]}
+        ),
+        "associations_batch_read: results[].to[].associationTypes[] entry must be a JSON object",
+        None,
+        id="associations-type-not-object",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {
+                **_BATCH,
+                "results": [
+                    {
+                        **_FROM,
+                        "to": [{**_TARGET, "associationTypes": [_without(_TYPE, "category")]}],
+                    }
+                ],
+            }
+        ),
+        "associations_batch_read: required field "
+        "'results[].to[].associationTypes[].category' is missing",
+        None,
+        id="associations-type-category-missing",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {
+                **_BATCH,
+                "results": [
+                    {
+                        **_FROM,
+                        "to": [{**_TARGET, "associationTypes": [{**_TYPE, "category": "CUSTOM"}]}],
+                    }
+                ],
+            }
+        ),
+        f"associations_batch_read: {_CATEGORY_ENUM}",
+        "CUSTOM",
+        id="associations-type-category-unknown",
+    ),
+    pytest.param(
+        lambda: parse_association_batch(
+            {
+                **_BATCH,
+                "results": [
+                    {**_FROM, "to": [{**_TARGET, "associationTypes": [_without(_TYPE, "typeId")]}]}
+                ],
+            }
+        ),
+        "associations_batch_read: required field "
+        "'results[].to[].associationTypes[].typeId' is missing",
+        None,
+        id="associations-type-id-missing",
+    ),
+    *(
+        pytest.param(
+            functools.partial(
+                parse_association_batch,
+                {
+                    **_BATCH,
+                    "results": [
+                        {
+                            **_FROM,
+                            "to": [{**_TARGET, "associationTypes": [{**_TYPE, "typeId": type_id}]}],
+                        }
+                    ],
+                },
+            ),
+            "associations_batch_read: field "
+            "'results[].to[].associationTypes[].typeId' must be an integer",
+            None,
+            id=f"associations-type-id-{kind}",
+        )
+        for kind, type_id in (("string", "200"), ("decimal", Decimal("200.5")), ("bool", True))
+    ),
     # crm_search
     pytest.param(
         lambda: parse_search_page("x"),
@@ -1443,6 +1897,30 @@ DEFECT_CASES = [
         id="search-record-properties-missing",
     ),
     pytest.param(
+        lambda: parse_search_page({"total": 1, "results": [{**_RECORD, "id": 12345}]}),
+        "crm_search: 'record.id' must be a string",
+        "12345",
+        id="search-record-id-integer",
+    ),
+    pytest.param(
+        lambda: parse_search_page({"total": 1, "results": [_without(_RECORD, "createdAt")]}),
+        "crm_search: required field 'record.createdAt' is missing",
+        None,
+        id="search-record-created-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_search_page({"total": 1, "results": [{**_RECORD, "updatedAt": "later"}]}),
+        f"crm_search: 'record.updatedAt': {INSTANT_EXPECTED}",
+        "later",
+        id="search-record-updated-at-malformed",
+    ),
+    pytest.param(
+        lambda: parse_search_page({"total": 1, "results": [{**_RECORD, "archived": None}]}),
+        "crm_search: required field 'record.archived' is missing",
+        None,
+        id="search-record-archived-null",
+    ),
+    pytest.param(
         lambda: parse_search_page({"total": 0, "results": [], "paging": []}),
         "crm_search: field 'paging' must be a JSON object",
         None,
@@ -1488,6 +1966,48 @@ DEFECT_CASES = [
         id="property-type-missing",
     ),
     pytest.param(
+        lambda: parse_property({**_PROPERTY, "name": "  "}),
+        "properties: field 'name' must not be blank",
+        None,
+        id="property-name-blank",
+    ),
+    pytest.param(
+        lambda: parse_property({**_PROPERTY, "type": ""}),
+        "properties: field 'type' must not be blank",
+        None,
+        id="property-type-blank",
+    ),
+    pytest.param(
+        lambda: parse_property(_without(_PROPERTY, "fieldType")),
+        "properties: required field 'fieldType' is missing",
+        None,
+        id="property-field-type-missing",
+    ),
+    pytest.param(
+        lambda: parse_property(_without(_PROPERTY, "description")),
+        "properties: required field 'description' is missing",
+        None,
+        id="property-description-missing",
+    ),
+    pytest.param(
+        lambda: parse_property({**_PROPERTY, "groupName": ["contactinformation"]}),
+        "properties: field 'groupName' must be a string",
+        None,
+        id="property-group-name-not-string",
+    ),
+    pytest.param(
+        lambda: parse_property(_without(_PROPERTY, "label")),
+        "properties: required field 'label' is missing",
+        None,
+        id="property-label-missing",
+    ),
+    pytest.param(
+        lambda: parse_property(_without(_PROPERTY, "options")),
+        "properties: required field 'options' is missing",
+        None,
+        id="property-options-missing",
+    ),
+    pytest.param(
         lambda: parse_property({**_PROPERTY, "options": {}}),
         "properties: field 'options' must be a JSON array",
         None,
@@ -1518,10 +2038,22 @@ DEFECT_CASES = [
         id="property-option-value-blank",
     ),
     pytest.param(
+        lambda: parse_property({**_PROPERTY, "options": [{**_OPTION, "value": 1406943076}]}),
+        "properties: 'options[].value' must be a string",
+        None,
+        id="property-option-value-integer",
+    ),
+    pytest.param(
         lambda: parse_property({**_PROPERTY, "options": [{**_OPTION, "hidden": "yes"}]}),
         "properties: field 'options[].hidden' must be a boolean",
         None,
         id="property-option-hidden-not-bool",
+    ),
+    pytest.param(
+        lambda: parse_property({**_PROPERTY, "options": [_without(_OPTION, "hidden")]}),
+        "properties: required field 'options[].hidden' is missing",
+        None,
+        id="property-option-hidden-missing",
     ),
     # Records decoded on their own carry no surface prefix.
     pytest.param(
@@ -1586,9 +2118,21 @@ DEFECT_CASES = [
     ),
     pytest.param(
         _contact({TOUCH_PROPERTY: True}),
-        f"contact property '{TOUCH_PROPERTY}': {INSTANT_EXPECTED}",
+        f"contact property '{TOUCH_PROPERTY}' must be a string",
         None,
         id="contact-touch-bool",
+    ),
+    pytest.param(
+        _contact({TOUCH_PROPERTY: INSTANT_EPOCH_MS}),
+        f"contact property '{TOUCH_PROPERTY}' must be a string",
+        str(INSTANT_EPOCH_MS),
+        id="contact-touch-number",
+    ),
+    pytest.param(
+        _contact({CAMPAIGN_PROPERTY: 23456789012}),
+        f"contact property '{CAMPAIGN_PROPERTY}' must be a string",
+        "23456789012",
+        id="contact-campaign-number",
     ),
     pytest.param(
         _contact({}, updatedAt=_LEAKED),
@@ -1597,14 +2141,34 @@ DEFECT_CASES = [
         id="contact-updated-at-malformed",
     ),
     pytest.param(
-        lambda: contact_emails_sha256({"id": CONTACT_ID, "properties": {"email": [_LEAKED]}}),
+        _contact({}, updatedAt=""),
+        "field 'contact.updatedAt' must not be blank",
+        None,
+        id="contact-updated-at-empty",
+    ),
+    pytest.param(
+        _contact({}, createdAt=None),
+        "required field 'contact.createdAt' is missing",
+        None,
+        id="contact-created-at-null",
+    ),
+    pytest.param(
+        _contact({}, archived=0),
+        "field 'contact.archived' must be a boolean",
+        None,
+        id="contact-archived-not-boolean",
+    ),
+    pytest.param(
+        lambda: contact_emails_sha256(
+            {"id": CONTACT_ID, "properties": {"email": [_LEAKED]}, **_META}
+        ),
         "contact property 'email' must be a string",
         _LEAKED,
         id="contact-emails-primary-not-string",
     ),
     pytest.param(
         lambda: contact_emails_sha256(
-            {"id": CONTACT_ID, "properties": {"hs_additional_emails": [_LEAKED]}}
+            {"id": CONTACT_ID, "properties": {"hs_additional_emails": [_LEAKED]}, **_META}
         ),
         "contact property 'hs_additional_emails' must be a string",
         _LEAKED,
@@ -1617,94 +2181,129 @@ DEFECT_CASES = [
         id="contact-emails-properties-missing",
     ),
     pytest.param(
-        lambda: parse_meeting({"properties": {}}),
+        lambda: contact_emails_sha256({"id": CONTACT_ID, "properties": {}}),
+        "required field 'contact.createdAt' is missing",
+        None,
+        id="contact-emails-created-at-missing",
+    ),
+    pytest.param(
+        lambda: parse_meeting({"properties": {}, **_META}),
         "required field 'meeting.id' is missing",
         None,
         id="meeting-id-missing",
     ),
     pytest.param(
-        lambda: parse_meeting({"id": MEETING_ID, "properties": {"hs_meeting_outcome": {}}}),
+        # A meeting with an id and properties but no creation metadata is never read.
+        lambda: parse_meeting(
+            {
+                "id": MEETING_ID,
+                "properties": {"hs_createdate": INSTANT_ISO_Z},
+                "updatedAt": UPDATED_ISO,
+                "archived": False,
+            }
+        ),
+        "required field 'meeting.createdAt' is missing",
+        None,
+        id="meeting-created-at-missing",
+    ),
+    pytest.param(
+        _meeting({"hs_createdate": INSTANT_ISO_Z}, archived=None),
+        "required field 'meeting.archived' is missing",
+        None,
+        id="meeting-archived-missing",
+    ),
+    pytest.param(
+        _meeting({"hs_meeting_outcome": {}}),
         "meeting property 'hs_meeting_outcome' must be a string",
         None,
         id="meeting-outcome-not-string",
     ),
     pytest.param(
-        lambda: parse_meeting(
-            {"id": MEETING_ID, "properties": {"hs_meeting_source": "MEETINGS_PUBLIC\x00"}}
-        ),
+        _meeting({"hs_meeting_source": "MEETINGS_PUBLIC\x00"}),
         "meeting property 'hs_meeting_source' must not contain a NUL character",
         None,
         id="meeting-source-nul",
     ),
     pytest.param(
-        lambda: parse_meeting({"id": MEETING_ID, "properties": {"hs_createdate": "soon"}}),
+        _meeting({"hs_createdate": "soon"}),
         f"meeting property 'hs_createdate': {INSTANT_EXPECTED}",
         "soon",
         id="meeting-createdate-malformed",
     ),
     pytest.param(
-        lambda: parse_meeting(
-            {"id": MEETING_ID, "properties": {"hs_createdate": ""}, "createdAt": "later"}
-        ),
+        _meeting({"hs_createdate": ""}, createdAt="later"),
         f"'meeting.createdAt': {INSTANT_EXPECTED}",
         "later",
         id="meeting-created-at-malformed",
     ),
     pytest.param(
-        lambda: parse_meeting(
-            {
-                "id": MEETING_ID,
-                "properties": {
-                    "hs_createdate": INSTANT_ISO_Z,
-                    "hs_meeting_start_time": "2026-13-01",
-                },
-            }
-        ),
+        _meeting({"hs_createdate": INSTANT_ISO_Z, "hs_meeting_start_time": "2026-13-01"}),
         f"meeting property 'hs_meeting_start_time': {INSTANT_EXPECTED}",
         "2026-13-01",
         id="meeting-start-malformed",
     ),
     pytest.param(
-        lambda: parse_meeting(
-            {"id": MEETING_ID, "properties": {"hs_createdate": INSTANT_ISO_Z, "hs_timestamp": 1.5}}
-        ),
-        f"meeting property 'hs_timestamp': {INSTANT_EXPECTED}",
+        _meeting({"hs_createdate": INSTANT_ISO_Z, "hs_meeting_start_time": UPDATED_EPOCH_MS}),
+        "meeting property 'hs_meeting_start_time' must be a string",
+        str(UPDATED_EPOCH_MS),
+        id="meeting-start-number",
+    ),
+    pytest.param(
+        _meeting({"hs_createdate": INSTANT_ISO_Z, "hs_timestamp": 1.5}),
+        "meeting property 'hs_timestamp' must be a string",
         None,
         id="meeting-timestamp-float",
     ),
     pytest.param(
-        lambda: parse_deal({"id": "", "properties": {}}),
+        _deal({}, id=""),
         "'deal.id' must not be blank",
         None,
         id="deal-id-blank",
     ),
     pytest.param(
-        lambda: parse_deal(
-            {"id": DEAL_ID, "properties": {"createdate": INSTANT_ISO_Z, "dealstage": ["a"]}}
-        ),
+        _deal({}, id=99200000001),
+        "'deal.id' must be a string",
+        "99200000001",
+        id="deal-id-integer",
+    ),
+    pytest.param(
+        lambda: parse_deal(_without({"id": DEAL_ID, "properties": {}, **_META}, "updatedAt")),
+        "required field 'deal.updatedAt' is missing",
+        None,
+        id="deal-updated-at-missing",
+    ),
+    pytest.param(
+        _deal({"createdate": INSTANT_ISO_Z, "dealstage": ["a"]}),
         "deal property 'dealstage' must be a string",
         None,
         id="deal-stage-array",
     ),
     pytest.param(
-        lambda: parse_deal(
-            {"id": DEAL_ID, "properties": {"createdate": INSTANT_ISO_Z, "pipeline": "p\ud800"}}
-        ),
+        _deal({"createdate": INSTANT_ISO_Z, "pipeline": "p\ud800"}),
         "deal property 'pipeline' must be valid UTF-8 text",
         None,
         id="deal-pipeline-unencodable",
     ),
     pytest.param(
-        lambda: parse_deal({"id": DEAL_ID, "properties": {"createdate": "x"}}),
+        _deal({"createdate": "x"}),
         f"deal property 'createdate': {INSTANT_EXPECTED}",
         None,
         id="deal-createdate-malformed",
     ),
     pytest.param(
-        lambda: parse_deal({"id": DEAL_ID, "properties": {}, "createdAt": "never"}),
+        _deal({}, createdAt="never"),
         f"'deal.createdAt': {INSTANT_EXPECTED}",
         "never",
         id="deal-created-at-malformed",
+    ),
+    *(
+        pytest.param(
+            _deal({"amount": amount}),
+            "deal property 'amount' must be a string",
+            None,
+            id=f"deal-amount-{kind}",
+        )
+        for kind, amount in (("integer", 1500), ("decimal", Decimal("1500.50")), ("bool", False))
     ),
 ]
 

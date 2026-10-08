@@ -492,7 +492,8 @@ def test_b4_reason_constants_carry_the_plans_wording() -> None:
 
 
 def test_formatting_helpers_render_amounts_counts_shares_and_p_values() -> None:
-    """Budget card amounts render at the minor unit; unknown values never render as zero."""
+    """Budget card amounts render at the minor unit; unknown values never render as zero; a
+    p-value reads on the side of alpha it lies on."""
     assert budget._money(None, "USD") == "unavailable"
     assert budget._money("n/a", "USD") == "n/a"
     assert budget._money(Decimal("1400"), "USD") == "USD 1,400.00"
@@ -507,8 +508,14 @@ def test_formatting_helpers_render_amounts_counts_shares_and_p_values() -> None:
     assert budget._number(Decimal("6.000")) == "6"
     assert budget._number(Decimal("1.10")) == "1.1"
     assert budget._number(7) == "7"
-    assert budget._p_value(Decimal("0.00001")) == "p < 0.0001"
-    assert budget._p_value(Decimal("0.04999")) == "p = 0.0499"
+    alpha = Decimal("0.05")
+    assert budget._p_value(Decimal("0.00001"), alpha) == "p < 0.0001"
+    assert budget._p_value(Decimal("0.0123"), alpha) == "p = 0.0123"
+    # Four places would show 0.0500, which is not below alpha: places are added instead.
+    assert budget._p_value(Decimal("0.04999"), alpha) == "p = 0.04999"
+    assert budget._p_value(alpha, alpha) == "p = 0.0500"
+    # The "p <" bound never exceeds alpha: below 0.0001 it moves to the next power of ten.
+    assert budget._p_value(Decimal("0.000004"), Decimal("0.00005")) == "p < 0.00001"
     assert budget._singular("conversions") == "conversion"
     assert budget._singular("leads") == "lead"
     assert budget._singular("spend") == "spend"
@@ -987,8 +994,11 @@ def test_lifetime_budgets_show_no_utilization_and_are_excluded_from_cap_rules() 
         )
     history = budget_history(ctx, ("campaign", campaign_id))
     assert (history.utilization_applicable, history.window_utilization) == (False, None)
-    _daily, utilization = budget._b4_budget_metrics(ctx, campaign, "USD")
-    assert utilization.value == scenario.expect.values["utilization"]
+    # B4 is not a cap rule, so its card still shows the campaign's own history: "n/a".
+    assert budget._b4_history_subject(ctx, campaign) == ("campaign", campaign_id)
+    card = {metric.key: metric.value for metric in budget._history_metrics(history, None)}
+    assert card["window_utilization"] == scenario.expect.values["utilization"]
+    assert (card["known_days"], card["spending_day_share"]) == (0, None)
     evidence = budget_evidence(
         ctx,
         ("campaign", campaign_id),
@@ -1172,17 +1182,34 @@ def test_mixed_members_withhold_b1_b2_and_b3_for_the_shared_budget(
 
 
 def test_a_shared_budget_member_shows_no_utilization_of_its_own() -> None:
-    """AAP 0.5.4.5: a member has no utilization of its own, so a B4 card shows "n/a"."""
+    """AAP 0.5.4.5: a member has no utilization of its own; the shared amount is its only cap.
+
+    No history is computed for the member itself, so its B4 card shows the shared budget's
+    history: utilization over the budget-active days and the latest shared amount.
+    """
     scenario, ctx = _built("shared.poor_member.does_not_fire")
+    pool = _budget_id(scenario, "pool")
     member = ctx.campaigns[_campaign_id(scenario, "google", "m1")]
-    daily, utilization = budget._b4_budget_metrics(ctx, member, "USD")
-    assert utilization.value == "n/a"
-    assert daily.value == member.daily_budget
-    assert budget._subject_active(ctx, ("budget", _budget_id(scenario, "pool")))
+    assert ("campaign", member.id) not in budget_subjects(ctx)
+    with pytest.raises(ValueError, match="draws from explicitly shared budget"):
+        budget_history(ctx, ("campaign", member.id))
+    subject = budget._b4_history_subject(ctx, member)
+    assert subject == ("budget", pool)
+    shared = budget_history(ctx, subject)
+    assert shared.shared
+    assert shared.window_utilization is not None
+    card = {metric.key: metric for metric in budget._history_metrics(shared, None)}
+    assert card["window_utilization"].value == budget._share(shared.window_utilization)
+    assert card["known_days"].label == "Budget-active days"
+    assert shared.latest_daily_budget == ctx.budgets[pool].amount
+    extra = budget._b4_history_extra(ctx, subject, shared)
+    assert extra["budget_history"]["subject"] == {"type": "budget", "id": pool}
+    assert member.id in {entry["campaign_id"] for entry in extra["members"]}
+    assert budget._subject_active(ctx, ("budget", pool))
     paused = _fresh(
         ctx, campaigns={cid: replace(c, status="paused") for cid, c in ctx.campaigns.items()}
     )
-    assert not budget._subject_active(paused, ("budget", _budget_id(scenario, "pool")))
+    assert not budget._subject_active(paused, ("budget", pool))
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1248,7 @@ def test_b4_runs_the_rate_test_on_linkedin_leads_and_reports_sample_sizes() -> N
         f"Adjust weekend schedule or bids: weekend cost/outcome USD {values['weekend_cpo']} vs "
         f"weekday USD {values['weekday_cpo']}"
     )
-    assert budget._p_value(test.p_value) in item.reason
+    assert budget._p_value(test.p_value, test.alpha) in item.reason
     assert item.decision_subject is None
     assert item.increases_spend_on == ()
     assert item.depends_on == (DecisionSubject("campaign", campaign),)
@@ -1289,7 +1316,8 @@ def test_b4_weighted_attribution_is_withheld_even_when_daily_totals_are_whole() 
 
 
 def test_b4_zero_weekday_spend_is_no_exposure() -> None:
-    """AAP 0.5.4.5 B4: zero spend on the weekday side withholds "no exposure" too."""
+    """AAP 0.5.4.5 B4: zero spend on the weekday side withholds "no exposure" too; the sample
+    names the side."""
     scenario, ctx = _built("b4.google_last_click.fires")
     campaign = _campaign_id(scenario, "google", "weekly")
     weekend_only = _with_days(
@@ -1301,8 +1329,8 @@ def test_b4_zero_weekday_spend_is_no_exposure() -> None:
         ),
     )
     line = _withheld_on(budget.evaluate(weekend_only), B4, campaign)
-    assert line.reason.startswith(NO_EXPOSURE_REASON)
-    assert "weekday" in line.reason
+    assert line.reason == NO_EXPOSURE_REASON
+    assert (line.observed, line.required, line.unit) == (0, 1, "weekdays with spend")
 
 
 def test_b4_missing_outcomes_on_a_day_are_unavailable_never_zero() -> None:

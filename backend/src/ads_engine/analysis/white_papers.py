@@ -19,7 +19,9 @@ this module only decides each asset row's action and builds its item:
   over a window of at least ``w.retire_min_window_days``, with the QL stage available, no
   contact-share floor (``attribution.floor_share``) and no contact with unknown CRM evidence.
   When the spend multiple is met but a guard fails, W2 is withheld with that guard's reason and
-  the row shows "No change warranted".
+  the row shows "No change warranted". The comparison needs a positive cohort median: at a
+  median of 0, W2 is withheld ("spend-to-median comparison unavailable") and the row shows "No
+  change warranted".
 * **Otherwise** (rule ``W``): "No change warranted", with its numbers.
 
 Every asset row of every cohort therefore yields exactly one item, so the White papers table
@@ -79,7 +81,7 @@ from ads_engine.analysis.context import (
     Withheld,
     cohort_group,
 )
-from ads_engine.analysis.metrics import spend_increase_blocked
+from ads_engine.analysis.metrics import G1_THRESHOLD_KEYS, spend_increase_blocked
 from ads_engine.analysis.thresholds import Thresholds
 
 __all__ = [
@@ -143,7 +145,11 @@ THRESHOLD_KEYS: Final[tuple[str, ...]] = (
 
 The ``w.*`` keys decide the action; ``attribution.floor_share`` sets the floors and the W2
 contact-share guard; ``crm.booking_sources`` and ``crm.meeting_outcome_exclusions`` decide
-which meetings count as booked, the denominator of cost per meeting.
+which meetings count as booked, the denominator of cost per meeting. An item whose decision
+ran G1 over at least one contributing campaign (the W1 double down, and the "No change
+warranted" row whose W1 is withheld because G1 blocks every contributing campaign) also
+carries :data:`~ads_engine.analysis.metrics.G1_THRESHOLD_KEYS`, the controls that selected or
+left out its spend targets.
 """
 
 METRIC_KEYS: Final[tuple[str, ...]] = (
@@ -396,7 +402,9 @@ def _cohort_extra(cohort: Cohort, settings: _Settings) -> dict[str, Any]:
 
     Only spend is totalled across assets, within the cohort's currency: a contact who touched
     two assets is credited to both (any-touch), so no MQL, QL, meeting or deal total is shown,
-    and the note says so (AAP 0.5.4.7 "Credit and de-duplication").
+    and the note says so (AAP 0.5.4.7 "Credit and de-duplication"). ``retire_spend_floor`` (W2's
+    spend threshold) is set only for a positive median: at a median of 0 W2's spend-to-median
+    comparison is unavailable, so no floor of 0 is shown.
     """
     median = cohort.median_cost_per_ql
     view: dict[str, Any] = {
@@ -411,7 +419,8 @@ def _cohort_extra(cohort: Cohort, settings: _Settings) -> dict[str, Any]:
     if median is not None:
         view["median_cost_per_ql"] = _bounded(median)
         view["double_down_ceiling"] = _bounded(settings.double_down_ratio * median)
-        view["retire_spend_floor"] = _bounded(settings.retire_multiple * median)
+        if median > 0:
+            view["retire_spend_floor"] = _bounded(settings.retire_multiple * median)
     return view
 
 
@@ -429,9 +438,15 @@ class _Decision:
         action: The headline.
         reason: The reason sentence, filled only from numbers the item's evidence carries.
         increases: The campaigns a W1 double down raises spend on (``increases_spend_on``).
-        sample: The sample the decision was gated on, against its minimum.
+        sample: The sample of a gate the decision passed, against its minimum; ``None`` when
+            no gate passed. A gate the row falls short of is never its sample (P6): the
+            shortfall goes to ``extra`` and, where the pattern is otherwise met, to
+            ``withheld``.
         withheld: The W1 or W2 patterns withheld for this row, with their reasons.
         extra: Decision detail merged into ``evidence.extra``.
+        threshold_keys: Keys the decision applied beyond :data:`THRESHOLD_KEYS`:
+            :data:`~ads_engine.analysis.metrics.G1_THRESHOLD_KEYS` when G1 judged at least one
+            contributing campaign.
     """
 
     rule_id: str
@@ -441,6 +456,7 @@ class _Decision:
     sample: Sample | None = None
     withheld: tuple[Withheld, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
+    threshold_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,11 +476,18 @@ class _Insufficiency:
     required: int
 
     @property
-    def sample(self) -> Sample | None:
-        """The cohort QL against its minimum; ``None`` when the QL count is unavailable."""
-        if self.total_ql is None:
-            return None
-        return Sample(self.total_ql, self.required, "Qualified Leads across the cohort's assets")
+    def cohort_sample(self) -> dict[str, Any]:
+        """The cohort QL against its minimum, for ``evidence.extra.cohort_sample``.
+
+        Observational only: a cohort that falls short of the minimum is a failed gate, so its
+        rows carry no ``evidence.sample`` (P6); ``observed`` is ``None`` when the QL count is
+        unavailable.
+        """
+        return {
+            "observed": self.total_ql,
+            "required": self.required,
+            "unit": "Qualified Leads across the cohort's assets",
+        }
 
 
 def _insufficiency(cohort: Cohort, settings: _Settings) -> _Insufficiency | None:
@@ -556,12 +579,21 @@ def _no_change(
     sample: Sample | None = None,
     withheld: tuple[Withheld, ...] = (),
     extra: dict[str, Any] | None = None,
+    threshold_keys: tuple[str, ...] = (),
 ) -> _Decision:
     """Return the rule ``W`` "No change warranted" outcome."""
     detail = {} if extra is None else extra
     if withheld:
         detail = {**detail, "withheld_reasons": [item.reason for item in withheld]}
-    return _Decision(W, ACTION_NO_CHANGE, reason, sample=sample, withheld=withheld, extra=detail)
+    return _Decision(
+        W,
+        ACTION_NO_CHANGE,
+        reason,
+        sample=sample,
+        withheld=withheld,
+        extra=detail,
+        threshold_keys=threshold_keys,
+    )
 
 
 def _decide_with_ql(
@@ -573,6 +605,11 @@ def _decide_with_ql(
     median. Under a contact floor QL is a floor and cost per QL a ceiling, so both only move
     further in W1's favour; the floor flags travel with the item. G1 then removes every
     contributing campaign it blocks; with none left W1 is withheld.
+
+    Below ``w.min_ql`` the row is "No change warranted" with no ``evidence.sample`` (P6): the
+    shortfall is in ``extra.w1_sample``, and when the cost pattern holds W1 is withheld with
+    the QL observed and required. Every other outcome passed the QL gate and carries it as its
+    sample.
     """
     currency = row.currency
     cost = row.cost_per_ql
@@ -584,13 +621,35 @@ def _decide_with_ql(
         f"cohort median of {median_text})"
     )
     ql_text = _count_text(row.ql, "Qualified Lead")
-    sample = Sample(ql, settings.min_ql, "Qualified Leads")
     if ql < settings.min_ql:
+        # P6: a QL count below W1's minimum is a failed gate, never the item's sample. The
+        # shortfall is kept in extra, and W1 is withheld with it when the cost pattern holds.
+        below_minimum: tuple[Withheld, ...] = ()
+        if cost.value is not None and cost.value <= ceiling:
+            below_minimum = (
+                Withheld(
+                    rule_id=W1,
+                    section=WHITE_PAPERS,
+                    entity=row.entity,
+                    reason=f"{ql_text} of the {settings.min_ql} W1 needs",
+                    observed=ql,
+                    required=settings.min_ql,
+                    unit="Qualified Leads",
+                ),
+            )
         return _no_change(
             f"{ql_text}, below the {settings.min_ql} W1 needs; cost per Qualified Lead "
             f"{cost_text} against the {currency} cohort median of {median_text}.",
-            sample=sample,
+            withheld=below_minimum,
+            extra={
+                "w1_sample": {
+                    "observed": ql,
+                    "required": settings.min_ql,
+                    "unit": "Qualified Leads",
+                }
+            },
         )
+    sample = Sample(ql, settings.min_ql, "Qualified Leads")
     if cost.value is None or cost.value > ceiling:
         # A ceiling ("≤ X", under a floor) above the threshold does not prove the true cost is.
         verdict = "is not shown to be within" if cost.ceiling else "is above"
@@ -612,6 +671,9 @@ def _decide_with_ql(
         f"{ceiling_text}, with {ql_text} (W1 needs {settings.min_ql})"
     )
     blocked_names = ", ".join(ctx.campaign_name(cid) for cid in left_out)
+    # G1 judged the contributing campaigns, so the keys that selected or excluded the spend
+    # targets are part of the evidence; with no contributing campaign G1 judged none.
+    g1_keys = G1_THRESHOLD_KEYS if row.campaign_ids else ()
     if not targets:
         why = (
             W1_ALL_BLOCKED_REASON
@@ -633,12 +695,21 @@ def _decide_with_ql(
             sample=sample,
             withheld=(withheld,),
             extra=extra,
+            threshold_keys=g1_keys,
         )
     reason = f"{qualifies}."
     if blocked_names:
         reason += f" Left out because G1 blocks spend increases on them: {blocked_names}."
     action = ACTION_DOUBLE_DOWN_PREFIX + ", ".join(ctx.campaign_name(cid) for cid in targets)
-    return _Decision(W1, action, reason, increases=targets, sample=sample, extra=extra)
+    return _Decision(
+        W1,
+        action,
+        reason,
+        increases=targets,
+        sample=sample,
+        extra=extra,
+        threshold_keys=g1_keys,
+    )
 
 
 def _w2_guards(ctx: AnalysisContext, row: AssetRow, settings: _Settings) -> tuple[Withheld, ...]:
@@ -699,25 +770,47 @@ def _decide_without_ql(
     W2 needs spend >= ``w.retire_spend_multiple`` x the cohort median cost per QL, compared
     exactly as ``spend >= multiple x median`` so no rounded quotient decides it, and every
     :func:`_w2_guards` guard to hold. A row without spend is never retired.
+
+    The comparison needs a positive cohort median. A median of 0 (the cohort's assets with QL
+    had no window spend) leaves spend / median undefined, so W2 is withheld with "spend-to-median
+    comparison unavailable" (observed unavailable, required ``w.retire_spend_multiple``): no
+    ratio and no retirement threshold are shown, and the guards are not evaluated.
     """
     currency = row.currency
     spend = row.spend
     spend_text = _money(spend, currency)
     median_text = _money(median, currency)
     multiple_text = _plain(settings.retire_multiple)
-    retire_at = settings.retire_multiple * median
-    ratio = None if median == 0 else _plain_decimal(spend / median)
+    ratio = None if median <= 0 else _plain_decimal(spend / median)
     extra: dict[str, Any] = {"spend_to_median": ratio}
-    ratio_text = (
-        f"against a {currency} cohort median cost per Qualified Lead of {median_text}"
-        if ratio is None
-        else (
-            f"{format(ratio, 'f')} x the {currency} cohort median cost per Qualified Lead of "
-            f"{median_text}"
-        )
-    )
     if spend <= 0:
         return _no_change("No spend and no Qualified Lead in the window.", extra=extra)
+    if ratio is None:
+        # The median is 0: "spend >= multiple x 0" would retire any paid row, so W2's
+        # spend-to-median comparison is reported unavailable instead of judged.
+        why = (
+            f"spend-to-median comparison unavailable: the {currency} cohort median cost per "
+            f"Qualified Lead is {median_text}"
+        )
+        unavailable = Withheld(
+            rule_id=W2,
+            section=WHITE_PAPERS,
+            entity=row.entity,
+            reason=why,
+            observed=None,
+            required=settings.retire_multiple,
+            unit="x cohort median cost per Qualified Lead",
+        )
+        return _no_change(
+            f"No Qualified Lead yet after {spend_text} of spend, but W2 is withheld: {why}.",
+            withheld=(unavailable,),
+            extra=extra,
+        )
+    retire_at = settings.retire_multiple * median
+    ratio_text = (
+        f"{format(ratio, 'f')} x the {currency} cohort median cost per Qualified Lead of "
+        f"{median_text}"
+    )
     if spend < retire_at:
         return _no_change(
             f"No Qualified Lead yet; spend {spend_text} is {ratio_text}, below the "
@@ -806,7 +899,7 @@ def _candidate(
         metrics=_row_metrics(row),
         baselines=baselines,
         sample=decision.sample,
-        threshold_keys=THRESHOLD_KEYS,
+        threshold_keys=tuple(dict.fromkeys((*THRESHOLD_KEYS, *decision.threshold_keys))),
         extra={
             **_row_extra(ctx, table, row),
             # The cross-asset view rides on every row of its cohort: AAP 0.5.3 defines a closed
@@ -848,7 +941,8 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     * **Insufficient data** (``W``) for every row of a cohort whose assets together have fewer
       than ``w.cohort_min_total_ql`` (3) QL, whose QL count is unavailable, or with no asset at
       ``w.median_min_ql`` (1) QL: the median is too unstable, or undefined, to compare against.
-      One cohort-wide withheld line states the shortfall.
+      One cohort-wide withheld line states the shortfall, and each row carries it in
+      ``extra.cohort_sample``, never as its ``evidence.sample`` (P6).
     * **W1 Double down** when QL >= ``w.min_ql`` (3) and cost per QL <= ``w.double_down_ratio``
       (0.8) x the cohort median: a white paper well below the cohort's typical cost per
       Qualified Lead earns more spend. It names the contributing campaigns G1 leaves unblocked
@@ -858,7 +952,8 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
       cohort median over a window of >= ``w.retire_min_window_days`` (28) days, with the QL
       stage available, no contact-share floor (``attribution.floor_share``, 10%) and no unknown
       CRM evidence: three typical Qualified Leads' worth of spend with none to show. A failing
-      guard withholds W2 with its reason.
+      guard withholds W2 with its reason. The comparison needs a positive cohort median: a
+      median of 0 withholds W2 ("spend-to-median comparison unavailable").
     * **No change warranted** (``W``) otherwise.
 
     Each item's evidence shows, in the table's column order, spend, LinkedIn leads (platform),
@@ -868,7 +963,10 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     holds the per-creative partition and ``baselines`` the cohort median. MQL and QL are never
     combined. Items rank by cost per QL ascending, then zero-QL rows by spend descending.
 
-    Threshold keys: :data:`THRESHOLD_KEYS`, copied into every item's ``evidence.thresholds``.
+    Threshold keys: :data:`THRESHOLD_KEYS`, copied into every item's ``evidence.thresholds``,
+    plus :data:`~ads_engine.analysis.metrics.G1_THRESHOLD_KEYS` (the ``budget.*`` gate keys,
+    ``b2.poor_efficiency_ratio`` and ``b2.min_expected_outcomes``) on the items whose decision
+    ran G1 over a contributing campaign: the W1 double down and the row whose W1 G1 withholds.
 
     Args:
         ctx: The analysis context.
@@ -902,8 +1000,13 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
         items: list[Candidate] = []
         for row in cohort.rows:
             if insufficient is not None:
+                # P6: the cohort shortfall is observational on each row (no failed sample);
+                # the cohort-wide withheld line above lists it.
                 decision = _Decision(
-                    W, ACTION_INSUFFICIENT_DATA, insufficient.reason, sample=insufficient.sample
+                    W,
+                    ACTION_INSUFFICIENT_DATA,
+                    insufficient.reason,
+                    extra={"cohort_sample": insufficient.cohort_sample},
                 )
             else:
                 decision = _decide(ctx, row, cohort, settings)

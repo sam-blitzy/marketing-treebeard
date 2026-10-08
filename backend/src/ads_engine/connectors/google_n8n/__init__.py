@@ -26,9 +26,11 @@ Submodules:
     client: ``GoogleAdsWebhookClient``, one webhook call per GAQL query, following a page token
         when one is present; the ``CallBudget`` protocol that meters every call against the
         product's own cap, and ``UNMETERED`` for simulated runs and tests.
-    partition: ``partitioned_fetch``, which reports each fetch as complete or incomplete through
-        keyset scans and id-range and date partitioning, and the safe-absence enumerations that
-        let ``sync`` infer a removed or missing entity only from complete reads.
+    partition: ``PartitionedFetcher``, which binds one webhook client, and so its call budget,
+        at construction; its ``partitioned_fetch(query_id, scope)`` reports each fetch as
+        complete or incomplete through keyset scans and id-range and date partitioning. Also
+        the safe-absence enumerations that let ``sync`` infer a removed or missing entity only
+        from complete reads.
 
 Dependencies run one way: ``queries`` <- ``parser`` <- ``client`` <- ``partition``. Nothing here
 imports ``sync``, ``simulation``, ``db``, ``analysis`` or ``api``; ``sync`` injects the call

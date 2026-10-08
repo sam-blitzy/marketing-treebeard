@@ -1153,17 +1153,12 @@ def _pair_candidate(
             f"needed: {NOT_ESTIMABLE} ({not_estimable_reason})"
         )
     elif isinstance(sample_needed, int):
-        if sample_needed > 0:
-            needed = (
-                f"about {_count(sample_needed)} more impressions per variant needed at the "
-                "observed difference"
-            )
-        else:
-            needed = (
-                f"no more impressions per variant needed: the current samples already reach "
-                f"power {_level(config.power)} at the observed difference"
-            )
-        label = f"{leader.name} ahead, not yet distinguishable{adjusted_text}; {needed}"
+        # One template for every estimated figure, 0 included; the power context is evidence.
+        label = (
+            f"{leader.name} ahead, not yet distinguishable{adjusted_text}; about "
+            f"{_count(sample_needed)} more impressions per variant needed at the observed "
+            "difference"
+        )
     else:
         label = (
             f"{leader.name} ahead, not yet distinguishable{adjusted_text}; more impressions "
@@ -1230,6 +1225,12 @@ def _pair_candidate(
             ),
             "comparisons": comparisons,
             "sample_needed": sample_needed,
+            "power": config.power,
+            # True when the current samples already reach cr.power at the observed
+            # difference (0 more needed); None when no figure was estimated.
+            "power_reached_at_observed_difference": (
+                sample_needed == 0 if isinstance(sample_needed, int) else None
+            ),
             "not_estimable_reason": not_estimable_reason,
             "variant_count": len(campaign.variants),
             "excluded": [_excluded_row(c) for c in campaign.excluded],

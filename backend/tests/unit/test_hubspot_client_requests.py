@@ -20,6 +20,9 @@ Covers every call :class:`HubSpotClient` makes and the cross-module contracts it
   and marked incomplete;
 * binding verification: stage labels resolved against ``lifecyclestage`` options, unavailable
   bindings with their reasons (never zero), property mode with a 404, the Google link;
+* the bound contact property map: one-argument contact reads after ``verify_bindings``,
+  ``bind_contact_properties`` or the constructor argument, an explicit ``props`` overriding
+  it, and an unbound read refused before any call;
 * the recovery probe; the 4 req/s throttle on every attempt; a 429 ``Retry-After`` retried
   after the platform's wait; no token or email in any captured log event.
 
@@ -978,7 +981,9 @@ async def test_contacts_by_email_sends_idproperty_email_and_maps_back_by_digest(
 
 
 @pytest.mark.anyio
-async def test_contacts_by_email_precedence_found_then_failure_then_not_found() -> None:
+async def test_contacts_by_email_failure_outranks_not_found_and_a_listed_result_is_a_defect() -> (
+    None
+):
     returned = "returned@example.com"
     conflicting = "conflicting@example.com"
     server = Server(
@@ -986,18 +991,34 @@ async def test_contacts_by_email_precedence_found_then_failure_then_not_found() 
             _objects(
                 [_contact("110", returned)],
                 [
-                    _batch_error("VALIDATION_ERROR", [returned], message="Invalid input"),
                     _batch_error("OBJECT_NOT_FOUND", [conflicting]),
                     _batch_error("VALIDATION_ERROR", [conflicting], message="Invalid input"),
                 ],
-            )
+            ),
+            # A failed input is absent from results, so a returned contact that an error entry
+            # also names is contradictory attribution, never a match.
+            _objects(
+                [_contact("111", returned)],
+                [_batch_error("VALIDATION_ERROR", [returned], message="Invalid input")],
+            ),
         )
     )
     async with _client(server) as client:
         lookup = await client.contacts_by_email([returned, conflicting], PROPS)
+        with pytest.raises(QueryDefect) as defect:
+            await client.contacts_by_email([returned], PROPS)
     assert set(lookup.found) == {email_sha256(returned)}
     assert lookup.failed == {email_sha256(conflicting)}
     assert lookup.not_found == frozenset()
+    assert (defect.value.source, defect.value.endpoint, defect.value.code) == (
+        "hubspot",
+        "parse",
+        "validation",
+    )
+    assert defect.value.message == (
+        "objects_batch_read: a 'results' contact answers to an email an 'errors' entry names"
+    )
+    assert returned not in repr(defect.value)
 
 
 @pytest.mark.anyio
@@ -1993,6 +2014,190 @@ async def test_verify_propagates_access_denied_and_transient_failures() -> None:
 def test_crm_bindings_round_trip_through_the_property_map() -> None:
     bindings = CrmBindings.unavailable("not yet verified", at=DAY0)
     assert contact_property_map(bindings, _google_settings()) == ContactPropertyMap()
+
+
+# ---------------------------------------------------------------------------------------------
+# The bound contact property map of one-argument contact reads
+# ---------------------------------------------------------------------------------------------
+
+
+def _stored_bindings() -> CrmBindings:
+    """Return stored bindings whose contact property map is ``PROPS``."""
+    return CrmBindings(
+        mql=ResolvedBinding(available=True, property=MQL_PROPERTY, label="First meeting booked"),
+        ql=ResolvedBinding(
+            available=True, property=QL_PROPERTY, stage_id=QL_STAGE_ID, label="Qualified Lead"
+        ),
+        google=GoogleCrmBinding(available=False, reason="HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY unset"),
+        verified_at=DAY0,
+    )
+
+
+def _request_properties(server: Server) -> list[list[str]]:
+    """Return the ``properties`` list of every contact batch read, in order."""
+    return [body["properties"] for body in server.bodies("objects_batch_read")]
+
+
+@pytest.mark.anyio
+async def test_one_argument_contact_reads_use_the_map_verify_bindings_binds() -> None:
+    definitions = {"lifecyclestage": _lifecycle(), QL_PROPERTY: _datetime_property(QL_PROPERTY)}
+    properties = _properties_route(definitions)
+    contact = _contact("201", "lead.one@example.com", {QL_PROPERTY: "2026-09-06T10:00:00Z"})
+
+    def route(call: Call) -> Outcome:
+        if call.surface == "objects_batch_read":
+            return _objects([contact])
+        return properties(call)
+
+    server = Server(route)
+    mapping = _mapping(_stage("First meeting booked"), _stage("Qualified Lead"))
+    async with _client(server) as client:
+        assert client.contact_properties is None
+        bindings = await client.verify_bindings(mapping, _no_google())
+        batch = await client.contacts_by_id(["201"])
+        lookup = await client.contacts_by_email(["lead.one@example.com"])
+
+    # The unavailable MQL binding stays unbound: never requested, so it reads unavailable.
+    bound = ContactPropertyMap(ql_property=QL_PROPERTY)
+    assert client.contact_properties == bound
+    assert contact_property_map(bindings, _no_google()) == bound
+    assert _request_properties(server) == [list(bound.request_properties())] * 2
+    assert batch.read_status == {"201": "ok"}
+    assert batch.records["201"].ql_at == datetime(2026, 9, 6, 10, tzinfo=UTC)
+    assert batch.records["201"].mql_at is None
+    assert lookup.found[email_sha256("lead.one@example.com")].hs_id == "201"
+
+
+@pytest.mark.anyio
+async def test_bind_contact_properties_binds_stored_bindings_for_one_argument_reads() -> None:
+    contact = _contact(
+        "201",
+        "lead.one@example.com",
+        {MQL_PROPERTY: "2026-09-05", QL_PROPERTY: "2026-09-06T10:00:00Z"},
+    )
+    server = Server(lambda call: _objects([contact]))
+    unavailable = CrmBindings.unavailable("not yet verified", at=DAY0)
+    async with _client(server) as client:
+        assert client.bind_contact_properties(_stored_bindings(), _no_google()) == PROPS
+        lookup = await client.contacts_by_email(["lead.one@example.com"])
+        batch = await client.contacts_by_id(["201"])
+        # Rebinding replaces the map, and unavailable bindings stay unbound exactly as stored.
+        assert client.bind_contact_properties(unavailable, _no_google()) == ContactPropertyMap()
+        refreshed = await client.contacts_by_id(["201"])
+
+    assert client.contact_properties == ContactPropertyMap()
+    assert server.bodies("objects_batch_read") == [
+        {
+            "idProperty": "email",
+            "inputs": [{"id": "lead.one@example.com"}],
+            "properties": list(PROPS.request_properties()),
+        },
+        {"inputs": [{"id": "201"}], "properties": list(PROPS.request_properties())},
+        {"inputs": [{"id": "201"}], "properties": list(ContactPropertyMap().request_properties())},
+    ]
+    assert lookup.found[email_sha256("lead.one@example.com")].mql_at == datetime(
+        2026, 9, 5, tzinfo=UTC
+    )
+    assert batch.records["201"].ql_at == datetime(2026, 9, 6, 10, tzinfo=UTC)
+    # Unbound counts read unavailable (None) even when the portal sends the old property.
+    assert (refreshed.records["201"].mql_at, refreshed.records["201"].ql_at) == (None, None)
+
+
+@pytest.mark.anyio
+async def test_constructor_and_from_settings_bind_contact_properties() -> None:
+    server = Server(lambda call: _objects([_contact("201", "lead.one@example.com")]))
+    transport = httpx.MockTransport(server.handle)
+    async with build_client("hubspot", transport, settings=Settings()) as http:
+        constructed = HubSpotClient(
+            http,
+            SecretStr(TOKEN),
+            live=True,
+            retry=RetryPolicy(sleep=server.sleep),
+            limiter=server.limiter,
+            contact_properties=PROPS,
+        )
+        configured = HubSpotClient.from_settings(
+            Settings(hubspot_access_token=SecretStr(TOKEN)),
+            http,
+            retry=RetryPolicy(sleep=server.sleep),
+            limiter=server.limiter,
+            contact_properties=PROPS,
+        )
+        by_id = await constructed.contacts_by_id(["201"])
+        by_email = await configured.contacts_by_email(["lead.one@example.com"])
+    assert constructed.contact_properties == PROPS
+    assert configured.contact_properties == PROPS
+    assert _request_properties(server) == [list(PROPS.request_properties())] * 2
+    assert by_id.read_status == {"201": "ok"}
+    assert set(by_email.found) == {email_sha256("lead.one@example.com")}
+
+
+@pytest.mark.anyio
+async def test_explicit_props_override_the_bound_map_without_rebinding() -> None:
+    override = ContactPropertyMap(ql_property=QL_PROPERTY)
+    server = Server(lambda call: _objects([_contact("201", "lead.one@example.com")]))
+    async with _client(server) as client:
+        client.bind_contact_properties(_stored_bindings(), _no_google())
+        await client.contacts_by_id(["201"], override)
+        await client.contacts_by_email(["lead.one@example.com"], props=override)
+        await client.contacts_by_id(["201"])
+    assert _request_properties(server) == [
+        list(override.request_properties()),
+        list(override.request_properties()),
+        list(PROPS.request_properties()),
+    ]
+    assert client.contact_properties == PROPS
+
+
+@pytest.mark.anyio
+async def test_unbound_one_argument_contact_reads_raise_before_any_call() -> None:
+    mapping = _mapping(_stage("First meeting booked"), _stage("Qualified Lead"))
+    server = Server(
+        scripted(
+            *_outage(),
+            _hubspot_error(403, "MISSING_SCOPES", "This app hasn't been granted all scopes."),
+        )
+    )
+    unbound = "contact properties are not bound"
+
+    def assert_unbound(defect: pytest.ExceptionInfo[QueryDefect]) -> None:
+        """The refusal is a classified HubSpot defect naming the contact batch read."""
+        assert defect.value.source == "hubspot"
+        assert defect.value.code == "CONTACT_PROPERTIES_UNBOUND"
+        assert defect.value.endpoint == "objects_batch_read contacts"
+        assert defect.value.http_status is None
+
+    async with _client(server) as client:
+        with pytest.raises(QueryDefect, match=unbound) as defect:
+            await client.contacts_by_email(["lead.one@example.com"])
+        assert_unbound(defect)
+        with pytest.raises(QueryDefect, match=unbound) as defect:
+            await client.contacts_by_id(["201"])
+        assert_unbound(defect)
+        with pytest.raises(QueryDefect, match=unbound) as defect:
+            await client.contacts_by_email([])
+        assert_unbound(defect)
+        with pytest.raises(QueryDefect, match=unbound) as defect:
+            await client.contacts_by_id([])
+        assert_unbound(defect)
+        assert server.calls == []
+        assert client.calls == 0
+        # A failed verification binds nothing, so the reads still refuse to guess.
+        with pytest.raises(TransientError):
+            await client.verify_bindings(mapping, _no_google())
+        assert client.contact_properties is None
+        calls_before = len(server.calls)
+        with pytest.raises(QueryDefect, match=unbound) as defect:
+            await client.contacts_by_id(["201"])
+        assert_unbound(defect)
+        assert len(server.calls) == calls_before
+        # ...and keeps a map bound before it.
+        client.bind_contact_properties(_stored_bindings(), _no_google())
+        with pytest.raises(AccessDenied):
+            await client.verify_bindings(mapping, _no_google())
+        assert client.contact_properties == PROPS
+    assert {call.surface for call in server.calls} == {"properties"}
+    assert len(server.calls) == RetryPolicy().attempts + 1
 
 
 # ---------------------------------------------------------------------------------------------

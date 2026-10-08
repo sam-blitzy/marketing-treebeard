@@ -50,18 +50,14 @@ Example:
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
-from functools import cache
 from types import MappingProxyType
 from typing import Any, Final, Literal, NamedTuple, cast, get_args
-
-import yaml
 
 from ads_engine.analysis.context import (
     B1,
@@ -152,22 +148,21 @@ from ads_engine.analysis.context import (
     Source,
     SubjectKey,
     TargetReadStatus,
+    keyword_external_id,
     objective_group,
     search_term_external_id,
 )
 from ads_engine.analysis.thresholds import (
-    CONTENT_ASSETS_FILE,
     CREATIVE_URN_PREFIX,
     FORM_URN_PREFIX,
-    HUBSPOT_MAPPING_FILE,
-    THRESHOLDS_FILE,
-    ConfigError,
     ContentAsset,
     CrmBindings,
     GoogleCrmBinding,
     ResolvedBinding,
     StageBinding,
     Thresholds,
+    config_fingerprint,
+    override_value,
     resolve_config_dir,
 )
 from ads_engine.analysis.window import DAY_SOURCES, AnalysisWindow, SourceDayInfo, default_end
@@ -558,8 +553,9 @@ class FeedbackSpec:
         kind: ``dismiss``, ``snooze`` or ``done``.
         source: The entity's source.
         entity_type: ``campaign``, ``budget``, ``ad_group``, ``keyword``, ``creative`` or
-            ``search_term`` resolve ``key`` through the world; any other type takes ``key`` as
-            the composite external id itself.
+            ``search_term`` resolve ``key`` through the world (a keyword to its ad group and
+            criterion id, as K3 keys it); any other type takes ``key`` as the composite
+            external id itself.
         key: A spec key; for ``search_term`` it is ``"{ad_group_key}|{term}"``.
         until_offset_hours: When the suppression ends, in hours after the anchor's UTC midnight.
     """
@@ -850,9 +846,10 @@ class Scenario:
         """Load the configuration with this scenario's overrides and registry applied.
 
         Returns:
-            :meth:`Thresholds.load` when the scenario overrides nothing, otherwise the
-            configuration rebuilt through :meth:`Thresholds.from_trees`, so ``config_hash``
-            reflects every override. No file is written.
+            :meth:`Thresholds.load` of the config files with the scenario's threshold
+            overrides and registry applied (the plain load when it has neither), through
+            :func:`thresholds_with`, so validation and ``config_hash`` are those of files
+            holding the same values. No file is written.
 
         Raises:
             ConfigError: When an override names a missing key or the resulting configuration
@@ -1081,65 +1078,21 @@ class EntityIndex:
         return (ref.entity, self.id(ref.source, ref.entity, ref.key))
 
     def entity_key(self, source: str, entity: str, key: str) -> str:
-        """The stable entity key ``{source}:{type}:{external id}`` feedback is matched on."""
+        """The entity key ``{source}:{type}:{external id}`` built from the platform id alone.
+
+        Feedback matches campaigns, budgets, ad groups and creatives on it. A keyword's criterion
+        id is unique only within its ad group, so keyword items and feedback are keyed on
+        :func:`keyword_external_id` instead.
+        """
         return f"{source}:{entity}:{self.external_id(source, entity, key)}"
 
 
 # ---------------------------------------------------------------------------
-# Configuration with overrides (Thresholds.from_trees, so config_hash follows every override)
+# Configuration with overrides (Thresholds.load applies them: same parsing, validation and hash)
 # ---------------------------------------------------------------------------
 
-_MAPPING_KEYS: Final[frozenset[str]] = frozenset(
-    {"crm.booking_sources", "crm.meeting_outcome_exclusions"}
-)
+# (config directory, config_fingerprint, normalised overrides, registry) -> configuration.
 _THRESHOLDS_CACHE: dict[tuple[object, ...], Thresholds] = {}
-
-
-@cache
-def _documents(directory: str) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    """Parse the three config files of ``directory`` once (read-only use; callers deep-copy).
-
-    Raises:
-        ConfigError: When a file is missing or not a YAML mapping.
-    """
-    documents: list[Mapping[str, Any]] = []
-    for name in (THRESHOLDS_FILE, CONTENT_ASSETS_FILE, HUBSPOT_MAPPING_FILE):
-        path = f"{directory}/{name}"
-        try:
-            with open(path, encoding="utf-8") as handle:
-                loaded: object = yaml.safe_load(handle)
-        except OSError as exc:
-            raise ConfigError(name, None, f"cannot read {path}: {exc}") from exc
-        if not isinstance(loaded, Mapping):
-            raise ConfigError(name, None, "top level must be a mapping")
-        documents.append(loaded)
-    return documents[0], documents[1], documents[2]
-
-
-def _yaml_value(value: object) -> object:
-    """Convert an override value to the YAML scalar or list the loader would have produced."""
-    if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else float(value)
-    if isinstance(value, tuple | list):
-        return [_yaml_value(item) for item in value]
-    return value
-
-
-def _set_dotted(tree: dict[str, Any], key: str, value: object, file: str) -> None:
-    """Replace the value at an existing dotted key of a parsed document.
-
-    Raises:
-        ConfigError: When the key does not exist, so a misspelt override fails loudly.
-    """
-    parts = key.split(".")
-    node: Any = tree
-    for part in parts[:-1]:
-        if not isinstance(node, dict) or part not in node:
-            raise ConfigError(file, key, "threshold override names a missing key")
-        node = node[part]
-    if not isinstance(node, dict) or parts[-1] not in node:
-        raise ConfigError(file, key, "threshold override names a missing key")
-    node[parts[-1]] = _yaml_value(value)
 
 
 def thresholds_with(
@@ -1147,10 +1100,16 @@ def thresholds_with(
 ) -> Thresholds:
     """Load the configuration with dotted-key overrides and an optional registry.
 
-    The shipped files are parsed, the overrides replace existing keys only, and the
-    configuration is rebuilt with :meth:`Thresholds.from_trees`, so it is validated exactly as
-    at load (``window.presets`` must still contain ``window.default_days``) and its
-    ``config_hash`` reflects every override. Results are memoised per distinct input.
+    :meth:`Thresholds.load` reads the config files with its strict loader, replaces existing
+    keys only (a misspelt key fails) and validates the result as it validates files holding
+    the same values (``window.presets`` must still contain ``window.default_days``), so its
+    ``config_hash`` reflects every override and this module parses no YAML itself (AAP
+    0.6.2). With no overrides and no registry it is the plain :meth:`Thresholds.load`.
+
+    Results are memoised per config directory, :func:`config_fingerprint` of its files and
+    distinct input, with values compared as :func:`override_value` normalises them
+    (``Decimal("0.90")`` and ``0.9``, a tuple and a list, are one entry). Any byte edit to a
+    config file therefore loads afresh, and unchanged files return the same instance.
 
     Args:
         overrides: Dotted keys of ``config/thresholds.yaml`` (or ``crm.booking_sources`` and
@@ -1161,39 +1120,29 @@ def thresholds_with(
         The validated configuration.
 
     Raises:
-        ConfigError: When an override names a missing key or validation fails.
+        ConfigError: Naming the file and key, when the config directory or a file is missing
+            or unreadable, a file is not valid YAML, an override names a missing key, or
+            validation fails.
     """
-    directory = resolve_config_dir()
+    directory = resolve_config_dir().absolute()
+    fingerprint = config_fingerprint(directory)
     assets = None if content_assets is None else tuple(content_assets)
     cache_key: tuple[object, ...] = (
         str(directory),
-        tuple(sorted((key, repr(_yaml_value(value))) for key, value in overrides.items())),
+        fingerprint,
+        tuple(sorted((key, repr(override_value(value))) for key, value in overrides.items())),
         assets,
     )
     cached = _THRESHOLDS_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    if not overrides and assets is None:
-        result = Thresholds.load(directory)
-    else:
-        raw_thresholds, raw_assets, raw_mapping = _documents(str(directory.absolute()))
-        thresholds_doc: dict[str, Any] = copy.deepcopy(dict(raw_thresholds))
-        mapping_doc: dict[str, Any] = copy.deepcopy(dict(raw_mapping))
-        assets_doc: dict[str, Any] = copy.deepcopy(dict(raw_assets))
-        for key, value in overrides.items():
-            if key in _MAPPING_KEYS:
-                _set_dotted(mapping_doc, key, value, HUBSPOT_MAPPING_FILE)
-            else:
-                _set_dotted(thresholds_doc, key, value, THRESHOLDS_FILE)
-        if assets is not None:
-            assets_doc = {"assets": [asset.to_json() for asset in assets]}
-        result = Thresholds.from_trees(
-            thresholds=thresholds_doc,
-            content_assets=assets_doc,
-            hubspot_mapping=mapping_doc,
-            source_dir=directory.absolute(),
-        )
-    _THRESHOLDS_CACHE[cache_key] = result
+    result = Thresholds.load(directory, overrides=overrides, content_assets=assets)
+    # Keep only entries of the files as they are now, and only when no edit raced the load.
+    for stale in [key for key in _THRESHOLDS_CACHE if key[0] == str(directory)]:
+        if stale[1] != fingerprint:
+            del _THRESHOLDS_CACHE[stale]
+    if config_fingerprint(directory) == fingerprint:
+        _THRESHOLDS_CACHE[cache_key] = result
     return result
 
 
@@ -2796,10 +2745,16 @@ class _Converter:
         )
 
     def _google_touch_contacts(self, link: GoogleCrmBinding) -> list[ContactRecord]:
-        """Google-touch contacts whose touch date falls within the window's UTC bounds."""
+        """Google-touch contacts whose touch falls within the window's Google-native bounds.
+
+        ``[start 00:00, end + 1 day 00:00)`` in the Google account's time zone (UTC while
+        none is known), as ``load_context`` selects them (AAP 0.5.4.1 native days).
+        """
         if link.campaign_property is None or link.touch_date_property is None:
             return []
-        start, end = self.window.utc_bounds()
+        zone = self.sources.google_timezone or "UTC"
+        start, _ = AnalysisWindow.day_bounds(self.window.start, zone)
+        _, end = AnalysisWindow.day_bounds(self.window.end, zone)
         found = self.world.hubspot_search(
             "contacts",
             (
@@ -2952,6 +2907,32 @@ class _Converter:
                 read[key] = [inside[0]] if len(inside) == 1 else [inside[0], inside[-1]]
         return read
 
+    def read_latest_observations(self) -> dict[tuple[str, int], Observation]:
+        """Each campaign's and budget's newest snapshot at or before the build instant.
+
+        ``load_context`` reads these independently of the window, as the current state budget
+        proposals are sized from. The replay writes every snapshot this converter models
+        (cut at the build instant) in the order the sync jobs would insert them, so each
+        entity's newest replayed observation stands for its newest stored one. Among
+        snapshots sharing the newest ``captured_at``, the last one replayed wins: the row
+        ``load_context``'s ``ORDER BY captured_at DESC, id DESC LIMIT 1`` probe returns (ids
+        ascend in insertion order), and the same row the window series ends on at that
+        instant, so the current state never depends on which of the two a rule reads.
+        """
+        latest: dict[tuple[str, int], Observation] = {}
+        for key, rows in self.observations.items():
+            if key[0] not in ("campaign", "budget"):
+                continue
+            best: Observation | None = None
+            for row in rows:
+                if row.captured_at > self.now:
+                    continue
+                if best is None or row.captured_at >= best.captured_at:
+                    best = row
+            if best is not None:
+                latest[key] = best
+        return latest
+
     def _inferred_shape(self, key: SubjectKey) -> DecisionShape:
         """The shape of a subject with no decision: ``budget``, ``shared_member`` or own."""
         subject_type, subject_id = key
@@ -3037,7 +3018,28 @@ class _Converter:
         return tuple(rows)
 
     def _feedback_key(self, item: FeedbackSpec) -> str:
-        """The ``{source}:{type}:{external id}`` key of a feedback spec's entity."""
+        """The ``{source}:{type}:{external id}`` key of a feedback spec's entity.
+
+        Keywords and search terms are keyed as the rules key their items: a keyword by its ad
+        group and criterion id (:func:`keyword_external_id`, a criterion id being unique only
+        within its ad group), a search term by :func:`search_term_external_id`. Every other
+        indexed type takes its platform id (:meth:`EntityIndex.entity_key`).
+
+        Raises:
+            KeyError: When the world has no such indexed entity.
+        """
+        if item.entity_type == "keyword":
+            keyword_criterion = self.index.external_id(item.source, "keyword", item.key)
+            google = self.wspec.google
+            group_key = next(
+                spec.ad_group_key
+                for spec in (() if google is None else google.keywords)
+                if spec.key == item.key
+            )
+            external = keyword_external_id(
+                self.index.external_id("google", "ad_group", group_key), keyword_criterion
+            )
+            return f"{item.source}:keyword:{external}"
         if item.entity_type in _INDEXED_FEEDBACK_TYPES:
             return self.index.entity_key(item.source, item.entity_type, item.key)
         if item.entity_type == "search_term":
@@ -3099,6 +3101,9 @@ class _Converter:
             segment_windows=self.segment_windows,
             observations=MappingProxyType(
                 {key: tuple(rows) for key, rows in sorted(self.read_observations().items())}
+            ),
+            latest_observations=MappingProxyType(
+                dict(sorted(self.read_latest_observations().items()))
             ),
             leads=tuple(self.lead_rows),
             discrepancies=self.discrepancies(),
@@ -3782,7 +3787,9 @@ def _k2_scenarios(module: str) -> Iterator[Scenario]:
         fires=(world("k2.min_conversions", candidate("3", "30")), fires),
         does_not_fire=(
             world("k2.min_conversions", candidate("2", "30")),
-            Expectation(K2, False, {"conversions": 2}),
+            Expectation(
+                K2, False, {"conversions": 2}, withheld_reason="conversions 2 of 3 required"
+            ),
         ),
     )
     yield from _pair(
@@ -5805,6 +5812,8 @@ _PAPER_FORMS: Final[Mapping[str, int]] = MappingProxyType(
     }
 )
 _CHEAP_FORM: Final = 990_000_501
+_UNLISTED_FORM: Final = 990_000_601
+"""A lead form no registry asset lists, so only a creative override routes its leads."""
 _LANDING_CREATIVE: Final = 990_001_301
 _EU_FORM: Final = 990_000_102
 
@@ -5926,8 +5935,9 @@ def _papers_context(
 ) -> ContextSpec:
     """A white paper registry (``guide-a`` by default) plus context-only CRM patches.
 
-    The simulated world lists exactly the registry's forms and override creatives, so each
-    scenario's registry names only the assets its world has.
+    The simulated world lists every form and override creative of the registry, so each
+    scenario's registry names only the assets its world has. A world may add a form no asset
+    lists (:data:`_UNLISTED_FORM`), whose leads reach an asset only through an override.
     """
     return ContextSpec(content_assets=assets, crm_patches=tuple(patches), **extra)
 
@@ -6149,8 +6159,22 @@ def _floor_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
     # 1,000 leads: 50 a day on -28..-11, one on -10 and 99 on -9..-1. Form version 2 drops the
     # email question, so leads from its first day on are unmatched (100 = 10.0%, 99 = 9.9%).
     leads = dict.fromkeys(_offsets(-28, -11), 50) | {-10: 1} | dict.fromkeys(_offsets(-9, -1), 11)
+    # Every matched lead (submitted on -10 at the latest) reaches MQL and QL, books a meeting
+    # and opens a deal one to two days later, so every count and both cost denominators are
+    # above 0 by the run.
+    outcomes = _funnel(
+        mql_share=1,
+        ql_share=1,
+        meeting_share=1,
+        meeting_sources=(("MEETINGS_PUBLIC", 1),),
+        deal_share=1,
+        mql_delay_days=(1, 2),
+        ql_delay_days=(1, 2),
+        meeting_delay_days=(1, 2),
+        deal_delay_days=(1, 2),
+    )
 
-    def floor_world(first_no_email_day: int) -> WorldSpec:
+    def floor_world(name: str, first_no_email_day: int, funnel: FunnelSpec) -> WorldSpec:
         form = _form(
             _PAPER_FORMS["guide-a"],
             "White paper form",
@@ -6158,26 +6182,76 @@ def _floor_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
             FormVersionSpec(2, _questions(email=False), active_from_offset=first_no_email_day),
         )
         paper = _Paper("cr-a", _PAPER_FORMS["guide-a"], "5000", leads)
-        return _papers_world("wp.contact_floor", (paper,), forms=(form,))
+        return _papers_world(name, (paper,), funnel=funnel, forms=(form,))
 
     yield from _pair(
         "wp.contact_floor",
         module,
-        "Floors: the contact floor at 10% renders >= and <= / not at 9.9%",
+        "Floors: the contact floor at 10% renders counts as >= N and costs as <= X / not at 9.9%",
         fires=(
-            floor_world(-10),
+            floor_world("wp.contact_floor", -10, outcomes),
             Expectation(
                 W1,
                 False,
-                {"leads": 1000, "unmatched": 100, "contact_share": "0.10"},
+                {
+                    "leads": 1000,
+                    "unmatched": 100,
+                    "contact_share": "0.10",
+                    "spend": "5000.00",
+                    "mql": "≥ 900",
+                    "ql": "≥ 900",
+                    "meetings_booked": "≥ 1099",
+                    "deals": "≥ 900",
+                    "cost_per_ql": "≤ 5.56",
+                    "cost_per_meeting": "≤ 4.55",
+                },
                 flags=(FLAG_ATTRIBUTION_FLOOR,),
             ),
         ),
         does_not_fire=(
-            floor_world(-9),
-            Expectation(W1, False, {"leads": 1000, "unmatched": 99, "contact_share": "0.099"}),
+            floor_world("wp.contact_floor", -9, outcomes),
+            Expectation(
+                W1,
+                False,
+                {
+                    "leads": 1000,
+                    "unmatched": 99,
+                    "contact_share": "0.099",
+                    "spend": "5000.00",
+                    "mql": 901,
+                    "ql": 901,
+                    "meetings_booked": 1100,
+                    "deals": 901,
+                    "cost_per_ql": "5.55",
+                    "cost_per_meeting": "4.55",
+                },
+            ),
         ),
         context=registry,
+    )
+    yield _case(
+        "wp.contact_floor_no_outcomes",
+        module,
+        "Floors: under the contact floor a zero QL or booked-meeting count renders its cost as "
+        "an em dash, never a <= X ceiling",
+        floor_world("wp.contact_floor_no_outcomes", -10, _FLAT_FUNNEL),
+        Expectation(
+            W1,
+            False,
+            {
+                "leads": 1000,
+                "unmatched": 100,
+                "contact_share": "0.10",
+                "ql": "≥ 0",
+                "meetings_booked": "≥ 0",
+                "cost_per_ql": "—",
+                "cost_per_meeting": "—",
+                "ql_cost_note": "no QL yet",
+                "meeting_cost_note": "no meetings yet",
+            },
+            flags=(FLAG_ATTRIBUTION_FLOOR,),
+        ),
+        registry,
     )
     yield _case(
         "wp.creative_floor",
@@ -6348,20 +6422,74 @@ def _floor_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
 def _credit_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
     """Credit and de-duplication, override precedence, currencies and asset overlap."""
     repeat = _funnel(repeat_person_share=1, ql_share=1, ql_delay_days=(5, 5))
-    yield _case(
-        "wp.credit_latest_touch",
-        module,
-        "Credit and de-duplication: events are credited to the latest prior touch's creative, "
-        "with per-creative rows summing to the asset total",
-        _papers_world(
-            "wp.credit_latest_touch",
+
+    def touches_world(name: str, delay: int) -> WorldSpec:
+        """One person touching cr-a1 on -28 and cr-a2 on -25; every event ``delay`` days later.
+
+        Event delays run from the person's first touch, so 1 day puts MQL, QL, the booked
+        meeting's creation and the deal between the two touches, and 5 days after both.
+        """
+        events = _funnel(
+            repeat_person_share=1,
+            mql_share=1,
+            ql_share=1,
+            meeting_share=1,
+            meeting_sources=(("MEETINGS_PUBLIC", 1),),
+            deal_share=1,
+            mql_delay_days=(delay, delay),
+            ql_delay_days=(delay, delay),
+            meeting_delay_days=(delay, delay),
+            deal_delay_days=(delay, delay),
+        )
+        return _papers_world(
+            name,
             (
                 _Paper("cr-a1", _PAPER_FORMS["guide-a"], "500", {-28: 1}),
                 _Paper("cr-a2", _PAPER_FORMS["guide-a"], "500", {-25: 1}),
             ),
-            funnel=repeat,
+            funnel=events,
+        )
+
+    yield _case(
+        "wp.credit_latest_touch",
+        module,
+        "Credit and de-duplication: MQL, QL, meetings and deals are credited to the latest prior "
+        "touch's creative, with per-creative rows summing to the asset total",
+        touches_world("wp.credit_latest_touch", 5),
+        Expectation(
+            W1,
+            False,
+            {
+                "credited_creative": "cr-a2",
+                "mql": 1,
+                "ql": 1,
+                "meetings_booked": 2,
+                "deals": 1,
+                "rows_sum_to_total": True,
+            },
         ),
-        Expectation(W1, False, {"credited_creative": "cr-a2", "ql": 1, "rows_sum_to_total": True}),
+        registry,
+    )
+    yield _case(
+        "wp.credit_between_touches",
+        module,
+        "Credit and de-duplication: MQL, QL, meetings and deals between a contact's two touches "
+        "are credited to the earlier touch's creative, the latest touch at or before each event, "
+        "not the contact's last touch",
+        touches_world("wp.credit_between_touches", 1),
+        Expectation(
+            W1,
+            False,
+            {
+                "credited_creative": "cr-a1",
+                "last_touch_creative": "cr-a2",
+                "mql": 1,
+                "ql": 1,
+                "meetings_booked": 2,
+                "deals": 1,
+                "rows_sum_to_total": True,
+            },
+        ),
         registry,
     )
     yield _case(
@@ -6387,19 +6515,31 @@ def _credit_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
         Expectation(W1, False, {"leads": 3, "contacts": 1, "mql": 1}),
         registry,
     )
+    # The overridden creative's call-to-action form is listed under no asset, so the override
+    # alone routes its spend and its leads to guide-c (check_overrides accepts it: the form
+    # maps to no asset). Its leads reach QL, so their credit follows the lead to the asset.
     override = _asset("guide-c", _PAPER_FORMS["guide-c"], creatives=(_LANDING_CREATIVE,))
     yield _case(
         "wp.override_precedence",
         module,
-        "Credit and de-duplication: the creative override applies to both spend and leads",
+        "Credit and de-duplication: the creative override applies to both spend and leads: the "
+        "overridden creative's spend and the leads on its unlisted form resolve to the "
+        "override's asset",
         _papers_world(
             "wp.override_precedence",
             (
                 _Paper(
                     "cr-c", _PAPER_FORMS["guide-c"], "250", dict.fromkeys(_offsets(-28, -24), 1)
                 ),
-                _Paper("cr-landing", None, "500", {}, creative_id=_LANDING_CREATIVE),
+                _Paper(
+                    "cr-override",
+                    _UNLISTED_FORM,
+                    "500",
+                    dict.fromkeys(_offsets(-23, -21), 1),
+                    creative_id=_LANDING_CREATIVE,
+                ),
             ),
+            funnel=_QL_FUNNEL,
         ),
         Expectation(
             W1,
@@ -6407,7 +6547,12 @@ def _credit_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
             {
                 "asset": "guide-c",
                 "spend": "750.00",
+                "leads": 8,
+                "ql": 8,
                 "override_creative": f"{CREATIVE_URN_PREFIX}{_LANDING_CREATIVE}",
+                "override_spend": "500.00",
+                "override_leads": 3,
+                "override_ql": 3,
             },
         ),
         _papers_context(assets=(override,)),
@@ -7105,9 +7250,9 @@ def _google_client_scenarios(module: str) -> Iterator[Scenario]:
         "google.keyset_25000",
         module,
         "Keyset enumeration: a Q-G2 scan over 25,000 campaigns runs pages of 9,999, 9,999 and "
-        "7,002 rows with strictly increasing campaign.id filters",
+        "5,002 rows with strictly increasing campaign.id filters",
         bulk("google.keyset_25000", campaigns=24_999),
-        pages=(9_999, 9_999, 7_002),
+        pages=(9_999, 9_999, 5_002),
         campaigns=25_000,
     )
     yield _transport(
@@ -7115,7 +7260,8 @@ def _google_client_scenarios(module: str) -> Iterator[Scenario]:
         module,
         "Keyset enumeration: Q-G4 runs the same keyset scan over ad groups",
         bulk("google.keyset_ad_groups", campaigns=1, ad_groups_per_campaign=25_000),
-        pages=(9_999, 9_999, 7_002),
+        pages=(9_999, 9_999, 5_002),
+        ad_groups=25_000,
     )
     removal = PlatformChange(
         "google",

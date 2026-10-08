@@ -4,10 +4,12 @@ Covers the filters (:class:`SearchFilter`, :func:`deal_search_filter`,
 :func:`google_contacts_filter`), the request body (:func:`search_body`), the instant encoding
 (:func:`epoch_ms`) and :func:`search_partitioned`: one-day partitioning of ``[start, end)``,
 half-open ``GTE``/``LT`` epoch-millisecond filters, whole-hour halving of a partition whose
-``total`` exceeds 10,000 (24 → 12 → 6 → 3 → 1 + 2 → 1 + 1), the one-hour partition read to
-exactly 10,000 results and marked incomplete, transient failures that keep the rows already
-read, propagation of ``AccessDenied`` and ``QueryDefect``, paging-contract breaches, argument
-validation, and the ``hubspot.search`` log event.
+``total`` exceeds 10,000 (24 → 12 → 6 → 3 → 1 + 2 → 1 + 1), the one-hour partition read up to
+10,000 results and marked incomplete whether or not its last page carries a cursor, paging
+that ends with fewer distinct records than its ``total``, transient failures that keep the
+rows already read, propagation of ``AccessDenied`` and ``QueryDefect``, paging-contract
+breaches (repeated and backward cursors included), argument validation, and the
+``hubspot.search`` log event.
 
 Every page is served by an in-memory pager. :class:`ContractPager` answers the way the CRM
 Search contract (``backend/tests/contracts/hubspot/crm_search.json``) documents: it checks
@@ -47,6 +49,7 @@ from ads_engine.connectors.hubspot.search import (
     MIN_PARTITION,
     PAGE_SIZE,
     RESULT_CEILING,
+    SHORT_READ_REASON,
     SearchFilter,
     SearchOutcome,
     SearchPager,
@@ -292,7 +295,9 @@ class ContractPager:
     numeric ``after`` offsets, as HubSpot pages. ``total`` is the match count unless
     ``total_for`` overrides it; ``fail_on`` may raise instead of answering; ``max_page`` caps
     the records per page below the requested ``limit``; ``trailing_cursor`` keeps a cursor on
-    the last page, which HubSpot does when that page ends exactly on the ceiling.
+    the last page, which HubSpot does when that page ends exactly on the ceiling;
+    ``ceiling_ends_paging`` drops the cursor from a page that ends on the ceiling although
+    more records match, since no page past 10,000 can be served.
     """
 
     def __init__(
@@ -303,6 +308,7 @@ class ContractPager:
         range_property: str = "createdate",
         max_page: int | None = None,
         trailing_cursor: bool = False,
+        ceiling_ends_paging: bool = False,
         total_for: Callable[[Call, int], int] | None = None,
         fail_on: Callable[[Call], BaseException | None] | None = None,
     ) -> None:
@@ -319,6 +325,7 @@ class ContractPager:
         self._range_property = range_property
         self._max_page = max_page
         self._trailing_cursor = trailing_cursor
+        self._ceiling_ends_paging = ceiling_ends_paging
         self._total_for = total_for
         self._fail_on = fail_on
         self.attempts = 0
@@ -374,6 +381,8 @@ class ContractPager:
         next_after: str | None = None
         if end < len(matched) or (self._trailing_cursor and results):
             next_after = str(end)
+        if self._ceiling_ends_paging and end >= RESULT_CEILING:
+            next_after = None
         page = _page(results, total=total, after=next_after)
         self.served.append(
             Served(
@@ -460,6 +469,7 @@ def test_limits_match_the_contract() -> None:
     assert timedelta(days=1) == DAY
     assert timedelta(hours=1) == MIN_PARTITION
     assert CEILING_REASON == "result limit reached at one-hour partition"
+    assert SHORT_READ_REASON == "search paging ended before its reported total"
 
 
 def test_pagers_satisfy_the_runtime_checkable_protocol() -> None:
@@ -1294,6 +1304,146 @@ async def test_search_lists_every_ceiling_partition_and_states_the_reason_once()
     assert len(outcome.rows) == 2 * RESULT_CEILING
 
 
+@pytest.mark.anyio
+async def test_search_keeps_an_overfull_hour_incomplete_when_its_last_page_has_no_cursor() -> None:
+    deals = _deals_between(DAY0, DAY0 + HOUR, 12_000)
+    pager = ContractPager(deals, ceiling_ends_paging=True)
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + HOUR))
+
+    last = pager.served[-1]
+    assert (last.offset, len(last.ids), last.total, last.next_after) == (9_800, 200, 12_000, None)
+    assert pager.attempts == RESULT_CEILING // PAGE_SIZE
+    assert max(served.offset + served.limit for served in pager.served) <= RESULT_CEILING
+    assert _ids(outcome) == [deal["id"] for deal in deals[:RESULT_CEILING]]
+    assert outcome.completeness == "incomplete"
+    assert outcome.reason == CEILING_REASON
+    assert outcome.partitions_incomplete == ((DAY0, DAY0 + HOUR),)
+    assert outcome.calls == RESULT_CEILING // PAGE_SIZE
+
+
+@pytest.mark.anyio
+async def test_search_splits_an_overfull_day_to_one_hour_before_its_cursorless_ceiling() -> None:
+    deals = _deals_between(_at(2), _at(3), 12_000)
+    pager = ContractPager(deals, ceiling_ends_paging=True)
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + DAY))
+
+    assert pager.first_pages() == [
+        (_at(0), _at(24)),
+        (_at(0), _at(12)),
+        (_at(0), _at(6)),
+        (_at(0), _at(3)),
+        (_at(0), _at(1)),
+        (_at(1), _at(3)),
+        (_at(1), _at(2)),
+        (_at(2), _at(3)),
+        (_at(3), _at(6)),
+        (_at(6), _at(12)),
+        (_at(12), _at(24)),
+    ]
+    hour = [served for served in pager.served if served.span == (_at(2), _at(3))]
+    assert len(hour) == RESULT_CEILING // PAGE_SIZE
+    assert hour[-1].next_after is None
+    assert hour[-1].total == 12_000
+    assert max(served.offset + served.limit for served in pager.served) <= RESULT_CEILING
+    assert _ids(outcome) == [deal["id"] for deal in deals[:RESULT_CEILING]]
+    assert outcome.completeness == "incomplete"
+    assert outcome.reason == CEILING_REASON
+    assert outcome.partitions_incomplete == ((_at(2), _at(3)),)
+
+
+@pytest.mark.anyio
+async def test_duplicated_pages_never_certify_completeness_at_the_ceiling() -> None:
+    # Fifty pages use all 10,000 result positions, but page 25 repeats page 24, so only
+    # 9,800 distinct deals arrive against a reported total of 9,900.
+    def ids_on(page: int) -> range:
+        source = page - 1 if page == 25 else page
+        return range(source * PAGE_SIZE, (source + 1) * PAGE_SIZE)
+
+    pages = [
+        _page(
+            [_deal(index, DAY0) for index in ids_on(page)],
+            total=9_900,
+            after=str((page + 1) * PAGE_SIZE),
+        )
+        for page in range(RESULT_CEILING // PAGE_SIZE)
+    ]
+    pager = ScriptedPager(*pages)
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + HOUR))
+
+    assert pager.exhausted
+    assert [body["limit"] for body in pager.bodies] == [PAGE_SIZE] * (RESULT_CEILING // PAGE_SIZE)
+    assert pager.bodies[-1]["after"] == str(RESULT_CEILING - PAGE_SIZE)
+    assert len(outcome.rows) == 9_800
+    assert outcome.completeness == "incomplete"
+    assert outcome.reason == CEILING_REASON
+    assert outcome.partitions_incomplete == ((DAY0, DAY0 + HOUR),)
+
+
+# --- search_partitioned: paging that ends before its total ------------------------------------
+
+
+@pytest.mark.anyio
+async def test_an_empty_page_with_a_positive_total_and_no_cursor_is_a_short_read(
+    captured: list[EventDict],
+) -> None:
+    pager = ScriptedPager(
+        _page([_deal(1, DAY0 + HOUR)], total=1),
+        _page([], total=5),
+    )
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + 2 * DAY))
+
+    assert pager.exhausted
+    assert _ids(outcome) == [str(DEAL_ID_BASE + 1)]
+    assert outcome.completeness == "incomplete"
+    assert outcome.reason == SHORT_READ_REASON
+    assert outcome.partitions_incomplete == ((DAY0 + DAY, DAY0 + 2 * DAY),)
+    assert outcome.calls == 2
+    (event,) = _search_events(captured)
+    assert event["event"] == "hubspot.search"
+    assert event["log_level"] == "warning"
+    assert event["completeness"] == "incomplete"
+    assert event["partitions"] == 2
+    assert event["partitions_incomplete"] == 1
+
+
+@pytest.mark.anyio
+async def test_paging_that_ends_with_repeated_records_short_of_the_total_is_incomplete() -> None:
+    pager = ScriptedPager(
+        _page([_deal(1, _at(1)), _deal(2, _at(2))], total=4, after="2"),
+        _page([_deal(2, _at(2)), _deal(3, _at(3))], total=4),
+    )
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + DAY))
+
+    # Four raw rows match the total of 4, but only three distinct deals arrived.
+    assert pager.exhausted
+    assert _ids(outcome) == [str(DEAL_ID_BASE + index) for index in (1, 2, 3)]
+    assert outcome.completeness == "incomplete"
+    assert outcome.reason == SHORT_READ_REASON
+    assert outcome.partitions_incomplete == ((DAY0, DAY0 + DAY),)
+
+
+@pytest.mark.anyio
+async def test_a_short_read_and_a_ceiling_state_both_reasons_in_partition_order() -> None:
+    deals = _deals_between(_at(0), _at(1), 10_001)
+
+    def short_total(call: Call, matched: int) -> int:
+        # The second hour reports two matches but its paging ends without returning any.
+        return 2 if call.lo == _at(1) else matched
+
+    pager = ContractPager(deals, total_for=short_total)
+
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (_at(0), _at(1.5)))
+
+    assert outcome.reason == f"{CEILING_REASON}; {SHORT_READ_REASON}"
+    assert outcome.partitions_incomplete == ((_at(0), _at(1)), (_at(1), _at(1.5)))
+    assert len(outcome.rows) == RESULT_CEILING
+
+
 # --- search_partitioned: transient failures --------------------------------------------------
 
 
@@ -1465,6 +1615,57 @@ async def test_a_cursor_that_does_not_advance_is_a_query_defect() -> None:
         await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + DAY))
     _assert_paging_defect(caught.value, "search paging cursor did not advance")
     assert pager.exhausted
+
+
+@pytest.mark.anyio
+async def test_a_cursor_cycle_is_a_query_defect_raised_before_another_request() -> None:
+    pager = ScriptedPager(
+        _page([_deal(1, _at(1))], total=10, after="cursor-a"),
+        _page([_deal(2, _at(2))], total=10, after="cursor-b"),
+        _page([_deal(3, _at(3))], total=10, after="cursor-a"),
+        _page([_deal(4, _at(4))], total=10),
+    )
+    with pytest.raises(QueryDefect) as caught:
+        await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + DAY))
+    _assert_paging_defect(caught.value, "search paging cursor repeated an earlier cursor")
+    assert [body.get("after") for body in pager.bodies] == [None, "cursor-a", "cursor-b"]
+    assert not pager.exhausted
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("400", "200"), ("200", "0200")],
+    ids=["backwards", "same-offset"],
+)
+async def test_a_numeric_cursor_that_does_not_increase_is_a_query_defect(
+    first: str, second: str
+) -> None:
+    pager = ScriptedPager(
+        _page([_deal(1, _at(1))], total=10, after=first),
+        _page([_deal(2, _at(2))], total=10, after=second),
+        _page([_deal(3, _at(3))], total=10),
+    )
+    with pytest.raises(QueryDefect) as caught:
+        await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + DAY))
+    _assert_paging_defect(caught.value, "search paging cursor did not advance")
+    assert [body.get("after") for body in pager.bodies] == [None, first]
+    assert not pager.exhausted
+
+
+@pytest.mark.anyio
+async def test_a_cursor_repeated_by_another_partition_is_accepted() -> None:
+    pager = ScriptedPager(
+        _page([_deal(1, _at(1))], total=2, after="200"),
+        _page([_deal(2, _at(2))], total=2),
+        _page([_deal(3, _at(25))], total=2, after="200"),
+        _page([_deal(4, _at(26))], total=2),
+    )
+    outcome = await search_partitioned(pager, "deals", deal_search_filter(), (DAY0, DAY0 + 2 * DAY))
+    assert pager.exhausted
+    assert [body.get("after") for body in pager.bodies] == [None, "200", None, "200"]
+    assert _ids(outcome) == [str(DEAL_ID_BASE + index) for index in (1, 2, 3, 4)]
+    assert outcome.is_complete
 
 
 @pytest.mark.anyio

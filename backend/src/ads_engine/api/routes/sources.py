@@ -52,7 +52,7 @@ Example::
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Final
 
@@ -119,18 +119,28 @@ def _is_stale(last_success_at: datetime | None, *, now: datetime, stale_after: t
     ``analysis.overlay`` exports no staleness helper, so the age rule lives here, once, with
     the same comparison ``analysis.context.Freshness.is_stale`` makes: a dataset that never
     succeeded is stale, and so is one whose last success is more than ``stale_after`` before
-    ``now``. The coverage-versus-window-end part of staleness applies to the items of a run
-    (the overlay) and not to this screen, which has no run window.
+    ``now``. The age is the elapsed time between the two instants, taken on UTC operands, so
+    it stays exact when they straddle a DST change. The coverage-versus-window-end part of
+    staleness applies to the items of a run (the overlay) and not to this screen, which has
+    no run window.
 
     Args:
-        last_success_at: When the dataset last refreshed successfully, if ever.
-        now: The request's instant.
+        last_success_at: When the dataset last refreshed successfully, if ever (tz-aware).
+        now: The request's instant (tz-aware).
         stale_after: ``sources.stale_after_hours`` as a duration.
 
     Returns:
         ``True`` when the dataset is stale now.
+
+    Raises:
+        ValueError: When ``now`` or ``last_success_at`` is naive, so it names no instant.
     """
-    return last_success_at is None or now - last_success_at > stale_after
+    for instant in (now, last_success_at):
+        if instant is not None and instant.utcoffset() is None:
+            raise ValueError("dataset staleness compares instants: a naive datetime names none")
+    if last_success_at is None:
+        return True
+    return now.astimezone(UTC) - last_success_at.astimezone(UTC) > stale_after
 
 
 def _freshness_views(

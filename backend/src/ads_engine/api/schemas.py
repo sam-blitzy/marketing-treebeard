@@ -4,8 +4,10 @@ Every route in ``ads_engine.api.routes`` declares its request body and ``respons
 this module, and ``web/src/api/types.ts`` mirrors it field for field, so the names and nesting
 here are the wire contract. The groups are:
 
-* **Shared types**: :data:`Money`, :data:`MetricValue` and the ``Literal`` vocabularies
-  (:data:`SourceName`, :data:`SectionKey`, :data:`FlagCode` …), each declared once.
+* **Shared types**: :data:`Money`, :data:`MetricValue`, :data:`PositiveBigInt` (request ids
+  bounded by :data:`BIGINT_MAX`), :data:`StorableText` and :data:`StorableNote` (request
+  text PostgreSQL can store) and the ``Literal`` vocabularies (:data:`SourceName`,
+  :data:`SectionKey`, :data:`FlagCode` …), each declared once.
 * **Errors**: :class:`ErrorResponse` (``{"error": {"code", "message"}}``) and
   :data:`ERROR_RESPONSES` for the routes' ``responses=``.
 * **Auth and runs**: :class:`LoginRequest`, :class:`Me`, :class:`Run`,
@@ -48,6 +50,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Final, Literal, Self, get_args
 
 from pydantic import (
+    AfterValidator,
     AwareDatetime,
     BaseModel,
     BeforeValidator,
@@ -105,6 +108,7 @@ from ads_engine.db.models.ops import (
 )
 
 __all__ = [
+    "BIGINT_MAX",
     "ERROR_RESPONSES",
     "NOTE_MAX_LENGTH",
     "ApiModel",
@@ -157,6 +161,7 @@ __all__ = [
     "Mode",
     "Money",
     "Overlay",
+    "PositiveBigInt",
     "Projection",
     "ProvenanceEntry",
     "RecommendationsPage",
@@ -175,6 +180,8 @@ __all__ = [
     "SourceModes",
     "SourceName",
     "StatTest",
+    "StorableNote",
+    "StorableText",
     "SubjectIn",
     "SubjectType",
     "SubjectView",
@@ -251,6 +258,59 @@ MetricValue = Annotated[str | int | float | bool | None, BeforeValidator(_metric
 """A value copied from frozen evidence ``jsonb``: decimal strings for exact numbers (money,
 rates, shares), integers for counts, a pre-rendered string such as ``"n/a"``, or ``null`` for
 unavailable (never ``0``)."""
+
+BIGINT_MAX: Final = 2**63 - 1
+"""The largest value a PostgreSQL ``bigint`` holds, the type of every internal id column.
+
+Request ids are bounded by it, through :data:`PositiveBigInt` in bodies and
+``Query(le=BIGINT_MAX)`` on routes, so an id the database cannot represent is a 422
+validation error, never a ``bigint out of range`` database error."""
+
+PositiveBigInt = Annotated[int, Field(gt=0, le=BIGINT_MAX)]
+"""An internal id a request names: a positive integer of at most :data:`BIGINT_MAX`.
+
+A larger value is refused with 422 before any SQL runs, because it could never match a
+``bigint`` primary key and binding it would fail in the database instead."""
+
+
+def _utf8_encodable(value: str) -> bool:
+    """Whether UTF-8 can encode ``value``; an unpaired surrogate such as U+D800 cannot."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _storable_text(value: str) -> str:
+    """Return ``value`` unchanged when a PostgreSQL ``text`` column can store it.
+
+    PostgreSQL ``text`` cannot hold U+0000, and psycopg sends every string as UTF-8, which
+    an unpaired surrogate cannot be encoded in. Either would fail in the driver or the
+    server after the request was accepted, so it is refused here, as a 422. Pydantic's
+    ``str`` validation already refuses unpaired surrogates (``string_unicode``); the check
+    keeps this validator's guarantee whatever ``str`` schema runs before it.
+
+    The message names the problem, never the value, which may be an email. The error is
+    raised outside any ``except`` block, so it chains no ``UnicodeEncodeError`` carrying
+    the string.
+
+    Raises:
+        ValueError: When ``value`` contains U+0000 or a code point UTF-8 cannot encode.
+    """
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL (U+0000) character")
+    if not _utf8_encodable(value):
+        raise ValueError("must be valid Unicode text, without unpaired surrogates")
+    return value
+
+
+StorableText = Annotated[str, AfterValidator(_storable_text)]
+"""Request text bound for a PostgreSQL ``text`` column or comparison.
+
+A value holding U+0000 or a code point UTF-8 cannot encode is refused with 422 before any
+SQL runs; every other value, non-ASCII included, passes unchanged. Length bounds stay on
+each field."""
 
 # ---------------------------------------------------------------------------
 # Vocabularies (each equal to its database tuple; checked at import)
@@ -358,6 +418,12 @@ FindingCode = Literal[
 
 NOTE_MAX_LENGTH: Final = 2000
 """The longest free-text note a decision, resolution or feedback request may carry."""
+
+StorableNote = Annotated[str, Field(max_length=NOTE_MAX_LENGTH), AfterValidator(_storable_text)]
+"""A free-text note: at most :data:`NOTE_MAX_LENGTH` characters of :data:`StorableText`.
+
+The length bound belongs to the ``str`` schema and runs first, so an overlong note is
+``string_too_long`` whatever it contains."""
 
 
 def _check_vocabularies() -> None:
@@ -513,12 +579,14 @@ class LoginRequest(RequestModel):
 
     Attributes:
         email: The admin email, trimmed and lowercased before the length check, so the login
-            matches ``app_user.email`` whatever case the user typed.
+            matches ``app_user.email`` whatever case the user typed. It is compared in SQL,
+            so text PostgreSQL cannot hold (:data:`StorableText`) is a 422.
         password: The password exactly as typed: never trimmed or transformed, because every
-            character is part of the secret.
+            character is part of the secret. It is held in memory only and never stored or
+            sent to SQL, so it is not :data:`StorableText`.
     """
 
-    email: str = Field(min_length=1, max_length=320)
+    email: StorableText = Field(min_length=1, max_length=320)
     password: str = Field(min_length=1, max_length=1024)
 
     @field_validator("email", mode="before")
@@ -529,7 +597,7 @@ class LoginRequest(RequestModel):
 
 
 class Me(ApiModel):
-    """The signed-in user (``GET /auth/me``, ``POST /auth/login``).
+    """The signed-in user (``GET /auth/me``, ``POST /auth/login``, ``POST /auth/logout``).
 
     Attributes:
         email: The admin email.
@@ -1158,11 +1226,11 @@ class FeedbackRequest(RequestModel):
 
     Attributes:
         kind: ``dismiss`` (30 days), ``snooze`` (7 days) or ``done`` (30 days), as configured.
-        note: An optional note.
+        note: An optional note (:data:`StorableNote`).
     """
 
     kind: FeedbackKind
-    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+    note: StorableNote | None = None
 
 
 class Feedback(ApiModel):
@@ -1226,11 +1294,11 @@ class SubjectIn(RequestModel):
 
     Attributes:
         type: ``campaign`` or ``budget`` (a Google explicitly shared budget).
-        id: The subject's internal id.
+        id: The subject's internal id, 1 to :data:`BIGINT_MAX`.
     """
 
     type: SubjectType
-    id: int = Field(gt=0)
+    id: PositiveBigInt
 
 
 class _ExpectedFieldsIn(RequestModel):
@@ -1292,14 +1360,15 @@ class DecisionRequest(RequestModel):
     Attributes:
         subject: The decision subject.
         patch: The fields being decided.
-        recommendation_id: The item the decision was recorded from, if any.
-        note: An optional note.
+        recommendation_id: The item the decision was recorded from, if any; 1 to
+            :data:`BIGINT_MAX`.
+        note: An optional note (:data:`StorableNote`).
     """
 
     subject: SubjectIn
     patch: DecisionPatchIn
-    recommendation_id: int | None = Field(default=None, gt=0)
-    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+    recommendation_id: PositiveBigInt | None = None
+    note: StorableNote | None = None
 
 
 class IntendedStateIn(_ExpectedFieldsIn):
@@ -1323,12 +1392,12 @@ class ResolveRequest(RequestModel):
         resolution: The resolution; which ones apply depends on the discrepancy's kind and
             the subject's decision shape (AAP 0.5.4.4).
         intended_state: Required by ``record_intended`` only.
-        note: An optional note.
+        note: An optional note (:data:`StorableNote`).
     """
 
     resolution: ResolutionKey
     intended_state: IntendedStateIn | None = None
-    note: str | None = Field(default=None, max_length=NOTE_MAX_LENGTH)
+    note: StorableNote | None = None
 
 
 class SubjectView(ApiModel):

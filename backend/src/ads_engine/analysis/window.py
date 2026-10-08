@@ -27,6 +27,11 @@ Window rules (AAP 0.5.4.1, 0.5.3):
   the Google account's time zone and yesterday UTC. Today is always excluded as a partial day.
 * A custom window ends no later than the default end and spans 1 to ``window.max_days`` days;
   anything else raises :class:`InvalidWindow`, which the API maps to 422 with its ``code``.
+  ``custom`` has two call shapes that share one validation:
+  ``AnalysisWindow.custom(start, end, config=..., sources=..., now=...)`` on the class builds
+  the window from the loaded configuration and the sources' boundaries at ``now``, and
+  ``window.custom(start, end)`` on a configured window (AAP 0.5.1) reuses that window's
+  configuration, boundaries and default end.
 * A window shorter than ``window.trusted_min_days`` is a short window; sustained-pattern rules
   need at least ``window.sustained_min_days``; C3a segment evidence exists only for a window in
   ``window.presets`` ending on the default end. Every one of these values is read from
@@ -49,13 +54,16 @@ Example:
     >>> window = AnalysisWindow.default(thresholds, info)  # doctest: +SKIP
     >>> window.days, window.short_window, window.is_segment_window()  # doctest: +SKIP
     (28, False, True)
+    >>> window.custom(window.end - timedelta(days=6), window.end).days  # doctest: +SKIP
+    7
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol, overload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ads_engine.analysis.thresholds import Thresholds
@@ -194,6 +202,44 @@ def _aware_now(now: datetime | None) -> datetime:
     if candidate.tzinfo is None or candidate.utcoffset() is None:
         raise ValueError("now must be a tz-aware datetime (an instant), found a naive datetime")
     return candidate
+
+
+def _check_span(start: date, end: date, latest: date, max_days: int) -> None:
+    """Enforce the window bounds of AAP 0.5.3 ``POST /runs`` and 0.5.4.1, in a fixed order.
+
+    The end is no later than ``latest``, the default window end, and the span runs from 1 day
+    to ``max_days`` (``window.max_days``). Every path that builds or constructs a window
+    applies this one check, so a bound is reported with the same code and message whichever
+    path met it.
+
+    Args:
+        start: The first native date, inclusive.
+        end: The last native date, inclusive.
+        latest: The default window end the window may not pass.
+        max_days: ``window.max_days``, the longest window in days.
+
+    Raises:
+        InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
+            ``latest``), ``too_long`` above ``max_days``, or ``too_short`` below 1 day.
+    """
+    if end < start:
+        raise InvalidWindow("end_before_start", f"Window end {end} is before its start {start}")
+    if end > latest:
+        raise InvalidWindow(
+            "end_after_default_end",
+            f"Window end {end} is after the default window end {latest}, the latest date "
+            "complete in every source's native day",
+        )
+    days = (end - start).days + 1
+    if days > max_days:
+        raise InvalidWindow(
+            "too_long",
+            f"Window of {days} days exceeds the {max_days}-day maximum (window.max_days)",
+        )
+    # Unreachable once end >= start (the span is then at least 1 day); kept so the
+    # documented bound "from 1 day" is checked explicitly rather than implied.
+    if days < 1:
+        raise InvalidWindow("too_short", f"Window of {days} days is shorter than 1 day")
 
 
 # ---------------------------------------------------------------------------
@@ -344,14 +390,115 @@ def default_end(sources: SourceDayInfo, *, now: datetime | None = None) -> date:
 # ---------------------------------------------------------------------------
 
 
+class _WindowSettings(Protocol):
+    """The configured ``window.*`` values a window is built with.
+
+    Both :class:`~ads_engine.analysis.thresholds.Thresholds` (the loaded configuration) and
+    :class:`AnalysisWindow` (the values it was built with) provide them, so a custom window is
+    assembled the same way from either.
+    """
+
+    @property
+    def trusted_min_days(self) -> int:
+        """``window.trusted_min_days``."""
+        ...
+
+    @property
+    def default_days(self) -> int:
+        """``window.default_days``."""
+        ...
+
+    @property
+    def sustained_min_days(self) -> int:
+        """``window.sustained_min_days``."""
+        ...
+
+    @property
+    def presets(self) -> tuple[int, ...]:
+        """``window.presets``."""
+        ...
+
+    @property
+    def max_days(self) -> int:
+        """``window.max_days``."""
+        ...
+
+
+class _ConfiguredCustom(Protocol):
+    """``AnalysisWindow.custom`` read from the class: the configuration-aware form."""
+
+    def __call__(
+        self,
+        start: date,
+        end: date,
+        *,
+        config: Thresholds,
+        sources: SourceDayInfo,
+        now: datetime | None = None,
+    ) -> AnalysisWindow:
+        """Return a validated custom window built from ``config`` and ``sources`` at ``now``."""
+        ...
+
+
+class _BoundCustom(Protocol):
+    """``window.custom`` read from an instance: the AAP 0.5.1 two-argument form."""
+
+    def __call__(self, start: date, end: date) -> AnalysisWindow:
+        """Return a validated custom window built from the window's own configuration."""
+        ...
+
+
+class _CustomConstructor:
+    """The ``AnalysisWindow.custom`` descriptor: one name, two call shapes.
+
+    Read from the class it returns the configuration-aware constructor
+    ``custom(start, end, *, config, sources, now=None)``; read from a window it returns the
+    two-argument constructor ``custom(start, end)`` bound to that window's configuration. Both
+    validate through the same routine. As a class attribute without an annotation it is not a
+    dataclass field.
+    """
+
+    @overload
+    def __get__(self, instance: None, owner: type[AnalysisWindow]) -> _ConfiguredCustom: ...
+
+    @overload
+    def __get__(
+        self, instance: AnalysisWindow, owner: type[AnalysisWindow] | None = None
+    ) -> _BoundCustom: ...
+
+    def __get__(
+        self, instance: AnalysisWindow | None, owner: type[AnalysisWindow] | None = None
+    ) -> _ConfiguredCustom | _BoundCustom:
+        """Return the class-level or the bound constructor, by how ``custom`` was reached.
+
+        Raises:
+            TypeError: When called with neither an instance nor an owner class.
+        """
+        if instance is not None:
+            return instance._custom_within
+        if owner is None:
+            raise TypeError("AnalysisWindow.custom must be read from AnalysisWindow or a window")
+        return owner._custom_from_config
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisWindow:
     """An inclusive calendar-date range applied to each source's native days.
 
-    Build it with :meth:`default` (the configured default window) or :meth:`custom` (a
-    validated ``POST /runs`` or ``ads-engine analyze`` window). Whether a run is ``default`` or
-    ``custom`` is the caller's decision (AAP 0.5.3, "Run kinds"): a custom window equal to the
-    default is still a custom run.
+    Build it with :meth:`default` (the configured default window) or ``custom`` (a validated
+    ``POST /runs`` or ``ads-engine analyze`` window), in either of its two call shapes:
+
+    * ``AnalysisWindow.custom(start, end, config=config, sources=sources, now=now)`` on the
+      class, when no window exists yet: it reads ``window.*`` from ``config`` and computes the
+      default end from ``sources`` at ``now``.
+    * ``window.custom(start, end)`` on a configured window, for example
+      ``AnalysisWindow.default(config, sources).custom(start, end)`` (AAP 0.5.1): it reuses
+      that window's ``window.*`` values, its sources and boundaries and its
+      :attr:`default_end`, so it needs no configuration and no clock.
+
+    Both shapes validate through one routine and raise the same :class:`InvalidWindow` codes
+    and messages. Whether a run is ``default`` or ``custom`` is the caller's decision (AAP
+    0.5.3, "Run kinds"): a custom window equal to the default is still a custom run.
 
     The window carries the configured window settings it was built with, so its flags and
     evidence always reflect ``config/thresholds.yaml`` rather than literals (AAP 0.5.4.1).
@@ -360,7 +507,8 @@ class AnalysisWindow:
         start: The first native date, inclusive.
         end: The last native date, inclusive.
         default_end: The default window end at build time (:func:`default_end`). Segment
-            matching and :attr:`is_default_shape` compare against it.
+            matching, :attr:`is_default_shape` and ``window.custom(start, end)`` compare
+            against it.
         source_days: One :class:`SourceDays` per day source, each with exactly ``start`` and
             ``end`` and that source's boundary.
         trusted_min_days: ``window.trusted_min_days``; shorter windows are flagged short.
@@ -368,10 +516,15 @@ class AnalysisWindow:
         sustained_min_days: ``window.sustained_min_days``; sustained-pattern rules are withheld
             below it.
         presets: ``window.presets``, stored ascending and distinct.
+        max_days: ``window.max_days``, the longest window; ``window.custom(start, end)``
+            rejects a longer span. It is configuration, not evidence, so :meth:`to_json`
+            leaves it out.
 
     Raises:
-        InvalidWindow: On construction, ``end_before_start`` when ``end`` precedes ``start`` and
-            ``end_after_default_end`` when ``end`` is after ``default_end``.
+        InvalidWindow: On construction, ``end_before_start`` when ``end`` precedes ``start``,
+            ``end_after_default_end`` when ``end`` is after ``default_end`` and ``too_long``
+            when the window spans more than ``max_days`` days, with the messages ``custom``
+            raises.
         TypeError: On construction, when a date field is not a native ``date``.
         ValueError: On construction, when ``source_days`` is empty, repeats a source or
             disagrees with ``start``/``end``, or a day count is not a positive integer.
@@ -385,20 +538,16 @@ class AnalysisWindow:
     default_days: int
     sustained_min_days: int
     presets: tuple[int, ...]
+    max_days: int
+
+    custom = _CustomConstructor()
 
     def __post_init__(self) -> None:
         """Enforce the window invariants and normalise the tuple fields."""
         start = _native_date(self.start, "start")
         end = _native_date(self.end, "end")
         latest = _native_date(self.default_end, "default_end")
-        if end < start:
-            raise InvalidWindow("end_before_start", f"Window end {end} is before its start {start}")
-        if end > latest:
-            raise InvalidWindow(
-                "end_after_default_end",
-                f"Window end {end} is after the default window end {latest}, the latest date "
-                "complete in every source's native day",
-            )
+        _check_span(start, end, latest, _positive_int(self.max_days, "max_days"))
 
         raw_days: object = self.source_days
         if not isinstance(raw_days, tuple | list):
@@ -460,16 +609,21 @@ class AnalysisWindow:
         return cls._build(start, end, end, config, sources)
 
     @classmethod
-    def custom(
+    def _custom_from_config(
         cls,
         start: date,
         end: date,
         *,
-        config: Thresholds,
-        sources: SourceDayInfo,
+        config: Thresholds | None = None,
+        sources: SourceDayInfo | None = None,
         now: datetime | None = None,
     ) -> AnalysisWindow:
-        """Return a validated custom window (AAP 0.5.3 ``POST /runs``).
+        """Return a validated custom window (AAP 0.5.3 ``POST /runs``): the class-level form.
+
+        Reached as ``AnalysisWindow.custom(start, end, config=config, sources=sources,
+        now=now)``. Use it where no window exists yet, as ``POST /runs`` and
+        ``ads-engine analyze`` do; on a configured window, ``window.custom(start, end)``
+        builds the same window without restating the configuration.
 
         The end is no later than the default window end, and the span runs from 1 day to
         ``window.max_days`` (LinkedIn's daily retention). A window equal to the default is
@@ -478,8 +632,9 @@ class AnalysisWindow:
         Args:
             start: The first native date, inclusive.
             end: The last native date, inclusive.
-            config: The loaded configuration; ``window.*`` values are read from it.
-            sources: The sources' native day boundaries.
+            config: The loaded configuration; ``window.*`` values are read from it. Required;
+                the static type of ``AnalysisWindow.custom`` marks it so.
+            sources: The sources' native day boundaries. Required, like ``config``.
             now: The current instant; ``datetime.now(UTC)`` when omitted. Must be tz-aware.
 
         Returns:
@@ -489,35 +644,74 @@ class AnalysisWindow:
             InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
                 the default end), ``too_long`` above ``window.max_days``, or ``too_short``
                 below 1 day.
-            TypeError: When ``start`` or ``end`` is not a native ``date``, or ``now`` is not a
-                ``datetime``.
+            TypeError: When ``config`` or ``sources`` is missing, ``start`` or ``end`` is not
+                a native ``date``, or ``now`` is not a ``datetime``.
             ValueError: When ``now`` is naive.
         """
+        if config is None or sources is None:
+            missing = [
+                name for name, value in (("config", config), ("sources", sources)) if value is None
+            ]
+            raise TypeError(
+                "AnalysisWindow.custom(start, end) on the class needs the keyword arguments "
+                f"config and sources (missing: {', '.join(missing)}); to reuse a window's "
+                "configuration call custom(start, end) on that window, for example "
+                "AnalysisWindow.default(config, sources).custom(start, end)"
+            )
+        # The dates are checked before ``now`` is read, so a non-date is reported first.
         first = _native_date(start, "start")
         last = _native_date(end, "end")
         latest = default_end(sources, now=now)
-        if last < first:
-            raise InvalidWindow(
-                "end_before_start", f"Window end {last} is before its start {first}"
-            )
-        if last > latest:
-            raise InvalidWindow(
-                "end_after_default_end",
-                f"Window end {last} is after the default window end {latest}, the latest date "
-                "complete in every source's native day",
-            )
-        days = (last - first).days + 1
-        max_days = config.max_days
-        if days > max_days:
-            raise InvalidWindow(
-                "too_long",
-                f"Window of {days} days exceeds the {max_days}-day maximum (window.max_days)",
-            )
-        # Unreachable once end >= start (the span is then at least 1 day); kept so the
-        # documented bound "from 1 day" is checked explicitly rather than implied.
-        if days < 1:
-            raise InvalidWindow("too_short", f"Window of {days} days is shorter than 1 day")
-        return cls._build(first, last, latest, config, sources)
+        return cls._custom_window(first, last, latest, config, sources.boundaries())
+
+    def _custom_within(self, start: date, end: date) -> AnalysisWindow:
+        """Return a validated custom window on this window's configuration: the AAP 0.5.1 form.
+
+        Reached as ``window.custom(start, end)``. The new window keeps this window's
+        ``window.*`` values (:attr:`trusted_min_days`, :attr:`default_days`,
+        :attr:`sustained_min_days`, :attr:`presets`, :attr:`max_days`), its day sources and
+        boundaries in order, and its :attr:`default_end`, which bounds the new end. No clock
+        is read: on a window from ``AnalysisWindow.default(config, sources, now=now)`` it
+        returns exactly what ``AnalysisWindow.custom(start, end, config=config,
+        sources=sources, now=now)`` returns. For a later instant build a fresh default window.
+
+        Args:
+            start: The first native date, inclusive.
+            end: The last native date, inclusive.
+
+        Returns:
+            The custom window, with one :class:`SourceDays` per day source of this window.
+
+        Raises:
+            InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
+                :attr:`default_end`), ``too_long`` above :attr:`max_days`, or ``too_short``
+                below 1 day.
+            TypeError: When ``start`` or ``end`` is not a native ``date``.
+        """
+        boundaries = {item.source: item.boundary for item in self.source_days}
+        return type(self)._custom_window(start, end, self.default_end, self, boundaries)
+
+    @classmethod
+    def _custom_window(
+        cls,
+        start: object,
+        end: object,
+        latest: date,
+        settings: _WindowSettings,
+        boundaries: Mapping[DaySource, str],
+    ) -> AnalysisWindow:
+        """Validate and assemble a custom window; both ``custom`` call shapes end here.
+
+        Raises:
+            InvalidWindow: As :func:`_check_span`.
+            TypeError: When ``start`` or ``end`` is not a native ``date``.
+        """
+        first = _native_date(start, "start")
+        last = _native_date(end, "end")
+        # Checked before assembly: SourceDays would otherwise reject a reversed range with a
+        # plain ValueError instead of the InvalidWindow code POST /runs returns.
+        _check_span(first, last, latest, settings.max_days)
+        return cls._assemble(first, last, latest, settings, boundaries)
 
     @classmethod
     def _build(
@@ -528,20 +722,33 @@ class AnalysisWindow:
         config: Thresholds,
         sources: SourceDayInfo,
     ) -> AnalysisWindow:
+        """Assemble a window from the loaded configuration and the sources' boundaries."""
+        return cls._assemble(start, end, latest, config, sources.boundaries())
+
+    @classmethod
+    def _assemble(
+        cls,
+        start: date,
+        end: date,
+        latest: date,
+        settings: _WindowSettings,
+        boundaries: Mapping[DaySource, str],
+    ) -> AnalysisWindow:
         """Assemble a window: the same dates for every day source, each with its boundary."""
         source_days = tuple(
             SourceDays(source=source, start=start, end=end, boundary=boundary)
-            for source, boundary in sources.boundaries().items()
+            for source, boundary in boundaries.items()
         )
         return cls(
             start=start,
             end=end,
             default_end=latest,
             source_days=source_days,
-            trusted_min_days=config.trusted_min_days,
-            default_days=config.default_days,
-            sustained_min_days=config.sustained_min_days,
-            presets=config.presets,
+            trusted_min_days=settings.trusted_min_days,
+            default_days=settings.default_days,
+            sustained_min_days=settings.sustained_min_days,
+            presets=settings.presets,
+            max_days=settings.max_days,
         )
 
     # -- flags (AAP 0.5.4.1, 0.5.4.2 P5, 0.3.2) ------------------------------------------
