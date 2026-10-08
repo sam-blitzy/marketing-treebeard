@@ -1,0 +1,180 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "criteria"
+      ],
+      [
+        "campaigns",
+        "List(urn%3Ali%3AsponsoredCampaign%3A990010000,urn%3Ali%3AsponsoredCampaign%3A990010001,urn%3Ali%3AsponsoredCampaign%3A990010002,urn%3Ali%3AsponsoredCampaign%3A990010003,urn%3Ali%3AsponsoredCampaign%3A990010004,urn%3Ali%3AsponsoredCampaign%3A990010005)"
+      ],
+      [
+        "intendedStatuses",
+        "List(ACTIVE,PAUSED,DRAFT,ARCHIVED,CANCELED,PENDING_DELETION,REMOVED)"
+      ],
+      [
+        "pageSize",
+        "100"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/adAccounts/990000001/creatives"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010000",
+          "content": {
+            "reference": "urn:li:share:990030000"
+          },
+          "createdAt": 1772799600000,
+          "id": "urn:li:sponsoredCreative:990001000",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799600000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000101",
+            "label": "DOWNLOAD"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010000",
+          "content": {
+            "reference": "urn:li:share:990030001"
+          },
+          "createdAt": 1772799660000,
+          "id": "urn:li:sponsoredCreative:990001001",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799660000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000101",
+            "label": "DOWNLOAD"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010001",
+          "content": {
+            "reference": "urn:li:share:990030002"
+          },
+          "createdAt": 1772799720000,
+          "id": "urn:li:sponsoredCreative:990001002",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799720000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000201",
+            "label": "DOWNLOAD"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010001",
+          "content": {
+            "reference": "urn:li:share:990030003"
+          },
+          "createdAt": 1772799780000,
+          "id": "urn:li:sponsoredCreative:990001003",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799780000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000201",
+            "label": "DOWNLOAD"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010002",
+          "content": {
+            "reference": "urn:li:share:990030004"
+          },
+          "createdAt": 1772799840000,
+          "id": "urn:li:sponsoredCreative:990001004",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799840000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000301",
+            "label": "DOWNLOAD"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010002",
+          "content": {
+            "reference": "urn:li:share:990030005"
+          },
+          "createdAt": 1772799900000,
+          "id": "urn:li:sponsoredCreative:990001005",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799900000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000301",
+            "label": "LEARN_MORE"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010004",
+          "content": {
+            "reference": "urn:li:share:990030007"
+          },
+          "createdAt": 1772800020000,
+          "id": "urn:li:sponsoredCreative:990001007",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772800020000,
+          "leadgenCallToAction": {
+            "destination": "urn:li:adForm:990000301",
+            "label": "REGISTER"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010005",
+          "content": {
+            "reference": "urn:li:share:990030008"
+          },
+          "createdAt": 1772800080000,
+          "id": "urn:li:sponsoredCreative:990001008",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772800080000
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaign": "urn:li:sponsoredCampaign:990010003",
+          "content": {
+            "reference": "urn:li:share:990030006"
+          },
+          "createdAt": 1772799960000,
+          "id": "urn:li:sponsoredCreative:990001301",
+          "intendedStatus": "ACTIVE",
+          "isTest": false,
+          "lastModifiedAt": 1772799960000
+        }
+      ],
+      "metadata": {
+        "nextPageToken": null
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.creatives"
+}

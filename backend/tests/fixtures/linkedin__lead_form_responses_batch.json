@@ -1,0 +1,466 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "ids",
+        "List(16b17c21-b19d-fb29-4b8f-ccb45e4646c3-2,6786f542-5410-18cf-838d-1f9cda9d623b-0,428acde7-ee7f-94fb-08ba-42a52ffa0b9a-1)"
+      ],
+      [
+        "owner",
+        "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+      ],
+      [
+        "leadType",
+        "(leadType:SPONSORED)"
+      ],
+      [
+        "fields",
+        "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,id,submittedAt,testLead,formResponse,form:(hiddenFields,creationLocale,name,id,content)"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/leadFormResponses"
+  },
+  "response": {
+    "body": {
+      "errors": {},
+      "results": {
+        "16b17c21-b19d-fb29-4b8f-ccb45e4646c3-2": {
+          "associatedEntityInfo": {
+            "associatedCreative": {
+              "content": {
+                "reference": "urn:li:share:990030003"
+              },
+              "id": "urn:li:sponsoredCreative:990001003",
+              "intendedStatus": "ACTIVE"
+            }
+          },
+          "form": {
+            "content": {
+              "questions": [
+                {
+                  "name": "firstName",
+                  "predefinedField": "FIRST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "First name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3001
+                },
+                {
+                  "name": "lastName",
+                  "predefinedField": "LAST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "Last name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3002
+                },
+                {
+                  "name": "workEmail",
+                  "predefinedField": "WORK_EMAIL",
+                  "question": {
+                    "localized": {
+                      "en_US": "Work email"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3003
+                },
+                {
+                  "name": "jobTitle",
+                  "predefinedField": "JOB_TITLE",
+                  "question": {
+                    "localized": {
+                      "en_US": "Job title"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3004
+                }
+              ]
+            },
+            "id": 990000201,
+            "name": "Paid Media Benchmarks 2026"
+          },
+          "formResponse": {
+            "answers": [
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Emery"
+                  }
+                },
+                "questionId": 3001
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Hayes"
+                  }
+                },
+                "questionId": 3002
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "emery.hayes.4317943d@sim.invalid"
+                  }
+                },
+                "questionId": 3003
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Director of Revenue Operations"
+                  }
+                },
+                "questionId": 3004
+              }
+            ]
+          },
+          "id": "16b17c21-b19d-fb29-4b8f-ccb45e4646c3-2",
+          "leadMetadataInfo": {
+            "sponsoredLeadMetadataInfo": {
+              "campaign": {
+                "id": "urn:li:sponsoredCampaign:990010001",
+                "name": "Benchmarks - Lead gen (NA)",
+                "type": "SPONSORED_UPDATES"
+              }
+            }
+          },
+          "leadType": "SPONSORED",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "ownerInfo": {
+            "sponsoredAccountInfo": {
+              "name": "Simulated Ads - North America",
+              "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+            }
+          },
+          "submittedAt": 1788498965737,
+          "testLead": false,
+          "versionedLeadGenFormUrn": "urn:li:versionedLeadGenForm:(urn:li:leadGenForm:990000201,1)"
+        },
+        "428acde7-ee7f-94fb-08ba-42a52ffa0b9a-1": {
+          "associatedEntityInfo": {
+            "associatedCreative": {
+              "content": {
+                "reference": "urn:li:share:990030004"
+              },
+              "id": "urn:li:sponsoredCreative:990001004",
+              "intendedStatus": "ACTIVE"
+            }
+          },
+          "form": {
+            "content": {
+              "questions": [
+                {
+                  "name": "firstName",
+                  "predefinedField": "FIRST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "First name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 4001
+                },
+                {
+                  "name": "lastName",
+                  "predefinedField": "LAST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "Last name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 4002
+                },
+                {
+                  "name": "email",
+                  "predefinedField": "EMAIL",
+                  "question": {
+                    "localized": {
+                      "en_US": "Email address"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 4003
+                },
+                {
+                  "name": "company",
+                  "predefinedField": "COMPANY_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "Company name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 4004
+                },
+                {
+                  "name": "challenge",
+                  "question": {
+                    "localized": {
+                      "en_US": "What is your biggest attribution challenge?"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 4005
+                }
+              ]
+            },
+            "id": 990000301,
+            "name": "The Attribution Playbook"
+          },
+          "formResponse": {
+            "answers": [
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Quinn"
+                  }
+                },
+                "questionId": 4001
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Sutton"
+                  }
+                },
+                "questionId": 4002
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "quinn.sutton.57b95cd5@sim.invalid"
+                  }
+                },
+                "questionId": 4003
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Copperline Systems"
+                  }
+                },
+                "questionId": 4004
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Getting sales to trust the numbers"
+                  }
+                },
+                "questionId": 4005
+              }
+            ]
+          },
+          "id": "428acde7-ee7f-94fb-08ba-42a52ffa0b9a-1",
+          "leadMetadataInfo": {
+            "sponsoredLeadMetadataInfo": {
+              "campaign": {
+                "id": "urn:li:sponsoredCampaign:990010002",
+                "name": "Attribution Playbook - Lead gen",
+                "type": "SPONSORED_UPDATES"
+              }
+            }
+          },
+          "leadType": "SPONSORED",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "ownerInfo": {
+            "sponsoredAccountInfo": {
+              "name": "Simulated Ads - North America",
+              "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+            }
+          },
+          "submittedAt": 1788511399141,
+          "testLead": false,
+          "versionedLeadGenFormUrn": "urn:li:versionedLeadGenForm:(urn:li:leadGenForm:990000301,1)"
+        },
+        "6786f542-5410-18cf-838d-1f9cda9d623b-0": {
+          "associatedEntityInfo": {
+            "associatedCreative": {
+              "content": {
+                "reference": "urn:li:share:990030002"
+              },
+              "id": "urn:li:sponsoredCreative:990001002",
+              "intendedStatus": "ACTIVE"
+            }
+          },
+          "form": {
+            "content": {
+              "questions": [
+                {
+                  "name": "firstName",
+                  "predefinedField": "FIRST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "First name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3001
+                },
+                {
+                  "name": "lastName",
+                  "predefinedField": "LAST_NAME",
+                  "question": {
+                    "localized": {
+                      "en_US": "Last name"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3002
+                },
+                {
+                  "name": "workEmail",
+                  "predefinedField": "WORK_EMAIL",
+                  "question": {
+                    "localized": {
+                      "en_US": "Work email"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3003
+                },
+                {
+                  "name": "jobTitle",
+                  "predefinedField": "JOB_TITLE",
+                  "question": {
+                    "localized": {
+                      "en_US": "Job title"
+                    },
+                    "preferredLocale": {
+                      "country": "US",
+                      "language": "en"
+                    }
+                  },
+                  "questionId": 3004
+                }
+              ]
+            },
+            "id": 990000201,
+            "name": "Paid Media Benchmarks 2026"
+          },
+          "formResponse": {
+            "answers": [
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Quinn"
+                  }
+                },
+                "questionId": 3001
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Lowell"
+                  }
+                },
+                "questionId": 3002
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "quinn.lowell.e1efca2e@sim.invalid"
+                  }
+                },
+                "questionId": 3003
+              },
+              {
+                "answerDetails": {
+                  "textQuestionAnswer": {
+                    "answer": "Director of Revenue Operations"
+                  }
+                },
+                "questionId": 3004
+              }
+            ]
+          },
+          "id": "6786f542-5410-18cf-838d-1f9cda9d623b-0",
+          "leadMetadataInfo": {
+            "sponsoredLeadMetadataInfo": {
+              "campaign": {
+                "id": "urn:li:sponsoredCampaign:990010001",
+                "name": "Benchmarks - Lead gen (NA)",
+                "type": "SPONSORED_UPDATES"
+              }
+            }
+          },
+          "leadType": "SPONSORED",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "ownerInfo": {
+            "sponsoredAccountInfo": {
+              "name": "Simulated Ads - North America",
+              "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+            }
+          },
+          "submittedAt": 1788502119479,
+          "testLead": false,
+          "versionedLeadGenFormUrn": "urn:li:versionedLeadGenForm:(urn:li:leadGenForm:990000201,1)"
+        }
+      },
+      "statuses": {}
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.lead_form_responses_batch"
+}
