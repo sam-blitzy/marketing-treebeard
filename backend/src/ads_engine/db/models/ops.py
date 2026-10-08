@@ -268,6 +268,11 @@ class SourceConnection(IdPkMixin, Base):
         calls_24h: Call bookings in the counted window described above, a conservative
             upper bound on the calls in the trailing 24 hours (server default ``0``).
         calls_hourly: Call counts keyed by UTC hour (server default ``'{}'::jsonb``).
+        access_generation: Incremented in the same transaction as every recorded access
+            denial and every entry into automatic fallback (server default ``0``). A live
+            build is bound to the value read before its probe and may activate only while
+            it is unchanged, so a denial recorded by any process voids every earlier live
+            build of the source.
     """
 
     __tablename__ = "source_connection"
@@ -285,6 +290,7 @@ class SourceConnection(IdPkMixin, Base):
     # Per-hour buckets rather than a single counter: a sliding 24 h window needs to drop
     # the oldest hour as time passes, which a lone running total cannot do.
     calls_hourly: Mapped[dict[str, Any]] = mapped_column(server_default=sa.text("'{}'::jsonb"))
+    access_generation: Mapped[int] = mapped_column(server_default=sa.text("0"))
 
     __table_args__ = (
         check_in("source", SOURCES),

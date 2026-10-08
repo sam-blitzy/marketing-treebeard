@@ -564,6 +564,9 @@ def _create_ops_tables() -> None:
             server_default=sa.text(EMPTY_JSONB),
             nullable=False,
         ),
+        sa.Column(
+            "access_generation", sa.BigInteger(), server_default=sa.text(ZERO), nullable=False
+        ),
         _pk("source_connection"),
         _source_check("source_connection"),
         _in_check("source_connection", "mode", MODES),

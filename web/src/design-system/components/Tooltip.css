@@ -3,11 +3,15 @@
 /*
  * Help text on metrics. Class contract with Tooltip.tsx, which renders:
  *
- *   <span class="ds-tooltip">                    hover, focus and Escape handlers live here
- *     trigger                                    a focusable child element (for example a
- *                                                Button) carrying aria-describedby, or, for a
- *                                                string child,
- *                                                <span class="ds-tooltip__trigger" tabindex="0">
+ *   <span class="ds-tooltip">                    hover and focus handlers live here
+ *     <span>                                     an element child whose own focusable element
+ *       child                                    (a Button or field control) carries
+ *     </span>                                    aria-describedby; this span takes no styling
+ *     or
+ *     <span class="ds-tooltip__trigger" tabindex="0" aria-describedby="…">
+ *       child                                    a string, or an element child with no
+ *     </span>                                    focusable described element (a plain span, a
+ *                                                disabled or loading Button)
  *     <span class="ds-tooltip__content" role="tooltip" id="…" hidden>…</span>
  *   </span>
  *
@@ -16,24 +20,43 @@
  * - hoverable: the content is a descendant of the wrapper that owns the hover handlers, and
  *   the ::before bridge below covers the gap between trigger and content, so the pointer can
  *   move onto the content without leaving the wrapper;
- * - persistent and dismissible: Tooltip.tsx hides it on Escape, blur or pointer leave and never
- *   on a timer. This file declares no transition or animation, so dismissal is never delayed.
+ * - persistent and dismissible: Tooltip.tsx hides it on Escape, or once hover and focus have
+ *   both ended (a pointer leave alone keeps a focused tooltip open, and a blur alone keeps a
+ *   hovered one open), and never on a timer. This file declares no transition or animation,
+ *   so dismissal is never delayed.
  *
- * Every colour, spacing, typography, radius, shadow and stacking value is a token from
+ * Placement: while the content is open, Tooltip.tsx lays it out with position: fixed from the
+ * wrapper's viewport rectangle. It opens below the trigger, aligned to its inline start; it
+ * flips above when there is not enough room below and more room above, and shifts along the
+ * inline axis, narrowing on a small viewport, so it stays inside the viewport. It is
+ * recomputed after every render while open, on resize and on scroll of any ancestor. Fixed
+ * positioning keeps the content clear of an ancestor that clips or scrolls its overflow (a
+ * DataTable region, a Dialog panel), while it stays a DOM descendant of the wrapper, so hover
+ * and aria-describedby work unchanged. An ancestor with transform, filter, perspective,
+ * contain or will-change of those would become the containing block of the fixed content and
+ * offset it; no wrapper in this design system sets them.
+ *
+ * Every colour, spacing, typography, radius, shadow, stacking and size value is a token from
  * ../tokens.css, so binding Blitzy OS touches tokens.css alone.
  */
 
-/* Positioning context for the content; inline-block keeps the wrapper in the text flow. */
+/*
+ * inline-block keeps the wrapper in the text flow; its box is the trigger rectangle the content
+ * is placed against.
+ */
 .ds-tooltip {
-  position: relative;
   display: inline-block;
 }
 
 /*
- * Text trigger (string child): a dotted underline and the help cursor mark the term as having
- * help text. The underline offset is a spacing token, so it scales with text resizing.
+ * Focusable trigger (a string child, or an element child with no focus stop of its own): a
+ * dotted underline and the help cursor mark the term as having help text. The underline offset
+ * is a spacing token, so it scales with text resizing. inline-block makes the trigger's box,
+ * and so its focus ring, enclose a wrapped element child such as a disabled Button or field;
+ * it is the wrapper's only in-flow content, so text triggers lay out as before.
  */
 .ds-tooltip__trigger {
+  display: inline-block;
   text-decoration: underline dotted;
   text-underline-offset: var(--space-1);
   cursor: help;
@@ -51,20 +74,23 @@
 }
 
 /*
- * The bubble, opened below the trigger and aligned to its inline start. It sizes to its text up
- * to eight --space-8 steps, then wraps; overflow-wrap breaks a long unbroken value (an id or
- * URL) instead of letting it overflow. The inverted pair (text colour as background, surface
- * colour as text) has the same contrast ratio as body text on the surface. text-align and the
- * typography are set explicitly so a tooltip inside a table header or a heading does not
- * inherit centring or a heavier weight.
+ * The bubble, placed by Tooltip.tsx as described under Placement above: it sets left and top,
+ * a narrower max-width when the viewport is smaller than the bubble's own maximum, and
+ * data-placement="bottom" or "top". Tooltip.tsx reads both margins from this rule: the block
+ * margin (--space-1) is the gap to the trigger, which the ::before bridge below fills, and the
+ * inline margin (--space-2) is the distance kept from the viewport's inline edges. It sizes to
+ * its text up to eight --space-8 steps, then wraps; overflow-wrap breaks a long unbroken value
+ * (an id or URL) instead of letting it overflow. The inverted pair (text colour as background,
+ * surface colour as text) has the same contrast ratio as body text on the surface. text-align
+ * and the typography are set explicitly so a tooltip inside a table header or a heading does
+ * not inherit centring or a heavier weight.
  */
 .ds-tooltip__content {
-  position: absolute;
-  inset-block-start: calc(var(--size-full) + var(--space-1));
-  inset-inline-start: 0;
+  position: fixed;
   z-index: var(--z-tooltip);
   inline-size: max-content;
   max-inline-size: calc(var(--space-8) * 8);
+  margin: var(--space-1) var(--space-2);
   padding: var(--space-2) var(--space-3);
   background: var(--color-text);
   color: var(--color-surface);
@@ -86,9 +112,10 @@
 }
 
 /*
- * Hover bridge (SC 1.4.13 hoverable): a transparent strip filling the --space-1 gap above the
- * bubble. Pointer events on a pseudo-element target the bubble itself, so crossing the gap
- * from the trigger never leaves the wrapper and never closes the tooltip.
+ * Hover bridge (SC 1.4.13 hoverable): a transparent strip filling the --space-1 gap between
+ * the bubble and the trigger, above the bubble when it opens below the trigger. Pointer events
+ * on a pseudo-element target the bubble itself, so crossing the gap from the trigger never
+ * leaves the wrapper and never closes the tooltip.
  */
 .ds-tooltip__content::before {
   content: "";
@@ -96,6 +123,12 @@
   inset-block-end: var(--size-full);
   inset-inline: 0;
   block-size: var(--space-1);
+}
+
+/* Flipped above the trigger: the bridge moves to the bubble's lower edge, facing the trigger. */
+.ds-tooltip__content[data-placement="top"]::before {
+  inset-block-start: var(--size-full);
+  inset-block-end: auto;
 }
 
 /*

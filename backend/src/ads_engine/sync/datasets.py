@@ -14,8 +14,13 @@ ids never join within one source. :class:`DatasetManager` owns every state chang
 * :meth:`DatasetManager.readiness` decides whether a backfilled dataset may activate: every
   required freshness row is recorded and ``complete``, or ``incomplete`` with a reason, and
   never ``unknown``; every staged ``lead_match`` row has been attempted at least once; a
-  simulated LinkedIn dataset's companion is ready too. Staging the rows is the job of
-  ``sync/lead_match.py``; readiness only counts.
+  live LinkedIn dataset with leads has an effective CRM dataset in which every lead is
+  staged; a simulated LinkedIn dataset's companion is ready too. Staging the rows is the
+  job of ``sync/lead_match.py``; readiness only counts.
+* :meth:`DatasetManager.unhydrated_matches` counts a CRM dataset's matches whose contact's
+  meeting or deal associations are not read yet: the debt a build's own CRM dataset must
+  clear before it activates. It is not part of readiness.
+
 * :meth:`DatasetManager.activate` flips a ready dataset (and its companion) to ``active``
   and retires the source's previous active primary (and its companions) in one
   transaction, serialised on the source's ``source_connection`` row. The previous
@@ -63,7 +68,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.analysis.thresholds import CrmBindings
 from ads_engine.db import repositories
-from ads_engine.db.models.crm import LEAD_MATCH_STATUSES, Lead, LeadMatch
+from ads_engine.db.models.crm import (
+    ASSOCIATION_FETCH_STATUSES,
+    CONTACT_READ_STATUSES,
+    CRM_OBJECT_TYPES,
+    LEAD_MATCH_STATUSES,
+    CrmAssociationFetch,
+    CrmContact,
+    Lead,
+    LeadMatch,
+)
 from ads_engine.db.models.ops import (
     DATASET_ROLES,
     DATASET_STATES,
@@ -107,7 +121,16 @@ _RETIRED: Final = "retired"
 _PRIMARY: Final = "primary"
 _COMPANION: Final = "companion"
 _PENDING: Final = "pending"
+_MATCHED: Final = "matched"
+_CONTACT_READ_OK: Final = "ok"
 _CONNECTION_OK: Final = "ok"
+
+# A matched contact's CRM evidence is read through its contact-to-meeting and contact-to-deal
+# association fetches; an ``ok`` fetch whose targets are not read yet has no target-read
+# status (``crm_association_fetch``, ``db/models/crm.py``).
+_CONTACT: Final = "contact"
+_HYDRATED_TARGETS: Final = ("meeting", "deal")
+_FETCH_OK: Final = "ok"
 
 # Discovery of Google-touch contacts runs only when both Google CRM properties are
 # configured and verified, so only then does a HubSpot primary dataset get this row.
@@ -123,8 +146,9 @@ def _check_vocabulary() -> None:
     """Verify the values used here against the schema's enumerations.
 
     Raises:
-        RuntimeError: If a state, role, mode or match status is not the one ``db/models``
-            constrains its column to, or the Google-contacts dataset name is unknown.
+        RuntimeError: If a state, role, mode, match status, contact-read status, CRM object
+            type or association-fetch status is not the one ``db/models`` constrains its
+            column to, or the Google-contacts dataset name is unknown.
     """
     if tuple(DATASET_STATES) != (_BUILDING, _ACTIVE, _RETIRED):
         raise RuntimeError(f"dataset states {DATASET_STATES!r} no longer match sync/datasets.py")
@@ -132,8 +156,21 @@ def _check_vocabulary() -> None:
         raise RuntimeError(f"dataset roles {DATASET_ROLES!r} no longer match sync/datasets.py")
     if get_args(Mode) != tuple(MODES):
         raise RuntimeError(f"modes {MODES!r} no longer match sync/datasets.py")
-    if _PENDING not in LEAD_MATCH_STATUSES:
-        raise RuntimeError(f"lead_match statuses {LEAD_MATCH_STATUSES!r} lack {_PENDING!r}")
+    for status in (_PENDING, _MATCHED):
+        if status not in LEAD_MATCH_STATUSES:
+            raise RuntimeError(f"lead_match statuses {LEAD_MATCH_STATUSES!r} lack {status!r}")
+    if _CONTACT_READ_OK not in CONTACT_READ_STATUSES:
+        raise RuntimeError(
+            f"contact read statuses {CONTACT_READ_STATUSES!r} lack {_CONTACT_READ_OK!r}"
+        )
+    if not {_CONTACT, *_HYDRATED_TARGETS} <= set(CRM_OBJECT_TYPES):
+        raise RuntimeError(
+            f"CRM object types {CRM_OBJECT_TYPES!r} no longer match sync/datasets.py"
+        )
+    if _FETCH_OK not in ASSOCIATION_FETCH_STATUSES:
+        raise RuntimeError(
+            f"association fetch statuses {ASSOCIATION_FETCH_STATUSES!r} lack {_FETCH_OK!r}"
+        )
     if _GOOGLE_CONTACTS not in SOURCE_DATASETS["hubspot"]:
         raise RuntimeError(f"{_GOOGLE_CONTACTS!r} is not a HubSpot freshness dataset")
 
@@ -237,10 +274,16 @@ class Readiness:
     * every required freshness row (:meth:`DatasetManager.required_freshness`) exists and is
       ``complete``, or ``incomplete`` with a recorded reason; never ``unknown``;
     * HubSpot, primary or companion: no ``lead_match`` row of this CRM dataset is still
-      ``pending``, so every staged row was attempted at least once;
+      ``pending``, so every staged row was attempted at least once. Rows of leads whose
+      LinkedIn dataset has retired are not counted: matching never attempts them;
     * LinkedIn: no ``lead_match`` row of this dataset's leads is ``pending`` against its
       effective CRM dataset (HubSpot's active primary for a live dataset), and a simulated
       dataset has a companion that is itself ready;
+    * live LinkedIn with at least one lead: an effective CRM dataset exists (HubSpot has
+      an active primary) and every lead has a ``lead_match`` row in it, so a HubSpot
+      primary replaced during the build is detected and LinkedIn-attributed CRM evidence
+      is complete from the first run on the dataset. A live dataset with no lead has
+      nothing to match and carries no CRM requirement;
     * Google: freshness only.
 
     Attributes:
@@ -256,6 +299,9 @@ class Readiness:
             one; ``None`` otherwise.
         reasons: Human-readable shortfalls, for logs and ``source_dataset.reason``; empty
             exactly when ``ready``.
+        unstaged_leads: Leads of a live LinkedIn dataset with no ``lead_match`` row in its
+            effective CRM dataset, or all its leads when it has none (HubSpot has no active
+            primary); always 0 for the other datasets.
     """
 
     dataset_id: int
@@ -266,6 +312,7 @@ class Readiness:
     incomplete_without_reason: tuple[str, ...]
     companion: Readiness | None = None
     reasons: tuple[str, ...] = ()
+    unstaged_leads: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +807,7 @@ class DatasetManager:
             source=source,
             ready=result.ready,
             pending_matches=result.pending_matches,
+            unstaged_leads=result.unstaged_leads,
             reasons=list(result.reasons),
         )
         return result
@@ -792,6 +840,7 @@ class DatasetManager:
             reasons.append(f"incomplete with no recorded reason: {', '.join(without_reason)}")
 
         pending = 0
+        unstaged = 0
         companion: Readiness | None = None
         if dataset.source == "hubspot":
             pending = await self._pending_in_crm(session, dataset.id)
@@ -824,6 +873,24 @@ class DatasetManager:
                         f"{_plural(pending, 'lead match', 'lead matches')} of this dataset's "
                         f"leads not yet attempted in CRM dataset {crm_dataset_id}"
                     )
+                if dataset.mode == "live":
+                    # Rows staged against an earlier HubSpot primary do not count: a replaced
+                    # CRM dataset leaves the leads unstaged in the one in effect now.
+                    unstaged = await self._unstaged_leads(session, dataset.id, crm_dataset_id)
+                    if unstaged:
+                        reasons.append(
+                            f"{_plural(unstaged, 'lead', 'leads')} of this dataset not yet "
+                            f"staged in CRM dataset {crm_dataset_id}"
+                        )
+            elif dataset.mode == "live":
+                # HubSpot has no active primary, so the leads cannot have been matched
+                # anywhere. A dataset with no lead has nothing to match and is not held.
+                unstaged = await self._lead_count(session, dataset.id)
+                if unstaged:
+                    reasons.append(
+                        "no effective CRM dataset: HubSpot has no active primary dataset to "
+                        f"match {_plural(unstaged, 'lead', 'leads')} against"
+                    )
 
         return Readiness(
             dataset_id=dataset.id,
@@ -834,15 +901,27 @@ class DatasetManager:
             incomplete_without_reason=tuple(without_reason),
             companion=companion,
             reasons=tuple(reasons),
+            unstaged_leads=unstaged,
         )
 
     @staticmethod
     async def _pending_in_crm(session: AsyncSession, crm_dataset_id: int) -> int:
-        """Count the never-attempted ``lead_match`` rows staged in one CRM dataset."""
+        """Count the never-attempted ``lead_match`` rows staged in one CRM dataset.
+
+        Rows of leads whose LinkedIn dataset has retired are not counted: matching never
+        attempts them (no evidence reads them again), so they would hold the CRM dataset
+        forever once LinkedIn activated a newer dataset.
+        """
         count = await session.scalar(
             select(func.count())
             .select_from(LeadMatch)
-            .where(LeadMatch.crm_dataset_id == crm_dataset_id, LeadMatch.status == _PENDING)
+            .join(Lead, Lead.id == LeadMatch.lead_id)
+            .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
+            .where(
+                LeadMatch.crm_dataset_id == crm_dataset_id,
+                LeadMatch.status == _PENDING,
+                SourceDataset.state != _RETIRED,
+            )
         )
         return int(count or 0)
 
@@ -861,6 +940,93 @@ class DatasetManager:
                 LeadMatch.status == _PENDING,
             )
         )
+        return int(count or 0)
+
+    @staticmethod
+    async def _lead_count(session: AsyncSession, lead_dataset_id: int) -> int:
+        """Count the leads of one LinkedIn dataset."""
+        count = await session.scalar(
+            select(func.count()).select_from(Lead).where(Lead.dataset_id == lead_dataset_id)
+        )
+        return int(count or 0)
+
+    @staticmethod
+    async def _unstaged_leads(
+        session: AsyncSession, lead_dataset_id: int, crm_dataset_id: int
+    ) -> int:
+        """Count one LinkedIn dataset's leads that have no ``lead_match`` row in a CRM dataset."""
+        staged = select(LeadMatch.lead_id).where(
+            LeadMatch.lead_id == Lead.id, LeadMatch.crm_dataset_id == crm_dataset_id
+        )
+        count = await session.scalar(
+            select(func.count())
+            .select_from(Lead)
+            .where(Lead.dataset_id == lead_dataset_id, ~staged.exists())
+        )
+        return int(count or 0)
+
+    async def unhydrated_matches(
+        self, crm_dataset_id: int, *, session: AsyncSession | None = None
+    ) -> int:
+        """Count a CRM dataset's matches whose contact's associations are not read yet.
+
+        A ``lead_match`` row of the dataset counts when it is ``matched`` with its contact
+        read ``ok``, its lead's LinkedIn dataset is not retired, and its contact
+        (``crm_contact.hs_id`` in the same dataset) lacks its contact-to-meeting or its
+        contact-to-deal ``crm_association_fetch`` row, or has one that is ``ok`` with no
+        target-read status (associations read, their targets not). Every other recorded
+        fetch outcome was attempted and does not count; whether it is known evidence is
+        attribution's concern.
+
+        Matching stores a contact and its outcome but reads none of its associations, so a
+        row matched after the dataset's CRM backfill, by a build or by any other matcher,
+        leaves this debt behind. ``sync/mode.py`` reruns the backfill of a build's own CRM
+        dataset until it is 0 before that dataset activates. The count is not part of
+        :meth:`readiness`, which counts attempted rows and freshness only.
+
+        Args:
+            crm_dataset_id: A HubSpot dataset, primary or companion.
+            session: Read in the caller's session.
+
+        Returns:
+            The number of such rows; 0 for a dataset that holds none.
+        """
+        hydrated = [
+            select(CrmAssociationFetch.id)
+            .where(
+                CrmAssociationFetch.dataset_id == crm_dataset_id,
+                CrmAssociationFetch.object_type == _CONTACT,
+                CrmAssociationFetch.object_id == CrmContact.hs_id,
+                CrmAssociationFetch.to_type == to_type,
+                ~and_(
+                    CrmAssociationFetch.status == _FETCH_OK,
+                    CrmAssociationFetch.target_read_status.is_(None),
+                ),
+            )
+            .exists()
+            for to_type in _HYDRATED_TARGETS
+        ]
+        async with self._unit(session) as unit:
+            count = await unit.scalar(
+                select(func.count())
+                .select_from(LeadMatch)
+                .join(
+                    CrmContact,
+                    and_(
+                        CrmContact.id == LeadMatch.contact_id,
+                        CrmContact.dataset_id == LeadMatch.crm_dataset_id,
+                    ),
+                )
+                .join(Lead, Lead.id == LeadMatch.lead_id)
+                .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
+                .where(
+                    LeadMatch.crm_dataset_id == crm_dataset_id,
+                    LeadMatch.status == _MATCHED,
+                    LeadMatch.contact_read_status == _CONTACT_READ_OK,
+                    SourceDataset.state != _RETIRED,
+                    ~and_(*hydrated),
+                )
+            )
         return int(count or 0)
 
     # -- transitions -------------------------------------------------------------------

@@ -6,11 +6,16 @@
  * with Dialog.tsx and Dialog.test.tsx, so keep them exactly as written:
  *
  *   .ds-dialog                  fixed overlay covering the viewport; centres the panel
+ *     .ds-visually-hidden       leading focus sentinel, a span with tabindex="0"
  *     .ds-dialog__backdrop      aria-hidden dimming layer; a click on it closes the dialog
  *     .ds-dialog__panel         role="dialog", aria-modal="true", tabindex="-1"
  *       .ds-dialog__header      h2.ds-dialog__title and the Close button
  *       .ds-dialog__body        the caller's content
  *       .ds-dialog__footer      optional row of the caller's actions
+ *     .ds-visually-hidden       trailing focus sentinel, a span with tabindex="0"
+ *
+ * The two sentinels are styled by the .ds-visually-hidden utility in shared.css, which
+ * Dialog.tsx imports, so this file holds no rule for them.
  *
  * Every colour, spacing, typography, radius, shadow, z-index, opacity and size value is a token
  * from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The only literals are layout

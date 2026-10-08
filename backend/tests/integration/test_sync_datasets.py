@@ -946,8 +946,17 @@ async def test_live_linkedin_readiness_counts_its_leads_in_hubspots_active_prima
     linkedin = await manager.begin("linkedin", "live", reason="recovered")
     await _make_fresh(manager, sessions, linkedin)
     leads = await _leads(sessions, linkedin, 2)
-    # No HubSpot dataset is active, so there is no CRM dataset to stage against.
-    assert (await manager.readiness(linkedin)).ready
+    # No HubSpot dataset is active, so the leads have no CRM dataset to be matched in: the
+    # dataset is held, and its previous dataset stays active, until HubSpot has a primary.
+    readiness = await manager.readiness(linkedin)
+    assert not readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads) == (0, 2)
+    assert readiness.reasons == (
+        "no effective CRM dataset: HubSpot has no active primary dataset to match 2 leads against",
+    )
+    with pytest.raises(DatasetStateError, match="no effective CRM dataset"):
+        await manager.activate(linkedin)
+    assert await _state(sessions, linkedin) == "building"
 
     hubspot, _ = await _activated(manager, sessions, "hubspot", "live")
     other = await manager.begin("hubspot", "live")
@@ -965,6 +974,80 @@ async def test_live_linkedin_readiness_counts_its_leads_in_hubspots_active_prima
     await _attempt(sessions, hubspot, leads)
     assert (await manager.readiness(linkedin)).ready
     assert (await manager.readiness(other)).pending_matches == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_live_linkedin_readiness_detects_a_replaced_hubspot_primary(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    first, _ = await _activated(manager, sessions, "hubspot", "live")
+    linkedin = await manager.begin("linkedin", "live", reason="recovered")
+    await _make_fresh(manager, sessions, linkedin)
+    leads = await _leads(sessions, linkedin, 2)
+    await _stage(sessions, leads, first, "no_match")
+    assert (await manager.readiness(linkedin)).ready
+
+    # HubSpot activates a new primary while the LinkedIn build runs: the rows attempted in
+    # the replaced one no longer count, and readiness says which leads still need staging.
+    second, _ = await _activated(manager, sessions, "hubspot", "live")
+    readiness = await manager.readiness(linkedin)
+    assert not readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads) == (0, 2)
+    assert readiness.reasons == (f"2 leads of this dataset not yet staged in CRM dataset {second}",)
+
+    await _stage(sessions, leads[:1], second)
+    readiness = await manager.readiness(linkedin)
+    assert (readiness.pending_matches, readiness.unstaged_leads) == (1, 1)
+    assert readiness.reasons == (
+        f"1 lead match of this dataset's leads not yet attempted in CRM dataset {second}",
+        f"1 lead of this dataset not yet staged in CRM dataset {second}",
+    )
+
+    await _stage(sessions, leads[1:], second)
+    await _attempt(sessions, second, leads)
+    assert (await manager.readiness(linkedin)).ready
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_hubspot_readiness_ignores_pending_rows_of_a_retired_linkedin_dataset(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    old_linkedin, _ = await _activated(manager, sessions, "linkedin", "live")
+    old_leads = await _leads(sessions, old_linkedin, 2)
+    building = await manager.begin("hubspot", "live", reason="recovered")
+    await _make_fresh(manager, sessions, building)
+    await _stage(sessions, old_leads, building)
+    assert (await manager.readiness(building)).pending_matches == 2
+
+    # LinkedIn activates a new dataset: its predecessor's rows are never attempted again,
+    # so they no longer hold the HubSpot build; rows of the active dataset's leads still do.
+    new_linkedin, _ = await _activated(manager, sessions, "linkedin", "live")
+    assert await _state(sessions, old_linkedin) == "retired"
+    assert (await manager.readiness(building)).ready
+    new_leads = await _leads(sessions, new_linkedin, 1)
+    await _stage(sessions, new_leads, building)
+    readiness = await manager.readiness(building)
+    assert readiness.pending_matches == 1
+    assert readiness.reasons == (f"1 lead match not yet attempted in CRM dataset {building}",)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_live_linkedin_without_leads_needs_no_crm_dataset(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    linkedin = await manager.begin("linkedin", "live", reason="recovered")
+    await _make_fresh(manager, sessions, linkedin)
+    # No lead and no HubSpot primary: nothing is to be matched, so nothing holds it.
+    readiness = await manager.readiness(linkedin)
+    assert readiness.ready
+    assert (readiness.pending_matches, readiness.unstaged_leads, readiness.reasons) == (0, 0, ())
+    activation = await manager.activate(linkedin)
+    assert activation == Activation(
+        source="linkedin", activated=(linkedin,), retired=(), mode="live"
+    )
 
 
 # ---------------------------------------------------------------------------------------

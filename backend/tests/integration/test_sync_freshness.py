@@ -4,8 +4,9 @@ The pure parts need no database: the dataset names per source, the reason prefix
 validation of :class:`FreshnessOutcome`, the merge rules that fold an outcome into a stored
 row, and :func:`needs_repair`.
 
-:func:`record_freshness` and :func:`load_freshness` run against the PostgreSQL 18 test
-database named by ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``). The module
+:func:`record_freshness`, :func:`mark_unknown` and :func:`load_freshness` run against the
+PostgreSQL 18 test database named by ``TEST_DATABASE_URL`` (falling back to
+``DATABASE_URL``). The module
 creates a private schema, builds only ``source_dataset`` and ``dataset_freshness`` in it,
 points every connection's ``search_path`` at it alone, and drops it with ``CASCADE`` at
 teardown, so the ``public`` schema and every other schema stay untouched. An unreachable
@@ -43,6 +44,7 @@ from ads_engine.sync.freshness import (
     FreshnessOutcome,
     is_repairable_reason,
     load_freshness,
+    mark_unknown,
     needs_repair,
     record_freshness,
     source_of,
@@ -1508,6 +1510,30 @@ async def test_record_freshness_refuses_a_retired_dataset(sessions: Sessions) ->
 
 @pytest.mark.anyio
 @pytest.mark.db
+async def test_mark_unknown_refuses_a_retired_dataset(sessions: Sessions) -> None:
+    """A retired dataset is read-only: its freshness row is never marked unknown either."""
+    dataset_id = await _create_dataset(sessions)
+    await _record(sessions, dataset_id, METRICS, _success(0, (1, 28)))
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(SourceDataset)
+            .where(SourceDataset.id == dataset_id)
+            .values(state="retired", retired_at=_at(1))
+        )
+
+    with pytest.raises(DatasetNotWritable) as refused:
+        async with sessions() as session, session.begin():
+            await mark_unknown(
+                session, dataset_id, METRICS, reason="days restated after the recorded success"
+            )
+
+    assert (refused.value.dataset_id, refused.value.state) == (dataset_id, "retired")
+    loaded = await _load(sessions, dataset_id)
+    assert _state(loaded[METRICS]) == _expected(0, 0, (1, 28), "complete")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
 async def test_record_freshness_never_commits(sessions: Sessions) -> None:
     """The caller's transaction owns the row: rolling it back leaves no row behind."""
     dataset_id = await _create_dataset(sessions)
@@ -1613,3 +1639,112 @@ async def test_a_delayed_older_success_keeps_a_newer_failure(sessions: Sessions)
 
     later = await _record(sessions, commit_order, METRICS, _success(3, (29, 31)))
     assert _state(later) == _expected(3, 3, (1, 31), "complete")
+
+
+# ---------------------------------------------------------------------------------------
+# mark_unknown: withdrawing what a row vouches for
+# ---------------------------------------------------------------------------------------
+
+CONTACTS = "hubspot.contacts"
+RESTAGED = "3 lead matches staged after the CRM backfill"
+
+
+async def _mark(sessions: Sessions, dataset_id: int, dataset: str) -> DatasetFreshness | None:
+    """Mark one row unknown in its own committed transaction and return it."""
+    async with sessions() as session, session.begin():
+        return await mark_unknown(session, dataset_id, dataset, reason=RESTAGED)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_mark_unknown_keeps_the_history_and_coverage(sessions: Sessions) -> None:
+    """Only completeness and reason change; timestamps and coverage stand, and it persists."""
+    dataset_id = await _create_dataset(sessions, "hubspot")
+    await _record(sessions, dataset_id, CONTACTS, _success(0, (1, 28)))
+    await _record(sessions, dataset_id, CONTACTS, FreshnessOutcome.failure(_at(1), reason="x"))
+    marked = await _mark(sessions, dataset_id, CONTACTS)
+
+    assert marked is not None
+    assert _state(marked) == (_at(1), _at(0), _day(1), _day(28), "unknown", RESTAGED)
+    loaded = await _load(sessions, dataset_id)
+    assert _state(loaded[CONTACTS]) == _state(marked)
+    assert needs_repair(loaded[CONTACTS]) is False
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_later_success_replaces_the_mark_and_a_failure_keeps_it(
+    sessions: Sessions,
+) -> None:
+    """A failure after the mark leaves the row unknown; the next success verifies it again."""
+    dataset_id = await _create_dataset(sessions, "hubspot")
+    await _record(sessions, dataset_id, CONTACTS, _success(0, (1, 28)))
+    await _mark(sessions, dataset_id, CONTACTS)
+
+    failed = await _record(
+        sessions, dataset_id, CONTACTS, FreshnessOutcome.failure(_at(1), reason="HTTP 503")
+    )
+    assert _state(failed) == _expected(1, 0, (1, 28), "unknown", "HTTP 503")
+
+    rerun = await _record(sessions, dataset_id, CONTACTS, _success(2, (1, 30)))
+    assert _state(rerun) == _expected(2, 2, (1, 30), "complete")
+
+    await _mark(sessions, dataset_id, CONTACTS)
+    # A success at the stored instant (a fixed clock) is current, so it replaces it too.
+    same_instant = await _record(
+        sessions,
+        dataset_id,
+        CONTACTS,
+        _success(2, (1, 30), complete=False, reason=INTERRUPTED, repairable=True),
+    )
+    assert _state(same_instant) == _expected(2, 2, (1, 30), "incomplete", INTERRUPTED)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_mark_unknown_writes_nothing_for_an_absent_row(sessions: Sessions) -> None:
+    """An absent row already reads as unknown: nothing is inserted."""
+    dataset_id = await _create_dataset(sessions, "hubspot")
+    assert await _mark(sessions, dataset_id, CONTACTS) is None
+    assert await _count(sessions, dataset_id) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_mark_unknown_rejects_a_blank_reason_and_foreign_datasets(
+    sessions: Sessions,
+) -> None:
+    """A blank reason, an unknown name, a missing or another source's dataset is refused."""
+    hubspot_id = await _create_dataset(sessions, "hubspot")
+    await _record(sessions, hubspot_id, CONTACTS, _success(0, (1, 28)))
+
+    async with sessions() as session:
+        with pytest.raises(ValueError, match="a reason is required"):
+            await mark_unknown(session, hubspot_id, CONTACTS, reason="  ")
+        with pytest.raises(ValueError, match="unknown freshness dataset"):
+            await mark_unknown(session, hubspot_id, "hubspot.meetings", reason=RESTAGED)
+        missing_id = int(await session.scalar(select(func.max(SourceDataset.id))) or 0) + 1000
+        with pytest.raises(ValueError, match=f"source dataset {missing_id} does not exist"):
+            await mark_unknown(session, missing_id, CONTACTS, reason=RESTAGED)
+        with pytest.raises(ValueError, match="belongs to google"):
+            await mark_unknown(session, hubspot_id, METRICS, reason=RESTAGED)
+
+    loaded = await _load(sessions, hubspot_id)
+    assert _state(loaded[CONTACTS]) == _expected(0, 0, (1, 28), "complete")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_mark_unknown_never_commits(sessions: Sessions) -> None:
+    """The caller's transaction owns the change: rolling it back keeps the row verified."""
+    dataset_id = await _create_dataset(sessions, "hubspot")
+    await _record(sessions, dataset_id, CONTACTS, _success(0, (1, 28)))
+
+    async with sessions() as session:
+        marked = await mark_unknown(session, dataset_id, CONTACTS, reason=RESTAGED)
+        assert marked is not None
+        assert marked.completeness == "unknown"
+        await session.rollback()
+
+    loaded = await _load(sessions, dataset_id)
+    assert _state(loaded[CONTACTS]) == _expected(0, 0, (1, 28), "complete")

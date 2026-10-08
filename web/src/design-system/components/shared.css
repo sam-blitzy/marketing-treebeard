@@ -2,9 +2,12 @@
 
 /*
  * Wrappers import this file next to their own stylesheet. It holds only these utilities:
- * - .ds-visually-hidden: text that assistive technology reads but the screen does not show.
- *   Used by Spinner (the label inside role="status"), Card (the "Rank " prefix before the rank
- *   number) and DataTable (the "Details" header of the expand column).
+ * - .ds-visually-hidden: content that assistive technology reads, or that keyboard focus can
+ *   land on, but the screen does not show. Used by Spinner (the label inside role="status"), Card
+ *   (the "Rank " prefix before the rank number), DataTable (the "Details" header of the expand
+ *   column), DateRangePicker (the role="status" region that announces a failed Apply), Dialog
+ *   (the empty leading and trailing focus sentinels around the panel) and PageShell (the skip
+ *   link, together with the modifier below).
  * - .ds-visually-hidden--focusable: combined with .ds-visually-hidden, the element stays hidden
  *   until it receives focus, then appears. Used by the PageShell skip link "Skip to main content"
  *   (WCAG 2.2 SC 2.4.1 Bypass Blocks).

@@ -1,10 +1,13 @@
 """Claiming due ``lead_match`` rows: which rows, in which order, through which index.
 
 ``ads_engine.sync.lead_match._claim`` locks the next batch of one CRM dataset's due rows
-(AAP 0.3.3, "Retry schedule" and "Restart safety"): ``pending`` rows, and ``no_match`` and
-``error`` rows whose retry is due, ordered by ``next_attempt_at`` with ``NULL`` first and ties
-broken by ``lead_id``, at most :data:`~ads_engine.sync.lead_match.BATCH_SIZE` rows, with
-``FOR UPDATE OF lead_match SKIP LOCKED``. The partial index ``ix_lead_match_claim`` on
+(AAP 0.3.3, "Retry schedule" and "Restart safety") and returns a snapshot of each: ``pending``
+rows whose ``next_attempt_at`` is empty or has passed (a row leased to a running batch is not
+due until its lease expires), and ``no_match`` and ``error`` rows whose retry is due, ordered
+by ``next_attempt_at`` with ``NULL`` first and ties broken by ``lead_id``, at most
+:data:`~ads_engine.sync.lead_match.BATCH_SIZE` rows, with ``FOR UPDATE OF lead_match SKIP
+LOCKED``. Leasing the claimed rows is the caller's next step, so these tests call ``_claim``
+alone. The partial index ``ix_lead_match_claim`` on
 (``crm_dataset_id``, ``next_attempt_at NULLS FIRST``, ``lead_id``) holds exactly the claimable
 rows in that order, so a batch reads its rows in order and stops at its limit.
 
@@ -53,7 +56,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from ads_engine.db.base import Base
 from ads_engine.db.models import accounts, crm, ops
-from ads_engine.sync.lead_match import BATCH_SIZE, _claim
+from ads_engine.sync.lead_match import BATCH_SIZE, _Claim, _claim
 
 pytestmark = pytest.mark.integration
 
@@ -365,9 +368,9 @@ async def world(session: AsyncSession) -> World:
     )
 
 
-def _claimed(claims: list[Any]) -> list[tuple[int, str]]:
+def _claimed(claims: list[_Claim]) -> list[tuple[int, str]]:
     """Return each claim's (``lead_id``, ``status``), in claim order."""
-    return [(claim.match.lead_id, claim.match.status) for claim in claims]
+    return [(claim.lead_id, claim.status) for claim in claims]
 
 
 # ---------------------------------------------------------------------------------------
@@ -419,7 +422,7 @@ async def test_the_claim_returns_the_due_rows_by_next_attempt_null_first_then_le
     # Retries that stopped: no next attempt is scheduled.
     await _match(session, lead[11], world.crm, "no_match", None, attempts=9)
     await _match(session, lead[12], world.crm, "error", None, attempts=1)
-    # Not yet due, whatever the status.
+    # Not yet due, whatever the status; the pending row stands for one under a batch's lease.
     await _match(session, lead[13], world.crm, "no_match", _at(1), attempts=1)
     await _match(session, lead[14], world.crm, "error", NOW + timedelta(microseconds=1))
     await _match(session, lead[15], world.crm, "pending", _at(1))

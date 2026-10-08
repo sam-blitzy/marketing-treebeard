@@ -50,6 +50,8 @@ import './Select.css';
 
 import { useId, type ChangeEvent, type ReactNode, type Ref } from 'react';
 
+import { hasContent, mergeIdRefs } from './a11y';
+
 /**
  * One choice in a {@link Select}.
  *
@@ -137,15 +139,11 @@ export interface SelectProps<V extends string = string> {
   id?: string;
   /** Ref to the rendered `<select>` element (React 19 passes `ref` as a regular prop). */
   ref?: Ref<HTMLSelectElement>;
-}
-
-/**
- * Whether a hint or error node renders visible content. `undefined`, `null`, booleans and the
- * empty string render nothing in React, so they neither produce an empty `<p>` nor mark the
- * select invalid; `0` and every other node count as content. Same rule as `TextField`.
- */
-function hasContent(node: ReactNode): boolean {
-  return node !== undefined && node !== null && typeof node !== 'boolean' && node !== '';
+  /**
+   * Extra description ids for the control, such as the id a wrapping `Tooltip` passes. They are
+   * appended to the control's `aria-describedby` after the hint and error ids, each id once.
+   */
+  'aria-describedby'?: string;
 }
 
 /**
@@ -179,24 +177,36 @@ function hasContent(node: ReactNode): boolean {
  * ```
  */
 export function Select<V extends string = string>(props: SelectProps<V>) {
-  const { label, options, value, onChange, hint, error, disabled, required, name, id, ref } =
-    props;
+  const {
+    label,
+    options,
+    value,
+    onChange,
+    hint,
+    error,
+    disabled,
+    required,
+    name,
+    id,
+    ref,
+    'aria-describedby': extraDescribedBy,
+  } = props;
 
   const autoId = useId();
   const selectId = id ?? `${autoId}-select`;
   const hintId = `${selectId}-hint`;
   const errorId = `${selectId}-error`;
 
+  // The same content rule and description order as TextField, from ./a11y: a hint or error
+  // with no content renders nothing, neither an empty <p> nor an invalid select. Extra ids,
+  // such as a Tooltip's, follow.
   const showHint = hasContent(hint);
   const showError = hasContent(error);
-  const describedByIds: string[] = [];
-  if (showHint) {
-    describedByIds.push(hintId);
-  }
-  if (showError) {
-    describedByIds.push(errorId);
-  }
-  const describedBy = describedByIds.length > 0 ? describedByIds.join(' ') : undefined;
+  const describedBy = mergeIdRefs(
+    showHint ? hintId : undefined,
+    showError ? errorId : undefined,
+    extraDescribedBy,
+  );
 
   // The DOM reports the chosen value as a plain string. Mapping it back to the option that
   // carries it yields a typed V without an assertion; a string no option carries is ignored.

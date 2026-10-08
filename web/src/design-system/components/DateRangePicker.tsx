@@ -21,7 +21,7 @@
  *     form[novalidate]
  *       div.ds-daterange__custom-fields      Start date and End date TextFields, then Apply
  *       div.ds-visually-hidden[role=status]  always rendered; the latest failed Apply's
- *                                            submit-error summary (`../shared.css`)
+ *                                            submit-error summary (`./shared.css`)
  * ```
  *
  * With an invalid window configuration, `div.ds-daterange` holds only the label and a critical

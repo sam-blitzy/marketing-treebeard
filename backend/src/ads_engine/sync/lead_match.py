@@ -53,11 +53,30 @@ any other pair):
     (the simulated HubSpot transport answers real emails for a deterministic share).
 
 Restart safety:
-    :func:`run_matching` claims due rows with ``FOR UPDATE OF lead_match SKIP LOCKED`` and
-    commits once per batch. A crash or an exception mid-batch rolls that batch back, so its
-    rows stay claimable unchanged and no state is lost; batches already committed stand.
-    ``AccessDenied`` and ``QueryDefect`` raised by a connector call propagate, because
-    ``sync/mode.py`` alone decides what follows from them.
+    :func:`run_matching` works one batch at a time, and no transaction, row lock or pooled
+    connection is held while LinkedIn or HubSpot is called:
+
+    1. **Claim**, in one short transaction: due rows are selected ``FOR UPDATE OF
+       lead_match SKIP LOCKED``, which still serialises claims so concurrent runs take
+       disjoint rows, and each claimed row is leased by setting its ``next_attempt_at`` to
+       the batch's lease instant (:data:`CLAIM_LEASE`). A future ``next_attempt_at`` is not
+       due, so no other run claims a leased row; its status and attempts are untouched, so
+       a leased ``pending`` row still counts as not attempted for readiness. Commit.
+    2. **Attempt** with no session open: the LinkedIn re-fetch, decoding and the single
+       HubSpot lookup.
+    3. **Persist**, in a second short transaction: the claimed rows are locked again
+       ``FOR UPDATE`` and written only while they still hold the lease (status, attempts
+       and ``next_attempt_at`` exactly as the claim left them), and only the contacts the
+       lookup found for those rows are stored. A row whose lease expired and was claimed
+       again elsewhere belongs to that run and is skipped, its contact included, so newer
+       state that run stored is never overwritten. Commit.
+
+    An exception or a cancellation between the claim and the persist hands the lease back
+    (every row still under it gets its previous ``next_attempt_at`` again) and then
+    propagates, so the batch's rows are due again unchanged; batches already committed
+    stand. A process that dies mid-batch leaves its lease to expire, after which the rows
+    are due again: no state is lost. ``AccessDenied`` and ``QueryDefect`` raised by a
+    connector call propagate, because ``sync/mode.py`` alone decides what follows from them.
 
 Example:
     The CRM job of a sync cycle::
@@ -70,14 +89,17 @@ Example:
         report = await run_matching(get_sessionmaker(), crm_dataset_id, clients, now=now)
 """
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import asyncio
+import time
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import distinct_on, insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -109,6 +131,7 @@ from ads_engine.simulation import is_simulated_email
 
 __all__ = [
     "BATCH_SIZE",
+    "CLAIM_LEASE",
     "MATCH_HORIZON",
     "REASON_DATASET_MISMATCH",
     "REASON_EMAIL_UNRETRIEVABLE",
@@ -160,6 +183,20 @@ many attempts (about a week), then stops like any other row.
 
 BATCH_SIZE: Final = 100
 """Rows claimed per batch: the product's LinkedIn re-fetch size and HubSpot's batch read."""
+
+CLAIM_LEASE: Final = timedelta(minutes=30)
+"""How long a claimed batch stays reserved for the run that claimed it.
+
+The claim writes the lease instant to each claimed row's ``next_attempt_at`` and commits, so
+the re-fetch and the lookup run with no row lock or connection held while no other run can
+claim the rows. The instant is the run's ``now`` plus the time the run has spent so far plus
+this lease: ``now`` is fixed for a whole run, and the elapsed term keeps a late batch's lease
+ahead of the wall clock. A batch normally makes one LinkedIn and one HubSpot call, each at
+most three attempts of 60 s with waits of at most 120 s between them, so about 14 minutes at
+worst; the lease leaves room beyond that. A batch that outlives it anyway (many ad accounts
+in one batch) loses only the rows another run has re-claimed meanwhile, which the persist
+step detects and skips. Rows a dead process leaves leased are due again once it has passed.
+"""
 
 _INSERT_CHUNK: Final = 1_000
 """Rows per ``INSERT``: seven bind parameters each stays far below PostgreSQL's limit."""
@@ -302,7 +339,33 @@ async def _lead_dataset(session: AsyncSession, lead_dataset_id: int) -> SourceDa
     return dataset
 
 
-def _pair_problem(lead_dataset_id: int, lead_mode: str, crm: SourceDataset) -> str | None:
+@dataclass(frozen=True, slots=True)
+class _CrmView:
+    """The fields of a CRM dataset that matching reads after its claim has committed.
+
+    The re-fetch and the lookup run with no session open, so they read this snapshot rather
+    than a ``SourceDataset`` bound to a closed session.
+    """
+
+    id: int
+    mode: str
+    role: str
+    parent_dataset_id: int | None
+
+    @classmethod
+    def of(cls, dataset: SourceDataset) -> _CrmView:
+        """Snapshot a loaded dataset row."""
+        return cls(
+            id=dataset.id,
+            mode=dataset.mode,
+            role=dataset.role,
+            parent_dataset_id=dataset.parent_dataset_id,
+        )
+
+
+def _pair_problem(
+    lead_dataset_id: int, lead_mode: str, crm: SourceDataset | _CrmView
+) -> str | None:
     """Return why leads of one LinkedIn dataset may not be matched in ``crm``, or ``None``.
 
     Simulated leads match only their own companion, so a simulated email never reaches a
@@ -618,7 +681,8 @@ class MatchReport:
     ``errors`` and ``skipped``, so they sum to ``attempted``.
 
     Attributes:
-        attempted: Rows claimed and attempted.
+        attempted: Rows claimed, attempted and written. A row whose lease was lost to
+            another run before the write belongs to that run and is not counted.
         matched: Rows matched to a contact.
         no_match: Rows HubSpot reported as not found (retried on schedule).
         no_email: Rows whose response carried no decodable email (terminal).
@@ -682,9 +746,18 @@ async def known_versions(session: AsyncSession, linkedin_dataset_id: int) -> Kno
 
 @dataclass(frozen=True, slots=True)
 class _Claim:
-    """One claimed row with what matching needs of its lead."""
+    """One claimed row as it stood when claimed, with what matching needs of its lead.
 
-    match: LeadMatch
+    No ORM object is kept, because the claim's transaction has committed by the time the
+    row is attempted. ``status``, ``attempts`` and ``previous_attempt_at`` (the
+    ``next_attempt_at`` the lease replaced) let the persist step verify the lease and a
+    release restore the row.
+    """
+
+    lead_id: int
+    status: str
+    attempts: int
+    previous_attempt_at: datetime | None
     lead_dataset_id: int
     lead_mode: str
     external_id: str
@@ -731,6 +804,7 @@ class _BatchCounts:
     retries_exhausted: int = 0
     defects: int = 0
     hash_mismatches: int = 0
+    leases_lost: int = 0
 
 
 @dataclass(slots=True)
@@ -764,19 +838,22 @@ async def _claim(
 ) -> list[_Claim]:
     """Lock and return up to :data:`BATCH_SIZE` due rows of one CRM dataset.
 
-    Due: ``pending`` rows always; ``no_match`` and ``error`` rows whose ``next_attempt_at``
-    has passed (a row with no ``next_attempt_at`` has stopped retrying). Leads of a retired
-    LinkedIn dataset are never attempted: no evidence reads them again. Only ``lead_match``
-    rows are locked (``FOR UPDATE OF lead_match SKIP LOCKED``): locking the joined
-    ``source_dataset`` rows would block a concurrent activation, and rows another worker
-    holds are skipped rather than waited for.
+    Due: ``pending`` rows whose ``next_attempt_at`` is empty or has passed (a leased row is
+    not due until its lease expires); ``no_match`` and ``error`` rows whose
+    ``next_attempt_at`` has passed (a row with no ``next_attempt_at`` has stopped
+    retrying). Leads of a retired LinkedIn dataset are never attempted: no evidence reads
+    them again. Only ``lead_match`` rows are locked (``FOR UPDATE OF lead_match SKIP
+    LOCKED``): locking the joined ``source_dataset`` rows would block a concurrent
+    activation, and rows another worker holds are skipped rather than waited for. The
+    caller leases the rows (:func:`_lease`) before this transaction commits.
 
     The status test is :data:`~ads_engine.db.models.crm.LEAD_MATCH_CLAIMABLE_SQL`, sent as
     literal SQL, so PostgreSQL proves under custom and generic plans alike that the partial
     index ``ix_lead_match_claim`` (``crm_dataset_id``, ``next_attempt_at NULLS FIRST``,
     ``lead_id``) applies. That index returns the claimable rows in this query's order, so a
     batch reads its rows in order and stops at its limit instead of sorting every due row;
-    only the due-time test is bound to ``now``.
+    only the due-time test is bound to ``now``. A leased ``pending`` row stays in that
+    index; the due-time test alone keeps it out of other claims until its lease expires.
     """
     statement = (
         select(
@@ -807,7 +884,10 @@ async def _claim(
     result = await session.execute(statement)
     return [
         _Claim(
-            match=match,
+            lead_id=match.lead_id,
+            status=match.status,
+            attempts=match.attempts,
+            previous_attempt_at=match.next_attempt_at,
             lead_dataset_id=dataset_id,
             lead_mode=mode,
             external_id=external_id,
@@ -817,6 +897,135 @@ async def _claim(
         )
         for match, dataset_id, mode, external_id, account_id, submitted_at, email_sha256 in result
     ]
+
+
+async def _lease(
+    session: AsyncSession, crm_dataset_id: int, claims: Sequence[_Claim], lease_until: datetime
+) -> None:
+    """Reserve the claimed rows until ``lease_until``, inside the claim's transaction.
+
+    The rows are still locked by :func:`_claim`. Once this transaction commits, their
+    ``next_attempt_at`` lies in the future, so no other claim finds them due while the batch
+    calls LinkedIn and HubSpot without holding any lock. Status and attempts stay as they
+    are.
+    """
+    await session.execute(
+        update(LeadMatch)
+        .where(
+            LeadMatch.crm_dataset_id == crm_dataset_id,
+            LeadMatch.lead_id.in_([claim.lead_id for claim in claims]),
+        )
+        .values(next_attempt_at=lease_until)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _held(
+    session: AsyncSession, crm_dataset_id: int, claims: Sequence[_Claim], lease_until: datetime
+) -> dict[int, LeadMatch]:
+    """Lock the claimed rows again and return those still under this batch's lease.
+
+    A row still holds the lease when its status, attempts and ``next_attempt_at`` are
+    exactly as the claim left them. Otherwise the lease expired and another run claimed the
+    row (and perhaps already wrote it), or the row is gone; it is no longer this batch's.
+    Rows are locked in key order, so two batches writing back never deadlock.
+
+    Returns:
+        The held rows, keyed by lead id.
+    """
+    rows = await session.scalars(
+        select(LeadMatch)
+        .where(
+            LeadMatch.crm_dataset_id == crm_dataset_id,
+            LeadMatch.lead_id.in_([claim.lead_id for claim in claims]),
+        )
+        .order_by(LeadMatch.lead_id)
+        .with_for_update()
+    )
+    current = {row.lead_id: row for row in rows}
+    held: dict[int, LeadMatch] = {}
+    for claim in claims:
+        row = current.get(claim.lead_id)
+        if (
+            row is not None
+            and row.status == claim.status
+            and row.attempts == claim.attempts
+            and row.next_attempt_at == lease_until
+        ):
+            held[claim.lead_id] = row
+    return held
+
+
+async def _release(
+    factory: async_sessionmaker[AsyncSession],
+    crm_dataset_id: int,
+    claims: Sequence[_Claim],
+    lease_until: datetime,
+) -> int:
+    """Hand a batch's lease back: each row still under it gets its previous due time.
+
+    Returns:
+        The number of rows released; rows whose lease was already lost are left alone.
+    """
+    async with factory() as session, session.begin():
+        held = await _held(session, crm_dataset_id, claims, lease_until)
+        for claim in claims:
+            row = held.get(claim.lead_id)
+            if row is not None:
+                row.next_attempt_at = claim.previous_attempt_at
+        return len(held)
+
+
+async def _release_quietly(
+    factory: async_sessionmaker[AsyncSession],
+    crm_dataset_id: int,
+    claims: Sequence[_Claim],
+    lease_until: datetime,
+) -> None:
+    """Release a failed batch's lease while the batch's exception propagates.
+
+    A database error is logged (counts and the error type only) and never replaces that
+    exception: the lease then expires at ``lease_until`` and the rows are due again.
+    """
+    try:
+        released = await _release(factory, crm_dataset_id, claims, lease_until)
+    except SQLAlchemyError as exc:
+        _log.warning(
+            "sync.lead_match.release_failed",
+            crm_dataset_id=crm_dataset_id,
+            claimed=len(claims),
+            error=type(exc).__name__,
+        )
+        return
+    _log.info(
+        "sync.lead_match.released",
+        crm_dataset_id=crm_dataset_id,
+        claimed=len(claims),
+        released=released,
+    )
+
+
+async def _run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
+    """Run a cleanup coroutine to completion even if the calling task is cancelled.
+
+    The cleanup runs in a task of its own behind :func:`asyncio.shield`, so a cancellation
+    that ended the batch, or one that arrives meanwhile, never abandons the release
+    halfway. A cancellation received while waiting is re-raised once the cleanup has
+    finished.
+    """
+    task = asyncio.create_task(cleanup)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as err:
+            if task.done():
+                raise
+            cancelled = err
+        else:
+            break
+    if cancelled is not None:
+        raise cancelled
 
 
 async def _versions_for(
@@ -831,27 +1040,28 @@ async def _versions_for(
 
 
 async def _refetch(
-    session: AsyncSession,
-    crm: SourceDataset,
+    crm: _CrmView,
     claims: Sequence[_Claim],
     clients: MatchClients,
-    versions: dict[int, KnownVersions],
+    versions: Mapping[int, KnownVersions],
 ) -> _Refetch:
     """Re-fetch the claimed leads from LinkedIn and decode their emails transiently.
 
     Rows the isolation rule forbids, rows whose response LinkedIn no longer returns, rows
     with no decodable email and rows whose response breaks the contract get their outcome
-    here; every decoded email is returned for the single HubSpot lookup of the batch.
+    here; every decoded email is returned for the single HubSpot lookup of the batch. Runs
+    with no session open: ``versions`` already holds the stored form-version maps of every
+    claimed lead's dataset (:func:`_claim_batch`).
 
     Raises:
-        AccessDenied: When LinkedIn refuses the credentials; the batch rolls back.
+        AccessDenied: When LinkedIn refuses the credentials; the batch's lease is released.
         QueryDefect: When a whole LinkedIn response breaks the contract.
     """
     refetch = _Refetch(outcomes={}, emails={}, waiting={})
     live_portal = clients.hubspot.live
     groups: dict[tuple[int, str], list[_Claim]] = {}
     for claim in claims:
-        lead_id = claim.match.lead_id
+        lead_id = claim.lead_id
         if _pair_problem(claim.lead_dataset_id, claim.lead_mode, crm) is not None:
             # Defence in depth: staging already refuses these pairs (module docstring).
             simulated_to_live = claim.lead_mode == "simulated" and crm.mode == "live"
@@ -863,7 +1073,7 @@ async def _refetch(
 
     for (lead_dataset_id, account_id), members in sorted(groups.items()):
         client = clients.linkedin_for(lead_dataset_id)
-        known = await _versions_for(session, versions, lead_dataset_id)
+        known = versions[lead_dataset_id]
         for start in range(0, len(members), LEAD_BATCH_SIZE):
             chunk = members[start : start + LEAD_BATCH_SIZE]
             batch = await client.get_lead_responses(
@@ -871,7 +1081,7 @@ async def _refetch(
             )
             interrupted = batch.interrupted_by
             for claim in chunk:
-                lead_id = claim.match.lead_id
+                lead_id = claim.lead_id
                 element = batch.found.get(claim.external_id)
                 if element is None:
                     if interrupted is not None:
@@ -925,12 +1135,29 @@ async def _lookup(clients: MatchClients, emails: dict[str, str]) -> EmailLookup 
         emails.clear()
 
 
+def _keep_held(refetch: _Refetch, held: Mapping[int, LeadMatch]) -> None:
+    """Keep only the rows still under the lease among those waiting for the lookup.
+
+    Every email left with no held row is dropped from ``refetch.waiting``, so neither its
+    contact nor an outcome is written: the row belongs to the run that re-claimed it, which
+    may already have stored a newer contact.
+    """
+    for digest in list(refetch.waiting):
+        members = [claim for claim in refetch.waiting[digest] if claim.lead_id in held]
+        if members:
+            refetch.waiting[digest] = members
+        else:
+            del refetch.waiting[digest]
+
+
 async def _store_contacts(
     session: AsyncSession, crm_dataset_id: int, contacts: Iterable[ContactRow]
 ) -> dict[str, int]:
     """Upsert matched contacts into the CRM dataset; return their ids keyed by HubSpot id.
 
-    Only the contact's email hash is stored, never an address.
+    The caller passes only the contacts found for rows still under the batch's lease
+    (:func:`_keep_held`); no contacts means no statement. Only the contact's email hash is
+    stored, never an address.
     """
     rows: dict[str, dict[str, Any]] = {}
     for contact in contacts:
@@ -955,7 +1182,11 @@ async def _store_contacts(
 def _lookup_outcomes(
     refetch: _Refetch, lookup: EmailLookup | None, contact_ids: Mapping[str, int]
 ) -> None:
-    """Turn the HubSpot lookup into the outcome of every row that waited for it."""
+    """Turn the HubSpot lookup into the outcome of every held row that waited for it.
+
+    ``refetch.waiting`` holds only rows still under the lease (:func:`_keep_held`), and
+    ``contact_ids`` every contact found for them.
+    """
     for digest, members in refetch.waiting.items():
         outcome: _Outcome
         if lookup is not None and digest in lookup.found:
@@ -969,17 +1200,24 @@ def _lookup_outcomes(
             # Listed as failed, or (defensively) given no outcome at all: no answer yet.
             outcome = _LOOKUP_FAILED
         for claim in members:
-            refetch.outcomes[claim.match.lead_id] = outcome
+            refetch.outcomes[claim.lead_id] = outcome
 
 
 def _apply(
-    claims: Sequence[_Claim], outcomes: Mapping[int, _Outcome], now: datetime
+    claims: Sequence[_Claim],
+    rows: Mapping[int, LeadMatch],
+    outcomes: Mapping[int, _Outcome],
+    now: datetime,
 ) -> _BatchCounts:
-    """Write every claimed row's outcome: one more attempt, checked now, next due or done."""
+    """Write each held row's outcome: one more attempt, checked now, next due or done.
+
+    ``claims`` are the batch's claims whose lease still holds and ``rows`` their rows, locked
+    again by :func:`_held`.
+    """
     counts = _BatchCounts(attempted=len(claims))
     for claim in claims:
-        row = claim.match
-        outcome = outcomes.get(row.lead_id)
+        row = rows[claim.lead_id]
+        outcome = outcomes.get(claim.lead_id)
         if outcome is None:
             raise RuntimeError("a claimed lead_match row was left without an outcome")
         row.attempts = row.attempts + 1
@@ -1016,25 +1254,66 @@ def _apply(
     return counts
 
 
-async def _match_batch(
-    session: AsyncSession,
-    crm: SourceDataset,
+async def _claim_batch(
+    factory: async_sessionmaker[AsyncSession],
+    crm_dataset_id: int,
+    now: datetime,
+    lead_dataset_id: int | None,
+    lease_until: datetime,
+    versions: dict[int, KnownVersions],
+) -> tuple[_CrmView, list[_Claim]]:
+    """Claim and lease one batch in a short transaction of its own, then commit.
+
+    The stored form-version maps of the claimed leads' datasets are loaded into
+    ``versions`` here (once per run), so the attempt that follows needs no session.
+
+    Returns:
+        The CRM dataset's snapshot and the claims; no claim when nothing is due.
+    """
+    async with factory() as session, session.begin():
+        crm = await _crm_dataset(session, crm_dataset_id)
+        claims = await _claim(session, crm.id, now, lead_dataset_id)
+        if claims:
+            await _lease(session, crm.id, claims, lease_until)
+            for claimed_dataset_id in sorted({claim.lead_dataset_id for claim in claims}):
+                await _versions_for(session, versions, claimed_dataset_id)
+        return _CrmView.of(crm), claims
+
+
+async def _attempt_batch(
+    factory: async_sessionmaker[AsyncSession],
+    crm: _CrmView,
     claims: Sequence[_Claim],
     clients: MatchClients,
     now: datetime,
-    versions: dict[int, KnownVersions],
+    lease_until: datetime,
+    versions: Mapping[int, KnownVersions],
 ) -> _BatchCounts:
-    """Attempt one claimed batch inside its transaction; the caller commits."""
-    refetch = await _refetch(session, crm, claims, clients, versions)
+    """Attempt one leased batch, then write its outcomes in a short transaction.
+
+    The re-fetch and the lookup run with no session open. The write first checks that the
+    CRM dataset is still writable and locks the claimed rows again; only rows still under
+    ``lease_until`` are written, with only the contacts the lookup found for them, and the
+    rest are counted as lost leases. A batch that holds no row writes nothing.
+    """
+    refetch = await _refetch(crm, claims, clients, versions)
     lookup = await _lookup(clients, refetch.emails)
-    contact_ids = await _store_contacts(
-        session, crm.id, () if lookup is None else lookup.found.values()
-    )
-    _lookup_outcomes(refetch, lookup, contact_ids)
-    counts = _apply(claims, refetch.outcomes, now)
-    counts.defects = refetch.defects
-    counts.hash_mismatches = refetch.hash_mismatches
-    await session.flush()
+    async with factory() as session, session.begin():
+        await _crm_dataset(session, crm.id)
+        held = await _held(session, crm.id, claims, lease_until)
+        _keep_held(refetch, held)
+        found: Mapping[str, ContactRow] = {} if lookup is None else lookup.found
+        contact_ids = await _store_contacts(
+            session, crm.id, [found[digest] for digest in refetch.waiting if digest in found]
+        )
+        _lookup_outcomes(refetch, lookup, contact_ids)
+        counts = _apply(
+            [claim for claim in claims if claim.lead_id in held], held, refetch.outcomes, now
+        )
+        counts.leases_lost = len(claims) - len(held)
+        counts.defects = refetch.defects
+        counts.hash_mismatches = refetch.hash_mismatches
+        await session.flush()
     return counts
 
 
@@ -1052,10 +1331,12 @@ def _log_batch(crm_dataset_id: int, counts: _BatchCounts) -> None:
         "retries_exhausted": counts.retries_exhausted,
         "defects": counts.defects,
         "hash_mismatches": counts.hash_mismatches,
+        "leases_lost": counts.leases_lost,
     }
-    if counts.skipped or counts.defects or counts.hash_mismatches:
+    if counts.skipped or counts.defects or counts.hash_mismatches or counts.leases_lost:
         # Each indicates a defect upstream: rows staged against the wrong CRM dataset, a
-        # response that breaks the Lead Sync contract, or a parser that hashes differently.
+        # response that breaks the Lead Sync contract, a parser that hashes differently, or
+        # a batch that outlived CLAIM_LEASE so another run re-claimed some of its rows.
         _log.warning("sync.lead_match.batch", **fields)
     else:
         _log.info("sync.lead_match.batch", **fields)
@@ -1064,16 +1345,24 @@ def _log_batch(crm_dataset_id: int, counts: _BatchCounts) -> None:
 async def _pending_left(
     factory: async_sessionmaker[AsyncSession], crm_dataset_id: int, lead_dataset_id: int | None
 ) -> int:
-    """Count the rows of a CRM dataset still ``pending``, as the readiness test does."""
+    """Count the rows of a CRM dataset still ``pending``, as the readiness test does.
+
+    Rows of leads whose LinkedIn dataset has retired are not counted: they are never claimed
+    and the readiness test ignores them too.
+    """
     statement = (
         select(func.count())
         .select_from(LeadMatch)
-        .where(LeadMatch.crm_dataset_id == crm_dataset_id, LeadMatch.status == _PENDING)
+        .join(Lead, Lead.id == LeadMatch.lead_id)
+        .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
+        .where(
+            LeadMatch.crm_dataset_id == crm_dataset_id,
+            LeadMatch.status == _PENDING,
+            SourceDataset.state != "retired",
+        )
     )
     if lead_dataset_id is not None:
-        statement = statement.join(Lead, Lead.id == LeadMatch.lead_id).where(
-            Lead.dataset_id == lead_dataset_id
-        )
+        statement = statement.where(Lead.dataset_id == lead_dataset_id)
     async with factory() as session:
         return int(await session.scalar(statement) or 0)
 
@@ -1089,27 +1378,38 @@ async def run_matching(
 ) -> MatchReport:
     """Attempt every due ``lead_match`` row of one CRM dataset, one batch at a time.
 
-    Each batch runs in its own transaction:
+    No transaction, row lock or pooled connection is held while LinkedIn or HubSpot is
+    called. Each batch:
 
-    1. **Claim** up to :data:`BATCH_SIZE` due rows with ``FOR UPDATE OF lead_match SKIP
-       LOCKED`` (``pending`` first, then the longest-overdue retries).
-    2. **Re-fetch** the leads from LinkedIn by plain response id, per (lead dataset, ad
+    1. **Claims** up to :data:`BATCH_SIZE` due rows with ``FOR UPDATE OF lead_match SKIP
+       LOCKED`` (``pending`` first, then the longest-overdue retries), so concurrent runs
+       claim disjoint rows, leases them until ``now`` plus the run's elapsed time plus
+       :data:`CLAIM_LEASE` (written to ``next_attempt_at``), and commits.
+    2. **Re-fetches** the leads from LinkedIn by plain response id, per (lead dataset, ad
        account), through ``clients.linkedin_for``. An id LinkedIn no longer returns ends as
        terminal ``error`` (:data:`REASON_EMAIL_UNRETRIEVABLE`); ids left unread by a
        transient failure end as ``error`` with that failure's reason and are retried.
-    3. **Decode** each email with the response's own form-version map. ``no_email`` is
+    3. **Decodes** each email with the response's own form-version map. ``no_email`` is
        terminal.
-    4. **Look up** the decoded emails in one ``contacts_by_email`` call, then drop the
-       plaintext. Found contacts are upserted into ``crm_contact`` of the CRM dataset (email
-       hash only) and their rows become ``matched``; not found becomes ``no_match`` and a
+    4. **Looks up** the decoded emails in one ``contacts_by_email`` call, then drops the
+       plaintext. Found contacts become ``matched``; not found becomes ``no_match`` and a
        failed read ``error``, both retried; a simulated address a live portal refused
        becomes terminal ``error`` (:data:`REASON_SIMULATED_WITHHELD`).
-    5. **Write** every claimed row: one more attempt, ``last_checked_at = now``, and the next
-       due time from :func:`next_attempt_after` for a retried outcome, then commit.
+    5. **Writes**, in a second short transaction that first checks the CRM dataset is still
+       writable and locks the rows again ``FOR UPDATE``, every row still under the lease:
+       the contacts found for those rows, and no others, are upserted into ``crm_contact``
+       of the CRM dataset (email hash only), and each row gets one more attempt,
+       ``last_checked_at = now`` and the next due time from :func:`next_attempt_after` for a
+       retried outcome; then commits. A row whose lease expired and was claimed again by
+       another run is left to that run, its contact included, so newer state that run
+       stored is never overwritten.
 
-    A crash or exception mid-batch rolls back that batch only; its rows stay claimable
-    unchanged and committed batches stand (AAP 0.3.3, "Restart safety"). Rows already
-    attempted in this run are not due again before ``now``, so the loop ends.
+    An exception or a cancellation between the claim and the write releases the lease
+    (each row still under it gets its previous ``next_attempt_at`` again) and propagates
+    unchanged, so the batch's rows are due again exactly as before and committed batches
+    stand (AAP 0.3.3, "Restart safety"). A process that dies mid-batch leaves the lease to
+    expire, after which the rows are due again. Rows attempted or leased in this run are
+    not due again before ``now``, so the loop ends.
 
     Args:
         sessionmaker: The session factory; ``None`` uses the process-wide one.
@@ -1128,9 +1428,10 @@ async def run_matching(
         ValueError: If ``now`` is naive, ``max_batches`` is not a positive integer, the CRM
             dataset is not HubSpot's, or the HubSpot client's mode differs from the CRM
             dataset's.
-        DatasetNotWritable: If the CRM dataset is missing or retired.
-        AccessDenied: When LinkedIn or HubSpot refuses the credentials; the current batch
-            rolls back and ``sync/mode.py`` decides what follows.
+        DatasetNotWritable: If the CRM dataset is missing or retired, including when it is
+            retired while a batch is being attempted.
+        AccessDenied: When LinkedIn or HubSpot refuses the credentials; the current batch's
+            lease is released and ``sync/mode.py`` decides what follows.
         QueryDefect: When a whole response or a request breaks its contract.
     """
     _require_aware(now, "now")
@@ -1151,13 +1452,25 @@ async def run_matching(
     totals = _BatchCounts()
     batches = 0
     versions: dict[int, KnownVersions] = {}
+    started = time.monotonic()
     while max_batches is None or batches < max_batches:
-        async with factory() as session, session.begin():
-            crm = await _crm_dataset(session, crm_dataset_id)
-            claims = await _claim(session, crm.id, now, lead_dataset_id)
-            if not claims:
-                break
-            counts = await _match_batch(session, crm, claims, clients, now, versions)
+        # ``now`` is fixed for the whole run, so the time spent so far keeps a later batch's
+        # lease CLAIM_LEASE ahead of the wall clock at its claim.
+        lease_until = now + timedelta(seconds=time.monotonic() - started) + CLAIM_LEASE
+        claimed_in, claims = await _claim_batch(
+            factory, crm_dataset_id, now, lead_dataset_id, lease_until, versions
+        )
+        if not claims:
+            break
+        try:
+            counts = await _attempt_batch(
+                factory, claimed_in, claims, clients, now, lease_until, versions
+            )
+        except BaseException:
+            # The claim has committed: hand the lease back so the rows are due again
+            # unchanged, then let the batch's own exception propagate.
+            await _run_to_completion(_release_quietly(factory, claimed_in.id, claims, lease_until))
+            raise
         batches += 1
         _log_batch(crm_dataset_id, counts)
         totals.attempted += counts.attempted

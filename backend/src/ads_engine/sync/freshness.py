@@ -17,6 +17,9 @@ outcome into the stored row:
   attempt that re-covers the whole stored range may do that.
 * A failure changes only ``last_attempt_at`` and ``reason``; the last good data, its
   coverage and its completeness stand (AAP 0.3.3, transient row of the fallback table).
+* :func:`mark_unknown` turns a row ``unknown`` when data was added after the success it
+  records (contacts matched into a building CRM dataset after its refresh); the next
+  success replaces the mark and a failure keeps it.
 * Outcomes are folded in the order their attempts started, whatever order they commit
   in. Both timestamps only move forward. A failure that started before the stored latest
   attempt is obsolete and changes nothing. A success that started before the stored
@@ -76,6 +79,7 @@ __all__ = [
     "FreshnessOutcome",
     "is_repairable_reason",
     "load_freshness",
+    "mark_unknown",
     "needs_repair",
     "record_freshness",
     "source_of",
@@ -570,6 +574,27 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
     return merged
 
 
+async def _checked_source(session: AsyncSession, dataset_id: int, dataset: str) -> Source:
+    """Return the source of a freshness dataset name that ``dataset_id`` may record.
+
+    Raises:
+        ValueError: If ``dataset`` is unknown, ``dataset_id`` does not exist, or the source
+            dataset belongs to a different source than ``dataset``.
+    """
+    source = source_of(dataset)
+    dataset_source = await session.scalar(
+        select(SourceDataset.source).where(SourceDataset.id == dataset_id)
+    )
+    if dataset_source is None:
+        raise ValueError(f"source dataset {dataset_id} does not exist")
+    if dataset_source != source:
+        raise ValueError(
+            f"freshness dataset {dataset!r} belongs to {source}, "
+            f"but source dataset {dataset_id} is {dataset_source}"
+        )
+    return source
+
+
 async def record_freshness(
     session: AsyncSession,
     dataset_id: int,
@@ -631,17 +656,7 @@ async def record_freshness(
         ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired,
             including retired by an activation that committed while this call waited.
     """
-    source = source_of(dataset)
-    dataset_source = await session.scalar(
-        select(SourceDataset.source).where(SourceDataset.id == dataset_id)
-    )
-    if dataset_source is None:
-        raise ValueError(f"source dataset {dataset_id} does not exist")
-    if dataset_source != source:
-        raise ValueError(
-            f"freshness dataset {dataset!r} belongs to {source}, "
-            f"but source dataset {dataset_id} is {dataset_source}"
-        )
+    source = await _checked_source(session, dataset_id, dataset)
     await repositories.ensure_writable(session, dataset_id)
 
     key = {"source": source, "dataset_id": dataset_id, "dataset": dataset}
@@ -697,6 +712,71 @@ async def record_freshness(
     else:
         _log.warning("sync.freshness", **event)
     return written
+
+
+async def mark_unknown(
+    session: AsyncSession, dataset_id: int, dataset: str, *, reason: str
+) -> DatasetFreshness | None:
+    """Withdraw what a stored ``dataset_freshness`` row vouches for: make it ``unknown``.
+
+    For data a recorded success no longer covers, for example contacts matched into a
+    building CRM dataset after its contact refresh and associations ran. Only
+    ``completeness`` and ``reason`` change; ``last_attempt_at``, ``last_success_at`` and
+    the coverage stand, so the row keeps its history while consumers and the readiness test
+    read it as unverified. The row is locked ``FOR UPDATE`` first, so the change serialises
+    with :func:`record_freshness` writers of the same row.
+
+    A later success replaces the mark: :func:`record_freshness` treats an ``unknown`` row as
+    vouching for nothing, so the success's own coverage, completeness and reason apply. A
+    later failure keeps it, because a failure never changes completeness. The function
+    flushes but never commits; the caller's transaction owns the change.
+
+    Retired datasets are read-only (AAP 0.3.3), so before the freshness row is locked the
+    source dataset is locked with :func:`~ads_engine.db.repositories.ensure_writable`, in
+    the code base's lock order (``source_dataset`` before ``dataset_freshness``): a retired
+    one is refused, and the lifecycle lock held until the caller's transaction ends keeps an
+    activation from retiring it before this change commits.
+
+    Args:
+        session: The caller's session.
+        dataset_id: The ``source_dataset`` the row belongs to.
+        dataset: The dataset name, one of :data:`ops.DATASETS`.
+        reason: Why the row's data is no longer verified; must not be blank.
+
+    Returns:
+        The updated row, or ``None`` when no row exists yet: an absent row already reads as
+        ``unknown``, so nothing is written.
+
+    Raises:
+        ValueError: If ``reason`` is blank, ``dataset`` is unknown, ``dataset_id`` does not
+            exist, or the source dataset belongs to a different source than ``dataset``.
+        ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired,
+            including retired by an activation that committed while this call waited.
+    """
+    if not reason.strip():
+        raise ValueError("a reason is required to mark freshness unknown")
+    await _checked_source(session, dataset_id, dataset)
+    await repositories.ensure_writable(session, dataset_id)
+    row = await session.scalar(
+        select(DatasetFreshness)
+        .where(DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == dataset)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        return None
+    previous = row.completeness
+    row.completeness = "unknown"
+    row.reason = reason
+    await session.flush()
+    _log.warning(
+        "sync.freshness.unknown",
+        dataset_id=dataset_id,
+        dataset=dataset,
+        previous_completeness=previous,
+        reason=reason,
+    )
+    return row
 
 
 async def load_freshness(session: AsyncSession, dataset_id: int) -> dict[str, DatasetFreshness]:

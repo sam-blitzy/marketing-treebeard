@@ -40,6 +40,8 @@ import './TextField.css';
 
 import { useId, type ChangeEvent, type HTMLAttributes, type ReactNode, type Ref } from 'react';
 
+import { hasContent, mergeIdRefs } from './a11y';
+
 /**
  * The single-line input types `TextField` supports: free text, an email address, a password,
  * a number (budget amounts in the decision form) and a calendar date (custom window bounds).
@@ -102,6 +104,11 @@ interface TextFieldBaseProps {
   autoComplete?: string;
   /** Example input shown while the field is empty. It never replaces the visible label. */
   placeholder?: string;
+  /**
+   * Extra description ids for the control, such as the id a wrapping `Tooltip` passes. They are
+   * appended to the control's `aria-describedby` after the hint and error ids, each id once.
+   */
+  'aria-describedby'?: string;
 }
 
 /**
@@ -168,15 +175,6 @@ export type TextFieldProps = TextFieldInputProps | TextFieldMultilineProps;
 /** Rows a multiline field shows when `rows` is omitted or unusable. */
 const DEFAULT_ROWS = 3;
 
-/**
- * Whether a hint or error node renders visible content. `undefined`, `null`, booleans and the
- * empty string render nothing in React, so they neither produce an empty `<p>` nor mark the
- * field invalid; `0` and every other node count as content.
- */
-function hasContent(node: ReactNode): boolean {
-  return node !== undefined && node !== null && typeof node !== 'boolean' && node !== '';
-}
-
 /** A positive whole number of rows, or {@link DEFAULT_ROWS} when `rows` is unusable. */
 function normaliseRows(rows: number | undefined): number {
   if (rows === undefined || !Number.isFinite(rows) || rows < 1) {
@@ -235,6 +233,7 @@ export function TextField(props: TextFieldProps) {
     id,
     autoComplete,
     placeholder,
+    'aria-describedby': extraDescribedBy,
   } = props;
 
   const autoId = useId();
@@ -242,16 +241,15 @@ export function TextField(props: TextFieldProps) {
   const hintId = `${inputId}-hint`;
   const errorId = `${inputId}-error`;
 
+  // A hint or error with no content renders nothing (see hasContent in ./a11y), so it neither
+  // produces an empty <p> nor marks the field invalid. Extra ids, such as a Tooltip's, follow.
   const showHint = hasContent(hint);
   const showError = hasContent(error);
-  const describedByIds: string[] = [];
-  if (showHint) {
-    describedByIds.push(hintId);
-  }
-  if (showError) {
-    describedByIds.push(errorId);
-  }
-  const describedBy = describedByIds.length > 0 ? describedByIds.join(' ') : undefined;
+  const describedBy = mergeIdRefs(
+    showHint ? hintId : undefined,
+    showError ? errorId : undefined,
+    extraDescribedBy,
+  );
 
   // One handler serves both elements: a change event of either control is assignable to it.
   const handleChange = (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
