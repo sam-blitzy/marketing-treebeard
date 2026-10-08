@@ -15,6 +15,8 @@ runner itself:
 * ``run_analysis`` reads the context in one read-only ``REPEATABLE READ`` snapshot, writes
   every output once with the dataset ids and modes it read, stamps the requests it served,
   and is deterministic; on the simulated default world all five sections populate;
+* the typed entity keys keep only ids of stored rows, and a run whose outputs carry more
+  distinct ids than PostgreSQL's 65,535 bind parameters still persists in one transaction;
 * the lock, the single-running index, crash recovery, a failing rule, a contradicting
   override, a lost lock and a rule writing a runner-owned evidence key each leave the
   database in the state the contract names.
@@ -31,15 +33,15 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
-from sqlalchemy import Executable, Update, create_engine, func, select, text
+from sqlalchemy import Executable, Update, create_engine, event, func, select, text
 from sqlalchemy.engine import URL, Result, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,9 +60,12 @@ from ads_engine.analysis.context import (
     ENTITY_SEARCH_TERM,
     ENTITY_SEGMENT,
     ENTITY_TERM_CLUSTER,
+    K3,
+    KEYWORDS,
     SECTION_ORDER,
     AnalysisContext,
     EntityRef,
+    Withheld,
     creative_pair_external_id,
     keyword_external_id,
     search_term_external_id,
@@ -70,7 +75,7 @@ from ads_engine.analysis.lock import RunInProgress, analysis_lock
 from ads_engine.analysis.thresholds import ConfigError, Thresholds, resolve_config_dir
 from ads_engine.analysis.window import InvalidWindow
 from ads_engine.db.base import Base
-from ads_engine.db.models.accounts import AdAccount, Campaign
+from ads_engine.db.models.accounts import AdAccount, AdGroup, Campaign, Keyword
 from ads_engine.db.models.analysis import (
     AnalysisRequest,
     AnalysisRun,
@@ -80,7 +85,7 @@ from ads_engine.db.models.analysis import (
     RunWithheld,
 )
 from ads_engine.db.models.ops import SourceDataset
-from ads_engine.db.session import dispose_engine, reset_engine, session_scope
+from ads_engine.db.session import dispose_engine, get_engine, reset_engine, session_scope
 from ads_engine.logging import logged_as
 from ads_engine.settings import Settings, get_settings
 from ads_engine.simulation.scenarios import FIXED_NOW, SCENARIOS, ContextSpec
@@ -102,6 +107,9 @@ _CALLER_CONTEXT: ContextVar[str] = ContextVar("analysis_runner_test_caller", def
 
 _WAIT_S = 30.0
 """The longest any test waits on a thread event before it fails instead of hanging."""
+
+_BIND_LIMIT = 65_535
+"""PostgreSQL's most bind parameters in one statement (the wire protocol's int16 count)."""
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +825,223 @@ async def test_typed_keys_keep_only_ids_of_stored_rows(app_db: str) -> None:
         known = await runner._known_ids(session, [present, missing])
     assert present.row(known)["campaign_id"] == world.campaign
     assert missing.row(known) == dict.fromkeys(_KEY_COLUMNS)
+
+
+async def _seed_keyword(world: _World) -> tuple[int, int]:
+    """Store one ad group and one keyword under the seeded Google campaign.
+
+    Returns:
+        ``(ad_group_id, keyword_id)``.
+    """
+    async with session_scope() as session:
+        ad_group = AdGroup(
+            source="google",
+            dataset_id=world.google,
+            campaign_id=world.campaign,
+            external_id="777",
+            name="Brand terms",
+            status="ENABLED",
+        )
+        session.add(ad_group)
+        await session.flush()
+        keyword = Keyword(
+            source="google",
+            dataset_id=world.google,
+            ad_group_id=ad_group.id,
+            criterion_id="9001",
+            text="acme analytics",
+            match_type="EXACT",
+            status="ENABLED",
+            quality_score=7,
+        )
+        session.add(keyword)
+        await session.flush()
+        return ad_group.id, keyword.id
+
+
+def _bind_count(parameters: object) -> int:
+    """How many parameters one cursor execution sends (the largest set of an executemany)."""
+    if isinstance(parameters, Mapping):
+        return len(parameters)
+    if isinstance(parameters, list | tuple):
+        sets = [item for item in parameters if isinstance(item, Mapping | list | tuple)]
+        if sets and len(sets) == len(parameters):
+            return max(len(item) for item in sets)
+        return len(parameters)
+    return 0
+
+
+@contextmanager
+def _statement_binds() -> Iterator[list[tuple[str, int]]]:
+    """Record ``(statement head, parameter count)`` of every statement the application sends.
+
+    The head is the statement's first 120 characters with its whitespace collapsed, enough
+    to name the verb and the table.
+    """
+    engine = get_engine().sync_engine
+    seen: list[tuple[str, int]] = []
+
+    def record(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: object,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        seen.append((" ".join(statement[:240].split())[:120], _bind_count(parameters)))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _key_lookups(seen: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """The ``(table, parameter count)`` of each recorded typed-key existence ``SELECT``."""
+    targets = {"campaign", "budget", "ad_group", "keyword", "creative"}
+    lookups: list[tuple[str, int]] = []
+    for head, count in seen:
+        words = head.split(" ")
+        if words[0] == "SELECT" and "FROM" in words:
+            table = words[words.index("FROM") + 1]
+            if table in targets and words[1] == f"{table}.id":
+                lookups.append((table, count))
+    return lookups
+
+
+@pytest.mark.anyio
+async def test_known_ids_beyond_the_bind_parameter_limit_travel_as_one_array(
+    app_db: str, log: _LogRecorder
+) -> None:
+    world = await _seed()
+    ad_group, stored = await _seed_keyword(world)
+    keyword_ids = range(stored, stored + 70_000)
+    assert len(keyword_ids) > _BIND_LIMIT
+    keys = [
+        *(runner._TypedKeys(keyword_id=keyword_id) for keyword_id in keyword_ids),
+        runner._TypedKeys(campaign_id=world.campaign, ad_group_id=ad_group, keyword_id=stored),
+        runner._TypedKeys(campaign_id=world.campaign + 1000, budget_id=77),
+    ]
+    with _statement_binds() as seen:
+        async with session_scope() as session:
+            known = await runner._known_ids(session, keys)
+
+    assert known == {
+        "campaign_id": frozenset({world.campaign}),
+        "budget_id": frozenset(),
+        "ad_group_id": frozenset({ad_group}),
+        "keyword_id": frozenset({stored}),
+        "creative_id": frozenset(),
+    }
+    # Each column with ids is checked by one statement with one (array) parameter.
+    assert _key_lookups(seen) == [("campaign", 1), ("budget", 1), ("ad_group", 1), ("keyword", 1)]
+    assert keys[-2].row(known) == {
+        "campaign_id": world.campaign,
+        "budget_id": None,
+        "ad_group_id": ad_group,
+        "keyword_id": stored,
+        "creative_id": None,
+    }
+    assert keys[0].row(known)["keyword_id"] == stored
+    assert all(item.row(known) == dict.fromkeys(_KEY_COLUMNS) for item in keys[1:-2])
+    assert keys[-1].row(known) == dict.fromkeys(_KEY_COLUMNS)
+    unmatched = {
+        fields["column"]: fields["count"]
+        for fields in log.named("analysis_run_entity_keys_unmatched")
+    }
+    assert unmatched == {"campaign_id": 1, "budget_id": 1, "keyword_id": len(keyword_ids) - 1}
+
+
+@pytest.mark.anyio
+async def test_a_run_with_more_typed_ids_than_bind_parameters_persists_in_one_transaction(
+    app_db: str, log: _LogRecorder
+) -> None:
+    world = await _seed()
+    ad_group, stored = await _seed_keyword(world)
+    run_id = await _insert_run("default", "running", None)
+    keyword_ids = range(stored, stored + _BIND_LIMIT + 65)
+    total = len(keyword_ids)
+    assert total > _BIND_LIMIT
+    withheld = tuple(
+        (
+            runner._withheld_row(
+                run_id,
+                KEYWORDS,
+                Withheld(
+                    rule_id=K3,
+                    section=KEYWORDS,
+                    entity=EntityRef(
+                        "google",
+                        ENTITY_KEYWORD,
+                        keyword_id,
+                        keyword_external_id("777", keyword_id),
+                        f"keyword {keyword_id}",
+                    ),
+                    reason="quality score on 3 of 5 required days in the recent 14 days",
+                    observed=3,
+                    required=5,
+                    unit="days",
+                ),
+            ),
+            runner._TypedKeys(
+                campaign_id=world.campaign, ad_group_id=ad_group, keyword_id=keyword_id
+            ),
+        )
+        for keyword_id in keyword_ids
+    )
+    prepared = runner._PreparedRun(
+        recommendations=(),
+        findings=(),
+        withheld=withheld,
+        suppression=(),
+        data_modes={"google": "live", "linkedin": "simulated", "hubspot": "live"},
+        dataset_ids={
+            "google": world.google,
+            "linkedin": world.linkedin,
+            "hubspot": world.hubspot,
+            "hubspot_linkedin_effective": world.companion,
+        },
+        summary={"withheld_total": total},
+    )
+
+    with _statement_binds() as seen:
+        run = await runner._persist(run_id, prepared)
+
+    assert (run.id, run.status) == (run_id, "succeeded")
+    assert run.finished_at is not None
+    assert _key_lookups(seen) == [("campaign", 1), ("ad_group", 1), ("keyword", 1)]
+    assert max(count for _, count in seen) <= _BIND_LIMIT
+    (unmatched,) = log.named("analysis_run_entity_keys_unmatched")
+    assert unmatched == {"column": "keyword_id", "count": total - 1}
+    async with session_scope() as session:
+        stored_rows = (
+            await session.execute(
+                select(
+                    func.count(),
+                    func.count(RunWithheld.keyword_id),
+                    func.min(RunWithheld.keyword_id),
+                    func.count(RunWithheld.campaign_id),
+                    func.count(RunWithheld.ad_group_id),
+                    func.count(func.distinct(RunWithheld.entity["id"])),
+                ).where(RunWithheld.run_id == run_id)
+            )
+        ).one()
+        # Rows written by one transaction carry its id as xmin, as does the run row's
+        # succeeded version: every output committed together with the state change.
+        writers = await session.execute(
+            text(
+                "SELECT xmin::text FROM run_withheld WHERE run_id = :run_id "
+                "UNION SELECT xmin::text FROM analysis_run WHERE id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        transactions: Sequence[str] = writers.scalars().all()
+    # Every row is stored; only the stored keyword keeps its key, every absent one is NULL,
+    # while the stored campaign and ad group stay set and the evidence keeps each keyword.
+    assert tuple(stored_rows) == (total, 1, stored, total, total, total)
+    assert len(transactions) == 1
 
 
 # ---------------------------------------------------------------------------

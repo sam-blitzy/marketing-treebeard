@@ -219,6 +219,12 @@ _RULES: Final[tuple[tuple[str, Callable[[AnalysisContext], RuleResult]], ...]] =
     ("creative", creative.evaluate),
     ("white_papers", white_papers.evaluate),
 )
+"""Each rule module's name and its ``evaluate`` callable, in :data:`EVALUATION_ORDER`.
+
+The callables are bound here, at import, so replacing a module's ``evaluate`` afterwards
+does not change what a run evaluates. :func:`_evaluate` reads this tuple at call time, so
+replacing ``_RULES`` itself is the seam that substitutes an evaluator.
+"""
 
 DATASET_ID_KEYS: Final[tuple[str, ...]] = (
     "google",
@@ -268,7 +274,12 @@ _ANALYSIS_THREAD_PREFIX: Final = "ads-engine-analysis"
 """The name prefix of the thread the pure part of every run executes on."""
 
 _FAILURE_RECORD_TIMEOUT_S: Final = 30.0
-"""The bound, in seconds, on marking a failed run ``failed`` and stamping its requests."""
+"""The bound, in seconds, on marking a failed run's row ``failed`` (:func:`_mark_failed`).
+
+It bounds only that terminal-state write: requests are stamped only by the run's claim,
+committed before its context is loaded (:func:`_claim_requests`), and failure handling never
+touches ``analysis_request``.
+"""
 
 # The analysis thread pool: one worker, created on first use. The analysis lock admits one
 # run per process at a time, and run_analysis waits for its computation to stop before the
@@ -790,7 +801,9 @@ async def _known_ids(
     those rows from the active datasets, but a C0 item keeps a discrepancy's subject id even
     when the context lacks that row. Checking existence in the persisting transaction makes
     a missing row leave its key ``NULL`` (the evidence keeps the entity) instead of failing
-    the whole run on a foreign-key violation.
+    the whole run on a foreign-key violation. Each column's distinct ids travel as one
+    PostgreSQL array parameter (``id = ANY(:ids)``), so any number of them stays within the
+    bind-parameter limit.
     """
     wanted: dict[str, set[int]] = {column: set() for column in _KEY_COLUMNS}
     for item in keys:
@@ -802,7 +815,9 @@ async def _known_ids(
         if not ids:
             known[column] = frozenset()
             continue
-        result = await session.execute(select(target).where(target.in_(ids)))
+        result = await session.execute(
+            select(target).where(target == any_(literal(ids, ARRAY(BigInteger()))))
+        )
         known[column] = frozenset(int(value) for value in result.scalars())
         missing = len(ids) - len(known[column])
         if missing:
@@ -1344,8 +1359,9 @@ class _RunProgress:
 def _evaluate(ctx: AnalysisContext, checkpoint: Callable[[], None]) -> tuple[RuleResult, ...]:
     """Evaluate every rule module in :data:`EVALUATION_ORDER`, passing ``checkpoint`` first.
 
-    ``_RULES`` is read at call time, and ``checkpoint`` runs before each module, so a
-    cancelled run stops before the next module starts rather than after the last.
+    ``_RULES`` is read at call time and its ``evaluate`` callables, bound at import, are
+    called as found there; ``checkpoint`` runs before each module, so a cancelled run stops
+    before the next module starts rather than after the last.
 
     Raises:
         _ComputationStoppedError: From ``checkpoint``, after the run was cancelled.
@@ -1370,8 +1386,10 @@ def _compute(
     Executes on the analysis thread (:func:`_in_analysis_thread`) and alone touches ``ctx``
     meanwhile, including its per-run ``cache``. It checks the white-paper creative overrides,
     evaluates the rule modules, applies precedence and renders every output row with its
-    typed keys and the summary counts. The override check, the rule modules and precedence
-    are looked up when they run, never bound at import. A checkpoint precedes the override
+    typed keys and the summary counts. The override check and precedence are looked up when
+    they run; the rule evaluators are the callables :data:`_RULES` bound at import, read
+    from it when :func:`_evaluate` runs, so replacing ``_RULES`` substitutes an evaluator
+    and replacing a module's ``evaluate`` does not. A checkpoint precedes the override
     check, each rule module, precedence and the row rendering; once ``progress.stop`` is set
     the computation raises there. ``progress.stage`` names the step in progress.
 
