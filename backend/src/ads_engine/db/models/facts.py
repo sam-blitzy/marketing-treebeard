@@ -33,7 +33,9 @@ nullable. On ``fact_creative_daily`` every metric is nullable, ``cost``, ``impre
 ``clicks`` included, because a LinkedIn analytics element may omit any metric (the
 ``ad_analytics`` contract); an omitted metric is stored as ``NULL``, never coerced to zero.
 Every ``fact_segment_window`` metric is nullable for the same reason. A ``NULL`` also
-satisfies each table's ``ck_<table>_non_negative`` check.
+satisfies each table's ``ck_<table>_non_negative`` check, which otherwise admits only finite
+values of zero or above: every ``numeric`` metric is also kept from ``NaN``, which
+PostgreSQL sorts above every number and which would turn every window ``SUM`` into ``NaN``.
 
 **Dataset-qualified entity references** (AAP 0.3.3: only ``lead_match`` links two datasets).
 Every entity reference is a composite foreign key (``<entity>_id``, ``dataset_id``) to the
@@ -181,6 +183,13 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
             "conversions_value",
             "budget_lost_is",
             "impression_share",
+            numeric=(
+                "cost",
+                "conversions",
+                "conversions_value",
+                "budget_lost_is",
+                "impression_share",
+            ),
         ),
         # Dataset-qualified: the campaign must belong to this row's dataset.
         sa.ForeignKeyConstraint(
@@ -261,6 +270,7 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
             "leads",
             "landing_page_clicks",
             "website_conversions",
+            numeric=("cost", "conversions", "conversions_value"),
         ),
         # Dataset-qualified: the creative must belong to this row's dataset.
         sa.ForeignKeyConstraint(
@@ -328,6 +338,7 @@ class FactKeywordDaily(IdPkMixin, DatasetScopedMixin, Base):
             "conversions_value",
             "historical_quality_score",
             "average_cpc",
+            numeric=("cost", "conversions", "conversions_value", "average_cpc"),
         ),
         # Dataset-qualified: the keyword must belong to this row's dataset.
         sa.ForeignKeyConstraint(
@@ -418,7 +429,14 @@ class FactSearchTermDaily(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         check_in("term_status", SEARCH_TERM_STATUSES),
-        non_negative("cost", "impressions", "clicks", "conversions", "conversions_value"),
+        non_negative(
+            "cost",
+            "impressions",
+            "clicks",
+            "conversions",
+            "conversions_value",
+            numeric=("cost", "conversions", "conversions_value"),
+        ),
         # Dataset-qualified: the ad group and the campaign must belong to this row's dataset.
         sa.ForeignKeyConstraint(
             ["ad_group_id", "dataset_id"],
@@ -505,7 +523,7 @@ class FactSegmentWindow(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         check_in("facet", SEGMENT_FACETS),
-        non_negative("impressions", "clicks", "cost", "leads"),
+        non_negative("impressions", "clicks", "cost", "leads", numeric=("cost",)),
         sa.CheckConstraint("window_end >= window_start", name="window_order"),
         # Dataset-qualified: the campaign must belong to this row's dataset.
         sa.ForeignKeyConstraint(

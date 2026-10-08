@@ -213,14 +213,22 @@ def check_in(column: str, values: Sequence[str], *, name: str | None = None) -> 
     return CheckConstraint(f"{column_sql} IN ({allowed})", name=name or f"{column}_valid")
 
 
-def non_negative(*columns: str, name: str = "non_negative") -> CheckConstraint:
-    """Build the ``CHECK`` constraint that keeps metric columns at zero or above.
+def non_negative(
+    *columns: str, name: str = "non_negative", numeric: Sequence[str] = ()
+) -> CheckConstraint:
+    """Build the ``CHECK`` constraint that keeps metric columns finite and at zero or above.
 
     Fact tables guard their metrics (cost, impressions, clicks, conversions and the like)
-    with this constraint. The SQL text is ``"col1 >= 0 AND col2 >= 0 ..."`` in argument
-    order, with column names quoted exactly as :func:`check_in` quotes them, and the
-    migration repeats it verbatim. A ``NULL`` metric, which means
-    "unavailable", satisfies the constraint.
+    with this constraint. Each column renders as ``<col> >= 0``, and each column named in
+    ``numeric`` as ``<col> >= 0 AND <col> <> 'NaN'::numeric``. The conditions are joined by
+    ``" AND "`` in argument order, with column names quoted exactly as :func:`check_in`
+    quotes them, and the migration repeats the text verbatim.
+
+    ``numeric`` must name every ``numeric`` column the constraint covers. PostgreSQL's
+    ``numeric`` type stores ``NaN`` and sorts it above every number, so ``'NaN' >= 0`` is
+    true: without the extra condition a ``NaN`` passes the check and turns every window
+    ``SUM`` of the column into ``NaN``. ``bigint`` has no ``NaN`` and needs no such
+    condition. A ``NULL`` metric, which means "unavailable", satisfies both conditions.
 
     The naming convention renders the constraint as ``ck_<table>_<name>``, for example
     ``ck_fact_campaign_daily_non_negative``. Keep ``name`` short enough that the full
@@ -229,24 +237,42 @@ def non_negative(*columns: str, name: str = "non_negative") -> CheckConstraint:
     Example:
         >>> str(non_negative("cost", "clicks").sqltext)
         'cost >= 0 AND clicks >= 0'
+        >>> str(non_negative("cost", "clicks", numeric=("cost",)).sqltext)
+        "cost >= 0 AND cost <> 'NaN'::numeric AND clicks >= 0"
 
     Args:
         *columns: The metric columns, in the order they should appear in the SQL text.
         name: Constraint name before the convention is applied.
+        numeric: The columns among ``columns`` whose type is ``numeric``, which must also
+            differ from ``NaN``; their order does not affect the text.
 
     Returns:
         A named ``CheckConstraint`` ready for a model's ``__table_args__``.
 
     Raises:
-        ValueError: If no column is given, a column is repeated, or a column name is empty
-            or contains a quote, a backslash or whitespace.
+        TypeError: If ``numeric`` is a single string rather than a sequence of strings.
+        ValueError: If no column is given, a column is repeated, a column name is empty or
+            contains a quote, a backslash or whitespace, or ``numeric`` repeats a column or
+            names one that is not among ``columns``.
     """
+    if isinstance(numeric, str):
+        raise TypeError("numeric must be a sequence of column names, not a single string")
     if not columns:
         raise ValueError("non_negative() needs at least one column")
     if len(set(columns)) != len(columns):
         raise ValueError(f"non_negative() received duplicate columns: {list(columns)!r}")
-    conditions = " AND ".join(f"{_column_sql(column)} >= 0" for column in columns)
-    return CheckConstraint(conditions, name=name)
+    if len(set(numeric)) != len(numeric):
+        raise ValueError(f"non_negative() received duplicate numeric columns: {list(numeric)!r}")
+    unknown = [column for column in numeric if column not in columns]
+    if unknown:
+        raise ValueError(f"non_negative() numeric columns {unknown!r} are not among its columns")
+    conditions: list[str] = []
+    for column in columns:
+        column_sql = _column_sql(column)
+        conditions.append(f"{column_sql} >= 0")
+        if column in numeric:
+            conditions.append(f"{column_sql} <> 'NaN'::numeric")
+    return CheckConstraint(" AND ".join(conditions), name=name)
 
 
 class Base(AsyncAttrs, DeclarativeBase):

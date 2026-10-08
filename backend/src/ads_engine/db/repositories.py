@@ -5,7 +5,9 @@ few reads that ``analysis`` and ``api`` share with ``sync`` (so neither imports 
 
 * :func:`upsert_facts` and :func:`upsert_entities` write rows with ``INSERT ... ON CONFLICT
   (<__natural_key__>) DO UPDATE``. Re-running a sync is therefore safe, and restated
-  platform data overwrites the earlier values (AAP 0.1.1, 0.3.2).
+  platform data overwrites the earlier values (AAP 0.1.1, 0.3.2). Rows are written in
+  ascending natural-key order whatever the caller's order, so concurrent writers of
+  overlapping keys take their locks in one order and queue instead of deadlocking.
 * :func:`append_snapshots` appends ``entity_snapshot`` observations and never updates one
   (AAP 0.5.2).
 * :func:`lock_dataset`, :func:`ensure_writable`, :func:`active_datasets`,
@@ -23,8 +25,10 @@ Rules every function here follows:
   dataset cannot retire between the check and the commit. ``source`` is taken from the
   dataset, never trusted from the row.
 * **Value types**: values arrive as ``Decimal``, tz-aware ``datetime`` and native ``date``
-  and are written unchanged. A ``float`` or a naive ``datetime`` is rejected with
-  ``ValueError`` rather than coerced, and dates are never rebucketed (AAP 0.5.4.1).
+  and are written unchanged. A ``float``, a non-finite ``Decimal`` (``NaN``, ``sNaN``,
+  ``Infinity``), a naive ``datetime``, any ``datetime`` for a ``date`` column or a bare
+  ``date`` for a ``timestamptz`` column is rejected with ``ValueError`` rather than
+  coerced, so dates are never rebucketed (AAP 0.5.4.1).
 * **Transactions**: nothing here commits, rolls back or opens a transaction in a
   caller's session. Callers wrap the work in :func:`ads_engine.db.session.session_scope`
   and pass that session, so data, freshness and the ``analysis_request`` they trigger
@@ -47,11 +51,21 @@ Example::
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from functools import cache
+from itertools import groupby
 from typing import Any, Final, TypedDict
 
-from sqlalchemy import PrimaryKeyConstraint, Table, UniqueConstraint, delete, select
+from sqlalchemy import (
+    Date,
+    DateTime,
+    PrimaryKeyConstraint,
+    Table,
+    UniqueConstraint,
+    delete,
+    select,
+)
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -326,29 +340,59 @@ def _as_source(value: str) -> Source:
     raise ValueError(f"unknown source {value!r}; expected one of {list(SOURCES)}")
 
 
-def _check_value(table: str, column: str, value: object) -> None:
+def _check_value(table: Table, column: str, value: object) -> None:
     """Reject a value whose type would lose meaning on the way into PostgreSQL.
 
-    Decision 6 (value types): money and conversions travel as ``Decimal`` and instants as
-    tz-aware ``datetime``. A ``float`` would be bound as ``float8`` and silently rounded
-    into ``numeric``; a naive ``datetime`` would be read in the session time zone. Both are
-    refused here instead of coerced.
+    Decision 6 (value types): money and conversions travel as ``Decimal``, instants as
+    tz-aware ``datetime`` and native days as ``date``. A ``float`` would be bound as
+    ``float8`` and silently rounded into ``numeric``; a naive ``datetime`` would be read in
+    the session time zone. A non-finite ``Decimal`` (``NaN``, ``sNaN``, ``Infinity`` or
+    ``-Infinity``) is no amount at all: PostgreSQL stores a ``numeric`` ``NaN``, sorts it
+    above every number and turns every window ``SUM`` it enters into ``NaN``.
+
+    Temporal values must also match their column's type. ``datetime`` subclasses ``date``,
+    so a ``datetime`` for a ``date`` column would be bound as ``timestamptz`` and cast to
+    its day in the session's UTC zone, moving a Google day in the account's time zone to
+    another date; native days are never rebucketed (AAP 0.5.2, 0.5.4.1). A bare ``date``
+    for a ``timestamptz`` column would be read as UTC midnight, an instant nobody observed.
+    All of these are refused here instead of coerced.
 
     Args:
-        table: Table name, for the error message.
-        column: Column name, for the error message.
+        table: The table written to; its name goes into the error message and its column
+            types decide which temporal values fit.
+        column: The column the value is written to; a column of ``table``.
         value: The value to check.
 
     Raises:
-        ValueError: If ``value`` is a ``float`` or a naive ``datetime``.
+        ValueError: If ``value`` is a ``float``, a non-finite ``Decimal``, any ``datetime``
+            for a ``date`` column, a naive ``datetime``, or a ``date`` that is not a
+            ``datetime`` for a ``timestamptz`` column.
     """
     if isinstance(value, float):
         raise ValueError(
-            f"{table}.{column}: float {value!r} is not accepted; pass Decimal for amounts "
+            f"{table.name}.{column}: float {value!r} is not accepted; pass Decimal for amounts "
             "and conversions or int for counts"
         )
-    if isinstance(value, datetime) and value.utcoffset() is None:
-        raise ValueError(f"{table}.{column}: naive datetime {value!r}; instants must be tz-aware")
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError(
+            f"{table.name}.{column}: non-finite Decimal {value!r} is not accepted; amounts "
+            "and conversions must be finite numbers"
+        )
+    if isinstance(value, datetime):
+        if isinstance(table.c[column].type, Date):
+            raise ValueError(
+                f"{table.name}.{column}: datetime {value!r} is not accepted for a date column; "
+                "pass the source's native date, which is never rebucketed"
+            )
+        if value.utcoffset() is None:
+            raise ValueError(
+                f"{table.name}.{column}: naive datetime {value!r}; instants must be tz-aware"
+            )
+    elif isinstance(value, date) and isinstance(table.c[column].type, DateTime):
+        raise ValueError(
+            f"{table.name}.{column}: date {value!r} is not accepted for a timestamptz column; "
+            "instants must be tz-aware datetimes"
+        )
 
 
 def _prepare(rows: Sequence[Row], info: _ModelInfo, dataset: SourceDataset) -> list[dict[str, Any]]:
@@ -360,17 +404,24 @@ def _prepare(rows: Sequence[Row], info: _ModelInfo, dataset: SourceDataset) -> l
     the same row twice in one statement, and a restated row later in the batch carries the
     newest values.
 
+    The result is sorted by natural key (:func:`_natural_order`), whatever the caller's
+    order. Every writer then takes the row and unique-index locks of the keys it shares
+    with another writer in the same ascending order, so two concurrent transactions that
+    upsert overlapping keys queue behind each other instead of deadlocking (SQLSTATE
+    40P01).
+
     Args:
         rows: The caller's rows.
         info: The verified model description.
         dataset: The writable target dataset.
 
     Returns:
-        One dict per distinct natural key, in first-occurrence order.
+        One dict per distinct natural key, in ascending natural-key order.
 
     Raises:
         ValueError: If a row carries an unknown column, another ``dataset_id`` or
-            ``source``, a ``float`` or a naive ``datetime``.
+            ``source``, a ``float``, a non-finite ``Decimal``, a naive ``datetime``, a
+            ``datetime`` for a ``date`` column or a ``date`` for a ``timestamptz`` column.
         NaturalKeyError: If a row lacks a natural-key value or carries ``None`` for one.
     """
     prepared: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -396,9 +447,28 @@ def _prepare(rows: Sequence[Row], info: _ModelInfo, dataset: SourceDataset) -> l
         if missing:
             raise NaturalKeyError(f"{info.name} row {position} lacks natural-key values {missing}")
         for column, value in values.items():
-            _check_value(info.name, column, value)
+            _check_value(info.table, column, value)
         prepared[tuple(values[name] for name in info.natural_key)] = values
-    return list(prepared.values())
+    return [prepared[key] for key in sorted(prepared, key=_natural_order)]
+
+
+def _natural_order(key: tuple[Any, ...]) -> tuple[tuple[str, str, Any], ...]:
+    """Return the sort key that orders natural-key tuples totally, whatever their value types.
+
+    Each value is preceded by its type's module and qualified name, so values of two types
+    are ordered by type and never compared with each other, which would raise
+    ``TypeError``. Values of one type compare as Python compares them: numbers, strings,
+    dates and tz-aware instants. Lock ordering needs only that every writer sorts the same
+    keys the same way, not that the order matches an index's collation.
+
+    Args:
+        key: A natural-key tuple, in ``__natural_key__`` order; no value is ``None`` or a
+            non-finite ``Decimal`` (:func:`_prepare` has refused both).
+
+    Returns:
+        ``((module, qualname, value), ...)``, one triple per key value.
+    """
+    return tuple((type(value).__module__, type(value).__qualname__, value) for value in key)
 
 
 def _group_by_columns(
@@ -410,6 +480,9 @@ def _group_by_columns(
     as ``NULL`` nor overwritten on conflict: it keeps its server default on insert and its
     stored value on update. Groups and their members keep first-occurrence order.
 
+    Only the plain inserts of :func:`append_snapshots` group this way, because they take no
+    conflict locks; the upserts split their rows with :func:`_runs_by_columns` instead.
+
     Args:
         rows: Prepared rows.
 
@@ -420,6 +493,31 @@ def _group_by_columns(
     for position, values in enumerate(rows):
         groups.setdefault(tuple(sorted(values)), []).append((position, values))
     return list(groups.items())
+
+
+def _runs_by_columns(
+    rows: Sequence[dict[str, Any]],
+) -> list[tuple[tuple[str, ...], list[dict[str, Any]]]]:
+    """Split rows into consecutive runs that supply the same set of columns, keeping order.
+
+    The upserts send one statement per run, so, as with :func:`_group_by_columns`, a column
+    a row does not supply is neither inserted as ``NULL`` nor overwritten on conflict. Runs
+    rather than groups keep the whole batch in the order :func:`_prepare` sorted it, so its
+    row and unique-index locks are taken in ascending natural-key order even when the rows
+    supply different column sets. Grouping across the batch would let two writers whose
+    rows supply different columns for the same keys lock them in different orders. A batch
+    of one column set is a single run, so a single statement.
+
+    Args:
+        rows: Prepared rows, in ascending natural-key order.
+
+    Returns:
+        ``(columns, rows)`` pairs in row order, columns sorted by name.
+    """
+    return [
+        (columns, list(members))
+        for columns, members in groupby(rows, key=lambda values: tuple(sorted(values)))
+    ]
 
 
 def _upsert_statement(model: type[Base], info: _ModelInfo, columns: Sequence[str]) -> Insert:
@@ -640,8 +738,13 @@ async def upsert_facts(
       instant of this call, replacing any value a row supplies, because the column records
       when the stored value was last written.
 
-    Rows are executed as one ORM bulk upsert per supplied column set; SQLAlchemy's
-    insertmanyvalues batching keeps each statement under PostgreSQL's bind-parameter limit.
+    Rows are written in ascending natural-key order, whatever the caller's order, as one ORM
+    bulk upsert per consecutive run of rows that supply the same columns (one statement for
+    a batch of one column set); SQLAlchemy's insertmanyvalues batching keeps each statement
+    under PostgreSQL's bind-parameter limit. Concurrent writers of overlapping keys
+    therefore take their locks in one order and queue instead of deadlocking. A deadlock is
+    not retried here: a retry needs the caller's transaction rolled back, which this
+    function never does.
 
     Fact foreign keys to entities are NOT NULL and dataset-qualified, so a fact row whose
     entity is not stored yet raises ``IntegrityError``. Callers stub the entity first with
@@ -670,7 +773,9 @@ async def upsert_facts(
             natural key omits ``dataset_id``, or a row lacks a natural-key value.
         DatasetNotWritable: If the dataset is missing or retired.
         ValueError: If a row carries an unknown column, another dataset or source, a
-            ``float`` or a naive ``datetime``.
+            ``float``, a non-finite ``Decimal``, a naive ``datetime``, a ``datetime`` for
+            a ``date`` column (``date``, ``window_start``, ``window_end``) or a ``date``
+            for a ``timestamptz`` column.
     """
     info = _scoped_info(table)
     if not info.has_fetched_at:
@@ -687,9 +792,9 @@ async def upsert_facts(
         fetched_at = utcnow()
         for values in prepared:
             values["fetched_at"] = fetched_at
-        for columns, members in _group_by_columns(prepared):
+        for columns, members in _runs_by_columns(prepared):
             statement = _upsert_statement(table, info, columns)
-            await unit.execute(statement, [values for _, values in members])
+            await unit.execute(statement, members)
     _log.debug("db.upsert_facts", table=info.name, dataset_id=dataset.id, rows=len(prepared))
     return len(prepared)
 
@@ -705,7 +810,9 @@ async def upsert_entities(
     AAP 0.5.1 ("Repositories") and 0.3.2 (entity state is fetched in full every cycle).
     The same guard, preparation and ``ON CONFLICT (<__natural_key__>) DO UPDATE`` as
     :func:`upsert_facts`, plus ``RETURNING id, <natural key>``; PostgreSQL returns both
-    inserted and updated rows. When the model has ``fetched_at`` (``crm_association_fetch``)
+    inserted and updated rows. As there, rows are written in ascending natural-key order in
+    consecutive runs of one column set, so concurrent writers of overlapping entities queue
+    instead of deadlocking. When the model has ``fetched_at`` (``crm_association_fetch``)
     every row gets this call's ``utcnow()`` instant.
 
     Sync jobs use it for campaign groups, campaigns, budgets, conversion actions, ad
@@ -729,8 +836,9 @@ async def upsert_entities(
             :func:`upsert_facts`), or a row lacks a natural-key value.
         DatasetNotWritable: If the dataset is missing or retired.
         ValueError: If a row carries an unknown column, another dataset or source, a
-            ``float`` or a naive ``datetime``, or its natural key belongs to a row of
-            another dataset.
+            ``float``, a non-finite ``Decimal``, a naive ``datetime``, a ``datetime`` for a
+            ``date`` column or a ``date`` for a ``timestamptz`` column, or its natural key
+            belongs to a row of another dataset.
     """
     info = _scoped_info(model)
     if not info.has_id:
@@ -747,9 +855,9 @@ async def upsert_entities(
             values["fetched_at"] = fetched_at
     key_columns = [info.table.c[name] for name in info.natural_key]
     ids: dict[tuple[Any, ...], int] = {}
-    for columns, members in _group_by_columns(prepared):
+    for columns, members in _runs_by_columns(prepared):
         statement = _upsert_statement(model, info, columns).returning(info.table.c.id, *key_columns)
-        result = await session.execute(statement, [values for _, values in members])
+        result = await session.execute(statement, members)
         for returned in result:
             stored = tuple(returned)
             ids[stored[1:]] = int(stored[0])
@@ -829,7 +937,7 @@ async def append_snapshots(
             per distinct ``dataset_id``.
         ValueError: If a row carries an unknown column or an ``id``, lacks an integer
             ``dataset_id``, lacks a tz-aware ``captured_at``, names another source than its
-            dataset's, or carries a ``float``.
+            dataset's, or carries a ``float`` or a non-finite ``Decimal``.
     """
     if not rows:
         return []
@@ -868,7 +976,7 @@ async def _append_snapshots(session: AsyncSession, rows: Sequence[Row]) -> list[
         if not isinstance(captured_at, datetime) or captured_at.utcoffset() is None:
             raise ValueError(f"{name} row {position} lacks a tz-aware captured_at")
         for column, value in values.items():
-            _check_value(name, column, value)
+            _check_value(table, column, value)
         prepared.append(values)
 
     ids: dict[int, int] = {}

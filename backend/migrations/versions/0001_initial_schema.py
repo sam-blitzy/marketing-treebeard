@@ -314,20 +314,29 @@ def _source_check(table: str) -> sa.CheckConstraint:
     return _in_check(table, "source", SOURCES)
 
 
-def _non_negative(table: str, *columns: str) -> sa.CheckConstraint:
+def _non_negative(table: str, *columns: str, numeric: Sequence[str] = ()) -> sa.CheckConstraint:
     """Return ``ck_<table>_non_negative``, the text ``ads_engine.db.base.non_negative`` renders.
 
-    The text is ``col1 >= 0 AND col2 >= 0 ...`` in argument order. A NULL metric, which means
-    "unavailable", satisfies it.
+    Each column renders as ``<col> >= 0`` and each ``numeric`` column as ``<col> >= 0 AND
+    <col> <> 'NaN'::numeric``, joined by ``AND`` in argument order. PostgreSQL sorts a
+    ``numeric`` NaN above every number, so ``>= 0`` alone would admit it. A NULL metric,
+    which means "unavailable", satisfies it. No metric column is a reserved word, so the
+    column names are never quoted.
 
     Args:
         table: The table name.
         *columns: The metric columns, in the model's order.
+        numeric: The columns among ``columns`` of type ``numeric``, as the model names them.
 
     Returns:
         The named check constraint.
     """
-    return _check(table, "non_negative", " AND ".join(f"{column} >= 0" for column in columns))
+    conditions: list[str] = []
+    for column in columns:
+        conditions.append(f"{column} >= 0")
+        if column in numeric:
+            conditions.append(f"{column} <> 'NaN'::numeric")
+    return _check(table, "non_negative", " AND ".join(conditions))
 
 
 def _unique(table: str, *columns: str, name: str | None = None) -> sa.UniqueConstraint:
@@ -893,9 +902,9 @@ def _create_fact_tables() -> None:
 
     Each references its entity through a dataset-qualified composite foreign key, so a fact
     can only point at an entity of its own dataset, and each guards its metrics with a
-    ``non_negative`` check that a NULL ("unavailable") metric satisfies. Besides its
-    entity-leading indexes, each daily table has ``ix_<table>_dataset_date`` on
-    (``dataset_id``, ``date``) and ``fact_segment_window`` has
+    ``non_negative`` check that a NULL ("unavailable") metric satisfies and a ``numeric``
+    NaN does not. Besides its entity-leading indexes, each daily table has
+    ``ix_<table>_dataset_date`` on (``dataset_id``, ``date``) and ``fact_segment_window`` has
     ``ix_fact_segment_window_dataset_window`` on (``dataset_id``, ``window_start``,
     ``window_end``), for window reads that leave the entity unconstrained.
     """
@@ -924,6 +933,13 @@ def _create_fact_tables() -> None:
             "conversions_value",
             "budget_lost_is",
             "impression_share",
+            numeric=(
+                "cost",
+                "conversions",
+                "conversions_value",
+                "budget_lost_is",
+                "impression_share",
+            ),
         ),
         _same_dataset_fk("fact_campaign_daily", "campaign_id", "campaign"),
         _unique("fact_campaign_daily", "dataset_id", "campaign_id", "date"),
@@ -967,6 +983,7 @@ def _create_fact_tables() -> None:
             "leads",
             "landing_page_clicks",
             "website_conversions",
+            numeric=("cost", "conversions", "conversions_value"),
         ),
         _same_dataset_fk("fact_creative_daily", "creative_id", "creative"),
         _unique("fact_creative_daily", "dataset_id", "creative_id", "date"),
@@ -1004,6 +1021,7 @@ def _create_fact_tables() -> None:
             "conversions_value",
             "historical_quality_score",
             "average_cpc",
+            numeric=("cost", "conversions", "conversions_value", "average_cpc"),
         ),
         _same_dataset_fk("fact_keyword_daily", "keyword_id", "keyword"),
         _unique("fact_keyword_daily", "dataset_id", "keyword_id", "date"),
@@ -1045,6 +1063,7 @@ def _create_fact_tables() -> None:
             "clicks",
             "conversions",
             "conversions_value",
+            numeric=("cost", "conversions", "conversions_value"),
         ),
         _same_dataset_fk("fact_search_term_daily", "ad_group_id", "ad_group"),
         _same_dataset_fk("fact_search_term_daily", "campaign_id", "campaign"),
@@ -1093,7 +1112,9 @@ def _create_fact_tables() -> None:
         _pk("fact_segment_window"),
         _source_check("fact_segment_window"),
         _in_check("fact_segment_window", "facet", SEGMENT_FACETS),
-        _non_negative("fact_segment_window", "impressions", "clicks", "cost", "leads"),
+        _non_negative(
+            "fact_segment_window", "impressions", "clicks", "cost", "leads", numeric=("cost",)
+        ),
         _check("fact_segment_window", "window_order", WINDOW_ORDER_SQL),
         _same_dataset_fk("fact_segment_window", "campaign_id", "campaign"),
         _unique(

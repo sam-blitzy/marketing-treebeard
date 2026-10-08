@@ -724,3 +724,88 @@ def test_non_negative_rejects_unsafe_column_names(column: str) -> None:
         ValueError, match=r"^column name .+ must not contain quotes, backslashes or whitespace$"
     ):
         non_negative("cost", column)
+
+
+# --- non_negative: numeric columns are also kept from NaN ---------------------------------
+
+
+def test_non_negative_keeps_numeric_columns_from_nan_in_argument_order() -> None:
+    # The NaN guard follows each numeric column's own ``>= 0``, whatever order ``numeric``
+    # lists them in, and the constraint name is unchanged.
+    constraint = non_negative("cost", "clicks", "conversions", numeric=("conversions", "cost"))
+    assert str(constraint.sqltext) == (
+        "cost >= 0 AND cost <> 'NaN'::numeric AND clicks >= 0 "
+        "AND conversions >= 0 AND conversions <> 'NaN'::numeric"
+    )
+    assert constraint.name == "non_negative"
+
+
+def test_non_negative_without_numeric_columns_renders_the_plain_text() -> None:
+    plain = "cost >= 0 AND clicks >= 0"
+    assert str(non_negative("cost", "clicks").sqltext) == plain
+    assert str(non_negative("cost", "clicks", numeric=()).sqltext) == plain
+    assert str(non_negative("cost", "clicks", numeric=[]).sqltext) == plain
+
+
+def test_non_negative_accepts_any_sequence_and_an_explicit_name_with_numeric_columns() -> None:
+    constraint = non_negative("amount", name="amount_non_negative", numeric=["amount"])
+    assert str(constraint.sqltext) == "amount >= 0 AND amount <> 'NaN'::numeric"
+    assert constraint.name == "amount_non_negative"
+
+
+@pytest.mark.parametrize(("column", "rendered"), _IDENTIFIER_CASES)
+def test_non_negative_quotes_numeric_columns_in_both_conditions(column: str, rendered: str) -> None:
+    assert str(non_negative("clicks", column, numeric=(column,)).sqltext) == (
+        f"clicks >= 0 AND {rendered} >= 0 AND {rendered} <> 'NaN'::numeric"
+    )
+
+
+def test_non_negative_numeric_check_renders_valid_ddl() -> None:
+    # ``::numeric`` must reach the DDL verbatim, never be read as a bind parameter.
+    reg = _mirror_registry()
+
+    @reg.mapped
+    class Metric(IdPkMixin):
+        __tablename__ = "metric"
+
+        cost: Mapped[Money]
+        clicks: Mapped[int]
+        order: Mapped[Money | None]
+
+        __table_args__ = (non_negative("cost", "clicks", "order", numeric=("cost", "order")),)
+
+    assert (
+        "CONSTRAINT ck_metric_non_negative CHECK (cost >= 0 AND cost <> 'NaN'::numeric "
+        'AND clicks >= 0 AND "order" >= 0 AND "order" <> \'NaN\'::numeric)'
+    ) in _ddl_lines(reg.metadata.tables["metric"])
+
+
+@pytest.mark.parametrize("columns", [("cost",), ()])
+def test_non_negative_rejects_a_bare_string_of_numeric_columns_first(
+    columns: tuple[str, ...],
+) -> None:
+    with pytest.raises(
+        TypeError, match=r"^numeric must be a sequence of column names, not a single string$"
+    ):
+        non_negative(*columns, numeric="cost")
+
+
+def test_non_negative_rejects_duplicate_numeric_columns() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^non_negative\(\) received duplicate numeric columns: \['cost', 'cost'\]$",
+    ):
+        non_negative("cost", "clicks", numeric=("cost", "cost"))
+
+
+@pytest.mark.parametrize(
+    ("numeric", "unknown"),
+    [(("conversions",), r"\['conversions'\]"), (("cost", "spend", "Cost"), r"\['spend', 'Cost'\]")],
+)
+def test_non_negative_rejects_numeric_columns_it_does_not_cover(
+    numeric: tuple[str, ...], unknown: str
+) -> None:
+    with pytest.raises(
+        ValueError, match=rf"^non_negative\(\) numeric columns {unknown} are not among its columns$"
+    ):
+        non_negative("cost", "clicks", numeric=numeric)
