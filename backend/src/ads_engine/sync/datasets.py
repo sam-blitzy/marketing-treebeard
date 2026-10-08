@@ -1116,7 +1116,7 @@ class DatasetManager:
                 status=_CONNECTION_OK,
                 reason=reason if reason is not None else peek.reason,
                 calls_24h=0,
-                calls_hourly={},
+                calls_by_minute={},
             )
             .on_conflict_do_nothing(index_elements=["source"])
         )

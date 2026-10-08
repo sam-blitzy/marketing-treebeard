@@ -20,23 +20,35 @@ State lives in the database, on the ``source_connection`` row whose ``source`` i
 ``google``, so the worker, ``ads-engine sync`` and ``ads-engine capture-fixtures`` all
 share one cap:
 
-* ``calls_hourly``: call counts per UTC hour, keyed ``"YYYY-MM-DDTHH"``;
+* ``calls_by_minute``: call counts per UTC minute, keyed ``"YYYY-MM-DDTHH:MM"``; a row
+  written in the former hour format, keyed ``"YYYY-MM-DDTHH"``, is read as the last minute
+  of each hour, so those calls keep counting until the former window released them;
 * ``calls_24h``: their sum over the counted window, shown on ``/sources``.
+
+Minute buckets, rather than one entry per call or per second, keep that row bounded:
+``GOOGLE_DAILY_CALL_BUDGET`` has no upper bound, yet whatever the cap the row holds about
+1,444 keys at most: the 1,441 minute buckets that can be counting at one instant, plus the
+few booked ahead of the clock. A minute is also fine enough for the window to slide with
+the clock: a bucket counts until 24 h after it ends, so a call frees up at most one minute
+later than 24 h after the latest instant its POST can start.
 
 Every read-modify-write runs in a short transaction of its own, never inside the caller's
 job transaction, under ``SELECT ... FOR UPDATE`` on that row. The row lock is therefore
 held for milliseconds, and concurrent coroutines and processes cannot overspend. No count
 is ever cached in process, and database errors propagate unchanged.
 
-The clock that places a call in its hour is read only once the row lock is held, so a
+The clock that places a call in its minute is read only once the row lock is held, so a
 call that waited for the lock is placed at the instant it is admitted, not when it asked.
-An admitted call is booked in the hour that holds that instant plus the dispatch bound
-(140 s), the longest its POST can take to start leaving once ``acquire`` returns: a call
-admitted in the last 140 s of an hour counts in the next hour, which the window already
-counts. The bound runs from the return, not the admission, so the clock is read again
-once the booking has committed. When the commit took so long that the POST could now
-start after the booked hour, the booking stays counted and the call is reserved afresh,
-or refused, so a POST never leaves after the hour it was booked in.
+An admitted call is booked in the minute that holds that instant plus the dispatch bound
+(140 s), the longest its POST can take to start leaving once ``acquire`` returns: the
+booking sits two or three minutes ahead of the current minute, and the window counts it
+at once. It keeps counting until 24 h after its minute ends, so a call stays counted from
+its admission until 24 h after the minute by which its POST has started: more than 24 h
+plus the bound, and at most one minute more. The bound runs from the return, not the
+admission, so the clock is read again once the booking has committed. When the commit
+took so long that the POST could now start after the booked minute, the booking stays
+counted and the call is reserved afresh, or refused, so a POST never leaves after the
+minute it was booked in.
 
 Example:
     One ``acquire`` per POST attempt; a refusal is a deferral, never a retry::
@@ -70,15 +82,18 @@ from ads_engine.db.session import get_sessionmaker
 from ads_engine.logging import get_logger
 from ads_engine.settings import Settings, Source, get_settings
 
-__all__ = ["BUDGET_ENDPOINT", "WINDOW_BUCKETS", "GoogleCallBudget"]
+__all__ = ["BUCKET_WIDTH", "BUDGET_ENDPOINT", "WINDOW", "GoogleCallBudget"]
 
 _log = get_logger(__name__)
 
 BUDGET_ENDPOINT: Final = "webhook"
 """The ``endpoint`` of every :class:`CallBudgetExhausted` raised here: the n8n webhook."""
 
-WINDOW_BUCKETS: Final = 25
-"""UTC hour buckets counted against the cap: the current hour plus the 24 preceding ones."""
+WINDOW: Final = timedelta(hours=24)
+"""The sliding window the cap applies to: no 24 h of webhook POSTs exceeds the cap."""
+
+BUCKET_WIDTH: Final = timedelta(minutes=1)
+"""Width of the UTC buckets calls are counted in: one minute, starting on the minute."""
 
 _SOURCE: Final[Source] = "google"
 _EXHAUSTED_CODE: Final = "CALL_BUDGET_EXHAUSTED"
@@ -87,11 +102,11 @@ _EXHAUSTED_CODE: Final = "CALL_BUDGET_EXHAUSTED"
 # on every refusal, so the log shows consumption without one line per webhook call.
 _LOG_EVERY_CALLS: Final = 50
 
-# The oldest counted bucket starts this long before the current one, and a bucket stops
-# being counted once the current bucket starts more than 24 h after it, which happens
-# exactly WINDOW_BUCKETS hours after the bucket itself started.
-_LOOKBACK: Final = timedelta(hours=WINDOW_BUCKETS - 1)
-_BUCKET_LIFETIME: Final = timedelta(hours=WINDOW_BUCKETS)
+# A bucket counts from its first booking until WINDOW after it ends, which is this long
+# after it starts. Every POST booked in it has started to leave by its end, so each keeps
+# counting for at least 24 h after it leaves, and no sliding 24 h of POSTs can exceed the
+# cap.
+_BUCKET_LIFETIME: Final = WINDOW + BUCKET_WIDTH
 
 # The dispatch bound: the longest time from acquire() returning to its POST starting to
 # leave. connectors/http.py builds the request at once and hands it to httpx. The AAP's
@@ -100,16 +115,22 @@ _BUCKET_LIFETIME: Final = timedelta(hours=WINDOW_BUCKETS)
 # 10 s connect timeout, which httpcore applies to the TCP connect (name resolution
 # included) and again to the TLS handshake of the https webhook. Past either limit httpx
 # raises PoolTimeout or ConnectTimeout instead of sending later, so on a direct connection
-# the POST starts to leave within 120 + 10 + 10 = 140 s. The call is booked in the hour
-# holding admission + bound, and acquire() re-checks that hour against the clock after
-# the commit, so the booked bucket is never earlier than the hour the POST leaves in and
-# the call keeps counting for at least 24 h after it is made. That bucket is at most the
-# next one, which _evaluate already counts as a bucket ahead of the current one, so the
-# call also counts from the moment it is reserved.
+# the POST starts to leave within 120 + 10 + 10 = 140 s. The call is booked in the minute
+# holding admission + bound, and acquire() re-checks that minute against the clock after
+# the commit, so the booked bucket is never earlier than the minute the POST leaves in and
+# the call keeps counting for at least 24 h after it is made. That bucket is two or three
+# minutes after the current one, which _evaluate already counts as a bucket ahead of it,
+# so the call also counts from the moment it is reserved.
 _DISPATCH_BOUND: Final = timedelta(seconds=SOURCE_TIMEOUTS["google"] + 2 * CONNECT_TIMEOUT_SECONDS)
 
-_BUCKET_KEY_FORMAT: Final = "%Y-%m-%dT%H"
-_BUCKET_KEY_RE: Final = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})")
+_BUCKET_KEY_FORMAT: Final = "%Y-%m-%dT%H:%M"
+_BUCKET_KEY_RE: Final = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})")
+
+# Rows written before calls were counted by minute keyed them by UTC hour, "YYYY-MM-DDTHH",
+# and that window counted an hour's calls until 25 h after the hour started. Such a key is
+# read as the last minute of its hour, whose bucket stops counting at exactly that instant.
+_FORMER_HOUR_KEY_RE: Final = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})")
+_FORMER_HOUR_LAST_MINUTE: Final = timedelta(hours=1) - BUCKET_WIDTH
 
 # Bounds the wait for the row lock. Every holder of this lock keeps it for milliseconds,
 # so a long wait means a caller's own open transaction holds the row (for example a job
@@ -119,7 +140,7 @@ _BUCKET_KEY_RE: Final = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})
 _LOCK_TIMEOUT: Final = text("SET LOCAL lock_timeout = '10s'")
 
 _LOCK_ROW: Final = (
-    select(SourceConnection.calls_hourly, SourceConnection.calls_24h)
+    select(SourceConnection.calls_by_minute, SourceConnection.calls_24h)
     .where(SourceConnection.source == _SOURCE)
     .with_for_update()
 )
@@ -128,7 +149,7 @@ _LOCK_ROW: Final = (
 # sync/mode.py owns every later mode and status change and never resets the counters.
 _ENSURE_ROW: Final = (
     insert(SourceConnection)
-    .values(source=_SOURCE, mode="live", status="ok", calls_24h=0, calls_hourly={})
+    .values(source=_SOURCE, mode="live", status="ok", calls_24h=0, calls_by_minute={})
     .on_conflict_do_nothing(index_elements=["source"])
 )
 
@@ -138,43 +159,61 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _hour_start(instant: datetime) -> datetime:
-    """Return the start of the UTC hour that contains ``instant``."""
-    return instant.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+def _bucket_start(instant: datetime) -> datetime:
+    """Return the start of the UTC minute that contains ``instant``."""
+    return instant.astimezone(UTC).replace(second=0, microsecond=0)
 
 
 def _bucket_key(start: datetime) -> str:
-    """Render a bucket start as its ``calls_hourly`` key, for example ``2026-10-07T14``."""
+    """Render a bucket start as its ``calls_by_minute`` key, for example ``2026-10-07T14:05``."""
     return start.strftime(_BUCKET_KEY_FORMAT)
 
 
 def _parse_bucket_key(key: object) -> datetime | None:
-    """Parse a canonical ``"YYYY-MM-DDTHH"`` key into its UTC hour start.
+    """Parse a stored key into the start of the UTC minute bucket its calls count in.
+
+    A canonical ``"YYYY-MM-DDTHH:MM"`` key names its own minute. A key in the former hour
+    format, ``"YYYY-MM-DDTHH"``, held the calls counted in that UTC hour, which the former
+    window of 25 hour buckets kept counting until 25 h after the hour started. It is read as
+    the last minute of its hour: that bucket stops counting 24 h after it ends, at exactly
+    the same instant, so every call already counted keeps counting until the former window
+    released it, and no later.
 
     Args:
-        key: A key of the stored ``calls_hourly`` object.
+        key: A key of the stored ``calls_by_minute`` object: a canonical minute key, or an
+            hour key of a row written before calls were counted by minute.
 
     Returns:
-        The aware UTC start of the hour, or ``None`` for anything that is not a canonical
-        key of a real calendar hour.
+        The aware UTC start of the key's minute; for a former hour key, the start of the
+        last minute of that hour (``"2026-10-08T10"`` gives 10:59 UTC). ``None`` for
+        anything that is neither a canonical key of a real calendar minute nor a former key
+        of a real calendar hour.
     """
     if not isinstance(key, str):
         return None
     match = _BUCKET_KEY_RE.fullmatch(key)
-    if match is None:
+    if match is not None:
+        year, month, day, hour, minute = (int(part) for part in match.groups())
+        try:
+            return datetime(year, month, day, hour, minute, tzinfo=UTC)
+        except ValueError:
+            return None
+    former = _FORMER_HOUR_KEY_RE.fullmatch(key)
+    if former is None:
         return None
-    year, month, day, hour = (int(part) for part in match.groups())
+    year, month, day, hour = (int(part) for part in former.groups())
     try:
-        return datetime(year, month, day, hour, tzinfo=UTC)
+        hour_start = datetime(year, month, day, hour, tzinfo=UTC)
     except ValueError:
         return None
+    return hour_start + _FORMER_HOUR_LAST_MINUTE
 
 
 def _parse_count(value: object) -> int | None:
     """Parse a stored bucket count.
 
     Args:
-        value: A value of the stored ``calls_hourly`` object.
+        value: A value of the stored ``calls_by_minute`` object.
 
     Returns:
         A non-negative integer count. A finite non-negative float is rounded *up*, so a
@@ -196,11 +235,11 @@ class _Window:
 
     Attributes:
         now: The UTC instant the window was evaluated at.
-        current: Start of the current UTC hour bucket.
+        current: Start of the current UTC minute bucket.
         buckets: Counted bucket starts and their positive counts. Buckets later than
-            ``current`` (a call booked in the next hour under the dispatch bound, or one
-            written by a process whose clock runs ahead) are kept and counted, which errs
-            towards refusing a call rather than overspending.
+            ``current`` (every booking, which the dispatch bound places two or three
+            minutes ahead, and any written by a process whose clock runs ahead) are kept
+            and counted, which errs towards refusing a call rather than overspending.
         used: The sum of ``buckets``.
         dirty: Whether the stored row differs from this pruned state and must be written.
     """
@@ -215,12 +254,13 @@ class _Window:
     def reservation(self) -> datetime:
         """Start of the bucket a call admitted at ``now`` is booked in.
 
-        It is the UTC hour holding ``now`` plus the 140 s dispatch bound: ``current`` for
-        most of the hour, and the next hour for a call admitted within the bound of the
-        hour's end, whose POST may start after that end. ``acquire`` relies on the booking
-        only when :meth:`covers_dispatch_after` holds for the instant it returns at.
+        It is the UTC minute holding ``now`` plus the 140 s dispatch bound, the latest
+        minute the call's POST may start in: two minutes after ``current`` for a call
+        admitted in the first 40 s of its minute, three minutes after it otherwise.
+        ``acquire`` relies on the booking only when :meth:`covers_dispatch_after` holds for
+        the instant it returns at.
         """
-        return _hour_start(self.now + _DISPATCH_BOUND)
+        return _bucket_start(self.now + _DISPATCH_BOUND)
 
     def covers_dispatch_after(self, instant: datetime) -> bool:
         """Whether a POST that starts within the dispatch bound of ``instant`` stays booked.
@@ -230,12 +270,12 @@ class _Window:
                 to the dispatch bound, read after the booking committed.
 
         Returns:
-            ``True`` when the latest such POST falls in the :attr:`reservation` hour or
+            ``True`` when the latest such POST falls in the :attr:`reservation` minute or
             before it, so the booking keeps counting for at least 24 h after the POST.
-            ``False`` when it could fall in a later hour, whose call the booking would
+            ``False`` when it could fall in a later minute, whose call the booking would
             stop counting less than 24 h after it was made.
         """
-        return _hour_start(instant + _DISPATCH_BOUND) <= self.reservation
+        return _bucket_start(instant + _DISPATCH_BOUND) <= self.reservation
 
     def with_call(self) -> dict[datetime, int]:
         """Return the buckets with one more call in the :attr:`reservation` bucket."""
@@ -247,8 +287,9 @@ class _Window:
         """Return how long until enough buckets leave the window for one call to fit.
 
         When the window holds exactly ``cap`` calls, which is the normal case, this is the
-        time until the oldest counted bucket leaves the window. When it holds more (the
-        cap was lowered), as many of the oldest buckets as needed must leave first.
+        time until the oldest counted bucket leaves the window, 24 h after its minute ends.
+        When it holds more (the cap was lowered), as many of the oldest buckets as needed
+        must leave first.
 
         Args:
             cap: The call cap.
@@ -262,38 +303,44 @@ class _Window:
         for start in sorted(self.buckets):
             freed += self.buckets[start]
             if self.used - freed < cap:
-                return (start + _BUCKET_LIFETIME - self.now).total_seconds()
+                # Measured from now, so a start near datetime.max cannot overflow.
+                return (_BUCKET_LIFETIME - (self.now - start)).total_seconds()
         return None
 
 
 def _serialise(buckets: Mapping[datetime, int]) -> dict[str, int]:
-    """Render buckets as the ``calls_hourly`` object, ordered by hour."""
+    """Render buckets as the ``calls_by_minute`` object, ordered by minute."""
     return {_bucket_key(start): buckets[start] for start in sorted(buckets)}
 
 
-def _evaluate(stored_hourly: object, stored_total: int, now: datetime) -> _Window:
+def _evaluate(stored_by_minute: object, stored_total: int, now: datetime) -> _Window:
     """Prune the stored counters to the counted window at ``now``.
 
-    Buckets that started more than 24 hours before the current hour bucket are dropped,
-    and so are zero counts. A key or count this module cannot have written (the row was
-    edited by hand) cannot be placed in time; it is dropped too, with a warning, so one
-    corrupt entry can never block every later call.
+    A bucket is dropped once 24 h have passed since it ended, that is once its start plus
+    :data:`BUCKET_WIDTH` plus :data:`WINDOW` is not after ``now``, and so are zero counts.
+    A key in the former hour format keeps its count in the last minute of its hour, added
+    to any count stored for that minute, and is dropped only once the former window would
+    have released it. Converted keys still counted are logged, as a count, in
+    ``google.budget.hour_buckets_converted``, and the row is marked for rewriting in
+    minute keys. A key or count this module cannot have written (the row was edited by
+    hand) cannot be placed in time; it is dropped too, with a warning, so one corrupt
+    entry can never block every later call.
 
     Args:
-        stored_hourly: The stored ``calls_hourly`` value.
+        stored_by_minute: The stored ``calls_by_minute`` value.
         stored_total: The stored ``calls_24h`` value.
         now: The aware UTC instant to evaluate at.
 
     Returns:
         The pruned window, with ``dirty`` set when the row must be rewritten.
     """
-    current = _hour_start(now)
-    oldest = current - _LOOKBACK
+    current = _bucket_start(now)
     buckets: dict[datetime, int] = {}
     discarded = 0
+    converted = 0
     entries: list[tuple[object, object]] = []
-    if isinstance(stored_hourly, Mapping):
-        entries.extend(stored_hourly.items())
+    if isinstance(stored_by_minute, Mapping):
+        entries.extend(stored_by_minute.items())
     else:
         # Not an object at all (JSON null, a list): nothing in it can be placed in time.
         discarded += 1
@@ -303,13 +350,19 @@ def _evaluate(stored_hourly: object, stored_total: int, now: datetime) -> _Windo
         if start is None or count is None:
             discarded += 1
             continue
-        if count == 0 or start < oldest:
+        # Measured back from now: a start near datetime.max cannot overflow, as it would
+        # when the bucket lifetime is added to it.
+        if count == 0 or now - start >= _BUCKET_LIFETIME:
             continue
+        if isinstance(key, str) and _FORMER_HOUR_KEY_RE.fullmatch(key) is not None:
+            converted += 1
         buckets[start] = buckets.get(start, 0) + count
     if discarded:
         _log.warning("google.budget.buckets_discarded", source=_SOURCE, discarded=discarded)
+    if converted:
+        _log.info("google.budget.hour_buckets_converted", source=_SOURCE, converted=converted)
     used = sum(buckets.values())
-    dirty = stored_total != used or stored_hourly != _serialise(buckets)
+    dirty = stored_total != used or stored_by_minute != _serialise(buckets)
     return _Window(now=now, current=current, buckets=buckets, used=used, dirty=dirty)
 
 
@@ -358,19 +411,19 @@ async def _lock_window(
         # once per database, and ON CONFLICT covers two processes creating it at once.
         await session.execute(_ENSURE_ROW)
         row = (await session.execute(_LOCK_ROW)).one()
-    return _evaluate(row.calls_hourly, row.calls_24h, clock())
+    return _evaluate(row.calls_by_minute, row.calls_24h, clock())
 
 
 async def _store(session: AsyncSession, buckets: Mapping[datetime, int], used: int) -> None:
     """Write the counters of the locked Google row.
 
-    Only ``calls_hourly`` and ``calls_24h`` are written; mode, status and every other
+    Only ``calls_by_minute`` and ``calls_24h`` are written; mode, status and every other
     column belong to ``sync/mode.py``.
     """
     await session.execute(
         update(SourceConnection)
         .where(SourceConnection.source == _SOURCE)
-        .values(calls_hourly=_serialise(buckets), calls_24h=used)
+        .values(calls_by_minute=_serialise(buckets), calls_24h=used)
         .execution_options(synchronize_session=False)
     )
 
@@ -383,19 +436,19 @@ class GoogleCallBudget:
     left. Every instance reads and writes the same ``source_connection`` row, so a worker
     and a CLI process holding separate instances share one count.
 
-    **Window.** Calls are counted in UTC hour buckets, and the window is the current hour
-    bucket plus the 24 preceding ones (:data:`WINDOW_BUCKETS`), together with any bucket
-    ahead of it. Hour buckets can only approximate a sliding 24 h, so the approximation is
-    deliberately conservative: any 24 h interval ending now lies inside those 25 buckets,
-    so the count is never below the true number of calls in the trailing 24 h, and no 24 h
-    interval can ever exceed the cap. A call is booked in the hour holding its admission
-    instant plus the 140 s dispatch bound, the longest its POST can take to start leaving
-    once :meth:`acquire` returns: a call admitted within 140 s of an hour's end is booked
-    in the next hour. The price is that a call keeps counting for up to 25 h plus that
-    bound. Advancing 25 h plus the bound from a call's last admission always frees it. A
-    reservation whose commit lasts so long that the POST could start after the booked
-    hour is not relied on: it stays counted, and the call is reserved again or refused, so
-    one such call may count twice for a day.
+    **Window.** Calls are counted in UTC minute buckets (:data:`BUCKET_WIDTH`), and a
+    bucket counts from its first booking until :data:`WINDOW`, 24 h, after it ends. A call
+    is booked in the minute holding its admission instant plus the 140 s dispatch bound,
+    the longest its POST can take to start leaving once :meth:`acquire` returns, so the
+    booking sits two or three minutes ahead of the current minute and counts at once.
+    Every POST therefore keeps counting for at least 24 h after it leaves, and no sliding
+    24 h of POSTs can exceed the cap. The count is a tight upper bound on the calls in the
+    trailing 24 h: a call counts from its admission until 24 h after the minute by which
+    its POST has started, which is more than 24 h plus the bound and at most one minute
+    more. Advancing 24 h plus the bound plus one minute from a call's last admission always
+    frees it. A reservation whose commit lasts so long that the POST could start after the
+    booked minute is not relied on: it stays counted, and the call is reserved again or
+    refused, so one such call may count twice for a day.
 
     **Cap.** ``Settings.google_daily_call_budget`` (``GOOGLE_DAILY_CALL_BUDGET``, 1,000 by
     default). A cap of 0 refuses every call. A lowered cap takes effect at once: calls
@@ -468,12 +521,12 @@ class GoogleCallBudget:
 
         The clock is checked before any session is opened, but the instant that admits and
         places the call is read only once the row lock is held, so a wait for the lock
-        across an hour's end cannot book the call in the hour it asked in. The call is
-        booked in the hour holding that instant plus the 140 s dispatch bound.
+        across a minute's end cannot book the call in the minute it asked in. The call is
+        booked in the minute holding that instant plus the 140 s dispatch bound.
 
         The bound runs from this method's return, so the clock is read again after the
         booking commits. When the UPDATE or the COMMIT took so long that the POST could
-        now start after the booked hour, the booking would stop counting less than 24 h
+        now start after the booked minute, the booking would stop counting less than 24 h
         after the POST, so it is not relied on: ``google.budget.reservation_expired`` is
         logged, the booking stays counted (an over-count, which only errs towards
         refusing), and the call is reserved afresh in a new short transaction, with the
@@ -483,7 +536,7 @@ class GoogleCallBudget:
         Raises:
             CallBudgetExhausted: When the window already holds ``cap`` calls. Its
                 ``retry_after`` is the number of seconds until a call frees up, which is
-                when the oldest counted hour bucket leaves the window whenever the window
+                when the oldest counted minute bucket leaves the window whenever the window
                 holds exactly ``cap`` calls; ``None`` for a cap of 0. A refused
                 reservation counts nothing; an expired booking it was to replace stays
                 counted. No POST may be made.
@@ -495,18 +548,18 @@ class GoogleCallBudget:
         # Fails fast on a clock without an offset; this reading places nothing.
         self._now()
         window = await self._reserve()
-        # A booking fails this check only when the clock passed its hour's end less the
+        # A booking fails this check only when the clock passed its minute's end less the
         # dispatch bound between the reading under the lock and the one after the commit.
         # A fresh booking is placed by a reading taken no earlier than that one, so each
-        # further failure needs wall time to pass another hour's end, and each
+        # further failure needs wall time to pass another minute's end, and each
         # re-reservation takes one more call of the cap: the loop runs at most once more
-        # per elapsed hour, and at most ``cap`` times before a reservation is refused.
+        # per elapsed minute, and at most ``cap`` times before a reservation is refused.
         while not window.covers_dispatch_after(after_commit := self._now()):
             _log.warning(
                 "google.budget.reservation_expired",
                 source=_SOURCE,
                 booked=_bucket_key(window.reservation),
-                needed=_bucket_key(_hour_start(after_commit + _DISPATCH_BOUND)),
+                needed=_bucket_key(_bucket_start(after_commit + _DISPATCH_BOUND)),
             )
             window = await self._reserve()
         used = window.used + 1
@@ -516,7 +569,7 @@ class GoogleCallBudget:
     async def used_24h(self) -> int:
         """Prune the window and return the calls it holds.
 
-        Persists the pruned ``calls_hourly`` and the recomputed ``calls_24h``, so
+        Persists the pruned ``calls_by_minute`` and the recomputed ``calls_24h``, so
         ``/sources`` stays current while no calls are made; the scheduler calls this on
         each wake. The row is written only when pruning changed it. As in :meth:`acquire`,
         the window is evaluated at the clock read once the row lock is held.
@@ -581,7 +634,7 @@ class GoogleCallBudget:
         """Read the clock as an aware UTC instant.
 
         Raises:
-            ValueError: When the clock returns a naive datetime, whose hour bucket would
+            ValueError: When the clock returns a naive datetime, whose minute bucket would
                 depend on the host's time zone.
         """
         instant = self._clock()

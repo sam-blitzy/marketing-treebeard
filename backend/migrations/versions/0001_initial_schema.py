@@ -559,7 +559,7 @@ def _create_ops_tables() -> None:
         sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("calls_24h", sa.BigInteger(), server_default=sa.text(ZERO), nullable=False),
         sa.Column(
-            "calls_hourly",
+            "calls_by_minute",
             postgresql.JSONB(),
             server_default=sa.text(EMPTY_JSONB),
             nullable=False,

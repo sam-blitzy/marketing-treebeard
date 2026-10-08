@@ -1,6 +1,6 @@
 """Tests for ``ads_engine.sync.budget_guard``: the product's own cap on n8n webhook calls.
 
-The pure parts need no database: the hour-bucket keys, the stored counts, the pruning of
+The pure parts need no database: the minute-bucket keys, the stored counts, the pruning of
 the counted window, the time until a call frees up, whether a booking covers a POST
 delayed by up to the dispatch bound, and the checks that run before any session is opened.
 
@@ -49,22 +49,31 @@ from ads_engine.db.base import Base
 from ads_engine.db.models.ops import SourceConnection, SourceDataset
 from ads_engine.settings import Settings, get_settings
 from ads_engine.sync import budget_guard
-from ads_engine.sync.budget_guard import BUDGET_ENDPOINT, WINDOW_BUCKETS, GoogleCallBudget
+from ads_engine.sync.budget_guard import BUCKET_WIDTH, BUDGET_ENDPOINT, WINDOW, GoogleCallBudget
 
 type Sessions = async_sessionmaker[AsyncSession]
 type LogEvent = tuple[str, str, dict[str, object]]
 type StoredCounters = tuple[object, int]
 
-NOW = datetime(2026, 10, 7, 14, 30, tzinfo=UTC)
-"""The instant most tests run at: half past the hour, 30 minutes from either boundary."""
+NOW = datetime(2026, 10, 7, 14, 30, 30, tzinfo=UTC)
+"""The instant most tests run at: 14:30:30, 30 seconds from either minute boundary."""
 
-CURRENT = NOW.replace(minute=0)
-"""Start of the current UTC hour bucket at :data:`NOW`."""
+CURRENT = NOW.replace(second=0)
+"""Start of the current UTC minute bucket at :data:`NOW`."""
 
-KEY_FORMAT = "%Y-%m-%dT%H"
+BOOKED = 2
+"""Minutes after :data:`CURRENT` of the bucket a call admitted at :data:`NOW` is booked in:
+14:30:30 plus the 140 s dispatch bound is 14:32:50."""
 
-FULL_DAY = (CURRENT + timedelta(hours=WINDOW_BUCKETS) - NOW).total_seconds()
-"""Seconds until a call made at :data:`NOW` leaves the window: 24.5 h."""
+DAY = 24 * 60
+"""The window in minutes: the bucket ``DAY`` minutes before the current one is the oldest
+still counted."""
+
+KEY_FORMAT = "%Y-%m-%dT%H:%M"
+
+FULL_DAY = (CURRENT + timedelta(minutes=BOOKED) + BUCKET_WIDTH + WINDOW - NOW).total_seconds()
+"""Seconds until a call made at :data:`NOW` leaves the window: 24 h after its booked minute
+ends, 24 h and 150 s."""
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
 
@@ -99,14 +108,19 @@ N8N_WORKFLOW_ERROR: Mapping[str, object] = {"message": "Error in workflow"}
 """n8n's observed HTTP 500 body for a failed workflow, documented in ``search.json``."""
 
 
-def _key(hours: int = 0) -> str:
-    """Return the ``calls_hourly`` key of the bucket ``hours`` after the current one."""
-    return (CURRENT + timedelta(hours=hours)).strftime(KEY_FORMAT)
+def _key(minutes: int = 0) -> str:
+    """Return the ``calls_by_minute`` key of the bucket ``minutes`` after the current one."""
+    return (CURRENT + timedelta(minutes=minutes)).strftime(KEY_FORMAT)
 
 
-def _start(hours: int = 0) -> datetime:
-    """Return the start of the bucket ``hours`` after the current one."""
-    return CURRENT + timedelta(hours=hours)
+def _start(minutes: int = 0) -> datetime:
+    """Return the start of the bucket ``minutes`` after the current one."""
+    return CURRENT + timedelta(minutes=minutes)
+
+
+def _freed_at(start: datetime) -> datetime:
+    """Return the instant the bucket starting at ``start`` stops counting: 24 h after it ends."""
+    return start + BUCKET_WIDTH + WINDOW
 
 
 class _Clock:
@@ -203,34 +217,73 @@ def _settings(cap: int) -> Settings:
 # ---------------------------------------------------------------------------------------
 
 
-def test_a_bucket_key_names_the_utc_hour_and_parses_back() -> None:
-    """Any aware instant maps to its UTC hour, rendered ``YYYY-MM-DDTHH`` and parsed back."""
-    instant = datetime(2026, 10, 7, 16, 45, 12, 5, tzinfo=timezone(timedelta(hours=2)))
-    start = budget_guard._hour_start(instant)
+def test_a_bucket_key_names_the_utc_minute_and_parses_back() -> None:
+    """Any aware instant maps to its UTC minute, rendered ``YYYY-MM-DDTHH:MM``, parsed back."""
+    instant = datetime(2026, 10, 7, 16, 30, 59, 999999, tzinfo=timezone(timedelta(hours=2)))
+    start = budget_guard._bucket_start(instant)
 
     assert start == CURRENT
     assert start.tzinfo is UTC
-    assert budget_guard._bucket_key(start) == "2026-10-07T14" == _key()
-    assert budget_guard._parse_bucket_key("2026-10-07T14") == CURRENT
+    assert budget_guard._bucket_key(start) == "2026-10-07T14:30" == _key()
+    assert budget_guard._parse_bucket_key("2026-10-07T14:30") == CURRENT
+    assert budget_guard._bucket_start(CURRENT) == CURRENT
     assert budget_guard._utcnow().tzinfo is UTC
+
+
+def test_the_window_is_24_hours_of_one_minute_buckets() -> None:
+    """The cap applies to a sliding 24 h, counted in one-minute buckets."""
+    assert WINDOW.total_seconds() == 86400.0
+    assert BUCKET_WIDTH.total_seconds() == 60.0
+    assert budget_guard._BUCKET_LIFETIME.total_seconds() == 86460.0
+
+
+@pytest.mark.parametrize(
+    ("key", "start"),
+    [
+        pytest.param("2026-10-08T10", datetime(2026, 10, 8, 10, 59, tzinfo=UTC), id="hour-10"),
+        pytest.param("2026-10-08T23", datetime(2026, 10, 8, 23, 59, tzinfo=UTC), id="hour-23"),
+        pytest.param("2026-10-08T00", datetime(2026, 10, 8, 0, 59, tzinfo=UTC), id="hour-00"),
+        pytest.param(
+            "9999-12-31T23", datetime(9999, 12, 31, 23, 59, tzinfo=UTC), id="last-calendar-hour"
+        ),
+    ],
+)
+def test_a_key_in_the_former_hour_format_is_read_as_the_last_minute_of_its_hour(
+    key: str, start: datetime
+) -> None:
+    """A former ``YYYY-MM-DDTHH`` key is placed in the start of its hour's last minute."""
+    parsed = budget_guard._parse_bucket_key(key)
+
+    assert parsed == start
+    assert parsed is not None
+    assert parsed.tzinfo is UTC
 
 
 @pytest.mark.parametrize(
     "key",
     [
-        pytest.param("2026-10-07T14:00", id="minutes"),
-        pytest.param("2026-10-07 14", id="space"),
-        pytest.param("2026-10-7T14", id="short-day"),
-        pytest.param("2026-10-07T24", id="hour-24"),
-        pytest.param("2026-13-01T00", id="month-13"),
-        pytest.param("2026-02-30T00", id="february-30"),
+        pytest.param("2026-10-08T24", id="hour-key-24"),
+        pytest.param("2026-02-30T10", id="hour-key-february-30"),
+        pytest.param("2026-13-01T10", id="hour-key-month-13"),
+        pytest.param("2026-10-08T1", id="hour-key-short-hour"),
+        pytest.param("2026-10-08T10:", id="hour-key-trailing-colon"),
+        pytest.param("2026-10-08 10", id="hour-key-space"),
+        pytest.param("2026-10-07T14:30:00", id="seconds"),
+        pytest.param("2026-10-07 14:30", id="space"),
+        pytest.param("2026-10-07T1430", id="no-colon"),
+        pytest.param("2026-10-7T14:30", id="short-day"),
+        pytest.param("2026-10-07T14:3", id="short-minute"),
+        pytest.param("2026-10-07T24:00", id="hour-24"),
+        pytest.param("2026-10-07T14:60", id="minute-60"),
+        pytest.param("2026-13-01T00:00", id="month-13"),
+        pytest.param("2026-02-30T00:00", id="february-30"),
         pytest.param("", id="empty"),
         pytest.param(2026, id="integer"),
         pytest.param(None, id="none"),
     ],
 )
-def test_a_key_that_is_not_a_calendar_hour_is_not_parsed(key: object) -> None:
-    """Only a canonical key of a real calendar hour has a bucket start."""
+def test_a_key_that_is_not_a_calendar_minute_is_not_parsed(key: object) -> None:
+    """Only a canonical key of a real minute, or a former key of a real hour, has a start."""
     assert budget_guard._parse_bucket_key(key) is None
 
 
@@ -275,34 +328,52 @@ def test_a_stored_count_that_is_not_a_count_is_rejected(value: object) -> None:
 # ---------------------------------------------------------------------------------------
 
 
-def test_the_window_counts_the_current_hour_and_the_24_before_it() -> None:
-    """A bucket 25 h before the current one is pruned; the 25 buckets after it count."""
-    stored = {_key(hours): 1 for hours in range(-25, 1)}
-    window = budget_guard._evaluate(stored, 26, NOW)
+def test_the_window_counts_the_current_minute_and_the_24_hours_before_it() -> None:
+    """A bucket that ended more than 24 h ago is pruned; the 1,441 buckets after it count."""
+    stored = {_key(minutes): 1 for minutes in range(-DAY - 1, 1)}
+    window = budget_guard._evaluate(stored, DAY + 2, NOW)
 
-    assert WINDOW_BUCKETS == 25
     assert (window.now, window.current) == (NOW, CURRENT)
-    assert sorted(window.buckets) == [_start(hours) for hours in range(-24, 1)]
-    assert window.used == WINDOW_BUCKETS
+    assert sorted(window.buckets) == [_start(minutes) for minutes in range(-DAY, 1)]
+    assert window.used == DAY + 1
     assert window.dirty
+
+
+@pytest.mark.parametrize(
+    ("before_end", "counted"),
+    [
+        pytest.param(timedelta(microseconds=1), True, id="last-microsecond"),
+        pytest.param(timedelta(0), False, id="24h-after-its-end"),
+    ],
+)
+def test_a_bucket_counts_until_exactly_24_hours_after_it_ends(
+    before_end: timedelta, counted: bool
+) -> None:
+    """The bucket of 14:30 counts until the next day's 14:31:00, and not at that instant."""
+    start = _start()
+    window = budget_guard._evaluate({_key(): 1}, 1, _freed_at(start) - before_end)
+
+    assert _freed_at(start) == datetime(2026, 10, 8, 14, 31, tzinfo=UTC)
+    assert dict(window.buckets) == ({start: 1} if counted else {})
+    assert window.dirty is not counted
 
 
 def test_the_window_prunes_old_and_zero_buckets_and_keeps_buckets_ahead() -> None:
-    """Old and zero buckets go; a bucket ahead of the clock counts; output is hour-ordered."""
+    """Old and zero buckets go; a bucket ahead of the clock counts; output is minute-ordered."""
     stored = {
-        _key(2): 3,
+        _key(BOOKED + 3): 3,
         _key(0): 2,
         _key(-3): 0,
-        _key(-24): 1,
-        _key(-25): 4,
+        _key(-DAY): 1,
+        _key(-DAY - 1): 4,
     }
     window = budget_guard._evaluate(stored, 10, NOW)
 
-    assert dict(window.buckets) == {_start(-24): 1, _start(0): 2, _start(2): 3}
+    assert dict(window.buckets) == {_start(-DAY): 1, _start(0): 2, _start(BOOKED + 3): 3}
     assert window.used == 6
     assert window.dirty
     serialised = budget_guard._serialise(window.buckets)
-    assert list(serialised.items()) == [(_key(-24), 1), (_key(0), 2), (_key(2), 3)]
+    assert list(serialised.items()) == [(_key(-DAY), 1), (_key(0), 2), (_key(BOOKED + 3), 3)]
 
 
 @pytest.mark.parametrize(
@@ -326,7 +397,7 @@ def test_malformed_entries_are_discarded_with_a_warning(log_events: list[LogEven
     """Keys and counts this module cannot have written are dropped and counted in one warning."""
     stored: dict[object, object] = {
         "not-a-key": 50,
-        "2026-02-30T00": 50,
+        "2026-02-30T00:00": 50,
         14: 1,
         _key(-1): -3,
         _key(-2): "7",
@@ -352,14 +423,14 @@ def test_malformed_entries_are_discarded_with_a_warning(log_events: list[LogEven
         pytest.param(None, id="json-null"),
         pytest.param([], id="empty-list"),
         pytest.param([1, 2], id="list"),
-        pytest.param("2026-10-07T14", id="string"),
+        pytest.param("2026-10-07T14:30", id="string"),
         pytest.param(3, id="number"),
     ],
 )
 def test_a_stored_value_that_is_not_an_object_counts_nothing(
     stored: object, log_events: list[LogEvent]
 ) -> None:
-    """A non-object ``calls_hourly`` is one discarded entry, and the row is rewritten."""
+    """A non-object ``calls_by_minute`` is one discarded entry, and the row is rewritten."""
     window = budget_guard._evaluate(stored, 0, NOW)
 
     assert dict(window.buckets) == {}
@@ -372,20 +443,127 @@ def test_a_stored_value_that_is_not_an_object_counts_nothing(
 
 def test_a_well_formed_window_logs_nothing(log_events: list[LogEvent]) -> None:
     """No warning is logged when every entry can be placed in time."""
-    budget_guard._evaluate({_key(0): 1, _key(-30): 2}, 3, NOW)
+    budget_guard._evaluate({_key(0): 1, _key(-DAY - 30): 2}, 3, NOW)
 
     assert log_events == []
 
 
-def test_a_call_is_added_to_the_current_hour_without_changing_the_window() -> None:
-    """``with_call`` returns new buckets with one more call in the current hour."""
+def test_a_key_in_the_former_hour_format_keeps_its_calls_in_the_hours_last_minute(
+    log_events: list[LogEvent],
+) -> None:
+    """An hour key's count moves to its HH:59 bucket, added to that minute's own count.
+
+    Nothing is discarded: the conversion is logged as a count, never as a warning, and
+    the row is rewritten in minute keys only.
+    """
+    stored = {"2026-10-07T14": 5, "2026-10-07T14:59": 2, _key(BOOKED): 1}
+    window = budget_guard._evaluate(stored, 8, NOW)
+
+    last_minute = datetime(2026, 10, 7, 14, 59, tzinfo=UTC)
+    assert dict(window.buckets) == {_start(BOOKED): 1, last_minute: 7}
+    assert window.used == 8
+    assert window.dirty
+    assert budget_guard._serialise(window.buckets) == {_key(BOOKED): 1, "2026-10-07T14:59": 7}
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1})
+    ]
+
+
+def test_a_converted_row_is_rewritten_even_when_its_total_matches(
+    log_events: list[LogEvent],
+) -> None:
+    """The stored total already holds the hour's calls; only the key format differs."""
+    window = budget_guard._evaluate({"2026-10-07T14": 5}, 5, NOW)
+
+    assert dict(window.buckets) == {datetime(2026, 10, 7, 14, 59, tzinfo=UTC): 5}
+    assert window.used == 5
+    assert window.dirty
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("now", "counted"),
+    [
+        pytest.param(
+            datetime(2026, 10, 8, 14, 59, 59, 999999, tzinfo=UTC), True, id="last-microsecond"
+        ),
+        pytest.param(datetime(2026, 10, 8, 15, 0, tzinfo=UTC), False, id="25h-after-hour-start"),
+    ],
+)
+def test_an_hour_key_counts_until_25_hours_after_its_hour_starts(
+    now: datetime, counted: bool, log_events: list[LogEvent]
+) -> None:
+    """An hour key is released when the former window released it, and is then dropped.
+
+    The 14:00 hour's calls count until the next day's 15:00, as under the former window
+    of 25 hour buckets; at that instant they are dropped as expired, with no event logged.
+    """
+    window = budget_guard._evaluate({"2026-10-07T14": 5}, 5, now)
+
+    last_minute = datetime(2026, 10, 7, 14, 59, tzinfo=UTC)
+    assert dict(window.buckets) == ({last_minute: 5} if counted else {})
+    assert window.used == (5 if counted else 0)
+    assert window.dirty
+    expected_events: list[LogEvent] = (
+        [("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1})]
+        if counted
+        else []
+    )
+    assert log_events == expected_events
+
+
+def test_converted_and_discarded_keys_are_logged_apart(log_events: list[LogEvent]) -> None:
+    """Only unplaceable entries are warned about; every counted hour key is one conversion."""
+    stored: dict[object, object] = {
+        "2026-10-07T13": 2,
+        "2026-10-07T14": 3,
+        "2026-10-07T12": 0,
+        "2026-10-07T11": "4",
+        "2026-10-07T24": 6,
+        "2026-10-05T14": 9,
+    }
+    window = budget_guard._evaluate(stored, 99, NOW)
+
+    assert dict(window.buckets) == {
+        datetime(2026, 10, 7, 13, 59, tzinfo=UTC): 2,
+        datetime(2026, 10, 7, 14, 59, tzinfo=UTC): 3,
+    }
+    assert window.used == 5
+    assert log_events == [
+        ("warning", "google.budget.buckets_discarded", {"source": "google", "discarded": 2}),
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 2}),
+    ]
+
+
+def test_keys_at_the_end_of_the_calendar_are_counted_without_overflowing(
+    log_events: list[LogEvent],
+) -> None:
+    """A bucket whose lifetime would pass ``datetime.max`` is counted and never raises."""
+    last_minute = datetime(9999, 12, 31, 23, 59, tzinfo=UTC)
+    window = budget_guard._evaluate({"9999-12-31T23:59": 1, "9999-12-31T23": 2}, 3, NOW)
+
+    assert dict(window.buckets) == {last_minute: 3}
+    assert window.used == 3
+    assert (
+        window.seconds_until_free(3)
+        == (budget_guard._BUCKET_LIFETIME - (NOW - last_minute)).total_seconds()
+    )
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1})
+    ]
+
+
+def test_a_call_is_added_to_its_booked_minute_without_changing_the_window() -> None:
+    """``with_call`` returns new buckets with one more call in the booked minute."""
     window = budget_guard._evaluate({_key(-1): 2}, 2, NOW)
     first = window.with_call()
-    later = budget_guard._evaluate({_key(-1): 2, _key(0): 4}, 6, NOW).with_call()
+    later = budget_guard._evaluate({_key(-1): 2, _key(BOOKED): 4}, 6, NOW).with_call()
 
-    assert window.reservation == CURRENT
-    assert first == {_start(-1): 2, _start(0): 1}
-    assert later == {_start(-1): 2, _start(0): 5}
+    assert window.reservation == _start(BOOKED)
+    assert first == {_start(-1): 2, _start(BOOKED): 1}
+    assert later == {_start(-1): 2, _start(BOOKED): 5}
     assert dict(window.buckets) == {_start(-1): 2}
 
 
@@ -400,31 +578,35 @@ def test_the_dispatch_bound_covers_the_pool_wait_and_both_connect_phases() -> No
 @pytest.mark.parametrize(
     ("instant", "booked"),
     [
-        pytest.param(NOW, CURRENT, id="mid-hour"),
-        pytest.param(CURRENT.replace(minute=57, second=39), CURRENT, id="57m39s-own-hour"),
+        pytest.param(NOW, _start(BOOKED), id="mid-minute"),
+        pytest.param(CURRENT, _start(2), id="minute-start-two-ahead"),
         pytest.param(
-            CURRENT.replace(minute=57, second=39, microsecond=999999),
-            CURRENT,
-            id="just-outside-the-bound",
+            CURRENT.replace(second=39, microsecond=999999),
+            _start(2),
+            id="39s-last-instant-two-ahead",
         ),
-        pytest.param(CURRENT.replace(minute=57, second=40), _start(1), id="57m40s-next-hour"),
-        pytest.param(CURRENT.replace(minute=58, second=30), _start(1), id="58m30s-next-hour"),
+        pytest.param(CURRENT.replace(second=40), _start(3), id="40s-three-ahead"),
         pytest.param(
-            CURRENT.replace(minute=59, second=59, microsecond=999999),
-            _start(1),
-            id="last-instant-next-hour",
+            CURRENT.replace(second=59, microsecond=999999),
+            _start(3),
+            id="last-instant-three-ahead",
         ),
         pytest.param(
-            datetime(2026, 10, 7, 23, 58, 30, tzinfo=UTC),
-            datetime(2026, 10, 8, 0, tzinfo=UTC),
+            datetime(2026, 10, 7, 23, 57, 39, 999999, tzinfo=UTC),
+            datetime(2026, 10, 7, 23, 59, tzinfo=UTC),
+            id="same-day",
+        ),
+        pytest.param(
+            datetime(2026, 10, 7, 23, 57, 40, tzinfo=UTC),
+            datetime(2026, 10, 8, 0, 0, tzinfo=UTC),
             id="next-day",
         ),
     ],
 )
-def test_a_call_admitted_within_the_bound_of_the_hour_end_is_booked_in_the_next_hour(
+def test_a_call_is_booked_in_the_minute_holding_its_admission_plus_the_bound(
     instant: datetime, booked: datetime
 ) -> None:
-    """A call admitted within 140 s of its hour's end counts in the next hour from at once."""
+    """A call counts at once in the minute its POST may start in at the latest."""
     window = budget_guard._evaluate({}, 0, instant)
     buckets = window.with_call()
     after = budget_guard._evaluate(budget_guard._serialise(buckets), 1, instant)
@@ -433,22 +615,23 @@ def test_a_call_admitted_within_the_bound_of_the_hour_end_is_booked_in_the_next_
     assert buckets == {booked: 1}
     assert after.used == 1
     assert not after.dirty
-    # The call frees up 25 h after the start of the bucket it was booked in, so it counts
-    # for more than 24 h after its admission and at most 25 h plus the bound.
+    # The call frees up 24 h after the end of the minute it was booked in, so it counts
+    # for more than 24 h plus the bound after its admission, and at most one minute more.
+    bound = budget_guard._DISPATCH_BOUND
     retry_after = after.seconds_until_free(1)
     assert retry_after is not None
-    assert retry_after == (booked + timedelta(hours=WINDOW_BUCKETS) - instant).total_seconds()
-    assert timedelta(hours=24) < timedelta(seconds=retry_after) <= timedelta(hours=25, seconds=140)
-    # A POST starting as late as the bound allows still leaves in the booked hour or before.
-    assert budget_guard._hour_start(instant + budget_guard._DISPATCH_BOUND) <= booked
+    assert retry_after == (_freed_at(booked) - instant).total_seconds()
+    assert WINDOW + bound < timedelta(seconds=retry_after) <= WINDOW + bound + BUCKET_WIDTH
+    # A POST starting as late as the bound allows still leaves in the booked minute.
+    assert budget_guard._bucket_start(instant + bound) == booked
     assert window.covers_dispatch_after(instant)
 
 
 DISPATCH_ADMITTED = datetime(2026, 10, 6, 10, 55, tzinfo=UTC)
-"""A call admitted at 10:55:00 is booked in hour 10: its POST leaves by 10:57:20."""
+"""A call admitted at 10:55:00 is booked in minute 10:57: its POST leaves by 10:57:20."""
 
-DISPATCH_ADMITTED_LATE = datetime(2026, 10, 6, 10, 58, tzinfo=UTC)
-"""A call admitted at 10:58:00 is booked in hour 11: its POST may leave after 11:00."""
+DISPATCH_ADMITTED_LATE = datetime(2026, 10, 6, 10, 55, 40, tzinfo=UTC)
+"""A call admitted at 10:55:40 is booked in minute 10:58: its POST leaves by 10:58:00."""
 
 
 @pytest.mark.parametrize(
@@ -457,18 +640,18 @@ DISPATCH_ADMITTED_LATE = datetime(2026, 10, 6, 10, 58, tzinfo=UTC)
         pytest.param(DISPATCH_ADMITTED, DISPATCH_ADMITTED, True, id="no-delay"),
         pytest.param(
             DISPATCH_ADMITTED,
-            DISPATCH_ADMITTED.replace(minute=57, second=39, microsecond=999999),
+            DISPATCH_ADMITTED.replace(second=39, microsecond=999999),
             True,
-            id="last-instant-the-bound-stays-in-the-hour",
+            id="last-instant-the-bound-stays-in-the-minute",
         ),
         pytest.param(
             DISPATCH_ADMITTED,
-            DISPATCH_ADMITTED.replace(minute=57, second=40),
+            DISPATCH_ADMITTED.replace(second=40),
             False,
-            id="bound-reaches-the-next-hour",
+            id="bound-reaches-the-next-minute",
         ),
         pytest.param(
-            DISPATCH_ADMITTED, DISPATCH_ADMITTED + timedelta(seconds=300), False, id="300s-later"
+            DISPATCH_ADMITTED, DISPATCH_ADMITTED + timedelta(seconds=60), False, id="60s-later"
         ),
         pytest.param(
             DISPATCH_ADMITTED,
@@ -478,28 +661,28 @@ DISPATCH_ADMITTED_LATE = datetime(2026, 10, 6, 10, 58, tzinfo=UTC)
         ),
         pytest.param(
             DISPATCH_ADMITTED_LATE,
-            DISPATCH_ADMITTED_LATE + timedelta(seconds=100),
+            DISPATCH_ADMITTED_LATE + timedelta(seconds=50),
             True,
-            id="booked-ahead-100s-later",
+            id="booked-three-ahead-50s-later",
         ),
         pytest.param(
             DISPATCH_ADMITTED_LATE,
-            datetime(2026, 10, 6, 11, 57, 39, tzinfo=UTC),
+            datetime(2026, 10, 6, 10, 56, 39, 999999, tzinfo=UTC),
             True,
-            id="booked-ahead-last-instant",
+            id="booked-three-ahead-last-instant",
         ),
         pytest.param(
             DISPATCH_ADMITTED_LATE,
-            datetime(2026, 10, 6, 11, 57, 40, tzinfo=UTC),
+            datetime(2026, 10, 6, 10, 56, 40, tzinfo=UTC),
             False,
-            id="booked-ahead-bound-reaches-hour-12",
+            id="booked-three-ahead-bound-reaches-10h59",
         ),
     ],
 )
-def test_a_booking_covers_the_dispatch_only_while_the_bound_stays_in_its_hour(
+def test_a_booking_covers_the_dispatch_only_while_the_bound_stays_in_its_minute(
     admitted: datetime, after_commit: datetime, covered: bool
 ) -> None:
-    """The booking holds when a POST up to 140 s after the commit check is in its hour."""
+    """The booking holds when a POST up to 140 s after the commit check is in its minute."""
     window = budget_guard._evaluate({}, 0, admitted)
 
     assert window.covers_dispatch_after(after_commit) is covered
@@ -507,24 +690,25 @@ def test_a_booking_covers_the_dispatch_only_while_the_bound_stays_in_its_hour(
 
 def test_a_full_window_frees_a_call_when_its_oldest_bucket_leaves() -> None:
     """At exactly the cap, a call fits once the oldest counted bucket leaves the window."""
-    window = budget_guard._evaluate({_key(-24): 3, _key(0): 2}, 5, NOW)
+    window = budget_guard._evaluate({_key(-DAY): 3, _key(BOOKED): 2}, 5, NOW)
 
-    # The bucket that started 24 h before the current one leaves at the next hour: 30 min.
-    assert window.seconds_until_free(5) == 1800.0
+    # The bucket that started 24 h before the current one leaves when the current minute
+    # ends: 30 s.
+    assert window.seconds_until_free(5) == 30.0
 
 
 def test_a_lowered_cap_waits_until_enough_buckets_leave() -> None:
     """Above the cap, as many of the oldest buckets as needed must leave first."""
-    window = budget_guard._evaluate({_key(-24): 3, _key(-10): 1, _key(0): 2}, 6, NOW)
+    window = budget_guard._evaluate({_key(-DAY): 3, _key(-600): 1, _key(BOOKED): 2}, 6, NOW)
 
-    assert window.seconds_until_free(3) == (_start(-10) + timedelta(hours=25) - NOW).total_seconds()
+    assert window.seconds_until_free(3) == (_freed_at(_start(-600)) - NOW).total_seconds()
     assert window.seconds_until_free(2) == FULL_DAY
-    assert window.seconds_until_free(6) == 1800.0
+    assert window.seconds_until_free(6) == 30.0
 
 
-def test_a_bucket_ahead_of_the_clock_frees_up_25_hours_after_its_own_start() -> None:
-    """A bucket written by a clock running ahead counts until 25 h after it started."""
-    window = budget_guard._evaluate({_key(3): 2}, 2, NOW)
+def test_a_bucket_ahead_of_the_clock_frees_up_24_hours_after_it_ends() -> None:
+    """A bucket written by a clock running ahead counts until 24 h after its minute ends."""
+    window = budget_guard._evaluate({_key(BOOKED + 180): 2}, 2, NOW)
 
     assert window.seconds_until_free(2) == FULL_DAY + 3 * 3600
 
@@ -587,7 +771,7 @@ def test_a_negative_cap_is_rejected() -> None:
 async def test_a_clock_without_an_offset_is_rejected_before_any_database_work(
     instant: datetime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An instant with no UTC offset has no hour bucket, so no session is ever opened."""
+    """An instant with no UTC offset has no minute bucket, so no session is ever opened."""
 
     def lookup() -> Sessions:
         pytest.fail("no session may be opened for an instant without an offset")
@@ -695,34 +879,40 @@ def _budget(sessions: Sessions, cap: int = 1000, clock: _Clock | None = None) ->
     )
 
 
-async def _seed(sessions: Sessions, hourly_json: str, total: int) -> None:
-    """Commit a live Google row whose ``calls_hourly`` is the raw JSON ``hourly_json``."""
+async def _seed(sessions: Sessions, by_minute_json: str, total: int) -> None:
+    """Commit a live Google row whose ``calls_by_minute`` is the raw JSON ``by_minute_json``."""
     async with sessions() as session, session.begin():
         await session.execute(
             text(
-                "INSERT INTO source_connection (source, mode, status, calls_24h, calls_hourly) "
-                "VALUES ('google', 'live', 'ok', :total, CAST(:hourly AS jsonb))"
+                "INSERT INTO source_connection (source, mode, status, calls_24h, calls_by_minute) "
+                "VALUES ('google', 'live', 'ok', :total, CAST(:by_minute AS jsonb))"
             ),
-            {"total": total, "hourly": hourly_json},
+            {"total": total, "by_minute": by_minute_json},
         )
 
 
-async def _seed_counts(sessions: Sessions, hourly: Mapping[str, object], total: int) -> None:
-    """Commit a live Google row holding ``hourly`` and ``total``, as if edited by hand."""
-    await _seed(sessions, json.dumps(hourly), total)
+async def _seed_counts(sessions: Sessions, by_minute: Mapping[str, object], total: int) -> None:
+    """Commit a live Google row holding ``by_minute`` and ``total``, as if edited by hand."""
+    await _seed(sessions, json.dumps(by_minute), total)
 
 
 async def _stored(sessions: Sessions) -> StoredCounters | None:
-    """Return the Google row's ``(calls_hourly, calls_24h)``, or ``None`` with no row."""
+    """Return the Google row's ``(calls_by_minute, calls_24h)``, or ``None`` with no row."""
     async with sessions() as session:
         row = (
             await session.execute(
-                select(SourceConnection.calls_hourly, SourceConnection.calls_24h).where(
+                select(SourceConnection.calls_by_minute, SourceConnection.calls_24h).where(
                     SourceConnection.source == "google"
                 )
             )
         ).one_or_none()
-    return None if row is None else (row.calls_hourly, row.calls_24h)
+    return None if row is None else (row.calls_by_minute, row.calls_24h)
+
+
+async def _clear(sessions: Sessions) -> None:
+    """Delete every ``source_connection`` row, so the next call finds no Google call metered."""
+    async with sessions() as session, session.begin():
+        await session.execute(delete(SourceConnection))
 
 
 async def _row_count(sessions: Sessions) -> int:
@@ -757,41 +947,43 @@ async def test_the_first_acquire_creates_the_live_google_row(sessions: Sessions)
         row = (await session.scalars(select(SourceConnection))).one()
     assert (row.source, row.mode, row.status, row.reason) == ("google", "live", "ok", None)
     assert (row.active_dataset_id, row.last_attempt_at) == (None, None)
-    assert (row.calls_hourly, row.calls_24h) == ({"2026-10-07T14": 1}, 1)
+    assert (row.calls_by_minute, row.calls_24h) == ({"2026-10-07T14:32": 1}, 1)
 
 
 @pytest.mark.anyio
 @pytest.mark.db
-async def test_each_call_counts_in_its_own_utc_hour(sessions: Sessions) -> None:
-    """Calls in one hour share its bucket; the next hour opens a new one."""
+async def test_each_call_counts_in_its_own_utc_minute(sessions: Sessions) -> None:
+    """Calls booked in one minute share its bucket; the next minute opens a new one."""
     clock = _Clock()
     budget = _budget(sessions, cap=10, clock=clock)
     for _ in range(3):
         await budget.acquire()
-    assert await _stored(sessions) == ({_key(0): 3}, 3)
+    assert await _stored(sessions) == ({_key(BOOKED): 3}, 3)
 
-    clock.advance(timedelta(hours=1))
+    clock.advance(BUCKET_WIDTH)
     await budget.acquire()
 
-    assert await _stored(sessions) == ({_key(0): 3, _key(1): 1}, 4)
+    assert await _stored(sessions) == ({_key(BOOKED): 3, _key(BOOKED + 1): 1}, 4)
     assert await budget.used_24h() == 4
     assert await budget.remaining() == 6
 
 
 @pytest.mark.anyio
 @pytest.mark.db
-async def test_the_hour_bucket_is_utc_whatever_the_clock_zone(sessions: Sessions) -> None:
-    """An aware instant in another zone is counted in its UTC hour."""
+async def test_the_minute_bucket_is_utc_whatever_the_clock_zone(sessions: Sessions) -> None:
+    """An aware instant in another zone is counted in its UTC minute."""
     clock = _Clock(NOW.astimezone(timezone(timedelta(hours=-4))))
     await _budget(sessions, clock=clock).acquire()
 
-    assert await _stored(sessions) == ({"2026-10-07T14": 1}, 1)
+    assert await _stored(sessions) == ({"2026-10-07T14:32": 1}, 1)
 
 
 @pytest.mark.anyio
 @pytest.mark.db
-async def test_the_default_clock_counts_in_the_current_utc_hour(sessions: Sessions) -> None:
-    """Without an injected clock, the call lands in the hour of now plus the bound."""
+async def test_the_default_clock_counts_in_the_minute_of_now_plus_the_bound(
+    sessions: Sessions,
+) -> None:
+    """Without an injected clock, the call lands in the minute of now plus the bound."""
     budget = GoogleCallBudget(_settings(5), sessionmaker=sessions)
     bound = budget_guard._DISPATCH_BOUND
     before = datetime.now(UTC)
@@ -800,15 +992,16 @@ async def test_the_default_clock_counts_in_the_current_utc_hour(sessions: Sessio
 
     stored = await _stored(sessions)
     assert stored is not None
-    hourly, total = stored
-    assert isinstance(hourly, dict)
-    hours = {(before + bound).strftime(KEY_FORMAT), (after + bound).strftime(KEY_FORMAT)}
-    # Both hours are booked only when the clock passed hh:57:40 between the reading under
-    # the lock and the one after the commit, which re-books the call in the later hour.
-    assert hourly
-    assert set(hourly) <= hours
-    assert set(hourly.values()) == {1}
-    assert total == len(hourly)
+    by_minute, total = stored
+    assert isinstance(by_minute, dict)
+    minutes = {(before + bound).strftime(KEY_FORMAT), (after + bound).strftime(KEY_FORMAT)}
+    # Both minutes are booked only when the clock passed a minute's 40 s mark between the
+    # reading under the lock and the one after the commit, which re-books the call in the
+    # later minute.
+    assert by_minute
+    assert set(by_minute) <= minutes
+    assert set(by_minute.values()) == {1}
+    assert total == len(by_minute)
 
 
 @pytest.mark.anyio
@@ -830,7 +1023,7 @@ async def test_acquire_writes_only_the_counters_of_an_existing_row(sessions: Ses
                 active_dataset_id=dataset.id,
                 last_attempt_at=attempted,
                 calls_24h=2,
-                calls_hourly={_key(-1): 2},
+                calls_by_minute={_key(-1): 2},
             )
         )
         dataset_id = dataset.id
@@ -841,7 +1034,7 @@ async def test_acquire_writes_only_the_counters_of_an_existing_row(sessions: Ses
         row = (await session.scalars(select(SourceConnection))).one()
     assert (row.mode, row.status, row.reason) == ("live", "stale", reason)
     assert (row.active_dataset_id, row.last_attempt_at) == (dataset_id, attempted)
-    assert (row.calls_hourly, row.calls_24h) == ({_key(-1): 2, _key(0): 1}, 3)
+    assert (row.calls_by_minute, row.calls_24h) == ({_key(-1): 2, _key(BOOKED): 1}, 3)
 
 
 @pytest.mark.anyio
@@ -869,7 +1062,7 @@ async def test_acquire_refuses_at_the_cap_and_counts_nothing(
     assert error.http_status is None
     assert error.retry_after == FULL_DAY
     assert error.message == "Google call budget exhausted: 3 of 3 calls in the last 24 h"
-    assert await _stored(sessions) == ({_key(0): 3}, 3)
+    assert await _stored(sessions) == ({_key(BOOKED): 3}, 3)
     assert log_events == [
         (
             "warning",
@@ -894,7 +1087,9 @@ async def test_a_refused_call_fits_exactly_retry_after_seconds_later(sessions: S
         await budget.acquire()
     retry_after = first.value.retry_after
     assert retry_after is not None
-    assert retry_after == (_start(-20) + timedelta(hours=25) - NOW).total_seconds()
+    # The first call, made 20 h before NOW, was booked in 18:32 the day before.
+    assert retry_after == (_freed_at(_start(BOOKED - 20 * 60)) - NOW).total_seconds()
+    assert retry_after == 4 * 3600 + 150
 
     clock.advance(timedelta(seconds=retry_after - 1))
     with pytest.raises(CallBudgetExhausted) as second:
@@ -904,34 +1099,135 @@ async def test_a_refused_call_fits_exactly_retry_after_seconds_later(sessions: S
     clock.advance(timedelta(seconds=1))
     await budget.acquire()
 
-    assert await _stored(sessions) == ({_key(0): 1, _key(5): 1}, 2)
+    # Admitted at 18:33:00, the call is booked in 18:35.
+    assert await _stored(sessions) == ({_key(BOOKED): 1, "2026-10-07T18:35": 1}, 2)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("made", "booked", "probe", "probe_retry_after", "freed_key"),
+    [
+        pytest.param(
+            datetime(2026, 10, 8, 10, 30, tzinfo=UTC),
+            "2026-10-08T10:32",
+            timedelta(hours=24, seconds=1),
+            179.0,
+            "2026-10-09T10:35",
+            id="made-at-10h30m00s",
+        ),
+        pytest.param(
+            datetime(2026, 10, 8, 10, 58, tzinfo=UTC),
+            "2026-10-08T11:00",
+            timedelta(hours=24, seconds=30),
+            150.0,
+            "2026-10-09T11:03",
+            id="made-at-10h58m00s",
+        ),
+    ],
+)
+async def test_calls_at_the_cap_free_up_24_hours_after_their_booked_minute_ends(
+    sessions: Sessions,
+    made: datetime,
+    booked: str,
+    probe: timedelta,
+    probe_retry_after: float,
+    freed_key: str,
+) -> None:
+    """The cap holds for a sliding 24 h: admission resumes 24 h and 3 min after the calls.
+
+    Five calls made at ``made`` under a cap of 5 are booked in the minute holding ``made``
+    plus the 140 s dispatch bound, and stop counting 24 h after that minute ends: a call is
+    refused a second before, and admitted at that instant.
+    """
+    clock = _Clock(made)
+    budget = _budget(sessions, cap=5, clock=clock)
+    for _ in range(5):
+        await budget.acquire()
+    assert await _stored(sessions) == ({booked: 5}, 5)
+
+    clock.now = made + timedelta(seconds=1)
+    with pytest.raises(CallBudgetExhausted) as at_once:
+        await budget.acquire()
+    assert at_once.value.retry_after == 86579.0
+
+    clock.now = made + probe
+    with pytest.raises(CallBudgetExhausted) as next_day:
+        await budget.acquire()
+    assert next_day.value.retry_after == probe_retry_after
+
+    freed = made + timedelta(hours=24, minutes=3)
+    clock.now = freed - timedelta(seconds=1)
+    with pytest.raises(CallBudgetExhausted) as last_second:
+        await budget.acquire()
+    assert last_second.value.retry_after == 1.0
+
+    clock.now = freed
+    await budget.acquire()
+    assert await _stored(sessions) == ({freed_key: 1}, 1)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_call_counts_for_24_hours_plus_the_bound_and_at_most_one_minute_more(
+    sessions: Sessions,
+) -> None:
+    """Wherever in its minute a call is admitted, it counts 24 h plus the bound, at most 1 min more.
+
+    At every whole second of a minute, and at its last microsecond, a call admitted under a
+    cap of 1 is still refused 24 h plus the 140 s dispatch bound less 1 s later. Its
+    ``retry_after`` ends after 24 h plus the bound and no later than one minute more, and
+    a call made then is admitted.
+    """
+    bound = budget_guard._DISPATCH_BOUND
+    minute = datetime(2026, 10, 8, 10, 30, tzinfo=UTC)
+    offsets = [timedelta(seconds=second) for second in range(60)]
+    offsets.append(timedelta(seconds=59, microseconds=999999))
+    for offset in offsets:
+        await _clear(sessions)
+        admitted = minute + offset
+        clock = _Clock(admitted)
+        budget = _budget(sessions, cap=1, clock=clock)
+        await budget.acquire()
+
+        clock.now = admitted + WINDOW + bound - timedelta(seconds=1)
+        with pytest.raises(CallBudgetExhausted) as raised:
+            await budget.acquire()
+        retry_after = raised.value.retry_after
+        assert retry_after is not None
+        freed = clock.now + timedelta(seconds=retry_after)
+        assert admitted + WINDOW + bound < freed <= admitted + WINDOW + bound + BUCKET_WIDTH
+
+        clock.now = admitted + WINDOW + bound + BUCKET_WIDTH
+        await budget.acquire()
+        assert await budget.used_24h() == 1
 
 
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_a_refusal_persists_the_pruned_window(sessions: Sessions) -> None:
     """A refused call still writes the pruned counters, so ``calls_24h`` stays current."""
-    await _seed_counts(sessions, {_key(-30): 5, _key(-25): 1, _key(0): 2}, 8)
+    await _seed_counts(sessions, {_key(-DAY - 300): 5, _key(-DAY - 1): 1, _key(BOOKED): 2}, 8)
 
     with pytest.raises(CallBudgetExhausted) as raised:
         await _budget(sessions, cap=2).acquire()
 
     assert raised.value.retry_after == FULL_DAY
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
 
 
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_a_refusal_leaves_a_clean_row_unwritten(sessions: Sessions) -> None:
     """When pruning changes nothing, a refused call does not rewrite the row."""
-    await _seed_counts(sessions, {_key(0): 2}, 2)
+    await _seed_counts(sessions, {_key(BOOKED): 2}, 2)
     version = await _row_version(sessions)
 
     with pytest.raises(CallBudgetExhausted):
         await _budget(sessions, cap=2).acquire()
 
     assert await _row_version(sessions) == version
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
 
 
 @pytest.mark.anyio
@@ -940,14 +1236,14 @@ async def test_a_lowered_cap_holds_at_once_and_frees_after_enough_buckets_leave(
     sessions: Sessions,
 ) -> None:
     """Calls counted above a lowered cap stay counted until enough of them leave."""
-    await _seed_counts(sessions, {_key(-24): 2, _key(-10): 2, _key(0): 1}, 5)
+    await _seed_counts(sessions, {_key(-DAY): 2, _key(-600): 2, _key(BOOKED): 1}, 5)
     clock = _Clock()
     budget = _budget(sessions, cap=3, clock=clock)
 
     with pytest.raises(CallBudgetExhausted) as raised:
         await budget.acquire()
 
-    retry_after = (_start(-10) + timedelta(hours=25) - NOW).total_seconds()
+    retry_after = (_freed_at(_start(-600)) - NOW).total_seconds()
     assert raised.value.retry_after == retry_after
     assert raised.value.message == "Google call budget exhausted: 5 of 3 calls in the last 24 h"
     assert await budget.remaining() == 0
@@ -955,7 +1251,8 @@ async def test_a_lowered_cap_holds_at_once_and_frees_after_enough_buckets_leave(
     clock.advance(timedelta(seconds=retry_after))
     await budget.acquire()
 
-    assert await _stored(sessions) == ({_key(0): 1, _key(15): 1}, 2)
+    # Admitted at the next day's 04:31:00, the call is booked in 04:33.
+    assert await _stored(sessions) == ({_key(BOOKED): 1, "2026-10-08T04:33": 1}, 2)
 
 
 @pytest.mark.anyio
@@ -979,8 +1276,8 @@ async def test_a_cap_of_zero_refuses_every_call_with_no_retry_after(sessions: Se
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_buckets_ahead_of_the_clock_are_counted(sessions: Sessions) -> None:
-    """Calls a process with a fast clock wrote in a later hour still count against the cap."""
-    await _seed_counts(sessions, {_key(3): 2}, 2)
+    """Calls a process with a fast clock wrote in a later minute still count against the cap."""
+    await _seed_counts(sessions, {_key(BOOKED + 180): 2}, 2)
     budget = _budget(sessions, cap=2)
 
     with pytest.raises(CallBudgetExhausted) as raised:
@@ -1005,21 +1302,23 @@ async def test_used_24h_without_a_row_is_zero_and_creates_none(sessions: Session
 @pytest.mark.db
 async def test_used_24h_returns_and_persists_the_pruned_sum(sessions: Sessions) -> None:
     """``used_24h`` sums the window, writes the pruned row once, and follows the clock."""
-    await _seed_counts(sessions, {_key(-25): 4, _key(-24): 1, _key(-1): 2, _key(0): 1}, 9)
+    await _seed_counts(
+        sessions, {_key(-DAY - 1): 4, _key(-DAY): 1, _key(-1): 2, _key(BOOKED): 1}, 9
+    )
     clock = _Clock()
     budget = _budget(sessions, cap=5, clock=clock)
 
     assert await budget.used_24h() == 4
-    assert await _stored(sessions) == ({_key(-24): 1, _key(-1): 2, _key(0): 1}, 4)
+    assert await _stored(sessions) == ({_key(-DAY): 1, _key(-1): 2, _key(BOOKED): 1}, 4)
 
     version = await _row_version(sessions)
     assert await budget.used_24h() == 4
     assert await budget.remaining() == 1
     assert await _row_version(sessions) == version
 
-    clock.advance(timedelta(hours=1))
+    clock.advance(BUCKET_WIDTH)
     assert await budget.used_24h() == 3
-    assert await _stored(sessions) == ({_key(-1): 2, _key(0): 1}, 3)
+    assert await _stored(sessions) == ({_key(-1): 2, _key(BOOKED): 1}, 3)
 
 
 @pytest.mark.anyio
@@ -1030,21 +1329,21 @@ async def test_corrupt_stored_buckets_are_discarded_and_never_block_a_call(
     """Hand-edited entries are dropped with one warning; the fractional count is rounded up."""
     corrupt = {
         "not-a-key": 50,
-        "2026-02-30T00": 50,
+        "2026-02-30T00:00": 50,
         _key(-1): -3,
         _key(-2): "7",
         _key(-3): True,
         _key(-4): None,
-        _key(0): 1.2,
+        _key(BOOKED): 1.2,
     }
     await _seed_counts(sessions, corrupt, 999)
     budget = _budget(sessions, cap=3)
 
     assert await budget.used_24h() == 2
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
     await budget.acquire()
 
-    assert await _stored(sessions) == ({_key(0): 3}, 3)
+    assert await _stored(sessions) == ({_key(BOOKED): 3}, 3)
     assert log_events == [
         ("warning", "google.budget.buckets_discarded", {"source": "google", "discarded": 6})
     ]
@@ -1052,19 +1351,115 @@ async def test_corrupt_stored_buckets_are_discarded_and_never_block_a_call(
 
 @pytest.mark.anyio
 @pytest.mark.db
-@pytest.mark.parametrize("hourly_json", ["null", "[]", "[1, 2]", '"2026-10-07T14"', "3"])
-async def test_a_stored_value_that_is_not_an_object_is_reset(
-    sessions: Sessions, log_events: list[LogEvent], hourly_json: str
+async def test_calls_counted_in_hour_buckets_count_until_the_former_window_frees_them(
+    sessions: Sessions, log_events: list[LogEvent]
 ) -> None:
-    """A ``calls_hourly`` that is not a JSON object is reset to ``{}`` and calls go on."""
-    await _seed(sessions, hourly_json, 4)
+    """A row in the former ``YYYY-MM-DDTHH`` format loses no call it counted.
+
+    The row holds 5 calls of the 10:00 hour against a cap of 5. They move to the 10:59
+    bucket, which stops counting at the next day's 11:00, exactly when the former window
+    of 25 hour buckets released them: a call is refused until then, and admitted at once.
+    """
+    await _seed_counts(sessions, {"2026-10-08T10": 5}, 5)
+    clock = _Clock(datetime(2026, 10, 8, 10, 31, tzinfo=UTC))
+    budget = _budget(sessions, cap=5, clock=clock)
+
+    with pytest.raises(CallBudgetExhausted) as at_once:
+        await budget.acquire()
+    assert at_once.value.retry_after == 88140.0
+    assert await _stored(sessions) == ({"2026-10-08T10:59": 5}, 5)
+
+    clock.now = datetime(2026, 10, 9, 10, 59, 59, tzinfo=UTC)
+    with pytest.raises(CallBudgetExhausted) as last_second:
+        await budget.acquire()
+    assert last_second.value.retry_after == 1.0
+
+    clock.now = datetime(2026, 10, 9, 11, 0, tzinfo=UTC)
+    await budget.acquire()
+
+    assert await _stored(sessions) == ({"2026-10-09T11:02": 1}, 1)
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1}),
+        (
+            "warning",
+            "google.budget.exhausted",
+            {"source": "google", "used": 5, "cap": 5, "retry_after": 88140.0},
+        ),
+        ("info", "google.budget", {"source": "google", "used": 5, "cap": 5, "remaining": 0}),
+        (
+            "warning",
+            "google.budget.exhausted",
+            {"source": "google", "used": 5, "cap": 5, "retry_after": 1.0},
+        ),
+        ("info", "google.budget", {"source": "google", "used": 5, "cap": 5, "remaining": 0}),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_an_admitted_call_rewrites_hour_buckets_in_minute_keys(
+    sessions: Sessions, log_events: list[LogEvent]
+) -> None:
+    """A call admitted beside hour buckets is booked, and the row is stored by minute."""
+    await _seed_counts(sessions, {"2026-10-08T09": 1, "2026-10-08T10": 3}, 4)
+    budget = _budget(sessions, cap=5, clock=_Clock(datetime(2026, 10, 8, 10, 31, tzinfo=UTC)))
+
+    await budget.acquire()
+
+    stored = {"2026-10-08T09:59": 1, "2026-10-08T10:33": 1, "2026-10-08T10:59": 3}
+    assert await _stored(sessions) == (stored, 5)
+    with pytest.raises(CallBudgetExhausted) as raised:
+        await budget.acquire()
+    # The 09:00 hour's call frees up first, at 10:00 the next day.
+    assert raised.value.retry_after == 84540.0 == 23 * 3600 + 29 * 60
+    assert await _stored(sessions) == (stored, 5)
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 2}),
+        (
+            "warning",
+            "google.budget.exhausted",
+            {"source": "google", "used": 5, "cap": 5, "retry_after": 84540.0},
+        ),
+        ("info", "google.budget", {"source": "google", "used": 5, "cap": 5, "remaining": 0}),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_used_24h_counts_and_persists_a_row_counted_in_hour_buckets(
+    sessions: Sessions, log_events: list[LogEvent]
+) -> None:
+    """``used_24h`` counts an hour key's calls and rewrites the row once, in minute keys."""
+    await _seed_counts(sessions, {"2026-10-08T10": 5}, 5)
+    budget = _budget(sessions, cap=5, clock=_Clock(datetime(2026, 10, 8, 10, 31, tzinfo=UTC)))
+
+    assert await budget.used_24h() == 5
+    assert await _stored(sessions) == ({"2026-10-08T10:59": 5}, 5)
+
+    version = await _row_version(sessions)
+    assert await budget.used_24h() == 5
+    assert await budget.remaining() == 0
+    assert await _row_version(sessions) == version
+    assert log_events == [
+        ("info", "google.budget.hour_buckets_converted", {"source": "google", "converted": 1})
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize("stored_json", ["null", "[]", "[1, 2]", '"2026-10-07T14:30"', "3"])
+async def test_a_stored_value_that_is_not_an_object_is_reset(
+    sessions: Sessions, log_events: list[LogEvent], stored_json: str
+) -> None:
+    """A ``calls_by_minute`` that is not a JSON object is reset to ``{}`` and calls go on."""
+    await _seed(sessions, stored_json, 4)
     budget = _budget(sessions, cap=3)
 
     assert await budget.used_24h() == 0
     assert await _stored(sessions) == ({}, 0)
     await budget.acquire()
 
-    assert await _stored(sessions) == ({_key(0): 1}, 1)
+    assert await _stored(sessions) == ({_key(BOOKED): 1}, 1)
     assert log_events == [
         ("warning", "google.budget.buckets_discarded", {"source": "google", "discarded": 1})
     ]
@@ -1086,7 +1481,7 @@ async def test_every_fiftieth_call_in_the_window_logs_budget_usage(
     assert log_events == [
         ("info", "google.budget", {"source": "google", "used": 50, "cap": 1000, "remaining": 950})
     ]
-    assert await _stored(sessions) == ({_key(-1): 48, _key(0): 2}, 50)
+    assert await _stored(sessions) == ({_key(-1): 48, _key(BOOKED): 2}, 50)
 
 
 @pytest.mark.anyio
@@ -1115,7 +1510,7 @@ async def test_concurrent_acquires_never_exceed_the_cap(sessions: Sessions) -> N
     assert len(admitted) == 5
     assert len(refused) == 15
     assert {error.retry_after for error in refused} == {FULL_DAY}
-    assert await _stored(sessions) == ({_key(0): 5}, 5)
+    assert await _stored(sessions) == ({_key(BOOKED): 5}, 5)
     assert await _row_count(sessions) == 1
 
 
@@ -1142,18 +1537,20 @@ async def test_acquire_waits_for_a_transaction_holding_the_row(sessions: Session
                 await holder.commit()
 
     assert waited
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
 
 
-ASKED_LATE = datetime(2026, 10, 6, 10, 59, 59, tzinfo=UTC)
-"""A call asked for one second before the hour's end, inside the dispatch bound."""
+ASKED_LATE = datetime(2026, 10, 6, 10, 59, 39, tzinfo=UTC)
+"""A call asked for 21 s before the hour's end: placed by this reading, it would be booked
+in 11:01, one minute before the post-lock reading books it."""
 
 ASKED_EARLY = datetime(2026, 10, 6, 10, 57, 30, tzinfo=UTC)
-"""A call asked for 150 s before the hour's end, outside the 140 s dispatch bound: only a
-post-lock reading places it later."""
+"""A call asked for 150 s before the hour's end: placed by this reading, it would be booked
+in 10:59, three minutes before the post-lock reading books it."""
 
 ADMITTED = datetime(2026, 10, 6, 11, 0, 5, tzinfo=UTC)
-"""When the holder of the row lock commits and the waiting call is admitted."""
+"""When the holder of the row lock commits and the waiting call is admitted, to be booked
+in 11:02."""
 
 
 class _SequenceClock:
@@ -1175,18 +1572,19 @@ class _SequenceClock:
 @pytest.mark.parametrize(
     "asked",
     [
-        pytest.param(ASKED_LATE, id="asked-at-10h59m59s"),
+        pytest.param(ASKED_LATE, id="asked-at-10h59m39s"),
         pytest.param(ASKED_EARLY, id="asked-at-10h57m30s"),
     ],
 )
-async def test_a_call_that_waits_for_the_lock_across_the_hour_counts_from_its_admission(
+async def test_a_call_that_waits_for_the_lock_across_minutes_counts_from_its_admission(
     sessions: Sessions, asked: datetime
 ) -> None:
     """The clock is read once the row lock is held, so a call cannot expire under 24 h.
 
-    The call asks at ``asked`` in hour 10, waits for the lock until 11:00:05 and is booked
-    in hour 11. With a cap of 1, the next day's 11:00:01, under 24 h after the call, is
-    still refused, and the call frees up only once hour 11's bucket leaves the window.
+    The call asks at ``asked``, waits for the lock until 11:00:05 and is booked in minute
+    11:02. With a cap of 1, the next day's 11:00:01, under 24 h after the call, is still
+    refused, and the call frees up only at 11:03:00, once minute 11:02's bucket leaves the
+    window.
     """
     await _seed_counts(sessions, {}, 0)
     clock = _Clock(asked)
@@ -1209,17 +1607,17 @@ async def test_a_call_that_waits_for_the_lock_across_the_hour_counts_from_its_ad
                 await holder.commit()
 
     assert waited
-    assert await _stored(sessions) == ({"2026-10-06T11": 1}, 1)
+    assert await _stored(sessions) == ({"2026-10-06T11:02": 1}, 1)
 
     clock.now = datetime(2026, 10, 7, 11, 0, 1, tzinfo=UTC)
     with pytest.raises(CallBudgetExhausted) as raised:
         await budget.acquire()
-    assert raised.value.retry_after == 3599.0
+    assert raised.value.retry_after == 179.0
     assert await budget.used_24h() == 1
 
-    clock.advance(timedelta(seconds=3599))
+    clock.advance(timedelta(seconds=179))
     await budget.acquire()
-    assert await _stored(sessions) == ({"2026-10-07T12": 1}, 1)
+    assert await _stored(sessions) == ({"2026-10-07T11:05": 1}, 1)
 
 
 @pytest.mark.anyio
@@ -1227,8 +1625,12 @@ async def test_a_call_that_waits_for_the_lock_across_the_hour_counts_from_its_ad
 async def test_used_24h_that_waits_for_the_lock_prunes_at_the_instant_it_holds_it(
     sessions: Sessions,
 ) -> None:
-    """A bucket that leaves the window while ``used_24h`` waits for the lock is not counted."""
-    await _seed_counts(sessions, {"2026-10-05T10": 1}, 1)
+    """A bucket that leaves the window while ``used_24h`` waits for the lock is not counted.
+
+    The bucket of the day before's 10:59 counts until 11:00:00, after the 10:59:39 asking
+    and before the 11:00:05 admission.
+    """
+    await _seed_counts(sessions, {"2026-10-05T10:59": 1}, 1)
     clock = _Clock(ASKED_LATE)
     budget = _budget(sessions, cap=1, clock=clock)
     counted: list[int] = []
@@ -1261,7 +1663,7 @@ async def test_the_call_is_placed_by_the_clock_read_inside_the_transaction(
     """The first reading only checks the clock; the one under the lock places the call.
 
     The third, after the commit, only confirms that a POST starting within the dispatch
-    bound of it still falls in the booked hour.
+    bound of it still falls in the booked minute.
     """
     if existing:
         await _seed_counts(sessions, {}, 0)
@@ -1271,7 +1673,7 @@ async def test_the_call_is_placed_by_the_clock_read_inside_the_transaction(
     await GoogleCallBudget(_settings(5), sessionmaker=sessions, clock=clock).acquire()
 
     assert clock.reads == [ASKED_EARLY, ADMITTED, committed]
-    assert await _stored(sessions) == ({"2026-10-06T11": 1}, 1)
+    assert await _stored(sessions) == ({"2026-10-06T11:02": 1}, 1)
 
 
 @pytest.mark.anyio
@@ -1286,7 +1688,7 @@ async def test_a_naive_reading_after_the_commit_raises_and_leaves_the_booking_co
         await GoogleCallBudget(_settings(5), sessionmaker=sessions, clock=clock).acquire()
 
     assert len(clock.reads) == 3
-    assert await _stored(sessions) == ({_key(0): 1}, 1)
+    assert await _stored(sessions) == ({_key(BOOKED): 1}, 1)
 
 
 def _sessions_delaying_updates(sessions: Sessions, clock: _Clock, *delays: timedelta) -> Sessions:
@@ -1324,31 +1726,32 @@ def _expired(booked: str, needed: str) -> LogEvent:
 
 @pytest.mark.anyio
 @pytest.mark.db
-async def test_a_booking_whose_commit_outlasts_its_hour_stays_counted_and_cap_one_refuses(
+async def test_a_booking_whose_commit_outlasts_its_minute_stays_counted_and_cap_one_refuses(
     sessions: Sessions, log_events: list[LogEvent]
 ) -> None:
-    """A 300 s UPDATE pushes the POST past hour 10; the re-reservation is refused at cap 1.
+    """A 60 s UPDATE pushes the POST past minute 10:57; the re-reservation is refused at cap 1.
 
-    Booked at 10:55:00 in hour 10, the commit returns at 11:00:00, when the POST could
-    leave as late as 11:02:20. The expired booking stays counted, so the re-reservation
+    Booked at 10:55:00 in minute 10:57, the commit returns at 10:56:00, when the POST could
+    leave as late as 10:58:20. The expired booking stays counted, so the re-reservation
     under the lock finds the cap reached and no POST may be sent.
     """
     clock = _Clock(DISPATCH_ADMITTED)
-    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=300))
+    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=60))
     budget = GoogleCallBudget(_settings(1), sessionmaker=delayed, clock=clock)
 
     with pytest.raises(CallBudgetExhausted) as raised:
         await budget.acquire()
 
-    assert clock.now == datetime(2026, 10, 6, 11, tzinfo=UTC)
-    assert raised.value.retry_after == 86400.0
-    assert await _stored(sessions) == ({"2026-10-06T10": 1}, 1)
+    # The booking of 10:57 frees up at the next day's 10:58:00, 24 h and 2 min away.
+    assert clock.now == datetime(2026, 10, 6, 10, 56, tzinfo=UTC)
+    assert raised.value.retry_after == 86520.0
+    assert await _stored(sessions) == ({"2026-10-06T10:57": 1}, 1)
     assert log_events == [
-        _expired("2026-10-06T10", "2026-10-06T11"),
+        _expired("2026-10-06T10:57", "2026-10-06T10:58"),
         (
             "warning",
             "google.budget.exhausted",
-            {"source": "google", "used": 1, "cap": 1, "retry_after": 86400.0},
+            {"source": "google", "used": 1, "cap": 1, "retry_after": 86520.0},
         ),
         ("info", "google.budget", {"source": "google", "used": 1, "cap": 1, "remaining": 0}),
     ]
@@ -1356,48 +1759,48 @@ async def test_a_booking_whose_commit_outlasts_its_hour_stays_counted_and_cap_on
 
 @pytest.mark.anyio
 @pytest.mark.db
-async def test_a_booking_whose_commit_outlasts_its_hour_is_made_again_in_the_later_hour(
+async def test_a_booking_whose_commit_outlasts_its_minute_is_made_again_in_the_later_minute(
     sessions: Sessions, log_events: list[LogEvent]
 ) -> None:
-    """Under a cap of 2 the call is re-booked in hour 11, and both bookings count.
+    """Under a cap of 2 the call is re-booked in minute 10:58, and both bookings count.
 
-    ``acquire`` returns at 11:00:00, so the POST leaves between then and 11:02:20, inside
-    the re-booked hour 11. The over-count admits no second call until 24 h after that
-    return, and the re-booked call still counts 24 h after the latest instant its POST
-    could leave.
+    ``acquire`` returns at 10:56:00, so the POST leaves between then and 10:58:20, inside
+    the re-booked minute 10:58. The over-count admits no second call until the first
+    booking frees up at the next day's 10:58:00, and the re-booked call still counts 24 h
+    after the latest instant its POST could leave.
     """
     clock = _Clock(DISPATCH_ADMITTED)
-    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=300))
+    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=60))
     budget = GoogleCallBudget(_settings(2), sessionmaker=delayed, clock=clock)
 
     await budget.acquire()
 
     returned = clock.now
     latest_post = returned + budget_guard._DISPATCH_BOUND
-    assert returned == datetime(2026, 10, 6, 11, tzinfo=UTC)
-    assert budget_guard._hour_start(latest_post) == datetime(2026, 10, 6, 11, tzinfo=UTC)
-    assert await _stored(sessions) == ({"2026-10-06T10": 1, "2026-10-06T11": 1}, 2)
-    assert log_events == [_expired("2026-10-06T10", "2026-10-06T11")]
+    assert returned == datetime(2026, 10, 6, 10, 56, tzinfo=UTC)
+    assert budget_guard._bucket_start(latest_post) == datetime(2026, 10, 6, 10, 58, tzinfo=UTC)
+    assert await _stored(sessions) == ({"2026-10-06T10:57": 1, "2026-10-06T10:58": 1}, 2)
+    assert log_events == [_expired("2026-10-06T10:57", "2026-10-06T10:58")]
 
-    with pytest.raises(CallBudgetExhausted) as same_hour:
+    with pytest.raises(CallBudgetExhausted) as same_minute:
         await budget.acquire()
-    assert same_hour.value.retry_after == 86400.0
+    assert same_minute.value.retry_after == 86520.0
 
-    clock.now = returned + timedelta(hours=24) - timedelta(seconds=1)
+    clock.now = datetime(2026, 10, 7, 10, 57, 59, tzinfo=UTC)
     with pytest.raises(CallBudgetExhausted) as next_day:
         await budget.acquire()
     assert next_day.value.retry_after == 1.0
 
     clock.advance(timedelta(seconds=1))
     await budget.acquire()
-    assert await _stored(sessions) == ({"2026-10-06T11": 1, "2026-10-07T11": 1}, 2)
+    assert await _stored(sessions) == ({"2026-10-06T10:58": 1, "2026-10-07T11:00": 1}, 2)
 
     with pytest.raises(CallBudgetExhausted) as full:
         await budget.acquire()
     retry_after = full.value.retry_after
     assert retry_after is not None
-    assert retry_after == 3600.0
-    assert clock.now + timedelta(seconds=retry_after) >= latest_post + timedelta(hours=24)
+    assert retry_after == 60.0
+    assert clock.now + timedelta(seconds=retry_after) >= latest_post + WINDOW
 
 
 @pytest.mark.anyio
@@ -1421,7 +1824,7 @@ async def test_a_lock_held_past_the_lock_timeout_fails_and_counts_nothing(
     # SQLSTATE 55P03 is lock_not_available, raised when lock_timeout expires.
     assert getattr(raised.value.orig, "sqlstate", None) == "55P03"
     assert waited >= 9.0
-    assert await _stored(sessions) == ({_key(0): 1}, 1)
+    assert await _stored(sessions) == ({_key(BOOKED): 1}, 1)
 
 
 @pytest.mark.anyio
@@ -1588,7 +1991,7 @@ async def test_every_post_attempt_is_metered_retries_included(sessions: Sessions
     ]
     assert len(waits) == 1
     assert await budget.used_24h() == 2
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
 
 
 @pytest.mark.anyio
@@ -1622,7 +2025,7 @@ async def test_a_budget_used_up_between_retries_ends_the_retries(sessions: Sessi
 
     assert len(webhook.requests) == 2
     assert len(waits) == 2
-    assert await _stored(sessions) == ({_key(0): 2}, 2)
+    assert await _stored(sessions) == ({_key(BOOKED): 2}, 2)
 
 
 class _TimedWebhook(_Webhook):
@@ -1653,25 +2056,26 @@ class _TimedWebhook(_Webhook):
 async def test_no_post_is_sent_on_a_booking_that_expired_during_its_commit(
     sessions: Sessions,
 ) -> None:
-    """A commit delayed past the booked hour sends nothing under a cap of 1, and never retries.
+    """A commit delayed past the booked minute sends nothing under a cap of 1, never retries.
 
-    Booked at 10:55:00 in hour 10, the commit returns at 11:00:00, so the POST could leave
-    in hour 11, which the booking does not cover. The re-reservation finds the cap reached.
+    Booked at 10:55:00 in minute 10:57, the commit returns at 10:56:00, so the POST could
+    leave in minute 10:58, which the booking does not cover. The re-reservation finds the
+    cap reached.
     """
     clock = _Clock(DISPATCH_ADMITTED)
     webhook = _TimedWebhook(clock, timedelta(0), (200, SEARCH_RESPONSE))
-    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=300))
+    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=60))
     budget = GoogleCallBudget(_settings(1), sessionmaker=delayed, clock=clock)
     waits: list[float] = []
 
     with pytest.raises(CallBudgetExhausted) as raised:
         await _search(webhook, budget, waits)
 
-    assert raised.value.retry_after == 86400.0
+    assert raised.value.retry_after == 86520.0
     assert webhook.requests == []
     assert webhook.sent_at == []
     assert waits == []
-    assert await _stored(sessions) == ({"2026-10-06T10": 1}, 1)
+    assert await _stored(sessions) == ({"2026-10-06T10:57": 1}, 1)
 
 
 @pytest.mark.anyio
@@ -1679,40 +2083,43 @@ async def test_no_post_is_sent_on_a_booking_that_expired_during_its_commit(
 async def test_a_post_delayed_up_to_the_bound_counts_for_24_hours_after_it_leaves(
     sessions: Sessions,
 ) -> None:
-    """A 100 s commit and a 139 s connection wait still send the POST in its booked hour.
+    """A 49 s commit and a 139 s connection wait still send the POST in its booked minute.
 
-    Admitted at 10:57:50, the call is booked in hour 11. The commit returns at 10:59:30 and
-    the POST leaves 139 s later, at 11:01:49, so the booking covers it. Under a cap of 1, a
-    second POST is refused until hour 11's bucket leaves the window, over 24 h later.
+    Admitted at 10:57:50, the call is booked in minute 11:00. The commit returns at 10:58:39
+    and the POST leaves 139 s later, at 11:00:58, so the booking covers it. Under a cap of
+    1, a second POST is refused until minute 11:00's bucket leaves the window, 24 h after
+    that minute ends.
     """
     clock = _Clock(datetime(2026, 10, 6, 10, 57, 50, tzinfo=UTC))
     dispatch_wait = budget_guard._DISPATCH_BOUND - timedelta(seconds=1)
     webhook = _TimedWebhook(clock, dispatch_wait, (200, SEARCH_RESPONSE))
-    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=100))
+    delayed = _sessions_delaying_updates(sessions, clock, timedelta(seconds=49))
     budget = GoogleCallBudget(_settings(1), sessionmaker=delayed, clock=clock)
     waits: list[float] = []
 
     await _search(webhook, budget, waits)
 
-    assert await _stored(sessions) == ({"2026-10-06T11": 1}, 1)
-    booked = budget_guard._parse_bucket_key("2026-10-06T11")
+    assert await _stored(sessions) == ({"2026-10-06T11:00": 1}, 1)
+    booked = budget_guard._parse_bucket_key("2026-10-06T11:00")
     assert booked is not None
     first = webhook.sent_at[0]
-    assert first == datetime(2026, 10, 6, 11, 1, 49, tzinfo=UTC)
-    assert budget_guard._hour_start(first) <= booked
+    assert first == datetime(2026, 10, 6, 11, 0, 58, tzinfo=UTC)
+    assert budget_guard._bucket_start(first) <= booked
 
-    clock.now = first + timedelta(hours=24) - timedelta(seconds=1)
+    clock.now = first + WINDOW - timedelta(seconds=1)
     with pytest.raises(CallBudgetExhausted) as raised:
         await _search(webhook, budget, waits)
     retry_after = raised.value.retry_after
     assert retry_after is not None
-    assert clock.now + timedelta(seconds=retry_after) == booked + timedelta(hours=WINDOW_BUCKETS)
+    assert retry_after == 3.0
+    assert clock.now + timedelta(seconds=retry_after) == _freed_at(booked)
     assert len(webhook.sent_at) == 1
 
     clock.advance(timedelta(seconds=retry_after))
     await _search(webhook, budget, waits)
 
     assert len(webhook.sent_at) == 2
-    assert webhook.sent_at[1] - first >= timedelta(hours=24)
+    assert webhook.sent_at[1] - first >= WINDOW
     assert waits == []
-    assert await _stored(sessions) == ({"2026-10-07T12": 1}, 1)
+    # Admitted at 11:01:00, the second call is booked in 11:03.
+    assert await _stored(sessions) == ({"2026-10-07T11:03": 1}, 1)

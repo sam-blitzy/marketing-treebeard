@@ -246,15 +246,16 @@ class SourceConnection(IdPkMixin, Base):
     ``sync/mode.py`` on every attempt. ``active_dataset_id`` is ``ON DELETE SET NULL`` so a
     purge never removes the connection row itself.
 
-    ``calls_hourly`` backs the product's own Google cap of ``GOOGLE_DAILY_CALL_BUDGET``
+    ``calls_by_minute`` backs the product's own Google cap of ``GOOGLE_DAILY_CALL_BUDGET``
     webhook calls per sliding 24 h (AAP 0.3.3). The cap must hold across the worker and the
     CLI processes, so the count lives in the database: ``sync/budget_guard.py`` keeps
-    per-UTC-hour call counts here, updated under ``SELECT ... FOR UPDATE`` on this row.
-    ``calls_24h`` is their total over the counted window, shown on ``/sources``: the
-    current UTC hour bucket, the 24 preceding ones and any bucket ahead of it. That is a
-    conservative upper bound on the calls in the trailing 24 hours, not an exact count: a
-    call stays counted for up to 25 hours, slightly longer when it is booked in the next
-    hour under the call budget's dispatch bound, and a call whose reservation had to be
+    per-UTC-minute call counts here, updated under ``SELECT ... FOR UPDATE`` on this row.
+    A call is booked in the minute by which its POST has started, and a minute bucket
+    counts until 24 hours after it ends. ``calls_24h`` is the total of the buckets still
+    counting, shown on ``/sources``. That is a tight upper bound on the calls in the
+    trailing 24 hours, not an exact count: a call counts from its admission until 24 hours
+    after the minute by which its POST has started, at most 24 hours plus the call
+    budget's 140 s dispatch bound plus one minute, and a call whose reservation had to be
     made again may count twice.
 
     Attributes:
@@ -265,9 +266,10 @@ class SourceConnection(IdPkMixin, Base):
             configured" or the platform's error code and failing endpoint.
         active_dataset_id: The source's active primary dataset, if any.
         last_attempt_at: When a job last called the source.
-        calls_24h: Call bookings in the counted window described above, a conservative
-            upper bound on the calls in the trailing 24 hours (server default ``0``).
-        calls_hourly: Call counts keyed by UTC hour (server default ``'{}'::jsonb``).
+        calls_24h: Call bookings in the counted window described above, a tight upper
+            bound on the calls in the trailing 24 hours (server default ``0``).
+        calls_by_minute: Call counts keyed by UTC minute, ``"YYYY-MM-DDTHH:MM"`` (server
+            default ``'{}'::jsonb``).
         access_generation: Incremented in the same transaction as every recorded access
             denial and every entry into automatic fallback (server default ``0``). A live
             build is bound to the value read before its probe and may activate only while
@@ -287,9 +289,9 @@ class SourceConnection(IdPkMixin, Base):
     )
     last_attempt_at: Mapped[datetime | None]
     calls_24h: Mapped[int] = mapped_column(server_default=sa.text("0"))
-    # Per-hour buckets rather than a single counter: a sliding 24 h window needs to drop
-    # the oldest hour as time passes, which a lone running total cannot do.
-    calls_hourly: Mapped[dict[str, Any]] = mapped_column(server_default=sa.text("'{}'::jsonb"))
+    # Per-minute buckets rather than a single counter: a sliding 24 h window needs to drop
+    # the oldest minute as time passes, which a lone running total cannot do.
+    calls_by_minute: Mapped[dict[str, Any]] = mapped_column(server_default=sa.text("'{}'::jsonb"))
     access_generation: Mapped[int] = mapped_column(server_default=sa.text("0"))
 
     __table_args__ = (
