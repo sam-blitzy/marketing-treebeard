@@ -280,15 +280,24 @@ describe('formatPercent', () => {
 });
 
 describe('formatCost', () => {
-  it('renders an em dash for a zero or unusable denominator', () => {
-    expect(formatCost('300', 0, 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', '0.000', 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', -1, 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', null, 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', undefined, 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', 'abc', 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', Number.POSITIVE_INFINITY, 'USD')).toBe(EM_DASH);
-    expect(formatCost('300', '1e400', 'USD')).toBe(EM_DASH);
+  it.each([0, -0, '0', '0.000', '-0.00'])('renders an em dash for the known zero %j', (zero) => {
+    expect(formatCost('300', zero, 'USD')).toBe(EM_DASH);
+  });
+
+  it.each([
+    null,
+    undefined,
+    '',
+    'abc',
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    '1e400',
+    -1,
+    '-0.5',
+  ])('renders the absent, unusable or negative denominator %j as unavailable', (denominator) => {
+    expect(formatCost('300', denominator, 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost('300', denominator, 'USD', 'no QL yet')).toBe(UNAVAILABLE);
   });
 
   it('names the reason after the dash', () => {
@@ -305,9 +314,46 @@ describe('formatCost', () => {
     expect(formatCost('10', 4, null)).toBe('2.5');
   });
 
+  it('divides exactly, never through a binary float', () => {
+    // A Number route renders $1,000,000,000,000.00 and $0.02 for the first two.
+    expect(formatCost('999999999999.994999', 1, 'USD')).toBe('$999,999,999,999.99');
+    expect(formatCost('0.075', 3, 'USD')).toBe('$0.03');
+    expect(formatCost('-0.075', 3, 'USD')).toBe('-$0.03');
+    expect(formatCost('1.005', 1, 'USD')).toBe('$1.01');
+    expect(formatCost('1', '0.3', 'USD')).toBe('$3.33');
+    expect(formatCost('-300', 4, 'USD')).toBe('-$75.00');
+    expect(formatCost('0', 3, 'USD')).toBe('$0.00');
+  });
+
+  it('reads exponent forms and numbers as their exact decimals', () => {
+    expect(formatCost('1.5e3', '1e1', 'USD')).toBe('$150.00');
+    expect(formatCost('3e-2', '1.2E1', null)).toBe('< 0.01');
+    expect(formatCost(1.005, 1, 'USD')).toBe('$1.01');
+    expect(formatCost(300.5, 2, 'USD')).toBe('$150.25');
+  });
+
+  it('rounds once at the currency minor digits', () => {
+    expect(formatCost('2', '3', 'KWD')).toBe('KWD 0.667');
+    expect(formatCost('1', 3, 'EURO')).toBe('0.33 EURO');
+    expect(formatCost('0.01', 3, null)).toBe('< 0.01');
+    expect(formatCost('-0.01', 3, null)).toBe('> -0.01');
+  });
+
+  it('renders an out-of-range operand or quotient as unavailable, promptly', () => {
+    const started = performance.now();
+    expect(formatCost('1e999999999', 3, 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost('300', '1e999999999', 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost('1e-999999999', 3, 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost('1e300', '1e-10', 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost(Number.MAX_VALUE, 1, 'USD')).toBe(UNAVAILABLE);
+    // Building 10n ** 999999999n alone takes over 20 s before it throws.
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it('renders unformattable spend as unavailable', () => {
     expect(formatCost(null, 3, 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('n/a', 3, 'USD')).toBe(UNAVAILABLE);
+    expect(formatCost(Number.NaN, 3, 'USD')).toBe(UNAVAILABLE);
   });
 });
 

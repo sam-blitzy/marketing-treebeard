@@ -12,8 +12,9 @@
  * - **Money from strings, never through `Number()`.** Amounts arrive as fixed-point decimal
  *   strings ({@link Money}) and are handed to `Intl.NumberFormat` as strings, which rounds the
  *   exact decimal: `"999999999999.994999"` USD renders `$999,999,999,999.99`, while a `Number`
- *   round trip would render `$1,000,000,000,000.00`. The one documented exception is the display
- *   quotient of {@link formatCost}.
+ *   round trip would render `$1,000,000,000,000.00`. Money is never converted to a binary
+ *   float, with no exception: the quotient of {@link formatCost} is exact decimal arithmetic on
+ *   `BigInt`, handed to `Intl` as a decimal string.
  * - **Dates as stored.** A daily date is the source's native calendar date (Google in the
  *   account's time zone, LinkedIn in UTC). It is printed exactly as stored and labelled with its
  *   source's day boundary, and is never parsed into a `Date`, which would shift it in other
@@ -86,6 +87,17 @@ const MAX_FRACTION_DIGITS = 20;
 
 /** Minor-unit digits assumed for an amount whose currency is missing or not recognised. */
 const DEFAULT_MINOR_DIGITS = 2;
+
+/**
+ * The highest power-of-ten place, and the negated lowest, that a non-zero digit of a
+ * {@link formatCost} operand or quotient may occupy. Every accepted value then lies below
+ * 10^308, inside the finite range of a JSON number (`Number.MAX_VALUE` ≈ 1.8 × 10^308), so
+ * `Intl.NumberFormat` renders it as a finite figure rather than `∞`, and the exact `BigInt`
+ * arithmetic never exceeds about 640 digits. A value with a digit outside the 10^-307 to
+ * 10^307 places, such as `"1e400"` or `"1e999999999"`, is unavailable, and is rejected before
+ * any power of ten is built.
+ */
+const MAX_EXACT_PLACE = 307;
 
 /** Fraction digits of a per-unit-of-spend rate: the six places the backend records it at. */
 const RATE_DIGITS = 6;
@@ -254,6 +266,86 @@ function hasFraction(value: Formattable): boolean {
   const wholeDigits = pointAt === -1 ? mantissa.length : pointAt;
   const digits = mantissa.replace('.', '');
   return /[1-9]/.test(digits.slice(Math.max(wholeDigits + exponent, 0)));
+}
+
+/** An exact decimal value, `coefficient × 10^exponent`, held without any binary float. */
+interface ExactDecimal {
+  readonly coefficient: bigint;
+  readonly exponent: number;
+}
+
+/**
+ * Converts a formattable value to an exact decimal whose coefficient carries the sign and no
+ * trailing zeros: `"-1.50e3"` → `-15n × 10^2`, `"0.075"` → `75n × 10^-3`. Zero in any form
+ * (`0`, `-0`, `"0.000"`, `"0e999"`) is `0n × 10^0`. A number is read as `String(value)`, the
+ * shortest decimal that round-trips it (`0.1` → `"0.1"`, `1e21` → `"1e+21"`), so a JSON number
+ * counts as the decimal it was written as.
+ *
+ * The bounds are checked on the digit text before any `BigInt` is built, so a pathological
+ * exponent or a very long digit string costs only a scan.
+ *
+ * @param value - A finite number or a validated decimal string.
+ * @returns The exact decimal, or `null` when a non-zero digit lies outside the places
+ *   ±{@link MAX_EXACT_PLACE}.
+ */
+function toExactDecimal(value: Formattable): ExactDecimal | null {
+  const text: `${number}` = typeof value === 'number' ? `${value}` : value;
+  const { mantissa, exponent } = splitDecimal(text);
+  const pointAt = mantissa.indexOf('.');
+  const fraction = pointAt === -1 ? 0 : mantissa.length - pointAt - 1;
+  const digits = mantissa.replace('.', '').replace(/^0+/, '');
+  const significant = digits.replace(/0+$/, '');
+  if (significant === '') {
+    return { coefficient: 0n, exponent: 0 };
+  }
+  const lowest = exponent - fraction + (digits.length - significant.length);
+  const highest = lowest + significant.length - 1;
+  if (lowest < -MAX_EXACT_PLACE || highest > MAX_EXACT_PLACE) {
+    return null;
+  }
+  const magnitude = BigInt(significant);
+  return { coefficient: text.startsWith('-') ? -magnitude : magnitude, exponent: lowest };
+}
+
+/**
+ * The quotient `spend / denominator` as a decimal string, computed exactly in `BigInt`, for
+ * {@link formatMoney} to round at `places` fraction digits.
+ *
+ * Rounding contract: the string holds the exact quotient truncated toward zero at `places + 1`
+ * fraction digits, followed by one sticky digit `1` when the division leaves a non-zero
+ * remainder, with the quotient's sign: at 2 places `"0.075"` / 3 → `"0.025"` and `"-1"` / 3 →
+ * `"-0.3331"`; at 0 places `"1000"` / 3 → `"333.31"`. It agrees with the exact quotient on
+ * every digit up to `places + 1` and records whether anything non-zero follows, so the single
+ * rounding `Intl.NumberFormat` or {@link formatDecimal} then applies at `places` digits or
+ * fewer equals rounding the exact quotient: the same rounding {@link formatMoney} gives a cost
+ * the backend stored. The sticky digit also keeps a tiny non-zero quotient non-zero, so
+ * formatDecimal's `"< 0.01"` bound still fires for it.
+ *
+ * @param spend - The exact spend.
+ * @param denominator - The exact denominator, above zero.
+ * @param places - The fraction digits the result is rounded to: the currency's minor digits.
+ * @returns The quotient text, or `null` when its integer part reaches past the
+ *   {@link MAX_EXACT_PLACE} place, where `Intl` could no longer render it as a finite figure.
+ */
+function exactQuotientText(
+  spend: ExactDecimal,
+  denominator: ExactDecimal,
+  places: number,
+): string | null {
+  const kept = places + 1;
+  const shift = spend.exponent - denominator.exponent + kept;
+  const magnitude = spend.coefficient < 0n ? -spend.coefficient : spend.coefficient;
+  const numerator = shift >= 0 ? magnitude * 10n ** BigInt(shift) : magnitude;
+  const divisor =
+    shift >= 0 ? denominator.coefficient : denominator.coefficient * 10n ** BigInt(-shift);
+  const digits = (numerator / divisor).toString().padStart(kept + 1, '0');
+  const whole = digits.slice(0, -kept);
+  if (whole.length - 1 > MAX_EXACT_PLACE) {
+    return null;
+  }
+  const sign = spend.coefficient < 0n ? '-' : '';
+  const sticky = numerator % divisor === 0n ? '' : '1';
+  return `${sign}${whole}.${digits.slice(-kept)}${sticky}`;
 }
 
 /** Clamps a requested digit count to an integer `Intl` accepts; `NaN` becomes 0. */
@@ -546,18 +638,26 @@ export function formatPercent(ratio: NumericInput, digits = 1): string {
  * Formats a cost per outcome, such as cost per Qualified Lead or cost per meeting booked, from
  * a spend and a count (AAP 0.5.4.7).
  *
- * - A denominator that is absent, non-numeric, zero, negative or non-finite renders
- *   {@link EM_DASH}, or `"— ({emptyReason})"` when a reason is given: `"— (no QL yet)"`,
- *   `"— (no meetings yet)"`. It never renders a finite value or a "≤ X" ceiling, because a cost
- *   exists only when the known denominator is above 0 (AAP 0.5.4.7; cost/conversion "—" when
- *   conversions are 0, AAP 0.5.4.3).
- * - Otherwise the quotient `Number(spend) / Number(denominator)` is formatted in the currency.
- *   This is the module's one float conversion of money: a derived display ratio that is never
- *   stored, summed or compared. A cost the backend already computed, as evidence carries it,
+ * - A denominator that is absent, non-numeric, non-finite, out of range (a digit beyond the
+ *   10^307 or 10^-307 place, such as `"1e400"`) or negative renders {@link UNAVAILABLE}, even
+ *   when a reason is given: an unknown count is unavailable evidence, never a known zero
+ *   (AAP 0.5.4.7, 0.11.1).
+ * - A denominator known to be zero (`0`, `-0`, `"0.000"`) renders {@link EM_DASH}, or
+ *   `"— ({emptyReason})"` when a reason is given: `"— (no QL yet)"`, `"— (no meetings yet)"`.
+ *   The spend is not consulted. It never renders a finite value or a "≤ X" ceiling, because a
+ *   cost exists only when the known denominator is above 0 (AAP 0.5.4.7; cost/conversion "—"
+ *   when conversions are 0, AAP 0.5.4.3).
+ * - Otherwise the quotient spend / denominator is computed exactly in decimal arithmetic, never
+ *   through a binary float, and formatted in the currency, rounded once at the currency's minor
+ *   digits as {@link formatMoney} rounds a stored amount: `("300", 4, "USD")` → `"$75.00"`,
+ *   `("0.075", 3, "USD")` → `"$0.03"`, `("999999999999.994999", 1, "USD")` →
+ *   `"$999,999,999,999.99"`. A cost the backend already computed, as evidence carries it,
  *   renders through {@link formatMoney} or {@link formatMetric} instead.
- * - An absent or non-numeric spend renders {@link UNAVAILABLE}.
+ * - A spend that is absent, non-numeric, non-finite or out of range renders
+ *   {@link UNAVAILABLE}, and so does a quotient of 10^308 or more, which no finite figure shows.
  *
- * @param spend - The spend, a {@link Money} decimal string.
+ * @param spend - The spend: a {@link Money} decimal string, or a number read as its shortest
+ *   decimal.
  * @param denominator - The count the spend is divided by.
  * @param currency - The spend's ISO 4217 currency code.
  * @param emptyReason - Why the denominator is zero, shown after the dash.
@@ -570,16 +670,24 @@ export function formatCost(
   emptyReason?: string,
 ): string {
   const divisor = toFormattable(denominator);
-  const count = divisor === null ? Number.NaN : Number(divisor);
-  if (!(count > 0) || !Number.isFinite(count)) {
+  if (divisor === null || isNegative(divisor)) {
+    return UNAVAILABLE;
+  }
+  if (isZero(divisor)) {
     const reason = textOrNull(emptyReason);
     return reason === null ? EM_DASH : `${EM_DASH} (${reason})`;
   }
-  const amount = toFormattable(spend);
-  if (amount === null) {
+  const count = toExactDecimal(divisor);
+  if (count === null) {
     return UNAVAILABLE;
   }
-  return formatMoney(Number(amount) / count, currency);
+  const amount = toFormattable(spend);
+  const exact = amount === null ? null : toExactDecimal(amount);
+  if (exact === null) {
+    return UNAVAILABLE;
+  }
+  const quotient = exactQuotientText(exact, count, currencyMinorDigits(currency));
+  return quotient === null ? UNAVAILABLE : formatMoney(quotient, currency);
 }
 
 /**
