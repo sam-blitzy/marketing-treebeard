@@ -35,9 +35,9 @@ Every test but the one persistence case is pure: no database and no network.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final
 
 import pytest
@@ -138,6 +138,7 @@ FOCUS: Final[Mapping[str, tuple[str, str, str]]] = {
     "b4.google_last_click": ("google", "campaign", "weekly"),
     "b4.linkedin": ("linkedin", "campaign", "li-cap"),
     "b4.no_exposure": ("google", "campaign", "weekly"),
+    "b4.rate_test": ("linkedin", "campaign", "li-cap"),
     "budget.lifetime": ("linkedin", "campaign", "li-cap"),
     "budget.unknown_not_idle": ("linkedin", "campaign", "slack"),
     "g1.b2_target": ("linkedin", "campaign", "hot"),
@@ -1690,6 +1691,102 @@ def test_b4_below_its_minimums_is_withheld_with_the_sample_sizes(
     assert line.reason == f"3 weekend days of {minimum} required; 6 outcomes of {outcomes} required"
     assert line.reason == "3 weekend days of 4 required; 6 outcomes of 10 required"
     assert (line.observed, line.required) == (3, minimum)
+
+
+@dataclass(frozen=True, slots=True)
+class _B4Side:
+    """One side (weekend or weekday) of a campaign's window days, as B4 totals it.
+
+    Attributes:
+        outcomes: The side's outcomes, a whole event count.
+        spend: The side's spend.
+        spend_days: The side's days with spend > 0.
+    """
+
+    outcomes: int
+    spend: Decimal
+    spend_days: int
+
+
+def _b4_sides(ctx: AnalysisContext, campaign_id: int) -> tuple[_B4Side, _B4Side]:
+    """A campaign's weekend and weekday totals over the window, recomputed from its days.
+
+    Saturday and Sunday of the campaign's native dates are the weekend, as B4 splits them.
+    Every day must report a whole outcome, so nothing is rounded here.
+    """
+    group = ctx.campaigns[campaign_id].objective_group
+    window = ctx.window
+    days = [day for day in ctx.campaign_days[campaign_id] if window.start <= day.date <= window.end]
+    sides: list[_B4Side] = []
+    for weekend in (True, False):
+        side = [day for day in days if (day.date.weekday() >= 5) is weekend]
+        outcomes = [day.outcome(group) for day in side]
+        whole = [value for value in outcomes if value is not None]
+        assert len(whole) == len(side), "every window day reports its outcome"
+        assert all(value == value.to_integral_value() for value in whole)
+        sides.append(
+            _B4Side(
+                outcomes=int(sum(whole, Decimal(0))),
+                spend=sum((day.cost for day in side), Decimal(0)),
+                spend_days=sum(1 for day in side if day.cost > 0),
+            )
+        )
+    return sides[0], sides[1]
+
+
+def test_b4_with_every_minimum_met_is_withheld_with_the_sample_sizes_when_p_reaches_alpha(
+    make_context: ContextFactory,
+) -> None:
+    """B4: an adequately sampled pattern whose rate test gives p ≥ alpha is withheld with its
+    sample sizes.
+
+    Both twins meet every minimum (weekend days and weekdays with spend, and outcomes) with
+    spend on both sides, and differ only in the weekend leads. The ``fires`` twin's test gives
+    p < ``b4.alpha`` and one B4 item. With more weekend leads the rates are no longer
+    distinguishable (p ≥ ``b4.alpha``), so the pattern is no item: its one withheld line names
+    the test, its p-value against alpha and the day and outcome counts, and its sample is the
+    outcome total against ``b4.min_outcomes``.
+    """
+    fires = SCENARIOS["b4.rate_test.fires"]
+    fired = make_context(fires.name)
+    _check_rate_test(fired, _b4_item(fires, fired, "linkedin", "li-cap"))
+
+    scenario = SCENARIOS["b4.rate_test.does_not_fire"]
+    ctx = make_context(scenario.name)
+    campaign = _campaign_id(scenario, "li-cap")
+    weekend, weekday = _b4_sides(ctx, campaign)
+    fired_weekend, fired_weekday = _b4_sides(fired, _campaign_id(fires, "li-cap"))
+    assert fired_weekday == weekday
+    assert (fired_weekend.spend, fired_weekend.spend_days) == (weekend.spend, weekend.spend_days)
+    assert fired_weekend.outcomes < weekend.outcomes
+
+    thresholds = ctx.thresholds
+    alpha = thresholds.ratio("b4.alpha")
+    minimum = thresholds.int("b4.min_outcomes")
+    total = weekend.outcomes + weekday.outcomes
+    assert weekend.spend > 0
+    assert weekday.spend > 0
+    assert weekend.spend_days >= thresholds.int("b4.min_weekend_days")
+    assert weekday.spend_days >= thresholds.int("b4.min_weekdays")
+    assert total >= minimum
+    test = poisson_rate_test(weekend.outcomes, weekend.spend, weekday.outcomes, weekday.spend)
+    assert test is not None
+    assert test.p_value >= alpha
+
+    out = _run(ctx)
+    assert _items(out, BUDGET, B4) == []
+    (line,) = _lines(out, B4, campaign)
+    shown = test.p_value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+    assert shown >= alpha
+    assert line.reason == (
+        f"weekend and weekday rates not distinguishable ({budget.B4_TEST_NAME} p = {shown}, "
+        f"alpha {alpha.normalize():f}): {weekend.spend_days} weekend days, "
+        f"{weekday.spend_days} weekdays, {total} outcomes"
+    )
+    assert "alpha 0.05)" in line.reason
+    assert (line.observed, line.required, line.unit) == (total, minimum, "outcomes")
+    assert scenario.expect.withheld_reason is not None
+    assert line.reason.startswith(scenario.expect.withheld_reason)
 
 
 def test_b4_runs_on_google_only_under_a_verified_last_click_contract(

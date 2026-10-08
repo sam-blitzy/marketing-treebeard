@@ -26,9 +26,10 @@ This file is loaded before any test module. It provides:
   analysis contexts.
 * **Configuration, logs and the CLI**: the repository thresholds, overridden copies written to
   ``tmp_path``, captured JSON log lines, and the ``ads-engine`` CLI run in a subprocess.
-* **Per-path coverage gates** (AAP 0.11.2): at session end, ``[tool.ads_engine.coverage_gates]``
-  in ``backend/pyproject.toml`` is enforced through the coverage API, because coverage.py has
-  no per-path ``fail_under``. pytest-cov keeps enforcing the 80% overall target itself.
+* **Coverage gates** (AAP 0.11.2): at session end, ``[tool.ads_engine.coverage_gates]`` in
+  ``backend/pyproject.toml`` is enforced through the coverage API, because coverage.py has no
+  per-path ``fail_under``. The 80% overall target is decided there too, on the unrounded total:
+  pytest-cov's own check still runs, but it compares the total rounded to the report precision.
 
 Test modules run in ``--import-mode=importlib`` with no ``__init__.py`` under ``tests/``, so they
 can never import this file. Everything shared is therefore a fixture, and a fixture may return
@@ -66,6 +67,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 
 if TYPE_CHECKING:
+    from coverage import Coverage
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from ads_engine.analysis.context import AnalysisContext
@@ -335,20 +337,80 @@ def _coverage_gates(pyproject: Path) -> dict[str, float] | str:
     return gates
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitCode) -> None:
-    """Enforce the per-path coverage gates of AAP 0.11.2 once pytest-cov has saved its data.
+def _gate_line(label: str, percent: float, minimum: float, precision: int) -> tuple[str, bool]:
+    """Decide one coverage gate on the unrounded percentage and format its report line.
 
-    The gates (``*/ads_engine/analysis/*`` and ``*/ads_engine/connectors/*/parser.py``, at
-    least 90% line coverage each) live in ``[tool.ads_engine.coverage_gates]`` of
-    ``backend/pyproject.toml``. pytest-cov saves and combines its data at the end of
+    ``label`` names the gate in the line: its include pattern, or ``overall`` for the total.
+    The gate is short when ``percent < minimum``: rounding never lets 89.96% meet a 90% floor.
+    The percentage is shown at the report precision, with one more digit at a time only while
+    the shown value would sit on the other side of the minimum from the verdict, so a short
+    89.96% reads ``89.96%`` (never ``90.0%``) and a passing 90.0% reads ``90.0%``.
+
+    Returns:
+        The report line, and whether the gate is short.
+    """
+    short = percent < minimum
+    digits = max(precision, 0)
+    shown = f"{percent:.{digits}f}"
+    # Terminates: with enough digits the shown text parses back to ``percent`` itself.
+    while (float(shown) < minimum) != short:
+        digits += 1
+        shown = f"{percent:.{digits}f}"
+    verdict = " FAILED" if short else ""
+    return f"coverage gate {label}: {shown}% (min {minimum:g}){verdict}", short
+
+
+def _check_gate(
+    config: pytest.Config,
+    cov: Coverage,
+    label: str,
+    include: list[str] | None,
+    minimum: float,
+    precision: int,
+) -> bool:
+    """Measure one coverage gate, print its line and return whether it is short.
+
+    ``include`` limits the report to the gate's files. ``None`` reports every measured file that
+    ``[tool.coverage.run]`` and ``[tool.coverage.report]`` select, which is pytest-cov's total.
+    No measured file counts as 0%, and a report that fails counts as a short gate.
+    """
+    from coverage.exceptions import CoverageException, NoDataError
+
+    try:
+        percent = cov.report(include=include, file=io.StringIO())
+    except NoDataError:
+        percent = 0.0
+    except CoverageException as exc:
+        _write_report_line(config, f"coverage gate {label}: report failed ({exc})", failed=True)
+        return True
+    line, short = _gate_line(label, percent, minimum, precision)
+    _write_report_line(config, line, failed=short)
+    return short
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitCode) -> None:
+    """Enforce the coverage gates of AAP 0.11.2 once pytest-cov has saved its data.
+
+    The per-path gates (``*/ads_engine/analysis/*`` and ``*/ads_engine/connectors/*/parser.py``,
+    at least 90% line coverage each) live in ``[tool.ads_engine.coverage_gates]`` of
+    ``backend/pyproject.toml``. The overall gate (backend overall at least 80%) takes
+    pytest-cov's minimum: ``--cov-fail-under`` when given, else ``[tool.coverage.report]
+    fail_under``; a minimum of 0 means no overall gate. pytest-cov's own overall check still
+    runs, but it compares the total rounded to the report precision, so a measured 79.96% passes
+    it; this hook closes that window. pytest-cov saves and combines its data at the end of
     ``pytest_runtestloop``, before this hook, so the data read here is complete; it is only
-    read, never combined or erased, and pytest-cov's own overall ``fail_under`` is untouched.
+    read, never combined or erased.
 
     Nothing happens when coverage is inactive: pytest-cov is not loaded, ``--no-cov`` was
     given, the run only collected tests, or no data file exists. Otherwise one line per gate is
-    printed, and a short gate turns an otherwise passing run into ``TESTS_FAILED``. A pattern
-    that matches no measured file counts as 0%, because the plan requires those modules to be
-    measured.
+    printed, the overall gate last, and a short gate turns an otherwise passing run into
+    ``TESTS_FAILED``. A pattern that matches no measured file counts as 0%, because the plan
+    requires those modules to be measured.
+
+    Each gate is decided on the unrounded percentage, so 89.96% is short of 90% and 79.96% of
+    80%. The line shows it at the report precision (``[tool.coverage.report] precision``), with
+    extra digits only where rounding would cross the minimum: ``89.96% (min 90) FAILED``, never
+    ``90.0%``.
     """
     del exitstatus  # session.exitstatus is the authoritative, writable status.
     config = session.config
@@ -358,7 +420,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitC
         return
 
     import coverage
-    from coverage.exceptions import CoverageException, NoDataError
 
     pyproject = BACKEND_DIR / "pyproject.toml"
     # pytest-cov fixes its data file when it starts, before pytest_configure changes directory,
@@ -382,25 +443,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitC
     cov.load()
     precision = int(cast("int", cov.get_option("report:precision")) or 0)
     for pattern, minimum in gates.items():
-        try:
-            percent = cov.report(include=[pattern], file=io.StringIO())
-        except NoDataError:
-            percent = 0.0
-        except CoverageException as exc:
-            _write_report_line(
-                config, f"coverage gate {pattern}: report failed ({exc})", failed=True
-            )
-            any_short = True
-            continue
-        shown = round(percent, precision)
-        short = shown < minimum
+        short = _check_gate(config, cov, pattern, [pattern], minimum, precision)
         any_short = any_short or short
-        verdict = " FAILED" if short else ""
-        _write_report_line(
-            config,
-            f"coverage gate {pattern}: {shown:.{precision}f}% (min {minimum:g}){verdict}",
-            failed=short,
-        )
+
+    # The overall minimum is pytest-cov's: --cov-fail-under when given, else fail_under.
+    fail_under = config.getoption("cov_fail_under", default=None)
+    if fail_under is None:
+        fail_under = cov.get_option("report:fail_under")
+    overall_minimum = float(cast("float | None", fail_under) or 0)
+    if overall_minimum > 0:
+        short = _check_gate(config, cov, "overall", None, overall_minimum, precision)
+        any_short = any_short or short
     if any_short and session.exitstatus == pytest.ExitCode.OK:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

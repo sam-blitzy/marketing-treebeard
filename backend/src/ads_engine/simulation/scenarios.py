@@ -4090,6 +4090,61 @@ def _k3_scenarios(module: str) -> Iterator[Scenario]:
         ),
     )
 
+    def fell(first_half_conversions: str) -> ExplicitDays:
+        """CPC 5.00 then 6.00 by half; the window's first day alone carries a conversion."""
+        first = {
+            o: _metrics(
+                "5.00",
+                50,
+                5,
+                first_half_conversions if o == -28 else "0",
+                historical_quality_score=7,
+            )
+            for o in _offsets(-28, -15)
+        }
+        second = {
+            o: _metrics("6.00", 50, 5, "0", historical_quality_score=7) for o in _offsets(-14, -1)
+        }
+        return ExplicitDays(first | second)
+
+    # The first half's single conversion sits exactly on k3.min_first_half_conversions (1); the
+    # twin moves it to 0, so conversions no longer "fell" and cost/conversion is unavailable in
+    # both halves.
+    yield from _pair(
+        "k3.conversions_fell",
+        module,
+        "K3: CPC up 20% with second-half conversions 0 and first-half conversions >= 1 fires / "
+        "no first-half conversion does not",
+        fires=(
+            _k3_world("k3.conversions_fell", fell("1")),
+            Expectation(
+                K3,
+                True,
+                {
+                    "cpc_ratio": "1.2",
+                    "cpa_ratio": None,
+                    "conversions_first_half": "1",
+                    "conversions_second_half": "0",
+                    "conversions_fell": True,
+                },
+            ),
+        ),
+        does_not_fire=(
+            _k3_world("k3.conversions_fell", fell("0")),
+            Expectation(
+                K3,
+                False,
+                {
+                    "cpc_ratio": "1.2",
+                    "cpa_ratio": None,
+                    "conversions_first_half": "0",
+                    "conversions_second_half": "0",
+                    "conversions_fell": False,
+                },
+            ),
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # LinkedIn and HubSpot building blocks
@@ -5745,6 +5800,42 @@ def _b4_scenarios(module: str) -> Iterator[Scenario]:
                 False,
                 {"weekend_days": 3, "required": 4},
                 withheld_reason="3 weekend days of 4 required",
+            ),
+        ),
+    )
+    # Every minimum is met on both twins (8 weekend days, 20 weekdays, 256 and 264 leads) and
+    # both sides had spend; only the weekend leads per day move, 7 to 8, which carries the
+    # rate test across alpha: 56 weekend leads on 800 against 200 weekday leads on 2,000
+    # give p = 0.0177, and 64 give p = 0.1195.
+    yield from _pair(
+        "b4.rate_test",
+        module,
+        "B4: an adequately sampled pattern whose rate test gives p < 0.05 fires / with every "
+        "minimum met, p >= 0.05 is withheld with its sample sizes",
+        fires=(
+            _budget_world(
+                "b4.rate_test", _weekly(li_weekday, li_weekend.with_(leads=7)), daily="500.00"
+            ),
+            Expectation(
+                B4,
+                True,
+                {
+                    "weekend_days": 8,
+                    "weekdays": 20,
+                    "weekend_outcomes": 56,
+                    "weekday_outcomes": 200,
+                },
+            ),
+        ),
+        does_not_fire=(
+            _budget_world(
+                "b4.rate_test", _weekly(li_weekday, li_weekend.with_(leads=8)), daily="500.00"
+            ),
+            Expectation(
+                B4,
+                False,
+                {"outcomes": 264, "required": 10},
+                withheld_reason="weekend and weekday rates not distinguishable",
             ),
         ),
     )

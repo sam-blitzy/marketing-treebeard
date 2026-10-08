@@ -219,7 +219,9 @@ source = ["ads_engine"]
 branch = false
 
 [tool.coverage.report]
-# Backend overall >= 80%, enforced by pytest-cov, which honours this value.
+# Backend overall >= 80% (AAP 0.11.2). pytest-cov enforces this value on the total rounded to
+# `precision`, so it alone would pass 79.96%; the pytest_sessionfinish hook in tests/conftest.py
+# also decides it on the unrounded total. --cov-fail-under overrides it for both.
 fail_under = 80
 show_missing = true
 precision = 1

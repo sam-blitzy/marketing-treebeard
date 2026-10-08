@@ -20,7 +20,8 @@ Coverage of the guarantees:
 * K1 gate, low and non-binary baselines, no probability claim, unusable baselines, fractional
   conversions, the spend floor, skipped statuses and ``ADDED`` terms.
 * K2 conversions and efficiency gates, adjacent terms (cap, Jaccard, exclusions, order, label).
-* K3 quality-score drop, quality-score days, snapshot fallback and the CPC rise.
+* K3 quality-score drop, quality-score days, snapshot fallback, and the CPC rise with
+  cost/conversion rising or with conversions falling to 0.
 * Search-term coverage, the output fields every item shows, ranking, thresholds read from
   configuration, and an empty section without Google.
 
@@ -315,6 +316,16 @@ def _halves(ctx: AnalysisContext, keyword: KeywordInfo) -> _Halves:
     return _Halves((cost_2 / clicks_2) / (cost_1 / clicks_1), cpa_ratio, conv_1, conv_2)
 
 
+def _conversions_fell(ctx: AnalysisContext, halves: _Halves) -> bool:
+    """Whether a keyword's conversions fell to 0, K3's alternative to a cost/conversion rise.
+
+    Read from the inputs: second-half conversions 0 with the first half's at least
+    ``k3.min_first_half_conversions``.
+    """
+    minimum = Fraction(ctx.thresholds.decimal("k3.min_first_half_conversions"))
+    return halves.second_conversions == 0 and halves.first_conversions >= minimum
+
+
 def _texts(item: Candidate | Withheld) -> tuple[str, ...]:
     """Every rendered text of an item or withheld line, lowercased for wording checks."""
     if isinstance(item, Withheld):
@@ -540,6 +551,17 @@ _RESOLVERS: dict[str, Callable[[_Probe, Any], Any]] = {
     ),
     "cpa_ratio": lambda p, _e: _item_metric_or(
         p, "cpa_ratio", lambda: _halves(p.ctx, p.keyword()).cpa_ratio
+    ),
+    "conversions_first_half": lambda p, _e: _item_metric_or(
+        p, "conversions_first_half", lambda: _halves(p.ctx, p.keyword()).first_conversions
+    ),
+    "conversions_second_half": lambda p, _e: _item_metric_or(
+        p, "conversions_second_half", lambda: _halves(p.ctx, p.keyword()).second_conversions
+    ),
+    "conversions_fell": lambda p, _e: (
+        p.item.evidence.extra["conversions_fell"]
+        if p.item is not None
+        else _conversions_fell(p.ctx, _halves(p.ctx, p.keyword()))
     ),
     "search_term_spend": _resolve_coverage("search_term_spend"),
     "keyword_spend": _resolve_coverage("keyword_spend"),
@@ -1243,9 +1265,6 @@ def test_k3_compares_quality_score_snapshots_when_daily_scores_are_absent(
 
 def test_k3_cpc_rise_without_a_matching_conversion_rise_fires(make_context: ContextFactory) -> None:
     """K3: CPC up 20% with flat conversions fires / CPC and conversions rising together do not."""
-    # The catalogue pairs this branch on cost/conversion; its "second-half conversions 0" variant
-    # has no scenario, and contexts are never built by hand in this module, so that variant
-    # waits for a catalogue scenario rather than test-local data.
     fires, held = _twin_runs(make_context, "k3.cpc_rise")
     item, keyword = _k3_target(fires)
     _assert_k3_gates(fires, item)
@@ -1267,6 +1286,63 @@ def test_k3_cpc_rise_without_a_matching_conversion_rise_fires(make_context: Cont
     assert held_halves.cpc_ratio == Fraction(6, 5) >= rise
     assert held_halves.cpa_ratio == 1 < rise
     assert held_halves.second_conversions > held_halves.first_conversions
+    assert held.items(K3) == ()
+    assert held.withheld(K3) == ()
+
+
+def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: ContextFactory) -> None:
+    """K3: CPC up 20% with second-half conversions 0 and first-half conversions >= 1 fires.
+
+    No first-half conversion does not: the twin moves the first half's single conversion below
+    ``k3.min_first_half_conversions``, so conversions did not fall and cost/conversion is
+    unavailable in both halves.
+    """
+    fires, held = _twin_runs(make_context, "k3.conversions_fell")
+    item, keyword = _k3_target(fires)
+    _assert_k3_gates(fires, item)
+    thresholds = fires.ctx.thresholds
+    rise = Fraction(thresholds.ratio("k3.rise_ratio"))
+    minimum = Fraction(thresholds.decimal("k3.min_first_half_conversions"))
+    halves = _halves(fires.ctx, keyword)
+    assert halves.cpc_ratio == Fraction(6, 5) >= rise
+    assert halves.first_conversions == minimum, "the first half sits on the threshold"
+    assert halves.second_conversions == 0
+    assert halves.cpa_ratio is None, "no second-half cost/conversion to compare"
+    assert _conversions_fell(fires.ctx, halves) is True
+    extra = item.evidence.extra
+    assert "cpc" in extra["triggers"]
+    assert "quality_score" not in extra["triggers"]
+    assert extra["conversions_fell"] is True
+    assert _exact(_metric(item, "cpc_ratio")) == halves.cpc_ratio
+    assert _exact(_metric(item, "conversions_first_half")) == halves.first_conversions
+    assert _exact(_metric(item, "conversions_second_half")) == 0
+    (first_start, first_end), _ = fires.ctx.window.halves()
+    first_cost = sum(
+        (
+            Fraction(day.cost)
+            for day in _window_days(fires.ctx, keyword)
+            if first_start <= day.date <= first_end
+        ),
+        Fraction(0),
+    )
+    assert _metric(item, "cost_per_conversion_first_half") == _cents(
+        first_cost / halves.first_conversions
+    )
+    second_cpa = item.evidence.metric("cost_per_conversion_second_half")
+    assert (second_cpa.value, second_cpa.unit) == (None, "currency")
+    assert second_cpa.to_json()["unavailable"] is True, "unavailable at 0 conversions, never 0"
+    assert _metric(item, "cpa_ratio") is None
+    assert "CPC rose from" in item.reason
+    fell = f"while conversions fell from {_metric(item, 'conversions_first_half')} to 0."
+    assert item.reason.endswith(fell)
+    assert "while cost/conversion rose" not in item.reason
+
+    held_halves = _halves(held.ctx, _keyword(held.ctx, keyword.text))
+    assert held_halves.cpc_ratio == Fraction(6, 5) >= rise
+    assert held_halves.first_conversions == held_halves.second_conversions == 0
+    assert held_halves.first_conversions < minimum
+    assert held_halves.cpa_ratio is None
+    assert _conversions_fell(held.ctx, held_halves) is False
     assert held.items(K3) == ()
     assert held.withheld(K3) == ()
 
