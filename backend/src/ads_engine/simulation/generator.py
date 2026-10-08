@@ -113,6 +113,8 @@ __all__ = [
     "DEFAULT_SPEC",
     "FAULT_KINDS",
     "FAULT_SURFACES",
+    "LEADS_PER_CREATIVE_DAY",
+    "PERSON_CREATIVE_POSITIONS",
     "SEGMENT_PIVOTS",
     "BulkDealSpec",
     "ContactRecord",
@@ -176,6 +178,8 @@ __all__ = [
     "StageSpec",
     "WorldSpec",
     "WorldState",
+    "person_contact_id",
+    "person_object_id",
 ]
 
 _log = get_logger("ads_engine.simulation")
@@ -461,18 +465,67 @@ _MICROS_PER_UNIT: Final = 1_000_000
 _GOLDEN: Final = 0.6180339887498949
 _DAY: Final = timedelta(days=1)
 
-# Offsets inside the HubSpot object-id ranges (each holds 10**11 ids), so each family of
-# simulated objects has its own block and ids never collide: persons' objects from 0,
-# Google-touch contacts' objects from 10**10, orphan deals from 2 * 10**10, bulk deals from
-# 3 * 10**10, and objects of seeded contacts answering real lead emails from 5 * 10**10 (two
-# per contact, see _CrmModel._hashed_object). Seeded contacts take 2 * 10**10 ids, so their
-# objects end below 9 * 10**10.
+# Offsets inside HUBSPOT_CONTACT_IDS, HUBSPOT_MEETING_IDS and HUBSPOT_DEAL_IDS (each holds
+# 10**11 ids). Each family of simulated objects has its own block, so ids never collide, and
+# every id is a pure function of a durable key, never of a position in generation order: a
+# world rebuilt on a later date (whose default anchor and history start follow the clock)
+# gives every contact, meeting and deal it still holds the id it had before.
+#
+# * [0, 10**10): simulated LinkedIn people, keyed by the coordinates of their first lead
+#   (person_contact_id): contact at slot, meetings and deals at slot * _OBJECTS_PER_CONTACT + j.
+# * [10**10, 2 * 10**10): Google-touch contact ``index`` at 10**10 + index; its meetings and
+#   deals at 10**10 + index * _OBJECTS_PER_CONTACT + j.
+# * [2 * 10**10, 3 * 10**10): orphan deal ``index`` at 2 * 10**10 + index.
+# * [3 * 10**10, 5 * 10**10): bulk deal ``index`` at 3 * 10**10 + index.
+# * [5 * 10**10, 9 * 10**10): meetings and deals of the seeded contacts answering real lead
+#   emails (whose contacts are offsets below _HASHED_CONTACT_SPAN of HUBSPOT_HASHED_CONTACT_IDS),
+#   at 5 * 10**10 + offset * _OBJECTS_PER_CONTACT + j; see _CrmModel._hashed_object.
+# * [9 * 10**10, 10**11): never allocated.
+#
+# Here j < _OBJECTS_PER_CONTACT is the object's position in its contact's draw.
+_PERSON_BLOCK: Final = 0
 _GOOGLE_CRM_BLOCK: Final = 10**10
 _ORPHAN_DEAL_BLOCK: Final = 2 * 10**10
 _BULK_DEAL_BLOCK: Final = 3 * 10**10
 _HASHED_OBJECT_BLOCK: Final = 5 * 10**10
 _HASHED_CONTACT_SPAN: Final = 2 * 10**10
-_HASHED_OBJECTS_PER_CONTACT: Final = 2
+# Meeting ids and deal ids each contact owns: a funnel draw makes at most two meetings
+# (``max_meetings``) and at most two deals (one after the touch, one before it).
+_OBJECTS_PER_CONTACT: Final = 2
+# Contacts a block can hold with their objects: 5 * 10**9 people or Google-touch contacts.
+_PERSON_SLOTS: Final = (_GOOGLE_CRM_BLOCK - _PERSON_BLOCK) // _OBJECTS_PER_CONTACT
+_GOOGLE_CONTACT_SLOTS: Final = (_ORPHAN_DEAL_BLOCK - _GOOGLE_CRM_BLOCK) // _OBJECTS_PER_CONTACT
+
+PERSON_CREATIVE_POSITIONS: Final = 200
+"""Creatives of a world spec whose lead responses can create simulated people.
+
+A person's first lead must come from a creative at an index below this in the spec's
+``linkedin.creatives`` (:func:`person_contact_id`).
+"""
+
+LEADS_PER_CREATIVE_DAY: Final = 500
+"""Lead responses (test leads included) one creative can generate on one UTC day.
+
+Each (creative, UTC day) owns this many consecutive person slots, one per response, so
+:func:`person_contact_id` is injective by construction.
+"""
+
+_EPOCH_DAY: Final = date(1970, 1, 1)
+# Slots per UTC day: 200 creatives * 500 responses = 100_000.
+_PERSON_SLOTS_PER_DAY: Final = PERSON_CREATIVE_POSITIONS * LEADS_PER_CREATIVE_DAY
+# UTC days from 1970-01-01 the person block covers: 5 * 10**9 // 100_000 = 50_000, so first
+# leads up to 2106-11-23.
+_PERSON_DAYS: Final = _PERSON_SLOTS // _PERSON_SLOTS_PER_DAY
+# A repeat lead reuses one of the people created most recently before it, and a shared meeting
+# adds one of the person contacts registered most recently before its owner. A choice by
+# position in the whole history would pick someone else in a world rebuilt on a later date,
+# whose history starts later and so holds fewer early people; the most recent ones before a
+# lead are the same in both worlds once the lead lies this many people past the later start
+# (about four and a half days of the default world's leads) and both worlds generated the
+# same leads in between. A world with at most this many earlier people chooses among all of
+# them, exactly as a choice over the whole history does.
+_REPEAT_WINDOW: Final = 64
+_PARTNER_WINDOW: Final = 64
 
 _FIRST_NAMES: Final = (
     "Avery",
@@ -2093,6 +2146,11 @@ class HubSpotSpec(_Replaceable):
                 _check_text("Google CRM property", name)
         _check_int("google_touch_contacts", self.google_touch_contacts)
         _require(
+            self.google_touch_contacts <= _GOOGLE_CONTACT_SLOTS,
+            f"google_touch_contacts must be <= {_GOOGLE_CONTACT_SLOTS}, the contacts whose "
+            "meetings and deals the Google id block holds",
+        )
+        _require(
             isinstance(self.deal_currency, str) and len(self.deal_currency) == 3,
             "deal_currency must be an ISO 4217 code",
         )
@@ -2902,7 +2960,8 @@ class ContactRecord:
         lifecycle_stage: Current ``lifecyclestage`` option value.
         stage_entered: Option value to the instant the contact entered it
             (``hs_v2_date_entered_{value}``); a skipped stage is absent.
-        bound_dates: Property-mode MQL/QL properties to their date (midnight UTC).
+        bound_dates: Property-mode MQL/QL properties to the instant the event happened (the
+            earlier one when MQL and QL bind the same property).
         google_campaign_ref: Google campaign id of a Google-touch contact.
         google_touch_at: Google touch instant of a Google-touch contact.
     """
@@ -2916,7 +2975,7 @@ class ContactRecord:
     updated_at: datetime
     lifecycle_stage: str
     stage_entered: Mapping[str, datetime]
-    bound_dates: Mapping[str, date]
+    bound_dates: Mapping[str, datetime]
     google_campaign_ref: str | None
     google_touch_at: datetime | None
 
@@ -4877,10 +4936,18 @@ _CHALLENGES: Final = (
 
 @dataclass(slots=True)
 class _Person:
-    """A simulated person behind one or more lead responses (internal, append-only)."""
+    """A simulated person behind one or more lead responses (internal, append-only).
+
+    ``creative_position``, ``day`` and ``ordinal`` are the coordinates of the first lead, which
+    key the person's CRM ids (:func:`person_contact_id`); ``index`` is the position in
+    generation order and identifies the person only within one world.
+    """
 
     index: int
     key: str
+    creative_position: int
+    day: date
+    ordinal: int
     email: str
     email_sha256: str
     first_name: str
@@ -4891,10 +4958,16 @@ class _Person:
 
 @dataclass(frozen=True, slots=True)
 class _RawLead:
-    """A generated lead response before its person is assigned."""
+    """A generated lead response before its person is assigned.
+
+    ``day`` is its UTC date and ``ordinal`` its position among the creative's responses
+    that day.
+    """
 
     id: str
     creative_key: str
+    day: date
+    ordinal: int
     submitted_at: datetime
     test_lead: bool
     hide_creative: bool
@@ -4920,7 +4993,11 @@ class _LinkedInModel:
     Lead responses are generated per creative and UTC day from that day's ``leads``, so the
     daily analytics and the Lead Sync responses always agree. People are assigned to responses
     in chronological order, day by day, so a repeat lead only ever reuses an earlier person and
-    every assignment is stable however far the clock has advanced.
+    every assignment is stable however far the clock has advanced. A person is keyed by their
+    first lead (its id, creative, day and position that day), and a repeat lead reuses one of
+    the ``_REPEAT_WINDOW`` most recent people before it, so a world rebuilt on a later date,
+    whose history starts later, keeps the email and CRM ids of every person it still holds,
+    and the person of every repeat lead with the same people before it.
     """
 
     def __init__(self, core: _Core, spec: LinkedInSpec) -> None:
@@ -4945,6 +5022,9 @@ class _LinkedInModel:
             )
         _check_unique("LinkedIn creative id", self.creative_ids.values())
         self.creative_by_id = {value: key for key, value in self.creative_ids.items()}
+        self.creative_positions = {
+            creative.key: index for index, creative in enumerate(spec.creatives)
+        }
         self.post_ids = {
             creative.key: LINKEDIN_POST_IDS.at(index)
             for index, creative in enumerate(spec.creatives)
@@ -5549,6 +5629,8 @@ class _LinkedInModel:
                 _RawLead(
                     id=_response_id(_sha256(f"{self.core.seed}:lead-id:{label}")),
                     creative_key=key,
+                    day=day,
+                    ordinal=index,
                     submitted_at=submitted,
                     test_lead=test,
                     hide_creative=not test and rng.random() < hide_share,
@@ -5586,10 +5668,15 @@ class _LinkedInModel:
                 day += _DAY
 
     def _person_for(self, lead: _RawLead) -> _Person:
-        """Assign the person who submitted ``lead``: a new one, or a repeat of an earlier one."""
+        """Assign the person who submitted ``lead``: a new one, or a repeat of a recent one.
+
+        A repeat reuses one of the ``_REPEAT_WINDOW`` people created most recently, so the
+        choice survives a later history start.
+        """
         rng = _rng(self.core.seed, "person", lead.id)
         if self.persons and rng.random() < self._repeat_share:
-            person = self.persons[int(rng.random() * len(self.persons))]
+            recent = self.persons[-_REPEAT_WINDOW:]
+            person = recent[int(rng.random() * len(recent))]
             person.touches.append(lead.submitted_at)
             return person
         suffix = _sha256(f"{self.core.seed}:person:{lead.id}")[:8]
@@ -5597,6 +5684,9 @@ class _LinkedInModel:
         person = _Person(
             index=len(self.persons),
             key=lead.id,
+            creative_position=self.creative_positions[lead.creative_key],
+            day=lead.day,
+            ordinal=lead.ordinal,
             email=email,
             email_sha256=_sha256(_normalise_email(email)),
             first_name=lead.first_name,
@@ -5687,6 +5777,145 @@ class _LinkedInModel:
 # ---------------------------------------------------------------------------
 # HubSpot
 # ---------------------------------------------------------------------------
+
+
+_OWNED_OBJECT_IDS: Final[Mapping[str, IdRange]] = MappingProxyType(
+    {"meetings": HUBSPOT_MEETING_IDS, "deals": HUBSPOT_DEAL_IDS}
+)
+
+
+def person_contact_id(creative_position: int, day: date, ordinal: int) -> str:
+    """Return the contact id of the simulated person whose first lead is the given response.
+
+    A simulated LinkedIn person is created by their first lead response: the ``ordinal``-th
+    response (test leads included) that the creative at index ``creative_position`` of the
+    world spec's ``linkedin.creatives`` generated on the UTC date ``day``. Those are the
+    coordinates the response id itself is seeded from, and the contact id is an injective
+    function of them alone, so it does not depend on where the world's history starts or on
+    how many people came before: a world rebuilt on a later date gives every person it still
+    holds the same id, and never gives a person's id to anyone else.
+
+    Args:
+        creative_position: Index of the creative in the spec's ``linkedin.creatives``, below
+            :data:`PERSON_CREATIVE_POSITIONS` (its id is ``LINKEDIN_CREATIVE_IDS.at(index)``
+            unless the spec sets one).
+        day: UTC date of the first lead, from 1970-01-01 to 2106-11-23.
+        ordinal: The lead's position among that creative's responses on ``day``, below
+            :data:`LEADS_PER_CREATIVE_DAY`.
+
+    Returns:
+        The contact id, a decimal string in ``HUBSPOT_CONTACT_IDS``.
+
+    Raises:
+        ValueError: When ``creative_position`` or ``ordinal`` is not a non-negative integer,
+            ``day`` is not a date, or a coordinate lies outside the capacity of the id layout.
+
+    Example:
+        >>> person_contact_id(0, date(2026, 9, 4), 0)
+        '9900002070000000'
+        >>> person_contact_id(5, date(2026, 9, 4), 3)
+        '9900002070002503'
+    """
+    slot = _person_slot(creative_position, day, ordinal)
+    return str(HUBSPOT_CONTACT_IDS.at(_PERSON_BLOCK + slot))
+
+
+def person_object_id(object_type: Literal["meetings", "deals"], contact_id: str, index: int) -> str:
+    """Return the id of a simulated person's ``index``-th meeting or deal.
+
+    Each person contact owns two meeting ids and two deal ids, derived from its contact id
+    alone, so a meeting or deal keeps its id, and an id keeps its event, however the world's
+    history start moves.
+
+    Args:
+        object_type: ``"meetings"`` or ``"deals"``.
+        contact_id: The person's contact id, as :func:`person_contact_id` returns it.
+        index: The object's position among the person's meetings or deals: 0 or 1.
+
+    Returns:
+        The object id, a decimal string in ``HUBSPOT_MEETING_IDS`` or ``HUBSPOT_DEAL_IDS``.
+
+    Raises:
+        ValueError: When ``object_type`` is neither ``"meetings"`` nor ``"deals"``,
+            ``contact_id`` is not a simulated person's contact id, or ``index`` is not 0 or 1.
+
+    Example:
+        >>> person_object_id("meetings", "9900002070000000", 1)
+        '9900204140000001'
+    """
+    return _owned_object_id(object_type, contact_id, index, _PERSON_BLOCK, _PERSON_SLOTS, "person")
+
+
+def _person_slot(creative_position: int, day: date, ordinal: int) -> int:
+    """The slot of a first lead: ``(days * creatives + position) * leads per day + ordinal``.
+
+    Every coordinate is bounds-checked, so distinct coordinates never share a slot.
+
+    Raises:
+        ValueError: As :func:`person_contact_id` documents.
+    """
+    _check_int("creative_position", creative_position)
+    _check_int("ordinal", ordinal)
+    _require(
+        isinstance(day, date) and not isinstance(day, datetime),
+        f"day must be a date, found {day!r}",
+    )
+    _require(
+        creative_position < PERSON_CREATIVE_POSITIONS,
+        f"creative position {creative_position} exceeds the {PERSON_CREATIVE_POSITIONS} "
+        "creatives whose leads simulated person ids cover",
+    )
+    days = (day - _EPOCH_DAY).days
+    _require(
+        0 <= days < _PERSON_DAYS,
+        f"lead day {day.isoformat()} lies outside the {_PERSON_DAYS} UTC days from "
+        f"{_EPOCH_DAY.isoformat()} that simulated person ids cover",
+    )
+    # A world rejects lead creatives past the position limit and ExplicitDays days at the
+    # lead limit when it is built (_CrmModel._check_person_layout); a DailyProfile draws its
+    # leads day by day and cannot be bounded statically, so this check is its runtime guard.
+    _require(
+        ordinal < LEADS_PER_CREATIVE_DAY,
+        f"lead ordinal {ordinal} exceeds the {LEADS_PER_CREATIVE_DAY} responses a creative "
+        "can generate on one day in simulated person ids",
+    )
+    return (days * PERSON_CREATIVE_POSITIONS + creative_position) * LEADS_PER_CREATIVE_DAY + ordinal
+
+
+def _owned_object_id(
+    object_type: str, contact_id: str, index: int, block: int, slots: int, owner: str
+) -> str:
+    """The id of the ``index``-th meeting or deal of a contact in a block of contact ids.
+
+    The contact at ``block + slot`` of ``HUBSPOT_CONTACT_IDS`` owns the ids from
+    ``block + slot * _OBJECTS_PER_CONTACT`` of the meeting and deal ranges.
+
+    Args:
+        object_type: ``"meetings"`` or ``"deals"``.
+        contact_id: The owning contact's id.
+        index: The object's position in the contact's draw, below ``_OBJECTS_PER_CONTACT``.
+        block: Offset of the contact block in ``HUBSPOT_CONTACT_IDS``.
+        slots: Contacts the block holds.
+        owner: What the block holds, for error messages.
+
+    Raises:
+        ValueError: For an unknown object type, a contact id outside the block, or an index
+            outside ``[0, _OBJECTS_PER_CONTACT)``.
+    """
+    family = _OWNED_OBJECT_IDS.get(object_type)
+    _require(family is not None, f"object_type must be meetings or deals, found {object_type!r}")
+    _require(
+        HUBSPOT_CONTACT_IDS.contains(contact_id)
+        and 0 <= int(contact_id) - HUBSPOT_CONTACT_IDS.start - block < slots,
+        f"{contact_id!r} is not a simulated {owner} contact id",
+    )
+    _check_int("index", index)
+    _require(
+        index < _OBJECTS_PER_CONTACT,
+        f"a {owner} contact owns {_OBJECTS_PER_CONTACT} {object_type}, found index {index}",
+    )
+    slot = int(contact_id) - HUBSPOT_CONTACT_IDS.start - block
+    return str(cast(IdRange, family).at(block + slot * _OBJECTS_PER_CONTACT + index))
 
 
 @dataclass(frozen=True, slots=True)
@@ -5836,6 +6065,8 @@ class _CrmModel:
         self.linkedin = linkedin
         self.google = google
         self.google_properties = google_properties
+        if linkedin is not None:
+            self._check_person_layout(linkedin)
         self.options, self.added_labels = self._build_options()
         self.option_order = {option.value: option.display_order for option in self.options}
         self.mql_target = self._target(mapping.mql)
@@ -5850,12 +6081,46 @@ class _CrmModel:
         self._deals: dict[str, _DealTruth] = {}
         self._meetings_of: dict[str, list[str]] = {}
         self._deals_of: dict[str, list[str]] = {}
-        self._meeting_counter = 0
-        self._deal_counter = 0
         self._hashed_cache: dict[
             int, tuple[_ContactTruth, tuple[_MeetingTruth, ...], tuple[_DealTruth, ...]]
         ] = {}
         self._google_built = False
+
+    def _check_person_layout(self, linkedin: _LinkedInModel) -> None:
+        """Reject a LinkedIn spec whose leads the simulated person id layout cannot hold.
+
+        A person's contact id derives from the spec position of their first lead's creative
+        and that lead's position among the creative's responses on its UTC day
+        (:func:`person_contact_id`). Every lead creative must therefore sit below
+        :data:`PERSON_CREATIVE_POSITIONS`, and every day an :class:`ExplicitDays` profile of
+        one states must hold fewer than :data:`LEADS_PER_CREATIVE_DAY` leads. A
+        :class:`DailyProfile` draws its leads day by day and cannot be bounded here, so
+        :func:`_person_slot` still checks each first lead's ordinal when its person is built.
+
+        Raises:
+            ValueError: Naming the first lead creative at position
+                :data:`PERSON_CREATIVE_POSITIONS` or beyond, or the first ``ExplicitDays``
+                day of a lead creative stating :data:`LEADS_PER_CREATIVE_DAY` leads or more.
+        """
+        for key in linkedin.lead_creatives:
+            position = linkedin.creative_positions[key]
+            _require(
+                position < PERSON_CREATIVE_POSITIONS,
+                f"lead creative {key} is at position {position} of linkedin.creatives; "
+                "simulated person ids cover only lead creatives below position "
+                f"PERSON_CREATIVE_POSITIONS ({PERSON_CREATIVE_POSITIONS})",
+            )
+            profile = linkedin.creatives[key].profile
+            if not isinstance(profile, ExplicitDays):
+                continue
+            for offset, metrics in profile.days.items():
+                _require(
+                    metrics.leads < LEADS_PER_CREATIVE_DAY,
+                    f"lead creative {key} states {metrics.leads} leads on ExplicitDays offset "
+                    f"{offset}; each day must state fewer than LEADS_PER_CREATIVE_DAY "
+                    f"({LEADS_PER_CREATIVE_DAY}), the responses of one creative on one UTC day "
+                    "that simulated person ids cover",
+                )
 
     # -- stages and properties ---------------------------------------------------------------------
 
@@ -5969,7 +6234,7 @@ class _CrmModel:
             )
         for target in (self.mql_target, self.ql_target):
             if target is not None and target[0] == "property":
-                records.append(PropertyRecord("contacts", target[1], target[1], "date", "date"))
+                records.append(instant("contacts", target[1], target[1]))
         if self.google_properties is not None:
             campaign_property, touch_property = self.google_properties
             records.append(text("contacts", campaign_property, "Google Ads campaign"))
@@ -6100,8 +6365,8 @@ class _CrmModel:
         rng = _rng(self.core.seed, "crm", person.key)
         if rng.random() >= float(self.funnel.match_share):
             return
-        contact_id = str(HUBSPOT_CONTACT_IDS.at(person.index))
-        draw = self._draw(rng, person.first_touch)
+        contact_id = person_contact_id(person.creative_position, person.day, person.ordinal)
+        draw = self._draw(rng, person.first_touch, max_meetings=_OBJECTS_PER_CONTACT)
         self._register(
             contact_id,
             draw,
@@ -6130,17 +6395,39 @@ class _CrmModel:
         *,
         google: bool,
     ) -> None:
-        """Allocate a contact's meetings and deals and index everything."""
-        meeting_ids: list[str] = []
-        for draw_meeting in draw.meetings:
+        """Allocate a contact's meetings and deals and index everything.
+
+        Each object's id derives from the contact id and its position in the draw, and a
+        shared meeting's second contact is one of the ``_PARTNER_WINDOW`` person contacts
+        registered most recently, so ids and attendees survive a later history start.
+
+        Raises:
+            ValueError: When the draw holds more meetings or deals than a contact owns ids.
+        """
+        _require(
+            len(draw.meetings) <= _OBJECTS_PER_CONTACT and len(draw.deals) <= _OBJECTS_PER_CONTACT,
+            f"contact {contact_id} draws more than {_OBJECTS_PER_CONTACT} meetings or deals",
+        )
+
+        def object_id(object_type: Literal["meetings", "deals"], position: int) -> str:
             if google:
-                meeting_id = str(HUBSPOT_MEETING_IDS.at(_GOOGLE_CRM_BLOCK + self._meeting_counter))
-            else:
-                meeting_id = str(HUBSPOT_MEETING_IDS.at(self._meeting_counter))
-            self._meeting_counter += 1
+                return _owned_object_id(
+                    object_type,
+                    contact_id,
+                    position,
+                    _GOOGLE_CRM_BLOCK,
+                    _GOOGLE_CONTACT_SLOTS,
+                    "Google-touch",
+                )
+            return person_object_id(object_type, contact_id, position)
+
+        meeting_ids: list[str] = []
+        for position, draw_meeting in enumerate(draw.meetings):
+            meeting_id = object_id("meetings", position)
             contacts = [contact_id]
             if draw_meeting.shared and self._person_contacts and not google:
-                partner = self._person_contacts[int(rng.random() * len(self._person_contacts))]
+                recent = self._person_contacts[-_PARTNER_WINDOW:]
+                partner = recent[int(rng.random() * len(recent))]
                 if partner != contact_id:
                     contacts.append(partner)
             meeting = _MeetingTruth(
@@ -6157,12 +6444,8 @@ class _CrmModel:
                 self._meetings_of.setdefault(member, []).append(meeting_id)
             meeting_ids.append(meeting_id)
         deal_ids: list[str] = []
-        for made, stage, amount in draw.deals:
-            if google:
-                deal_id = str(HUBSPOT_DEAL_IDS.at(_GOOGLE_CRM_BLOCK + self._deal_counter))
-            else:
-                deal_id = str(HUBSPOT_DEAL_IDS.at(self._deal_counter))
-            self._deal_counter += 1
+        for position, (made, stage, amount) in enumerate(draw.deals):
+            deal_id = object_id("deals", position)
             self._deals[deal_id] = _DealTruth(
                 id=deal_id,
                 name=f"{last_name} - Analytics platform",
@@ -6205,15 +6488,13 @@ class _CrmModel:
             return
         start = _midnight(self.core.history_start)
         span = float(self.core.spec.history_days)
-        saved_meetings, saved_deals = self._meeting_counter, self._deal_counter
-        self._meeting_counter = self._deal_counter = 0
         for index in range(self.spec.google_touch_contacts):
             rng = _rng(self.core.seed, "google-crm", str(index))
             touch = start + timedelta(days=rng.uniform(0.0, span))
             campaign = campaigns[int(rng.random() * len(campaigns))]
             first, last = rng.choice(_FIRST_NAMES), rng.choice(_LAST_NAMES)
             email = f"google-contact-{index:05d}@{SIM_EMAIL_DOMAIN}"
-            draw = self._draw(rng, touch)
+            draw = self._draw(rng, touch, max_meetings=_OBJECTS_PER_CONTACT)
             self._register(
                 str(HUBSPOT_CONTACT_IDS.at(_GOOGLE_CRM_BLOCK + index)),
                 draw,
@@ -6226,7 +6507,6 @@ class _CrmModel:
                 touch,
                 google=True,
             )
-        self._meeting_counter, self._deal_counter = saved_meetings, saved_deals
 
     @cached_property
     def _orphans(self) -> tuple[_DealTruth, ...]:
@@ -6290,9 +6570,9 @@ class _CrmModel:
         contact_id = str(HUBSPOT_HASHED_CONTACT_IDS.at(offset))
         rng = _rng(self.core.seed, "hashed", contact_id)
         touch = _midnight(self.core.anchor) - timedelta(days=rng.uniform(0.0, 120.0))
-        draw = self._draw(rng, touch, max_meetings=_HASHED_OBJECTS_PER_CONTACT)
+        draw = self._draw(rng, touch, max_meetings=_OBJECTS_PER_CONTACT)
         first, last = rng.choice(_FIRST_NAMES), rng.choice(_LAST_NAMES)
-        base = _HASHED_OBJECT_BLOCK + offset * _HASHED_OBJECTS_PER_CONTACT
+        base = _HASHED_OBJECT_BLOCK + offset * _OBJECTS_PER_CONTACT
         meetings = tuple(
             _MeetingTruth(
                 id=str(HUBSPOT_MEETING_IDS.at(base + index)),
@@ -6303,7 +6583,7 @@ class _CrmModel:
                 canceled=meeting.canceled,
                 contact_ids=(contact_id,),
             )
-            for index, meeting in enumerate(draw.meetings[:_HASHED_OBJECTS_PER_CONTACT])
+            for index, meeting in enumerate(draw.meetings[:_OBJECTS_PER_CONTACT])
         )
         deals = tuple(
             _DealTruth(
@@ -6314,7 +6594,7 @@ class _CrmModel:
                 amount=amount,
                 contact_ids=(contact_id,),
             )
-            for index, (made, stage, amount) in enumerate(draw.deals[:_HASHED_OBJECTS_PER_CONTACT])
+            for index, (made, stage, amount) in enumerate(draw.deals[:_OBJECTS_PER_CONTACT])
         )
         truth = _ContactTruth(
             id=contact_id,
@@ -6347,13 +6627,17 @@ class _CrmModel:
         return int(digest[8:24], 16) % _HASHED_CONTACT_SPAN
 
     def _hashed_object(self, family: IdRange, object_id: str) -> tuple[int, int] | None:
-        """Decode a seeded contact's meeting or deal id into ``(contact offset, index)``."""
+        """Decode a seeded contact's meeting or deal id into ``(contact offset, index)``.
+
+        Only ids of the seeded contacts' block decode; any other id, a person's object above
+        it included, is ``None``.
+        """
         if not family.contains(object_id):
             return None
         relative = int(object_id) - family.start - _HASHED_OBJECT_BLOCK
-        if relative < 0:
+        if not 0 <= relative < _HASHED_CONTACT_SPAN * _OBJECTS_PER_CONTACT:
             return None
-        return relative // _HASHED_OBJECTS_PER_CONTACT, relative % _HASHED_OBJECTS_PER_CONTACT
+        return relative // _OBJECTS_PER_CONTACT, relative % _OBJECTS_PER_CONTACT
 
     # -- lookups -----------------------------------------------------------------------------------
 
@@ -6385,9 +6669,9 @@ class _CrmModel:
         if not HUBSPOT_DEAL_IDS.contains(deal_id):
             return None
         relative = int(deal_id) - HUBSPOT_DEAL_IDS.start
-        if relative >= _BULK_DEAL_BLOCK:
+        if _BULK_DEAL_BLOCK <= relative < _HASHED_OBJECT_BLOCK:
             return self._bulk_deal(relative - _BULK_DEAL_BLOCK)
-        if relative >= _ORPHAN_DEAL_BLOCK:
+        if _ORPHAN_DEAL_BLOCK <= relative < _BULK_DEAL_BLOCK:
             index = relative - _ORPHAN_DEAL_BLOCK
             orphans = self._orphans
             return orphans[index] if index < len(orphans) else None
@@ -6410,7 +6694,7 @@ class _CrmModel:
         if truth.created_at > now:
             return None
         entered: dict[str, datetime] = {"lead": truth.created_at}
-        bound: dict[str, date] = {}
+        bound: dict[str, datetime] = {}
         for target, instant in ((self.mql_target, truth.mql_at), (self.ql_target, truth.ql_at)):
             if target is None or instant is None or instant > now:
                 continue
@@ -6419,15 +6703,13 @@ class _CrmModel:
                 previous = entered.get(name)
                 entered[name] = instant if previous is None else min(previous, instant)
             else:
-                day = instant.date()
-                previous_day = bound.get(name)
-                bound[name] = day if previous_day is None else min(previous_day, day)
+                previous = bound.get(name)
+                bound[name] = instant if previous is None else min(previous, instant)
         entered = {
             value: instant for value, instant in entered.items() if value in self.option_order
         }
         stage = max(entered, key=lambda value: self.option_order[value]) if entered else "lead"
-        events = [truth.created_at, *entered.values()]
-        events += [_midnight(day) for day in bound.values()]
+        events = [truth.created_at, *entered.values(), *bound.values()]
         updated = max(instant for instant in events if instant <= now)
         return ContactRecord(
             id=truth.id,
@@ -6607,23 +6889,48 @@ class _CrmModel:
     ) -> tuple[HubSpotRecord, ...]:
         """Every existing record of a type matching all ``filters``, sorted.
 
+        Seeded contacts answering real lead emails, with their meetings and deals, are
+        searched once a lookup (by email hash, by id or through an association) has
+        materialised them, exactly as batch reads and associations return them. Hashes never
+        asked for cannot be enumerated, so until then none of those records is searchable.
+        Each record appears once, however many lookups reached it, and the same existence,
+        filter and sort rules apply to every record.
+
         Raises:
             ValueError: For an unknown object type.
         """
         self._ensure_people()
+        # ``_ensure_people`` and ``_hashed`` grow these stores under the lock from other
+        # threads: snapshot them all at one moment, then build the records outside it.
+        with self._lock:
+            hashed = tuple(self._hashed_cache.values())
+            contacts = dict(self._contacts)
+            meetings = dict(self._meetings)
+            stored_deals = tuple(self._deals.values())
         records: list[HubSpotRecord] = []
         if object_type == "contacts":
-            for truth in list(self._contacts.values()):
+            for hashed_contact, _meetings, _deals in hashed:
+                contacts.setdefault(hashed_contact.id, hashed_contact)
+            for truth in contacts.values():
                 contact = self.contact_record(truth)
                 if contact is not None:
                     records.append(contact)
         elif object_type == "meetings":
-            for meeting_truth in list(self._meetings.values()):
+            for _contact, hashed_meetings, _deals in hashed:
+                for hashed_meeting in hashed_meetings:
+                    meetings.setdefault(hashed_meeting.id, hashed_meeting)
+            for meeting_truth in meetings.values():
                 meeting = self.meeting_record(meeting_truth)
                 if meeting is not None:
                     records.append(meeting)
         elif object_type == "deals":
-            for deal_truth in (*self._deals.values(), *self._orphans, *self._bulk_deals):
+            deals = {
+                stored.id: stored for stored in (*stored_deals, *self._orphans, *self._bulk_deals)
+            }
+            for _contact, _meetings, hashed_deals in hashed:
+                for hashed_deal in hashed_deals:
+                    deals.setdefault(hashed_deal.id, hashed_deal)
+            for deal_truth in deals.values():
                 deal = self.deal_record(deal_truth)
                 if deal is not None:
                     records.append(deal)
@@ -6683,7 +6990,11 @@ class SimulatedWorld:
     Raises:
         ValueError: When an explicitly passed content asset lies outside the reserved LinkedIn
             ranges, an asset form or override creative is missing from the spec, a platform
-            change names an unknown entity, or a removed stage label is unknown.
+            change names an unknown entity, or a removed stage label is unknown; and, in a
+            world with LinkedIn and HubSpot parts, when a lead creative (one with a lead form
+            and a profile) sits at position :data:`PERSON_CREATIVE_POSITIONS` or beyond in
+            ``linkedin.creatives``, or an ``ExplicitDays`` day of a lead creative states
+            :data:`LEADS_PER_CREATIVE_DAY` leads or more.
         ConfigError: When the config files are needed and invalid.
     """
 
@@ -7311,8 +7622,11 @@ class SimulatedWorld:
         ``filters`` form one AND group. Results are sorted by ``sort_property`` (records
         without a value last, then by id) or by id.
 
-        Seeded contacts answering real lead emails are found by email lookups only, never by
-        search. ``total`` is the length of the result; paging is the caller's.
+        Seeded contacts answering real lead emails, and their meetings and deals, are found
+        by search once a lookup (an email-hash batch read, a by-id read or an association)
+        has materialised them; the world cannot enumerate hashes it was never asked for. Each
+        record appears once, however many lookups reached it. ``total`` is the length of the
+        result; paging is the caller's.
         """
         return self._require_crm().search(object_type, filters, sort_property, descending)
 

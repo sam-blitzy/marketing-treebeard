@@ -30,7 +30,7 @@ import re
 import socket
 from collections import Counter
 from collections.abc import Callable, Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -39,7 +39,7 @@ import httpx
 import pytest
 from pydantic import AliasChoices, SecretStr
 
-from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.analysis.thresholds import StageBinding, Thresholds
 from ads_engine.connectors.errors import QueryDefect, TransientError
 from ads_engine.connectors.google_n8n.client import (
     SIMULATED_SECRET,
@@ -49,7 +49,12 @@ from ads_engine.connectors.google_n8n.client import (
 )
 from ads_engine.connectors.google_n8n.queries import QUERIES
 from ads_engine.connectors.http import RetryPolicy, build_client, send_json
-from ads_engine.connectors.hubspot.client import HubSpotClient, RateLimiter
+from ads_engine.connectors.hubspot.client import (
+    HubSpotClient,
+    RateLimiter,
+    contact_property_map,
+)
+from ads_engine.connectors.hubspot.parser import parse_instant
 from ads_engine.connectors.linkedin.auth import (
     SIMULATED_TOKEN,
     TOKEN_URL,
@@ -61,7 +66,13 @@ from ads_engine.connectors.linkedin.parser import decode_email
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import SIM_GOOGLE_CUSTOMER_ID
 from ads_engine.simulation import transport as transport_module
-from ads_engine.simulation.generator import DEFAULT_SPEC, Fault, SimulatedWorld
+from ads_engine.simulation.generator import (
+    DEFAULT_SPEC,
+    ContactRecord,
+    Fault,
+    SearchFilter,
+    SimulatedWorld,
+)
 from ads_engine.simulation.payloads import (
     ContractViolation,
     RenderedResponse,
@@ -459,6 +470,62 @@ async def test_the_hubspot_client_reads_crm_surfaces_through_build_client() -> N
     assert definition.name == "lifecyclestage"
     assert "Qualified Lead" in {option.label for option in definition.options}
     assert journal == [JournalEntry("hubspot", "properties", "GET", PROPERTY_PATH, 200, None)]
+
+
+@pytest.mark.anyio
+async def test_a_property_bound_stage_keeps_its_instant_through_the_unchanged_parser() -> None:
+    """AAP 0.5.4.7: a property-mode MQL is a datetime, compared with the touch as an instant.
+
+    A same-day event must order correctly against a touch an hour earlier, on the event's
+    instant and an hour later, so it is neither counted before its touch nor dropped after it.
+    """
+    booked = "date_first_meeting_was_booked"
+    config = _config()
+    mapping = dataclasses.replace(config.mapping, mql=StageBinding("property", (), booked))
+    world = SimulatedWorld(
+        42, SPEC, clock=lambda: NOW, content_assets=config.content_assets, mapping=mapping
+    )
+    contacts = cast(
+        tuple[ContactRecord, ...],
+        world.hubspot_search("contacts", [SearchFilter(booked, "HAS_PROPERTY")]),
+    )
+    # Events at least an hour from either UTC midnight, so all three touches share their day.
+    truths = {
+        contact.id: contact.bound_dates[booked]
+        for contact in contacts
+        if time(1) <= contact.bound_dates[booked].time() < time(23)
+    }
+    assert truths
+    first = min(truths)
+    settings = get_settings()
+    async with build_client("hubspot", transport=mock_transport("hubspot", world)) as http:
+        client = _hubspot_client(http, retry=_recording_policy([]))
+        bindings = await client.verify_bindings(mapping, settings)
+        batch = await client.contacts_by_id(
+            sorted(truths), contact_property_map(bindings, settings)
+        )
+        raw = await http.post(
+            f"{HUBSPOT_CRM}/objects/2026-09/contacts/batch/read",
+            headers=HUBSPOT_HEADERS,
+            json={"inputs": [{"id": first}], "properties": [booked]},
+        )
+    assert (bindings.mql.available, bindings.mql.property) == (True, booked)
+    assert batch.read_status == dict.fromkeys(sorted(truths), "ok")
+    (record,) = raw.json()["results"]
+    wire = record["properties"][booked]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", wire)
+    assert parse_instant(wire) == batch.records[first].mql_at
+    hour = timedelta(hours=1)
+    for hs_id, truth in truths.items():
+        event = truth.replace(microsecond=truth.microsecond // 1000 * 1000)
+        parsed = batch.records[hs_id].mql_at
+        assert parsed is not None
+        assert parsed == event
+        assert parsed.time() != time(0)
+        # Counted only when the bound stage instant is at or after the touch.
+        for touch, counted in ((event - hour, True), (event, True), (event + hour, False)):
+            assert touch.date() == event.date()
+            assert (parsed >= touch) is counted
 
 
 # ---------------------------------------------------------------------------------------------

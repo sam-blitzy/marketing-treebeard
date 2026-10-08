@@ -650,7 +650,9 @@ class DatasetManager:
             ValueError: If the dataset is not a HubSpot dataset.
         """
         async with self._unit(session) as unit:
-            dataset = await repositories.ensure_writable(unit, dataset_id)
+            # Exclusive: this transaction updates the row it guards, and two binders that
+            # each held the shared guard would deadlock upgrading it.
+            dataset = await repositories.ensure_writable(unit, dataset_id, exclusive=True)
             self._require_hubspot(dataset)
             dataset.crm_bindings = bindings.to_json()
             await unit.flush()

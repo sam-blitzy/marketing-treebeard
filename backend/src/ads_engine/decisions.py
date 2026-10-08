@@ -31,23 +31,34 @@ the decided budget. Every rejection is a :class:`DecisionError` whose ``status_c
 ``code`` ``api/app.py`` maps to ``{"error": {"code", "message"}}``.
 
 **Resolutions.** :data:`RESOLUTIONS` is the (kind, shape) matrix of AAP 0.5.4.4, and
-:func:`resolve_discrepancy` applies one resolution. :func:`compare`, :func:`write_baseline`,
-:func:`raise_discrepancy` and :func:`auto_resolve` are the detection-side helpers
-``sync/snapshots.py`` calls after each entity sync; it decides ``untracked`` and
-``missing`` itself, from baseline timing and complete enumeration (AAP 0.3.3 safe absence).
+:func:`resolve_discrepancy` applies one resolution. :func:`compare`, :func:`verified_match`,
+:func:`write_baseline`, :func:`raise_discrepancy`, :func:`auto_resolve` and
+:func:`auto_resolve_absent` are the detection-side helpers ``sync/snapshots.py`` calls after
+each entity sync, with every subject's state loaded at once by :func:`load_subject_states`;
+it decides ``untracked`` and ``missing`` itself, from baseline timing and complete
+enumeration (AAP 0.3.3 safe absence).
 
 **Invariants every function keeps:**
 
 * Decisions and discrepancies are dataset-scoped. A user decision or resolution on a subject
   whose dataset is not ``active`` is refused with :class:`SubjectRetired` (409
   ``subject_retired``), so a simulated decision never becomes a live campaign's expected
-  state (AAP 0.3.2, 0.3.3).
+  state (AAP 0.3.2, 0.3.3). The detection-side writers (:func:`write_baseline`,
+  :func:`raise_discrepancy`, :func:`auto_resolve`) refuse a ``retired`` dataset the same
+  way and write in ``building`` and ``active`` ones.
 * Money is ``Decimal`` throughout, never ``float``. Google amounts are compared in micros,
   their native integer precision; LinkedIn amounts are validated to the currency's minor
   unit and compared exactly, so rounding can neither cause nor hide a mismatch.
-* Nothing here commits. Callers (API routes, sync jobs) own the transaction; functions
-  flush, and every write that changes what the latest run shows enqueues one
-  ``analysis_request`` in the same transaction (AAP 0.3.2).
+* Nothing here commits a caller's session. Callers (API routes, sync jobs) own the
+  transaction; functions flush, and every write that changes what the latest run shows
+  enqueues one ``analysis_request`` in the same transaction (AAP 0.3.2).
+  :func:`record_decision` and :func:`resolve_discrepancy` keep the AAP 0.5.1 signatures
+  with ``session`` as an optional keyword; called without one they run in a transaction
+  of their own (:func:`ads_engine.db.session.use_session`).
+* Every writer of a subject locks, and holds until its transaction ends, first the
+  subject's dataset ``FOR SHARE`` (an activation cannot retire it meanwhile), then the
+  campaign or budget row ``FOR NO KEY UPDATE`` (concurrent writers of one subject apply
+  one after the other), then its ``discrepancy`` rows.
 * Logs carry ids, kinds, shapes and origins only: never ``decided_by`` (an email), notes or
   amounts.
 
@@ -55,25 +66,30 @@ Example::
 
     async with get_sessionmaker()() as session:  # ads_engine.db.session
         decision = await record_decision(
-            session,
             SubjectRef(type="campaign", id=42),
             DecisionPatch(status="paused"),
-            origin="user",
+            "user",
+            session=session,
             decided_by=user.email,
         )
         await session.commit()
+
+    # Without a session the call commits a transaction of its own.
+    await resolve_discrepancy(discrepancy_id, "decision_correct")
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
+from itertools import batched
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, Literal, TypeIs, get_args
 
-from sqlalchemy import select
+from sqlalchemy import Select, select, union
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ads_engine.db.models.accounts import (
     BUDGET_PERIODS,
@@ -94,7 +110,8 @@ from ads_engine.db.models.decisions import (
 )
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.db.models.snapshots import EntitySnapshot
-from ads_engine.db.repositories import enqueue_analysis_request
+from ads_engine.db.repositories import enqueue_analysis_request, lock_dataset
+from ads_engine.db.session import use_session
 from ads_engine.logging import get_logger
 
 __all__ = [
@@ -120,9 +137,11 @@ __all__ = [
     "SubjectRef",
     "SubjectRetired",
     "SubjectState",
+    "SubjectStates",
     "SubjectType",
     "apply_patch",
     "auto_resolve",
+    "auto_resolve_absent",
     "compare",
     "decision_shape",
     "describe_decision",
@@ -133,6 +152,7 @@ __all__ = [
     "from_micros",
     "is_valid_amount",
     "load_subject_state",
+    "load_subject_states",
     "minor_unit_exponent",
     "parse_intended_state",
     "raise_discrepancy",
@@ -140,6 +160,7 @@ __all__ = [
     "resolve_discrepancy",
     "round_to_minor_unit",
     "to_micros",
+    "verified_match",
     "write_baseline",
 ]
 
@@ -401,7 +422,9 @@ class PlatformStateUnknown(DecisionError):  # noqa: N818 - name fixed by the dec
     Raised when a snapshot lacks what its shape needs: a campaign status outside the
     normalised set, a shared member without its budget, or a shared budget whose amount
     Google omitted. Such an amount is unknown, never zero, so no ``budget`` decision can be
-    written for it until a later sync observes it (``Budget`` model contract). Code
+    written for it until a later sync observes it (``Budget`` model contract). Also raised
+    when the snapshot a resolution would adopt was observed in another budget shape or
+    period than the subject has now; a later entity sync refreshes the comparison. Code
     ``platform_state_unknown``.
     """
 
@@ -1021,7 +1044,11 @@ def expected_state_from_snapshot(
     """Materialise the platform state a snapshot observed, in a decision shape.
 
     Used for baselines (:func:`write_baseline`), ``adopt_platform`` and
-    ``platform_correct``. Only the fields the shape owns are filled:
+    ``platform_correct``. A baseline materialises the snapshot of the sync that observed
+    the subject's current state; a resolution first checks that its older snapshot was
+    observed in ``shape`` and ``budget_period`` (:func:`_check_observed_shape`), so old
+    values are never combined with a new shape or period. Only the fields the shape owns
+    are filled:
 
     * ``own_budget``: the status plus the campaign's own amounts. LinkedIn takes
       ``budget_daily`` and ``budget_total`` as observed; Google takes
@@ -1081,6 +1108,154 @@ def expected_state_from_snapshot(
     else:
         daily, total = snapshot.budget_daily, snapshot.budget_total
     return ExpectedState(shape="own_budget", status=status, daily_budget=daily, total_budget=total)
+
+
+@dataclass(frozen=True, slots=True)
+class _Observation:
+    """The budget shape a snapshot recorded of its own entity when it was captured.
+
+    Attributes:
+        shape: The decision shape the observed state fits.
+        budget_period: The Google budget period observed; ``None`` on LinkedIn and for a
+            Google campaign without a budget.
+        budget_id: For a ``shared_member`` observation, the shared budget drawn from;
+            ``None`` otherwise.
+    """
+
+    shape: DecisionShape
+    budget_period: BudgetPeriod | None
+    budget_id: int | None
+
+
+def _observed_shape(snapshot: EntitySnapshot) -> _Observation | None:
+    """Read the budget shape and period a snapshot observed from its own metadata.
+
+    The ``sync.snapshots.SnapshotRow`` builders record them at capture time:
+
+    * a Google campaign is a ``shared_member`` of ``budget_id`` when its payload says
+      ``explicitly_shared``, and ``own_budget`` otherwise, with payload ``budget_period``;
+    * a LinkedIn campaign is always ``own_budget`` (payload ``explicitly_shared`` false and
+      ``budget_period`` null);
+    * a Google budget is a ``budget`` with payload ``period``.
+
+    Args:
+        snapshot: A campaign or budget snapshot.
+
+    Returns:
+        The observation, or ``None`` when the snapshot does not record it: a missing
+        payload key, an unknown period, a shared member without ``budget_id``, or an
+        entity type or source that has no decision subjects.
+    """
+    payload: object = snapshot.payload
+    if not isinstance(payload, Mapping):
+        return None
+    if snapshot.entity_type == "budget":
+        period = payload.get("period")
+        if snapshot.source != "google" or not _is_period(period):
+            return None
+        return _Observation(shape="budget", budget_period=period, budget_id=None)
+    if snapshot.entity_type != "campaign" or "budget_period" not in payload:
+        return None
+    shared = payload.get("explicitly_shared")
+    raw_period = payload["budget_period"]
+    if not isinstance(shared, bool) or not (raw_period is None or _is_period(raw_period)):
+        return None
+    if snapshot.source == "linkedin":
+        if shared or raw_period is not None:
+            return None
+        return _Observation(shape="own_budget", budget_period=None, budget_id=None)
+    if snapshot.source != "google":
+        return None
+    if not shared:
+        return _Observation(shape="own_budget", budget_period=raw_period, budget_id=None)
+    if snapshot.budget_id is None:
+        return None
+    return _Observation(
+        shape="shared_member", budget_period=raw_period, budget_id=snapshot.budget_id
+    )
+
+
+def _shape_text(shape: DecisionShape, period: BudgetPeriod | None, budget_id: int | None) -> str:
+    """Describe a budget shape for a refusal message, for example ``own_budget (DAILY)``."""
+    if shape == "shared_member":
+        return f"shared_member of budget id {budget_id}"
+    return shape if period is None else f"{shape} ({period})"
+
+
+def _check_observed_shape(
+    snapshot: EntitySnapshot, state: SubjectState, *, discrepancy_id: int
+) -> None:
+    """Refuse to adopt a snapshot observed in another budget shape or period than now.
+
+    A discrepancy keeps the snapshot it compared, and that snapshot can predate the
+    subject's current state: ``sync.snapshots`` does not judge a snapshot captured before
+    the current decision, so an older discrepancy survives while the campaign moves onto
+    or off an explicitly shared budget, or its budget changes period. Materialising the
+    old values in the current shape would record a non-shared budget as a shared
+    assignment, or relabel a daily amount as a total one (AAP 0.5.2: the subject's
+    *current* state fixes the shape). The snapshot's own metadata
+    (:func:`_observed_shape`) must therefore match the subject now:
+
+    * the observed shape equals ``state.shape``;
+    * a ``shared_member`` was observed on the shared budget it draws from now
+      (``state.budget_id``);
+    * an ``own_budget`` or ``budget`` observation has the budget period that applies now
+      (``state.budget_period``; ``None`` on LinkedIn).
+
+    A snapshot whose metadata is missing or unknown is refused the same way: its shape
+    cannot be established, so it is never combined with the current one.
+
+    Args:
+        snapshot: The snapshot a resolution would adopt, already checked to be the
+            subject's.
+        state: The subject's current state.
+        discrepancy_id: The discrepancy being resolved, named in the refusal.
+
+    Raises:
+        PlatformStateUnknown: If the observation does not match the subject's current
+            shape and period (409 ``platform_state_unknown``). A later entity sync
+            compares the subject again and refreshes or closes the discrepancy.
+    """
+    observed = _observed_shape(snapshot)
+    current_text = _shape_text(state.shape, state.budget_period, state.budget_id)
+    details: dict[str, object] = {
+        "discrepancy_id": discrepancy_id,
+        "snapshot_id": snapshot.id,
+        "observed_shape": None if observed is None else observed.shape,
+        "observed_budget_period": None if observed is None else observed.budget_period,
+        "observed_budget_id": None if observed is None else observed.budget_id,
+        "current_shape": state.shape,
+        "current_budget_period": state.budget_period,
+        "current_budget_id": state.budget_id,
+    }
+    refresh = (
+        f"The next entity sync that compares {state.name} again refreshes or closes this "
+        "discrepancy; resolve it after that."
+    )
+    if observed is None:
+        raise PlatformStateUnknown(
+            "platform_state_unknown",
+            f"The platform state this discrepancy compared (snapshot {snapshot.id}) does not "
+            "record the budget shape it was observed in, so it cannot be adopted as "
+            f"{state.name}'s current {current_text} state. {refresh}",
+            details=details,
+        )
+    if observed.shape != state.shape:
+        coherent = False
+    elif observed.shape == "shared_member":
+        coherent = observed.budget_id == state.budget_id
+    else:
+        coherent = observed.budget_period == state.budget_period
+    if coherent:
+        return
+    observed_text = _shape_text(observed.shape, observed.budget_period, observed.budget_id)
+    raise PlatformStateUnknown(
+        "platform_state_unknown",
+        f"The platform state this discrepancy compared (snapshot {snapshot.id}) was observed "
+        f"before {state.name}'s budget shape or period changed: it shows {observed_text}, "
+        f"and the subject is now {current_text}. {refresh}",
+        details=details,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1476,15 +1651,15 @@ def _compare_tombstone(
     """Compare a snapshot with an ``acknowledge_removal`` tombstone.
 
     A snapshot captured at or before the tombstone says nothing about a reappearance. A
-    later one means a complete enumeration returned the entity again: a campaign whose
-    status is not ``ended`` gives ``status``; a budget subject has no status, so its
-    reappearance gives ``budget``.
+    later one means a complete enumeration returned the entity again, and that return is
+    the reappearance whatever the platform now reports: a campaign gives ``status`` even
+    when its normalised status is ``ended`` (Q-G2b returns a removed campaign as
+    ``REMOVED``) or unreported; a budget subject has no status, so its reappearance gives
+    ``budget``.
     """
     if snapshot.captured_at <= decision.decided_at:
         return []
     if state.ref.type == "campaign":
-        if snapshot.status is None or snapshot.status == "ended":
-            return []
         return [
             Mismatch(
                 kind="status",
@@ -1583,14 +1758,18 @@ def compare(snapshot: EntitySnapshot, decision: Decision, *, state: SubjectState
       a discrepancy on the budget subject alone;
     * ``budget`` on a ``budget`` decision when its amount differs in micros.
 
-    A tombstone (``acknowledge_removal``) is compared only for reappearance: a campaign
-    snapshot captured after it whose status is not ``ended`` gives ``status``. AAP 0.5.4.4
-    calls the reappearance discrepancy a ``status`` one, but a budget subject has no
-    status (AAP 0.5.2), so a shared budget's reappearance gives ``budget`` instead.
+    A tombstone (``acknowledge_removal``) is compared only for reappearance: any campaign
+    snapshot captured after it gives ``status``, whatever status it reports (a removed
+    campaign Q-G2b returns as ``ended`` included), because the platform returning the
+    entity is what contradicts the tombstone. AAP 0.5.4.4 calls the reappearance
+    discrepancy a ``status`` one, but a budget subject has no status (AAP 0.5.2), so a
+    shared budget's reappearance gives ``budget`` instead.
 
     ``untracked`` and ``missing`` are never produced here: ``sync/snapshots.py`` decides
-    them from baseline timing and complete enumeration (AAP 0.3.3 safe absence). A status
-    the snapshot does not report is unknown and raises nothing.
+    them from baseline timing and complete enumeration (AAP 0.3.3 safe absence). Outside a
+    tombstone, a value the snapshot does not report (a status, a Google amount or period)
+    is unknown and raises nothing; an empty result is therefore not proof of a match,
+    which :func:`verified_match` establishes.
 
     Args:
         snapshot: The subject's snapshot, normally this sync's.
@@ -1598,7 +1777,7 @@ def compare(snapshot: EntitySnapshot, decision: Decision, *, state: SubjectState
         state: The subject's current state (for shape, source, period and currency).
 
     Returns:
-        The mismatches, status first; empty when the snapshot matches.
+        The mismatches, status first; empty when nothing the snapshot reports differs.
 
     Raises:
         ValueError: If the snapshot or the decision belongs to another subject.
@@ -1652,6 +1831,75 @@ def compare(snapshot: EntitySnapshot, decision: Decision, *, state: SubjectState
     return mismatches
 
 
+def _comparison_known(
+    snapshot: EntitySnapshot, expected: ExpectedState, state: SubjectState
+) -> bool:
+    """Whether the snapshot reports every value :func:`compare` reads for ``expected``.
+
+    A campaign's normalised status; a shared member's ``budget_id``; and, for a Google
+    ``budget`` subject or a Google ``own_budget`` campaign whose snapshot names a budget or
+    whose decision owns an amount, the amount in micros and the budget period. LinkedIn
+    reports its amounts on the campaign row, so an absent one is no budget, not unknown.
+    """
+    if (
+        state.ref.type == "campaign"
+        and expected.status is not None
+        and not _is_campaign_status(snapshot.status)
+    ):
+        return False
+    if expected.shape == "shared_member" or state.shape == "shared_member":
+        return snapshot.budget_id is not None
+    if state.source != "google":
+        return True
+    if (
+        state.ref.type == "campaign"
+        and snapshot.budget_id is None
+        and _decided_micros(expected) is None
+    ):
+        return True
+    return snapshot.budget_amount_micros is not None and state.budget_period is not None
+
+
+def verified_match(snapshot: EntitySnapshot, decision: Decision, *, state: SubjectState) -> bool:
+    """Whether a snapshot is established to match the subject's current decision (rule C0).
+
+    AAP 0.5.4.4 closes a discrepancy "when a later snapshot matches the current decision".
+    :func:`compare` raises nothing for a value the snapshot does not report, so its empty
+    result only says that nothing known differs. This predicate is ``True`` only when
+    :func:`compare` finds no mismatch *and* every value the comparison needs is known:
+
+    * a campaign's normalised status, since every campaign decision has one;
+    * a ``shared_member``'s ``budget_id``, the shared budget the snapshot names;
+    * on Google, a ``budget`` subject's amount in micros and the budget period, and the same
+      for an ``own_budget`` campaign whose snapshot names a budget or whose decision owns
+      an amount. A Google campaign snapshot naming no budget, against a decision owning no
+      amount, has no amount to verify. LinkedIn amounts live on the campaign row, so an
+      absent one means the campaign has no such budget and is compared as such.
+
+    A tombstone (``acknowledge_removal``) is never verified by a snapshot: one captured
+    after it is a reappearance that contradicts it, and one captured at or before it says
+    nothing about the platform since. Pure: no I/O.
+
+    Args:
+        snapshot: The subject's snapshot, normally this sync's.
+        decision: The subject's current decision.
+        state: The subject's current state (for shape, source, period and currency).
+
+    Returns:
+        ``True`` when the snapshot verifiably matches the decision; ``False`` when anything
+        differs, a needed value is unknown, or the decision is a tombstone.
+
+    Raises:
+        ValueError: If the snapshot or the decision belongs to another subject.
+    """
+    if compare(snapshot, decision, state=state):
+        return False
+    expected = expected_state_of(decision)
+    if expected.tombstone:
+        return False
+    return _comparison_known(snapshot, expected, state)
+
+
 # ---------------------------------------------------------------------------------------
 # Loading subject state
 # ---------------------------------------------------------------------------------------
@@ -1670,113 +1918,387 @@ def _instant(now: datetime | None) -> datetime:
     return now
 
 
-async def _budget_currency(session: AsyncSession, budget: Budget) -> str:
-    """Return the currency of a Google budget, which carries no account of its own.
+_STATE_CHUNK: Final[int] = 2_000
+"""Subjects loaded per round of :func:`load_subject_states`. Each round issues a fixed
+number of statements, and its largest ``IN`` list (the budgets of a round's campaigns, their
+decided budgets and its budget subjects) stays far below PostgreSQL's bind-parameter limit."""
 
-    The currency is that of the accounts whose campaigns draw from the budget, or else of
-    the dataset's Google account. Amounts are never converted across currencies, so an
-    ambiguous answer is refused rather than guessed.
 
-    Raises:
-        SubjectNotFound: If no single currency can be determined.
+@dataclass(frozen=True, slots=True)
+class SubjectStates:
+    """What :func:`load_subject_states` loaded: each subject's state, or why it has none.
+
+    Every requested subject is in exactly one of the two mappings.
+
+    Attributes:
+        states: The state of each subject that could be loaded.
+        not_found: For each other subject, the :class:`SubjectNotFound` that
+            :func:`load_subject_state` raises for it.
     """
-    by_members = await session.execute(
-        select(AdAccount.currency)
-        .join(Campaign, Campaign.account_id == AdAccount.id)
-        .where(Campaign.budget_id == budget.id)
-        .distinct()
-    )
-    currencies = set(by_members.scalars())
-    if not currencies:
-        by_dataset = await session.execute(
-            select(AdAccount.currency)
-            .where(AdAccount.dataset_id == budget.dataset_id, AdAccount.source == "google")
-            .distinct()
-        )
-        currencies = set(by_dataset.scalars())
-    if len(currencies) != 1:
-        raise SubjectNotFound(
-            "not_found",
-            f"The currency of shared budget {budget.external_id} cannot be determined.",
-            details={"budget_id": budget.id},
-        )
-    return currencies.pop()
+
+    states: Mapping[SubjectRef, SubjectState]
+    not_found: Mapping[SubjectRef, SubjectNotFound]
+
+    def require(self, ref: SubjectRef) -> SubjectState:
+        """Return the state of ``ref``, or raise the error it could not be loaded with.
+
+        Args:
+            ref: A subject that was requested.
+
+        Returns:
+            The subject's state.
+
+        Raises:
+            SubjectNotFound: If the subject could not be loaded; a fresh exception carrying
+                the recorded code, message and details.
+            KeyError: If ``ref`` was not requested.
+        """
+        state = self.states.get(ref)
+        if state is not None:
+            return state
+        error = self.not_found.get(ref)
+        if error is None:
+            raise KeyError(f"{ref} was not loaded")
+        raise SubjectNotFound(error.code, error.message, details=error.details)
 
 
-async def _latest_snapshot(
-    session: AsyncSession, ref: SubjectRef, dataset_id: int
-) -> EntitySnapshot | None:
-    """Return the subject's newest snapshot (by ``captured_at``, then ``id``)."""
-    result = await session.execute(
-        select(EntitySnapshot)
-        .where(
-            EntitySnapshot.entity_type == ref.type,
-            EntitySnapshot.entity_id == ref.id,
-            EntitySnapshot.dataset_id == dataset_id,
-        )
-        .order_by(EntitySnapshot.captured_at.desc(), EntitySnapshot.id.desc())
-        .limit(1)
-    )
-    return result.scalars().first()
+async def _budget_currencies(
+    session: AsyncSession, budgets: Sequence[Budget]
+) -> dict[int, frozenset[str]]:
+    """Return the candidate currencies of each Google budget, which has no account of its own.
 
-
-async def _current_decision(
-    session: AsyncSession, ref: SubjectRef, dataset_id: int
-) -> Decision | None:
-    """Return the subject's latest decision (by ``decided_at``, then ``id``)."""
-    result = await session.execute(
-        select(Decision)
-        .where(
-            Decision.subject_type == ref.type,
-            Decision.subject_id == ref.id,
-            Decision.dataset_id == dataset_id,
-        )
-        .order_by(Decision.decided_at.desc(), Decision.id.desc())
-        .limit(1)
-    )
-    return result.scalars().first()
-
-
-async def load_subject_state(session: AsyncSession, ref: SubjectRef) -> SubjectState:
-    """Load what validation and comparison need to know about a subject now.
-
-    * **Campaign**: the campaign, its ``ad_account`` (currency), its Google budget row and
-      its dataset. A Google campaign on an explicitly shared budget is a ``shared_member``
-      (``budget_id`` set to that budget); otherwise it owns its budget fields: LinkedIn
-      the budgets present on the campaign row, Google the field its budget period owns.
-    * **Budget**: the budget, which must be explicitly shared, and its currency from the
-      accounts of the campaigns drawing from it (or the dataset's Google account).
-
-    The newest ``entity_snapshot`` and the latest ``decision`` are loaded too. Entity and
-    dataset rows are re-read from the database (``populate_existing``), because sync jobs
-    upsert them with Core statements that do not refresh the session's identity map.
+    A budget's currency is that of the accounts whose campaigns draw from it, or else of its
+    dataset's Google accounts. One statement reads the member accounts of every budget, and
+    one more the dataset accounts of the budgets that have no member. Amounts are never
+    converted across currencies, so the caller refuses a budget with other than exactly one
+    candidate rather than guess.
 
     Args:
         session: The caller's session.
-        ref: The subject.
+        budgets: The budget rows.
 
     Returns:
-        The subject's state.
+        Budget id mapped to its candidate currencies (possibly empty).
+    """
+    if not budgets:
+        return {}
+    found: dict[int, set[str]] = {budget.id: set() for budget in budgets}
+    by_members = await session.execute(
+        select(Campaign.budget_id, AdAccount.currency)
+        .select_from(AdAccount)
+        .join(Campaign, Campaign.account_id == AdAccount.id)
+        .where(Campaign.budget_id.in_(sorted(found)))
+        .distinct()
+    )
+    for budget_id, currency in by_members:
+        if budget_id is not None:
+            found[budget_id].add(currency)
+    orphans = sorted({budget.dataset_id for budget in budgets if not found[budget.id]})
+    if orphans:
+        by_dataset: dict[int, set[str]] = {}
+        rows = await session.execute(
+            select(AdAccount.dataset_id, AdAccount.currency)
+            .where(AdAccount.dataset_id.in_(orphans), AdAccount.source == "google")
+            .distinct()
+        )
+        for dataset_id, currency in rows:
+            by_dataset.setdefault(dataset_id, set()).add(currency)
+        for budget in budgets:
+            if not found[budget.id]:
+                found[budget.id] = by_dataset.get(budget.dataset_id, set())
+    return {budget_id: frozenset(currencies) for budget_id, currencies in found.items()}
+
+
+def _subject_table(subject_type: SubjectType) -> type[Campaign] | type[Budget]:
+    """Return the entity table of a subject type."""
+    return Campaign if subject_type == "campaign" else Budget
+
+
+async def _newest_snapshots(
+    session: AsyncSession, subject_type: SubjectType, ids: Sequence[int]
+) -> dict[int, EntitySnapshot]:
+    """Return each subject's newest snapshot (by ``captured_at``, then ``id``), in one statement.
+
+    Only snapshots in the subject's own dataset count. A correlated ``LIMIT 1`` subquery per
+    subject walks ``ix_entity_snapshot_entity_captured`` from its newest entry, so the cost
+    does not grow with a subject's snapshot history.
+    """
+    if not ids:
+        return {}
+    entity = _subject_table(subject_type)
+    candidate = aliased(EntitySnapshot)
+    newest = (
+        select(candidate.id)
+        .where(
+            candidate.entity_type == subject_type,
+            candidate.entity_id == entity.id,
+            candidate.dataset_id == entity.dataset_id,
+        )
+        .order_by(candidate.captured_at.desc(), candidate.id.desc())
+        .limit(1)
+        .correlate(entity)
+        .scalar_subquery()
+    )
+    rows = await session.scalars(
+        select(EntitySnapshot).where(
+            EntitySnapshot.id.in_(select(newest).where(entity.id.in_(ids)))
+        )
+    )
+    return {row.entity_id: row for row in rows}
+
+
+async def _current_decisions(
+    session: AsyncSession, subject_type: SubjectType, ids: Sequence[int]
+) -> dict[int, Decision]:
+    """Return each subject's latest decision (by ``decided_at``, then ``id``), in one statement.
+
+    Only decisions in the subject's own dataset count; ``ix_decision_subject_latest`` serves
+    the correlated ``LIMIT 1`` subquery per subject.
+    """
+    if not ids:
+        return {}
+    entity = _subject_table(subject_type)
+    candidate = aliased(Decision)
+    latest = (
+        select(candidate.id)
+        .where(
+            candidate.subject_type == subject_type,
+            candidate.subject_id == entity.id,
+            candidate.dataset_id == entity.dataset_id,
+        )
+        .order_by(candidate.decided_at.desc(), candidate.id.desc())
+        .limit(1)
+        .correlate(entity)
+        .scalar_subquery()
+    )
+    rows = await session.scalars(
+        select(Decision).where(Decision.id.in_(select(latest).where(entity.id.in_(ids))))
+    )
+    return {row.subject_id: row for row in rows}
+
+
+def _row_lock(lock: bool) -> dict[str, bool] | None:
+    """Return the ``with_for_update`` flags of a subject-row lock, or ``None`` for none.
+
+    ``FOR NO KEY UPDATE`` serialises the decision, baseline, resolution and detection
+    writers of one subject and conflicts with a sync's upsert of the row, while letting
+    through the ``FOR KEY SHARE`` checks that snapshot, decision and fact inserts take on it.
+    """
+    return {"key_share": True} if lock else None
+
+
+async def _lock_subject_dataset(session: AsyncSession, ref: SubjectRef) -> SourceDataset | None:
+    """Lock the subject's dataset with the lifecycle guard before the subject row is locked.
+
+    A subject's ``dataset_id`` is immutable provenance (upserts never rewrite it), so it is
+    read without a lock. The dataset is then locked ``FOR SHARE`` through
+    :func:`~ads_engine.db.repositories.lock_dataset` until the caller's transaction ends,
+    the first step of the lock order ``source_dataset`` -> subject row -> ``discrepancy``.
+
+    Returns:
+        The dataset as committed now, or ``None`` when the subject or its dataset does not
+        exist.
+    """
+    if ref.type == "campaign":
+        dataset_id = await session.scalar(select(Campaign.dataset_id).where(Campaign.id == ref.id))
+    else:
+        dataset_id = await session.scalar(select(Budget.dataset_id).where(Budget.id == ref.id))
+    if dataset_id is None:
+        return None
+    return await lock_dataset(session, dataset_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _StateRows:
+    """The rows one round of :func:`load_subject_states` read, keyed by id."""
+
+    campaigns: Mapping[int, Campaign]
+    budgets: Mapping[int, Budget]
+    accounts: Mapping[int, AdAccount]
+    datasets: Mapping[int, SourceDataset]
+    currencies: Mapping[int, frozenset[str]]
+    snapshots: Mapping[tuple[str, int], EntitySnapshot]
+    decisions: Mapping[tuple[str, int], Decision]
+
+
+async def _lock_subject_datasets(
+    session: AsyncSession, refs: Sequence[SubjectRef]
+) -> dict[int, SourceDataset]:
+    """Lock the datasets of ``refs`` with the lifecycle guard, before any subject row.
+
+    The many-subject form of :func:`_lock_subject_dataset`: the subjects' immutable
+    ``dataset_id`` values are read without a lock (one statement per round of
+    :data:`_STATE_CHUNK`), then each dataset is locked ``FOR SHARE`` through
+    :func:`~ads_engine.db.repositories.lock_dataset` in ``id`` order (a primary before its
+    companion) until the caller's transaction ends.
+
+    Returns:
+        Each locked dataset as committed now, by id.
+    """
+    dataset_ids: set[int] = set()
+    for chunk in batched(refs, _STATE_CHUNK, strict=False):
+        owners: list[Select[int]] = []
+        campaign_ids = sorted({ref.id for ref in chunk if ref.type == "campaign"})
+        budget_ids = sorted({ref.id for ref in chunk if ref.type == "budget"})
+        if campaign_ids:
+            owners.append(select(Campaign.dataset_id).where(Campaign.id.in_(campaign_ids)))
+        if budget_ids:
+            owners.append(select(Budget.dataset_id).where(Budget.id.in_(budget_ids)))
+        if owners:
+            named = owners[0] if len(owners) == 1 else union(*owners)
+            dataset_ids.update(await session.scalars(named))
+    locked: dict[int, SourceDataset] = {}
+    for dataset_id in sorted(dataset_ids):
+        dataset = await lock_dataset(session, dataset_id)
+        if dataset is not None:
+            locked[dataset_id] = dataset
+    return locked
+
+
+async def _read_state_rows(
+    session: AsyncSession,
+    refs: Sequence[SubjectRef],
+    *,
+    lock: bool = False,
+    locked_datasets: Mapping[int, SourceDataset] | None = None,
+) -> _StateRows:
+    """Read every row the states of ``refs`` need, in a fixed number of statements.
+
+    At most ten: the campaigns, the latest decision per campaign and per budget subject,
+    the budgets (budget subjects, the campaigns' budgets and the budgets their decisions
+    assign), the campaigns' accounts, the shared budgets' member and dataset currencies,
+    the datasets, and the newest snapshot per campaign and per budget subject. Entity,
+    account and dataset rows are re-read from the database (``populate_existing``), because
+    sync jobs upsert them with Core statements that do not refresh the identity map.
+
+    With ``lock`` the subject rows are read ``FOR NO KEY UPDATE`` before any decision or
+    snapshot (campaigns, then budget subjects, each in ``id`` order; the other budgets are
+    read in one more statement without a lock), and the datasets already locked by
+    :func:`_lock_subject_datasets` (``locked_datasets``) are not read again.
+    """
+    campaign_ids = sorted({ref.id for ref in refs if ref.type == "campaign"})
+    budget_ids = sorted({ref.id for ref in refs if ref.type == "budget"})
+    campaigns: dict[int, Campaign] = {}
+    if campaign_ids:
+        statement = select(Campaign).where(Campaign.id.in_(campaign_ids))
+        if lock:
+            statement = statement.order_by(Campaign.id).with_for_update(key_share=True)
+        campaigns = {
+            row.id: row
+            for row in await session.scalars(statement.execution_options(populate_existing=True))
+        }
+    budgets: dict[int, Budget] = {}
+    if lock and budget_ids:
+        budgets = {
+            row.id: row
+            for row in await session.scalars(
+                select(Budget)
+                .where(Budget.id.in_(budget_ids))
+                .order_by(Budget.id)
+                .with_for_update(key_share=True)
+                .execution_options(populate_existing=True)
+            )
+        }
+    decisions: dict[tuple[str, int], Decision] = {
+        ("campaign", subject_id): row
+        for subject_id, row in (await _current_decisions(session, "campaign", campaign_ids)).items()
+    }
+    decisions.update(
+        (("budget", subject_id), row)
+        for subject_id, row in (await _current_decisions(session, "budget", budget_ids)).items()
+    )
+    wanted_budgets = set(budget_ids)
+    wanted_budgets.update(row.budget_id for row in campaigns.values() if row.budget_id is not None)
+    wanted_budgets.update(row.budget_id for row in decisions.values() if row.budget_id is not None)
+    if lock:
+        wanted_budgets.difference_update(budget_ids)
+    if wanted_budgets:
+        budgets.update(
+            (row.id, row)
+            for row in await session.scalars(
+                select(Budget)
+                .where(Budget.id.in_(sorted(wanted_budgets)))
+                .execution_options(populate_existing=True)
+            )
+        )
+    account_ids = sorted({row.account_id for row in campaigns.values()})
+    accounts: dict[int, AdAccount] = {}
+    if account_ids:
+        accounts = {
+            row.id: row
+            for row in await session.scalars(
+                select(AdAccount)
+                .where(AdAccount.id.in_(account_ids))
+                .execution_options(populate_existing=True)
+            )
+        }
+    shared = [
+        budgets[budget_id]
+        for budget_id in budget_ids
+        if budget_id in budgets and budgets[budget_id].explicitly_shared
+    ]
+    currencies = await _budget_currencies(session, shared)
+    datasets: dict[int, SourceDataset] = dict(locked_datasets or {})
+    dataset_ids = sorted(
+        ({row.dataset_id for row in campaigns.values()} | {row.dataset_id for row in shared})
+        - datasets.keys()
+    )
+    if dataset_ids:
+        datasets.update(
+            (row.id, row)
+            for row in await session.scalars(
+                select(SourceDataset)
+                .where(SourceDataset.id.in_(dataset_ids))
+                .execution_options(populate_existing=True)
+            )
+        )
+    snapshots: dict[tuple[str, int], EntitySnapshot] = {
+        ("campaign", entity_id): row
+        for entity_id, row in (
+            await _newest_snapshots(session, "campaign", sorted(campaigns))
+        ).items()
+    }
+    snapshots.update(
+        (("budget", entity_id), row)
+        for entity_id, row in (
+            await _newest_snapshots(session, "budget", [row.id for row in shared])
+        ).items()
+    )
+    return _StateRows(
+        campaigns=campaigns,
+        budgets=budgets,
+        accounts=accounts,
+        datasets=datasets,
+        currencies=currencies,
+        snapshots=snapshots,
+        decisions=decisions,
+    )
+
+
+def _build_state(ref: SubjectRef, rows: _StateRows) -> SubjectState:
+    """Build one subject's state from the rows :func:`_read_state_rows` read.
+
+    The checks run in the order :func:`load_subject_state` documents, so a subject that
+    fails several of them gets the first one's error.
 
     Raises:
-        SubjectNotFound: If the campaign or budget does not exist, the budget is not
-            explicitly shared, or the budget's currency cannot be determined.
+        SubjectNotFound: If the campaign or its account does not exist, the budget does not
+            exist or is not explicitly shared, its currency cannot be determined, the
+            subject's source has no decision subjects, or its dataset does not exist.
     """
     budget: Budget | None
     if ref.type == "campaign":
-        campaign = await session.get(Campaign, ref.id, populate_existing=True)
+        campaign = rows.campaigns.get(ref.id)
         if campaign is None:
             raise SubjectNotFound("not_found", f"Campaign {ref.id} does not exist.")
-        account = await session.get(AdAccount, campaign.account_id)
+        account = rows.accounts.get(campaign.account_id)
         if account is None:
             raise SubjectNotFound("not_found", f"The account of campaign {ref.id} does not exist.")
         source: object = campaign.source
         dataset_id = campaign.dataset_id
         currency = account.currency
         name = campaign.name
-        budget = None
-        if campaign.budget_id is not None:
-            budget = await session.get(Budget, campaign.budget_id, populate_existing=True)
+        budget = None if campaign.budget_id is None else rows.budgets.get(campaign.budget_id)
         shared_budget: Budget | None = None
         if source == "linkedin":
             has_daily = campaign.daily_budget is not None
@@ -1793,16 +2315,23 @@ async def load_subject_state(session: AsyncSession, ref: SubjectRef) -> SubjectS
         budget_id = shared_budget.id if shared_budget is not None else None
         budget_external_id = shared_budget.external_id if shared_budget is not None else None
     else:
-        budget = await session.get(Budget, ref.id, populate_existing=True)
+        budget = rows.budgets.get(ref.id)
         if budget is None or not budget.explicitly_shared:
             raise SubjectNotFound(
                 "not_found",
                 f"Budget {ref.id} is not an explicitly shared budget; only shared budgets "
                 "are decision subjects.",
             )
+        candidates = rows.currencies.get(budget.id, frozenset())
+        if len(candidates) != 1:
+            raise SubjectNotFound(
+                "not_found",
+                f"The currency of shared budget {budget.external_id} cannot be determined.",
+                details={"budget_id": budget.id},
+            )
+        (currency,) = candidates
         source = budget.source
         dataset_id = budget.dataset_id
-        currency = await _budget_currency(session, budget)
         name = f"Shared budget {budget.external_id}"
         raw_period = budget.period
         has_daily = raw_period == "DAILY"
@@ -1813,19 +2342,15 @@ async def load_subject_state(session: AsyncSession, ref: SubjectRef) -> SubjectS
     if not _is_decision_source(source):
         raise SubjectNotFound("not_found", f"{ref.type} {ref.id} is not a decision subject.")
     period = raw_period if _is_period(raw_period) else None
-    dataset = await session.get(SourceDataset, dataset_id, populate_existing=True)
+    dataset = rows.datasets.get(dataset_id)
     if dataset is None:
         raise SubjectNotFound("not_found", f"The dataset of {ref.type} {ref.id} does not exist.")
-    snapshot = await _latest_snapshot(session, ref, dataset_id)
-    decision = await _current_decision(session, ref, dataset_id)
+    decision = rows.decisions.get((ref.type, ref.id))
     decided_budget_external_id: str | None = None
     if decision is not None and decision.budget_id is not None:
-        if budget is not None and budget.id == decision.budget_id:
-            decided_budget_external_id = budget.external_id
-        else:
-            decided_budget = await session.get(Budget, decision.budget_id)
-            if decided_budget is not None:
-                decided_budget_external_id = decided_budget.external_id
+        decided_budget = rows.budgets.get(decision.budget_id)
+        if decided_budget is not None:
+            decided_budget_external_id = decided_budget.external_id
     return SubjectState(
         ref=ref,
         dataset_id=dataset_id,
@@ -1841,10 +2366,108 @@ async def load_subject_state(session: AsyncSession, ref: SubjectRef) -> SubjectS
         budget_period=period,
         budget_id=budget_id,
         budget_external_id=budget_external_id,
-        latest_snapshot=snapshot,
+        latest_snapshot=rows.snapshots.get((ref.type, ref.id)),
         current_decision=decision,
         decided_budget_external_id=decided_budget_external_id,
     )
+
+
+async def load_subject_states(
+    session: AsyncSession, refs: Iterable[SubjectRef], *, lock: bool = False
+) -> SubjectStates:
+    """Load the states of many subjects with a number of statements independent of their count.
+
+    Each subject's state is exactly what :func:`load_subject_state` returns for it (the
+    rules are documented there), and each subject it cannot load is reported with the
+    :class:`SubjectNotFound` that function raises, so one unloadable subject never hides the
+    others. The subjects are read in rounds of :data:`_STATE_CHUNK`, each issuing at most
+    ten statements: entity, account and dataset rows are re-read (``populate_existing``),
+    and the newest snapshot and latest decision of every subject come from one statement
+    per subject type. Detection after an entity sync and ``GET /discrepancies`` load their
+    subjects this way instead of one subject at a time.
+
+    With ``lock`` the subjects are locked as :func:`load_subject_state` locks one, in one
+    order shared by every writer: first every subject's dataset ``FOR SHARE``
+    (:func:`_lock_subject_datasets`), then the campaign rows and then the budget rows
+    ``FOR NO KEY UPDATE``, each in ascending ``id`` order across all rounds, and only then
+    are their snapshots and decisions read. That adds two statements to a pass (the
+    datasets' ids and the lock of each dataset) and one per round with budget subjects.
+
+    Args:
+        session: The caller's session; with ``lock``, its transaction holds the locks.
+        refs: The subjects; repeats are loaded once.
+        lock: Take the dataset and subject locks; the detection and baseline writers of an
+            entity sync pass ``True``. Reads for display leave it ``False``.
+
+    Returns:
+        Every requested subject's state, or its :class:`SubjectNotFound`.
+
+    Raises:
+        TypeError: If an element of ``refs`` is not a :class:`SubjectRef`.
+    """
+    wanted: dict[SubjectRef, None] = {}
+    for ref in refs:
+        if not isinstance(ref, SubjectRef):
+            raise TypeError(f"subjects must be SubjectRef values, not {ref!r}")
+        wanted[ref] = None
+    ordered = list(wanted)
+    locked_datasets: dict[int, SourceDataset] = {}
+    if lock:
+        # One lock order for every writer: all datasets first, then campaigns, then
+        # budgets, ascending ids, so two concurrent bulk lockers never wait on each other
+        # in a cycle.
+        ordered.sort(key=lambda ref: (ref.type != "campaign", ref.id))
+        locked_datasets = await _lock_subject_datasets(session, ordered)
+    states: dict[SubjectRef, SubjectState] = {}
+    not_found: dict[SubjectRef, SubjectNotFound] = {}
+    for chunk in batched(ordered, _STATE_CHUNK, strict=False):
+        rows = await _read_state_rows(session, chunk, lock=lock, locked_datasets=locked_datasets)
+        for ref in chunk:
+            try:
+                states[ref] = _build_state(ref, rows)
+            except SubjectNotFound as exc:
+                not_found[ref] = exc
+    return SubjectStates(states=MappingProxyType(states), not_found=MappingProxyType(not_found))
+
+
+async def load_subject_state(
+    session: AsyncSession, ref: SubjectRef, *, lock: bool = False
+) -> SubjectState:
+    """Load what validation and comparison need to know about a subject now.
+
+    * **Campaign**: the campaign, its ``ad_account`` (currency), its Google budget row and
+      its dataset. A Google campaign on an explicitly shared budget is a ``shared_member``
+      (``budget_id`` set to that budget); otherwise it owns its budget fields: LinkedIn
+      the budgets present on the campaign row, Google the field its budget period owns.
+    * **Budget**: the budget, which must be explicitly shared, and its currency from the
+      accounts of the campaigns drawing from it (or the dataset's Google account).
+
+    The newest ``entity_snapshot`` and the latest ``decision`` are loaded too. Entity and
+    dataset rows are re-read from the database (``populate_existing``), because sync jobs
+    upsert them with Core statements that do not refresh the session's identity map. This
+    is :func:`load_subject_states` for one subject.
+
+    With ``lock``, every writer of the subject serialises before it reads the expected
+    state: the subject's dataset is locked ``FOR SHARE`` (so no activation can retire it
+    until the caller's transaction ends), then the campaign or budget row ``FOR NO KEY
+    UPDATE``, and only then are the snapshot and the current decision read. A second
+    writer of the same subject waits for the first to commit and then reads its decision
+    (READ COMMITTED), so concurrent patches never lose each other's change.
+
+    Args:
+        session: The caller's session; with ``lock``, its transaction holds the locks.
+        ref: The subject.
+        lock: Take the dataset and subject locks; every decision, baseline, resolution and
+            detection writer passes ``True``. Reads for display leave it ``False``.
+
+    Returns:
+        The subject's state.
+
+    Raises:
+        SubjectNotFound: If the campaign or budget does not exist, the budget is not
+            explicitly shared, or the budget's currency cannot be determined.
+    """
+    return (await load_subject_states(session, [ref], lock=lock)).require(ref)
 
 
 def _ensure_active(state: SubjectState) -> None:
@@ -1873,12 +2496,14 @@ async def _insert_decision(
     recommendation_id: int | None,
     patch: Mapping[str, str],
     note: str | None,
+    flush: bool = True,
 ) -> Decision:
-    """Append one ``decision`` row holding ``expected`` and flush it.
+    """Append one ``decision`` row holding ``expected`` and flush it, unless ``flush`` is off.
 
     ``decided_at`` never moves behind the current decision's: the latest row by
     (``decided_at``, ``id``) is the "last decided" state, so a caller clock that runs
-    behind another process's must not leave an older decision on top.
+    behind another process's must not leave an older decision on top. With ``flush``
+    false the row stays pending for the caller's single flush of many rows.
     """
     current = state.current_decision
     if current is not None and current.decided_at > decided_at:
@@ -1902,7 +2527,8 @@ async def _insert_decision(
         note=note,
     )
     session.add(row)
-    await session.flush()
+    if flush:
+        await session.flush()
     return row
 
 
@@ -1912,11 +2538,11 @@ async def _insert_decision(
 
 
 async def record_decision(
-    session: AsyncSession,
     subject: SubjectRef,
     patch: DecisionPatch,
     origin: Origin,
     *,
+    session: AsyncSession | None = None,
     decided_by: str | None = None,
     recommendation_id: int | None = None,
     note: str | None = None,
@@ -1925,8 +2551,11 @@ async def record_decision(
     """Record a decision submitted as a patch and return the appended row.
 
     AAP 0.5.2: the server reads the subject's current expected state, applies the patch,
-    validates the result and writes one complete row for the subject's shape. The checks
-    run in this order:
+    validates the result and writes one complete row for the subject's shape. The subject's
+    dataset and row are locked first (:func:`load_subject_state` with ``lock``) and stay
+    locked until the transaction ends, so two concurrent patches of one subject apply one
+    after the other and neither loses the other's fields, and the dataset cannot retire
+    before the row commits. The checks run in this order:
 
     1. the subject's dataset must be ``active`` (:class:`SubjectRetired`, 409);
     2. the subject must have a decision (``untracked_subject``: resolve its ``untracked``
@@ -1935,15 +2564,20 @@ async def record_decision(
        rules, amount precision, materialisation and ``no_change``.
 
     The row is flushed and one ``analysis_request`` (reason ``decision``) is queued in the
-    same transaction (AAP 0.3.2). Nothing is committed: the caller owns the transaction.
+    same transaction (AAP 0.3.2). The signature is AAP 0.5.1's ``record_decision(subject,
+    patch, origin)``: with ``session`` nothing is committed and the caller owns the
+    transaction; without one the decision and its ``analysis_request`` commit together in
+    a transaction of their own.
 
     Args:
-        session: The caller's session.
         subject: The campaign or shared budget being decided.
         patch: The submitted fields only.
         origin: ``user``, or ``recommendation`` when recorded from an item; ``baseline``
             rows are written by :func:`write_baseline` and ``resolution`` rows by
             :func:`resolve_discrepancy`.
+        session: The caller's session, joined without committing; the locks are then held
+            until the caller's transaction ends. ``None`` runs the write in a transaction
+            of its own, committed on success and rolled back on error.
         decided_by: Email of the user recording it; stored, never logged.
         recommendation_id: The recommendation the decision was recorded from.
         note: Free-text note; stored, never logged.
@@ -1964,7 +2598,34 @@ async def record_decision(
     if origin == "recommendation" and recommendation_id is None:
         raise ValueError("a recommendation decision needs its recommendation_id")
     instant = _instant(now)
-    state = await load_subject_state(session, subject)
+    async with use_session(session) as unit:
+        return await _record_decision(
+            unit,
+            subject,
+            patch,
+            origin,
+            instant=instant,
+            decided_by=decided_by,
+            recommendation_id=recommendation_id,
+            note=note,
+        )
+
+
+async def _record_decision(
+    session: AsyncSession,
+    subject: SubjectRef,
+    patch: DecisionPatch,
+    origin: Origin,
+    *,
+    instant: datetime,
+    decided_by: str | None,
+    recommendation_id: int | None,
+    note: str | None,
+) -> Decision:
+    """Apply :func:`record_decision` inside ``session``, its arguments already checked."""
+    # Locked before the expected state is read: a concurrent writer of the subject commits
+    # first and its decision is the one this patch applies over.
+    state = await load_subject_state(session, subject, lock=True)
     _ensure_active(state)
     current = state.current_expected
     if current is None:
@@ -2034,6 +2695,13 @@ discrepancy, and :func:`resolve_discrepancy` refuses any other combination with 
 """
 
 
+def _already_resolved(discrepancy_id: int) -> DiscrepancyClosed:
+    """Return the 409 refusing a resolution of an already resolved discrepancy."""
+    return DiscrepancyClosed(
+        "discrepancy_resolved", f"Discrepancy {discrepancy_id} is already resolved."
+    )
+
+
 async def _lock_discrepancy(session: AsyncSession, discrepancy_id: int) -> Discrepancy | None:
     """Load and row-lock one discrepancy, re-read from the database."""
     result = await session.execute(
@@ -2050,8 +2718,14 @@ async def _comparison_snapshot(
 ) -> EntitySnapshot:
     """Return the snapshot a discrepancy compared, else the subject's newest one.
 
+    Every resolution that materialises a snapshot (``platform_correct``,
+    ``adopt_platform`` and the ``acknowledge_removal`` fallback) takes it from here, so
+    each adopts only a snapshot observed in the subject's current budget shape and period
+    (:func:`_check_observed_shape`).
+
     Raises:
-        PlatformStateUnknown: If the subject has no snapshot at all.
+        PlatformStateUnknown: If the subject has no snapshot at all, or the snapshot was
+            observed in another budget shape or period than the subject has now.
     """
     snapshot: EntitySnapshot | None = None
     if discrepancy.snapshot_id is not None:
@@ -2065,6 +2739,7 @@ async def _comparison_snapshot(
             details={"discrepancy_id": discrepancy.id},
         )
     _check_snapshot_of(snapshot, state.ref)
+    _check_observed_shape(snapshot, state, discrepancy_id=discrepancy.id)
     return snapshot
 
 
@@ -2073,23 +2748,43 @@ def _platform_correction(
 ) -> ExpectedState:
     """Return the expected state ``platform_correct`` writes for a discrepancy kind.
 
-    The platform value replaces the discrepant field and the rest of the decided shape is
-    kept: ``status`` adopts the platform status; ``budget`` adopts the platform amount, or
-    for a member the new ``budget_id``, keeping the decided status. When the subject
-    changed shape (a member moved onto or off a shared budget), or the current decision is
-    a tombstone of a reappeared entity, the platform state is written in the new shape,
-    keeping the decided status where both shapes have one.
+    AAP 0.5.4.4. ``platform`` is the compared snapshot materialised in the subject's
+    current shape, and ``current`` is the expected state of its current decision. The
+    platform value replaces the discrepant field; what else is kept depends on the kind:
+
+    * ``status``: the platform status. In an unchanged shape every other decided field is
+      kept. When the subject changed shape (a campaign moved onto or off an explicitly
+      shared budget), the old shape's fields cannot be held by the new one, so the
+      platform state in the new shape is written, the platform status included.
+    * ``budget``: the platform amount (``own_budget`` and ``budget`` subjects) or, for a
+      member, the new ``budget_id``, keeping the decided status. When the subject changed
+      shape, the platform state in the new shape is written with the decided status, so a
+      ``status`` discrepancy of the subject stays open for its own resolution.
+    * No current decision, or a tombstone of a reappeared entity: the platform state.
+
+    Args:
+        kind: The discrepancy kind, ``status`` or ``budget``.
+        platform: The platform state in the subject's current shape.
+        current: The current decision's expected state, or ``None`` when untracked.
+
+    Returns:
+        The expected state to record.
+
+    Raises:
+        ValueError: If ``kind`` is neither ``status`` nor ``budget``, the only kinds
+            :data:`RESOLUTIONS` offers ``platform_correct`` for.
     """
-    if current is None:
+    if kind not in ("status", "budget"):
+        raise ValueError(f"platform_correct resolves status and budget kinds, not {kind!r}")
+    if current is None or current.tombstone:
         return platform
-    if current.tombstone:
-        return platform
-    if current.shape != platform.shape:
+    shape_changed = current.shape != platform.shape
+    if kind == "status":
+        return platform if shape_changed else replace(current, status=platform.status)
+    if shape_changed:
         if platform.status is not None and current.status is not None:
             return replace(platform, status=current.status)
         return platform
-    if kind == "status":
-        return replace(current, status=platform.status)
     if platform.shape == "own_budget":
         return replace(
             current, daily_budget=platform.daily_budget, total_budget=platform.total_budget
@@ -2107,22 +2802,31 @@ def _close(discrepancy: Discrepancy, resolution: Resolution, instant: datetime) 
 
 
 async def resolve_discrepancy(
-    session: AsyncSession,
     discrepancy_id: int,
     resolution: Resolution,
     intended_state: Mapping[str, object] | None = None,
     *,
+    session: AsyncSession | None = None,
     decided_by: str | None = None,
     note: str | None = None,
     now: datetime | None = None,
 ) -> Discrepancy:
     """Apply one C0 resolution to an open or awaiting discrepancy (AAP 0.5.4.4).
 
-    The discrepancy is row-locked first. Effects by resolution:
+    Locks are taken in the order every decision and detection writer uses, and held until
+    the transaction ends: the discrepancy's dataset ``FOR SHARE`` (an activation cannot
+    retire it before the resolution commits), the subject row ``FOR NO KEY UPDATE``
+    (resolutions of different discrepancies of one subject, and its ordinary decisions,
+    apply one after the other, each over the other's decision), then the discrepancy row
+    ``FOR UPDATE``, re-checked so a resolution that waited on a concurrent one that closed
+    it is refused. Effects by resolution:
 
     * ``platform_correct`` (``status``, ``budget``): writes a ``resolution`` decision that
       adopts the platform value from the compared snapshot (the status, the amount, or a
-      member's new ``budget_id``), keeping the rest of the shape; closes at once.
+      member's new ``budget_id``), keeping the rest of the shape; closes at once. After a
+      shape change the platform state is written in the new shape, with the platform
+      status for ``status`` and the decided status for ``budget``
+      (:func:`_platform_correction`).
     * ``decision_correct`` (``status``, ``budget``, ``missing``): writes nothing and moves
       the row to ``awaiting_platform``; :func:`auto_resolve` closes it once a later
       snapshot matches (for ``missing``, once a complete enumeration returns the entity).
@@ -2137,14 +2841,18 @@ async def resolve_discrepancy(
 
     A row moved to ``awaiting_platform`` records the chosen resolution, which it keeps
     when it later closes. One ``analysis_request`` is queued: ``decision`` for
-    ``record_intended``, ``discrepancy_resolved`` otherwise. Nothing is committed.
+    ``record_intended``, ``discrepancy_resolved`` otherwise. The signature is AAP 0.5.1's
+    ``resolve_discrepancy(id, resolution, intended_state?)``: with ``session`` nothing is
+    committed; without one the resolution commits in a transaction of its own.
 
     Args:
-        session: The caller's session.
         discrepancy_id: The discrepancy to resolve.
         resolution: The resolution API key.
         intended_state: For ``record_intended`` only, the intended state in the subject's
             shape.
+        session: The caller's session, joined without committing; the locks are then held
+            until the caller's transaction ends. ``None`` runs the resolution in a
+            transaction of its own, committed on success and rolled back on error.
         decided_by: Email of the user resolving it; stored on any decision written, never
             logged.
         note: Free-text note stored on any decision written; never logged.
@@ -2155,22 +2863,49 @@ async def resolve_discrepancy(
 
     Raises:
         SubjectNotFound: If the discrepancy or its subject does not exist (404).
-        DiscrepancyClosed: If it is already resolved (409).
+        DiscrepancyClosed: If it is already resolved, including by a concurrent resolution
+            or auto-resolution this call waited on (409).
         SubjectRetired: If its dataset is not active (409 ``subject_retired``).
         InvalidResolution: If the resolution is not valid for the (kind, shape) pair, or
             ``intended_state`` is missing, misplaced or invalid (422).
-        PlatformStateUnknown: If the platform state to adopt is not known (409).
+        PlatformStateUnknown: If the platform state to adopt is not known, or the compared
+            snapshot was observed in another budget shape or period than the subject has
+            now (409); nothing is written.
         ValueError: If ``now`` is naive.
     """
     instant = _instant(now)
-    discrepancy = await _lock_discrepancy(session, discrepancy_id)
+    async with use_session(session) as unit:
+        return await _resolve_discrepancy(
+            unit,
+            discrepancy_id,
+            resolution,
+            intended_state,
+            instant=instant,
+            decided_by=decided_by,
+            note=note,
+        )
+
+
+async def _resolve_discrepancy(
+    session: AsyncSession,
+    discrepancy_id: int,
+    resolution: Resolution,
+    intended_state: Mapping[str, object] | None,
+    *,
+    instant: datetime,
+    decided_by: str | None,
+    note: str | None,
+) -> Discrepancy:
+    """Apply :func:`resolve_discrepancy` inside ``session``, its instant already checked."""
+    # Lock order: source_dataset -> subject row -> discrepancy row, the order of every
+    # decision and detection writer. The discrepancy is read unlocked first, for its dataset
+    # and subject, and locked and re-checked once the subject is locked.
+    discrepancy = await session.get(Discrepancy, discrepancy_id, populate_existing=True)
     if discrepancy is None:
         raise SubjectNotFound("not_found", f"Discrepancy {discrepancy_id} does not exist.")
     if discrepancy.state == "resolved":
-        raise DiscrepancyClosed(
-            "discrepancy_resolved", f"Discrepancy {discrepancy_id} is already resolved."
-        )
-    dataset = await session.get(SourceDataset, discrepancy.dataset_id, populate_existing=True)
+        raise _already_resolved(discrepancy_id)
+    dataset = await lock_dataset(session, discrepancy.dataset_id)
     if dataset is None or dataset.state != "active":
         raise SubjectRetired(
             "subject_retired",
@@ -2188,9 +2923,16 @@ async def resolve_discrepancy(
             details={"resolution": resolution},
         )
     state = await load_subject_state(
-        session, SubjectRef(type=subject_type, id=discrepancy.subject_id)
+        session, SubjectRef(type=subject_type, id=discrepancy.subject_id), lock=True
     )
     _ensure_active(state)
+    locked = await _lock_discrepancy(session, discrepancy_id)
+    if locked is None:
+        raise SubjectNotFound("not_found", f"Discrepancy {discrepancy_id} does not exist.")
+    if locked.state == "resolved":
+        # A concurrent resolver, or a sync's auto-resolution, closed it meanwhile.
+        raise _already_resolved(discrepancy_id)
+    discrepancy = locked
     allowed = RESOLUTIONS.get((kind, state.shape), frozenset())
     if resolution not in allowed:
         offered = [key for key in DISCREPANCY_RESOLUTIONS if key in allowed]
@@ -2282,7 +3024,14 @@ async def resolve_discrepancy(
 
 
 async def write_baseline(
-    session: AsyncSession, ref: SubjectRef, snapshot: EntitySnapshot, *, now: datetime
+    session: AsyncSession,
+    ref: SubjectRef,
+    snapshot: EntitySnapshot,
+    *,
+    now: datetime,
+    state: SubjectState | None = None,
+    locked: bool = False,
+    flush: bool = True,
 ) -> Decision:
     """Record a subject's observed platform state as its ``baseline`` decision.
 
@@ -2299,6 +3048,18 @@ async def write_baseline(
         ref: The campaign or shared budget.
         snapshot: The subject's snapshot from this entity sync.
         now: The decision instant (tz-aware).
+        state: The subject's state when the caller already loaded it (for example with
+            :func:`load_subject_states` for every subject of a sync). Unless ``locked``,
+            it is loaded again here with :func:`load_subject_state` and ``lock``.
+        locked: Whether ``state`` was loaded with :func:`load_subject_states` and ``lock``
+            in the caller's current transaction, whose dataset and subject locks it still
+            holds, so its ``dataset_state`` is current and nothing is locked or read again
+            here; an entity sync's detection and baseline passes, which lock every subject
+            at once, pass ``True``. Otherwise those locks are taken here, also when
+            ``state`` is supplied, since a state alone proves no lock.
+        flush: Whether to flush the new row. A caller writing many baselines passes
+            ``False`` and flushes once, which inserts them in batches; the row's ``id``
+            is assigned by that flush.
 
     Returns:
         The baseline decision, or the subject's existing current decision.
@@ -2308,11 +3069,18 @@ async def write_baseline(
         SubjectRetired: If its dataset is retired.
         PlatformStateUnknown: If the snapshot cannot be materialised, for example a
             shared budget whose amount Google omitted; retry on a later sync.
-        ValueError: If the snapshot describes another entity or dataset, or ``now`` is
-            naive.
+        ValueError: If the snapshot describes another entity or dataset, ``state``
+            describes another subject, or ``now`` is naive.
     """
     instant = _instant(now)
-    state = await load_subject_state(session, ref)
+    if state is not None and state.ref != ref:
+        raise ValueError(f"state describes {state.ref}, not {ref}")
+    if state is None or not locked:
+        # Locked like every decision writer, so the "already has a decision" check below
+        # sees a concurrent writer's committed row and the dataset cannot retire before this
+        # commits. A supplied state is reused only when its caller loaded it under those
+        # locks in this transaction (``locked``).
+        state = await load_subject_state(session, ref, lock=True)
     if state.dataset_state == "retired":
         raise SubjectRetired(
             "subject_retired",
@@ -2343,6 +3111,7 @@ async def write_baseline(
         recommendation_id=None,
         patch={},
         note=None,
+        flush=flush,
     )
     _log.debug(
         "decisions.baseline_written",
@@ -2355,19 +3124,28 @@ async def write_baseline(
 
 
 async def _subject_provenance(session: AsyncSession, ref: SubjectRef) -> tuple[str, int, str]:
-    """Return the subject's ``source``, ``dataset_id`` and dataset state.
+    """Lock the subject and return its ``source``, ``dataset_id`` and dataset state.
+
+    The subject's dataset is locked ``FOR SHARE`` and then its row ``FOR NO KEY UPDATE``,
+    the lock order of every decision writer, and both locks last until the caller's
+    transaction ends: a discrepancy is never raised in a dataset retired meanwhile, nor
+    beside a concurrent decision or resolution of the subject.
 
     Raises:
         SubjectNotFound: If the subject or its dataset does not exist.
     """
+    dataset = await _lock_subject_dataset(session, ref)
     entity: Campaign | Budget | None
     if ref.type == "campaign":
-        entity = await session.get(Campaign, ref.id)
+        entity = await session.get(
+            Campaign, ref.id, populate_existing=True, with_for_update=_row_lock(True)
+        )
     else:
-        entity = await session.get(Budget, ref.id)
+        entity = await session.get(
+            Budget, ref.id, populate_existing=True, with_for_update=_row_lock(True)
+        )
     if entity is None:
         raise SubjectNotFound("not_found", f"{ref.type.capitalize()} {ref.id} does not exist.")
-    dataset = await session.get(SourceDataset, entity.dataset_id, populate_existing=True)
     if dataset is None:
         raise SubjectNotFound("not_found", f"The dataset of {ref.type} {ref.id} does not exist.")
     return entity.source, entity.dataset_id, dataset.state
@@ -2392,10 +3170,40 @@ async def _unresolved(
     return list(result.scalars())
 
 
-async def _awaiting_intended(session: AsyncSession, ref: SubjectRef) -> Discrepancy | None:
-    """Return the subject's ``untracked`` row waiting after ``record_intended``, if any."""
-    for row in await _unresolved(session, ref, "untracked"):
-        if row.state == "awaiting_platform" and row.resolution == "record_intended":
+async def _subject_unresolved(
+    session: AsyncSession, ref: SubjectRef, unresolved: Sequence[Discrepancy] | None
+) -> list[Discrepancy]:
+    """Return the subject's non-resolved discrepancies, oldest first.
+
+    ``unresolved`` is what the caller already row-locked for the subject (detection locks
+    every non-resolved row of its dataset in one statement); without it they are locked
+    and read here.
+
+    Raises:
+        ValueError: If a preloaded row belongs to another subject.
+    """
+    if unresolved is None:
+        return await _unresolved(session, ref)
+    for row in unresolved:
+        if row.subject_type != ref.type or row.subject_id != ref.id:
+            raise ValueError(
+                f"discrepancy {row.id} belongs to {row.subject_type} {row.subject_id}, "
+                f"not {ref.type} {ref.id}"
+            )
+    return sorted(
+        (row for row in unresolved if row.state != "resolved"),
+        key=lambda row: (row.detected_at, row.id),
+    )
+
+
+def _awaiting_intended(rows: Sequence[Discrepancy]) -> Discrepancy | None:
+    """Return the ``untracked`` row among ``rows`` that waits after ``record_intended``."""
+    for row in rows:
+        if (
+            row.kind == "untracked"
+            and row.state == "awaiting_platform"
+            and row.resolution == "record_intended"
+        ):
             return row
     return None
 
@@ -2415,6 +3223,52 @@ def _refresh(
     discrepancy.decision_id = decision_id
 
 
+async def _refresh_waiting(
+    session: AsyncSession,
+    waiting: Discrepancy,
+    ref: SubjectRef,
+    *,
+    state: SubjectState | None,
+    platform_value: Mapping[str, Any] | None,
+    snapshot_id: int | None,
+    decision_id: int | None,
+) -> None:
+    """Refresh an ``untracked`` row waiting after ``record_intended`` with a new comparison.
+
+    Its values describe the whole subject, as the ``untracked`` item and ``record_intended``
+    wrote them, never only the fields that differ: the platform side becomes the complete
+    state the compared snapshot observed, in the subject's shape
+    (:func:`describe_snapshot`), so a field that converged shows its new value; the decided
+    side becomes the compared decision (:func:`describe_decision`), so an ordinary decision
+    recorded after the intended state replaces it on the card. ``snapshot_id`` and
+    ``decision_id`` follow; ``detected_at``, the state and the resolution are kept. The
+    preloaded ``state`` normally holds that snapshot and decision, so nothing is read;
+    otherwise the subject is loaded here. Only without a snapshot is ``platform_value``
+    merged into the stored platform side.
+    """
+    subject = state if state is not None else await load_subject_state(session, ref)
+    snapshot: EntitySnapshot | None = None
+    if snapshot_id is not None:
+        latest = subject.latest_snapshot
+        if latest is not None and latest.id == snapshot_id:
+            snapshot = latest
+        else:
+            snapshot = await session.get(EntitySnapshot, snapshot_id)
+    decision = subject.current_decision
+    if decision_id is not None and (decision is None or decision.id != decision_id):
+        decision = await session.get(Decision, decision_id)
+    if snapshot is not None:
+        waiting.platform_value = describe_snapshot(snapshot, state=subject)
+    else:
+        merged = dict(waiting.platform_value or {})
+        merged.update(platform_value or {})
+        waiting.platform_value = merged
+    waiting.snapshot_id = snapshot_id
+    if decision is not None:
+        waiting.decided_value = describe_decision(decision, state=subject)
+        waiting.decision_id = decision.id
+
+
 async def raise_discrepancy(
     session: AsyncSession,
     ref: SubjectRef,
@@ -2425,6 +3279,10 @@ async def raise_discrepancy(
     snapshot_id: int | None,
     decision_id: int | None,
     detected_at: datetime,
+    state: SubjectState | None = None,
+    locked: bool = False,
+    unresolved: Sequence[Discrepancy] | None = None,
+    queue_analysis: bool = True,
 ) -> Discrepancy:
     """Open a discrepancy, or refresh the subject's non-resolved one of the same kind.
 
@@ -2436,14 +3294,22 @@ async def raise_discrepancy(
 
     A ``status`` or ``budget`` mismatch on a subject whose ``untracked`` discrepancy waits
     (``awaiting_platform``) after ``record_intended`` is that same pending change: the
-    intended state *is* the current decision. It refreshes the waiting row's platform
-    value and snapshot, which is returned, instead of opening a second C0 item; the row
-    still closes through :func:`auto_resolve` once the platform matches, and stays
+    intended state *is* the current decision. It refreshes the waiting row, which is
+    returned, instead of opening a second C0 item: its platform side becomes the complete
+    state the compared snapshot observed and its decided side the compared decision, with
+    their ids, so the card shows the current platform state against the current decision
+    even after one field converged or a later decision replaced the intended state. The
+    row still closes through :func:`auto_resolve` once the platform matches, and stays
     resolvable by ``adopt_platform`` or a new ``record_intended`` meanwhile.
 
     Otherwise a new ``open`` row is inserted inside a savepoint and one
-    ``analysis_request`` (``discrepancy_created``) is queued; if a concurrent writer
+    ``analysis_request`` (``discrepancy_created``) is queued, unless the caller coalesces
+    the requests of a whole detection pass (``queue_analysis``); if a concurrent writer
     inserted the row first, that row is refreshed instead.
+
+    The subject's dataset (``FOR SHARE``) and row (``FOR NO KEY UPDATE``) are locked before
+    any discrepancy row, in the order decision writers and resolutions use, and stay locked
+    until the caller's transaction ends.
 
     Args:
         session: The caller's session.
@@ -2455,6 +3321,20 @@ async def raise_discrepancy(
         snapshot_id: The snapshot compared; ``None`` for ``missing``.
         decision_id: The decision compared; ``None`` for ``untracked``.
         detected_at: The detection instant (tz-aware).
+        state: The subject's state when the caller already loaded it. Its source,
+            dataset and dataset state are used only when ``locked``; they are read under
+            the locks here otherwise.
+        locked: Whether ``state`` was loaded with :func:`load_subject_states` and ``lock``
+            in the caller's current transaction, whose dataset and subject locks it still
+            holds, so its ``dataset_state`` is current and nothing is locked or read again
+            here; an entity sync's detection and baseline passes, which lock every subject
+            at once, pass ``True``. Otherwise those locks are taken here, also when
+            ``state`` is supplied, since a state alone proves no lock.
+        unresolved: The subject's non-resolved discrepancies when the caller already
+            row-locked them, for example with one ``FOR UPDATE`` over its dataset; locked
+            and read here otherwise.
+        queue_analysis: Whether to queue the ``discrepancy_created`` request for a new
+            row. A caller that passes ``False`` queues one for its whole pass.
 
     Returns:
         The new or refreshed discrepancy.
@@ -2462,43 +3342,56 @@ async def raise_discrepancy(
     Raises:
         SubjectNotFound: If the subject does not exist.
         SubjectRetired: If its dataset is retired.
-        ValueError: If ``kind`` is unknown or ``detected_at`` is naive.
+        ValueError: If ``kind`` is unknown, ``detected_at`` is naive, ``state`` describes
+            another subject, or a preloaded discrepancy belongs to another subject.
     """
     if not _is_kind(kind):
         raise ValueError(f"discrepancy kind must be one of {DISCREPANCY_KINDS}, not {kind!r}")
     if detected_at.utcoffset() is None:
         raise ValueError("detected_at must be a timezone-aware datetime")
-    source, dataset_id, dataset_state = await _subject_provenance(session, ref)
+    if state is not None and state.ref != ref:
+        raise ValueError(f"state describes {state.ref}, not {ref}")
+    source: str
+    if state is not None and locked:
+        source, dataset_id, dataset_state = state.source, state.dataset_id, state.dataset_state
+    else:
+        # A supplied state proves no lock, so the lifecycle guard is taken here unless the
+        # caller holds it (``locked``): no discrepancy lands in a dataset retired meanwhile.
+        source, dataset_id, dataset_state = await _subject_provenance(session, ref)
     if dataset_state == "retired":
         raise SubjectRetired(
             "subject_retired",
             f"{ref.type} {ref.id} belongs to a retired dataset; no discrepancy is raised.",
             details={"dataset_id": dataset_id},
         )
-    existing = await _unresolved(session, ref, kind)
-    if existing:
+    pending = await _subject_unresolved(session, ref, unresolved)
+    existing = next((row for row in pending if row.kind == kind), None)
+    if existing is not None:
         _refresh(
-            existing[0],
+            existing,
             decided_value=decided_value,
             platform_value=platform_value,
             snapshot_id=snapshot_id,
             decision_id=decision_id,
         )
         await session.flush()
-        return existing[0]
+        return existing
     if kind in ("status", "budget"):
-        waiting = await _awaiting_intended(session, ref)
+        waiting = _awaiting_intended(pending)
         if waiting is not None:
             # The intended state recorded for an untracked subject is the decision this
             # mismatch is measured against, and its untracked row already waits for the
             # platform to reach it; a second C0 item would ask the user to resolve the same
-            # pending change twice. The waiting row takes the latest platform value instead.
-            merged = dict(waiting.platform_value or {})
-            merged.update(platform_value or {})
-            waiting.platform_value = merged
-            waiting.snapshot_id = snapshot_id
-            if decision_id is not None:
-                waiting.decision_id = decision_id
+            # pending change twice. The waiting row takes the latest comparison instead.
+            await _refresh_waiting(
+                session,
+                waiting,
+                ref,
+                state=state,
+                platform_value=platform_value,
+                snapshot_id=snapshot_id,
+                decision_id=decision_id,
+            )
             await session.flush()
             return waiting
 
@@ -2532,7 +3425,8 @@ async def raise_discrepancy(
         )
         await session.flush()
         return concurrent[0]
-    await enqueue_analysis_request(session, "discrepancy_created")
+    if queue_analysis:
+        await enqueue_analysis_request(session, "discrepancy_created")
     _log.info(
         "decisions.discrepancy_raised",
         discrepancy_id=row.id,
@@ -2551,13 +3445,21 @@ async def auto_resolve(
     *,
     now: datetime,
     state: SubjectState | None = None,
+    locked: bool = False,
     enumeration_complete: bool = False,
+    unresolved: Sequence[Discrepancy] | None = None,
+    queue_analysis: bool = True,
 ) -> list[Discrepancy]:
     """Close the subject's discrepancies once its snapshot matches its decision.
 
     AAP 0.5.4.4: every ``status``, ``budget`` and ``untracked`` discrepancy in ``open`` or
     ``awaiting_platform`` resolves when a later snapshot matches the current decision,
-    re-checked on every entity sync. A ``missing`` discrepancy closes here only when it is
+    re-checked on every entity sync. The match must be established by
+    :func:`verified_match`, not merely uncontradicted: a snapshot that omits a value the
+    comparison needs (a campaign status, a Google amount or budget period, a member's
+    ``budget_id``) closes nothing, and neither does any snapshot against a tombstone. The
+    whole snapshot must match, so one remaining mismatch keeps every row of the subject
+    open. A ``missing`` discrepancy closes here only when it is
     ``awaiting_platform`` after ``decision_correct`` and the caller states that a complete
     enumeration returned the entity (``enumeration_complete``); it never auto-closes from
     ``open``. Without a decision (an untracked subject) or a snapshot, nothing closes.
@@ -2566,7 +3468,15 @@ async def auto_resolve(
     ``None`` for a row that closed on its own. The ``discrepancy.resolution`` CHECK admits
     only the five resolution API keys, so an automatic match is recorded by
     ``resolved_at`` alone. One ``analysis_request`` (``discrepancy_resolved``) is queued
-    when anything closed.
+    when anything closed, unless the caller coalesces the requests of a whole detection
+    pass (``queue_analysis``).
+
+    Retired datasets are read-only (AAP 0.3.3). With a decision and a snapshot, the
+    subject's dataset (``FOR SHARE``) and row (``FOR NO KEY UPDATE``) are locked, also when
+    ``state`` is supplied, before any discrepancy row, and stay locked until the caller's
+    transaction ends; only a caller that already holds them for ``state`` (``locked``)
+    skips that. A ``retired`` dataset is refused whether or not anything would close,
+    while ``building`` and ``active`` ones are judged.
 
     Args:
         session: The caller's session.
@@ -2574,28 +3484,59 @@ async def auto_resolve(
         snapshot: The subject's snapshot from this sync, or ``None`` when absent.
         decision: The subject's current decision, or ``None`` when untracked.
         now: The resolution instant (tz-aware).
-        state: The subject's state when the caller already loaded it.
+        state: The subject's state when the caller already loaded it; otherwise it is
+            loaded here with :func:`load_subject_state` and ``lock``.
+        locked: Whether ``state`` was loaded with :func:`load_subject_states` and ``lock``
+            in the caller's current transaction, whose dataset and subject locks it still
+            holds, so its ``dataset_state`` is current and nothing is locked or read again
+            here; an entity sync's detection and baseline passes, which lock every subject
+            at once, pass ``True``. Otherwise those locks are taken here, also when
+            ``state`` is supplied, since a state alone proves no lock.
         enumeration_complete: Whether a complete enumeration returned the entity in this
             sync (AAP 0.3.3 safe absence); required to close ``missing``.
+        unresolved: The subject's non-resolved discrepancies when the caller already
+            row-locked them; locked and read here otherwise.
+        queue_analysis: Whether to queue the ``discrepancy_resolved`` request. A caller
+            that passes ``False`` queues one for its whole pass.
 
     Returns:
-        The discrepancies closed, oldest first.
+        The discrepancies closed, oldest first; ``[]`` without a decision or a snapshot,
+        before any lock or read.
 
     Raises:
-        SubjectNotFound: If the subject does not exist.
-        ValueError: If the snapshot or decision belongs to another subject, or ``now`` is
-            naive.
+        SubjectNotFound: If the subject or its dataset does not exist.
+        SubjectRetired: If its dataset is retired (409 ``subject_retired``); nothing is
+            closed and no ``analysis_request`` is queued.
+        ValueError: If the snapshot, decision or a preloaded discrepancy belongs to another
+            subject, ``state`` describes another subject, or ``now`` is naive.
     """
     instant = _instant(now)
     if decision is None or snapshot is None:
         return []
-    subject_state = state if state is not None else await load_subject_state(session, ref)
+    subject_state = (
+        state if state is not None else await load_subject_state(session, ref, lock=True)
+    )
     if subject_state.ref != ref:
         raise ValueError(f"state describes {subject_state.ref}, not {ref}")
-    if compare(snapshot, decision, state=subject_state):
+    # Retired datasets are read-only. A supplied state proves no lock unless its caller
+    # loaded it under the dataset and subject locks in this transaction (``locked``), so
+    # otherwise the lifecycle guard is taken (or re-taken, a no-op inside the caller's own
+    # locks) here, before any discrepancy row is locked: an activation that retired the
+    # dataset first, or committed while this writer waited on it, is seen.
+    if state is not None and not locked:
+        _, dataset_id, dataset_state = await _subject_provenance(session, ref)
+    else:
+        dataset_id, dataset_state = subject_state.dataset_id, subject_state.dataset_state
+    if dataset_state == "retired":
+        raise SubjectRetired(
+            "subject_retired",
+            f"{ref.type} {ref.id} belongs to a retired dataset; no discrepancy is resolved.",
+            details={"dataset_id": dataset_id},
+        )
+    if not verified_match(snapshot, decision, state=subject_state):
         return []
     closed: list[Discrepancy] = []
-    for discrepancy in await _unresolved(session, ref):
+    for discrepancy in await _subject_unresolved(session, ref, unresolved):
         closable = discrepancy.kind in _AUTO_RESOLVABLE_KINDS or (
             discrepancy.kind == "missing"
             and discrepancy.state == "awaiting_platform"
@@ -2609,9 +3550,119 @@ async def auto_resolve(
     if not closed:
         return []
     await session.flush()
-    await enqueue_analysis_request(session, "discrepancy_resolved")
+    if queue_analysis:
+        await enqueue_analysis_request(session, "discrepancy_resolved")
     _log.info(
         "decisions.auto_resolved",
+        subject_type=ref.type,
+        subject_id=ref.id,
+        discrepancy_ids=[row.id for row in closed],
+        kinds=sorted({row.kind for row in closed}),
+    )
+    return closed
+
+
+_ABSENCE_CLOSABLE_KINDS: Final[frozenset[str]] = frozenset({"status", "budget"})
+"""Kinds a tombstoned subject's renewed absence closes (:func:`auto_resolve_absent`)."""
+
+
+async def auto_resolve_absent(
+    session: AsyncSession,
+    ref: SubjectRef,
+    decision: Decision,
+    *,
+    now: datetime,
+    state: SubjectState | None = None,
+    locked: bool = False,
+    unresolved: Sequence[Discrepancy] | None = None,
+    queue_analysis: bool = True,
+) -> list[Discrepancy]:
+    """Close a tombstoned subject's ``status`` and ``budget`` discrepancies while it is absent.
+
+    Call this only when a complete enumeration (AAP 0.3.3 safe absence) did not return the
+    subject. An ``acknowledge_removal`` tombstone records that the entity is gone (AAP
+    0.5.4.4), so a complete enumeration that does not return it observes exactly the
+    decided state. :func:`verified_match` never matches a tombstone against a snapshot,
+    so without this a ``status`` (or, for a shared budget, ``budget``) discrepancy raised
+    when the entity came back, open or ``awaiting_platform`` after ``decision_correct``,
+    would stay open after it disappeared again; the same holds for one left over from
+    before the removal. Every such non-resolved row is closed: ``state`` ``resolved`` and
+    ``resolved_at`` set, its ``resolution`` kept as :func:`auto_resolve` keeps it. No
+    ``missing`` discrepancy is raised for the absence, and ``untracked`` and ``missing``
+    rows are left as they are. With a decision that is not a tombstone nothing closes: a
+    tracked subject's absence is a ``missing`` discrepancy, never a match.
+
+    One ``analysis_request`` (``discrepancy_resolved``) is queued when anything closed,
+    unless the caller coalesces the requests of a whole detection pass
+    (``queue_analysis``).
+
+    Retired datasets are read-only (AAP 0.3.3), so with a tombstone the subject's dataset
+    (``FOR SHARE``) and row (``FOR NO KEY UPDATE``) are locked before any discrepancy row,
+    as :func:`auto_resolve` locks them, and a ``retired`` dataset is refused.
+
+    Args:
+        session: The caller's session.
+        ref: The subject the complete enumeration did not return.
+        decision: The subject's current decision.
+        now: The resolution instant (tz-aware).
+        state: The subject's state when the caller already loaded it; its dataset state
+            is used only when ``locked``.
+        locked: Whether ``state`` was loaded with :func:`load_subject_states` and ``lock``
+            in the caller's current transaction, whose dataset and subject locks it still
+            holds, so its ``dataset_state`` is current and nothing is locked or read again
+            here; an entity sync's detection and baseline passes, which lock every subject
+            at once, pass ``True``. Otherwise those locks are taken here, also when
+            ``state`` is supplied, since a state alone proves no lock.
+        unresolved: The subject's non-resolved discrepancies when the caller already
+            row-locked them; locked and read here otherwise.
+        queue_analysis: Whether to queue the ``discrepancy_resolved`` request. A caller
+            that passes ``False`` queues one for its whole pass.
+
+    Returns:
+        The discrepancies closed, oldest first; ``[]`` for a decision that is not a
+        tombstone, before any lock or read.
+
+    Raises:
+        SubjectNotFound: If the subject or its dataset does not exist.
+        SubjectRetired: If its dataset is retired (409 ``subject_retired``); nothing is
+            closed and no ``analysis_request`` is queued.
+        ValueError: If the decision or a preloaded discrepancy belongs to another subject,
+            ``state`` describes another subject, or ``now`` is naive.
+    """
+    instant = _instant(now)
+    if decision.subject_type != ref.type or decision.subject_id != ref.id:
+        raise ValueError(
+            f"decision {decision.id} belongs to {decision.subject_type} {decision.subject_id}, "
+            f"not {ref.type} {ref.id}"
+        )
+    if state is not None and state.ref != ref:
+        raise ValueError(f"state describes {state.ref}, not {ref}")
+    if not decision.tombstone:
+        return []
+    if state is not None and locked:
+        dataset_id, dataset_state = state.dataset_id, state.dataset_state
+    else:
+        _, dataset_id, dataset_state = await _subject_provenance(session, ref)
+    if dataset_state == "retired":
+        raise SubjectRetired(
+            "subject_retired",
+            f"{ref.type} {ref.id} belongs to a retired dataset; no discrepancy is resolved.",
+            details={"dataset_id": dataset_id},
+        )
+    closed: list[Discrepancy] = []
+    for discrepancy in await _subject_unresolved(session, ref, unresolved):
+        if discrepancy.kind not in _ABSENCE_CLOSABLE_KINDS:
+            continue
+        discrepancy.state = "resolved"
+        discrepancy.resolved_at = instant
+        closed.append(discrepancy)
+    if not closed:
+        return []
+    await session.flush()
+    if queue_analysis:
+        await enqueue_analysis_request(session, "discrepancy_resolved")
+    _log.info(
+        "decisions.auto_resolved_absent",
         subject_type=ref.type,
         subject_id=ref.id,
         discrepancy_ids=[row.id for row in closed],

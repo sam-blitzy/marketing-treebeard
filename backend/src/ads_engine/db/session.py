@@ -4,7 +4,7 @@ The API, the worker and the ``ads-engine`` CLI all reach PostgreSQL 18 through t
 using SQLAlchemy 2.1 async sessions on psycopg 3. Nothing connects at import time: the
 engine is a lazy, process-wide singleton built from ``DATABASE_URL`` on first use.
 
-Three entry points cover every caller:
+These entry points cover every caller:
 
 * :func:`session_scope` is the shared unit-of-work helper for requests and jobs.
   Repository functions never commit, so everything written inside one scope (for example
@@ -13,6 +13,9 @@ Three entry points cover every caller:
       async with session_scope() as session:
           session.add(decision)
           await enqueue_analysis_request(session, reason="decision")
+
+* :func:`use_session` backs the interfaces whose ``session`` is optional: it joins the
+  caller's session untouched, or runs the call in a :func:`session_scope` of its own.
 
 * :func:`dedicated_connection` checks out one physical connection in ``AUTOCOMMIT`` mode
   for holding session-level advisory locks (the ``analysis`` lock and the scheduler lock).
@@ -59,6 +62,7 @@ __all__ = [
     "json_dumps",
     "reset_engine",
     "session_scope",
+    "use_session",
 ]
 
 _log = get_logger(__name__)
@@ -400,7 +404,7 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
     atomically::
 
         async with session_scope() as session:
-            await upsert_facts(session, FactCampaignDaily, rows, dataset_id)
+            await upsert_facts(FactCampaignDaily, rows, dataset_id, session=session)
 
     Not every commit passes through a scope. ``GoogleCallBudget.acquire`` and
     ``GoogleCallBudget.used_24h`` (and so ``remaining``) in ``sync/budget_guard.py`` run
@@ -424,6 +428,33 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         await _run_to_completion(_abandon_session(session))
         raise
     await _run_to_completion(session.close())
+
+
+@asynccontextmanager
+async def use_session(session: AsyncSession | None = None) -> AsyncIterator[AsyncSession]:
+    """Join the caller's session, or run a unit of work of its own.
+
+    The binding behind the session-optional public interfaces, for example
+    ``record_decision(subject, patch, origin)`` and ``upsert_facts(table, rows,
+    dataset_id)``. With a session, that session is yielded untouched: it is neither
+    committed, rolled back nor closed, so the work lands in the caller's transaction.
+    Without one, a :func:`session_scope` is opened, committed when the block exits
+    normally and rolled back when it raises::
+
+        async with use_session(session) as unit:
+            await upsert_entities(unit, Campaign, rows, dataset_id)
+
+    Args:
+        session: The caller's session, or ``None`` for a transaction owned by the block.
+
+    Yields:
+        The caller's session, or a new one inside its own transaction.
+    """
+    if session is not None:
+        yield session
+        return
+    async with session_scope() as owned:
+        yield owned
 
 
 async def _release_advisory_locks(conn: AsyncConnection) -> None:

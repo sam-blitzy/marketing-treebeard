@@ -80,6 +80,7 @@ from ads_engine.analysis.overlay import (
     ItemOverlayView,
     OverlayResult,
     OverlayView,
+    _load_feedback,
     current_dataset_ids,
     is_current,
     item_is_current,
@@ -2511,6 +2512,159 @@ async def _page_of(
             await session.scalars(select(Recommendation).where(Recommendation.id.in_(item_ids)))
         )
         return await overlay(session, run, items, NOW, thresholds=thresholds)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_feedback_applies_only_to_the_exact_rule_and_entity_of_each_item(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        provenance = _prov(google)
+        earlier = await _run(session)
+        run = await _run(session)
+        dismissed = await _item(session, run, provenance=provenance, entity_id="7|a")
+        same_rule = await _item(session, run, provenance=provenance, entity_id="7|b")
+        other_rule = await _item(
+            session, run, rule_id=K2, provenance=provenance, entity_type="keyword", entity_id="9"
+        )
+        # Active feedback on keys no item of the page carries: the same rule and type on
+        # another entity, the same entity id under another type, another rule on the entity.
+        elsewhere = await _item(session, earlier, provenance=provenance, entity_id="7|z")
+        retyped = await _item(session, earlier, rule_id=K2, provenance=provenance, entity_id="9")
+        other_rule_same_entity = await _item(
+            session, earlier, rule_id=K3, provenance=provenance, entity_id="7|b"
+        )
+        day = timedelta(days=1)
+        await _feedback(session, dismissed, "dismiss", until=NOW + 30 * day, created_at=NOW - day)
+        for given in (elsewhere, retyped, other_rule_same_entity):
+            await _feedback(session, given, "snooze", until=NOW + 7 * day, created_at=NOW - day)
+        await _feedback(
+            session, same_rule, "dismiss", until=NOW - timedelta(minutes=1), created_at=NOW - day
+        )
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert {item_id: view.hidden_by for item_id, view in result.items.items()} == {
+        dismissed.id: "dismiss",
+        same_rule.id: None,
+        other_rule.id: None,
+    }
+
+    # The lookup reads only the page's exact keys: feedback on any other key never loads.
+    page_keys = [
+        (item.rule_id, item.entity_type, item.entity_id)
+        for item in (dismissed, same_rule, other_rule)
+    ]
+    async with sessions() as session:
+        assert await _load_feedback(session, page_keys * 3, NOW) == {
+            (K1, "search_term", "7|a"): "dismiss"
+        }
+        assert await _load_feedback(session, [], NOW) == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_feedback_with_a_null_entity_matches_only_items_with_the_same_null_entity(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        provenance = _prov(google)
+        earlier = await _run(session)
+        run = await _run(session)
+        entityless = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id=None
+        )
+        untyped_named = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id="x"
+        )
+        typed_without_id = await _item(
+            session, run, rule_id=K3, provenance=provenance, entity_type="keyword", entity_id=None
+        )
+        typed_named = await _item(
+            session, run, rule_id=K3, provenance=provenance, entity_type="keyword", entity_id="5"
+        )
+        unmatched_entityless = await _item(
+            session, run, rule_id=C1, provenance=provenance, entity_type=None, entity_id=None
+        )
+        # Rows that differ from a page key only in a NULL or named component.
+        named_elsewhere = await _item(
+            session,
+            earlier,
+            rule_id=C1,
+            provenance=provenance,
+            entity_type="campaign",
+            entity_id="11",
+        )
+        day = timedelta(days=1)
+        await _feedback(session, entityless, "snooze", until=NOW + 7 * day, created_at=NOW - day)
+        await _feedback(
+            session, typed_without_id, "done", until=NOW + 30 * day, created_at=NOW - day
+        )
+        await _feedback(
+            session, named_elsewhere, "dismiss", until=NOW + 30 * day, created_at=NOW - day
+        )
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert {item_id: view.hidden_by for item_id, view in result.items.items()} == {
+        entityless.id: "snooze",
+        untyped_named.id: None,
+        typed_without_id.id: "done",
+        typed_named.id: None,
+        unmatched_entityless.id: None,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_the_latest_feedback_in_force_wins_per_exact_key_and_expired_rows_are_ignored(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        provenance = _prov(google)
+        run = await _run(session)
+        tie = await _item(session, run, provenance=provenance, entity_id="7|tie")
+        entityless = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id=None
+        )
+        later_expired = await _item(session, run, provenance=provenance, entity_id="7|late")
+        only_expired = await _item(session, run, provenance=provenance, entity_id="7|gone")
+        ends_now = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id="7|now"
+        )
+        day = timedelta(days=1)
+        written = NOW - day
+        # Written at the same instant: the row inserted last (the higher id) wins.
+        await _feedback(session, tie, "snooze", until=NOW + 7 * day, created_at=written)
+        await _feedback(session, tie, "dismiss", until=NOW + 30 * day, created_at=written)
+        # A NULL entity key follows the same rule: the latest row in force wins.
+        await _feedback(session, entityless, "done", until=NOW + 30 * day, created_at=NOW - 3 * day)
+        await _feedback(session, entityless, "snooze", until=NOW + 7 * day, created_at=written)
+        await _feedback(
+            session, entityless, "dismiss", until=NOW - timedelta(seconds=1), created_at=NOW
+        )
+        # A later row that has already expired never overrides one still in force.
+        await _feedback(
+            session, later_expired, "done", until=NOW + 30 * day, created_at=NOW - 2 * day
+        )
+        await _feedback(
+            session, later_expired, "snooze", until=NOW - timedelta(hours=1), created_at=written
+        )
+        await _feedback(
+            session, only_expired, "dismiss", until=NOW - 2 * day, created_at=NOW - 32 * day
+        )
+        await _feedback(session, ends_now, "snooze", until=NOW, created_at=NOW - 7 * day)
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert {item_id: view.hidden_by for item_id, view in result.items.items()} == {
+        tie.id: "dismiss",
+        entityless.id: "snooze",
+        later_expired.id: "done",
+        only_expired.id: None,
+        ends_now.id: None,
+    }
 
 
 # ---------------------------------------------------------------------------------------

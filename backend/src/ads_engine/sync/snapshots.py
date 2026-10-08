@@ -10,7 +10,9 @@ AAP 0.5.1 ("Sync jobs and snapshots"), 0.5.2 ("Dated snapshots", "Decisions: sha
 2. :func:`ensure_baseline` records the observed platform state as the ``baseline``
    decision of every campaign and Google shared budget that has none yet, while the
    dataset's baseline is still open (:func:`baseline_sealed`), so day one raises no false
-   discrepancies.
+   discrepancies. A subject observed while it was open whose baseline had to wait for a
+   value the platform did not report (a shared budget's amount) is baselined as soon as
+   a later sync reports it, even after the seal.
 3. :func:`detect_discrepancies` compares each decision subject's newest snapshot with its
    current decision and raises ``status``, ``budget``, ``untracked`` and ``missing``
    discrepancies, then closes the ones whose subject now matches.
@@ -18,9 +20,24 @@ AAP 0.5.1 ("Sync jobs and snapshots"), 0.5.2 ("Dated snapshots", "Decisions: sha
 **This module detects; it never writes decisions or discrepancies itself.** Every
 ``decision`` and ``discrepancy`` row is written through :mod:`ads_engine.decisions`
 (:func:`~ads_engine.decisions.write_baseline`, :func:`~ads_engine.decisions.raise_discrepancy`,
-:func:`~ads_engine.decisions.auto_resolve`), which also queues the ``analysis_request`` for a
-created or resolved discrepancy; nothing here queues a second one. ``analysis/discrepancy.py``
-only renders the stored rows as C0 items.
+:func:`~ads_engine.decisions.auto_resolve`, :func:`~ads_engine.decisions.auto_resolve_absent`).
+Detection asks them not to queue an
+``analysis_request`` per row and queues one ``discrepancy_created`` and one
+``discrepancy_resolved`` request per pass when it created or closed anything (AAP 0.3.2; the
+worker coalesces requests within 60 s anyway). ``analysis/discrepancy.py`` only renders the
+stored rows as C0 items.
+
+**Set-based.** Baseline and detection read a number of statements that does not grow with
+the number of subjects: subject states come from
+:func:`~ads_engine.decisions.load_subject_states`, detection row-locks the dataset's
+non-resolved discrepancies in one statement, and subjects are judged in memory. Writes are
+proportional to the rows created or changed; baselines are inserted with one flush.
+
+**Locks.** Both passes load their subjects with ``lock``, in the order every decision
+writer uses: the dataset ``FOR SHARE`` (so no activation retires it until the sync
+commits), then the subject rows ``FOR NO KEY UPDATE``, then (detection) the discrepancy
+rows. The :mod:`ads_engine.decisions` writers are told they hold those locks
+(``locked``), so they neither lock nor read anything again.
 
 **Decision subjects** are campaigns of both sources and Google explicitly shared budgets
 (AAP 0.5.2). Campaign groups, ad groups, keywords, creatives and conversion actions are
@@ -59,7 +76,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Final
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine.db.models.accounts import (
@@ -75,18 +92,20 @@ from ads_engine.db.models.accounts import (
 from ads_engine.db.models.decisions import DISCREPANCY_KINDS, Decision, Discrepancy
 from ads_engine.db.models.ops import SOURCES, SourceDataset
 from ads_engine.db.models.snapshots import ENTITY_TYPES, EntitySnapshot
-from ads_engine.db.repositories import append_snapshots
+from ads_engine.db.repositories import append_snapshots, enqueue_analysis_request
 from ads_engine.decisions import (
     DiscrepancyKind,
     PlatformStateUnknown,
     SubjectRef,
     SubjectState,
+    SubjectStates,
     auto_resolve,
+    auto_resolve_absent,
     compare,
     describe_decision,
     describe_snapshot,
     from_micros,
-    load_subject_state,
+    load_subject_states,
     raise_discrepancy,
     write_baseline,
 )
@@ -911,7 +930,7 @@ async def write_snapshots(
             f"once, for example {repeated[:5]}"
         )
     await _check_entities(session, dataset_id, rows)
-    ids = await append_snapshots(session, [row.to_row(dataset_id, instant) for row in rows])
+    ids = await append_snapshots([row.to_row(dataset_id, instant) for row in rows], session=session)
     written = dict(zip((row.key for row in rows), ids, strict=True))
     _log.debug(
         "sync.snapshots_written",
@@ -953,8 +972,9 @@ async def baseline_sealed(session: AsyncSession, dataset_id: int) -> bool:
     completed with completeness ``complete``: an incomplete first enumeration (a deferred
     keyset page, a failed Q-G2b chunk, a LinkedIn listing cut short) may have omitted
     campaigns, and those must be baselined when a later sync returns them rather than be
-    raised as ``untracked``. Once sealed, a subject seen without a decision is
-    ``untracked``.
+    raised as ``untracked``. Once sealed, a subject first seen without a decision is
+    ``untracked``; one observed while the baseline was open whose baseline had to wait for
+    a value the platform did not report is still baselined by :func:`ensure_baseline`.
 
     The verdict is read from the dataset's ``{source}.entities`` freshness row
     (:func:`~ads_engine.sync.freshness.load_freshness`): sealed when ``last_success_at``
@@ -1031,6 +1051,67 @@ async def _unbaselined(
     return pairs
 
 
+async def _deferred_baselines(
+    session: AsyncSession, dataset_id: int, observed: Mapping[SubjectRef, datetime]
+) -> frozenset[SubjectRef]:
+    """Return the decision-less subjects whose baseline waited while the baseline was open.
+
+    ``observed`` maps subjects without a decision to the instant this sync observed them.
+    One of them was observed with the baseline population, and its baseline deferred, when
+    an earlier snapshot of the dataset shows it as a decision subject (any campaign
+    snapshot; a budget snapshot that marks it explicitly shared) and it has never had an
+    ``untracked`` discrepancy. No stored marker is needed: while the baseline is open a
+    decision-less subject is baselined unless its platform state cannot be materialised
+    (:class:`~ads_engine.decisions.PlatformStateUnknown`, for example a shared budget
+    whose amount Google omitted), and detection raises nothing for it; once sealed, every
+    decision-less subject a sync observes gets its ``untracked`` discrepancy in that same
+    sync, and that row closes only with a decision (``adopt_platform``, ``record_intended``
+    or a match against one). Every other subject here is first seen after the baseline.
+
+    One statement per subject type and :data:`_ID_CHUNK` subjects.
+
+    Args:
+        session: The entity sync's session.
+        dataset_id: The dataset just synced.
+        observed: Decision-less subjects mapped to this sync's ``captured_at`` for them.
+
+    Returns:
+        The subjects whose baseline is deferred.
+    """
+    found: set[SubjectRef] = set()
+    for subject_type in ("campaign", "budget"):
+        wanted = {ref.id: at for ref, at in observed.items() if ref.type == subject_type}
+        for chunk in _chunks(sorted(wanted)):
+            ever_untracked = (
+                select(Discrepancy.id)
+                .where(
+                    Discrepancy.dataset_id == dataset_id,
+                    Discrepancy.subject_type == subject_type,
+                    Discrepancy.subject_id == EntitySnapshot.entity_id,
+                    Discrepancy.kind == "untracked",
+                )
+                .exists()
+            )
+            statement = (
+                select(EntitySnapshot.entity_id, func.min(EntitySnapshot.captured_at))
+                .where(
+                    EntitySnapshot.dataset_id == dataset_id,
+                    EntitySnapshot.entity_type == subject_type,
+                    EntitySnapshot.entity_id.in_(chunk),
+                    ~ever_untracked,
+                )
+                .group_by(EntitySnapshot.entity_id)
+            )
+            if subject_type == "budget":
+                statement = statement.where(
+                    EntitySnapshot.payload.contains({"explicitly_shared": True})
+                )
+            for entity_id, first_seen in await session.execute(statement):
+                if first_seen < wanted[entity_id]:
+                    found.add(SubjectRef(type=subject_type, id=entity_id))
+    return frozenset(found)
+
+
 async def ensure_baseline(
     session: AsyncSession,
     dataset_id: int,
@@ -1038,7 +1119,7 @@ async def ensure_baseline(
     captured_at: datetime,
     sealed: bool,
 ) -> int:
-    """Write the ``baseline`` decision of every subject that has none, while unsealed.
+    """Write the ``baseline`` decision of every subject of the baseline population that has none.
 
     AAP 0.5.2 ("Decisions: baseline"; "baseline per decision shape"). While the baseline
     is open (``sealed`` is false, from :func:`baseline_sealed`), every campaign of the
@@ -1055,7 +1136,17 @@ async def ensure_baseline(
     Idempotent: a subject that already has a decision keeps it, so calling this again
     writes nothing. A subject whose observed state cannot be materialised (a shared budget
     whose amount Google omitted, :class:`~ads_engine.decisions.PlatformStateUnknown`) is
-    skipped and logged; a later sync retries it while the baseline is open.
+    skipped and logged as ``sync.baseline_deferred``; a later sync retries it. That retry
+    continues after the baseline seals: such a subject was observed with the baseline
+    population, not first seen after it (AAP 0.5.4.4 ``untracked``), so once sealed this
+    still baselines every decision-less subject first observed before this sync and never
+    raised as ``untracked`` (identified from snapshot and discrepancy history, see
+    :func:`_deferred_baselines`), as soon as its state can be materialised. A subject
+    first seen after the seal gets no baseline; detection raises it as ``untracked``.
+
+    The states of every subject come from one
+    :func:`~ads_engine.decisions.load_subject_states` call and the new rows are inserted
+    with one flush, so the statements sent do not grow with the number of subjects.
 
     Args:
         session: The entity sync's session; nothing is committed here.
@@ -1073,19 +1164,38 @@ async def ensure_baseline(
     """
     instant = _check_instant(captured_at, "captured_at")
     await _subject_source(session, dataset_id)
+    candidates = await _unbaselined(session, dataset_id, instant)
     if sealed:
-        _log.debug("sync.baseline_sealed", dataset_id=dataset_id)
-        return 0
+        waiting = await _deferred_baselines(
+            session, dataset_id, {ref: snapshot.captured_at for ref, snapshot in candidates}
+        )
+        candidates = [(ref, snapshot) for ref, snapshot in candidates if ref in waiting]
+        if not candidates:
+            _log.debug("sync.baseline_sealed", dataset_id=dataset_id)
+            return 0
+    # Locked like every decision writer, so a decision a concurrent writer committed is
+    # seen and kept, and the dataset cannot retire before this sync commits.
+    loaded = await load_subject_states(session, [ref for ref, _ in candidates], lock=True)
     written: Counter[str] = Counter()
     deferred: list[dict[str, object]] = []
-    for ref, snapshot in await _unbaselined(session, dataset_id, instant):
+    for ref, snapshot in candidates:
         try:
-            decision = await write_baseline(session, ref, snapshot, now=instant)
+            decision = await write_baseline(
+                session,
+                ref,
+                snapshot,
+                now=instant,
+                state=loaded.require(ref),
+                locked=True,
+                flush=False,
+            )
         except PlatformStateUnknown as exc:
             deferred.append({"subject_type": ref.type, "subject_id": ref.id, "code": exc.code})
             continue
         if decision.origin == "baseline" and decision.decided_at == instant:
             written[decision.shape] += 1
+    # One flush inserts every baseline of the sync in batches instead of one round trip each.
+    await session.flush()
     total = sum(written.values())
     _log.info(
         "sync.baseline",
@@ -1210,13 +1320,15 @@ class DetectionReport:
         refreshed: Non-resolved rows that already existed and were refreshed with this
             sync's comparison instead of being raised again.
         auto_resolved: Discrepancies closed because the subject's snapshot now matches its
-            decision.
+            decision, or because a complete enumeration no longer returns a subject whose
+            decision is a tombstone.
         checked: Subjects examined: present, removed and (after a complete enumeration)
             missing ones.
         skipped: Subjects examined but not judged: a snapshot captured before the current
             decision, a tombstone while the enumeration is incomplete, a missing subject
-            that is untracked or already tombstoned, or an untracked subject while the
-            baseline is open whose baseline could not be written.
+            that is untracked or already tombstoned, or a subject without a decision whose
+            baseline could not be written, while the baseline is open or, for a subject
+            observed while it was open, after it sealed.
     """
 
     raised: Mapping[str, int]
@@ -1253,10 +1365,49 @@ class _Tally:
         )
 
 
+def _discrepancy_subject(row: Discrepancy) -> SubjectRef:
+    """Return the decision subject a discrepancy row is about.
+
+    Raises:
+        ValueError: If the row holds a subject type the table's ``CHECK`` rules out.
+    """
+    if row.subject_type == "campaign":
+        return SubjectRef(type="campaign", id=row.subject_id)
+    if row.subject_type == "budget":
+        return SubjectRef(type="budget", id=row.subject_id)
+    raise ValueError(f"discrepancy {row.id} holds an unknown subject type {row.subject_type!r}")
+
+
+async def _lock_unresolved(
+    session: AsyncSession, dataset_id: int
+) -> dict[SubjectRef, list[Discrepancy]]:
+    """Row-lock every non-resolved discrepancy of the dataset in one statement, by subject.
+
+    The rows are locked in ``id`` order, the same order on every pass, and re-read from the
+    database (``populate_existing``). Each subject's rows are returned oldest first
+    (``detected_at``, then ``id``); :mod:`ads_engine.decisions` works on them instead of
+    locking and reading each subject's rows again.
+    """
+    rows = await session.scalars(
+        select(Discrepancy)
+        .where(Discrepancy.dataset_id == dataset_id, Discrepancy.state != "resolved")
+        .order_by(Discrepancy.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    grouped: dict[SubjectRef, list[Discrepancy]] = {}
+    for row in rows:
+        grouped.setdefault(_discrepancy_subject(row), []).append(row)
+    for subject_rows in grouped.values():
+        subject_rows.sort(key=lambda row: (row.detected_at, row.id))
+    return grouped
+
+
 async def _raise(
     session: AsyncSession,
     tally: _Tally,
-    ref: SubjectRef,
+    state: SubjectState,
+    rows: list[Discrepancy],
     kind: DiscrepancyKind,
     *,
     decided_value: Mapping[str, Any] | None,
@@ -1270,51 +1421,31 @@ async def _raise(
     :func:`~ads_engine.decisions.raise_discrepancy` refreshes the subject's non-resolved
     row of the kind when one exists (``uq_discrepancy_open_subject_kind``), so a rerun of
     detection never duplicates a row; a row id that was already open before this pass is
-    counted as refreshed, any other as raised.
+    counted as refreshed, any other as raised. It works on the subject's preloaded state and
+    locked rows (``rows``, which a new row joins) and leaves the ``analysis_request`` to the
+    pass, which queues one for everything it created.
     """
     row = await raise_discrepancy(
         session,
-        ref,
+        state.ref,
         kind,
         decided_value=decided_value,
         platform_value=platform_value,
         snapshot_id=snapshot_id,
         decision_id=decision_id,
         detected_at=detected_at,
+        state=state,
+        locked=True,
+        unresolved=rows,
+        queue_analysis=False,
     )
     if row.id in tally.open_ids:
         tally.refreshed += 1
     else:
         tally.open_ids.add(row.id)
         tally.raised[kind] += 1
-
-
-async def _load_present_snapshot(
-    session: AsyncSession, state: SubjectState, snapshot_id: int, dataset_id: int
-) -> EntitySnapshot:
-    """Return this sync's snapshot of a present subject, checked against the subject.
-
-    ``load_subject_state`` already loaded the subject's newest snapshot, which is normally
-    this sync's; it is read again only when it is not.
-
-    Raises:
-        ValueError: If the snapshot does not exist, describes another entity or belongs to
-            another dataset.
-    """
-    snapshot = state.latest_snapshot
-    if snapshot is None or snapshot.id != snapshot_id:
-        snapshot = await session.get(EntitySnapshot, snapshot_id)
-    if (
-        snapshot is None
-        or snapshot.entity_type != state.ref.type
-        or snapshot.entity_id != state.ref.id
-        or snapshot.dataset_id != dataset_id
-    ):
-        raise ValueError(
-            f"snapshot {snapshot_id} is not a snapshot of {state.ref.type} {state.ref.id} "
-            f"in dataset {dataset_id}"
-        )
-    return snapshot
+    if all(existing is not row for existing in rows):
+        rows.append(row)
 
 
 async def _shared_budgets(session: AsyncSession, dataset_id: int, ids: Iterable[int]) -> list[int]:
@@ -1336,37 +1467,95 @@ async def _shared_budgets(session: AsyncSession, dataset_id: int, ids: Iterable[
     return sorted(found)
 
 
-async def _subject_state(session: AsyncSession, ref: SubjectRef, dataset_id: int) -> SubjectState:
-    """Load a subject's state and check that it belongs to the dataset being synced.
+def _dataset_states(
+    loaded: SubjectStates, refs: Sequence[SubjectRef], dataset_id: int
+) -> dict[SubjectRef, SubjectState]:
+    """Return each subject's state, checked to belong to the dataset being synced.
 
     Raises:
-        SubjectNotFound: If the subject does not exist or is not a decision subject.
-        ValueError: If it belongs to another dataset.
+        SubjectNotFound: If a subject does not exist or is not a decision subject.
+        ValueError: If one belongs to another dataset.
     """
-    state = await load_subject_state(session, ref)
-    if state.dataset_id != dataset_id:
-        raise ValueError(
-            f"{ref.type} {ref.id} belongs to dataset {state.dataset_id}, not {dataset_id}"
+    states: dict[SubjectRef, SubjectState] = {}
+    for ref in refs:
+        state = loaded.require(ref)
+        if state.dataset_id != dataset_id:
+            raise ValueError(
+                f"{ref.type} {ref.id} belongs to dataset {state.dataset_id}, not {dataset_id}"
+            )
+        states[ref] = state
+    return states
+
+
+async def _present_snapshots(
+    session: AsyncSession,
+    states: Mapping[SubjectRef, SubjectState],
+    snapshot_ids: Mapping[SubjectRef, int],
+    dataset_id: int,
+) -> dict[SubjectRef, EntitySnapshot]:
+    """Return this sync's snapshot of every present subject, checked against the subject.
+
+    :func:`~ads_engine.decisions.load_subject_states` already loaded each subject's newest
+    snapshot, which is normally this sync's; the others are read together, one statement
+    per :data:`_ID_CHUNK` ids.
+
+    Raises:
+        ValueError: If a snapshot does not exist, describes another entity or belongs to
+            another dataset.
+    """
+    reread: set[int] = set()
+    for ref, snapshot_id in snapshot_ids.items():
+        latest = states[ref].latest_snapshot
+        if latest is None or latest.id != snapshot_id:
+            reread.add(snapshot_id)
+    others: dict[int, EntitySnapshot] = {}
+    for chunk in _chunks(sorted(reread)):
+        result = await session.scalars(select(EntitySnapshot).where(EntitySnapshot.id.in_(chunk)))
+        others.update((row.id, row) for row in result)
+    found: dict[SubjectRef, EntitySnapshot] = {}
+    for ref, snapshot_id in snapshot_ids.items():
+        latest = states[ref].latest_snapshot
+        snapshot = (
+            latest if latest is not None and latest.id == snapshot_id else others.get(snapshot_id)
         )
-    return state
+        if (
+            snapshot is None
+            or snapshot.entity_type != ref.type
+            or snapshot.entity_id != ref.id
+            or snapshot.dataset_id != dataset_id
+        ):
+            raise ValueError(
+                f"snapshot {snapshot_id} is not a snapshot of {ref.type} {ref.id} "
+                f"in dataset {dataset_id}"
+            )
+        found[ref] = snapshot
+    return found
 
 
 async def _check_present(
     session: AsyncSession,
     tally: _Tally,
-    ref: SubjectRef,
-    snapshot_id: int,
+    state: SubjectState,
+    snapshot: EntitySnapshot,
+    rows: list[Discrepancy],
     *,
-    dataset_id: int,
     enumeration: EnumerationResult,
     sealed: bool,
+    deferred: frozenset[SubjectRef],
     now: datetime,
 ) -> None:
     """Judge one subject this sync returned against its current decision.
 
+    ``state``, ``snapshot`` and the subject's locked non-resolved ``rows`` were loaded for
+    the whole pass, so judging reads nothing more; only what changes is written.
+
     * No decision: ``untracked`` once the baseline is sealed; while it is open the subject
       is left to :func:`ensure_baseline` (it is reached here without a decision only when
-      its baseline could not be materialised yet).
+      its baseline could not be materialised yet). A subject observed while the baseline
+      was open whose baseline is still deferred (``deferred``, from
+      :func:`_deferred_baselines`) is not ``untracked`` after the seal either: it was not
+      first seen after the baseline, and :func:`ensure_baseline` baselines it once its
+      state is known. It is skipped meanwhile.
     * A snapshot captured before the current decision was recorded is not judged. The
       decision may have been recorded while this sync was reading the platform, after the
       user applied the change there, so that snapshot can neither confirm nor contradict
@@ -1377,21 +1566,22 @@ async def _check_present(
       complete: AAP 0.5.4.4 raises the reappearance discrepancy when "a complete
       enumeration later returns it".
     * Otherwise :func:`~ads_engine.decisions.compare` gives the ``status`` and ``budget``
-      mismatches at native precision, each raised; with none, every closable discrepancy
-      of the subject is closed by :func:`~ads_engine.decisions.auto_resolve`.
+      mismatches at native precision, each raised; with none,
+      :func:`~ads_engine.decisions.auto_resolve` closes every closable discrepancy of the
+      subject once :func:`~ads_engine.decisions.verified_match` establishes the match, so
+      a value the snapshot omits leaves them open.
     """
     tally.checked += 1
-    state = await _subject_state(session, ref, dataset_id)
-    snapshot = await _load_present_snapshot(session, state, snapshot_id, dataset_id)
     decision = state.current_decision
     if decision is None:
-        if not sealed:
+        if not sealed or state.ref in deferred:
             tally.skipped += 1
             return
         await _raise(
             session,
             tally,
-            ref,
+            state,
+            rows,
             "untracked",
             decided_value=None,
             platform_value=describe_snapshot(snapshot, state=state),
@@ -1411,7 +1601,8 @@ async def _check_present(
         await _raise(
             session,
             tally,
-            ref,
+            state,
+            rows,
             mismatch.kind,
             decided_value=mismatch.decided_value,
             platform_value=mismatch.platform_value,
@@ -1422,12 +1613,15 @@ async def _check_present(
     if not mismatches:
         closed = await auto_resolve(
             session,
-            ref,
+            state.ref,
             snapshot,
             decision,
             now=now,
             state=state,
+            locked=True,
             enumeration_complete=enumeration.complete,
+            unresolved=rows,
+            queue_analysis=False,
         )
         tally.auto_resolved += len(closed)
 
@@ -1435,29 +1629,46 @@ async def _check_present(
 async def _check_missing(
     session: AsyncSession,
     tally: _Tally,
-    ref: SubjectRef,
+    state: SubjectState,
+    rows: list[Discrepancy],
     *,
-    dataset_id: int,
     now: datetime,
 ) -> None:
     """Raise ``missing`` for a tracked subject a complete enumeration did not return.
 
     Tracked means the subject has a current decision that is not a tombstone. While the
     current decision is a tombstone (``acknowledge_removal``) the absence is the
-    acknowledged state and nothing is raised; an untracked subject has nothing to be
-    missing from. The discrepancy has no snapshot (``snapshot_id`` is ``None``) and no
-    platform value.
+    acknowledged state: nothing is raised (the subject counts as skipped), and the
+    subject's ``status`` and ``budget`` discrepancies, such as one raised when it came back
+    in between, are closed by :func:`~ads_engine.decisions.auto_resolve_absent`, because
+    the platform again shows exactly what the tombstone records. An untracked subject has
+    nothing to be missing from. The discrepancy has no snapshot (``snapshot_id`` is
+    ``None``) and no platform value.
     """
     tally.checked += 1
-    state = await _subject_state(session, ref, dataset_id)
     decision = state.current_decision
-    if decision is None or decision.tombstone:
+    if decision is None:
         tally.skipped += 1
+        return
+    if decision.tombstone:
+        tally.skipped += 1
+        closed = await auto_resolve_absent(
+            session,
+            state.ref,
+            decision,
+            now=now,
+            state=state,
+            locked=True,
+            unresolved=rows,
+            queue_analysis=False,
+        )
+        tally.auto_resolved += len(closed)
         return
     await _raise(
         session,
         tally,
-        ref,
+        state,
+        rows,
         "missing",
         decided_value=describe_decision(decision, state=state),
         platform_value=None,
@@ -1482,7 +1693,6 @@ async def detect_discrepancies(
 
     * **Present** (``present_*`` and Google ``removed_campaign_ids``): this sync's
       snapshot is compared with the current decision through
-      :func:`~ads_engine.decisions.load_subject_state` and
       :func:`~ads_engine.decisions.compare`, and each mismatch is raised with
       :func:`~ads_engine.decisions.raise_discrepancy`: ``status`` when the normalised
       status differs; ``budget`` when an owned amount differs at native precision (Google
@@ -1490,20 +1700,38 @@ async def detect_discrepancies(
       differs. A shared budget's amount change raises one discrepancy on the budget
       subject and none on its members, whose decisions own no amount. A Q-G2b ``REMOVED``
       campaign, snapshotted as ``ended``, is compared the same way. A present subject with
-      no decision is ``untracked`` once the baseline is ``sealed``. A tombstoned subject
+      no decision is ``untracked`` once the baseline is ``sealed``, unless it was observed
+      while the baseline was open and its baseline is still deferred for a value the
+      platform has not reported (it is skipped until :func:`ensure_baseline` can write
+      it). A tombstoned subject
       that a complete enumeration returns again gets a ``status`` discrepancy against the
-      tombstone (``budget`` for a shared budget, which has no status). When nothing
-      differs, :func:`~ads_engine.decisions.auto_resolve` closes the subject's ``status``,
-      ``budget`` and ``untracked`` discrepancies, and a ``missing`` one waiting after
-      ``decision_correct`` once a complete enumeration returned the entity.
+      tombstone whatever status it is returned with, a Q-G2b ``REMOVED`` campaign
+      snapshotted as ``ended`` included (``budget`` for a shared budget, which has no
+      status). When the snapshot verifiably matches
+      (:func:`~ads_engine.decisions.verified_match`: nothing differs and every compared
+      value is known), :func:`~ads_engine.decisions.auto_resolve` closes the subject's
+      ``status``, ``budget`` and ``untracked`` discrepancies, and a ``missing`` one
+      waiting after ``decision_correct`` once a complete enumeration returned the entity.
     * **Missing** (only when ``enumeration.complete``): a tracked subject in
       ``missing_*_ids`` gets a ``missing`` discrepancy, unless its current decision is a
-      tombstone. An incomplete enumeration infers no removal or disappearance: the
+      tombstone. A tombstoned subject's absence matches the tombstone: no ``missing`` is
+      raised, and :func:`~ads_engine.decisions.auto_resolve_absent` closes its ``status``
+      and ``budget`` discrepancies (for example the reappearance one raised when it came
+      back in between). An incomplete enumeration infers no removal or disappearance: the
       previous snapshot stands (AAP 0.3.3 safe absence).
 
+    **Set-based.** The pass reads a number of statements that does not grow with the
+    number of subjects: :func:`~ads_engine.decisions.load_subject_states` locks the
+    dataset and every subject (``lock``) and loads each subject's state with its newest
+    snapshot and current decision, one statement then row-locks every non-resolved
+    discrepancy of the dataset (in ``id`` order), and the subjects are judged in
+    memory. Writes are proportional to the rows created or changed. One
+    ``analysis_request`` ``discrepancy_created`` is queued when the pass created any
+    discrepancy and one ``discrepancy_resolved`` when it closed any (AAP 0.3.2), instead
+    of one per row.
+
     Re-running detection on the same sync is safe: a non-resolved row of the same subject
-    and kind is refreshed, never duplicated. The ``analysis_request`` for each created or
-    resolved discrepancy is queued by :mod:`ads_engine.decisions`, not here.
+    and kind is refreshed, never duplicated.
 
     Args:
         session: The entity sync's session; nothing is committed here.
@@ -1523,7 +1751,8 @@ async def detect_discrepancies(
             or is not the enumeration's source, a present subject has no snapshot of this
             sync, or a subject belongs to another dataset.
         SubjectNotFound: If a campaign id does not exist.
-        SubjectRetired: If the dataset is retired.
+        SubjectRetired: If the dataset is retired, from the first subject judged; a pass
+            that skips every subject writes nothing.
     """
     instant = _check_instant(now, "now")
     source = await _subject_source(session, dataset_id)
@@ -1532,13 +1761,6 @@ async def detect_discrepancies(
             f"the enumeration describes {enumeration.source}, but dataset {dataset_id} "
             f"belongs to {source}"
         )
-    open_ids = await session.scalars(
-        select(Discrepancy.id).where(
-            Discrepancy.dataset_id == dataset_id, Discrepancy.state != "resolved"
-        )
-    )
-    tally = _Tally(open_ids=set(open_ids))
-
     present = [
         SubjectRef(type="campaign", id=campaign_id)
         for campaign_id in sorted(
@@ -1549,6 +1771,7 @@ async def detect_discrepancies(
         SubjectRef(type="budget", id=budget_id)
         for budget_id in await _shared_budgets(session, dataset_id, enumeration.present_budget_ids)
     )
+    present_snapshot_ids: dict[SubjectRef, int] = {}
     for ref in present:
         snapshot_id = snapshot_ids.get((ref.type, ref.id))
         if snapshot_id is None:
@@ -1556,17 +1779,8 @@ async def detect_discrepancies(
                 f"{ref.type} {ref.id} was returned by this sync but has no snapshot of it in "
                 "snapshot_ids"
             )
-        await _check_present(
-            session,
-            tally,
-            ref,
-            snapshot_id,
-            dataset_id=dataset_id,
-            enumeration=enumeration,
-            sealed=sealed,
-            now=instant,
-        )
-
+        present_snapshot_ids[ref] = snapshot_id
+    missing: list[SubjectRef] = []
     if enumeration.complete:
         missing = [
             SubjectRef(type="campaign", id=campaign_id)
@@ -1578,10 +1792,49 @@ async def detect_discrepancies(
                 session, dataset_id, enumeration.missing_budget_ids
             )
         )
-        for ref in missing:
-            await _check_missing(session, tally, ref, dataset_id=dataset_id, now=instant)
+
+    subjects = [*present, *missing]
+    # Lock order of every decision writer: the dataset, then the subject rows (both taken
+    # by the locked load), then the discrepancy rows.
+    states = _dataset_states(
+        await load_subject_states(session, subjects, lock=True), subjects, dataset_id
+    )
+    unresolved = await _lock_unresolved(session, dataset_id)
+    tally = _Tally(open_ids={row.id for rows in unresolved.values() for row in rows})
+    snapshots = await _present_snapshots(session, states, present_snapshot_ids, dataset_id)
+    deferred: frozenset[SubjectRef] = frozenset()
+    if sealed:
+        deferred = await _deferred_baselines(
+            session,
+            dataset_id,
+            {
+                ref: snapshots[ref].captured_at
+                for ref in present
+                if states[ref].current_decision is None
+            },
+        )
+    for ref in present:
+        await _check_present(
+            session,
+            tally,
+            states[ref],
+            snapshots[ref],
+            unresolved.setdefault(ref, []),
+            enumeration=enumeration,
+            sealed=sealed,
+            deferred=deferred,
+            now=instant,
+        )
+    for ref in missing:
+        await _check_missing(
+            session, tally, states[ref], unresolved.setdefault(ref, []), now=instant
+        )
 
     report = tally.report()
+    if report.total_raised:
+        await enqueue_analysis_request(session, "discrepancy_created")
+    if report.auto_resolved:
+        await enqueue_analysis_request(session, "discrepancy_resolved")
     event: dict[str, object] = {
         "dataset_id": dataset_id,
         "source": source,

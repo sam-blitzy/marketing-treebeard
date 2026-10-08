@@ -43,10 +43,22 @@ another dataset can never delete the row. The entity column is listed first, so 
 convention still names each constraint ``fk_<table>_<entity>_id_<entity table>``.
 
 **Indexes** (AAP 0.2.1: "Daily facts are indexed by entity and date"). Each daily table has
-an (entity, ``date``) index that serves window aggregation and, because it leads with the
+an (entity, ``date``) index that serves one entity's day range and, because it leads with the
 entity column of the composite foreign key, the ``ON DELETE CASCADE`` from the entity
 table; PostgreSQL does not index referencing columns by itself. The natural-key unique
 constraint leads with ``dataset_id`` and serves the cascade from ``source_dataset``.
+
+Window aggregation (``analysis.metrics.aggregate``) filters on ``dataset_id`` and a ``date``
+range and leaves the entity unconstrained. Neither index above holds those rows as one
+contiguous range, because both place the entity (and, for search terms, the criterion and
+term) before ``date``. Each daily table therefore also has ``ix_<table>_dataset_date`` on
+(``dataset_id``, ``date``), so a window, and K1's trailing baseline span on
+``fact_campaign_daily``, reads only its own dataset's rows on its own days however much
+history the table retains. ``fact_segment_window`` has
+``ix_fact_segment_window_dataset_window`` on (``dataset_id``, ``window_start``,
+``window_end``) for the same reason: its natural key places campaign, facet and value before
+the window dates, and this index serves C3a's exact-window lookup and the list of a
+dataset's fetched windows.
 
 Every foreign key is ``ON DELETE CASCADE``, so purging a retired dataset is the single
 ``DELETE FROM source_dataset WHERE id = :retired`` (AAP 0.3.3). Foreign keys name their
@@ -178,6 +190,8 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
         ),
         sa.UniqueConstraint("dataset_id", "campaign_id", "date"),
         sa.Index("ix_fact_campaign_daily_campaign_date", "campaign_id", "date"),
+        # Window aggregation and K1's baseline span: one dataset's days, every campaign.
+        sa.Index("ix_fact_campaign_daily_dataset_date", "dataset_id", "date"),
     )
 
 
@@ -256,6 +270,8 @@ class FactCreativeDaily(IdPkMixin, DatasetScopedMixin, Base):
         ),
         sa.UniqueConstraint("dataset_id", "creative_id", "date"),
         sa.Index("ix_fact_creative_daily_creative_date", "creative_id", "date"),
+        # Window aggregation: one dataset's days, every creative.
+        sa.Index("ix_fact_creative_daily_dataset_date", "dataset_id", "date"),
     )
 
 
@@ -321,6 +337,8 @@ class FactKeywordDaily(IdPkMixin, DatasetScopedMixin, Base):
         ),
         sa.UniqueConstraint("dataset_id", "keyword_id", "date"),
         sa.Index("ix_fact_keyword_daily_keyword_date", "keyword_id", "date"),
+        # Window aggregation: one dataset's days, every keyword.
+        sa.Index("ix_fact_keyword_daily_dataset_date", "dataset_id", "date"),
     )
 
 
@@ -422,6 +440,8 @@ class FactSearchTermDaily(IdPkMixin, DatasetScopedMixin, Base):
         ),
         sa.Index("ix_fact_search_term_daily_ad_group_date", "ad_group_id", "date"),
         sa.Index("ix_fact_search_term_daily_campaign_date", "campaign_id", "date"),
+        # Window aggregation: one dataset's days, every ad group, criterion and term.
+        sa.Index("ix_fact_search_term_daily_dataset_date", "dataset_id", "date"),
     )
 
 
@@ -501,5 +521,9 @@ class FactSegmentWindow(IdPkMixin, DatasetScopedMixin, Base):
             "window_start",
             "window_end",
             name="uq_fact_segment_window_natural",
+        ),
+        # C3a's exact-window lookup and the list of fetched windows: one dataset, any campaign.
+        sa.Index(
+            "ix_fact_segment_window_dataset_window", "dataset_id", "window_start", "window_end"
         ),
     )

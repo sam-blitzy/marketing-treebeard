@@ -53,6 +53,7 @@ from ads_engine.analysis.context import (
     DiscrepancyInfo,
     FeedbackInfo,
     Observation,
+    SubjectKey,
     keyword_external_id,
     search_term_external_id,
 )
@@ -90,6 +91,7 @@ from ads_engine.simulation import (
 from ads_engine.simulation.generator import (
     ContactRecord,
     GoogleSearchTermSpec,
+    PlatformChange,
     PropertyRecord,
     SearchFilter,
     SimulatedWorld,
@@ -1437,7 +1439,8 @@ def test_custom_dates_build_a_custom_window() -> None:
 def test_stored_decisions_and_discrepancies_pass_through() -> None:
     base = _scenario("c0.status.fires")
     plain = base.build_context()
-    key = next(iter(plain.decisions))
+    # A campaign: a budget subject's decision has no status (ck_decision_shape_columns).
+    key = next(key for key in plain.decisions if key[0] == "campaign")
     current = plain.decisions[key]
     later = dataclasses.replace(
         current, status="paused", decided_at=FIXED_NOW - timedelta(hours=1), origin="user"
@@ -1541,6 +1544,32 @@ def test_an_incomplete_entity_enumeration_infers_no_removal() -> None:
     assert [(row.completeness, row.reason) for row in rows] == [("incomplete", "page deferred")]
 
 
+def test_an_open_baseline_baselines_a_campaign_first_seen_late() -> None:
+    # While no entity sync has completed, the baseline stays open: a campaign a later sync
+    # returns first is baselined there instead of being raised as untracked.
+    fires = _scenario("c0.untracked_campaign.fires")
+    late: SubjectKey = ("campaign", fires.ids.id("google", "campaign", "late"))
+    assert late not in fires.build_context().decisions
+    unsealed = _with_context(
+        fires,
+        freshness={"google.entities": FreshnessOverride("incomplete", reason="page deferred")},
+    )
+    ctx = unsealed.build_context()
+    assert ctx.discrepancies == ()
+    baseline = ctx.decisions[late]
+    assert (baseline.origin, baseline.decided_at) == ("baseline", MIDNIGHT - timedelta(hours=48))
+
+
+def test_an_absent_tombstone_closes_its_reappearance_discrepancy() -> None:
+    fires = _scenario("c0.acknowledge.fires")
+    assert {item.kind for item in fires.build_context().discrepancies} == {"status"}
+    gone_again = PlatformChange("google", "campaign", "brand", at_offset_hours=-15, disappear=True)
+    spec = fires.spec.with_(platform_changes=(*fires.spec.platform_changes, gone_again))
+    ctx = dataclasses.replace(fires, spec=spec).build_context()
+    # The acknowledged removal stands again: no missing, and the status row closed.
+    assert ctx.discrepancies == ()
+
+
 def test_no_snapshot_cadence_reads_no_snapshot_history() -> None:
     base = _scenario("k1.gate.fires")
     assert base.build_context().observations
@@ -1633,7 +1662,7 @@ def test_clearing_ql_on_the_contacts_turns_scale_into_a_veto() -> None:
     assert after.eligible_contacts == before.eligible_contacts
 
 
-def test_a_date_property_binding_reads_stage_dates_at_utc_midnight() -> None:
+def test_a_datetime_property_binding_reads_the_exact_stage_instants() -> None:
     base = _scenario("wp.costs.fires")
     assert base.context.crm_patches == ()
     shipped = base.thresholds()
@@ -1652,14 +1681,13 @@ def test_a_date_property_binding_reads_stage_dates_at_utc_midnight() -> None:
     contacts = ctx.linkedin_crm.contacts.values()
     entered = [contact.ql_at for contact in contacts if contact.ql_at is not None]
     assert len(entered) == len(contacts) == 10
-    assert all(instant.tzinfo is UTC and instant.time() == time(0) for instant in entered)
+    assert all(instant.tzinfo is UTC for instant in entered)
+    # Instants keep their time of day; HubSpot events are compared as instants (AAP 0.5.4.1).
+    assert any(instant.time() != time(0) for instant in entered)
     staged = base.build_context().linkedin_crm
     assert staged is not None
-    assert {
-        hs_id: cast(datetime, contact.ql_at).date() for hs_id, contact in staged.contacts.items()
-    } == {
-        hs_id: cast(datetime, contact.ql_at).date()
-        for hs_id, contact in ctx.linkedin_crm.contacts.items()
+    assert {hs_id: contact.ql_at for hs_id, contact in staged.contacts.items()} == {
+        hs_id: contact.ql_at for hs_id, contact in ctx.linkedin_crm.contacts.items()
     }
 
 
@@ -1687,6 +1715,22 @@ def test_catalogue_helpers_keep_exact_totals() -> None:
 C0_SCENARIOS = tuple(name for name, s in SCENARIOS.items() if s.expect.rule_id == C0)
 
 
+def _side(item: DiscrepancyInfo, side: str) -> Mapping[str, Any]:
+    """One side of a discrepancy's stored comparison, which must be present."""
+    value = item.decided_value if side == "decided" else item.platform_value
+    assert value is not None, (item.kind, side)
+    return value
+
+
+def _shown(item: DiscrepancyInfo, side: str) -> object:
+    """What a C0 expectation's ``decided`` / ``platform`` names: a status, or an amount."""
+    value = _side(item, side)
+    if item.kind != "budget":
+        return value["status"]
+    daily = value.get("daily_budget")
+    return Decimal(cast(str, daily if daily is not None else value["total_budget"]))
+
+
 @pytest.mark.parametrize("name", C0_SCENARIOS)
 def test_c0_expectations_hold_on_the_built_context(name: str) -> None:
     scenario = SCENARIOS[name]
@@ -1695,10 +1739,38 @@ def test_c0_expectations_hold_on_the_built_context(name: str) -> None:
     values = scenario.expect.values
     assert bool(result.candidates) is scenario.expect.fires
     assert len(result.candidates) == len(ctx.discrepancies)
-    if values.get("open") == 0:
-        assert ctx.discrepancies == ()
+    if "open" in values:
+        assert len(ctx.discrepancies) == values["open"]
     if "kind" in values:
         assert {item.kind for item in ctx.discrepancies} == {values["kind"]}
+    if "subject_kinds" in values:
+        assert sorted((item.subject_type, item.kind) for item in ctx.discrepancies) == list(
+            cast(tuple[tuple[str, str], ...], values["subject_kinds"])
+        )
+    for side in ("decided", "platform"):
+        if side in values:
+            for item in ctx.discrepancies:
+                expected = values[side]
+                wanted = Decimal(cast(str, expected)) if item.kind == "budget" else expected
+                assert _shown(item, side) == wanted, (item.kind, side)
+        if f"{side}_micros" in values:
+            micros = {_side(item, side)["amount_micros"] for item in ctx.discrepancies}
+            assert micros == {values[f"{side}_micros"]}
+    if "tombstone" in values:
+        assert {_side(item, "decided").get("tombstone") for item in ctx.discrepancies} == {
+            values["tombstone"]
+        }
+    if "detected_at_offset_hours" in values:
+        offset = cast(int, values["detected_at_offset_hours"])
+        assert {item.detected_at for item in ctx.discrepancies} == {
+            MIDNIGHT + timedelta(hours=offset)
+        }
+    if "budget_discrepancies" in values:
+        on_budgets = [item for item in ctx.discrepancies if item.subject_type == "budget"]
+        assert len(on_budgets) == values["budget_discrepancies"]
+    if "member_discrepancies" in values:
+        on_members = [item for item in ctx.discrepancies if item.shape == "shared_member"]
+        assert len(on_members) == values["member_discrepancies"]
     if "state" in values:
         assert {item.state for item in ctx.discrepancies} == {values["state"]}
     if "subject_type" in values:

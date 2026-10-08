@@ -15,6 +15,7 @@ import re
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -61,6 +62,8 @@ from ads_engine.simulation.generator import (
     DEFAULT_SPEC,
     FAULT_KINDS,
     FAULT_SURFACES,
+    LEADS_PER_CREATIVE_DAY,
+    PERSON_CREATIVE_POSITIONS,
     SEGMENT_PIVOTS,
     BulkDealSpec,
     ContactRecord,
@@ -99,6 +102,8 @@ from ads_engine.simulation.generator import (
     SimulatedWorld,
     StageSpec,
     WorldSpec,
+    person_contact_id,
+    person_object_id,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1532,6 +1537,304 @@ def test_every_simulated_lead_person_resolves_to_their_contact(world: SimulatedW
     assert world.hubspot_contact_by_email_hash(sha256(test_lead.email)) is None
 
 
+def lead_ordinal(creative_key: str, day: date, response_id: str) -> int:
+    """A response's position among its creative's responses on ``day``, recovered from its id.
+
+    The world seeds response ids from ``{seed}:lead-id:{creative key}:{day}:{position}``.
+    """
+    for ordinal in range(LEADS_PER_CREATIVE_DAY):
+        label = f"42:lead-id:{creative_key}:{day.isoformat()}:{ordinal}"
+        digest = hashlib.sha256(label.encode()).hexdigest()
+        candidate = (
+            f"{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+            f"-{int(digest[32], 16) % 10}"
+        )
+        if candidate == response_id:
+            return ordinal
+    raise AssertionError(f"{response_id} is no response of {creative_key} on {day}")
+
+
+def first_lead_day(contact_id: str) -> date:
+    """The UTC day of a simulated person's first lead, decoded from their contact id."""
+    slot = int(contact_id) - HUBSPOT_CONTACT_IDS.start
+    return date(1970, 1, 1) + timedelta(
+        days=slot // (PERSON_CREATIVE_POSITIONS * LEADS_PER_CREATIVE_DAY)
+    )
+
+
+def is_person(contact_id: str) -> bool:
+    """Whether a contact id lies in the simulated people's block of ``HUBSPOT_CONTACT_IDS``."""
+    return (
+        HUBSPOT_CONTACT_IDS.contains(contact_id)
+        and int(contact_id) - HUBSPOT_CONTACT_IDS.start < 10**10
+    )
+
+
+def owner_of(meeting: MeetingRecord) -> str:
+    """The attendee whose own meeting ids include ``meeting`` (a shared meeting adds a guest)."""
+    (owner,) = (
+        contact_id
+        for contact_id in meeting.contact_ids
+        if meeting.id in {person_object_id("meetings", contact_id, j) for j in (0, 1)}
+    )
+    return owner
+
+
+def test_person_crm_ids_derive_from_each_persons_first_lead(world: SimulatedWorld) -> None:
+    positions = {creative.key: index for index, creative in enumerate(linkedin_part().creatives)}
+    keys = {
+        creative.id: creative.key
+        for account in (NA, EMEA)
+        for creative in world.linkedin_creatives(account)
+    }
+    first_leads: dict[str, LinkedInLeadResponse] = {}
+    for account in (NA, EMEA):
+        for response in all_responses(world, account):
+            if response.test_lead:
+                continue
+            known = first_leads.get(response.email)
+            order = (response.submitted_at, response.id)
+            if known is None or order < (known.submitted_at, known.id):
+                first_leads[response.email] = response
+    checked = 0
+    for email, lead in first_leads.items():
+        contact = world.hubspot_contact_by_email_hash(sha256(email))
+        if contact is None:
+            continue
+        key = keys[lead.source_creative_id]
+        day = lead.submitted_at.date()
+        expected = person_contact_id(positions[key], day, lead_ordinal(key, day, lead.id))
+        assert contact.id == expected
+        assert first_lead_day(contact.id) == day
+        owned = {person_object_id("deals", contact.id, j) for j in (0, 1)}
+        assert set(world.hubspot_associations("contacts", "deals", contact.id)) <= owned
+        checked += 1
+    assert checked > 2000
+    meetings = cast(tuple[MeetingRecord, ...], world.hubspot_search("meetings", ()))
+    people_meetings = [m for m in meetings if all(is_person(c) for c in m.contact_ids)]
+    assert len(people_meetings) > 1000
+    # Every meeting of the people is owned by exactly one attendee, whose meeting ids name it.
+    assert all(owner_of(meeting) in meeting.contact_ids for meeting in people_meetings)
+
+
+def test_person_ids_are_injective_and_bounded_by_construction() -> None:
+    first_day, last_day = date(1970, 1, 1), date(2106, 11, 23)
+    per_day = PERSON_CREATIVE_POSITIONS * LEADS_PER_CREATIVE_DAY
+    last = (PERSON_CREATIVE_POSITIONS - 1, last_day, LEADS_PER_CREATIVE_DAY - 1)
+    corners = {
+        (0, first_day, 0): 0,
+        (0, first_day, LEADS_PER_CREATIVE_DAY - 1): LEADS_PER_CREATIVE_DAY - 1,
+        (1, first_day, 0): LEADS_PER_CREATIVE_DAY,
+        (PERSON_CREATIVE_POSITIONS - 1, first_day, LEADS_PER_CREATIVE_DAY - 1): per_day - 1,
+        (0, first_day + timedelta(days=1), 0): per_day,
+        last: 5 * 10**9 - 1,
+    }
+    for coordinates, offset in corners.items():
+        contact_id = person_contact_id(*coordinates)
+        assert contact_id == str(HUBSPOT_CONTACT_IDS.at(offset))
+        assert person_object_id("meetings", contact_id, 0) == str(
+            HUBSPOT_MEETING_IDS.at(2 * offset)
+        )
+        assert person_object_id("deals", contact_id, 1) == str(HUBSPOT_DEAL_IDS.at(2 * offset + 1))
+    # The last person slot's second deal ends just below the first Google-touch object.
+    assert person_object_id("deals", person_contact_id(*last), 1) == str(
+        HUBSPOT_DEAL_IDS.at(10**10 - 1)
+    )
+    sample = [
+        (position, day, ordinal)
+        for position in (0, 1, PERSON_CREATIVE_POSITIONS - 1)
+        for day in (first_day, first_day + timedelta(days=1), ANCHOR, last_day)
+        for ordinal in (0, 1, LEADS_PER_CREATIVE_DAY - 1)
+    ]
+    assert len({person_contact_id(*coordinates) for coordinates in sample}) == len(sample)
+    rejected: list[tuple[tuple[Any, ...], str]] = [
+        ((PERSON_CREATIVE_POSITIONS, ANCHOR, 0), "creative position 200 exceeds"),
+        ((-1, ANCHOR, 0), "creative_position must be >= 0"),
+        ((True, ANCHOR, 0), "creative_position must be an integer"),
+        ((0, ANCHOR, LEADS_PER_CREATIVE_DAY), "lead ordinal 500 exceeds"),
+        ((0, ANCHOR, -1), "ordinal must be >= 0"),
+        ((0, date(1969, 12, 31), 0), "lies outside the 50000 UTC days"),
+        ((0, last_day + timedelta(days=1), 0), "lies outside the 50000 UTC days"),
+        ((0, NOW, 0), "day must be a date"),
+    ]
+    for arguments, message in rejected:
+        with pytest.raises(ValueError, match=message):
+            person_contact_id(*arguments)
+    contact_id = person_contact_id(0, ANCHOR, 0)
+    with pytest.raises(ValueError, match="object_type must be meetings or deals"):
+        person_object_id(cast(Any, "companies"), contact_id, 0)
+    with pytest.raises(ValueError, match="owns 2 deals, found index 2"):
+        person_object_id("deals", contact_id, 2)
+    with pytest.raises(ValueError, match="index must be >= 0"):
+        person_object_id("deals", contact_id, -1)
+    for other in (
+        str(HUBSPOT_CONTACT_IDS.at(10**10)),
+        str(HUBSPOT_HASHED_CONTACT_IDS.start),
+        "not-an-id",
+    ):
+        with pytest.raises(ValueError, match="is not a simulated person contact id"):
+            person_object_id("meetings", other, 0)
+
+
+def person_layout_spec(
+    position: int, profile: DailyProfile | ExplicitDays, *, hubspot: bool = True
+) -> WorldSpec:
+    """A world whose only lead creative sits at ``position`` of ``linkedin.creatives``.
+
+    Landing-page creatives with no delivery fill the positions before it.
+    """
+    fillers = tuple(
+        LinkedInCreativeSpec(
+            f"filler_{index}",
+            "cmp",
+            f"Filler {index}",
+            "Filler intro text",
+            landing_page_url="https://www.sim.invalid/offer",
+        )
+        for index in range(position)
+    )
+    lead = LinkedInCreativeSpec(
+        "cr_lead",
+        "cmp",
+        "Lead headline",
+        "Lead intro text",
+        lead_form_id=PIPELINE_FORM,
+        profile=profile,
+    )
+    return WorldSpec(
+        "person-layout",
+        anchor=ANCHOR,
+        linkedin=_li(creatives=(*fillers, lead)),
+        hubspot=HubSpotSpec() if hubspot else None,
+    )
+
+
+def test_a_world_rejects_lead_creatives_its_person_ids_cannot_cover_when_built() -> None:
+    daily = _P.with_(form_open_rate=Decimal("0.05"), form_completion_rate=Decimal("0.5"))
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "lead creative cr_lead is at position 200 of linkedin.creatives; simulated person "
+            "ids cover only lead creatives below position PERSON_CREATIVE_POSITIONS (200)"
+        ),
+    ):
+        build(person_layout_spec(PERSON_CREATIVE_POSITIONS, daily), content_assets=())
+    full = DayMetrics(
+        cost=Decimal("50.00"),
+        impressions=20_000,
+        clicks=1_000,
+        form_opens=LEADS_PER_CREATIVE_DAY,
+        leads=LEADS_PER_CREATIVE_DAY,
+    )
+    below = full.with_(leads=LEADS_PER_CREATIVE_DAY - 1)
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "lead creative cr_lead states 500 leads on ExplicitDays offset -2; each day must "
+            "state fewer than LEADS_PER_CREATIVE_DAY (500)"
+        ),
+    ):
+        build(person_layout_spec(0, ExplicitDays({-3: below, -2: full})), content_assets=())
+    # At both limits less one the world builds, and its people take the layout's last slots.
+    edge = build(
+        person_layout_spec(PERSON_CREATIVE_POSITIONS - 1, ExplicitDays({-2: below})),
+        content_assets=(),
+    )
+    day = ANCHOR - timedelta(days=2)
+    slots = {
+        person_contact_id(PERSON_CREATIVE_POSITIONS - 1, day, ordinal)
+        for ordinal in range(LEADS_PER_CREATIVE_DAY - 1)
+    }
+    contacts = cast(tuple[ContactRecord, ...], edge.hubspot_search("contacts", ()))
+    assert len(contacts) > 300
+    assert {contact.id for contact in contacts} <= slots
+    assert edge.self_check() == ()
+    # Without a HubSpot part no person takes a contact id, so no position limit applies.
+    linkedin_only = build(
+        person_layout_spec(PERSON_CREATIVE_POSITIONS, daily, hubspot=False), content_assets=()
+    )
+    assert all_responses(linkedin_only, NA)
+
+
+def test_a_restart_on_a_later_date_keeps_every_simulated_crm_identity() -> None:
+    # The default spec has no anchor: a worker restarted a day later rebuilds the world with
+    # its anchor and history start a day later. Ids must still name the same people and events.
+    first = build(DEFAULT_SPEC, now=NOW)
+    later = build(DEFAULT_SPEC, now=NOW + timedelta(days=1))
+    assert later.history_start == first.history_start + timedelta(days=1)
+    first_contacts = {
+        c.id: c for c in cast(tuple[ContactRecord, ...], first.hubspot_search("contacts", ()))
+    }
+    later_contacts = {
+        c.id: c for c in cast(tuple[ContactRecord, ...], later.hubspot_search("contacts", ()))
+    }
+    first_ids = {contact.email_sha256: contact.id for contact in first_contacts.values()}
+    later_ids = {contact.email_sha256: contact.id for contact in later_contacts.values()}
+    shared_hashes = first_ids.keys() & later_ids.keys()
+    assert len(shared_hashes) >= 0.99 * len(first_ids)
+    assert all(first_ids[digest] == later_ids[digest] for digest in shared_hashes)
+    shared_ids = first_contacts.keys() & later_contacts.keys()
+    assert all(first_contacts[i].email_sha256 == later_contacts[i].email_sha256 for i in shared_ids)
+    # The people the later world lacks are those whose first lead precedes its history.
+    assert all(first_lead_day(i) < later.history_start for i in first_contacts.keys() - shared_ids)
+    # A by-id refresh, as lead matching runs it, returns the same person with the same history.
+    refreshed = later.hubspot_contacts_by_id(sorted(first_contacts, key=int))
+    assert {contact.id for contact in refreshed} == shared_ids
+    for contact in refreshed:
+        before = first_contacts[contact.id]
+        assert contact.email_sha256 == before.email_sha256
+        assert contact.created_at == before.created_at
+        assert before.stage_entered.items() <= contact.stage_entered.items()
+    first_meetings = {
+        m.id: m for m in cast(tuple[MeetingRecord, ...], first.hubspot_search("meetings", ()))
+    }
+    later_meetings = {
+        m.id: m for m in cast(tuple[MeetingRecord, ...], later.hubspot_search("meetings", ()))
+    }
+    shared_meetings = first_meetings.keys() & later_meetings.keys()
+    assert len(shared_meetings) >= 0.98 * len(first_meetings)
+    guests_changed = 0
+    for meeting_id in shared_meetings:
+        before, after = first_meetings[meeting_id], later_meetings[meeting_id]
+        assert (before.title, before.created_at, before.start_at, before.source) == (
+            after.title,
+            after.created_at,
+            after.start_at,
+            after.source,
+        )
+        assert owner_of(before) == owner_of(after)
+        if not set(before.contact_ids) <= set(after.contact_ids):
+            guests_changed += 1
+    # A shared meeting's guest is one of the most recent people before its owner, so only an
+    # owner among the later world's first people (or next to a lead only one world has, where
+    # a delivery trend counts from the history start) can get another guest.
+    assert guests_changed <= 2
+    first_deals = {d.id: d for d in cast(tuple[DealRecord, ...], first.hubspot_search("deals", ()))}
+    later_deals = {d.id: d for d in cast(tuple[DealRecord, ...], later.hubspot_search("deals", ()))}
+    shared_deals = first_deals.keys() & later_deals.keys()
+    assert len(shared_deals) >= 0.98 * len(first_deals)
+    for deal_id in shared_deals:
+        before_deal, after_deal = first_deals[deal_id], later_deals[deal_id]
+        assert (before_deal.name, before_deal.stage, before_deal.amount) == (
+            after_deal.name,
+            after_deal.stage,
+            after_deal.amount,
+        )
+        assert before_deal.contact_ids == after_deal.contact_ids
+        if before_deal.contact_ids:
+            assert before_deal.created_at == after_deal.created_at
+        else:
+            # Orphan deals are drawn over the 90 days before the anchor, so they move with it.
+            assert after_deal.created_at - before_deal.created_at == timedelta(days=1)
+    # A repeat lead reuses one of the most recent people before it, so, likewise, only a few
+    # repeat leads name another person (a choice among every earlier person moved about 90).
+    first_emails = {r.id: r.email for account in (NA, EMEA) for r in all_responses(first, account)}
+    later_emails = {r.id: r.email for account in (NA, EMEA) for r in all_responses(later, account)}
+    shared_leads = first_emails.keys() & later_emails.keys()
+    assert len(shared_leads) >= 0.98 * len(first_emails)
+    assert sum(1 for lead in shared_leads if first_emails[lead] != later_emails[lead]) <= 3
+
+
 def test_contact_stages_record_when_each_bound_stage_was_entered(world: SimulatedWorld) -> None:
     contacts = world.hubspot_search("contacts", ())
     assert len(contacts) > 1000
@@ -1631,6 +1934,18 @@ def test_deals_link_to_their_contacts_and_orphans_to_none(world: SimulatedWorld)
     assert world.hubspot_deals([orphans[1].id, "123", orphans[0].id]) == (orphans[1], orphans[0])
     orphan_block = HUBSPOT_DEAL_IDS.at(2 * 10**10 + 6)
     assert world.hubspot_deals([str(orphan_block), str(HUBSPOT_DEAL_IDS.start - 1)]) == ()
+
+
+def test_object_ids_decode_only_inside_their_own_block(world: SimulatedWorld) -> None:
+    # The last ids of the Google, orphan and bulk blocks, and the never-allocated block above
+    # the seeded contacts' objects, hold nothing in the default world.
+    for offset in (2 * 10**10 - 1, 3 * 10**10 - 1, 5 * 10**10 - 1, 9 * 10**10, 10**11 - 1):
+        assert world.hubspot_deals([str(HUBSPOT_DEAL_IDS.at(offset))]) == ()
+        assert world.hubspot_meetings([str(HUBSPOT_MEETING_IDS.at(offset))]) == ()
+    deals = cast(tuple[DealRecord, ...], world.hubspot_search("deals", ()))
+    deal = next(deal for deal in deals if deal.contact_ids and is_person(deal.contact_ids[0]))
+    assert world.hubspot_deals([deal.id]) == (deal,)
+    assert deal.id in {person_object_id("deals", deal.contact_ids[0], j) for j in (0, 1)}
 
 
 def test_associations_without_targets_are_empty_and_unknown_pairs_fail(
@@ -1756,9 +2071,10 @@ def test_crm_search_sorts_by_a_property_with_missing_values_last(world: Simulate
         world.hubspot_search("companies", ())
 
 
-def test_seeded_contacts_answer_a_deterministic_share_of_real_lead_hashes(
-    world: SimulatedWorld,
-) -> None:
+def test_seeded_contacts_answer_a_deterministic_share_of_real_lead_hashes() -> None:
+    # Its own world: the seeded contacts it materialises become searchable, and the shared
+    # fixture's contact searches must keep returning only simulated people.
+    world = build()
     digests = [sha256(f"real.person.{index}@example.com") for index in range(400)]
     answered = {digest: world.hashed_contact_for(digest) for digest in digests}
     hits = {digest: contact for digest, contact in answered.items() if contact is not None}
@@ -1774,7 +2090,7 @@ def test_seeded_contacts_answer_a_deterministic_share_of_real_lead_hashes(
         assert world.hashed_contact_for(digest.upper()) == contact
         assert again.hashed_contact_for(digest) == contact
         assert world.hubspot_contact_by_email_hash(digest) is None
-        assert contact.id not in searchable
+        assert contact.id in searchable
         (by_id,) = world.hubspot_contacts_by_id([contact.id])
         assert (by_id.id, by_id.email_sha256) == (contact.id, None)
         if world.hubspot_associations("contacts", "meetings", contact.id):
@@ -1802,7 +2118,120 @@ def test_seeded_contacts_answer_a_deterministic_share_of_real_lead_hashes(
     assert all(never.hashed_contact_for(digest) is None for digest in digests[:50])
 
 
-def test_a_property_bound_stage_is_recorded_as_a_contact_date() -> None:
+def test_crm_search_finds_materialised_seeded_records_once() -> None:
+    world = build()
+    object_types = ("contacts", "meetings", "deals")
+    simulated_only = {kind: world.hubspot_search(kind, ()) for kind in object_types}
+    assert not any(
+        HUBSPOT_HASHED_CONTACT_IDS.contains(contact.id) for contact in simulated_only["contacts"]
+    )
+
+    # Real-looking lead emails until one is answered by a seeded contact with both objects.
+    found: tuple[str, ContactRecord, tuple[str, ...], tuple[str, ...]] | None = None
+    for index in range(1000):
+        digest = sha256(f"real.buyer.{index}@example.com")
+        contact = world.hashed_contact_for(digest)
+        if contact is None:
+            continue
+        deal_ids = world.hubspot_associations("contacts", "deals", contact.id)
+        meeting_ids = world.hubspot_associations("contacts", "meetings", contact.id)
+        if deal_ids and meeting_ids:
+            found = (digest, contact, deal_ids, meeting_ids)
+            break
+    assert found is not None, "no seeded contact with a deal and a meeting"
+    digest, seeded, deal_ids, meeting_ids = found
+    (deal,) = world.hubspot_deals(deal_ids[:1])
+    (by_id,) = world.hubspot_contacts_by_id([seeded.id])
+
+    def ids(kind: str, *filters: SearchFilter) -> list[str]:
+        return [record.id for record in world.hubspot_search(kind, filters)]
+
+    # Search agrees with batch reads and associations for every object type.
+    assert deal in world.hubspot_search("deals", ())
+    assert by_id in world.hubspot_search("contacts", ())
+    assert set(meeting_ids) <= set(ids("meetings"))
+    created = ms(deal.created_at)
+    assert deal.id in ids("deals", SearchFilter("createdate", "BETWEEN", created - 1, created + 1))
+    window = (
+        SearchFilter("createdate", "GTE", created),
+        SearchFilter("createdate", "LT", created + 1),
+    )
+    assert ids("deals", *window) == [
+        record.id
+        for record in world.hubspot_search("deals", ())
+        if ms(record.created_at) == created
+    ]
+    assert deal.id in ids("deals", *window)
+    by_creation = cast(
+        tuple[DealRecord, ...], world.hubspot_search("deals", (), sort_property="createdate")
+    )
+    assert [record.created_at for record in by_creation] == sorted(
+        record.created_at for record in by_creation
+    )
+    # The materialised records join the simulated people's, and only seeded ones are added.
+    searched = {kind: world.hubspot_search(kind, ()) for kind in object_types}
+    for kind in object_types:
+        before = {record.id for record in simulated_only[kind]}
+        added = [record for record in searched[kind] if record.id not in before]
+        assert before <= {record.id for record in searched[kind]}
+        assert added
+        for record in added:
+            owners = (record.id,) if isinstance(record, ContactRecord) else record.contact_ids
+            assert owners
+            assert all(HUBSPOT_HASHED_CONTACT_IDS.contains(owner) for owner in owners)
+
+    # Repeated lookups through every surface never duplicate a record.
+    assert world.hashed_contact_for(digest) == seeded
+    assert world.hashed_contact_for(digest.upper()) == seeded
+    assert [record.id for record in world.hubspot_deals(deal_ids)] == list(deal_ids)
+    assert [record.id for record in world.hubspot_meetings(meeting_ids)] == list(meeting_ids)
+    assert world.hubspot_contacts_by_id([seeded.id]) == (by_id,)
+    assert world.hubspot_associations("deals", "contacts", deal.id) == (seeded.id,)
+    assert world.hubspot_associations("meetings", "contacts", meeting_ids[0]) == (seeded.id,)
+    for kind in object_types:
+        again = ids(kind)
+        assert len(again) == len(set(again))
+        assert world.hubspot_search(kind, ()) == searched[kind]
+    assert ids("deals", *window).count(deal.id) == 1
+
+    # A record materialised before its instant stays out of search until then. A deal is
+    # created at least an hour after its contact, so the contact already exists.
+    early = build(now=deal.created_at - timedelta(seconds=1))
+    early_contact = early.hashed_contact_for(digest)
+    assert early_contact is not None
+    assert early_contact.id == seeded.id
+    assert early.hubspot_deals([deal.id]) == ()
+    assert deal.id not in {record.id for record in early.hubspot_search("deals", ())}
+    assert seeded.id in {record.id for record in early.hubspot_search("contacts", ())}
+
+
+def test_crm_search_is_duplicate_free_while_other_threads_materialise_records() -> None:
+    # A fresh world: the first searches build the simulated people while lookups on other
+    # threads materialise seeded contacts, so both grow the stores that search snapshots.
+    world = build()
+    object_types = ("contacts", "meetings", "deals")
+    digests = [sha256(f"real.concurrent.{index}@example.com") for index in range(240)]
+
+    def look_up(chunk: Sequence[str]) -> list[str]:
+        answered = (world.hashed_contact_for(digest) for digest in chunk)
+        return [contact.id for contact in answered if contact is not None]
+
+    def search(kind: str) -> list[str]:
+        return [record.id for record in world.hubspot_search(kind, ())]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lookups = [pool.submit(look_up, digests[start::4]) for start in range(4)]
+        searches = [pool.submit(search, kind) for _round in range(4) for kind in object_types]
+        materialised = {contact_id for future in lookups for contact_id in future.result()}
+        results = [future.result() for future in searches]
+
+    assert materialised
+    for ids in results:
+        assert len(ids) == len(set(ids))
+    assert materialised <= set(search("contacts"))
+
+
+def test_a_property_bound_stage_is_recorded_as_a_contact_instant() -> None:
     bound = HubSpotMapping(
         mql=StageBinding("property", (), "date_first_meeting_was_booked"),
         ql=MAPPING.ql,
@@ -1810,9 +2239,11 @@ def test_a_property_bound_stage_is_recorded_as_a_contact_date() -> None:
         meeting_outcome_exclusions=MAPPING.meeting_outcome_exclusions,
     )
     property_world = build(mapping=bound)
+    stage_world = build()
     definition = property_world.hubspot_property("contacts", "date_first_meeting_was_booked")
     assert definition is not None
-    assert definition.type == "date"
+    # A property-mode binding names a datetime property (AAP 0.5.4.7).
+    assert (definition.type, definition.field_type) == ("datetime", "date")
     contacts = cast(
         tuple[ContactRecord, ...],
         property_world.hubspot_search(
@@ -1822,19 +2253,25 @@ def test_a_property_bound_stage_is_recorded_as_a_contact_date() -> None:
     assert contacts
     for contact in contacts:
         booked = contact.bound_dates["date_first_meeting_was_booked"]
+        assert booked.tzinfo is UTC
         assert property_world.hubspot_properties(contact)["date_first_meeting_was_booked"] == booked
         assert MQL_STAGE not in contact.stage_entered
-        assert contact.updated_at >= midnight(booked)
-    after = ms(midnight(ANCHOR - timedelta(days=30)))
-    recent = property_world.hubspot_search(
-        "contacts", [SearchFilter("date_first_meeting_was_booked", "GTE", after)]
-    )
-    assert {c.id for c in recent} == {
-        c.id
-        for c in contacts
-        if midnight(c.bound_dates["date_first_meeting_was_booked"])
-        >= midnight(ANCHOR - timedelta(days=30))
-    }
+        assert contact.updated_at >= booked
+        # The same event the stage-label world records as its MQL stage entry, to the instant.
+        (staged,) = stage_world.hubspot_contacts_by_id([contact.id])
+        assert staged.stage_entered[MQL_STAGE] == booked
+    # Events keep their time of day: they are instants, not calendar dates.
+    assert any(c.bound_dates["date_first_meeting_was_booked"].time() != time(0) for c in contacts)
+    pivot = sorted(c.bound_dates["date_first_meeting_was_booked"] for c in contacts)[
+        len(contacts) // 2
+    ]
+    for after in (ms(pivot), ms(pivot) + 1):
+        recent = property_world.hubspot_search(
+            "contacts", [SearchFilter("date_first_meeting_was_booked", "GTE", after)]
+        )
+        assert {c.id for c in recent} == {
+            c.id for c in contacts if ms(c.bound_dates["date_first_meeting_was_booked"]) >= after
+        }
 
 
 def test_a_removed_stage_label_leaves_its_binding_unresolved() -> None:

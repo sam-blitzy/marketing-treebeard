@@ -7,8 +7,16 @@ instant. Rows are never updated or deleted while their dataset is active:
 ``db/repositories.append_snapshots`` only inserts, so the table carries no natural key and
 no ``__natural_key__``. The rows of a retired dataset are removed with it by the
 ``dataset_id`` cascade when the dataset is purged (AAP 0.3.3). That cascade looks rows up
-through ``ix_entity_snapshot_dataset_id``, because an active dataset's history is never
-purged and no other index of the table leads with ``dataset_id``.
+through an index leading with ``dataset_id``: the table has no natural-key unique to serve
+it, so it declares ``ix_entity_snapshot_dataset_id``, because an active dataset's history is
+never purged and a purge must not scan it.
+
+Every key from a snapshot to another row of its dataset is dataset-qualified (AAP 0.3.3:
+only ``lead_match`` links two datasets): ``budget_id`` references ``budget`` through
+(``budget_id``, ``dataset_id``), and the table's own unique (``dataset_id``, ``id``) anchors
+``discrepancy.snapshot_id``. The polymorphic ``entity_id`` has no foreign key; the snapshot
+writer (``sync/snapshots.write_snapshots``) refuses an id that is not a row of the
+snapshot's own dataset.
 
 The snapshots are the state the logic depends on beyond the fetched daily facts:
 
@@ -76,15 +84,30 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
     or ``conversion_action``). A single column cannot reference several tables, so it has no
     foreign key; the row is still removed with its dataset through the ``dataset_id``
     cascade, because a snapshot always belongs to the same dataset as its entity.
+    ``sync/snapshots.write_snapshots``, the only caller of
+    ``db/repositories.append_snapshots``, enforces that: it refuses an ``entity_id`` that is
+    not a row of the ``entity_type`` table in the snapshot's dataset.
 
-    ``budget_id`` is a real foreign key to ``budget`` with ``ON DELETE CASCADE``, consistent
-    with every other key between rows of one dataset (AAP 0.5.2). It is indexed
+    ``budget_id`` is a real, dataset-qualified foreign key: (``budget_id``, ``dataset_id``)
+    references ``budget`` (``id``, ``dataset_id``) with ``ON DELETE CASCADE``, consistent
+    with every other key between rows of one dataset (AAP 0.5.2), so a snapshot can name only
+    a budget of its own dataset; a ``NULL`` is not checked. It is indexed
     (``ix_entity_snapshot_budget_id``) for dated shared-budget membership queries and so the
-    cascade does not scan the table per deleted budget.
+    cascade does not scan the table per deleted budget. The table's own unique
+    (``dataset_id``, ``id``) is the target of ``discrepancy.snapshot_id``'s dataset-qualified
+    foreign key.
 
     The index ``ix_entity_snapshot_entity_captured`` on (``entity_type``, ``entity_id``,
-    ``captured_at DESC``) serves both "newest snapshot per entity" for the discrepancy check
-    and the ordered observation history of one entity for budget-day classification.
+    ``captured_at DESC``) serves "newest snapshot per entity" for the discrepancy check, the
+    ordered observation history of one entity, and the analysis's bounded per-keyword probes
+    for the first and last quality-score observation inside a window (K3).
+
+    The index ``ix_entity_snapshot_dataset_type_captured`` on (``dataset_id``,
+    ``entity_type``, ``captured_at``) serves the analysis window's observation range: every
+    campaign, budget and conversion-action snapshot of an active dataset captured inside the
+    window and its margin is one contiguous index range per (``dataset_id``,
+    ``entity_type``), however long the retained history grows (AAP 0.3.2 keeps it with no
+    purge).
 
     The index ``ix_entity_snapshot_dataset_id`` on (``dataset_id``) serves the purge's
     ``dataset_id`` cascade from ``source_dataset``. The table has no natural-key unique to
@@ -109,8 +132,8 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
         budget_amount_micros: The Google budget amount in micros, Google's native integer
             precision, so C0 compares without rounding (AAP 0.5.4.4); ``None`` for LinkedIn.
         budget_id: On Google campaign rows, the :class:`~ads_engine.db.models.accounts.Budget`
-            the campaign drew from at ``captured_at``; this gives dated shared-budget
-            membership (AAP 0.5.4.5). ``None`` for every other row.
+            of the snapshot's own dataset the campaign drew from at ``captured_at``; this
+            gives dated shared-budget membership (AAP 0.5.4.5). ``None`` for every other row.
         quality_score: On keyword rows, ``ad_group_criterion.quality_info.quality_score``
             from Q-G7 (1 to 10), including keywords with no traffic; ``None`` when Google
             leaves it unpopulated and on every other entity type.
@@ -131,22 +154,36 @@ class EntitySnapshot(IdPkMixin, DatasetScopedMixin, Base):
     budget_daily: Mapped[Decimal | None]
     budget_total: Mapped[Decimal | None]
     budget_amount_micros: Mapped[int | None]
-    budget_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("budget.id", ondelete="CASCADE"),
-        index=True,
-    )
+    budget_id: Mapped[int | None] = mapped_column(index=True)
     quality_score: Mapped[int | None]
     payload: Mapped[dict[str, Any]] = mapped_column(server_default=sa.text("'{}'::jsonb"))
 
     __table_args__ = (
         check_in("source", SOURCES),
         check_in("entity_type", ENTITY_TYPES),
+        # Dataset-qualified: the budget must belong to this snapshot's dataset; a NULL
+        # budget_id (every row but a Google campaign's) is not checked.
+        sa.ForeignKeyConstraint(
+            ["budget_id", "dataset_id"],
+            ["budget.id", "budget.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        # Anchors the dataset-qualified (snapshot_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
         sa.Index(
             "ix_entity_snapshot_entity_captured",
             "entity_type",
             "entity_id",
             captured_at.desc(),
         ),
-        # No index above leads with dataset_id; this serves the purge's dataset_id cascade.
+        # The analysis window's range of a dataset's campaign, budget and conversion-action
+        # observations: entity-free, so ix_entity_snapshot_entity_captured cannot serve it.
+        sa.Index(
+            "ix_entity_snapshot_dataset_type_captured",
+            "dataset_id",
+            "entity_type",
+            "captured_at",
+        ),
+        # The table has no natural-key unique; this serves the purge's dataset_id cascade.
         sa.Index("ix_entity_snapshot_dataset_id", "dataset_id"),
     )

@@ -89,7 +89,7 @@ from datetime import UTC, date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import ARRAY, ColumnElement, Text, and_, any_, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine.analysis.context import (
@@ -739,7 +739,8 @@ class _LiveState:
         open_discrepancies: How many unresolved discrepancies the active datasets hold.
         freshness: ``dataset_freshness`` rows of the current datasets, keyed
             ``(dataset_id, dataset name)``.
-        feedback: The latest active feedback kind per ``(rule_id, entity_type, entity_id)``.
+        feedback: The latest active feedback kind per ``(rule_id, entity_type, entity_id)``
+            of the page's non-C0 items.
     """
 
     datasets: _CurrentDatasets
@@ -830,16 +831,55 @@ async def _load_freshness(
     return rows
 
 
-async def _load_feedback(
-    session: AsyncSession, rule_ids: Iterable[str], now: datetime
-) -> dict[FeedbackKey, str]:
-    """Read the feedback still in force at ``now`` for the page's rules.
+def _feedback_key_filter(keys: Iterable[FeedbackKey]) -> ColumnElement[bool] | None:
+    """Match exactly the distinct ``keys``; ``None`` when there are none.
 
-    When several active rows match one rule and entity, the latest one written wins: it is the
-    user's most recent choice (for example a dismiss given after a snooze).
+    The keys are grouped by ``(rule_id, entity_type)``. Each group is one conjunction of
+    equality on both, ``IS NULL`` for a ``None`` entity type, and ``entity_id = ANY(:ids)``
+    over its entity ids as one array parameter, so the parameter count grows with the groups,
+    not the items. A group holding a ``None`` entity id adds an ``entity_id IS NULL``
+    conjunction: ``NULL`` never equals ``NULL`` in SQL, so equality or a tuple ``IN`` would
+    drop that key. Every conjunction constrains the three leading columns of
+    ``ix_recommendation_feedback_rule_entity``, so that index also bounds ``until``.
     """
-    rules = sorted(set(rule_ids))
-    if not rules:
+    feedback = RecommendationFeedback
+    groups: dict[tuple[str, str | None], set[str | None]] = {}
+    for rule_id, entity_type, entity_id in keys:
+        groups.setdefault((rule_id, entity_type), set()).add(entity_id)
+    clauses: list[ColumnElement[bool]] = []
+    for (rule_id, entity_type), entity_ids in groups.items():
+        rule_and_type = and_(
+            feedback.rule_id == rule_id,
+            (
+                feedback.entity_type.is_(None)
+                if entity_type is None
+                else feedback.entity_type == entity_type
+            ),
+        )
+        named = sorted(entity_id for entity_id in entity_ids if entity_id is not None)
+        if named:
+            clauses.append(
+                and_(rule_and_type, feedback.entity_id == any_(literal(named, ARRAY(Text()))))
+            )
+        if None in entity_ids:
+            clauses.append(and_(rule_and_type, feedback.entity_id.is_(None)))
+    return or_(*clauses) if clauses else None
+
+
+async def _load_feedback(
+    session: AsyncSession, keys: Iterable[FeedbackKey], now: datetime
+) -> dict[FeedbackKey, str]:
+    """Read the feedback still in force at ``now`` on the page's exact rule and entity keys.
+
+    One statement over the distinct ``(rule_id, entity_type, entity_id)`` keys
+    (:func:`_feedback_key_filter`), served by ``ix_recommendation_feedback_rule_entity``:
+    feedback on the same rule but another entity, and expired history, are never read. Only
+    ``until`` after ``now`` is in force. When several active rows match one key, the latest
+    one written wins: it is the user's most recent choice (for example a dismiss given after
+    a snooze).
+    """
+    key_filter = _feedback_key_filter(keys)
+    if key_filter is None:
         return {}
     result = await session.execute(
         select(
@@ -848,7 +888,7 @@ async def _load_feedback(
             RecommendationFeedback.entity_id,
             RecommendationFeedback.kind,
         )
-        .where(RecommendationFeedback.until > now, RecommendationFeedback.rule_id.in_(rules))
+        .where(RecommendationFeedback.until > now, key_filter)
         .order_by(RecommendationFeedback.created_at, RecommendationFeedback.id)
     )
     active: dict[FeedbackKey, str] = {}
@@ -1530,7 +1570,13 @@ async def overlay(
         freshness=MappingProxyType(await _load_freshness(session, datasets.ids)),
         feedback=MappingProxyType(
             await _load_feedback(
-                session, (item.rule_id for item in items if item.rule_id != C0), now
+                session,
+                (
+                    (item.rule_id, item.entity_type, item.entity_id)
+                    for item in items
+                    if item.rule_id != C0
+                ),
+                now,
             )
         ),
     )

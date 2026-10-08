@@ -8,8 +8,9 @@ few reads that ``analysis`` and ``api`` share with ``sync`` (so neither imports 
   platform data overwrites the earlier values (AAP 0.1.1, 0.3.2).
 * :func:`append_snapshots` appends ``entity_snapshot`` observations and never updates one
   (AAP 0.5.2).
-* :func:`ensure_writable`, :func:`active_datasets`, :func:`active_dataset_id` and
-  :func:`effective_crm_dataset_id` read ``source_dataset`` (AAP 0.3.3).
+* :func:`lock_dataset`, :func:`ensure_writable`, :func:`active_datasets`,
+  :func:`active_dataset_id` and :func:`effective_crm_dataset_id` read ``source_dataset``
+  (AAP 0.3.3).
 * :func:`enqueue_analysis_request` queues a default-window rerun (AAP 0.3.2).
 * :func:`sync_content_assets` rewrites the white paper registry from
   ``config/content_assets.yaml`` (AAP 0.5.2).
@@ -18,13 +19,20 @@ Rules every function here follows:
 
 * **Provenance**: every write is scoped to one ``dataset_id`` and first passes
   :func:`ensure_writable`, because a retired dataset is read-only until it is purged
-  (AAP 0.3.3). ``source`` is taken from the dataset, never trusted from the row.
+  (AAP 0.3.3). Its lifecycle lock lasts until the caller's transaction ends, so a
+  dataset cannot retire between the check and the commit. ``source`` is taken from the
+  dataset, never trusted from the row.
 * **Value types**: values arrive as ``Decimal``, tz-aware ``datetime`` and native ``date``
   and are written unchanged. A ``float`` or a naive ``datetime`` is rejected with
   ``ValueError`` rather than coerced, and dates are never rebucketed (AAP 0.5.4.1).
-* **Transactions**: nothing here commits, rolls back or opens a transaction. Callers wrap
-  the work in :func:`ads_engine.db.session.session_scope`, so data, freshness and the
-  ``analysis_request`` they trigger commit atomically. Functions may ``flush()``.
+* **Transactions**: nothing here commits, rolls back or opens a transaction in a
+  caller's session. Callers wrap the work in :func:`ads_engine.db.session.session_scope`
+  and pass that session, so data, freshness and the ``analysis_request`` they trigger
+  commit atomically. Functions may ``flush()``. :func:`upsert_facts` and
+  :func:`append_snapshots` keep the AAP 0.5.1 signatures, ``upsert_facts(table, rows,
+  dataset_id)`` and ``append_snapshots(rows)``, with ``session`` as an optional keyword:
+  given, the call joins it; omitted, the call runs in a unit of work of its own
+  (:func:`ads_engine.db.session.use_session`).
 * **Model contract**: every upsertable model declares ``__natural_key__``, the NOT NULL
   columns of its natural-key unique constraint. That contract is verified at call time and
   a violation raises :class:`NaturalKeyError`.
@@ -33,7 +41,7 @@ Example::
 
     async with session_scope() as session:
         ids = await upsert_entities(session, Campaign, campaign_rows, dataset_id)
-        await upsert_facts(session, FactCampaignDaily, daily_rows, dataset_id)
+        await upsert_facts(FactCampaignDaily, daily_rows, dataset_id, session=session)
         await enqueue_analysis_request(session, "metrics_sync")
 """
 
@@ -56,6 +64,7 @@ from ads_engine.db.models import (
     EntitySnapshot,
     SourceDataset,
 )
+from ads_engine.db.session import use_session
 from ads_engine.logging import get_logger
 from ads_engine.settings import SOURCES, Source
 
@@ -73,6 +82,7 @@ __all__ = [
     "enqueue_analysis_request",
     "ensure_writable",
     "entity_id_map",
+    "lock_dataset",
     "sync_content_assets",
     "upsert_entities",
     "upsert_facts",
@@ -449,17 +459,60 @@ def _upsert_statement(model: type[Base], info: _ModelInfo, columns: Sequence[str
     )
 
 
-async def ensure_writable(session: AsyncSession, dataset_id: int) -> SourceDataset:
-    """Load a dataset and refuse writes to a missing or retired one.
+async def lock_dataset(
+    session: AsyncSession, dataset_id: int, *, exclusive: bool = False
+) -> SourceDataset | None:
+    """Load one dataset under a lifecycle lock that conflicts with its retirement.
 
-    AAP 0.3.3 (datasets and provenance): retired datasets are read-only, kept 30 days and
-    then purged. ``building`` and ``active`` datasets are writable. The row is re-read from
-    the database (``populate_existing``, after the session's autoflush), so the guard sees
-    the state committed at call time rather than a stale identity-map copy.
+    AAP 0.3.3: one transaction activates a dataset and retires the previous one with its
+    companions, and retired datasets are read-only. ``DatasetManager.activate`` locks the
+    rows it retires ``FOR UPDATE`` and updates them, so the shared lock taken here makes
+    the two serialise. A retirement waits for every writer already holding the lock until
+    that writer's transaction ends, and a writer arriving while a retirement is
+    uncommitted waits for it and then reads the committed ``retired`` state (READ
+    COMMITTED re-check), so no write can land in a dataset retired after its check.
+
+    The lock is held until the caller's transaction commits or rolls back. Every writer
+    takes its locks in one order across the code base, the order activation uses:
+    ``source_connection`` -> ``source_dataset`` (a primary before its companion) ->
+    subject row (``campaign``, ``budget``) -> ``discrepancy`` rows.
 
     Args:
-        session: The caller's session.
+        session: The caller's session; its transaction holds the lock.
+        dataset_id: The dataset to lock.
+        exclusive: Take ``FOR NO KEY UPDATE`` instead of ``FOR SHARE``, for a caller that
+            updates the dataset row itself: two shared holders that both upgrade would
+            deadlock. It still lets the ``FOR KEY SHARE`` checks of foreign-key inserts
+            through.
+
+    Returns:
+        The dataset as committed now (``populate_existing``, after the session's
+        autoflush), or ``None`` when no such dataset exists.
+    """
+    return await session.get(
+        SourceDataset,
+        dataset_id,
+        populate_existing=True,
+        with_for_update={"key_share": True} if exclusive else {"read": True},
+    )
+
+
+async def ensure_writable(
+    session: AsyncSession, dataset_id: int, *, exclusive: bool = False
+) -> SourceDataset:
+    """Lock a dataset and refuse writes to a missing or retired one.
+
+    AAP 0.3.3 (datasets and provenance): retired datasets are read-only, kept 30 days and
+    then purged. ``building`` and ``active`` datasets are writable. The row is read under
+    :func:`lock_dataset`'s lifecycle lock, which is held until the caller's transaction
+    ends: a retirement cannot commit between this check and the caller's commit, and a
+    check that waited on a retirement sees it committed and refuses.
+
+    Args:
+        session: The caller's session; its transaction holds the lock.
         dataset_id: The dataset a write targets.
+        exclusive: Lock ``FOR NO KEY UPDATE`` for a caller that then updates the dataset
+            row (see :func:`lock_dataset`).
 
     Returns:
         The dataset, so callers get its ``source`` and ``mode``.
@@ -467,7 +520,7 @@ async def ensure_writable(session: AsyncSession, dataset_id: int) -> SourceDatas
     Raises:
         DatasetNotWritable: If the dataset does not exist (``state=None``) or is retired.
     """
-    dataset = await session.get(SourceDataset, dataset_id, populate_existing=True)
+    dataset = await lock_dataset(session, dataset_id, exclusive=exclusive)
     if dataset is None:
         raise DatasetNotWritable(dataset_id, None)
     if dataset.state == "retired":
@@ -566,10 +619,11 @@ async def effective_crm_dataset_id(session: AsyncSession, linkedin_dataset_id: i
 
 
 async def upsert_facts(
-    session: AsyncSession,
-    model: type[Base],
+    table: type[Base],
     rows: Sequence[Row],
     dataset_id: int,
+    *,
+    session: AsyncSession | None = None,
 ) -> int:
     """Idempotently write daily fact rows into one dataset, restatements overwriting.
 
@@ -594,40 +648,48 @@ async def upsert_facts(
     :func:`upsert_entities`, for example a campaign removed before first tracking that still
     has spend in the backfill window.
 
+    The signature is AAP 0.5.1's ``upsert_facts(table, rows, dataset_id)``. A sync job
+    passes its ``session`` so the facts commit with its freshness row and its
+    ``analysis_request``; without one the write is its own unit of work.
+
     Args:
-        session: The caller's session; nothing is committed here.
-        model: A fact model (``FactCampaignDaily``, ``FactCreativeDaily``,
-            ``FactKeywordDaily``, ``FactSearchTermDaily`` or ``FactSegmentWindow``).
+        table: The fact table's mapped model class (``FactCampaignDaily``,
+            ``FactCreativeDaily``, ``FactKeywordDaily``, ``FactSearchTermDaily`` or
+            ``FactSegmentWindow``).
         rows: Column-name rows; ``dataset_id`` and ``source`` may be omitted.
         dataset_id: The building or active dataset written to.
+        session: The caller's session, joined without committing; the dataset guard is then
+            held until the caller's transaction ends. ``None`` runs the write in a
+            transaction of its own, committed on success and rolled back on error.
 
     Returns:
         The number of distinct rows written; 0, with no statement, for empty ``rows``.
 
     Raises:
-        NaturalKeyError: If ``model`` breaks the contract, has no ``fetched_at``, its
+        NaturalKeyError: If ``table`` breaks the contract, has no ``fetched_at``, its
             natural key omits ``dataset_id``, or a row lacks a natural-key value.
         DatasetNotWritable: If the dataset is missing or retired.
         ValueError: If a row carries an unknown column, another dataset or source, a
             ``float`` or a naive ``datetime``.
     """
-    info = _scoped_info(model)
+    info = _scoped_info(table)
     if not info.has_fetched_at:
         raise NaturalKeyError(
-            f"{model.__name__} has no fetched_at column; use upsert_entities for entity rows"
+            f"{table.__name__} has no fetched_at column; use upsert_entities for entity rows"
         )
     if "dataset_id" not in info.natural_key:
-        raise NaturalKeyError(f"{model.__name__}.__natural_key__ must include dataset_id")
+        raise NaturalKeyError(f"{table.__name__}.__natural_key__ must include dataset_id")
     if not rows:
         return 0
-    dataset = await ensure_writable(session, dataset_id)
-    prepared = _prepare(rows, info, dataset)
-    fetched_at = utcnow()
-    for values in prepared:
-        values["fetched_at"] = fetched_at
-    for columns, members in _group_by_columns(prepared):
-        statement = _upsert_statement(model, info, columns)
-        await session.execute(statement, [values for _, values in members])
+    async with use_session(session) as unit:
+        dataset = await ensure_writable(unit, dataset_id)
+        prepared = _prepare(rows, info, dataset)
+        fetched_at = utcnow()
+        for values in prepared:
+            values["fetched_at"] = fetched_at
+        for columns, members in _group_by_columns(prepared):
+            statement = _upsert_statement(table, info, columns)
+            await unit.execute(statement, [values for _, values in members])
     _log.debug("db.upsert_facts", table=info.name, dataset_id=dataset.id, rows=len(prepared))
     return len(prepared)
 
@@ -738,7 +800,9 @@ async def entity_id_map(
     return mapping
 
 
-async def append_snapshots(session: AsyncSession, rows: Sequence[Row]) -> list[int]:
+async def append_snapshots(
+    rows: Sequence[Row], *, session: AsyncSession | None = None
+) -> list[int]:
     """Append ``entity_snapshot`` observations and return their ids in input order.
 
     AAP 0.5.2 (``entity_snapshot``: "Append-only") and 0.5.4.1 (budget history). Every row
@@ -747,10 +811,15 @@ async def append_snapshots(session: AsyncSession, rows: Sequence[Row]) -> list[i
     an effective time. Ids come back in input order, because discrepancy detection stores
     the ``snapshot_id`` it compared.
 
+    The signature is AAP 0.5.1's ``append_snapshots(rows)``. An entity sync passes its
+    ``session`` so the snapshots commit with its entities, baselines and discrepancies.
+
     Args:
-        session: The caller's session; nothing is committed here.
         rows: Snapshot rows, each carrying its own ``dataset_id`` and a tz-aware
             ``captured_at``. ``source`` may be omitted; it is set from the dataset.
+        session: The caller's session, joined without committing; the dataset guards are
+            then held until the caller's transaction ends. ``None`` runs the write in a
+            transaction of its own, committed on success and rolled back on error.
 
     Returns:
         The new snapshot ids, one per input row, in input order; ``[]`` for empty ``rows``.
@@ -764,6 +833,12 @@ async def append_snapshots(session: AsyncSession, rows: Sequence[Row]) -> list[i
     """
     if not rows:
         return []
+    async with use_session(session) as unit:
+        return await _append_snapshots(unit, rows)
+
+
+async def _append_snapshots(session: AsyncSession, rows: Sequence[Row]) -> list[int]:
+    """Validate and insert non-empty snapshot rows in ``session``; see :func:`append_snapshots`."""
     table = _table_of(EntitySnapshot)
     name = table.name
     columns = frozenset(table.c.keys())

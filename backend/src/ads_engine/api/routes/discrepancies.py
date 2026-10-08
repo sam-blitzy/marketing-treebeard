@@ -15,11 +15,13 @@ complete intended state is for a shape, tombstones, immediate closure versus
 ``awaiting_platform``, the retired-dataset refusal and the rerun request all belong to
 :mod:`ads_engine.decisions`. This module reads :data:`ads_engine.decisions.RESOLUTIONS` only
 to show each discrepancy its valid resolutions, takes each subject's decision shape, name,
-source and currency from :func:`ads_engine.decisions.load_subject_state` (the same state
-:func:`ads_engine.decisions.resolve_discrepancy` validates against, so the resolutions
-offered are exactly the ones the ``POST`` accepts), and delegates every write. Domain
-rejections propagate unchanged as :class:`ads_engine.decisions.DecisionError` subclasses,
-which ``api/app.py`` renders as ``{"error": {"code", "message"}}``:
+source and currency from :func:`ads_engine.decisions.load_subject_states` (the list, every
+subject in one set-based call) and :func:`ads_engine.decisions.load_subject_state` (the
+``POST``): the same state :func:`ads_engine.decisions.resolve_discrepancy` validates against,
+so the resolutions offered are exactly the ones the ``POST`` accepts. Every write is
+delegated. Domain rejections propagate unchanged as
+:class:`ads_engine.decisions.DecisionError` subclasses, which ``api/app.py`` renders as
+``{"error": {"code", "message"}}``:
 
 * ``InvalidResolution``: 422 (a resolution not valid for the pair, or an intended state that
   is incomplete or does not fit the subject's shape);
@@ -62,6 +64,7 @@ from ads_engine.decisions import (
     SubjectState,
     SubjectType,
     load_subject_state,
+    load_subject_states,
     resolve_discrepancy,
 )
 from ads_engine.logging import get_logger
@@ -139,7 +142,8 @@ def _view(row: Discrepancy, state: SubjectState) -> schemas.Discrepancy:
 
     Args:
         row: The discrepancy row.
-        state: Its subject's state from :func:`ads_engine.decisions.load_subject_state`.
+        state: Its subject's state, as :func:`ads_engine.decisions.load_subject_state`
+            builds it.
 
     Returns:
         The discrepancy view.
@@ -169,35 +173,26 @@ def _view(row: Discrepancy, state: SubjectState) -> schemas.Discrepancy:
     )
 
 
-async def _listed_subject_state(
-    session: AsyncSession, row: Discrepancy, ref: SubjectRef
-) -> SubjectState | None:
-    """Load a listed discrepancy's subject state, or ``None`` when it cannot be loaded.
+def _report_unavailable(row: Discrepancy, ref: SubjectRef, error: SubjectNotFound) -> None:
+    """Log that a listed discrepancy is left out because its subject cannot be loaded.
 
     Args:
-        session: The request's session.
-        row: The discrepancy that names the subject (for the log line).
+        row: The first listed discrepancy that names the subject.
         ref: The subject.
-
-    Returns:
-        The subject's state, or ``None`` when the domain reports the subject not found.
+        error: The domain's reason, from :func:`ads_engine.decisions.load_subject_states`.
     """
-    try:
-        return await load_subject_state(session, ref)
-    except SubjectNotFound as exc:
-        # Priority decision: a subject the domain cannot load (its row gone, a budget that is
-        # no longer explicitly shared, or a shared budget whose currency is undeterminable)
-        # has no decision shape, so no resolution is offerable and resolve_discrepancy would
-        # answer 404 for it. Its discrepancy is left out of the list with a warning instead
-        # of failing the whole resolver list with a 404 for one row.
-        _log.warning(
-            "discrepancies.subject_unavailable",
-            discrepancy_id=row.id,
-            subject_type=ref.type,
-            subject_id=ref.id,
-            code=exc.code,
-        )
-        return None
+    # Priority decision: a subject the domain cannot load (its row gone, a budget that is no
+    # longer explicitly shared, or a shared budget whose currency is undeterminable) has no
+    # decision shape, so no resolution is offerable and resolve_discrepancy would answer 404
+    # for it. Its discrepancies are left out of the list with a warning instead of failing
+    # the whole resolver list with a 404 for one subject.
+    _log.warning(
+        "discrepancies.subject_unavailable",
+        discrepancy_id=row.id,
+        subject_type=ref.type,
+        subject_id=ref.id,
+        code=error.code,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -361,17 +356,20 @@ async def list_discrepancies(
             statement.order_by(Discrepancy.detected_at, Discrepancy.id).limit(limit)
         )
     ).all()
-    # The decision shape is a property of the subject, not of the discrepancy: it is loaded
-    # once per distinct subject, which the unresolved discrepancies bound to a few.
-    subjects: dict[SubjectRef, SubjectState | None] = {}
+    # The decision shape is a property of the subject, not of the discrepancy: every distinct
+    # subject of the page is loaded once, all of them in one set-based domain call whose
+    # statement count does not grow with the number of subjects.
+    refs = [_subject_ref(row) for row in rows]
+    loaded = await load_subject_states(session, refs)
+    unavailable: set[SubjectRef] = set()
     views: list[schemas.Discrepancy] = []
-    for row in rows:
-        ref = _subject_ref(row)
-        if ref not in subjects:
-            subjects[ref] = await _listed_subject_state(session, row, ref)
-        subject_state = subjects[ref]
+    for row, ref in zip(rows, refs, strict=True):
+        subject_state = loaded.states.get(ref)
         if subject_state is not None:
             views.append(_view(row, subject_state))
+        elif ref not in unavailable:
+            unavailable.add(ref)
+            _report_unavailable(row, ref, loaded.not_found[ref])
     if len(rows) == limit:
         # A full read of rows may have more behind it; a page of fewer views does not end
         # the list, because rows whose subject is unavailable are left out of the views.
@@ -432,10 +430,10 @@ async def resolve(
     """
     intended = None if body.intended_state is None else body.intended_state.present_fields()
     row = await resolve_discrepancy(
-        session,
         discrepancy_id,
         body.resolution,
         intended,
+        session=session,
         decided_by=user.email,
         note=body.note,
         now=now,

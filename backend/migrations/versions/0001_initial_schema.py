@@ -18,6 +18,10 @@ and PostgreSQL resolves the order itself:
 
 * every ``dataset_id``, ``crm_dataset_id`` and ``parent_dataset_id`` reference, and every
   foreign key between two rows of the same dataset, is ``ON DELETE CASCADE``;
+* every foreign key between two rows of the same dataset is dataset-qualified
+  (:func:`_same_dataset_fk`): the composite (``<column>``, ``dataset_id``) references the
+  parent's unique (``dataset_id``, ``id``), so a row can never point at another dataset's
+  parent and purging one dataset never cascades into another;
 * ``lead_match`` is the only table that links two datasets (a LinkedIn lead and a CRM
   contact), and both of its links cascade, so purging either side removes only its own
   matching state;
@@ -191,6 +195,12 @@ OK_EMPTY_SHAPE_SQL: str = (
 # when every associated id was returned.
 TARGET_READ_OK_COMPLETE_SQL: str = (
     "target_read_status <> 'ok' OR cardinality(missing_target_ids) = 0"
+)
+# mirrors ads_engine.db.models.crm.LEAD_MATCH_CLAIMABLE_SQL, the partial-index predicate of
+# ix_lead_match_claim: pending rows, and no_match or error rows with a retry scheduled.
+LEAD_MATCH_CLAIMABLE_SQL: str = (
+    "(lead_match.status = 'pending' OR (lead_match.status IN ('no_match', 'error')"
+    " AND lead_match.next_attempt_at IS NOT NULL))"
 )
 # mirrors ads_engine.db.models.decisions._SHAPE_COLUMNS_SQL: the columns each decision shape
 # may fill (AAP 0.5.2 "Decisions: shapes").
@@ -618,9 +628,13 @@ def _create_account_tables() -> None:
 
     Every foreign key between two rows of one dataset cascades, and each referencing column
     is indexed unless it leads another index, so a purge never scans a child table per
-    parent row. Raw platform values (``campaign.raw_status``, ``campaign_group.status``,
-    ``ad_group.status``, ``keyword.status`` and ``match_type``, ``creative.intended_status``
-    and the ``conversion_action`` vocabulary columns) are open ``text`` with no ``CHECK``.
+    parent row. Each such key is dataset-qualified (:func:`_same_dataset_fk`) against its
+    parent's unique (``dataset_id``, ``id``), which every parent (``ad_account``,
+    ``campaign_group``, ``budget``, ``campaign``, ``ad_group``, ``lead_form``) declares in
+    its own ``create_table`` before its children are created. Raw platform values
+    (``campaign.raw_status``, ``campaign_group.status``, ``ad_group.status``,
+    ``keyword.status`` and ``match_type``, ``creative.intended_status`` and the
+    ``conversion_action`` vocabulary columns) are open ``text`` with no ``CHECK``.
     """
     op.create_table(
         "ad_account",
@@ -634,6 +648,8 @@ def _create_account_tables() -> None:
         _pk("ad_account"),
         _source_check("ad_account"),
         _unique("ad_account", "dataset_id", "source", "external_id"),
+        # Anchors the dataset-qualified (account_id, dataset_id) foreign keys of child rows.
+        _unique("ad_account", "dataset_id", "id"),
         _dataset_fk("ad_account"),
     )
 
@@ -651,6 +667,8 @@ def _create_account_tables() -> None:
         _in_check("budget", "period", BUDGET_PERIODS),
         _check("budget", "amount_pair", AMOUNT_PAIR_SQL),
         _unique("budget", "dataset_id", "external_id"),
+        # Anchors the dataset-qualified (budget_id, dataset_id) foreign keys of child rows.
+        _unique("budget", "dataset_id", "id"),
         _dataset_fk("budget"),
     )
 
@@ -688,6 +706,8 @@ def _create_account_tables() -> None:
         _pk("lead_form"),
         _source_check("lead_form"),
         _unique("lead_form", "dataset_id", "canonical_urn"),
+        # Anchors the dataset-qualified (lead_form_id, dataset_id) foreign keys of child rows.
+        _unique("lead_form", "dataset_id", "id"),
         _dataset_fk("lead_form"),
     )
 
@@ -716,8 +736,10 @@ def _create_account_tables() -> None:
         _pk("campaign_group"),
         _source_check("campaign_group"),
         _unique("campaign_group", "dataset_id", "account_id", "external_id"),
+        # Anchors the dataset-qualified (campaign_group_id, dataset_id) foreign keys of child rows.
+        _unique("campaign_group", "dataset_id", "id"),
         _dataset_fk("campaign_group"),
-        _fk("campaign_group", ["account_id"], "ad_account", ondelete="CASCADE"),
+        _same_dataset_fk("campaign_group", "account_id", "ad_account"),
     )
     _create_index("ix_campaign_group_account_id", "campaign_group", ["account_id"])
 
@@ -744,9 +766,10 @@ def _create_account_tables() -> None:
         # Anchors the dataset-qualified (campaign_id, dataset_id) foreign keys of child rows.
         _unique("campaign", "dataset_id", "id"),
         _dataset_fk("campaign"),
-        _fk("campaign", ["account_id"], "ad_account", ondelete="CASCADE"),
-        _fk("campaign", ["campaign_group_id"], "campaign_group", ondelete="CASCADE"),
-        _fk("campaign", ["budget_id"], "budget", ondelete="CASCADE"),
+        _same_dataset_fk("campaign", "account_id", "ad_account"),
+        # Nullable composite keys (MATCH SIMPLE): a NULL group or budget is not checked.
+        _same_dataset_fk("campaign", "campaign_group_id", "campaign_group"),
+        _same_dataset_fk("campaign", "budget_id", "budget"),
     )
     _create_index("ix_campaign_account_id", "campaign", ["account_id"])
     _create_index("ix_campaign_budget_id", "campaign", ["budget_id"])
@@ -765,7 +788,7 @@ def _create_account_tables() -> None:
         _unique("ad_group", "dataset_id", "campaign_id", "external_id"),
         _unique("ad_group", "dataset_id", "id"),
         _dataset_fk("ad_group"),
-        _fk("ad_group", ["campaign_id"], "campaign", ondelete="CASCADE"),
+        _same_dataset_fk("ad_group", "campaign_id", "campaign"),
     )
     _create_index("ix_ad_group_campaign_id", "ad_group", ["campaign_id"])
 
@@ -787,7 +810,7 @@ def _create_account_tables() -> None:
         _unique("creative", "dataset_id", "urn"),
         _unique("creative", "dataset_id", "id"),
         _dataset_fk("creative"),
-        _fk("creative", ["campaign_id"], "campaign", ondelete="CASCADE"),
+        _same_dataset_fk("creative", "campaign_id", "campaign"),
     )
     _create_index("ix_creative_campaign_id", "creative", ["campaign_id"])
 
@@ -810,7 +833,7 @@ def _create_account_tables() -> None:
         _source_check("lead_form_version"),
         _unique("lead_form_version", "lead_form_id", "version"),
         _dataset_fk("lead_form_version"),
-        _fk("lead_form_version", ["lead_form_id"], "lead_form", ondelete="CASCADE"),
+        _same_dataset_fk("lead_form_version", "lead_form_id", "lead_form"),
     )
     _create_index("ix_lead_form_version_dataset_id", "lead_form_version", ["dataset_id"])
 
@@ -852,7 +875,7 @@ def _create_account_tables() -> None:
         _unique("keyword", "dataset_id", "ad_group_id", "criterion_id"),
         _unique("keyword", "dataset_id", "id"),
         _dataset_fk("keyword"),
-        _fk("keyword", ["ad_group_id"], "ad_group", ondelete="CASCADE"),
+        _same_dataset_fk("keyword", "ad_group_id", "ad_group"),
     )
     _create_index("ix_keyword_ad_group_id", "keyword", ["ad_group_id"])
 
@@ -867,7 +890,11 @@ def _create_fact_tables() -> None:
 
     Each references its entity through a dataset-qualified composite foreign key, so a fact
     can only point at an entity of its own dataset, and each guards its metrics with a
-    ``non_negative`` check that a NULL ("unavailable") metric satisfies.
+    ``non_negative`` check that a NULL ("unavailable") metric satisfies. Besides its
+    entity-leading indexes, each daily table has ``ix_<table>_dataset_date`` on
+    (``dataset_id``, ``date``) and ``fact_segment_window`` has
+    ``ix_fact_segment_window_dataset_window`` on (``dataset_id``, ``window_start``,
+    ``window_end``), for window reads that leave the entity unconstrained.
     """
     op.create_table(
         "fact_campaign_daily",
@@ -901,6 +928,9 @@ def _create_fact_tables() -> None:
     )
     _create_index(
         "ix_fact_campaign_daily_campaign_date", "fact_campaign_daily", ["campaign_id", "date"]
+    )
+    _create_index(
+        "ix_fact_campaign_daily_dataset_date", "fact_campaign_daily", ["dataset_id", "date"]
     )
 
     op.create_table(
@@ -942,6 +972,9 @@ def _create_fact_tables() -> None:
     _create_index(
         "ix_fact_creative_daily_creative_date", "fact_creative_daily", ["creative_id", "date"]
     )
+    _create_index(
+        "ix_fact_creative_daily_dataset_date", "fact_creative_daily", ["dataset_id", "date"]
+    )
 
     op.create_table(
         "fact_keyword_daily",
@@ -975,6 +1008,9 @@ def _create_fact_tables() -> None:
     )
     _create_index(
         "ix_fact_keyword_daily_keyword_date", "fact_keyword_daily", ["keyword_id", "date"]
+    )
+    _create_index(
+        "ix_fact_keyword_daily_dataset_date", "fact_keyword_daily", ["dataset_id", "date"]
     )
 
     op.create_table(
@@ -1030,6 +1066,11 @@ def _create_fact_tables() -> None:
         "fact_search_term_daily",
         ["campaign_id", "date"],
     )
+    _create_index(
+        "ix_fact_search_term_daily_dataset_date",
+        "fact_search_term_daily",
+        ["dataset_id", "date"],
+    )
 
     op.create_table(
         "fact_segment_window",
@@ -1065,6 +1106,11 @@ def _create_fact_tables() -> None:
         _dataset_fk("fact_segment_window"),
     )
     _create_index("ix_fact_segment_window_campaign_id", "fact_segment_window", ["campaign_id"])
+    _create_index(
+        "ix_fact_segment_window_dataset_window",
+        "fact_segment_window",
+        ["dataset_id", "window_start", "window_end"],
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1076,9 +1122,12 @@ def _create_snapshot_tables() -> None:
     """Create ``entity_snapshot`` (``ads_engine.db.models.snapshots``).
 
     ``entity_id`` is polymorphic over :data:`ENTITY_TYPES` and so carries no foreign key;
-    ``budget_id`` is the Google budget a campaign drew from at ``captured_at`` and cascades.
-    The table has no natural key, so the purge cascade finds rows through
-    ``ix_entity_snapshot_dataset_id``.
+    ``budget_id`` is the Google budget of the snapshot's own dataset a campaign drew from at
+    ``captured_at``, a dataset-qualified key that cascades. The unique (``dataset_id``,
+    ``id``) anchors ``discrepancy.snapshot_id``'s dataset-qualified key. The table has no
+    natural key, so the purge cascade finds rows through ``ix_entity_snapshot_dataset_id``.
+    ``ix_entity_snapshot_dataset_type_captured`` serves the analysis window's observation
+    range and ``ix_entity_snapshot_entity_captured`` each entity's history.
     """
     op.create_table(
         "entity_snapshot",
@@ -1102,11 +1151,20 @@ def _create_snapshot_tables() -> None:
         _pk("entity_snapshot"),
         _source_check("entity_snapshot"),
         _in_check("entity_snapshot", "entity_type", ENTITY_TYPES),
+        # Anchors the dataset-qualified (snapshot_id, dataset_id) foreign keys of child rows.
+        _unique("entity_snapshot", "dataset_id", "id"),
         _dataset_fk("entity_snapshot"),
-        _fk("entity_snapshot", ["budget_id"], "budget", ondelete="CASCADE"),
+        # Nullable composite key (MATCH SIMPLE): a NULL budget_id is not checked.
+        _same_dataset_fk("entity_snapshot", "budget_id", "budget"),
     )
     _create_index("ix_entity_snapshot_budget_id", "entity_snapshot", ["budget_id"])
     _create_index("ix_entity_snapshot_dataset_id", "entity_snapshot", ["dataset_id"])
+    # The analysis window's entity-free observation range per dataset and entity type.
+    _create_index(
+        "ix_entity_snapshot_dataset_type_captured",
+        "entity_snapshot",
+        ["dataset_id", "entity_type", "captured_at"],
+    )
     _create_index(
         "ix_entity_snapshot_entity_captured",
         "entity_snapshot",
@@ -1172,6 +1230,13 @@ def _create_crm_tables() -> None:
         _dataset_fk("crm_contact"),
     )
     _create_index("ix_crm_contact_dataset_email", "crm_contact", ["dataset_id", "email_sha256"])
+    # Google-touch discovery: a dataset's contacts with a campaign ref, by touch-instant range.
+    _create_index(
+        "ix_crm_contact_dataset_google_touch",
+        "crm_contact",
+        ["dataset_id", "google_touch_at"],
+        where="google_campaign_ref IS NOT NULL",
+    )
 
     op.create_table(
         "crm_meeting",
@@ -1303,6 +1368,13 @@ def _create_crm_tables() -> None:
     _create_index("ix_lead_match_contact_id", "lead_match", ["contact_id"])
     _create_index(
         "ix_lead_match_due", "lead_match", ["crm_dataset_id", "status", "next_attempt_at"]
+    )
+    # The matching claim's due rows in its exact order; claimable rows only.
+    _create_index(
+        "ix_lead_match_claim",
+        "lead_match",
+        ["crm_dataset_id", sa.text("next_attempt_at NULLS FIRST"), "lead_id"],
+        where=LEAD_MATCH_CLAIMABLE_SQL,
     )
 
 
@@ -1512,6 +1584,8 @@ def _create_analysis_tables() -> None:
         "recommendation_feedback",
         ["rule_id", "entity_type", "entity_id", "until"],
     )
+    # The runner's read of every row still in force is a range over ``until`` alone.
+    _create_index("ix_recommendation_feedback_until", "recommendation_feedback", ["until"])
 
 
 # ---------------------------------------------------------------------------------------
@@ -1525,7 +1599,10 @@ def _create_decision_tables() -> None:
     Both are dataset-scoped, so a simulated decision never becomes the expected state of a
     live campaign. ``subject_id`` points at a campaign or a budget according to
     ``subject_type`` and therefore carries no foreign key. ``ck_decision_shape_columns``
-    fixes which columns each decision shape may fill (AAP 0.5.2).
+    fixes which columns each decision shape may fill (AAP 0.5.2). ``decision.budget_id``
+    and ``discrepancy``'s ``snapshot_id`` and ``decision_id`` are dataset-qualified keys;
+    ``decision`` declares the unique (``dataset_id``, ``id``) that ``decision_id``
+    references.
     """
     op.create_table(
         "decision",
@@ -1557,13 +1634,22 @@ def _create_decision_tables() -> None:
         _in_check("decision", "status", CAMPAIGN_STATUSES),
         _in_check("decision", "origin", DECISION_ORIGINS),
         _check("decision", "shape_columns", SHAPE_COLUMNS_SQL),
+        # Anchors the dataset-qualified (decision_id, dataset_id) foreign keys of child rows.
+        _unique("decision", "dataset_id", "id"),
         _dataset_fk("decision"),
-        _fk("decision", ["budget_id"], "budget", ondelete="CASCADE"),
+        # Nullable composite key (MATCH SIMPLE): a NULL budget_id is not checked.
+        _same_dataset_fk("decision", "budget_id", "budget"),
         # SET NULL: the decision log outlives the run whose item it was recorded from.
         _fk("decision", ["recommendation_id"], "recommendation", ondelete="SET NULL"),
     )
     _create_index("ix_decision_budget_id", "decision", ["budget_id"])
     _create_index("ix_decision_dataset_id", "decision", ["dataset_id"])
+    # The decision log's newest-first page, probed per active dataset (GET /decisions).
+    _create_index(
+        "ix_decision_dataset_decided",
+        "decision",
+        ["dataset_id", sa.text("decided_at DESC"), sa.text("id DESC")],
+    )
     _create_index(
         "ix_decision_subject_latest",
         "decision",
@@ -1593,8 +1679,9 @@ def _create_decision_tables() -> None:
         _in_check("discrepancy", "state", DISCREPANCY_STATES),
         _in_check("discrepancy", "resolution", DISCREPANCY_RESOLUTIONS),
         _dataset_fk("discrepancy"),
-        _fk("discrepancy", ["snapshot_id"], "entity_snapshot", ondelete="CASCADE"),
-        _fk("discrepancy", ["decision_id"], "decision", ondelete="CASCADE"),
+        # Nullable composite keys (MATCH SIMPLE): a NULL snapshot or decision is not checked.
+        _same_dataset_fk("discrepancy", "snapshot_id", "entity_snapshot"),
+        _same_dataset_fk("discrepancy", "decision_id", "decision"),
     )
     _create_index("ix_discrepancy_dataset_id", "discrepancy", ["dataset_id"])
     _create_index("ix_discrepancy_decision_id", "discrepancy", ["decision_id"])

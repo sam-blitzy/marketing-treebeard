@@ -24,6 +24,17 @@ and PostgreSQL resolves the order itself. Each such foreign-key column is indexe
 already leads an index, because PostgreSQL does not index referencing columns and the
 cascade would otherwise scan the child table once per deleted parent row.
 
+**Dataset-qualified parent references** (AAP 0.3.3: only ``lead_match`` links two datasets).
+Every parent reference between these tables (``campaign_group`` and ``campaign`` to
+``ad_account``, ``campaign`` to ``campaign_group`` and ``budget``, ``ad_group`` and
+``creative`` to ``campaign``, ``keyword`` to ``ad_group`` and ``lead_form_version`` to
+``lead_form``) is a composite foreign key (``<column>``, ``dataset_id``) to the parent's
+unique (``dataset_id``, ``id``). The database therefore rejects a parent of another dataset,
+so purging one dataset can never cascade into another dataset's rows. The parent column is
+listed first, so the naming convention still names each constraint
+``fk_<table>_<column>_<parent table>``. A ``NULL`` in a nullable parent column
+(``campaign.campaign_group_id``, ``campaign.budget_id``) is not checked (``MATCH SIMPLE``).
+
 Normalised enumerations are ``text`` guarded by :func:`~ads_engine.db.base.check_in`. Raw
 platform columns (``campaign.raw_status``, ``campaign_group.status``, ``ad_group.status``,
 ``keyword.status`` and ``match_type``, ``creative.intended_status``, and
@@ -100,6 +111,10 @@ class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
     taken within one ``currency``. The Google account's ``timezone`` sets Google's native
     day boundary; LinkedIn days are UTC (AAP 0.5.4.1).
 
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    keys of ``campaign_group`` and ``campaign``, so a group or campaign can belong only to an
+    account of its own dataset.
+
     Attributes:
         external_id: The Google customer id (10 digits) or the LinkedIn account id.
         name: The platform's descriptive name of the account; ``None`` when the source
@@ -122,6 +137,8 @@ class AdAccount(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "source", "external_id"),
+        # Anchors the dataset-qualified (account_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
     @property
@@ -142,8 +159,13 @@ class CampaignGroup(IdPkMixin, DatasetScopedMixin, Base):
     snapshotted as ``entity_type=campaign_group``; shown in campaign evidence. Groups are not
     decision subjects: decisions and discrepancies cover campaigns and budgets only.
 
+    ``account_id`` is dataset-qualified: (``account_id``, ``dataset_id``) references the
+    account's unique (``dataset_id``, ``id``). The group's own unique (``dataset_id``,
+    ``id``) key is the target of ``campaign.campaign_group_id``'s dataset-qualified foreign
+    key, so a campaign can belong only to a group of its own dataset.
+
     Attributes:
-        account_id: The owning :class:`AdAccount`.
+        account_id: The owning :class:`AdAccount`, of the group's own dataset.
         external_id: The LinkedIn campaign group id.
         name: The group's name.
         status: The raw LinkedIn status, stored as returned.
@@ -156,10 +178,7 @@ class CampaignGroup(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "campaign_group"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "account_id", "external_id")
 
-    account_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("ad_account.id", ondelete="CASCADE"),
-        index=True,
-    )
+    account_id: Mapped[int] = mapped_column(index=True)
     external_id: Mapped[str]
     name: Mapped[str]
     status: Mapped[str]
@@ -170,7 +189,15 @@ class CampaignGroup(IdPkMixin, DatasetScopedMixin, Base):
 
     __table_args__ = (
         check_in("source", SOURCES),
+        # Dataset-qualified: the account must belong to this group's dataset.
+        sa.ForeignKeyConstraint(
+            ["account_id", "dataset_id"],
+            ["ad_account.id", "ad_account.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "account_id", "external_id"),
+        # Anchors the dataset-qualified (campaign_group_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -186,19 +213,24 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
     fixes the campaign's decision shape (``own_budget`` or ``shared_member``, AAP 0.5.2).
 
     The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
-    keys of ``fact_campaign_daily``, ``fact_search_term_daily``, ``fact_segment_window`` and
-    ``lead``, so a row can reference only a campaign of its own dataset.
+    keys of ``ad_group``, ``creative``, ``fact_campaign_daily``, ``fact_search_term_daily``,
+    ``fact_segment_window`` and ``lead``, so a row can reference only a campaign of its own
+    dataset. The campaign's own parent references, ``account_id``, ``campaign_group_id`` and
+    ``budget_id``, are dataset-qualified the same way; a ``NULL`` group or budget is not
+    checked.
 
     Attributes:
-        account_id: The owning :class:`AdAccount`.
+        account_id: The owning :class:`AdAccount`, of the campaign's own dataset.
         external_id: The Google campaign id or LinkedIn campaign id.
         name: The campaign's name.
         status: ``active``, ``paused`` or ``ended`` (:data:`CAMPAIGN_STATUSES`).
         raw_status: The platform status as returned, for example ``ENABLED`` or ``ARCHIVED``.
         objective_or_channel: LinkedIn ``objectiveType`` or Google
             ``advertising_channel_type``; selects the outcome metric (AAP 0.5.4.1).
-        campaign_group_id: The LinkedIn :class:`CampaignGroup`; ``None`` for Google.
-        budget_id: The Google :class:`Budget` the campaign draws from; ``None`` for LinkedIn.
+        campaign_group_id: The LinkedIn :class:`CampaignGroup`, of the campaign's own
+            dataset; ``None`` for Google.
+        budget_id: The Google :class:`Budget` the campaign draws from, of the campaign's own
+            dataset; ``None`` for LinkedIn.
         daily_budget: The campaign's daily budget, if it has one; ``None`` for a Google
             campaign whose budget's amount is unknown.
         total_budget: The campaign's lifetime or custom-period budget, if it has one; ``None``
@@ -210,23 +242,14 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "campaign"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "account_id", "external_id")
 
-    account_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("ad_account.id", ondelete="CASCADE"),
-        index=True,
-    )
+    account_id: Mapped[int] = mapped_column(index=True)
     external_id: Mapped[str]
     name: Mapped[str]
     status: Mapped[str]
     raw_status: Mapped[str]
     objective_or_channel: Mapped[str | None]
-    campaign_group_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("campaign_group.id", ondelete="CASCADE"),
-        index=True,
-    )
-    budget_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("budget.id", ondelete="CASCADE"),
-        index=True,
-    )
+    campaign_group_id: Mapped[int | None] = mapped_column(index=True)
+    budget_id: Mapped[int | None] = mapped_column(index=True)
     daily_budget: Mapped[Decimal | None]
     total_budget: Mapped[Decimal | None]
     budget_period: Mapped[str | None]
@@ -235,6 +258,23 @@ class Campaign(IdPkMixin, DatasetScopedMixin, Base):
         check_in("source", SOURCES),
         check_in("status", CAMPAIGN_STATUSES),
         check_in("budget_period", BUDGET_PERIODS),
+        # Dataset-qualified: the account, the group and the budget must belong to this
+        # campaign's dataset. A NULL campaign_group_id or budget_id is not checked.
+        sa.ForeignKeyConstraint(
+            ["account_id", "dataset_id"],
+            ["ad_account.id", "ad_account.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["campaign_group_id", "dataset_id"],
+            ["campaign_group.id", "campaign_group.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["budget_id", "dataset_id"],
+            ["budget.id", "budget.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "account_id", "external_id"),
         # Anchors the dataset-qualified (campaign_id, dataset_id) foreign keys of child rows.
         sa.UniqueConstraint("dataset_id", "id"),
@@ -261,6 +301,10 @@ class Budget(IdPkMixin, DatasetScopedMixin, Base):
     as unknown and withhold every amount-dependent calculation, such as utilization and the
     C0 amount comparison, rather than substitute a value.
 
+    The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
+    keys of ``campaign.budget_id``, ``entity_snapshot.budget_id`` and ``decision.budget_id``,
+    so a campaign, snapshot or decision can name only a budget of its own dataset.
+
     Attributes:
         external_id: The Google ``campaign_budget.id``.
         amount: The budget amount in the account's currency; ``None`` when Google omits the
@@ -286,6 +330,8 @@ class Budget(IdPkMixin, DatasetScopedMixin, Base):
         check_in("period", BUDGET_PERIODS),
         sa.CheckConstraint(_AMOUNT_PAIR_SQL, name="amount_pair"),
         sa.UniqueConstraint("dataset_id", "external_id"),
+        # Anchors the dataset-qualified (budget_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -337,11 +383,12 @@ class AdGroup(IdPkMixin, DatasetScopedMixin, Base):
     check (AAP 0.5.4.4).
 
     The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
-    key of ``fact_search_term_daily``, so a search term can reference only an ad group of
-    its own dataset.
+    keys of ``keyword`` and ``fact_search_term_daily``, so a keyword or search term can
+    reference only an ad group of its own dataset. ``campaign_id`` is dataset-qualified the
+    same way.
 
     Attributes:
-        campaign_id: The owning :class:`Campaign`.
+        campaign_id: The owning :class:`Campaign`, of the ad group's own dataset.
         external_id: The Google ``ad_group.id``.
         name: The ad group's name.
         status: The raw Google status, stored as returned.
@@ -350,16 +397,19 @@ class AdGroup(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "ad_group"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "campaign_id", "external_id")
 
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-        index=True,
-    )
+    campaign_id: Mapped[int] = mapped_column(index=True)
     external_id: Mapped[str]
     name: Mapped[str]
     status: Mapped[str]
 
     __table_args__ = (
         check_in("source", SOURCES),
+        # Dataset-qualified: the campaign must belong to this ad group's dataset.
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "campaign_id", "external_id"),
         # Anchors the dataset-qualified (ad_group_id, dataset_id) foreign keys of child rows.
         sa.UniqueConstraint("dataset_id", "id"),
@@ -377,10 +427,10 @@ class Keyword(IdPkMixin, DatasetScopedMixin, Base):
 
     The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
     key of ``fact_keyword_daily``, so a keyword fact can reference only a keyword of its own
-    dataset.
+    dataset. ``ad_group_id`` is dataset-qualified the same way.
 
     Attributes:
-        ad_group_id: The owning :class:`AdGroup`.
+        ad_group_id: The owning :class:`AdGroup`, of the keyword's own dataset.
         criterion_id: The Google ``ad_group_criterion.criterion_id``.
         text: The keyword text.
         match_type: The raw match type, for example ``EXACT`` or ``PHRASE``.
@@ -392,10 +442,7 @@ class Keyword(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "keyword"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "ad_group_id", "criterion_id")
 
-    ad_group_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("ad_group.id", ondelete="CASCADE"),
-        index=True,
-    )
+    ad_group_id: Mapped[int] = mapped_column(index=True)
     criterion_id: Mapped[str]
     text: Mapped[str]
     match_type: Mapped[str]
@@ -404,6 +451,12 @@ class Keyword(IdPkMixin, DatasetScopedMixin, Base):
 
     __table_args__ = (
         check_in("source", SOURCES),
+        # Dataset-qualified: the ad group must belong to this keyword's dataset.
+        sa.ForeignKeyConstraint(
+            ["ad_group_id", "dataset_id"],
+            ["ad_group.id", "ad_group.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "ad_group_id", "criterion_id"),
         # Anchors the dataset-qualified (keyword_id, dataset_id) foreign keys of child rows.
         sa.UniqueConstraint("dataset_id", "id"),
@@ -421,10 +474,10 @@ class Creative(IdPkMixin, DatasetScopedMixin, Base):
 
     The unique (``dataset_id``, ``id``) key is the target of the dataset-qualified foreign
     keys of ``fact_creative_daily`` and ``lead``, so a row can reference only a creative of
-    its own dataset.
+    its own dataset. ``campaign_id`` is dataset-qualified the same way.
 
     Attributes:
-        campaign_id: The owning :class:`Campaign`.
+        campaign_id: The owning :class:`Campaign`, of the creative's own dataset.
         urn: The creative URN, for example ``urn:li:sponsoredCreative:123``.
         intended_status: The raw LinkedIn ``intendedStatus``, stored as returned.
         post_urn: The URN of the post the creative references, if any.
@@ -438,10 +491,7 @@ class Creative(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "creative"
     __natural_key__: ClassVar[tuple[str, ...]] = ("dataset_id", "urn")
 
-    campaign_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("campaign.id", ondelete="CASCADE"),
-        index=True,
-    )
+    campaign_id: Mapped[int] = mapped_column(index=True)
     urn: Mapped[str]
     intended_status: Mapped[str | None]
     post_urn: Mapped[str | None]
@@ -452,6 +502,12 @@ class Creative(IdPkMixin, DatasetScopedMixin, Base):
 
     __table_args__ = (
         check_in("source", SOURCES),
+        # Dataset-qualified: the campaign must belong to this creative's dataset.
+        sa.ForeignKeyConstraint(
+            ["campaign_id", "dataset_id"],
+            ["campaign.id", "campaign.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("dataset_id", "urn"),
         # Anchors the dataset-qualified (creative_id, dataset_id) foreign keys of child rows.
         sa.UniqueConstraint("dataset_id", "id"),
@@ -465,6 +521,9 @@ class LeadForm(IdPkMixin, DatasetScopedMixin, Base):
     creative call-to-action destinations join on ``canonical_urn``, so every version of a
     form maps to the same asset. A row may first be created from a lead response's form
     decoration, before the ``leadForms`` sync has read the form's name and current version.
+
+    The unique (``dataset_id``, ``id``) key is the target of ``lead_form_version``'s
+    dataset-qualified foreign key, so a version can belong only to a form of its own dataset.
 
     Attributes:
         canonical_urn: The canonical ``urn:li:leadGenForm:{id}``.
@@ -482,6 +541,8 @@ class LeadForm(IdPkMixin, DatasetScopedMixin, Base):
     __table_args__ = (
         check_in("source", SOURCES),
         sa.UniqueConstraint("dataset_id", "canonical_urn"),
+        # Anchors the dataset-qualified (lead_form_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
     )
 
 
@@ -495,14 +556,16 @@ class LeadFormVersion(IdPkMixin, DatasetScopedMixin, Base):
     response's form decoration and from the ``leadForms`` sync of each form's current version.
 
     The natural key is (``lead_form_id``, ``version``), exactly as AAP 0.5.2 states; it is
-    dataset-scoped through ``lead_form_id``, whose form belongs to one dataset. That unique
-    index leads with ``lead_form_id``, so the cascade from :class:`LeadForm` needs no
+    dataset-scoped through ``lead_form_id``, whose form belongs to one dataset: the
+    dataset-qualified foreign key (``lead_form_id``, ``dataset_id``) references the form's
+    unique (``dataset_id``, ``id``), so a version always shares its form's dataset. That
+    unique index leads with ``lead_form_id``, so the cascade from :class:`LeadForm` needs no
     separate index. Because the natural key does not lead with ``dataset_id``, the direct
     ``dataset_id`` cascade from ``source_dataset`` is served by its own index,
     ``ix_lead_form_version_dataset_id``.
 
     Attributes:
-        lead_form_id: The :class:`LeadForm` this version belongs to.
+        lead_form_id: The :class:`LeadForm` this version belongs to, of its own dataset.
         version: The integer form version.
         email_question_ids: Ids of the questions whose ``predefinedField`` is an email field
             (server default ``'{}'::text[]``).
@@ -512,15 +575,19 @@ class LeadFormVersion(IdPkMixin, DatasetScopedMixin, Base):
     __tablename__ = "lead_form_version"
     __natural_key__: ClassVar[tuple[str, ...]] = ("lead_form_id", "version")
 
-    lead_form_id: Mapped[int] = mapped_column(
-        sa.ForeignKey("lead_form.id", ondelete="CASCADE"),
-    )
+    lead_form_id: Mapped[int]
     version: Mapped[int]
     email_question_ids: Mapped[list[str]] = mapped_column(server_default=sa.text("'{}'::text[]"))
     first_seen_at: Mapped[datetime]
 
     __table_args__ = (
         check_in("source", SOURCES),
+        # Dataset-qualified: the form must belong to this version's dataset.
+        sa.ForeignKeyConstraint(
+            ["lead_form_id", "dataset_id"],
+            ["lead_form.id", "lead_form.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.UniqueConstraint("lead_form_id", "version"),
         # The natural key leads with lead_form_id; this serves the purge's dataset_id cascade.
         sa.Index("ix_lead_form_version_dataset_id", "dataset_id"),

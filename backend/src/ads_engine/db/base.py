@@ -369,8 +369,12 @@ class DatasetScopedMixin:
     A foreign key that must stay within the child row's own dataset is, by convention,
     dataset-qualified: the composite (``<parent>_id``, ``dataset_id``) references
     ``<parent>`` (``id``, ``dataset_id``) and is backed by the parent's unique
-    (``dataset_id``, ``id``). The fact tables and ``lead`` reference ``campaign``,
-    ``ad_group``, ``keyword`` and ``creative`` this way, and ``lead_match`` references
+    (``dataset_id``, ``id``). Every key between two rows of one dataset is declared this
+    way: the entity tables' parent keys (to ``ad_account``, ``campaign_group``, ``budget``,
+    ``campaign``, ``ad_group`` and ``lead_form``), the fact tables' and ``lead``'s keys to
+    ``campaign``, ``ad_group``, ``keyword`` and ``creative``, the ``budget_id`` keys of
+    ``entity_snapshot`` and ``decision``, and ``discrepancy``'s keys to ``entity_snapshot``
+    and ``decision``. A ``NULL`` in a nullable key is not checked. ``lead_match`` references
     ``crm_contact`` through (``contact_id``, ``crm_dataset_id``) -> ``crm_contact`` (``id``,
     ``dataset_id``). The database therefore rejects those references across datasets, and
     ``lead_match`` is the only table designed to link two datasets.

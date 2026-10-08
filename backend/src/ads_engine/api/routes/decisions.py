@@ -9,7 +9,9 @@ What this module does, and what it leaves to the domain:
 
 * **Reading** is a single joined statement per request: each ``decision`` row with its
   subject's name, source and currency (:func:`_decision_query`), restricted to the active
-  primary datasets, so decisions about replaced data never reappear in the log.
+  primary datasets, so decisions about replaced data never reappear in the log. The
+  newest-first page is drawn from one bounded index probe per active dataset
+  (:func:`_newest_decision_ids`), so its cost does not grow with the log's history.
 * **Writing** delegates every rule to :func:`ads_engine.decisions.record_decision`: the
   decision shape, the per-shape field rules, the currency's minor unit, empty and no-op
   patches, retired subjects and the rerun request all live there (AAP 0.5.2, 0.3.2). The
@@ -35,10 +37,11 @@ Example:
              "daily_budget": "120.000000", "patch": {"daily_budget": "120.00"}, ...}
 """
 
+from collections.abc import Sequence
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Select, and_, case, distinct, func, select
+from sqlalchemy import BigInteger, Select, and_, case, column, distinct, func, select, true, values
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -177,6 +180,48 @@ def _decision_query() -> Select[DecisionRow, str | None, str | None, str | None]
     )
 
 
+def _newest_decision_ids(
+    dataset_ids: Sequence[int],
+    *,
+    subject_type: schemas.SubjectType | None,
+    limit: int,
+) -> Select[int]:
+    """Return the ids of the newest ``limit`` decisions of each listed dataset.
+
+    One bounded probe per dataset: a ``VALUES`` list of the dataset ids joined ``LATERAL``
+    to ``ORDER BY decided_at DESC, id DESC LIMIT limit``, which
+    ``ix_decision_dataset_decided`` (``dataset_id``, ``decided_at DESC``, ``id DESC``) serves
+    as an index scan that stops after ``limit`` rows, however long the log grows. A single
+    ``dataset_id IN (...)`` with the same order would read and sort every decision of the
+    listed datasets instead, because the index orders rows within one dataset only. With
+    ``subject_type`` the probe skips the other type's rows as it walks the same index.
+
+    The newest ``limit`` rows of the union are exactly the newest ``limit`` rows of all the
+    listed datasets together, since each of them is among its own dataset's newest
+    ``limit``; the caller applies the final order and limit.
+
+    Args:
+        dataset_ids: The datasets to read, at least one.
+        subject_type: Restrict to ``campaign`` or ``budget`` subjects.
+        limit: Rows kept per dataset.
+
+    Returns:
+        ``SELECT id`` of at most ``limit`` decisions per dataset.
+    """
+    listed = values(column("dataset_id", BigInteger), name="listed_dataset").data(
+        [(dataset_id,) for dataset_id in dataset_ids]
+    )
+    newest = select(DecisionRow.id).where(DecisionRow.dataset_id == listed.c.dataset_id)
+    if subject_type is not None:
+        newest = newest.where(DecisionRow.subject_type == subject_type)
+    probe = (
+        newest.order_by(DecisionRow.decided_at.desc(), DecisionRow.id.desc())
+        .limit(limit)
+        .lateral("newest_decision")
+    )
+    return select(probe.c.id).select_from(listed).join(probe, true())
+
+
 def _subject_view(
     row: DecisionRow,
     *,
@@ -271,6 +316,10 @@ async def list_decisions(
     replaced data never reappear. Rows are ordered by ``decided_at`` and then ``id``, both
     descending, so a subject's first row is its current "last decided" state.
 
+    One subject's history is read through ``ix_decision_subject_latest``; the whole log, or
+    one subject type's, through the newest ``limit`` rows of each active dataset
+    (:func:`_newest_decision_ids`), merged into the same order and limit.
+
     Args:
         user: The signed-in user.
         session: The request's session; only read.
@@ -297,11 +346,17 @@ async def list_decisions(
     active_ids = [dataset.id for dataset in (await active_datasets(session)).values()]
     if not active_ids:
         return []
-    statement = _decision_query().where(DecisionRow.dataset_id.in_(active_ids))
-    if subject_type is not None:
-        statement = statement.where(DecisionRow.subject_type == subject_type)
     if subject_id is not None:
-        statement = statement.where(DecisionRow.subject_id == subject_id)
+        # One subject's history, which ix_decision_subject_latest serves directly.
+        statement = _decision_query().where(
+            DecisionRow.dataset_id.in_(active_ids),
+            DecisionRow.subject_type == subject_type,
+            DecisionRow.subject_id == subject_id,
+        )
+    else:
+        # The whole log: bounded per-dataset probes, never a sort of the whole history.
+        newest = _newest_decision_ids(active_ids, subject_type=subject_type, limit=limit)
+        statement = _decision_query().where(DecisionRow.id.in_(newest))
     statement = statement.order_by(DecisionRow.decided_at.desc(), DecisionRow.id.desc()).limit(
         limit
     )
@@ -360,11 +415,11 @@ async def create_decision(
         if not await item_is_current(session, recommendation):
             raise conflict("subject_retired", _HISTORICAL_MESSAGE)
     decision = await record_decision(
-        session,
         SubjectRef(type=body.subject.type, id=body.subject.id),
         # Only the fields the client sent: an absent field keeps its decided value.
         DecisionPatch.from_mapping(body.patch.present_fields()),
         "recommendation" if recommendation_id is not None else "user",
+        session=session,
         decided_by=user.email,
         recommendation_id=recommendation_id,
         note=body.note,

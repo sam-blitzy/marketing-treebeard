@@ -226,13 +226,15 @@ def test_lead_form_version_adds_no_index_leading_with_lead_form_id() -> None:
 
 
 def test_entity_snapshot_keeps_its_history_and_budget_indexes() -> None:
-    """The newest-per-entity index and the budget foreign-key index are unchanged."""
+    """The newest-per-entity index and the budget foreign-key index are unchanged, beside the
+    analysis window's (dataset, type, captured_at) range index."""
     table = _table("entity_snapshot")
     indexes = {str(index.name): index for index in table.indexes}
     assert set(indexes) == {
         "ix_entity_snapshot_entity_captured",
         "ix_entity_snapshot_budget_id",
         "ix_entity_snapshot_dataset_id",
+        "ix_entity_snapshot_dataset_type_captured",
     }
     rendered = {
         name: str(CreateIndex(index).compile(dialect=_PG)).strip()
@@ -245,4 +247,43 @@ def test_entity_snapshot_keeps_its_history_and_budget_indexes() -> None:
     assert rendered["ix_entity_snapshot_budget_id"] == (
         "CREATE INDEX ix_entity_snapshot_budget_id ON entity_snapshot (budget_id)"
     )
-    assert _unique_constraints(table) == []
+    assert rendered["ix_entity_snapshot_dataset_type_captured"] == (
+        "CREATE INDEX ix_entity_snapshot_dataset_type_captured ON entity_snapshot "
+        "(dataset_id, entity_type, captured_at)"
+    )
+    # No natural key: the only unique is (dataset_id, id), the target of discrepancy's
+    # dataset-qualified snapshot key.
+    uniques = {_key_columns(c): str(c.name) for c in _unique_constraints(table)}
+    assert uniques == {("dataset_id", "id"): "uq_entity_snapshot_dataset_id_id"}
+
+
+def test_decision_keeps_its_subject_and_budget_indexes() -> None:
+    """The per-subject history index and the budget foreign-key index are unchanged, beside
+    the log page's per-dataset (dataset_id, decided_at DESC, id DESC) index."""
+    table = _table("decision")
+    indexes = {str(index.name): index for index in table.indexes}
+    assert set(indexes) == {
+        "ix_decision_subject_latest",
+        "ix_decision_budget_id",
+        "ix_decision_dataset_id",
+        "ix_decision_dataset_decided",
+    }
+    rendered = {
+        name: str(CreateIndex(index).compile(dialect=_PG)).strip()
+        for name, index in indexes.items()
+    }
+    assert rendered["ix_decision_subject_latest"] == (
+        "CREATE INDEX ix_decision_subject_latest ON decision "
+        "(subject_type, subject_id, decided_at DESC)"
+    )
+    assert rendered["ix_decision_budget_id"] == (
+        "CREATE INDEX ix_decision_budget_id ON decision (budget_id)"
+    )
+    assert rendered["ix_decision_dataset_decided"] == (
+        "CREATE INDEX ix_decision_dataset_decided ON decision "
+        "(dataset_id, decided_at DESC, id DESC)"
+    )
+    # Inserted, never upserted, so no natural key: the only unique is (dataset_id, id), the
+    # target of discrepancy's dataset-qualified decision key.
+    uniques = {_key_columns(c): str(c.name) for c in _unique_constraints(table)}
+    assert uniques == {("dataset_id", "id"): "uq_decision_dataset_id_id"}

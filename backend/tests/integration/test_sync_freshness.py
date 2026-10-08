@@ -21,7 +21,7 @@ from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 
 import anyio
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -30,6 +30,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from ads_engine.db.base import Base
 from ads_engine.db.models.ops import COMPLETENESS, DATASETS, DatasetFreshness, SourceDataset
+from ads_engine.db.repositories import DatasetNotWritable
 from ads_engine.sync import freshness
 from ads_engine.sync.freshness import (
     PERMANENT_REASONS,
@@ -1482,6 +1483,27 @@ async def test_record_freshness_rejects_unknown_missing_and_foreign_datasets(
             await record_freshness(session, linkedin_id, METRICS, outcome)
 
     assert await _load(sessions, linkedin_id) == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_record_freshness_refuses_a_retired_dataset(sessions: Sessions) -> None:
+    """A retired dataset is read-only: its freshness row is never written again."""
+    dataset_id = await _create_dataset(sessions)
+    await _record(sessions, dataset_id, METRICS, _success(0, (1, 28)))
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(SourceDataset)
+            .where(SourceDataset.id == dataset_id)
+            .values(state="retired", retired_at=_at(1))
+        )
+
+    with pytest.raises(DatasetNotWritable) as refused:
+        await _record(sessions, dataset_id, METRICS, _success(2, (1, 30)))
+
+    assert (refused.value.dataset_id, refused.value.state) == (dataset_id, "retired")
+    loaded = await _load(sessions, dataset_id)
+    assert _state(loaded[METRICS]) == _expected(0, 0, (1, 28), "complete")
 
 
 @pytest.mark.anyio

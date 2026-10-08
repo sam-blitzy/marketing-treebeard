@@ -36,10 +36,12 @@ withholding the guarantee names is set), moved across its threshold in ``does_no
 differ (the coverage twin still emits K1, only without the coverage flag).
 
 Boundaries: imports ``ads_engine.simulation`` (reserved ids), ``simulation.generator``,
-``analysis.context``, ``analysis.window``, ``analysis.thresholds`` and ``db.models.ops`` only. No
-database, network or file writes; building a context reads the three config files at most (through
-:class:`~ads_engine.analysis.thresholds.Thresholds`). Importing the module builds every scenario
-spec but never a world.
+``analysis.context``, ``analysis.window``, ``analysis.thresholds``, ``db.models.ops`` and, for
+the C0 replay, the pure comparison contract of ``ads_engine.decisions`` with the
+``db.models.decisions`` and ``db.models.snapshots`` rows it reads (built transient, never added
+to a session). No database, network or file writes; building a context reads the three config
+files at most (through :class:`~ads_engine.analysis.thresholds.Thresholds`). Importing the
+module builds every scenario spec but never a world.
 
 Example:
     >>> scenario = SCENARIOS["k1.gate.fires"]
@@ -55,7 +57,7 @@ import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Final, Literal, NamedTuple, cast, get_args
 
@@ -166,7 +168,18 @@ from ads_engine.analysis.thresholds import (
     resolve_config_dir,
 )
 from ads_engine.analysis.window import DAY_SOURCES, AnalysisWindow, SourceDayInfo, default_end
+from ads_engine.db.models.decisions import Decision
 from ads_engine.db.models.ops import DATASETS, SOURCES
+from ads_engine.db.models.snapshots import EntitySnapshot
+from ads_engine.decisions import (
+    Mismatch,
+    SubjectState,
+    compare,
+    describe_decision,
+    describe_snapshot,
+    verified_match,
+)
+from ads_engine.decisions import SubjectRef as DecisionRef
 from ads_engine.simulation import (
     DEFAULT_SCENARIO,
     DEFAULT_SEED,
@@ -175,8 +188,6 @@ from ads_engine.simulation import (
     GOOGLE_CAMPAIGN_IDS,
     GOOGLE_CONVERSION_ACTION_IDS,
     GOOGLE_CRITERION_IDS,
-    HUBSPOT_CONTACT_IDS,
-    HUBSPOT_DEAL_IDS,
     LINKEDIN_CAMPAIGN_GROUP_IDS,
     LINKEDIN_CAMPAIGN_IDS,
     LINKEDIN_CREATIVE_IDS,
@@ -226,6 +237,8 @@ from ads_engine.simulation.generator import (
     SegmentValueSpec,
     SimulatedWorld,
     WorldSpec,
+    person_contact_id,
+    person_object_id,
 )
 
 __all__ = [
@@ -373,8 +386,9 @@ _SNAPSHOT_MARGIN: Final = timedelta(days=2)
 # AAP 0.3.2 BACKFILL_DAYS default; freshness coverage starts here.
 _BACKFILL_DAYS: Final = 180
 _ONE_DAY: Final = timedelta(days=1)
-_MICROS: Final = 1_000_000
 _CENT: Final = Decimal("0.01")
+# The scale of every amount column (``numeric(18, 6)``, ``db.base``).
+_STORED_QUANTUM: Final = Decimal("0.000001")
 
 # Normalised campaign statuses, per source (the connectors' status maps; AAP 0.5.2).
 _GOOGLE_STATUS: Final[Mapping[str, str]] = MappingProxyType(
@@ -1256,19 +1270,13 @@ def _epoch_ms(instant: datetime) -> int:
     return int((instant - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1))
 
 
-def _to_micros(amount: Decimal) -> int:
-    """An amount in exact micros (Google budgets are compared at native precision)."""
-    return int((amount * _MICROS).to_integral_value(ROUND_HALF_EVEN))
+def _stored(amount: Decimal | None) -> Decimal | None:
+    """An amount as a ``numeric(18, 6)`` column returns it (``db.base``), at six places.
 
-
-def _minor(amount: Decimal | None) -> Decimal | None:
-    """An amount at the currency's minor unit (LinkedIn budgets are compared in cents)."""
-    return None if amount is None else amount.quantize(_CENT, ROUND_HALF_EVEN)
-
-
-def _json_amount(amount: Decimal | None) -> str | None:
-    """A decided or platform amount as the fixed-point string evidence carries."""
-    return None if amount is None else f"{amount:f}"
+    Discrepancy detection reads the snapshot and decision rows back from the database, so the
+    values it stores carry this exponent; amounts never have more places, so nothing rounds.
+    """
+    return None if amount is None else amount.quantize(_STORED_QUANTUM)
 
 
 def _email_hash(email: str) -> str:
@@ -1363,7 +1371,6 @@ class _Open:
 
     subject: SubjectKey
     source: Source
-    shape: DecisionShape
     kind: DiscrepancyKind
     decided_value: Mapping[str, Any] | None
     platform_value: Mapping[str, Any] | None
@@ -1381,6 +1388,12 @@ class _Platform:
     total_budget: Decimal | None
     amount_micros: int | None
     budget_id: int | None
+    budget_period: str | None
+
+
+# What decides a C0 comparison: the subject, its snapshot's values, the decision, and whether
+# the snapshot was captured after that decision (a tombstone's reappearance).
+type _VerdictKey = tuple[SubjectKey, _Platform, DecisionInfo, bool]
 
 
 # ---------------------------------------------------------------------------
@@ -1432,6 +1445,10 @@ class _Converter:
         self.google_external = self._external_keys("google", "campaign")
         self.linkedin_external = self._external_keys("linkedin", "campaign")
         self.budget_external = self._external_keys("google", "budget")
+        self.budget_external_ids = {
+            self.index.id("google", "budget", key): external
+            for external, key in self.budget_external.items()
+        }
         self.group_external = self._external_keys("google", "ad_group")
         self.criterion_external = self._external_keys("google", "keyword")
         self.creative_external = self._external_keys("linkedin", "creative")
@@ -1595,14 +1612,19 @@ class _Converter:
 
         Each sync writes one snapshot per tracked entity; the first writes the baseline
         decision of every campaign and explicitly shared budget in its own shape (AAP 0.5.2),
-        so the dataset is taken to start at the first snapshot the context reads. Decisions of
-        the spec are recorded at their instants, and after every later sync each subject's
-        newest snapshot is compared with its current decision exactly as discrepancy
-        detection does: ``status`` and ``budget`` mismatches at native precision (Google
-        micros, LinkedIn minor units), ``untracked`` subjects first seen after the baseline,
-        and ``missing`` subjects a complete enumeration no longer returns. A later matching
-        snapshot resolves ``status``, ``budget`` and ``untracked``; ``missing`` closes only by
-        an acknowledged removal or, once ``awaiting_platform``, by a matching snapshot. A
+        so the dataset is taken to start at the first snapshot the context reads. While no
+        enumeration of a source completes, its baseline stays open and a subject first
+        returned later is baselined too (AAP 0.3.3). Decisions of the spec are recorded at
+        their instants, and after every later sync each subject is judged as
+        ``sync.snapshots.detect_discrepancies`` judges it (:meth:`_detect`), through
+        the domain's own pure contract: :func:`~ads_engine.decisions.compare` and
+        :func:`~ads_engine.decisions.verified_match` on transient snapshot and decision rows,
+        with the values :func:`~ads_engine.decisions.describe_snapshot` and
+        :func:`~ads_engine.decisions.describe_decision` store. A mismatch raises its kind or
+        refreshes the unresolved row of that kind (latest values, first ``detected_at``); only
+        a verified match of the whole snapshot closes the subject's ``status``, ``budget`` and
+        ``untracked`` rows, and ``missing`` closes only by an acknowledged removal or, once
+        ``awaiting_platform``, by a verified match from a complete enumeration. A
         :class:`DiscrepancySpec` in state ``awaiting_platform`` that names a discrepancy the
         history has open at its instant records ``decision_correct`` on it there.
         """
@@ -1614,6 +1636,10 @@ class _Converter:
         self.history: dict[SubjectKey, list[DecisionInfo]] = {}
         self.last_platform: dict[SubjectKey, _Platform] = {}
         self.subject_source: dict[SubjectKey, Source] = {}
+        self.subject_currency: dict[SubjectKey, str] = {}
+        self.subject_names: dict[SubjectKey, str] = {}
+        self.decision_rows: dict[DecisionInfo, Decision] = {}
+        self.verdicts: dict[_VerdictKey, tuple[tuple[Mismatch, ...], bool]] = {}
         self.open: dict[tuple[SubjectKey, str], _Open] = {}
         self.google_incomplete = self._entities_incomplete("google")
         self.linkedin_incomplete = self._entities_incomplete("linkedin")
@@ -1709,6 +1735,8 @@ class _Converter:
                 )
                 subject: SubjectKey = ("campaign", campaign_id)
                 self.subject_source[subject] = "google"
+                self.subject_currency[subject] = self.wspec.google.currency
+                self.subject_names[subject] = record.name
                 platform[subject] = _Platform(
                     shape=_shape_of("google", record.budget_explicitly_shared),
                     status=status,
@@ -1716,6 +1744,7 @@ class _Converter:
                     total_budget=record.budget_total_amount,
                     amount_micros=micros,
                     budget_id=budget_id,
+                    budget_period=record.budget_period,
                 )
                 referenced.add(record.budget_key)
             for budget_key in sorted(referenced):
@@ -1744,6 +1773,10 @@ class _Converter:
                 if budget.explicitly_shared:
                     subject = ("budget", budget_id)
                     self.subject_source[subject] = "google"
+                    self.subject_currency[subject] = self.wspec.google.currency
+                    self.subject_names[subject] = (
+                        f"Shared budget {self.budget_external_ids[budget_id]}"
+                    )
                     platform[subject] = _Platform(
                         shape="budget",
                         status=None,
@@ -1751,6 +1784,7 @@ class _Converter:
                         total_budget=budget.total_amount,
                         amount_micros=micros,
                         budget_id=None,
+                        budget_period=budget.period,
                     )
             for keyword in self.world.google_keywords(at):
                 if keyword.status == "REMOVED" or not self.index.has(
@@ -1808,6 +1842,8 @@ class _Converter:
                     )
                     subject = ("campaign", campaign_id)
                     self.subject_source[subject] = "linkedin"
+                    self.subject_currency[subject] = campaign.currency
+                    self.subject_names[subject] = campaign.name
                     platform[subject] = _Platform(
                         shape="own_budget",
                         status=status,
@@ -1815,6 +1851,7 @@ class _Converter:
                         total_budget=campaign.total_budget,
                         amount_micros=None,
                         budget_id=None,
+                        budget_period=None,
                     )
         self.last_platform.update(platform)
         return platform
@@ -1842,7 +1879,8 @@ class _Converter:
         self.history.setdefault(decision.key, []).append(decision)
         self.history[decision.key].sort(key=lambda item: item.decided_at)
         if decision.tombstone:
-            self._resolve(decision.key, "missing", force=True)
+            # acknowledge_removal resolves the missing discrepancy at once (AAP 0.5.4.4).
+            self._close(decision.key, "missing")
 
     def decision_at(self, key: SubjectKey, at: datetime) -> DecisionInfo | None:
         """The latest decision of a subject recorded at or before ``at``."""
@@ -1925,127 +1963,220 @@ class _Converter:
             origin=item.origin,
         )
 
-    @staticmethod
-    def _budget_differs(decision: DecisionInfo, state: _Platform, source: Source) -> bool:
-        """Whether the platform's budget differs from the decision at native precision."""
-        if decision.shape == "shared_member":
-            return decision.budget_id != state.budget_id
-        if source == "google":
-            decided = (
-                decision.daily_budget
-                if decision.daily_budget is not None
-                else decision.total_budget
-            )
-            decided_micros = None if decided is None else _to_micros(decided)
-            return decided_micros != state.amount_micros
-        return _minor(decision.daily_budget) != _minor(state.daily_budget) or _minor(
-            decision.total_budget
-        ) != _minor(state.total_budget)
+    # -- discrepancy detection: the domain's pure C0 contract on transient rows ----------
 
-    @staticmethod
-    def _value(
-        shape: DecisionShape,
-        status: str | None,
-        daily: Decimal | None,
-        total: Decimal | None,
-        budget_id: int | None,
-    ) -> dict[str, Any]:
-        """A decided or platform state as the JSON a discrepancy stores, per shape."""
-        if shape == "budget":
-            return {"daily_budget": _json_amount(daily), "total_budget": _json_amount(total)}
-        if shape == "shared_member":
-            return {"status": status, "budget_id": budget_id}
-        return {
-            "status": status,
-            "daily_budget": _json_amount(daily),
-            "total_budget": _json_amount(total),
-        }
+    def _complete(self, source: Source) -> bool:
+        """Whether every entity enumeration of ``source`` completes (AAP 0.3.3 safe absence).
+
+        A replay's completeness is fixed per source (a persistent enumeration fault or an
+        ``entities`` freshness override), so the dataset's baseline is sealed after its first
+        sync exactly when this holds (``sync.snapshots.baseline_sealed``).
+        """
+        return not (self.google_incomplete if source == "google" else self.linkedin_incomplete)
+
+    def _snapshot_row(self, key: SubjectKey, state: _Platform, at: datetime) -> EntitySnapshot:
+        """This sync's ``entity_snapshot`` of a subject, as a transient row (never stored)."""
+        source = self.subject_source[key]
+        return EntitySnapshot(
+            dataset_id=self.datasets[source].dataset_id,
+            source=source,
+            entity_type=key[0],
+            entity_id=key[1],
+            captured_at=at,
+            status=state.status,
+            budget_daily=_stored(state.daily_budget),
+            budget_total=_stored(state.total_budget),
+            budget_amount_micros=state.amount_micros,
+            budget_id=state.budget_id,
+            payload={},
+        )
+
+    def _decision_row(self, decision: DecisionInfo) -> Decision:
+        """A decision as a transient ``decision`` row (never stored), built once per decision."""
+        row = self.decision_rows.get(decision)
+        if row is None:
+            source = self.subject_source[decision.key]
+            row = Decision(
+                dataset_id=self.datasets[source].dataset_id,
+                source=source,
+                subject_type=decision.subject_type,
+                subject_id=decision.subject_id,
+                shape=decision.shape,
+                status=decision.status,
+                daily_budget=_stored(decision.daily_budget),
+                total_budget=_stored(decision.total_budget),
+                budget_id=decision.budget_id,
+                tombstone=decision.tombstone,
+                decided_at=decision.decided_at,
+                origin=decision.origin,
+                patch={},
+            )
+            self.decision_rows[decision] = row
+        return row
+
+    def _subject_state(
+        self,
+        key: SubjectKey,
+        state: _Platform,
+        decision: DecisionInfo | None,
+        snapshot: EntitySnapshot | None,
+    ) -> SubjectState:
+        """What ``decisions.load_subject_state`` reads for a subject after this sync.
+
+        The entity rows follow the subject's newest snapshot (``state``): its shape, budget
+        period, own budget fields and, for a shared member, the shared budget it draws from.
+        """
+        subject_type, subject_id = key
+        source = self.subject_source[key]
+        member = state.shape == "shared_member"
+        period = (
+            cast(BudgetPeriod, state.budget_period)
+            if state.budget_period in get_args(BudgetPeriod)
+            else None
+        )
+        if source == "linkedin":
+            has_daily = state.daily_budget is not None
+            has_total = state.total_budget is not None
+        else:
+            has_daily = not member and period == "DAILY"
+            has_total = not member and period == "CUSTOM_PERIOD"
+        shared_id = state.budget_id if member else None
+        decided_id = None if decision is None else decision.budget_id
+        return SubjectState(
+            ref=DecisionRef(type=subject_type, id=subject_id),
+            dataset_id=self.datasets[source].dataset_id,
+            dataset_state="active",
+            source="google" if source == "google" else "linkedin",
+            currency=self.subject_currency[key],
+            name=self.subject_names[key],
+            shape=state.shape,
+            has_daily_budget=has_daily,
+            has_total_budget=has_total,
+            budget_period=period,
+            budget_id=shared_id,
+            budget_external_id=None if shared_id is None else self.budget_external_ids[shared_id],
+            latest_snapshot=snapshot,
+            current_decision=None if decision is None else self._decision_row(decision),
+            decided_budget_external_id=(
+                None if decided_id is None else self.budget_external_ids.get(decided_id)
+            ),
+        )
+
+    def _verdict(
+        self, key: SubjectKey, state: _Platform, decision: DecisionInfo, at: datetime
+    ) -> tuple[tuple[Mismatch, ...], bool]:
+        """The mismatches of :func:`~ads_engine.decisions.compare` and its verified match.
+
+        Both read only the snapshot's values, the subject state those values fix, the
+        decision and whether the snapshot was captured after it, so one result serves every
+        sync at which all of them are unchanged.
+        """
+        memo: _VerdictKey = (key, state, decision, at > decision.decided_at)
+        found = self.verdicts.get(memo)
+        if found is None:
+            snapshot = self._snapshot_row(key, state, at)
+            subject = self._subject_state(key, state, decision, snapshot)
+            row = self._decision_row(decision)
+            found = (
+                tuple(compare(snapshot, row, state=subject)),
+                verified_match(snapshot, row, state=subject),
+            )
+            self.verdicts[memo] = found
+        return found
 
     def _raise(
         self,
         key: SubjectKey,
         kind: DiscrepancyKind,
         at: datetime,
-        decision: DecisionInfo | None,
-        state: _Platform | None,
+        decided: Mapping[str, Any] | None,
+        platform: Mapping[str, Any] | None,
     ) -> None:
-        """Open a discrepancy unless one of the same kind is already unresolved."""
-        if (key, kind) in self.open:
+        """Open a discrepancy, or refresh the subject's unresolved one of the same kind.
+
+        As ``decisions.raise_discrepancy`` does, a refreshed row takes this comparison's
+        decided and platform values and keeps its ``detected_at`` and state.
+        """
+        decided_value = None if decided is None else MappingProxyType(dict(decided))
+        platform_value = None if platform is None else MappingProxyType(dict(platform))
+        found = self.open.get((key, kind))
+        if found is not None:
+            self.open[(key, kind)] = replace(
+                found, decided_value=decided_value, platform_value=platform_value
+            )
             return
-        shape: DecisionShape = (
-            decision.shape if decision is not None else cast(_Platform, state).shape
-        )
-        decided = (
-            None
-            if decision is None
-            else self._value(
-                decision.shape,
-                decision.status,
-                decision.daily_budget,
-                decision.total_budget,
-                decision.budget_id,
-            )
-        )
-        platform = (
-            None
-            if state is None
-            else self._value(
-                state.shape, state.status, state.daily_budget, state.total_budget, state.budget_id
-            )
-        )
         self.open[(key, kind)] = _Open(
             subject=key,
             source=self.subject_source[key],
-            shape=shape,
             kind=kind,
-            decided_value=decided,
-            platform_value=platform,
+            decided_value=decided_value,
+            platform_value=platform_value,
             detected_at=at,
         )
 
-    def _resolve(self, key: SubjectKey, kind: str, *, force: bool = False) -> None:
-        """Close an unresolved discrepancy; ``missing`` closes only when forced or awaited."""
-        found = self.open.get((key, kind))
-        if found is None:
+    def _close(self, key: SubjectKey, *kinds: DiscrepancyKind) -> None:
+        """Resolve the subject's unresolved discrepancies of ``kinds``."""
+        for kind in kinds:
+            self.open.pop((key, kind), None)
+
+    def _missing(self, key: SubjectKey, decision: DecisionInfo, at: datetime) -> None:
+        """Judge a tracked subject a complete enumeration did not return.
+
+        ``missing`` against the current decision, valued by
+        :func:`~ads_engine.decisions.describe_decision`; under a tombstone the absence is the
+        acknowledged state, so nothing is raised and the subject's ``status`` and ``budget``
+        rows (a reappearance that went away again) close.
+        """
+        if decision.tombstone:
+            self._close(key, "status", "budget")
             return
-        if kind == "missing" and not force and found.state != "awaiting_platform":
-            return
-        del self.open[(key, kind)]
+        subject = self._subject_state(key, self.last_platform[key], decision, None)
+        decided = describe_decision(self._decision_row(decision), state=subject)
+        self._raise(key, "missing", at, decided, None)
 
     def _detect(
         self, at: datetime, platform: Mapping[SubjectKey, _Platform], tracked: set[SubjectKey]
     ) -> None:
-        """Compare every subject's newest snapshot with its current decision."""
+        """Judge every subject after one entity sync, as ``sync.snapshots`` does.
+
+        A returned subject without a decision is ``untracked`` (valued by
+        :func:`~ads_engine.decisions.describe_snapshot`) once the baseline is sealed, and is
+        baselined while it is open (``ensure_baseline``). A tombstone is judged only on a
+        complete enumeration. Otherwise every mismatch :func:`~ads_engine.decisions.compare`
+        finds is raised or refreshed, and with none the subject's ``status``, ``budget`` and
+        ``untracked`` rows close once :func:`~ads_engine.decisions.verified_match` holds, with
+        an ``awaiting_platform`` ``missing`` row too when the enumeration is complete. A
+        tracked subject a complete enumeration did not return goes to :meth:`_missing`.
+        :meth:`decision_at` never returns a decision recorded after ``at``, so no snapshot
+        here predates the decision it is judged against.
+        """
         for key in sorted(tracked | platform.keys()):
+            complete = self._complete(self.subject_source[key])
             decision = self.decision_at(key, at)
             state = platform.get(key)
-            source = self.subject_source[key]
             if state is None:
-                incomplete = (
-                    self.google_incomplete if source == "google" else self.linkedin_incomplete
-                )
-                if key in tracked and not incomplete and not (decision and decision.tombstone):
-                    self._raise(key, "missing", at, decision, None)
+                if complete and decision is not None:
+                    self._missing(key, decision, at)
                 continue
             if decision is None:
-                if key not in tracked:
-                    self._raise(key, "untracked", at, None, state)
+                if not complete:
+                    self._record(self._baseline(key, state, at))
+                    continue
+                snapshot = self._snapshot_row(key, state, at)
+                subject = self._subject_state(key, state, None, snapshot)
+                self._raise(key, "untracked", at, None, describe_snapshot(snapshot, state=subject))
                 continue
-            status_differs = state.shape != "budget" and state.status != decision.status
-            budget_differs = not decision.tombstone and self._budget_differs(
-                decision, state, source
-            )
-            if status_differs:
-                self._raise(key, "status", at, decision, state)
-            else:
-                self._resolve(key, "status")
-            if budget_differs:
-                self._raise(key, "budget", at, decision, state)
-            else:
-                self._resolve(key, "budget")
-            if not status_differs and not budget_differs:
-                self._resolve(key, "untracked")
-                self._resolve(key, "missing")
+            if decision.tombstone and not complete:
+                continue
+            mismatches, verified = self._verdict(key, state, decision, at)
+            for mismatch in mismatches:
+                self._raise(key, mismatch.kind, at, mismatch.decided_value, mismatch.platform_value)
+            if mismatches or not verified:
+                continue
+            self._close(key, "status", "budget", "untracked")
+            missing = self.open.get((key, "missing"))
+            if missing is not None and missing.state == "awaiting_platform" and complete:
+                self._close(key, "missing")
 
     # -- entities ------------------------------------------------------------------------
 
@@ -3194,7 +3325,9 @@ def context_from_world(
         The analysis context.
 
     Raises:
-        ValueError: When ``now`` is naive, or the spec names an entity the world lacks.
+        ValueError: When ``now`` is naive, the spec names an entity the world lacks, or a
+            recorded decision that a later sync compares breaks its shape's column rules
+            (which the ``decision`` table's check constraint enforces).
         InvalidWindow: When the spec's window is not a valid window at ``now``.
     """
     instant = world.now() if now is None else now
@@ -4472,6 +4605,91 @@ def _c0_scenarios(module: str) -> Iterator[Scenario]:
         ),
         context=tombstone,
     )
+    removed_while_gone = _change("brand", "status", "REMOVED", -60)
+    yield from _pair(
+        "c0.tombstone_ended",
+        module,
+        "C0 acknowledgement: a tombstoned campaign a complete enumeration returns as REMOVED "
+        "(snapshotted as ended) raises a status discrepancy against the tombstone / none while "
+        "it stays absent",
+        fires=(
+            _c0_world(
+                "c0.tombstone_ended",
+                changes=(
+                    _change(
+                        "brand", None, None, -100, disappear=True, reappear_at_offset_hours=-30
+                    ),
+                    removed_while_gone,
+                ),
+            ),
+            Expectation(
+                C0,
+                True,
+                {"kind": "status", "decided": "ended", "platform": "ended", "tombstone": True},
+            ),
+        ),
+        does_not_fire=(
+            _c0_world(
+                "c0.tombstone_ended",
+                changes=(
+                    _change("brand", None, None, -100, disappear=True),
+                    removed_while_gone,
+                ),
+            ),
+            _no_open(),
+        ),
+        context=tombstone,
+    )
+    # Pool B's only member disappears with it; both removals are acknowledged.
+    pool_b_removed = ContextSpec(
+        content_assets=_NO_ASSETS,
+        decisions=(
+            DecisionSpec(
+                SubjectRef("google", "campaign", "member-c"),
+                -90,
+                tombstone=True,
+                origin="resolution",
+            ),
+            DecisionSpec(
+                SubjectRef("google", "budget", "pool-b"), -90, tombstone=True, origin="resolution"
+            ),
+        ),
+    )
+    yield from _pair(
+        "c0.tombstone_budget",
+        module,
+        "C0 acknowledgement: a tombstoned shared budget a complete enumeration returns again "
+        "raises one budget discrepancy against the tombstone, since budget subjects have no "
+        "status / none while it stays absent",
+        fires=(
+            _c0_world(
+                "c0.tombstone_budget",
+                changes=(
+                    _change(
+                        "member-c", None, None, -100, disappear=True, reappear_at_offset_hours=-30
+                    ),
+                ),
+            ),
+            Expectation(
+                C0,
+                True,
+                {
+                    "subject_kinds": (("budget", "budget"), ("campaign", "status")),
+                    "budget_discrepancies": 1,
+                    "member_discrepancies": 1,
+                    "tombstone": True,
+                },
+            ),
+        ),
+        does_not_fire=(
+            _c0_world(
+                "c0.tombstone_budget",
+                changes=(_change("member-c", None, None, -100, disappear=True),),
+            ),
+            _no_open(),
+        ),
+        context=pool_b_removed,
+    )
     awaiting = ContextSpec(
         content_assets=_NO_ASSETS,
         discrepancies=(DiscrepancySpec(_BRAND, "missing", -90, state="awaiting_platform"),),
@@ -4524,6 +4742,55 @@ def _c0_scenarios(module: str) -> Iterator[Scenario]:
         ContextSpec(
             content_assets=_NO_ASSETS,
             discrepancies=(DiscrepancySpec(_BRAND, "budget", -90, state="awaiting_platform"),),
+        ),
+    )
+    paused_and_raised = (
+        _change("brand", "status", "PAUSED", -60),
+        _change("brand-budget", "amount", "120.00", -60),
+        _change("brand", "status", "ENABLED", -30),
+    )
+    yield from _pair(
+        "c0.whole_snapshot",
+        module,
+        "C0 lifecycle: discrepancies close only when the whole snapshot matches, so a status "
+        "that reverts while the budget mismatch remains keeps both open / both reverting "
+        "closes both",
+        fires=(
+            _c0_world("c0.whole_snapshot", changes=paused_and_raised),
+            Expectation(
+                C0, True, {"subject_kinds": (("campaign", "budget"), ("campaign", "status"))}
+            ),
+        ),
+        does_not_fire=(
+            _c0_world(
+                "c0.whole_snapshot",
+                changes=(*paused_and_raised, _change("brand-budget", "amount", "100.00", -30)),
+            ),
+            _no_open(),
+        ),
+    )
+    yield _case(
+        "c0.refreshed_evidence",
+        module,
+        "C0 lifecycle: a later mismatch refreshes the unresolved discrepancy of its kind, so one "
+        "budget discrepancy shows the latest platform amount and keeps its first detection",
+        _c0_world(
+            "c0.refreshed_evidence",
+            changes=(
+                _change("brand-budget", "amount", "120.00", -60),
+                _change("brand-budget", "amount", "130.00", -30),
+            ),
+        ),
+        Expectation(
+            C0,
+            True,
+            {
+                "open": 1,
+                "kind": "budget",
+                "decided_micros": 100_000_000,
+                "platform_micros": 130_000_000,
+                "detected_at_offset_hours": -60,
+            },
         ),
     )
     yield _case(
@@ -6304,8 +6571,7 @@ def _floor_scenarios(module: str, registry: ContextSpec) -> Iterator[Scenario]:
         context=_COHORT_CONTEXT,
     )
     deals = _funnel(deal_share=1, deal_delay_days=(2, 3))
-    first_deal = str(HUBSPOT_DEAL_IDS.at(0))
-    first_contact = str(HUBSPOT_CONTACT_IDS.at(0))
+    first_contact, first_deal = _first_person_ids()
     two_deals = replace(deals, pre_touch_deal_share=Decimal(1))
     yield _case(
         "wp.target_read_partial",
@@ -6980,6 +7246,20 @@ def _lead_response_id(creative_key: str, offset: int, index: int = 0) -> str:
     )
 
 
+def _first_person_ids() -> tuple[str, str]:
+    """The contact id and first deal id of the first person in a one-creative catalogue world.
+
+    In the :func:`_one_paper` and :func:`_sources_world` worlds the only creative is the first
+    of the spec, and its first lead (the only response on day -28, see :data:`_TEN_LEADS`)
+    creates the first person. The ids derive from those coordinates alone
+    (:func:`~ads_engine.simulation.generator.person_contact_id`), so, like
+    :func:`_lead_response_id`, faults and expectations can name them before any world is
+    built; the catalogue tests confirm them through the faults that name them.
+    """
+    contact = person_contact_id(0, FIXED_ANCHOR + timedelta(days=-28), 0)
+    return contact, person_object_id("deals", contact, 0)
+
+
 def _sources_world(name: str, *faults: Fault, funnel: FunnelSpec = _FLAT_FUNNEL) -> WorldSpec:
     """Every source: the K1 search campaign, the capped LinkedIn campaign and a CRM."""
     google = cast(GoogleSpec, _keywords_world(name, target=_target(61)).google)
@@ -7426,7 +7706,7 @@ def _hubspot_client_scenarios(module: str) -> Iterator[Scenario]:
         booked.with_hubspot(association_page_size=1),
         continuation=True,
     )
-    contact = str(HUBSPOT_CONTACT_IDS.at(0))
+    contact = _first_person_ids()[0]
     yield _transport(
         "hubspot.assoc_207",
         module,
@@ -7460,7 +7740,7 @@ def _hubspot_client_scenarios(module: str) -> Iterator[Scenario]:
         ),
         failed_call=True,
     )
-    deal = str(HUBSPOT_DEAL_IDS.at(0))
+    deal = _first_person_ids()[1]
     yield _transport(
         "hubspot.target_omitted",
         module,

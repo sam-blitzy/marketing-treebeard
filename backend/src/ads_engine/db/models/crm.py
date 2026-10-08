@@ -73,6 +73,7 @@ __all__ = [
     "ASSOCIATION_FETCH_STATUSES",
     "CONTACT_READ_STATUSES",
     "CRM_OBJECT_TYPES",
+    "LEAD_MATCH_CLAIMABLE_SQL",
     "LEAD_MATCH_STATUSES",
     "TARGET_READ_STATUSES",
     "CrmAssociation",
@@ -135,6 +136,23 @@ _OK_EMPTY_SHAPE_SQL: Final[str] = (
 _TARGET_READ_OK_COMPLETE_SQL: Final[str] = (
     "target_read_status <> 'ok' OR cardinality(missing_target_ids) = 0"
 )
+
+LEAD_MATCH_CLAIMABLE_SQL: Final[str] = (
+    "(lead_match.status = 'pending' OR (lead_match.status IN ('no_match', 'error')"
+    " AND lead_match.next_attempt_at IS NOT NULL))"
+)
+"""The ``lead_match`` rows matching can still claim: the predicate of ``ix_lead_match_claim``.
+
+``pending`` rows, and ``no_match`` or ``error`` rows with a retry scheduled. ``matched``,
+``no_email`` and rows whose retries stopped (``next_attempt_at IS NULL``) are terminal and
+stay out of the index, so they never sort ahead of due rows in its ``NULLS FIRST`` order.
+The migration repeats this text verbatim, and the claim in ``sync/lead_match.py`` uses it
+as-is next to its due-time test, so PostgreSQL proves the partial index applies to the
+claim under custom and generic plans alike; status tests sent as bind parameters could not
+prove it under a generic plan. Columns are table-qualified because the claim joins tables
+that also have a ``status``, and the outer parentheses keep the text one term wherever it
+is combined with other criteria.
+"""
 
 
 class Lead(IdPkMixin, DatasetScopedMixin, Base):
@@ -218,7 +236,11 @@ class LeadMatch(Base):
 
     ``sync/lead_match.py`` writes these rows directly rather than through a natural-key
     upsert, claiming due rows with ``FOR UPDATE SKIP LOCKED`` and committing per batch, so a
-    crash mid-job loses no state. ``ix_lead_match_due`` serves that claim and also the
+    crash mid-job loses no state. The partial index ``ix_lead_match_claim`` on
+    (``crm_dataset_id``, ``next_attempt_at NULLS FIRST``, ``lead_id``) serves that claim: it
+    holds only the rows :data:`LEAD_MATCH_CLAIMABLE_SQL` admits, in the claim's own order, so
+    each batch reads its rows in order and stops at its limit rather than sorting every due
+    row. ``ix_lead_match_due`` serves the per-status counts of the readiness test and the
     cascade from ``source_dataset``; the primary key serves the cascade from ``lead``, and
     ``ix_lead_match_contact_id`` the cascade from ``crm_contact``.
 
@@ -270,7 +292,8 @@ class LeadMatch(Base):
     )
     status: Mapped[str]
     attempts: Mapped[int] = mapped_column(server_default=sa.text("0"))
-    next_attempt_at: Mapped[datetime | None]
+    # Bound to a name (not annotation-only) so __table_args__ can index it NULLS FIRST.
+    next_attempt_at: Mapped[datetime | None] = mapped_column()
     last_checked_at: Mapped[datetime | None]
     contact_id: Mapped[int | None] = mapped_column(index=True)
     contact_read_status: Mapped[str | None]
@@ -290,6 +313,15 @@ class LeadMatch(Base):
             ondelete="CASCADE",
         ),
         sa.Index("ix_lead_match_due", "crm_dataset_id", "status", "next_attempt_at"),
+        # The claim's due rows in its exact order (next_attempt_at NULLS FIRST, lead_id),
+        # holding claimable rows only, so no terminal row is ever read ahead of a due one.
+        sa.Index(
+            "ix_lead_match_claim",
+            "crm_dataset_id",
+            next_attempt_at.asc().nulls_first(),
+            "lead_id",
+            postgresql_where=sa.text(LEAD_MATCH_CLAIMABLE_SQL),
+        ),
     )
 
 
@@ -309,7 +341,9 @@ class CrmContact(IdPkMixin, DatasetScopedMixin, Base):
 
     ``uq_crm_contact_dataset_id_id`` makes (``dataset_id``, ``id``) a key that
     :class:`LeadMatch` references, so a match can only point at a contact of its own CRM
-    dataset.
+    dataset. ``ix_crm_contact_dataset_google_touch``, partial on ``google_campaign_ref IS NOT
+    NULL``, serves Google-touch discovery: a dataset's Google-linked contacts within a window,
+    read as a ``google_touch_at`` range without visiting the contacts that carry no ref.
 
     Attributes:
         hs_id: The HubSpot contact id.
@@ -346,6 +380,14 @@ class CrmContact(IdPkMixin, DatasetScopedMixin, Base):
         sa.UniqueConstraint("dataset_id", "id"),
         # Lead matching and simulated contact lookups find a dataset's contact by email hash.
         sa.Index("ix_crm_contact_dataset_email", "dataset_id", "email_sha256"),
+        # Google-touch discovery (analysis.metrics._google_touch_contacts): one dataset's
+        # contacts with a campaign ref, by touch-instant range, in touch order.
+        sa.Index(
+            "ix_crm_contact_dataset_google_touch",
+            "dataset_id",
+            "google_touch_at",
+            postgresql_where=sa.text("google_campaign_ref IS NOT NULL"),
+        ),
     )
 
 

@@ -1,7 +1,8 @@
 """Tests for ``ads_engine.sync.snapshots``: snapshots, baselines and C0 discrepancy detection.
 
 The pure parts need no database: the :class:`SnapshotRow` builders and their validation,
-:class:`EnumerationResult` invariants and :class:`DetectionReport`.
+:class:`EnumerationResult` invariants, :class:`DetectionReport`, and
+:func:`~ads_engine.decisions.verified_match`, the match detection closes discrepancies on.
 
 The database tests run against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``). The module creates a private
@@ -22,13 +23,15 @@ enumeration; tombstones; ``awaiting_platform`` auto-resolution.
 
 import os
 import uuid
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections import Counter
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any, TypedDict
 
 import pytest
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -50,10 +53,21 @@ from ads_engine.db.models.ops import SourceDataset
 from ads_engine.db.models.snapshots import EntitySnapshot
 from ads_engine.db.repositories import DatasetNotWritable
 from ads_engine.decisions import (
+    BudgetPeriod,
     DecisionPatch,
+    DecisionShape,
+    DecisionSource,
     SubjectRef,
+    SubjectState,
+    auto_resolve,
+    auto_resolve_absent,
+    compare,
+    load_subject_state,
+    raise_discrepancy,
     record_decision,
     resolve_discrepancy,
+    verified_match,
+    write_baseline,
 )
 from ads_engine.sync import snapshots
 from ads_engine.sync.freshness import REASON_INTERRUPTED, FreshnessOutcome, record_freshness
@@ -420,6 +434,187 @@ def test_detection_report_totals_its_raised_counts() -> None:
         skipped=0,
     )
     assert report.total_raised == 4
+
+
+# ---------------------------------------------------------------------------------------
+# Pure: decisions.verified_match, the match auto_resolve closes on
+# ---------------------------------------------------------------------------------------
+
+CAMPAIGN = SubjectRef(type="campaign", id=10)
+SHARED = SubjectRef(type="budget", id=5)
+OWN_BUDGET_ID = 4
+"""The id of the budget, not explicitly shared, that :data:`CAMPAIGN` draws from."""
+
+
+def _subject(
+    ref: SubjectRef,
+    *,
+    source: DecisionSource = "google",
+    period: BudgetPeriod | None = "DAILY",
+    budget_id: int | None = None,
+) -> SubjectState:
+    """Return a subject's state as ``load_subject_state`` builds it, with no database."""
+    shape: DecisionShape = "own_budget"
+    if ref.type == "budget":
+        shape = "budget"
+    elif budget_id is not None:
+        shape = "shared_member"
+    return SubjectState(
+        ref=ref,
+        dataset_id=1,
+        dataset_state="active",
+        source=source,
+        currency="USD",
+        name=f"{ref.type} {ref.id}",
+        shape=shape,
+        has_daily_budget=shape != "shared_member" and period == "DAILY",
+        has_total_budget=False,
+        budget_period=period,
+        budget_id=budget_id,
+        budget_external_id=None if budget_id is None else "502",
+        latest_snapshot=None,
+        current_decision=None,
+    )
+
+
+def _entity_snapshot(
+    ref: SubjectRef,
+    *,
+    at: datetime,
+    status: str | None = "active",
+    micros: int | None = OWN_MICROS,
+    budget_id: int | None = OWN_BUDGET_ID,
+    source: str = "google",
+    daily: Decimal | None = None,
+) -> EntitySnapshot:
+    """Return an unsaved snapshot, free to carry values the row builders refuse."""
+    return EntitySnapshot(
+        id=900,
+        source=source,
+        dataset_id=1,
+        entity_type=ref.type,
+        entity_id=ref.id,
+        captured_at=at,
+        status=status,
+        budget_daily=daily,
+        budget_total=None,
+        budget_amount_micros=micros,
+        budget_id=budget_id,
+        quality_score=None,
+        payload={},
+    )
+
+
+def _decision(
+    ref: SubjectRef,
+    *,
+    shape: DecisionShape = "own_budget",
+    status: str | None = "active",
+    daily: Decimal | None = Decimal("100"),
+    budget_id: int | None = None,
+    tombstone: bool = False,
+    at: datetime = T0,
+    source: str = "google",
+) -> Decision:
+    """Return an unsaved decision row."""
+    return Decision(
+        id=800,
+        source=source,
+        dataset_id=1,
+        subject_type=ref.type,
+        subject_id=ref.id,
+        shape=shape,
+        status=status,
+        daily_budget=daily,
+        total_budget=None,
+        budget_id=budget_id,
+        tombstone=tombstone,
+        decided_at=at,
+        origin="baseline",
+        patch={},
+    )
+
+
+def test_verified_match_needs_the_status_amount_and_period_known() -> None:
+    state = _subject(CAMPAIGN)
+    decision = _decision(CAMPAIGN)
+    known = _entity_snapshot(CAMPAIGN, at=_at(3))
+    assert compare(known, decision, state=state) == []
+    assert verified_match(known, decision, state=state) is True
+    # compare() raises nothing for a value the snapshot does not report; that is no match.
+    unknown_status = _entity_snapshot(CAMPAIGN, at=_at(3), status=None)
+    omitted_amount = _entity_snapshot(CAMPAIGN, at=_at(3), micros=None)
+    unknown_period = _subject(CAMPAIGN, period=None)
+    for snapshot, subject in (
+        (unknown_status, state),
+        (omitted_amount, state),
+        (known, unknown_period),
+    ):
+        assert compare(snapshot, decision, state=subject) == []
+        assert verified_match(snapshot, decision, state=subject) is False
+    other = _entity_snapshot(SubjectRef(type="campaign", id=11), at=_at(3))
+    with pytest.raises(ValueError, match="describes"):
+        verified_match(other, decision, state=state)
+
+
+def test_verified_match_on_a_shared_budget_needs_its_amount_and_period() -> None:
+    decision = _decision(SHARED, shape="budget", status=None, daily=Decimal("50"))
+    state = _subject(SHARED)
+    known = _entity_snapshot(SHARED, at=_at(3), status=None, micros=SHARED_MICROS, budget_id=None)
+    omitted = _entity_snapshot(SHARED, at=_at(3), status=None, micros=None, budget_id=None)
+    assert verified_match(known, decision, state=state) is True
+    assert compare(omitted, decision, state=state) == []
+    assert verified_match(omitted, decision, state=state) is False
+    assert compare(known, decision, state=_subject(SHARED, period=None)) == []
+    assert verified_match(known, decision, state=_subject(SHARED, period=None)) is False
+
+
+def test_verified_match_on_a_shared_member_needs_only_its_assignment() -> None:
+    member = SubjectRef(type="campaign", id=12)
+    state = _subject(member, budget_id=SHARED.id)
+    decision = _decision(member, shape="shared_member", daily=None, budget_id=SHARED.id)
+    # The shared amount belongs to the budget subject, so an omitted one does not matter.
+    assigned = _entity_snapshot(member, at=_at(3), micros=None, budget_id=SHARED.id)
+    assert verified_match(assigned, decision, state=state) is True
+    unnamed = _entity_snapshot(member, at=_at(3), micros=None, budget_id=None)
+    assert verified_match(unnamed, decision, state=state) is False
+
+
+def test_verified_match_never_matches_a_tombstone() -> None:
+    state = _subject(CAMPAIGN)
+    tombstone = _decision(CAMPAIGN, status="ended", tombstone=True, at=_at(4))
+    before = _entity_snapshot(CAMPAIGN, at=_at(4), status="ended")
+    after = _entity_snapshot(CAMPAIGN, at=_at(6), status="ended")
+    assert compare(before, tombstone, state=state) == []
+    assert verified_match(before, tombstone, state=state) is False
+    assert [mismatch.kind for mismatch in compare(after, tombstone, state=state)] == ["status"]
+    assert verified_match(after, tombstone, state=state) is False
+    budget_tombstone = _decision(
+        SHARED, shape="budget", status=None, daily=Decimal("50"), tombstone=True, at=_at(4)
+    )
+    returned = _entity_snapshot(
+        SHARED, at=_at(6), status=None, micros=SHARED_MICROS, budget_id=None
+    )
+    assert [m.kind for m in compare(returned, budget_tombstone, state=_subject(SHARED))] == [
+        "budget"
+    ]
+    assert verified_match(returned, budget_tombstone, state=_subject(SHARED)) is False
+
+
+def test_verified_match_reads_budgets_the_snapshot_cannot_carry() -> None:
+    # A LinkedIn amount lives on the campaign row: absent there means no such budget.
+    linkedin = _subject(CAMPAIGN, source="linkedin", period=None)
+    bare = _entity_snapshot(CAMPAIGN, at=_at(3), source="linkedin", micros=None, budget_id=None)
+    no_budget = _decision(CAMPAIGN, source="linkedin", daily=None)
+    assert verified_match(bare, no_budget, state=linkedin) is True
+    budgeted = _decision(CAMPAIGN, source="linkedin", daily=Decimal("25.00"))
+    assert verified_match(bare, budgeted, state=linkedin) is False
+    # A Google campaign naming no budget has no amount to verify, unless one was decided.
+    google = _subject(CAMPAIGN, period=None)
+    unbudgeted = _entity_snapshot(CAMPAIGN, at=_at(3), micros=None, budget_id=None)
+    assert verified_match(unbudgeted, _decision(CAMPAIGN, daily=None), state=google) is True
+    assert compare(unbudgeted, _decision(CAMPAIGN), state=google) == []
+    assert verified_match(unbudgeted, _decision(CAMPAIGN), state=google) is False
 
 
 # ---------------------------------------------------------------------------------------
@@ -1272,7 +1467,9 @@ async def test_tombstone_suppresses_missing_until_the_campaign_reappears(
     )
     (missing,) = await _open(sessions, world.dataset_id)
     async with sessions() as session, session.begin():
-        resolved = await resolve_discrepancy(session, missing.id, "acknowledge_removal", now=_at(4))
+        resolved = await resolve_discrepancy(
+            missing.id, "acknowledge_removal", session=session, now=_at(4)
+        )
     assert resolved.state == "resolved"
     still_absent = await _sync(
         sessions, world.dataset_id, absent, at=_at(6), missing_campaigns=frozenset({world.own})
@@ -1293,6 +1490,97 @@ async def test_tombstone_suppresses_missing_until_the_campaign_reappears(
 
 
 @pytest.mark.anyio
+async def test_tombstoned_campaign_returned_as_removed_raises_status(sessions: Sessions) -> None:
+    # AAP 0.5.4.4: "If a complete enumeration later returns it, a status discrepancy is
+    # raised against the tombstone" - the return is the reappearance, even when Q-G2b
+    # returns the campaign as REMOVED and it is snapshotted as ended.
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    absent = _google_rows(world, without=frozenset({world.own}))
+    await _sync(
+        sessions, world.dataset_id, absent, at=_at(3), missing_campaigns=frozenset({world.own})
+    )
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+        await session.execute(
+            update(Campaign)
+            .where(Campaign.id == world.own)
+            .values(status="ended", raw_status="REMOVED")
+        )
+    still_absent = await _sync(
+        sessions, world.dataset_id, absent, at=_at(6), missing_campaigns=frozenset({world.own})
+    )
+    assert still_absent.report.total_raised == 0
+    assert await _open(sessions, world.dataset_id) == []
+    removed_row = SnapshotRow.campaign(
+        source="google",
+        entity_id=world.own,
+        status="ended",
+        raw_status="REMOVED",
+        budget_id=world.own_budget,
+        budget_period="DAILY",
+        budget_amount_micros=OWN_MICROS,
+    )
+    returned = [*absent, removed_row]
+    removed = frozenset({world.own})
+    partial = await _sync(
+        sessions, world.dataset_id, returned, at=_at(9), complete=False, removed=removed
+    )
+    assert partial.report.total_raised == 0
+    assert partial.report.skipped == 1
+    assert await _open(sessions, world.dataset_id) == []
+    complete = await _sync(sessions, world.dataset_id, returned, at=_at(12), removed=removed)
+    assert dict(complete.report.raised) == {"status": 1, "budget": 0, "untracked": 0, "missing": 0}
+    (row,) = await _open(sessions, world.dataset_id)
+    tombstone = (await _decisions(sessions, world.dataset_id))[-1]
+    assert tombstone.tombstone is True
+    assert (row.subject_type, row.subject_id, row.kind, row.state) == (
+        "campaign",
+        world.own,
+        "status",
+        "open",
+    )
+    assert row.decided_value == {"status": "ended", "tombstone": True}
+    assert row.platform_value == {"status": "ended"}
+    assert row.snapshot_id == complete.snapshot_ids[("campaign", world.own)]
+    assert row.decision_id == tombstone.id
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(row.id, "platform_correct", session=session, now=_at(13))
+    adopted = (await _decisions(sessions, world.dataset_id))[-1]
+    assert (adopted.status, adopted.tombstone, adopted.origin) == ("ended", False, "resolution")
+    after = await _sync(sessions, world.dataset_id, returned, at=_at(15), removed=removed)
+    assert after.report.total_raised == 0
+    assert await _open(sessions, world.dataset_id) == []
+
+
+@pytest.mark.anyio
+async def test_tombstoned_shared_budget_returned_raises_budget(sessions: Sessions) -> None:
+    # A budget subject has no status (AAP 0.5.2), so its reappearance is a budget item.
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    absent = [row for row in _google_rows(world) if row.key != ("budget", world.other_shared)]
+    gone = frozenset({world.other_shared})
+    await _sync(sessions, world.dataset_id, absent, at=_at(3), missing_budgets=gone)
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+    still_absent = await _sync(sessions, world.dataset_id, absent, at=_at(6), missing_budgets=gone)
+    assert still_absent.report.total_raised == 0
+    assert await _open(sessions, world.dataset_id) == []
+    returned = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(9))
+    assert dict(returned.report.raised) == {"status": 0, "budget": 1, "untracked": 0, "missing": 0}
+    (row,) = await _open(sessions, world.dataset_id)
+    assert (row.subject_type, row.subject_id, row.kind) == ("budget", world.other_shared, "budget")
+    assert row.decided_value is not None
+    assert row.platform_value is not None
+    assert row.decided_value["tombstone"] is True
+    assert "status" not in row.decided_value
+    assert "status" not in row.platform_value
+    assert row.platform_value["amount_micros"] == 70_000_000
+
+
+@pytest.mark.anyio
 async def test_awaiting_platform_auto_resolves_when_the_platform_matches(
     sessions: Sessions,
 ) -> None:
@@ -1301,7 +1589,7 @@ async def test_awaiting_platform_auto_resolves_when_the_platform_matches(
     await _sync(sessions, world.dataset_id, _google_rows(world, own_status="paused"), at=_at(3))
     (row,) = await _open(sessions, world.dataset_id)
     async with sessions() as session, session.begin():
-        waiting = await resolve_discrepancy(session, row.id, "decision_correct", now=_at(4))
+        waiting = await resolve_discrepancy(row.id, "decision_correct", session=session, now=_at(4))
     assert waiting.state == "awaiting_platform"
     unchanged = await _sync(
         sessions, world.dataset_id, _google_rows(world, own_status="paused"), at=_at(6)
@@ -1321,6 +1609,62 @@ async def test_awaiting_platform_auto_resolves_when_the_platform_matches(
 
 
 @pytest.mark.anyio
+async def test_awaiting_budget_stays_open_while_google_omits_the_amount(
+    sessions: Sessions,
+) -> None:
+    # An omitted amount is unknown, never a match: closing needs the decided amount observed.
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    differing = _google_rows(world, own_micros=OWN_MICROS + 1, shared_micros=60_000_000)
+    raised = await _sync(sessions, world.dataset_id, differing, at=_at(3))
+    assert raised.report.raised["budget"] == 2
+    rows = await _open(sessions, world.dataset_id)
+    assert _kinds(rows) == [
+        ("campaign", world.own, "budget"),
+        ("budget", world.shared_budget, "budget"),
+    ]
+    async with sessions() as session, session.begin():
+        for row in rows:
+            waiting = await resolve_discrepancy(
+                row.id, "decision_correct", session=session, now=_at(4)
+            )
+            assert waiting.state == "awaiting_platform"
+    unreported = {("campaign", world.own), ("budget", world.shared_budget)}
+    omitted = [
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=world.own,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=world.own_budget,
+            budget_period="DAILY",
+            budget_amount_micros=None,
+        ),
+        SnapshotRow.budget(
+            entity_id=world.shared_budget,
+            period="DAILY",
+            amount_micros=None,
+            explicitly_shared=True,
+        ),
+        *(row for row in _google_rows(world) if row.key not in unreported),
+    ]
+    blind = await _sync(sessions, world.dataset_id, omitted, at=_at(6))
+    assert blind.report.total_raised == 0
+    assert blind.report.auto_resolved == 0
+    still = await _open(sessions, world.dataset_id)
+    assert [(row.id, row.state) for row in still] == [(row.id, "awaiting_platform") for row in rows]
+    matched = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(9))
+    assert matched.report.auto_resolved == 2
+    assert await _open(sessions, world.dataset_id) == []
+    async with sessions() as session:
+        closed = [await session.get(Discrepancy, row.id) for row in rows]
+    assert [(row.state, row.resolution, row.resolved_at) for row in closed if row] == [
+        ("resolved", "decision_correct", _at(9)),
+        ("resolved", "decision_correct", _at(9)),
+    ]
+
+
+@pytest.mark.anyio
 async def test_missing_after_decision_correct_closes_on_a_complete_return(
     sessions: Sessions,
 ) -> None:
@@ -1332,7 +1676,7 @@ async def test_missing_after_decision_correct_closes_on_a_complete_return(
     )
     (missing,) = await _open(sessions, world.dataset_id)
     async with sessions() as session, session.begin():
-        await resolve_discrepancy(session, missing.id, "decision_correct", now=_at(4))
+        await resolve_discrepancy(missing.id, "decision_correct", session=session, now=_at(4))
     partial = await _sync(
         sessions, world.dataset_id, _google_rows(world), at=_at(6), complete=False
     )
@@ -1353,10 +1697,10 @@ async def test_a_snapshot_older_than_the_decision_is_not_judged(sessions: Sessio
         )
         # The user pauses the campaign in Google and records it while this sync is running.
         await record_decision(
-            session,
             SubjectRef(type="campaign", id=world.own),
             DecisionPatch(status="paused"),
             origin="user",
+            session=session,
             decided_by="ops@example.com",
             now=_at(3.5),
         )
@@ -1521,3 +1865,630 @@ async def test_detection_refuses_inconsistent_input(sessions: Sessions) -> None:
                 session, world.dataset_id, present, wrong, sealed=False, now=_at(0)
             )
         await session.rollback()
+
+
+# ---------------------------------------------------------------------------------------
+# Database: set-based baseline and detection
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ManyWorld:
+    """A Google dataset with ``count`` own-budget campaigns and two shared budgets."""
+
+    dataset_id: int
+    campaigns: tuple[int, ...]
+    budgets: tuple[int, ...]
+    members: tuple[int, ...]
+    shared: tuple[int, ...]
+
+
+async def _many_world(sessions: Sessions, count: int) -> ManyWorld:
+    """Commit an active Google dataset with ``count`` own-budget campaigns, each on its own
+    budget, plus two explicitly shared budgets with two members each."""
+    async with sessions() as session, session.begin():
+        dataset_id = await _dataset(session, "google")
+        account = AdAccount(
+            source="google",
+            dataset_id=dataset_id,
+            external_id="1234567890",
+            name="Acme",
+            currency="USD",
+            timezone="America/New_York",
+        )
+        session.add(account)
+        await session.flush()
+        budgets = [
+            await _budget(session, dataset_id, f"9{index}", OWN_MICROS, shared=False)
+            for index in range(count)
+        ]
+        shared = [
+            await _budget(session, dataset_id, f"8{index}", SHARED_MICROS, shared=True)
+            for index in range(2)
+        ]
+        campaigns = [
+            await _google_campaign(
+                session, dataset_id, account.id, f"c{index}", budget, own_micros=OWN_MICROS
+            )
+            for index, budget in enumerate(budgets)
+        ]
+        members = [
+            await _google_campaign(session, dataset_id, account.id, f"m{index}", shared[index % 2])
+            for index in range(4)
+        ]
+        return ManyWorld(
+            dataset_id=dataset_id,
+            campaigns=tuple(campaigns),
+            budgets=tuple(budgets),
+            members=tuple(members),
+            shared=tuple(shared),
+        )
+
+
+def _many_rows(world: ManyWorld, *, paused: frozenset[int] = frozenset()) -> list[SnapshotRow]:
+    """Return one sync's snapshot rows for a :class:`ManyWorld`."""
+    rows = [
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=campaign,
+            status="paused" if campaign in paused else "active",
+            raw_status="PAUSED" if campaign in paused else "ENABLED",
+            budget_id=budget,
+            budget_period="DAILY",
+            budget_amount_micros=OWN_MICROS,
+        )
+        for campaign, budget in zip(world.campaigns, world.budgets, strict=True)
+    ]
+    rows.extend(
+        SnapshotRow.campaign(
+            source="google",
+            entity_id=member,
+            status="active",
+            raw_status="ENABLED",
+            budget_id=world.shared[index % 2],
+            budget_period="DAILY",
+            budget_amount_micros=SHARED_MICROS,
+            explicitly_shared=True,
+        )
+        for index, member in enumerate(world.members)
+    )
+    rows.extend(
+        SnapshotRow.budget(
+            entity_id=budget, period="DAILY", amount_micros=OWN_MICROS, explicitly_shared=False
+        )
+        for budget in world.budgets
+    )
+    rows.extend(
+        SnapshotRow.budget(
+            entity_id=budget, period="DAILY", amount_micros=SHARED_MICROS, explicitly_shared=True
+        )
+        for budget in world.shared
+    )
+    return rows
+
+
+async def _requests(session: AsyncSession) -> Counter[str]:
+    """Return the number of ``analysis_request`` rows per reason."""
+    result = await session.execute(
+        select(AnalysisRequest.reason, func.count()).group_by(AnalysisRequest.reason)
+    )
+    counts: Counter[str] = Counter()
+    for reason, total in result:
+        counts[reason] = total
+    return counts
+
+
+@dataclass(frozen=True)
+class CountedSync:
+    """One entity sync with the statements its baseline and detection steps sent."""
+
+    result: SyncResult
+    baseline_statements: int
+    detection_statements: int
+    requests: Counter[str]
+
+
+async def _counted_sync(
+    sessions: Sessions, dataset_id: int, rows: Sequence[SnapshotRow], *, at: datetime
+) -> CountedSync:
+    """Run one complete Google entity sync, counting the statements of baseline and detection
+    and the analysis requests the sync queued."""
+    engine = sessions.kw["bind"]
+    step: list[str] = ["idle"]
+    counts: Counter[str] = Counter()
+
+    def count(*_: object) -> None:
+        counts[step[0]] += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        async with sessions() as session, session.begin():
+            before = await _requests(session)
+            sealed = await baseline_sealed(session, dataset_id)
+            ids = await write_snapshots(session, dataset_id, rows, captured_at=at)
+            step[0] = "baseline"
+            baselines = await ensure_baseline(session, dataset_id, captured_at=at, sealed=sealed)
+            step[0] = "idle"
+            enumeration = EnumerationResult(
+                source="google",
+                complete=True,
+                present_campaign_ids=frozenset(
+                    row.entity_id for row in rows if row.entity_type == "campaign"
+                ),
+                present_budget_ids=frozenset(
+                    row.entity_id for row in rows if row.entity_type == "budget"
+                ),
+            )
+            step[0] = "detection"
+            report = await detect_discrepancies(
+                session, dataset_id, enumeration, ids, sealed=sealed, now=at
+            )
+            step[0] = "idle"
+            after = await _requests(session)
+            await record_freshness(
+                session,
+                dataset_id,
+                "google.entities",
+                FreshnessOutcome.success(
+                    at, covered_from=None, covered_through=None, complete=True
+                ),
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    return CountedSync(
+        result=SyncResult(sealed=sealed, baselines=baselines, report=report, snapshot_ids=ids),
+        baseline_statements=counts["baseline"],
+        detection_statements=counts["detection"],
+        requests=after - before,
+    )
+
+
+@pytest.mark.anyio
+async def test_baseline_and_detection_statements_do_not_grow_with_the_subjects(
+    sessions: Sessions,
+) -> None:
+    runs: dict[int, list[CountedSync]] = {}
+    for count in (10, 200):
+        world = await _many_world(sessions, count)
+        paused = frozenset(world.campaigns[:5])
+        runs[count] = [
+            await _counted_sync(sessions, world.dataset_id, _many_rows(world), at=_at(0)),
+            await _counted_sync(sessions, world.dataset_id, _many_rows(world), at=_at(3)),
+            await _counted_sync(
+                sessions, world.dataset_id, _many_rows(world, paused=paused), at=_at(6)
+            ),
+            await _counted_sync(
+                sessions, world.dataset_id, _many_rows(world, paused=paused), at=_at(9)
+            ),
+            await _counted_sync(sessions, world.dataset_id, _many_rows(world), at=_at(12)),
+        ]
+        first, unchanged, changed, again, restored = runs[count]
+        assert (first.result.sealed, first.result.baselines) == (False, count + 6)
+        assert first.result.report.total_raised == 0
+        assert unchanged.result.report.total_raised == 0
+        assert unchanged.result.report.checked == count + 6
+        assert changed.result.report.raised["status"] == 5
+        assert changed.requests["discrepancy_created"] == 1
+        assert (again.result.report.total_raised, again.result.report.refreshed) == (0, 5)
+        assert again.requests["discrepancy_created"] == 0
+        assert restored.result.report.auto_resolved == 5
+        assert restored.requests["discrepancy_resolved"] == 1
+        assert await _open(sessions, world.dataset_id) == []
+    small = [(run.baseline_statements, run.detection_statements) for run in runs[10]]
+    large = [(run.baseline_statements, run.detection_statements) for run in runs[200]]
+    assert small == large
+    # Reads are a fixed handful; writes follow only the rows created or changed.
+    first, unchanged, changed, again, restored = runs[200]
+    assert first.baseline_statements <= 20
+    assert unchanged.detection_statements <= 15
+    assert changed.detection_statements - unchanged.detection_statements <= 5 * 3 + 1
+    assert restored.detection_statements - unchanged.detection_statements <= 5 + 1
+
+
+# ---------------------------------------------------------------------------------------
+# Database: a baseline deferred while the baseline was open
+# ---------------------------------------------------------------------------------------
+
+
+def _shared_unreported(world: GoogleWorld) -> list[SnapshotRow]:
+    """Return the world's rows with the shared budget's amount omitted by Google."""
+    return [
+        row
+        if row.key != ("budget", world.shared_budget)
+        else SnapshotRow.budget(
+            entity_id=world.shared_budget,
+            period="DAILY",
+            amount_micros=None,
+            explicitly_shared=True,
+        )
+        for row in _google_rows(world)
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_baseline_deferred_by_the_sealing_sync_is_written_once_known(
+    sessions: Sessions,
+) -> None:
+    # The first, complete sync seals the baseline although Google omitted the shared
+    # budget's amount; the budget was observed with the baseline population, so it is
+    # baselined once an amount is reported and is never untracked (AAP 0.5.4.4).
+    world = await _google_world(sessions)
+    first = await _sync(sessions, world.dataset_id, _shared_unreported(world), at=_at(0))
+    assert (first.sealed, first.baselines, first.report.skipped) == (False, 4, 1)
+    still_unknown = await _sync(sessions, world.dataset_id, _shared_unreported(world), at=_at(3))
+    assert (still_unknown.sealed, still_unknown.baselines) == (True, 0)
+    assert still_unknown.report.total_raised == 0
+    assert still_unknown.report.skipped == 1
+    assert await _open(sessions, world.dataset_id) == []
+    known = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    assert (known.sealed, known.baselines) == (True, 1)
+    assert known.report.total_raised == 0
+    assert known.report.skipped == 0
+    assert await _open(sessions, world.dataset_id) == []
+    baseline = [
+        row
+        for row in await _decisions(sessions, world.dataset_id)
+        if (row.subject_type, row.subject_id) == ("budget", world.shared_budget)
+    ]
+    assert [(row.origin, row.shape, row.daily_budget, row.decided_at) for row in baseline] == [
+        ("baseline", "budget", Decimal("50.000000"), _at(6))
+    ]
+    changed = await _sync(
+        sessions, world.dataset_id, _google_rows(world, shared_micros=60_000_000), at=_at(9)
+    )
+    assert dict(changed.report.raised) == {"status": 0, "budget": 1, "untracked": 0, "missing": 0}
+
+
+@pytest.mark.anyio
+async def test_subjects_first_seen_as_subjects_after_the_seal_stay_untracked(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    async with sessions() as session, session.begin():
+        later_shared = await _budget(session, world.dataset_id, "505", 40_000_000, shared=False)
+    unshared_row = SnapshotRow.budget(
+        entity_id=later_shared, period="DAILY", amount_micros=40_000_000, explicitly_shared=False
+    )
+    first = await _sync(sessions, world.dataset_id, [*_google_rows(world), unshared_row], at=_at(0))
+    assert first.baselines == 5
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(Budget).where(Budget.id == later_shared).values(explicitly_shared=True)
+        )
+        new_shared = await _budget(session, world.dataset_id, "506", 30_000_000, shared=True)
+    rows = [
+        *_google_rows(world),
+        SnapshotRow.budget(
+            entity_id=later_shared,
+            period="DAILY",
+            amount_micros=40_000_000,
+            explicitly_shared=True,
+        ),
+        SnapshotRow.budget(
+            entity_id=new_shared, period="DAILY", amount_micros=30_000_000, explicitly_shared=True
+        ),
+    ]
+    second = await _sync(sessions, world.dataset_id, rows, at=_at(3))
+    assert (second.sealed, second.baselines) == (True, 0)
+    assert dict(second.report.raised) == {"status": 0, "budget": 0, "untracked": 2, "missing": 0}
+    assert sorted(_kinds(await _open(sessions, world.dataset_id))) == [
+        ("budget", later_shared, "untracked"),
+        ("budget", new_shared, "untracked"),
+    ]
+    third = await _sync(sessions, world.dataset_id, rows, at=_at(6))
+    assert (third.baselines, third.report.total_raised, third.report.refreshed) == (0, 0, 2)
+
+
+# ---------------------------------------------------------------------------------------
+# Database: the untracked row waiting after record_intended
+# ---------------------------------------------------------------------------------------
+
+
+def _late_campaign_row(campaign_id: int, budget_id: int, status: str, micros: int) -> SnapshotRow:
+    """Return a Google own-budget campaign snapshot with the given status and amount."""
+    return SnapshotRow.campaign(
+        source="google",
+        entity_id=campaign_id,
+        status=status,
+        raw_status="ENABLED" if status == "active" else "PAUSED",
+        budget_id=budget_id,
+        budget_period="DAILY",
+        budget_amount_micros=micros,
+    )
+
+
+def _amounts(value: dict[str, object] | None) -> tuple[object, Decimal | None, object]:
+    """Return a stored value's status, daily budget and micros, the budget as a Decimal."""
+    assert value is not None
+    daily = value["daily_budget"]
+    assert daily is None or isinstance(daily, str)
+    return value["status"], None if daily is None else Decimal(daily), value["amount_micros"]
+
+
+@pytest.mark.anyio
+async def test_the_waiting_untracked_row_shows_the_current_platform_and_decision(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    async with sessions() as session, session.begin():
+        late_budget = await _budget(session, world.dataset_id, "507", OWN_MICROS, shared=False)
+        late = await _google_campaign(
+            session, world.dataset_id, world.account_id, "17", late_budget, own_micros=OWN_MICROS
+        )
+
+    def rows(status: str, micros: int) -> list[SnapshotRow]:
+        return [
+            *_google_rows(world),
+            _late_campaign_row(late, late_budget, status, micros),
+            SnapshotRow.budget(
+                entity_id=late_budget, period="DAILY", amount_micros=micros, explicitly_shared=False
+            ),
+        ]
+
+    seen = await _sync(sessions, world.dataset_id, rows("active", OWN_MICROS), at=_at(3))
+    assert seen.report.raised["untracked"] == 1
+    (untracked,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        waiting = await resolve_discrepancy(
+            untracked.id,
+            "record_intended",
+            {"status": "paused", "daily_budget": "120"},
+            session=session,
+            now=_at(4),
+        )
+        intended_id = waiting.decision_id
+    assert intended_id is not None
+
+    # The budget converges to the intended 120 while the status still differs: the card
+    # shows the platform's complete current state, not the stale 100.
+    converged = await _sync(sessions, world.dataset_id, rows("active", 120_000_000), at=_at(6))
+    assert (converged.report.total_raised, converged.report.refreshed) == (0, 1)
+    (row,) = await _open(sessions, world.dataset_id)
+    assert (row.id, row.kind, row.state, row.resolution, row.detected_at) == (
+        untracked.id,
+        "untracked",
+        "awaiting_platform",
+        "record_intended",
+        _at(3),
+    )
+    assert _amounts(row.platform_value) == ("active", Decimal(120), 120_000_000)
+    assert _amounts(row.decided_value) == ("paused", Decimal(120), 120_000_000)
+    assert row.platform_value is not None
+    assert row.platform_value["currency"] == "USD"
+    assert row.snapshot_id == converged.snapshot_ids[("campaign", late)]
+    assert row.decision_id == intended_id
+
+    # A later ordinary decision replaces the intended state on the waiting card.
+    async with sessions() as session, session.begin():
+        later = await record_decision(
+            SubjectRef(type="campaign", id=late),
+            DecisionPatch(daily_budget=Decimal(130)),
+            origin="user",
+            session=session,
+            decided_by="ops@example.com",
+            now=_at(7),
+        )
+        later_id = later.id
+    differing = await _sync(sessions, world.dataset_id, rows("active", 120_000_000), at=_at(9))
+    assert (differing.report.total_raised, differing.report.refreshed) == (0, 2)
+    (row,) = await _open(sessions, world.dataset_id)
+    assert row.id == untracked.id
+    assert _amounts(row.decided_value) == ("paused", Decimal(130), 130_000_000)
+    assert _amounts(row.platform_value) == ("active", Decimal(120), 120_000_000)
+    assert (row.decision_id, row.snapshot_id) == (
+        later_id,
+        differing.snapshot_ids[("campaign", late)],
+    )
+
+    # Called on its own, raise_discrepancy loads the subject and the compared snapshot.
+    first_seen = seen.snapshot_ids[("campaign", late)]
+    async with sessions() as session, session.begin():
+        folded = await raise_discrepancy(
+            session,
+            SubjectRef(type="campaign", id=late),
+            "status",
+            decided_value={"status": "paused"},
+            platform_value={"status": "active"},
+            snapshot_id=first_seen,
+            decision_id=later_id,
+            detected_at=_at(10),
+        )
+        assert (folded.id, folded.snapshot_id, folded.decision_id) == (
+            untracked.id,
+            first_seen,
+            later_id,
+        )
+        assert _amounts(folded.platform_value) == ("active", Decimal(100), OWN_MICROS)
+        assert _amounts(folded.decided_value) == ("paused", Decimal(130), 130_000_000)
+        assert folded.detected_at == _at(3)
+        # Measured against an older decision and no snapshot, the decided side is that
+        # decision and the reported platform fields are merged into the stored ones.
+        older = await raise_discrepancy(
+            session,
+            SubjectRef(type="campaign", id=late),
+            "status",
+            decided_value={"status": "paused"},
+            platform_value={"status": "ended"},
+            snapshot_id=None,
+            decision_id=intended_id,
+            detected_at=_at(10),
+        )
+        assert (older.id, older.snapshot_id, older.decision_id) == (untracked.id, None, intended_id)
+        assert _amounts(older.platform_value) == ("ended", Decimal(100), OWN_MICROS)
+        assert _amounts(older.decided_value) == ("paused", Decimal(120), 120_000_000)
+
+    matched = await _sync(sessions, world.dataset_id, rows("paused", 130_000_000), at=_at(12))
+    assert matched.report.auto_resolved == 1
+    assert await _open(sessions, world.dataset_id) == []
+    async with sessions() as session:
+        closed = await session.get(Discrepancy, untracked.id)
+    assert closed is not None
+    assert (closed.state, closed.resolution, closed.resolved_at) == (
+        "resolved",
+        "record_intended",
+        _at(12),
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Database: a tombstoned subject absent again
+# ---------------------------------------------------------------------------------------
+
+
+async def _closed(
+    sessions: Sessions, discrepancy_id: int
+) -> tuple[str, str | None, datetime | None]:
+    """Return a discrepancy's state, resolution and resolution instant."""
+    async with sessions() as session:
+        row = await session.get(Discrepancy, discrepancy_id)
+    assert row is not None
+    return row.state, row.resolution, row.resolved_at
+
+
+@pytest.mark.anyio
+async def test_renewed_absence_closes_the_reappearance_against_a_tombstone(
+    sessions: Sessions,
+) -> None:
+    # The tombstone records that the campaign is gone, so a complete enumeration that no
+    # longer returns it matches the tombstone: the reappearance item closes, open or
+    # waiting after decision_correct, and no missing is raised.
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    absent = _google_rows(world, without=frozenset({world.own}))
+    gone = frozenset({world.own})
+    await _sync(sessions, world.dataset_id, absent, at=_at(3), missing_campaigns=gone)
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+    back = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    assert back.report.raised["status"] == 1
+    (reappeared,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session:
+        before = await _requests(session)
+    absent_again = await _sync(
+        sessions, world.dataset_id, absent, at=_at(9), missing_campaigns=gone
+    )
+    assert absent_again.report.total_raised == 0
+    assert (absent_again.report.auto_resolved, absent_again.report.skipped) == (1, 1)
+    assert await _open(sessions, world.dataset_id) == []
+    assert await _closed(sessions, reappeared.id) == ("resolved", None, _at(9))
+    async with sessions() as session:
+        after = await _requests(session)
+    assert (after - before)["discrepancy_resolved"] == 1
+
+    returned = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(12))
+    assert returned.report.raised["status"] == 1
+    (again,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(again.id, "decision_correct", session=session, now=_at(13))
+    partial = await _sync(sessions, world.dataset_id, absent, at=_at(15), complete=False)
+    assert (partial.report.auto_resolved, partial.report.total_raised) == (0, 0)
+    assert [row.state for row in await _open(sessions, world.dataset_id)] == ["awaiting_platform"]
+    confirmed = await _sync(sessions, world.dataset_id, absent, at=_at(18), missing_campaigns=gone)
+    assert (confirmed.report.auto_resolved, confirmed.report.total_raised) == (1, 0)
+    assert await _closed(sessions, again.id) == ("resolved", "decision_correct", _at(18))
+    assert await _open(sessions, world.dataset_id) == []
+
+
+@pytest.mark.anyio
+async def test_renewed_absence_closes_a_tombstoned_shared_budget_item(sessions: Sessions) -> None:
+    world = await _google_world(sessions)
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    absent = [row for row in _google_rows(world) if row.key != ("budget", world.other_shared)]
+    gone = frozenset({world.other_shared})
+    await _sync(sessions, world.dataset_id, absent, at=_at(3), missing_budgets=gone)
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+    back = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    assert back.report.raised["budget"] == 1
+    (reappeared,) = await _open(sessions, world.dataset_id)
+    absent_again = await _sync(sessions, world.dataset_id, absent, at=_at(9), missing_budgets=gone)
+    assert (absent_again.report.auto_resolved, absent_again.report.total_raised) == (1, 0)
+    assert await _closed(sessions, reappeared.id) == ("resolved", None, _at(9))
+    assert await _open(sessions, world.dataset_id) == []
+
+
+# ---------------------------------------------------------------------------------------
+# Database: the detection-side helpers without preloaded input
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_discrepancy_of_an_unknown_subject_type_is_refused() -> None:
+    row = Discrepancy(id=7, subject_type="keyword", subject_id=1, kind="status")
+    with pytest.raises(ValueError, match="unknown subject type"):
+        snapshots._discrepancy_subject(row)
+
+
+class Comparison(TypedDict):
+    """The comparison keywords of :func:`raise_discrepancy`, typed as its signature takes them."""
+
+    decided_value: Mapping[str, Any] | None
+    platform_value: Mapping[str, Any] | None
+    snapshot_id: int | None
+    decision_id: int | None
+    detected_at: datetime
+
+
+@pytest.mark.anyio
+async def test_detection_helpers_work_standalone_and_check_preloaded_input(
+    sessions: Sessions,
+) -> None:
+    world = await _google_world(sessions)
+    first = await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(0))
+    own = SubjectRef(type="campaign", id=world.own)
+    member = SubjectRef(type="campaign", id=world.member_a)
+    snapshot_id = first.snapshot_ids[("campaign", world.own)]
+    async with sessions() as session, session.begin():
+        own_state = await load_subject_state(session, own)
+        member_state = await load_subject_state(session, member)
+        decision = own_state.current_decision
+        snapshot = own_state.latest_snapshot
+        assert decision is not None
+        assert snapshot is not None
+        assert snapshot.id == snapshot_id
+        values: Comparison = {
+            "decided_value": {"status": "active"},
+            "platform_value": {"status": "paused"},
+            "snapshot_id": snapshot_id,
+            "decision_id": decision.id,
+            "detected_at": _at(1),
+        }
+        with pytest.raises(ValueError, match="state describes"):
+            await raise_discrepancy(session, own, "status", **values, state=member_state)
+        with pytest.raises(ValueError, match="state describes"):
+            await write_baseline(session, own, snapshot, now=_at(1), state=member_state)
+        before = await _requests(session)
+        row = await raise_discrepancy(session, own, "status", **values)
+        assert (row.state, row.kind, row.detected_at) == ("open", "status", _at(1))
+        with pytest.raises(ValueError, match="belongs to campaign"):
+            await raise_discrepancy(session, member, "status", **values, unresolved=[row])
+        with pytest.raises(ValueError, match="belongs to campaign"):
+            await auto_resolve_absent(session, member, decision, now=_at(2))
+        assert await auto_resolve_absent(session, own, decision, now=_at(2)) == []
+        closed = await auto_resolve(session, own, snapshot, decision, now=_at(2))
+        assert [item.id for item in closed] == [row.id]
+        assert (row.state, row.resolved_at) == ("resolved", _at(2))
+        requests = await _requests(session) - before
+        assert (requests["discrepancy_created"], requests["discrepancy_resolved"]) == (1, 1)
+        await session.rollback()
+
+    # A tombstone's renewed absence closes its status item standalone, queueing its own rerun.
+    absent = _google_rows(world, without=frozenset({world.own}))
+    gone = frozenset({world.own})
+    await _sync(sessions, world.dataset_id, absent, at=_at(3), missing_campaigns=gone)
+    (missing,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        await resolve_discrepancy(missing.id, "acknowledge_removal", session=session, now=_at(4))
+    await _sync(sessions, world.dataset_id, _google_rows(world), at=_at(6))
+    (reappeared,) = await _open(sessions, world.dataset_id)
+    async with sessions() as session, session.begin():
+        tombstone = (await load_subject_state(session, own)).current_decision
+        assert tombstone is not None
+        assert tombstone.tombstone is True
+        before = await _requests(session)
+        closed = await auto_resolve_absent(session, own, tombstone, now=_at(7))
+        assert [item.id for item in closed] == [reappeared.id]
+        assert (await _requests(session) - before)["discrepancy_resolved"] == 1
+    assert await _open(sessions, world.dataset_id) == []

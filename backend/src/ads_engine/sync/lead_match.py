@@ -76,7 +76,7 @@ from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import distinct_on, insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -95,7 +95,13 @@ from ads_engine.connectors.linkedin.parser import (
 )
 from ads_engine.db import repositories
 from ads_engine.db.models.accounts import AdAccount, Campaign, LeadForm, LeadFormVersion
-from ads_engine.db.models.crm import LEAD_MATCH_STATUSES, CrmContact, Lead, LeadMatch
+from ads_engine.db.models.crm import (
+    LEAD_MATCH_CLAIMABLE_SQL,
+    LEAD_MATCH_STATUSES,
+    CrmContact,
+    Lead,
+    LeadMatch,
+)
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.db.session import get_sessionmaker
 from ads_engine.logging import get_logger
@@ -187,7 +193,6 @@ _MATCHED: Final = "matched"
 _NO_MATCH: Final = "no_match"
 _NO_EMAIL: Final = "no_email"
 _ERROR: Final = "error"
-_CLAIMABLE: Final = (_PENDING, _NO_MATCH, _ERROR)
 _READ_OK: Final = "ok"
 
 if not {_PENDING, _MATCHED, _NO_MATCH, _NO_EMAIL, _ERROR} <= set(LEAD_MATCH_STATUSES):
@@ -448,16 +453,21 @@ async def create_pending(
     reasons = _checked_reasons(no_email_reasons, wanted)
     if not wanted:
         return 0
-    crm = await _crm_dataset(session, crm_dataset_id)
     datasets_of: dict[int, int] = {}
     for start in range(0, len(wanted), _INSERT_CHUNK):
         chunk = wanted[start : start + _INSERT_CHUNK]
         result = await session.execute(select(Lead.id, Lead.dataset_id).where(Lead.id.in_(chunk)))
         datasets_of.update((lead_id, dataset_id) for lead_id, dataset_id in result)
+    lead_datasets = sorted(set(datasets_of.values()))
+    # Lock order: the LinkedIn datasets' lifecycle guards before the CRM dataset's, the
+    # order activation locks a primary and its companion in; the reverse could deadlock.
+    for lead_dataset_id in lead_datasets:
+        await repositories.lock_dataset(session, lead_dataset_id)
+    crm = await _crm_dataset(session, crm_dataset_id)
     missing = [lead_id for lead_id in wanted if lead_id not in datasets_of]
     if missing:
         raise ValueError(f"{len(missing)} of {len(wanted)} leads to stage do not exist")
-    for lead_dataset_id in sorted(set(datasets_of.values())):
+    for lead_dataset_id in lead_datasets:
         await _check_pair(session, lead_dataset_id, crm)
     rows = [
         _row(
@@ -519,6 +529,9 @@ async def stage_rows(
     _require_aware(since, "since")
     if now is not None:
         _require_aware(now, "now")
+    # Lock order: the LinkedIn dataset's lifecycle guard before the CRM dataset's, the
+    # order activation locks a primary and its companion in; the reverse could deadlock.
+    await repositories.lock_dataset(session, lead_dataset_id)
     crm = await _crm_dataset(session, crm_dataset_id)
     await _check_pair(session, lead_dataset_id, crm)
     # An alias, correlated to ``lead`` only: the outer query joins ``lead_match`` as well.
@@ -757,6 +770,13 @@ async def _claim(
     rows are locked (``FOR UPDATE OF lead_match SKIP LOCKED``): locking the joined
     ``source_dataset`` rows would block a concurrent activation, and rows another worker
     holds are skipped rather than waited for.
+
+    The status test is :data:`~ads_engine.db.models.crm.LEAD_MATCH_CLAIMABLE_SQL`, sent as
+    literal SQL, so PostgreSQL proves under custom and generic plans alike that the partial
+    index ``ix_lead_match_claim`` (``crm_dataset_id``, ``next_attempt_at NULLS FIRST``,
+    ``lead_id``) applies. That index returns the claimable rows in this query's order, so a
+    batch reads its rows in order and stops at its limit instead of sorting every due row;
+    only the due-time test is bound to ``now``.
     """
     statement = (
         select(
@@ -774,9 +794,8 @@ async def _claim(
         .join(SourceDataset, SourceDataset.id == Lead.dataset_id)
         .where(
             LeadMatch.crm_dataset_id == crm_dataset_id,
-            LeadMatch.status.in_(_CLAIMABLE),
+            text(LEAD_MATCH_CLAIMABLE_SQL),
             or_(LeadMatch.next_attempt_at.is_(None), LeadMatch.next_attempt_at <= now),
-            or_(LeadMatch.status == _PENDING, LeadMatch.next_attempt_at.is_not(None)),
             SourceDataset.state != "retired",
         )
         .order_by(LeadMatch.next_attempt_at.asc().nulls_first(), LeadMatch.lead_id)

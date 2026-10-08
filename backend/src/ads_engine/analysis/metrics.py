@@ -1281,8 +1281,16 @@ def _observation_bounds(window: AnalysisWindow, max_gap_hours: int) -> tuple[dat
 async def _load_observations(scope: QueryScope) -> dict[tuple[str, int], list[Observation]]:
     """Load campaign, budget and conversion-action observations bracketing the window.
 
-    Ordered ascending by ``captured_at`` (then id) within each ``(entity_type, entity_id)``,
-    which serves the ``ix_entity_snapshot_entity_captured`` index.
+    The predicates leave the entity open, so ``ix_entity_snapshot_entity_captured`` (which
+    leads with the entity) cannot bound the read. ``ix_entity_snapshot_dataset_type_captured``
+    on (``dataset_id``, ``entity_type``, ``captured_at``) does: each active ad dataset and
+    observed entity type is one contiguous ``captured_at`` range of that index, so only the
+    window's observations (and its margin) are read, never the retained history outside it,
+    keyword snapshots or a retired dataset's rows.
+
+    That index does not supply the result order. The rows come back ordered by
+    ``(entity_type, entity_id)`` and, within each, ascending by ``captured_at`` then id, by
+    a sort of just the window's rows, a set bounded by the window's entities and syncs.
     """
     ad_ids = scope.ad_dataset_ids()
     if not ad_ids:
@@ -1369,42 +1377,66 @@ async def _load_keyword_observations(
 
     K3's snapshot fallback compares exactly these two Q-G7 quality-score observations
     (AAP 0.5.4.3), and no other rule reads keyword snapshots. Keywords are snapshotted every
-    entity sync, so a full window history is thousands of rows per keyword; reading only the
-    two that matter (``DISTINCT ON`` over ``ix_entity_snapshot_entity_captured``) keeps a
-    180-day custom run inside the AAP 0.3.2 budget of 30 s.
+    entity sync, so a full window history is thousands of rows per keyword. One statement
+    therefore drives from the Google dataset's ``keyword`` rows and reads each keyword's two
+    observations through two ``LATERAL`` probes, ``ORDER BY captured_at, id LIMIT 1`` in
+    each direction. ``ix_entity_snapshot_entity_captured`` (``entity_type``, ``entity_id``,
+    ``captured_at DESC``) serves each probe as a bounded scan of that one keyword's window,
+    so the read costs two index probes per keyword, never the window's whole keyword
+    history; that keeps a 180-day custom run inside the AAP 0.1.1 budget of 30 s.
+
+    A snapshot always belongs to the dataset of the entity it names
+    (``sync/snapshots.write_snapshots`` refuses any other), so the dataset's keywords reach
+    every keyword snapshot of the dataset. Ties on ``captured_at`` break by snapshot id: the
+    first observation is the lowest id at the earliest instant, the last the highest id at
+    the latest. When both share one instant the keyword keeps a single observation, the
+    last. A keyword with no observation inside the window is absent.
     """
     google = scope.dataset_id("google")
     if google is None:
         return {}
     lower, upper = _google_window_instants(scope, timezone)
+    kw = Keyword
     snap = EntitySnapshot
-    where = (
+    # The Observation columns: _snapshot_columns without its leading (entity_type, entity_id).
+    observed = _snapshot_columns()[2:]
+    in_window = (
         snap.dataset_id == google,
         snap.entity_type == "keyword",
+        snap.entity_id == kw.id,
         snap.captured_at >= lower,
         snap.captured_at <= upper,
     )
     first = (
-        sa.select(*_snapshot_columns())
-        .where(*where)
-        .order_by(snap.entity_id, snap.captured_at.asc(), snap.id.asc())
-        .ext(distinct_on(snap.entity_id))
+        sa.select(*observed)
+        .where(*in_window)
+        .order_by(snap.captured_at.asc(), snap.id.asc())
+        .limit(1)
+        .lateral("first_observation")
     )
     last = (
-        sa.select(*_snapshot_columns())
-        .where(*where)
-        .order_by(snap.entity_id, snap.captured_at.desc(), snap.id.desc())
-        .ext(distinct_on(snap.entity_id))
+        sa.select(*observed)
+        .where(*in_window)
+        .order_by(snap.captured_at.desc(), snap.id.desc())
+        .limit(1)
+        .lateral("last_observation")
     )
-    picked: dict[int, dict[datetime, Observation]] = defaultdict(dict)
-    for stmt in (first, last):
-        for _entity_type, entity_id, *columns in (await scope.session.execute(stmt)).all():
-            observation = _observation(*columns)
-            picked[entity_id][observation.captured_at] = observation
-    return {
-        ("keyword", entity_id): [by_time[instant] for instant in sorted(by_time)]
-        for entity_id, by_time in picked.items()
-    }
+    stmt = (
+        sa.select(kw.id, *first.c, *last.c)
+        .select_from(kw)
+        .join(first, sa.true())
+        .join(last, sa.true())
+        .where(kw.dataset_id == google)
+        .order_by(kw.id)
+    )
+    width = len(observed)
+    picked: dict[tuple[str, int], list[Observation]] = {}
+    for keyword_id, *columns in (await scope.session.execute(stmt)).all():
+        earliest = _observation(*columns[:width])
+        latest = _observation(*columns[width:])
+        same_instant = earliest.captured_at == latest.captured_at
+        picked[("keyword", keyword_id)] = [latest] if same_instant else [earliest, latest]
+    return picked
 
 
 @dataclass(slots=True)
@@ -1556,6 +1588,37 @@ def _contact_columns() -> tuple[Any, ...]:
     )
 
 
+def _google_touch_contacts(
+    dataset_id: int, lower: datetime, upper: datetime
+) -> sa.Select[*tuple[Any, ...]]:
+    """Select one dataset's Google-touch contacts, touched in ``[lower, upper)`` (AAP 0.3.3).
+
+    A contact qualifies when it carries a ``google_campaign_ref``; it is ordered by touch,
+    then id in code-point order (:data:`_CODE_POINT`). The literal ``IS NOT NULL`` lets the
+    planner match the partial index ``ix_crm_contact_dataset_google_touch``, which serves the
+    dataset equality and the touch range, so contacts with no ref are never visited.
+
+    Args:
+        dataset_id: The HubSpot dataset read.
+        lower: The inclusive lower touch instant.
+        upper: The exclusive upper touch instant.
+
+    Returns:
+        The statement selecting :func:`_contact_columns`.
+    """
+    ct = CrmContact
+    return (
+        sa.select(*_contact_columns())
+        .where(
+            ct.dataset_id == dataset_id,
+            ct.google_campaign_ref.is_not(None),
+            ct.google_touch_at >= lower,
+            ct.google_touch_at < upper,
+        )
+        .order_by(ct.google_touch_at, ct.hs_id.collate(_CODE_POINT))
+    )
+
+
 async def _load_crm(
     scope: QueryScope,
     row: SourceDataset,
@@ -1615,16 +1678,7 @@ async def _load_crm(
         veto_lower, veto_upper = _google_window_instants(scope, google_timezone)
         member_lower, member_upper = _google_window_instants(scope, member_day_timezone)
         touch_lower, touch_upper = min(veto_lower, member_lower), max(veto_upper, member_upper)
-        result = await session.execute(
-            sa.select(*_contact_columns())
-            .where(
-                ct.dataset_id == dataset_id,
-                ct.google_campaign_ref.is_not(None),
-                ct.google_touch_at >= touch_lower,
-                ct.google_touch_at < touch_upper,
-            )
-            .order_by(ct.google_touch_at, ct.hs_id.collate(_CODE_POINT))
-        )
+        result = await session.execute(_google_touch_contacts(dataset_id, touch_lower, touch_upper))
         for columns in result.all():
             info = _contact_info(*columns)
             discovered.append(info)

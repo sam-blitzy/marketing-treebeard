@@ -1346,11 +1346,9 @@ class SourceModeController:
         """Record a transient failure on the named freshness rows and the connection."""
         reason = await self._failure_reason(source, exc)
         async with self._transaction() as session:
-            target = dataset_id
-            if target is None:
-                target = await repositories.active_dataset_id(session, source)
-            if target is not None and names:
-                await self._record_failed_freshness(session, target, names, exc, now)
+            # Lock order: source_connection before the source_dataset guard the freshness
+            # write takes, the order DatasetManager.activate locks them in; the reverse
+            # order could deadlock against a concurrent activation of this source.
             await self._record_connection(
                 source,
                 status=_STATUS_STALE,
@@ -1359,6 +1357,11 @@ class SourceModeController:
                 sticky_denied=True,
                 session=session,
             )
+            target = dataset_id
+            if target is None:
+                target = await repositories.active_dataset_id(session, source)
+            if target is not None and names:
+                await self._record_failed_freshness(session, target, names, exc, now)
 
     @staticmethod
     async def _record_failed_freshness(

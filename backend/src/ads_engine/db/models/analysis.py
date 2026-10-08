@@ -262,13 +262,28 @@ class Recommendation(IdPkMixin, _RunEntityKeysMixin, Base):
     :class:`AnalysisRun`.
 
     ``entity_type`` and ``entity_id`` name the item's entity as a stable, informational key
-    with no foreign key. ``entity_id`` is ``text``: the internal id as a decimal string for an
-    entity with a table row, or a composite key for one without a row, such as a search term
-    within an ad group, a demographic segment value, a keyword cluster or a content-asset
-    slug. Feedback copies the pair, so a dismissal, snooze or done matches the same rule and
-    entity in later runs (AAP 0.5.2 ``recommendation_feedback``). The typed entity keys from
-    the mixin carry the referential links and become ``NULL`` when a purge removes the
-    entity; ``entity_type``, ``entity_id`` and the evidence keep the item readable.
+    with no foreign key, written from the rule's
+    :class:`~ads_engine.analysis.context.EntityRef`. ``entity_type`` is its ``type``, for
+    example ``campaign``, ``keyword`` or ``search_term``. ``entity_id`` is ``text``, its
+    :attr:`~ads_engine.analysis.context.EntityRef.key` ``{source}:{type}:{external_id}``,
+    for example ``google:campaign:1234567890``. ``external_id`` is the platform id of an
+    entity with a table row (the account, campaign, ``campaign_budget`` or ad group id, a
+    keyword's criterion id, a creative URN) and a composite for an entity without one: a
+    search term ``{ad_group_external_id}|{matched_criterion_id}|{term}``, a demographic
+    segment ``{campaign_external_id}|{facet}|{value}``, a white paper within one currency
+    ``{slug}|{CURRENCY}``, a CR1 creative pair as its two creative URNs sorted and
+    ``|``-joined, and a search-term cluster as its sorted head tokens joined by spaces. The
+    key is built from platform ids, not internal row ids, so it survives a re-sync and a
+    dataset transition of the same platform entity; only a C0 subject whose row the run's
+    context lacks falls back to ``internal-{id}`` as its ``external_id``, and C0 takes no
+    feedback. Feedback copies ``rule_id`` and the pair, so a dismissal, snooze or done
+    matches the same rule and entity in later runs (AAP 0.5.2 ``recommendation_feedback``).
+
+    Internal row ids live only in the nullable typed keys from :class:`_RunEntityKeysMixin`
+    (``campaign_id``, ``budget_id``, ``ad_group_id``, ``keyword_id``, ``creative_id``). They
+    carry the referential links within the run's datasets and become ``NULL`` when a purge
+    removes the entity; ``entity_type``, ``entity_id`` and the evidence keep the item
+    readable.
 
     Attributes:
         run_id: The :class:`AnalysisRun` that produced the item.
@@ -279,7 +294,9 @@ class Recommendation(IdPkMixin, _RunEntityKeysMixin, Base):
         rule_id: The rule that produced the item, for example ``K1`` or ``C0``.
         entity_type: The kind of entity the item is about, for example ``campaign`` or
             ``search_term``; ``None`` for an item without an entity.
-        entity_id: The stable text key of that entity; ``None`` for an item without one.
+        entity_id: The entity's stable external key ``{source}:{type}:{external_id}``,
+            built from platform ids rather than internal row ids; ``None`` for an item
+            without an entity.
         rank: The item's rank within its group, from 1.
         action: The recommended action as a headline.
         reason: The reason sentence, rendered from the evidence by the rule's template.
@@ -446,15 +463,22 @@ class RecommendationFeedback(IdPkMixin, Base):
 
     ``rule_id``, ``entity_type`` and ``entity_id`` are copied from the recommendation, so the
     match across runs needs no join and survives a purge that nulls the recommendation's
-    typed entity keys. ``ix_recommendation_feedback_rule_entity`` serves that match.
+    typed entity keys. Two indexes serve the two reads. The overlay looks up the exact
+    ``(rule_id, entity_type, entity_id)`` keys of one page, with ``until`` after the read time,
+    through ``ix_recommendation_feedback_rule_entity``. The runner reads every row still in
+    force before it knows its items, a range over ``until`` alone, through
+    ``ix_recommendation_feedback_until``; expired rows stay as history and outside that range.
 
     Attributes:
         recommendation_id: The :class:`Recommendation` the feedback was given on; the only
             foreign key.
         rule_id: The item's rule, copied from the recommendation.
-        entity_type: The item's entity type, copied from the recommendation.
-        entity_id: The item's stable entity key (``text``), copied from the recommendation;
-            no foreign key.
+        entity_type: The item's entity type, copied from the recommendation; ``None`` when
+            the item has none.
+        entity_id: The item's stable external entity key ``{source}:{type}:{external_id}``
+            (``text``), copied from :attr:`Recommendation.entity_id`, never one of its
+            internal-id typed keys; no foreign key. ``None`` when the item has none, and a
+            ``NULL`` matches only an item whose own key is ``NULL``.
         kind: ``dismiss``, ``snooze`` or ``done`` (:data:`FEEDBACK_KINDS`).
         until: When the suppression ends.
         note: The user's note, if any.
@@ -465,7 +489,8 @@ class RecommendationFeedback(IdPkMixin, Base):
     __tablename__ = "recommendation_feedback"
 
     # Recommendations are deleted only with their run, which normal operation never does, and
-    # feedback is looked up by rule and entity, so the CASCADE action needs no index here.
+    # feedback is looked up by rule and entity or by expiry, so the CASCADE action needs no
+    # index here.
     recommendation_id: Mapped[int] = mapped_column(
         sa.ForeignKey("recommendation.id", ondelete="CASCADE"),
     )
@@ -487,4 +512,5 @@ class RecommendationFeedback(IdPkMixin, Base):
             "entity_id",
             "until",
         ),
+        sa.Index("ix_recommendation_feedback_until", "until"),
     )

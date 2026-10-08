@@ -24,8 +24,9 @@ The seven modules, in dependency order:
 * ``analysis``: analysis runs and requests, recommendations, findings, withheld patterns,
   suppression counts and feedback.
 
-The package re-exports every model class and every enumeration constant named in each
-module's ``__all__``, so callers may write either form::
+The package re-exports every model class and every constant (the enumerations and
+``crm.LEAD_MATCH_CLAIMABLE_SQL``) named in each module's ``__all__``, so callers may write
+either form::
 
     from ads_engine.db.models import Campaign, SOURCES
     from ads_engine.db.models.accounts import Campaign
@@ -88,6 +89,7 @@ from ads_engine.db.models.crm import (
     ASSOCIATION_FETCH_STATUSES,
     CONTACT_READ_STATUSES,
     CRM_OBJECT_TYPES,
+    LEAD_MATCH_CLAIMABLE_SQL,
     LEAD_MATCH_STATUSES,
     TARGET_READ_STATUSES,
     CrmAssociation,
@@ -145,6 +147,7 @@ __all__: list[str] = [
     "DISCREPANCY_STATES",
     "ENTITY_TYPES",
     "FEEDBACK_KINDS",
+    "LEAD_MATCH_CLAIMABLE_SQL",
     "LEAD_MATCH_STATUSES",
     "MODES",
     "RECOMMENDATION_SECTIONS",

@@ -59,6 +59,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ads_engine.db import repositories
 from ads_engine.db.models.ops import COMPLETENESS, DATASETS, DatasetFreshness, SourceDataset
 from ads_engine.logging import get_logger
 from ads_engine.settings import SOURCES, Source
@@ -610,6 +611,11 @@ async def record_freshness(
     compares start times. The function flushes but never commits; the caller's
     transaction makes the freshness row atomic with the data it describes.
 
+    Retired datasets are read-only (AAP 0.3.3), so the source dataset is then locked with
+    :func:`~ads_engine.db.repositories.ensure_writable`: a retired one is refused, and the
+    lifecycle lock held until the caller's transaction ends keeps an activation from
+    retiring it before this row commits.
+
     Args:
         session: The caller's session, inside the transaction that wrote the data.
         dataset_id: The ``source_dataset`` the data was written to.
@@ -622,6 +628,8 @@ async def record_freshness(
     Raises:
         ValueError: If ``dataset`` is unknown, ``dataset_id`` does not exist, or the source
             dataset belongs to a different source than ``dataset``.
+        ads_engine.db.repositories.DatasetNotWritable: If the source dataset is retired,
+            including retired by an activation that committed while this call waited.
     """
     source = source_of(dataset)
     dataset_source = await session.scalar(
@@ -634,6 +642,7 @@ async def record_freshness(
             f"freshness dataset {dataset!r} belongs to {source}, "
             f"but source dataset {dataset_id} is {dataset_source}"
         )
+    await repositories.ensure_writable(session, dataset_id)
 
     key = {"source": source, "dataset_id": dataset_id, "dataset": dataset}
     # FOR UPDATE locks nothing when the row is missing, so make sure it exists first; the

@@ -3428,6 +3428,114 @@ async def test_keyword_snapshots_keep_the_first_and_last_inside_google_window(
 
 
 @pytest.mark.anyio
+async def test_keyword_observations_break_captured_at_ties_by_snapshot_id(
+    sessions: Sessions, window: AnalysisWindow, thresholds: Thresholds
+) -> None:
+    """Each keyword's per-keyword probes keep the lowest snapshot id at the earliest instant
+    inside Google's window and the highest id at the latest; a single observation, or two at
+    one instant (the last kept), yields one row; a keyword observed only outside the window,
+    or never, is absent; another dataset's or entity type's rows are never read."""
+    async with sessions.begin() as session:
+        g = await _dataset(session, "google", "live", "active")
+        old = await _dataset(session, "google", "live", "retired")
+        account = await _put(
+            session,
+            AdAccount(
+                source="google",
+                dataset_id=g,
+                external_id="1234567890",
+                name=None,
+                currency="USD",
+                timezone=GOOGLE_TZ,
+            ),
+        )
+        campaign = await _put(
+            session,
+            Campaign(
+                source="google",
+                dataset_id=g,
+                account_id=account.id,
+                external_id="111",
+                name="Search Brand",
+                status="active",
+                raw_status="ENABLED",
+                objective_or_channel="SEARCH",
+                budget_period="DAILY",
+            ),
+        )
+        group = await _put(
+            session,
+            AdGroup(
+                source="google",
+                dataset_id=g,
+                campaign_id=campaign.id,
+                external_id="5001",
+                name="Terms",
+                status="ENABLED",
+            ),
+        )
+        keywords: dict[str, int] = {}
+        for criterion, name in enumerate(("ties", "single", "same_instant", "outside", "never")):
+            row = await _put(
+                session,
+                Keyword(
+                    source="google",
+                    dataset_id=g,
+                    ad_group_id=group.id,
+                    criterion_id=str(7001 + criterion),
+                    text=f"acme {name}",
+                    match_type="EXACT",
+                    status="ENABLED",
+                ),
+            )
+            keywords[name] = row.id
+        # Inserted out of time order, so snapshot ids do not follow captured_at: the earliest
+        # instant's lower id carries quality 3 and the latest instant's higher id quality 5.
+        for name, instant, quality in (
+            ("ties", NY_UPPER, 6),
+            ("ties", NY_LOWER, 3),
+            ("ties", MID_NOON, 4),
+            ("ties", NY_LOWER, 2),
+            ("ties", NY_UPPER, 5),
+            ("ties", NY_LOWER - SECOND, 1),
+            ("ties", NY_UPPER + SECOND, 7),
+            ("single", MID_06, 8),
+            ("same_instant", MID_NOON, 9),
+            ("same_instant", MID_NOON, 10),
+            ("outside", NY_LOWER - SECOND, 11),
+            ("outside", NY_UPPER + SECOND, 12),
+        ):
+            await _snapshot(
+                session,
+                "google",
+                g,
+                "keyword",
+                keywords[name],
+                instant,
+                status="ENABLED",
+                quality_score=quality,
+            )
+        await _snapshot(
+            session, "google", old, "keyword", keywords["single"], MID_NOON, quality_score=13
+        )
+        await _snapshot(session, "google", g, "campaign", campaign.id, MID_NOON, status="active")
+
+    async with sessions() as session:
+        scope = _scope(session, window, thresholds, {"google": DatasetRef(g, "google", "live")})
+        read = await metrics._load_keyword_observations(scope, GOOGLE_TZ)
+
+    assert {
+        key: [(item.captured_at, item.quality_score) for item in items]
+        for key, items in read.items()
+    } == {
+        ("keyword", keywords["ties"]): [(NY_LOWER, 3), (NY_UPPER, 5)],
+        ("keyword", keywords["single"]): [(MID_06, 8)],
+        ("keyword", keywords["same_instant"]): [(MID_NOON, 10)],
+    }
+    assert list(read) == sorted(read)
+
+
+@pytest.mark.anyio
 async def test_discrepancy_shape_comes_from_the_latest_decision_else_the_inferred_shape(
     context: AnalysisContext, world: _World
 ) -> None:

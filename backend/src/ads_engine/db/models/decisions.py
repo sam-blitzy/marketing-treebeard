@@ -16,7 +16,11 @@ becomes the expected state of a live campaign. Purging a retired dataset is the 
 ``DELETE FROM source_dataset WHERE id = :retired``: the ``dataset_id`` cascade removes both
 tables' rows, and the intra-dataset keys (``discrepancy`` -> ``decision`` and
 ``entity_snapshot``, ``decision`` -> ``budget``) are ``ON DELETE CASCADE`` as well, so
-PostgreSQL resolves the order itself. Each referencing column is indexed, because PostgreSQL
+PostgreSQL resolves the order itself. Those keys are dataset-qualified (AAP 0.3.3: only
+``lead_match`` links two datasets): each composite (``<column>``, ``dataset_id``) references
+the parent's unique (``dataset_id``, ``id``), so a decision or discrepancy can name only a
+budget, snapshot or decision of its own dataset and purging another dataset never cascades
+into it; a ``NULL`` key is not checked. Each referencing column is indexed, because PostgreSQL
 does not index referencing columns and the cascade would otherwise scan the child table once
 per deleted parent row. ``decision.recommendation_id`` is the one cross-run key; it is
 ``ON DELETE SET NULL``, the action AAP 0.5.2 gives every key that points into run history.
@@ -24,7 +28,9 @@ per deleted parent row. ``decision.recommendation_id`` is the one cross-run key;
 ``subject_id`` holds the internal ``id`` of the ``campaign`` or ``budget`` row named by
 ``subject_type``. One column cannot reference two tables, so it has no foreign key; a subject
 and its decisions always belong to the same dataset and leave together through the
-``dataset_id`` cascade.
+``dataset_id`` cascade. ``ads_engine/decisions.py`` guarantees it: every decision and
+discrepancy takes its ``dataset_id`` from the subject row itself (``load_subject_state``,
+``_subject_provenance``).
 
 Neither model declares ``__natural_key__``: rows are inserted by ``ads_engine/decisions.py``
 and the sync jobs, never upserted by ``db/repositories.py``. This module imports only
@@ -132,6 +138,13 @@ class Decision(IdPkMixin, DatasetScopedMixin, Base):
     the state the discrepancy check (C0) compares each new snapshot against.
     ``ix_decision_subject_latest`` on (``subject_type``, ``subject_id``, ``decided_at DESC``)
     serves that lookup and the per-subject history of ``GET /decisions``.
+    ``ix_decision_dataset_decided`` on (``dataset_id``, ``decided_at DESC``, ``id DESC``)
+    serves the log's newest-first page: ``GET /decisions`` reads the newest rows of each
+    active dataset as one bounded index probe per dataset, never the whole history.
+
+    ``budget_id`` is dataset-qualified: (``budget_id``, ``dataset_id``) references the
+    budget's unique (``dataset_id``, ``id``). The table's own unique (``dataset_id``, ``id``)
+    is the target of ``discrepancy.decision_id``'s dataset-qualified foreign key.
 
     A submission is a patch carrying only the fields being decided. ``ads_engine/decisions.py``
     reads the subject's current expected state, applies the patch, validates the result and
@@ -172,8 +185,8 @@ class Decision(IdPkMixin, DatasetScopedMixin, Base):
         total_budget: The decided lifetime or custom-period budget in the account's
             currency; ``None`` where the shape or the subject has none.
         budget_id: For ``shared_member`` rows only, the shared
-            :class:`~ads_engine.db.models.accounts.Budget` the campaign is assigned to;
-            ``None`` for every other shape.
+            :class:`~ads_engine.db.models.accounts.Budget` of the decision's own dataset the
+            campaign is assigned to; ``None`` for every other shape.
         tombstone: Whether the row records an acknowledged removal (server default
             ``false``); set only by ``acknowledge_removal``.
         decided_at: When the decision was recorded, set by the writer with
@@ -198,10 +211,7 @@ class Decision(IdPkMixin, DatasetScopedMixin, Base):
     status: Mapped[str | None]
     daily_budget: Mapped[Decimal | None]
     total_budget: Mapped[Decimal | None]
-    budget_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("budget.id", ondelete="CASCADE"),
-        index=True,
-    )
+    budget_id: Mapped[int | None] = mapped_column(index=True)
     tombstone: Mapped[bool] = mapped_column(server_default=sa.text("false"))
     # Bound to a name (not annotation-only) so __table_args__ can index it descending.
     decided_at: Mapped[datetime] = mapped_column()
@@ -221,13 +231,30 @@ class Decision(IdPkMixin, DatasetScopedMixin, Base):
         check_in("status", CAMPAIGN_STATUSES),
         check_in("origin", DECISION_ORIGINS),
         sa.CheckConstraint(_SHAPE_COLUMNS_SQL, name="shape_columns"),
+        # Dataset-qualified: a shared member's budget must belong to this decision's
+        # dataset; a NULL budget_id (every other shape) is not checked.
+        sa.ForeignKeyConstraint(
+            ["budget_id", "dataset_id"],
+            ["budget.id", "budget.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        # Anchors the dataset-qualified (decision_id, dataset_id) foreign keys of child rows.
+        sa.UniqueConstraint("dataset_id", "id"),
         sa.Index(
             "ix_decision_subject_latest",
             "subject_type",
             "subject_id",
             decided_at.desc(),
         ),
-        # No index above leads with dataset_id; this serves the purge's dataset_id cascade
+        # The decision log's newest-first page, probed per active dataset (GET /decisions).
+        # ``id`` comes from IdPkMixin, so the class body names it rather than binding it.
+        sa.Index(
+            "ix_decision_dataset_decided",
+            "dataset_id",
+            decided_at.desc(),
+            sa.desc("id"),
+        ),
+        # The table has no natural-key unique; this serves the purge's dataset_id cascade
         # (the DatasetScopedMixin contract that every dataset-scoped table has one).
         sa.Index("ix_decision_dataset_id", "dataset_id"),
     )
@@ -271,9 +298,10 @@ class Discrepancy(IdPkMixin, DatasetScopedMixin, Base):
             ``untracked``, which has no decision.
         platform_value: The platform side of the comparison as a JSON object; ``None`` for
             ``missing``, where the platform no longer returns the entity.
-        snapshot_id: The :class:`~ads_engine.db.models.snapshots.EntitySnapshot` the
-            comparison read; ``None`` for ``missing``.
-        decision_id: The :class:`Decision` the comparison read; ``None`` for ``untracked``.
+        snapshot_id: The :class:`~ads_engine.db.models.snapshots.EntitySnapshot` of the
+            discrepancy's own dataset the comparison read; ``None`` for ``missing``.
+        decision_id: The :class:`Decision` of the discrepancy's own dataset the comparison
+            read; ``None`` for ``untracked``.
         detected_at: When the discrepancy was detected, set by the writer with
             :func:`ads_engine.db.base.utcnow`.
         state: ``open``, ``awaiting_platform`` or ``resolved`` (:data:`DISCREPANCY_STATES`).
@@ -289,14 +317,8 @@ class Discrepancy(IdPkMixin, DatasetScopedMixin, Base):
     kind: Mapped[str]
     decided_value: Mapped[dict[str, Any] | None]
     platform_value: Mapped[dict[str, Any] | None]
-    snapshot_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("entity_snapshot.id", ondelete="CASCADE"),
-        index=True,
-    )
-    decision_id: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("decision.id", ondelete="CASCADE"),
-        index=True,
-    )
+    snapshot_id: Mapped[int | None] = mapped_column(index=True)
+    decision_id: Mapped[int | None] = mapped_column(index=True)
     detected_at: Mapped[datetime]
     state: Mapped[str]
     resolved_at: Mapped[datetime | None]
@@ -308,6 +330,19 @@ class Discrepancy(IdPkMixin, DatasetScopedMixin, Base):
         check_in("kind", DISCREPANCY_KINDS),
         check_in("state", DISCREPANCY_STATES),
         check_in("resolution", DISCREPANCY_RESOLUTIONS),
+        # Dataset-qualified: the snapshot and the decision compared must belong to this
+        # discrepancy's dataset; a NULL snapshot_id (missing) or decision_id (untracked) is
+        # not checked.
+        sa.ForeignKeyConstraint(
+            ["snapshot_id", "dataset_id"],
+            ["entity_snapshot.id", "entity_snapshot.dataset_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["decision_id", "dataset_id"],
+            ["decision.id", "decision.dataset_id"],
+            ondelete="CASCADE",
+        ),
         sa.Index(
             "uq_discrepancy_open_subject_kind",
             "subject_type",
