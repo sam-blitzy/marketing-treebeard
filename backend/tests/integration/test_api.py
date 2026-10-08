@@ -974,7 +974,6 @@ async def test_protected_routes_401_without_session(
 
 
 async def test_error_shape_on_every_error_status(
-    api_client: httpx.AsyncClient,
     admin_user: AppUser,
     login: LoginFunction,
     test_identity: AdminIdentity,
@@ -984,33 +983,40 @@ async def test_error_shape_on_every_error_status(
     Each body is exactly the envelope, with no other key at either level: 401 without a
     session, 403 without the CSRF header, 404 for an unknown run and an unknown path, 409 for a
     second pending sync request, 422 for an invalid body and 429 for the 6th login attempt.
+    The login limiter runs on a fixed injected clock, so all six attempts count at one instant:
+    the 429 never depends on how long the requests and password checks take, and its
+    ``Retry-After`` is the whole window.
     """
     del admin_user
+    app = create_app()
+    app.state.login_limiter = security.LoginRateLimiter(clock=lambda: 0.0)
     csrf = dict(test_identity.csrf_headers)
-    assert_error(await api_client.get(api("/auth/me")), 401, "unauthenticated")
-    assert_error(await api_client.post(api("/runs"), json={}), 403, "csrf_header_missing")
+    async with serve(app) as client:
+        assert_error(await client.get(api("/auth/me")), 401, "unauthenticated")
+        assert_error(await client.post(api("/runs"), json={}), 403, "csrf_header_missing")
 
-    await login(api_client)  # attempt 1 of the minute
-    assert_error(await api_client.get(api("/runs/999999")), 404, "not_found")
-    assert_error(await api_client.get(api("/no-such-route")), 404, "not_found")
-    first_sync = await api_client.post(api("/sources/google/sync"), headers=csrf)
-    assert first_sync.status_code == 202, first_sync.text
-    assert_error(
-        await api_client.post(api("/sources/google/sync"), headers=csrf), 409, "sync_pending"
-    )
-    invalid = await api_client.post(api("/runs"), json={"window_start": "soon"}, headers=csrf)
-    assert_error(invalid, 422, "validation_error")
-
-    for _ in range(security.LOGIN_MAX_ATTEMPTS - 1):  # attempts 2 to 5
-        wrong = await post_login(
-            api_client, test_identity, email=test_identity.email, password="wrong-password"
+        await login(client)  # attempt 1 of the window
+        assert_error(await client.get(api("/runs/999999")), 404, "not_found")
+        assert_error(await client.get(api("/no-such-route")), 404, "not_found")
+        first_sync = await client.post(api("/sources/google/sync"), headers=csrf)
+        assert first_sync.status_code == 202, first_sync.text
+        assert_error(
+            await client.post(api("/sources/google/sync"), headers=csrf), 409, "sync_pending"
         )
-        assert_error(wrong, 401, "invalid_credentials")
-    limited = await post_login(
-        api_client, test_identity, email=test_identity.email, password=test_identity.password
-    )
-    assert_error(limited, 429, "rate_limited")
-    assert int(limited.headers["Retry-After"]) >= 1
+        invalid = await client.post(api("/runs"), json={"window_start": "soon"}, headers=csrf)
+        assert_error(invalid, 422, "validation_error")
+
+        for _ in range(security.LOGIN_MAX_ATTEMPTS - 1):  # attempts 2 to 5
+            wrong = await post_login(
+                client, test_identity, email=test_identity.email, password="wrong-password"
+            )
+            assert_error(wrong, 401, "invalid_credentials")
+        limited = await post_login(
+            client, test_identity, email=test_identity.email, password=test_identity.password
+        )
+        assert_error(limited, 429, "rate_limited")
+        # Every attempt counted at t=0, so the oldest leaves the window a full window later.
+        assert limited.headers["Retry-After"] == str(security.LOGIN_WINDOW_SECONDS)
 
 
 async def test_healthz_without_auth(api_client: httpx.AsyncClient) -> None:

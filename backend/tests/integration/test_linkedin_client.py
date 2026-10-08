@@ -50,7 +50,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
-from secrets import token_hex
 from typing import Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote
 
@@ -1908,12 +1907,34 @@ async def test_tokens_never_logged(
     assert "Bearer" not in text
 
 
-def volatile_token(label: str) -> str:
-    """A 384-character token no setting knows, as long as a LinkedIn access token.
+def volatile_token(label: str, *, length: int = 384) -> str:
+    """A deterministic opaque hex token no setting knows, the same on every run.
 
-    Derived at run time, so the secret scan never reads a test value as a credential.
+    The token concatenates the SHA-256 hex digests of ``test-volatile-{label}-{block}``
+    for blocks 0, 1, 2 and onward and keeps the first ``length`` characters, so it never
+    repeats with a period and distinct labels give unrelated tokens. A failing fragment is
+    reproduced by calling it again with the same label and length. Derived at run time,
+    so the secret scan never reads a test value as a credential.
+
+    Args:
+        label: Distinguishes this token from every other one a test uses.
+        length: The number of characters; the default, 384, is as long as a LinkedIn
+            access token.
+
+    Returns:
+        ``length`` lowercase hexadecimal characters.
+
+    Raises:
+        ValueError: If ``length`` is not positive.
     """
-    return hashlib.sha256(f"test-volatile-{label}".encode()).hexdigest() * 6
+    if length <= 0:
+        raise ValueError(f"volatile_token length must be positive, got {length}")
+    blocks = -(-length // 64)
+    stream = "".join(
+        hashlib.sha256(f"test-volatile-{label}-{block}".encode()).hexdigest()
+        for block in range(blocks)
+    )
+    return stream[:length]
 
 
 @dataclass(slots=True)
@@ -2085,15 +2106,16 @@ async def test_a_token_replaced_by_a_refresh_never_reaches_a_later_call_error_or
 ) -> None:
     """Logs never contain a token the client stopped using, echoed by a later call.
 
-    The first exchange issues a random 420-character access token; ``GET adAccounts``
-    answers 401, so the client invalidates it, the second exchange issues another, and the
-    repeated call succeeds. A new call, whose request carries only the second token, then
-    gets a 403 whose message opens with the first one in plain prose, so a 300-character
-    cut of an unstripped reason would keep its start. Neither token, nor any 16-character
-    fragment of either, reaches the raised error or any logged event.
+    The first exchange issues a deterministic opaque 420-character access token;
+    ``GET adAccounts`` answers 401, so the client invalidates it, the second exchange issues
+    another, and the repeated call succeeds. A new call, whose request carries only the
+    second token, then gets a 403 whose message opens with the first one in plain prose, so
+    a 300-character cut of an unstripped reason would keep its start. Neither token, nor any
+    16-character fragment of either, reaches the raised error or any logged event.
     """
     captured_logs.configure(level="DEBUG")
-    first_access, second_access = token_hex(210), token_hex(210)
+    first_access = volatile_token("replaced-access-1", length=420)
+    second_access = volatile_token("replaced-access-2", length=420)
 
     def issued(access: str) -> httpx.Response:
         """A successful exchange issuing ``access``."""
@@ -2165,18 +2187,20 @@ async def test_provider_held_refresh_tokens_never_reach_a_rest_error_or_a_log(
 ) -> None:
     """Logs never contain a secret only the token provider holds, echoed by a REST call.
 
-    The first exchange issues a random access token and rotates the configured refresh
-    token to a random 400-character one that no setting knows and no REST request carries.
-    ``GET adAccounts`` then answers 403 with a message opening with that rotated token in
-    plain prose, so a 300-character cut of an unstripped reason would keep its start. A
-    second exchange, after an invalidation, rotates it again: the next call's 403 opens with
-    the refresh token now retired, and a third call's quotes the configured refresh token,
-    the client secret and the current rotated token. No 16-character fragment of any of
-    them, nor of the access tokens, reaches a raised error or any logged event.
+    The first exchange issues a deterministic opaque access token and rotates the configured
+    refresh token to an opaque 400-character one that no setting knows and no REST request
+    carries. ``GET adAccounts`` then answers 403 with a message opening with that rotated
+    token in plain prose, so a 300-character cut of an unstripped reason would keep its
+    start. A second exchange, after an invalidation, rotates it again: the next call's 403
+    opens with the refresh token now retired, and a third call's quotes the configured
+    refresh token, the client secret and the current rotated token. No 16-character fragment
+    of any of them, nor of the access tokens, reaches a raised error or any logged event.
     """
     captured_logs.configure(level="DEBUG")
-    first_access, second_access = token_hex(200), token_hex(200)
-    first_rotated, second_rotated = token_hex(200), token_hex(200)
+    first_access = volatile_token("held-access-1", length=400)
+    second_access = volatile_token("held-access-2", length=400)
+    first_rotated = volatile_token("held-refresh-1", length=400)
+    second_rotated = volatile_token("held-refresh-2", length=400)
 
     def issued(access: str, refresh: str) -> httpx.Response:
         """A successful exchange issuing ``access`` and rotating to ``refresh``."""

@@ -43,7 +43,7 @@ import logging
 import os
 import shutil
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date
@@ -76,6 +76,7 @@ from ads_engine.decisions import SubjectRetired
 from ads_engine.settings import ConfigurationError, Settings, get_settings
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.payloads import canonical_json, validate_capture
+from ads_engine.simulation.scenarios import FIXED_CLOCK
 from ads_engine.simulation.transport import mock_transport
 from ads_engine.sync import budget_guard, jobs, mode
 
@@ -1485,7 +1486,7 @@ def test_capture_writes_no_short_secret(
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", SHORT_SECRET)
     get_settings.cache_clear()
     settings = get_settings()
-    inner = mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("hubspot", _capture_world(settings), settings=settings)
     _live(monkeypatch, _embed_short_secret(inner))
     code = cli.main(["capture-fixtures", "--source", "hubspot"])
     out, err = capsys.readouterr()
@@ -1508,10 +1509,7 @@ def test_capture_fails_closed_when_a_secret_survives_redaction(
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", SHORT_SECRET)
     get_settings.cache_clear()
     settings = get_settings()
-    _live(
-        monkeypatch,
-        mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings),
-    )
+    _live(monkeypatch, mock_transport("hubspot", _capture_world(settings), settings=settings))
     redact_capture = cli._redact_capture
 
     def leaky(capture: dict[str, Any], policy: Any, source: Any) -> dict[str, Any]:
@@ -1556,7 +1554,7 @@ def test_capture_writes_no_percent_encoded_short_secret(
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", secret)
     get_settings.cache_clear()
     settings = get_settings()
-    inner = mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("hubspot", _capture_world(settings), settings=settings)
     _live(monkeypatch, _embed_short_secret(inner, spelling))
     code = cli.main(["capture-fixtures", "--source", "hubspot"])
     out, err = capsys.readouterr()
@@ -1590,7 +1588,7 @@ def test_capture_fails_closed_on_a_short_secret_encoded_more_than_once(
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", SHORT_SECRET)
     get_settings.cache_clear()
     settings = get_settings()
-    inner = mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("hubspot", _capture_world(settings), settings=settings)
     # Redaction matches one level of encoding; these spellings decode to the secret only after
     # two and four rounds.
     _live(monkeypatch, _embed_short_secret(inner, spelling))
@@ -1677,7 +1675,12 @@ EXPECTED_SURFACES = {
 
 @pytest.fixture
 def capture_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A working directory with the contracts and config, and live (fake) credentials."""
+    """A working directory with the contracts and config, and live (fake) credentials.
+
+    The capture's request windows end at :func:`FIXED_CLOCK`, the clock of every world
+    :func:`_capture_world` builds, so each window selects the same records at any host time.
+    """
+    monkeypatch.setattr(cli, "_capture_now", FIXED_CLOCK)
     shutil.copytree(CONTRACTS, tmp_path / "tests" / "contracts")
     for stale in (tmp_path / "tests" / "contracts").glob("*/captured/*.json"):
         stale.unlink()
@@ -1695,6 +1698,11 @@ def capture_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", HUBSPOT_TOKEN)
     get_settings.cache_clear()
     return tmp_path
+
+
+def _capture_world(settings: Settings) -> SimulatedWorld:
+    """The simulated platform a capture reads, on the clock ``capture_dir`` gives the capture."""
+    return SimulatedWorld.from_settings(settings, clock=FIXED_CLOCK)
 
 
 @pytest.fixture
@@ -1734,7 +1742,7 @@ def _counted_google(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
         The requests that reached the transport, in arrival order; it grows as the CLI runs.
     """
     settings = get_settings()
-    inner = mock_transport("google", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("google", _capture_world(settings), settings=settings)
     seen: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1764,7 +1772,7 @@ def test_capture_writes_every_surface_redacted(
     source: str,
 ) -> None:
     settings = get_settings()
-    world = SimulatedWorld.from_settings(settings)
+    world = _capture_world(settings)
     _live(monkeypatch, mock_transport(source, world, settings=settings))
     code = cli.main(["capture-fixtures", "--source", source])
     out, err = capsys.readouterr()
@@ -1869,7 +1877,7 @@ def _multipage_live(
     from ads_engine.simulation.payloads import identify_surface
 
     settings = get_settings()
-    inner = mock_transport(source, SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport(source, _capture_world(settings), settings=settings)
     counts: dict[str, int] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -2148,7 +2156,7 @@ def test_capture_continues_past_a_forbidden_surface(
     capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     settings = get_settings()
-    inner = mock_transport("linkedin", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("linkedin", _capture_world(settings), settings=settings)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/rest/posts":
@@ -2163,6 +2171,94 @@ def test_capture_continues_past_a_forbidden_surface(
     out, err = capsys.readouterr()
     assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["linkedin"] - {"posts"}
     assert "capture-fixtures linkedin: posts: linkedin posts: ACCESS_DENIED" in err
+
+
+NO_SPONSORED_LEAD = "lead_form_responses_batch: no sponsored lead in the last 30 days"
+
+
+def _linkedin_lead_responses_answered(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Callable[[httpx.Response], Awaitable[httpx.Response]],
+) -> dict[str, int]:
+    """Serve the CLI's LinkedIn calls from the simulator, with ``lead_form_responses`` re-answered.
+
+    ``answer`` receives the simulator's response to the responses listing and returns the one
+    the CLI gets.
+
+    Returns:
+        Requests per contract surface (``payloads.identify_surface``); it grows as the CLI runs.
+    """
+    from ads_engine.simulation.payloads import identify_surface
+
+    settings = get_settings()
+    inner = mock_transport("linkedin", _capture_world(settings), settings=settings)
+    counts: dict[str, int] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        surface = identify_surface("linkedin", request)
+        counts[surface] = counts.get(surface, 0) + 1
+        response = await inner.handle_async_request(request)
+        return await answer(response) if surface == "lead_form_responses" else response
+
+    _live(monkeypatch, httpx.MockTransport(handler))
+    return counts
+
+
+def test_capture_linkedin_says_when_the_one_response_read_is_a_test_lead(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A test lead read with ``count=1`` is not re-fetched, and is not called an absent lead.
+
+    The responses listing still costs one request and is captured; no batch request is sent.
+    """
+
+    async def as_test_lead(response: httpx.Response) -> httpx.Response:
+        body = json.loads(await response.aread())
+        for element in body["elements"]:
+            element["testLead"] = True
+        return httpx.Response(response.status_code, json=body)
+
+    counts = _linkedin_lead_responses_answered(monkeypatch, as_test_lead)
+    assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_OK
+    out, err = capsys.readouterr()
+    expected = EXPECTED_SURFACES["linkedin"] - {"lead_form_responses_batch"}
+    assert counts == dict.fromkeys(expected, 1), err[-2000:]
+    assert {Path(path).stem for path in _written(out)} == expected
+    documents = _captured_documents(capture_dir, "linkedin")
+    (element,) = documents["lead_form_responses"]["response"]["body"]["elements"]
+    assert element["testLead"] is True
+    validate_capture(documents["lead_form_responses"], root=capture_dir / "tests" / "contracts")
+    assert (
+        "capture-fixtures linkedin: not captured: lead_form_responses_batch: the one lead "
+        "response read was a test lead, which is never re-fetched"
+    ) in err
+    assert NO_SPONSORED_LEAD not in err
+
+
+def test_capture_linkedin_says_when_no_lead_response_was_read(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A responses listing cut short on its one page fails, and is not called an absent lead.
+
+    The 429 asks for a wait longer than the client sleeps through, so the call ends at once.
+    """
+
+    async def throttled(response: httpx.Response) -> httpx.Response:
+        await response.aread()
+        return httpx.Response(429, json={"status": 429}, headers={"Retry-After": "3600"})
+
+    counts = _linkedin_lead_responses_answered(monkeypatch, throttled)
+    assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_FAILURE
+    out, err = capsys.readouterr()
+    expected = EXPECTED_SURFACES["linkedin"] - {"lead_form_responses_batch"}
+    assert counts == dict.fromkeys(expected, 1), err[-2000:]
+    assert {Path(path).stem for path in _written(out)} == expected - {"lead_form_responses"}
+    assert "capture-fixtures linkedin: lead_form_responses: " in err
+    assert (
+        "capture-fixtures linkedin: not captured: lead_form_responses_batch: "
+        "no lead response was read"
+    ) in err
+    assert NO_SPONSORED_LEAD not in err
 
 
 def test_capture_stops_when_the_credentials_are_refused(
@@ -2202,7 +2298,7 @@ def test_capture_reports_a_capture_that_breaks_its_contract(
     capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     settings = get_settings()
-    inner = mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings)
+    inner = mock_transport("hubspot", _capture_world(settings), settings=settings)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         response = await inner.handle_async_request(request)
@@ -2445,10 +2541,7 @@ def test_capture_creates_a_missing_output_directory(
     captured = _captured(capture_dir, "hubspot")
     shutil.rmtree(captured)
     settings = get_settings()
-    _live(
-        monkeypatch,
-        mock_transport("hubspot", SimulatedWorld.from_settings(settings), settings=settings),
-    )
+    _live(monkeypatch, mock_transport("hubspot", _capture_world(settings), settings=settings))
     code = cli.main(["capture-fixtures", "--source", "hubspot"])
     out, err = capsys.readouterr()
     assert code == cli.EXIT_OK, err[-2000:]

@@ -1395,6 +1395,17 @@ _CONTACTS: Final = "contacts"
 _DEALS: Final = "deals"
 
 
+def _capture_now() -> datetime:
+    """The instant a capture's request windows end at: the current instant in UTC.
+
+    Each source's capture reads it once, so all of its windows (Google's and LinkedIn's
+    "yesterday", the 30-day lead and deal look-backs) end at the same instant. Tests replace
+    it with the clock of the simulated world they serve, so the windows select the same
+    records whatever the host clock reads. ``captured_at`` stays the response's arrival time.
+    """
+    return datetime.now(UTC)
+
+
 @dataclasses.dataclass(slots=True)
 class _CaptureRun:
     """The recorder of one source's capture and what went wrong on the way.
@@ -1563,7 +1574,7 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
 
     # One call per template, each reserved in the shared budget before its POST.
     budget = await _google_budget(settings)
-    day = datetime.now(UTC).date() - timedelta(days=1)
+    day = _capture_now().date() - timedelta(days=1)
     campaign_id: int | None = None
     ad_group_id: int | None = None
     async with build_client("google", run.recorder, settings=settings) as http:
@@ -1614,7 +1625,7 @@ async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
     from ads_engine.connectors.linkedin.client import LinkedInClient
 
     account = settings.linkedin_ad_account_ids[0]
-    now = datetime.now(UTC)
+    now = _capture_now()
     day = now.date() - timedelta(days=1)
     async with build_client("linkedin", run.recorder, settings=settings) as http:
         tokens = LinkedInTokenProvider(settings, http)
@@ -1697,7 +1708,14 @@ async def _capture_linkedin_creatives(
 async def _capture_linkedin_leads(
     client: LinkedInClient, account: str, now: datetime, run: _CaptureRun
 ) -> None:
-    """Capture ``lead_forms``, ``lead_form_responses`` and ``lead_form_responses_batch``."""
+    """Capture ``lead_forms``, ``lead_form_responses`` and ``lead_form_responses_batch``.
+
+    The responses listing reads one response (``count=1``), so the batch re-fetch is skipped
+    whenever that response yields no sponsored lead, with a reason that says which case held:
+    nothing was read (the call failed or a transient error cut it short), the response read
+    was a test lead (dropped at ingest and never re-fetched; a sponsored lead may still exist
+    in the window), or the window held no response at all.
+    """
     forms = await run.step(
         "lead_forms", partial(client.list_lead_forms, account, page_size=1, max_pages=1)
     )
@@ -1718,7 +1736,13 @@ async def _capture_linkedin_leads(
         return
     run.interrupted("lead_form_responses", responses.interrupted_by)
     if not responses.leads:
-        run.skipped.append("lead_form_responses_batch: no sponsored lead in the last 30 days")
+        if responses.interrupted_by is not None:
+            reason = "no lead response was read"
+        elif responses.test_leads_skipped > 0:
+            reason = "the one lead response read was a test lead, which is never re-fetched"
+        else:
+            reason = "no sponsored lead in the last 30 days"
+        run.skipped.append(f"lead_form_responses_batch: {reason}")
         return
     batch = await run.step(
         "lead_form_responses_batch",
@@ -1742,7 +1766,7 @@ async def _capture_hubspot(settings: Settings, run: _CaptureRun, thresholds: Thr
     from ads_engine.connectors.hubspot.client import PROBE_EMAIL, HubSpotClient
     from ads_engine.connectors.hubspot.search import deal_search_filter, search_body
 
-    now = datetime.now(UTC)
+    now = _capture_now()
     async with build_client("hubspot", run.recorder, settings=settings) as http:
         client = HubSpotClient.from_settings(settings, http, live=True)
         await run.step("properties", partial(client.property, _CONTACTS, _LIFECYCLE_STAGE))

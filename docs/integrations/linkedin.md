@@ -695,7 +695,9 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
   only response was the 400.
 - **Output**: it writes `tests/contracts/linkedin/captured/{surface}.json`, each shaped
   `{surface, captured_at, request, response}`. `access_token` is captured only in refresh mode,
-  and `lead_form_responses_batch` only when a lead was read in the last 30 days.
+  and `lead_form_responses_batch` only when the one lead response read (`count=1`, the last
+  30 days) is a sponsored lead. A test lead is never re-fetched; the skip reason then says so,
+  rather than reporting that the window holds no sponsored lead.
 - **Redaction**: every capture is redacted before it is written, with the marker `"<redacted>"`.
   That covers:
   - `Authorization` values, with the scheme kept;

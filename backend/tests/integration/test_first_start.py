@@ -30,7 +30,10 @@ Every test runs on the real PostgreSQL 18 test database of ``tests/conftest.py``
 test by its ``db`` fixture) with no network: conftest removes every source credential, so all
 three sources are simulated and every request goes through the simulator's ``MockTransport``.
 The worker's ``startup`` is called directly, exactly as ``Scheduler.run_forever`` awaits it once
-it holds the scheduler lock, so no scheduler tick and no real sleep ever runs. It accepts no
+it holds the scheduler lock, so no scheduler tick and no scheduler-loop sleep runs. Connector
+throttling still applies: its HubSpot clients share the process-wide limiter of 4 requests per
+second (:data:`~ads_engine.connectors.hubspot.client.SHARED_LIMITER`), which waits in real time
+on the simulated calls too and takes most of each startup's duration. ``startup`` accepts no
 clock, so the simulated world is generated relative to the real clock; ``BACKFILL_DAYS`` is set
 to :data:`BACKFILL_DAYS` to keep each startup to seconds rather than minutes.
 """

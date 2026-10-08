@@ -698,18 +698,19 @@ def test_parse_deal_empty_amount_is_unavailable(contract: ContractLoader) -> Non
 
 
 def test_parse_deal_creation_is_never_the_current_time(contract: ContractLoader) -> None:
-    before = datetime.now(UTC)
     with_createdate = parse_deal(read_one(contract, crm_record(DEAL_ID, deal_properties())))
     without_createdate = parse_deal(
         read_one(contract, crm_record(DEAL_ID, deal_properties(createdate=None)))
     )
 
+    # Exact fixture instants, not a comparison with the host clock: each row carries its own
+    # source field's value, so the result holds under any clock, frozen or early.
     assert with_createdate.created_at == utc(2026, 9, 14, 13, 20)
     # Without `createdate` the record's own creation instant is used, never now().
     assert without_createdate.created_at == utc(2026, 9, 1, 9)
+    assert with_createdate.created_at != without_createdate.created_at
     for row in (with_createdate, without_createdate):
         assert row.created_at is not None
-        assert row.created_at < before
 
 
 def test_deal_properties_list_exactly_the_properties_read(contract: ContractLoader) -> None:
