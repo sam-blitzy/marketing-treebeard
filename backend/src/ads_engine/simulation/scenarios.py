@@ -7653,9 +7653,12 @@ def _linkedin_client_scenarios(module: str) -> Iterator[Scenario]:
         "Analytics: a next paging link is followed when present",
         _world(
             "linkedin.next_link",
-            linkedin=replace(_linkedin((campaign,), many[:3], forms=()), analytics_next_links=True),
+            linkedin=replace(_linkedin((campaign,), many, forms=()), analytics_next_links=True),
         ),
         next_followed=True,
+        elements_cap=15_000,
+        creatives=100,
+        days=180,
     )
     statuses: tuple[LinkedInCampaignStatus, ...] = (
         "ACTIVE",

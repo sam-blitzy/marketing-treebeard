@@ -7,9 +7,10 @@ fire and not fire. These tests hold the catalogue to that contract (names, twins
 differences, the module partition and rule coverage), build every scenario's context without a
 database, exercise every validation branch of the declarative specs, the configuration
 overrides and the CRM binding resolution, and cross-check the expectations the rule code that
-already exists can evaluate (C0 discrepancies, the pipeline veto and K3 keyword entity keys) and
+already exists can evaluate (C0 discrepancies, the pipeline veto and K3 keyword entity keys),
 the keyset page sizes the Google keyset cases state, by scanning their worlds through the live
-webhook client on the simulated transport.
+webhook client on the simulated transport, and the 15,000-element split and ``next`` link the
+LinkedIn analytics cases state, by reading their worlds through the live LinkedIn client.
 
 No database or network, and the shipped ``config/`` files are only read: the tests of edited
 configurations work on copies under ``tmp_path``.
@@ -27,6 +28,7 @@ from types import MappingProxyType
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -78,6 +80,14 @@ from ads_engine.connectors.google_n8n.client import (
 from ads_engine.connectors.google_n8n.parser import get_field
 from ads_engine.connectors.google_n8n.queries import INT64_MIN_ID, KEYSET_LIMIT, LAST_ID, QUERIES
 from ads_engine.connectors.http import build_client
+from ads_engine.connectors.linkedin.auth import SIMULATED_TOKEN, StaticTokenProvider
+from ads_engine.connectors.linkedin.client import (
+    MAX_ANALYTICS_ELEMENTS,
+    LinkedInClient,
+    Listing,
+    restli_date_range,
+)
+from ads_engine.connectors.linkedin.parser import CreativeDailyRow
 from ads_engine.db.models.ops import DATASETS, SOURCES
 from ads_engine.settings import get_settings
 from ads_engine.simulation import (
@@ -1968,6 +1978,171 @@ async def test_keyset_pages_are_what_a_scan_of_the_world_returns(name: str) -> N
     pages = await _keyset_scan(world, query_id)
     assert tuple(len(page) for page in pages) == expected
     assert {key for page in pages for key in page} == listed
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn analytics element cap, read through the live client on the simulated transport
+# ---------------------------------------------------------------------------
+
+ANALYTICS_CAP_CASE = "linkedin.analytics_cap.case"
+NEXT_LINK_CASE = "linkedin.next_link.case"
+# The values both LinkedIn analytics cases state alike: they differ only in the next links.
+ANALYTICS_STATED = ("elements_cap", "creatives", "days")
+
+type _Exchange = tuple[httpx.Request, httpx.Response]
+
+
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    """Keeps every request and its read response, as the wrapped transport answered them.
+
+    The simulated transport's journal records paths only, so the paging envelope of each
+    response and the continuation parameters of each request are read from these exchanges.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+        self.exchanges: list[_Exchange] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Answer ``request`` through the wrapped transport and keep it with its read response."""
+        response = await self._inner.handle_async_request(request)
+        await response.aread()
+        self.exchanges.append((request, response))
+        return response
+
+    async def aclose(self) -> None:
+        """Close the wrapped transport."""
+        await self._inner.aclose()
+
+
+def _stated_range(scenario: Scenario) -> tuple[date, date]:
+    """The scenario's stated ``days``, ending the day before :func:`FIXED_CLOCK`'s date."""
+    days = cast(int, scenario.expect.values["days"])
+    end = FIXED_CLOCK().date() - timedelta(days=1)
+    return end - timedelta(days=days - 1), end
+
+
+async def _read_daily_analytics(
+    scenario: Scenario,
+) -> tuple[Listing[CreativeDailyRow], list[_Exchange]]:
+    """One ``analytics_daily`` of the scenario's account over its stated range, with its exchanges.
+
+    The live client reads through the strict simulated transport. No ``list_creatives`` runs
+    first and no ``expected_creatives`` is passed, so the creative count is unknown and the
+    whole range is one request: the element cap alone decides what follows it (AAP 0.3.3).
+    """
+    world = scenario.world()
+    (account_id,) = world.linkedin_account_ids
+    recorder = _RecordingTransport(mock_transport("linkedin", world, strict=True))
+    async with build_client("linkedin", recorder) as http:
+        client = LinkedInClient(http, StaticTokenProvider(SIMULATED_TOKEN))
+        listing = await client.analytics_daily(account_id, _stated_range(scenario))
+    return listing, recorder.exchanges
+
+
+def _page(response: httpx.Response) -> tuple[int, tuple[str, ...]]:
+    """An ``adAnalytics`` response's element count and the ``rel`` of each ``paging.links``."""
+    body = cast(dict[str, Any], response.json())
+    links = cast(list[dict[str, Any]], body["paging"]["links"])
+    return len(body["elements"]), tuple(cast(str, link["rel"]) for link in links)
+
+
+def _check_every_creative_day(scenario: Scenario, listing: Listing[CreativeDailyRow]) -> None:
+    """The listing is complete with one distinct row per stated creative and stated day."""
+    creatives = cast(int, scenario.expect.values["creatives"])
+    days = cast(int, scenario.expect.values["days"])
+    start, _ = _stated_range(scenario)
+    keys = {(row.creative_urn, row.date) for row in listing.rows}
+    assert (listing.complete, listing.reason, listing.interrupted_by) == (True, None, None)
+    assert len(listing.rows) == len(keys) == creatives * days
+    assert len({urn for urn, _ in keys}) == creatives
+    assert {day for _, day in keys} == {start + timedelta(days=offset) for offset in range(days)}
+
+
+def test_the_linkedin_analytics_cases_differ_only_in_next_links() -> None:
+    """AAP 0.11.2 (``integration/test_linkedin_client.py``): "the 15,000-element split; a
+    ``next`` link followed", on two worlds with a single input moved.
+
+    Both cases state the client's cap and more creative days than one response holds, so each
+    first response is at the cap, and only ``linkedin.next_link.case`` adds a ``next`` link.
+    """
+    split, followed = _scenario(ANALYTICS_CAP_CASE), _scenario(NEXT_LINK_CASE)
+    assert input_differences(split, followed) == ("spec.linkedin.analytics_next_links",)
+    assert split.spec.linkedin is not None
+    assert followed.spec.linkedin is not None
+    assert not split.spec.linkedin.analytics_next_links
+    assert followed.spec.linkedin.analytics_next_links
+    stated = {key: cast(int, split.expect.values[key]) for key in ANALYTICS_STATED}
+    assert stated == {key: followed.expect.values[key] for key in ANALYTICS_STATED}
+    assert stated["elements_cap"] == MAX_ANALYTICS_ELEMENTS
+    assert stated["creatives"] * stated["days"] > stated["elements_cap"]
+
+
+@pytest.mark.anyio
+async def test_a_capped_analytics_response_with_a_next_link_is_followed_unsplit() -> None:
+    """AAP 0.11.2 (``integration/test_linkedin_client.py``): "the 15,000-element split; a
+    ``next`` link followed", the ``next`` link half.
+
+    On ``linkedin.next_link.case`` the first ``adAnalytics`` response holds exactly the stated
+    cap of elements and a ``rel=next`` link. The client requests that link at once, with the
+    ``start``/``count`` continuation the simulator accepts, over the same date range (no
+    split), and the listing is complete: 18,000 distinct creative days in 2 calls.
+    """
+    scenario = _scenario(NEXT_LINK_CASE)
+    values = scenario.expect.values
+    assert values["next_followed"] is True
+    cap = cast(int, values["elements_cap"])
+    total = cast(int, values["creatives"]) * cast(int, values["days"])
+    listing, exchanges = await _read_daily_analytics(scenario)
+    assert [_page(response) for _, response in exchanges] == [(cap, ("next",)), (total - cap, ())]
+    (first, capped), (continued, _) = exchanges
+    whole = restli_date_range(*_stated_range(scenario))
+    assert [request.url.params.get("dateRange") for request, _ in exchanges] == [whole, whole]
+    assert "start" not in first.url.params
+    assert "count" not in first.url.params
+    (link,) = cast(list[dict[str, Any]], capped.json()["paging"]["links"])
+    assert continued.url.raw_path.decode("ascii") == link["href"]
+    assert (continued.url.params.get("start"), continued.url.params.get("count")) == (
+        str(cap),
+        str(cap),
+    )
+    assert listing.calls == len(exchanges) == 2
+    _check_every_creative_day(scenario, listing)
+
+
+@pytest.mark.anyio
+async def test_a_capped_analytics_response_without_a_next_link_is_split_by_date() -> None:
+    """AAP 0.11.2 (``integration/test_linkedin_client.py``): "the 15,000-element split; a
+    ``next`` link followed", the split half.
+
+    On ``linkedin.analytics_cap.case`` the first ``adAnalytics`` response holds exactly the
+    stated cap of elements and no ``next`` link, so it may be truncated: the client discards it
+    and reads the two halves of its date range, 15,000 then 9,000 and 9,000 elements in 3
+    calls, and the listing is complete with 18,000 distinct creative days.
+    """
+    scenario = _scenario(ANALYTICS_CAP_CASE)
+    values = scenario.expect.values
+    assert values["split"] == "date_range"
+    cap = cast(int, values["elements_cap"])
+    creatives = cast(int, values["creatives"])
+    days = cast(int, values["days"])
+    listing, exchanges = await _read_daily_analytics(scenario)
+    start, end = _stated_range(scenario)
+    mid = start + timedelta(days=(days - 1) // 2)
+    first_half = (mid - start).days + 1
+    assert [_page(response) for _, response in exchanges] == [
+        (cap, ()),
+        (creatives * first_half, ()),
+        (creatives * (days - first_half), ()),
+    ]
+    assert [request.url.params.get("dateRange") for request, _ in exchanges] == [
+        restli_date_range(start, end),
+        restli_date_range(start, mid),
+        restli_date_range(mid + timedelta(days=1), end),
+    ]
+    assert not any("start" in request.url.params for request, _ in exchanges)
+    assert listing.calls == len(exchanges) == 3
+    _check_every_creative_day(scenario, listing)
 
 
 def test_the_override_routes_the_overridden_creatives_spend_and_leads() -> None:
