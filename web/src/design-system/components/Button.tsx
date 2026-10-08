@@ -72,16 +72,20 @@ export type ButtonSize = 'sm' | 'md';
  * Every native `<button>` attribute is accepted and forwarded to the element (`onClick`,
  * `disabled`, `id`, `name`, `value`, `form`, `children`, every `aria-*` attribute such as
  * `aria-pressed`, `aria-expanded`, `aria-controls`, `aria-describedby` and `aria-label`, and
- * `ref`, which React 19 passes as a regular prop), except two: there is no `className` or
- * `style` prop, because feature code must not restyle a wrapper (AAP 0.4.4). Appearance comes
- * only from `variant` and `size`.
+ * `ref`, which React 19 passes as a regular prop), except three:
+ *
+ * - there is no `className` or `style` prop, because feature code must not restyle a wrapper
+ *   (AAP 0.4.4). Appearance comes only from `variant` and `size`;
+ * - there is no `dangerouslySetInnerHTML` prop, because the content always goes through
+ *   `children`, which React escapes, into the label slot. React rejects an element given both,
+ *   and raw HTML would bypass that escaping.
  *
  * GAP: bind to Blitzy OS on source arrival. These are product-level props, not Blitzy OS
  * props; on binding, they map onto the Blitzy OS button.
  */
 export interface ButtonProps extends Omit<
   ComponentPropsWithRef<'button'>,
-  'className' | 'style' | 'type'
+  'className' | 'style' | 'type' | 'dangerouslySetInnerHTML'
 > {
   /** The visual weight. Defaults to `'secondary'`. */
   variant?: ButtonVariant;
@@ -106,9 +110,12 @@ export interface ButtonProps extends Omit<
  *
  * The button is disabled when `disabled` is `true` or while `loading`. Native `disabled` keeps
  * the click from firing and takes the button out of the tab order until it is enabled again.
- * The attributes this component owns (`type`, `className`, `disabled` and `aria-busy`) are
- * applied after the forwarded props, so they always reflect `type`, `variant`, `size`,
- * `disabled` and `loading`.
+ * The attributes this component owns (`type`, `className`, `disabled`, `aria-busy` and
+ * `dangerouslySetInnerHTML`) are applied after the forwarded props, so they always reflect
+ * `type`, `variant`, `size`, `disabled` and `loading`. `dangerouslySetInnerHTML` is always
+ * unset: the content goes only through the escaped children in the label slot, so a
+ * `dangerouslySetInnerHTML` that reaches the props untyped (from JavaScript, or a spread of an
+ * untyped object) is discarded instead of colliding with the label.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *
@@ -147,6 +154,7 @@ export function Button({
       className={`ds-button ds-button--${variant} ds-button--${size}`}
       disabled={disabled === true || loading}
       aria-busy={loading ? true : undefined}
+      dangerouslySetInnerHTML={undefined}
     >
       <span className="ds-button__label">{children}</span>
       {loading ? (

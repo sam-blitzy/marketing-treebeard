@@ -133,6 +133,7 @@ __all__ = [
     "FLAG_STALE",
     "FLAG_UNKNOWN_CRM_EVIDENCE",
     "FLAG_UNVERIFIED_DISCREPANCIES",
+    "FULL_STATE_DATASETS",
     "G1",
     "GROUP_BLOCK",
     "GROUP_CHANGES",
@@ -2082,6 +2083,14 @@ class RuleResult:
 # Input types: datasets and freshness (AAP 0.3.2, 0.3.3)
 # ---------------------------------------------------------------------------
 
+FULL_STATE_DATASETS: Final[frozenset[str]] = frozenset({"google.entities", "linkedin.entities"})
+"""Datasets an entity sync re-reads in full current state, with no native date range.
+
+Their ``dataset_freshness`` rows record no coverage of their own (``sync/freshness.py``
+``FreshnessOutcome``: a success with no range is a full-state read), so the window checks of
+:class:`Freshness` judge them by completeness and age alone.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class DatasetRef:
@@ -2172,9 +2181,11 @@ class Freshness:
         """Return whether the dataset is stale for a window ending on ``window_end`` (P4).
 
         Stale when it last succeeded more than ``stale_after`` (``sources.stale_after_hours``)
-        before ``now``, never succeeded, or covers less than the window end (AAP 0.3.2). The
-        age is the elapsed time between the two instants, taken on UTC operands, so it stays
-        exact when ``now`` and the last success straddle a DST change.
+        before ``now``, never succeeded, or covers less than the window end (AAP 0.3.2). A
+        full-state dataset (:data:`FULL_STATE_DATASETS`) records no date range, so only its
+        age can make it stale. The age is the elapsed time between the two instants, taken on
+        UTC operands, so it stays exact when ``now`` and the last success straddle a DST
+        change.
 
         Args:
             now: The tz-aware instant the age is judged at.
@@ -2190,12 +2201,48 @@ class Freshness:
             return True
         if now.astimezone(UTC) - self.last_success_at.astimezone(UTC) > stale_after:
             return True
+        if self.dataset in FULL_STATE_DATASETS:
+            return False
         return self.covered_through is None or self.covered_through < window_end
 
     @property
     def is_complete(self) -> bool:
         """Whether the dataset is ``complete`` over its covered range."""
         return self.completeness == "complete"
+
+    def is_complete_over(self, *, window_start: date, window_end: date) -> bool:
+        """Return whether the dataset is complete over the range ``[window_start, window_end]``.
+
+        AAP 0.3.2 (P4): an item is incomplete "when any of its datasets is not ``complete``
+        over the window". :attr:`completeness` describes only the covered range, so a dated
+        dataset is complete over the required range only when it is ``complete``, its
+        coverage starts on or before ``window_start`` and it ends on or after ``window_end``.
+        The range is the run's window, or wider where a rule reads further back: the overlay
+        passes a K1 item's ``google.metrics_daily`` the start of its frozen baseline window.
+        Coverage that stops before ``window_end`` is therefore incomplete as well as stale
+        (:meth:`is_stale`). A full-state dataset (:data:`FULL_STATE_DATASETS`) has no date
+        range, so its completeness alone decides.
+
+        Example:
+            >>> covered = (date(2026, 9, 20), date(2026, 10, 1))
+            >>> row = Freshness(3, "google.metrics_daily", None, None, *covered, "complete")
+            >>> row.is_complete_over(window_start=date(2026, 9, 20), window_end=date(2026, 10, 1))
+            True
+            >>> row.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
+            False
+            >>> row.is_complete_over(window_start=date(2026, 9, 20), window_end=date(2026, 10, 2))
+            False
+        """
+        if self.completeness != "complete":
+            return False
+        if self.dataset in FULL_STATE_DATASETS:
+            return True
+        return (
+            self.covered_from is not None
+            and self.covered_from <= window_start
+            and self.covered_through is not None
+            and self.covered_through >= window_end
+        )
 
     def status(self) -> DatasetStatus:
         """Return the dataset's frozen :class:`DatasetStatus` for evidence."""

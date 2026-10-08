@@ -50,16 +50,18 @@ export interface InlineProps {
   /**
    * The element to render. Defaults to `div`. Use `ul` or `ol` when the children form a list,
    * for example a row of flags or source chips; every child must then be an `<li>`, because
-   * a list element may contain only list items. The list keeps its semantics while its
-   * markers, indentation and outer spacing are cleared.
+   * a list element may contain only list items. The list's markers, indentation and outer
+   * spacing are cleared, so it carries `role="list"`: Safari's VoiceOver stops announcing an
+   * unmarked list as a list without the explicit role.
    */
   as?: 'div' | 'ul' | 'ol';
   /** The element's `id`, for example as the target of an in-page link or `aria-controls`. */
   id?: string;
   /**
-   * Accessible name of the row. Meaningful when the row is a list (`as="ul"` or `as="ol"`),
-   * whose list role takes a name; a plain `div` has the generic role, which assistive
-   * technology does not name, so leave it unset there.
+   * Accessible name of the row. On a list (`as="ul"` or `as="ol"`) it names the list. On a
+   * `div` the row is exposed as a labelled `group`, because ARIA does not allow a name on an
+   * element with no role and assistive technology would never announce it. An empty label is
+   * treated as no label.
    */
   'aria-label'?: string;
   /** The row's content. With `as="ul"` or `as="ol"`, `<li>` elements only. */
@@ -74,7 +76,8 @@ export interface InlineProps {
  * - `ds-inline--nowrap` when `wrap` is `false`;
  * - `ds-inline--align-{align}` and `ds-inline--justify-{justify}` when those props are set.
  *
- * When `as` is `ul` or `ol`, every child must be an `<li>`.
+ * When `as` is `ul` or `ol`, every child must be an `<li>`, and the list carries `role="list"`.
+ * A `div` given a non-empty `aria-label` carries `role="group"`; without one it has no role.
  *
  * @example
  * ```tsx
@@ -92,7 +95,8 @@ export interface InlineProps {
  * GAP: bind to Blitzy OS on source arrival.
  *
  * @param props - see {@link InlineProps}
- * @returns the `as` element carrying the layout classes, `id`, `aria-label` and children
+ * @returns the `as` element carrying the layout classes, `id`, `aria-label`, the derived `role`
+ *   and children
  */
 export function Inline({
   gap = 2,
@@ -118,8 +122,12 @@ export function Inline({
   // `as` is a closed union of intrinsic tags, so the JSX below renders exactly one of them.
   const Element = as;
 
+  // Lists keep their list role under Inline.css's marker reset; a labelled div becomes a group so
+  // its name is exposed (see InlineProps.as and InlineProps['aria-label']).
+  const role = as === 'div' ? (ariaLabel ? 'group' : undefined) : 'list';
+
   return (
-    <Element className={classes.join(' ')} id={id} aria-label={ariaLabel}>
+    <Element className={classes.join(' ')} id={id} aria-label={ariaLabel} role={role}>
       {children}
     </Element>
   );

@@ -57,6 +57,7 @@ from ads_engine.connectors.linkedin.auth import (
     StaticTokenProvider,
 )
 from ads_engine.connectors.linkedin.client import LinkedInClient
+from ads_engine.connectors.linkedin.parser import decode_email
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import SIM_GOOGLE_CUSTOMER_ID
 from ads_engine.simulation import transport as transport_module
@@ -398,6 +399,30 @@ async def test_the_linkedin_client_reads_rest_surfaces_through_build_client() ->
         *[JournalEntry("linkedin", "lead_forms", "GET", "/rest/leadForms", 200, None)]
         * forms.calls,
     ]
+
+
+@pytest.mark.anyio
+async def test_the_linkedin_client_re_fetches_simulated_leads_by_id() -> None:
+    """Simulated batch elements carry the identity the client binds each re-fetch to.
+
+    Every real lead re-fetched by plain id is found and decodes to an email; test leads, which
+    ingest never stores, come back with ``testLead`` true and are failed.
+    """
+    world = _world()
+    start_ms = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp()) * 1000
+    end_ms = int(NOW.timestamp()) * 1000
+    responses = world.linkedin_lead_responses(NA_ACCOUNT, start_ms, end_ms)
+    real = [response.id for response in responses if not response.test_lead]
+    tests = [response.id for response in responses if response.test_lead]
+    assert real
+    assert tests
+    async with build_client("linkedin", transport=mock_transport("linkedin", world)) as http:
+        client = LinkedInClient(http, StaticTokenProvider(SIMULATED_TOKEN))
+        batch = await client.get_lead_responses(NA_ACCOUNT, [*real, *tests])
+    assert set(batch.found) == set(real)
+    assert batch.failed == frozenset(tests)
+    assert batch.interrupted_by is None
+    assert all(decode_email(element, {}).status == "ok" for element in batch.found.values())
 
 
 @pytest.mark.anyio

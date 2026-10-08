@@ -17,9 +17,16 @@
  */
 
 /*
- * Base chip. inline-flex keeps the chip on the text line and centres its label vertically;
- * nowrap keeps a short label such as "Short window" on one line inside a wrapping Inline row.
+ * Base chip. inline-flex keeps the chip on the text line and centres its label vertically.
  * The border takes currentColor, so each tone modifier recolours text and border together.
+ *
+ * A short label such as "Short window" stays on one line inside a wrapping Inline row, because
+ * a flex row wraps between chips before it shrinks one. A label longer than its track, such as
+ * a long flag or an unbroken URN, wraps inside the chip instead of overflowing the row or card,
+ * and the chip keeps its full text, size and padding (WCAG 2.2 SC 1.4.10 Reflow, SC 1.4.4
+ * Resize Text). overflow-wrap is anywhere, not break-word, because only anywhere lowers the
+ * chip's min-content size, which is what lets a flex or grid track shrink it to fit, as in
+ * EmptyState.css.
  */
 .ds-badge {
   display: inline-flex;
@@ -38,7 +45,7 @@
   border: calc(var(--space-1) / 4) solid currentColor;
   border-radius: var(--radius-sm);
   background: var(--color-surface);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 /*

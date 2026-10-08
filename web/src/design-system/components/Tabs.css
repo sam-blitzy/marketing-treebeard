@@ -7,7 +7,8 @@
  *   <div class="ds-tabs">
  *     <div class="ds-tabs__list" role="tablist" aria-label="…">
  *       <button class="ds-tabs__tab" role="tab" aria-selected="true|false" aria-controls="…"
- *               tabindex="0|-1">Label <span class="ds-tabs__count">3</span></button>
+ *               tabindex="0|-1"><span class="ds-tabs__label">Label</span>
+ *         <span class="ds-tabs__count">3</span></button>
  *     </div>
  *     <div class="ds-tabs__panel" role="tabpanel" aria-labelledby="…" tabindex="0" hidden>…</div>
  *   </div>
@@ -84,8 +85,24 @@
   outline-offset: calc(var(--space-1) / 2);
 }
 
-/* Item count beside the label ("Block 3"); tabular figures keep counts the same width. */
+/*
+ * Label slot (WCAG 2.2 SC 1.4.10 Reflow). The list wraps whole tabs, so a tab's own minimum
+ * width must stay small: min-inline-size: 0 lets the label shrink below its content width, and
+ * overflow-wrap: anywhere lets an unbroken label such as a long identifier wrap inside its tab
+ * instead of widening the row. anywhere, not break-word, is used because only anywhere lowers
+ * the label's min-content width. The label is never truncated.
+ */
+.ds-tabs__label {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Item count beside the label ("Block 3"); tabular figures keep counts the same width, and
+ * flex-shrink: 0 keeps the count whole beside a wrapped label.
+ */
 .ds-tabs__count {
+  flex-shrink: 0;
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   font-variant-numeric: tabular-nums;

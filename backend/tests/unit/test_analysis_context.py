@@ -37,6 +37,7 @@ from ads_engine.analysis.context import (
     FEEDBACK_SUPPRESSION,
     FINDING_CODES,
     FLAG_CODES,
+    FULL_STATE_DATASETS,
     GROUP_ORDER,
     GROUP_TITLES,
     K1,
@@ -1151,6 +1152,121 @@ def test_freshness_and_feedback_require_an_aware_now() -> None:
         FeedbackInfo("C1", "campaign", "k", "snooze", date(2026, 10, 6))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match=r"FeedbackInfo\.until"):
         FeedbackInfo("C1", "campaign", "k", "snooze", naive)
+
+
+def test_full_state_datasets_are_the_entity_syncs() -> None:
+    assert frozenset({"google.entities", "linkedin.entities"}) == FULL_STATE_DATASETS
+    assert set(DATASETS) >= FULL_STATE_DATASETS
+    assert "FULL_STATE_DATASETS" in ctx_module.__all__
+
+
+@pytest.mark.parametrize(
+    ("dataset", "completeness", "covered_from", "covered_through", "expected"),
+    [
+        # The review's reproduction: complete over 2026-09-20..2026-10-01, but the window
+        # starts on 2026-09-04, so 16 requested days are not covered.
+        ("google.metrics_daily", "complete", date(2026, 9, 20), date(2026, 10, 1), False),
+        ("google.metrics_daily", "complete", date(2026, 9, 5), date(2026, 10, 1), False),
+        ("google.metrics_daily", "complete", date(2026, 9, 4), date(2026, 10, 1), True),
+        ("google.metrics_daily", "complete", date(2026, 4, 1), date(2026, 10, 1), True),
+        ("google.metrics_daily", "complete", date(2026, 4, 1), date(2026, 10, 5), True),
+        # Coverage that stops before the window end is not complete over the window.
+        ("google.metrics_daily", "complete", date(2026, 4, 1), date(2026, 9, 30), False),
+        ("google.search_terms", "complete", date(2026, 9, 4), date(2026, 9, 4), False),
+        # Short at both ends.
+        ("google.metrics_daily", "complete", date(2026, 9, 5), date(2026, 9, 30), False),
+        # Half a range is no range.
+        ("google.metrics_daily", "complete", date(2026, 4, 1), None, False),
+        ("google.metrics_daily", "complete", None, date(2026, 10, 1), False),
+        ("linkedin.leads", "complete", None, None, False),
+        ("google.metrics_daily", "incomplete", date(2026, 4, 1), date(2026, 10, 1), False),
+        ("hubspot.contacts", "unknown", date(2026, 4, 1), date(2026, 10, 1), False),
+        # A full-state entity read has no date range: its completeness alone decides.
+        ("google.entities", "complete", None, None, True),
+        ("linkedin.entities", "complete", date(2026, 9, 20), date(2026, 9, 21), True),
+        ("google.entities", "incomplete", None, None, False),
+        ("linkedin.entities", "unknown", None, None, False),
+    ],
+)
+def test_freshness_is_complete_over_requires_coverage_of_the_whole_window(
+    dataset: str,
+    completeness: str,
+    covered_from: date | None,
+    covered_through: date | None,
+    expected: bool,
+) -> None:
+    row = Freshness(
+        3,
+        dataset,
+        NOW,
+        NOW - timedelta(hours=1),
+        covered_from,
+        covered_through,
+        completeness,  # type: ignore[arg-type]
+    )
+    assert (
+        row.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
+        is expected
+    )
+    # The covered-range verdict other callers read is unchanged.
+    assert row.is_complete is (completeness == "complete")
+
+
+def test_a_required_range_wider_than_the_window_needs_coverage_from_its_own_start() -> None:
+    # A K1 item's google.metrics_daily must cover its 90-day baseline, not only the window.
+    row = Freshness(
+        3,
+        "google.metrics_daily",
+        NOW,
+        NOW - timedelta(hours=1),
+        date(2026, 9, 4),
+        date(2026, 10, 1),
+        "complete",
+    )
+    assert row.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
+    assert not row.is_complete_over(window_start=date(2026, 7, 4), window_end=date(2026, 10, 1))
+    baseline = dataclasses.replace(row, covered_from=date(2026, 7, 4))
+    assert baseline.is_complete_over(window_start=date(2026, 7, 4), window_end=date(2026, 10, 1))
+
+
+def test_coverage_short_of_the_window_end_is_both_stale_and_incomplete() -> None:
+    row = Freshness(
+        3,
+        "google.search_terms",
+        NOW,
+        NOW - timedelta(hours=1),
+        date(2026, 4, 1),
+        date(2026, 9, 30),
+        "complete",
+    )
+    day = timedelta(hours=24)
+    # AAP 0.3.2: stale when it covers less than the window end, and incomplete when it is not
+    # complete over the window, which coverage ending a day early is not.
+    assert row.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 1))
+    assert not row.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
+    # Coverage reaching the window end is neither.
+    covered = dataclasses.replace(row, covered_through=date(2026, 10, 1))
+    assert not covered.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 1))
+    assert covered.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
+
+
+@pytest.mark.parametrize("dataset", sorted(FULL_STATE_DATASETS))
+def test_full_state_datasets_are_stale_by_age_alone(dataset: str) -> None:
+    day = timedelta(hours=24)
+    fresh = Freshness(3, dataset, NOW, NOW - timedelta(hours=2), None, None, "complete")
+    for window_end in (date(2026, 9, 1), date(2026, 10, 5), date(2026, 12, 31)):
+        assert not fresh.is_stale(now=NOW, stale_after=day, window_end=window_end)
+    covered = dataclasses.replace(
+        fresh, covered_from=date(2026, 4, 1), covered_through=date(2026, 9, 1)
+    )
+    assert not covered.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 5))
+    old = dataclasses.replace(fresh, last_success_at=NOW - timedelta(hours=25))
+    assert old.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 5))
+    never = dataclasses.replace(fresh, last_success_at=None)
+    assert never.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 5))
+    # A dated dataset with the same row is stale: it covers no date of the window.
+    dated = dataclasses.replace(fresh, dataset="google.metrics_daily")
+    assert dated.is_stale(now=NOW, stale_after=day, window_end=date(2026, 10, 5))
 
 
 def test_entity_infos_validate_and_default() -> None:

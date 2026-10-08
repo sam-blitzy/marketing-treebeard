@@ -15,15 +15,31 @@
  * - SC 1.4.10 Reflow: the table sits in a region that scrolls on the inline axis, so a wide table
  *   never makes the page scroll sideways at a 320 CSS px viewport.
  * - SC 2.1.1 Keyboard: that region is focusable (`tabindex="0"`), so keyboard users can scroll it
- *   with the arrow keys, and it is named by the caption so its focus stop is announced. The
+ *   with the arrow keys, and it carries the table's name so its focus stop is announced. The
  *   expand toggles are native buttons carrying `aria-expanded` and `aria-controls`.
+ * - SC 4.1.2 Name, Role, Value and SC 2.5.3 Label in Name: the table and its region always share
+ *   one non-empty name. A text caption (a string, number or bigint) is that name: the table is
+ *   named by its `<caption>` and the region by `aria-labelledby` pointing at it. A rich caption
+ *   (an element or an iterable of nodes) is shown in the `<caption>` too, but what it renders is
+ *   not known before rendering: it may be empty, whitespace or hidden from assistive technology.
+ *   It therefore comes with a required plain-text `captionLabel`, which names both the table and
+ *   the region through `aria-label` and should contain the caption's visible words.
+ *
+ * A table is rendered only when it can be named and has columns to lay out. A caption with no
+ * content (an empty or whitespace-only string, or an iterable none of whose entries has any) or a
+ * rich caption without a non-blank `captionLabel` would leave both the table and its region
+ * without an accessible name, and an empty `columns` array would give the empty-state cell
+ * `colSpan={0}` and every row an empty `<tr>`. In each case the component renders an
+ * {@link EmptyState} titled "Table unavailable", whose reason names what is missing, instead of
+ * the table. It is static content, with no live-region role.
  *
  * The styling lives in `DataTable.css`, whose class names are the contract this component
  * renders: `ds-datatable__region`, `ds-datatable`, `ds-datatable__caption`,
  * `ds-datatable__header`, `ds-datatable__cell`, `ds-datatable__cell--start` and `--end`,
  * `ds-datatable__toggle-cell`, `ds-datatable__detail-row`, `ds-datatable__detail-cell` and
  * `ds-datatable__empty`. The visually hidden "Details" header of the expand column uses
- * `ds-visually-hidden` from `shared.css`.
+ * `ds-visually-hidden` from `shared.css`, and the configuration state is styled by
+ * `EmptyState.css`.
  *
  * The table deliberately has no sorting, pagination or selection: rows arrive already ranked by
  * the analysis run (AAP 0.5.4), and no screen in AAP 0.5.5 asks for any of the three.
@@ -39,10 +55,11 @@
 import './shared.css';
 import './DataTable.css';
 
-import { Fragment, useId, useState } from 'react';
+import { Fragment, isValidElement, useId, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import { Button } from './Button';
+import { EmptyState } from './EmptyState';
 
 /**
  * One column of a {@link DataTable}, typed by the row it reads.
@@ -75,32 +92,19 @@ export interface DataTableColumn<Row> {
 }
 
 /**
- * Props of {@link DataTable}.
- *
- * The interface is deliberately closed: there is no `className` or `style` prop, because feature
- * code must not restyle a wrapper (AAP 0.4.4).
- *
- * Expansion is enabled by passing `renderExpanded`. The table then adds a leading column of
- * toggle buttons, and each data row is followed by a detail row spanning every column, hidden
- * until its toggle is pressed. The white paper table uses it to expand each asset row to its
- * per-creative rows, including "unknown creative" (AAP 0.5.5). Expanded rows are remembered by
- * `getRowKey`, so a row stays open when the rows are re-rendered in another order.
- *
- * GAP: bind to Blitzy OS on source arrival. These are product-level props, not Blitzy OS props;
- * on binding, they map onto the Blitzy OS table component.
+ * The props of {@link DataTable} other than its caption props: the columns, rows, row keys,
+ * empty-table message and expansion. {@link DataTableProps} adds the caption props.
  */
-export interface DataTableProps<Row> {
-  /** The columns, in display order. */
+interface DataTableBaseProps<Row> {
+  /**
+   * The columns, in display order. A table needs at least one: with none, the component
+   * renders its "Table unavailable" configuration state instead of a table.
+   */
   columns: readonly DataTableColumn<Row>[];
   /** The rows, in display order. Zero rows render `emptyMessage` in a single full-width cell. */
   rows: readonly Row[];
   /** Returns a stable key, unique within `rows`, for a row: the React key and expansion id. */
   getRowKey: (row: Row) => string;
-  /**
-   * The table's caption, for example "White papers · EUR". Required, because every table has
-   * one (AAP 0.5.5); it names both the table and its scrolling region.
-   */
-  caption: ReactNode;
   /** Shown when `rows` is empty. Defaults to "No rows". */
   emptyMessage?: ReactNode;
   /** Renders the detail content of an expanded row. Omitted, the table is not expandable. */
@@ -113,6 +117,83 @@ export interface DataTableProps<Row> {
    */
   expandLabel?: (row: Row, expanded: boolean) => string;
 }
+
+/** A text caption of a {@link DataTable}: text or a number, which is also the table's name. */
+type DataTableTextCaption = string | number | bigint;
+
+/**
+ * A rich caption of a {@link DataTable}: an element, a fragment or an iterable of nodes, such as
+ * `<span>White papers · <abbr title="Euro">EUR</abbr></span>`.
+ *
+ * Text captions are excluded, and so are `null`, `undefined`, booleans and promises, because
+ * they render nothing (or nothing yet). The intersection with `object` keeps a string, which is
+ * itself an iterable of strings, from passing as a rich caption.
+ */
+type DataTableRichCaption = Exclude<
+  ReactNode,
+  DataTableTextCaption | null | undefined | boolean | PromiseLike<unknown>
+> &
+  object;
+
+/** The caption props of a table whose caption is text: the caption names the table. */
+interface DataTableTextCaptionProps {
+  /**
+   * The table's caption, for example "White papers · EUR". Required, because every table has
+   * one (AAP 0.5.5). It is shown in the `<caption>`, which names the table, and the scrolling
+   * region is named by it through `aria-labelledby`. A blank string, such as `''` or `'   '`,
+   * renders the "Table unavailable" configuration state instead of a table.
+   */
+  caption: DataTableTextCaption;
+  /** Not taken: a text caption is already the table's plain-text name. */
+  captionLabel?: never;
+}
+
+/** The caption props of a table whose caption is rich content: `captionLabel` names the table. */
+interface DataTableRichCaptionProps {
+  /**
+   * The table's caption as rich content, shown in the `<caption>`. Required, because every
+   * table has one (AAP 0.5.5).
+   *
+   * What rich content renders is not known before rendering: an empty fragment, an element
+   * holding only whitespace, a component that returns `null` or an `aria-hidden` element all
+   * name nothing. The table is therefore named by `captionLabel`, never by this content. A
+   * caption with no content at all, such as `[]` or an array of blank strings, renders the
+   * "Table unavailable" configuration state instead of a table.
+   */
+  caption: DataTableRichCaption;
+  /**
+   * The plain-text accessible name of the table and its scrolling region, set as the
+   * `aria-label` of both. Required with a rich caption, and must have non-whitespace text: a
+   * blank label renders the "Table unavailable" configuration state instead of a table.
+   *
+   * It should contain the caption's visible words, in their order, for example "White papers ·
+   * EUR" for `<span>White papers · <abbr title="Euro">EUR</abbr></span>`, so a speech-input
+   * user can name the table by what they see (WCAG 2.5.3 Label in Name).
+   */
+  captionLabel: string;
+}
+
+/**
+ * Props of {@link DataTable}.
+ *
+ * The props are deliberately closed: there is no `className` or `style` prop, because feature
+ * code must not restyle a wrapper (AAP 0.4.4).
+ *
+ * The caption props take one of two shapes. A text caption (a string, number or bigint) names
+ * the table itself and takes no `captionLabel`. A rich caption (an element, fragment or iterable
+ * of nodes) requires a plain-text `captionLabel`, which names the table and its region.
+ *
+ * Expansion is enabled by passing `renderExpanded`. The table then adds a leading column of
+ * toggle buttons, and each data row is followed by a detail row spanning every column, hidden
+ * until its toggle is pressed. The white paper table uses it to expand each asset row to its
+ * per-creative rows, including "unknown creative" (AAP 0.5.5). Expanded rows are remembered by
+ * `getRowKey`, so a row stays open when the rows are re-rendered in another order.
+ *
+ * GAP: bind to Blitzy OS on source arrival. These are product-level props, not Blitzy OS props;
+ * on binding, they map onto the Blitzy OS table component.
+ */
+export type DataTableProps<Row> = DataTableBaseProps<Row> &
+  (DataTableTextCaptionProps | DataTableRichCaptionProps);
 
 /** The empty-table message used when `emptyMessage` is not given. */
 const DEFAULT_EMPTY_MESSAGE = 'No rows';
@@ -137,10 +218,138 @@ function defaultCell(row: unknown, key: string): ReactNode {
   return null;
 }
 
+/** The title of the configuration state rendered in place of a table that cannot be shown. */
+const UNAVAILABLE_TITLE = 'Table unavailable';
+
 /**
- * Data table: renders a focusable, caption-named scrolling region holding one native `<table>`
- * with its caption, a header row of `<th scope="col">` cells and one body row per entry of
- * `rows`, or a single empty-state row when there are none.
+ * Whether a caption has structural content to show, judged from the node itself without
+ * rendering it.
+ *
+ * A string with at least one non-whitespace character, a number or bigint, and a React element
+ * have content. An iterable has content when at least one of its entries does, checked
+ * recursively and stopping at the first such entry. `null`, `undefined`, booleans, empty or
+ * whitespace-only strings and iterables without such an entry have none, and neither has
+ * anything else React accepts as a node, such as a portal, whose content renders outside the
+ * caption, or a promise, whose content is not known yet.
+ *
+ * For text this settles the table's name. For rich content it does not: an element counts as
+ * content whatever it renders, so an empty fragment, an element holding only whitespace, a
+ * component returning `null` and an `aria-hidden` element all pass. That is why a rich caption
+ * is named by its required `captionLabel` (see {@link captionNaming}), and this check only
+ * rejects rich captions that cannot show anything at all.
+ *
+ * Iterables are read entry by entry, so an iterable caption is an array or another re-iterable
+ * collection; a one-shot iterator such as a generator, which React does not support as children
+ * either, would be consumed by this check.
+ *
+ * @param node the caption, or one entry of an iterable caption
+ * @returns `true` when the caption has content to show in the `<caption>`
+ */
+function hasCaptionContent(node: ReactNode): boolean {
+  if (typeof node === 'string') {
+    return node.trim() !== '';
+  }
+  if (typeof node === 'number' || typeof node === 'bigint') {
+    return true;
+  }
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return false;
+  }
+  if (isValidElement(node)) {
+    return true;
+  }
+  if (Symbol.iterator in node) {
+    for (const entry of node) {
+      if (hasCaptionContent(entry)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * How a table and its region are named, or what the caption props lack to name them:
+ * - `caption`: a text caption names the table, and the region points at it;
+ * - `label`: a rich caption's `captionLabel` names both through `aria-label`;
+ * - `no-caption`: the caption has no content;
+ * - `no-label`: a rich caption has no `captionLabel` with non-whitespace text.
+ */
+type CaptionNaming =
+  | { readonly kind: 'caption' }
+  | { readonly kind: 'label'; readonly label: string }
+  | { readonly kind: 'no-caption' }
+  | { readonly kind: 'no-label' };
+
+/**
+ * Decides how a table is named from its caption props, deterministically and without inspecting
+ * the rendered DOM.
+ *
+ * A caption without content (see {@link hasCaptionContent}) names nothing. A text caption (a
+ * string, number or bigint) with content is the name, and any `captionLabel` beside it is not
+ * used. Any other caption is rich, and is named by `captionLabel` only when that is a string with
+ * non-whitespace text. The parameters are typed for what JavaScript callers and untyped spreads
+ * can pass, not only for what {@link DataTableProps} allows.
+ *
+ * @param caption the `caption` prop
+ * @param captionLabel the `captionLabel` prop
+ * @returns how the table is named, or which part of the caption props is missing
+ */
+function captionNaming(caption: ReactNode, captionLabel: unknown): CaptionNaming {
+  if (!hasCaptionContent(caption)) {
+    return { kind: 'no-caption' };
+  }
+  if (typeof caption === 'string' || typeof caption === 'number' || typeof caption === 'bigint') {
+    return { kind: 'caption' };
+  }
+  if (typeof captionLabel === 'string' && captionLabel.trim() !== '') {
+    return { kind: 'label', label: captionLabel };
+  }
+  return { kind: 'no-label' };
+}
+
+/**
+ * The reason a table cannot be rendered, naming what its props lack.
+ *
+ * @param naming how the caption props name the table (see {@link captionNaming})
+ * @param hasColumns whether `columns` holds at least one column
+ * @returns the reason sentence, or `null` when the table can be rendered
+ */
+function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string | null {
+  if (naming.kind === 'no-caption') {
+    return hasColumns
+      ? 'This table has no caption to name it.'
+      : 'This table has no caption to name it and no columns to show.';
+  }
+  if (naming.kind === 'no-label') {
+    return hasColumns
+      ? "This table's caption has no text label to name it."
+      : "This table's caption has no text label to name it, and the table has no columns to show.";
+  }
+  if (!hasColumns) {
+    return 'This table has no columns to show.';
+  }
+  return null;
+}
+
+/**
+ * Data table: renders a focusable, named scrolling region holding one native `<table>` with its
+ * caption, a header row of `<th scope="col">` cells and one body row per entry of `rows`, or a
+ * single empty-state row when there are none.
+ *
+ * The table and the region share one name. A text caption names the table through its
+ * `<caption>`, and the region through `aria-labelledby` pointing at that caption. A rich caption
+ * is shown in the `<caption>` as given, and its required `captionLabel` names the table and the
+ * region through `aria-label`, because what rich content renders cannot be known before it is
+ * rendered.
+ *
+ * When the caption has no content, a rich caption has no `captionLabel` with non-whitespace
+ * text, or `columns` is empty, it renders no table and no region: it renders an
+ * {@link EmptyState} titled "Table unavailable" whose reason names what is missing (the caption,
+ * the caption's text label, the columns, or the caption part and the columns together). A
+ * nameless table would break SC 1.3.1 and leave the focusable region unnamed, and a table
+ * without columns has no cells to lay out. The state is static, with no `alert` role, because
+ * it reports how the table was configured rather than a change at run time.
  *
  * When `renderExpanded` is given, the first column holds a quiet, small {@link Button} per row
  * whose `aria-expanded` reflects the row's state and whose `aria-controls` names the row's detail
@@ -171,6 +380,14 @@ function defaultCell(row: unknown, key: string): ReactNode {
  *   renderExpanded={(r) => <CreativeRows asset={r} />}
  *   expandLabel={(r, open) => `${open ? 'Hide' : 'Show'} creatives for ${r.asset}`}
  * />
+ *
+ * <DataTable
+ *   caption={<>Evidence · <abbr title="Euro">EUR</abbr></>}
+ *   captionLabel="Evidence · EUR"
+ *   columns={evidenceColumns}
+ *   rows={evidenceRows}
+ *   getRowKey={(r) => r.metric}
+ * />
  * ```
  */
 export function DataTable<Row>({
@@ -178,6 +395,7 @@ export function DataTable<Row>({
   rows,
   getRowKey,
   caption,
+  captionLabel,
   emptyMessage,
   renderExpanded,
   expandLabel,
@@ -186,6 +404,14 @@ export function DataTable<Row>({
   const captionId = `${baseId}-caption`;
   const [expandedKeys, setExpandedKeys] = useState<ReadonlySet<string>>(() => new Set());
 
+  const naming = captionNaming(caption, captionLabel);
+  const reason = unavailableReason(naming, columns.length > 0);
+  if (reason !== null) {
+    return <EmptyState title={UNAVAILABLE_TITLE}>{reason}</EmptyState>;
+  }
+
+  // A rich caption's label names the table and the region; a text caption names them itself.
+  const label = naming.kind === 'label' ? naming.label : undefined;
   const expandable = renderExpanded !== undefined;
   const totalColumns = columns.length + (expandable ? 1 : 0);
 
@@ -203,8 +429,14 @@ export function DataTable<Row>({
   };
 
   return (
-    <div className="ds-datatable__region" role="region" aria-labelledby={captionId} tabIndex={0}>
-      <table className="ds-datatable">
+    <div
+      className="ds-datatable__region"
+      role="region"
+      aria-label={label}
+      aria-labelledby={label === undefined ? captionId : undefined}
+      tabIndex={0}
+    >
+      <table className="ds-datatable" aria-label={label}>
         <caption id={captionId} className="ds-datatable__caption">
           {caption}
         </caption>

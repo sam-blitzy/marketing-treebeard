@@ -27,6 +27,9 @@
  * - secondary: --color-text on --color-surface is at least 4.5:1, and its --color-border
  *   outline is at least 3:1 (SC 1.4.11);
  * - quiet: --color-accent text is at least 4.5:1 on both the surface and the page background;
+ * - active (being pressed): primary keeps --color-surface text on --color-accent; secondary
+ *   (--color-text) and quiet (--color-accent) text on the --color-bg fill is at least 4.5:1, and
+ *   quiet's --color-border hairline around that fill is at least 3:1 on both backgrounds;
  * - focus ring: --color-accent is at least 3:1 on both backgrounds (SC 2.4.7, 2.4.13).
  *
  * Target size (SC 2.5.8, minimum 24 by 24 CSS px): md is at least --space-8 (32px) tall and sm at
@@ -117,6 +120,42 @@
 }
 
 /*
+ * Active (being pressed). The button drops the hover raise and moves down by the hairline width
+ * (a quarter of --space-1, 1px at the 16px root, the same derivation as the border). translate
+ * moves only the painted box, so the layout never shifts. Each variant also takes a token colour
+ * cue, so the press reads on every variant, the shadowless quiet one included: primary darkens
+ * its border to --color-text around the unchanged --color-surface label on --color-accent;
+ * secondary and quiet fill with --color-bg, on which their --color-text and --color-accent
+ * labels stay at least 4.5:1, and secondary darkens its border to --color-text. The --color-bg
+ * fill is the page background itself, so quiet also shows its reserved hairline border in
+ * --color-border, which is at least 3:1 on both the surface and the page background; the press
+ * therefore reads on either background without shifting the layout.
+ * Disabled buttons never react, and neither do loading ones, because Button.tsx disables the
+ * button while loading. A persistent pressed toggle keeps its own, stronger raise. The focus
+ * ring is an outline and is unaffected. Only box-shadow is transitioned, so the move is instant
+ * and reduced motion needs no rule of its own. These rules follow the hover rule, at the same
+ * specificity, so the press wins while the pointer is still over the button.
+ */
+.ds-button:active:not(:disabled):not([aria-pressed="true"]) {
+  box-shadow: none;
+  translate: 0 calc(var(--space-1) / 4);
+}
+
+.ds-button--primary:active:not(:disabled):not([aria-pressed="true"]) {
+  border-color: var(--color-text);
+}
+
+.ds-button--secondary:active:not(:disabled):not([aria-pressed="true"]) {
+  background: var(--color-bg);
+  border-color: var(--color-text);
+}
+
+.ds-button--quiet:active:not(:disabled):not([aria-pressed="true"]) {
+  background: var(--color-bg);
+  border-color: var(--color-border);
+}
+
+/*
  * Keyboard focus. Restates the base ring from ../tokens.css (half of --space-1 wide, 2px at a
  * 16px root, offset by the same amount) at component specificity, so no later rule can drop it.
  * The ring is never removed.
@@ -127,12 +166,13 @@
 }
 
 /*
- * Disabled. opacity is a unitless number, not a colour, so every variant dims alike without a
- * colour function. Inactive controls are exempt from the contrast minimums (SC 1.4.3, 1.4.11).
+ * Disabled. --opacity-disabled is a unitless opacity, not a colour, so every variant dims alike
+ * without a colour function, and the field controls in TextField.css share the same token.
+ * Inactive controls are exempt from the contrast minimums (SC 1.4.3, 1.4.11).
  */
 .ds-button:disabled {
   cursor: not-allowed;
-  opacity: 0.6;
+  opacity: var(--opacity-disabled);
 }
 
 /* Loading. Button.tsx also disables the button; this rule follows :disabled so the cursor reads as busy. */
@@ -140,13 +180,24 @@
   cursor: progress;
 }
 
-/* Slots */
+/*
+ * Slots. The label may shrink below its content width (min-inline-size: 0) and break anywhere,
+ * so a long unbroken label such as a URN or an id wraps inside the button instead of widening a
+ * narrow parent (WCAG 2.2 SC 1.4.10 Reflow). anywhere, not break-word, is used because only
+ * anywhere lowers the label's min-content width, which is what sizes the button. The label is
+ * never truncated, and a caller that sets white-space: nowrap (the DataTable toggle cell) keeps
+ * it on one line. The spinner never shrinks, so the loading cue keeps its size beside a wrapped
+ * label.
+ */
 .ds-button__label {
   display: inline-block;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 
 .ds-button__spinner {
   display: inline-flex;
+  flex-shrink: 0;
 }
 
 /*

@@ -78,8 +78,10 @@
 }
 
 /*
- * Lists: a ul or ol Stack keeps its list semantics (the caller supplies the li children) but
- * drops the user-agent bullets, outer margin and indentation, so the gap alone spaces the items.
+ * Lists: a ul or ol Stack drops the user-agent bullets, outer margin and indentation, so the gap
+ * alone spaces the items (the caller supplies the li children). Safari's VoiceOver stops
+ * announcing an unmarked list as a list, so its list semantics are kept by the role="list" that
+ * Stack.tsx sets on both list elements.
  */
 ul.ds-stack,
 ol.ds-stack {

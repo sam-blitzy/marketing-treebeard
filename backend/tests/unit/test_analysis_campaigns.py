@@ -16,7 +16,7 @@ Pure: no database and no network.
 """
 
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -24,7 +24,7 @@ from typing import Any, Final
 
 import pytest
 
-from ads_engine.analysis import campaigns
+from ads_engine.analysis import budget, campaigns
 from ads_engine.analysis.attribution import VetoPopulation, attribution_for
 from ads_engine.analysis.campaigns import (
     C1_THRESHOLD_KEYS,
@@ -84,10 +84,13 @@ from ads_engine.analysis.context import (
     LeadInfo,
     RuleResult,
     Source,
+    SubjectKey,
     Withheld,
 )
+from ads_engine.analysis.metrics import native_day_zone
 from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
 from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, ResolvedBinding
+from ads_engine.analysis.window import AnalysisWindow
 from ads_engine.simulation.scenarios import (
     FIXED_NOW,
     MODULE_CAMPAIGNS,
@@ -159,6 +162,9 @@ GOOGLE_POPULATION_DATASETS: Final = (
     "hubspot.contacts",
     "hubspot.associations",
 )
+
+MEETING_EXCLUSIONS: Final = "crm.meeting_outcome_exclusions"
+"""The meeting outcomes the veto population's meeting count leaves out (AAP 0.5.4.7)."""
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +492,10 @@ def test_every_declared_threshold_key_is_configured() -> None:
         for key in keys:
             assert ctx.thresholds.value(key) is not None, key
     assert set(VETO_THRESHOLD_KEYS) <= set(C1B_THRESHOLD_KEYS)
+    # The veto's meeting count applies the outcome exclusions; booking sources never enter it.
+    assert MEETING_EXCLUSIONS in VETO_THRESHOLD_KEYS
+    assert MEETING_EXCLUSIONS in C1B_THRESHOLD_KEYS
+    assert "crm.booking_sources" not in VETO_THRESHOLD_KEYS
 
 
 def test_formatting_helpers_render_amounts_counts_and_shares() -> None:
@@ -504,8 +514,6 @@ def test_formatting_helpers_render_amounts_counts_and_shares() -> None:
     assert campaigns._one_place(Decimal("2.95")) == "2.9"
     assert campaigns._q_floor(Decimal("2.9999995")) == Decimal("2.999999")
     assert campaigns._share(Decimal(2) / Decimal(22)) == Decimal("0.0909")
-    assert campaigns._sum_known([1, 2, 3]) == 6
-    assert campaigns._sum_known([1, None, 3]) is None
     assert campaigns._singular("conversions") == "conversion"
     assert campaigns._singular("leads") == "lead"
     assert campaigns._singular("spend") == "spend"
@@ -707,7 +715,20 @@ def test_c1b_pauses_a_campaign_whose_matured_leads_reach_no_pipeline() -> None:
     assert item.decision_subject == DecisionSubject("campaign", campaign_id)
     assert item.increases_spend_on == ()
     assert item.flags == ()
-    assert item.evidence.extra == {"proposed_status": "paused", "matured_ql": 0}
+    assert item.evidence.extra == {
+        "proposed_status": "paused",
+        "matured_ql": 0,
+        "campaign_group": {
+            "state": "loaded",
+            "id": ctx.campaigns[campaign_id].campaign_group_id,
+            "external_id": "990020000",
+            "name": "Always-on lead gen",
+            "status": "ACTIVE",
+            "daily_budget": None,
+            "total_budget": None,
+            "currency": "USD",
+        },
+    }
     assert item.required_datasets == (
         "linkedin.leads",
         "linkedin.analytics_daily",
@@ -906,6 +927,31 @@ def test_a_c1b_item_needs_a_population() -> None:
         )
 
 
+def test_veto_evidence_records_the_meeting_outcome_exclusions_it_counted_under() -> None:
+    # The shipped mapping excludes cancelled meetings; a tuned configuration's list is copied.
+    # Evidence is frozen with the run, so a configured list is recorded as a tuple.
+    scenario, ctx = _built("c1b.eligible.fires")
+    c1b = _only(campaigns.evaluate(ctx), C1B)
+    assert c1b.evidence.thresholds[MEETING_EXCLUSIONS] == ("CANCELED",)
+    tuned = _tuned(scenario, ctx, {MEETING_EXCLUSIONS: ["CANCELED", "NO_SHOW"]})
+    tuned_c1b = _only(campaigns.evaluate(tuned), C1B)
+    assert tuned_c1b.evidence.thresholds[MEETING_EXCLUSIONS] == ("CANCELED", "NO_SHOW")
+    # C2 Scale and Hold read a veto population, and so does the Scale's B1 card.
+    _, scale_ctx = _built("c2.outcome_scale.case")
+    scale = _only(campaigns.evaluate(scale_ctx), C2)
+    assert scale.evidence.thresholds[MEETING_EXCLUSIONS] == ("CANCELED",)
+    b1 = _only(budget.evaluate(scale_ctx), B1)
+    assert b1.evidence.thresholds[MEETING_EXCLUSIONS] == ("CANCELED",)
+    _, hold_ctx = _built("c2.outcome_hold.case")
+    hold = _only(campaigns.evaluate(hold_ctx), C2)
+    assert hold.evidence.thresholds[MEETING_EXCLUSIONS] == ("CANCELED",)
+    # Without a CRM link there is no population, so neither C2 nor its B1 card carries the key.
+    _, unlinked = _built("shared.poor_member.does_not_fire")
+    for item in (_only(campaigns.evaluate(unlinked), C2), _only(budget.evaluate(unlinked), B1)):
+        assert item.has_flag(FLAG_NO_CRM_LINK)
+        assert MEETING_EXCLUSIONS not in item.evidence.thresholds
+
+
 # ---------------------------------------------------------------------------
 # C2 Scale or Hold
 # ---------------------------------------------------------------------------
@@ -1001,6 +1047,74 @@ def test_c2_hold_under_the_veto_offers_no_b1_and_raises_no_spend() -> None:
     assert entry.kind == "hold"
     assert entry.veto is not None
     assert entry.veto.veto_fires
+
+
+@pytest.mark.parametrize(
+    ("name", "action", "expected"),
+    [
+        ("c2.outcome_scale.case", SCALE_ACTION, Decimal("21.000000")),
+        ("c2.outcome_hold.case", HOLD_ACTION, Decimal("21.000000")),
+        # Two campaigns share the account baseline, so expected differs from observed (140).
+        ("g1.b2_target.does_not_fire", SCALE_ACTION, Decimal("137.518987")),
+    ],
+)
+def test_c2_cards_show_expected_outcomes_at_the_account_baseline(
+    name: str, action: str, expected: Decimal
+) -> None:
+    _, ctx = _built(name)
+    entries = {
+        entry.entity.key: entry for entry in scale_outcomes(ctx) if isinstance(entry, ScaleOutcome)
+    }
+    items = [item for item in _items(campaigns.evaluate(ctx), C2) if item.action == action]
+    assert items
+    shown = []
+    for item in items:
+        entry = entries[item.entity_ref.key]
+        assert entry.baseline is not None
+        metric = item.evidence.metric("expected_outcomes")
+        # AAP 0.5.4.1: spend ÷ the baseline cost per outcome, recorded at six places.
+        assert metric.value == (entry.spend / entry.baseline).quantize(Decimal("0.000001"))
+        assert (metric.label, metric.unit) == ("Expected leads at the account baseline", "leads")
+        shown.append(metric.value)
+    assert expected in shown
+    # It sits beside the window outcomes, ahead of cost per outcome.
+    keys = [metric.key for metric in items[0].evidence.metrics]
+    assert keys[keys.index("outcomes") + 1 : keys.index("outcomes") + 3] == [
+        "expected_outcomes",
+        "cost_per_outcome",
+    ]
+
+
+def test_c2_expected_outcomes_are_unavailable_without_a_baseline() -> None:
+    _, ctx = _built("c2.outcome_scale.case")
+    (entry,) = scale_outcomes(ctx)
+    assert isinstance(entry, ScaleOutcome)
+    item = campaigns._c2_candidate(
+        ctx,
+        campaigns._Settings.of(ctx),
+        attribution_for(ctx),
+        replace(entry, baseline=None),
+        campaigns._Notes(),
+    )
+    metric = item.evidence.metric("expected_outcomes")
+    assert metric.value is None
+    assert metric.unavailable
+    assert item.evidence.to_json()["metrics"][3] == {
+        "key": "expected_outcomes",
+        "label": "Expected leads at the account baseline",
+        "value": None,
+        "unit": "leads",
+        "unavailable": True,
+    }
+    assert [(baseline.key, baseline.value) for baseline in item.evidence.baselines] == [
+        ("baseline_cost_per_outcome", None),
+        ("max_cost_per_outcome", None),
+    ]
+    # The reason sentence is unchanged and cites no baseline it does not have.
+    assert item.reason == (
+        "Capped on 28 of 28 known-budget days with 21 leads at USD 129.33 per lead: raise the "
+        "daily budget from USD 100.00 to USD 120.00 (B1)."
+    )
 
 
 @pytest.mark.parametrize(
@@ -1213,6 +1327,72 @@ def test_a_g1_blocked_scale_is_still_built_for_the_post_filter() -> None:
     assert DecisionSubject("budget", pool) in item.increases_spend_on
 
 
+def _left_pool() -> tuple[AnalysisContext, SubjectKey, SubjectKey, int, int]:
+    """The pool whose member m2 left for Pool B mid-window: (ctx, pool, pool B, m1, m2)."""
+    scenario, ctx = _built("shared.member_changed_intraday.case")
+    pool = ("budget", scenario.ids.id("google", "budget", "pool"))
+    pool_b = ("budget", scenario.ids.id("google", "budget", "pool-b"))
+    m1, m2 = (_campaign_id(scenario, "google", key) for key in ("m1", "m2"))
+    assert ctx.campaigns[m2].budget_id == pool_b[1]
+    return ctx, pool, pool_b, m1, m2
+
+
+def _blocking(
+    monkeypatch: pytest.MonkeyPatch, ctx: AnalysisContext, blocked: frozenset[SubjectKey]
+) -> AnalysisContext:
+    """A fresh copy of ``ctx`` whose G1 set (``spend_increase_blocked``) is ``blocked``."""
+
+    def fixed(context: AnalysisContext) -> frozenset[SubjectKey]:
+        return blocked
+
+    monkeypatch.setattr(campaigns, "spend_increase_blocked", fixed)
+    return _fresh(ctx)
+
+
+def test_a_member_that_left_the_shared_budget_is_no_g1_target_of_its_increase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, pool, pool_b, m1, m2 = _left_pool()
+    budget_subject = DecisionSubject(*pool)
+    targets = (budget_subject, DecisionSubject("campaign", m1))
+    # m2 left the pool for Pool B, whose own G1 block (B2 there) now covers m2.
+    blocked = _blocking(monkeypatch, ctx, frozenset({pool_b, ("campaign", m2)}))
+    (entry,) = [entry for entry in scale_outcomes(blocked) if entry.subject == pool]
+    assert isinstance(entry, ScaleOutcome)
+    assert (entry.kind, entry.g1_blocked) == ("scale", False)
+    assert (entry.members, entry.receivers) == ((m1, m2), (m1,))
+    assert entry.increases_spend_on == targets
+    item = _only(campaigns.evaluate(blocked), C2)
+    assert item.increases_spend_on == targets
+    assert "g1_blocked" not in item.evidence.extra
+    # m2 stays in the evidence and the dependencies with its member days before it left.
+    assert [row["campaign_id"] for row in item.evidence.extra["members"]] == [m1, m2]
+    assert DecisionSubject("campaign", m2) in item.depends_on
+    # B1 reads the same evaluation, so it declares the identical targets and is not blocked.
+    (b1,) = [line for line in budget.evaluate(blocked).candidates if line.rule_id == B1]
+    assert b1.entity_ref.id == pool[1]
+    assert b1.increases_spend_on == targets
+    assert "g1_blocked" not in b1.evidence.extra
+
+
+@pytest.mark.parametrize("target", ["budget", "receiver"])
+def test_a_block_on_the_budget_or_a_current_receiver_still_blocks_its_increase(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    ctx, pool, _, m1, _ = _left_pool()
+    # The budget-level block is the one metrics.spend_increase_blocked sets when the aggregate
+    # meets B2 or any member (historical members included) meets the member-level predicate.
+    key: SubjectKey = pool if target == "budget" else ("campaign", m1)
+    blocked = _blocking(monkeypatch, ctx, frozenset({key}))
+    (entry,) = [entry for entry in scale_outcomes(blocked) if entry.subject == pool]
+    assert isinstance(entry, ScaleOutcome)
+    assert (entry.kind, entry.g1_blocked) == ("scale", True)
+    assert _only(campaigns.evaluate(blocked), C2).evidence.extra["g1_blocked"] is True
+    (b1,) = [line for line in budget.evaluate(blocked).candidates if line.rule_id == B1]
+    assert b1.evidence.extra["g1_blocked"] is True
+    assert b1.increases_spend_on == entry.increases_spend_on
+
+
 def test_a_shared_budget_holds_on_its_members_combined_google_veto() -> None:
     scenario, ctx = _built("shared.poor_member.does_not_fire")
     pool = scenario.ids.id("google", "budget", "pool")
@@ -1396,46 +1576,185 @@ def test_the_outcome_label_falls_back_without_a_loaded_member() -> None:
     assert campaigns._outcome_label(ctx, (999_999,)) == "outcomes"
 
 
-def test_combined_veto_sums_members_and_names_why_it_cannot_judge() -> None:
-    _, ctx = _built("shared.poor_member.does_not_fire")
-    settings = campaigns._Settings.of(ctx)
-    assert campaigns._combined_veto(ctx, settings, []) is None
-    judged = campaigns._combined_veto(
-        ctx,
-        settings,
-        [_population(5, matured=12), _population(3, matured=10, unresolved=1)],
+def _touch_crm(touches: Sequence[tuple[str, datetime]]) -> CrmData:
+    """HubSpot's primary with one discovered Google contact per ``(campaign ref, touch)``.
+
+    Every contact has a genuine zero of meetings and deals and no Qualified Lead date.
+    """
+    people = tuple(
+        ContactInfo(
+            f"{870_000 + n}", lifecycle_stage="lead", google_campaign_ref=ref, google_touch_at=at
+        )
+        for n, (ref, at) in enumerate(touches)
     )
-    assert judged is not None
-    assert (judged.campaign_id, judged.source, judged.leads) == (3, "google", 22)
-    assert (judged.matured_leads, judged.matched_leads, judged.unresolved_leads) == (22, 21, 1)
-    assert judged.unresolved_share == Decimal(1) / Decimal(22)
-    assert (judged.eligible_contacts, judged.ql, judged.mql, judged.meetings) == (21, 0, 0, 0)
-    assert (judged.available, judged.reason, judged.attribution_floor) == (True, None, False)
-    assert judged.veto_fires
-    unavailable = campaigns._combined_veto(
-        ctx,
-        settings,
-        [_population(2), _population(999, available=False, reason="QL stage unresolved")],
+    fetches = {
+        ("contact", person.hs_id, to_type): AssociationFetchInfo(
+            "contact", person.hs_id, to_type, "ok_empty"
+        )
+        for person in people
+        for to_type in ("meeting", "deal")
+    }
+    return CrmData(GOOGLE_CRM, LINKED, fetches=fetches, google_contacts=people)
+
+
+def _shared_entry(ctx: AnalysisContext, pool: SubjectKey) -> ScaleOutcome:
+    (entry,) = [entry for entry in scale_outcomes(ctx) if entry.subject == pool]
+    assert isinstance(entry, ScaleOutcome)
+    return entry
+
+
+def test_touches_before_a_member_joined_never_enter_the_shared_budget_veto() -> None:
+    scenario, ctx = _built("shared.membership_mid_window.case")
+    pool = ("budget", scenario.ids.id("google", "budget", "pool"))
+    m1, m3 = (_campaign_id(scenario, "google", key) for key in ("m1", "m3"))
+    m1_ref, m3_ref = (scenario.ids.external_id("google", "campaign", key) for key in ("m1", "m3"))
+    # Twenty zero-QL contacts touched m3 on its own budget, before it joined the pool; summed
+    # in from m3's full-window population they would make the pool Hold. One contact touched
+    # m1 on a member day.
+    touches = [*[(m3_ref, MATURED_TOUCH)] * 20, (m1_ref, MATURED_TOUCH)]
+    linked = _with_google_crm(ctx, _touch_crm(touches))
+    entry = _shared_entry(linked, pool)
+    assert entry.history.members[m3][0] > MATURED_TOUCH.date()
+    assert entry.kind == "scale"
+    assert entry.veto is not None
+    assert (entry.veto.campaign_id, entry.veto.eligible_contacts) == (m1, 1)
+    assert not entry.veto.veto_fires
+    # The campaign keeps its own population; only the budget's is read on member days.
+    assert attribution_for(linked).veto[m3].eligible_contacts == 20
+    item = _only(campaigns.evaluate(linked), C2)
+    assert item.action == SCALE_ACTION
+    metrics = _metrics(item)
+    assert (metrics["leads"], metrics["matured_leads"], metrics["eligible_contacts"]) == (1, 1, 1)
+    assert metrics["ql"] == 0
+    # Every card of the budget shows this one population: budget_crm and the B1 item.
+    view = budget.budget_crm(linked, pool)
+    assert (view.scope, view.eligible_contacts, view.ql, view.flags) == ("google", 1, 0, ())
+    (b1,) = [line for line in budget.evaluate(linked).candidates if line.rule_id == B1]
+    assert _metrics(b1)["eligible_contacts"] == 1
+
+
+def test_the_shared_budget_veto_dates_member_days_in_the_google_account_zone() -> None:
+    scenario, ctx = _built("shared.membership_mid_window.case")
+    pool = ("budget", scenario.ids.id("google", "budget", "pool"))
+    m3 = _campaign_id(scenario, "google", "m3")
+    m3_ref = scenario.ids.external_id("google", "campaign", "m3")
+    tuned = _tuned(scenario, ctx, {"crm.lead_maturity_days": 1})
+    assert tuned.window.boundary("google") == "America/New_York"
+    assert _shared_entry(tuned, pool).history.members[m3][0].isoformat() == "2026-09-22"
+    # 23:00 on 2026-09-21 in New York (the day m3 changed budgets) and 01:00 on 2026-09-22,
+    # its first member day; both instants fall on 2026-09-22 in UTC.
+    for at, eligible in (
+        (datetime(2026, 9, 22, 3, 0, tzinfo=UTC), 0),
+        (datetime(2026, 9, 22, 5, 0, tzinfo=UTC), 1),
+    ):
+        linked = _fresh(tuned, google_crm=_touch_crm([(m3_ref, at)]))
+        veto = _shared_entry(linked, pool).veto
+        assert veto is not None
+        assert veto.eligible_contacts == eligible, at
+        assert budget.budget_crm(linked, pool).eligible_contacts == eligible, at
+
+
+@pytest.mark.parametrize(
+    ("last_touch", "kind", "action", "eligible"),
+    [
+        # 22:00 on 2026-09-17 in New York: matured against the native window end, though
+        # within 14 days of the UTC end.
+        (datetime(2026, 9, 18, 2, 0, tzinfo=UTC), "hold", HOLD_ACTION, 20),
+        (datetime(2026, 9, 18, 4, 0, tzinfo=UTC), "hold", HOLD_ACTION, 20),
+        (datetime(2026, 9, 18, 4, 0, 0, 1, tzinfo=UTC), "scale", SCALE_ACTION, 19),
+    ],
+    ids=["after-the-utc-cutoff", "on-the-native-cutoff", "younger-than-the-native-cutoff"],
+)
+def test_the_shared_budget_veto_matures_touches_against_the_native_window_end(
+    last_touch: datetime, kind: str, action: str, eligible: int
+) -> None:
+    scenario, ctx = _built("shared.poor_member.does_not_fire")
+    pool = ("budget", scenario.ids.id("google", "budget", "pool"))
+    m1 = _campaign_id(scenario, "google", "m1")
+    m1_ref = scenario.ids.external_id("google", "campaign", "m1")
+    zone = native_day_zone(ctx, "google")
+    assert zone == "America/New_York"
+    native_end = AnalysisWindow.day_bounds(ctx.window.end, zone)[1]
+    assert native_end - timedelta(days=14) == datetime(2026, 9, 18, 4, 0, tzinfo=UTC)
+    assert ctx.window.utc_bounds()[1] - timedelta(days=14) < datetime(2026, 9, 18, 2, 0, tzinfo=UTC)
+    members = _shared_entry(ctx, pool).history.members[m1]
+    for at in (MATURED_TOUCH, last_touch):
+        assert any(
+            lower <= at < upper
+            for lower, upper in (AnalysisWindow.day_bounds(day, zone) for day in members)
+        ), at
+    # Nineteen zero-QL contacts matured on m1's member days, and a twentieth at last_touch.
+    linked = _with_google_crm(
+        ctx, _touch_crm([*[(m1_ref, MATURED_TOUCH)] * 19, (m1_ref, last_touch)])
     )
-    assert unavailable is not None
-    assert (unavailable.available, unavailable.veto_fires) == (False, False)
-    assert unavailable.reason == "Campaign #999: QL stage unresolved"
-    floored = campaigns._combined_veto(
-        ctx, settings, [_population(2, matured=10, unresolved=1), _population(3, unresolved=3)]
+    entry = _shared_entry(linked, pool)
+    assert entry.veto is not None
+    assert (entry.kind, entry.veto.eligible_contacts, entry.veto.ql) == (kind, eligible, 0)
+    assert entry.veto.veto_fires is (kind == "hold")
+    item = _only(campaigns.evaluate(linked), C2)
+    assert (item.entity_ref.id, item.action) == (pool[1], action)
+    assert _metrics(item)["eligible_contacts"] == eligible
+    assert budget.budget_crm(linked, pool).eligible_contacts == eligible
+    b1 = [line for line in budget.evaluate(linked).candidates if line.rule_id == B1]
+    assert [line.entity_ref.id for line in b1] == ([] if kind == "hold" else [pool[1]])
+
+
+def test_a_touch_after_a_member_left_counts_for_the_budget_it_moved_to() -> None:
+    scenario = SCENARIOS["shared.member_changed_intraday.case"]
+    ctx, pool, pool_b, _, m2 = _left_pool()
+    tuned = _tuned(scenario, ctx, {"crm.lead_maturity_days": 1})
+    ref = tuned.campaigns[m2].external_id
+    on_pool = datetime(2026, 9, 20, 15, 0, tzinfo=UTC)
+    on_pool_b = datetime(2026, 9, 29, 15, 0, tzinfo=UTC)
+    linked = _fresh(tuned, google_crm=_touch_crm([(ref, on_pool), (ref, on_pool_b)]))
+    veto = _shared_entry(linked, pool).veto
+    assert veto is not None
+    assert veto.eligible_contacts == 1
+    assert budget.budget_crm(linked, pool).eligible_contacts == 1
+    assert budget.budget_crm(linked, pool_b).eligible_contacts == 1
+    assert attribution_for(linked).veto[m2].eligible_contacts == 2
+
+
+def test_budget_cards_read_the_population_their_c2_item_reads() -> None:
+    scenario, ctx = _built("c2.outcome_scale.case")
+    campaign_id = _campaign_id(scenario, "linkedin", "li-pipeline")
+    view = budget.budget_crm(ctx, ("campaign", campaign_id))
+    veto = attribution_for(ctx).veto[campaign_id]
+    assert (view.scope, view.eligible_contacts, view.ql, view.flags) == (
+        "linkedin",
+        veto.eligible_contacts,
+        veto.ql,
+        (),
     )
-    assert floored is not None
-    assert floored.attribution_floor
-    assert floored.reason == "13.3% of matured leads unresolved in HubSpot (floor 10%)"
-    unknown_ql = campaigns._combined_veto(ctx, settings, [_population(2), _population(3, ql=None)])
-    assert unknown_ql is not None
-    assert (unknown_ql.ql, unknown_ql.mql, unknown_ql.veto_fires) == (None, None, False)
-    empty = campaigns._combined_veto(ctx, settings, [_population(2, matured=0)])
-    assert empty is not None
-    assert (empty.unresolved_share, empty.attribution_floor, empty.available) == (
-        None,
-        False,
-        True,
+    shared, shared_ctx = _built("shared.poor_member.does_not_fire")
+    pool = shared.ids.id("google", "budget", "pool")
+    solo = ("campaign", _campaign_id(shared, "google", "solo"))
+    (unlinked,) = budget.budget_crm(shared_ctx, solo).flags
+    assert unlinked.code == FLAG_NO_CRM_LINK
+    with pytest.raises(KeyError, match="budget 999999"):
+        budget.budget_crm(shared_ctx, ("budget", 999_999))
+    # Linked, but no member campaign of the pool is loaded: there is no population to show.
+    linked = _fresh(shared_ctx, google_crm=_touch_crm([]))
+    loaded = {cid: c for cid, c in linked.campaigns.items() if c.budget_id != pool}
+    assert budget.budget_crm(_fresh(linked, campaigns=loaded), ("budget", pool)) == (
+        budget.BudgetCrm(None, None, None)
     )
+
+
+@pytest.mark.parametrize(
+    "population",
+    [
+        _population(1),
+        _population(1, available=False, reason="Qualified Lead stage unavailable: unbound"),
+        _population(1, matured=20, unresolved=4, available=False, reason="20%", floor=True),
+        _population(1, matured=20, unknown=2, available=False, reason="CRM evidence unknown"),
+    ],
+    ids=["judged", "unavailable", "floored", "unknown-evidence"],
+)
+def test_budget_cards_flag_a_population_exactly_as_its_c2_item_does(
+    population: VetoPopulation,
+) -> None:
+    assert budget._population_flags(population) == campaigns._veto_flags(population)
 
 
 def test_veto_flags_explain_every_reason_the_pipeline_cannot_be_judged() -> None:
@@ -1707,6 +2026,165 @@ def test_c3a_declares_the_entities_it_reads_so_their_freshness_reaches_the_item(
             "complete",
             ctx.window.end,
         )
+
+
+# ---------------------------------------------------------------------------
+# Campaign-group evidence on LinkedIn campaign cards (AAP 0.5.2)
+# ---------------------------------------------------------------------------
+
+GROUP_EXTERNAL_ID: Final = "990020000"
+GROUP_NAME: Final = "Always-on lead gen"
+
+LINKEDIN_CAMPAIGN_CARDS: Final = (
+    ("cr3.zero_exposure.case", C1),
+    ("c1b.eligible.fires", C1B),
+    ("c2.outcome_scale.case", C2),
+    ("c2.outcome_hold.case", C2),
+    ("c3a.preset.case", C3A),
+)
+"""Scenarios whose item of the rule is built from a LinkedIn campaign in a campaign group."""
+
+
+def _unavailable_group(state: str, group_id: int | None) -> dict[str, object]:
+    """The group evidence of a campaign whose group is not loaded, or that has none."""
+    return {
+        "state": state,
+        "id": group_id,
+        "external_id": None,
+        "name": None,
+        "status": None,
+        "daily_budget": None,
+        "total_budget": None,
+        "currency": None,
+    }
+
+
+def _linkedin_card(ctx: AnalysisContext, rule_id: str) -> tuple[Candidate, CampaignInfo]:
+    """The one LinkedIn item of ``rule_id`` and the campaign it was built from."""
+    (item,) = [
+        item
+        for item in _items(campaigns.evaluate(ctx), rule_id)
+        if item.entity_ref.source == "linkedin"
+    ]
+    # A C3a item's entity is the segment; its campaign is named in the evidence.
+    campaign_id = item.evidence.extra["campaign_id"] if rule_id == C3A else item.entity_ref.id
+    assert isinstance(campaign_id, int)
+    return item, ctx.campaigns[campaign_id]
+
+
+@pytest.mark.parametrize(("name", "rule_id"), LINKEDIN_CAMPAIGN_CARDS)
+def test_linkedin_campaign_cards_name_their_campaign_group(name: str, rule_id: str) -> None:
+    _, ctx = _built(name)
+    item, campaign = _linkedin_card(ctx, rule_id)
+    assert campaign.campaign_group_id in ctx.campaign_groups
+    # The scenario group sets no budget of its own: both stay unavailable, never 0.
+    assert item.evidence.extra["campaign_group"] == {
+        "state": "loaded",
+        "id": campaign.campaign_group_id,
+        "external_id": GROUP_EXTERNAL_ID,
+        "name": GROUP_NAME,
+        "status": "ACTIVE",
+        "daily_budget": None,
+        "total_budget": None,
+        "currency": "USD",
+    }
+    assert item.evidence.to_json()["extra"]["campaign_group"]["daily_budget"] is None
+    # Evidence only: decisions, holds and G1 targets cover the campaign, never its group.
+    own = DecisionSubject("campaign", campaign.id)
+    assert item.depends_on == (own,)
+    assert item.decision_subject in (own, None)
+    assert item.increases_spend_on in ((own,), ())
+
+
+def test_campaign_group_budgets_are_shown_as_reported_in_the_account_currency() -> None:
+    scenario, ctx = _built("c1b.eligible.fires")
+    campaign = ctx.campaigns[_campaign_id(scenario, "linkedin", "li-pipeline")]
+    assert campaign.campaign_group_id is not None
+    group = ctx.campaign_groups[campaign.campaign_group_id]
+    budgeted = replace(group, daily_budget=Decimal("250.00"), total_budget=Decimal("9000.50"))
+    item = _only(campaigns.evaluate(_fresh(ctx, campaign_groups={group.id: budgeted})), C1B)
+    shown = item.evidence.extra["campaign_group"]
+    assert (shown["state"], shown["daily_budget"], shown["total_budget"], shown["currency"]) == (
+        "loaded",
+        Decimal("250.00"),
+        Decimal("9000.50"),
+        "USD",
+    )
+    # Frozen evidence keeps money as exact decimal strings.
+    rendered = item.evidence.to_json()["extra"]["campaign_group"]
+    assert (rendered["daily_budget"], rendered["total_budget"]) == ("250.00", "9000.50")
+    # A group with only a total budget keeps its daily budget unavailable.
+    lifetime = replace(group, total_budget=Decimal("9000.50"))
+    only_total = campaigns._campaign_group_extra(
+        _fresh(ctx, campaign_groups={group.id: lifetime}), campaign
+    )
+    assert (
+        only_total["campaign_group"]["daily_budget"],
+        only_total["campaign_group"]["total_budget"],
+    ) == (None, Decimal("9000.50"))
+
+
+def test_a_campaign_group_that_is_not_loaded_keeps_its_id_and_nothing_else() -> None:
+    scenario, ctx = _built("c1b.eligible.fires")
+    campaign = ctx.campaigns[_campaign_id(scenario, "linkedin", "li-pipeline")]
+    item = _only(campaigns.evaluate(_fresh(ctx, campaign_groups={})), C1B)
+    assert item.evidence.extra["campaign_group"] == _unavailable_group(
+        "not_loaded", campaign.campaign_group_id
+    )
+    # The card's own keys are unchanged beside it.
+    assert (item.evidence.extra["proposed_status"], item.evidence.extra["matured_ql"]) == (
+        "paused",
+        0,
+    )
+
+
+@pytest.mark.parametrize(("name", "rule_id"), LINKEDIN_CAMPAIGN_CARDS)
+def test_a_campaign_in_no_group_says_so_explicitly(name: str, rule_id: str) -> None:
+    _, ctx = _built(name)
+    ungrouped = {
+        cid: replace(campaign, campaign_group_id=None) for cid, campaign in ctx.campaigns.items()
+    }
+    item, _ = _linkedin_card(_fresh(ctx, campaigns=ungrouped), rule_id)
+    assert item.evidence.extra["campaign_group"] == _unavailable_group("ungrouped", None)
+    assert item.evidence.to_json()["extra"]["campaign_group"]["state"] == "ungrouped"
+
+
+def test_the_campaign_group_currency_is_its_accounts() -> None:
+    scenario, ctx = _built("c1b.eligible.fires")
+    campaign = ctx.campaigns[_campaign_id(scenario, "linkedin", "li-pipeline")]
+    assert campaign.campaign_group_id is not None
+    group = ctx.campaign_groups[campaign.campaign_group_id]
+
+    def currency(context: AnalysisContext) -> object:
+        return campaigns._campaign_group_extra(context, campaign)["campaign_group"]["currency"]
+
+    assert currency(ctx) == ctx.accounts[group.account_id].currency == "USD"
+    # Without the account row, the campaign's own account still prices its group.
+    assert currency(_fresh(ctx, accounts={})) == "USD"
+    # A group of another account is priced by that account, and unpriced when it is absent.
+    elsewhere = replace(group, account_id=group.account_id + 100)
+    euro = AccountInfo(elsewhere.account_id, "linkedin", "990000077", "EMEA", "EUR")
+    moved = _fresh(ctx, campaign_groups={group.id: elsewhere})
+    assert currency(_fresh(moved, accounts={**ctx.accounts, euro.id: euro})) == "EUR"
+    assert currency(moved) is None
+
+
+def test_google_cards_carry_no_campaign_group() -> None:
+    _, ctx = _built("default")
+    result = campaigns.evaluate(ctx)
+    google = [item for item in result.candidates if item.entity_ref.source == "google"]
+    assert {(item.rule_id, item.entity_ref.type) for item in google} >= {
+        (C1, ENTITY_CAMPAIGN),
+        (C2, ENTITY_CAMPAIGN),
+    }
+    assert all("campaign_group" not in item.evidence.extra for item in google)
+    # A shared budget lists its members and has no group either.
+    _, shared = _built("shared.poor_member.does_not_fire")
+    item = _only(campaigns.evaluate(shared), C2)
+    assert item.entity_ref.type == ENTITY_BUDGET
+    assert "campaign_group" not in item.evidence.extra
+    search = next(c for c in ctx.campaigns.values() if c.source == "google")
+    assert campaigns._campaign_group_extra(ctx, search) == {}
 
 
 # ---------------------------------------------------------------------------

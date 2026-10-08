@@ -13,6 +13,9 @@ Submodules:
         responses and the transient batch re-fetch of lead responses by id.
     parser: Typed rows from LinkedIn payloads, versioned lead-form URNs split into the
         canonical form URN plus version, and lead email hashing.
+    projections: Generator, run from ``backend/``, that writes the Lead Sync ``fields``
+        projection both lead-response contracts record into the packaged, generated
+        ``_projections_generated`` module the client imports.
 
 Personal data: a lead email exists only in memory while it is matched to a HubSpot contact.
 It is persisted only as the SHA-256 hash of the normalised (trimmed, lowercased) address.

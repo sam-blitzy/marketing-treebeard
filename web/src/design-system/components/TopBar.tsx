@@ -8,7 +8,9 @@
  *
  * - `ds-topbar`: the bar, always;
  * - `ds-topbar__product`: the product name, always;
- * - `ds-topbar__actions`: the actions row, only when `children` is passed.
+ * - `ds-topbar__actions`: the actions row, only when `children` renders something (not when it
+ *   is omitted, `null`, a boolean, an empty string or an array of children none of which
+ *   renders; `0` renders).
  *
  * Landmarks and headings: `PageShell` wraps its `topBar` slot in the page's `<header>`, which is
  * the one `banner` landmark, so `TopBar` renders a plain `<div>` and never a second `<header>`.
@@ -47,9 +49,37 @@ export interface TopBarProps {
   /**
    * Controls shown at the inline end of the bar, for example the signed-in email and a
    * "Sign out" `Button`. They are laid out in a wrapping row, so on a narrow viewport they drop
-   * onto their own line. When omitted, the actions row is not rendered at all.
+   * onto their own line. When omitted (or `null`, a boolean, an empty string, or an array of
+   * children none of which renders, as several `{signedIn && …}` controls give when signed
+   * out), the actions row is not rendered at all; any other value, including `0`, renders it.
    */
   children?: ReactNode;
+}
+
+/**
+ * Whether a slot value renders anything.
+ *
+ * React renders nothing for `undefined`, `null`, booleans and the empty string, so conditional
+ * controls must not leave an empty container behind: `TopBar.css` spaces the bar's items with a
+ * flex gap and wraps them, so an empty actions row would still take a gap step and, on a narrow
+ * bar, wrap onto a line of its own and add a row gap below the product name.
+ *
+ * Several conditional controls, such as
+ * `{signedIn && <span>{email}</span>}{signedIn && <Button>Sign out</Button>}`, reach `children`
+ * as an array (`[false, false]` when signed out), and React flattens nested arrays when it
+ * renders them. An array therefore has content only when at least one of its items, at any
+ * depth, has content. Any other value, including `0`, renders and counts; an iterable that is
+ * not an array is not walked, because reading a one-shot iterator here would leave nothing for
+ * React to render.
+ *
+ * @param node - the `children` value, or one item of it
+ * @returns `true` when the slot has content to render
+ */
+function hasContent(node: ReactNode): boolean {
+  if (Array.isArray(node)) {
+    return node.some(hasContent);
+  }
+  return node !== undefined && node !== null && typeof node !== 'boolean' && node !== '';
 }
 
 /**
@@ -77,14 +107,15 @@ export interface TopBarProps {
  * ```
  *
  * @param props - see {@link TopBarProps}
- * @returns a `div.ds-topbar` holding the product name and, when `children` is passed, a
- *   `div.ds-topbar__actions` holding the children
+ * @returns a `div.ds-topbar` holding the product name and, when `children` renders something
+ *   (anything but `undefined`, `null`, a boolean, an empty string or an array of children none
+ *   of which renders), a `div.ds-topbar__actions` holding the children
  */
 export function TopBar({ productName, children }: TopBarProps) {
   return (
     <div className="ds-topbar">
       <span className="ds-topbar__product">{productName}</span>
-      {children !== undefined && <div className="ds-topbar__actions">{children}</div>}
+      {hasContent(children) && <div className="ds-topbar__actions">{children}</div>}
     </div>
   );
 }

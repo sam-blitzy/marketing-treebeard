@@ -12,11 +12,11 @@
  *       .ds-dialog__body        the caller's content
  *       .ds-dialog__footer      optional row of the caller's actions
  *
- * Every colour, spacing, typography, radius, shadow and z-index value is a token from
- * ../tokens.css, so binding Blitzy OS touches tokens.css alone. The only literals are layout
- * keywords, 100% sizes and the backdrop opacity. The border and focus-ring widths derive from
- * --space-1, the same way the base focus ring in tokens.css and the hairline border in
- * shared.css do, so no px literal appears here either.
+ * Every colour, spacing, typography, radius, shadow, z-index, opacity and size value is a token
+ * from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The only literals are layout
+ * keywords. The full-extent sizes are --size-full and the backdrop opacity is --opacity-backdrop.
+ * The border and focus-ring widths derive from --space-1, the same way the base focus ring in
+ * tokens.css and the hairline border in shared.css do, so no px literal appears here either.
  *
  * Accessibility (WCAG 2.2 AA):
  * - 1.4.10 Reflow: the panel never exceeds the viewport in either axis and scrolls internally,
@@ -47,14 +47,15 @@
 
 /*
  * Dimming layer. It is the panel's sibling, not its parent, so its opacity fades only the page
- * behind the dialog and never the panel. The colour is the text token at half opacity rather
- * than a colour function, because component CSS may take colours only from tokens.
+ * behind the dialog and never the panel. The colour is the text token dimmed by the
+ * --opacity-backdrop token rather than a colour function, because component CSS may take
+ * colours only from tokens.
  */
 .ds-dialog__backdrop {
   position: absolute;
   inset: 0;
   background: var(--color-text);
-  opacity: 0.5;
+  opacity: var(--opacity-backdrop);
 }
 
 /*
@@ -70,9 +71,9 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  inline-size: 100%;
+  inline-size: var(--size-full);
   max-inline-size: calc(var(--space-8) * 16);
-  max-block-size: 100%;
+  max-block-size: var(--size-full);
   overflow: auto;
   overscroll-behavior: contain;
   padding: var(--space-5);

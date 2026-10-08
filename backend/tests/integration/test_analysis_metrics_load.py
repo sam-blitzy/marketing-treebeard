@@ -3204,6 +3204,76 @@ async def test_hubspot_alone_loads_only_the_google_crm_link(
     assert (context.segment_windows, context.k1_baseline) == ((), None)
 
 
+TOKYO = "Asia/Tokyo"
+TOKYO_LOWER = datetime(2026, 9, 8, 15, 0, tzinfo=UTC)
+"""The default window's first day, 2026-09-09, starts nine hours before UTC in Tokyo."""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "zone_from", ["window-boundary", "first-google-account-with-a-zone"], ids=str
+)
+async def test_google_touch_discovery_covers_the_native_days_of_a_zone_east_of_utc(
+    sessions: Sessions, thresholds: Thresholds, zone_from: str
+) -> None:
+    # The zone is the window's Google boundary or, without one, the first Google account's
+    # zone: the zone native_day_zone returns and shared-budget histories date member days in.
+    window = AnalysisWindow.default(
+        thresholds,
+        SourceDayInfo(TOKYO)
+        if zone_from == "window-boundary"
+        else SourceDayInfo(None, ("linkedin",)),
+        now=NOW,
+    )
+    assert (window.start, window.end) == (START, END)
+    assert AnalysisWindow.day_bounds(START, TOKYO)[0] == TOKYO_LOWER < UTC_LOWER
+    async with sessions.begin() as session:
+        hubspot = await _dataset(
+            session, "hubspot", "live", "active", bindings=VALID_BINDINGS.to_json()
+        )
+        if zone_from != "window-boundary":
+            google = await _dataset(session, "google", "live", "active")
+            for external_id, timezone in (("5550000001", None), ("5550000002", TOKYO)):
+                await _put(
+                    session,
+                    AdAccount(
+                        source="google",
+                        dataset_id=google,
+                        external_id=external_id,
+                        name=None,
+                        currency="USD",
+                        timezone=timezone,
+                    ),
+                )
+        for hs_id, touch in (
+            ("t-before-both", TOKYO_LOWER - MICRO),
+            ("t-on-native-start", TOKYO_LOWER),
+            ("t-first-native-day", TOKYO_LOWER + timedelta(hours=1)),
+            # After the last Tokyo day (it ends at 15:00 UTC) but inside the UTC window.
+            ("t-last-utc-day", UTC_UPPER - timedelta(hours=4)),
+            ("t-at-utc-upper", UTC_UPPER),
+        ):
+            await _contact(
+                session, hubspot, hs_id, google_campaign_ref="111", google_touch_at=touch
+            )
+    async with sessions() as session:
+        context = await load_context(session, window, thresholds, kind="default", now=NOW)
+    assert metrics.native_day_zone(context, "google") == TOKYO
+    crm = context.google_crm
+    assert crm is not None
+    # Discovery covers the native window of each veto that judges these contacts. With a
+    # Tokyo window boundary both vetoes read the Tokyo days, so the last UTC day, after the
+    # last Tokyo day, is not read. Without one, the per-campaign veto falls back to the first
+    # Google account's zone (none here, so UTC) and the shared-budget veto to the first
+    # account with a zone (Tokyo): the union reads the first Tokyo day and the last UTC day.
+    # An instant outside every bound is never read.
+    expected = ["t-on-native-start", "t-first-native-day"]
+    if zone_from != "window-boundary":
+        expected.append("t-last-utc-day")
+    assert [contact.hs_id for contact in crm.google_contacts] == expected
+    assert set(crm.contacts) == set(expected)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "sources",

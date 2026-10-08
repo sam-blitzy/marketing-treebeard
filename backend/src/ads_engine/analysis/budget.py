@@ -50,15 +50,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 from typing import Any, Final
 
 # The CRM Qualified Lead count every budget card shows "where linked" (AAP 0.5.4.5) is the
 # veto population that attribution builds; reading it from the one memoised attribution table
-# keeps B1-B4 numbers identical to the Campaigns section's. This import goes beyond the file
-# plan's dependency list because the AAP's card requirement outranks that list; attribution
-# imports only context and thresholds, so no import cycle arises.
-from ads_engine.analysis.attribution import VetoPopulation, attribution_for
+# (and a shared budget's from the same builder C2 reads) keeps B1-B4 numbers identical to the
+# Campaigns section's. This import goes beyond the file plan's dependency list because the
+# AAP's card requirement outranks that list; attribution imports only context, thresholds and
+# window, so no import cycle arises.
+from ads_engine.analysis.attribution import VetoPopulation, attribution_for, shared_budget_veto
 from ads_engine.analysis.campaigns import (
     VETO_THRESHOLD_KEYS,
     ScaleOutcome,
@@ -113,6 +115,7 @@ from ads_engine.analysis.metrics import (
     budget_subjects,
     cost_per_outcome,
     counting_contract,
+    native_day_zone,
     subject_baseline,
     subject_campaigns,
     subject_objective_groups,
@@ -292,7 +295,6 @@ class _Settings:
     b4_min_outcomes: int
     b4_alpha: Decimal
     sustained_min: int
-    floor_share: Decimal
 
     @classmethod
     def of(cls, ctx: AnalysisContext) -> _Settings:
@@ -337,7 +339,6 @@ class _Settings:
             b4_min_outcomes=thresholds.int("b4.min_outcomes"),
             b4_alpha=alpha,
             sustained_min=thresholds.int("window.sustained_min_days"),
-            floor_share=thresholds.ratio("attribution.floor_share"),
         )
 
 
@@ -696,81 +697,31 @@ def _no_crm_link_flag(reason: str) -> Flag:
     return Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")
 
 
-def _population_flags(
-    ctx: AnalysisContext,
-    settings: _Settings,
-    populations: Sequence[VetoPopulation],
-) -> tuple[Flag, ...]:
-    """The flags explaining why a (combined) population's counts cannot be fully trusted.
+def _population_flags(population: VetoPopulation) -> tuple[Flag, ...]:
+    """The flags explaining why a population's counts cannot be fully trusted.
 
-    One population keeps its own floor verdict, exactly as the Campaigns section shows it.
-    Several populations (a shared budget's members) pool the unresolved share (unresolved ÷
-    matured leads), so the floor is judged on all of the members' leads together.
+    The population keeps its own floor verdict, exactly as the Campaigns section shows it.
     """
     flags: list[Flag] = []
-    unavailable = next((item for item in populations if not item.available), None)
-    if unavailable is not None:
-        prefix = f"{ctx.campaign_name(unavailable.campaign_id)}: " if len(populations) > 1 else ""
-        flags.append(
-            Flag(FLAG_PIPELINE_UNAVAILABLE, f"Pipeline unavailable: {prefix}{unavailable.reason}")
-        )
-    share: Decimal | None
-    if len(populations) == 1:
-        single = populations[0]
-        share = single.unresolved_share if single.attribution_floor else None
-    else:
-        matured = sum(item.matured_leads for item in populations)
-        unresolved = sum(item.unresolved_leads for item in populations)
-        pooled = Decimal(unresolved) / Decimal(matured) if matured else None
-        share = pooled if pooled is not None and pooled >= settings.floor_share else None
-    if share is not None:
+    if not population.available:
+        flags.append(Flag(FLAG_PIPELINE_UNAVAILABLE, f"Pipeline unavailable: {population.reason}"))
+    if population.attribution_floor and population.unresolved_share is not None:
         flags.append(
             Flag(
                 FLAG_ATTRIBUTION_FLOOR,
-                f"Floor: {_percent(share)} of matured leads unmatched in HubSpot",
+                f"Floor: {_percent(population.unresolved_share)} of matured leads unmatched in "
+                "HubSpot",
             )
         )
-    unknown = sum(population.unknown_evidence_contacts for population in populations)
-    if unknown:
-        eligible = sum(population.eligible_contacts for population in populations)
+    if population.unknown_evidence_contacts:
         flags.append(
             Flag(
                 FLAG_UNKNOWN_CRM_EVIDENCE,
-                f"Unknown CRM evidence for {unknown} of {eligible} eligible contacts",
+                f"Unknown CRM evidence for {population.unknown_evidence_contacts} of "
+                f"{population.eligible_contacts} eligible contacts",
             )
         )
     return tuple(flags)
-
-
-def _sum_known(values: Iterable[int | None]) -> int | None:
-    """Sum counts, or ``None`` when any is unavailable: an unknown part is never zero."""
-    total = 0
-    for value in values:
-        if value is None:
-            return None
-        total += value
-    return total
-
-
-def _combined(
-    ctx: AnalysisContext,
-    settings: _Settings,
-    scope: CrmScope,
-    populations: Sequence[VetoPopulation],
-) -> BudgetCrm:
-    """The CRM evidence of one or more populations of one scope.
-
-    Counts are summed, which is exact for a Google shared budget: each touch-date contact
-    carries one campaign reference, so no contact sits in two members' populations.
-    """
-    if not populations:
-        return BudgetCrm(None, None, None)
-    return BudgetCrm(
-        scope,
-        sum(population.eligible_contacts for population in populations),
-        _sum_known(population.ql for population in populations),
-        _population_flags(ctx, settings, populations),
-    )
 
 
 def budget_crm(ctx: AnalysisContext, subject: SubjectKey) -> BudgetCrm:
@@ -781,35 +732,42 @@ def budget_crm(ctx: AnalysisContext, subject: SubjectKey) -> BudgetCrm:
     * A Google campaign links only through the verified Google-to-CRM link; otherwise the
       result carries ``no_crm_link`` and no Google QL count is computed, and a
       LinkedIn-derived subset never stands in.
-    * A Google shared budget combines its member campaigns' populations
-      (:func:`~ads_engine.analysis.metrics.subject_campaigns`).
+    * A Google shared budget reads one population: its members' touch-date contacts on their
+      member days only (:func:`~ads_engine.analysis.attribution.shared_budget_veto`), the
+      days its spend and outcomes are aggregated over (AAP 0.5.4.5), so a contact touched
+      before a campaign joined or after it left is never counted.
 
-    The populations come from the run's one memoised attribution table, so these counts
-    equal the Campaigns section's. A budget card shows them; no rule here evaluates a veto.
+    Campaign populations come from the run's one memoised attribution table and a shared
+    budget's from the same builder its C2 item reads, so these counts equal the Campaigns
+    section's. A budget card shows them; no rule here evaluates a veto.
 
     Raises:
         KeyError: When the subject is not in the context.
-        ConfigError: When ``attribution.floor_share`` is missing.
+        ValueError: When a budget subject is not explicitly shared.
+        ConfigError: When an attribution threshold is missing.
     """
-    settings = _Settings.of(ctx)
     subject_type, subject_id = subject
+    member_days: Mapping[int, tuple[date, ...]] = {}
     if subject_type == "campaign":
-        campaign = ctx.campaigns[subject_id]
-        members: tuple[int, ...] = (campaign.id,)
-        source: Source = campaign.source
+        source: Source = ctx.campaigns[subject_id].source
     else:
         if subject_id not in ctx.budgets:
             raise KeyError(f"budget {subject_id} is not in the analysis context")
-        members = subject_campaigns(ctx, subject)
+        member_days = budget_history(ctx, subject).members
         source = "google"
     scope: CrmScope = "linkedin" if source == "linkedin" else "google"
     if scope == "google":
         gap = _google_link_gap(ctx)
         if gap is not None:
             return BudgetCrm(None, None, None, (_no_crm_link_flag(gap),))
-    veto = attribution_for(ctx).veto
-    populations = [veto[cid] for cid in members if cid in veto]
-    return _combined(ctx, settings, scope, populations)
+    population = (
+        attribution_for(ctx).veto.get(subject_id)
+        if subject_type == "campaign"
+        else shared_budget_veto(ctx, member_days, native_day_zone(ctx, "google"))
+    )
+    if population is None:
+        return BudgetCrm(None, None, None)
+    return BudgetCrm.from_veto(population, scope, _population_flags(population))
 
 
 # ---------------------------------------------------------------------------

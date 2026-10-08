@@ -50,13 +50,21 @@ export interface StackProps {
    *
    * - `'ul'` or `'ol'`: a list; every child must be an `<li>` element so the list semantics stay
    *   valid. The user-agent bullets and indentation are removed, so the gap alone spaces items.
+   *   The list carries `role="list"`, because `Stack.css` removes list markers and Safari's
+   *   VoiceOver stops announcing an unmarked list as a list without the explicit role.
    * - `'section'`: a landmark region only when it has an accessible name, so give it an
    *   `aria-label` (or label it by its content); an unnamed section is not exposed as a region.
+   *   No explicit role is set, so the section keeps its native semantics.
    */
   as?: 'div' | 'ul' | 'ol' | 'section';
   /** The element's `id`, for example the target of an in-page anchor link. */
   id?: string;
-  /** The accessible name of the rendered element, most useful with `as="section"`. */
+  /**
+   * The accessible name of the rendered element. On a list it names the list, and on a section it
+   * makes the section a `region` landmark. On a `div` the stack is exposed as a labelled `group`,
+   * because ARIA does not allow a name on an element with no role and assistive technology would
+   * never announce it. An empty label is treated as no label.
+   */
   'aria-label'?: string;
   /** The stacked content. With `as="ul"` or `as="ol"`, `<li>` elements only. */
   children?: ReactNode;
@@ -66,8 +74,11 @@ export interface StackProps {
  * Vertical layout primitive: renders one element (`div`, `ul`, `ol` or `section`) that lays its
  * children out in a column, separated by a spacing token.
  *
- * When `as` is `'ul'` or `'ol'`, children must be `<li>` elements. `as="section"` should carry an
- * `aria-label` (or be labelled by its content) to form a landmark region.
+ * When `as` is `'ul'` or `'ol'`, children must be `<li>` elements, and the list carries
+ * `role="list"` so it stays a list under the marker reset. `as="section"` should carry an
+ * `aria-label` (or be labelled by its content) to form a landmark region. A `div` given a
+ * non-empty `aria-label` carries `role="group"`, so its name is exposed; without one it has no
+ * role.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *
@@ -104,8 +115,14 @@ export function Stack({
       : `ds-stack ds-stack--gap-${gap} ds-stack--align-${align}`;
   const Element = as;
 
+  // Lists keep their list role under Stack.css's marker reset; a labelled div becomes a group so
+  // its name is exposed; a section keeps its native role (see StackProps.as and
+  // StackProps['aria-label']).
+  const role =
+    as === 'ul' || as === 'ol' ? 'list' : as === 'div' && ariaLabel ? 'group' : undefined;
+
   return (
-    <Element className={className} id={id} aria-label={ariaLabel}>
+    <Element className={className} id={id} aria-label={ariaLabel} role={role}>
       {children}
     </Element>
   );

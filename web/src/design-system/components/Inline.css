@@ -107,8 +107,9 @@
 
 /*
  * List rendering (as="ul" or as="ol"): the caller supplies <li> children. Only the browser's
- * markers, indentation and outer spacing are cleared, so the row lays out like the div form
- * while the list element keeps its semantics.
+ * markers, indentation and outer spacing are cleared, so the row lays out like the div form.
+ * Safari's VoiceOver stops announcing an unmarked list as a list, so its list semantics are kept
+ * by the role="list" that Inline.tsx sets on both list elements.
  */
 ul.ds-inline,
 ol.ds-inline {

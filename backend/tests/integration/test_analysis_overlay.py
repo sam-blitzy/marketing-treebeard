@@ -24,6 +24,7 @@ private schema. An unreachable database fails the database tests; it never skips
 """
 
 import copy
+import doctest
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -89,7 +90,6 @@ from ads_engine.analysis.thresholds import (
     CONTENT_ASSETS_FILE,
     HUBSPOT_MAPPING_FILE,
     THRESHOLDS_FILE,
-    ConfigError,
     Thresholds,
 )
 from ads_engine.db.base import Base
@@ -350,38 +350,79 @@ def test_overlay_result_renders_items_keyed_by_their_string_id() -> None:
 # ---------------------------------------------------------------------------------------
 
 
+def _entry(*, drop: str | None = None, **changes: object) -> dict[str, object]:
+    """Return the complete current entry (google 3, live, primary), edited or minus ``drop``."""
+    entry: dict[str, object] = {
+        "source": "google",
+        "dataset_id": 3,
+        "mode": "live",
+        "role": "primary",
+    }
+    entry.update(changes)
+    if drop is not None:
+        del entry[drop]
+    return entry
+
+
 @pytest.mark.parametrize(
     ("provenance", "expected"),
     [
-        ([], True),
-        ([{"source": "google", "dataset_id": 3, "mode": "live"}], True),
-        ([{"source": "linkedin", "dataset_id": 4}], False),
+        # Complete entries: current exactly when every dataset id is current.
+        ([_entry()], True),
+        ([_entry(), _entry(source="linkedin", dataset_id=5, mode="simulated")], True),
+        ([_entry(), _entry(source="linkedin", dataset_id=9, mode="simulated")], False),
+        ([ProvenanceEntry("google", 3, "live", "primary")], True),
         (
             [
-                {"source": "google", "dataset_id": 3, "mode": "live", "role": "primary"},
-                {"source": "linkedin", "dataset_id": 5, "mode": "simulated", "role": "primary"},
+                ProvenanceEntry("google", 3, "live", "primary"),
+                ProvenanceEntry("hubspot", 5, "simulated", "companion"),
             ],
             True,
         ),
-        (
-            [
-                {"source": "google", "dataset_id": 3, "mode": "live", "role": "primary"},
-                {"source": "linkedin", "dataset_id": 9, "mode": "simulated", "role": "primary"},
-            ],
-            False,
-        ),
-        ([ProvenanceEntry("google", 3, "live", "primary")], True),
         ([ProvenanceEntry("hubspot", 6, "simulated", "companion")], False),
+        ([ProvenanceEntry("google", 3, "live", "primary"), _entry(dataset_id=5)], True),
+        # Fails closed: an empty provenance is unverifiable, never current.
+        ([], False),
+        ((), False),
+        # A current id never vouches for an entry missing or misstating a key.
+        ([_entry(drop="role")], False),
+        ([_entry(drop="mode")], False),
+        ([_entry(drop="source")], False),
+        ([_entry(drop="dataset_id")], False),
+        ([_entry(source="posthog")], False),
+        ([_entry(source=["google"])], False),
+        ([_entry(mode="mock")], False),
+        ([_entry(role="parent")], False),
+        ([_entry(role=None)], False),
+        ([_entry(dataset_id="3")], False),
+        ([_entry(dataset_id=True)], False),
+        ([_entry(dataset_id=1.0)], False),
+        ([{"source": "linkedin", "dataset_id": 4}], False),
         ([{"source": "google"}], False),
-        ([{"source": "google", "dataset_id": "3"}], False),
-        ([{"source": "google", "dataset_id": True}], False),
+        # One undecodable entry makes the whole provenance unverifiable: nothing is dropped.
+        ([_entry(), _entry(dataset_id=5, drop="role")], False),
+        ([ProvenanceEntry("google", 3, "live", "primary"), {"dataset_id": 5}], False),
+        ([_entry(), 3], False),
+        ([_entry(), None], False),
         ([3], False),
+        ("google", False),
     ],
 )
-def test_is_current_requires_every_provenance_dataset_to_be_current(
+def test_is_current_requires_a_complete_provenance_of_current_datasets(
     provenance: Sequence[Any], expected: bool
 ) -> None:
     assert is_current(provenance, frozenset({1, 3, 5})) is expected
+
+
+def test_is_current_doctest_examples_hold() -> None:
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(optionflags=doctest.ELLIPSIS)
+    examples = finder.find(is_current, "is_current", globs={"is_current": is_current})
+    assert examples
+    assert examples[0].examples
+    for example in examples:
+        runner.run(example)
+    assert runner.summarize(verbose=False).failed == 0
 
 
 # ---------------------------------------------------------------------------------------
@@ -450,14 +491,21 @@ async def test_overlay_rejects_items_of_another_run(shipped: Thresholds) -> None
 
 
 @pytest.mark.anyio
-async def test_overlay_without_thresholds_fails_when_the_config_does_not_load(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_overlay_requires_injected_thresholds_and_never_loads_the_config(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
+    def forbidden_load(*args: object, **kwargs: object) -> Thresholds:
+        pytest.fail("overlay() read config/*.yaml on the async read path")
+
+    monkeypatch.setattr(Thresholds, "load", forbidden_load)
+    # An unbound session: any database read would raise UnboundExecutionError, not TypeError.
     session = AsyncSession()
     try:
-        with pytest.raises(ConfigError, match="no config directory"):
-            await overlay(session, _transient_run(), [], NOW)
+        with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
+            await overlay(session, _transient_run(), [], NOW)  # type: ignore[call-arg]
+        for value, found in ((None, "NoneType"), ({"window": {}}, "dict")):
+            with pytest.raises(TypeError, match=rf"injected by the caller .*found {found}$"):
+                await overlay(session, _transient_run(), [], NOW, thresholds=value)  # type: ignore[arg-type]
     finally:
         await session.close()
 
@@ -610,10 +658,15 @@ async def _freshness(
     *,
     success: datetime | None = FRESH,
     through: date | None = WINDOW_END,
+    covered_from: date = WINDOW_START - timedelta(days=150),
     completeness: str = "complete",
     reason: str | None = None,
 ) -> None:
-    """Insert one ``dataset_freshness`` row of ``dataset``."""
+    """Insert one ``dataset_freshness`` row of ``dataset``.
+
+    Coverage is ``[covered_from, through]``, or no range at all when ``through`` is ``None``
+    (a sync records both ends or neither).
+    """
     session.add(
         DatasetFreshness(
             source=dataset.source,
@@ -621,7 +674,7 @@ async def _freshness(
             dataset=name,
             last_attempt_at=FRESH if success is None else success,
             last_success_at=success,
-            covered_from=None if through is None else WINDOW_START - timedelta(days=150),
+            covered_from=None if through is None else covered_from,
             covered_through=through,
             completeness=completeness,
             reason=reason,
@@ -825,7 +878,7 @@ async def _page(
     sessions: Sessions,
     run_id: int,
     *,
-    thresholds: Thresholds | None,
+    thresholds: Thresholds,
     findings: Sequence[RunFinding] | None = None,
 ) -> OverlayResult:
     """Load a run and its items in a fresh session and overlay them, as the API does."""
@@ -1126,6 +1179,9 @@ async def test_items_from_a_replaced_dataset_are_historical_and_keep_their_prove
     )
     assert after.overlay.source_modes == {"google": "live", "linkedin": "live", "hubspot": "live"}
     assert BANNER_SIMULATED_SOURCES not in {banner.code for banner in after.banners}
+    # A historical item's required datasets resolve to the current ones, which are fresh, so
+    # the page lists nothing stale or incomplete.
+    assert (after.overlay.stale_datasets, after.overlay.incomplete_datasets) == ((), ())
 
     stored = await _stored(sessions, white_paper.id)
     assert stored.evidence["provenance"] == frozen_provenance
@@ -1365,9 +1421,11 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
                 FLAG_STALE,
                 "Data as of 2026-10-06 11:00 UTC; google.search_terms covers through 2026-10-05",
             ),
+            # Both shortfalls are named: the recorded reason and the missing last day.
             Flag(
                 FLAG_INCOMPLETE,
-                "Incomplete: google.search_terms (result limit reached at finest partition)",
+                "Incomplete: google.search_terms (result limit reached at finest partition; "
+                "covers through 2026-10-05, before the window end 2026-10-06)",
             ),
         ),
     )
@@ -1385,7 +1443,13 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
             "Data as of: no successful sync of linkedin.segments; linkedin.leads covers no "
             "dates yet",
         ),
-        Flag(FLAG_INCOMPLETE, "Incomplete: linkedin.segments (unknown)"),
+        # A dated dataset that covers no dates is not complete over the window either; an
+        # unknown one with no coverage names both shortfalls.
+        Flag(
+            FLAG_INCOMPLETE,
+            "Incomplete: linkedin.segments (unknown; covers no dates); "
+            "linkedin.leads (covers no dates)",
+        ),
     )
     assert result.items[no_crm.id] == ItemOverlayView(
         held_now=False,
@@ -1397,14 +1461,21 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
         ),
     )
     assert result.overlay.source_modes == {"google": "live", "linkedin": "live", "hubspot": None}
+    # The page lists what the cards flag: hubspot.deal_search has no current dataset at all.
     assert result.overlay.stale_datasets == (
         "google.metrics_daily",
         "google.search_terms",
         "linkedin.analytics_daily",
         "linkedin.segments",
         "linkedin.leads",
+        "hubspot.deal_search",
     )
-    assert result.overlay.incomplete_datasets == ("google.search_terms", "linkedin.segments")
+    assert result.overlay.incomplete_datasets == (
+        "google.search_terms",
+        "linkedin.segments",
+        "linkedin.leads",
+        "hubspot.deal_search",
+    )
     assert result.banners == (
         BannerView(
             code=BANNER_STALE_DATASETS,
@@ -1414,18 +1485,21 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
                 "google.search_terms (last success 2026-10-07 11:00 UTC), "
                 "linkedin.analytics_daily (last success 2026-10-06 11:59 UTC), "
                 "linkedin.segments (no successful sync), "
-                "linkedin.leads (last success 2026-10-07 11:00 UTC)"
+                "linkedin.leads (last success 2026-10-07 11:00 UTC), "
+                "hubspot.deal_search (no successful sync)"
             ),
-            count=5,
+            count=6,
         ),
         BannerView(
             code=BANNER_INCOMPLETE_DATASETS,
             tone="warning",
             message=(
                 "Incomplete data: google.search_terms (result limit reached at finest "
-                "partition), linkedin.segments (unknown)"
+                "partition; covers through 2026-10-05, before the window end 2026-10-06), "
+                "linkedin.segments (unknown; covers no dates), "
+                "linkedin.leads (covers no dates), hubspot.deal_search (no freshness record)"
             ),
-            count=2,
+            count=4,
         ),
     )
 
@@ -1452,6 +1526,458 @@ async def test_staleness_reads_the_configured_stale_after_hours(
     )
     assert lenient.overlay.stale_datasets == ()
     assert lenient.banners == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_coverage_starting_after_the_window_start_is_incomplete_over_the_window(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    window_start, window_end = date(2026, 9, 4), date(2026, 10, 1)
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        linkedin = await _dataset(session, "linkedin")
+        # The review's reproduction: complete and fresh, but only from 2026-09-20.
+        await _freshness(
+            session,
+            google,
+            "google.metrics_daily",
+            covered_from=date(2026, 9, 20),
+            through=window_end,
+        )
+        # Entity syncs re-read full current state and record no date range.
+        await _freshness(session, google, "google.entities", through=None)
+        await _freshness(session, linkedin, "linkedin.entities", success=OLD, through=None)
+        run = await _run(session, start=window_start, end=window_end)
+        # K2 reads no lookback, so its required range is exactly the run's window (a K1
+        # item's google.metrics_daily must also cover its baseline: tested below).
+        metrics = await _item(
+            session,
+            run,
+            rule_id=K2,
+            provenance=_prov(google),
+            required=("google.metrics_daily", "google.entities"),
+        )
+        entities = await _item(
+            session, run, rule_id="CR1", provenance=_prov(linkedin), required=("linkedin.entities",)
+        )
+        covered = await _run(session, start=date(2026, 9, 20), end=window_end, kind="custom")
+        boundary = await _item(
+            session,
+            covered,
+            rule_id=K2,
+            provenance=_prov(google),
+            required=("google.metrics_daily",),
+        )
+
+    shortfall = "google.metrics_daily (covers from 2026-09-20, after the window start 2026-09-04)"
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.items[metrics.id] == ItemOverlayView(
+        held_now=False,
+        historical=False,
+        data_status_now="live",
+        flags_now=(Flag(FLAG_INCOMPLETE, f"Incomplete: {shortfall}"),),
+    )
+    # A full-state dataset is stale by age alone, with no coverage shortfall to name.
+    assert result.items[entities.id] == ItemOverlayView(
+        held_now=False,
+        historical=False,
+        data_status_now="stale",
+        flags_now=(Flag(FLAG_STALE, "Data as of 2026-10-06 11:00 UTC"),),
+    )
+    assert result.overlay.stale_datasets == ("linkedin.entities",)
+    assert result.overlay.incomplete_datasets == ("google.metrics_daily",)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message="Stale data: linkedin.entities (last success 2026-10-06 11:00 UTC)",
+            count=1,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message=f"Incomplete data: {shortfall}",
+            count=1,
+        ),
+    )
+    assert "(complete)" not in str(result.to_json())
+
+    # A window that starts where the coverage starts is complete over the window.
+    exact = await _page(sessions, covered.id, thresholds=shipped)
+    assert exact.items[boundary.id] == ItemOverlayView(
+        held_now=False, historical=False, data_status_now="live"
+    )
+    assert exact.overlay.incomplete_datasets == ()
+    assert BANNER_INCOMPLETE_DATASETS not in {banner.code for banner in exact.banners}
+
+
+def _k1_evidence(
+    run: AnalysisRun,
+    provenance: list[dict[str, Any]],
+    *,
+    thresholds: dict[str, Any],
+    baseline_window: object = None,
+) -> dict[str, Any]:
+    """Return a K1 item's frozen evidence; ``extra.baseline_window`` only when given."""
+    extra: dict[str, Any] = {"term_status": "NONE"}
+    if baseline_window is not None:
+        extra["baseline_window"] = baseline_window
+    return {
+        "window": {
+            "start": run.window_start.isoformat(),
+            "end": run.window_end.isoformat(),
+            "days": (run.window_end - run.window_start).days + 1,
+            "source_days": [],
+        },
+        "metrics": [],
+        "baselines": [],
+        "thresholds": thresholds,
+        "datasets": [],
+        "provenance": provenance,
+        "extra": extra,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_k1_items_metrics_must_cover_its_frozen_baseline_window(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # The verifier's reproduction: K1's baseline rate reads google.metrics_daily over the
+    # trailing k1.baseline_days ending at the window end (AAP 0.5.4.3), so a K1 item needs
+    # that dataset complete from the baseline start, not only from the window start.
+    window_start, window_end = date(2026, 9, 4), date(2026, 10, 1)
+    baseline_days = shipped.int("k1.baseline_days")
+    baseline_start = window_end - timedelta(days=baseline_days - 1)
+    assert baseline_start == date(2026, 7, 4)
+    frozen_window = {
+        "start": baseline_start.isoformat(),
+        "end": window_end.isoformat(),
+        "days": baseline_days,
+    }
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        for name in ("google.search_terms", "google.metrics_daily"):
+            await _freshness(session, google, name, covered_from=window_start, through=window_end)
+        run = await _run(session, start=window_start, end=window_end)
+        required = ("google.search_terms", "google.metrics_daily")
+
+        async def k1(entity_id: str, evidence: dict[str, Any]) -> Recommendation:
+            return await _item(
+                session, run, entity_id=entity_id, required=required, evidence=evidence
+            )
+
+        frozen = await k1(
+            "7|frozen",
+            _k1_evidence(
+                run,
+                _prov(google),
+                thresholds={"k1.baseline_days": baseline_days},
+                baseline_window=frozen_window,
+            ),
+        )
+        # A non-K1 item reading the same datasets needs only the run's window.
+        expand = await _item(
+            session,
+            run,
+            rule_id=K2,
+            entity_id="7|expand",
+            provenance=_prov(google),
+            required=required,
+        )
+        # No frozen baseline window and no frozen length: the configured k1.baseline_days.
+        missing = await k1("7|missing", _k1_evidence(run, _prov(google), thresholds={}))
+        # A malformed frozen start falls back to the frozen length, never to the window start.
+        frozen_days = await k1(
+            "7|frozen-days",
+            _k1_evidence(
+                run,
+                _prov(google),
+                thresholds={"k1.baseline_days": 60},
+                baseline_window={**frozen_window, "start": "2026-13-01"},
+            ),
+        )
+        # Malformed start and length alike: the configured length.
+        malformed = [
+            await k1(
+                f"7|malformed-{index}",
+                _k1_evidence(
+                    run,
+                    _prov(google),
+                    thresholds=frozen_thresholds,
+                    baseline_window=baseline_window,
+                ),
+            )
+            for index, (baseline_window, frozen_thresholds) in enumerate(
+                [
+                    ("2026-07-04", {"k1.baseline_days": True}),
+                    ({"end": window_end.isoformat()}, {"k1.baseline_days": "90"}),
+                    ({**frozen_window, "start": None}, {"k1.baseline_days": 0}),
+                    ({**frozen_window, "start": "2026-07-04T00:00:00"}, {}),
+                    ({**frozen_window, "start": 20260704}, {"k1.baseline_days": 12.5}),
+                ]
+            )
+        ]
+
+    baseline = "covers from 2026-09-04, after the K1 baseline start 2026-07-04"
+    sixty_days = "covers from 2026-09-04, after the K1 baseline start 2026-08-03"
+    result = await _page(sessions, run.id, thresholds=shipped)
+    for item in (frozen, missing, *malformed):
+        assert result.items[item.id] == ItemOverlayView(
+            held_now=False,
+            historical=False,
+            data_status_now="live",
+            flags_now=(Flag(FLAG_INCOMPLETE, f"Incomplete: google.metrics_daily ({baseline})"),),
+        ), item.evidence
+    assert result.items[frozen_days.id].flags_now == (
+        Flag(FLAG_INCOMPLETE, f"Incomplete: google.metrics_daily ({sixty_days})"),
+    )
+    assert result.items[expand.id] == ItemOverlayView(
+        held_now=False, historical=False, data_status_now="live"
+    )
+    # The K2 card's complete check of google.metrics_daily never masks the K1 cards' checks.
+    assert result.overlay.stale_datasets == ()
+    assert result.overlay.incomplete_datasets == ("google.metrics_daily",)
+    incomplete_banner = BannerView(
+        code=BANNER_INCOMPLETE_DATASETS,
+        tone="warning",
+        message=f"Incomplete data: google.metrics_daily ({baseline}; {sixty_days})",
+        count=1,
+    )
+    assert result.banners == (incomplete_banner,)
+    assert "(complete)" not in str(result.to_json())
+
+    # The page reads the same in any item order.
+    async with sessions() as session:
+        stored_run = await session.get(AnalysisRun, run.id)
+        assert stored_run is not None
+        items = list(
+            await session.scalars(
+                select(Recommendation)
+                .where(Recommendation.run_id == run.id)
+                .order_by(Recommendation.id.desc())
+            )
+        )
+        reversed_page = await overlay(session, stored_run, items, NOW, thresholds=shipped)
+    assert reversed_page.overlay == result.overlay
+    assert reversed_page.banners == result.banners
+
+    # Only an item with no usable frozen value reads the configured length.
+    shorter = await _page(sessions, run.id, thresholds=_thresholds("k1", baseline_days=30))
+    assert shorter.items[missing.id].flags_now == (
+        Flag(
+            FLAG_INCOMPLETE,
+            "Incomplete: google.metrics_daily "
+            "(covers from 2026-09-04, after the K1 baseline start 2026-09-02)",
+        ),
+    )
+    assert shorter.items[frozen.id] == result.items[frozen.id]
+    assert shorter.items[frozen_days.id] == result.items[frozen_days.id]
+    # A lookback no longer than the window leaves the window as the required range.
+    window_long = await _page(sessions, run.id, thresholds=_thresholds("k1", baseline_days=28))
+    assert window_long.items[missing.id].flags_now == ()
+
+    # Coverage from the baseline start completes every K1 item.
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(
+                DatasetFreshness.dataset_id == google.id,
+                DatasetFreshness.dataset == "google.metrics_daily",
+            )
+            .values(covered_from=baseline_start)
+        )
+    covered = await _page(sessions, run.id, thresholds=shipped)
+    assert all(view.flags_now == () for view in covered.items.values())
+    assert covered.overlay.incomplete_datasets == ()
+    assert covered.banners == ()
+    # The overlay never rewrites the frozen evidence it read.
+    assert (await _stored(sessions, frozen.id)).evidence == frozen.evidence
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_coverage_ending_before_the_window_end_is_stale_and_incomplete(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # AAP 0.3.2: stale when a dataset covers less than the window end, and incomplete when it
+    # is not complete over the window, which coverage missing the window's last day is not.
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        linkedin = await _dataset(session, "linkedin")
+        await _freshness(
+            session, google, "google.metrics_daily", through=WINDOW_END - timedelta(days=1)
+        )
+        # A row no item requires is judged over the run's window too.
+        await _freshness(
+            session, linkedin, "linkedin.analytics_daily", through=WINDOW_END - timedelta(days=2)
+        )
+        run = await _run(session)
+        expand = await _item(
+            session, run, rule_id=K2, provenance=_prov(google), required=("google.metrics_daily",)
+        )
+
+    end_shortfall = "covers through 2026-10-05, before the window end 2026-10-06"
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.items[expand.id] == ItemOverlayView(
+        held_now=False,
+        historical=False,
+        data_status_now="stale",
+        flags_now=(
+            Flag(
+                FLAG_STALE,
+                "Data as of 2026-10-07 11:00 UTC; google.metrics_daily covers through 2026-10-05",
+            ),
+            Flag(FLAG_INCOMPLETE, f"Incomplete: google.metrics_daily ({end_shortfall})"),
+        ),
+    )
+    both = ("google.metrics_daily", "linkedin.analytics_daily")
+    assert result.overlay.stale_datasets == both
+    assert result.overlay.incomplete_datasets == both
+    assert result.banners == (
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message=(
+                "Stale data: google.metrics_daily (last success 2026-10-07 11:00 UTC), "
+                "linkedin.analytics_daily (last success 2026-10-07 11:00 UTC)"
+            ),
+            count=2,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message=(
+                f"Incomplete data: google.metrics_daily ({end_shortfall}), "
+                "linkedin.analytics_daily "
+                "(covers through 2026-10-04, before the window end 2026-10-06)"
+            ),
+            count=2,
+        ),
+    )
+
+    # Short at both ends: a K1 item names both shortfalls; the page names each reason once.
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(
+                DatasetFreshness.dataset_id == google.id,
+                DatasetFreshness.dataset == "google.metrics_daily",
+            )
+            .values(covered_from=WINDOW_START)
+        )
+        stored_run = await session.get(AnalysisRun, run.id)
+        assert stored_run is not None
+        block = await _item(
+            session, stored_run, provenance=_prov(google), required=("google.metrics_daily",)
+        )
+    start_shortfall = "covers from 2026-09-09, after the K1 baseline start 2026-07-09"
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.items[block.id].flags_now[1] == Flag(
+        FLAG_INCOMPLETE,
+        f"Incomplete: google.metrics_daily ({start_shortfall}; {end_shortfall})",
+    )
+    assert result.items[expand.id].flags_now[1] == Flag(
+        FLAG_INCOMPLETE, f"Incomplete: google.metrics_daily ({end_shortfall})"
+    )
+    assert result.overlay.incomplete_datasets == both
+    assert result.banners[1] == BannerView(
+        code=BANNER_INCOMPLETE_DATASETS,
+        tone="warning",
+        message=(
+            f"Incomplete data: google.metrics_daily ({start_shortfall}; {end_shortfall}), "
+            "linkedin.analytics_daily "
+            "(covers through 2026-10-04, before the window end 2026-10-06)"
+        ),
+        count=2,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_the_page_lists_and_banners_name_required_datasets_without_freshness(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        linkedin = await _dataset(session, "linkedin")
+        await _freshness(session, google, "google.metrics_daily")
+        # A stale row no item requires still reaches the page, as before.
+        await _freshness(session, linkedin, "linkedin.leads", success=OLD)
+        run = await _run(session)
+        # google.search_terms has no freshness row; HubSpot has no active dataset at all.
+        keyword = await _item(
+            session,
+            run,
+            provenance=_prov(google),
+            required=("google.search_terms", "google.metrics_daily"),
+        )
+        expand = await _item(
+            session, run, rule_id=K2, provenance=_prov(google), required=("google.search_terms",)
+        )
+        pipeline = await _item(
+            session,
+            run,
+            rule_id="C1b",
+            section="campaigns",
+            group="pause",
+            entity_type="campaign",
+            entity_id="31",
+            provenance=_prov(linkedin),
+            required=("hubspot.contacts",),
+        )
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    for item, name in ((keyword, "google.search_terms"), (expand, "google.search_terms")):
+        assert result.items[item.id].flags_now == (
+            Flag(FLAG_STALE, f"Data as of: no successful sync of {name}"),
+            Flag(FLAG_INCOMPLETE, f"Incomplete: {name} (no freshness record)"),
+        )
+    assert result.items[pipeline.id].flags_now == (
+        Flag(FLAG_STALE, "Data as of: no successful sync of hubspot.contacts"),
+        Flag(FLAG_INCOMPLETE, "Incomplete: hubspot.contacts (no freshness record)"),
+    )
+    # Each dataset counts once, however many cards require it.
+    assert result.overlay.stale_datasets == (
+        "google.search_terms",
+        "linkedin.leads",
+        "hubspot.contacts",
+    )
+    assert result.overlay.incomplete_datasets == ("google.search_terms", "hubspot.contacts")
+    assert result.banners == (
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message=(
+                "Stale data: google.search_terms (no successful sync), "
+                "linkedin.leads (last success 2026-10-06 11:00 UTC), "
+                "hubspot.contacts (no successful sync)"
+            ),
+            count=3,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message=(
+                "Incomplete data: google.search_terms (no freshness record), "
+                "hubspot.contacts (no freshness record)"
+            ),
+            count=2,
+        ),
+    )
+    # Every dataset a card flags is on the page.
+    for view in result.items.values():
+        for flag in view.flags_now:
+            names = result.overlay.stale_datasets
+            if flag.code == FLAG_INCOMPLETE:
+                names = result.overlay.incomplete_datasets
+            assert any(name in flag.message for name in names), flag
+
+    # Only the items on the page contribute: a page without them lists the rows alone.
+    rows_only = await _page_of(sessions, run.id, [], shipped)
+    assert rows_only.overlay.stale_datasets == ("linkedin.leads",)
+    assert rows_only.overlay.incomplete_datasets == ()
 
 
 # ---------------------------------------------------------------------------------------
@@ -1490,11 +2016,25 @@ async def test_without_active_datasets_any_provenance_is_historical(
     assert result.overlay == OverlayView(
         open_discrepancies=0,
         source_modes={"google": None, "linkedin": None, "hubspot": None},
-        stale_datasets=(),
-        incomplete_datasets=(),
+        stale_datasets=("google.metrics_daily",),
+        incomplete_datasets=("google.metrics_daily",),
         computed_at=NOW,
     )
-    assert result.banners == ()
+    # The historical item's required dataset has no current dataset: the page says so too.
+    assert result.banners == (
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message="Stale data: google.metrics_daily (no successful sync)",
+            count=1,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message="Incomplete data: google.metrics_daily (no freshness record)",
+            count=1,
+        ),
+    )
     # The frozen mode stands in for a source that has no current dataset.
     assert result.items[replaced.id] == ItemOverlayView(
         held_now=True,
@@ -1506,21 +2046,30 @@ async def test_without_active_datasets_any_provenance_is_historical(
             Flag(FLAG_INCOMPLETE, "Incomplete: google.metrics_daily (no freshness record)"),
         ),
     )
+    # No provenance is unverifiable: historical, with every action disabled; the frozen
+    # simulated or mixed status still labels the card.
     assert result.items[bare_simulated.id] == ItemOverlayView(
-        held_now=False,
-        historical=False,
+        held_now=True,
+        held_reason_now=HISTORICAL_REASON,
+        historical=True,
         data_status_now="simulated",
         flags_now=(Flag(FLAG_SIMULATED, "Simulated data"),),
     )
     assert result.items[bare_mixed.id] == ItemOverlayView(
-        held_now=False,
-        historical=False,
+        held_now=True,
+        held_reason_now=HISTORICAL_REASON,
+        historical=True,
         data_status_now="mixed",
         flags_now=(Flag(FLAG_SIMULATED, "Joins live and simulated data"),),
     )
     assert result.items[bare_stale.id] == ItemOverlayView(
-        held_now=False, historical=False, data_status_now="live"
+        held_now=True,
+        held_reason_now=HISTORICAL_REASON,
+        historical=True,
+        data_status_now="live",
     )
+    for view in result.items.values():
+        assert not view.actions_enabled
     for malformed in (not_a_list, not_an_object, not_a_mapping):
         assert result.items[malformed.id] == ItemOverlayView(
             held_now=True,
@@ -1540,7 +2089,187 @@ async def test_without_active_datasets_any_provenance_is_historical(
         assert await current_dataset_ids(session) == frozenset()
         assert not await item_is_current(session, replaced)
         assert not await item_is_current(session, not_a_mapping)
-        assert await item_is_current(session, bare_simulated)
+        assert not await item_is_current(session, bare_simulated)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_unverifiable_provenance_is_historical_even_when_its_ids_are_current(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        await _freshness(session, google, "google.metrics_daily")
+        run = await _run(session)
+        complete = _prov(google)[0]
+        required = ("google.metrics_daily",)
+        current = await _item(session, run, provenance=[complete], required=required)
+        unverifiable_evidence: list[dict[str, Any]] = [
+            {"metrics": []},
+            {"provenance": []},
+            {"provenance": [{key: value for key, value in complete.items() if key != "source"}]},
+            {"provenance": [{key: value for key, value in complete.items() if key != "mode"}]},
+            {"provenance": [{key: value for key, value in complete.items() if key != "role"}]},
+            {"provenance": [{**complete, "source": "posthog"}]},
+            {"provenance": [{**complete, "mode": "mock"}]},
+            {"provenance": [{**complete, "role": "parent"}]},
+            {"provenance": [complete, {**complete, "role": None}]},
+        ]
+        unverifiable = [
+            await _item(
+                session,
+                run,
+                entity_id=f"7|unverifiable-{index}",
+                required=required,
+                evidence=evidence,
+                held=index == 0,
+                held_reason=HELD_DISCREPANCY_REASON if index == 0 else None,
+            )
+            for index, evidence in enumerate(unverifiable_evidence)
+        ]
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.items[current.id] == ItemOverlayView(
+        held_now=False, historical=False, data_status_now="live"
+    )
+    assert result.items[current.id].actions_enabled
+    for item in unverifiable:
+        view = result.items[item.id]
+        assert view == ItemOverlayView(
+            held_now=True,
+            held_reason_now=HISTORICAL_REASON,
+            historical=True,
+            data_status_now="live",
+        ), item.evidence
+        assert not view.actions_enabled
+    assert result.overlay.stale_datasets == ()
+    assert result.overlay.incomplete_datasets == ()
+    assert result.banners == ()
+
+    async with sessions() as session:
+        assert await current_dataset_ids(session) == frozenset({google.id})
+        assert await item_is_current(session, current)
+        for item in unverifiable:
+            assert not await item_is_current(session, item), item.evidence
+    # The overlay never rewrites the frozen evidence it could not verify.
+    for item, evidence in zip(unverifiable, unverifiable_evidence, strict=True):
+        assert (await _stored(sessions, item.id)).evidence == evidence
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_an_unverifiable_linkedin_item_still_reports_against_the_effective_crm_dataset(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # The verifier's reproduction: LinkedIn is simulated, so LinkedIn-attributed hubspot.*
+    # datasets are the companion's (AAP 0.5.4.1, 0.3.3). The companion has no
+    # hubspot.contacts row while HubSpot's primary is fresh.
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        linkedin = await _dataset(session, "linkedin", mode="simulated")
+        companion = await _companion(session, linkedin)
+        hubspot = await _dataset(session, "hubspot")
+        await _freshness(session, google, "google.metrics_daily")
+        await _freshness(session, linkedin, "linkedin.leads")
+        await _freshness(session, hubspot, "hubspot.contacts")
+        run = await _run(session)
+        required = ("linkedin.leads", "hubspot.contacts")
+        # A complete LinkedIn entry plus a companion entry missing its role.
+        no_role = _prov(linkedin, companion)
+        del no_role[1]["role"]
+        # A malformed LinkedIn entry: still LinkedIn-attributed, as it requires linkedin.leads.
+        no_mode = _prov(linkedin, companion)
+        del no_mode[0]["mode"]
+        # Google-to-CRM evidence with a malformed Google entry keeps reading HubSpot's primary.
+        google_crm_provenance = _prov(google, hubspot)
+        del google_crm_provenance[0]["source"]
+        pipeline = await _item(
+            session,
+            run,
+            rule_id="C1b",
+            section="campaigns",
+            group="pause",
+            entity_type="campaign",
+            entity_id="31",
+            provenance=no_role,
+            required=required,
+            data_status="simulated",
+        )
+        veto = await _item(
+            session,
+            run,
+            rule_id="W1",
+            section="white_papers",
+            group="cohort:USD",
+            entity_type="content_asset",
+            entity_id="wp-1",
+            provenance=no_mode,
+            required=required,
+            data_status="simulated",
+        )
+        google_crm = await _item(
+            session,
+            run,
+            rule_id="C2",
+            section="campaigns",
+            group="scale",
+            entity_type="campaign",
+            entity_id="41",
+            provenance=google_crm_provenance,
+            required=("google.metrics_daily", "hubspot.contacts"),
+        )
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    companion_flags = (
+        Flag(FLAG_STALE, "Data as of: no successful sync of hubspot.contacts"),
+        Flag(FLAG_INCOMPLETE, "Incomplete: hubspot.contacts (no freshness record)"),
+    )
+    # Currentness still fails closed: every unverifiable item is historical.
+    assert result.items[pipeline.id] == ItemOverlayView(
+        held_now=True,
+        held_reason_now=HISTORICAL_REASON,
+        historical=True,
+        data_status_now="simulated",
+        flags_now=(Flag(FLAG_SIMULATED, "Simulated data (LinkedIn)"), *companion_flags),
+    )
+    assert result.items[veto.id] == ItemOverlayView(
+        held_now=True,
+        held_reason_now=HISTORICAL_REASON,
+        historical=True,
+        data_status_now="simulated",
+        flags_now=(Flag(FLAG_SIMULATED, "Simulated data (HubSpot)"), *companion_flags),
+    )
+    assert result.items[google_crm.id] == ItemOverlayView(
+        held_now=True, held_reason_now=HISTORICAL_REASON, historical=True, data_status_now="live"
+    )
+    # The page lists and banners carry the companion-scope verdict the cards show.
+    assert result.overlay.stale_datasets == ("hubspot.contacts",)
+    assert result.overlay.incomplete_datasets == ("hubspot.contacts",)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_SIMULATED_SOURCES,
+            tone="info",
+            message="Simulated data: LinkedIn (simulated data mode)",
+            count=1,
+        ),
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message="Stale data: hubspot.contacts (no successful sync)",
+            count=1,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message="Incomplete data: hubspot.contacts (no freshness record)",
+            count=1,
+        ),
+    )
+    async with sessions() as session:
+        for item in (pipeline, veto, google_crm):
+            assert not await item_is_current(session, item)
+    # The overlay never rewrites the frozen evidence it could not verify.
+    assert (await _stored(sessions, pipeline.id)).evidence["provenance"] == no_role
 
 
 # ---------------------------------------------------------------------------------------
@@ -1644,21 +2373,6 @@ async def test_the_short_window_banner_uses_the_configured_trusted_minimum(
         else ()
     )
     assert result.banners == expected
-
-
-@pytest.mark.anyio
-@pytest.mark.db
-async def test_overlay_without_thresholds_loads_the_shipped_configuration(
-    sessions: Sessions, shipped: Thresholds, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async with sessions() as session, session.begin():
-        run = await _run(session, start=WINDOW_END - timedelta(days=9))
-    monkeypatch.chdir(REPO_ROOT)
-
-    result = await _page(sessions, run.id, thresholds=None)
-    assert [banner.message for banner in result.banners] == [
-        f"Window of 10 days is below the {shipped.trusted_min_days}-day trusted minimum"
-    ]
 
 
 @pytest.mark.anyio

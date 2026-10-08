@@ -59,7 +59,7 @@
  */
 .ds-field__control {
   box-sizing: border-box;
-  inline-size: 100%;
+  inline-size: var(--size-full);
   min-block-size: var(--space-8);
   margin: 0;
   padding-block: var(--space-2);
@@ -93,6 +93,26 @@
 }
 
 /*
+ * Hover and engaged states, shared by TextField, Select and the DateRangePicker date fields.
+ * Hover darkens the border to the muted text token, which stays at least 3:1 on both the
+ * surface and the page background (WCAG 2.2 SC 1.4.11), and only on devices whose primary
+ * pointer can hover, so the state never sticks after a tap. Engaged (focused, or being pressed,
+ * which covers a select opened by mouse, where :focus-visible may not match) takes the accent
+ * border alongside the focus-visible ring; it follows the hover rule at the same specificity, so
+ * it wins while the pointer is still over the control. An invalid control keeps its critical
+ * border and a disabled one never reacts, through the :not() guards rather than source order.
+ */
+@media (hover: hover) {
+  .ds-field__control:hover:not(:disabled):not([aria-invalid="true"]) {
+    border-color: var(--color-text-muted);
+  }
+}
+
+.ds-field__control:is(:focus, :active):not(:disabled):not([aria-invalid="true"]) {
+  border-color: var(--color-accent);
+}
+
+/*
  * Invalid: TextField.tsx and Select.tsx set aria-invalid="true" only while an error message is
  * shown. The .ds-field__error text identifies the error in words (WCAG 2.2 SC 3.3.1), so the
  * critical border colour is never the only cue.
@@ -108,7 +128,7 @@
  */
 .ds-field__control:disabled {
   cursor: not-allowed;
-  opacity: 0.6;
+  opacity: var(--opacity-disabled);
 }
 
 /* Multiline TextField: the user may grow the textarea vertically, never sideways. */

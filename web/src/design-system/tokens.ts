@@ -29,7 +29,9 @@
 /**
  * Every semantic CSS custom property, in `tokens.css` declaration order (AAP 0.4.3): ten
  * colours, eight spacing steps, the font family, five font sizes, two font weights, two line
- * heights, two radii, two shadows and three z-index layers.
+ * heights, two radii, two shadows, three z-index layers, two opacities and one size. The
+ * opacities and the size extend the AAP 0.4.3 list, so that every component value, including
+ * disabled and backdrop opacity and full-extent geometry, resolves to a token (AAP 0.4.4).
  *
  * `tokens.test.ts` holds `tokens.css` to this exact list and order, so a token added, renamed
  * or removed in one place and not the other fails the tests.
@@ -72,6 +74,9 @@ export const TOKEN_NAMES = [
   '--z-banner',
   '--z-dialog',
   '--z-tooltip',
+  '--opacity-disabled',
+  '--opacity-backdrop',
+  '--size-full',
 ] as const;
 
 /**
@@ -203,5 +208,14 @@ export const tokens = {
     banner: cssVar('--z-banner'),
     dialog: cssVar('--z-dialog'),
     tooltip: cssVar('--z-tooltip'),
+  },
+  /** Inactive-control and backdrop opacities. GAP: bind to Blitzy OS on source arrival. */
+  opacity: {
+    disabled: cssVar('--opacity-disabled'),
+    backdrop: cssVar('--opacity-backdrop'),
+  },
+  /** The full extent of the containing block. GAP: bind to Blitzy OS on source arrival. */
+  size: {
+    full: cssVar('--size-full'),
   },
 } as const;

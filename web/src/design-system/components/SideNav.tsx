@@ -27,6 +27,14 @@
  * Without `renderLink`, each item renders a plain `<a href>`, which suits in-page anchors such
  * as `#section-keywords`.
  *
+ * Every destination is validated before either rendering path sees it. Only a same-origin route
+ * path (`/decisions`, `/actions?run=3`) or an in-page fragment (`#section-keywords`) is a safe
+ * `href`. An item with any other `href` (a scheme such as `javascript:` or `data:`, a
+ * protocol-relative `//host`, a relative path, or a string with whitespace, control characters
+ * or a backslash) fails closed: it renders an inert placeholder `<a>` with no `href`, keeping
+ * the class contract, the label and count and `aria-current`, and `renderLink` is never called
+ * for it. A custom renderer therefore only ever receives a validated destination.
+ *
  * The Blitzy OS source is unavailable, so this is a product wrapper at the last
  * graceful-degradation step (AAP 0.4.4): semantic HTML styled solely by semantic tokens. Binding
  * Blitzy OS later changes only this file's internals and `SideNav.css`; the props below are the
@@ -58,8 +66,18 @@ export interface SideNavItem {
   /** Visible text of the link, and the start of its accessible name. */
   label: ReactNode;
   /**
-   * Destination of the link: a route path such as `/decisions`, or an in-page anchor such as
-   * `#section-keywords`.
+   * Destination of the link, in one of two accepted forms:
+   * - a same-origin route path: a single leading `/` not followed by another `/` or a `\`, with
+   *   an optional query or fragment, such as `/decisions` or `/actions?run=3`;
+   * - an in-page anchor: a leading `#`, such as `#section-keywords`.
+   *
+   * Any other value is unsafe and is never rendered as a destination: a scheme of any kind
+   * (`javascript:`, `data:`, `https:`, `mailto:`…), a protocol-relative `//host` or `/\host`, a
+   * relative path without the leading `/`, the empty string, or a string holding whitespace, an
+   * ASCII control character (U+0000–U+001F, U+007F) or a backslash anywhere, since browsers drop
+   * tabs and newlines inside a URL and read a backslash as a slash. An item with an unsafe `href`
+   * renders an inert placeholder `<a>` with no `href` attribute, with the same class, label,
+   * count and `aria-current` as its link would have had, and `renderLink` is not called for it.
    */
   href: string;
   /**
@@ -89,7 +107,11 @@ export interface SideNavItem {
  * GAP: bind to Blitzy OS on source arrival.
  */
 export interface SideNavLinkProps {
-  /** The item's `href`, unchanged. */
+  /**
+   * The item's `href`, unchanged, and only ever a validated one: a same-origin route path or an
+   * in-page anchor (see {@link SideNavItem.href}). An item with an unsafe `href` gets no link
+   * props at all.
+   */
   href: string;
   /** `ds-sidenav__link`, plus `ds-sidenav__link--current` on the current item. */
   className: string;
@@ -121,16 +143,78 @@ export interface SideNavProps {
    */
   items: readonly SideNavItem[];
   /**
-   * Optional custom link renderer, called once per item with the item and the props built for
-   * its link. It must return a single link element carrying every prop in `linkProps`. Omitted,
-   * each item renders a plain `<a>`.
+   * Optional custom link renderer, called once per item whose `href` is safe, with the item and
+   * the props built for its link; `item.href` and `linkProps.href` are then the same validated
+   * destination. It must return a single link element carrying every prop in `linkProps`. It is
+   * never called for an item with an unsafe `href`, which renders the inert placeholder
+   * described at {@link SideNavItem.href} instead. Omitted, each safe item renders a plain `<a>`.
    */
   renderLink?: (item: SideNavItem, linkProps: SideNavLinkProps) => ReactNode;
 }
 
+/** Highest code point of the ASCII C0 control range, U+0000–U+001F. */
+const C0_CONTROL_MAX = 0x1f;
+
+/** Code point of DELETE, U+007F, the one ASCII control character above the C0 range. */
+const DELETE_CODE = 0x7f;
+
 /**
- * Builds the link props of one item: the class contract, the current-state attribute and the
- * label and count content.
+ * Whether `href` holds a character that can change how a browser parses it: an ASCII control
+ * character (U+0000–U+001F or U+007F), whitespace of any kind, or a backslash.
+ *
+ * Browsers remove tabs and newlines anywhere in a URL, so `/\t/evil.com` would be read as the
+ * protocol-relative `//evil.com`, and they read a backslash as a slash, so `/\evil.com` would be
+ * too. The control characters are compared by code unit, because a regular expression holding
+ * them is what ESLint's `no-control-regex` reports.
+ *
+ * @param href - the destination to inspect
+ * @returns `true` when `href` holds at least one such character
+ */
+function hasUnsafeCharacter(href: string): boolean {
+  for (let index = 0; index < href.length; index += 1) {
+    const code = href.charCodeAt(index);
+    if (code <= C0_CONTROL_MAX || code === DELETE_CODE) {
+      return true;
+    }
+  }
+  return /\s/u.test(href) || href.includes('\\');
+}
+
+/**
+ * Whether `href` is a safe destination for a {@link SideNav} link: an in-page anchor (a leading
+ * `#`) or a same-origin route path (a single leading `/` not followed by another `/` or a `\`,
+ * with an optional query or fragment after the path), free of the characters
+ * `hasUnsafeCharacter` rejects. Every other string is unsafe, the empty string included.
+ *
+ * It is an allowlist of the two forms the navigation needs, not a blocklist of schemes: a string
+ * that starts with `#` or `/` cannot carry a scheme, so no spelling of `javascript:`, `data:` or
+ * any other scheme passes.
+ *
+ * @param href - the item's destination
+ * @returns `true` when `href` may be rendered as a link destination
+ */
+function isSafeHref(href: string): boolean {
+  if (hasUnsafeCharacter(href)) {
+    return false;
+  }
+  if (href.startsWith('#')) {
+    return true;
+  }
+  const afterLeadingSlash = href.charAt(1);
+  return href.startsWith('/') && afterLeadingSlash !== '/' && afterLeadingSlash !== '\\';
+}
+
+/**
+ * What an item's link shows and states, apart from its destination: every
+ * {@link SideNavLinkProps} field except `href`. A safe item's link and an unsafe item's inert
+ * placeholder render the same content.
+ */
+type SideNavLinkContent = Omit<SideNavLinkProps, 'href'>;
+
+/**
+ * Builds the content of one item's link: the class contract, the current-state attribute and the
+ * label and count content. The destination is added only once it is validated, by
+ * {@link SideNav}.
  *
  * The count is preceded by a space text node. In the flex layout of `SideNav.css` that
  * whitespace-only node renders nothing, but it separates the label from the count in the link's
@@ -138,9 +222,9 @@ export interface SideNavProps {
  * implementation, whether or not it reads the CSS display of the two spans.
  *
  * @param item - the item the link is for
- * @returns the props for the item's link
+ * @returns the content of the item's link, without its `href`
  */
-function buildLinkProps(item: SideNavItem): SideNavLinkProps {
+function buildLinkContent(item: SideNavItem): SideNavLinkContent {
   const hasCount = item.count !== undefined && Number.isFinite(item.count);
   const children = (
     <>
@@ -157,13 +241,17 @@ function buildLinkProps(item: SideNavItem): SideNavLinkProps {
   // The current-state attribute is left out of a non-current item's props rather than set to
   // undefined, so a custom link that spreads them renders no aria-current at all.
   return item.current === true
-    ? { href: item.href, className: CURRENT_LINK_CLASS, 'aria-current': 'page', children }
-    : { href: item.href, className: LINK_CLASS, children };
+    ? { className: CURRENT_LINK_CLASS, 'aria-current': 'page', children }
+    : { className: LINK_CLASS, children };
 }
 
 /**
  * Vertical navigation list: a `<nav>` landmark named by `label`, holding one link per item with
  * its optional count, in the order given.
+ *
+ * Each item's `href` is validated before it is rendered or handed to `renderLink`. An item with
+ * an unsafe `href` renders an inert placeholder `<a>` without `href`, and `renderLink` is not
+ * called for it (see {@link SideNavItem.href}). The component neither throws nor logs.
  *
  * The list stays an `<ul>` without an explicit `role="list"`: `SideNav.css` removes its markers,
  * and WebKit keeps the list semantics of an unmarked list inside a `<nav>`, so VoiceOver still
@@ -200,19 +288,32 @@ export function SideNav({ label, items, renderLink }: SideNavProps) {
     <nav className="ds-sidenav" aria-label={label}>
       <ul className="ds-sidenav__list">
         {items.map((item) => {
-          const linkProps = buildLinkProps(item);
-          const link =
-            renderLink === undefined ? (
-              <a
-                href={linkProps.href}
-                className={linkProps.className}
-                aria-current={linkProps['aria-current']}
-              >
-                {linkProps.children}
+          const content = buildLinkContent(item);
+          let link: ReactNode;
+          if (isSafeHref(item.href)) {
+            const linkProps: SideNavLinkProps = { href: item.href, ...content };
+            link =
+              renderLink === undefined ? (
+                <a
+                  href={linkProps.href}
+                  className={linkProps.className}
+                  aria-current={linkProps['aria-current']}
+                >
+                  {linkProps.children}
+                </a>
+              ) : (
+                renderLink(item, linkProps)
+              );
+          } else {
+            // Fails closed: an unsafe destination is never rendered and never reaches renderLink.
+            // An <a> without href is the HTML placeholder for a link: it is not focusable and
+            // cannot be followed, yet keeps the class contract, label, count and current state.
+            link = (
+              <a className={content.className} aria-current={content['aria-current']}>
+                {content.children}
               </a>
-            ) : (
-              renderLink(item, linkProps)
             );
+          }
 
           return (
             <li key={item.key} className="ds-sidenav__item">

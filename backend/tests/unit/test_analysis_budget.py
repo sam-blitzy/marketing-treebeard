@@ -19,7 +19,7 @@ network.
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any, Final, cast
 from zoneinfo import ZoneInfo
 
@@ -447,7 +447,6 @@ def test_settings_read_every_budget_threshold_once_per_run() -> None:
     assert settings.b4_min_outcomes == thresholds.int("b4.min_outcomes")
     assert settings.b4_alpha == thresholds.ratio("b4.alpha")
     assert settings.sustained_min == thresholds.int("window.sustained_min_days")
-    assert settings.floor_share == thresholds.ratio("attribution.floor_share")
 
 
 @pytest.mark.parametrize(
@@ -1457,54 +1456,29 @@ def test_budget_crm_combines_the_members_of_a_linked_shared_budget() -> None:
 def test_budget_crm_flags_explain_untrustworthy_counts() -> None:
     """AAP 0.5.4.1: unavailable pipelines, the attribution floor and unknown evidence are flagged.
 
-    One population keeps its own floor verdict; several (a shared budget's members) pool the
-    unresolved share over all matured leads, so it is judged against the floor share once.
+    A card's population keeps its own verdicts, exactly as the Campaigns section shows them. A
+    shared budget reads one population over its members' member days
+    (:func:`~ads_engine.analysis.attribution.shared_budget_veto`), whose floor is already
+    judged on all of those matured leads together, so the card never pools members itself.
     """
-    scenario, ctx = _built("shared.poor_member.does_not_fire")
-    settings = budget._Settings.of(ctx)
+    scenario, _ = _built("shared.poor_member.does_not_fire")
     m1 = _campaign_id(scenario, "google", "m1")
-    m2 = _campaign_id(scenario, "google", "m2")
-    floor = ctx.thresholds.ratio("attribution.floor_share")
-    single = budget._population_flags(
-        ctx,
-        settings,
-        [_population(m1, unresolved=2, floor=True, available=False, reason="floor reached")],
+    flagged = budget._population_flags(
+        _population(
+            m1, unresolved=2, unknown=1, floor=True, available=False, reason="floor reached"
+        )
     )
-    assert [flag.code for flag in single] == [FLAG_PIPELINE_UNAVAILABLE, FLAG_ATTRIBUTION_FLOOR]
-    assert single[0].message == "Pipeline unavailable: floor reached"
-    share = budget._percent(Decimal(2) / Decimal(20))
-    assert single[1].message == f"Floor: {share} of matured leads unmatched in HubSpot"
-    at_floor = int((floor * 40).to_integral_value(rounding=ROUND_CEILING))
-    pooled = budget._population_flags(
-        ctx,
-        settings,
-        [
-            _population(m1, matured=20, unresolved=at_floor, unknown=1),
-            _population(m2, matured=20, available=False, reason="QL stage unresolved"),
-        ],
-    )
-    assert [flag.code for flag in pooled] == [
+    assert [flag.code for flag in flagged] == [
         FLAG_PIPELINE_UNAVAILABLE,
         FLAG_ATTRIBUTION_FLOOR,
         FLAG_UNKNOWN_CRM_EVIDENCE,
     ]
-    assert (
-        pooled[0].message == f"Pipeline unavailable: {ctx.campaign_name(m2)}: QL stage unresolved"
-    )
-    assert pooled[2].message == f"Unknown CRM evidence for 1 of {40 - at_floor} eligible contacts"
-    below = budget._population_flags(
-        ctx,
-        settings,
-        [_population(m1, matured=20, unresolved=at_floor - 1), _population(m2, matured=20)],
-    )
-    assert below == ()
-    combined = budget._combined(
-        ctx, settings, "google", [_population(m1, ql=2), _population(m2, ql=None)]
-    )
-    assert (combined.eligible_contacts, combined.ql) == (40, None)
-    assert budget._combined(ctx, settings, "google", []) == BudgetCrm(None, None, None)
-    assert budget._sum_known([1, 2]) == 3
-    assert budget._sum_known([1, None]) is None
+    assert flagged[0].message == "Pipeline unavailable: floor reached"
+    share = budget._percent(Decimal(2) / Decimal(20))
+    assert flagged[1].message == f"Floor: {share} of matured leads unmatched in HubSpot"
+    assert flagged[2].message == "Unknown CRM evidence for 1 of 18 eligible contacts"
+    # An unresolved share below the floor verdict, on a judged population, flags nothing.
+    assert budget._population_flags(_population(m1, unresolved=1)) == ()
     assert BudgetCrm.from_veto(None, "google") == BudgetCrm(None, None, None)
     assert BudgetCrm.from_veto(_population(m1, ql=4), "google") == BudgetCrm("google", 20, 4)
 

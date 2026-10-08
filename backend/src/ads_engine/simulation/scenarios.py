@@ -2706,9 +2706,10 @@ class _Converter:
             )
             if deal.created_at is not None and lower <= deal.created_at <= self.now
         )
+        touch_lower = self._google_touch_range()[0]
         discovered = sorted(
             (state.contacts[contact_id] for contact_id in google_ids),
-            key=lambda item: (item.google_touch_at or lower, item.hs_id),
+            key=lambda item: (item.google_touch_at or touch_lower, item.hs_id),
         )
         return CrmData(
             dataset=ref,
@@ -2744,17 +2745,24 @@ class _Converter:
             google_touch_at=record.google_touch_at,
         )
 
-    def _google_touch_contacts(self, link: GoogleCrmBinding) -> list[ContactRecord]:
-        """Google-touch contacts whose touch falls within the window's Google-native bounds.
+    def _google_touch_range(self) -> tuple[datetime, datetime]:
+        """The half-open instant range Google-touch discovery covers, as ``load_context`` reads.
 
-        ``[start 00:00, end + 1 day 00:00)`` in the Google account's time zone (UTC while
-        none is known), as ``load_context`` selects them (AAP 0.5.4.1 native days).
+        The window's Google-native instants, ``[start 00:00, end + 1 day 00:00)`` in the
+        Google account's time zone (UTC while none is known; AAP 0.5.4.1 native days). The
+        one account zone is both the per-campaign veto's and the zone budget histories date
+        shared-budget member days in, so this range serves both vetoes.
         """
+        zone = self.sources.google_timezone or "UTC"
+        lower, _ = AnalysisWindow.day_bounds(self.window.start, zone)
+        _, upper = AnalysisWindow.day_bounds(self.window.end, zone)
+        return lower, upper
+
+    def _google_touch_contacts(self, link: GoogleCrmBinding) -> list[ContactRecord]:
+        """Google-touch contacts whose touch date falls within :meth:`_google_touch_range`."""
         if link.campaign_property is None or link.touch_date_property is None:
             return []
-        zone = self.sources.google_timezone or "UTC"
-        start, _ = AnalysisWindow.day_bounds(self.window.start, zone)
-        _, end = AnalysisWindow.day_bounds(self.window.end, zone)
+        start, end = self._google_touch_range()
         found = self.world.hubspot_search(
             "contacts",
             (

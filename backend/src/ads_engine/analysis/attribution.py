@@ -51,8 +51,8 @@ missing value is ``None`` and renders "unavailable", never 0. Downstream CRM eve
 of run time (``ctx.now``): an event instant after the run is not counted.
 
 Purity: imports only :mod:`ads_engine.analysis.context`, :mod:`ads_engine.analysis.thresholds`
-(types), :mod:`ads_engine.analysis.window` (the UTC boundary name) and the standard library.
-No database, network, settings or logging access.
+(types), :mod:`ads_engine.analysis.window` (the UTC boundary name and native day bounds) and
+the standard library. No database, network, settings or logging access.
 
 Example:
     >>> table = attribution_for(ctx)  # doctest: +SKIP
@@ -63,9 +63,10 @@ Example:
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from types import MappingProxyType
 from typing import Any, Final
@@ -96,7 +97,7 @@ from ads_engine.analysis.context import (
     json_value,
 )
 from ads_engine.analysis.thresholds import ContentAsset, ResolvedBinding, StageBinding
-from ads_engine.analysis.window import UTC_BOUNDARY
+from ads_engine.analysis.window import UTC_BOUNDARY, AnalysisWindow
 
 __all__ = [
     "ATTRIBUTION_THRESHOLD_KEYS",
@@ -119,6 +120,7 @@ __all__ = [
     "attribution_for",
     "build_attribution",
     "contact_evidence_known",
+    "shared_budget_veto",
 ]
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2080,114 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
             refresh_problem=refresh_problem,
         )
     return populations
+
+
+def _on_member_day(days: tuple[Sequence[datetime], Sequence[datetime]], touch: datetime) -> bool:
+    """Whether ``touch`` lies in a member day, given the days' ascending starts and ends."""
+    starts, ends = days
+    index = bisect_right(starts, touch) - 1
+    return index >= 0 and touch < ends[index]
+
+
+def shared_budget_veto(
+    ctx: AnalysisContext, member_days: Mapping[int, Sequence[date]], zone: str
+) -> VetoPopulation | None:
+    """Return a Google shared budget's matured population over its members' member days.
+
+    AAP 0.5.4.5 aggregates a shared budget's spend and outcomes over member days only, so its
+    pipeline veto (AAP 0.5.4.1) is judged on the same Google native days. The population is
+    the touch-date contacts of ``ctx.google_crm`` whose campaign property equals a member
+    campaign's external id and whose touch instant lies in one of that campaign's member days
+    in the window: native day ``d`` is ``[d 00:00, d + 1 day 00:00)`` in ``zone``, the Google
+    account zone the member days were classified in, compared as instants (HubSpot events are
+    instants). A touch is matured when it is at or before the native window end
+    (``window.end + 1 day 00:00`` in ``zone``) minus ``crm.lead_maturity_days``. A touch
+    before a campaign joined the budget or after it left therefore never enters, and no UTC
+    bound moves a touch in or out of the first or last native day. Each contact counts as one
+    matched lead; one found through several members counts once, at its earliest admitted
+    touch; QL, MQL and meetings count only at or after that touch and by the run, and a
+    meeting of contacts of two members counts once. Known evidence, the floor and the veto
+    follow the per-campaign population.
+
+    The population comes from the same touch-date discovery as the per-campaign Google veto
+    (:func:`_google_veto`), so its refresh is judged the same way: when the
+    ``hubspot.google_contacts`` refresh is unknown (:func:`_google_refresh_problem`), the
+    population is unavailable with that reason and its eligible contacts count as unknown
+    evidence, even with none admitted, because the refresh may have missed some. Otherwise
+    each eligible contact is judged on its own reads; discovered contacts have no per-contact
+    refresh status.
+
+    Args:
+        ctx: The run's analysis context.
+        member_days: Each member campaign's native member days, for example
+            :attr:`~ads_engine.analysis.metrics.BudgetHistory.members`; a date outside the
+            window is not a member day of this run.
+        zone: The IANA zone of those dates
+            (:func:`~ads_engine.analysis.metrics.native_day_zone` for ``google``).
+
+    Returns:
+        The population, keyed by the lowest member campaign id; ``None`` without a verified
+        Google-to-CRM link (no Google veto is evaluated) or without a member Google campaign
+        in the context.
+
+    Raises:
+        ConfigError: When a threshold in :data:`ATTRIBUTION_THRESHOLD_KEYS` is missing.
+        ValueError: When ``zone`` is not a loadable IANA zone.
+    """
+    crm = ctx.google_crm
+    if crm is None or not crm.bindings.google.available:
+        return None
+    by_ref: dict[str, list[tuple[datetime, datetime]]] = {}
+    members: list[int] = []
+    for campaign_id in sorted(member_days):
+        campaign = ctx.campaigns.get(campaign_id)
+        if campaign is None or campaign.source != "google":
+            continue
+        members.append(campaign_id)
+        bounds = by_ref.setdefault(campaign.external_id.strip(), [])
+        bounds.extend(
+            AnalysisWindow.day_bounds(day, zone)
+            for day in set(member_days[campaign_id])
+            if ctx.window.contains(day)
+        )
+    if not members:
+        return None
+    days: dict[str, tuple[list[datetime], list[datetime]]] = {}
+    for ref, spans in by_ref.items():
+        ordered = sorted(spans)
+        days[ref] = ([start for start, _ in ordered], [end for _, end in ordered])
+    settings = _Settings.of(ctx)
+    # Member-day spans are window dates, so they bound a touch to the native window; maturity
+    # is measured back from that window's native end, never from its UTC end.
+    cutoff = AnalysisWindow.day_bounds(ctx.window.end, zone)[1] - settings.maturity
+    touches: dict[str, datetime] = {}
+    found: dict[str, ContactInfo] = {}
+    for contact in crm.google_contacts:
+        ref, touch = (contact.google_campaign_ref or "").strip(), contact.google_touch_at
+        if not ref or touch is None or touch > cutoff:
+            continue
+        member = days.get(ref)
+        if member is None or not _on_member_day(member, touch):
+            continue
+        found.setdefault(contact.hs_id, contact)
+        earlier = touches.get(contact.hs_id)
+        if earlier is None or touch < earlier:
+            touches[contact.hs_id] = touch
+    eligible = dict(sorted(touches.items()))
+    return _judge(
+        source="google",
+        campaign_id=members[0],
+        crm=crm,
+        contacts={**crm.contacts, **found},
+        touches=eligible,
+        refresh_unknown=MappingProxyType({}),
+        settings=settings,
+        now=ctx.now,
+        leads=len(eligible),
+        matured=len(eligible),
+        matched=len(eligible),
+        refresh_problem=_google_refresh_problem(ctx, crm),
+    )
 
 
 def _campaigns(ctx: AnalysisContext, source: Source) -> list[CampaignInfo]:

@@ -60,7 +60,7 @@
  */
 .ds-tooltip__content {
   position: absolute;
-  inset-block-start: calc(100% + var(--space-1));
+  inset-block-start: calc(var(--size-full) + var(--space-1));
   inset-inline-start: 0;
   z-index: var(--z-tooltip);
   inline-size: max-content;
@@ -93,7 +93,7 @@
 .ds-tooltip__content::before {
   content: "";
   position: absolute;
-  inset-block-end: 100%;
+  inset-block-end: var(--size-full);
   inset-inline: 0;
   block-size: var(--space-1);
 }

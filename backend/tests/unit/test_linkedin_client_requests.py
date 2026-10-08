@@ -65,13 +65,13 @@ from ads_engine.connectors.linkedin.client import (
     _check_date_range,
     _check_page_size,
     _checked_lead_id,
+    _checked_offset_paging,
     _chunks,
     _cursor_token,
     _distinct,
     _distinct_rows,
     _elements,
     _epoch_ms,
-    _has_next_link,
     _is_post_urn,
     _log_outcome,
     _next_href,
@@ -735,6 +735,13 @@ def test_relative_href_strips_the_rest_base_and_keeps_query_bytes(href: str, rel
         ("https://evil.example/rest/adAnalytics", "outside https://api.linkedin.com"),
         ("//api.linkedin.com/rest/adAnalytics", "outside https://api.linkedin.com"),
         ("https://api.linkedin.com:8443/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://api.linkedin.com:444/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://api.linkedin.com:443/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://api.linkedin.com:/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://api.linkedin.com:x/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://user@api.linkedin.com/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://u:p@api.linkedin.com/rest/adAnalytics", "outside https://api.linkedin.com"),
+        ("https://api.linkedin.com@evil.example/rest/x", "outside https://api.linkedin.com"),
         ("/v2/adAnalytics?start=2", "outside the versioned REST base"),
         ("/rest/", "malformed path"),
         ("/rest/adAccounts/../adAnalytics", "malformed path"),
@@ -744,10 +751,64 @@ def test_relative_href_strips_the_rest_base_and_keeps_query_bytes(href: str, rel
     ],
 )
 def test_relative_href_rejects_links_outside_the_versioned_api(href: str, fragment: str) -> None:
-    """A link to another host, scheme or base, or with a traversing path, is a defect."""
+    """A link to another host, scheme, port, user or base, or a traversing path, is a defect."""
     with pytest.raises(QueryDefect) as raised:
         _relative_href(href, "ad_analytics")
     _assert_defect(raised.value, "ad_analytics", fragment)
+
+
+# Links urlsplit cannot parse, then links holding a character that is not visible ASCII: one
+# urlsplit would silently drop, a host that lower-cases to api.linkedin.com (U+212A KELVIN
+# SIGN), and characters httpx would re-encode or refuse.
+_INVALID_HREFS = [
+    pytest.param("https://[invalid/rest/leadForms", id="unclosed-ipv6-bracket"),
+    pytest.param("https://api.linkedin.com]/rest/leadForms", id="unopened-ipv6-bracket"),
+    pytest.param("https://[::1x]/rest/leadForms", id="invalid-ipv6-literal"),
+    pytest.param("https://[127.0.0.1]/rest/leadForms", id="bracketed-ipv4"),
+    pytest.param("https://[v1]/rest/leadForms", id="invalid-ipvfuture"),
+    pytest.param("https://api.linkedin.com\uff03/rest/leadForms", id="nfkc-unsafe-host"),
+    pytest.param("https://api.lin\u212aedin.com/rest/leadForms?start=2", id="kelvin-sign-host"),
+    pytest.param("/rest/lead\nForms?start=2", id="line-break"),
+    pytest.param("/rest/leadForms?start=\t2", id="tab"),
+    pytest.param("\x00/rest/leadForms?start=2", id="leading-nul"),
+    pytest.param("/rest/leadForms?start=2\x00", id="nul"),
+    pytest.param("/rest/leadForms?start=2\x7f", id="del"),
+    pytest.param("/rest/leadForms?start=\u00e92", id="non-ascii-query"),
+    pytest.param("/rest/leadForms?start= 2", id="raw-space"),
+]
+
+
+@pytest.mark.parametrize("href", _INVALID_HREFS)
+def test_relative_href_rejects_an_invalid_url_without_quoting_it(href: str) -> None:
+    """A link that is not a valid URL is a ``validation`` defect, never a ``ValueError``.
+
+    The defect names no part of the link and chains no ``urlsplit`` error, whose message
+    would quote it.
+    """
+    with pytest.raises(QueryDefect) as raised:
+        _relative_href(href, "lead_forms")
+    _assert_defect(raised.value, "lead_forms", "a 'next' link is not a valid URL")
+    assert raised.value.message == "a 'next' link is not a valid URL"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None or raised.value.__suppress_context__
+
+
+def _rejected_next_links(path: str) -> list[Any]:
+    """Return ``(href, fragment)`` params of ``next`` links to ``path`` that are defects.
+
+    First links that are not valid URLs (three ``urlsplit`` rejects, then a control
+    character), then links naming user information or a port on the API host.
+    """
+    invalid = "a 'next' link is not a valid URL"
+    offsite = "a 'next' link points outside https://api.linkedin.com"
+    return [
+        pytest.param(f"https://[invalid/rest/{path}", invalid, id="unclosed-ipv6-bracket"),
+        pytest.param(f"https://api.linkedin.com]/rest/{path}", invalid, id="unopened-bracket"),
+        pytest.param(f"https://[::1x]/rest/{path}", invalid, id="invalid-ipv6-literal"),
+        pytest.param(f"/rest/{path}?start=1\x00", invalid, id="control-character"),
+        pytest.param(f"https://user@api.linkedin.com/rest/{path}", offsite, id="user-info"),
+        pytest.param(f"https://api.linkedin.com:444/rest/{path}", offsite, id="port"),
+    ]
 
 
 def test_next_href_reads_only_the_rel_next_link() -> None:
@@ -890,36 +951,214 @@ def test_distinct_rows_keeps_the_first_row_per_key() -> None:
     assert _distinct_rows([], lambda row: row) == ([], 0)
 
 
+_NEXT_LINK = {"rel": "next", "href": "/rest/leadForms?start=20", "type": "application/json"}
+
+
 @pytest.mark.parametrize(
-    ("body", "expected"),
+    ("paging", "expected"),
     [
-        ({}, False),
-        ({"paging": {"start": 0, "count": 10}}, False),
-        ({"paging": {"links": []}}, False),
-        ({"paging": {"links": ["next", {"rel": "prev", "href": "x"}]}}, False),
-        ({"paging": {"links": [{"rel": "next", "href": "/rest/leadForms?start=10"}]}}, True),
-        ({"paging": {"links": [{"rel": "next"}]}}, True),
+        pytest.param({"start": 10, "count": 10}, False, id="no-total-no-links"),
+        pytest.param({"start": 10, "count": 10, "total": 0, "links": []}, False, id="empty-links"),
+        pytest.param(
+            {"start": 10, "count": 10, "links": [{"rel": "prev", "href": "/rest/leadForms"}]},
+            False,
+            id="prev-link-only",
+        ),
+        pytest.param({"start": 10, "count": 10, "links": [_NEXT_LINK]}, True, id="next-link"),
+        pytest.param(
+            {
+                "start": 10,
+                "count": 10,
+                "total": 10,
+                "links": [{"rel": "next", "href": "https://api.linkedin.com/rest/leadForms?x=1"}],
+            },
+            True,
+            id="absolute-next-link",
+        ),
     ],
 )
-def test_has_next_link_reports_only_the_presence_of_rel_next(
-    body: dict[str, Any], expected: bool
+def test_checked_offset_paging_reports_a_next_link_on_a_valid_envelope(
+    paging: dict[str, Any], expected: bool
 ) -> None:
-    """Offset listings use the presence of ``rel=next`` only; the href is never read."""
-    assert _has_next_link(body, "lead_forms") is expected
+    """A contract envelope echoing the requested ``start`` and ``count`` reports ``rel=next``."""
+    assert _checked_offset_paging({"paging": paging}, "lead_forms", start=10, count=10) is expected
 
 
 @pytest.mark.parametrize(
-    ("paging", "fragment"),
+    ("body", "fragment"),
     [
-        ([], "field 'paging' is not a JSON object"),
-        ({"links": {}}, "field 'paging.links' is not a list"),
+        pytest.param({}, "the response has no 'paging' object", id="paging-absent"),
+        pytest.param({"paging": None}, "field 'paging' is not a JSON object", id="paging-null"),
+        pytest.param({"paging": []}, "field 'paging' is not a JSON object", id="paging-list"),
+        pytest.param({"paging": {"count": 10}}, "field 'paging.start' is missing", id="no-start"),
+        pytest.param(
+            {"paging": {"start": "10", "count": 10}},
+            "field 'paging.start' is not an integer",
+            id="start-string",
+        ),
+        pytest.param(
+            {"paging": {"start": True, "count": 10}},
+            "field 'paging.start' is not an integer",
+            id="start-bool",
+        ),
+        pytest.param(
+            {"paging": {"start": None, "count": 10}},
+            "field 'paging.start' is not an integer",
+            id="start-null",
+        ),
+        pytest.param(
+            {"paging": {"start": 0, "count": 10}},
+            "field 'paging.start' does not match the requested start",
+            id="start-mismatch",
+        ),
+        pytest.param({"paging": {"start": 10}}, "field 'paging.count' is missing", id="no-count"),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10.0}},
+            "field 'paging.count' is not an integer",
+            id="count-float",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 100}},
+            "field 'paging.count' does not match the requested count",
+            id="count-mismatch",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "total": -1}},
+            "field 'paging.total' is negative",
+            id="total-negative",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "total": "1"}},
+            "field 'paging.total' is not an integer",
+            id="total-string",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "total": False}},
+            "field 'paging.total' is not an integer",
+            id="total-bool",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": {}}},
+            "field 'paging.links' is not a list",
+            id="links-object",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": None}},
+            "field 'paging.links' is not a list",
+            id="links-null",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": ["next"]}},
+            "an item of 'paging.links' is not a JSON object",
+            id="link-string",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{"rel": "next"}]}},
+            "an item of 'paging.links' has no string 'href'",
+            id="link-without-href",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{"href": "/rest/leadForms"}]}},
+            "an item of 'paging.links' has no string 'rel'",
+            id="link-without-rel",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{"rel": 1, "href": "/rest/x"}]}},
+            "an item of 'paging.links' has no string 'rel'",
+            id="link-rel-not-a-string",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{**_NEXT_LINK, "type": 1}]}},
+            "field 'type' of an item of 'paging.links' is not a string",
+            id="link-type-not-a-string",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{"rel": "next", "href": " "}]}},
+            "a 'next' link has no href",
+            id="next-href-blank",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [{"rel": "next", "href": "https://www.example.com/rest/leadForms"}],
+                }
+            },
+            "a 'next' link points outside https://api.linkedin.com",
+            id="next-href-off-host",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [{"rel": "next", "href": "http://api.linkedin.com/rest/leadForms"}],
+                }
+            },
+            "a 'next' link points outside https://api.linkedin.com",
+            id="next-href-plain-http",
+        ),
+        pytest.param(
+            {"paging": {"start": 10, "count": 10, "links": [{"rel": "next", "href": "/v2/x"}]}},
+            "a 'next' link is outside the versioned REST base /rest/",
+            id="next-href-outside-rest",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [{"rel": "next", "href": "https://[invalid/rest/leadForms"}],
+                }
+            },
+            "a 'next' link is not a valid URL",
+            id="next-href-unclosed-ipv6-bracket",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [{"rel": "next", "href": "/rest/leadForms?start=\x0020"}],
+                }
+            },
+            "a 'next' link is not a valid URL",
+            id="next-href-control-character",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [{"rel": "next", "href": "https://u@api.linkedin.com/rest/leadForms"}],
+                }
+            },
+            "a 'next' link points outside https://api.linkedin.com",
+            id="next-href-user-info",
+        ),
+        pytest.param(
+            {
+                "paging": {
+                    "start": 10,
+                    "count": 10,
+                    "links": [
+                        {"rel": "next", "href": "https://api.linkedin.com:444/rest/leadForms"}
+                    ],
+                }
+            },
+            "a 'next' link points outside https://api.linkedin.com",
+            id="next-href-port",
+        ),
     ],
 )
-def test_has_next_link_rejects_a_malformed_paging_block(paging: object, fragment: str) -> None:
-    """A malformed ``paging`` block is a defect in offset listings too."""
+def test_checked_offset_paging_rejects_a_broken_envelope(
+    body: dict[str, Any], fragment: str
+) -> None:
+    """A missing, malformed or mismatched ``paging`` envelope is a defect, never an end."""
     with pytest.raises(QueryDefect) as raised:
-        _has_next_link({"paging": paging}, "lead_forms")
-    _assert_defect(raised.value, "lead_forms", fragment)
+        _checked_offset_paging(body, "lead_form_responses", start=10, count=10)
+    _assert_defect(raised.value, "lead_form_responses", fragment)
 
 
 @pytest.mark.parametrize(
@@ -1265,17 +1504,67 @@ async def test_follow_follows_relative_and_absolute_next_links_at_once() -> None
 
 
 @pytest.mark.anyio
-async def test_follow_stops_on_an_empty_page_whatever_its_link_says() -> None:
-    """An empty page ends the chain even when it carries a ``next`` link."""
+async def test_follow_follows_the_next_link_of_an_empty_page() -> None:
+    """An empty page with a ``next`` link is not the end: the rows behind it are read."""
+    second = f"{ANALYTICS_URL}&start=10"
+    third = f"{ANALYTICS_URL}&start=20"
+    server = Server(
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{second}")),
+        _ok(_analytics_page([], f"/rest/{third}")),
+        _ok(_analytics_page([_daily_element(2), _daily_element(3)])),
+    )
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally)
+    assert [_relative(request) for request in server.requests] == [ANALYTICS_URL, second, third]
+    assert [e["impressions"] for e in pages.elements] == [1, 2, 3]
+    assert (pages.capped, pages.interrupted_by, tally.calls) == (False, None, 3)
+
+
+@pytest.mark.anyio
+async def test_follow_rejects_an_empty_page_whose_next_link_repeats_a_request() -> None:
+    """An empty page linking back to a request already read is a defect, never the end."""
+    second = f"{ANALYTICS_URL}&start=10"
+    server = Server(
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{second}")),
+        _ok(_analytics_page([], f"/rest/{second}")),
+    )
+    async with _linkedin(server) as linkedin:
+        with pytest.raises(QueryDefect) as raised:
+            await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    _assert_defect(raised.value, "ad_analytics", "repeats an earlier request")
+    assert len(server.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_follow_bounds_a_chain_of_empty_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty pages that keep returning fresh ``next`` links are cut off at the bound."""
+    monkeypatch.setattr(client_module, "_MAX_NEXT_LINKS", 2)
+    server = Server(
+        *(_ok(_analytics_page([], f"/rest/{ANALYTICS_URL}&start={i}")) for i in range(1, 4))
+    )
+    async with _linkedin(server) as linkedin:
+        with pytest.raises(QueryDefect) as raised:
+            await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    _assert_defect(raised.value, "ad_analytics", "more than 2 'next' links in one chain")
+    assert len(server.requests) == 3
+
+
+@pytest.mark.anyio
+async def test_follow_marks_a_transient_failure_after_an_empty_page_as_interrupted() -> None:
+    """A continuation of an empty page that fails transiently interrupts the chain."""
     server = Server(
         _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=10")),
         _ok(_analytics_page([], f"/rest/{ANALYTICS_URL}&start=20")),
+        *_outage(),
     )
+    tally = _Tally()
     async with _linkedin(server) as linkedin:
-        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
-    assert len(server.requests) == 2
-    assert len(pages.elements) == 1
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally)
+    assert [e["impressions"] for e in pages.elements] == [1]
+    assert isinstance(pages.interrupted_by, TransientError)
     assert not pages.capped
+    assert tally.calls == 3
 
 
 @pytest.mark.anyio
@@ -1354,6 +1643,26 @@ async def test_follow_rejects_an_offsite_next_link_before_following_it() -> None
         with pytest.raises(QueryDefect, match=re.escape("outside https://api.linkedin.com")):
             await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
     assert len(server.requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("href", "fragment"), _rejected_next_links("adAnalytics"))
+async def test_analytics_daily_rejects_an_unusable_next_link_before_following_it(
+    href: str, fragment: str
+) -> None:
+    """An invalid, user-info or ported ``next`` link is a defect through ``_follow``.
+
+    The page is empty, so the link is the only continuation; it is never sent, and no
+    ``ValueError`` escapes the connector.
+    """
+    server = Server(_ok(_analytics_page([], href)))
+    day = date(2026, 9, 1)
+    async with _linkedin(server) as linkedin:
+        with pytest.raises(QueryDefect) as raised:
+            await linkedin.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=1)
+    _assert_defect(raised.value, "ad_analytics", fragment)
+    assert len(server.requests) == 1
+    assert _relative(server.requests[0]) == ANALYTICS_URL
 
 
 @pytest.mark.anyio
@@ -1678,6 +1987,230 @@ async def test_offset_pages_reject_a_malformed_paging_block() -> None:
     server = Server(_ok({"elements": [_lead_form(1)], "paging": []}))
     with pytest.raises(QueryDefect, match="field 'paging' is not a JSON object"):
         await _offset_run(server, page_size=2, max_pages=None)
+
+
+@pytest.mark.anyio
+async def test_offset_pages_validate_the_envelope_before_consuming_a_page() -> None:
+    """A second page answering offset 0 again is a defect, and its elements are never consumed."""
+    forms = [_lead_form(1), _lead_form(2)]
+    server = Server(
+        _ok(_offset_page("lead_forms", forms, start=0, count=2, has_next=False)),
+        _ok(_offset_page("lead_forms", forms, start=0, count=2, has_next=False)),
+    )
+    consumed: list[list[Any]] = []
+    async with _linkedin(server) as linkedin:
+        with pytest.raises(QueryDefect) as raised:
+            await linkedin._offset_pages(
+                "lead_forms",
+                "leadForms",
+                [("q", "owner"), ("owner", _owner(ACCOUNT_URN))],
+                (),
+                page_size=2,
+                max_pages=None,
+                tally=_Tally(),
+                consume=consumed.append,
+            )
+    _assert_defect(raised.value, "lead_forms", "field 'paging.start' does not match")
+    assert len(consumed) == 1
+    assert [dict(_query_pairs(r))["start"] for r in server.requests] == ["0", "2"]
+
+
+_LEAD_RANGE = (datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC))
+_OFFSET_SURFACES = ("lead_forms", "lead_form_responses")
+
+
+def _lead_response(index: int) -> dict[str, Any]:
+    """Return the documented lead response renumbered to ``index``."""
+    element: dict[str, Any] = _sample("lead_form_responses")["elements"][0]
+    element["id"] = f"aaaabbbb-0000-cccc-1111-dddd2222eeee-{index}"
+    return element
+
+
+def _offset_element(surface: str, index: int) -> dict[str, Any]:
+    """Return element ``index`` of an offset listing on ``surface``."""
+    return _lead_form(index) if surface == "lead_forms" else _lead_response(index)
+
+
+async def _list_offset(
+    surface: str, server: Server, *, page_size: int
+) -> tuple[bool, str | None, int, int]:
+    """Run ``list_lead_forms`` or ``list_lead_responses``; return completeness, rows and calls."""
+    async with _linkedin(server) as linkedin:
+        if surface == "lead_forms":
+            forms = await linkedin.list_lead_forms(ACCOUNT_ID, page_size=page_size)
+            return forms.complete, forms.reason, len(forms.rows), forms.calls
+        leads = await linkedin.list_lead_responses(
+            ACCOUNT_ID, _LEAD_RANGE, known_versions={}, page_size=page_size
+        )
+        return leads.complete, leads.reason, len(leads.leads), leads.calls
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+async def test_lead_listings_reject_an_empty_page_without_paging(surface: str) -> None:
+    """``{"elements": []}`` breaks the required ``paging`` block: a defect, not an empty listing."""
+    server = Server(_ok({"elements": []}))
+    with pytest.raises(QueryDefect) as raised:
+        await _list_offset(surface, server, page_size=LEAD_PAGE_SIZE)
+    _assert_defect(raised.value, surface, "the response has no 'paging' object")
+    assert len(server.requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+@pytest.mark.parametrize(
+    ("paging", "fragment"),
+    [
+        pytest.param(None, "the response has no 'paging' object", id="paging-absent"),
+        pytest.param([], "field 'paging' is not a JSON object", id="paging-list"),
+        pytest.param("0", "field 'paging' is not a JSON object", id="paging-string"),
+        pytest.param({"count": 2}, "field 'paging.start' is missing", id="start-missing"),
+        pytest.param(
+            {"start": "0", "count": 2}, "field 'paging.start' is not an integer", id="start-str"
+        ),
+        pytest.param(
+            {"start": False, "count": 2}, "field 'paging.start' is not an integer", id="start-bool"
+        ),
+        pytest.param({"start": 0}, "field 'paging.count' is missing", id="count-missing"),
+        pytest.param(
+            {"start": 0, "count": 100},
+            "field 'paging.count' does not match the requested count",
+            id="count-mismatch",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "total": -1},
+            "field 'paging.total' is negative",
+            id="total-negative",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "total": "1"},
+            "field 'paging.total' is not an integer",
+            id="total-str",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "links": {}},
+            "field 'paging.links' is not a list",
+            id="links-not-a-list",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "links": [{"rel": "next"}]},
+            "an item of 'paging.links' has no string 'href'",
+            id="link-without-href",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "links": [{"href": "/rest/leadForms?start=2"}]},
+            "an item of 'paging.links' has no string 'rel'",
+            id="link-without-rel",
+        ),
+        pytest.param(
+            {"start": 0, "count": 2, "links": [{"rel": ["next"], "href": "/rest/leadForms"}]},
+            "an item of 'paging.links' has no string 'rel'",
+            id="link-rel-not-a-string",
+        ),
+        pytest.param(
+            {
+                "start": 0,
+                "count": 2,
+                "links": [{"rel": "next", "href": "https://evil.example/rest/leadForms?start=2"}],
+            },
+            "a 'next' link points outside https://api.linkedin.com",
+            id="next-href-off-host",
+        ),
+    ],
+)
+async def test_lead_listings_reject_a_broken_paging_envelope_on_a_short_page(
+    surface: str, paging: object, fragment: str
+) -> None:
+    """A short page whose envelope breaks its contract is a defect, never the listing's end."""
+    body: dict[str, Any] = {"elements": [_offset_element(surface, 1)]}
+    if paging is not None:
+        body["paging"] = paging
+    server = Server(_ok(body))
+    with pytest.raises(QueryDefect) as raised:
+        await _list_offset(surface, server, page_size=2)
+    _assert_defect(raised.value, surface, fragment)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+@pytest.mark.parametrize(("href", "fragment"), _rejected_next_links("leadForms"))
+async def test_lead_listings_reject_an_unusable_next_link(
+    surface: str, href: str, fragment: str
+) -> None:
+    """An HTTP 200 page whose only flaw is its ``next`` href is a defect, never a ``ValueError``.
+
+    The body is an empty first page with a contract envelope, the shape of the review's
+    reproduction, so the listing is never reported complete.
+    """
+    link = {"rel": "next", "href": href}
+    paging = {"start": 0, "count": LEAD_PAGE_SIZE, "links": [link]}
+    server = Server(_ok(_conforming(surface, {"elements": [], "paging": paging})))
+    with pytest.raises(QueryDefect) as raised:
+        await _list_offset(surface, server, page_size=LEAD_PAGE_SIZE)
+    _assert_defect(raised.value, surface, fragment)
+    assert len(server.requests) == 1
+    _assert_contract_request(surface, server.requests[0])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+async def test_lead_listings_reject_a_second_page_answering_the_first_offset(surface: str) -> None:
+    """Page 2 answered with ``start=0`` is a defect: the listing is not reported complete."""
+    first = [_offset_element(surface, 1), _offset_element(surface, 2)]
+    server = Server(
+        _ok(_offset_page(surface, first, start=0, count=2, has_next=False)),
+        _ok(_offset_page(surface, [_offset_element(surface, 3)], start=0, count=2, has_next=False)),
+    )
+    with pytest.raises(QueryDefect) as raised:
+        await _list_offset(surface, server, page_size=2)
+    _assert_defect(raised.value, surface, "field 'paging.start' does not match the requested start")
+    assert [dict(_query_pairs(r))["start"] for r in server.requests] == ["0", "2"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+@pytest.mark.parametrize(
+    "paging",
+    [
+        pytest.param({"start": 0, "count": 2}, id="no-total-no-links"),
+        pytest.param({"start": 0, "count": 2, "total": 1, "links": []}, id="total-and-links"),
+    ],
+)
+async def test_lead_listings_end_on_a_valid_short_page(
+    surface: str, paging: dict[str, Any]
+) -> None:
+    """A contract envelope on a short page without ``next`` ends the listing complete."""
+    body = _conforming(surface, {"elements": [_offset_element(surface, 1)], "paging": paging})
+    server = Server(_ok(body))
+    assert await _list_offset(surface, server, page_size=2) == (True, None, 1, 1)
+    _assert_contract_request(surface, server.requests[0])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("surface", _OFFSET_SURFACES)
+@pytest.mark.parametrize(
+    "href",
+    [
+        pytest.param("/rest/leadForms?count=2&start=2", id="relative"),
+        pytest.param("https://api.linkedin.com/rest/leadFormResponses?start=2", id="absolute"),
+    ],
+)
+async def test_lead_listings_read_on_after_a_short_page_with_a_valid_next_link(
+    surface: str, href: str
+) -> None:
+    """A short page with a valid ``next`` link continues from the template; an empty page ends."""
+    link = {"rel": "next", "href": href, "type": "application/json"}
+    paging = {"start": 0, "count": 2, "total": 1, "links": [link]}
+    first = _conforming(surface, {"elements": [_offset_element(surface, 1)], "paging": paging})
+    server = Server(
+        _ok(first),
+        _ok(_offset_page(surface, [], start=2, count=2, has_next=False)),
+    )
+    assert await _list_offset(surface, server, page_size=2) == (True, None, 1, 2)
+    assert [dict(_query_pairs(r))["start"] for r in server.requests] == ["0", "2"]
+    for request in server.requests:
+        _assert_contract_request(surface, request)
 
 
 # ---------------------------------------------------------------------------------------------

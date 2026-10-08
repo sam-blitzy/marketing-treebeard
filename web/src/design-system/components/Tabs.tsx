@@ -16,8 +16,10 @@
  *
  * No headless library is used (AAP 0.4.5). The styling lives in `Tabs.css`, whose class names are
  * the contract this component renders: `ds-tabs`, `ds-tabs__list`, `ds-tabs__tab`,
- * `ds-tabs__count` and `ds-tabs__panel`. The selected tab is styled from `aria-selected`, so the
- * visual state can never disagree with the state announced to assistive technology.
+ * `ds-tabs__label`, `ds-tabs__count` and `ds-tabs__panel`. The label sits in its own span so a
+ * long unbroken label wraps inside its tab instead of widening the row. The selected tab is
+ * styled from `aria-selected`, so the visual state can never disagree with the state announced
+ * to assistive technology.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
@@ -44,7 +46,10 @@ export interface TabItem {
    * argument. Keys must be unique within one `tabs` array and stable across renders.
    */
   key: string;
-  /** The visible tab label, for example `"Block"`. It forms the tab's accessible name. */
+  /**
+   * The visible tab label, for example `"Block"`. It forms the tab's accessible name. A long
+   * unbroken label, such as an identifier, wraps inside its tab and is never truncated.
+   */
   label: ReactNode;
   /**
    * Optional item count shown beside the label, for example the number of items in a sub-list.
@@ -209,7 +214,7 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
                 select(tab.key);
               }}
             >
-              {tab.label}
+              <span className="ds-tabs__label">{tab.label}</span>
               {/* The space between label and count keeps the accessible name "Block 3". */}
               {tab.count !== undefined && (
                 <>

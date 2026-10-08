@@ -21,7 +21,12 @@ Contract fidelity (``backend/tests/contracts/linkedin/*.json``):
     projection and headers. The simulation's mock transport validates requests against the
     same files, so live and simulated calls take one code path and this module never
     branches on the data mode. Where a contract records live 202609 behaviour that differs
-    from the plan text, the contract is followed and the call site says so.
+    from the plan text, the contract is followed and the call site says so. The Lead Sync
+    projection :data:`LEAD_FIELDS` is no literal of this module:
+    :mod:`ads_engine.connectors.linkedin.projections` generates it from the ``request.fields``
+    of the ``lead_form_responses`` and ``lead_form_responses_batch`` contracts into the
+    packaged ``_projections_generated`` module, and a unit test fails while that module is
+    stale. Importing this module therefore reads no file and works from any working directory.
 
 Errors:
     Every call goes through :func:`ads_engine.connectors.http.send_json`, which owns the
@@ -62,6 +67,9 @@ import httpx
 
 from ads_engine.connectors.errors import AccessDenied, QueryDefect, TransientError
 from ads_engine.connectors.http import DEFAULT_RETRY, JsonResponse, RetryPolicy, send_json
+from ads_engine.connectors.linkedin._projections_generated import (
+    LEAD_FIELDS as _GENERATED_LEAD_FIELDS,
+)
 from ads_engine.connectors.linkedin.auth import TokenSource
 from ads_engine.connectors.linkedin.parser import (
     CAMPAIGN_GROUP_SEARCH_STATUSES,
@@ -159,15 +167,18 @@ LEAD_BATCH_SIZE: Final = 100
 MAX_ANALYTICS_ELEMENTS: Final = 15_000
 """Most elements one ``adAnalytics`` response returns; a response at the cap may be truncated."""
 
-LEAD_FIELDS: Final = (
-    "ownerInfo,associatedEntityInfo,leadMetadataInfo,owner,leadType,versionedLeadGenFormUrn,"
-    "id,submittedAt,testLead,formResponse,form:(hiddenFields,creationLocale,name,id,content)"
-)
-"""Lead Sync response projection, verbatim from LinkedIn's Lead Sync API migration guide.
+LEAD_FIELDS: Final[str] = _GENERATED_LEAD_FIELDS
+"""Lead Sync response projection, generated from the lead-response contracts.
 
-It decorates each response with the ``form`` built from the response's own
-``versionedLeadGenFormUrn`` (AAP 0.2.4). Its commas, colon and parentheses are sent raw: see
-:data:`_LEAD_FIELDS_QUERY_VALUE`.
+It is the ``request.fields`` that ``lead_form_responses.json`` and
+``lead_form_responses_batch.json`` both record: the projection of LinkedIn's Lead Sync API
+migration guide, verbatim (AAP 0.2.4, 0.3.3). It decorates each response with the ``form``
+built from the response's own ``versionedLeadGenFormUrn``.
+:mod:`ads_engine.connectors.linkedin.projections` writes it into the packaged
+``_projections_generated`` module, so importing this module reads no file. The simulator
+validates requests against the same contracts, and a unit test fails while the generated value
+differs from them, so live and simulated calls send one projection. Its commas, colon and
+parentheses are sent raw: see :data:`_LEAD_FIELDS_QUERY_VALUE`.
 """
 
 DAILY_FIELDS: Final = (
@@ -450,10 +461,13 @@ class LeadBatch:
     logged, and ``found`` is excluded from ``repr`` because its elements hold emails.
 
     Attributes:
-        found: Each re-fetched response element, keyed by its plain response id.
+        found: Each re-fetched response element, keyed by its plain response id. An element
+            is here only when its own ``id`` is that id, its ``owner.sponsoredAccount`` the
+            requested account, its ``leadType`` ``SPONSORED`` and its ``testLead`` ``false``.
         failed: Requested ids that were not re-fetched: present in ``errors``, absent from
-            ``results``, or not yet read when a transient error ended the batch.
-            ``sync/lead_match.py`` records each as a failed re-fetch.
+            ``results``, answered by an element whose identity fields do not match the
+            request (or are missing), or not yet read when a transient error ended the
+            batch. ``sync/lead_match.py`` records each as a failed re-fetch.
         interrupted_by: The transient error that ended the batch early, or ``None``.
         calls: LinkedIn calls made.
     """
@@ -557,8 +571,26 @@ def _relative_href(href: str, surface: str) -> str:
     LinkedIn returns links as ``/rest/...`` paths or absolute ``https://api.linkedin.com``
     URLs. The ``/rest/`` prefix is stripped because the client's base URL already ends in
     ``/rest/`` and httpx's base-URL merge would otherwise double it.
+
+    Only visible ASCII characters reach LinkedIn byte for byte, so a link holding any other
+    character is rejected before it is parsed: ``urlsplit`` would silently drop a tab or a
+    line break, and a non-ASCII host could lower-case to ``api.linkedin.com``. An absolute
+    link must name exactly ``https://api.linkedin.com``; user information or any port, even
+    ``:443``, makes it another authority.
+
+    Raises:
+        QueryDefect: A ``validation`` defect when the link is not a valid URL, points
+            outside ``https://api.linkedin.com`` or ``/rest/``, or has a malformed path. The
+            message never quotes the link.
     """
-    parts = urlsplit(href)
+    if any(not "!" <= char <= "~" for char in href):
+        raise _defect("a 'next' link is not a valid URL", surface)
+    try:
+        parts = urlsplit(href)
+    except ValueError:
+        # An unbalanced or invalid bracketed host. urlsplit's message quotes the link, so
+        # it is not chained onto the defect.
+        raise _defect("a 'next' link is not a valid URL", surface) from None
     if (parts.scheme or parts.netloc) and (
         parts.scheme != "https" or parts.netloc.lower() != _API_HOST
     ):
@@ -703,23 +735,82 @@ def _segment_key(row: SegmentRow) -> tuple[str, str, str]:
     return row.campaign_urn, row.facet, row.value
 
 
-def _has_next_link(body: _Element, surface: str) -> bool:
-    """Whether ``paging.links`` holds a ``rel=next`` entry; the href itself is not read.
+def _paging_integer(paging: _Element, key: str, surface: str) -> int | None:
+    """Return the integer ``paging.{key}``, or ``None`` when the key is absent.
 
-    Offset-paged Lead Sync listings never follow the href (it reorders the projection and
-    the time range), they only use its presence to decide whether another page exists.
+    A present value that is not an integer (``null``, a string or a boolean included) is a
+    ``validation`` defect.
     """
-    paging = body.get("paging")
-    if paging is None:
-        return False
+    if key not in paging:
+        return None
+    value = paging[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _defect(f"field 'paging.{key}' is not an integer", surface)
+    return value
+
+
+def _checked_offset_paging(body: _Element, surface: str, *, start: int, count: int) -> bool:
+    """Validate the ``paging`` envelope of one Lead Sync offset page; report a ``next`` link.
+
+    The lead_forms and lead_form_responses contracts require ``paging`` as an object with
+    integer ``start`` and ``count``; ``total`` (an integer, page-local for responses) and
+    ``links`` are optional. ``start`` must echo the requested offset and ``count`` the
+    requested page size, as both contracts' documented samples do for their documented
+    requests, so a page answering another offset or size is never read as this one. Each
+    ``links`` item needs a string ``rel`` and ``href`` and, when present, a string ``type``. A
+    ``rel=next`` href must stay on ``https://api.linkedin.com`` under ``/rest/``
+    (:func:`_relative_href`) although offset listings never follow it: it reorders the
+    projection and the time range, so only its presence is used.
+
+    Args:
+        body: The page's response body.
+        surface: The contract surface, for errors.
+        start: The ``start`` the page was requested with.
+        count: The ``count`` the page was requested with.
+
+    Returns:
+        Whether ``paging.links`` holds a ``rel=next`` link.
+
+    Raises:
+        QueryDefect: When the envelope breaks its contract or answers another page.
+    """
+    if "paging" not in body:
+        raise _defect("the response has no 'paging' object", surface)
+    paging = body["paging"]
     if not isinstance(paging, Mapping):
         raise _defect("field 'paging' is not a JSON object", surface)
-    links = paging.get("links")
-    if links is None:
+    for key, requested in (("start", start), ("count", count)):
+        value = _paging_integer(paging, key, surface)
+        if value is None:
+            raise _defect(f"field 'paging.{key}' is missing", surface)
+        if value != requested:
+            raise _defect(f"field 'paging.{key}' does not match the requested {key}", surface)
+    total = _paging_integer(paging, "total", surface)
+    if total is not None and total < 0:
+        raise _defect("field 'paging.total' is negative", surface)
+    if "links" not in paging:
         return False
+    links = paging["links"]
     if not isinstance(links, list):
         raise _defect("field 'paging.links' is not a list", surface)
-    return any(isinstance(link, Mapping) and link.get("rel") == "next" for link in links)
+    has_next = False
+    for link in links:
+        if not isinstance(link, Mapping):
+            raise _defect("an item of 'paging.links' is not a JSON object", surface)
+        rel = link.get("rel")
+        href = link.get("href")
+        if not isinstance(rel, str):
+            raise _defect("an item of 'paging.links' has no string 'rel'", surface)
+        if not isinstance(href, str):
+            raise _defect("an item of 'paging.links' has no string 'href'", surface)
+        if "type" in link and not isinstance(link["type"], str):
+            raise _defect("field 'type' of an item of 'paging.links' is not a string", surface)
+        if rel == "next":
+            if not href.strip():
+                raise _defect("a 'next' link has no href", surface)
+            _relative_href(href.strip(), surface)
+            has_next = True
+    return has_next
 
 
 def _discovered_campaign(element: _Element, surface: str) -> str:
@@ -751,6 +842,28 @@ def _checked_lead_id(lead_id: str) -> str:
     if '"' in lead_id:
         raise ValueError("a lead response id must not hold a double quote")
     return lead_id
+
+
+def _is_requested_lead(element: _Element, lead_id: str, account_urn: str) -> bool:
+    """Whether a batch re-fetch element is the requested sponsored response of the account.
+
+    A ``results`` map key alone never binds an element to a request: the element's own
+    ``id`` must be the requested plain id, ``owner.sponsoredAccount`` the requested account
+    URN, ``leadType`` ``SPONSORED`` (the request's ``leadType`` selector) and ``testLead``
+    the boolean ``false`` (test leads are dropped at ingest, so no stored lead re-fetches as
+    one). A missing or mistyped field fails the check, so the email of another response,
+    another owner or a test lead is never decoded for the requested lead.
+    """
+    owner = element.get("owner")
+    response_id = element.get("id")
+    return (
+        isinstance(response_id, str)
+        and response_id == lead_id
+        and isinstance(owner, Mapping)
+        and owner.get("sponsoredAccount") == account_urn
+        and element.get("leadType") == "SPONSORED"
+        and element.get("testLead") is False
+    )
 
 
 def _log_outcome(
@@ -826,6 +939,15 @@ class LinkedInClient:
     A probe listing whose ``interrupted_by`` is set failed transiently; ``complete=False``
     with reason ``"page limit"`` only means the probe stopped after its one page.
 
+    Per-account context: the two-argument forms ``analytics_daily(acct, range)`` and
+    ``list_lead_responses(acct, range)`` use what this client learned earlier for the
+    account. :meth:`list_creatives` records the creative count that sizes the daily
+    analytics chunks (one chunk for the whole range when no count is known; a chunk at the
+    response cap is split either way). :meth:`list_lead_forms` and
+    :meth:`list_lead_responses` record form-version maps by ``(canonical URN, version)``
+    for decoding later responses of exactly that version. An explicit
+    ``expected_creatives`` or ``known_versions`` replaces that context for the call.
+
     Example::
 
         async with build_client("linkedin", transport=mock_transport("linkedin", world)) as http:
@@ -861,6 +983,15 @@ class LinkedInClient:
         # Campaigns with delivery per (account URN, window start, window end), found by the
         # segment fallback's discovery call and shared by the three demographic pivots.
         self._delivering_campaigns: dict[tuple[str, date, date], tuple[tuple[str, ...], bool]] = {}
+        # Creatives per account URN, from the de-duplicated rows of this client's most recent
+        # list_creatives of that account; analytics_daily sizes its date chunks with it when
+        # the caller passes no expected_creatives.
+        self._creative_counts: dict[str, int] = {}
+        # Form-version maps per account URN, keyed by (canonical URN, version): every current
+        # version list_lead_forms read and every decoration list_lead_responses learned for
+        # that account. list_lead_responses decodes with them when the caller passes no
+        # known_versions; each map only ever decodes responses of its own version.
+        self._form_versions: dict[str, dict[tuple[str, int], FormVersionMap]] = {}
 
     def __repr__(self) -> str:
         """Return the class name only; the token source is never shown."""
@@ -938,9 +1069,12 @@ class LinkedInClient:
         """Read a request and every ``rel=next`` link it leads to.
 
         ``adAnalytics`` documents no pagination, but live responses can carry a ``next``
-        link, which is followed at once. An empty page ends the chain whatever its link
-        says, and a repeated link is a defect, so the chain always terminates. A transient
-        failure stops the chain and keeps the elements already read.
+        link, which is followed at once, from an empty page too: only a response without a
+        ``next`` link ends the chain, so no row behind an empty page is lost. A link back to
+        any request already read is a defect, and so is a chain of more than
+        :data:`_MAX_NEXT_LINKS` links, so the chain always terminates. A transient failure
+        stops the chain, keeps the elements already read and sets ``interrupted_by``, so the
+        caller reports the listing incomplete.
         """
         pages = _Pages()
         seen: set[str] = {url}
@@ -957,8 +1091,6 @@ class LinkedInClient:
             href = _next_href(body, surface)
             if href is None:
                 pages.capped = len(elements) >= MAX_ANALYTICS_ELEMENTS
-                return pages
-            if not elements:
                 return pages
             if href in seen:
                 raise _defect("a 'next' link repeats an earlier request", surface)
@@ -1031,6 +1163,12 @@ class LinkedInClient:
         for forms either: Lead Sync pages forms the same way, and under an overall total the
         rule used here costs at most one extra, empty page instead of a missed one.
 
+        Envelope (both contracts' ``#/response/body/required``): each page's ``paging`` block
+        is validated by :func:`_checked_offset_paging` before its elements are consumed or
+        the stop rule is applied. A page without ``paging``, with a non-integer ``start`` or
+        ``count``, one echoing another offset or page size, or with a malformed link is a
+        ``QueryDefect``, never the end of the listing.
+
         Args:
             surface: The contract surface, for errors and logs.
             path: The finder path relative to ``/rest/``.
@@ -1055,8 +1193,9 @@ class LinkedInClient:
                 return False, exc.reason, exc
             body = _body_object(response, surface)
             elements = _elements(body, surface)
+            has_next = _checked_offset_paging(body, surface, start=start, count=page_size)
             consume(elements)
-            more = bool(elements) and (len(elements) >= page_size or _has_next_link(body, surface))
+            more = bool(elements) and (len(elements) >= page_size or has_next)
             if not more:
                 return True, None, None
             if pages == limit:
@@ -1216,6 +1355,10 @@ class LinkedInClient:
         An empty ``campaigns`` returns an empty, complete listing without a call: LinkedIn
         reads an empty ``campaigns=List()`` as "no filter".
 
+        The number of creatives returned is remembered for the account, and
+        :meth:`analytics_daily` sizes its date chunks with it when called without
+        ``expected_creatives``.
+
         Args:
             account_id: The numeric ad account id or its URN.
             campaigns: Campaign ids or ``urn:li:sponsoredCampaign:{id}`` URNs; repeats are
@@ -1247,7 +1390,9 @@ class LinkedInClient:
             rows.extend(chunk_rows)
             if interrupted is not None:
                 break
-        return self._listing(surface, rows, tally, interrupted, key=_urn_key)
+        listing = self._listing(surface, rows, tally, interrupted, key=_urn_key)
+        self._creative_counts[account_urn] = len(listing.rows)
+        return listing
 
     async def get_posts(self, urns: Sequence[str]) -> PostBatch:
         """Read the headline and intro text of the posts creatives reference (contract ``posts``).
@@ -1362,20 +1507,25 @@ class LinkedInClient:
         account_id: str,
         date_range: tuple[date, date],
         *,
-        expected_creatives: int,
+        expected_creatives: int | None = None,
     ) -> Listing[CreativeDailyRow]:
         """Read daily per-creative performance on UTC days (contract ``ad_analytics``).
 
         ``GET adAnalytics?q=analytics&pivot=CREATIVE&timeGranularity=DAILY&dateRange=(start:
         (year:Y,month:M,day:D),end:(year:Y,month:M,day:D))&accounts=List({encoded account
-        URN})&fields={DAILY_FIELDS}``. ``pivotValues`` and ``dateRange`` appear only inside
-        ``fields``, as response fields, never as request filters (AAP 0.2.4).
+        URN})&fields={DAILY_FIELDS}``. ``dateRange`` is both a required request parameter,
+        selecting the chunk's days, and a response field selected in ``fields``, which gives
+        each element's day. ``pivotValues`` is a response field only: it is requested through
+        ``fields`` and never sent as a request parameter (contract ``ad_analytics``,
+        ``#/request/url`` and ``#/request/required_query``).
 
         Partitioning, so no stored day is ever silently truncated:
 
-        * the range is cut into chunks of ``max(1, 14,999 // max(expected_creatives, 1))``
-          days, so creatives times days stays below the 15,000-element response cap, and the
-          chunks are read in ascending date order;
+        * the range is cut into chunks of ``max(1, 14,999 // max(n, 1))`` days, where ``n`` is
+          ``expected_creatives`` when given, else the creative count of this client's most
+          recent :meth:`list_creatives` of the account, so creatives times days stays below
+          the 15,000-element response cap; with neither, the creative count is unknown and
+          the whole range is one chunk. Chunks are read in ascending date order;
         * a ``next`` link is followed at once until none remains;
         * a response with at least 15,000 elements and no ``next`` link may be truncated: its
           rows are discarded and its range is split at the midpoint into ``[start, mid]``
@@ -1383,30 +1533,45 @@ class LinkedInClient:
         * a single day at the cap keeps its rows and makes the listing incomplete with the
           reason "result limit reached at finest partition (one day)".
 
+        The creative count only sizes the first chunks; completeness never depends on it,
+        because any chunk at the cap is split as above.
+
         The caller caps ``date_range`` at 180 days, LinkedIn's 6-month daily retention (the
         backfill and ``window.max_days``); this method does not enforce it.
 
         Args:
             account_id: The numeric ad account id or its URN.
             date_range: Inclusive ``(start, end)`` UTC dates.
-            expected_creatives: The creatives expected to report, for chunk sizing; the
-                creative count of the account's entity sync.
+            expected_creatives: The creatives expected to report, for chunk sizing, such as
+                the creative count of the account's entity sync. ``None`` (the default) uses
+                the count from this client's most recent :meth:`list_creatives` of the
+                account, or one chunk for the whole range when there is none.
 
         Returns:
             One row per creative and UTC day, de-duplicated on that pair.
 
         Raises:
-            ValueError: When the range starts after it ends or ``expected_creatives`` is
-                negative.
+            ValueError: When the range starts after it ends, or ``expected_creatives`` is
+                given and is negative or a ``bool``.
         """
         start, end = _check_date_range(date_range)
-        if isinstance(expected_creatives, bool) or expected_creatives < 0:
+        if expected_creatives is not None and (
+            isinstance(expected_creatives, bool) or expected_creatives < 0
+        ):
             raise ValueError("expected_creatives must be a non-negative integer")
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_ANALYTICS
         tally = _Tally()
         accounts = restli_list([encode_urn(account_urn)])
-        span_days = max(1, (MAX_ANALYTICS_ELEMENTS - 1) // max(expected_creatives, 1))
+        creatives = (
+            self._creative_counts.get(account_urn)
+            if expected_creatives is None
+            else expected_creatives
+        )
+        if creatives is None:
+            span_days = (end - start).days + 1
+        else:
+            span_days = max(1, (MAX_ANALYTICS_ELEMENTS - 1) // max(creatives, 1))
         chunks: list[tuple[date, date]] = []
         cursor = start
         while True:
@@ -1629,6 +1794,10 @@ class LinkedInClient:
         element yields the canonical ``urn:li:leadGenForm:{id}``, the current ``versionId``
         and that version's question map.
 
+        Each returned form's version map is remembered for the account under its
+        ``(canonical URN, version)``, and :meth:`list_lead_responses` decodes undecorated
+        responses of that exact version with it when called without ``known_versions``.
+
         Args:
             account_id: The numeric ad account id or its URN.
             page_size: ``count`` per page, 1 to 100; the recovery probe sends 1.
@@ -1658,7 +1827,7 @@ class LinkedInClient:
             tally=tally,
             consume=consume,
         )
-        return self._listing(
+        listing = self._listing(
             surface,
             rows,
             tally,
@@ -1666,13 +1835,17 @@ class LinkedInClient:
             key=_form_key,
             reason=None if complete else reason,
         )
+        bound = self._form_versions.setdefault(account_urn, {})
+        for form in listing.rows:
+            bound[(form.version_map.canonical_urn, form.version_map.version)] = form.version_map
+        return listing
 
     async def list_lead_responses(
         self,
         account_id: str,
         submitted_range: tuple[datetime, datetime],
         *,
-        known_versions: KnownVersions,
+        known_versions: KnownVersions | None = None,
         page_size: int = LEAD_PAGE_SIZE,
         max_pages: int | None = None,
     ) -> LeadListing:
@@ -1685,9 +1858,16 @@ class LinkedInClient:
         minus 1 h overlap" (AAP 0.3.2). The projection is sent raw, as the contract
         requires; decoding it once still returns :data:`LEAD_FIELDS` exactly.
 
-        Each element is parsed with ``parse_lead`` against ``known_versions`` extended by
+        Each element is parsed with ``parse_lead`` against the starting maps extended by
         every map learned from an earlier element's ``form`` decoration, so a later response
-        of the same version decodes even without a decoration. ``limitedToTestLeads=false``
+        of the same version decodes even without a decoration. The starting maps are
+        ``known_versions`` when given, used as passed; otherwise the maps this client holds
+        for the account: every current version its :meth:`list_lead_forms` read and every
+        decoration an earlier call of this method learned. Either way, each decoration
+        learned here is remembered for the account. Decoding stays version-specific: a
+        response's own decoration wins, a map is looked up only under the response's
+        ``(canonical URN, version)``, and a version with no map ends ``no_email`` with the
+        reason "unknown form version". ``limitedToTestLeads=false``
         returns test and real leads together (AAP 0.2.4): test leads are counted in
         ``test_leads_skipped`` and never returned. Responses repeated within the listing
         (offset paging can shift while new leads arrive) are kept once, the first.
@@ -1698,7 +1878,10 @@ class LinkedInClient:
         Args:
             account_id: The numeric ad account id or its URN.
             submitted_range: Timezone-aware ``(start, end)`` instants.
-            known_versions: Stored form-version maps keyed by ``(canonical URN, version)``.
+            known_versions: Stored form-version maps keyed by ``(canonical URN, version)``,
+                used instead of the client's maps for the account; the recovery probe passes
+                ``{}``. ``None`` (the default) uses the maps this client holds for the
+                account.
             page_size: ``count`` per page, 1 to 100; the recovery probe sends 1.
             max_pages: Stop after this many pages (reason "page limit").
 
@@ -1714,7 +1897,10 @@ class LinkedInClient:
         account_urn = sponsored_account_urn(account_id)
         surface = _SURFACE_LEAD_RESPONSES
         tally = _Tally()
-        known: dict[tuple[str, int], FormVersionMap] = dict(known_versions)
+        bound = self._form_versions.setdefault(account_urn, {})
+        known: dict[tuple[str, int], FormVersionMap] = dict(
+            bound if known_versions is None else known_versions
+        )
         learned: dict[tuple[str, int], FormVersionMap] = {}
         leads: list[ParsedLead] = []
         seen_ids: set[str] = set()
@@ -1730,6 +1916,7 @@ class LinkedInClient:
                 if lead.version_map is not None:
                     version_key = (lead.version_map.canonical_urn, lead.version_map.version)
                     known[version_key] = lead.version_map
+                    bound[version_key] = lead.version_map
                     learned.setdefault(version_key, lead.version_map)
                 if lead.external_id in seen_ids:
                     counts["repeats_dropped"] += 1
@@ -1794,6 +1981,14 @@ class LinkedInClient:
         eventually ``error`` with reason "email no longer retrievable". A transient error
         stops the batch, and every id not yet read is failed.
 
+        Identity: an element is found only when its own fields bind it to the request, never
+        by its map key alone. Its ``id`` must equal the requested plain id,
+        ``owner.sponsoredAccount`` the requested account URN, ``leadType`` ``SPONSORED`` and
+        ``testLead`` the boolean ``false``. An element missing any of these, or holding
+        another response, owner, lead type or a test lead, is failed the same way, so its
+        email is never decoded or matched for the requested lead; the ``linkedin.listing``
+        event counts these as ``identity_rejected``.
+
         Personal data: this is the transient path only. The caller passes each found
         element to ``parser.decode_email``, holds the plaintext only for one HubSpot
         ``contacts_by_email`` call and drops it; nothing is stored or logged, and ``found``
@@ -1816,6 +2011,7 @@ class LinkedInClient:
         tally = _Tally()
         found: dict[str, Mapping[str, object]] = {}
         failed: set[str] = set()
+        identity_rejected = 0
         interrupted: TransientError | None = None
         chunks = _chunks(wanted, LEAD_BATCH_SIZE)
         for index, chunk in enumerate(chunks):
@@ -1837,6 +2033,9 @@ class LinkedInClient:
                 element = results.get(lead_id)
                 if lead_id in failed_keys or element is None:
                     failed.add(lead_id)
+                elif not _is_requested_lead(element, lead_id, account_urn):
+                    identity_rejected += 1
+                    failed.add(lead_id)
                 else:
                     found[lead_id] = element
         _log_outcome(
@@ -1846,6 +2045,7 @@ class LinkedInClient:
             complete=interrupted is None,
             reason=None if interrupted is None else interrupted.reason,
             failed=len(failed),
+            identity_rejected=identity_rejected,
         )
         return LeadBatch(
             found=found,

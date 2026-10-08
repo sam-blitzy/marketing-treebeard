@@ -34,6 +34,7 @@ from ads_engine.analysis.attribution import (
     attribution_for,
     build_attribution,
     contact_evidence_known,
+    shared_budget_veto,
 )
 from ads_engine.analysis.context import (
     FINDING_PIPELINE_UNAVAILABLE,
@@ -1427,6 +1428,321 @@ def test_an_unbound_ql_stage_is_named_before_an_unknown_google_refresh(
     assert population.reason == f"Qualified Lead stage unavailable: {QL_MISSING.reason}"
     assert population.unknown_evidence_contacts == 1
     assert not population.available
+
+
+# -- a Google shared budget's population over member days (AAP 0.5.4.5, 0.5.4.1) ------------
+
+NEW_YORK = "America/New_York"
+"""The Google account zone of ACCOUNTS: the zone budget histories date member days in."""
+
+
+def _days(first: date, last: date) -> tuple[date, ...]:
+    """Every native date from ``first`` through ``last``."""
+    return tuple(first + n * ONE_DAY for n in range((last - first).days + 1))
+
+
+def _discovered(name: str, ref: str, at: datetime, **fields: Any) -> ContactInfo:
+    """A contact found by Google touch-date discovery for campaign ``ref`` at ``at``."""
+    return _contact(name, google_campaign_ref=ref, google_touch_at=at, **fields)
+
+
+def _shared_context(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    discovered: Sequence[ContactInfo],
+    **crm: Any,
+) -> AnalysisContext:
+    """A context whose primary HubSpot dataset holds ``discovered``, Google link verified."""
+    bindings = crm.pop("bindings", _bindings(google=GOOGLE_LINK))
+    google_crm = _crm(HUBSPOT, [], bindings=bindings, google_contacts=discovered, **crm)
+    return _context(thresholds, window, linkedin_crm=None, google_crm=google_crm)
+
+
+# G_A drew from the budget from the window start through 2026-09-18, then left; G_B joined on
+# 2026-09-14 and stayed. Every touch below is in the window and matured unless stated.
+MEMBER_DAYS: dict[int, tuple[date, ...]] = {
+    G_A: _days(date(2026, 9, 7), date(2026, 9, 18)),
+    G_B: _days(date(2026, 9, 14), date(2026, 10, 4)),
+}
+BEFORE_JOINING = datetime(2026, 9, 10, 15, 0, tzinfo=UTC)
+AFTER_LEAVING = datetime(2026, 9, 19, 15, 0, tzinfo=UTC)
+ON_BOTH = datetime(2026, 9, 15, 15, 0, tzinfo=UTC)
+
+
+def test_a_shared_budget_population_holds_only_touches_on_member_days(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    on_member_days = [_discovered(f"g-{n}", "20001", ON_BOTH) for n in range(1, 20)]
+    outside = [
+        _discovered("g-before-joining", "20002", BEFORE_JOINING),
+        _discovered("g-after-leaving", "20001", AFTER_LEAVING),
+        _discovered("g-young", "20002", YOUNG),
+        _discovered("g-at-window-end", "20002", WINDOW_END),
+        _discovered("g-not-a-member", "20003", ON_BOTH),
+    ]
+    ctx = _shared_context(thresholds, window, [*on_member_days, *outside])
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.source, population.campaign_id) == ("google", G_A)
+    assert population.leads == population.matured_leads == population.matched_leads == 19
+    assert (population.eligible_contacts, population.unresolved_leads) == (19, 0)
+    assert (population.mql, population.ql, population.meetings) == (0, 0, 0)
+    assert population.available
+    # Nineteen eligible contacts: no veto. The members' full-window populations hold the
+    # pre-membership and post-membership touches too, which summed would reach twenty-one.
+    assert not population.veto_fires
+    table = build_attribution(ctx)
+    assert table.veto[G_A].eligible_contacts + table.veto[G_B].eligible_contacts == 21
+
+
+def test_a_qualified_lead_from_before_joining_never_clears_the_shared_budget_veto(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    zero_ql = [_discovered(f"g-{n}", "20001", ON_BOTH) for n in range(1, 21)]
+    converted = _discovered(
+        "g-converted-elsewhere", "20002", BEFORE_JOINING, ql_at=BEFORE_JOINING + ONE_DAY
+    )
+    ctx = _shared_context(thresholds, window, [*zero_ql, converted])
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.eligible_contacts, population.ql) == (20, 0)
+    assert population.veto_fires
+    assert build_attribution(ctx).veto[G_B].ql == 1
+
+
+def test_member_days_are_dated_in_the_google_account_zone_and_compared_as_instants(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    day = date(2026, 9, 10)  # [2026-09-10 04:00 UTC, 2026-09-11 04:00 UTC) in New York
+    discovered = [
+        # 22:00 on 2026-09-10 in New York, already 2026-09-11 in UTC: counted, with its QL.
+        _discovered(
+            "g-late-evening",
+            "20001",
+            datetime(2026, 9, 11, 2, 0, tzinfo=UTC),
+            ql_at=datetime(2026, 9, 12, tzinfo=UTC),
+        ),
+        # 22:00 on 2026-09-09 in New York: the day before the member day.
+        _discovered("g-day-before", "20001", datetime(2026, 9, 10, 2, 0, tzinfo=UTC)),
+        # Midnight in New York opens the member day; the next midnight closes it.
+        _discovered("g-at-day-start", "20001", datetime(2026, 9, 10, 4, 0, tzinfo=UTC)),
+        _discovered("g-at-next-day", "20001", datetime(2026, 9, 11, 4, 0, tzinfo=UTC)),
+    ]
+    ctx = _shared_context(thresholds, window, discovered)
+    new_york = shared_budget_veto(ctx, {G_A: (day,)}, NEW_YORK)
+    assert new_york is not None
+    assert (new_york.eligible_contacts, new_york.ql) == (2, 1)
+    # Read on UTC dates, the same day would hold the wrong two contacts.
+    utc = shared_budget_veto(ctx, {G_A: (day,)}, "UTC")
+    assert utc is not None
+    assert (utc.eligible_contacts, utc.ql) == (2, 0)
+    with pytest.raises(ValueError, match="tz"):
+        shared_budget_veto(ctx, {G_A: (day,)}, "Not/AZone")
+
+
+# The window's native end is 2026-10-05 00:00 in New York (04:00 UTC), so a member-day touch
+# is matured at or before 2026-09-21 04:00 UTC: four hours after the UTC-derived CUTOFF.
+NATIVE_CUTOFF = datetime(2026, 9, 21, 4, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("last_touch", "eligible", "fires"),
+    [
+        (CUTOFF + timedelta(hours=2), 20, True),
+        (NATIVE_CUTOFF, 20, True),
+        (NATIVE_CUTOFF + timedelta(microseconds=1), 19, False),
+    ],
+    ids=[
+        "between-the-utc-and-native-cutoffs-is-matured",
+        "touch-on-the-native-cutoff-is-matured",
+        "younger-than-the-native-cutoff-leaves-19-contacts",
+    ],
+)
+def test_shared_budget_maturity_is_measured_back_from_the_native_window_end(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    last_touch: datetime,
+    eligible: int,
+    fires: bool,
+) -> None:
+    native_end = AnalysisWindow.day_bounds(window.end, NEW_YORK)[1]
+    assert native_end - timedelta(days=14) == NATIVE_CUTOFF > CUTOFF
+    discovered = [
+        *(_discovered(f"g-{n}", "20002", ON_BOTH) for n in range(1, 20)),
+        # 2026-09-20 or 2026-09-21 in New York: one of G_B's member days either way.
+        _discovered("g-last", "20002", last_touch),
+    ]
+    ctx = _shared_context(thresholds, window, discovered)
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert population.leads == population.matured_leads == population.eligible_contacts
+    assert (population.eligible_contacts, population.ql) == (eligible, 0)
+    assert population.available
+    assert population.veto_fires is fires
+
+
+def test_shared_budget_population_follows_native_days_in_a_zone_east_of_utc(
+    thresholds: Thresholds,
+) -> None:
+    tokyo = "Asia/Tokyo"
+    window = AnalysisWindow.default(thresholds, SourceDayInfo(tokyo), now=NOW)
+    first_lower, first_upper = AnalysisWindow.day_bounds(window.start, tokyo)
+    utc_lower, utc_upper = window.utc_bounds()
+    assert first_lower < utc_lower < first_upper
+    native_cutoff = AnalysisWindow.day_bounds(window.end, tokyo)[1] - timedelta(days=14)
+    utc_cutoff = utc_upper - timedelta(days=14)
+    assert native_cutoff < utc_cutoff
+    member_days = {G_A: tuple(window.dates())}
+    discovered = [
+        # The first native day starts nine hours before the UTC window: counted.
+        _discovered("g-first-native-day", "20001", first_lower + timedelta(hours=1)),
+        # The last instant before the first native day: outside the window.
+        _discovered("g-before-the-window", "20001", first_lower - timedelta(microseconds=1)),
+        # Matured by the UTC end but not by the native end, which comes nine hours earlier.
+        _discovered("g-young-natively", "20001", native_cutoff + timedelta(hours=1)),
+        _discovered("g-on-the-native-cutoff", "20001", native_cutoff),
+    ]
+    ctx = _shared_context(thresholds, window, discovered)
+    population = shared_budget_veto(ctx, member_days, tokyo)
+    assert population is not None
+    assert population.eligible_contacts == population.leads == 2
+    # A member date outside the window is not a member day of this run.
+    outside = {G_A: (window.start - ONE_DAY,)}
+    population = shared_budget_veto(ctx, outside, tokyo)
+    assert population is not None
+    assert population.eligible_contacts == 0
+
+
+def test_a_contact_found_through_two_members_counts_once_at_its_earliest_touch(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    first, second = ON_BOTH - ONE_DAY, ON_BOTH + ONE_DAY
+    discovered = [
+        _discovered("g-twice", "20001", second, ql_at=ON_BOTH),
+        _discovered("g-twice", "20002", first, ql_at=ON_BOTH),
+        _discovered("g-other", "20002", first),
+    ]
+    associations: dict[tuple[str, str, str], tuple[str, ...]] = {
+        ("contact", "g-twice", "meeting"): ("m-shared",),
+        ("contact", "g-other", "meeting"): ("m-shared",),
+    }
+    fetches: dict[tuple[str, str, str], AssociationFetchInfo | None] = {
+        key: AssociationFetchInfo("contact", key[1], "meeting", "ok", "ok") for key in associations
+    }
+    meeting = MeetingInfo("m-shared", ON_BOTH, ON_BOTH, None, None, "MEETINGS_PUBLIC")
+    ctx = _shared_context(
+        thresholds,
+        window,
+        discovered,
+        associations=associations,
+        fetches=fetches,
+        meetings=[meeting],
+    )
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    # One eligible contact per person; its QL lies after its earliest touch (via G_B) though
+    # before its touch via G_A; the meeting both contacts share counts once.
+    assert population.leads == population.matured_leads == population.eligible_contacts == 2
+    assert (population.ql, population.meetings) == (1, 1)
+    assert population.unknown_evidence_contacts == 0
+
+
+@pytest.mark.parametrize(
+    ("google_crm", "member_days"),
+    [
+        (None, MEMBER_DAYS),
+        (_crm(HUBSPOT, [], bindings=_bindings(google=NO_GOOGLE_LINK)), MEMBER_DAYS),
+        (_crm(HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK)), {}),
+        (
+            _crm(HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK)),
+            {LI_A: MEMBER_DAYS[G_A], 999: MEMBER_DAYS[G_A]},
+        ),
+    ],
+    ids=["no-primary-crm-dataset", "google-link-not-verified", "no-member", "no-google-member"],
+)
+def test_no_shared_budget_population_without_a_verified_link_or_a_google_member(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    google_crm: CrmData | None,
+    member_days: Mapping[int, tuple[date, ...]],
+) -> None:
+    ctx = _context(thresholds, window, linkedin_crm=None, google_crm=google_crm)
+    assert shared_budget_veto(ctx, member_days, NEW_YORK) is None
+
+
+def test_a_shared_budget_population_judges_known_evidence_like_a_campaigns(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    discovered = [_discovered(f"g-{n}", "20001", ON_BOTH) for n in range(1, 21)]
+    broken = AssociationFetchInfo("contact", "g-1", "deal", "error")
+    unknown = _shared_context(
+        thresholds, window, discovered, fetches={("contact", "g-1", "deal"): broken}
+    )
+    population = shared_budget_veto(unknown, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert population.unknown_evidence_contacts == 1
+    assert population.reason == "CRM evidence unknown for 1 of 20 eligible contacts"
+    assert not population.veto_fires
+    unbound = _shared_context(
+        thresholds, window, discovered, bindings=_bindings(ql=QL_MISSING, google=GOOGLE_LINK)
+    )
+    population = shared_budget_veto(unbound, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.ql, population.available) == (None, False)
+    assert population.reason == f"Qualified Lead stage unavailable: {QL_MISSING.reason}"
+
+
+@pytest.mark.parametrize(
+    ("freshness", "reason"),
+    [
+        pytest.param((), f"{GOOGLE_REFRESH_UNKNOWN} has no freshness record", id="missing"),
+        pytest.param(
+            (
+                _google_contacts_freshness(
+                    last_success_at=NOW - timedelta(hours=4), reason="HTTP 429 after 3 attempts"
+                ),
+            ),
+            f"{GOOGLE_REFRESH_UNKNOWN} last attempt failed: HTTP 429 after 3 attempts",
+            id="last-attempt-failed",
+        ),
+        pytest.param(
+            (_google_contacts_freshness(covered_through=date(2026, 10, 3)),),
+            f"{GOOGLE_REFRESH_UNKNOWN} covers 2026-04-10 to 2026-10-03, not {WINDOW_DATES}",
+            id="ends-before-the-window-end",
+        ),
+    ],
+)
+def test_an_unknown_google_contact_refresh_makes_the_shared_budget_population_unavailable(
+    thresholds: Thresholds,
+    window: AnalysisWindow,
+    freshness: tuple[Freshness, ...],
+    reason: str,
+) -> None:
+    # A shared budget's population comes from the same touch-date discovery as each Google
+    # campaign's, so an unknown discovery refresh leaves it unjudged with the same reason.
+    discovered = [_discovered(f"g-{n}", "20001", ON_BOTH) for n in range(1, 21)]
+    google_crm = _crm(
+        HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK), google_contacts=discovered
+    )
+    known = _context(thresholds, window, linkedin_crm=None, google_crm=google_crm)
+    fired = shared_budget_veto(known, MEMBER_DAYS, NEW_YORK)
+    assert fired is not None
+    assert (fired.eligible_contacts, fired.available, fired.veto_fires) == (20, True, True)
+    ctx = _context(
+        thresholds, window, linkedin_crm=None, google_crm=google_crm, freshness=freshness
+    )
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.eligible_contacts, population.ql) == (20, 0)
+    assert population.unknown_evidence_contacts == 20
+    assert population.unknown_evidence
+    assert (population.available, population.veto_fires) == (False, False)
+    assert population.reason == reason == build_attribution(ctx).veto[G_A].reason
+    # Without a touch on any member day it is unavailable too: the refresh may have missed some.
+    empty = shared_budget_veto(ctx, {G_B: MEMBER_DAYS[G_B]}, NEW_YORK)
+    assert empty is not None
+    assert (empty.eligible_contacts, empty.unknown_evidence_contacts) == (0, 0)
+    assert (empty.available, empty.veto_fires, empty.reason) == (False, False, reason)
 
 
 # -- the table, the population type and the helpers ------------------------------------------

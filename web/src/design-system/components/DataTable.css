@@ -26,7 +26,7 @@
 
 .ds-datatable__region {
   overflow-x: auto;
-  max-inline-size: 100%;
+  max-inline-size: var(--size-full);
   border: calc(var(--space-1) / 4) solid var(--color-border);
   border-radius: var(--radius-md);
   background: var(--color-surface);
@@ -39,7 +39,7 @@
 }
 
 .ds-datatable {
-  inline-size: 100%;
+  inline-size: var(--size-full);
   border-collapse: collapse;
   font-size: var(--font-size-sm);
   line-height: var(--line-height-normal);
@@ -94,11 +94,12 @@ th.ds-datatable__cell {
 }
 
 /*
- * The expand column shrinks to its toggle button. In table layout a 1% inline size is the
- * shrink-to-fit idiom (the column takes its minimum content width), not a design value.
+ * The expand column shrinks to its toggle button. Table layout never sizes a column below its
+ * min-content width, so a zero preferred inline size shrinks the column to the toggle button,
+ * whose nowrap label sets that width. 0 is a keyword exception, not a design value.
  */
 .ds-datatable__toggle-cell {
-  inline-size: 1%;
+  inline-size: 0;
   white-space: nowrap;
 }
 

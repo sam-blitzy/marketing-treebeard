@@ -66,6 +66,13 @@
   --z-banner: 10; /* GAP: placeholder, not Blitzy OS */
   --z-dialog: 100; /* GAP: placeholder, not Blitzy OS */
   --z-tooltip: 200; /* GAP: placeholder, not Blitzy OS */
+
+  /* Opacity: unitless 0 to 1 element opacity, not a colour, for inactive controls and the modal backdrop */
+  --opacity-disabled: 0.6; /* GAP: placeholder, not Blitzy OS */
+  --opacity-backdrop: 0.5; /* GAP: placeholder, not Blitzy OS */
+
+  /* Size: the full extent of the containing block, so component geometry holds no percentage literal */
+  --size-full: 100%; /* GAP: placeholder, not Blitzy OS */
 }
 
 /* Base layer: the only global rules in the SPA; values from the tokens above. GAP: rebind with Blitzy OS base styles on source arrival. */

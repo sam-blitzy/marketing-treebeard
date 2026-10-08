@@ -67,6 +67,7 @@ from ads_engine.analysis.thresholds import (
     StageBinding,
     Thresholds,
 )
+from ads_engine.analysis.window import AnalysisWindow
 from ads_engine.connectors.google_n8n.client import (
     SIMULATED_SECRET,
     SIMULATED_WEBHOOK_URL,
@@ -87,8 +88,10 @@ from ads_engine.simulation import (
     scenarios,
 )
 from ads_engine.simulation.generator import (
+    ContactRecord,
     GoogleSearchTermSpec,
     PropertyRecord,
+    SearchFilter,
     SimulatedWorld,
     WorldSpec,
 )
@@ -1374,6 +1377,48 @@ def test_context_takes_verified_bindings_from_the_spec() -> None:
     assert ctx.google_crm is not None
     assert ctx.linkedin_crm.bindings == bindings
     assert ctx.google_crm.bindings == bindings
+
+
+def test_google_touch_discovery_covers_the_first_native_day_of_a_zone_east_of_utc() -> None:
+    # As load_context: discovery reads the window's native Tokyo days [start 00:00, end + 1
+    # day 00:00), so the shared-budget veto, which dates member days natively, sees a touch on
+    # the first Tokyo day of the window, before its UTC start, and none after the last one.
+    tokyo = "Asia/Tokyo"
+    base = _scenario("hubspot.google_discovery.case")
+    spec = base.spec.with_google(time_zone=tokyo)
+    world = SimulatedWorld(
+        DEFAULT_SEED, spec, clock=FIXED_CLOCK, content_assets=base.context.content_assets
+    )
+    context = dataclasses.replace(base.context, window=(-25, -1), kind="custom")
+    ctx = context_from_world(world, context, base.thresholds(), now=FIXED_NOW)
+    assert ctx.window.boundary("google") == tokyo
+    utc_lower, utc_upper = ctx.window.utc_bounds()
+    native_lower = AnalysisWindow.day_bounds(ctx.window.start, tokyo)[0]
+    native_upper = AnalysisWindow.day_bounds(ctx.window.end, tokyo)[1]
+    assert native_lower < utc_lower
+    assert native_upper < utc_upper
+    properties = world.google_crm_properties
+    assert properties is not None
+    everyone = [
+        record
+        for record in world.hubspot_search(
+            "contacts", (SearchFilter(properties[0], "HAS_PROPERTY"),)
+        )
+        if isinstance(record, ContactRecord) and record.google_touch_at is not None
+    ]
+    expected = sorted(
+        (cast(datetime, record.google_touch_at), record.id)
+        for record in everyone
+        if native_lower <= cast(datetime, record.google_touch_at) < native_upper
+    )
+    crm = ctx.google_crm
+    assert crm is not None
+    discovered = [(contact.google_touch_at, contact.hs_id) for contact in crm.google_contacts]
+    assert discovered == expected
+    # The world holds a touch on the first Tokyo day, before the UTC start, and touches
+    # outside both bounds: the first is discovered, the others are not.
+    assert any(at < utc_lower for at, _ in discovered)
+    assert any(cast(datetime, record.google_touch_at) < native_lower for record in everyone)
 
 
 # ---------------------------------------------------------------------------

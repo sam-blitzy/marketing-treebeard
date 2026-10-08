@@ -40,16 +40,18 @@ import type { MouseEvent, ReactNode } from 'react';
 const MAIN_ID = 'ds-main';
 
 /**
- * Whether an optional slot was given something to render. `undefined`, `null` and booleans
- * render nothing in React, so a slot passed `cond && <SideNav />` that evaluates to `false` or
- * `null` gets no container either: an empty side-navigation column would still take its fixed
- * track width and push main content aside.
+ * Whether an optional slot was given something to render. `undefined`, `null`, booleans and the
+ * empty string render nothing in React, so a slot passed `cond && <SideNav />` that evaluates to
+ * `false`, `null` or `''` gets no container either: an empty side-navigation column would still
+ * take its fixed track width and the body gap and push main content aside, and an empty actions
+ * container would still take a gap step beside its heading. Any other value, including `0`,
+ * renders and keeps its container.
  *
  * @param node the slot's content
  * @returns `true` when the slot's container should be rendered
  */
 function hasContent(node: ReactNode): boolean {
-  return node !== undefined && node !== null && typeof node !== 'boolean';
+  return node !== undefined && node !== null && typeof node !== 'boolean' && node !== '';
 }
 
 /**
@@ -66,7 +68,8 @@ export interface PageShellProps {
   topBar: ReactNode;
   /**
    * The side navigation, normally `SideNav`, which supplies its own `<nav>` landmark. Omitted
-   * (or `null` / `false`), no side-navigation column is rendered and main takes the full row.
+   * (or `null`, a boolean or an empty string), no side-navigation column is rendered and main
+   * takes the full row; any other value, including `0`, renders the column.
    */
   sideNav?: ReactNode;
   /** The page content, rendered inside the `<main>` landmark. */
@@ -82,7 +85,11 @@ export interface PageShellProps {
 export interface PageShellTitleProps {
   /** The page title, rendered as the page's single `<h1>`. */
   children: ReactNode;
-  /** Controls placed beside the title, such as a "Sync now" button. Omitted, none render. */
+  /**
+   * Controls placed beside the title, such as a "Sync now" button. Omitted (or `null`, a
+   * boolean or an empty string), no actions container is rendered; any other value, including
+   * `0`, renders it.
+   */
   actions?: ReactNode;
 }
 
@@ -106,7 +113,10 @@ export interface PageShellSectionProps {
    * nested inside a level-2 section, so heading levels are never skipped.
    */
   headingLevel?: 2 | 3;
-  /** Controls placed beside the heading. Omitted, none render. */
+  /**
+   * Controls placed beside the heading. Omitted (or `null`, a boolean or an empty string), no
+   * actions container is rendered; any other value, including `0`, renders it.
+   */
   actions?: ReactNode;
   /** The section content, rendered below the heading row. */
   children: ReactNode;

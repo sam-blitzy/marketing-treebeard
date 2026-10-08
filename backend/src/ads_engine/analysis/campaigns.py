@@ -41,7 +41,12 @@ from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decimal
 from typing import Any, Final, Literal
 
-from ads_engine.analysis.attribution import AttributionTable, VetoPopulation, attribution_for
+from ads_engine.analysis.attribution import (
+    AttributionTable,
+    VetoPopulation,
+    attribution_for,
+    shared_budget_veto,
+)
 from ads_engine.analysis.context import (
     C1,
     C1B,
@@ -98,6 +103,7 @@ from ads_engine.analysis.metrics import (
     cap_constrained,
     cost_per_outcome,
     expected_outcomes,
+    native_day_zone,
     spend_increase_blocked,
     subject_baseline,
     subject_campaigns,
@@ -144,15 +150,22 @@ VETO_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "crm.veto_min_leads",
     "crm.lead_maturity_days",
     "attribution.floor_share",
+    "crm.meeting_outcome_exclusions",
 )
-"""The keys of the CRM pipeline veto (AAP 0.5.4.1), added wherever veto evidence is shown."""
+"""The keys of the CRM pipeline veto (AAP 0.5.4.1), added wherever veto evidence is shown.
+
+``crm.meeting_outcome_exclusions`` decides which meetings the population's meeting count
+includes (C1b's meetings = 0 gate and the meetings shown beside the veto);
+``crm.booking_sources`` does not enter that count.
+"""
 
 C1B_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "c1b.min_window_days",
     *VETO_THRESHOLD_KEYS,
     "window.sustained_min_days",
 )
-"""Every key C1b applies; its eligible-contact minimum reuses ``crm.veto_min_leads``."""
+"""Every key C1b applies; its eligible-contact minimum reuses ``crm.veto_min_leads``, and its
+meetings = 0 gate counts only meetings outside ``crm.meeting_outcome_exclusions``."""
 
 C2_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "scale.min_outcomes",
@@ -196,6 +209,9 @@ SCALE_CACHE_KEY: Final = "scale_outcomes"
 
 _SETTINGS_CACHE_KEY: Final = "campaigns.settings"
 """``ctx.cache`` key of the run's :class:`_Settings`."""
+
+_CAMPAIGN_GROUP_KEY: Final = "campaign_group"
+"""``evidence.extra`` key of a LinkedIn campaign card's campaign group (AAP 0.5.2)."""
 
 _LEADS_BY_CAMPAIGN_CACHE_KEY: Final = "campaigns.leads_by_campaign"
 """``ctx.cache`` key of the run's window leads grouped by campaign (:func:`_leads_by_campaign`)."""
@@ -382,16 +398,6 @@ def _singular(label: str) -> str:
     return label[:-1] if label.endswith("s") else label
 
 
-def _sum_known(values: Iterable[int | None]) -> int | None:
-    """Sum counts, or ``None`` when any is unavailable: an unknown part is never zero."""
-    total = 0
-    for value in values:
-        if value is None:
-            return None
-        total += value
-    return total
-
-
 # ---------------------------------------------------------------------------
 # Entities, subjects and datasets
 # ---------------------------------------------------------------------------
@@ -402,6 +408,59 @@ def _campaign_ref(campaign: CampaignInfo) -> EntityRef:
     return EntityRef(
         campaign.source, ENTITY_CAMPAIGN, campaign.id, campaign.external_id, campaign.name
     )
+
+
+def _campaign_group_extra(ctx: AnalysisContext, campaign: CampaignInfo) -> dict[str, Any]:
+    """The ``evidence.extra`` entry naming a LinkedIn campaign's campaign group.
+
+    AAP 0.5.2: a campaign group is "shown in campaign evidence", while decisions and
+    discrepancies cover campaigns and budgets only. The group is therefore evidence alone,
+    never a decision subject, a P1 dependency or a G1 target. Google campaigns have no
+    campaign groups, so a Google campaign gets ``{}``.
+
+    Returns:
+        ``{"campaign_group": {state, id, external_id, name, status, daily_budget,
+        total_budget, currency}}``. ``state`` is ``loaded`` (the group's identity, name, raw
+        LinkedIn status and reported budgets, in its account's currency; a budget the group
+        does not set stays ``None``, never 0), ``not_loaded`` (the campaign names a group the
+        context does not hold: the id is kept and every other field is ``None``, unavailable)
+        or ``ungrouped`` (the campaign belongs to no group; every field is ``None``).
+    """
+    if campaign.source != "linkedin":
+        return {}
+    group_id = campaign.campaign_group_id
+    group = None if group_id is None else ctx.campaign_groups.get(group_id)
+    if group is None:
+        return {
+            _CAMPAIGN_GROUP_KEY: {
+                "state": "ungrouped" if group_id is None else "not_loaded",
+                "id": group_id,
+                "external_id": None,
+                "name": None,
+                "status": None,
+                "daily_budget": None,
+                "total_budget": None,
+                "currency": None,
+            }
+        }
+    account = ctx.accounts.get(group.account_id)
+    currency: str | None = None
+    if account is not None:
+        currency = account.currency
+    elif group.account_id == campaign.account_id:
+        currency = campaign.currency
+    return {
+        _CAMPAIGN_GROUP_KEY: {
+            "state": "loaded",
+            "id": group.id,
+            "external_id": group.external_id,
+            "name": group.name,
+            "status": group.status,
+            "daily_budget": group.daily_budget,
+            "total_budget": group.total_budget,
+            "currency": currency,
+        }
+    }
 
 
 def _subject_ref(ctx: AnalysisContext, subject: SubjectKey) -> EntityRef:
@@ -543,72 +602,27 @@ def _campaign_crm(
     return _CrmView(veto, "google", () if veto is None else _veto_flags(veto))
 
 
-def _combined_veto(
-    ctx: AnalysisContext, settings: _Settings, populations: Sequence[VetoPopulation]
-) -> VetoPopulation | None:
-    """Combine the Google populations of a shared budget's members into one veto.
-
-    AAP 0.5.4.5 aggregates a shared budget over its members. Counts are summed, which is
-    exact for Google: each touch-date contact carries one campaign reference, so no contact
-    appears in two members' populations. The pipeline is unavailable when any member's is;
-    MQL, QL and meetings are unavailable when any member's are. ``campaign_id`` is the lowest
-    member id, because a population is keyed by campaign.
-    """
-    if not populations:
-        return None
-    matured = sum(item.matured_leads for item in populations)
-    unresolved = sum(item.unresolved_leads for item in populations)
-    eligible = sum(item.eligible_contacts for item in populations)
-    share = Decimal(unresolved) / Decimal(matured) if matured else None
-    floor = share is not None and share >= settings.floor_share
-    reason: str | None = None
-    for item in populations:
-        if not item.available:
-            reason = f"{ctx.campaign_name(item.campaign_id)}: {item.reason}"
-            break
-    if reason is None and floor and share is not None:
-        reason = (
-            f"{_percent(share)} of matured leads unresolved in HubSpot "
-            f"(floor {_percent(settings.floor_share)})"
-        )
-    ql = _sum_known(item.ql for item in populations)
-    available = reason is None
-    return VetoPopulation(
-        source=populations[0].source,
-        campaign_id=min(item.campaign_id for item in populations),
-        matured_leads=matured,
-        matched_leads=sum(item.matched_leads for item in populations),
-        unresolved_leads=unresolved,
-        eligible_contacts=eligible,
-        unresolved_share=share,
-        unknown_evidence_contacts=sum(item.unknown_evidence_contacts for item in populations),
-        mql=_sum_known(item.mql for item in populations),
-        ql=ql,
-        meetings=_sum_known(item.meetings for item in populations),
-        available=available,
-        reason=reason,
-        veto_fires=available and eligible >= settings.veto_min and ql == 0,
-        leads=sum(item.leads for item in populations),
-        attribution_floor=floor,
-    )
-
-
 def _subject_crm(
     ctx: AnalysisContext,
-    settings: _Settings,
     attribution: AttributionTable,
     subject: SubjectKey,
-    members: Sequence[int],
+    history: BudgetHistory,
 ) -> _CrmView:
-    """The pipeline evidence of a budget subject (C2): a campaign's, or its members' combined."""
+    """The pipeline evidence of a budget subject (C2): a campaign's, or a shared budget's.
+
+    A shared budget's population is the Google touch-date contacts of its members on their
+    member days only (:func:`~ads_engine.analysis.attribution.shared_budget_veto`), the days
+    its spend and outcomes are aggregated over (AAP 0.5.4.5), dated in the zone its history
+    classified them in. A contact touched before a campaign joined the budget or after it left
+    never enters its veto, and one veto serves the C2 item and its B1.
+    """
     subject_type, subject_id = subject
     if subject_type == "campaign":
         return _campaign_crm(ctx, attribution, ctx.campaigns[subject_id])
     gap = _google_link_gap(ctx)
     if gap is not None:
         return _CrmView(None, None, (_no_crm_link_flag(gap),))
-    populations = [attribution.veto[cid] for cid in members if cid in attribution.veto]
-    veto = _combined_veto(ctx, settings, populations)
+    veto = shared_budget_veto(ctx, history.members, native_day_zone(ctx, "google"))
     return _CrmView(veto, "google", () if veto is None else _veto_flags(veto))
 
 
@@ -788,9 +802,14 @@ class ScaleOutcome:
         crm_scope: The CRM dataset the veto read; ``None`` without one.
         flags: ``no_crm_link``, ``pipeline_unavailable``, ``attribution_floor``,
             ``unknown_crm_evidence`` and, for a shared budget, ``shared_budget``.
-        members: The campaigns the subject's spend comes from (a campaign is its own member).
+        members: The campaigns the subject's spend comes from (a campaign is its own member;
+            a shared budget's are those with member days in the window plus those drawing
+            from it now), for the evidence and the item's dependencies.
+        receivers: The campaigns a spend increase on the subject lands on now: the campaign
+            itself, or the campaigns drawing from the shared budget now. A campaign that left
+            the budget keeps its member days in ``members`` but is no longer raised by it.
         currency: The currency of every amount.
-        g1_blocked: Whether G1 blocks a spend increase on the subject or a member
+        g1_blocked: Whether G1 blocks a spend increase on the subject or a receiver
             (:func:`~ads_engine.analysis.metrics.spend_increase_blocked`). Only a ``scale``
             entry can be blocked: its C2 "Scale" and B1 items are still built, declaring their
             targets, so the precedence G1 post-filter removes them and counts ``g1_blocked``.
@@ -811,6 +830,7 @@ class ScaleOutcome:
     crm_scope: CrmScope | None
     flags: tuple[Flag, ...]
     members: tuple[int, ...]
+    receivers: tuple[int, ...]
     currency: str
     g1_blocked: bool = False
 
@@ -826,9 +846,13 @@ class ScaleOutcome:
 
     @property
     def increases_spend_on(self) -> tuple[DecisionSubject, ...]:
-        """The G1 targets of a Scale (and its B1): the subject plus every member campaign."""
+        """The G1 targets of a Scale (and its B1): the subject plus every receiver campaign.
+
+        AAP 0.5.4.2: a candidate declares the campaigns and budgets whose spend it would
+        raise, so a campaign that has left a shared budget is no target of its increase.
+        """
         targets = [self.decision_subject]
-        targets.extend(DecisionSubject("campaign", cid) for cid in self.members)
+        targets.extend(DecisionSubject("campaign", cid) for cid in self.receivers)
         return tuple(dict.fromkeys(targets))
 
 
@@ -899,8 +923,9 @@ def scale_outcomes(ctx: AnalysisContext) -> tuple[ScaleEntry, ...]:
       ``budget.min_known_days`` known-budget active days, ``budget.min_spending_days``
       spending days, and capped days ≥ ``budget.min_capped_days`` and ≥
       ``budget.sustained_share`` of the known-budget active days);
-    * G1 does not block a spend increase on it
-      (:func:`~ads_engine.analysis.metrics.spend_increase_blocked`).
+    * G1 does not block a spend increase on it or on a campaign the increase would raise now
+      (:attr:`ScaleOutcome.receivers`;
+      :func:`~ads_engine.analysis.metrics.spend_increase_blocked`).
 
     The pipeline veto is evaluated separately: when it fires the entry is a ``hold``, and
     otherwise a ``scale``, flagged ``pipeline_unavailable`` or ``no_crm_link`` when the veto
@@ -922,7 +947,8 @@ def scale_outcomes(ctx: AnalysisContext) -> tuple[ScaleEntry, ...]:
 
     Threshold keys: ``scale.min_outcomes``, ``scale.max_cpa_ratio``, ``b1.step``,
     ``window.sustained_min_days``, the ``budget.*`` gate keys and, through the veto,
-    ``crm.veto_min_leads``, ``crm.lead_maturity_days`` and ``attribution.floor_share``.
+    ``crm.veto_min_leads``, ``crm.lead_maturity_days``, ``attribution.floor_share`` and
+    ``crm.meeting_outcome_exclusions``.
     """
     cached = ctx.cache.get(SCALE_CACHE_KEY)
     if isinstance(cached, _ScaleMemo):
@@ -950,6 +976,21 @@ def _subject_active(ctx: AnalysisContext, subject: SubjectKey, members: Sequence
         for cid in members
         if cid in ctx.campaigns
     )
+
+
+def _spend_receivers(ctx: AnalysisContext, subject: SubjectKey) -> tuple[int, ...]:
+    """The campaigns a spend increase on a budget subject lands on now, ascending.
+
+    AAP 0.5.4.2: G1 targets are the campaigns and budgets whose spend an increase would
+    raise. A campaign subject raises only itself; a shared budget raises the campaigns drawing
+    from it now. A campaign that left the budget mid-window keeps its member days in the
+    evidence, but a raise of this budget no longer reaches it, so its own G1 block (for
+    example B2 on the budget it moved to) cannot suppress this increase.
+    """
+    subject_type, subject_id = subject
+    if subject_type == "campaign":
+        return (subject_id,)
+    return tuple(sorted(c.id for c in ctx.campaigns.values() if c.budget_id == subject_id))
 
 
 def _outcome_label(ctx: AnalysisContext, members: Sequence[int]) -> str:
@@ -1035,7 +1076,7 @@ def _scale_entry(
     if current is None:
         return None
     currency = _subject_currency(ctx, subject)
-    view = _subject_crm(ctx, settings, attribution, subject, members)
+    view = _subject_crm(ctx, attribution, subject, history)
     flags = list(view.flags)
     if subject[0] == "budget":
         flags.append(
@@ -1045,7 +1086,8 @@ def _scale_entry(
             )
         )
     hold = view.veto is not None and view.veto.veto_fires
-    targets: list[SubjectKey] = [subject, *(("campaign", cid) for cid in members)]
+    receivers = _spend_receivers(ctx, subject)
+    targets: list[SubjectKey] = [subject, *(("campaign", cid) for cid in receivers)]
     g1_blocked = any(target in blocked for target in targets)
     if hold and g1_blocked:
         # Not eligible, and a Hold declares no spend increase the G1 post-filter could remove.
@@ -1066,6 +1108,7 @@ def _scale_entry(
         crm_scope=view.scope,
         flags=tuple(flags),
         members=members,
+        receivers=receivers,
         currency=currency,
         g1_blocked=g1_blocked,
     )
@@ -1280,17 +1323,32 @@ def _c2_candidate(
     outcome: ScaleOutcome,
     notes: _Notes,
 ) -> Candidate:
-    """The C2 "Scale" or "Hold" item of one :class:`ScaleOutcome`."""
+    """The C2 "Scale" or "Hold" item of one :class:`ScaleOutcome`.
+
+    The card shows spend, outcomes, expected outcomes (spend ÷ the account baseline cost per
+    outcome, AAP 0.5.4.1; ``None``, unavailable, without a baseline), cost per outcome, the
+    day counts of the cap gate and the veto counts (AAP 0.5.5: "Pause and scale cards show
+    spend, outcomes, expected outcomes and CRM QL"). A shared budget lists its members in
+    ``extra.members``; a LinkedIn campaign subject names its campaign group in
+    ``extra.campaign_group`` (:func:`_campaign_group_extra`), and a Google campaign has none.
+    """
     history = outcome.history
     currency = outcome.currency
     label = _outcome_label(ctx, outcome.members)
     scale = outcome.kind == "scale"
     view = _CrmView(outcome.veto, outcome.crm_scope, outcome.flags)
     notes.note_view(ctx, outcome.entity, view)
+    expected = expected_outcomes(outcome.spend, outcome.baseline)
     metrics = [
         Metric("spend", "Window spend", outcome.spend, "currency", currency),
         Metric("window_days", "Window days", ctx.window.days, "days"),
         Metric("outcomes", f"Window {label}", outcome.outcomes, label),
+        Metric(
+            "expected_outcomes",
+            f"Expected {label} at the account baseline",
+            None if expected is None else _q(expected),
+            label,
+        ),
         Metric(
             "cost_per_outcome",
             f"Cost per {_singular(label)}",
@@ -1327,6 +1385,8 @@ def _c2_candidate(
         }
     if outcome.shared:
         extra["members"] = _members_extra(ctx, outcome)
+    else:
+        extra.update(_campaign_group_extra(ctx, ctx.campaigns[outcome.subject[1]]))
     if outcome.veto is not None:
         extra["matured_ql"] = outcome.veto.ql
     if outcome.g1_blocked:
@@ -1397,9 +1457,10 @@ def _c2(
 
     AAP 0.5.4.4 C2. "Scale" links to its B1 item (``extra.b1_link``), which carries the
     amount; its decision affordance writes the subject (the shared budget itself when shared,
-    with every member in ``extra.members``) and it declares the subject and its members as
-    G1 targets. "Hold" ("platform outcomes are not reaching Qualified Lead") is emitted
-    whenever the veto fires, offers only "Mark done" and raises no spend.
+    with every member in ``extra.members``) and it declares the subject and the campaigns
+    drawing from it now (:attr:`ScaleOutcome.receivers`) as G1 targets. "Hold" ("platform
+    outcomes are not reaching Qualified Lead") is emitted whenever the veto fires, offers only
+    "Mark done" and raises no spend.
 
     Threshold keys: ``scale.min_outcomes``, ``scale.max_cpa_ratio``, ``b1.step``,
     ``window.sustained_min_days``, the ``budget.*`` gate keys and the veto keys.
@@ -1545,7 +1606,12 @@ def _c1_candidate(
     expected: Decimal,
     baseline: Decimal,
 ) -> Candidate:
-    """The C1 "Pause" item of one campaign."""
+    """The C1 "Pause" item of one campaign.
+
+    Shows spend, days with spend, outcomes, expected outcomes and the baseline, plus the
+    linked CRM QL. A LinkedIn campaign's card also names its campaign group in
+    ``extra.campaign_group`` (:func:`_campaign_group_extra`); a Google card has none.
+    """
     currency = ctx.account_currency(campaign.id)
     label = OUTCOME_LABELS[campaign.objective_group]
     days = ctx.window.days
@@ -1595,7 +1661,7 @@ def _c1_candidate(
         threshold_keys=(
             C1_THRESHOLD_KEYS if view.veto is None else (*C1_THRESHOLD_KEYS, *VETO_THRESHOLD_KEYS)
         ),
-        extra={"proposed_status": "paused"},
+        extra={"proposed_status": "paused", **_campaign_group_extra(ctx, campaign)},
     )
     reason = (
         f"Spent {_money_of(evidence, 'spend')} on {_value(evidence, 'spend_days')} of "
@@ -1701,8 +1767,9 @@ def _c1b(
     when the campaign's matured population has at least ``crm.veto_min_leads`` (20) eligible
     contacts (distinct contacts behind matched leads submitted at least
     ``crm.lead_maturity_days`` before the window end), their Qualified Leads and meetings
-    are both 0, the pipeline is available, the unresolved share is below
-    ``attribution.floor_share`` and no eligible contact's CRM evidence is unknown.
+    (outcomes in ``crm.meeting_outcome_exclusions`` not counted) are both 0, the pipeline is
+    available, the unresolved share is below ``attribution.floor_share`` and no eligible
+    contact's CRM evidence is unknown.
 
     Rationale: platform leads that never reach Qualified Lead are not pipeline. The gates
     exist because a zero under a floor or unknown evidence "may be an artefact of unmatched
@@ -1744,7 +1811,11 @@ def _c1b_candidate(
     entity: EntityRef,
     view: _CrmView,
 ) -> Candidate:
-    """The C1b item of one LinkedIn campaign whose eligible contacts produced no pipeline."""
+    """The C1b item of one LinkedIn campaign whose eligible contacts produced no pipeline.
+
+    The card shows spend beside the veto counts and names the campaign's campaign group in
+    ``extra.campaign_group`` (:func:`_campaign_group_extra`).
+    """
     veto = view.veto
     if veto is None:
         raise ValueError(f"C1b needs a pipeline population for campaign {campaign.id}")
@@ -1760,7 +1831,11 @@ def _c1b_candidate(
         metrics=metrics,
         sample=Sample(veto.eligible_contacts, settings.veto_min, "contacts"),
         threshold_keys=C1B_THRESHOLD_KEYS,
-        extra={"proposed_status": "paused", "matured_ql": veto.ql},
+        extra={
+            "proposed_status": "paused",
+            "matured_ql": veto.ql,
+            **_campaign_group_extra(ctx, campaign),
+        },
     )
     reason = (
         f"{_value(evidence, 'eligible_contacts')} eligible contacts from "
@@ -1961,6 +2036,10 @@ def _c3a_candidate(
 ) -> Candidate:
     """The C3a launch idea of one segment.
 
+    The card shows the gap evidence (segment against campaign leads, cost per lead and
+    impressions) and names the source campaign's campaign group in ``extra.campaign_group``
+    (:func:`_campaign_group_extra`).
+
     ``campaign_cpl`` must be positive: it divides the segment's cost per lead, so
     :func:`_c3a` withholds a zero-spend campaign's segments before calling this.
     """
@@ -2014,6 +2093,7 @@ def _c3a_candidate(
             "campaign_id": campaign.id,
             "campaign_name": campaign.name,
             "segment_window": {"start": row.window_start, "end": row.window_end},
+            **_campaign_group_extra(ctx, campaign),
         },
     )
     share = _value(evidence, "impression_share")

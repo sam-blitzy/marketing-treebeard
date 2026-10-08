@@ -5,14 +5,17 @@ splitting of a capped range, ``next`` links, the one-day partition at the cap, U
 de-duplication), ``analytics_segments`` with its Statistics Finder request and the Analytics
 Finder fallback (``_delivering`` discovery and ``_segments_by_campaign``), ``list_lead_forms``,
 ``list_lead_responses``, ``get_lead_responses`` and the :class:`LeadListing` and
-:class:`LeadBatch` results.
+:class:`LeadBatch` results, and ``LEAD_FIELDS``, which both lead requests send. Its generator
+and the packaged module generated from the two lead-response contracts are covered by
+``test_linkedin_projections.py``.
 
 Every response is served by an ``httpx.MockTransport`` and shaped from
 ``backend/tests/contracts/linkedin/*.json``: a documented sample is served verbatim where a
 test names it, and every hand-built body uses only fields its contract defines (elements start
 from the documented sample where one exists) and is checked against the contract's response
-schema before it is served. The deliberately malformed bodies of the defect tests, and the one
-page without its required ``paging`` block, are the only exceptions. Requests are checked
+schema before it is served. The deliberately malformed bodies of the defect tests, and the
+batch elements of the identity tests that omit or mistype an identity field, are the only
+exceptions. Requests are checked
 against the contract's path, query keys, headers and ``fields`` projection. Assertions follow
 the module, which records live 202609 behaviour where it departs from the plan text: the
 ``fields`` projection is sent raw, batch ids are unquoted (``ids=List(<id>)``), demographic
@@ -27,6 +30,7 @@ import contextlib
 import copy
 import functools
 import hashlib
+import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -63,6 +67,7 @@ from ads_engine.connectors.linkedin.parser import (
     REASON_UNKNOWN_FORM_VERSION,
     SEGMENT_PIVOTS,
     FormVersionMap,
+    decode_email,
 )
 from ads_engine.settings import Settings, get_settings
 
@@ -75,6 +80,8 @@ ACCOUNT_ID = "990000001"
 ACCOUNT_URN = "urn:li:sponsoredAccount:990000001"
 ACCOUNTS = "List(urn%3Ali%3AsponsoredAccount%3A990000001)"
 OWNER = "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+OTHER_ACCOUNT_URN = "urn:li:sponsoredAccount:990000002"
+OTHER_ORGANIZATION_URN = "urn:li:organization:990000003"
 
 CREATIVE_A = "urn:li:sponsoredCreative:990001101"
 CREATIVE_B = "urn:li:sponsoredCreative:990001102"
@@ -110,6 +117,8 @@ SUBMITTED_MS = 1_790_000_000_123
 
 # The documented Lead Sync sample (lead_form_responses.json, lead_form_responses_batch.json).
 SAMPLE_LEAD_ID = "aaaabbbb-0000-cccc-1111-dddd2222eeee-5"
+SAMPLE_ACCOUNT_URN = "urn:li:sponsoredAccount:522529623"
+SAMPLE_OWNER = "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A522529623)"
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 EASTERN = timezone(timedelta(hours=-4), "EDT")
@@ -592,6 +601,8 @@ def test_request_constants_equal_their_contracts() -> None:
     assert _contract("ad_analytics_statistics")["request"]["fields"] == SEGMENT_FIELDS
     assert _contract("lead_form_responses")["request"]["fields"] == LEAD_FIELDS
     assert _contract("lead_form_responses_batch")["request"]["fields"] == LEAD_FIELDS
+    # LEAD_FIELDS is generated from those files, and both lead requests send that very value.
+    assert client_module._LEAD_FIELDS_QUERY_VALUE is LEAD_FIELDS
     assert _contract("lead_forms")["request"]["limits"]["page_size"] == LEAD_PAGE_SIZE
     assert _contract("lead_form_responses")["request"]["limits"]["page_size"] == LEAD_PAGE_SIZE
     batch_limits = _contract("lead_form_responses_batch")["request"]["limits"]
@@ -600,6 +611,34 @@ def test_request_constants_equal_their_contracts() -> None:
     for surface in ("ad_analytics", "ad_analytics_statistics"):
         assert _contract(surface)["request"]["limits"]["max_elements"] == MAX_ANALYTICS_ELEMENTS
     assert SEGMENT_DISCOVERY_FIELDS == "pivotValues,impressions"
+
+
+# ---------------------------------------------------------------------------------------------
+# LEAD_FIELDS, generated from the lead-response contracts
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_both_lead_requests_send_the_generated_projection_raw() -> None:
+    """``list_lead_responses`` and ``get_lead_responses`` both send ``LEAD_FIELDS`` unencoded."""
+    server = Server(
+        _sequence(
+            _json(_lead_page([])),
+            _json({"results": {}, "statuses": {}, "errors": {}}),
+        )
+    )
+    submitted = (datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC))
+    async with _linkedin(server) as client:
+        await client.list_lead_responses(ACCOUNT_ID, submitted, known_versions={})
+        await client.get_lead_responses(ACCOUNT_ID, [LEAD_A])
+
+    projections = {
+        surface: _contract(surface)["request"]["fields"]
+        for surface in ("lead_form_responses", "lead_form_responses_batch")
+    }
+    assert projections == dict.fromkeys(projections, LEAD_FIELDS)
+    assert [_params(request)["fields"] for request in server.requests] == [LEAD_FIELDS] * 2
+    assert all(f"&fields={LEAD_FIELDS}" in _query(request) for request in server.requests)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -825,22 +864,90 @@ async def test_analytics_daily_follows_next_links_and_dedupes_rows(
 
 
 @pytest.mark.anyio
-async def test_analytics_daily_next_link_chain_ends_on_an_empty_page() -> None:
-    """An empty page ends the next-link chain whatever its own link says."""
+async def test_analytics_daily_next_link_chain_continues_past_an_empty_page() -> None:
+    """An empty page with a next link is not the end: the rows behind it are kept."""
     day = date(2026, 9, 1)
     server = Server(
         _sequence(
             _json(_daily_body([_daily(CREATIVE_A, day)], next_href="/rest/adAnalytics?q=a")),
             _json(_daily_body([], next_href="/rest/adAnalytics?q=b")),
+            _json(_daily_body([_daily(CREATIVE_B, day)])),
         )
     )
     async with _linkedin(server) as client:
-        listing = await client.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=1)
+        listing = await client.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=2)
 
-    assert server.queries()[1] == "q=a"
-    assert len(server.requests) == 2
-    assert [row.creative_urn for row in listing.rows] == [CREATIVE_A]
+    assert server.queries()[1:] == ["q=a", "q=b"]
+    assert [row.creative_urn for row in listing.rows] == [CREATIVE_A, CREATIVE_B]
     assert listing.complete is True
+    assert listing.reason is None
+    assert listing.interrupted_by is None
+    assert listing.calls == 3
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_transient_failure_after_an_empty_page_is_incomplete() -> None:
+    """A transient failure reading past an empty page leaves the listing incomplete."""
+    day = date(2026, 9, 1)
+    server = Server(
+        _sequence(
+            _json(_daily_body([_daily(CREATIVE_A, day)], next_href="/rest/adAnalytics?q=a")),
+            _json(_daily_body([], next_href="/rest/adAnalytics?q=b")),
+            _unavailable(),
+            _unavailable(),
+        )
+    )
+    async with _linkedin(server) as client:
+        listing = await client.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=2)
+
+    assert server.queries()[1:] == ["q=a", "q=b", "q=b"]
+    assert [row.creative_urn for row in listing.rows] == [CREATIVE_A]
+    assert isinstance(listing.interrupted_by, TransientError)
+    assert listing.complete is False
+    assert listing.reason == listing.interrupted_by.reason
+    assert listing.calls == 3
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_empty_page_next_link_repeating_a_request_is_a_defect() -> None:
+    """An empty page linking back to a request already read is a defect, never the end."""
+    day = date(2026, 9, 1)
+    server = Server(
+        _sequence(
+            _json(_daily_body([_daily(CREATIVE_A, day)], next_href="/rest/adAnalytics?q=a")),
+            _json(_daily_body([], next_href="/rest/adAnalytics?q=a")),
+        )
+    )
+    async with _linkedin(server) as client:
+        with pytest.raises(QueryDefect, match="repeats an earlier request") as caught:
+            await client.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=1)
+
+    assert caught.value.endpoint == "ad_analytics"
+    assert caught.value.code == "validation"
+    assert len(server.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_chain_of_empty_pages_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty pages that keep returning fresh next links end in a defect at the bound."""
+    monkeypatch.setattr(client_module, "_MAX_NEXT_LINKS", 2)
+    day = date(2026, 9, 1)
+    pages = iter(range(1, 10))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Answer every page with no rows and a fresh next link."""
+        href = f"/rest/adAnalytics?q=analytics&start={next(pages)}"
+        return _json(_daily_body([], next_href=href))
+
+    server = Server(handle)
+    async with _linkedin(server) as client:
+        with pytest.raises(QueryDefect, match="more than 2 'next' links") as caught:
+            await client.analytics_daily(ACCOUNT_ID, (day, day), expected_creatives=1)
+
+    assert caught.value.endpoint == "ad_analytics"
+    assert len(server.requests) == 3
 
 
 @pytest.mark.anyio
@@ -999,6 +1106,129 @@ async def test_analytics_daily_rejects_invalid_arguments_without_a_call(
     assert server.requests == []
 
 
+def _creative_element(creative_id: int) -> Any:
+    """A creative element: the creatives sample renumbered, in campaign ``CAMPAIGN_LOW``."""
+    element = _sample("creatives")["elements"][0]
+    element.update(
+        id=f"urn:li:sponsoredCreative:{creative_id}", campaign=CAMPAIGN_LOW, account=ACCOUNT_URN
+    )
+    return element
+
+
+def _creatives_page(elements: Sequence[Any], token: str | None = None) -> Any:
+    """A ``creatives`` cursor page, with ``metadata.nextPageToken`` when another page follows."""
+    metadata = {} if token is None else {"nextPageToken": token}
+    return _conforming("creatives", {"elements": list(elements), "metadata": metadata})
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_two_arguments_without_a_creative_count_read_one_chunk() -> None:
+    """``analytics_daily(acct, range)`` with no creative count known reads the range at once."""
+    start, end = date(2026, 4, 5), date(2026, 10, 1)
+    server = Server(
+        _sequence(_json(_daily_body([_daily(CREATIVE_A, start), _daily(CREATIVE_B, end)])))
+    )
+    async with _linkedin(server) as client:
+        listing = await client.analytics_daily(ACCOUNT_ID, (start, end))
+
+    [request] = server.requests
+    params = _assert_contract_request(request, "ad_analytics")
+    assert params["dateRange"] == _restli_range(start, end)
+    assert (end - start).days + 1 == 180
+    assert [(row.creative_urn, row.date) for row in listing.rows] == [
+        (CREATIVE_A, start),
+        (CREATIVE_B, end),
+    ]
+    assert listing.complete is True
+    assert listing.reason is None
+    assert listing.calls == 1
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_two_arguments_still_split_a_capped_range() -> None:
+    """Without a creative count, a capped whole-range read is discarded and re-read in halves."""
+    first, last = date(2026, 9, 1), date(2026, 9, 5)
+    halves = {
+        _restli_range(first, last): _capped_daily_body(),
+        _restli_range(first, date(2026, 9, 3)): _daily_body(
+            [_daily(CREATIVE_A, first), _daily(CREATIVE_B, date(2026, 9, 3))]
+        ),
+        _restli_range(date(2026, 9, 4), last): _daily_body([_daily(CREATIVE_A, last)]),
+    }
+    server = Server(lambda request: _json(halves[_params(request)["dateRange"]]))
+    async with _linkedin(server) as client:
+        listing = await client.analytics_daily(ACCOUNT_ID, (first, last))
+
+    assert [_params(request)["dateRange"] for request in server.requests] == list(halves)
+    assert [(row.creative_urn, row.date) for row in listing.rows] == [
+        (CREATIVE_A, first),
+        (CREATIVE_B, date(2026, 9, 3)),
+        (CREATIVE_A, last),
+    ]
+    assert listing.complete is True
+    assert listing.calls == 3
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_two_arguments_single_day_at_the_cap_is_incomplete() -> None:
+    """Without a creative count, a one-day range at the cap keeps its rows and is incomplete."""
+    day = date(2026, 9, 1)
+    server = Server(_sequence(_json(_capped_daily_body())))
+    async with _linkedin(server) as client:
+        listing = await client.analytics_daily(ACCOUNT_ID, (day, day))
+
+    assert [_params(request)["dateRange"] for request in server.requests] == [
+        _restli_range(day, day)
+    ]
+    assert [(row.creative_urn, row.date) for row in listing.rows] == [(DISCARDED_CREATIVE, day)]
+    assert listing.complete is False
+    assert listing.reason == "result limit reached at finest partition (one day)"
+    assert listing.interrupted_by is None
+
+
+@pytest.mark.anyio
+async def test_analytics_daily_two_arguments_size_chunks_with_the_listed_creative_count() -> None:
+    """The account's creative count from ``list_creatives`` sizes a two-argument call's chunks.
+
+    ``list_creatives`` returns 101 distinct creatives (a repeat across pages counts once), so a
+    180-day range reads as 14,999 // 101 = 148 days, then 32 days. Another account has no count
+    and reads one chunk; an explicit ``expected_creatives`` still overrides the learned count.
+    """
+    start, end = date(2026, 4, 5), date(2026, 10, 1)
+    first_page = [_creative_element(990200000 + index) for index in range(100)]
+    second_page = [_creative_element(990200000), _creative_element(990200100)]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Serve two creatives pages, then an empty daily response for every analytics chunk."""
+        if request.url.path.endswith("/creatives"):
+            if "pageToken" in _params(request):
+                return _json(_creatives_page(second_page))
+            return _json(_creatives_page(first_page, "creatives-page-2"))
+        return _json(_daily_body([]))
+
+    server = Server(handle)
+    async with _linkedin(server) as client:
+        creatives = await client.list_creatives(ACCOUNT_ID, [CAMPAIGN_LOW])
+        learned = await client.analytics_daily(ACCOUNT_ID, (start, end))
+        other = await client.analytics_daily("990000002", (start, end))
+        explicit = await client.analytics_daily(ACCOUNT_ID, (start, end), expected_creatives=1000)
+
+    assert len(creatives.rows) == 101
+    analytics = [request for request in server.requests if request.url.path == "/rest/adAnalytics"]
+    for request in analytics:
+        _assert_contract_request(request, "ad_analytics")
+    ranges = [_params(request)["dateRange"] for request in analytics]
+    assert ranges[:2] == [
+        _restli_range(start, date(2026, 8, 30)),
+        _restli_range(date(2026, 8, 31), end),
+    ]
+    assert ranges[2] == _restli_range(start, end)
+    assert ranges[3] == _restli_range(start, date(2026, 4, 18))
+    assert (learned.calls, other.calls, explicit.calls) == (2, 1, 13)
+    assert len(ranges) == 2 + 1 + 13
+    assert [listing.complete for listing in (learned, other, explicit)] == [True, True, True]
+
+
 # ---------------------------------------------------------------------------------------------
 # analytics_segments: the Statistics Finder request
 # ---------------------------------------------------------------------------------------------
@@ -1083,6 +1313,68 @@ async def test_analytics_segments_statistics_transient_failure_is_incomplete() -
     assert listing.complete is False
     assert listing.reason == listing.interrupted_by.reason
     assert listing.calls == 1
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_statistics_next_link_continues_past_an_empty_page() -> None:
+    """An empty statistics page with a next link is followed; no row behind it is lost."""
+    value, facet = SEGMENT_VALUES["MEMBER_SENIORITY"]
+    surface = "ad_analytics_statistics"
+    server = Server(
+        _sequence(
+            _json(
+                _analytics_body(
+                    surface,
+                    [_segment([CAMPAIGN_LOW, value])],
+                    next_href="/rest/adAnalytics?q=statistics&start=1",
+                )
+            ),
+            _json(_analytics_body(surface, [], next_href="/rest/adAnalytics?q=statistics&start=2")),
+            _json(_statistics_body([_segment([CAMPAIGN_HIGH, value])])),
+        )
+    )
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    assert server.queries()[1:] == ["q=statistics&start=1", "q=statistics&start=2"]
+    assert [(row.campaign_urn, row.facet, row.value) for row in listing.rows] == [
+        (CAMPAIGN_LOW, facet, value),
+        (CAMPAIGN_HIGH, facet, value),
+    ]
+    assert listing.complete is True
+    assert listing.reason is None
+    assert listing.interrupted_by is None
+    assert listing.calls == 3
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_statistics_transient_failure_after_an_empty_page() -> None:
+    """A transient failure reading past an empty statistics page leaves it incomplete."""
+    value, _ = SEGMENT_VALUES["MEMBER_SENIORITY"]
+    surface = "ad_analytics_statistics"
+    server = Server(
+        _sequence(
+            _json(
+                _analytics_body(
+                    surface,
+                    [_segment([CAMPAIGN_LOW, value])],
+                    next_href="/rest/adAnalytics?q=statistics&start=1",
+                )
+            ),
+            _json(_analytics_body(surface, [], next_href="/rest/adAnalytics?q=statistics&start=2")),
+            _unavailable(),
+            _unavailable(),
+        )
+    )
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    assert len(server.requests) == 4
+    assert [row.campaign_urn for row in listing.rows] == [CAMPAIGN_LOW]
+    assert isinstance(listing.interrupted_by, TransientError)
+    assert listing.complete is False
+    assert listing.reason == listing.interrupted_by.reason
+    assert listing.calls == 3
 
 
 @pytest.mark.anyio
@@ -1371,6 +1663,56 @@ async def test_analytics_segments_campaign_transient_failure_stops_the_fallback(
     assert listing.reason == listing.interrupted_by.reason
 
 
+@pytest.mark.anyio
+async def test_analytics_segments_fallback_follows_next_links_past_empty_pages() -> None:
+    """Discovery and per-campaign chains read the pages behind an empty page."""
+    value, facet = SEGMENT_VALUES["MEMBER_SENIORITY"]
+    surface = "ad_analytics_statistics"
+    link = "/rest/adAnalytics?q=analytics&chain="
+    continuations = {
+        "discovery-2": _analytics_body(surface, [], next_href=f"{link}discovery-3"),
+        "discovery-3": _analytics_body(surface, [_discovery(CAMPAIGN_HIGH, 9)]),
+        "low-2": _analytics_body(surface, [_segment([value], impressions=11)]),
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Reject q=statistics; give discovery and one campaign an empty middle page."""
+        params = _params(request)
+        if params["q"] == "statistics":
+            return _error(400, '"MEMBER_SENIORITY" is not an enum symbol')
+        if "chain" in params:
+            return _json(continuations[params["chain"]])
+        if params["pivot"] == "CAMPAIGN":
+            first = [_discovery(CAMPAIGN_LOW, 5)]
+            return _json(_analytics_body(surface, first, next_href=f"{link}discovery-2"))
+        campaign = unquote(params["campaigns"].removeprefix("List(").removesuffix(")"))
+        if campaign == CAMPAIGN_LOW:
+            return _json(_analytics_body(surface, [], next_href=f"{link}low-2"))
+        return _json(_statistics_body([_segment([value], impressions=30)]))
+
+    server = Server(handle)
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    assert [_params(request).get("chain") for request in server.requests] == [
+        None,
+        None,
+        "discovery-2",
+        "discovery-3",
+        None,
+        "low-2",
+        None,
+    ]
+    assert [(row.campaign_urn, row.facet, row.impressions) for row in listing.rows] == [
+        (CAMPAIGN_LOW, facet, 11),
+        (CAMPAIGN_HIGH, facet, 30),
+    ]
+    assert listing.complete is True
+    assert listing.reason is None
+    assert listing.interrupted_by is None
+    assert listing.calls == 7
+
+
 # ---------------------------------------------------------------------------------------------
 # list_lead_forms
 # ---------------------------------------------------------------------------------------------
@@ -1383,14 +1725,24 @@ def _forms_query(*, count: int, start: int) -> str:
 
 @pytest.mark.anyio
 async def test_list_lead_forms_reads_the_documented_sample() -> None:
-    """The forms request carries the owner selector and count/start; the sample parses verbatim."""
-    server = Server(_sequence(_json(_sample("lead_forms"))))
-    async with _linkedin(server) as client:
-        listing = await client.list_lead_forms(ACCOUNT_ID)
+    """The forms request carries the owner selector and count/start; the sample parses verbatim.
 
-    [request] = server.requests
-    _assert_contract_request(request, "lead_forms")
-    assert _query(request) == _forms_query(count=100, start=0)
+    The sample answers the reference's own request, ``count=1&start=0``, and its ``paging``
+    echoes that count, so it is served for that request. Its one form fills the page, so the
+    listing reads on to an empty page at ``start=1`` and ends there.
+    """
+    server = Server(
+        _sequence(
+            _json(_sample("lead_forms")),
+            _json(_page("lead_forms", [], count=1, start=1)),
+        )
+    )
+    async with _linkedin(server) as client:
+        listing = await client.list_lead_forms(ACCOUNT_ID, page_size=1)
+
+    for request in server.requests:
+        _assert_contract_request(request, "lead_forms")
+    assert server.queries() == [_forms_query(count=1, start=0), _forms_query(count=1, start=1)]
     [form] = listing.rows
     assert form.canonical_urn == "urn:li:leadGenForm:6755260984438374400"
     assert form.external_id == "6755260984438374400"
@@ -1401,7 +1753,7 @@ async def test_list_lead_forms_reads_the_documented_sample() -> None:
     assert form.version_map.email_question_ids == ()
     assert form.version_map.question_ids == frozenset({10548, 10540})
     assert listing.complete is True
-    assert listing.calls == 1
+    assert listing.calls == 2
 
 
 @pytest.mark.anyio
@@ -1458,19 +1810,11 @@ async def test_list_lead_forms_short_page_with_a_next_link_reads_on_from_the_tem
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("without", ["links", "paging"])
-async def test_list_lead_forms_short_page_without_links_ends_the_listing(without: str) -> None:
-    """A short page with no ``paging.links``, or no ``paging`` block at all, has no next page.
-
-    The contract makes ``links`` optional; the page without ``paging`` breaks the contract's
-    required block and shows that the module still reads it as "no next link".
-    """
+async def test_list_lead_forms_short_page_without_links_ends_the_listing() -> None:
+    """A short page with no ``paging.links`` has no next page; the contract makes it optional."""
     body = _page("lead_forms", [_form(FORM_ID, 1, WORK_EMAIL_QUESTIONS)], count=2)
-    if without == "links":
-        del body["paging"]["links"]
-        _conforming("lead_forms", body)
-    else:
-        del body["paging"]
+    del body["paging"]["links"]
+    _conforming("lead_forms", body)
     server = Server(_sequence(_json(body)))
     async with _linkedin(server) as client:
         listing = await client.list_lead_forms(ACCOUNT_ID, page_size=2)
@@ -1484,6 +1828,7 @@ async def test_list_lead_forms_short_page_without_links_ends_the_listing(without
 @pytest.mark.parametrize(
     ("paging", "message"),
     [
+        pytest.param(None, "the response has no 'paging' object", id="paging-absent"),
         pytest.param([], "field 'paging' is not a JSON object", id="paging-not-an-object"),
         pytest.param(
             {"count": 2, "start": 0, "links": {}},
@@ -1495,8 +1840,13 @@ async def test_list_lead_forms_short_page_without_links_ends_the_listing(without
 async def test_list_lead_forms_malformed_paging_on_a_short_page_is_a_defect(
     paging: object, message: str
 ) -> None:
-    """A short page whose paging block breaks the contract is a defect, never an end of data."""
-    body = {"elements": [_form(FORM_ID, 1, WORK_EMAIL_QUESTIONS)], "paging": paging}
+    """A short page whose paging block breaks the contract is a defect, never an end of data.
+
+    ``paging`` is required by the contract, so a page without it (``None`` here) is a defect too.
+    """
+    body: dict[str, Any] = {"elements": [_form(FORM_ID, 1, WORK_EMAIL_QUESTIONS)]}
+    if paging is not None:
+        body["paging"] = paging
     server = Server(_sequence(_json(body)))
     async with _linkedin(server) as client:
         with pytest.raises(QueryDefect, match=message) as caught:
@@ -1819,13 +2169,18 @@ async def test_list_lead_responses_never_exposes_a_plaintext_email(
 
 @pytest.mark.anyio
 async def test_list_lead_responses_documented_sample_without_a_known_version() -> None:
-    """The unprojected documented sample parses verbatim: its version has no map, so no email."""
+    """The unprojected documented sample parses verbatim: its version has no map, so no email.
+
+    The sample answers a reference request without ``count``, so its ``paging.count`` is
+    LinkedIn's default of 10; it is served for a request of that page size.
+    """
     server = Server(_sequence(_json(_sample("lead_form_responses"))))
     async with _linkedin(server) as client:
         listing = await client.list_lead_responses(
-            ACCOUNT_ID, (RANGE_START, RANGE_END), known_versions={}
+            ACCOUNT_ID, (RANGE_START, RANGE_END), known_versions={}, page_size=10
         )
 
+    assert server.queries() == [_responses_query(count=10, start=0)]
     [lead] = listing.leads
     assert lead.external_id == SAMPLE_LEAD_ID
     assert lead.lead_form_urn == "urn:li:leadGenForm:3162"
@@ -1963,6 +2318,105 @@ async def test_list_lead_responses_rejects_invalid_arguments_without_a_call(
     assert server.requests == []
 
 
+@pytest.mark.anyio
+async def test_list_lead_responses_two_arguments_decode_with_versions_from_list_lead_forms() -> (
+    None
+):
+    """``list_lead_responses(acct, range)`` decodes undecorated responses with the forms read.
+
+    The client's ``list_lead_forms`` of the account supplies (form, 3): a response of version 3
+    decodes, version 2 of the same form stays "unknown form version", another account has no
+    maps, and an explicit ``known_versions={}`` is used as passed.
+    """
+    forms = _page(
+        "lead_forms", [_form(FORM_ID, FORM_VERSION, WORK_EMAIL_QUESTIONS)], count=LEAD_PAGE_SIZE
+    )
+    responses = _lead_page(
+        [
+            _lead(LEAD_A, EMAIL, decorated=False),
+            _lead(LEAD_B, OTHER_EMAIL, version=STORED_VERSION, decorated=False),
+        ]
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Serve the forms page or the responses page by path."""
+        if request.url.path == "/rest/leadForms":
+            return _json(forms)
+        return _json(responses)
+
+    server = Server(handle)
+    async with _linkedin(server) as client:
+        await client.list_lead_forms(ACCOUNT_ID)
+        listing = await client.list_lead_responses(ACCOUNT_ID, (RANGE_START, RANGE_END))
+        explicit = await client.list_lead_responses(
+            ACCOUNT_ID, (RANGE_START, RANGE_END), known_versions={}
+        )
+        other = await client.list_lead_responses("990000002", (RANGE_START, RANGE_END))
+
+    _assert_contract_request(server.requests[1], "lead_form_responses")
+    assert server.queries()[1] == _responses_query()
+    assert [
+        (lead.external_id, lead.email_status, lead.email_reason, lead.email_sha256)
+        for lead in listing.leads
+    ] == [
+        (LEAD_A, "ok", None, _sha256(EMAIL)),
+        (LEAD_B, "no_email", REASON_UNKNOWN_FORM_VERSION, None),
+    ]
+    assert listing.versions == ()
+    assert listing.complete is True
+    for unbound in (explicit, other):
+        assert [(lead.email_status, lead.email_reason) for lead in unbound.leads] == [
+            ("no_email", REASON_UNKNOWN_FORM_VERSION),
+            ("no_email", REASON_UNKNOWN_FORM_VERSION),
+        ]
+
+
+@pytest.mark.anyio
+async def test_list_lead_responses_two_arguments_reuse_decorations_learned_earlier() -> None:
+    """A decoration learned by one call decodes a later undecorated response of its version.
+
+    Maps learned under an explicit ``known_versions`` are remembered too, while an explicit
+    ``known_versions={}`` still starts from no map at all.
+    """
+    server = Server(
+        _sequence(
+            _json(_lead_page([_lead(LEAD_A, EMAIL)])),
+            _json(_lead_page([_lead(LEAD_B, OTHER_EMAIL, decorated=False)])),
+            _json(_lead_page([_lead(LEAD_C, THIRD_EMAIL, decorated=False)])),
+        )
+    )
+    async with _linkedin(server) as client:
+        first = await client.list_lead_responses(
+            ACCOUNT_ID, (RANGE_START, RANGE_END), known_versions={}
+        )
+        second = await client.list_lead_responses(ACCOUNT_ID, (RANGE_START, RANGE_END))
+        third = await client.list_lead_responses(
+            ACCOUNT_ID, (RANGE_START, RANGE_END), known_versions={}
+        )
+
+    assert [(version.canonical_urn, version.version) for version in first.versions] == [
+        (FORM_URN, FORM_VERSION)
+    ]
+    [lead_b] = second.leads
+    assert (lead_b.email_status, lead_b.email_sha256) == ("ok", _sha256(OTHER_EMAIL))
+    assert second.versions == ()
+    [lead_c] = third.leads
+    assert (lead_c.email_status, lead_c.email_reason) == ("no_email", REASON_UNKNOWN_FORM_VERSION)
+    assert lead_c.email_sha256 is None
+
+
+def test_analytics_daily_and_list_lead_responses_take_the_two_aap_arguments() -> None:
+    """Both methods bind ``(acct, range)`` alone; their context arguments default to ``None``."""
+    daily = inspect.signature(LinkedInClient.analytics_daily)
+    daily.bind(object(), ACCOUNT_ID, (date(2026, 9, 1), date(2026, 9, 1)))
+    assert daily.parameters["expected_creatives"].default is None
+    assert daily.parameters["expected_creatives"].kind is inspect.Parameter.KEYWORD_ONLY
+    leads = inspect.signature(LinkedInClient.list_lead_responses)
+    leads.bind(object(), ACCOUNT_ID, (RANGE_START, RANGE_END))
+    assert leads.parameters["known_versions"].default is None
+    assert leads.parameters["known_versions"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 # ---------------------------------------------------------------------------------------------
 # get_lead_responses
 # ---------------------------------------------------------------------------------------------
@@ -1972,22 +2426,24 @@ async def test_list_lead_responses_rejects_invalid_arguments_without_a_call(
 async def test_get_lead_responses_request_matches_the_batch_contract() -> None:
     """The re-fetch sends unquoted ids, owner, lead type and the raw projection, no method header.
 
-    The documented sample is served verbatim; an id absent from its results is a failed re-fetch.
+    The documented sample is served verbatim to a re-fetch for its own owner account, so its
+    element passes the identity check; an id absent from its results is a failed re-fetch.
     """
+    sample = _sample("lead_form_responses_batch")["results"][SAMPLE_LEAD_ID]
+    assert sample["owner"] == {"sponsoredAccount": SAMPLE_ACCOUNT_URN}
     server = Server(_sequence(_json(_sample("lead_form_responses_batch"))))
     async with _linkedin(server) as client:
-        batch = await client.get_lead_responses(ACCOUNT_URN, [SAMPLE_LEAD_ID, LEAD_A])
+        batch = await client.get_lead_responses(SAMPLE_ACCOUNT_URN, [SAMPLE_LEAD_ID, LEAD_A])
 
     [request] = server.requests
     params = _assert_contract_request(request, "lead_form_responses_batch")
     assert _query(request) == (
-        f"ids=List({SAMPLE_LEAD_ID},{LEAD_A})&owner={OWNER}&leadType=(leadType:SPONSORED)"
-        f"&fields={LEAD_FIELDS}"
+        f"ids=List({SAMPLE_LEAD_ID},{LEAD_A})&owner={SAMPLE_OWNER}"
+        f"&leadType=(leadType:SPONSORED)&fields={LEAD_FIELDS}"
     )
     assert '"' not in unquote(params["ids"])
     assert "%22" not in params["ids"]
     assert "X-RestLi-Method" not in request.headers
-    sample = _sample("lead_form_responses_batch")["results"][SAMPLE_LEAD_ID]
     assert dict(batch.found) == {SAMPLE_LEAD_ID: sample}
     assert batch.failed == frozenset({LEAD_A})
     assert batch.interrupted_by is None
@@ -2016,8 +2472,10 @@ async def test_get_lead_responses_chunks_ids_at_the_batch_size() -> None:
 
 @pytest.mark.anyio
 async def test_get_lead_responses_maps_results_statuses_and_errors() -> None:
-    """Keys are percent-decoded and unquoted; an error, a non-2xx status or absence fails an id."""
-    element = _lead(LEAD_A, EMAIL)
+    """Keys are percent-decoded and unquoted; an error, a non-2xx status or absence fails an id.
+
+    Each result carries its own plain id, as LinkedIn returns it, so only the envelope decides.
+    """
     requested = [
         "lead-ok",
         "lead-quoted",
@@ -2030,13 +2488,13 @@ async def test_get_lead_responses_maps_results_statuses_and_errors() -> None:
     ]
     body = {
         "results": {
-            "lead-ok": element,
-            '"lead-quoted"': element,
-            "lead%2Fslash": element,
-            "lead-top-error": element,
-            "lead-nested-error": element,
-            "lead-status-404": element,
-            "lead-status-200": element,
+            "lead-ok": _lead("lead-ok", EMAIL),
+            '"lead-quoted"': _lead("lead-quoted", EMAIL),
+            "lead%2Fslash": _lead("lead/slash", EMAIL),
+            "lead-top-error": _lead("lead-top-error", EMAIL),
+            "lead-nested-error": _lead("lead-nested-error", EMAIL),
+            "lead-status-404": _lead("lead-status-404", EMAIL),
+            "lead-status-200": _lead("lead-status-200", EMAIL),
             "statuses": {"lead-status-404": 404, "lead-status-200": 200},
             "errors": {"lead-nested-error": {"status": 404, "message": "Not found"}},
         },
@@ -2053,10 +2511,119 @@ async def test_get_lead_responses_maps_results_statuses_and_errors() -> None:
         "lead-status-404,lead-status-200,lead-absent)"
     )
     assert set(batch.found) == {"lead-ok", "lead-quoted", "lead/slash", "lead-status-200"}
-    assert all(found == element for found in batch.found.values())
+    assert all(found == _lead(lead_id, EMAIL) for lead_id, found in batch.found.items())
     assert batch.failed == frozenset(
         {"lead-top-error", "lead-nested-error", "lead-status-404", "lead-absent"}
     )
+
+
+# Marks an identity field the parametrised element omits.
+ABSENT = object()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("key", "value", "conforming"),
+    [
+        pytest.param("id", LEAD_B, True, id="id-of-another-response"),
+        pytest.param("id", f" {LEAD_A} ", True, id="id-padded"),
+        pytest.param("id", LEAD_A.upper(), True, id="id-other-case"),
+        pytest.param("id", ABSENT, False, id="id-missing"),
+        pytest.param("id", 990000001, False, id="id-not-a-string"),
+        pytest.param("owner", {"sponsoredAccount": OTHER_ACCOUNT_URN}, True, id="owner-other"),
+        pytest.param("owner", {"sponsoredAccount": ACCOUNT_ID}, True, id="owner-not-a-urn"),
+        pytest.param("owner", {"organization": OTHER_ORGANIZATION_URN}, True, id="owner-organic"),
+        pytest.param("owner", {}, True, id="owner-empty"),
+        pytest.param("owner", ABSENT, False, id="owner-missing"),
+        pytest.param("owner", ACCOUNT_URN, False, id="owner-not-an-object"),
+        pytest.param("testLead", True, True, id="test-lead"),
+        pytest.param("testLead", ABSENT, False, id="test-lead-missing"),
+        pytest.param("testLead", "false", False, id="test-lead-string"),
+        pytest.param("testLead", 0, False, id="test-lead-zero"),
+        pytest.param("leadType", "COMPANY", True, id="lead-type-company"),
+        pytest.param("leadType", "sponsored", True, id="lead-type-lowercase"),
+        pytest.param("leadType", ABSENT, False, id="lead-type-missing"),
+    ],
+)
+async def test_get_lead_responses_fails_an_element_not_bound_to_its_request(
+    key: str, value: object, conforming: bool, captured: list[EventDict]
+) -> None:
+    """An element is found only by its own id, sponsored owner, lead type and testLead false.
+
+    The element under the requested key stays decodable, so only the identity check keeps its
+    email from being matched to the requested lead: the id is failed, as an unretrievable
+    response, and the outcome event counts the rejection without any id or email. Elements
+    missing a required field or holding a mistyped one break the contract on purpose.
+    """
+    element = _lead(LEAD_A, EMAIL)
+    if value is ABSENT:
+        del element[key]
+    else:
+        element[key] = value
+    assert decode_email(element, {}).email == EMAIL
+    body = {"results": {LEAD_A: element}, "statuses": {}, "errors": {}}
+    schema = _contract("lead_form_responses_batch")["response"]["body"]
+    errors = _schema_errors(body, schema, "lead_form_responses_batch")
+    assert (errors == []) is conforming, errors
+    server = Server(_sequence(_json(body)))
+    async with _linkedin(server) as client:
+        batch = await client.get_lead_responses(ACCOUNT_ID, [LEAD_A])
+
+    assert dict(batch.found) == {}
+    assert batch.failed == frozenset({LEAD_A})
+    assert batch.interrupted_by is None
+    assert batch.calls == 1
+    assert "@" not in repr(batch)
+    [outcome] = _events(captured, "linkedin.listing")
+    assert (outcome["rows"], outcome["failed"], outcome["identity_rejected"]) == (0, 1, 1)
+    assert outcome["complete"] is True
+    assert "@" not in repr(outcome)
+    assert LEAD_A not in repr(outcome)
+
+
+@pytest.mark.anyio
+async def test_get_lead_responses_never_binds_another_response_to_the_requested_id(
+    captured: list[EventDict],
+) -> None:
+    """A result keyed A holding B's response fails A; the correct results are still found.
+
+    Decoding B's email for lead A would match A to B's CRM contact, so A ends as a failed
+    re-fetch however well-formed B's response is. In the same batch B and C are found and
+    decode to their own emails, a test lead is failed, and an absent id is failed without
+    counting as an identity rejection.
+    """
+    body = {
+        "results": {
+            LEAD_A: _lead(LEAD_B, OTHER_EMAIL),
+            LEAD_B: _lead(LEAD_B, OTHER_EMAIL),
+            LEAD_C: _lead(LEAD_C, THIRD_EMAIL),
+            TEST_LEAD: _lead(TEST_LEAD, TEST_LEAD_EMAIL, test_lead=True),
+        },
+        "statuses": {},
+        "errors": {},
+    }
+    _conforming("lead_form_responses_batch", body)
+    server = Server(_sequence(_json(body)))
+    async with _linkedin(server) as client:
+        batch = await client.get_lead_responses(
+            ACCOUNT_ID, [LEAD_A, LEAD_B, LEAD_C, TEST_LEAD, "lead-absent"]
+        )
+
+    assert set(batch.found) == {LEAD_B, LEAD_C}
+    assert batch.failed == frozenset({LEAD_A, TEST_LEAD, "lead-absent"})
+    decoded_b = decode_email(batch.found[LEAD_B], {})
+    decoded_c = decode_email(batch.found[LEAD_C], {})
+    assert (decoded_b.status, decoded_b.email) == ("ok", OTHER_EMAIL)
+    assert (decoded_c.status, decoded_c.email, decoded_c.sha256) == (
+        "ok",
+        THIRD_EMAIL,
+        _sha256(THIRD_EMAIL),
+    )
+    assert "@" not in repr(batch)
+    [outcome] = _events(captured, "linkedin.listing")
+    assert (outcome["rows"], outcome["failed"], outcome["identity_rejected"]) == (2, 3, 2)
+    assert "@" not in repr(outcome)
+    assert all(lead_id not in repr(outcome) for lead_id in (LEAD_A, LEAD_B, LEAD_C, TEST_LEAD))
 
 
 @pytest.mark.anyio
@@ -2084,6 +2651,7 @@ async def test_get_lead_responses_transient_failure_fails_every_unread_id(
     [outcome] = _events(captured, "linkedin.listing")
     assert outcome["complete"] is False
     assert outcome["failed"] == 150
+    assert outcome["identity_rejected"] == 0
     assert outcome["reason"] == batch.interrupted_by.reason
 
 

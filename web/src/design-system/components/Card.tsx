@@ -65,10 +65,15 @@ export interface CardHeaderProps {
   headingLevel?: 3 | 4;
   /**
    * The card's rank within its group, shown ahead of the headline. Assistive technology reads
-   * it as "Rank {rank}". Omitted, no rank is rendered.
+   * it as "Rank {rank}". Omitted (or `null`, a boolean or an empty string), no rank is rendered,
+   * so no "Rank" prefix is announced without a value; any other value, including `0`, renders
+   * and reads as "Rank 0".
    */
   rank?: ReactNode;
-  /** The entity line: the entity name and its source. Omitted, no entity line is rendered. */
+  /**
+   * The entity line: the entity name and its source. Omitted (or `null`, a boolean or an empty
+   * string), no entity line is rendered; any other value, including `0`, renders it.
+   */
   meta?: ReactNode;
 }
 
@@ -99,6 +104,22 @@ export interface CardFooterProps {
  * labelled by its headline through `aria-labelledby`. `null` outside a `Card`.
  */
 const CardTitleIdContext = createContext<string | null>(null);
+
+/**
+ * Whether a slot value renders anything.
+ *
+ * React renders nothing for `undefined`, `null`, booleans and the empty string, so a
+ * conditional slot such as `rank={ranked && position}` must not leave an empty container
+ * behind: `Card.css` spaces the header parts with a flex gap, so an empty container would still
+ * indent the headline, and an empty rank would still announce its visually hidden "Rank "
+ * prefix with no value. Any other value, including `0`, renders and counts.
+ *
+ * @param node - the `rank` or `meta` value
+ * @returns `true` when the slot has content to render
+ */
+function hasContent(node: ReactNode): boolean {
+  return node !== undefined && node !== null && typeof node !== 'boolean' && node !== '';
+}
 
 /**
  * The card surface: an `<article>` labelled by the heading its `Card.Header` renders.
@@ -137,7 +158,7 @@ function CardHeader({ title, headingLevel = 3, rank, meta }: CardHeaderProps) {
 
   return (
     <div className="ds-card__header">
-      {rank !== undefined && (
+      {hasContent(rank) && (
         <span className="ds-card__rank">
           <span className="ds-visually-hidden">Rank </span>
           {rank}
@@ -146,7 +167,7 @@ function CardHeader({ title, headingLevel = 3, rank, meta }: CardHeaderProps) {
       <Heading id={headingId} className="ds-card__title">
         {title}
       </Heading>
-      {meta !== undefined && <div className="ds-card__meta">{meta}</div>}
+      {hasContent(meta) && <div className="ds-card__meta">{meta}</div>}
     </div>
   );
 }

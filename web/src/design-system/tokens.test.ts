@@ -57,6 +57,9 @@ const TOKEN_NAMES = [
   '--z-banner',
   '--z-dialog',
   '--z-tooltip',
+  '--opacity-disabled',
+  '--opacity-backdrop',
+  '--size-full',
 ] as const;
 
 const REDUCED_MOTION_PRELUDE = /^@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)$/;

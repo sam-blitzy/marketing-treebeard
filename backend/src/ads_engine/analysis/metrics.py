@@ -192,6 +192,7 @@ __all__ = [
     "load_context",
     "member_poor_efficiency",
     "membership_value",
+    "native_day_zone",
     "outcome",
     "shared_budget_history",
     "source_totals",
@@ -1563,6 +1564,7 @@ async def _load_crm(
     google_contacts: bool,
     freshness: Mapping[tuple[int, str], Freshness],
     google_timezone: str | None,
+    member_day_timezone: str | None,
 ) -> CrmData:
     """Load everything a context reads from one HubSpot dataset (AAP 0.3.3, 0.5.4.7).
 
@@ -1570,7 +1572,12 @@ async def _load_crm(
       and the dataset's bindings verify the Google link, the Google-touch contacts:
       ``google_campaign_ref`` set and ``google_touch_at`` within the window's Google-native
       instants (:func:`_google_window_instants`: ``[start 00:00, end + 1 day 00:00)`` at the
-      window's Google boundary, else ``google_timezone``, else UTC; AAP 0.5.4.1 native days).
+      window's Google boundary, else the fallback zone, else UTC; AAP 0.5.4.1 native days).
+      Two readers judge these contacts and each needs its own native window loaded: the
+      per-campaign Google veto falls back to ``google_timezone`` (the first Google account's
+      zone) and the shared-budget veto to ``member_day_timezone`` (the first Google account
+      with a zone, as :func:`native_day_zone` dates member days). Discovery covers the union
+      of both windows, which coincide whenever those zones agree.
       Bindings never verified, undecodable or with the link unavailable discover none, so
       Google refs stored under a link that is no longer verified never enter the load;
     * contact-to-meeting and contact-to-deal associations and fetch outcomes of those
@@ -1605,7 +1612,9 @@ async def _load_crm(
             contacts[info.hs_id] = info
     discovered: list[ContactInfo] = []
     if google_contacts and bindings.google.available:
-        touch_lower, touch_upper = _google_window_instants(scope, google_timezone)
+        veto_lower, veto_upper = _google_window_instants(scope, google_timezone)
+        member_lower, member_upper = _google_window_instants(scope, member_day_timezone)
+        touch_lower, touch_upper = min(veto_lower, member_lower), max(veto_upper, member_upper)
         result = await session.execute(
             sa.select(*_contact_columns())
             .where(
@@ -2064,8 +2073,18 @@ async def load_context(
     observations.update(await _load_keyword_observations(scope, google_timezone))
     latest_observations = await _load_latest_observations(scope)
 
-    # 6. Leads; 7. CRM data.
+    # 6. Leads; 7. CRM data. Google-touch discovery also covers the native days in the zone
+    # native_day_zone falls back to (the first Google account with a zone), the zone budget
+    # histories date shared-budget member days in.
     leads = await _load_leads(scope)
+    member_day_timezone = next(
+        (
+            acct.timezone
+            for acct in entities.accounts.values()
+            if acct.source == "google" and acct.timezone
+        ),
+        None,
+    )
     linkedin_crm: CrmData | None = None
     google_crm: CrmData | None = None
     if scope.linkedin_crm_id is not None and scope.linkedin_crm_id == scope.google_crm_id:
@@ -2076,6 +2095,7 @@ async def load_context(
             google_contacts=True,
             freshness=freshness,
             google_timezone=google_timezone,
+            member_day_timezone=member_day_timezone,
         )
         linkedin_crm = google_crm = shared
     else:
@@ -2087,6 +2107,7 @@ async def load_context(
                 google_contacts=False,
                 freshness=freshness,
                 google_timezone=google_timezone,
+                member_day_timezone=member_day_timezone,
             )
         if scope.google_crm_id is not None:
             google_crm = await _load_crm(
@@ -2096,6 +2117,7 @@ async def load_context(
                 google_contacts=True,
                 freshness=freshness,
                 google_timezone=google_timezone,
+                member_day_timezone=member_day_timezone,
             )
 
     # 8. Discrepancies; 9. decisions; 10. feedback; 11. segment windows.
@@ -2975,6 +2997,17 @@ def _source_tz(ctx: AnalysisContext, source: Source) -> str:
             if account.source == "google" and account.timezone:
                 return account.timezone
     return UTC_BOUNDARY
+
+
+def native_day_zone(ctx: AnalysisContext, source: Source) -> str:
+    """Return the IANA zone of ``source``'s native days, as budget histories classify them.
+
+    AAP 0.5.4.1 native-day policy: Google days are in the account's ``customer.time_zone``,
+    LinkedIn days in UTC. The zone is the window's boundary for the source, else the first
+    Google account's zone, else UTC; :func:`shared_budget_history` dates member days in it, so
+    a reader that relates instants to those member days must use this same zone.
+    """
+    return _source_tz(ctx, source)
 
 
 def _facts_by_date(ctx: AnalysisContext, campaign_id: int) -> Mapping[date, DayFact]:
