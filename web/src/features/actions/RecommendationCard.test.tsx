@@ -14,8 +14,15 @@
  *   "Dismiss" and "Snooze for 7 days" on all but C0, whose resolver renders instead. Each
  *   feedback posts once to `POST /recommendations/{id}/feedback` with the CSRF header.
  * - **Failures and locks**: a 409 `subject_retired` shows "Computed from replaced data" and locks
- *   every action; any other failure shows the API's message; a historical item shows the badge
- *   and its frozen provenance with every action disabled, the C0 resolver too.
+ *   every action, whether a feedback or the decision form received it, also once the dialog has
+ *   closed and when it was closed while the save ran; any other failure shows the API's
+ *   message; a historical item shows the badge and its frozen provenance with every action
+ *   disabled, the C0 resolver too.
+ * - **Outcomes and focus**: inside an `ActionOutcomeProvider`, a recorded feedback or decision is
+ *   announced in the provider's polite region, which outlives the card a refetch removes, and
+ *   focus moves to the next card's first enabled action, else the previous card's, else the
+ *   section heading, unless the user has moved it elsewhere. A decision saved after its dialog
+ *   was closed and reopened is reported too, and leaves the reopened dialog open with its edits.
  * - **Holds**: a held item states why and links the Campaigns discrepancy group.
  *
  * The network is stubbed below the real API client by `../../test/mockApi`, which fails a test
@@ -25,12 +32,13 @@
  */
 import { apiError, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { useRecommendations } from '../../api/queries';
 import type { DataStatus, Decision, FeedbackKind, Item, ProvenanceEntry } from '../../api/types';
-import { Button } from '../../design-system';
+import { Button, PageShell, Stack } from '../../design-system';
 import { formatWindowChip } from '../../lib/format';
 import {
   FIXTURE_BUDGET_IDS,
@@ -48,6 +56,7 @@ import {
   makeRecommendationsPage,
 } from '../../test/fixtures';
 import {
+  ActionOutcomeProvider,
   BLOCKING_DISCREPANCY_LINK_LABEL,
   DECISION_RECORDED_MESSAGE,
   FEEDBACK_LABELS,
@@ -57,6 +66,7 @@ import {
   RecommendationActions,
   RecommendationCard,
   historicalProvenanceText,
+  useActionOutcome,
 } from './RecommendationCard';
 
 // ---------------------------------------------------------------------------------------------
@@ -802,6 +812,507 @@ describe('RecommendationCard: record decision', () => {
     expect(
       within(dialog).getByText('Applies to the shared budget used by: Search Partners — US'),
     ).toBeDefined();
+  });
+
+  it('locks every action on a 409 subject_retired from the form, after the dialog closes', async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+    });
+    const item = c1Item();
+    await renderCard(<RecommendationCard item={item} />);
+
+    const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+    opener.focus();
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    // The form shows the refusal itself, and the card leaves focus to it while the dialog is
+    // open.
+    expect(await within(dialog).findByText(HISTORICAL_LABEL)).toBeDefined();
+    await waitFor(() => {
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // The lock is the card's own now: the same message, focused, and every action disabled.
+    const message = within(cardOf(item)).getByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    expect(document.activeElement?.getAttribute('tabindex')).toBe('-1');
+    expect(buttonNames(item)).toEqual([RECORD_DECISION_LABEL, 'Dismiss', 'Snooze for 7 days']);
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', true);
+      fireEvent.click(button);
+    }
+    // Reopening, which would start a fresh, unlocked form, is impossible.
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts(api)).toHaveLength(1);
+    expect(within(cardOf(item)).queryByRole('alert')).toBeNull();
+  });
+
+  it('still locks the card when the 409 arrives after the dialog was closed mid-save', async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending decision response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
+    });
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': () => pending,
+    });
+    const item = c1Item();
+    await renderCard(<RecommendationCard item={item} />);
+
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    // Closing the dialog unmounts the form while its request runs.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(
+      within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }),
+    ).toHaveProperty('disabled', false);
+
+    release(apiError(409, 'subject_retired', 'The dataset is no longer active.'));
+
+    const message = await within(cardOf(item)).findByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', true);
+    }
+  });
+
+  it('announces a recorded decision in the provider region, outside the card', async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': json(
+        201,
+        genericCrmDecision({
+          id: 811,
+          origin: 'user',
+          status: 'paused',
+          patch: { status: 'paused' },
+        }),
+      ),
+    });
+    const item = c1Item();
+    await renderCard(
+      <ActionOutcomeProvider>
+        <RecommendationCard item={item} />
+      </ActionOutcomeProvider>,
+    );
+
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    const line = await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE);
+    // Inside a provider the card's own line is visible but no second live region.
+    expect(line.getAttribute('role')).toBeNull();
+    expect(outcomeRegion().textContent).toBe(
+      `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
+    );
+  });
+
+  it('keeps a reopened dialog and its edits when an earlier save ends late, and reports it', async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending decision response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
+    });
+    const saved = genericCrmDecision({
+      id: 811,
+      origin: 'user',
+      status: 'paused',
+      patch: { status: 'paused' },
+    });
+    let saves = 0;
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      // The first save waits for the test; any later one is answered at once.
+      'POST /decisions': () => {
+        saves += 1;
+        return saves === 1 ? pending : json(201, saved);
+      },
+    });
+    const item = c1Item();
+    await renderCard(
+      <ActionOutcomeProvider>
+        <RecommendationCard item={item} />
+      </ActionOutcomeProvider>,
+    );
+
+    const first = await openDecisionDialog(item);
+    fireEvent.click(within(first).getByRole('button', { name: 'Save decision' }));
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    // Closing the dialog unmounts the form while its request runs; reopening starts a new one.
+    fireEvent.click(within(first).getByRole('button', { name: 'Close' }));
+    const second = await openDecisionDialog(item);
+    const noteText = 'Pause until the CRM sync is fixed';
+    fireEvent.change(within(second).getByRole('textbox', { name: 'Note' }), {
+      target: { value: noteText },
+    });
+
+    release(json(201, saved));
+
+    // The first save is reported on the card and in the provider's region...
+    expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(outcomeRegion().textContent).toBe(
+      `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
+    );
+    // ...and the reopened dialog stays open with the edit it was given.
+    expect(screen.getByRole('dialog', { name: RECORD_DECISION_LABEL })).toBe(second);
+    expect(within(second).getByRole('textbox', { name: 'Note' })).toHaveProperty(
+      'value',
+      noteText,
+    );
+
+    // The reopened dialog's own save still closes it.
+    fireEvent.click(within(second).getByRole('button', { name: 'Save decision' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(posts(api)).toHaveLength(2);
+    expect(posts(api)[1]?.body).toEqual({
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm },
+      patch: { status: 'paused' },
+      recommendation_id: FIXTURE_ITEM_IDS.c1,
+      note: noteText,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Outcome announcements and focus recovery
+// ---------------------------------------------------------------------------------------------
+
+/** The keyword cards of the default fixture page, in page order: block, expand, review. */
+const KEYWORD_IDS = [FIXTURE_ITEM_IDS.k1, FIXTURE_ITEM_IDS.k2, FIXTURE_ITEM_IDS.k3] as const;
+
+/**
+ * The polite region of the `ActionOutcomeProvider`: the one `role="status"` element outside
+ * every card.
+ */
+function outcomeRegion(): HTMLElement {
+  const regions = screen
+    .getAllByRole('status')
+    .filter((region) => region.closest('article') === null);
+  expect(regions).toHaveLength(1);
+  const [region] = regions;
+  if (region === undefined) {
+    throw new Error('no outcome region outside the cards');
+  }
+  return region;
+}
+
+/** The confirmation the provider announces for `kind` on `item`. */
+function feedbackOutcome(kind: FeedbackKind, item: Item): string {
+  const name = item.entity.name;
+  expect(name).not.toBeNull();
+  return `${FEEDBACK_STATUS_MESSAGES[kind]}: ${item.action} (${String(name)})`;
+}
+
+/**
+ * Serves the default fixture page so that, as the API's overlay does, every feedback the stub
+ * has accepted hides its item from the next read (`current.hidden_by`).
+ *
+ * @param respond - answers each feedback post; a 201 with the posted kind when omitted
+ */
+function serveLiveOverlay(respond?: () => Promise<MockResponse>): void {
+  const hidden = new Map<number, FeedbackKind>();
+  api.use({
+    'GET /recommendations': () => {
+      const page = makeRecommendationsPage();
+      for (const [id, kind] of hidden) {
+        findPageItem(page, id).current.hidden_by = kind;
+      }
+      return json(200, page);
+    },
+    'POST /recommendations/:id/feedback': async (call) => {
+      const id = Number(call.params.id);
+      const { kind } = call.body as { kind: FeedbackKind };
+      const response =
+        respond === undefined
+          ? json(201, makeFeedback(kind, { recommendation_id: id }))
+          : await respond();
+      if (response.status === 201) {
+        hidden.set(id, kind);
+      }
+      return response;
+    },
+  });
+}
+
+/**
+ * The cards of `ids` from the live recommendations query, in order, less those the overlay
+ * hides, as a section drops them: inside one `PageShell.Section` (an `<h2>`) and an
+ * `ActionOutcomeProvider`, after an "Elsewhere" button outside both.
+ */
+function LiveCards({ ids }: { ids: readonly number[] }) {
+  const { data } = useRecommendations();
+  const items =
+    data === undefined
+      ? []
+      : ids
+          .map((id) => findPageItem(data, id))
+          .filter((item) => item.current.hidden_by === null);
+  return (
+    <Stack>
+      <Button>Elsewhere</Button>
+      <ActionOutcomeProvider>
+        <PageShell.Section id="section-keywords" title="Keywords to adjust">
+          <Stack>
+            {items.map((item) => (
+              <RecommendationCard key={item.id} item={item} />
+            ))}
+          </Stack>
+        </PageShell.Section>
+      </ActionOutcomeProvider>
+    </Stack>
+  );
+}
+
+/**
+ * {@link LiveCards} with the cards in a group: a `PageShell.Section` (an `<h3>`) inside the
+ * `<h2>` section, rendered only while it has a card, as a section drops an emptied group.
+ */
+function LiveGroup({ ids }: { ids: readonly number[] }) {
+  const { data } = useRecommendations();
+  const items =
+    data === undefined
+      ? []
+      : ids
+          .map((id) => findPageItem(data, id))
+          .filter((item) => item.current.hidden_by === null);
+  return (
+    <ActionOutcomeProvider>
+      <PageShell.Section id="section-keywords" title="Keywords to adjust">
+        {items.length === 0 ? null : (
+          <PageShell.Section id="group-keywords-block" title="Block" headingLevel={3}>
+            {items.map((item) => (
+              <RecommendationCard key={item.id} item={item} headingLevel={4} />
+            ))}
+          </PageShell.Section>
+        )}
+      </PageShell.Section>
+    </ActionOutcomeProvider>
+  );
+}
+
+/** Renders {@link LiveCards} and waits for its cards. */
+async function renderLiveCards(ids: readonly number[]): Promise<Item[]> {
+  const page = makeRecommendationsPage();
+  const items = ids.map((id) => findPageItem(page, id));
+  await renderCard(<LiveCards ids={ids} />);
+  await screen.findByRole('article', { name: items[0]?.action ?? '' });
+  return items;
+}
+
+/** Presses a card's action as a keyboard user does: focus first, then activate. */
+function press(item: Item, label: string): void {
+  const button = within(cardOf(item)).getByRole('button', { name: label });
+  button.focus();
+  fireEvent.click(button);
+}
+
+describe('RecommendationActions: outcome announcement and focus after feedback', () => {
+  it('starts with an empty provider region before the cards', async () => {
+    serveLiveOverlay();
+    const [first] = await renderLiveCards(KEYWORD_IDS);
+    if (first === undefined) {
+      throw new Error('no card');
+    }
+
+    const region = outcomeRegion();
+    expect(region.textContent).toBe('');
+    expect(region.childNodes).toHaveLength(0);
+    expect(region.compareDocumentPosition(cardOf(first))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    // Inside the provider no card renders a live region of its own.
+    expect(within(cardOf(first)).queryByRole('status')).toBeNull();
+  });
+
+  it.each(FEEDBACK_KINDS)(
+    'announces "%s" outside the removed card and focuses the next card',
+    async (kind) => {
+      serveLiveOverlay();
+      const [first, second] = await renderLiveCards(KEYWORD_IDS);
+      if (first === undefined || second === undefined) {
+        throw new Error('missing cards');
+      }
+
+      press(first, FEEDBACK_LABELS[kind]);
+
+      // The refetch carries hidden_by, so the card leaves the page; its confirmation does not.
+      await waitFor(() => {
+        expect(screen.queryByRole('article', { name: first.action })).toBeNull();
+      });
+      expect(outcomeRegion().textContent).toBe(feedbackOutcome(kind, first));
+      expect(outcomeRegion().closest('section')).toBeNull();
+      const next = within(cardOf(second)).getByRole('button', { name: FEEDBACK_LABELS.done });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(next);
+      });
+    },
+  );
+
+  it('focuses the previous card after the last one leaves, then the one before it', async () => {
+    serveLiveOverlay();
+    const [first, second, third] = await renderLiveCards(KEYWORD_IDS);
+    if (first === undefined || second === undefined || third === undefined) {
+      throw new Error('missing cards');
+    }
+
+    press(third, FEEDBACK_LABELS.snooze);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('article', { name: third.action })).toBeNull();
+    });
+    const previous = within(cardOf(second)).getByRole('button', { name: FEEDBACK_LABELS.done });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(previous);
+    });
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('snooze', third));
+
+    press(second, FEEDBACK_LABELS.dismiss);
+
+    // The removed third card is skipped; the nearest card still on the page takes focus.
+    const remaining = within(cardOf(first)).getByRole('button', { name: FEEDBACK_LABELS.done });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(remaining);
+    });
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', second));
+  });
+
+  it('announces a repeated message as a new node, so it is read again', async () => {
+    /** Announces one fixed text through the nearest provider. */
+    function Announcer() {
+      const announce = useActionOutcome();
+      return (
+        <Button
+          onClick={() => {
+            announce?.('Dismissed: Pause (Generic CRM — US)');
+          }}
+        >
+          Announce
+        </Button>
+      );
+    }
+    await renderCard(
+      <ActionOutcomeProvider>
+        <Announcer />
+      </ActionOutcomeProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Announce' }));
+    const first = outcomeRegion().firstChild;
+    expect(outcomeRegion().textContent).toBe('Dismissed: Pause (Generic CRM — US)');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Announce' }));
+    expect(outcomeRegion().textContent).toBe('Dismissed: Pause (Generic CRM — US)');
+    expect(outcomeRegion().childNodes).toHaveLength(1);
+    expect(outcomeRegion().firstChild).not.toBe(first);
+    // An outcome is polite, never an alert (AAP 0.5.5 reserves alert for discrepancies).
+    expect(screen.queryAllByRole('alert')).toEqual([]);
+  });
+
+  it('focuses the section heading when the only card leaves', async () => {
+    serveLiveOverlay();
+    const [only] = await renderLiveCards([FIXTURE_ITEM_IDS.k1]);
+    if (only === undefined) {
+      throw new Error('missing card');
+    }
+
+    press(only, FEEDBACK_LABELS.done);
+
+    const heading = screen.getByRole('heading', { level: 2, name: 'Keywords to adjust' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+    expect(heading.getAttribute('tabindex')).toBe('-1');
+    expect(screen.queryByRole('article')).toBeNull();
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('done', only));
+  });
+
+  it('waits for the refetched page: an emptied group leaves, so its section heading takes focus', async () => {
+    serveLiveOverlay();
+    const only = pageItem(FIXTURE_ITEM_IDS.k1);
+    await renderCard(<LiveGroup ids={[only.id]} />);
+    await screen.findByRole('article', { name: only.action });
+
+    press(only, FEEDBACK_LABELS.dismiss);
+
+    // The group's <h3> leaves the page with its last card, so the enclosing <h2> takes focus.
+    const heading = screen.getByRole('heading', { level: 2, name: 'Keywords to adjust' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+    expect(screen.queryByRole('heading', { level: 3 })).toBeNull();
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', only));
+  });
+
+  it('leaves focus where the user moved it while the feedback was pending', async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending feedback response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
+    });
+    serveLiveOverlay(() => pending);
+    const [first] = await renderLiveCards(KEYWORD_IDS);
+    if (first === undefined) {
+      throw new Error('missing card');
+    }
+
+    press(first, FEEDBACK_LABELS.dismiss);
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+    release(json(201, makeFeedback('dismiss', { recommendation_id: first.id })));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('article', { name: first.action })).toBeNull();
+    });
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', first));
+    // Let the recovery timer run: it finds focus moved away from the card and leaves it.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it('keeps the recorded card locked with its status line while it stays on the page', async () => {
+    api.use({ 'POST /recommendations/:id/feedback': json(201, makeFeedback('dismiss')) });
+    const item = pageItem(FIXTURE_ITEM_IDS.k1);
+    await renderCard(
+      <ActionOutcomeProvider>
+        <RecommendationCard item={item} />
+      </ActionOutcomeProvider>,
+    );
+
+    press(item, FEEDBACK_LABELS.dismiss);
+
+    const line = await within(cardOf(item)).findByText(FEEDBACK_STATUS_MESSAGES.dismiss);
+    expect(line.getAttribute('role')).toBeNull();
+    expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', item));
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', true);
+    }
   });
 });
 

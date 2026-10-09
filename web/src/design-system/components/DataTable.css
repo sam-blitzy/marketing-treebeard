@@ -9,10 +9,12 @@
  *       thead > tr > th.ds-datatable__header + .ds-datatable__cell--start | --end
  *       tbody > tr > td | th[scope=row].ds-datatable__cell + .ds-datatable__cell--start | --end
  *       tbody > tr.ds-datatable__detail-row[hidden] > td.ds-datatable__detail-cell
+ *         > div.ds-datatable__detail-content                    only while the row is expanded
  *       tbody > tr > td.ds-datatable__empty                     when there are no rows
  *
  * The expand column's header and data cells also carry .ds-datatable__toggle-cell. When the
- * table is expandable, every data row is followed by its detail row, hidden while collapsed.
+ * table is expandable, its region also carries .ds-datatable__region--expandable, and every
+ * data row is followed by its detail row, hidden while collapsed.
  *
  * The region scrolls a table wider than its container on the inline axis, so the page itself
  * never scrolls sideways at a 320 CSS px viewport (WCAG 2.2 SC 1.4.10 Reflow). It is focusable
@@ -30,6 +32,17 @@
   border: calc(var(--space-1) / 4) solid var(--color-border);
   border-radius: var(--radius-md);
   background: var(--color-surface);
+}
+
+/*
+ * An expandable table's region is an inline-size query container, so its detail content (below)
+ * can be sized from the region's visible inline size rather than from the table's. Only this
+ * modifier carries it: inline-size containment sizes the region as if it had no content, which
+ * leaves a region that fills its container's inline size unchanged, but would collapse one in a
+ * shrink-to-fit context, such as an inline-block or a flex item that is not stretched.
+ */
+.ds-datatable__region--expandable {
+  container-type: inline-size;
 }
 
 /* Restates the base :focus-visible ring from ../tokens.css so the region keeps it on rebinding. */
@@ -125,6 +138,22 @@ th.ds-datatable__cell {
   padding: var(--space-3);
   border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
   background: var(--color-bg);
+}
+
+/*
+ * The expanded content. The detail cell spans every column, so it is as wide as the table, which
+ * can be far wider than the region's visible area: content laid out at the cell's width would
+ * put its far end, such as a nested table's end-aligned columns, out of view at every scroll
+ * position. The wrapper is therefore at most the region's visible inline size (the query
+ * container from .ds-datatable__region--expandable) less the cell's inline padding on both
+ * sides, which also stops it from widening the table. It sticks at the cell's padding from the
+ * region's inline start, so it stays wholly in view while the row's columns scroll sideways
+ * beneath it. A nested table wider than the wrapper scrolls in its own region.
+ */
+.ds-datatable__detail-content {
+  position: sticky;
+  inset-inline-start: var(--space-3);
+  max-inline-size: calc(var(--size-container-full) - 2 * var(--space-3));
 }
 
 /* Explicit, so no display rule on table rows can bring back a collapsed detail row. */

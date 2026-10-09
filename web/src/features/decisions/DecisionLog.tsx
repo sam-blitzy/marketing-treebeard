@@ -173,7 +173,10 @@ interface SubjectGroup {
   decisions: Decision[];
 }
 
-/** The subject the "Record decision" dialog is open for. */
+/**
+ * The subject the "Record decision" dialog is open for. Each opening builds a new one, because
+ * its identity tells a save that ends late which opening it was made in.
+ */
 interface DialogTarget {
   /** The subject, as `DecisionForm` posts it. */
   subject: SubjectIn;
@@ -604,7 +607,14 @@ export function DecisionLog() {
             <DecisionForm
               subject={dialogTarget.subject}
               currency={dialogTarget.currency}
-              onDone={closeDialog}
+              onDone={() => {
+                // DecisionForm reports a save even after its dialog was closed mid-request, so
+                // only the dialog of the target that saved closes. Every opening builds a fresh
+                // target, so a dialog opened in the meantime, for another subject or reopened
+                // for this one, keeps its edits.
+                const savedTarget = dialogTarget;
+                setDialogTarget((current) => (current === savedTarget ? null : current));
+              }}
               onCancel={closeDialog}
             />
           </Stack>

@@ -10,7 +10,10 @@
  *    with "Back to default");
  * 4. the {@link GlobalBanners}, in their fixed order, open discrepancies first;
  * 5. the {@link SectionNav}: anchor links with item counts for the five sections;
- * 6. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
+ * 6. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
+ *    card confirms an outcome there, such as "Dismissed: Pause (Generic CRM — US)": it outlives
+ *    the card a recorded feedback removes;
+ * 7. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
  *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
  *
@@ -65,6 +68,7 @@ import { Button, EmptyState, PageShell, Spinner, Stack } from '../../design-syst
 import { CustomRunBanner } from '../status/CustomRunBanner';
 import { GlobalBanners } from '../status/GlobalBanners';
 import { StatusBar } from '../status/StatusBar';
+import { ActionOutcomeProvider } from './RecommendationCard';
 import { SectionNav } from './SectionNav';
 import { BudgetSection } from './sections/BudgetSection';
 import { CampaignsSection } from './sections/CampaignsSection';
@@ -299,7 +303,9 @@ interface ActionsContentProps {
 /**
  * The loaded page: status bar, custom-window banner (custom runs only), global banners, section
  * navigation and the five sections in {@link SECTION_ORDER}, each with the run and overlay of the
- * same response, so every part describes one moment.
+ * same response, so every part describes one moment. The sections sit inside one
+ * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
+ * section, announces each card's outcome even after the card has left the page.
  */
 function ActionsContent({ page }: ActionsContentProps): ReactElement {
   const { run, overlay, banners, sections } = page;
@@ -311,15 +317,17 @@ function ActionsContent({ page }: ActionsContentProps): ReactElement {
       {run.kind === 'custom' && <CustomRunBanner run={run} />}
       <GlobalBanners banners={banners} overlay={overlay} />
       <SectionNav sections={sections} />
-      {SECTION_ORDER.map((key) => {
-        const section = sectionsByKey.get(key);
-        // The API always returns all five sections; a key it left out is skipped, never stubbed.
-        if (section === undefined) {
-          return null;
-        }
-        const SectionComponent = SECTION_COMPONENTS[key];
-        return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
-      })}
+      <ActionOutcomeProvider>
+        {SECTION_ORDER.map((key) => {
+          const section = sectionsByKey.get(key);
+          // The API always returns all five sections; a key it left out is skipped, never stubbed.
+          if (section === undefined) {
+            return null;
+          }
+          const SectionComponent = SECTION_COMPONENTS[key];
+          return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
+        })}
+      </ActionOutcomeProvider>
     </ActionsFrame>
   );
 }

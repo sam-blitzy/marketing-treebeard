@@ -60,6 +60,7 @@ const TOKEN_NAMES = [
   '--opacity-disabled',
   '--opacity-backdrop',
   '--size-full',
+  '--size-container-full',
 ] as const;
 
 const REDUCED_MOTION_PRELUDE = /^@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)$/;

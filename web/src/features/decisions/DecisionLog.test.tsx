@@ -14,7 +14,9 @@
  *   rendered by decision shape, tombstones included;
  * - the loading, failed, empty and row-limit states, and a failed refetch that keeps the log;
  * - "Record decision", which opens one page-level dialog hosting `DecisionForm` for that subject
- *   in its currency, closes on save or cancel, and lets the refetched log show the new row first.
+ *   in its currency, closes on save or cancel, and lets the refetched log show the new row first;
+ *   a save that ends after its dialog closed leaves a dialog opened since, for another subject
+ *   or the same one, open with its edits.
  *
  * `../../test/mockApi` is imported first so its `afterEach` check runs after Testing Library's
  * cleanup (Vitest skips later hooks once one throws).
@@ -742,5 +744,140 @@ describe('DecisionLog "Record decision"', () => {
       `subject_type=campaign&subject_id=${String(FIXTURE_CAMPAIGN_IDS.pipelineEmea)}`,
       `subject_type=budget&subject_id=${String(FIXTURE_BUDGET_IDS.search)}`,
     ]);
+  });
+
+  it("keeps another subject's dialog open when a save ends after its own dialog closed", async () => {
+    const emea = makeDecision('own_budget', {
+      subject: subject({
+        id: FIXTURE_CAMPAIGN_IDS.pipelineEmea,
+        name: 'Lead Gen — Pipeline Report EMEA',
+        source: 'linkedin',
+        currency: 'EUR',
+      }),
+      daily_budget: '100.00',
+    });
+    const shared = makeDecision('budget');
+    const save = deferred<MockResponse>();
+    const api = mockApi({
+      ...logHandlers([emea, shared]),
+      [formKey('campaign', emea.subject.id)]: json(200, [emea]),
+      [formKey('budget', shared.subject.id)]: json(200, [shared]),
+      'POST /decisions': () => save.promise,
+    });
+
+    await renderLog();
+    await findTable('Lead Gen — Pipeline Report EMEA');
+    const [linkedin, budget] = screen.getAllByRole('button', { name: 'Record decision' });
+    if (linkedin === undefined || budget === undefined) {
+      throw new Error('A "Record decision" action is missing');
+    }
+
+    fireEvent.click(linkedin);
+    const first = await screen.findByRole('dialog', { name: 'Record decision' });
+    fireEvent.change(await within(first).findByLabelText('Status'), {
+      target: { value: 'paused' },
+    });
+    fireEvent.click(buttonNamed('Save decision', first));
+    await waitFor(() => {
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+    });
+    // The first dialog closes while its save runs; the shared budget's dialog opens.
+    fireEvent.click(buttonNamed('Close', first));
+    fireEvent.click(budget);
+    const second = await screen.findByRole('dialog', { name: 'Record decision' });
+    await within(second).findByLabelText('Daily budget');
+
+    const unfilteredReads = () => logCalls(api).filter((call) => !call.search.has('subject_type'));
+    const readsBefore = unfilteredReads().length;
+    save.resolve(json(201, { ...emea, id: 830, origin: 'user', status: 'paused' }));
+
+    // The save settles once its invalidation has refetched the log; then its onDone runs.
+    await waitFor(() => {
+      expect(unfilteredReads().length).toBeGreaterThan(readsBefore);
+    });
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(screen.getByRole('dialog', { name: 'Record decision' })).toBe(second);
+    expect(
+      within(second).getByText('Search Shared Budget · Shared budget · Google'),
+    ).toBeTruthy();
+  });
+
+  it('keeps the same subject reopened, with its edits, when a save ends after its dialog closed', async () => {
+    const emea = makeDecision('own_budget', {
+      subject: subject({
+        id: FIXTURE_CAMPAIGN_IDS.pipelineEmea,
+        name: 'Lead Gen — Pipeline Report EMEA',
+        source: 'linkedin',
+        currency: 'EUR',
+      }),
+      daily_budget: '100.00',
+    });
+    const saved: Decision = { ...emea, id: 830, origin: 'user', status: 'paused' };
+    const firstSave = deferred<MockResponse>();
+    let saves = 0;
+    const api = mockApi({
+      ...logHandlers([emea]),
+      [formKey('campaign', emea.subject.id)]: json(200, [emea]),
+      // The first save waits for the test; any later one is answered at once.
+      'POST /decisions': () => {
+        saves += 1;
+        return saves === 1 ? firstSave.promise : json(201, saved);
+      },
+    });
+
+    await renderLog();
+    await findTable('Lead Gen — Pipeline Report EMEA');
+    const record = buttonNamed('Record decision');
+
+    fireEvent.click(record);
+    const first = await screen.findByRole('dialog', { name: 'Record decision' });
+    fireEvent.change(await within(first).findByLabelText('Status'), {
+      target: { value: 'paused' },
+    });
+    fireEvent.click(buttonNamed('Save decision', first));
+    await waitFor(() => {
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+    });
+    // The dialog closes while its save runs, and reopens for the same subject with new edits.
+    fireEvent.click(buttonNamed('Close', first));
+    fireEvent.click(record);
+    const second = await screen.findByRole('dialog', { name: 'Record decision' });
+    const noteText = 'Paused for the EMEA quarter close';
+    fireEvent.change(await within(second).findByLabelText('Status'), {
+      target: { value: 'ended' },
+    });
+    fireEvent.change(within(second).getByLabelText('Note'), { target: { value: noteText } });
+
+    const unfilteredReads = () => logCalls(api).filter((call) => !call.search.has('subject_type'));
+    const readsBefore = unfilteredReads().length;
+    firstSave.resolve(json(201, saved));
+
+    // The save settles once its invalidation has refetched the log; then its onDone runs.
+    await waitFor(() => {
+      expect(unfilteredReads().length).toBeGreaterThan(readsBefore);
+    });
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(screen.getByRole('dialog', { name: 'Record decision' })).toBe(second);
+    expect((within(second).getByLabelText('Status') as HTMLSelectElement).value).toBe('ended');
+    expect((within(second).getByLabelText('Note') as HTMLTextAreaElement).value).toBe(noteText);
+
+    // The reopened dialog's own save still closes it.
+    fireEvent.click(buttonNamed('Save decision', second));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(api.calls.filter((call) => call.method === 'POST')[1]?.body).toEqual({
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineEmea },
+      patch: { status: 'ended' },
+      note: noteText,
+    });
   });
 });

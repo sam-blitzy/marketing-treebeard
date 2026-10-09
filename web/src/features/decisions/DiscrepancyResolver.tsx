@@ -431,6 +431,31 @@ function resolveErrorMessage(error: unknown): string {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * The "Record intended state" dialog of one discrepancy: whether it is open, and which opening
+ * it is. `session` grows with every opening, so a save that ends after its dialog was closed
+ * can tell whether the dialog shown now is still its own.
+ */
+interface DialogSession {
+  /** Whether the dialog is shown. */
+  readonly open: boolean;
+  /** The number of the latest opening; `0` before the first. */
+  readonly session: number;
+}
+
+/** The dialog before its first opening. */
+const CLOSED_DIALOG: DialogSession = { open: false, session: 0 };
+
+/** The dialog opened anew: a session no earlier save belongs to. */
+function openDialogSession(current: DialogSession): DialogSession {
+  return { open: true, session: current.session + 1 };
+}
+
+/** The dialog closed, keeping its session; unchanged when it is closed already. */
+function closeDialogSession(current: DialogSession): DialogSession {
+  return current.open ? { ...current, open: false } : current;
+}
+
+/**
  * The resolution controls of one discrepancy: one `Button` per entry of
  * `discrepancy.resolutions`, in the API's order, the first `primary` and the rest `secondary`,
  * labelled from {@link RESOLUTION_LABELS}.
@@ -438,7 +463,8 @@ function resolveErrorMessage(error: unknown): string {
  * - "Record intended state" opens a `Dialog` titled "Record intended state" holding
  *   `DecisionForm` (`mode="intended_state"`) for the discrepancy's subject, with its own Save and
  *   Cancel buttons. Saving closes the dialog; Cancel, Escape, the Close button and the backdrop
- *   close it without posting.
+ *   close it without posting. A save that ends after its dialog was closed and reopened is
+ *   still reported, and leaves the reopened dialog open with its edits.
  * - Every other resolution posts `POST /discrepancies/{id}/resolve` with `{ resolution }` at
  *   once. While it runs, the clicked button shows its loading state and the others are disabled.
  * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
@@ -468,7 +494,7 @@ function DiscrepancyResolutionBody({
   onResolved,
 }: DiscrepancyResolutionProps) {
   const resolve = useResolveDiscrepancy();
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
   const [outcome, setOutcome] = useState<DiscrepancyState | null>(null);
 
   const error = resolve.error;
@@ -535,15 +561,19 @@ function DiscrepancyResolutionBody({
     // A failure of an earlier resolution no longer describes what the dialog is about to post.
     resolve.reset();
     setOutcome(null);
-    setDialogOpen(true);
+    setDialog(openDialogSession);
   };
 
   const closeIntendedState = () => {
-    setDialogOpen(false);
+    setDialog(closeDialogSession);
   };
 
-  const handleIntendedSaved = () => {
-    setDialogOpen(false);
+  // DecisionForm calls the onDone it had when the user saved, even after its dialog was closed,
+  // so a save that ends late closes only the opening it was made in (`session`): a dialog
+  // reopened in the meantime keeps its edits. The intended state is recorded either way, so the
+  // outcome is still shown and reported.
+  const handleIntendedSaved = (session: number) => {
+    setDialog((current) => (current.session === session ? closeDialogSession(current) : current));
     // The API moves a record_intended discrepancy to awaiting_platform (decisions.py
     // resolve_discrepancy); DecisionForm reports success without the response body, so the
     // update passed on is this discrepancy advanced by exactly that transition.
@@ -564,6 +594,8 @@ function DiscrepancyResolutionBody({
 
   const errorText = error === null ? null : resolveErrorMessage(error);
   const outcomeText = outcome === null ? null : OUTCOME_TEXT[outcome];
+  // The opening this render's intended-state form belongs to.
+  const formSession = dialog.session;
 
   return (
     // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive and feature code
@@ -605,7 +637,7 @@ function DiscrepancyResolutionBody({
       */}
       <div role="status">{outcomeText}</div>
       <Dialog
-        open={dialogOpen}
+        open={dialog.open}
         title={RESOLUTION_LABELS.record_intended}
         onClose={closeIntendedState}
       >
@@ -614,7 +646,9 @@ function DiscrepancyResolutionBody({
           subject={{ type: discrepancy.subject.type, id: discrepancy.subject.id }}
           discrepancy={discrepancy}
           currency={discrepancy.subject.currency}
-          onDone={handleIntendedSaved}
+          onDone={() => {
+            handleIntendedSaved(formSession);
+          }}
           onCancel={closeIntendedState}
           disabled={locked}
         />

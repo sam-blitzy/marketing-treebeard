@@ -71,8 +71,9 @@
   --opacity-disabled: 0.6; /* GAP: placeholder, not Blitzy OS */
   --opacity-backdrop: 0.5; /* GAP: placeholder, not Blitzy OS */
 
-  /* Size: the full extent of the containing block, so component geometry holds no percentage literal */
+  /* Size: the full extent of the containing block, and the full inline size of the nearest inline-size query container, so component geometry holds no percentage or container-unit literal */
   --size-full: 100%; /* GAP: placeholder, not Blitzy OS */
+  --size-container-full: 100cqi; /* GAP: placeholder, not Blitzy OS */
 }
 
 /* Base layer: the only global rules in the SPA; values from the tokens above. GAP: rebind with Blitzy OS base styles on source arrival. */

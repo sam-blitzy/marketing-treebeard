@@ -65,6 +65,8 @@ import {
   variants,
   whitePaperCells,
   whitePaperCostNotes,
+  whitePaperMqlLabel,
+  whitePaperMqlMetricLabel,
 } from './evidenceExtra';
 
 // ---------------------------------------------------------------------------------------------
@@ -1813,6 +1815,70 @@ describe('whitePaperCostNotes', () => {
   });
 });
 
+describe('whitePaperMqlLabel', () => {
+  it('reads the stage label each white-paper row recorded', () => {
+    const ids = [FIXTURE_ITEM_IDS.wEur, FIXTURE_ITEM_IDS.wEurNoChange, FIXTURE_ITEM_IDS.wUsd];
+    for (const id of ids) {
+      const item = pageItem(id);
+      expect(whitePaperMqlLabel(item)).toBe('First meeting booked');
+      expect(whitePaperMqlLabel(item.evidence)).toBe('First meeting booked');
+    }
+  });
+
+  it('returns null for an absent, null, blank or non-string label', () => {
+    expect(whitePaperMqlLabel(withExtra({ mql_label: null }))).toBeNull();
+    expect(whitePaperMqlLabel(withExtra({ mql_label: '  ' }))).toBeNull();
+    expect(
+      whitePaperMqlLabel(withExtra({ mql_label: { label: 'First meeting booked' } })),
+    ).toBeNull();
+    expect(whitePaperMqlLabel(withExtra({}))).toBeNull();
+    expect(whitePaperMqlLabel(withExtra(null))).toBeNull();
+    expect(whitePaperMqlLabel(pageItem(FIXTURE_ITEM_IDS.b1))).toBeNull();
+    expect(whitePaperMqlLabel(null)).toBeNull();
+  });
+});
+
+describe('whitePaperMqlMetricLabel', () => {
+  it("reads the header the backend recorded on a row's MQL metric", () => {
+    expect(whitePaperMqlMetricLabel(pageItem(FIXTURE_ITEM_IDS.wEur))).toBe(
+      'MQL (First meeting booked)',
+    );
+    // An unavailable MQL count keeps its recorded label.
+    expect(whitePaperMqlMetricLabel(pageItem(FIXTURE_ITEM_IDS.wUsd).evidence)).toBe(
+      'MQL (First meeting booked)',
+    );
+    expect(whitePaperMqlMetricLabel(withExtra(null, [metric('mql', 3, { label: 'MQL' })]))).toBe(
+      'MQL',
+    );
+  });
+
+  it('reads the first mql metric, as metricByKey does', () => {
+    const evidence = withExtra(null, [
+      metric('ql', 2, { label: 'Qualified Lead' }),
+      metric('mql', 3, { label: 'MQL (First meeting booked)' }),
+      metric('mql', 4, { label: 'MQL (Demo held)' }),
+    ]);
+    expect(whitePaperMqlMetricLabel(evidence)).toBe('MQL (First meeting booked)');
+  });
+
+  it('returns null without an mql metric or a recorded label, never the key', () => {
+    expect(
+      whitePaperMqlMetricLabel(rawEvidence({ metrics: [{ key: 'mql', value: 3 }] })),
+    ).toBeNull();
+    expect(
+      whitePaperMqlMetricLabel(rawEvidence({ metrics: [{ key: 'mql', label: ' ', value: 3 }] })),
+    ).toBeNull();
+    expect(
+      whitePaperMqlMetricLabel(rawEvidence({ metrics: [{ key: 'mql', label: 7, value: 3 }] })),
+    ).toBeNull();
+    expect(whitePaperMqlMetricLabel(rawEvidence({ metrics: 'mql' }))).toBeNull();
+    expect(whitePaperMqlMetricLabel(rawEvidence({ metrics: [null, 'mql'] }))).toBeNull();
+    expect(whitePaperMqlMetricLabel(withExtra(null, [metric('ql', 2)]))).toBeNull();
+    expect(whitePaperMqlMetricLabel(pageItem(FIXTURE_ITEM_IDS.k1))).toBeNull();
+    expect(whitePaperMqlMetricLabel(null)).toBeNull();
+  });
+});
+
 describe('cohortSummary', () => {
   it("reads each currency cohort's spend total and overlap note", () => {
     expect(cohortSummary(pageItem(FIXTURE_ITEM_IDS.wEur))).toEqual({
@@ -1983,6 +2049,7 @@ describe('readers over every card of the default page', () => {
       expect(variants(item).length > 0, rule).toBe(rule === 'CR3');
       expect(creativeRows(item).length > 0, rule).toBe(rule.startsWith('W'));
       expect(cohortSummary(item) !== null, rule).toBe(rule.startsWith('W'));
+      expect(whitePaperMqlLabel(item) !== null, rule).toBe(rule.startsWith('W'));
       expect(sharedMembers(item).length > 0, rule).toBe(item.decision_subject?.type === 'budget');
       expect(Object.keys(decisionContextFor(item)).length === 0, rule).toBe(
         item.decision_subject === null,

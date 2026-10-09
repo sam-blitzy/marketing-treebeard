@@ -34,12 +34,13 @@
  * the table. It is static content, with no live-region role.
  *
  * The styling lives in `DataTable.css`, whose class names are the contract this component
- * renders: `ds-datatable__region`, `ds-datatable`, `ds-datatable__caption`,
+ * renders: `ds-datatable__region` and, on an expandable table's region,
+ * `ds-datatable__region--expandable`, `ds-datatable`, `ds-datatable__caption`,
  * `ds-datatable__header`, `ds-datatable__cell`, `ds-datatable__cell--start` and `--end`,
- * `ds-datatable__toggle-cell`, `ds-datatable__detail-row`, `ds-datatable__detail-cell` and
- * `ds-datatable__empty`. The visually hidden "Details" header of the expand column uses
- * `ds-visually-hidden` from `shared.css`, and the configuration state is styled by
- * `EmptyState.css`.
+ * `ds-datatable__toggle-cell`, `ds-datatable__detail-row`, `ds-datatable__detail-cell`,
+ * `ds-datatable__detail-content` and `ds-datatable__empty`. The visually hidden "Details"
+ * header of the expand column uses `ds-visually-hidden` from `shared.css`, and the
+ * configuration state is styled by `EmptyState.css`.
  *
  * The table deliberately has no sorting, pagination or selection: rows arrive already ranked by
  * the analysis run (AAP 0.5.4), and no screen in AAP 0.5.5 asks for any of the three.
@@ -189,7 +190,9 @@ interface DataTableRichCaptionProps {
  * toggle buttons, and each data row is followed by a detail row spanning every column, hidden
  * until its toggle is pressed. The white paper table uses it to expand each asset row to its
  * per-creative rows, including "unknown creative" (AAP 0.5.5). Expanded rows are remembered by
- * `getRowKey`, so a row stays open when the rows are re-rendered in another order.
+ * `getRowKey`, so a row stays open when the rows are re-rendered in another order. The expanded
+ * content is laid out at the region's visible width and stays in view while the row's columns
+ * scroll sideways, so it may hold its own tables, each scrolling in its own region.
  *
  * GAP: bind to Blitzy OS on source arrival. These are product-level props, not Blitzy OS props;
  * on binding, they map onto the Blitzy OS table component.
@@ -360,6 +363,14 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  * derived from `useId` and the row index, so any row key is safe and ids never collide between
  * two tables on one page.
  *
+ * The detail cell spans every column, so it is as wide as the whole table, which can be far
+ * wider than the region's visible area. An expandable table's region therefore carries
+ * `ds-datatable__region--expandable`, and the expanded content sits in a
+ * `ds-datatable__detail-content` wrapper that `DataTable.css` lays out at the region's visible
+ * inline size and pins at its inline start, so the whole of it stays in view while the row's
+ * columns scroll sideways; a nested table wider than that scrolls in its own region. A table
+ * without `renderExpanded` renders neither class.
+ *
  * The only state is the set of expanded row keys; the component has no effects.
  *
  * GAP: bind to Blitzy OS on source arrival.
@@ -432,7 +443,9 @@ export function DataTable<Row>({
 
   return (
     <div
-      className="ds-datatable__region"
+      className={
+        expandable ? 'ds-datatable__region ds-datatable__region--expandable' : 'ds-datatable__region'
+      }
       role="region"
       aria-label={label}
       aria-labelledby={label === undefined ? captionId : undefined}
@@ -514,7 +527,9 @@ export function DataTable<Row>({
                   {expandable ? (
                     <tr id={detailId} className="ds-datatable__detail-row" hidden={!expanded}>
                       <td className="ds-datatable__detail-cell" colSpan={totalColumns}>
-                        {expanded ? renderExpanded(row) : null}
+                        {expanded ? (
+                          <div className="ds-datatable__detail-content">{renderExpanded(row)}</div>
+                        ) : null}
                       </td>
                     </tr>
                   ) : null}

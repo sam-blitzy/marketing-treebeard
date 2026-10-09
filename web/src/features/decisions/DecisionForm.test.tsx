@@ -1017,6 +1017,140 @@ describe('DecisionForm', () => {
     });
   });
 
+  describe('outcomes reported to the consumer', () => {
+    /** Props of an intended-state form for the fixture's untracked discrepancy. */
+    const INTENDED: DecisionFormProps = {
+      subject: OWN_BUDGET,
+      mode: 'intended_state',
+      discrepancy: makeDiscrepancy('untracked'),
+    };
+
+    it('calls onRetired once on a 409 subject_retired to a decision', async () => {
+      const onRetired = vi.fn<() => void>();
+      const onDone = vi.fn<() => void>();
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+      });
+      await renderForm({ subject: OWN_BUDGET, prefill: { status: 'paused' }, onRetired, onDone });
+
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText('Computed from replaced data')).toBeDefined();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      expect(onDone).not.toHaveBeenCalled();
+    });
+
+    it('calls onRetired once on a 409 subject_retired to an intended state', async () => {
+      const onRetired = vi.fn<() => void>();
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, []),
+        'POST /discrepancies/:id/resolve': apiError(
+          409,
+          'subject_retired',
+          'The dataset is no longer active.',
+        ),
+      });
+      await renderForm({ ...INTENDED, onRetired });
+
+      fireEvent.click(saveButton('Save intended state'));
+
+      expect(await screen.findByText('Computed from replaced data')).toBeDefined();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      expect(saveButton('Save intended state')).toHaveProperty('disabled', true);
+    });
+
+    it('does not call onRetired on a 422 or a 409 discrepancy_resolved', async () => {
+      const onRetired = vi.fn<() => void>();
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': apiError(422, 'no_change', 'The patch changes nothing.'),
+      });
+      const { unmount } = await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { status: 'paused' },
+        onRetired,
+      });
+      fireEvent.click(saveButton());
+      expect(await screen.findByText('The patch changes nothing.')).toBeDefined();
+      unmount();
+
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, []),
+        'POST /discrepancies/:id/resolve': apiError(
+          409,
+          'discrepancy_resolved',
+          'The discrepancy is already resolved.',
+        ),
+      });
+      await renderForm({ ...INTENDED, onRetired });
+      fireEvent.click(saveButton('Save intended state'));
+      expect(await screen.findByText('Already resolved')).toBeDefined();
+
+      expect(onRetired).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['onDone', json(201, makeDecision('own_budget', { status: 'paused' }))],
+      ['onRetired', apiError(409, 'subject_retired', 'The dataset is no longer active.')],
+    ] as const)(
+      'calls %s even when the form unmounted while its save ran',
+      async (callback, response) => {
+        const onDone = vi.fn<() => void>();
+        const onRetired = vi.fn<() => void>();
+        const pending = deferredResponse();
+        const api = mockApi({
+          [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+          'POST /decisions': () => pending.promise,
+        });
+
+        /** The form, with a button that removes it, as closing its dialog does. */
+        function Closable() {
+          const [shown, setShown] = useState(true);
+          return (
+            <>
+              <Button
+                onClick={() => {
+                  setShown(false);
+                }}
+              >
+                Close form
+              </Button>
+              {shown ? (
+                <DecisionForm
+                  subject={OWN_BUDGET}
+                  prefill={{ status: 'paused' }}
+                  onDone={onDone}
+                  onRetired={onRetired}
+                />
+              ) : null}
+            </>
+          );
+        }
+        await renderWithProviders(<Closable />, { path: '/decisions' });
+        fireEvent.click(await screen.findByRole('button', { name: 'Save decision' }));
+        await waitFor(() => {
+          expect(callsTo(api, 'POST', '/decisions')).toHaveLength(1);
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Close form' }));
+        expect(screen.queryByRole('button', { name: 'Save decision' })).toBeNull();
+
+        pending.resolve(response);
+
+        const called = callback === 'onDone' ? onDone : onRetired;
+        const other = callback === 'onDone' ? onRetired : onDone;
+        await waitFor(() => {
+          expect(called).toHaveBeenCalledTimes(1);
+        });
+        expect(other).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   describe('form identity', () => {
     it('starts a fresh form, without the previous edits, when the subject changes', async () => {
       const other: SubjectIn = { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm };

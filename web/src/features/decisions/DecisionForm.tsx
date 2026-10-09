@@ -34,9 +34,13 @@
  *   finer digits are never rounded away, so an unchanged micro amount is posted exactly as the
  *   API sent it.
  * - **Errors are the API's.** 422 messages are shown as returned. A 409 `subject_retired`
- *   locks the form for as long as it records about that subject (AAP 0.3.2), and a 409
+ *   locks the form for as long as it records about that subject (AAP 0.3.2) and is reported
+ *   through `onRetired`, so the consumer locks its own actions too; a 409
  *   `discrepancy_resolved` reads "Already resolved". Error banners never take `role="alert"`,
  *   which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
+ * - **Outcomes outlive the form.** `onDone` and `onRetired` reach the consumer even when the
+ *   form unmounted while its request ran, as it does when its dialog is closed mid-save. A
+ *   consumer that can reopen its dialog therefore closes only the opening that saved.
  * - **One form per identity.** Edits, the note, the save outcome and those locks belong to
  *   what the form records about and posts: the subject, the mode, the discrepancy and the
  *   recommendation. A change to any of them starts a fresh form, so one subject's edits are
@@ -142,8 +146,21 @@ export interface DecisionFormProps {
    * discrepancy's subject currency is used.
    */
   currency?: string | null;
-  /** Called after the decision or intended state has been saved. */
+  /**
+   * Called after the decision or intended state has been saved. It is called even when the form
+   * unmounted while the request ran, for example because its dialog was closed, so the consumer
+   * still learns the outcome. The call is to the `onDone` the form had when the user saved, so
+   * it can carry which dialog opening it belongs to: a consumer that can reopen its dialog while
+   * a save runs must close only the opening that saved, never whichever dialog is open when
+   * `onDone` runs, or a late save discards the reopened dialog's edits.
+   */
   onDone?: () => void;
+  /**
+   * Called when a save is refused with 409 `subject_retired`, so the consumer can lock what
+   * else it shows for that subject (AAP 0.3.2): the form locks only itself. Like `onDone`, it is
+   * called even when the form unmounted while the request ran.
+   */
+  onRetired?: () => void;
   /** Called by the "Cancel" button, which is rendered only when this is given. */
   onCancel?: () => void;
   /** Disables every field and the submit button, for example on a historical item. */
@@ -551,7 +568,8 @@ function isResolvedError(error: unknown): boolean {
  * fields and is disabled while nothing changed. Intended-state mode posts
  * `{ resolution: 'record_intended', intended_state, note? }` with the complete state for the
  * shape. Success calls `onDone`. A 409 `subject_retired` disables every control while the form
- * records about that subject; the enclosing `Dialog` keeps its own Close button.
+ * records about that subject and calls `onRetired`; the enclosing `Dialog` keeps its own Close
+ * button. Both callbacks are called even when the form unmounted while the request ran.
  *
  * The form's edits, note, save outcome and locks belong to its identity: the subject's type
  * and id, the mode, the discrepancy's id and `recommendationId`. When any of them changes, even
@@ -604,6 +622,7 @@ function DecisionFormBody(props: DecisionFormProps) {
     recommendationId,
     members,
     onDone,
+    onRetired,
     onCancel,
     disabled = false,
   } = props;
@@ -752,9 +771,13 @@ function DecisionFormBody(props: DecisionFormProps) {
   const handleError = (error: unknown) => {
     if (isRetiredError(error)) {
       setRetired(true);
+      onRetired?.();
     } else if (isResolvedError(error)) {
       setClosed(true);
     }
+  };
+  const handleSaved = () => {
+    onDone?.();
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -770,7 +793,11 @@ function DecisionFormBody(props: DecisionFormProps) {
       if (noteText !== '') {
         body.note = noteText;
       }
-      recordDecision.mutate(body, { onSuccess: () => onDone?.(), onError: handleError });
+      // mutateAsync, not mutate's per-call callbacks: TanStack Query drops those once the form
+      // has unmounted, as it does when its dialog is closed while the request runs, and the
+      // outcome must still reach the consumer. The rejection is handled here in full; the
+      // form's own error banner reads `activeMutation.error`.
+      void recordDecision.mutateAsync(body).then(handleSaved, handleError);
       return;
     }
     if (discrepancy === undefined) {
@@ -780,10 +807,10 @@ function DecisionFormBody(props: DecisionFormProps) {
     if (noteText !== '') {
       body.note = noteText;
     }
-    resolveDiscrepancy.mutate(
-      { id: discrepancy.id, body },
-      { onSuccess: () => onDone?.(), onError: handleError },
-    );
+    // As above: the outcome reaches the consumer even after the form has unmounted.
+    void resolveDiscrepancy
+      .mutateAsync({ id: discrepancy.id, body })
+      .then(handleSaved, handleError);
   };
 
   const statusOptions: SelectOption<StatusChoice>[] = CAMPAIGN_STATUSES.map((status) => ({

@@ -1460,6 +1460,44 @@ export function whitePaperCostNotes(source: MaybeSource): Readonly<Record<string
   };
 }
 
+/**
+ * The MQL stage label a white-paper row's counts were bound to when its run computed it
+ * (`white_papers._row_extra`, `extra.mql_label`: the label the MQL binding resolved to, for
+ * example "First meeting booked"). It is frozen with the evidence, so a later change of the
+ * binding in `GET /config` never relabels the counts this row recorded (AAP 0.3.2).
+ *
+ * @param source - The white-paper item or its evidence.
+ * @returns The label as recorded; `null` when absent, blank or not a string, which is also how
+ *   the backend records a binding that named no label.
+ */
+export function whitePaperMqlLabel(source: MaybeSource): string | null {
+  return readString(readExtra(source)?.mql_label);
+}
+
+/**
+ * The header the backend recorded on a white-paper row's MQL metric (`white_papers._mql_label`:
+ * "MQL ({label})", or plain "MQL" when the binding named no label), read from the first `mql`
+ * entry of `evidence.metrics`, as {@link metricByKey} finds it. Unlike {@link metricByKey}, a
+ * blank or missing label is not replaced by the key, so only a label the run recorded is
+ * returned.
+ *
+ * @param source - The white-paper item or its evidence.
+ * @returns The recorded label, verbatim; `null` when the evidence has no `mql` metric or its
+ *   label is blank or not a string.
+ */
+export function whitePaperMqlMetricLabel(source: MaybeSource): string | null {
+  const evidence = evidenceOf(source);
+  if (evidence === null) {
+    return null;
+  }
+  for (const entry of readArray(evidence.metrics)) {
+    if (isRecord(entry) && readString(entry.key) === 'mql') {
+      return readString(entry.label);
+    }
+  }
+  return null;
+}
+
 /** The cross-asset view of one currency cohort (AAP 0.5.4.7 "Across assets"). */
 export interface CohortSummary {
   /** The cohort's currency; every amount below is in it. */

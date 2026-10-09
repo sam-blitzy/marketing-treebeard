@@ -12,6 +12,8 @@
  *   table shows `emptyMessage` across every column;
  * - expandable rows: one native toggle button per row with `aria-expanded` and `aria-controls`
  *   pointing at its detail row, which is hidden and empty until expanded, remembered by row key;
+ *   an expandable table's region carries the expandable modifier and an expanded row's content
+ *   sits in the detail content wrapper, while a table that cannot expand renders neither;
  * - an unnamed or column-less table renders the static "Table unavailable" state naming what is
  *   missing, and no table or region.
  */
@@ -358,6 +360,42 @@ describe('DataTable', () => {
       expect(document.getElementById(detailId)?.textContent).toBe('');
     });
 
+    it('marks the region expandable and wraps expanded content in the detail content wrapper', () => {
+      renderAssets({ renderExpanded: renderDetail });
+      const region = screen.getByRole('region', { name: 'White papers · EUR' });
+      expect(region.className).toBe('ds-datatable__region ds-datatable__region--expandable');
+      // Collapsed rows render no wrapper, so a hidden detail row stays empty.
+      expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
+
+      const toggle = at(screen.getAllByRole('button', { name: 'Show details' }), 0);
+      fireEvent.click(toggle);
+
+      const detailCell = document
+        .getElementById(toggle.getAttribute('aria-controls') ?? '')
+        ?.querySelector(':scope > td.ds-datatable__detail-cell');
+      const wrappers = Array.from(detailCell?.children ?? []);
+      expect(wrappers).toHaveLength(1);
+      const wrapper = at(wrappers, 0);
+      expect(wrapper.tagName).toBe('DIV');
+      expect(wrapper.className).toBe('ds-datatable__detail-content');
+      expect(wrapper.innerHTML).toBe('<p>Creatives of Buyer guide</p>');
+      expect(document.querySelectorAll('.ds-datatable__detail-content')).toHaveLength(1);
+
+      fireEvent.click(toggle);
+
+      expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
+      expect(region.className).toBe('ds-datatable__region ds-datatable__region--expandable');
+    });
+
+    it('marks the region of an expandable table expandable even when it has no rows', () => {
+      renderAssets({ rows: [], renderExpanded: renderDetail });
+
+      expect(screen.getByRole('region', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable__region ds-datatable__region--expandable',
+      );
+      expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
+    });
+
     it('operates the toggle from the keyboard as a native button', () => {
       renderAssets({ renderExpanded: renderDetail });
       const toggle = at(screen.getAllByRole('button', { name: 'Show details' }), 1);
@@ -432,6 +470,12 @@ describe('DataTable', () => {
       expect(screen.queryByRole('button')).toBeNull();
       expect(document.querySelector('.ds-datatable__detail-row')).toBeNull();
       expect(screen.getAllByRole('columnheader')).toHaveLength(COLUMNS.length);
+      // A table that cannot expand keeps the plain region, with no expandable modifier or wrapper.
+      expect(screen.getByRole('region', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable__region',
+      );
+      expect(document.querySelector('.ds-datatable__region--expandable')).toBeNull();
+      expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
     });
   });
 

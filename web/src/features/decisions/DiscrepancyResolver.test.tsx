@@ -14,7 +14,8 @@
  *   `{ resolution }` alone and the CSRF header, shows its outcome in a polite status region and
  *   reports the API's response to `onResolved`;
  * - "Record intended state" opens a dialog holding `DecisionForm` with exactly the fields of the
- *   subject's decision shape, and posts the complete intended state;
+ *   subject's decision shape, and posts the complete intended state; a save that ends after its
+ *   dialog was closed and reopened is reported and leaves the reopened dialog open with its edits;
  * - 409 `subject_retired` and 409 `discrepancy_resolved` lock every control; 409
  *   `platform_state_unknown`, 422 `resolution_not_allowed` and 422 `intended_state_invalid` show
  *   the API's own message and leave the controls usable; `disabled` locks every control;
@@ -1116,5 +1117,62 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     await openIntendedState();
 
     expect(screen.queryByText('The platform state is not known yet.')).toBeNull();
+  });
+
+  it('keeps a reopened dialog and its edits when an earlier save ends late, and reports it', async () => {
+    const discrepancy = makeDiscrepancy('untracked');
+    const updated: Discrepancy = {
+      ...discrepancy,
+      state: 'awaiting_platform',
+      resolution: 'record_intended',
+    };
+    const firstSave = deferred<MockResponse>();
+    let saves = 0;
+    const api = mockApi({
+      'GET /decisions': json(200, []),
+      // The first save waits for the test; any later one is answered at once.
+      [RESOLVE_KEY]: () => {
+        saves += 1;
+        return saves === 1 ? firstSave.promise : json(200, updated);
+      },
+    });
+    const { onResolved } = await renderResolution(discrepancy);
+
+    const first = await openIntendedState();
+    saveIntendedState(first);
+    await waitFor(() => {
+      expect(resolveCalls(api)).toHaveLength(1);
+    });
+    // Closing the dialog unmounts the form while its request runs; reopening starts a new one.
+    fireEvent.click(buttonNamed('Close', first));
+    const second = await openIntendedState();
+    const noteText = 'Budget raised on the platform by the agency';
+    fireEvent.change(within(second).getByLabelText('Daily budget'), { target: { value: '240' } });
+    fireEvent.change(within(second).getByLabelText('Note'), { target: { value: noteText } });
+
+    firstSave.resolve(json(200, updated));
+
+    // The first save is reported in the status line and to onResolved...
+    await waitFor(() => {
+      expect(onResolved).toHaveBeenCalledTimes(1);
+    });
+    expect(onResolved).toHaveBeenCalledWith(updated);
+    expect(outcomeRegion().textContent).toBe('Waiting for the platform to match the decision');
+    // ...and the reopened dialog stays open with the edits it was given.
+    expect(screen.getByRole('dialog', { name: 'Record intended state' })).toBe(second);
+    expect((within(second).getByLabelText('Daily budget') as HTMLInputElement).value).toBe('240');
+    expect((within(second).getByLabelText('Note') as HTMLTextAreaElement).value).toBe(noteText);
+
+    // The reopened dialog's own save still closes it.
+    saveIntendedState(second);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(resolveCalls(api)[1]?.body).toEqual({
+      resolution: 'record_intended',
+      intended_state: { status: 'active', daily_budget: '240' },
+      note: noteText,
+    });
+    expect(onResolved).toHaveBeenCalledTimes(2);
   });
 });

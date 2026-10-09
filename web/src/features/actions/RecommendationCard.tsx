@@ -27,7 +27,14 @@
  *
  * A historical item keeps its card readable, but every footer action is disabled, the C0
  * resolver too (`resolver({ disabled: true })`). A 409 `subject_retired` from a screen that
- * went stale before its refetch locks the actions the same way and shows the same message.
+ * went stale before its refetch, whether a feedback or the decision form received it, locks the
+ * actions the same way for as long as the item is rendered and shows the same message.
+ *
+ * A recorded feedback can remove its own card: the refetched item carries `current.hidden_by`
+ * and its section drops it. The outcome is therefore announced in the polite region of an
+ * {@link ActionOutcomeProvider} above the cards, which outlives them (WCAG 2.2 SC 4.1.3), and
+ * keyboard focus, which the disabled or removed button lost, moves to the next card's first
+ * enabled action, else the previous card's, else the section heading (WCAG 2.2 SC 2.4.3).
  *
  * Every text on the card (action, reason, flag messages, held reason, entity name) comes from
  * the API, so no threshold, window length or rule wording is written into the client
@@ -37,7 +44,7 @@
  *
  * @packageDocumentation
  */
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { isApiError, useFeedback } from '../../api/queries';
@@ -224,6 +231,284 @@ function isRetiredError(error: unknown): boolean {
   return isApiError(error) && error.status === 409 && error.code === 'subject_retired';
 }
 
+/**
+ * The confirmation an outcome announces, naming the card it belongs to, because that card may
+ * be gone by the time it is read: "{status}: {action} ({entity name})", for example
+ * "Dismissed: Pause (Generic CRM — US)". A part the item does not carry is left out.
+ *
+ * @param status - the outcome, for example `FEEDBACK_STATUS_MESSAGES.dismiss` or
+ *   {@link DECISION_RECORDED_MESSAGE}
+ * @param item - the item the outcome was recorded on
+ * @returns the message for {@link ActionOutcomeProvider}'s region
+ */
+function outcomeMessage(status: string, item: Item): string {
+  const action = textOrNull(item.action);
+  const name = textOrNull(item.entity.name);
+  if (action === null) {
+    return name === null ? status : `${status}: ${name}`;
+  }
+  return name === null ? `${status}: ${action}` : `${status}: ${action} (${name})`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Outcome announcements
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Announces one outcome in the polite region of the nearest {@link ActionOutcomeProvider}.
+ * Blank text is ignored.
+ *
+ * @param message - the confirmation, for example "Marked done: Add "crm demo" as exact-match
+ *   negative (Generic CRM — US)"
+ */
+export type AnnounceActionOutcome = (message: string) => void;
+
+/** The announcer of the nearest {@link ActionOutcomeProvider}; `null` outside one. */
+const ActionOutcomeContext = createContext<AnnounceActionOutcome | null>(null);
+
+/** The latest announced outcome. */
+interface ActionOutcome {
+  /** The text announced. */
+  message: string;
+  /** Increases with every announcement, so each one renders as a new node. */
+  sequence: number;
+}
+
+/** Props of {@link ActionOutcomeProvider}. */
+export interface ActionOutcomeProviderProps {
+  /** The content whose card actions announce their outcomes here: on `/actions`, the sections. */
+  children?: ReactNode;
+}
+
+/**
+ * A polite live region for the outcomes of the card actions inside it (WCAG 2.2 SC 4.1.3),
+ * placed above those cards so that it outlives every one of them.
+ *
+ * A recorded feedback can unmount the card that recorded it: the refetched recommendations
+ * carry `current.hidden_by`, and the section drops the item. A status line inside that card
+ * would leave with it, unread. Every {@link RecommendationActions} inside this provider
+ * therefore announces "Marked done", "Dismissed", "Snoozed" or "Decision recorded", with the
+ * action and the entity name, here; its own status line stays visible but is no second live
+ * region, so nothing is announced twice.
+ *
+ * The region is a `<div role="status">` rendered before the children from the first render, so
+ * every message lands in a region that already exists. It is never `role="alert"`, which
+ * AAP 0.5.5 reserves for the discrepancy banner. It stays empty until the first outcome, and a
+ * `Stack` takes an empty status child out of its column, so it adds no space until then. Each
+ * message is a new child node, so the same text twice in a row (two cards dismissed with the
+ * same action on the same entity) is announced twice. The latest message stays until the next
+ * one replaces it.
+ *
+ * The provider renders no element around its children: place it among the children of a
+ * `Stack`, where the region and the children each take the column's gap.
+ *
+ * @param props - see {@link ActionOutcomeProviderProps}
+ * @returns the live region, followed by the children
+ *
+ * @example
+ * ```tsx
+ * <Stack gap={6}>
+ *   <SectionNav sections={sections} />
+ *   <ActionOutcomeProvider>
+ *     <KeywordsSection section={keywords} run={run} overlay={overlay} />
+ *     <BudgetSection section={budget} run={run} overlay={overlay} />
+ *   </ActionOutcomeProvider>
+ * </Stack>
+ * ```
+ */
+export function ActionOutcomeProvider({ children }: ActionOutcomeProviderProps): ReactElement {
+  const [outcome, setOutcome] = useState<ActionOutcome | null>(null);
+  // Stable for the provider's lifetime, so a card may call the announcer it captured from a
+  // request that settles after the card itself has unmounted.
+  const announce = useCallback<AnnounceActionOutcome>((message) => {
+    const text = message.trim();
+    if (text === '') {
+      return;
+    }
+    setOutcome((previous) => ({ message: text, sequence: (previous?.sequence ?? 0) + 1 }));
+  }, []);
+  return (
+    <ActionOutcomeContext value={announce}>
+      <div role="status">
+        {outcome === null ? null : <span key={outcome.sequence}>{outcome.message}</span>}
+      </div>
+      {children}
+    </ActionOutcomeContext>
+  );
+}
+
+/**
+ * The announcer of the nearest {@link ActionOutcomeProvider}, which {@link RecommendationActions}
+ * uses to confirm its outcomes outside the card.
+ *
+ * @returns the announcer, or `null` outside a provider, where each card keeps its own polite
+ *   status line
+ *
+ * @example
+ * ```tsx
+ * const announce = useActionOutcome();
+ * announce?.('Dismissed: Pause (Generic CRM — US)');
+ * ```
+ */
+export function useActionOutcome(): AnnounceActionOutcome | null {
+  return useContext(ActionOutcomeContext);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Focus recovery after a recorded feedback
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Finds the action rows of the cards: {@link RecommendationActionsBody} marks its row root with
+ * the attribute `data-recommendation-actions`.
+ */
+const ACTIONS_ROW_SELECTOR = '[data-recommendation-actions]';
+
+/** Where a feedback action was pressed, captured on the click while its card is on the page. */
+interface FocusOrigin {
+  /** The pressed action's row. */
+  row: HTMLElement;
+  /** The row's ancestor `<section>` elements, nearest first. */
+  sections: readonly HTMLElement[];
+  /**
+   * Every action row inside the outermost of those sections, or the whole document when there
+   * is none, in document order.
+   */
+  rows: readonly HTMLElement[];
+  /** The position of `row` in `rows`. */
+  index: number;
+}
+
+/**
+ * Captures where focus can go once a feedback is recorded: the pressed action's row, its
+ * enclosing sections and the action rows around it.
+ *
+ * @param row - the pressed action's row, or `null` before it is attached
+ * @returns the origin, or `null` without a row
+ */
+function captureFocusOrigin(row: HTMLElement | null): FocusOrigin | null {
+  if (row === null) {
+    return null;
+  }
+  const sections: HTMLElement[] = [];
+  for (let node = row.parentElement; node !== null; node = node.parentElement) {
+    if (node.localName === 'section') {
+      sections.push(node);
+    }
+  }
+  const scope: ParentNode = sections.at(-1) ?? row.ownerDocument;
+  const rows = Array.from(scope.querySelectorAll<HTMLElement>(ACTIONS_ROW_SELECTOR));
+  return { row, sections, rows, index: rows.indexOf(row) };
+}
+
+/**
+ * Whether keyboard focus is lost or still inside `scope`: on no element, on the body (where a
+ * browser leaves it once the focused button is disabled or removed), on an element no longer in
+ * the document, or inside `scope`. Anywhere else the user has moved focus, and it stays there.
+ *
+ * @param scope - the element focus counts as still being in, such as a card's action row
+ * @returns `true` when focus may be moved without taking it from where the user put it
+ */
+function focusIsLostOrWithin(scope: Element): boolean {
+  const { activeElement, body } = scope.ownerDocument;
+  return (
+    activeElement === null ||
+    activeElement === body ||
+    !activeElement.isConnected ||
+    scope.contains(activeElement)
+  );
+}
+
+/**
+ * The first action of a row that can take focus: an enabled button, neither `disabled` nor
+ * `aria-disabled="true"`, outside every `[hidden]` or `[inert]` subtree, such as a collapsed
+ * held disclosure, an inactive tab panel or a collapsed table detail row.
+ *
+ * @param row - an action row
+ * @returns the button, or `null` when the row offers none
+ */
+function firstEnabledAction(row: HTMLElement): HTMLButtonElement | null {
+  const buttons = Array.from(row.querySelectorAll('button'));
+  return (
+    buttons.find(
+      (button) =>
+        !button.disabled &&
+        button.getAttribute('aria-disabled') !== 'true' &&
+        button.closest('[hidden], [inert]') === null,
+    ) ?? null
+  );
+}
+
+/**
+ * The heading that names a section: the element its `aria-labelledby` points at.
+ * `PageShell.Section` labels each section by its `${id}-title` heading.
+ *
+ * @param section - a `<section>` element
+ * @returns the heading, or `null` when the section names none on the page
+ */
+function sectionHeading(section: HTMLElement): HTMLElement | null {
+  const [id] = (section.getAttribute('aria-labelledby') ?? '').split(/\s+/u).filter(Boolean);
+  return id === undefined ? null : section.ownerDocument.getElementById(id);
+}
+
+/**
+ * Focuses `element`. With `fromScript`, an element without a `tabindex` of its own (a heading,
+ * `<main>`) first gets `tabindex="-1"`, which lets script focus it without adding a tab stop.
+ *
+ * @param element - the element to focus
+ * @param fromScript - whether the element may need `tabindex="-1"` to take focus
+ * @returns whether focus is now on `element`: a browser refuses focus to an element that is not
+ *   rendered, which sends recovery on to the next candidate
+ */
+function moveFocusTo(element: HTMLElement, fromScript = false): boolean {
+  if (fromScript && !element.hasAttribute('tabindex')) {
+    element.setAttribute('tabindex', '-1');
+  }
+  element.focus();
+  return element.ownerDocument.activeElement === element;
+}
+
+/**
+ * Gives keyboard focus a stable place after a recorded feedback has disabled the action that
+ * had it, and often removed its card (WCAG 2.2 SC 2.4.3): the first enabled action of the next
+ * card row still on the page, else of the previous rows, nearest first, else the heading of
+ * the nearest enclosing section still on the page, else the page's `<main>`. Rows are looked
+ * for inside the outermost enclosing section only, so focus stays in the section the user was
+ * working in.
+ *
+ * Focus the user has moved away from the card in the meantime is left where it is
+ * ({@link focusIsLostOrWithin}).
+ *
+ * @param origin - what {@link captureFocusOrigin} captured on the click
+ */
+function recoverFocus(origin: FocusOrigin): void {
+  const { row, sections, rows, index } = origin;
+  if (!focusIsLostOrWithin(row)) {
+    return;
+  }
+  const following = rows.slice(index + 1);
+  const preceding = rows.slice(0, Math.max(index, 0)).reverse();
+  for (const candidate of [...following, ...preceding]) {
+    if (candidate === row || !candidate.isConnected) {
+      continue;
+    }
+    const action = firstEnabledAction(candidate);
+    if (action !== null && moveFocusTo(action)) {
+      return;
+    }
+  }
+  for (const section of sections) {
+    const heading = section.isConnected ? sectionHeading(section) : null;
+    if (heading !== null && moveFocusTo(heading, true)) {
+      return;
+    }
+  }
+  const main = row.ownerDocument.querySelector('main');
+  if (main !== null) {
+    moveFocusTo(main, true);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Footer actions
 // ---------------------------------------------------------------------------------------------
@@ -245,6 +530,31 @@ export interface RecommendationActionsProps {
 const SECONDARY_FEEDBACK: readonly FeedbackKind[] = ['dismiss', 'snooze'];
 
 /**
+ * The "Record decision" dialog of one card: whether it is open, and which opening it is.
+ * `session` grows with every opening, so a save that ends after its dialog was closed can tell
+ * whether the dialog shown now is still its own.
+ */
+interface DialogSession {
+  /** Whether the dialog is shown. */
+  readonly open: boolean;
+  /** The number of the latest opening; `0` before the first. */
+  readonly session: number;
+}
+
+/** The dialog before its first opening. */
+const CLOSED_DIALOG: DialogSession = { open: false, session: 0 };
+
+/** The dialog opened anew: a session no earlier save belongs to. */
+function openDialogSession(current: DialogSession): DialogSession {
+  return { open: true, session: current.session + 1 };
+}
+
+/** The dialog closed, keeping its session; unchanged when it is closed already. */
+function closeDialogSession(current: DialogSession): DialogSession {
+  return current.open ? { ...current, open: false } : current;
+}
+
+/**
  * A card's footer actions (AAP 0.5.5 "Footer actions"):
  *
  * - **Record decision** (primary) when the item has a `decision_subject`: it opens a `Dialog`
@@ -252,7 +562,9 @@ const SECONDARY_FEEDBACK: readonly FeedbackKind[] = ['dismiss', 'snooze'];
  *   prefilled as a patch with the item's proposed change (status `paused` for C1 and C1b; the
  *   proposed daily budget for B1, B2, B3 and C2 "Scale", written on the budget subject when the
  *   budget is shared, with every member listed). The form posts only the changed fields the
- *   subject's decision shape allows, and closes the dialog once the decision is saved.
+ *   subject's decision shape allows, and closes the dialog once the decision is saved. A save
+ *   that ends after its dialog was closed and reopened is still reported, and leaves the
+ *   reopened dialog open with its edits.
  * - **Mark done** on every other action: feedback `done`, which never writes a decision.
  * - **Dismiss** and **Snooze for 7 days** (quiet) on every item: feedback `dismiss` and
  *   `snooze`, posted as `POST /recommendations/{id}/feedback`.
@@ -261,12 +573,19 @@ const SECONDARY_FEEDBACK: readonly FeedbackKind[] = ['dismiss', 'snooze'];
  * renders their resolver instead (AAP 0.5.4.2, 0.5.4.4).
  *
  * Every action is disabled on a historical item (`current.historical`) and, from then on, after
- * a 409 `subject_retired`, which shows {@link HISTORICAL_LABEL}. While a feedback request is
- * pending, its button shows the loading state and every action is disabled; once it succeeds,
- * the actions stay disabled and a status line ("Marked done", "Dismissed", "Snoozed") stands
- * until the refetched recommendations hide the item. Any other failure shows the API's message
- * in a warning `Banner`, which takes focus so keyboard and screen-reader users land on it;
- * `role="alert"` stays reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
+ * a 409 `subject_retired` to a feedback or to the decision form (its `onRetired`), which shows
+ * {@link HISTORICAL_LABEL} in a warning `Banner` for as long as the item is rendered, including
+ * after the dialog closes. While a feedback request is pending, its button shows the loading
+ * state and every action is disabled; once it succeeds, the actions stay disabled and a status
+ * line ("Marked done", "Dismissed", "Snoozed") stands until the refetched recommendations hide
+ * the item. Inside an {@link ActionOutcomeProvider} that outcome, and a recorded decision, is
+ * announced in the provider's region, which outlives the card, instead of in the card's own
+ * line. Keyboard focus, lost with the disabled or removed button, then moves to the next card's
+ * first enabled action, else the previous card's, else the enclosing section's heading, else
+ * `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Any other failure shows
+ * the API's message in the warning `Banner`. The banner takes focus when it appears, or once the
+ * decision dialog closes, so keyboard and screen-reader users land on it; `role="alert"` stays
+ * reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
  *
  * @param props - see {@link RecommendationActionsProps}
  * @returns the actions, or `null` for a C0 item
@@ -296,20 +615,32 @@ export function RecommendationActions(props: RecommendationActionsProps): ReactE
  */
 function RecommendationActionsBody({ item, decisionContext }: RecommendationActionsProps) {
   const feedback = useFeedback();
+  const announce = useActionOutcome();
   const [retired, setRetired] = useState(false);
   const [recorded, setRecorded] = useState<FeedbackKind | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
+  const dialogOpen = dialog.open;
   const [decisionSaved, setDecisionSaved] = useState(false);
-  const errorRef = useRef<HTMLDivElement>(null);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const messageRef = useRef<HTMLDivElement>(null);
+
+  // A retirement learned from any write, a feedback's or the decision form's, shows the
+  // historical message (AAP 0.5.5: "shown as the same message"); otherwise a failed feedback
+  // shows its own text.
+  const message = retired ? HISTORICAL_LABEL : errorText;
 
   // A pressed button is disabled while its request runs, which drops keyboard focus to the
   // page. When the request fails, focus moves to the message instead (WCAG 2.2 SC 2.4.3, 3.3.1).
+  // The banner is no live region, so taking focus is how its message is read. While the
+  // decision dialog is open its focus trap owns focus, so the message waits and takes focus
+  // once the dialog closes: React runs the dialog's cleanup, which returns focus to the
+  // "Record decision" button a retirement has disabled, before this effect.
   useEffect(() => {
-    if (errorText !== null) {
-      errorRef.current?.focus();
+    if (message !== null && !dialogOpen) {
+      messageRef.current?.focus();
     }
-  }, [errorText]);
+  }, [message, dialogOpen]);
 
   const locked = item.current.historical || retired;
   const pending = feedback.isPending;
@@ -323,18 +654,30 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     }
     setErrorText(null);
     setDecisionSaved(false);
-    feedback.mutate(
-      { recommendationId: item.id, body: { kind } },
-      {
-        onSuccess: () => {
-          setRecorded(kind);
-        },
-        onError: (error) => {
-          if (isRetiredError(error)) {
-            setRetired(true);
-          }
-          setErrorText(feedbackErrorMessage(error));
-        },
+    // Captured on the click, while this card and its neighbours are on the page: a success can
+    // remove this card before focus is recovered.
+    const origin = captureFocusOrigin(rowRef.current);
+    // mutateAsync, not mutate's per-call callbacks, which TanStack Query skips once this card
+    // has unmounted: `useFeedback` settles only after the recommendations have been refetched,
+    // and a refetched item carrying `current.hidden_by` removes the card.
+    void feedback.mutateAsync({ recommendationId: item.id, body: { kind } }).then(
+      () => {
+        setRecorded(kind);
+        announce?.(outcomeMessage(FEEDBACK_STATUS_MESSAGES[kind], item));
+        if (origin !== null) {
+          // This continuation runs before React commits the refetched page, because TanStack
+          // Query notifies its observers from a zero-delay timer scheduled before it. A timer
+          // scheduled now runs after that commit, once a hidden card has left the page.
+          window.setTimeout(() => {
+            recoverFocus(origin);
+          }, 0);
+        }
+      },
+      (error: unknown) => {
+        if (isRetiredError(error)) {
+          setRetired(true);
+        }
+        setErrorText(feedbackErrorMessage(error));
       },
     );
   };
@@ -356,7 +699,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
 
   const subject = item.decision_subject;
   const closeDialog = () => {
-    setDialogOpen(false);
+    setDialog(closeDialogSession);
   };
 
   let decisionDialog: ReactNode = null;
@@ -364,6 +707,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     // The item's own evidence decides the prefill, members and currency; the caller's context
     // refines it.
     const context: DecisionContext = { ...decisionContextFor(item), ...decisionContext };
+    // The opening this render's form belongs to. DecisionForm calls the onDone it had when the
+    // user saved, even after its dialog was closed, so a save that ends late closes only its
+    // own opening: a dialog reopened in the meantime keeps its edits. The decision is recorded
+    // either way, so the outcome is still shown and announced.
+    const formSession = dialog.session;
     decisionDialog = (
       <Dialog open={dialogOpen} title={RECORD_DECISION_LABEL} onClose={closeDialog}>
         <DecisionForm
@@ -373,8 +721,16 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
           members={context.members}
           currency={context.currency}
           onDone={() => {
-            setDialogOpen(false);
+            setDialog((current) =>
+              current.session === formSession ? closeDialogSession(current) : current,
+            );
             setDecisionSaved(true);
+            announce?.(outcomeMessage(DECISION_RECORDED_MESSAGE, item));
+          }}
+          onRetired={() => {
+            // The subject's dataset was replaced: lock every footer action of this item, not
+            // only the form, so closing and reopening the dialog cannot lift the lock.
+            setRetired(true);
           }}
           onCancel={closeDialog}
           disabled={locked}
@@ -393,7 +749,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         onClick={() => {
           setErrorText(null);
           setDecisionSaved(false);
-          setDialogOpen(true);
+          setDialog(openDialogSession);
         }}
       >
         {RECORD_DECISION_LABEL}
@@ -410,25 +766,34 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         : null;
 
   return (
-    <Stack gap={2}>
-      <Inline gap={2}>
-        {primaryAction}
-        {SECONDARY_FEEDBACK.map((kind) => feedbackButton(kind, 'quiet'))}
-      </Inline>
-      {errorText === null ? null : (
-        // Unstyled focus target for the message after a failed request; the Banner carries no
-        // live-region role (AAP 0.5.5 reserves role="alert" for discrepancies).
-        <div ref={errorRef} tabIndex={-1}>
-          <Banner tone="warning" title={errorText} />
-        </div>
-      )}
-      {/*
-        A polite status region (WCAG 2.2 SC 4.1.3), rendered from the start so assistive
-        technology announces the text when it appears; while empty it adds no Stack gap.
-      */}
-      <div role="status">{statusText}</div>
-      {decisionDialog}
-    </Stack>
+    // The unstyled row root focus recovery finds the card's actions by (ACTIONS_ROW_SELECTOR);
+    // the Stack inside it does all the layout.
+    <div ref={rowRef} data-recommendation-actions="">
+      <Stack gap={2}>
+        <Inline gap={2}>
+          {primaryAction}
+          {SECONDARY_FEEDBACK.map((kind) => feedbackButton(kind, 'quiet'))}
+        </Inline>
+        {message === null ? null : (
+          // Unstyled focus target for the message after a failed request; the Banner carries no
+          // live-region role (AAP 0.5.5 reserves role="alert" for discrepancies).
+          <div ref={messageRef} tabIndex={-1}>
+            <Banner tone="warning" title={message} />
+          </div>
+        )}
+        {announce === null ? (
+          // Outside an ActionOutcomeProvider: a polite status region (WCAG 2.2 SC 4.1.3),
+          // rendered from the start so assistive technology announces the text when it appears;
+          // while empty it adds no Stack gap.
+          <div role="status">{statusText}</div>
+        ) : statusText === null ? null : (
+          // Inside one, the provider's region announces the outcome and outlives this card, so
+          // this line stays visible without being a second live region.
+          <div>{statusText}</div>
+        )}
+        {decisionDialog}
+      </Stack>
+    </div>
   );
 }
 

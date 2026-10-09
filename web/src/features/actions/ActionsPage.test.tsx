@@ -11,9 +11,11 @@
  * - **The loaded page**, top to bottom: the single `<h1>` "Actions", the status bar, the custom
  *   banner (custom runs only), the global banners in their fixed order (only the discrepancy
  *   banner is an alert, and the short-window banner reads "Window of N days is below the
- *   {trusted_min_days}-day trusted minimum"), the section navigation, then all five sections in
- *   the user's order, from one `GET /recommendations` response. A section the API omits is
- *   skipped and a repeated key renders once.
+ *   {trusted_min_days}-day trusted minimum"), the section navigation, the empty polite region
+ *   card outcomes are announced in, then all five sections in the user's order, from one
+ *   `GET /recommendations` response. A section the API omits is skipped and a repeated key
+ *   renders once. A recorded feedback whose refetch hides its card is still announced there,
+ *   and focus moves to the next card's action.
  * - **States.** "Loading actions" until the first response; "No analysis run yet" (404
  *   `not_found` or 409 `run_not_ready` for the default run) that fills in by itself; "Run not
  *   found" with "Back to default" for an unknown custom run (404 or 422); otherwise "Actions
@@ -35,9 +37,12 @@ import type { RecommendationsPage, Run } from '../../api/types';
 import {
   CUSTOM_RUN_ID,
   FIXTURE_BANNERS,
+  FIXTURE_ITEM_IDS,
   FIXTURE_SECTION_TITLES,
+  findPageItem,
   makeConfig,
   makeDiscrepancy,
+  makeFeedback,
   makeRecommendationsPage,
   makeRun,
   makeSection,
@@ -161,6 +166,24 @@ function noticeRegion(): HTMLElement {
 /** Whether `first` precedes `second` in document order. */
 function precedes(first: Element, second: Element): boolean {
   return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+}
+
+/**
+ * The loaded page's card-outcome region (`ActionOutcomeProvider`): the one
+ * `<div role="status">` between the section navigation and the first section.
+ */
+function outcomeRegion(): HTMLElement {
+  const nav = screen.getByRole('navigation', { name: 'Sections' });
+  const keywords = screen.getByRole('region', { name: 'Keywords to adjust' });
+  const regions = Array.from(document.querySelectorAll<HTMLElement>('div[role="status"]')).filter(
+    (region) => precedes(nav, region) && precedes(region, keywords),
+  );
+  expect(regions).toHaveLength(1);
+  const [region] = regions;
+  if (region === undefined) {
+    throw new Error('the page has no outcome region');
+  }
+  return region;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -308,6 +331,67 @@ describe('ActionsPage', () => {
       expect(sectionHeadings()).toEqual(SECTION_TITLES);
       expect(screen.queryByText('Actions could not be loaded')).toBeNull();
       expect(screen.queryByText('The API is restarting')).toBeNull();
+    });
+
+    it('holds an empty polite outcome region between the navigation and the sections', async () => {
+      await renderPage(defaultHandlers());
+      await loadedPage();
+
+      const region = outcomeRegion();
+      expect(region.getAttribute('role')).toBe('status');
+      expect(region.childNodes).toHaveLength(0);
+      expect(region.closest('article')).toBeNull();
+    });
+
+    it('announces a recorded feedback after its card leaves and focuses the next card', async () => {
+      const hidden = new Set<number>();
+      const pageNow = (): RecommendationsPage => {
+        const page = makeRecommendationsPage();
+        for (const id of hidden) {
+          findPageItem(page, id).current.hidden_by = 'dismiss';
+        }
+        return page;
+      };
+      await renderPage(
+        defaultHandlers({
+          'GET /recommendations': () => json(200, pageNow()),
+          'POST /recommendations/:id/feedback': (call) => {
+            const id = Number(call.params.id);
+            hidden.add(id);
+            return json(201, makeFeedback('dismiss', { recommendation_id: id }));
+          },
+        }),
+      );
+      await loadedPage();
+      const pause = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.c1);
+      const hold = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.c2Hold);
+      const card = (id: number): HTMLElement | null =>
+        document.getElementById(`item-${String(id)}`);
+      const pauseCard = card(pause.id);
+      if (pauseCard === null) {
+        throw new Error('the C1 card is not on the page');
+      }
+
+      const dismiss = within(pauseCard).getByRole('button', { name: 'Dismiss' });
+      dismiss.focus();
+      fireEvent.click(dismiss);
+
+      // SectionFrame drops the hidden item; the region above the sections keeps its outcome.
+      await waitFor(() => {
+        expect(card(pause.id)).toBeNull();
+      });
+      expect(outcomeRegion().textContent).toBe(
+        `Dismissed: ${pause.action} (${String(pause.entity.name)})`,
+      );
+      // The held card next in the Pause group is collapsed, so the Scale group's card is next.
+      const holdCard = card(hold.id);
+      if (holdCard === null) {
+        throw new Error('the C2 Hold card is not on the page');
+      }
+      const next = within(holdCard).getByRole('button', { name: 'Mark done' });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(next);
+      });
     });
   });
 

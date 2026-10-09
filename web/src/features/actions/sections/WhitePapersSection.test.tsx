@@ -5,10 +5,13 @@
  * They hold the section to its TSDoc contract and to the AAP's rendering rules:
  * - **One table per currency cohort**, captioned "White papers ({currency})", rows in the API's
  *   rank order, with the columns exactly in this order: Asset, Spend, LinkedIn leads, MQL headed
- *   with the bound stage label ("MQL (First meeting booked)", plain "MQL" while `GET /config`
- *   loads or fails), Qualified Lead, Meetings booked, Other meetings (ordering unverified), Deals
- *   after touch, Cost per Qualified Lead, Cost per meeting, Action. MQL and Qualified Lead are
- *   never blended into one column.
+ *   with the bound stage label ("MQL (First meeting booked)"), Qualified Lead, Meetings booked,
+ *   Other meetings (ordering unverified), Deals after touch, Cost per Qualified Lead, Cost per
+ *   meeting, Action. MQL and Qualified Lead are never blended into one column.
+ * - **The MQL label is frozen**: each table takes the label its rows recorded
+ *   (`extra.mql_label`, else the recorded MQL metric label), so a later binding never relabels
+ *   them; plain "MQL" when its rows recorded different ones. Only a table whose rows recorded
+ *   none takes `GET /config`'s label, plain "MQL" while that loads or fails.
  * - **Rendering rules.** Floors render "≥ N" for counts and "≤ X" for costs, exactly as
  *   `formatMetric` renders the evidence; an unavailable count (MQL or Qualified Lead) renders
  *   "unavailable", never 0; a cost with a zero denominator (QL 0, no meetings) renders "—" with
@@ -22,8 +25,9 @@
  *   across assets", and what the LinkedIn leads and meetings booked columns count. No other
  *   total exists, and no amount is summed across currencies.
  *
- * The section reads `GET /config` (for the MQL label) and nothing else; any other request fails
- * the test. Only the "Mark done" case also answers `POST /recommendations/:id/feedback`.
+ * The section reads `GET /config` (for the fallback MQL label) and nothing else; any other
+ * request fails the test. Only the "Mark done" case also answers
+ * `POST /recommendations/:id/feedback`.
  */
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandler, MockResponse } from '../../../test/mockApi';
@@ -34,6 +38,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   ConfigView,
   Evidence,
+  Group,
   Item,
   Metric,
   ResolvedBindingView,
@@ -184,8 +189,16 @@ function metric(key: string, value: Metric['value'], unit: string, currency: str
   };
 }
 
-/** A minimal "No change warranted" white-paper row with no reason or flag. */
-function whitePaperItem(id: number, entity: { name: string; id: string }, evidence: Evidence): Item {
+/**
+ * A minimal "No change warranted" white-paper row with no reason or flag, computed from live
+ * data, so its Asset cell is its name alone. `overrides` replaces any field (shallow).
+ */
+function whitePaperItem(
+  id: number,
+  entity: { name: string; id: string },
+  evidence: Evidence,
+  overrides: Partial<Item> = {},
+): Item {
   return makeItem({
     id,
     rule_id: 'W',
@@ -194,6 +207,52 @@ function whitePaperItem(id: number, entity: { name: string; id: string }, eviden
     entity: { source: 'linkedin', type: 'content_asset', ...entity },
     evidence,
     flags: [],
+    data_status: 'live',
+    current: makeItemOverlay({ data_status_now: 'live' }),
+    ...overrides,
+  });
+}
+
+/** The current `simulated` flag of every default-page white paper (`analysis/overlay.py`). */
+const SIMULATED_LINKEDIN_HUBSPOT = 'Simulated data (LinkedIn, HubSpot)';
+
+/** A default-page Asset cell's text: the asset name, then its simulated-data badge. */
+function simulatedAsset(name: string): string {
+  return `${name}${SIMULATED_LINKEDIN_HUBSPOT}`;
+}
+
+/** The Asset cell (row header) of the row named `name`, among `container`'s row headers. */
+function assetCell(container: HTMLElement, name: string): HTMLElement {
+  const cell = within(container)
+    .getAllByRole('rowheader')
+    .find((header) => header.textContent.startsWith(name));
+  if (cell === undefined) {
+    throw new Error(`no Asset cell for ${name}`);
+  }
+  return cell;
+}
+
+/**
+ * A white-paper row whose evidence records no MQL stage label and no MQL metric, only its spend
+ * and cohort, so its table's MQL header can come only from `GET /config`.
+ */
+function unlabelledItem(id: number, name: string, currency: string): Item {
+  return whitePaperItem(
+    id,
+    { name, id: `${name.toLowerCase().replaceAll(' ', '-')}|${currency}` },
+    makeEvidence({
+      metrics: [metric('spend', '100.00', 'currency', currency)],
+      extra: { cohort: { currency, spend_total: '100.00', overlap_note: '' } },
+    }),
+  );
+}
+
+/** A GBP cohort of one row, "UK Report", whose evidence records no MQL label. */
+function unlabelledCohort(): Group {
+  return makeGroup({
+    key: 'cohort:GBP',
+    title: 'GBP',
+    items: [unlabelledItem(71, 'UK Report', 'GBP')],
   });
 }
 
@@ -254,7 +313,7 @@ describe('WhitePapersSection', () => {
       expect(bodyRows(table('White papers (EUR)'))).toEqual([
         [
           'Details for The 2026 B2B Pipeline Report',
-          'The 2026 B2B Pipeline Report',
+          simulatedAsset('The 2026 B2B Pipeline Report'),
           '€2,840.00',
           '116',
           '≥ 14',
@@ -268,7 +327,7 @@ describe('WhitePapersSection', () => {
         ],
         [
           'Details for The Attribution Playbook',
-          'The Attribution Playbook',
+          simulatedAsset('The Attribution Playbook'),
           '€1,500.00',
           '31',
           '5',
@@ -359,8 +418,8 @@ describe('WhitePapersSection', () => {
       expect(
         bodyRows(table('White papers (EUR)')).map((row) => [row[1], row[cellIndex('cost_per_ql')]]),
       ).toEqual([
-        ['The Attribution Playbook', '€750.00'],
-        ['The 2026 B2B Pipeline Report', '≤ €473.33'],
+        [simulatedAsset('The Attribution Playbook'), '€750.00'],
+        [simulatedAsset('The 2026 B2B Pipeline Report'), '≤ €473.33'],
       ]);
     });
 
@@ -400,7 +459,7 @@ describe('WhitePapersSection', () => {
           metrics: [
             metric('spend', '600.00', 'currency', 'USD'),
             metric('linkedin_leads', 18, 'leads', null),
-            metric('mql', 4, 'contacts', null),
+            { ...metric('mql', 4, 'contacts', null), label: MQL_BOUND },
             metric('ql', null, 'contacts', null),
             metric('meetings_booked', 1, 'meetings', null),
             metric('other_meetings', 0, 'meetings', null),
@@ -475,7 +534,7 @@ describe('WhitePapersSection', () => {
       expect(bodyRows(table('White papers (USD)'))).toEqual([
         [
           'Details for Paid Media Benchmarks 2026',
-          'Paid Media Benchmarks 2026',
+          simulatedAsset('Paid Media Benchmarks 2026'),
           '$1,210.00',
           '41',
           'unavailable',
@@ -551,10 +610,32 @@ describe('WhitePapersSection', () => {
       }
       const wEur = pageItem(FIXTURE_ITEM_IDS.wEur);
       expect(within(details).getByText(wEur.reason)).toBeTruthy();
-      expect(listEntries(details, 'Evidence for The 2026 B2B Pipeline Report')).toEqual([
+      // The evidence as every recommendation shows it (AAP 0.5.4.8): each cited metric against
+      // its baseline, the sample, the thresholds applied and the datasets used.
+      const evidence = table('Evidence for The 2026 B2B Pipeline Report');
+      expect(evidence.closest('td')).toBe(details);
+      expect(headers(evidence)).toEqual(['Metric', 'Value', 'Baseline']);
+      const evidenceRows = bodyRows(evidence);
+      expect(evidenceRows.map((row) => row[0])).toEqual(
+        wEur.evidence.metrics.map((cited) => cited.label),
+      );
+      expect(evidenceRows.find((row) => row[0] === 'Cost per Qualified Lead')).toEqual([
+        'Cost per Qualified Lead',
+        '≤ €473.33',
         'Cohort median cost per Qualified Lead (EUR): €611.67',
-        'Sample: 6 / 3 Qualified Leads',
       ]);
+      expect(evidenceRows.find((row) => row[0] === MQL_BOUND)?.[1]).toBe('≥ 14');
+      expect(within(details).getByText('Sample: 6 / 3 Qualified Leads')).toBeTruthy();
+      const thresholds = listEntries(details, 'Thresholds applied');
+      expect(thresholds).toHaveLength(Object.keys(wEur.evidence.thresholds).length);
+      expect(thresholds).toContain('w.min_ql = 3');
+      expect(thresholds).toContain('w.double_down_ratio = 0.8');
+      expect(listEntries(details, 'Data used')).toEqual(
+        wEur.evidence.datasets.map(
+          (entry) => `${entry.dataset}: complete, covered through ${String(entry.covered_through)}`,
+        ),
+      );
+      expect(listEntries(details, 'Data used')).toHaveLength(6);
       expect(within(details).getByText('Floor: 12% of leads unmatched in HubSpot')).toBeTruthy();
       expect(within(details).getByText(/^1 other meeting \(ordering unverified\)/u)).toBeTruthy();
       expect(within(details).getByText(/^2026-09-08 – 2026-10-05 · 28 days/u)).toBeTruthy();
@@ -608,40 +689,249 @@ describe('WhitePapersSection', () => {
     });
   });
 
+  describe('the simulated-data label', () => {
+    it("labels each collapsed row of simulated data in its Asset cell, in the flag's own words", async () => {
+      await renderDefault();
+
+      for (const [caption, names] of [
+        ['White papers (EUR)', ['The 2026 B2B Pipeline Report', 'The Attribution Playbook']],
+        ['White papers (USD)', ['Paid Media Benchmarks 2026']],
+      ] as const) {
+        const cohort = table(caption);
+        for (const name of names) {
+          const cell = assetCell(cohort, name);
+          expect(cell.textContent).toBe(simulatedAsset(name));
+          expect(within(cell).getByText(SIMULATED_LINKEDIN_HUBSPOT)).toBeTruthy();
+          // Nothing was expanded to show it, and the toggle keeps the plain name.
+          const toggle = within(cohort).getByRole('button', { name: `Details for ${name}` });
+          expect(toggle.getAttribute('aria-expanded')).toBe('false');
+          expect(screen.queryByRole('table', { name: `Per creative: ${name}` })).toBeNull();
+        }
+      }
+    });
+
+    it('shows the mixed-data message, and a recorded flag after the source went live', async () => {
+      const mixed = whitePaperItem(
+        81,
+        { name: 'Mixed Data Report', id: 'mixed-data|EUR' },
+        makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+        {
+          flags: [
+            { code: 'simulated', message: 'Joins live and simulated data (HubSpot simulated)' },
+          ],
+          data_status: 'mixed',
+          current: makeItemOverlay({
+            data_status_now: 'mixed',
+            flags_now: [
+              { code: 'simulated', message: 'Joins live and simulated data (HubSpot simulated)' },
+            ],
+          }),
+        },
+      );
+      // Computed from simulated data, read after LinkedIn and HubSpot went live: the overlay
+      // carries no simulated flag now, and the recorded one still says so (AAP 0.3.2).
+      const recorded = whitePaperItem(
+        82,
+        { name: 'Recorded Simulation Report', id: 'recorded-simulation|EUR' },
+        makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+        {
+          flags: [{ code: 'simulated', message: SIMULATED_LINKEDIN_HUBSPOT }],
+          data_status: 'simulated',
+          current: makeItemOverlay({ data_status_now: 'live', flags_now: [] }),
+        },
+      );
+      const live = whitePaperItem(
+        83,
+        { name: 'Live Data Report', id: 'live-data|EUR' },
+        makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+      );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [makeGroup({ key: 'cohort:EUR', title: 'EUR', items: [mixed, recorded, live] })],
+        }),
+      );
+
+      const cohort = table('White papers (EUR)');
+      expect(assetCell(cohort, 'Mixed Data Report').textContent).toBe(
+        'Mixed Data ReportJoins live and simulated data (HubSpot simulated)',
+      );
+      expect(assetCell(cohort, 'Recorded Simulation Report').textContent).toBe(
+        `Recorded Simulation Report${SIMULATED_LINKEDIN_HUBSPOT}`,
+      );
+      // A row of live data only carries no label.
+      expect(assetCell(cohort, 'Live Data Report').textContent).toBe('Live Data Report');
+      expect(bodyRows(cohort).map((row) => row[0])).toEqual([
+        'Details for Mixed Data Report',
+        'Details for Recorded Simulation Report',
+        'Details for Live Data Report',
+      ]);
+    });
+
+    it('names the label from the data status when no simulated flag was given', async () => {
+      const simulated = whitePaperItem(
+        84,
+        { name: 'Unflagged Simulated Report', id: 'unflagged-simulated|EUR' },
+        makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+        { data_status: 'simulated' },
+      );
+      const mixedNow = whitePaperItem(
+        85,
+        { name: 'Unflagged Mixed Report', id: 'unflagged-mixed|EUR' },
+        makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+        { current: makeItemOverlay({ data_status_now: 'mixed' }) },
+      );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [makeGroup({ key: 'cohort:EUR', title: 'EUR', items: [simulated, mixedNow] })],
+        }),
+      );
+
+      const cohort = table('White papers (EUR)');
+      expect(assetCell(cohort, 'Unflagged Simulated Report').textContent).toBe(
+        'Unflagged Simulated ReportSimulated data',
+      );
+      expect(assetCell(cohort, 'Unflagged Mixed Report').textContent).toBe(
+        'Unflagged Mixed ReportJoins live and simulated data',
+      );
+    });
+  });
+
   describe('the MQL header', () => {
-    it('heads MQL plainly while the configuration loads, then with the bound stage label', async () => {
+    it('heads every table and per-creative table with the frozen label, never a later binding', async () => {
+      // The binding has since moved to another stage. The default page's rows recorded "First
+      // meeting booked" (extra.mql_label), so their counts keep that label; only the table
+      // whose row recorded none takes the current configuration's.
+      const rebound = configWithMql(binding('Demo held', null), binding('Demo held', null), {
+        stage_labels: ['Demo held'],
+      });
+      const section = defaultWhitePapers();
+      section.groups.push(
+        unlabelledCohort(),
+      );
+      await renderWhitePapers(section, json(200, rebound));
+      await screen.findAllByRole('columnheader', { name: 'MQL (Demo held)' });
+
+      expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders(MQL_BOUND));
+      expect(headers(table('White papers (USD)'))).toEqual(assetHeaders(MQL_BOUND));
+      expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders('MQL (Demo held)'));
+      fireEvent.click(screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }));
+      expect(headers(table('Per creative: The 2026 B2B Pipeline Report'))).toEqual([
+        'Creative',
+        ...metricHeaders(MQL_BOUND),
+      ]);
+      fireEvent.click(screen.getByRole('button', { name: 'Details for UK Report' }));
+      expect(headers(table('Per creative: UK Report'))).toEqual([
+        'Creative',
+        ...metricHeaders('MQL (Demo held)'),
+      ]);
+    });
+
+    it('takes the recorded MQL metric label when the evidence records no stage label', async () => {
+      // A binding that named no label is recorded as `mql_label: null` with the metric headed
+      // plainly "MQL": the column stays plain, whatever the configuration binds now.
+      const plain = whitePaperItem(
+        72,
+        { name: 'Unlabelled Binding Report', id: 'unlabelled-binding|EUR' },
+        makeEvidence({
+          metrics: [{ ...metric('mql', 3, 'contacts', null), label: 'MQL' }],
+          extra: { mql_label: null, cohort: { currency: 'EUR' } },
+        }),
+      );
+      const custom = whitePaperItem(
+        73,
+        { name: 'Custom Run Report', id: 'custom-run|USD' },
+        makeEvidence({
+          metrics: [{ ...metric('mql', 2, 'contacts', null), label: 'MQL (Demo held)' }],
+          extra: { cohort: { currency: 'USD' } },
+        }),
+      );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [
+            makeGroup({ key: 'cohort:EUR', title: 'EUR', items: [plain] }),
+            makeGroup({ key: 'cohort:USD', title: 'USD', items: [custom] }),
+            unlabelledCohort(),
+          ],
+        }),
+      );
+      // Only the GBP row recorded no label, so only its table takes the configured one.
+      await screen.findAllByRole('columnheader', { name: MQL_BOUND });
+
+      expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders(MQL_BOUND));
+      expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders('MQL'));
+      expect(headers(table('White papers (USD)'))).toEqual(assetHeaders('MQL (Demo held)'));
+    });
+
+    it('claims no single label for a table whose rows recorded different ones', async () => {
+      const first = whitePaperItem(
+        74,
+        { name: 'First Binding Report', id: 'first-binding|EUR' },
+        makeEvidence({ extra: { mql_label: 'First meeting booked', cohort: { currency: 'EUR' } } }),
+      );
+      const second = whitePaperItem(
+        75,
+        { name: 'Second Binding Report', id: 'second-binding|EUR' },
+        makeEvidence({ extra: { mql_label: 'Demo held', cohort: { currency: 'EUR' } } }),
+      );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [makeGroup({ key: 'cohort:EUR', title: 'EUR', items: [first, second] })],
+        }),
+      );
+
+      expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders('MQL'));
+      // Each row's own frozen label heads its per-creative table.
+      fireEvent.click(screen.getByRole('button', { name: 'Details for First Binding Report' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Details for Second Binding Report' }));
+      expect(headers(table('Per creative: First Binding Report'))).toContain(MQL_BOUND);
+      expect(headers(table('Per creative: Second Binding Report'))).toContain('MQL (Demo held)');
+    });
+
+    it('heads rows without a frozen label plainly while the configuration loads, then with its label', async () => {
       // The configuration answers only when the test releases it.
       const gate: { release?: (response: MockResponse) => void } = {};
       const pending = (): Promise<MockResponse> =>
         new Promise<MockResponse>((resolve) => {
           gate.release = resolve;
         });
-      await renderWhitePapers(defaultWhitePapers(), pending);
+      const section = defaultWhitePapers();
+      section.groups.push(
+        unlabelledCohort(),
+      );
+      await renderWhitePapers(section, pending);
 
-      expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders('MQL'));
+      expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders('MQL'));
+      // Frozen labels need no configuration.
+      expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders(MQL_BOUND));
       await waitFor(() => {
         expect(gate.release).toBeDefined();
       });
       gate.release?.(json(200, makeConfig()));
 
       await waitFor(() => {
-        expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders(MQL_BOUND));
+        expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders(MQL_BOUND));
       });
     });
 
-    it('heads MQL plainly when the configuration cannot be read', async () => {
+    it('heads rows without a frozen label plainly when the configuration cannot be read', async () => {
+      const section = defaultWhitePapers();
+      section.groups.push(
+        unlabelledCohort(),
+      );
       const { api } = await renderWhitePapers(
-        defaultWhitePapers(),
+        section,
         apiError(500, 'config_error', 'thresholds.yaml is invalid'),
       );
 
       await waitFor(() => {
         expect(api.calls).toHaveLength(1);
       });
-      // The failed read settles without retries; the header stays plain.
+      // The failed read settles without retries; the fallback header stays plain, and the
+      // frozen headers are unaffected.
       await waitFor(() => {
-        expect(headers(table('White papers (USD)'))).toEqual(assetHeaders('MQL'));
+        expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders('MQL'));
       });
+      expect(headers(table('White papers (USD)'))).toEqual(assetHeaders(MQL_BOUND));
     });
 
     it('follows the backend precedence: resolved label, configured label, then bound property', () => {
@@ -704,13 +994,16 @@ describe('WhitePapersSection', () => {
       await renderWhitePapers(section);
 
       expect(bodyRows(table('White papers (EUR)')).map((row) => row[1])).toEqual([
-        'The 2026 B2B Pipeline Report',
+        simulatedAsset('The 2026 B2B Pipeline Report'),
       ]);
       const heldCaption = 'White papers (EUR) held until discrepancies are resolved';
       expect(screen.queryByRole('table', { name: heldCaption })).toBeNull();
       fireEvent.click(screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }));
       const held = table(heldCaption);
-      expect(bodyRows(held).map((row) => row[1])).toEqual(['The Attribution Playbook']);
+      // Its overlay was replaced without current flags, so the recorded flag labels it.
+      expect(bodyRows(held).map((row) => row[1])).toEqual([
+        'The Attribution PlaybookSimulated data',
+      ]);
 
       fireEvent.click(within(held).getByRole('button', { name: 'Details for The Attribution Playbook' }));
       expect(screen.getByText('Resolve discrepancy on Brand Search — US first')).toBeTruthy();
@@ -832,13 +1125,23 @@ describe('WhitePapersSection', () => {
       if (details === null) {
         throw new Error('no detail cell');
       }
-      // A baseline with no metric to pair with is shown as its plain value; no sample applies.
-      expect(listEntries(details, 'Evidence for orphan-asset|EUR')).toEqual([
-        'Unpaired baseline: 0.5',
-      ]);
+      // No metric is cited, so the evidence table says so; a baseline with no metric to pair
+      // with is listed as its plain value, and no sample applies.
+      const evidence = table('Evidence for orphan-asset|EUR');
+      expect(within(evidence).getByText('No metrics recorded')).toBeTruthy();
+      expect(listEntries(details, 'Baselines')).toEqual(['Unpaired baseline: 0.5']);
+      expect(within(details).queryByText(/^Sample:/u)).toBeNull();
+      expect(within(details).queryByRole('list', { name: 'Thresholds applied' })).toBeNull();
 
       fireEvent.click(screen.getByRole('button', { name: 'Details for White paper 65' }));
-      expect(screen.queryByRole('list', { name: 'Evidence for White paper 65' })).toBeNull();
+      const sparse = table('Evidence for White paper 65').closest('td');
+      if (sparse === null) {
+        throw new Error('no detail cell');
+      }
+      expect(within(sparse).queryByRole('list', { name: 'Baselines' })).toBeNull();
+      expect(listEntries(sparse, 'Data used')).toEqual([
+        'google.metrics_daily: complete, covered through 2026-10-05',
+      ]);
     });
 
     it('shows the empty state when no white paper has a row to show', async () => {
