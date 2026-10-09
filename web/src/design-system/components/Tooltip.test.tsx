@@ -17,6 +17,8 @@ import { useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 
+// Button is imported on purpose: the Tooltip contract names Button, including its disabled and
+// loading states, as a trigger that forwards aria-describedby, so those cases need the real one.
 import { Button } from './Button';
 import { Tooltip } from './Tooltip';
 
@@ -274,6 +276,42 @@ describe('Tooltip opening, persistence and dismissal', () => {
     expect(isOpen()).toBe(false);
   });
 
+  it('describes a raw button child, opens on its focus, and closes on Escape and on its blur', () => {
+    render(
+      <Tooltip content="Spend divided by conversions">
+        <button type="button">Cost/conversion</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole('button', { name: 'Cost/conversion' });
+    const { trigger, bubble } = parts();
+
+    // Closed but present, so the button's reference resolves before the first focus, and the
+    // button itself is the one described stop.
+    expect(isOpen()).toBe(false);
+    expect(bubble.hidden).toBe(true);
+    expect(button.getAttribute('aria-describedby')).toBe(bubble.id);
+    expect(trigger.hasAttribute('tabindex')).toBe(false);
+
+    focus(button);
+    expect(screen.getByRole('tooltip').textContent).toBe('Spend divided by conversions');
+
+    fireEvent.keyDown(button, { key: 'Escape' });
+    expect(isOpen()).toBe(false);
+    expect(document.activeElement).toBe(button);
+
+    // Focus leaving and returning starts a new focus, which reopens the dismissed bubble.
+    act(() => {
+      button.blur();
+    });
+    focus(button);
+    expect(isOpen()).toBe(true);
+
+    act(() => {
+      button.blur();
+    });
+    expect(isOpen()).toBe(false);
+  });
+
   it('opens when the described child itself takes focus', () => {
     render(
       <Tooltip content="Help.">
@@ -384,6 +422,19 @@ describe('Tooltip opening, persistence and dismissal', () => {
     expect(isOpen()).toBe(false);
     expect(onKeyDown).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(note);
+  });
+
+  it('dismisses a hover-opened tooltip on Escape dispatched on the document itself', () => {
+    render(<Tooltip content="Help.">Metric</Tooltip>);
+    const { wrapper } = parts();
+    fireEvent.mouseEnter(wrapper);
+    expect(isOpen()).toBe(true);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(isOpen()).toBe(false);
+    // The pointer is still over the wrapper: the dismissal holds until the next hover starts.
+    expect(parts().bubble.hidden).toBe(true);
   });
 
   it('keeps the bubble open on keys other than Escape and lets them through', () => {

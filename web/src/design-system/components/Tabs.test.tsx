@@ -88,6 +88,11 @@ describe('Tabs', () => {
         expect(panel?.getAttribute('tabindex')).toBe('0');
       });
       expect(panels.map((panel) => panel.hidden)).toEqual([false, true, true]);
+      // Only the selected panel is exposed to assistive technology.
+      const visiblePanels = screen.getAllByRole('tabpanel');
+      expect(visiblePanels).toHaveLength(1);
+      expect(visiblePanels[0]).toBe(panels[0]);
+      expect(visiblePanels[0]?.textContent).toBe('Block list');
       // Hidden panels keep their content mounted.
       expect(panels.map((panel) => panel.textContent)).toEqual([
         'Block list',
@@ -153,6 +158,7 @@ describe('Tabs', () => {
 
       fireEvent.keyDown(tabAt(1), { key: 'ArrowRight' });
       expect(document.activeElement).toBe(tabAt(2));
+      expect(selectedStates()).toEqual(['false', 'false', 'true']);
 
       fireEvent.keyDown(tabAt(2), { key: 'ArrowRight' });
       expect(document.activeElement).toBe(tabAt(0));
@@ -170,6 +176,7 @@ describe('Tabs', () => {
 
       fireEvent.keyDown(tabAt(2), { key: 'ArrowLeft' });
       expect(document.activeElement).toBe(tabAt(1));
+      expect(selectedStates()).toEqual(['false', 'true', 'false']);
       expect(visiblePanelText()).toBe('Expand list');
     });
 
@@ -240,6 +247,31 @@ describe('Tabs', () => {
         <Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="review" onChange={onChange} />,
       );
       expect(selectedStates()).toEqual(['false', 'false', 'true']);
+      expect(visiblePanelText()).toBe('Review list');
+    });
+
+    it('reports an arrow-key selection and waits for the parent to adopt it', () => {
+      const onChange = vi.fn<(key: string) => void>();
+      const { rerender } = render(
+        <Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="expand" onChange={onChange} />,
+      );
+      tabAt(1).focus();
+
+      expect(fireEvent.keyDown(tabAt(1), { key: 'ArrowRight' })).toBe(false);
+
+      expect(onChange.mock.calls).toEqual([['review']]);
+      // Focus follows the key at once; the selection stays with the parent's key.
+      expect(document.activeElement).toBe(tabAt(2));
+      expect(selectedStates()).toEqual(['false', 'true', 'false']);
+      expect(visiblePanelText()).toBe('Expand list');
+
+      rerender(
+        <Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="review" onChange={onChange} />,
+      );
+
+      expect(selectedStates()).toEqual(['false', 'false', 'true']);
+      expect(allTabs().map((tab) => tab.getAttribute('tabindex'))).toEqual(['-1', '-1', '0']);
+      expect(document.activeElement).toBe(tabAt(2));
       expect(visiblePanelText()).toBe('Review list');
     });
 

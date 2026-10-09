@@ -9,14 +9,19 @@
  * own, so a Tab the dialog leaves to the browser shows as a keydown that is not prevented, and
  * the browser's step is simulated by focusing where the browser would go.
  *
+ * The last block repeats the core contract with a `TextField` body and a footer action, the
+ * shape `DecisionForm` gives the dialog on "Record decision", so the wrapper is also proven with
+ * a real design-system field rather than a raw input alone.
+ *
  * @packageDocumentation
  */
 import { StrictMode, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 
 import { Dialog } from './Dialog';
+import { TextField } from './TextField';
 import { Tooltip } from './Tooltip';
 
 /** The dialog's panel, the `role="dialog"` element. */
@@ -930,5 +935,167 @@ describe('Dialog keyboard focus trap', () => {
         opener.remove();
       }
     });
+  });
+});
+
+describe('Dialog with a TextField body (the DecisionForm case)', () => {
+  /**
+   * A parent shaped like "Record decision": an opener outside the dialog, a `TextField` as the
+   * body's only tab stop and a submit action in the footer. The parent owns `open`, and
+   * `onClose` closes the dialog, as the usage contract requires.
+   */
+  function DecisionFormHarness() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open
+        </button>
+        <Dialog
+          open={open}
+          title="Record decision"
+          onClose={() => setOpen(false)}
+          footer={<button type="button">Save</button>}
+        >
+          <TextField label="Note" value="" onChange={() => undefined} />
+        </Dialog>
+      </>
+    );
+  }
+
+  /**
+   * Renders the harness and opens the dialog as a user does: the opener takes focus first, as a
+   * click gives it in a browser (a jsdom click does not), and is then clicked.
+   *
+   * @returns the opener and the open dialog's panel
+   */
+  function openDecisionDialog(): { opener: HTMLElement; dialog: HTMLElement } {
+    render(<DecisionFormHarness />);
+    const opener = screen.getByRole('button', { name: 'Open' });
+    act(() => {
+      opener.focus();
+    });
+    fireEvent.click(opener);
+    return { opener, dialog: screen.getByRole('dialog', { name: 'Record decision' }) };
+  }
+
+  /**
+   * The open dialog's backdrop.
+   *
+   * @returns the `.ds-dialog__backdrop` element
+   */
+  function backdrop(): Element {
+    const element = document.querySelector('.ds-dialog__backdrop');
+    if (element === null) {
+      throw new Error('Dialog backdrop not found');
+    }
+    return element;
+  }
+
+  it('renders no dialog until the opener is used', () => {
+    render(<DecisionFormHarness />);
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByLabelText('Note')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save' })).toBeNull();
+  });
+
+  it('opens as a modal dialog named by its level-2 title, holding the field and the footer action', () => {
+    const { dialog } = openDecisionDialog();
+
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    const heading = within(dialog).getByRole('heading', { level: 2 });
+    expect(heading.textContent).toBe('Record decision');
+    expect(dialog.getAttribute('aria-labelledby')).toBe(heading.id);
+    expect(dialog.contains(screen.getByLabelText('Note'))).toBe(true);
+    const save = within(dialog).getByRole('button', { name: 'Save' });
+    expect(save.closest('.ds-dialog__footer')).not.toBeNull();
+  });
+
+  it('focuses the TextField control, the first tab stop of the body, on open', () => {
+    openDecisionDialog();
+
+    const note = screen.getByLabelText('Note');
+    expect(note.tagName).toBe('INPUT');
+    expect(document.activeElement).toBe(note);
+  });
+
+  it('wraps Tab from the footer action to the Close button and Shift+Tab back, leaving inner steps to the browser', () => {
+    const { dialog } = openDecisionDialog();
+    const close = within(dialog).getByRole('button', { name: 'Close' });
+    const note = screen.getByLabelText('Note');
+    const save = within(dialog).getByRole('button', { name: 'Save' });
+
+    // From the field to the footer action the browser's own step stays inside the panel.
+    expect(fireEvent.keyDown(note, { key: 'Tab' })).toBe(true);
+    expect(document.activeElement).toBe(note);
+
+    act(() => {
+      save.focus();
+    });
+    expect(fireEvent.keyDown(save, { key: 'Tab' })).toBe(false);
+    expect(document.activeElement).toBe(close);
+
+    expect(fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(save);
+  });
+
+  it('closes on Escape and returns focus to the opener', () => {
+    const { opener, dialog } = openDecisionDialog();
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByLabelText('Note')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it('closes from the Close button and returns focus to the opener', () => {
+    const { opener, dialog } = openDecisionDialog();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it('closes from a backdrop click and returns focus to the opener, also after reopening', () => {
+    const { opener } = openDecisionDialog();
+
+    fireEvent.click(backdrop());
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+
+    // The opener holds focus again, so a second opening records it as the return target too.
+    fireEvent.click(opener);
+    expect(document.activeElement).toBe(screen.getByLabelText('Note'));
+    fireEvent.click(backdrop());
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it('calls a mock onClose once per Escape and stays open while the parent keeps open true', () => {
+    const onClose = vi.fn();
+    render(
+      <Dialog
+        open
+        title="Record decision"
+        onClose={onClose}
+        footer={<button type="button">Save</button>}
+      >
+        <TextField label="Note" value="" onChange={() => undefined} />
+      </Dialog>,
+    );
+    const dialog = screen.getByRole('dialog', { name: 'Record decision' });
+    const note = screen.getByLabelText('Note');
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('dialog', { name: 'Record decision' })).toBe(dialog);
+    expect(document.activeElement).toBe(note);
+
+    // Escape typed in the field, where focus sits while a decision is entered, reaches the panel.
+    fireEvent.keyDown(note, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 });

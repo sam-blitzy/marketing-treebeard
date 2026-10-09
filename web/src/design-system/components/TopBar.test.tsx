@@ -72,11 +72,19 @@ describe('TopBar', () => {
       'ds-topbar__product',
       'ds-topbar__actions',
     ]);
-    expect(bar.querySelector('.ds-topbar__actions')?.textContent).toBe(
-      'admin@example.comSign out',
-    );
+    const actions = bar.querySelector('.ds-topbar__actions');
+    expect(actions?.textContent).toBe('admin@example.comSign out');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    const signOutButton = screen.getByRole('button', { name: 'Sign out' });
+    expect(actions?.contains(screen.getByText('admin@example.com'))).toBe(true);
+    expect(actions?.contains(signOutButton)).toBe(true);
+
+    // The actions row adds neither a heading nor a second banner landmark: PageShell's <header>
+    // is the page's only banner and PageShell.Title its only <h1>.
+    expect(screen.queryByRole('heading')).toBeNull();
+    expect(screen.queryByRole('banner')).toBeNull();
+
+    fireEvent.click(signOutButton);
     expect(signOut).toHaveBeenCalledTimes(1);
   });
 
