@@ -443,6 +443,8 @@ def _transient_run(run_id: int = 1, *, days: int = 28) -> AnalysisRun:
         data_modes={},
         dataset_ids={},
         config_hash="overlay-test",
+        default_days=28,
+        trusted_min_days=14,
         status="succeeded",
         started_at=NOW - timedelta(hours=2),
         finished_at=NOW - timedelta(hours=2),
@@ -707,8 +709,9 @@ async def _run(
     start: date = WINDOW_START,
     end: date = WINDOW_END,
     kind: str = "default",
+    trusted_min_days: int = 14,
 ) -> AnalysisRun:
-    """Insert a succeeded run over ``[start, end]``."""
+    """Insert a succeeded run over ``[start, end]`` computed under ``trusted_min_days``."""
     run = AnalysisRun(
         kind=kind,
         window_start=start,
@@ -718,6 +721,8 @@ async def _run(
         data_modes={},
         dataset_ids={},
         config_hash="overlay-test",
+        default_days=28,
+        trusted_min_days=trusted_min_days,
         status="succeeded",
         started_at=NOW - timedelta(hours=2),
         finished_at=NOW - timedelta(hours=2) + timedelta(minutes=1),
@@ -2340,23 +2345,42 @@ async def test_the_tracking_banner_names_the_sources_of_the_runs_stored_findings
 @pytest.mark.anyio
 @pytest.mark.db
 @pytest.mark.parametrize(
-    ("days", "trusted_min_days", "flagged"),
-    [(20, 21, True), (21, 21, False), (13, None, True), (14, None, False)],
+    ("days", "stored_min", "read_min", "flagged"),
+    [
+        (20, 21, 21, True),
+        (21, 21, 21, False),
+        (13, 14, 14, True),
+        (14, 14, 14, False),
+        # The run's stored minimum decides, never the configuration it is read under.
+        (20, 21, 14, True),
+        (14, 14, 21, False),
+        (20, 14, 21, False),
+    ],
 )
-async def test_the_short_window_banner_uses_the_configured_trusted_minimum(
+async def test_the_short_window_banner_uses_the_trusted_minimum_the_run_stored(
     sessions: Sessions,
     shipped: Thresholds,
     days: int,
-    trusted_min_days: int | None,
+    stored_min: int,
+    read_min: int,
     flagged: bool,
 ) -> None:
+    """P5: the banner judges the window against the run's stored ``trusted_min_days``.
+
+    The run stores the ``window.trusted_min_days`` it was computed with (AAP 0.5.3 "Where
+    outputs are frozen"), so the banner and its message quote that value whatever
+    ``window.trusted_min_days`` the overlay is read under.
+    """
     config = (
         shipped
-        if trusted_min_days is None
-        else _thresholds("window", trusted_min_days=trusted_min_days)
+        if read_min == shipped.trusted_min_days
+        else _thresholds("window", trusted_min_days=read_min)
     )
+    assert config.trusted_min_days == read_min
     async with sessions() as session, session.begin():
-        run = await _run(session, start=WINDOW_END - timedelta(days=days - 1))
+        run = await _run(
+            session, start=WINDOW_END - timedelta(days=days - 1), trusted_min_days=stored_min
+        )
 
     result = await _page(sessions, run.id, thresholds=config)
     expected = (
@@ -2364,10 +2388,7 @@ async def test_the_short_window_banner_uses_the_configured_trusted_minimum(
             BannerView(
                 code=BANNER_SHORT_WINDOW,
                 tone="warning",
-                message=(
-                    f"Window of {days} days is below the {config.trusted_min_days}-day "
-                    "trusted minimum"
-                ),
+                message=f"Window of {days} days is below the {stored_min}-day trusted minimum",
             ),
         )
         if flagged

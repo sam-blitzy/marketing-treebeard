@@ -372,9 +372,18 @@ function sourceDays(): SourceDay[] {
   return FIXTURE_SOURCE_DAYS.map((day) => ({ ...day }));
 }
 
-/** A fresh `Evidence.window` for {@link FIXTURE_WINDOW}. */
+/**
+ * A fresh `Evidence.window` for {@link FIXTURE_WINDOW}. Google's `America/New_York` and
+ * LinkedIn's `UTC` day boundaries differ, so the window says so, with the sentence
+ * `AnalysisWindow.describe()` renders.
+ */
 function evidenceWindow(): EvidenceWindow {
-  return { ...FIXTURE_WINDOW, source_days: sourceDays() };
+  return {
+    ...FIXTURE_WINDOW,
+    source_days: sourceDays(),
+    boundaries_differ: true,
+    description: `Google ${FIXTURE_WINDOW.start} to ${FIXTURE_WINDOW.end} (America/New_York); LinkedIn same dates (UTC)`,
+  };
 }
 
 /** Optional parts of a {@link metric}. */
@@ -743,8 +752,8 @@ export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.
   meeting_time_proxy: Object.freeze({
     code: 'meeting_time_proxy',
     message:
-      '1 other meetings (ordering unverified): booking time is proxied by record creation, so ' +
-      'they are excluded from cost per meeting',
+      '1 other meeting (ordering unverified): booking time is proxied by record creation, so ' +
+      'it is excluded from cost per meeting',
   } satisfies Flag),
   pipeline_unavailable: Object.freeze({
     code: 'pipeline_unavailable',
@@ -2104,8 +2113,8 @@ function campaignsSection(): Section {
     rule_id: 'C3b',
     action: "Create ad group or campaign for 'data warehouse'",
     reason:
-      "3 converting search terms share 'data warehouse' with 7 conversions at USD 41.00 per " +
-      'conversion; no keyword, ad group or campaign name contains those words.',
+      "3 converting search terms cluster around the words 'data warehouse' with 7 conversions " +
+      'at USD 41.00 per conversion; no keyword, ad group or campaign name contains those words.',
     entity: entity('google', 'term_cluster', 'data warehouse', 'data warehouse'),
     evidence: makeEvidence({
       metrics: [

@@ -666,7 +666,14 @@ def test_budget_capped_campaigns_spend_their_budget_and_lose_impression_share(
     for row in rows:
         if row.campaign_id in shared_ids:
             shared_spend[row.date] += row.cost
-    assert max(shared_spend.values()) <= Decimal(250)
+    # The members underuse their shared budget every day: joint spend stays at or below the
+    # B3 budget.under_utilization ratio (0.50) of its daily amount, so B3 can fire on it.
+    shared_amount = cast(
+        Decimal,
+        next(budget for budget in world.google_budgets() if budget.key == "b_shared").amount,
+    )
+    assert len(shared_spend) == 60
+    assert max(shared_spend.values()) <= Decimal("0.50") * shared_amount
 
 
 def test_a_shared_budget_caps_its_members_jointly() -> None:

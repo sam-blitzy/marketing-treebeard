@@ -475,6 +475,8 @@ async def test_a_request_above_serve_through_stays_pending(db: Sessions) -> None
             data_modes={},
             dataset_ids={},
             config_hash="0" * 64,
+            default_days=28,
+            trusted_min_days=14,
             status="succeeded",
             started_at=AT - timedelta(minutes=8),
             finished_at=AT - timedelta(minutes=8),

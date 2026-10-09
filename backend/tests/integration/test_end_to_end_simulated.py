@@ -308,7 +308,8 @@ def _check_evidence_window_and_boundaries(
 
     AAP 0.5.4.8 and 0.5.4.1: the evidence window equals the run's window, ``source_days`` names
     each day source (Google on the account's zone, LinkedIn on UTC) with the window's dates and
-    covers every day source the item read, metrics carry units (and a currency for money),
+    covers every day source the item read, ``boundaries_differ`` and ``description`` say that
+    those boundaries differ, metrics carry units (and a currency for money),
     thresholds and datasets are present and complete, and the frozen provenance names active
     simulated datasets. ``action`` and ``reason`` are stated.
     """
@@ -347,6 +348,17 @@ def _check_evidence_window_and_boundaries(
                 problems.append(f"{where}: {source} boundary {entry['boundary']}, not {boundary}")
             if (entry["start"], entry["end"]) != (run["window_start"], run["window_end"]):
                 problems.append(f"{where}: {source} days {entry['start']}..{entry['end']}")
+        if window.get("boundaries_differ") is not True:
+            problems.append(
+                f"{where}: boundaries_differ is {window.get('boundaries_differ')!r}, but Google "
+                f"days end in {google_zone} and LinkedIn days in {LINKEDIN_BOUNDARY}"
+            )
+        description = (
+            f"Google {run['window_start']} to {run['window_end']} ({google_zone}); "
+            f"LinkedIn same dates ({LINKEDIN_BOUNDARY})"
+        )
+        if window.get("description") != description:
+            problems.append(f"{where}: window description {window.get('description')!r}")
 
         metrics = evidence.get("metrics") or []
         if not metrics:

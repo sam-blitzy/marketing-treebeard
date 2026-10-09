@@ -154,9 +154,10 @@ async def _insert_run(probe: ProbeConnection, status: str) -> int:
     run_id = await _scalar(
         probe,
         "INSERT INTO analysis_run (kind, window_start, window_end, source_day_boundaries, "
-        "trigger, data_modes, dataset_ids, config_hash, status, started_at, finished_at) "
+        "trigger, data_modes, dataset_ids, config_hash, default_days, trusted_min_days, "
+        "status, started_at, finished_at) "
         "VALUES ('default', %s, %s, '[]'::jsonb, 'scheduled', '{}'::jsonb, '{}'::jsonb, "
-        "'hash', %s, %s, %s) RETURNING id",
+        "'hash', 28, 14, %s, %s, %s) RETURNING id",
         (
             date(2026, 9, 4),
             date(2026, 10, 1),

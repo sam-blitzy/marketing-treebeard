@@ -8,6 +8,9 @@ header whenever it read a full page of rows. These tests drive it over HTTP thro
 ``httpx.ASGITransport`` and check that following the ``Link`` header returns every row
 exactly once, in order, across ``detected_at`` ties, resolved cursor rows and rows whose
 subject is unavailable, and that bad paging parameters are 422s, never database errors.
+``POST /discrepancies/{id}/resolve`` is checked for one request-schema rule: an
+``intended_state`` amount that is not a plain decimal (``"2.5E+2"``) is a 422 that changes
+nothing.
 
 ``api/app.py`` does not exist yet, so :func:`_app` builds the smallest application that
 mounts the router the way it will: under ``/api/v1`` with the CSRF dependency, with handlers
@@ -46,7 +49,7 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 import ads_engine.db.models  # noqa: F401 - registers every table on Base.metadata
-from ads_engine.api import deps
+from ads_engine.api import deps, security
 from ads_engine.api.deps import ApiError, CurrentUser, require_csrf
 from ads_engine.api.routes import discrepancies
 from ads_engine.db.base import Base
@@ -756,3 +759,33 @@ async def test_short_page_with_unavailable_subject_ends_the_list(
     response = await client.get(PATH, params={"limit": len(UNRESOLVED_ORDER) + 2})
     assert _ids(response) == world.unresolved_ids()
     assert "link" not in response.headers
+
+
+# ---------------------------------------------------------------------------------------
+# Resolve: the request schema as published
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_an_intended_amount_in_exponent_form_is_a_422_and_changes_nothing(
+    world: World, sessions: Sessions, client: httpx.AsyncClient
+) -> None:
+    """``"2.5E+2"`` breaks the published plain-decimal pattern, so it is refused, not read."""
+    discrepancy_id = world.unresolved["tie_high"]
+    async with sessions() as session:
+        decisions_before = await session.scalar(select(func.count()).select_from(Decision))
+    response = await client.post(
+        f"{PATH}/{discrepancy_id}/resolve",
+        json={
+            "resolution": "record_intended",
+            "intended_state": {"status": "active", "daily_budget": "2.5E+2"},
+        },
+        headers={security.CSRF_HEADER: security.CSRF_VALUE},
+    )
+    _assert_error(response, 422, "validation_error")
+    async with sessions() as session:
+        row = await session.get(Discrepancy, discrepancy_id)
+        decisions_after = await session.scalar(select(func.count()).select_from(Decision))
+    assert row is not None
+    assert (row.state, row.resolution, row.resolved_at) == ("open", None, None)
+    assert decisions_after == decisions_before

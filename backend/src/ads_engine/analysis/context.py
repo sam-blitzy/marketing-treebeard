@@ -1089,8 +1089,20 @@ class EntityRef:
         return f"{self.source}:{self.type}:{self.external_id}"
 
     def to_json(self) -> dict[str, Any]:
-        """Return AAP 0.5.3 ``Item.entity``: ``{source, type, id, name}``."""
-        return {"source": self.source, "type": self.type, "id": self.id, "name": self.name}
+        """Return AAP 0.5.3 ``Item.entity``: ``{source, type, id, name}``.
+
+        ``id`` is :attr:`external_id`, the platform id or composite key that :attr:`key` and
+        the API's ``Item.entity.id`` carry, never the internal row :attr:`id`. Items
+        (``evidence.extra.entity``), findings and withheld patterns therefore name an entity
+        in one namespace, so a withheld pattern or finding can be tied to the entity's items,
+        and every entity, a composite one included, has an id.
+        """
+        return {
+            "source": self.source,
+            "type": self.type,
+            "id": self.external_id,
+            "name": self.name,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1654,8 +1666,10 @@ class Evidence:
     plain JSON objects and arrays.
 
     Attributes:
-        window: ``AnalysisWindow.to_json()``: ``{start, end, days, source_days}`` with each
-            source's native day boundary; read-only, ``source_days`` a tuple.
+        window: ``AnalysisWindow.to_json()``: ``{start, end, days, source_days,
+            boundaries_differ, description}`` with each source's native day boundary, whether
+            those boundaries differ, and the sentence naming each source's range and boundary;
+            read-only, ``source_days`` a tuple.
         metrics: Every number the reason cites, with units and currency; keys are unique.
         baselines: The values those metrics were compared against.
         sample: The sample size against its minimum, when the rule is sample-gated.
@@ -3584,8 +3598,9 @@ class AnalysisContext:
     ) -> Evidence:
         """Build an item's evidence; every rule builds its evidence through this helper.
 
-        * ``window`` is ``self.window.to_json()``, with each source's day boundary
-          (AAP 0.5.4.8).
+        * ``window`` is ``self.window.to_json()``, with each source's day boundary (AAP
+          0.5.4.8), ``boundaries_differ`` and the ``description`` sentence, so the evidence
+          says when the sources' day boundaries differ (AAP 0.5.4.1).
         * ``thresholds`` is ``self.thresholds.subset(*threshold_keys)``: exactly the configured
           values the rule applied.
         * ``datasets`` has one :class:`DatasetStatus` per required dataset (repeats dropped),

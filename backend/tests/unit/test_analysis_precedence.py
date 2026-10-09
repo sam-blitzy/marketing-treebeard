@@ -14,7 +14,7 @@ with :func:`dataclasses.replace` to move one input across a threshold. Pure: no 
 no network.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -40,6 +40,7 @@ from ads_engine.analysis.context import (
     C0,
     C1,
     C1B,
+    C2,
     CAMPAIGNS,
     CR1,
     CREATIVE,
@@ -57,7 +58,10 @@ from ads_engine.analysis.context import (
     ENTITY_SEGMENT,
     FINDING_CONVERSION_TRACKING_ABSENT,
     FINDING_INCOMPLETE_DATASET,
+    FINDING_NO_CRM_LINK,
+    FINDING_SEGMENT_WINDOW_UNAVAILABLE,
     FLAG_INCOMPLETE,
+    FLAG_NO_CRM_LINK,
     FLAG_NOT_DISTINGUISHABLE,
     FLAG_SHORT_WINDOW,
     FLAG_SIMULATED,
@@ -78,6 +82,8 @@ from ads_engine.analysis.context import (
     DecisionSubject,
     DiscrepancyInfo,
     EntityRef,
+    FeedbackInfo,
+    Finding,
     Flag,
     Freshness,
     ProvenanceEntry,
@@ -1189,8 +1195,18 @@ def test_dynamic_groups_order_by_spend_currency_and_key() -> None:
     ctx, out = run("default")
     creative_items = out.items[CREATIVE]
     groups = list(dict.fromkeys(item.candidate.group for item in creative_items))
-    spends = [metrics.window_totals(ctx, (int(group.split(":")[1]),)).spend for group in groups]
-    assert spends == sorted(spends, reverse=True)
+    campaign_ids = [int(group.split(":")[1]) for group in groups]
+    currencies = [ctx.account_currency(campaign_id) for campaign_id in campaign_ids]
+    # One contiguous block per currency, in currency-code order, spend descending in each.
+    assert len(set(currencies)) >= 2
+    assert currencies == sorted(currencies)
+    for currency in set(currencies):
+        spends = [
+            metrics.window_totals(ctx, (campaign_id,)).spend
+            for campaign_id, code in zip(campaign_ids, currencies, strict=True)
+            if code == currency
+        ]
+        assert spends == sorted(spends, reverse=True)
     _, candidate = sample_candidate(ctx)
     unknown = replace(
         candidate,
@@ -1228,9 +1244,402 @@ def test_dynamic_groups_order_by_spend_currency_and_key() -> None:
     assert [i.candidate.group for i in ranked.items[WHITE_PAPERS]] == ["cohort:EUR", "cohort:USD"]
 
 
+def test_creative_groups_never_rank_spend_across_currencies() -> None:
+    ctx, candidate = sample_candidate()
+
+    def item(campaign_id: int, spend: str, currency: str | None) -> Candidate:
+        return replace(
+            candidate,
+            section=CREATIVE,
+            group=creative_group(campaign_id),
+            entity_ref=replace(candidate.entity_ref, external_id=f"c|{campaign_id}|{currency}"),
+            evidence=candidate.evidence.with_extra(
+                campaign_spend=Decimal(spend), currency=currency
+            ),
+        )
+
+    # Campaigns outside the context: the currency and spend their items froze decide the order.
+    items = (
+        item(987001, "5000", "usd "),
+        item(987002, "100", "EUR"),
+        item(987003, "9000", "USD"),
+        item(987004, "1000000", "  "),
+        item(987005, "500000", "JPY"),
+        item(987006, "50", "USD"),
+        item(987006, "50", "EUR"),
+        item(987007, "2000000", None),
+    )
+    ranked = apply_precedence(RuleResult(candidates=tuple(reversed(items))), ctx)
+    groups = list(dict.fromkeys(i.candidate.group for i in ranked.items[CREATIVE]))
+    by_raw_spend = [
+        creative_group(campaign_id)
+        for campaign_id in (987007, 987004, 987005, 987003, 987001, 987002, 987006)
+    ]
+    assert groups != by_raw_spend
+    assert groups == [
+        creative_group(987002),
+        creative_group(987006),
+        creative_group(987005),
+        creative_group(987003),
+        creative_group(987001),
+        creative_group(987007),
+        creative_group(987004),
+    ]
+
+
 def test_merge_flag_keeps_one_badge_per_code() -> None:
     _, candidate = sample_candidate()
     existing = candidate.with_flags(Flag(FLAG_STALE, "Data as of rule text"))
     merged = precedence._merge_flag(existing, Flag(FLAG_STALE, "precedence text"))
     assert flag_message(merged, FLAG_STALE) == "Data as of rule text; precedence text"
     assert precedence._merge_flag(merged, Flag(FLAG_STALE, "precedence text")) is merged
+
+
+# ---------------------------------------------------------------------------
+# The no_crm_link finding counts the stored items (G1, feedback, holds, C0)
+# ---------------------------------------------------------------------------
+
+
+def built_no_crm_link(results: Sequence[RuleResult], section: str) -> Finding:
+    """The ``no_crm_link`` finding a section's rules built, before precedence."""
+    (finding,) = [
+        finding
+        for result in results
+        for finding in result.findings
+        if finding.code == FINDING_NO_CRM_LINK and finding.section == section
+    ]
+    return finding
+
+
+def no_crm_link_counts(out: PrecedenceOutput, section: str) -> tuple[int, int]:
+    """A section's stored ``no_crm_link`` ``items`` and how many stored items carry the flag."""
+    (finding,) = [found for found in out.findings[section] if found.code == FINDING_NO_CRM_LINK]
+    flagged = sum(1 for candidate in of_rule(out, section) if candidate.has_flag(FLAG_NO_CRM_LINK))
+    return finding.evidence["items"], flagged
+
+
+def test_no_crm_link_items_count_only_the_items_g1_leaves() -> None:
+    ctx = build("shared.poor_member.fires")
+    results = evaluate(ctx)
+    out = apply_precedence(results, ctx)
+    for section in (CAMPAIGNS, BUDGET):
+        built = built_no_crm_link(results, section)
+        # The rule counted the C2 Scale / B1 it built; G1 removed it, so no item is stored.
+        assert built.evidence["items"] == 1
+        assert out.suppressed[section][SUPPRESS_G1_BLOCKED] == 1
+        assert no_crm_link_counts(out, section) == (0, 0)
+        # The finding stays, with only its count changed and its evidence keys in order.
+        (stored,) = [f for f in out.findings[section] if f.code == FINDING_NO_CRM_LINK]
+        assert (stored.code, stored.section, stored.entity, stored.message) == (
+            built.code,
+            built.section,
+            built.entity,
+            built.message,
+        )
+        assert dict(stored.evidence) == {**built.evidence, "items": 0}
+        assert list(stored.evidence) == list(built.evidence)
+
+
+def test_no_crm_link_recount_leaves_other_findings_and_their_order_unchanged() -> None:
+    ctx = build("default")
+    results = evaluate(ctx)
+    other = Finding(
+        FINDING_SEGMENT_WINDOW_UNAVAILABLE,
+        CAMPAIGNS,
+        None,
+        "No segment data matches the window",
+        {"items": 99},
+    )
+    out = apply_precedence([RuleResult(findings=(other,)), *results], ctx)
+    assert [f.code for f in out.findings[CAMPAIGNS]] == [
+        FINDING_NO_CRM_LINK,
+        FINDING_SEGMENT_WINDOW_UNAVAILABLE,
+    ]
+    assert out.findings[CAMPAIGNS][1] == other
+    items, flagged = no_crm_link_counts(out, CAMPAIGNS)
+    assert items == flagged == built_no_crm_link(results, CAMPAIGNS).evidence["items"]
+
+
+def test_no_crm_link_items_drop_by_one_for_a_dismissed_google_item() -> None:
+    ctx = build("default")
+    before = apply_precedence(evaluate(ctx), ctx)
+    items, flagged = no_crm_link_counts(before, CAMPAIGNS)
+    assert items == flagged
+    c1 = next(c for c in of_rule(before, CAMPAIGNS, C1) if c.has_flag(FLAG_NO_CRM_LINK))
+    dismiss = FeedbackInfo(
+        rule_id=C1,
+        entity_type=c1.entity_ref.type,
+        entity_key=c1.entity_ref.key,
+        kind="dismiss",
+        until=ctx.now + timedelta(days=30),
+    )
+    dismissed = replace(ctx, feedback=(dismiss,), cache={})
+    results = evaluate(dismissed)
+    # The rule still counts the C1 it built; precedence counts what the run stores.
+    assert built_no_crm_link(results, CAMPAIGNS).evidence["items"] == items
+    out = apply_precedence(results, dismissed)
+    assert out.suppressed[CAMPAIGNS] == {SUPPRESS_FEEDBACK_DISMISS: 1}
+    assert c1.entity_ref.key not in {c.entity_ref.key for c in of_rule(out, CAMPAIGNS, C1)}
+    assert no_crm_link_counts(out, CAMPAIGNS) == (items - 1, flagged - 1)
+    assert no_crm_link_counts(out, BUDGET) == no_crm_link_counts(before, BUDGET)
+
+
+def test_no_crm_link_items_include_held_and_c0_items() -> None:
+    ctx = build("default")
+    scale = next(
+        c
+        for c in campaigns.evaluate(ctx).candidates
+        if c.rule_id == C2 and c.has_flag(FLAG_NO_CRM_LINK)
+    )
+    assert scale.entity_ref.type == ENTITY_CAMPAIGN
+    assert scale.entity_ref.id is not None
+    campaign = ctx.campaigns[scale.entity_ref.id]
+    info = DiscrepancyInfo(
+        id=7,
+        subject_type="campaign",
+        subject_id=campaign.id,
+        subject_name=campaign.name,
+        source="google",
+        shape="own_budget",
+        kind="status",
+        decided_value={"status": "active"},
+        platform_value={"status": "paused"},
+        detected_at=ctx.now - timedelta(hours=5),
+        state="open",
+    )
+    discrepant = replace(ctx, discrepancies=(info,), cache={})
+    results = evaluate(discrepant)
+    out = apply_precedence(results, discrepant)
+    flagged = [c for c in of_rule(out, CAMPAIGNS) if c.has_flag(FLAG_NO_CRM_LINK)]
+    assert [c.rule_id for c in flagged if c.is_discrepancy] == [C0]
+    assert [c.rule_id for c in flagged if c.held] == [C2]
+    # The rule counts no C0 item; the stored count holds the C0 and the held Scale.
+    assert built_no_crm_link(results, CAMPAIGNS).evidence["items"] == len(flagged) - 1
+    assert no_crm_link_counts(out, CAMPAIGNS) == (len(flagged), len(flagged))
+    held_budget = [c for c in of_rule(out, BUDGET) if c.held and c.has_flag(FLAG_NO_CRM_LINK)]
+    assert held_budget
+    items, stored = no_crm_link_counts(out, BUDGET)
+    assert items == stored
+    reordered = apply_precedence(list(reversed(results)), discrepant)
+    assert dict(reordered.findings) == dict(out.findings)
+
+
+# ---------------------------------------------------------------------------
+# The incomplete_dataset finding counts the stored items (feedback)
+# ---------------------------------------------------------------------------
+
+SEARCH_TERMS = "google.search_terms"
+METRICS = "google.metrics_daily"
+RESULT_LIMIT = "result limit reached at finest partition"
+
+
+def with_google_freshness(ctx: AnalysisContext, dataset: str, **changes: Any) -> AnalysisContext:
+    """``ctx`` with the freshness row of the Google ``dataset`` changed by ``changes``."""
+    key = (ctx.datasets["google"].dataset_id, dataset)
+    row = replace(ctx.freshness[key], **changes)
+    return replace(ctx, freshness={**ctx.freshness, key: row}, cache={})
+
+
+def incomplete_world(name: str) -> AnalysisContext:
+    """A world with an incomplete Google dataset read by several items of several sections.
+
+    ``search_terms``: the default world with ``google.search_terms`` cut short at its finest
+    partition. ``late_metrics``: the default world with ``google.metrics_daily`` covering from
+    three days into the window, so K1 items, judged from their earlier baseline start, and
+    every other item, judged from the window start, give the dataset different reasons. Any
+    other name is a catalogue scenario.
+    """
+    if name == "search_terms":
+        return with_google_freshness(
+            build("default"), SEARCH_TERMS, completeness="incomplete", reason=RESULT_LIMIT
+        )
+    if name == "late_metrics":
+        ctx = build("default")
+        return with_google_freshness(
+            ctx, METRICS, covered_from=ctx.window.start + timedelta(days=3)
+        )
+    return build(name)
+
+
+def incomplete_dataset_findings(out: PrecedenceOutput) -> dict[str, tuple[Finding, ...]]:
+    """Every section's ``incomplete_dataset`` findings, in their stored order."""
+    return {
+        section: tuple(f for f in out.findings[section] if f.code == FINDING_INCOMPLETE_DATASET)
+        for section in SECTION_ORDER
+    }
+
+
+def incomplete_dataset_finding(out: PrecedenceOutput, section: str, dataset: str) -> Finding:
+    """A section's one stored ``incomplete_dataset`` finding of ``dataset``."""
+    (finding,) = [
+        found
+        for found in incomplete_dataset_findings(out)[section]
+        if found.evidence["dataset"] == dataset
+    ]
+    return finding
+
+
+def incomplete_readers(out: PrecedenceOutput, section: str, dataset: str) -> list[Candidate]:
+    """A section's stored items whose ``incomplete`` flag names ``dataset``."""
+    return [
+        candidate
+        for candidate in of_rule(out, section)
+        if candidate.has_flag(FLAG_INCOMPLETE)
+        and f"{dataset} (" in flag_message(candidate, FLAG_INCOMPLETE)
+    ]
+
+
+def dismissing(ctx: AnalysisContext, items: Sequence[Candidate]) -> AnalysisContext:
+    """``ctx`` with an active dismiss on each of ``items``."""
+    feedback = tuple(
+        FeedbackInfo(
+            rule_id=item.rule_id,
+            entity_type=item.entity_ref.type,
+            entity_key=item.entity_ref.key,
+            kind="dismiss",
+            until=ctx.now + timedelta(days=30),
+        )
+        for item in items
+    )
+    return replace(ctx, feedback=feedback, cache={})
+
+
+def test_incomplete_dataset_items_drop_by_one_for_a_dismissed_reader() -> None:
+    ctx = incomplete_world("search_terms")
+    before = apply_precedence(evaluate(ctx), ctx)
+    built = incomplete_dataset_finding(before, KEYWORDS, SEARCH_TERMS)
+    readers = incomplete_readers(before, KEYWORDS, SEARCH_TERMS)
+    assert len(readers) >= 2
+    assert built.evidence["items"] == len(readers)
+    dismissed = dismissing(ctx, readers[:1])
+    out = apply_precedence(evaluate(dismissed), dismissed)
+    assert out.suppressed[KEYWORDS][SUPPRESS_FEEDBACK_DISMISS] == 1
+    stored = incomplete_dataset_finding(out, KEYWORDS, SEARCH_TERMS)
+    assert stored.evidence["items"] == len(incomplete_readers(out, KEYWORDS, SEARCH_TERMS))
+    assert stored.evidence["items"] == len(readers) - 1
+    # Only the count changes; the evidence keys keep their order.
+    assert (stored.code, stored.section, stored.entity, stored.message) == (
+        built.code,
+        built.section,
+        built.entity,
+        built.message,
+    )
+    assert dict(stored.evidence) == {**built.evidence, "items": len(readers) - 1}
+    assert list(stored.evidence) == list(built.evidence)
+    # Every other finding of every section, and the findings' order, is unchanged.
+    for section in SECTION_ORDER:
+        assert out.findings[section] == tuple(
+            stored if finding == built else finding for finding in before.findings[section]
+        )
+
+
+def test_incomplete_dataset_finding_stays_with_zero_items_when_every_reader_is_dismissed() -> None:
+    ctx = incomplete_world("search_terms")
+    before = apply_precedence(evaluate(ctx), ctx)
+    built = incomplete_dataset_finding(before, KEYWORDS, SEARCH_TERMS)
+    readers = incomplete_readers(before, KEYWORDS, SEARCH_TERMS)
+    dismissed = dismissing(ctx, readers)
+    out = apply_precedence(evaluate(dismissed), dismissed)
+    assert out.suppressed[KEYWORDS][SUPPRESS_FEEDBACK_DISMISS] == len(readers)
+    assert not incomplete_readers(out, KEYWORDS, SEARCH_TERMS)
+    stored = incomplete_dataset_finding(out, KEYWORDS, SEARCH_TERMS)
+    assert (stored.code, stored.section, stored.entity, stored.message) == (
+        built.code,
+        built.section,
+        built.entity,
+        built.message,
+    )
+    assert dict(stored.evidence) == {**built.evidence, "items": 0}
+    # Campaigns' C3b still reads the dataset, so its finding keeps its count.
+    assert incomplete_readers(before, CAMPAIGNS, SEARCH_TERMS)
+    assert incomplete_dataset_finding(out, CAMPAIGNS, SEARCH_TERMS) == (
+        incomplete_dataset_finding(before, CAMPAIGNS, SEARCH_TERMS)
+    )
+
+
+def test_incomplete_dataset_reasons_name_only_what_the_stored_readers_have() -> None:
+    ctx = incomplete_world("late_metrics")
+    start = ctx.window.start
+    window_reason = (
+        f"covers from {(start + timedelta(days=3)).isoformat()}, "
+        f"after the window start {start.isoformat()}"
+    )
+    before = apply_precedence(evaluate(ctx), ctx)
+    built = incomplete_dataset_finding(before, KEYWORDS, METRICS)
+    (k1_reason,) = [r for r in built.evidence["reasons"] if "after the K1 baseline start" in r]
+    assert set(built.evidence["reasons"]) == {k1_reason, window_reason}
+    k1 = of_rule(before, KEYWORDS, K1)
+    assert k1
+    dismissed = dismissing(ctx, k1)
+    out = apply_precedence(evaluate(dismissed), dismissed)
+    readers = incomplete_readers(out, KEYWORDS, METRICS)
+    assert readers
+    assert K1 not in {candidate.rule_id for candidate in readers}
+    stored = incomplete_dataset_finding(out, KEYWORDS, METRICS)
+    assert stored.evidence["items"] == len(readers) == built.evidence["items"] - len(k1)
+    # The K1 baseline reason went with the K1 items; the message names what is left.
+    assert stored.evidence["reasons"] == (window_reason,)
+    assert stored.message == f"{METRICS} is not complete over the window: {window_reason}"
+    assert list(stored.evidence) == list(built.evidence)
+    assert dict(stored.evidence) == {
+        **built.evidence,
+        "reasons": (window_reason,),
+        "items": len(readers),
+    }
+    # With every reader dismissed, the finding keeps every reason it was built with.
+    everyone = dismissing(ctx, incomplete_readers(before, KEYWORDS, METRICS))
+    gone = incomplete_dataset_finding(
+        apply_precedence(evaluate(everyone), everyone), KEYWORDS, METRICS
+    )
+    assert (gone.message, dict(gone.evidence)) == (built.message, {**built.evidence, "items": 0})
+
+
+def test_incomplete_dataset_recount_is_identical_for_any_input_order() -> None:
+    ctx = incomplete_world("late_metrics")
+    before = apply_precedence(evaluate(ctx), ctx)
+    targets = [of_rule(before, KEYWORDS, K1)[0], incomplete_readers(before, BUDGET, METRICS)[0]]
+    dismissed = dismissing(ctx, targets)
+    results = evaluate(dismissed)
+    out = apply_precedence(results, dismissed)
+    for section in (KEYWORDS, BUDGET):
+        assert out.suppressed[section][SUPPRESS_FEEDBACK_DISMISS] == 1
+        stored = incomplete_dataset_finding(out, section, METRICS)
+        assert stored.evidence["items"] == len(incomplete_readers(out, section, METRICS))
+        assert stored.evidence["items"] == (
+            incomplete_dataset_finding(before, section, METRICS).evidence["items"] - 1
+        )
+    reordered = apply_precedence(list(reversed(results)), dismissed)
+    assert dict(reordered.findings) == dict(out.findings)
+    # The recount itself depends only on the set of stored items, never their order.
+    built = incomplete_dataset_findings(before)
+    survivors = [item.candidate for item in out.all_items()]
+    forward = precedence._recount_incomplete_datasets(dismissed, built, survivors)
+    assert forward == precedence._recount_incomplete_datasets(dismissed, built, survivors[::-1])
+    assert forward == incomplete_dataset_findings(out)
+
+
+@pytest.mark.parametrize("name", ["p4.incomplete.case", "search_terms", "late_metrics"])
+def test_incomplete_dataset_findings_without_feedback_are_unchanged(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = incomplete_world(name)
+    assert not ctx.feedback
+    results = evaluate(ctx)
+    out = apply_precedence(results, ctx)
+    findings = incomplete_dataset_findings(out)
+    assert any(findings.values())
+    for section, found in findings.items():
+        for finding in found:
+            readers = incomplete_readers(out, section, finding.evidence["dataset"])
+            assert finding.evidence["items"] == len(readers)
+
+    def as_built(
+        _ctx: AnalysisContext,
+        built: Mapping[str, tuple[Finding, ...]],
+        _candidates: Sequence[Candidate],
+    ) -> dict[str, tuple[Finding, ...]]:
+        """Step 7's findings exactly as built, with no recount."""
+        return dict(built)
+
+    monkeypatch.setattr(precedence, "_recount_incomplete_datasets", as_built)
+    assert dict(apply_precedence(results, ctx).findings) == dict(out.findings)

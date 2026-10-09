@@ -19,6 +19,11 @@ test database; nothing reaches the network. The guarantees proven here:
   cancelled and answered 503 ``request_timeout``, logged as ``api.request_timeout``. A request
   that finishes in time, a ``TimeoutError`` of the application's own, a response already
   started, other ASGI scopes and an outside cancellation are left alone.
+* **HEAD requests** (RFC 9110 §9.3.2): ``HEAD`` answers every ``GET`` route, signed in or
+  anonymous, with ``GET``'s status and headers and no body, while the OpenAPI document publishes
+  no ``head`` operation; a 405's ``Allow`` that names ``GET`` names ``HEAD`` too, and ``HEAD`` on
+  a ``POST``-only route is 405 ``Allow: POST``. The deadline's 503 and the catch-all 500 log the
+  client's real method.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
   ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET`` or on a ``DATABASE_URL``
   the engine would refuse (malformed, or a driver other than psycopg 3), while an unreachable
@@ -1403,6 +1408,285 @@ async def test_openapi_document_served_to_signed_in_session(
     assert head.status_code == 200, head.headers
     assert head.content == b""
     assert head.headers["content-length"] == str(len(response.content))
+
+
+# ---------------------------------------------------------------------------------------------
+# HEAD requests (RFC 9110 §9.3.2: HEAD answers as GET does, without the content)
+# ---------------------------------------------------------------------------------------------
+
+HEAD_PARITY_PATHS: Final = (
+    "/auth/me",
+    "/runs/latest",
+    "/runs/{run_id}",
+    "/runs?kind=custom&limit=5",
+    "/recommendations",
+    "/recommendations?run_id={run_id}",
+    "/decisions",
+    "/discrepancies?state=open",
+    "/sources",
+    "/config",
+    "/healthz",
+    "/openapi.json",
+)
+"""Every ``GET`` path under ``/api/v1``, ``{run_id}`` standing for the seeded run."""
+
+PROTECTED_GET_REQUESTS: Final = tuple(
+    request for request in PROTECTED_REQUESTS if request.method == "GET"
+)
+"""The session-protected ``GET`` endpoints, each requested once."""
+
+
+def headers_except_cookies(response: httpx.Response) -> list[tuple[str, str]]:
+    """Every response header but ``Set-Cookie``, sorted, names lower case.
+
+    A session cookie is re-signed on each response with the signing second, so its value is
+    compared by name only (:func:`cookie_names`).
+    """
+    return sorted(
+        (name.lower(), value)
+        for name, value in response.headers.multi_items()
+        if name.lower() != "set-cookie"
+    )
+
+
+def cookie_names(response: httpx.Response) -> list[str]:
+    """The names of the cookies ``response`` sets, in header order."""
+    return [header.partition("=")[0].strip() for header in response.headers.get_list("set-cookie")]
+
+
+async def test_head_answers_as_get_on_every_get_route(seeded: Seeded, login: LoginFunction) -> None:
+    """RFC 9110 §9.3.2: ``HEAD`` answers every ``GET`` route with ``GET``'s status and headers.
+
+    On the seeded database, each ``GET`` path answers ``HEAD`` with the same status, the same
+    headers (``Content-Type`` and a ``Content-Length`` equal to the ``GET`` body's length) and
+    the same cookies, and with no body. The request clock is fixed, so the read-time overlay
+    and freshness, and with them the body lengths, are identical between the two requests.
+    """
+    run_id = seeded.facts.run_id
+    app = create_app()
+    instant = datetime.now(UTC)
+    app.dependency_overrides[deps.get_now] = lambda: instant
+    async with serve(app) as client:
+        await login(client)
+        for template in HEAD_PARITY_PATHS:
+            path = api(template.format(run_id=run_id))
+            get = await client.get(path)
+            head = await client.head(path)
+            assert get.status_code == 200, (path, get.text)
+            assert get.content, path
+            assert head.status_code == get.status_code, path
+            assert head.content == b"", path
+            assert head.headers["content-type"] == get.headers["content-type"], path
+            assert head.headers["content-length"] == str(len(get.content)), path
+            assert headers_except_cookies(head) == headers_except_cookies(get), path
+            assert cookie_names(head) == cookie_names(get), path
+
+
+async def test_anonymous_head_on_healthz_answers_as_get(api_client: httpx.AsyncClient) -> None:
+    """``HEAD /healthz`` needs no session and answers 200 with ``GET``'s headers and no body.
+
+    A liveness probe that sends ``HEAD`` (``curl -I``, an uptime monitor, a load-balancer
+    check) therefore sees a healthy API as healthy.
+    """
+    get = await api_client.get(api("/healthz"))
+    head = await api_client.head(api("/healthz"))
+    assert get.status_code == 200, get.text
+    assert head.status_code == 200, head.headers
+    assert head.content == b""
+    assert head.headers["content-length"] == str(len(get.content))
+    assert headers_except_cookies(head) == headers_except_cookies(get)
+    assert head.headers.get_list("set-cookie") == []
+
+
+@pytest.mark.parametrize(
+    "request_spec", PROTECTED_GET_REQUESTS, ids=lambda spec: f"HEAD {spec.path}"
+)
+async def test_anonymous_head_on_a_protected_route_is_401_without_body(
+    api_client: httpx.AsyncClient,
+    test_identity: AdminIdentity,
+    request_spec: ProtectedRequest,
+) -> None:
+    """AAP 0.5.3: ``HEAD`` meets the session check exactly as ``GET`` does.
+
+    An anonymous ``HEAD`` on each protected ``GET`` route is 401 with the JSON content type
+    and the envelope's length, and no body; no session is set.
+    """
+    get = await api_client.get(api(request_spec.path))
+    assert_error(get, 401, "unauthenticated")
+    head = await api_client.head(api(request_spec.path))
+    assert head.status_code == 401, head.headers
+    assert head.headers["content-type"].startswith("application/json")
+    assert head.content == b""
+    assert head.headers["content-length"] == str(len(get.content))
+    assert test_identity.session_cookie not in api_client.cookies
+
+
+async def test_405_allow_names_head_wherever_get_is_served(
+    api_client: httpx.AsyncClient, test_identity: AdminIdentity
+) -> None:
+    """A 405's ``Allow`` names ``HEAD`` beside ``GET``; ``HEAD`` on a POST-only route is 405.
+
+    ``POST`` on a ``GET``-only path is 405 ``method_not_allowed`` with ``Allow: GET, HEAD``.
+    ``HEAD /auth/login`` is served as ``GET``, which the route does not take: 405 with
+    ``Allow: POST``, ``GET``'s headers and no body.
+    """
+    csrf = dict(test_identity.csrf_headers)
+    for path in ("/healthz", "/auth/me"):
+        refused = await api_client.post(api(path), headers=csrf)
+        assert_error(refused, 405, "method_not_allowed")
+        assert refused.headers["allow"] == "GET, HEAD", path
+
+    get_login = await api_client.get(api("/auth/login"))
+    assert_error(get_login, 405, "method_not_allowed")
+    assert get_login.headers["allow"] == "POST"
+    head_login = await api_client.head(api("/auth/login"))
+    assert head_login.status_code == 405, head_login.headers
+    assert head_login.headers["allow"] == "POST"
+    assert head_login.content == b""
+    assert head_login.headers["content-length"] == str(len(get_login.content))
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"Allow": "GET"}, {"Allow": "GET, HEAD"}),
+        ({"Allow": "GET, HEAD"}, {"Allow": "GET, HEAD"}),
+        ({"Allow": "POST"}, {"Allow": "POST"}),
+        (
+            {"allow": "POST, GET", "Retry-After": "5"},
+            {"allow": "POST, GET, HEAD", "Retry-After": "5"},
+        ),
+        ({"Retry-After": "5"}, {"Retry-After": "5"}),
+    ],
+    ids=["get-only", "head-present", "no-get", "lower-case-name-and-other-header", "no-allow"],
+)
+def test_allow_with_head_extends_only_an_allow_naming_get(
+    headers: dict[str, str], expected: dict[str, str]
+) -> None:
+    """``HEAD`` is added to an ``Allow`` naming ``GET`` without it; nothing else changes."""
+    assert api_app._allow_with_head(headers) == expected
+
+
+async def test_head_middleware_serves_get_and_drops_only_the_body() -> None:
+    """Driven at the ASGI level, since ``httpx.ASGITransport`` itself drops a ``HEAD`` body.
+
+    For ``HEAD`` the wrapped application sees ``GET`` on a copy of the scope, with the original
+    receive channel; the server's scope still says ``HEAD``. The start message is forwarded
+    unchanged, the two streamed body chunks are dropped, and exactly one empty final body
+    message is sent.
+    """
+    start: Message = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", b"9"),
+            (b"set-cookie", b"ads_engine_session=signed; path=/"),
+        ],
+    }
+    seen: list[tuple[str, object, bool]] = []
+
+    async def streaming_app(scope: Scope, receive: Receive, send: Send) -> None:
+        """Record the method and channel it was given, then stream a body in two chunks."""
+        seen.append((scope["type"], scope.get("method"), receive is receive_nothing))
+        await send(start)
+        await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+        await send({"type": "http.response.body", "body": b"-two", "more_body": False})
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends."""
+        sent.append(message)
+
+    scope = {**http_scope("/api/v1/stream"), "method": "HEAD"}
+    await api_app._HeadAsGetMiddleware(streaming_app)(scope, receive_nothing, collect)
+
+    assert seen == [("http", "GET", True)]
+    assert scope["method"] == "HEAD"
+    assert sent == [start, {"type": "http.response.body", "body": b"", "more_body": False}]
+    assert sent[0] is start
+
+
+async def test_head_middleware_passes_other_methods_and_scopes_through() -> None:
+    """``GET``, ``POST``, lifespan and websocket scopes reach the application untouched.
+
+    The application receives the very scope, receive and send it was called with, and what it
+    sends, a body included, is forwarded as sent.
+    """
+    passed: list[tuple[Scope, Receive, Send]] = []
+    body: Message = {"type": "http.response.body", "body": b"{}", "more_body": False}
+
+    async def recording_app(scope: Scope, receive: Receive, send: Send) -> None:
+        """Record the arguments it was called with; answer an http scope with a body."""
+        passed.append((scope, receive, send))
+        if scope["type"] == "http":
+            await send(body)
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what reaches the server."""
+        sent.append(message)
+
+    middleware = api_app._HeadAsGetMiddleware(recording_app)
+    scopes: list[Scope] = [
+        http_scope("/api/v1/healthz"),
+        {**http_scope("/api/v1/runs"), "method": "POST"},
+        {"type": "lifespan"},
+        {"type": "websocket", "path": "/api/v1/ws", "headers": []},
+    ]
+    for scope in scopes:
+        await middleware(scope, receive_nothing, collect)
+
+    assert len(passed) == len(scopes)
+    for scope, (seen_scope, seen_receive, seen_send) in zip(scopes, passed, strict=True):
+        assert seen_scope is scope
+        assert seen_receive is receive_nothing
+        assert seen_send is collect
+    assert [scope.get("method") for scope in scopes] == ["GET", "POST", None, None]
+    assert sent == [body, body]
+
+
+async def test_head_errors_rendered_outside_the_middleware_log_the_real_method(
+    monkeypatch: pytest.MonkeyPatch, captured_logs: CapturedLogs
+) -> None:
+    """The request deadline and the catch-all 500 sit outside the HEAD handling.
+
+    A ``HEAD`` still running at a 0.5 s deadline is 503 and one that crashes is 500, each with
+    the JSON content type and no body, and ``api.request_timeout`` and ``api.unhandled_error``
+    name the client's method, ``HEAD``.
+    """
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    app = create_app()
+
+    async def stalled() -> dict[str, bool]:
+        """Wait for an event nobody sets."""
+        await asyncio.Event().wait()
+        return {"finished": True}
+
+    async def crashed() -> dict[str, bool]:
+        """Fail with an unexpected error."""
+        raise RuntimeError("unexpected failure")
+
+    app.add_api_route(api("/test-stalled"), stalled, methods=["GET"])
+    app.add_api_route(api("/test-crashed"), crashed, methods=["GET"])
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    # Starlette re-raises an unhandled error after answering 500; the client must not.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        timed_out = await client.head(api("/test-stalled"))
+        failed = await client.head(api("/test-crashed"))
+
+    for response, status in ((timed_out, 503), (failed, 500)):
+        assert response.status_code == status, response.headers
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.content == b""
+    [timeout_record] = events_named(captured_logs, "api.request_timeout")
+    assert (timeout_record["method"], timeout_record["path"]) == ("HEAD", api("/test-stalled"))
+    [unhandled] = events_named(captured_logs, "api.unhandled_error")
+    assert (unhandled["method"], unhandled["error_type"]) == ("HEAD", "RuntimeError")
 
 
 # ---------------------------------------------------------------------------------------------

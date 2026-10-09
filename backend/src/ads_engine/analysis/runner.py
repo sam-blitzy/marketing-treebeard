@@ -1244,6 +1244,10 @@ async def _insert_running(
 ) -> AnalysisRun:
     """Insert the run's ``running`` row and commit it at once.
 
+    The row records the window's ``default_days`` and ``trusted_min_days``, the values the
+    P5 short-window flag judges this window against, so the run's metadata and banner stay
+    frozen with the run whatever the configuration later says.
+
     The row is flushed first and its id recorded in ``progress.run_id`` before the commit.
     A failure or cancellation from then on, in the commit, while the session closes or at
     any later step, therefore reaches the failure handling of :func:`run_analysis` with the
@@ -1263,6 +1267,8 @@ async def _insert_running(
         window_end=window.end,
         source_day_boundaries=[item.to_json() for item in window.source_days],
         config_hash=config.config_hash,
+        default_days=window.default_days,
+        trusted_min_days=window.trusted_min_days,
         started_at=instant,
         finished_at=None,
         data_modes={},

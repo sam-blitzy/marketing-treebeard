@@ -19,6 +19,10 @@ uvicorn serves the factory, never a module-level application::
 * **Session cookie**: Starlette's ``SessionMiddleware`` signs ``ads_engine_session`` with
   ``SESSION_SECRET``. The cookie is always HttpOnly, ``SameSite=Lax`` and lives 12 h; it is
   ``Secure`` exactly when ``APP_BASE_URL`` is ``https://``.
+* **HEAD requests**: ``HEAD`` is answered wherever ``GET`` is, with ``GET``'s status and
+  headers and no body (RFC 9110 §9.3.2). It is served as ``GET`` beneath the routes, so the
+  OpenAPI document publishes no ``head`` operation, and a 405's ``Allow`` that names ``GET``
+  names ``HEAD`` too.
 * **Request deadline**: every HTTP request runs under a 45 s deadline. A request still
   running then, typically one waiting on a database that stopped answering, is cancelled
   and answered 503 ``request_timeout`` in the error envelope, and logged as one
@@ -32,13 +36,13 @@ uvicorn serves the factory, never a module-level application::
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
   failing the first request, and disposes the database pool on shutdown.
 
-No middleware beyond the session cookie and the request deadline is installed. The SPA is
-served same-origin by nginx, which also proxies ``/api``, so CORS and compression have no
-role here. Swagger UI and ReDoc are disabled: they load CDN assets that nginx's
-``default-src 'self'`` Content-Security-Policy blocks. The OpenAPI document, the contract
-``web/src/api/types.ts`` is written against, is served at ``/api/v1/openapi.json`` to a
-signed-in session only. FastAPI's own schema route is disabled, because it sits outside the
-guarded routers and would answer without a session.
+No middleware beyond the session cookie, the HEAD handling and the request deadline is
+installed. The SPA is served same-origin by nginx, which also proxies ``/api``, so CORS and
+compression have no role here. Swagger UI and ReDoc are disabled: they load CDN assets that
+nginx's ``default-src 'self'`` Content-Security-Policy blocks. The OpenAPI document, the
+contract ``web/src/api/types.ts`` is written against, is served at ``/api/v1/openapi.json``
+to a signed-in session only. FastAPI's own schema route is disabled, because it sits outside
+the guarded routers and would answer without a session.
 
 The API reads stored results only. Neither this module nor any module it imports loads
 ``ads_engine.connectors``, ``ads_engine.sync`` or ``ads_engine.simulation``: all external I/O
@@ -439,12 +443,41 @@ async def _handle_request_validation(request: Request, exc: Exception) -> JSONRe
     )
 
 
+def _allow_with_head(headers: Mapping[str, str]) -> dict[str, str]:
+    """Return ``headers`` with ``HEAD`` added to an ``Allow`` that names ``GET`` but not ``HEAD``.
+
+    A route's 405 names only the methods it declares, while :class:`_HeadAsGetMiddleware`
+    serves ``HEAD`` wherever ``GET`` is served. Every other header, and an ``Allow`` that
+    names no ``GET``, is returned unchanged.
+
+    Example::
+
+        _allow_with_head({"Allow": "GET"})  # {"Allow": "GET, HEAD"}
+        _allow_with_head({"Allow": "POST"})  # {"Allow": "POST"}
+
+    Args:
+        headers: The headers of a 405 the framework raised.
+
+    Returns:
+        A new mapping with the same headers, the ``Allow`` value extended where needed.
+    """
+    adjusted = dict(headers)
+    for name, value in headers.items():
+        if name.lower() != "allow":
+            continue
+        methods = [part.strip().upper() for part in value.split(",") if part.strip()]
+        if "GET" in methods and "HEAD" not in methods:
+            adjusted[name] = ", ".join((*methods, "HEAD"))
+    return adjusted
+
+
 async def _handle_http_exception(request: Request, exc: Exception) -> JSONResponse:
     """Render an HTTP error raised by Starlette or FastAPI in the error envelope.
 
     These come from the framework, not from the routes: an unknown path (404), a method a
     path does not support (405, with its ``Allow`` header) and similar. The code follows
-    the status; the message is the exception's detail, or the status phrase.
+    the status; the message is the exception's detail, or the status phrase. A 405's
+    ``Allow`` that names ``GET`` also names ``HEAD``, which is served wherever ``GET`` is.
 
     Args:
         request: The failed request.
@@ -463,7 +496,10 @@ async def _handle_http_exception(request: Request, exc: Exception) -> JSONRespon
             message = http.HTTPStatus(error.status_code).phrase
         except ValueError:
             message = "HTTP error"
-    return _error_response(error.status_code, code, message, error.headers)
+    headers: Mapping[str, str] | None = error.headers
+    if error.status_code == http.HTTPStatus.METHOD_NOT_ALLOWED and headers is not None:
+        headers = _allow_with_head(headers)
+    return _error_response(error.status_code, code, message, headers)
 
 
 async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
@@ -601,6 +637,66 @@ class _RequestDeadlineMiddleware:
 
 
 # ---------------------------------------------------------------------------
+# HEAD requests
+# ---------------------------------------------------------------------------
+
+
+class _HeadAsGetMiddleware:
+    """Answer ``HEAD`` wherever ``GET`` is served, with ``GET``'s status and headers, no body.
+
+    RFC 9110 §9.3.2 has a server answer ``HEAD`` exactly as it would ``GET``, without the
+    content, but FastAPI registers a path operation for its declared methods only, so every
+    ``@router.get`` route would refuse ``HEAD`` with 405. Declaring ``HEAD`` on the routes
+    would publish a second OpenAPI operation per path; this pure ASGI middleware serves it
+    beneath the routes instead, so the document keeps exactly the endpoint table.
+
+    For an ``http`` scope whose method is ``HEAD``, the wrapped application is called with a
+    shallow copy of the scope whose method is ``GET``; the server's own scope is never
+    modified and still says ``HEAD``. ``http.response.start`` is forwarded unchanged, so the
+    status and every header (``Content-Type``, ``Content-Length``, ``Set-Cookie``, ``Allow``,
+    ``Retry-After``) are ``GET``'s. Every body chunk is dropped, and the application's last
+    body message is replaced by one empty final one. Any other message is forwarded as sent.
+
+    Everything inside it, the session cookie, the CSRF guard, the routes and their error
+    handlers, sees ``GET``. A ``HEAD`` therefore meets the session check exactly as a ``GET``
+    does, and a ``HEAD`` on a path that serves no ``GET``, such as ``POST /auth/login``, is
+    405 with that route's own ``Allow``. Responses rendered outside it keep their body: the
+    request deadline's 503 ``request_timeout`` and Starlette's server-error 500
+    ``internal_error``, which also log the client's real method. The HTTP server drops those
+    bodies on the wire, because it reads the method from its own scope (uvicorn's h11 and
+    httptools protocols send no content for ``HEAD``). Other methods, and lifespan and
+    websocket scopes, pass through with the original receive and send channels.
+
+    Args:
+        app: The ASGI application it wraps.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Serve one ASGI connection, answering ``HEAD`` as ``GET`` without its body.
+
+        Args:
+            scope: The connection scope; never modified.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+        """
+        if scope["type"] != "http" or scope.get("method") != "HEAD":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_without_body(message: Message) -> None:
+            """Forward ``message``, replacing the response body with one empty final message."""
+            if message["type"] != "http.response.body":
+                await send(message)
+            elif not message.get("more_body", False):
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        await self.app({**scope, "method": "GET"}, receive, send_without_body)
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -653,14 +749,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 async def _serve_openapi(request: Request) -> JSONResponse:
-    """Serve the generated OpenAPI document at ``GET`` and ``HEAD /api/v1/openapi.json``.
+    """Serve the generated OpenAPI document at ``GET /api/v1/openapi.json``.
 
     The document is the contract ``web/src/api/types.ts`` is written against. FastAPI's own
     schema route is disabled, because FastAPI registers it outside the routers, where it
     would answer without a session (AAP 0.5.3 exempts only ``POST /auth/login`` and
     ``GET /healthz``). :func:`create_app` registers this route instead, behind the routers'
     CSRF guard and :func:`~ads_engine.api.deps.require_user`, and leaves it out of the
-    document, so the published paths stay exactly the endpoint table.
+    document, so the published paths stay exactly the endpoint table. ``HEAD`` is answered
+    as on every other ``GET`` route, by :class:`_HeadAsGetMiddleware`.
 
     Args:
         request: The current request; its application generates the document, which
@@ -759,13 +856,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     4. Install ``SessionMiddleware``: cookie ``ads_engine_session``, HttpOnly,
        ``SameSite=Lax``, ``Max-Age`` 12 h, path ``/``, and ``Secure`` exactly when
        ``APP_BASE_URL`` is ``https://``.
-    5. Install the request deadline around it, inside only Starlette's own server-error
+    5. Install the HEAD handling around it (:class:`_HeadAsGetMiddleware`): a ``HEAD`` is
+       served from the session cookie inwards as ``GET``, and answered with ``GET``'s status
+       and headers and no body.
+    6. Install the request deadline around that, inside only Starlette's own server-error
        middleware: an HTTP request still running after :data:`_REQUEST_TIMEOUT_S` is
        cancelled, answered 503 ``request_timeout`` and logged as ``api.request_timeout``.
-    6. Store the login rate limiter and the settings on ``app.state``. They are created
+    7. Store the login rate limiter and the settings on ``app.state``. They are created
        here rather than in the lifespan, because test transports run no lifespan.
-    7. Include every router under ``/api/v1`` behind the CSRF guard.
-    8. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope.
+    8. Include every router under ``/api/v1`` behind the CSRF guard, then the OpenAPI
+       document's ``GET`` route.
+    9. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope; a
+       405's ``Allow`` that names ``GET`` names ``HEAD`` too.
 
     Example::
 
@@ -848,9 +950,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         same_site="lax",
         https_only=settings.secure_cookies,
     )
-    # Added last, so it is the outermost user middleware: its deadline covers the session
-    # cookie, the routers and their error handlers. Only Starlette's server-error middleware,
-    # which renders the catch-all 500, sits outside it.
+    # Around the session cookie and inside the deadline: everything from the session cookie
+    # inwards sees a HEAD as GET, while the deadline's log names the client's real method.
+    app.add_middleware(_HeadAsGetMiddleware)
+    # Added last, so it is the outermost user middleware: its deadline covers the HEAD
+    # handling, the session cookie, the routers and their error handlers. Only Starlette's
+    # server-error middleware, which renders the catch-all 500, sits outside it.
     app.add_middleware(_RequestDeadlineMiddleware, timeout=_REQUEST_TIMEOUT_S)
     app.state.login_limiter = security.LoginRateLimiter()
     app.state.settings = settings
@@ -861,7 +966,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_api_route(
         _OPENAPI_PATH,
         _serve_openapi,
-        methods=["GET", "HEAD"],
+        methods=["GET"],
         dependencies=[*csrf_guard, Depends(require_user)],
         include_in_schema=False,
     )

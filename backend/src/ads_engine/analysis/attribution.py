@@ -118,6 +118,7 @@ __all__ = [
     "OrphanDealShare",
     "VetoPopulation",
     "attribution_for",
+    "bounded_decimal",
     "build_attribution",
     "contact_evidence_known",
     "shared_budget_veto",
@@ -175,8 +176,14 @@ _GOOGLE_CONTACTS_DATASET: Final = "hubspot.google_contacts"
 _NO_SPEND_NOTE: Final = "spend is attributed only to known creatives"
 _QL_UNAVAILABLE_NOTE: Final = "Qualified Lead count unavailable"
 _MEETINGS_UNAVAILABLE_NOTE: Final = "meeting count unavailable"
+_ORDERING_UNVERIFIED: Final = "(ordering unverified)"
+"""The qualifier of :data:`OTHER_MEETINGS_LABEL`, repeated by the ``meeting_time_proxy`` flag."""
 _HUNDRED: Final = Decimal(100)
 _PERCENT_PLACES: Final = Decimal("0.1")
+_STORED_PLACES: Final = Decimal("0.000001")
+"""Finest stored money precision (``numeric(18, 6)``); derived values are bounded to it."""
+_STORED_EXPONENT: Final = -6
+"""The exponent of :data:`_STORED_PLACES`."""
 
 type _CreativeKey = tuple[int | None, str | None]
 """A per-creative row key: ``(creative id, creative URN)``; ``(None, None)`` is unknown."""
@@ -195,11 +202,49 @@ def _percent(share: Decimal) -> str:
     return format(value, "f")
 
 
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    """Return ``"1 contact"`` / ``"2 contacts"``: the count with its noun agreeing in number."""
+    noun = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {noun}"
+
+
 def _share(part: int, whole: int) -> Decimal | None:
     """Return ``part / whole`` as an exact ``Decimal``; ``None`` when ``whole`` is 0."""
     if whole <= 0:
         return None
     return Decimal(part) / Decimal(whole)
+
+
+def bounded_decimal(value: Decimal) -> Decimal:
+    """Bound a derived amount or share to the stored money precision without padding it.
+
+    The one precision rule of white-paper evidence: a value finer than six decimals
+    (``numeric(18, 6)``) is rounded half-even to six, and a coarser one is returned unchanged,
+    so every place that cites a number cites the same value. Display text and every threshold
+    comparison keep using the exact value; only serialisation is bounded.
+
+    Args:
+        value: The exact amount or share, for example a cost quotient.
+
+    Returns:
+        ``value`` quantized to six decimals when its exponent is below -6, else ``value``
+        itself (non-finite values included).
+
+    Example:
+        >>> bounded_decimal(Decimal(2766) / Decimal(31))
+        Decimal('89.225806')
+        >>> bounded_decimal(Decimal("10.00"))
+        Decimal('10.00')
+    """
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < _STORED_EXPONENT:
+        return value.quantize(_STORED_PLACES, rounding=ROUND_HALF_EVEN)
+    return value
+
+
+def _bounded_json(value: Decimal | None) -> Any:
+    """Render an optional derived amount or share as JSON, bounded by :func:`bounded_decimal`."""
+    return json_value(None if value is None else bounded_decimal(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,9 +352,13 @@ class CostValue:
         return f"≤ {shown}" if self.ceiling else shown
 
     def to_json(self) -> dict[str, Any]:
-        """Return ``{value, ceiling, note, unavailable, display}``."""
+        """Return ``{value, ceiling, note, unavailable, display}``, ``value`` to six decimals.
+
+        ``value`` is bounded by :func:`bounded_decimal`, the precision every white-paper
+        metric cites; ``display`` renders the exact value.
+        """
         return {
-            "value": json_value(self.value),
+            "value": _bounded_json(self.value),
             "ceiling": self.ceiling,
             "note": self.note,
             "unavailable": self.unavailable,
@@ -485,7 +534,10 @@ class AssetRow:
         return tuple(Flag(code, self.flag_messages[code]) for code in self.flags)
 
     def to_json(self) -> dict[str, Any]:
-        """Return the row as plain JSON; MQL and QL are separate keys, never combined."""
+        """Return the row as plain JSON; MQL and QL are separate keys, never combined.
+
+        Costs and shares are bounded to six decimals by :func:`bounded_decimal`.
+        """
         return {
             "slug": self.slug,
             "title": self.title,
@@ -499,9 +551,9 @@ class AssetRow:
             "deals_after_touch": self.deals_after_touch.to_json(),
             "cost_per_ql": self.cost_per_ql.to_json(),
             "cost_per_meeting": self.cost_per_meeting.to_json(),
-            "contact_share": json_value(self.contact_share),
-            "unknown_evidence_share": json_value(self.unknown_evidence_share),
-            "creative_share": json_value(self.creative_share),
+            "contact_share": _bounded_json(self.contact_share),
+            "unknown_evidence_share": _bounded_json(self.unknown_evidence_share),
+            "creative_share": _bounded_json(self.creative_share),
             "already_mql_before": self.already_mql_before,
             "already_ql_before": self.already_ql_before,
             "skipped_mql": self.skipped_mql,
@@ -555,11 +607,14 @@ class Cohort:
             raise ValueError(f"Cohort {self.currency}: rows in another currency: {foreign}")
 
     def to_json(self) -> dict[str, Any]:
-        """Return the cohort as plain JSON (spend total only, with the overlap note)."""
+        """Return the cohort as plain JSON (spend total only, with the overlap note).
+
+        The median is bounded to six decimals by :func:`bounded_decimal`.
+        """
         return {
             "currency": self.currency,
             "spend_total": json_value(self.spend_total),
-            "median_cost_per_ql": json_value(self.median_cost_per_ql),
+            "median_cost_per_ql": _bounded_json(self.median_cost_per_ql),
             "overlap_note": self.overlap_note,
             "rows": [row.to_json() for row in self.rows],
         }
@@ -584,7 +639,8 @@ class OrphanDealShare:
             after a complete search, "unknown (deal search incomplete)" or "unknown (deal
             search incomplete; at least N deals not assessed)" after an incomplete one ("deal
             search completeness unknown" when its completeness is unknown), and "unknown (no
-            CRM dataset for LinkedIn-attributed evidence)" without a CRM dataset.
+            CRM dataset for LinkedIn-attributed evidence)" without a CRM dataset; "1 deal" for
+            N = 1.
         reason: Why the share is unknown, when it is.
     """
 
@@ -601,12 +657,16 @@ class OrphanDealShare:
         return self.unknown or (self.share is not None and self.share >= floor_share)
 
     def to_json(self) -> dict[str, Any]:
-        """Return the share as plain JSON."""
+        """Return the share as plain JSON, ``share`` bounded to six decimals.
+
+        ``share`` is bounded by :func:`bounded_decimal`; :meth:`is_floor` and ``label`` use the
+        exact share.
+        """
         return {
             "assessed": self.assessed,
             "orphans": self.orphans,
             "not_assessed": self.not_assessed,
-            "share": json_value(self.share),
+            "share": _bounded_json(self.share),
             "unknown": self.unknown,
             "label": self.label,
             "reason": self.reason,
@@ -644,8 +704,16 @@ class VetoPopulation:
         reason: Why the pipeline is unavailable.
         veto_fires: ``available`` and at least ``crm.veto_min_leads`` eligible contacts with
             QL 0.
-        leads: Every window lead of the campaign (LinkedIn), matured or not.
+        leads: Every window lead of the campaign (LinkedIn), matured or not; for Google,
+            every touch-date contact admitted to the window (or to a shared budget's member
+            days), matured or not, once each.
         attribution_floor: Whether the unresolved share reaches ``attribution.floor_share``.
+        young_leads: Google: the touch-date contacts whose earliest admitted touch is younger
+            than ``crm.lead_maturity_days``, shown beside the veto and never judged. ``None``
+            for LinkedIn, whose young cohort the campaign rules derive from window leads.
+        young_ql: Google: those young contacts that reached Qualified Lead at or after their
+            touch and by the run; ``None`` when the Qualified Lead binding is unavailable
+            (never 0 then), and ``None`` for LinkedIn.
     """
 
     source: Source
@@ -664,6 +732,8 @@ class VetoPopulation:
     veto_fires: bool
     leads: int = 0
     attribution_floor: bool = False
+    young_leads: int | None = None
+    young_ql: int | None = None
 
     def __post_init__(self) -> None:
         """Require a reason whenever the pipeline is unavailable."""
@@ -696,6 +766,8 @@ class VetoPopulation:
             "reason": self.reason,
             "veto_fires": self.veto_fires,
             "attribution_floor": self.attribution_floor,
+            "young_leads": self.young_leads,
+            "young_ql": self.young_ql,
         }
 
 
@@ -1061,7 +1133,8 @@ def _orphan_deals(ctx: AnalysisContext, crm: CrmData | None) -> OrphanDealShare:
     instead: "unknown (deal search incomplete)", or "unknown (deal search incomplete; at least
     N deals not assessed)" when N > 0, with "deal search completeness unknown" in place of
     "deal search incomplete" when the freshness row's completeness is ``unknown``. Without a
-    CRM dataset it is "unknown (no CRM dataset for LinkedIn-attributed evidence)".
+    CRM dataset it is "unknown (no CRM dataset for LinkedIn-attributed evidence)". Each count
+    agrees with its noun: "1 deal not assessed", "2 deals not assessed".
     """
     if crm is None:
         return OrphanDealShare(0, 0, 0, None, True, f"unknown ({_NO_CRM_REASON})", _NO_CRM_REASON)
@@ -1089,23 +1162,24 @@ def _orphan_deals(ctx: AnalysisContext, crm: CrmData | None) -> OrphanDealShare:
             else "deal search incomplete"
         )
     if not_assessed:
-        reasons.append(f"{not_assessed} deal-to-contact fetches unknown")
+        fetches = _plural(not_assessed, "deal-to-contact fetch", "deal-to-contact fetches")
+        reasons.append(f"{fetches} unknown")
     unknown = bool(reasons)
     share = _share(orphans, assessed)
     if search_gap is not None:
         # Deals the search never returned are absent from ``window_deal_ids``, so the count of
         # deals not assessed is only a lower bound and is stated as one, never as a bare 0.
         label = (
-            f"unknown ({search_gap}; at least {not_assessed} deals not assessed)"
+            f"unknown ({search_gap}; at least {_plural(not_assessed, 'deal')} not assessed)"
             if not_assessed
             else f"unknown ({search_gap})"
         )
     elif unknown:
-        label = f"unknown ({not_assessed} deals not assessed)"
+        label = f"unknown ({_plural(not_assessed, 'deal')} not assessed)"
     elif share is None:
         label = "no deals created in range"
     else:
-        label = f"{_percent(share)}% ({orphans} of {assessed} deals without a contact)"
+        label = f"{_percent(share)}% ({orphans} of {_plural(assessed, 'deal')} without a contact)"
     return OrphanDealShare(
         assessed=assessed,
         orphans=orphans,
@@ -1685,9 +1759,11 @@ def _build_row(
     if deal_floor:
         messages[FLAG_DEAL_FLOOR] = f"Deal counts are a floor: orphan-deal share {orphan.label}"
     if meetings.other > 0:
+        # Noun and pronoun agree with the count: "1 other meeting … it is", "2 … they are".
+        excluded = "it is" if meetings.other == 1 else "they are"
         messages[FLAG_MEETING_TIME_PROXY] = (
-            f"{meetings.other} {OTHER_MEETINGS_LABEL.lower()}: booking time is proxied by record "
-            "creation, so they are excluded from cost per meeting"
+            f"{_plural(meetings.other, 'other meeting')} {_ORDERING_UNVERIFIED}: booking time is "
+            f"proxied by record creation, so {excluded} excluded from cost per meeting"
         )
     if bindings.ql_reason is not None:
         messages[FLAG_PIPELINE_UNAVAILABLE] = (
@@ -1750,8 +1826,25 @@ def _cost_without_spend(count: CountValue, unavailable_note: str) -> CostValue:
     return CostValue(None, note=_NO_SPEND_NOTE)
 
 
+def _stage_heading(name: str, label: str | None) -> str:
+    """Return the heading a stage finding opens with: ``MQL (First meeting booked)``.
+
+    The bound label is parenthesised only when it differs from the stage name (compared
+    stripped and case-insensitively), so a Qualified Lead count bound to the "Qualified Lead"
+    stage reads "Qualified Lead", never "Qualified Lead (Qualified Lead)".
+    """
+    text = (label or "").strip()
+    if not text or text.casefold() == name.strip().casefold():
+        return name
+    return f"{name} ({text})"
+
+
 def _skipped_findings(row: AssetRow, bindings: _Bindings) -> list[Finding]:
-    """Return the row's ``skipped_stage`` findings, one per stage with skipped contacts."""
+    """Return the row's ``skipped_stage`` findings, one per stage with skipped contacts.
+
+    Each reads "{heading}: N contacts skipped this stage (not counted)" (AAP 0.5.4.7 "Skipped
+    stages"), with "1 contact" for a single contact and the heading of :func:`_stage_heading`.
+    """
     findings: list[Finding] = []
     stages: tuple[tuple[str, str | None, ResolvedBinding | None, int], ...] = (
         ("MQL", bindings.mql_label, bindings.mql, row.skipped_mql),
@@ -1760,13 +1853,13 @@ def _skipped_findings(row: AssetRow, bindings: _Bindings) -> list[Finding]:
     for name, label, binding, skipped in stages:
         if skipped <= 0:
             continue
-        heading = f"{name} ({label})" if label else name
+        heading = _stage_heading(name, label)
         findings.append(
             Finding(
                 FINDING_SKIPPED_STAGE,
                 WHITE_PAPERS,
                 row.entity,
-                f"{heading}: {skipped} contacts skipped this stage (not counted)",
+                f"{heading}: {_plural(skipped, 'contact')} skipped this stage (not counted)",
                 {
                     "stage": name,
                     "label": label,
@@ -1844,6 +1937,7 @@ def _judge(
     matured: int,
     matched: int,
     refresh_problem: str | None = None,
+    young: Mapping[str, datetime] | None = None,
 ) -> VetoPopulation:
     """Evaluate one campaign's pipeline veto over its eligible contacts (AAP 0.5.4.1).
 
@@ -1860,7 +1954,14 @@ def _judge(
     touch-date discovery, :func:`_google_refresh_problem`): every eligible contact's evidence
     is then unknown, and the pipeline is unavailable with that reason even when it has no
     eligible contact, because the refresh may have missed some.
+
+    ``young`` holds the Google touch-date contacts too young for the veto, each at its
+    earliest admitted touch. They never enter it: they are only counted beside it as
+    ``young_leads``, with the Qualified Leads they reached at or after that touch and by the
+    run as ``young_ql`` (``None`` without a resolved Qualified Lead stage). ``None``
+    (LinkedIn) leaves both counts ``None``.
     """
+    young_leads = None if young is None else len(young)
     unresolved = matured - matched
     share = _share(unresolved, matured)
     floor = share is not None and share >= settings.floor_share
@@ -1883,6 +1984,7 @@ def _judge(
             veto_fires=False,
             leads=leads,
             attribution_floor=floor,
+            young_leads=young_leads,
         )
     # Veto evidence is the AAP 0.5.4.1 list (refresh, fetches, target reads); the MQL binding
     # is not part of it, because the veto judges Qualified Leads and meetings only.
@@ -1907,6 +2009,11 @@ def _judge(
     ql = (
         _veto_stage(contacts, touches, lambda contact: contact.ql_at, now)
         if ql_binding.available
+        else None
+    )
+    young_ql = (
+        _veto_stage(contacts, young, lambda contact: contact.ql_at, now)
+        if young is not None and ql_binding.available
         else None
     )
     reason: str | None = None
@@ -1939,6 +2046,8 @@ def _judge(
         veto_fires=available and eligible >= settings.veto_min and ql == 0,
         leads=leads,
         attribution_floor=floor,
+        young_leads=young_leads,
+        young_ql=young_ql,
     )
 
 
@@ -2052,18 +2161,36 @@ def _google_refresh_problem(ctx: AnalysisContext, crm: CrmData) -> str | None:
     return None
 
 
+def _split_by_maturity(
+    touches: Mapping[str, datetime], cutoff: datetime
+) -> tuple[dict[str, datetime], dict[str, datetime]]:
+    """Split contacts at their earliest admitted touch: matured by ``cutoff``, else young.
+
+    Both mappings are ordered by contact id. A contact with a matured and a younger touch is
+    therefore matured, at its earliest touch, and never young.
+    """
+    ordered = sorted(touches.items())
+    return (
+        {hs_id: at for hs_id, at in ordered if at <= cutoff},
+        {hs_id: at for hs_id, at in ordered if at > cutoff},
+    )
+
+
 def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPopulation]:
     """Return the matured population of every Google campaign, from ``ctx.google_crm``.
 
     Only when the Google-to-CRM link is configured and verified (``bindings.google``):
     otherwise there is no Google entry and Google items carry ``no_crm_link``; a
-    LinkedIn-derived subset never stands in. The population is the contacts found by
-    touch-date discovery whose campaign property equals the campaign's external id and whose
-    touch date lies in the window and is matured; each counts as one matched lead at its touch.
-    The window and the maturity cutoff are Google-native (:func:`_google_window_instants`): a
-    touch is in the window when it falls in ``[start 00:00, end + 1 day 00:00)`` of the
-    Google account's day, and matured when it is at least ``crm.lead_maturity_days`` before
-    that upper instant.
+    LinkedIn-derived subset never stands in. The campaign's touch-date contacts are those
+    found by touch-date discovery whose campaign property equals the campaign's external id
+    and whose touch date lies in the window, each once, at its earliest window touch; they are
+    the population's ``leads``. The population is those whose earliest touch is matured; each
+    counts as one matched lead at that touch. The rest are ``young_leads``, never judged, shown
+    with the Qualified Leads they reached at or after their touch and by the run
+    (``young_ql``). The window and the maturity cutoff are Google-native
+    (:func:`_google_window_instants`): a touch is in the window when it falls in
+    ``[start 00:00, end + 1 day 00:00)`` of the Google account's day, and matured when it is
+    at least ``crm.lead_maturity_days`` before that upper instant.
 
     The ``hubspot.google_contacts`` row records the discovery and the by-id refresh of every
     stored Google-touch contact; a contact not read makes it ``incomplete``. When that refresh
@@ -2080,19 +2207,23 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
     cutoff = upper - settings.maturity
     by_ref: dict[str, dict[str, datetime]] = {}
     found: dict[str, ContactInfo] = {}
+    found_young: dict[str, ContactInfo] = {}
     for contact in crm.google_contacts:
         ref, touch = (contact.google_campaign_ref or "").strip(), contact.google_touch_at
-        if not ref or touch is None or not lower <= touch < upper or touch > cutoff:
+        if not ref or touch is None or not lower <= touch < upper:
             continue
-        found.setdefault(contact.hs_id, contact)
+        (found if touch <= cutoff else found_young).setdefault(contact.hs_id, contact)
         touches = by_ref.setdefault(ref, {})
         earlier = touches.get(contact.hs_id)
         if earlier is None or touch < earlier:
             touches[contact.hs_id] = touch
-    contacts: dict[str, ContactInfo] = {**crm.contacts, **found}
+    # A matured touch's record outranks a younger one's, so the judged population reads
+    # exactly the records it would read without the young cohort.
+    contacts: dict[str, ContactInfo] = {**crm.contacts, **found_young, **found}
     populations: dict[int, VetoPopulation] = {}
     for campaign in _campaigns(ctx, "google"):
-        touches = dict(sorted(by_ref.get(campaign.external_id.strip(), {}).items()))
+        admitted = by_ref.get(campaign.external_id.strip(), {})
+        touches, young = _split_by_maturity(admitted, cutoff)
         populations[campaign.id] = _judge(
             source="google",
             campaign_id=campaign.id,
@@ -2102,10 +2233,11 @@ def _google_veto(ctx: AnalysisContext, settings: _Settings) -> dict[int, VetoPop
             refresh_unknown=MappingProxyType({}),
             settings=settings,
             now=ctx.now,
-            leads=len(touches),
+            leads=len(admitted),
             matured=len(touches),
             matched=len(touches),
             refresh_problem=refresh_problem,
+            young=young,
         )
     return populations
 
@@ -2131,11 +2263,14 @@ def shared_budget_veto(
     instants). A touch is matured when it is at or before the native window end
     (``window.end + 1 day 00:00`` in ``zone``) minus ``crm.lead_maturity_days``. A touch
     before a campaign joined the budget or after it left therefore never enters, and no UTC
-    bound moves a touch in or out of the first or last native day. Each contact counts as one
-    matched lead; one found through several members counts once, at its earliest admitted
-    touch; QL, MQL and meetings count only at or after that touch and by the run, and a
-    meeting of contacts of two members counts once. Known evidence, the floor and the veto
-    follow the per-campaign population.
+    bound moves a touch in or out of the first or last native day. Every contact with an
+    admitted touch is one of the population's ``leads``, once, at its earliest admitted touch,
+    even when found through several members; those whose earliest touch is matured form the
+    judged population, each one matched lead, and the rest are ``young_leads``, never judged,
+    shown with the Qualified Leads they reached at or after their touch and by the run
+    (``young_ql``). QL, MQL and meetings count only at or after that touch and by the run,
+    and a meeting of contacts of two members counts once. Known evidence, the floor and the
+    veto follow the per-campaign population.
 
     The population comes from the same touch-date discovery as the per-campaign Google veto
     (:func:`_google_veto`), so its refresh is judged the same way. The
@@ -2191,31 +2326,34 @@ def shared_budget_veto(
     cutoff = AnalysisWindow.day_bounds(ctx.window.end, zone)[1] - settings.maturity
     touches: dict[str, datetime] = {}
     found: dict[str, ContactInfo] = {}
+    found_young: dict[str, ContactInfo] = {}
     for contact in crm.google_contacts:
         ref, touch = (contact.google_campaign_ref or "").strip(), contact.google_touch_at
-        if not ref or touch is None or touch > cutoff:
+        if not ref or touch is None:
             continue
         member = days.get(ref)
         if member is None or not _on_member_day(member, touch):
             continue
-        found.setdefault(contact.hs_id, contact)
+        (found if touch <= cutoff else found_young).setdefault(contact.hs_id, contact)
         earlier = touches.get(contact.hs_id)
         if earlier is None or touch < earlier:
             touches[contact.hs_id] = touch
-    eligible = dict(sorted(touches.items()))
+    eligible, young = _split_by_maturity(touches, cutoff)
     return _judge(
         source="google",
         campaign_id=members[0],
         crm=crm,
-        contacts={**crm.contacts, **found},
+        # A matured touch's record outranks a younger one's, as in the per-campaign population.
+        contacts={**crm.contacts, **found_young, **found},
         touches=eligible,
         refresh_unknown=MappingProxyType({}),
         settings=settings,
         now=ctx.now,
-        leads=len(eligible),
+        leads=len(touches),
         matured=len(eligible),
         matched=len(eligible),
         refresh_problem=_google_refresh_problem(ctx, crm),
+        young=young,
     )
 
 
@@ -2278,7 +2416,7 @@ def _binding_findings(bindings: _Bindings) -> list[Finding]:
     for name, label, reason, binding in stages:
         if reason is None:
             continue
-        heading = f"{name} ({label})" if label else name
+        heading = _stage_heading(name, label)
         findings.append(
             Finding(
                 FINDING_PIPELINE_UNAVAILABLE,

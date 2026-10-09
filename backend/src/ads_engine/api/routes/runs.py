@@ -32,9 +32,13 @@ Decisions taken in this module, each stated where its code lives:
   (end no later than the default window end, 1 day to ``window.max_days``) live once, in
   ``AnalysisWindow.custom``.
 * **One configuration per request.** The application's loaded thresholds
-  (:data:`~ads_engine.api.deps.ThresholdsDep`) validate the window, drive the run and render
-  the response, and the request's clock (:data:`~ads_engine.api.deps.NowDep`) fixes both the
-  default window end and the run instant, so the three can never disagree.
+  (:data:`~ads_engine.api.deps.ThresholdsDep`) validate the window and drive the run, and the
+  request's clock (:data:`~ads_engine.api.deps.NowDep`) fixes both the default window end and
+  the run instant, so they can never disagree.
+* **Run views are frozen with the run.** Every ``Run`` this module returns reads
+  ``default_days``, ``trusted_min_days`` and ``short_window`` from the window settings the run
+  stored when it was computed, never from today's configuration, so the read routes take no
+  thresholds.
 * **The request's read-only transaction ends before the run.** The run commits through
   sessions of its own; the request session has only read (the signed-in user and the window
   inputs), so it is rolled back before the computation to return its pooled connection rather
@@ -57,7 +61,6 @@ from typing import Annotated, Final
 from fastapi import APIRouter, Path, Query
 
 from ads_engine.analysis import runner
-from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.api import schemas
 from ads_engine.api.deps import (
     ApiError,
@@ -97,21 +100,18 @@ _NO_RUN_YET: Final = "No analysis run yet"
 """The 404 message of ``GET /runs/latest`` before the first default run succeeds."""
 
 
-def _to_view(run: AnalysisRun, thresholds: Thresholds, settings: Settings) -> schemas.Run:
+def _to_view(run: AnalysisRun, settings: Settings) -> schemas.Run:
     """Render a stored run as the ``Run`` response every route of this module returns.
 
     Args:
-        run: The stored ``analysis_run`` row.
-        thresholds: The loaded configuration (``window.default_days`` and
-            ``window.trusted_min_days``).
+        run: The stored ``analysis_run`` row, whose stored ``default_days`` and
+            ``trusted_min_days`` fill the window settings of the view.
         settings: The application's settings (``DISPLAY_TIMEZONE``).
 
     Returns:
         The run view.
     """
-    return schemas.Run.from_row(
-        run, thresholds=thresholds, display_timezone=settings.display_timezone
-    )
+    return schemas.Run.from_row(run, display_timezone=settings.display_timezone)
 
 
 # ``/runs/latest`` is declared before ``/runs/{run_id}``, and the id is an ``int``, so the
@@ -125,7 +125,6 @@ def _to_view(run: AnalysisRun, thresholds: Thresholds, settings: Settings) -> sc
 async def get_latest_run(
     user: UserDep,
     session: SessionDep,
-    thresholds: ThresholdsDep,
     settings: SettingsDep,
 ) -> schemas.Run:
     """Return the latest succeeded default run, the one ``/actions`` shows by default.
@@ -137,7 +136,6 @@ async def get_latest_run(
     Args:
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; only read.
-        thresholds: The loaded configuration, for the window settings of the view.
         settings: The application's settings, for ``DISPLAY_TIMEZONE``.
 
     Returns:
@@ -149,7 +147,7 @@ async def get_latest_run(
     run = await runner.latest_default_run(session)
     if run is None:
         raise ApiError(404, "not_found", _NO_RUN_YET)
-    return _to_view(run, thresholds, settings)
+    return _to_view(run, settings)
 
 
 @router.get(
@@ -162,7 +160,6 @@ async def get_run_by_id(
     run_id: Annotated[int, Path(gt=0, le=schemas.BIGINT_MAX, description="The run id.")],
     user: UserDep,
     session: SessionDep,
-    thresholds: ThresholdsDep,
     settings: SettingsDep,
 ) -> schemas.Run:
     """Return one run, default or custom, in any status.
@@ -175,7 +172,6 @@ async def get_run_by_id(
         run_id: The ``analysis_run`` id.
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; only read.
-        thresholds: The loaded configuration, for the window settings of the view.
         settings: The application's settings, for ``DISPLAY_TIMEZONE``.
 
     Returns:
@@ -187,7 +183,7 @@ async def get_run_by_id(
     run = await runner.get_run(session, run_id)
     if run is None:
         raise not_found(f"Run {run_id}")
-    return _to_view(run, thresholds, settings)
+    return _to_view(run, settings)
 
 
 @router.get(
@@ -199,7 +195,6 @@ async def get_run_by_id(
 async def list_runs_route(
     user: UserDep,
     session: SessionDep,
-    thresholds: ThresholdsDep,
     settings: SettingsDep,
     kind: Annotated[
         schemas.RunKind,
@@ -218,7 +213,6 @@ async def list_runs_route(
     Args:
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; only read.
-        thresholds: The loaded configuration, for the window settings of each view.
         settings: The application's settings, for ``DISPLAY_TIMEZONE``.
         kind: ``custom`` (the default) or ``default``.
         limit: How many runs to return, :data:`DEFAULT_LIMIT` when omitted.
@@ -227,7 +221,7 @@ async def list_runs_route(
         Up to ``limit`` runs, newest first; an empty list when there are none.
     """
     runs = await runner.list_runs(session, kind=kind, limit=limit)
-    return [_to_view(run, thresholds, settings) for run in runs]
+    return [_to_view(run, settings) for run in runs]
 
 
 @router.post(
@@ -262,7 +256,8 @@ async def create_run(
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; it reads the window inputs and is never
             committed.
-        thresholds: The loaded configuration the window, the run and the view all use.
+        thresholds: The loaded configuration the window and the run use; the view reads
+            the window settings the run stored from it.
         settings: The application's settings, for ``DISPLAY_TIMEZONE``.
         now: The request's instant: the default window end is derived from it and it is the
             run's instant.
@@ -302,4 +297,4 @@ async def create_run(
         days=window.days,
         user_id=user.id,
     )
-    return _to_view(run, thresholds, settings)
+    return _to_view(run, settings)

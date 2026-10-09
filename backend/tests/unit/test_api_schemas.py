@@ -4,9 +4,13 @@ Each test asserts behaviour that AAP 0.5.3 or the module's docstrings set:
 
 * shared scalars: :data:`Money` refuses floats, booleans, non-finite and over-precise
   amounts, serialises as a fixed-point decimal string, and publishes a request schema of
-  decimal strings or whole integers only; :data:`MetricValue` renders a
+  decimal strings or whole integers only; the request amounts (:data:`MoneyIn`) hold every
+  string to exactly the published plain-decimal pattern, while response models still read
+  stored amounts as they are; request ids (:data:`PositiveBigInt`) take only a real
+  integer; :data:`MetricValue` renders a
   ``Decimal`` exactly as ``analysis.context.json_value`` freezes it and keeps ``None``
-  ("unavailable") as ``null``, never ``0``;
+  ("unavailable") as ``null``, never ``0``; :data:`SampleSize` renders a whole-number withheld
+  size as the integer item evidence uses and a fractional one as its exact decimal string;
 * vocabularies: every ``Literal`` holds exactly the AAP values and its database or analysis
   tuple, and :func:`_check_vocabularies` raises on drift in values, count or section order;
 * base classes: responses ignore unknown keys and validate from ORM attributes, requests
@@ -206,6 +210,8 @@ def _run_row(**overrides: Any) -> AnalysisRun:
         "data_modes": {"google": "simulated", "linkedin": "simulated", "hubspot": "live"},
         "dataset_ids": {"google": 1, "linkedin": 2, "hubspot": 3},
         "config_hash": "c" * 64,
+        "default_days": 28,
+        "trusted_min_days": 14,
         "status": "succeeded",
         "started_at": NOW - timedelta(minutes=5),
         "finished_at": NOW,
@@ -214,8 +220,8 @@ def _run_row(**overrides: Any) -> AnalysisRun:
     return AnalysisRun(**values)
 
 
-def _run(thresholds: Thresholds) -> Run:
-    return Run.from_row(_run_row(), thresholds=thresholds, display_timezone="America/New_York")
+def _run() -> Run:
+    return Run.from_row(_run_row(), display_timezone="America/New_York")
 
 
 def _evidence() -> dict[str, Any]:
@@ -389,9 +395,11 @@ def test_money_input_passes_strings_integers_and_decimals_through(value: object)
     ("value", "expected"),
     [
         ("120.50", Decimal("120.50")),
-        (" 12.5 ", Decimal("12.5")),
+        ("0120", Decimal(120)),
+        ("12.3400000", Decimal("12.34")),
         (120, Decimal(120)),
         (Decimal("0.000001"), Decimal("0.000001")),
+        (Decimal("1E+2"), Decimal(100)),
         ("999999999999.999999", Decimal("999999999999.999999")),
     ],
 )
@@ -415,13 +423,18 @@ def test_money_on_the_json_wire_accepts_strings_and_integers_but_not_fractional_
 @pytest.mark.parametrize(
     ("value", "error_type"),
     [
-        ("NaN", "finite_number"),
-        ("Infinity", "finite_number"),
-        ("-Infinity", "finite_number"),
+        # Non-finite and unparsable text is not a plain decimal: the lexical check refuses it.
+        ("NaN", "value_error"),
+        ("Infinity", "value_error"),
+        ("-Infinity", "value_error"),
+        ("twelve", "value_error"),
+        # A Python caller's non-finite ``Decimal`` passes the lexical check and is refused here.
+        (Decimal("NaN"), "finite_number"),
+        (Decimal("Infinity"), "finite_number"),
+        (Decimal("-Infinity"), "finite_number"),
         ("1.1234567", "decimal_max_places"),
         (10**18, "decimal_max_digits"),
         ("1000000000000.000001", "decimal_max_digits"),
-        ("twelve", "decimal_parsing"),
     ],
 )
 def test_money_refuses_non_finite_over_precise_and_unparsable_amounts(
@@ -432,17 +445,94 @@ def test_money_refuses_non_finite_over_precise_and_unparsable_amounts(
     assert _error_types(error) == [error_type]
 
 
+_LEXICALLY_REFUSED_AMOUNTS = (
+    " 120 ",
+    "1e3",
+    "4.0E+2",
+    "2.5E+2",
+    "+5",
+    "-5",
+    "120.",
+    ".5",
+    "120\n",
+    "",
+    "\u0661\u0662\u0660",  # "١٢٠": Arabic-Indic digits, which ``Decimal`` would parse as 120.
+)
+"""Strings Pydantic's ``Decimal`` would take (or a near miss) that are not plain decimals:
+whitespace, exponents, signs, a leading or trailing point, a newline, nothing at all and
+non-ASCII digits."""
+
+_LEXICAL_MESSAGE = (
+    'Value error, send amounts as plain decimal strings such as "120.50": digits with an '
+    "optional fraction, and no sign, spaces or exponent"
+)
+"""The one message every lexically refused amount gets, whatever was sent."""
+
+
+@pytest.mark.parametrize("value", _LEXICALLY_REFUSED_AMOUNTS)
+@pytest.mark.parametrize(
+    "model", [DecisionPatchIn, IntendedStateIn], ids=lambda model: model.__name__
+)
+def test_request_amounts_refuse_strings_that_are_not_plain_decimals(
+    model: type[schemas.RequestModel], value: str
+) -> None:
+    for field in ("daily_budget", "total_budget"):
+        with pytest.raises(ValidationError) as error:
+            model.model_validate({field: value})
+        errors = error.value.errors()
+        assert [(item["loc"], item["type"]) for item in errors] == [((field,), "value_error")]
+        # The API renders ``loc: msg``: one fixed message, which never carries the input.
+        assert errors[0]["msg"] == _LEXICAL_MESSAGE
+    with pytest.raises(ValidationError, match=r"plain decimal strings"):
+        model.model_validate_json(json.dumps({"daily_budget": value}))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("120.50", Decimal("120.50")),
+        ("0120", Decimal(120)),
+        ("12.3400000", Decimal("12.34")),
+        (120, Decimal(120)),
+        (Decimal("250.125"), Decimal("250.125")),
+        (Decimal("2.5E+2"), Decimal(250)),
+    ],
+)
+@pytest.mark.parametrize(
+    "model", [DecisionPatchIn, IntendedStateIn], ids=lambda model: model.__name__
+)
+def test_request_amounts_accept_plain_decimal_strings_whole_integers_and_decimals(
+    model: type[schemas.RequestModel], value: object, expected: Decimal
+) -> None:
+    present = model.model_validate({"daily_budget": value, "total_budget": value}).present_fields()
+    assert present == {"daily_budget": expected, "total_budget": expected}
+    assert all(isinstance(amount, Decimal) for amount in present.values())
+
+
+def test_the_lexical_check_runs_before_money_and_passes_non_strings_through() -> None:
+    assert schemas._money_lexical_form("120.50") == "120.50"
+    for value in (120, Decimal("1E+2"), None, 120.5, True):
+        assert schemas._money_lexical_form(value) is value
+    with pytest.raises(ValueError, match=r"plain decimal strings"):
+        schemas._money_lexical_form("1e3")
+    # Floats and booleans still meet ``Money``'s own refusal behind the lexical check.
+    for value in (120.5, True):
+        with pytest.raises(ValidationError, match=r"not JSON numbers"):
+            DecisionPatchIn.model_validate({"daily_budget": value})
+    assert {"Money", "MoneyIn"} <= set(schemas.__all__)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
         ("120.50", "120.50"),
-        ("1E+2", "100"),
-        ("2.50E+1", "25.0"),
+        (Decimal("1E+2"), "100"),
+        (Decimal("2.50E+1"), "25.0"),
         ("0.0000000", "0.0000000"),
     ],
 )
 def test_money_serialises_as_fixed_point_text_in_json_and_stays_a_decimal_in_python(
-    value: str, expected: str
+    value: str | Decimal, expected: str
 ) -> None:
     patch = DecisionPatchIn.model_validate({"daily_budget": value})
     assert patch.model_dump(mode="json")["daily_budget"] == expected
@@ -500,6 +590,38 @@ def test_metric_value_keeps_one_json_type_per_value(value: object, expected: obj
     dumped = metric.model_dump(mode="json")["value"]
     assert dumped == expected
     assert type(dumped) is type(expected)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("1.000000"), 1),
+        (Decimal("28.000000"), 28),
+        (Decimal("0.000000"), 0),
+        (Decimal("1E+2"), 100),
+        (Decimal("2.900000"), "2.900000"),
+        (Decimal("0.300000"), "0.300000"),
+        (8, 8),
+        ("2.5", "2.5"),
+        (None, None),
+    ],
+)
+def test_sample_size_renders_whole_numbers_as_integers_and_fractions_exactly(
+    value: object, expected: object
+) -> None:
+    """A ``numeric(18,6)`` size renders as item evidence renders it: counts as integers."""
+    dumped = WithheldSample(observed=value, required=value, unit="clicks").model_dump(mode="json")
+    assert (dumped["observed"], dumped["required"]) == (expected, expected)
+    assert type(dumped["observed"]) is type(expected)
+    assert type(dumped["required"]) is type(expected)
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+def test_sample_size_refuses_a_non_finite_decimal(value: Decimal) -> None:
+    with pytest.raises(ValueError, match=r"sample sizes must be finite"):
+        schemas._sample_size_input(value)
+    with pytest.raises(ValidationError, match=r"sample sizes must be finite"):
+        WithheldSample(observed=value, required=Decimal("1.000000"), unit="clicks")
 
 
 def test_a_missing_number_stays_null_and_never_becomes_zero() -> None:
@@ -838,13 +960,12 @@ RUN_KEYS = {
 """AAP 0.5.3 ``Run``."""
 
 
-def test_run_from_row_reproduces_the_aap_run_shape(thresholds: Thresholds) -> None:
+def test_run_from_row_reproduces_the_aap_run_shape() -> None:
     run = Run.from_row(
         _run_row(
             source_day_boundaries=list(reversed(_source_days())),
             data_modes={"google": "simulated", "linkedin": "live"},
         ),
-        thresholds=thresholds,
         display_timezone="Europe/London",
     )
     dumped = run.model_dump(mode="json")
@@ -867,29 +988,56 @@ def test_run_from_row_reproduces_the_aap_run_shape(thresholds: Thresholds) -> No
 
 @pytest.mark.parametrize(
     ("trusted_min_days", "days", "short"),
-    [(None, 13, True), (None, 14, False), (21, 20, True), (21, 21, False)],
+    [(14, 13, True), (14, 14, False), (21, 20, True), (21, 21, False)],
 )
-def test_run_short_window_uses_the_configured_minimum(
-    thresholds: Thresholds, trusted_min_days: int | None, days: int, short: bool
+def test_run_short_window_uses_the_minimum_the_run_stored(
+    trusted_min_days: int, days: int, short: bool
 ) -> None:
-    config = (
-        thresholds
-        if trusted_min_days is None
-        else _thresholds_with(trusted_min_days=trusted_min_days)
-    )
     run = Run.from_row(
-        _run_row(window_start=DEFAULT_END - timedelta(days=days - 1)),
-        thresholds=config,
+        _run_row(
+            window_start=DEFAULT_END - timedelta(days=days - 1),
+            trusted_min_days=trusted_min_days,
+        ),
         display_timezone="UTC",
     )
     assert run.days == days
     assert run.short_window is short
-    assert run.trusted_min_days == config.trusted_min_days
+    assert run.trusted_min_days == trusted_min_days
 
 
-def test_run_from_row_handles_a_running_row_without_modes_or_boundaries(
-    thresholds: Thresholds,
+@pytest.mark.parametrize(
+    ("stored", "current_trusted_min_days", "short"),
+    [
+        # A 20-day run computed under trusted_min_days: 21, read under the shipped 14.
+        ({"default_days": 21, "trusted_min_days": 21}, 14, True),
+        # A 20-day run computed under the shipped 14, read after a change to 21.
+        ({"default_days": 28, "trusted_min_days": 14}, 21, False),
+    ],
+)
+def test_run_reports_the_window_settings_frozen_with_the_run_whatever_the_configuration(
+    stored: dict[str, int], current_trusted_min_days: int, short: bool
 ) -> None:
+    """AAP 0.5.3 "Where outputs are frozen": the view reads the run's stored settings.
+
+    ``Run.from_row`` takes no configuration, so ``default_days``, ``trusted_min_days`` and
+    ``short_window`` are those the 20-day run was computed with, never those loaded now,
+    which would judge the same window the other way.
+    """
+    current = _thresholds_with(trusted_min_days=current_trusted_min_days)
+    run = Run.from_row(
+        _run_row(window_start=DEFAULT_END - timedelta(days=19), **stored),
+        display_timezone="UTC",
+    )
+    assert (run.days, run.short_window) == (20, short)
+    assert (run.default_days, run.trusted_min_days) == (
+        stored["default_days"],
+        stored["trusted_min_days"],
+    )
+    assert run.trusted_min_days != current.trusted_min_days
+    assert (run.days < current.trusted_min_days) is not short
+
+
+def test_run_from_row_handles_a_running_row_without_modes_or_boundaries() -> None:
     run = Run.from_row(
         _run_row(
             kind="custom",
@@ -900,7 +1048,6 @@ def test_run_from_row_handles_a_running_row_without_modes_or_boundaries(
             source_day_boundaries=None,
             window_start=DEFAULT_END,
         ),
-        thresholds=thresholds,
         display_timezone="UTC",
     )
     assert (run.kind, run.trigger, run.status, run.finished_at) == (
@@ -929,10 +1076,10 @@ def test_run_from_row_handles_a_running_row_without_modes_or_boundaries(
     ],
 )
 def test_run_from_row_rejects_a_stored_value_outside_the_contract(
-    thresholds: Thresholds, overrides: dict[str, Any], error_type: str
+    overrides: dict[str, Any], error_type: str
 ) -> None:
     with pytest.raises(ValidationError) as error:
-        Run.from_row(_run_row(**overrides), thresholds=thresholds, display_timezone="UTC")
+        Run.from_row(_run_row(**overrides), display_timezone="UTC")
     assert _error_types(error) == [error_type]
 
 
@@ -963,15 +1110,85 @@ def test_run_and_evidence_windows_match_the_analysis_window(thresholds: Threshol
             window_start=window.start,
             window_end=window.end,
             source_day_boundaries=list(reversed(window.source_days_json())),
+            default_days=window.default_days,
+            trusted_min_days=window.trusted_min_days,
         ),
-        thresholds=thresholds,
         display_timezone="UTC",
     )
     assert run.days == window.days == 35
+    assert (run.default_days, run.trusted_min_days, run.short_window) == (
+        window.default_days,
+        window.trusted_min_days,
+        window.short_window,
+    )
     assert [day.model_dump(mode="json") for day in run.source_days] == window.source_days_json()
     assert EvidenceWindow.model_validate(window.to_json()).model_dump(mode="json") == (
         window.to_json()
     )
+
+
+@pytest.mark.parametrize(
+    ("sources", "differ", "description"),
+    [
+        (
+            NEW_YORK,
+            True,
+            "Google 2026-09-08 to 2026-10-05 (America/New_York); LinkedIn same dates (UTC)",
+        ),
+        (
+            SourceDayInfo(None),
+            False,
+            "Google 2026-09-08 to 2026-10-05 (UTC); LinkedIn same dates (UTC)",
+        ),
+    ],
+)
+def test_evidence_window_states_whether_the_day_boundaries_differ(
+    thresholds: Thresholds, sources: SourceDayInfo, differ: bool, description: str
+) -> None:
+    """AAP 0.5.4.1: when the boundaries differ, the evidence says so."""
+    window = AnalysisWindow.custom(
+        date(2026, 9, 8), DEFAULT_END, config=thresholds, sources=sources, now=NOW
+    )
+    parsed = EvidenceWindow.model_validate(window.to_json())
+    assert (parsed.boundaries_differ, parsed.description) == (differ, description)
+    dumped = parsed.model_dump(mode="json")
+    assert list(dumped) == [
+        "start",
+        "end",
+        "days",
+        "source_days",
+        "boundaries_differ",
+        "description",
+    ]
+    assert (dumped["boundaries_differ"], dumped["description"]) == (differ, description)
+
+
+def test_evidence_window_frozen_before_the_boundary_keys_reads_them_as_null() -> None:
+    stored = {"start": "2026-09-08", "end": "2026-10-05", "days": 28, "source_days": _source_days()}
+    parsed = EvidenceWindow.model_validate(stored)
+    assert (parsed.boundaries_differ, parsed.description) == (None, None)
+    dumped = parsed.model_dump(mode="json")
+    assert (dumped["boundaries_differ"], dumped["description"]) == (None, None)
+    assert {key: dumped[key] for key in stored} == stored
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "error_type"),
+    [("boundaries_differ", "sometimes", "bool_parsing"), ("description", 7, "string_type")],
+)
+def test_evidence_window_refuses_a_mistyped_boundary_statement(
+    key: str, value: object, error_type: str
+) -> None:
+    stored = {
+        "start": "2026-09-08",
+        "end": "2026-10-05",
+        "days": 28,
+        "source_days": _source_days(),
+        key: value,
+    }
+    with pytest.raises(ValidationError) as error:
+        EvidenceWindow.model_validate(stored)
+    assert _error_types(error) == [error_type]
 
 
 def test_create_run_request_parses_calendar_dates() -> None:
@@ -1153,18 +1370,23 @@ def test_create_run_request_leaves_the_window_bounds_to_analysis_window_custom(
 # ---------------------------------------------------------------------------
 
 
-def test_entity_view_renders_the_stored_integer_id_as_a_decimal_string() -> None:
+def test_entity_view_carries_the_external_id_items_use_not_the_row_id() -> None:
     ref = context.EntityRef(
         source="google", type="campaign", id=42, external_id="2233445566", name="Brand - US"
     )
     entity = EntityView.model_validate(ref.to_json())
-    assert entity.id == "42"
+    assert entity.id == "2233445566"
     assert entity.model_dump(mode="json") == {
         "source": "google",
         "type": "campaign",
-        "id": "42",
+        "id": "2233445566",
         "name": "Brand - US",
     }
+
+
+def test_entity_view_renders_an_integer_id_stored_by_an_earlier_run_as_a_decimal_string() -> None:
+    stored = {"source": "google", "type": "campaign", "id": 42, "name": "Brand - US"}
+    assert EntityView.model_validate(stored).model_dump(mode="json") == {**stored, "id": "42"}
 
 
 @pytest.mark.parametrize(
@@ -1178,13 +1400,22 @@ def test_entity_view_id_is_always_a_string(value: object, expected: str) -> None
     assert entity.id == expected
 
 
-def test_entity_view_id_may_be_null_for_an_account_wide_entity() -> None:
+def test_entity_view_of_an_entity_without_a_row_carries_its_composite_key() -> None:
     ref = context.EntityRef(
-        source="google", type="account", id=None, external_id="1234567890", name=""
+        source="google",
+        type="search_term",
+        id=None,
+        external_id=context.search_term_external_id("55", "901", "crm software"),
+        name="",
     )
     entity = EntityView.model_validate(ref.to_json())
-    assert entity.id is None
-    assert entity.name == "1234567890"
+    assert entity.id == "55|901|crm software"
+    assert entity.name == "55|901|crm software"
+
+
+def test_entity_view_id_may_be_null_when_the_stored_entity_carries_none() -> None:
+    stored = {"source": "google", "type": "search_term", "id": None, "name": "crm software"}
+    assert EntityView.model_validate(stored).id is None
 
 
 @pytest.mark.parametrize(
@@ -1419,10 +1650,8 @@ def test_flag_holds_a_code_and_a_message() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_recommendations_page_returns_the_five_sections_in_the_fixed_order(
-    thresholds: Thresholds,
-) -> None:
-    payload = _page(_run(thresholds))
+def test_recommendations_page_returns_the_five_sections_in_the_fixed_order() -> None:
+    payload = _page(_run())
     payload["sections"][0]["groups"] = [
         {"key": "block", "title": "Block", "items": [_item()]},
     ]
@@ -1450,7 +1679,7 @@ def test_recommendations_page_returns_the_five_sections_in_the_fixed_order(
     }
     assert set(dumped["overlay"]["source_modes"]) == {"google", "linkedin", "hubspot"}
     assert set(dumped["banners"][0]) == {"code", "tone", "message", "count"}
-    assert dumped["run"] == _run(thresholds).model_dump(mode="json")
+    assert dumped["run"] == _run().model_dump(mode="json")
 
 
 @pytest.mark.parametrize(
@@ -1463,11 +1692,9 @@ def test_recommendations_page_returns_the_five_sections_in_the_fixed_order(
         (),
     ],
 )
-def test_recommendations_page_refuses_any_other_section_list(
-    thresholds: Thresholds, keys: tuple[str, ...]
-) -> None:
+def test_recommendations_page_refuses_any_other_section_list(keys: tuple[str, ...]) -> None:
     with pytest.raises(ValidationError, match=r"sections must be exactly \['keywords'"):
-        RecommendationsPage.model_validate(_page(_run(thresholds), keys))
+        RecommendationsPage.model_validate(_page(_run(), keys))
 
 
 def test_section_refuses_an_unknown_key_and_a_non_integer_suppression_count() -> None:
@@ -1537,7 +1764,12 @@ def test_finding_from_row_returns_the_stored_finding() -> None:
     assert finding.model_dump(mode="json") == {
         "code": "k1_no_baseline",
         "section": "keywords",
-        "entity": {"source": "google", "type": "campaign", "id": "42", "name": "Brand - US"},
+        "entity": {
+            "source": "google",
+            "type": "campaign",
+            "id": "2233445566",
+            "name": "Brand - US",
+        },
         "message": "K1 withheld: 9 baseline conversions of 10 required",
         "evidence": {"baseline_conversions": 9, "required": 10},
     }
@@ -1588,7 +1820,7 @@ def test_finding_from_row_rejects_a_stored_value_outside_the_contract(
     assert _error_types(error) == [error_type]
 
 
-def test_withheld_from_row_renders_numeric_samples_as_fixed_point_strings() -> None:
+def test_withheld_from_row_renders_whole_number_samples_as_integers() -> None:
     ref = context.EntityRef("google", "account", 3, "1234567890", "Main account")
     row = RunWithheld(
         run_id=41,
@@ -1603,9 +1835,52 @@ def test_withheld_from_row_renders_numeric_samples_as_fixed_point_strings() -> N
     withheld = Withheld.from_row(row)
     assert withheld.model_dump(mode="json") == {
         "rule_id": "B4",
-        "entity": {"source": "google", "type": "account", "id": "3", "name": "Main account"},
+        "entity": {
+            "source": "google",
+            "type": "account",
+            "id": "1234567890",
+            "name": "Main account",
+        },
         "reason": "3 weekend days of 4 required",
-        "sample": {"observed": "3", "required": "4.000000", "unit": "weekend days"},
+        "sample": {"observed": 3, "required": 4, "unit": "weekend days"},
+    }
+
+
+def test_withheld_from_row_matches_the_item_sample_and_keeps_a_fraction_exact() -> None:
+    """``numeric(18,6)`` counts read back as ``Decimal("1.000000")`` render as item counts do."""
+    ref = context.EntityRef("linkedin", "campaign", 12, "990010001", "Benchmarks - Lead gen")
+    counts = RunWithheld(
+        run_id=41,
+        section="creative",
+        rule_id="CR1",
+        entity=ref.to_json(),
+        reason="1 eligible variant of 2 required",
+        observed=Decimal("1.000000"),
+        required=Decimal("2.000000"),
+        unit="variants",
+    )
+    dumped = Withheld.from_row(counts).model_dump(mode="json")
+    assert dumped["sample"] == {"observed": 1, "required": 2, "unit": "variants"}
+    item_sample = context.Sample(observed=1, required=2, unit="variants").to_json()
+    assert (dumped["sample"]["observed"], dumped["sample"]["required"]) == (
+        item_sample["observed"],
+        item_sample["required"],
+    )
+    assert dumped["entity"]["id"] == "990010001"
+    fractional = RunWithheld(
+        run_id=41,
+        section="campaigns",
+        rule_id="C1",
+        entity=ref.to_json(),
+        reason="2.9 expected outcomes of 3 required",
+        observed=Decimal("2.900000"),
+        required=Decimal("3.000000"),
+        unit="expected outcomes",
+    )
+    assert Withheld.from_row(fractional).model_dump(mode="json")["sample"] == {
+        "observed": "2.900000",
+        "required": 3,
+        "unit": "expected outcomes",
     }
 
 
@@ -1775,7 +2050,7 @@ def test_decision_request_optional_fields_default_to_null() -> None:
         (
             {"subject": {"type": "campaign", "id": "twelve"}, "patch": {}},
             ("subject", "id"),
-            "int_parsing",
+            "int_type",
         ),
         (
             {"subject": {"type": "campaign", "id": 1}, "patch": {}, "recommendation_id": 0},
@@ -1798,6 +2073,34 @@ def test_decision_request_refuses_bad_subjects_references_and_notes(
         DecisionRequest.model_validate(payload)
     errors = error.value.errors()
     assert [(item["loc"], item["type"]) for item in errors] == [(location, error_type)]
+
+
+@pytest.mark.parametrize("value", ["1", True, 1.0], ids=["string", "bool", "float"])
+def test_request_ids_take_only_a_real_integer(value: object) -> None:
+    subject = {"type": "campaign", "id": value}
+    with pytest.raises(ValidationError) as error:
+        schemas.SubjectIn.model_validate(subject)
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [(("id",), "int_type")]
+    with pytest.raises(ValidationError) as error:
+        DecisionRequest.model_validate(
+            {"subject": {"type": "campaign", "id": 1}, "patch": {}, "recommendation_id": value}
+        )
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("recommendation_id",), "int_type")
+    ]
+    with pytest.raises(ValidationError) as error:
+        DecisionRequest.model_validate_json(json.dumps({"subject": subject, "patch": {}}))
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("subject", "id"), "int_type")
+    ]
+
+
+def test_request_ids_accept_a_json_integer() -> None:
+    assert schemas.SubjectIn.model_validate({"type": "campaign", "id": 1}).id == 1
+    request = DecisionRequest.model_validate_json(
+        '{"subject": {"type": "campaign", "id": 1}, "patch": {}, "recommendation_id": 1}'
+    )
+    assert (request.subject.id, request.recommendation_id) == (1, 1)
 
 
 def test_bigint_max_is_the_largest_postgresql_bigint() -> None:
@@ -2282,6 +2585,28 @@ def test_discrepancy_from_row_accepts_any_iterable_and_collapses_repeats() -> No
     assert discrepancy.decided_value is None
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [("125", "125"), ("120.000000", "120.000000"), ("1E+3", "1000"), (" 12.5 ", "12.5")],
+)
+def test_response_models_read_stored_amounts_the_request_pattern_would_refuse(
+    stored: str, expected: str
+) -> None:
+    """Only requests are held to the plain-decimal form; stored ``jsonb`` amounts are read."""
+    decision = Decision.from_row(_decision_row(patch={"daily_budget": stored}), subject=_subject())
+    assert decision.model_dump(mode="json")["patch"] == {"daily_budget": expected}
+    money = {"daily_budget": stored, "total_budget": None, "currency": "USD"}
+    discrepancy = Discrepancy.from_row(
+        _discrepancy_row(kind="budget", decided_value=money, platform_value=money),
+        subject=_subject(),
+        shape="own_budget",
+        resolutions=["platform_correct", "decision_correct"],
+    )
+    dumped = discrepancy.model_dump(mode="json")
+    for side in ("decided_value", "platform_value"):
+        assert dumped[side] == {"daily_budget": expected, "total_budget": None, "currency": "USD"}
+
+
 def test_discrepancy_from_row_refuses_an_unknown_resolution() -> None:
     with pytest.raises(ValueError, match=r"unknown discrepancy resolutions \['ignore', 'snooze'\]"):
         Discrepancy.from_row(
@@ -2674,6 +2999,7 @@ _DEFAULTED_RESPONSE_KEYS: tuple[
         lambda: {"name": "Fisher's exact test", "p_value": "0.012", "alpha": "0.05"},
         ("p_adjusted",),
     ),
+    (EvidenceWindow, lambda: _evidence()["window"], ("boundaries_differ", "description")),
     (Evidence, _evidence, ("sample", "test", "extra")),
     (ItemOverlay, _overlay_now, ("held_reason_now", "hidden_by")),
     (Item, _item, ("held_reason", "decision_subject")),
@@ -2713,8 +3039,8 @@ _DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]
 
 def test_the_defaulted_response_keys_cover_every_defaulted_response_field() -> None:
     listed = {model: set(keys) for model, _, keys in _DEFAULTED_RESPONSE_KEYS}
-    assert len(listed) == 11
-    assert sum(len(keys) for keys in listed.values()) == 21
+    assert len(listed) == 12
+    assert sum(len(keys) for keys in listed.values()) == 23
     for model, keys in listed.items():
         defaulted = {name for name, field in model.model_fields.items() if not field.is_required()}
         assert defaulted == keys, model.__name__
@@ -2805,13 +3131,18 @@ def _published_money_accepts(schema: dict[str, Any], value: object) -> bool:
 
     A Python ``float`` stands for a JSON number written with a decimal point and ``bool`` for
     ``true``/``false``; neither is a JSON-schema ``integer`` here. The checker implements
-    exactly the keywords the schema uses, and the assertion keeps it that way.
+    exactly the keywords the schema uses, and the assertion keeps it that way. The pattern is
+    anchored at both ends, where ECMA-262's ``$`` matches only at the end of the input;
+    Python's ``$`` also matches before a final newline, so ``re.fullmatch`` stands for it.
     """
     accepted = False
     for branch in schema["anyOf"]:
         assert set(branch) <= {"type", "pattern", "minimum", "maximum"}, branch
         if branch["type"] == "string" and isinstance(value, str):
-            accepted |= re.search(branch["pattern"], value) is not None
+            pattern = branch["pattern"]
+            assert pattern.startswith("^"), pattern
+            assert pattern.endswith("$"), pattern
+            accepted |= re.fullmatch(pattern, value) is not None
         elif branch["type"] == "integer" and type(value) is int:
             accepted |= branch["minimum"] <= value <= branch["maximum"]
     return accepted
@@ -2845,10 +3176,20 @@ def test_money_request_schema_is_a_decimal_string_or_a_whole_integer_never_a_num
     assert _schema_types(schema) == {"string", "integer"}
     assert not {"max_digits", "decimal_places"} & set(schema)
     string, integer = schema["anyOf"]
-    assert set(string) == {"type", "pattern"}
+    # The published pattern is the very constant the request validator matches.
+    assert string == {"type": "string", "pattern": schemas._MONEY_PATTERN}
+    assert schemas._MONEY_RE.pattern == schemas._MONEY_PATTERN == r"^[0-9]+(?:\.[0-9]+)?$"
     assert integer == {"type": "integer", "minimum": 1, "maximum": 10**12 - 1}
     description = schema["description"]
-    for phrase in ("positive", "below 10^12", "minor unit", "422", "120.0"):
+    for phrase in (
+        "positive",
+        "below 10^12",
+        "minor unit",
+        "422",
+        "120.0",
+        "exact form",
+        "no sign, spaces or exponent",
+    ):
         assert phrase in description, phrase
 
 
@@ -2880,6 +3221,8 @@ def test_money_response_schema_stays_a_string(field: str) -> None:
     [
         ("120.50", Decimal("120.50")),
         ("12", Decimal(12)),
+        ("0120", Decimal(120)),
+        ("12.3400000", Decimal("12.34")),
         ("0.5", Decimal("0.5")),
         ("0.000001", Decimal("0.000001")),
         ("999999999999.999999", Decimal("999999999999.999999")),
@@ -2909,16 +3252,11 @@ def test_every_published_money_example_is_accepted_by_the_validators_and_the_dec
         None,
         "NaN",
         "Infinity",
-        "1.1234567",
-        "1000000000000",
         10**12,
-        "0",
-        "0.000000",
         0,
-        "-5",
         -5,
-        "",
         "twelve",
+        *_LEXICALLY_REFUSED_AMOUNTS,
     ],
 )
 @pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
@@ -2930,7 +3268,52 @@ def test_the_published_money_schema_refuses_what_the_validators_or_decision_rule
         amount = model.model_validate({"total_budget": value}).present_fields()["total_budget"]
     except ValidationError:
         return
-    # Zero and negative amounts parse; ``ads_engine.decisions`` refuses them with a 422.
+    # Only whole integers outside 1 to 10^12 - 1 parse; ``ads_engine.decisions`` refuses
+    # them with 422 ``invalid_amount``.
+    assert isinstance(value, int), value
+    assert not is_valid_amount(amount, source="google", currency="USD"), value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [*_LEXICALLY_REFUSED_AMOUNTS, "NaN", "Infinity", "twelve", "1,5", "12 000", "0x10", "1_000"],
+)
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_a_string_the_published_pattern_refuses_is_refused_by_the_validator(
+    model: type[schemas.RequestModel], value: str
+) -> None:
+    assert not _published_money_accepts(_money_request_schema(model, "daily_budget"), value)
+    with pytest.raises(ValidationError) as error:
+        model.model_validate({"daily_budget": value})
+    assert _error_types(error) == ["value_error"]
+
+
+@pytest.mark.parametrize(
+    ("value", "refusal"),
+    [
+        ("0", "invalid_amount"),
+        ("0.000000", "invalid_amount"),
+        ("0000", "invalid_amount"),
+        ("1000000000000", "invalid_amount"),
+        ("0.0000000", "invalid_amount"),
+        ("1.1234567", "decimal_max_places"),
+        ("1000000000000.000001", "decimal_max_digits"),
+    ],
+)
+@pytest.mark.parametrize("model", _EXPECTED_FIELD_MODELS, ids=lambda model: model.__name__)
+def test_the_published_pattern_is_lexical_and_the_value_rules_keep_their_own_refusals(
+    model: type[schemas.RequestModel], value: str, refusal: str
+) -> None:
+    """A plain decimal matches the pattern and is then judged on its value, by its own rule."""
+    assert _published_money_accepts(_money_request_schema(model, "daily_budget"), value)
+    if refusal.startswith("decimal_"):
+        with pytest.raises(ValidationError) as error:
+            model.model_validate({"daily_budget": value})
+        assert _error_types(error) == [refusal]
+        return
+    amount = model.model_validate({"daily_budget": value}).present_fields()["daily_budget"]
+    # ``invalid_amount``: not positive, or not below 10^12.
+    assert amount <= 0 or amount >= 10**12, value
     assert not is_valid_amount(amount, source="google", currency="USD"), value
 
 
@@ -3564,8 +3947,8 @@ def test_discrepancy_amounts_keep_their_stored_decimal_text_and_integer_micros()
         ),
         (
             _linkedin_money_case,
-            {"daily_budget": "120.50", "total_budget": None, "currency": "EUR"},
-            {"daily_budget": "90.00", "total_budget": None, "currency": "EUR"},
+            {"daily_budget": "120.500000", "total_budget": None, "currency": "EUR"},
+            {"daily_budget": "90.000000", "total_budget": None, "currency": "EUR"},
         ),
     ):
         kind, state, decided_value, platform_value = case()

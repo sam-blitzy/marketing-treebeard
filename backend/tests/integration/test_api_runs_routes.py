@@ -235,6 +235,8 @@ async def _insert_running_run() -> int:
             data_modes={},
             dataset_ids={},
             config_hash="0" * 64,
+            default_days=28,
+            trusted_min_days=14,
             status="running",
             started_at=NOW,
             finished_at=None,

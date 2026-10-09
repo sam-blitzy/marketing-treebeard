@@ -32,8 +32,9 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
 7. **P4 stale / incomplete**: per item, from its own ``required_datasets`` only (AAP 0.3.2:
    "A successful sync of one dataset never hides a failed refresh of another"); a live item
    with a stale dataset gets ``data_status = "stale"``; one ``incomplete_dataset`` finding per
-   incomplete dataset per section. The configured ``sources.stale_after_hours`` the datasets
-   were judged against is frozen into ``evidence.thresholds`` of every item with a required
+   incomplete dataset per section, its ``evidence.items`` recounted over the stored items
+   after feedback (step 10). The configured ``sources.stale_after_hours`` the datasets were
+   judged against is frozen into ``evidence.thresholds`` of every item with a required
    dataset, stale or not (AAP 0.5.4.8 "the thresholds applied").
 8. **P5 short window**: the ``short_window`` flag on every item (the banner is the
    overlay's, from ``Run.short_window``). The ``window.trusted_min_days`` the window was
@@ -44,7 +45,13 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
    unchanged (P8).
 10. **Feedback suppression**: active dismiss, snooze and done feedback drops its rule and
     entity (C0 exempt), counted ``feedback_dismiss`` / ``feedback_snooze`` /
-    ``feedback_done``.
+    ``feedback_done``. Each section's ``no_crm_link`` finding then recounts its
+    ``evidence.items`` over the section's surviving items that carry the flag, held and C0
+    items included, so the stored count matches the stored items
+    (:func:`_recount_no_crm_link`). Each ``incomplete_dataset`` finding likewise recounts its
+    ``evidence.items`` over the section's surviving items that read the dataset incomplete,
+    held and C0 items included, and cites only the reasons those items have; a finding with no
+    such item keeps its reasons with ``items`` 0 (:func:`_recount_incomplete_datasets`).
 11. **Ranking** (AAP 0.5.4.1 "Ranking ties: broken by entity name, then by id, so runs are
     deterministic"): C0 pinned first, then each group in display order, unheld before held,
     by ``rank_key``, entity name, id and key; ``rank`` is 1-based across the section.
@@ -102,7 +109,9 @@ from ads_engine.analysis.context import (
     FINDING_CODES,
     FINDING_CONVERSION_TRACKING_ABSENT,
     FINDING_INCOMPLETE_DATASET,
+    FINDING_NO_CRM_LINK,
     FLAG_INCOMPLETE,
+    FLAG_NO_CRM_LINK,
     FLAG_NOT_DISTINGUISHABLE,
     FLAG_SHORT_WINDOW,
     FLAG_SIMULATED,
@@ -339,7 +348,9 @@ class PrecedenceOutput:
     Attributes:
         items: The ranked items of each section, in rank order.
         findings: The findings of each section: P2 tracking findings first, then the rules'
-            findings, then P4 ``incomplete_dataset`` findings.
+            findings (a ``no_crm_link`` finding's ``items`` recounted over the section's
+            stored items), then P4 ``incomplete_dataset`` findings (``items`` and ``reasons``
+            recounted over the section's stored items).
         withheld: The withheld patterns of each section, in rule order (P6).
         suppressed: Per section, ``{reason: count}`` of the items precedence or a rule
             suppressed: ``g1_blocked``, ``tracking_absent``, ``feedback_*`` and any rule-level
@@ -1579,6 +1590,11 @@ class _IncompleteDataset:
     items: int = 0
 
 
+def _incomplete_message(name: str, reasons: Sequence[str]) -> str:
+    """The message of an ``incomplete_dataset`` finding, naming each of its reasons (P4)."""
+    return f"{name} is not complete over the window: {'; '.join(reasons)}"
+
+
 def _incomplete_finding(section: str, found: _IncompleteDataset) -> Finding:
     """The ``incomplete_dataset`` finding of one dataset in one section (P4)."""
     row = found.row
@@ -1587,7 +1603,7 @@ def _incomplete_finding(section: str, found: _IncompleteDataset) -> Finding:
         code=FINDING_INCOMPLETE_DATASET,
         section=section,
         entity=None,
-        message=f"{found.name} is not complete over the window: {'; '.join(reasons)}",
+        message=_incomplete_message(found.name, reasons),
         evidence={
             "dataset": found.name,
             "dataset_id": found.dataset_id,
@@ -1650,7 +1666,8 @@ def _apply_data_state(
     ``sources.stale_after_hours`` its datasets were judged against frozen into its
     ``evidence.thresholds`` (:func:`_with_applied_thresholds`). Each section gets one
     ``incomplete_dataset`` finding per incomplete dataset its items read, naming every reason
-    and how many items read it.
+    and how many items read it; step 10 recounts ``items`` and narrows ``reasons`` over the
+    items the run stores, after feedback suppression (:func:`_recount_incomplete_datasets`).
 
     Raises:
         ConfigError: When ``sources.stale_after_hours`` is missing or not an integer.
@@ -1833,25 +1850,153 @@ def _apply_feedback(
     return kept
 
 
+def _recount_no_crm_link(
+    findings: Mapping[str, tuple[Finding, ...]], candidates: Sequence[Candidate]
+) -> dict[str, tuple[Finding, ...]]:
+    """Recount each section's ``no_crm_link`` finding over the items the run stores.
+
+    ``campaigns.py`` and ``budget.py`` count the Google items carrying ``no_crm_link`` as
+    they build them, before G1 (step 2), P2 (step 5) and feedback (step 10) remove any, while
+    the run stores the finding beside the items that survive (AAP 0.5.3 "Where outputs are
+    frozen"). Each ``no_crm_link`` finding is therefore rebuilt with ``evidence.items`` set to
+    the number of ``candidates`` of its section that carry the flag, held and C0 items
+    included; its code, section, entity, message and every other evidence key are kept, as
+    is the findings' order. A finding whose items were all removed stays, with ``items`` 0:
+    the link gap held for the items the rules built, and the section's suppression counts
+    say why they are gone. The count depends only on the set of ``candidates``, never their
+    order.
+
+    Args:
+        findings: The rules' findings per section, in their stored order.
+        candidates: The items that survived every suppression step.
+
+    Returns:
+        The findings per section, each ``no_crm_link`` one carrying the recounted ``items``.
+    """
+    flagged: dict[str, int] = dict.fromkeys(findings, 0)
+    for candidate in candidates:
+        if candidate.has_flag(FLAG_NO_CRM_LINK):
+            flagged[candidate.section] = flagged.get(candidate.section, 0) + 1
+    return {
+        section: tuple(
+            replace(finding, evidence={**finding.evidence, "items": flagged[section]})
+            if finding.code == FINDING_NO_CRM_LINK
+            else finding
+            for finding in items
+        )
+        for section, items in findings.items()
+    }
+
+
+def _recount_incomplete_datasets(
+    ctx: AnalysisContext,
+    findings: Mapping[str, tuple[Finding, ...]],
+    candidates: Sequence[Candidate],
+) -> dict[str, tuple[Finding, ...]]:
+    """Recount each section's ``incomplete_dataset`` findings over the items the run stores.
+
+    Step 7 counts the items that read each incomplete dataset as it flags them, before
+    feedback (step 10) removes any, while the run stores the finding beside the items that
+    survive (AAP 0.5.3 "Where outputs are frozen"). Each surviving item's own datasets are
+    judged again with :func:`_checks`, which reads only what steps 8 to 10 leave unchanged
+    (required datasets, provenance, the frozen lookback start and its days threshold), so it
+    finds exactly the incomplete datasets step 7 flagged on that item. Each finding, keyed by
+    its section, ``dataset`` and ``dataset_id`` as step 7 keys it, is rebuilt with:
+
+    * ``evidence.items``: the number of ``candidates`` of its section that read the dataset
+      incomplete, held and C0 items included;
+    * ``evidence.reasons``, and the message naming them: the step-7 reasons, in their order,
+      that at least one of those items has, so a reason only a removed item's range gave (a
+      K1 baseline start) is no longer cited.
+
+    A finding no surviving item reads stays, with ``items`` 0 and its step-7 reasons: the
+    dataset is still incomplete for the items the rules built, and the section's suppression
+    counts say why they are gone. Its code, section, entity, every other evidence key and the
+    findings' order are kept. The result depends only on the set of ``candidates``, never
+    their order.
+
+    Args:
+        ctx: The analysis context step 7 judged the datasets in.
+        findings: Step 7's ``incomplete_dataset`` findings per section, in their stored order.
+        candidates: The items that survived every suppression step.
+
+    Returns:
+        The findings per section, each carrying the recounted ``items`` and its ``reasons``.
+    """
+    window_end = ctx.window.end
+    stale_after = ctx.stale_after
+    readers: dict[tuple[str, str, int | None], int] = {}
+    read_reasons: dict[tuple[str, str, int | None], set[str]] = {}
+    for candidate in candidates:
+        for check in _checks(ctx, candidate, stale_after):
+            if not check.incomplete:
+                continue
+            key = (candidate.section, check.name, check.dataset_id)
+            readers[key] = readers.get(key, 0) + 1
+            read_reasons.setdefault(key, set()).update(_incomplete_reasons(check, window_end))
+
+    def recounted(finding: Finding) -> Finding:
+        """One finding with ``items`` and ``reasons`` over the surviving items."""
+        name = finding.evidence["dataset"]
+        key = (finding.section, name, finding.evidence["dataset_id"])
+        built = list(finding.evidence["reasons"])
+        cited = read_reasons.get(key, set())
+        reasons = [reason for reason in built if reason in cited] or built
+        return replace(
+            finding,
+            message=_incomplete_message(name, reasons),
+            evidence={**finding.evidence, "reasons": reasons, "items": readers.get(key, 0)},
+        )
+
+    return {
+        section: tuple(
+            recounted(finding) if finding.code == FINDING_INCOMPLETE_DATASET else finding
+            for finding in items
+        )
+        for section, items in findings.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Step 11: ranking (AAP 0.5.4.1 "Ranking ties", 0.5.4.2 "Ranking", 0.5.5)
 # ---------------------------------------------------------------------------
 
 
+def _currency_code(value: object) -> str | None:
+    """A currency as its upper-case code, or ``None`` when it is not a non-blank string."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return None
+
+
 def _creative_group_order(
     ctx: AnalysisContext, group: str, items: Sequence[Candidate]
 ) -> tuple[Any, ...]:
-    """A creative group's position: its campaign's window spend descending, then name, id.
+    """A creative group's position: its campaign's currency, then window spend descending.
 
-    AAP 0.5.4.6: "Campaigns are ranked by spend, descending." The spend is the campaign's
-    window total (``metrics.window_totals``); a campaign missing from the context falls back
-    to the ``campaign_spend`` its items froze, and an unknown spend ranks last.
+    AAP 0.5.4.6: "Campaigns are ranked by spend, descending." Amounts are never compared
+    across currencies (AAP 0.1.1, 0.5.4.1), so the groups are partitioned by the campaign's
+    account currency first, in currency-code order as the white-paper cohorts are, and ranked
+    by spend within each partition; ties fall to the campaign name, id and group key. The
+    currency and spend are the context's (``ctx.account_currency``, the
+    ``metrics.window_totals`` spend); a campaign missing from the context falls back to the
+    ``currency`` and ``campaign_spend`` its items froze, the lowest code when the items
+    disagree. A group of unknown currency ranks after every currency partition, and an
+    unknown spend ranks last within its partition.
     """
     campaign_id = creative_group_campaign(group)
+    currency: str | None = None
     spend: Decimal | None = None
     if campaign_id is not None and campaign_id in ctx.campaigns:
+        currency = _currency_code(ctx.account_currency(campaign_id))
         spend = metrics.window_totals(ctx, (campaign_id,)).spend
     else:
+        codes = [
+            code
+            for code in (_currency_code(item.evidence.extra.get("currency")) for item in items)
+            if code is not None
+        ]
+        currency = min(codes) if codes else None
         frozen = [
             value
             for value in (item.evidence.extra.get("campaign_spend") for item in items)
@@ -1859,7 +2004,13 @@ def _creative_group_order(
         ]
         spend = max(frozen) if frozen else None
     name = group if campaign_id is None else ctx.campaign_name(campaign_id)
-    return (_orderable(None if spend is None else -spend), name, campaign_id or 0, group)
+    return (
+        (currency is None, currency or ""),
+        _orderable(None if spend is None else -spend),
+        name,
+        campaign_id or 0,
+        group,
+    )
 
 
 def _group_sequence(
@@ -1868,7 +2019,9 @@ def _group_sequence(
     """The display order of a section's groups.
 
     The static groups of :data:`GROUP_ORDER` first, in that order; then the dynamic creative
-    groups (one per campaign) by campaign spend descending; then the white-paper currency
+    groups (one per campaign) partitioned by the campaign's account currency in currency-code
+    order and by campaign spend descending within each currency, since amounts are never
+    compared across currencies (:func:`_creative_group_order`); then the white-paper currency
     cohorts by currency code; then any other group by key, so no item is ever dropped.
     """
     static = [group for group in GROUP_ORDER.get(section, ()) if group in groups]
@@ -1929,7 +2082,8 @@ def apply_precedence(
     """Guard, allocate, hold, suppress, flag and rank one run's rule outputs (AAP 0.5.4.2).
 
     The steps run in the fixed order of the module docstring: collect, G1, B3 allocation,
-    P1, P2, P3, P4, P5, the P6/P7/P8 checks, feedback suppression, ranking. Pure: the inputs
+    P1, P2, P3, P4, P5, the P6/P7/P8 checks, feedback suppression with the ``no_crm_link``
+    and ``incomplete_dataset`` recounts over the surviving items, ranking. Pure: the inputs
     are unchanged, and the same inputs, in any order, give the same output.
 
     Args:
@@ -1989,14 +2143,17 @@ def apply_precedence(
     # 9. P6, P7 and P8 checks.
     _check_items(candidates)
 
-    # 10. Feedback suppression (C0 exempt).
+    # 10. Feedback suppression (C0 exempt), then the no_crm_link and incomplete_dataset item
+    # counts over the surviving items.
     candidates = _apply_feedback(ctx, candidates, counts)
+    rule_findings = _recount_no_crm_link(collected.findings, candidates)
+    incomplete = _recount_incomplete_datasets(ctx, incomplete, candidates)
 
     # 11. Ranking.
     items = _rank(ctx, candidates)
 
     findings = {
-        section: (*tracking[section], *collected.findings[section], *incomplete[section])
+        section: (*tracking[section], *rule_findings[section], *incomplete[section])
         for section in SECTION_ORDER
     }
     return PrecedenceOutput(

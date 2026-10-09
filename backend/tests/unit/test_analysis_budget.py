@@ -972,6 +972,38 @@ def test_sustained_rules_are_withheld_below_the_sustained_window_minimum() -> No
     assert not any(reason.startswith("window ") for reason in reasons), reasons
 
 
+@pytest.mark.parametrize(
+    ("window", "reason"),
+    [
+        ((-1, -1), "window 1 day of 7 required"),
+        ((-2, -1), "window 2 days of 7 required"),
+        ((-6, -1), "window 6 days of 7 required"),
+    ],
+)
+def test_the_window_withheld_line_states_the_day_count_in_number(
+    window: tuple[int, int], reason: str
+) -> None:
+    """B2, B3 and B4 read "window 1 day of 7 required" on a one-day window, "days" otherwise.
+
+    The run-wide lines match the per-subject B1 line (C2's) in the same Budget section;
+    ``observed`` and ``required`` stay the bare counts and ``unit`` stays "days".
+    """
+    scenario = SCENARIOS["p5.sustained_min.does_not_fire"]
+    ctx = replace(scenario, context=replace(scenario.context, window=window)).build_context()
+    required = ctx.thresholds.int("window.sustained_min_days")
+    assert required == 7
+    result = budget.evaluate(ctx)
+    assert result.candidates == ()
+    expected = (reason, ctx.window.days, required, "days")
+    for rule_id in (B2, B3, B4):
+        (line,) = _withheld(result, rule_id)
+        assert line.entity is None, rule_id
+        assert (line.reason, line.observed, line.required, line.unit) == expected, rule_id
+    (b1,) = _withheld(result, B1)
+    assert b1.entity is not None
+    assert (b1.reason, b1.observed, b1.required, b1.unit) == expected
+
+
 def test_paused_subjects_get_no_budget_change() -> None:
     """B2, B3 and B4 judge only active subjects; a paused campaign yields nothing."""
     _, ctx = _built("b4.linkedin.fires")

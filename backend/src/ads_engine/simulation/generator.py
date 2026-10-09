@@ -3138,7 +3138,11 @@ def _default_google() -> GoogleSpec:
     * C1 fires on "Competitor - Conquest" (spend on about 85% of days, no conversions);
     * after about a week of snapshots C2/B1 fire on "Brand - Search" (capped, efficient), B2 on
       "Retargeting - Broad" (capped, poor efficiency) and B3 on "Display - Awareness" (about
-      36% utilization); the shared budget runs at about 83%;
+      36% utilization);
+    * B3 also fires on the explicitly shared "Product - Shared budget": its members spend about
+      41% of its 500 daily amount, so the budget itself is the item's subject. As the largest
+      donor it funds Brand's B1, so Display's B3 stays a plain decrease. This keeps P1's hold
+      on "a shared budget containing it" reachable on the default world;
     * search-term coverage is about 85-90% and every included conversion action is last-click
       with whole-number conversions, so the B4 Google counting contract can hold.
     """
@@ -3149,7 +3153,7 @@ def _default_google() -> GoogleSpec:
         GoogleBudgetSpec("b_retargeting", Decimal("120"), name="Retargeting - Broad budget"),
         GoogleBudgetSpec("b_display", Decimal("300"), name="Display - Awareness budget"),
         GoogleBudgetSpec(
-            "b_shared", Decimal("250"), explicitly_shared=True, name="Product - Shared budget"
+            "b_shared", Decimal("500"), explicitly_shared=True, name="Product - Shared budget"
         ),
         GoogleBudgetSpec(
             "b_webinar", Decimal("9000"), period="CUSTOM_PERIOD", name="Webinar - Lifetime budget"
@@ -3776,11 +3780,12 @@ DEFAULT_SPEC: Final[WorldSpec] = _default_spec()
 """The end-to-end world: every section populates on first start (AAP 0.11.2).
 
 Keywords (K1, K2, K3), Campaigns (C1, C3a, C3b), Budget (B4 plus withheld B1-B3 lines until
-snapshot history exists; then C2/B1, B2 and B3), Copy (CR1-CR3) and White papers (W rows with
-W1 on one asset; MQL bound to the custom "First meeting booked" stage, QL to the custom
-"Qualified Lead" stage). The platform state is static, so the first entity sync's baselines
-match it and no discrepancy arises until a user decision differs from it. No Google CRM
-properties are configured, so Google items carry ``no_crm_link``.
+snapshot history exists; then C2/B1, B2, and B3 on a campaign and on the explicitly shared
+"Product - Shared budget", whose item takes the budget as its subject), Copy (CR1-CR3) and
+White papers (W rows with W1 on one asset; MQL bound to the custom "First meeting booked"
+stage, QL to the custom "Qualified Lead" stage). The platform state is static, so the first
+entity sync's baselines match it and no discrepancy arises until a user decision differs from
+it. No Google CRM properties are configured, so Google items carry ``no_crm_link``.
 """
 
 

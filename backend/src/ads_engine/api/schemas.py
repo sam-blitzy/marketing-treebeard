@@ -4,10 +4,12 @@ Every route in ``ads_engine.api.routes`` declares its request body and ``respons
 this module, and ``web/src/api/types.ts`` mirrors it field for field, so the names and nesting
 here are the wire contract. The groups are:
 
-* **Shared types**: :data:`Money`, :data:`MetricValue`, :data:`PositiveBigInt` (request ids
-  bounded by :data:`BIGINT_MAX`), :data:`StorableText` and :data:`StorableNote` (request
-  text PostgreSQL can store), :data:`CalendarDate` (a request date, exactly ``YYYY-MM-DD``)
-  and the ``Literal`` vocabularies (:data:`SourceName`,
+* **Shared types**: :data:`Money`, :data:`MoneyIn` (a request amount: a plain decimal
+  string or a whole integer), :data:`MetricValue`, :data:`SampleSize` (a withheld sample
+  size), :data:`PositiveBigInt` (strict request ids bounded by :data:`BIGINT_MAX`),
+  :data:`StorableText` and :data:`StorableNote` (request text PostgreSQL can store),
+  :data:`CalendarDate` (a request date, exactly ``YYYY-MM-DD``) and the ``Literal``
+  vocabularies (:data:`SourceName`,
   :data:`SectionKey`, :data:`FlagCode` …), each declared once.
 * **Errors**: :class:`ErrorResponse` (``{"error": {"code", "message"}}``) and
   :data:`ERROR_RESPONSES` for the routes' ``responses=``.
@@ -184,6 +186,7 @@ __all__ = [
     "MetricValue",
     "Mode",
     "Money",
+    "MoneyIn",
     "Overlay",
     "PositiveBigInt",
     "Projection",
@@ -198,6 +201,7 @@ __all__ = [
     "RunStatus",
     "RunTrigger",
     "Sample",
+    "SampleSize",
     "Section",
     "SectionKey",
     "Source",
@@ -248,26 +252,67 @@ def _money_output(value: Decimal) -> str:
     return format(value, "f")
 
 
+_MONEY_PATTERN: Final = r"^[0-9]+(?:\.[0-9]+)?$"
+"""The exact lexical form of a request amount string: a plain positional decimal.
+
+ASCII digits, then optionally a ``.`` and at least one more ASCII digit. No sign, whitespace,
+exponent, leading or trailing ``.``, or non-ASCII digit (``"١٢٠"``). :data:`MoneyIn` enforces it
+and :data:`_MONEY_INPUT_SCHEMA` publishes it, so the two can never disagree. It states the form
+only: the value rules (positive, below 10^12, at most 6 decimal places once trailing zeros
+are dropped, the currency's minor unit) keep their own, more specific 422 answers.
+"""
+
+_MONEY_RE: Final = re.compile(_MONEY_PATTERN)
+""":data:`_MONEY_PATTERN`, compiled once for :func:`_money_lexical_form`."""
+
+
+def _money_lexical_form(value: object) -> object:
+    """Refuse a request amount string that is not a plain decimal (:data:`_MONEY_PATTERN`).
+
+    Pydantic's ``Decimal`` parsing is lax: it strips whitespace and takes a sign, an exponent
+    (``"1e3"``, ``"4.0E+2"``) and non-ASCII digits, none of which the published contract
+    allows. The whole string must match (``re.fullmatch``), so a trailing newline is refused
+    too. Every other value (an ``int``, a ``Decimal`` from a Python caller, ``None``) passes
+    through to :data:`Money`'s own checks, which still refuse a ``float`` or a ``bool``.
+
+    The message never repeats the value: the API renders validation failures as
+    ``loc: msg``.
+
+    Raises:
+        ValueError: When ``value`` is a ``str`` that is not a plain decimal.
+    """
+    if isinstance(value, str) and _MONEY_RE.fullmatch(value) is None:
+        raise ValueError(
+            'send amounts as plain decimal strings such as "120.50": digits with an optional '
+            "fraction, and no sign, spaces or exponent"
+        )
+    return value
+
+
 _MONEY_INPUT_SCHEMA: Final[JsonDict] = {
     "anyOf": [
-        {"type": "string", "pattern": r"^(?=.*[1-9])[0-9]{1,12}(?:\.[0-9]{1,6})?$"},
+        {"type": "string", "pattern": _MONEY_PATTERN},
         {"type": "integer", "minimum": 1, "maximum": 999_999_999_999},
     ],
     "description": (
-        'An exact amount: a decimal string such as "120.50", or a whole JSON integer. A JSON '
-        "number written with a fraction or a decimal point (120.5, 120.0) is refused. The "
-        "server checks that the amount is positive, below 10^12 and no finer than the "
-        "currency's minor unit (Google: a whole number of micros), and answers 422 otherwise."
+        'An exact amount: a plain decimal string such as "120.50", or a whole JSON integer. '
+        "The string pattern is the exact form the server accepts: ASCII digits with an "
+        "optional fraction, and no sign, spaces or exponent. A JSON number written with a "
+        "fraction or a decimal point (120.5, 120.0) is refused. The server then checks the "
+        "value: positive, below 10^12, at most 6 decimal places once trailing zeros are "
+        "dropped, and no finer than the currency's minor unit (Google: a whole number of "
+        "micros), and answers 422 otherwise."
     ),
 }
 """The request (validation-mode) JSON schema of :data:`Money`: what a client may send.
 
 Pydantic would publish an unrestricted JSON ``number`` that :func:`_money_input` refuses, plus
-the non-standard ``max_digits``/``decimal_places`` keys. This schema offers only the two forms
-that can succeed: a decimal string whose pattern requires a non-zero digit, at most 12 integer
-digits and at most 6 fraction digits, or a whole integer from 1 to 10^12 - 1. The validators
-still tolerate laxer strings (``" 12 "``, ``"1e2"``); the pattern advertises the canonical form
-only, never one they refuse.
+the non-standard ``max_digits``/``decimal_places`` keys. This schema offers the two forms
+:data:`MoneyIn` accepts: a string of exactly :data:`_MONEY_PATTERN`, or a whole integer from 1
+to 10^12 - 1. The pattern is lexical only; the value rules are stated in the description and
+answered with their own 422 codes (``ads_engine.decisions``' ``invalid_amount`` and
+``sub_minor_unit``, Pydantic's digit limits), so a string such as ``"0"`` or ``"12.3400000"``
+matches it and is judged on its value.
 """
 
 
@@ -282,9 +327,21 @@ Money = Annotated[
 
 Serialised as a fixed-point decimal string (``"120.500000"``), never in exponent notation,
 and published as a string in response schemas.
-Clients send a decimal string or a whole integer; a JSON number with a fraction is refused,
-because it has already lost precision. Request schemas publish :data:`_MONEY_INPUT_SCHEMA`.
+A JSON number with a fraction is refused, because it has already lost precision; any string
+``Decimal`` parses is taken, so response models read stored amounts as they are. Request
+fields use :data:`MoneyIn`, which also holds strings to :data:`_MONEY_PATTERN`, and publish
+:data:`_MONEY_INPUT_SCHEMA`.
 Validation to the currency's minor unit is ``ads_engine.decisions``' job (AAP 0.5.2).
+"""
+
+MoneyIn = Annotated[Money, BeforeValidator(_money_lexical_form)]
+"""A request amount: :data:`Money` whose strings must be plain decimals (:data:`_MONEY_PATTERN`).
+
+Clients send a plain decimal string (``"120.50"``) or a whole integer. A string with a sign,
+whitespace, an exponent or a non-ASCII digit is refused with 422, exactly as the published
+pattern says. The lexical check runs first (Pydantic runs the last-declared before-validator
+first), then :data:`Money`'s ``float``/``bool`` refusal, ``Decimal`` parsing and digit
+limits. Response models keep :data:`Money`, so stored amounts are never re-judged.
 """
 
 
@@ -310,6 +367,34 @@ MetricValue = Annotated[str | int | float | bool | None, BeforeValidator(_metric
 rates, shares), integers for counts, a pre-rendered string such as ``"n/a"``, or ``null`` for
 unavailable (never ``0``)."""
 
+
+def _sample_size_input(value: object) -> object:
+    """Render a ``numeric`` sample size in the type item evidence gives the same size.
+
+    ``run_withheld.observed`` and ``required`` are ``numeric(18,6)`` columns, so a count of
+    one reads back as ``Decimal("1.000000")``, while ``evidence.sample`` carries counts as
+    integers. A whole-number ``Decimal`` therefore becomes an ``int`` (``Decimal("28.000000")``
+    → ``28``) and a fractional one keeps its exact fixed-point string (``Decimal("2.900000")``
+    → ``"2.900000"``), as with fractional expected outcomes or conversions. Any other value
+    passes through unchanged.
+
+    Raises:
+        ValueError: When the ``Decimal`` is not finite.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"sample sizes must be finite, found {value}")
+        if value == value.to_integral_value():
+            return int(value)
+        return format(value, "f")
+    return value
+
+
+SampleSize = Annotated[int | str | None, BeforeValidator(_sample_size_input)]
+"""A withheld pattern's observed or required size: an integer for a whole-number size, a
+fixed-point decimal string for a fractional one, or ``null`` when no sample applies (never
+``0``)."""
+
 BIGINT_MAX: Final = 2**63 - 1
 """The largest value a PostgreSQL ``bigint`` holds, the type of every internal id column.
 
@@ -317,11 +402,14 @@ Request ids are bounded by it, through :data:`PositiveBigInt` in bodies and
 ``Query(le=BIGINT_MAX)`` on routes, so an id the database cannot represent is a 422
 validation error, never a ``bigint out of range`` database error."""
 
-PositiveBigInt = Annotated[int, Field(gt=0, le=BIGINT_MAX)]
+PositiveBigInt = Annotated[int, Field(strict=True, gt=0, le=BIGINT_MAX)]
 """An internal id a request names: a positive integer of at most :data:`BIGINT_MAX`.
 
-A larger value is refused with 422 before any SQL runs, because it could never match a
-``bigint`` primary key and binding it would fail in the database instead."""
+Strict, as the published ``integer`` schema says: only a real JSON integer is taken, so a
+string (``"1"``), a boolean (``true``) or a number with a decimal point (``1.0``) is refused
+with 422 rather than coerced. A larger value is refused with 422 before any SQL runs,
+because it could never match a ``bigint`` primary key and binding it would fail in the
+database instead."""
 
 
 def _utf8_encodable(value: str) -> bool:
@@ -775,8 +863,8 @@ class Run(ApiModel):
         source_days: Each day source's range and native day boundary, Google then LinkedIn.
         display_timezone: ``DISPLAY_TIMEZONE``, used only to format instants.
         short_window: Whether ``days`` is below ``trusted_min_days`` (AAP 0.5.4.1).
-        default_days: ``window.default_days``.
-        trusted_min_days: ``window.trusted_min_days``.
+        default_days: The ``window.default_days`` the run was computed with.
+        trusted_min_days: The ``window.trusted_min_days`` the run was computed with.
         trigger: ``scheduled``, ``event`` or ``manual``.
         data_modes: Each source's mode as the run read it.
         config_hash: Hash of the configuration the run used.
@@ -801,18 +889,17 @@ class Run(ApiModel):
     finished_at: AwareDatetime | None
 
     @classmethod
-    def from_row(cls, run: AnalysisRun, *, thresholds: Thresholds, display_timezone: str) -> Self:
+    def from_row(cls, run: AnalysisRun, *, display_timezone: str) -> Self:
         """Build the view of a stored run.
 
-        ``analysis_run`` stores no window settings, so ``default_days`` and
-        ``trusted_min_days`` come from the loaded configuration, and ``short_window`` is
-        ``days < trusted_min_days`` with that configured minimum, never a literal
-        (AAP 0.5.4.1). The flags frozen in each item's evidence keep the values the run used.
+        ``default_days`` and ``trusted_min_days`` are the ``window.*`` values frozen with the
+        run when it was computed, and ``short_window`` is ``days < trusted_min_days`` with
+        that stored minimum, never a literal and never today's configuration (AAP 0.5.4.1,
+        0.5.3 "Where outputs are frozen"). The view therefore agrees with the ``short_window``
+        flags frozen in the run's items however ``config/thresholds.yaml`` changes later.
 
         Args:
             run: The stored run.
-            thresholds: The loaded configuration (``window.default_days`` and
-                ``window.trusted_min_days``).
             display_timezone: ``DISPLAY_TIMEZONE`` from the settings.
 
         Returns:
@@ -823,7 +910,7 @@ class Run(ApiModel):
             pydantic.ValidationError: When the stored row holds a value outside the contract.
         """
         days = (run.window_end - run.window_start).days + 1
-        trusted_min_days = thresholds.trusted_min_days
+        trusted_min_days = run.trusted_min_days
         modes: Mapping[str, Any] = run.data_modes or {}
         return cls.model_validate(
             {
@@ -835,7 +922,7 @@ class Run(ApiModel):
                 "source_days": sorted(run.source_day_boundaries or [], key=_source_rank),
                 "display_timezone": display_timezone,
                 "short_window": days < trusted_min_days,
-                "default_days": thresholds.default_days,
+                "default_days": run.default_days,
                 "trusted_min_days": trusted_min_days,
                 "trigger": run.trigger,
                 "data_modes": {source: modes.get(source) for source in SOURCES},
@@ -888,10 +975,11 @@ class Flag(ApiModel):
 class EntityView(ApiModel):
     """The entity an item, finding or withheld pattern is about: ``{source, type, id, name}``.
 
-    ``id`` is an opaque identifier, always serialised as a string: the platform's external id
-    for items, and for findings and withheld patterns the identifier recorded with them at
-    compute time (an internal row id is rendered as its decimal string). ``None`` for an
-    account-wide or composite entity without one.
+    ``id`` is an opaque identifier, always serialised as a string. Items, findings and
+    withheld patterns share one namespace: the platform's external id, or the composite key of
+    an entity without a table row (``EntityRef.to_json``), so a finding or withheld pattern
+    names its entity exactly as that entity's items do. A numeric id recorded by an earlier
+    run renders as its decimal string. ``None`` when the stored entity carries no id.
 
     Attributes:
         source: The entity's source.
@@ -901,7 +989,8 @@ class EntityView(ApiModel):
         name: The display name.
     """
 
-    # Stored entity JSON carries integer ids; coercion keeps the wire type a single string.
+    # Entity JSON stored by earlier runs may carry a numeric id; coercion keeps the wire type
+    # a single string.
     model_config = ConfigDict(extra="ignore", from_attributes=True, coerce_numbers_to_str=True)
 
     source: SourceName | None
@@ -913,17 +1002,28 @@ class EntityView(ApiModel):
 class EvidenceWindow(ApiModel):
     """The exact window an item was computed over (``Evidence.window``).
 
+    When the sources' day boundaries differ, ``boundaries_differ`` says so, so misaligned
+    buckets are never presented as one common day (AAP 0.5.4.1).
+
     Attributes:
         start: First calendar date.
         end: Last calendar date, inclusive.
         days: Days in the window.
         source_days: Each day source's range and native day boundary.
+        boundaries_differ: Whether the sources' day boundaries differ, for example Google on
+            ``America/New_York`` and LinkedIn on ``UTC``. ``None`` on evidence frozen by a run
+            that predates this key.
+        description: Each source's range and boundary as one sentence, for example "Google
+            2026-09-04 to 2026-10-01 (America/New_York); LinkedIn same dates (UTC)". ``None``
+            on evidence frozen by a run that predates this key.
     """
 
     start: date
     end: date
     days: int
     source_days: list[SourceDay]
+    boundaries_differ: bool | None = None
+    description: str | None = None
 
 
 class Metric(ApiModel):
@@ -1201,14 +1301,17 @@ class Finding(ApiModel):
 class WithheldSample(ApiModel):
     """The sample a withheld pattern saw against the minimum it needed.
 
+    Both sizes are :data:`SampleSize`: integers for whole-number sizes, as ``evidence.sample``
+    renders counts, and fixed-point decimal strings for fractional ones.
+
     Attributes:
         observed: The sample observed; ``None`` when no sample applies.
         required: The minimum required; ``None`` when no sample applies.
         unit: The sample's unit, for example ``clicks`` or ``days``.
     """
 
-    observed: MetricValue
-    required: MetricValue
+    observed: SampleSize
+    required: SampleSize
     unit: str | None
 
 
@@ -1231,7 +1334,9 @@ class Withheld(ApiModel):
     def from_row(cls, row: RunWithheld) -> Self:
         """Build the view of a stored ``run_withheld`` row, exactly as recorded.
 
-        ``numeric`` sample sizes render as fixed-point strings, the form frozen evidence uses.
+        The ``numeric`` sample sizes keep their stored values and render as :data:`SampleSize`:
+        a whole-number size (``Decimal("1.000000")``) as the integer ``1``, as item evidence
+        renders counts, and a fractional one as its fixed-point string.
 
         Raises:
             pydantic.ValidationError: When the stored row holds a value outside the contract.
@@ -1458,8 +1563,8 @@ class _ExpectedFieldsIn(RequestModel):
     """
 
     status: CampaignStatus | None = Field(default=None, json_schema_extra=_publish_without_null)
-    daily_budget: Money | None = Field(default=None, json_schema_extra=_publish_without_null)
-    total_budget: Money | None = Field(default=None, json_schema_extra=_publish_without_null)
+    daily_budget: MoneyIn | None = Field(default=None, json_schema_extra=_publish_without_null)
+    total_budget: MoneyIn | None = Field(default=None, json_schema_extra=_publish_without_null)
 
     @model_validator(mode="after")
     def _no_explicit_null(self) -> Self:

@@ -114,12 +114,17 @@ These definitions apply to every rule that names them.
   - Today is always excluded as a partial day.
 - **Short window**: a window shorter than `window.trusted_min_days` (default 14) raises the
   short-window banner and puts the `short_window` flag on every item (P5).
+  - Each run records the `window.default_days` and `window.trusted_min_days` it was computed
+    with. Its `Run` metadata (`default_days`, `trusted_min_days`, `short_window`) and its
+    short-window banner use those recorded values, so a later edit to `config/thresholds.yaml`
+    never changes how an earlier run's window is judged.
 - **Presets**: `window.presets` (default [14, 28, 56, 90]) are the windows the window picker
   offers and the windows LinkedIn demographic segments are fetched for (`C3a`). Each preset ends
   on the default window end. The preset equal to `window.default_days` is marked "default".
 - **Sustained patterns**: `K3`, `C1`, `C1b`, `C2`/`B1`, `B2`, `B3` and `B4` need a window of at
   least `window.sustained_min_days` (default 7) days. Below it they are listed as withheld with
-  the observed and required days, for example "window 5 days of 7 required".
+  the observed and required days, for example "window 5 days of 7 required", or "window 1 day
+  of 7 required" for a one-day window.
 - **Longest window**: `window.max_days` (default 180), LinkedIn's daily analytics retention.
 - **Custom windows** (`POST /runs`): end no later than the default window end, and span 1 to
   `window.max_days` days.
@@ -131,9 +136,10 @@ These definitions apply to every rule that names them.
   - LinkedIn: UTC dates.
 - Daily rows are never relabelled or rebucketed. A window is one calendar-date range applied to
   each source's own dates.
-- Evidence lists each source's range and boundary in `source_days`, for example "Google
-  2026-09-04 to 2026-10-01 (America/New_York); LinkedIn same dates (UTC)". When the boundaries
-  differ, the evidence says so.
+- Evidence lists each source's range and boundary in `source_days`, and as one sentence in
+  `evidence.window.description`, for example "Google 2026-09-04 to 2026-10-01
+  (America/New_York); LinkedIn same dates (UTC)". When the boundaries differ, the evidence says
+  so: `evidence.window.boundaries_differ` is `true`.
 - No computation combines two sources' daily rows into one daily series. Cross-source joins work
   on instants:
   - white paper spend uses LinkedIn UTC days;
@@ -269,9 +275,12 @@ The pipeline link judges platform outcomes against HubSpot Qualified Leads (QL).
 - **Google campaigns** link only when both `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY` and
   `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` are configured and verified against the portal at
   startup. Their population is the contacts found by touch-date discovery
-  (`hubspot.google_contacts`), each counted as one matched lead at its touch date. Without the
-  link, Google items carry the `no_crm_link` flag, no Google QL count or veto is computed, and a
-  LinkedIn-derived subset never stands in. See [HubSpot integration](integrations/hubspot.md).
+  (`hubspot.google_contacts`), each counted as one matched lead at its touch date. Every
+  touch-date contact in the window is one of the card's "Google touch-date contacts"; those
+  whose touch is younger than `crm.lead_maturity_days` are shown apart, with the Qualified Leads
+  they already reached, and never judged. Without the link, Google items carry the `no_crm_link`
+  flag, no Google QL count or veto is computed, and a LinkedIn-derived subset never stands in.
+  See [HubSpot integration](integrations/hubspot.md).
 
 The veto population:
 
@@ -478,14 +487,20 @@ account's keyword list and `keyword_view` daily facts.
 **Every keyword card shows**, in this order: the term (or keyword text), spend, conversions,
 cost per conversion ("—" when conversions are 0) and the reason. The campaign and ad group sit
 beside them in `evidence.extra`. Conversions are decimals throughout, because data-driven
-attribution makes them fractional.
+attribution makes them fractional. Reasons, findings and withheld lines put a count's noun in
+the singular only at exactly 1 ("1 conversion", "1 click", "window 1 day of 14 required").
 
 **Search-term coverage**: the section carries one `search_term_coverage` finding per Google
 account, search-term spend ÷ keyword spend over the window. Google withholds low-volume search
 terms for privacy, so search-term totals fall below keyword totals. When coverage is below
 `keywords.min_search_term_coverage` (default 0.80), every `K1`, `K2` and `K3` item of the account
 carries the `search_term_coverage` flag ("Low search-term coverage: {percent}% of keyword
-spend").
+spend"). The finding states the minimum exactly as configured (0.80 → "80%", 0.8858 →
+"88.58%"). The percentage shows one decimal place and the evidence share (`coverage_share`)
+four, with more places only where fewer would put them on the other side of the minimum than
+the exact comparison: a share of 0.884654 against a minimum of 0.8848 reads "88.47%", never
+"88.5%". The finding, its evidence, the flag and each item's `evidence.extra` show the same
+percentage.
 
 **CRM link**: without the verified Google-to-CRM link
 ([CRM pipeline link and veto](#crm-pipeline-link-and-veto)), every `K1`, `K2` and `K3` item also
@@ -522,12 +537,18 @@ finding.
 - **Action**: "Add as exact-match negative". `K1` never recommends pausing a keyword; keyword
   problems belong to `K3`.
 - **Reason and extra output**: wasted spend (= spend), clicks, conversions, the matched keyword
-  and n\*, against the account rate and cost per conversion: "Spent {spend} over {days} days with
-  0 conversions across {clicks} clicks, at or above the minimum of {n\*} clicks for the
-  account's conversion rate of {r} (conversions ÷ clicks), and at least {multiple}x the account
-  cost/conversion of {cost per conversion}." For an `ADDED` term the reason adds "The term is
-  already a keyword: {text} ({match type}, criterion {criterion id}). An exact-match negative
-  also blocks that keyword's exact-match traffic."
+  and n\*, against the account rate, the account cost per conversion and the spend floor (the
+  `min_spend` baseline: `k1.min_spend_cpa_multiple` × the account cost per conversion, rounded
+  half-even at the minor unit like the spend): "Spent {spend} over {days} days with 0
+  conversions across {clicks} clicks, at or above the minimum of {n\*} clicks for the account's
+  conversion rate of {r} (conversions ÷ clicks), and {spend gate}." At the default multiple of
+  1 the spend gate reads "at least 1x the account cost/conversion of {cost per conversion}";
+  at any other multiple it reads "at or above the spend floor of {floor} ({multiple}x the
+  account cost/conversion)", because a multiple of the rounded cost per conversion can exceed
+  the spend that met the exact floor (14 × 1.43 = 20.02 against a spend and floor of 20.00).
+  For an `ADDED` term the reason adds "The term is already a keyword: {text} ({match type},
+  criterion {criterion id}). An exact-match negative also blocks that keyword's exact-match
+  traffic."
 - **Ranking**: spend, descending.
 - **Withheld or suppressed**:
   - a term below the click gate is withheld with clicks observed and required, for example
@@ -553,7 +574,12 @@ finding.
     so it is at or better than campaign efficiency.
 - **Action**: "Add as phrase-match keyword in {ad group}".
 - **Reason and extra output**: conversions, cost per conversion and the campaign's cost per
-  conversion, then the adjacent terms in `extra.adjacent_terms`:
+  conversion: "{conversions} conversions at {cost per conversion} per conversion over {days}
+  days, at or below {efficiency gate}." At the default ratio of 1 the efficiency gate reads
+  "1x the campaign's {campaign cost per conversion} per conversion"; at any other ratio it reads
+  "the highest qualifying cost/conversion of {maximum} ({ratio}x the campaign's
+  cost/conversion)", citing the `max_cost_per_conversion` baseline the term was compared with.
+  The reason then lists the adjacent terms in `extra.adjacent_terms`:
   - up to `k2.adjacent_max_terms` (default 5) other window search terms;
   - token Jaccard similarity ≥ `k2.adjacent_jaccard` (default 0.5), lowercased with stopwords
     removed;
@@ -594,7 +620,7 @@ finding.
 - **Ranking**: window spend, descending.
 - **Withheld or suppressed**:
   - a window shorter than the minimum withholds `K3` for the run ("window {days} days of
-    {required} required");
+    {required} required", or "window 1 day of {required} required" for a one-day window);
   - a keyword showing a pattern below the click minimum is withheld, for example "clicks 29 of
     30 required in the first half (2026-09-04 to 2026-09-17)";
   - a keyword that clears the click gate but has daily quality scores on too few days is
@@ -748,7 +774,8 @@ subject, and never one on its members.
   meetings). A LinkedIn campaign names its campaign group in `extra.campaign_group`.
 - **Ranking**: spend, descending.
 - **Withheld or suppressed**:
-  - a short window withholds `C1` for the run ("window {days} days of {required} required");
+  - a short window withholds `C1` for the run ("window {days} days of {required} required",
+    or "window 1 day of {required} required" for a one-day window);
   - zero outcomes on steady spend with too few expected outcomes, for example "expected
     conversions 2.9 of 3 required";
   - enough expected outcomes on too few spending days, for example "spend days 16 of 20 required
@@ -879,10 +906,15 @@ subject, and never one on its members.
   - the cluster has ≥ `c3b.min_terms` (default 3) converting terms and ≥ `c3b.min_conversions`
     (default 5) conversions in total;
   - its head tokens appear in no keyword text, ad group name or campaign name.
-- **Action**: "Create ad group or campaign for '{head tokens}'".
-- **Reason and extra output**: "{n} converting search terms share '{head tokens}' with
-  {conversions} conversions at {cost} per conversion; no keyword, ad group or campaign …". The
-  card lists the member terms with their spend and conversions.
+- **Action**: "Create ad group or campaign for '{head tokens}'". The head tokens follow the
+  member terms' word order: for each pair of head tokens a member contains, the one it uses
+  first earns a point, and tokens are listed by points, most first, then alphabetically on a tie
+  (members "revenue forecasting tool" and "b2b revenue forecasting" give "revenue forecasting").
+  `extra.head_tokens` and the cluster's entity key keep them in alphabetical order.
+- **Reason and extra output**: "{n} converting search terms cluster around the words
+  '{head tokens}' with {conversions} conversions at {cost} per conversion; no keyword, ad group
+  or campaign name contains those words." The card lists the member terms with their spend and
+  conversions.
 - **Ranking**: cluster conversions, descending.
 - **Withheld or suppressed**: an uncovered cluster below a minimum is withheld with its size, for
   example "converting search terms 2 of 3 required" or "conversions 4 of 5 required".
@@ -1086,7 +1118,8 @@ member days.
     example before the first conversion-action snapshot;
   - "fractional conversions" when the contract holds but a daily value is fractional;
   - "no exposure" for zero spend on either side;
-  - sample shortfalls, for example "3 weekend days of 4 required; 6 outcomes of 10 required";
+  - sample shortfalls, for example "3 weekend days of 4 required; 6 outcomes of 10 required",
+    with a count of exactly 1 in the singular ("1 weekend day of 4 required");
   - a test with p ≥ `b4.alpha`, with its p-value and sample sizes.
 - **Required datasets**: see the section rules above. For Google, `google.entities` carries the
   conversion-action snapshots the counting contract reads.
@@ -1095,9 +1128,11 @@ member days.
 
 ## Copy / creative changes (LinkedIn)
 
-Section `creative`, one group per campaign (`campaign:{id}`). Groups are ordered by campaign
-spend, descending. Within a campaign the combined `CR2`/`CR3` card comes first, then the `CR1`
-pairs by adjusted p-value, ascending.
+Section `creative`, one group per campaign (`campaign:{id}`). Amounts are never compared
+across currencies, so groups are partitioned by the campaign's account currency, in
+currency-code order as the white-paper cohorts are, and ordered by campaign spend, descending,
+within each currency. Ties fall back to campaign name, then id. Within a campaign the combined
+`CR2`/`CR3` card comes first, then the `CR1` pairs by adjusted p-value, ascending.
 
 **Variants** are the creatives of one LinkedIn campaign with
 ≥ `cr.min_impressions` (default 1000) window impressions. Only campaigns with
@@ -1468,7 +1503,7 @@ recommendation showed. The shape is the `Evidence` schema of `GET /api/v1/recomm
 
 | Field | Content |
 |-------|---------|
-| `window` | `start`, `end`, `days` and `source_days`: each source's `start`, `end` and day `boundary` |
+| `window` | `start`, `end`, `days` and `source_days`: each source's `start`, `end` and day `boundary`; `boundaries_differ`, whether those boundaries differ; `description`, each source's range and boundary as one sentence |
 | `metrics[]` | Every number the reason cites: `key`, `label`, `value`, `unit`, optional `currency`, `floor` (renders "≥ N" or "≤ X") and `unavailable` (renders "unavailable", never 0) |
 | `baselines[]` | `key`, `label`, `value` of what the metrics were compared against |
 | `sample` | `observed`, `required` and `unit` in the rule's own unit, with an optional labelled `projected` (`value`, `unit`, `basis`) |
@@ -1508,14 +1543,14 @@ A finding is a non-action observation shown at the top of its section.
 
 | Code | Emitted by | Meaning |
 |------|------------|---------|
-| `no_crm_link` | `C1`, `C2`, `C3b` (Campaigns), budget rules (Budget) | Google items have no CRM link; no Google QL counts or veto |
+| `no_crm_link` | `C1`, `C2`, `C3b` (Campaigns), budget rules (Budget) | Google items have no CRM link; no Google QL counts or veto. `evidence.items` counts the section's stored items that carry the flag (held and `C0` items included), after `G1`, P2 and feedback suppression |
 | `search_term_coverage` | Keywords section | Search-term spend ÷ keyword spend per Google account |
 | `k1_no_baseline` | `K1` | `K1` withheld account-wide: no usable conversion-rate baseline |
 | `segment_window_unavailable` | `C3a` | No segment data matches the run's window |
 | `pipeline_unavailable` | `C1`, `C1b`, `C2`, white paper attribution | The pipeline is unavailable for an entity, with the reason |
 | `skipped_stage` | White paper attribution | Contacts skipped a bound stage and are not counted |
 | `conversion_tracking_absent` | P2 | A source spent with zero outcomes; zero-outcome rules suppressed |
-| `incomplete_dataset` | P4 | A dataset a section uses is not complete over the window |
+| `incomplete_dataset` | P4 | A dataset a section uses is not complete over the window. `evidence.items` counts the section's stored items that read it incomplete (held and `C0` items included), after `G1`, P2 and feedback suppression, and `evidence.reasons` cites only reasons those items have. With no such item left, `items` is 0 and the reasons stay |
 
 ### Banners
 

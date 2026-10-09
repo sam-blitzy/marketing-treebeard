@@ -1725,6 +1725,8 @@ async def _seed_feedback(session: AsyncSession) -> None:
             data_modes={},
             dataset_ids={},
             config_hash="metrics-load-test",
+            default_days=28,
+            trusted_min_days=14,
             status="succeeded",
             started_at=NOW - timedelta(hours=2),
             finished_at=NOW - timedelta(hours=1),

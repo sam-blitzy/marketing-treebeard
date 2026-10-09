@@ -40,10 +40,11 @@ Decisions taken in this module, each stated where its code lives:
 * **Hold subjects**: an item's live P1 hold reads the subjects ``precedence.py`` froze in
   ``evidence.extra.depends_on`` (``[{type, id}]``) plus the item's own ``decision_subject``,
   the campaign or budget a decision on the item would write.
-* **Short-window minimum**: ``analysis_run`` stores the window but not
-  ``window.trusted_min_days``, so the short-window banner reads that value from the
-  configuration, exactly as ``api/schemas.py`` computes ``Run.short_window``; banner and run
-  metadata therefore always agree.
+* **Short-window minimum**: ``analysis_run`` stores the ``window.trusted_min_days`` the run
+  was computed with, the minimum its items' ``short_window`` flags were judged against. The
+  short-window banner reads that stored minimum, exactly as ``api/schemas.py`` computes
+  ``Run.short_window``, never today's configuration; banner, run metadata and frozen item
+  flags therefore always agree, even after ``config/thresholds.yaml`` changes.
 * **Required ranges** (P4, AAP 0.3.2): an item is ``stale`` when a required dataset is old
   or covers less than the window end, and ``incomplete`` when one is not ``complete`` over
   its required range: coverage starting after the range start or ending before the window
@@ -1504,9 +1505,10 @@ def _incomplete_banner(checks: Sequence[_DatasetCheck]) -> BannerView | None:
     return _banner(BANNER_INCOMPLETE_DATASETS, f"Incomplete data: {', '.join(parts)}", len(names))
 
 
-def _short_window_banner(run: AnalysisRun, trusted_min_days: int) -> BannerView | None:
-    """The run's window against the configured trusted minimum (P5)."""
+def _short_window_banner(run: AnalysisRun) -> BannerView | None:
+    """The run's window against the trusted minimum it was computed with (P5)."""
     days = (run.window_end - run.window_start).days + 1
+    trusted_min_days = run.trusted_min_days
     if days >= trusted_min_days:
         return None
     return _banner(
@@ -1522,7 +1524,6 @@ def _banners(
     *,
     stale_checks: Sequence[_DatasetCheck],
     incomplete_checks: Sequence[_DatasetCheck],
-    trusted_min_days: int,
 ) -> tuple[BannerView, ...]:
     """Build every banner that applies, in ``BANNER_ORDER`` (AAP 0.5.5)."""
     candidates = (
@@ -1531,7 +1532,7 @@ def _banners(
         _simulated_banner(live),
         _stale_banner(stale_checks),
         _incomplete_banner(incomplete_checks),
-        _short_window_banner(run, trusted_min_days),
+        _short_window_banner(run),
     )
     built = {banner.code: banner for banner in candidates if banner is not None}
     return tuple(built[code] for code in BANNER_ORDER if code in built)
@@ -1564,12 +1565,12 @@ async def overlay(
         now: The read time (tz-aware): feedback in force, staleness and ``computed_at``.
         findings: The run's stored findings, when the caller already loaded them; only the
             ``conversion_tracking_absent`` ones of this run are used. ``None`` reads them.
-        thresholds: Required: the loaded configuration (``sources.stale_after_hours``,
-            ``window.trusted_min_days``, and ``k1.baseline_days`` for a K1 item whose frozen
-            baseline window is unusable), the cached instance the caller already holds, as
-            the API injects ``app.state.thresholds`` through
-            :data:`~ads_engine.api.deps.ThresholdsDep`. It is never read from disk here, so
-            the async read path does no blocking file I/O.
+        thresholds: Required: the loaded configuration (``sources.stale_after_hours``, and
+            ``k1.baseline_days`` for a K1 item whose frozen baseline window is unusable), the
+            cached instance the caller already holds, as the API injects
+            ``app.state.thresholds`` through :data:`~ads_engine.api.deps.ThresholdsDep`. It
+            is never read from disk here, so the async read path does no blocking file I/O.
+            The short-window banner reads the run's stored ``trusted_min_days`` instead.
 
     Returns:
         The page-level overlay, one :class:`ItemOverlayView` per item keyed by its id, and the
@@ -1657,6 +1658,5 @@ async def overlay(
         stored_findings,
         stale_checks=stale_checks,
         incomplete_checks=incomplete_checks,
-        trusted_min_days=config.trusted_min_days,
     )
     return OverlayResult(overlay=view, items=MappingProxyType(views), banners=banners)

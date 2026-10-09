@@ -272,7 +272,7 @@ def test_json_value_renders_decimals_dates_and_collections() -> None:
     assert json_value(_entity()) == {
         "source": "google",
         "type": "campaign",
-        "id": 7,
+        "id": "123",
         "name": "Brand",
     }
     assert json_value(0.5) == 0.5
@@ -300,7 +300,7 @@ def test_json_value_rejects_unrenderable_values(value: object, error: type[Excep
 def test_entity_ref_key_json_and_blank_name() -> None:
     ref = _entity()
     assert ref.key == "google:campaign:123"
-    assert ref.to_json() == {"source": "google", "type": "campaign", "id": 7, "name": "Brand"}
+    assert ref.to_json() == {"source": "google", "type": "campaign", "id": "123", "name": "Brand"}
     assert _entity(name="  ").name == "123"
     with pytest.raises(ValueError, match="type"):
         EntityRef("google", "ad", None, "1", "x")
@@ -308,6 +308,31 @@ def test_entity_ref_key_json_and_blank_name() -> None:
         EntityRef("bing", "campaign", None, "1", "x")  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         EntityRef("google", "campaign", True, "1", "x")
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        EntityRef("google", "campaign", 2, "990000000001", "Generic - Attribution software"),
+        EntityRef(
+            "google", "search_term", None, search_term_external_id("55", "901", "crm"), "crm"
+        ),
+    ],
+)
+def test_entity_json_names_findings_and_withheld_patterns_by_the_item_key(
+    ref: EntityRef,
+) -> None:
+    """Findings, withheld patterns and items share the external-id namespace (AAP 0.5.3).
+
+    The stored item key is ``{source}:{type}:{external_id}`` and the API's ``Item.entity.id``
+    is its external id; the JSON every finding and withheld line stores carries that same id,
+    never the internal row id, so a withheld pattern can be tied to its entity's items.
+    """
+    finding = Finding("search_term_coverage", KEYWORDS, ref, "Search terms cover 72% of spend")
+    withheld = Withheld(K1, KEYWORDS, ref, "clicks 9 of 10 required", 9, 10, "clicks")
+    for entity in (ref.to_json(), finding.to_json()["entity"], withheld.to_json()["entity"]):
+        assert entity["id"] == ref.external_id
+        assert f"{entity['source']}:{entity['type']}:{entity['id']}" == ref.key
 
 
 def test_decision_subject_key_and_json() -> None:
@@ -591,7 +616,7 @@ def test_finding_and_withheld_rendering() -> None:
     )
     assert withheld.to_json() == {
         "rule_id": "B3",
-        "entity": {"source": "google", "type": "campaign", "id": 7, "name": "Brand"},
+        "entity": {"source": "google", "type": "campaign", "id": "123", "name": "Brand"},
         "reason": "spending days 3 of 5 required",
         "sample": {"observed": 3, "required": 5, "unit": "spending days"},
     }
@@ -1805,6 +1830,9 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
     )
     rendered = evidence.to_json()
     assert rendered["window"]["source_days"][0]["boundary"] == "America/New_York"
+    # Google's New York days and LinkedIn's UTC days differ, and the evidence says so.
+    assert rendered["window"]["boundaries_differ"] is True
+    assert rendered["window"]["description"] == window.describe()
     assert rendered["sample"] == {"observed": 25, "required": 20, "unit": "eligible contacts"}
     assert json.loads(json.dumps(rendered)) == rendered
     google = context.make_evidence(

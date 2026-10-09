@@ -11,6 +11,10 @@ error shape, never a database error rendered as 500:
   email or a decision note is refused before any SQL runs, and the message never repeats
   it, while an ordinary note, non-ASCII included, is stored exactly as sent.
 
+The request schema is enforced as published, too: an amount string that is not a plain
+decimal (``"1e3"``, ``" 120 "``, ``"4.0E+2"``) or a ``subject.id`` sent as the string ``"1"``
+is a 422 ``validation_error`` and writes nothing.
+
 One stored amount also has one rendering: ``POST /decisions`` answers from the committed
 row at its ``numeric(18,6)`` scale, exactly as a later ``POST`` carries it over and
 ``GET /decisions`` lists it, while ``patch`` echoes the amount as submitted.
@@ -661,3 +665,45 @@ async def test_the_answer_without_a_read_back_row_keeps_the_stored_scale(
         world.campaign_id,
         None,
     )
+
+
+# ---------------------------------------------------------------------------------------
+# The request schema as published
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("amount", ["1e3", " 120 ", "4.0E+2"])
+async def test_an_amount_that_is_not_a_plain_decimal_is_a_422_and_nothing_is_written(
+    sessions: Sessions, world: World, client: httpx.AsyncClient, amount: str
+) -> None:
+    """An exponent or padded amount is refused as the OpenAPI pattern says, not normalised."""
+    await _sign_in(client, world)
+    response = await client.post(
+        "/api/v1/decisions", json=_patch_body(world, {"daily_budget": amount}), headers=CSRF
+    )
+    _assert_validation_error(response, "body.patch.daily_budget")
+    # One fixed message, whatever was sent, so the submitted value is never repeated.
+    assert response.json()["error"]["message"] == (
+        "body.patch.daily_budget: Value error, send amounts as plain decimal strings such as "
+        '"120.50": digits with an optional fraction, and no sign, spaces or exponent'
+    )
+    assert await _decision_count(sessions, world.campaign_id) == 1
+
+
+@pytest.mark.anyio
+async def test_a_subject_id_sent_as_a_string_is_a_422_and_nothing_is_written(
+    sessions: Sessions, world: World, client: httpx.AsyncClient
+) -> None:
+    """``subject.id`` is a JSON integer; the string form of a real id is refused, not coerced."""
+    await _sign_in(client, world)
+    response = await client.post(
+        "/api/v1/decisions",
+        json={
+            "subject": {"type": "campaign", "id": str(world.campaign_id)},
+            "patch": {"status": "paused"},
+        },
+        headers=CSRF,
+    )
+    _assert_validation_error(response, "body.subject.id")
+    assert await _decision_count(sessions, world.campaign_id) == 1

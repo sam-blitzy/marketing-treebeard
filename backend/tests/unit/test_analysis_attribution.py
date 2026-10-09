@@ -41,6 +41,7 @@ from ads_engine.analysis.attribution import (
     CreditRow,
     OrphanDealShare,
     attribution_for,
+    bounded_decimal,
     build_attribution,
     contact_evidence_known,
 )
@@ -594,6 +595,142 @@ def test_cost_value_rejects_contract_violations(kwargs: dict[str, Any], message:
         CostValue(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Serialised precision: one value per cited number, bounded to numeric(18, 6)
+# ---------------------------------------------------------------------------
+
+
+def _decimal_places(text: str) -> int:
+    """Return the number of decimals a serialised ``Decimal`` string carries."""
+    exponent = Decimal(text).as_tuple().exponent
+    assert isinstance(exponent, int)
+    return max(0, -exponent)
+
+
+def _decimal_strings(value: object) -> list[str]:
+    """Every numeric string in a JSON tree (labels, notes and displays are not numbers)."""
+    if isinstance(value, Mapping):
+        return [
+            text
+            for key, item in value.items()
+            if key not in {"display", "label", "note", "reason", "message", "mql_label", "ql_label"}
+            for text in _decimal_strings(item)
+        ]
+    if isinstance(value, list):
+        return [text for item in value for text in _decimal_strings(item)]
+    if isinstance(value, str):
+        try:
+            parsed = Decimal(value)
+        except ArithmeticError:
+            return []
+        return [value] if parsed.is_finite() else []
+    return []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal(2766) / Decimal(31), "89.225806"),
+        (Decimal(2) / Decimal(35), "0.057143"),
+        (Decimal(1) / Decimal(3), "0.333333"),
+        (Decimal(2) / Decimal(3), "0.666667"),
+        # Half-even at the seventh decimal: down to an even digit, up to an even digit.
+        (Decimal("0.0000005"), "0.000000"),
+        (Decimal("0.0000015"), "0.000002"),
+        # Six decimals or coarser: returned unchanged, never padded.
+        (Decimal("123.456789"), "123.456789"),
+        (Decimal("10.00"), "10.00"),
+        (Decimal("412.5"), "412.5"),
+        (Decimal("1E+2"), "100"),
+        (Decimal(0), "0"),
+    ],
+)
+def test_bounded_decimal_rounds_below_six_decimals_half_even_and_never_pads(
+    value: Decimal, expected: str
+) -> None:
+    bounded = bounded_decimal(value)
+    assert format(bounded, "f") == expected
+    if _decimal_places(format(value, "f")) <= 6:
+        assert bounded is value
+
+
+def test_bounded_decimal_returns_non_finite_values_unchanged() -> None:
+    assert bounded_decimal(Decimal("Infinity")) == Decimal("Infinity")
+    assert bounded_decimal(Decimal("NaN")).is_nan()
+
+
+def test_cost_value_json_cites_six_decimals_while_value_and_display_stay_exact() -> None:
+    exact = Decimal(1000) / Decimal(13)
+    cost = CostValue(exact)
+    assert cost.to_json() == {
+        "value": "76.923077",
+        "ceiling": False,
+        "note": None,
+        "unavailable": False,
+        "display": "76.92",
+    }
+    assert cost.value == exact
+    ceiling = CostValue(exact, ceiling=True)
+    assert (ceiling.to_json()["value"], ceiling.to_json()["display"]) == ("76.923077", "≤ 76.92")
+    missing = CostValue(None, note=NO_QL_NOTE, unavailable=True)
+    assert (missing.to_json()["value"], missing.to_json()["display"]) == (None, "unavailable")
+
+
+def test_orphan_share_json_is_bounded_while_the_floor_compares_the_exact_share() -> None:
+    share = Decimal(2) / Decimal(35)
+    orphan = OrphanDealShare(35, 2, 0, share, False, "5.7% (2 of 35 deals without a contact)")
+    assert orphan.to_json()["share"] == "0.057143"
+    assert orphan.share == share
+    # Just below the floor: the serialised share rounds to 0.100000, the floor is not met.
+    near = Decimal("0.09999995")
+    below = OrphanDealShare(1, 0, 0, near, False, "10% (just below the floor)")
+    assert below.to_json()["share"] == "0.100000"
+    assert below.is_floor(Decimal("0.10")) is False
+    unknown = OrphanDealShare(0, 0, 1, None, True, "unknown (1 deals not assessed)")
+    assert unknown.to_json()["share"] is None
+
+
+def test_asset_row_and_cohort_json_bound_every_quotient_to_six_decimals(make: MakeContext) -> None:
+    """Costs, shares and the cohort median serialise at six decimals; internals stay exact.
+
+    Pipeline Report: Headline A with 3 QL on USD 100.00, the blank-headline creative with 4 QL on
+    USD 200.00, and 2 unmatched leads without a creative, so cost per QL is 300/7 for the asset,
+    100/3 and 50 per creative, and the contact and creative shares are 2/9.
+    """
+    a_leads, a_contacts = _qualified("a", 3, creative=CR_A, form=FORM_REPORT_1, first_id=1)
+    b_leads, b_contacts = _qualified("b", 4, creative=CR_B, form=FORM_REPORT_2, first_id=10)
+    unmatched = [_lead(20 + index, _t(9), creative=None) for index in range(2)]
+    table = build_attribution(
+        make(
+            crm=_crm([*a_contacts, *b_contacts]),
+            leads=[*a_leads, *b_leads, *unmatched],
+            spend=[_spend(CR_A, "100.00"), _spend(CR_B, "200.00")],
+        )
+    )
+    row = _row(table)
+    assert row.cost_per_ql.value == Decimal(300) / Decimal(7)
+    assert row.contact_share == row.creative_share == Decimal(2) / Decimal(9)
+    rendered = row.to_json()
+    assert rendered["cost_per_ql"]["value"] == "42.857143"
+    assert (rendered["contact_share"], rendered["creative_share"]) == ("0.222222", "0.222222")
+    assert rendered["unknown_evidence_share"] == "0"
+    credits = {credit["creative_id"]: credit for credit in rendered["creative_rows"]}
+    assert credits[CR_A]["cost_per_ql"]["value"] == "33.333333"
+    assert credits[CR_B]["cost_per_ql"]["value"] == "50.00"
+    assert _credit(row, CR_A).cost_per_ql.value == Decimal(100) / Decimal(3)
+    # The display renders the exact value: a ceiling, since the shares are above the floor.
+    assert rendered["cost_per_ql"]["display"] == "≤ 42.86"
+
+    (cohort,) = table.cohorts
+    assert cohort.median_cost_per_ql == Decimal(300) / Decimal(7)
+    assert cohort.to_json()["median_cost_per_ql"] == "42.857143"
+    numbers = _decimal_strings(cohort.to_json())
+    assert numbers
+    assert all(_decimal_places(text) <= 6 for text in numbers)
+    third = dataclasses.replace(row, unknown_evidence_share=Decimal(1) / Decimal(7))
+    assert third.to_json()["unknown_evidence_share"] == "0.142857"
+
+
 def test_attribution_threshold_keys_are_the_configured_aap_defaults(
     thresholds: Thresholds, window: AnalysisWindow
 ) -> None:
@@ -1023,9 +1160,8 @@ def test_stage_entries_count_only_at_or_after_the_contacts_anchor(make: MakeCont
             "code": FINDING_SKIPPED_STAGE,
             "section": WHITE_PAPERS,
             "entity": row.entity.to_json(),
-            "message": (
-                "Qualified Lead (Qualified Lead): 1 contacts skipped this stage (not counted)"
-            ),
+            # The QL label equals its stage name, so it is not repeated in parentheses.
+            "message": "Qualified Lead: 1 contact skipped this stage (not counted)",
             "evidence": {
                 "stage": "Qualified Lead",
                 "label": "Qualified Lead",
@@ -1035,6 +1171,65 @@ def test_stage_entries_count_only_at_or_after_the_contacts_anchor(make: MakeCont
                 "currency": "USD",
             },
         },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("label", "heading"),
+    [
+        ("Qualified Lead", "Qualified Lead"),
+        (" qualified LEAD ", "Qualified Lead"),
+        ("Sales Qualified Lead", "Qualified Lead (Sales Qualified Lead)"),
+    ],
+)
+@pytest.mark.parametrize(("skipped", "noun"), [(1, "contact"), (3, "contacts")])
+def test_a_skipped_stage_heading_omits_a_label_that_repeats_the_stage_name(
+    make: MakeContext, label: str, heading: str, skipped: int, noun: str
+) -> None:
+    touch = _t(10)
+    bindings = dataclasses.replace(_bindings(), ql=ResolvedBinding(True, QL_PROPERTY, "222", label))
+    contacts = [
+        ContactInfo(f"c{index}", "customer", mql_at=touch + timedelta(days=1))
+        for index in range(1, skipped + 1)
+    ]
+    leads = [
+        _lead(index, touch, contact=contact.hs_id) for index, contact in enumerate(contacts, 1)
+    ]
+    table = build_attribution(
+        make(crm=_crm(contacts, bindings=bindings), leads=leads, spend=[_spend(CR_A, "90.00")])
+    )
+
+    row = _row(table)
+    assert (row.skipped_mql, row.skipped_ql) == (0, skipped)
+    (finding,) = table.findings
+    assert finding.code == FINDING_SKIPPED_STAGE
+    assert finding.message == f"{heading}: {skipped} {noun} skipped this stage (not counted)"
+    # Only the message changes: the evidence still carries the stage and its bound label.
+    assert finding.evidence == {
+        "stage": "Qualified Lead",
+        "label": label,
+        "property": QL_PROPERTY,
+        "skipped": skipped,
+        "asset": REPORT,
+        "currency": "USD",
+    }
+
+
+def test_a_pipeline_unavailable_heading_omits_a_label_that_repeats_the_stage_name(
+    make: MakeContext,
+) -> None:
+    bindings = dataclasses.replace(
+        _bindings(), mql=ResolvedBinding(False, reason=MQL_REASON, label="mql")
+    )
+    contact = ContactInfo("c1", "salesqualifiedlead", ql_at=_t(12))
+    table = build_attribution(
+        make(crm=_crm([contact], bindings=bindings), leads=[_lead(1, _t(10), contact="c1")])
+    )
+
+    # The resolved label "mql" only repeats the stage name, so the heading is the bare name.
+    assert table.mql_label == "mql"
+    assert [finding.message for finding in table.findings] == [
+        f"MQL count unavailable: {MQL_REASON}"
     ]
 
 
@@ -1204,6 +1399,28 @@ def test_a_meeting_is_booked_only_with_creation_and_start_after_the_anchor(
     assert (credit.meetings_booked.value, credit.other_meetings.value) == (3, 2)
     assert credit.cost_per_meeting.render() == "200.00"
     _assert_partition(row)
+
+
+def test_one_other_meeting_is_named_in_the_singular(make: MakeContext) -> None:
+    touch = _t(10)
+    day = timedelta(days=1)
+    meeting = MeetingInfo("m-other", touch + day, touch + 2 * day, meeting_source="CRM_UI")
+    crm = _crm(
+        [ContactInfo("c1", "salesqualifiedlead")],
+        meetings=[meeting],
+        contact_meetings={"c1": [meeting.hs_id]},
+    )
+    table = build_attribution(
+        make(crm=crm, leads=[_lead(1, touch, contact="c1")], spend=[_spend(CR_A, "60.00")])
+    )
+
+    row = _row(table)
+    assert (row.meetings_booked.render(), row.other_meetings.render()) == ("0", "1")
+    assert row.flags == (FLAG_MEETING_TIME_PROXY,)
+    assert row.flag_messages[FLAG_MEETING_TIME_PROXY] == (
+        "1 other meeting (ordering unverified): booking time is proxied by record creation, "
+        "so it is excluded from cost per meeting"
+    )
 
 
 def test_events_of_several_contacts_count_once_for_the_latest_qualifying_touch(
@@ -1763,8 +1980,8 @@ ORPHAN_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
             1,
             None,
             True,
-            "unknown (1 deals not assessed)",
-            "1 deal-to-contact fetches unknown",
+            "unknown (1 deal not assessed)",
+            "1 deal-to-contact fetch unknown",
             True,
         ),
     ),
@@ -1777,10 +1994,35 @@ ORPHAN_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
             1,
             Decimal(1),
             True,
-            "unknown (1 deals not assessed)",
-            "1 deal-to-contact fetches unknown",
+            "unknown (1 deal not assessed)",
+            "1 deal-to-contact fetch unknown",
             True,
         ),
+    ),
+    (
+        "two deals not assessed",
+        {
+            "window_deal_ids": ["d0", "d1", "d2"],
+            "fetches": [
+                *_deal_fetches([], ["d2"]),
+                _fetch("deal", "d0", "contact", "ok", "partial"),
+            ],
+        },
+        (
+            1,
+            0,
+            2,
+            Decimal(0),
+            True,
+            "unknown (2 deals not assessed)",
+            "2 deal-to-contact fetches unknown",
+            True,
+        ),
+    ),
+    (
+        "one deal assessed",
+        {"window_deal_ids": ["d1"], "fetches": _deal_fetches(["d1"], [])},
+        (1, 1, 0, Decimal(1), False, "100% (1 of 1 deal without a contact)", None, True),
     ),
     (
         "deal search incomplete",
@@ -1809,8 +2051,8 @@ ORPHAN_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
             1,
             None,
             True,
-            "unknown (deal search incomplete; at least 1 deals not assessed)",
-            "deal search did not cover the range completely; 1 deal-to-contact fetches unknown",
+            "unknown (deal search incomplete; at least 1 deal not assessed)",
+            "deal search did not cover the range completely; 1 deal-to-contact fetch unknown",
             True,
         ),
     ),
@@ -1832,11 +2074,13 @@ def test_the_orphan_deal_share_is_measured_over_the_assessed_deals(
     table = build_attribution(make(crm=crm, leads=[_lead(1, _t(10), contact="c1")]))
 
     orphan = table.orphan_deals
+    # The share stays exact for the floor comparison and serialises at six decimals.
+    assert orphan.share == share
     assert orphan.to_json() == {
         "assessed": assessed,
         "orphans": orphans,
         "not_assessed": not_assessed,
-        "share": None if share is None else format(share, "f"),
+        "share": None if share is None else format(bounded_decimal(share), "f"),
         "unknown": unknown,
         "label": label,
         "reason": reason,
@@ -1914,9 +2158,9 @@ def test_an_unknown_deal_search_with_unassessed_deals_states_a_lower_bound(
     orphan = table.orphan_deals
     assert (orphan.unknown, orphan.assessed, orphan.not_assessed) == (True, 1, 1)
     assert orphan.label == (
-        "unknown (deal search completeness unknown; at least 1 deals not assessed)"
+        "unknown (deal search completeness unknown; at least 1 deal not assessed)"
     )
-    assert orphan.reason == "deal search unknown; 1 deal-to-contact fetches unknown"
+    assert orphan.reason == "deal search unknown; 1 deal-to-contact fetch unknown"
     assert _row(table).has_flag(FLAG_DEAL_FLOOR)
 
 
@@ -1934,7 +2178,7 @@ def test_a_complete_deal_search_freshness_row_keeps_the_share_known(make: MakeCo
         )
     )
     assert table.orphan_deals.unknown is False
-    assert table.orphan_deals.label == "0% (0 of 1 deals without a contact)"
+    assert table.orphan_deals.label == "0% (0 of 1 deal without a contact)"
     assert not _row(table).has_flag(FLAG_DEAL_FLOOR)
 
 
@@ -1999,7 +2243,7 @@ def test_an_unresolved_ql_binding_is_unavailable_never_zero(make: MakeContext) -
         FINDING_PIPELINE_UNAVAILABLE,
         WHITE_PAPERS,
         None,
-        f"Qualified Lead (Qualified Lead) count unavailable: {QL_REASON}",
+        f"Qualified Lead count unavailable: {QL_REASON}",
         {
             "stage": "Qualified Lead",
             "label": "Qualified Lead",
@@ -2009,7 +2253,7 @@ def test_an_unresolved_ql_binding_is_unavailable_never_zero(make: MakeContext) -
     )
     assert skipped.code == FINDING_SKIPPED_STAGE
     assert (
-        skipped.message == "MQL (First meeting booked): 1 contacts skipped this stage (not counted)"
+        skipped.message == "MQL (First meeting booked): 1 contact skipped this stage (not counted)"
     )
 
 
@@ -2072,7 +2316,7 @@ def test_without_a_crm_dataset_every_crm_count_is_unavailable(make: MakeContext)
     )
     assert [finding.message for finding in table.findings] == [
         f"MQL (First meeting booked) count unavailable: {NO_CRM_REASON}",
-        f"Qualified Lead (Qualified Lead) count unavailable: {NO_CRM_REASON}",
+        f"Qualified Lead count unavailable: {NO_CRM_REASON}",
     ]
     assert all(finding.evidence["property"] is None for finding in table.findings)
     _assert_partition(row)

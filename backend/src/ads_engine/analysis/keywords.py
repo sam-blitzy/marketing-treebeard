@@ -36,6 +36,14 @@ hide an item. Evidence shows ``Decimal`` display values: money at the currency's
 ratios to four places, rates to four significant digits and quality-score means to two places.
 Conversions are decimals throughout: data-driven attribution makes them fractional.
 
+Displayed gate values never contradict the comparison they report. A reason cites a gate that
+scales a baseline by a configured multiple other than 1 at the scaled value stored in evidence
+(K1's ``min_spend`` floor, K2's ``max_cost_per_conversion``), never as that multiple of a
+rounded baseline, and money rounds half-even, monotonically, on both sides of the comparison.
+Search-term coverage shows ``keywords.min_search_term_coverage`` exactly as configured, and the
+share (four places) and percentage (one place) gain places only where fewer would put them on
+the other side of it. Counts take a singular noun only at exactly 1 ("1 click", "1 day").
+
 Purity: no database, network, settings or logging access. The module imports only the rule
 contract (``context``), pure helpers of ``metrics``, the text primitives of ``text`` and the
 ``Thresholds`` type; it never imports ``precedence`` or ``runner``. Every threshold is read
@@ -309,9 +317,34 @@ def _mean(value: Fraction) -> Decimal:
     return _plain(_round(value, _MEAN_PLACES))
 
 
-def _percent(share: Fraction) -> Decimal:
-    """Return a share as a percentage with one decimal: ``5661/7161`` → ``79.1``."""
-    return _plain(_round(share * 100, _PERCENT_PLACES))
+def _beside_minimum(value: Fraction, minimum: Decimal, places: int) -> Decimal:
+    """Return ``value`` for display beside the configured ``minimum`` it was compared with.
+
+    ``value`` is rounded half-even to ``places`` decimal places, and to one more place at a
+    time until the shown value sits on the same side of ``minimum`` as ``value`` itself
+    (``value < minimum`` exactly when ``shown < minimum``), so text that calls the value below
+    its minimum, or not below it, never shows figures that say otherwise. Trailing zeros are
+    stripped, as :func:`_ratio` strips them.
+
+    The places stop growing: a value off the minimum lands on its own side once half a unit of
+    the last place is smaller than the gap, and a value equal to ``minimum``, a finite decimal,
+    is shown exactly at the minimum's own places.
+
+    Example:
+        >>> _beside_minimum(Fraction(791, 1000), Decimal("0.8"), 1)
+        Decimal('0.79')
+        >>> _beside_minimum(Fraction(88465, 1000), Decimal("88.48"), 1)
+        Decimal('88.46')
+        >>> _beside_minimum(Fraction(566100, 7161), Decimal("80"), 1)
+        Decimal('79.1')
+    """
+    target = _exact(minimum)
+    below = value < target
+    shown = _round(value, places)
+    while (_exact(shown) < target) is not below:
+        places += 1
+        shown = _round(value, places)
+    return _plain(shown)
 
 
 def _significant(value: Fraction, digits: int = _RATE_DIGITS) -> Decimal:
@@ -341,6 +374,16 @@ def _number_text(value: Decimal | int) -> str:
     if isinstance(value, int):
         return f"{value:,}"
     return format(value, ",f")
+
+
+def _counted(value: Decimal | int, singular: str, plural: str) -> str:
+    """Render a count with the noun that agrees with it: ``1 click``, ``5,661 clicks``.
+
+    Only a count of exactly 1 takes ``singular``; 0, fractional counts such as ``0.5`` and every
+    other count take ``plural``. ``value`` is rendered as :func:`_number_text` renders it, so a
+    conversion count passes through :func:`_count` first.
+    """
+    return f"{_number_text(value)} {singular if value == 1 else plural}"
 
 
 def _render(metric: Metric) -> str:
@@ -586,12 +629,21 @@ def _google_campaign(ctx: AnalysisContext, campaign_id: int) -> CampaignInfo | N
 class _Coverage:
     """Search-term coverage of one Google account over the window.
 
+    The displayed share and percentage are computed once, beside the configured minimum
+    (:func:`_beside_minimum`), so the finding, its evidence, every item's flag and
+    ``evidence.extra`` show the same figures, each on the side of the minimum that
+    ``below_minimum`` states.
+
     Attributes:
         account: The account.
         search_term_spend: Σ window search-term spend (exact).
         keyword_spend: Σ window keyword spend (exact).
         share: ``search_term_spend / keyword_spend``; ``None`` without keyword spend.
         below_minimum: Whether ``share`` is below ``keywords.min_search_term_coverage``.
+        shown_share: ``share`` for display: four places or more, beside the minimum share;
+            ``None`` without keyword spend.
+        percent: ``share`` as a percentage for display: one place or more, beside the
+            minimum percentage; ``None`` without keyword spend.
     """
 
     account: _Account
@@ -599,12 +651,14 @@ class _Coverage:
     keyword_spend: Decimal
     share: Fraction | None
     below_minimum: bool
+    shown_share: Decimal | None
+    percent: Decimal | None
 
     def flag(self) -> Flag | None:
         """Return the ``search_term_coverage`` flag for this account's keyword items, if low."""
-        if not self.below_minimum or self.share is None:
+        if not self.below_minimum or self.percent is None:
             return None
-        percent = format(_percent(self.share), "f")
+        percent = format(self.percent, "f")
         return Flag(
             FLAG_SEARCH_TERM_COVERAGE, f"Low search-term coverage: {percent}% of keyword spend"
         )
@@ -615,7 +669,7 @@ class _Coverage:
         return {
             "search_term_spend": _money(self.search_term_spend, currency),
             "keyword_spend": _money(self.keyword_spend, currency),
-            "percent": None if self.share is None else _percent(self.share),
+            "percent": self.percent,
             "below_minimum": self.below_minimum,
         }
 
@@ -627,7 +681,10 @@ def _coverage(
 
     Search-term spend is Σ ``ctx.search_terms`` cost (already window totals) and keyword spend
     Σ ``ctx.keyword_days`` cost on window dates, each over the account's campaigns. Coverage is
-    a ratio within one account, so no amount crosses a currency.
+    a ratio within one account, so no amount crosses a currency. The comparison with
+    ``keywords.min_search_term_coverage`` is exact; the displayed share (four places) and
+    percentage (one place) take more places only where fewer would put them on the other
+    side of the configured minimum (:func:`_beside_minimum`).
     """
     term_spend = dict.fromkeys(accounts, Decimal(0))
     keyword_spend = dict.fromkeys(accounts, Decimal(0))
@@ -644,6 +701,9 @@ def _coverage(
         keyword_spend[campaign.account_id] += sum(
             (day.cost for day in days if window.start <= day.date <= window.end), Decimal(0)
         )
+    # The configured minimum is a finite decimal, so both conversions are exact.
+    min_share = _to_decimal(cfg.min_coverage)
+    min_percent = _to_decimal(cfg.min_coverage * 100)
     coverage: dict[int, _Coverage] = {}
     for account_id, account in accounts.items():
         terms, keywords = term_spend[account_id], keyword_spend[account_id]
@@ -654,12 +714,25 @@ def _coverage(
             keyword_spend=keywords,
             share=share,
             below_minimum=share is not None and share < cfg.min_coverage,
+            shown_share=None if share is None else _beside_minimum(share, min_share, _RATIO_PLACES),
+            percent=(
+                None
+                if share is None
+                else _beside_minimum(share * 100, min_percent, _PERCENT_PLACES)
+            ),
         )
     return coverage
 
 
 def _coverage_finding(ctx: AnalysisContext, cfg: _Config, item: _Coverage) -> Finding:
-    """Return the section finding ``search_term_coverage`` for one account."""
+    """Return the section finding ``search_term_coverage`` for one account.
+
+    The message cites the coverage percentage and, when coverage is below
+    ``keywords.min_search_term_coverage``, the minimum exactly as configured (0.80 → "80%",
+    0.8858 → "88.58%"); the percentage is the one :func:`_coverage` placed on the minimum's
+    side, so "below the minimum" never cites a percentage at or above it. The evidence carries
+    the same displayed share and percentage with the configured ``min_share``.
+    """
     currency = item.account.currency
     terms = _money(item.search_term_spend, currency)
     keywords = _money(item.keyword_spend, currency)
@@ -668,14 +741,14 @@ def _coverage_finding(ctx: AnalysisContext, cfg: _Config, item: _Coverage) -> Fi
         "Google withholds low-volume search terms for privacy, so search-term totals fall "
         "below keyword totals."
     )
-    minimum = _percent(cfg.min_coverage)
-    if item.share is None:
+    minimum = _plain(_to_decimal(cfg.min_coverage * 100))
+    if item.percent is None:
         message = (
             f"Search-term coverage unavailable: no keyword spend over the {days}-day window. "
             f"{privacy}"
         )
     else:
-        percent = _percent(item.share)
+        percent = item.percent
         message = (
             f"Search terms cover {format(percent, 'f')}% of keyword spend "
             f"({_money_text(terms, currency)} of {_money_text(keywords, currency)}) over the "
@@ -695,8 +768,8 @@ def _coverage_finding(ctx: AnalysisContext, cfg: _Config, item: _Coverage) -> Fi
             "currency": currency,
             "search_term_spend": terms,
             "keyword_spend": keywords,
-            "coverage_share": None if item.share is None else _ratio(item.share),
-            "coverage_percent": None if item.share is None else _percent(item.share),
+            "coverage_share": item.shown_share,
+            "coverage_percent": item.percent,
             "min_share": _plain(_to_decimal(cfg.min_coverage)),
             "below_minimum": item.below_minimum,
             "window": ctx.window.to_json(),
@@ -836,7 +909,9 @@ def _flags(flag: Flag | None) -> tuple[Flag, ...]:
 
 def _k1_missing(cfg: _Config) -> tuple[str, str]:
     """Return ``(withheld reason, finding detail)`` for a run without any baseline facts."""
-    detail = f"no Google campaign facts in the trailing {cfg.k1_baseline_days} days"
+    detail = (
+        f"no Google campaign facts in the trailing {_counted(cfg.k1_baseline_days, 'day', 'days')}"
+    )
     return f"baseline unavailable: {detail}", detail
 
 
@@ -848,18 +923,18 @@ def _k1_unusable(baseline: RateBaseline, cfg: _Config) -> tuple[str, str] | None
     """
     span = cfg.k1_baseline_days
     required = _number_text(_plain(cfg.k1_min_baseline_conversions))
-    conversions = _number_text(_count(baseline.conversions))
+    conversions = _counted(_count(baseline.conversions), "conversion", "conversions")
     if baseline.conversions < cfg.k1_min_baseline_conversions:
         return (
             f"baseline conversions {_count(baseline.conversions):f} of "
             f"{_plain(cfg.k1_min_baseline_conversions):f} required",
-            f"the trailing {span}-day baseline has {conversions} conversions over "
-            f"{baseline.clicks:,} clicks, below the {required} required",
+            f"the trailing {span}-day baseline has {conversions} over "
+            f"{_counted(baseline.clicks, 'click', 'clicks')}, below the {required} required",
         )
     # ``k1.min_baseline_conversions`` is validated positive, so a rate of 0 (no conversions)
     # always fails the check above; only a baseline without clicks is left to reject.
     if baseline.clicks <= 0:
-        detail = f"the trailing {span}-day baseline has {conversions} conversions but no clicks"
+        detail = f"the trailing {span}-day baseline has {conversions} but no clicks"
         return f"baseline rate unavailable: {detail}", detail
     return None
 
@@ -954,7 +1029,7 @@ class _BaselineCoverage:
             detail = (
                 f"Google daily metrics cover {self.covered_from.isoformat()} to "
                 f"{self.covered_through.isoformat()} of {span} ({covered} of "
-                f"{self.span_days} days covered)"
+                f"{_counted(self.span_days, 'day', 'days')} covered)"
             )
         state = self._state()
         if state is not None:
@@ -1033,15 +1108,17 @@ def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]
         # No facts at all: assess the span the baseline would have read.
         span = (ctx.window.end - timedelta(days=cfg.k1_baseline_days - 1), ctx.window.end)
     coverage = _k1_baseline_coverage(ctx, cfg, *span)
+    minimum = _counted(
+        _plain(cfg.k1_min_baseline_conversions), "baseline conversion", "baseline conversions"
+    )
     finding = Finding(
         code=FINDING_K1_NO_BASELINE,
         section=KEYWORDS,
         entity=None,
         message=(
             f"Block candidates withheld account-wide: {detail}. K1 sets its minimum clicks "
-            "from the account's conversion rate, which needs at least "
-            f"{_number_text(_plain(cfg.k1_min_baseline_conversions))} baseline conversions "
-            "and a rate above 0."
+            f"from the account's conversion rate, which needs at least {minimum} and a rate "
+            "above 0."
         ),
         evidence={
             "baseline_conversions": None if baseline is None else _count(baseline.conversions),
@@ -1070,24 +1147,44 @@ def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]
 def _k1_reason(evidence: Evidence) -> str:
     """Render K1's reason from its evidence only (AAP 0.5.4: the text cannot drift).
 
+    The spend gate is cited at the values it was compared at. With ``k1.min_spend_cpa_multiple``
+    at 1 the reason says "at least 1x the account cost/conversion of {cost/conversion}"; with
+    any other multiple it cites the ``min_spend`` baseline, "at or above the spend floor of
+    {floor} ({multiple}x the account cost/conversion)", because a multiple of the displayed
+    cost/conversion can exceed the displayed spend that cleared the exact floor. Spend, the
+    floor and the cost/conversion are each rounded half-even at the minor unit, and rounding is
+    monotone, so the displayed spend is never below the displayed value it is said to reach.
+
     An ``ADDED`` term always names its matched keyword criterion and warns that an exact-match
     negative also blocks that keyword's exact-match traffic. Each part of the matched keyword
     the evidence lacks (text, match type or criterion) is labelled unavailable, never dropped.
     Any other term names its matched keyword when the evidence has one.
     """
-    days = evidence.window["days"]
+    days = _counted(_number(evidence.window["days"]), "day", "days")
     spend = _render(evidence.metric("wasted_spend"))
-    clicks = _render(evidence.metric("clicks"))
-    n_star = _render(evidence.metric("min_clicks"))
+    clicks = _counted(_number(evidence.metric("clicks").value), "click", "clicks")
+    n_star = _counted(_number(evidence.metric("min_clicks").value), "click", "clicks")
     rate = _number(_baseline(evidence, "baseline_rate").value)
-    cpa = _number(_baseline(evidence, "account_cost_per_conversion").value)
     currency = evidence.metric("spend").currency
     multiple = _number(evidence.extra["min_spend_cpa_multiple"])
+    if multiple == 1:
+        cpa = _number(_baseline(evidence, "account_cost_per_conversion").value)
+        spend_floor = (
+            f"at least {_number_text(multiple)}x the account cost/conversion of "
+            f"{_money_text(cpa, currency)}"
+        )
+    else:
+        # Any other multiple of the displayed cost/conversion is not the floor compared
+        # (14 x 1.43 = 20.02 against an exact floor of 20.00), so the floor itself is cited.
+        floor = _number(_baseline(evidence, "min_spend").value)
+        spend_floor = (
+            f"at or above the spend floor of {_money_text(floor, currency)} "
+            f"({_number_text(multiple)}x the account cost/conversion)"
+        )
     reason = (
-        f"Spent {spend} over {days} days with 0 conversions across {clicks} clicks, at or "
-        f"above the minimum of {n_star} clicks for the account's conversion rate of "
-        f"{_number_text(rate)} (conversions ÷ clicks), and at least {_number_text(multiple)}x "
-        f"the account cost/conversion of {_money_text(cpa, currency)}."
+        f"Spent {spend} over {days} with 0 conversions across {clicks}, at or "
+        f"above the minimum of {n_star} for the account's conversion rate of "
+        f"{_number_text(rate)} (conversions ÷ clicks), and {spend_floor}."
     )
     if evidence.extra.get("term_status") == "ADDED":
         # Q-G6 may omit any part of the matched keyword: the criterion is named whenever it is
@@ -1156,6 +1253,15 @@ def _k1_candidate(
             "account_cost_per_conversion",
             f"Account cost/conversion ({currency})",
             _money(account_cpa, currency),
+        ),
+        # The floor the spend was compared with, rounded half-even like the spend and never
+        # up: spend is stored at micros, so a spend of 20.002 clears an exact floor of 20.0015
+        # yet would show 20.00 against a rounded-up 20.01. Rounding is monotone, so a spend at
+        # or above the floor never shows below it.
+        Baseline(
+            "min_spend",
+            f"Spend floor ({currency})",
+            _money(_exact(cfg.k1_spend_multiple) * account_cpa, currency),
         ),
         Baseline(
             "baseline_rate",
@@ -1239,7 +1345,7 @@ def _k1_without_cpa(ctx: AnalysisContext, account: _Account, totals: Totals | No
             entity=account.ref,
             reason=(
                 "account cost/conversion unavailable: conversions unavailable on "
-                f"{totals.unreported_days} of {totals.days} days in the "
+                f"{totals.unreported_days} of {_counted(totals.days, 'day', 'days')} in the "
                 f"{ctx.window.days}-day window"
             ),
             observed=totals.days - totals.unreported_days,
@@ -1303,8 +1409,9 @@ def _evaluate_k1(
     makes no statistical claim (:func:`k1_min_clicks`). With fewer than
     ``k1.min_baseline_conversions`` baseline conversions, or no usable rate, K1 is withheld
     account-wide with the ``k1_no_baseline`` finding. The spend floor requires at least one
-    typical conversion's cost to have been spent. A term at the spend floor but below n* is
-    listed as withheld with its clicks observed and required.
+    typical conversion's cost to have been spent; each item's evidence carries it as the
+    ``min_spend`` baseline beside the account cost/conversion. A term at the spend floor but
+    below n* is listed as withheld with its clicks observed and required.
 
     Baseline coverage: the baseline spans ``k1.baseline_days`` whether or not
     ``google.metrics_daily`` covers all of it, for example a custom window near the start of
@@ -1483,19 +1590,38 @@ def _adjacent(pool: _AdjacentPool, cfg: _Config, term: str) -> list[_TermTotals]
 
 
 def _k2_reason(evidence: Evidence) -> str:
-    """Render K2's reason from its evidence only."""
-    days = evidence.window["days"]
-    conversions = _render(evidence.metric("conversions"))
+    """Render K2's reason from its evidence only.
+
+    The efficiency gate is cited at the values it was compared at. With ``k2.max_cpa_ratio``
+    at 1 the reason says "at or below 1x the campaign's {cost/conversion} per conversion";
+    with any other ratio it cites the ``max_cost_per_conversion`` baseline, "at or below the
+    highest qualifying cost/conversion of {max} ({ratio}x the campaign's cost/conversion)",
+    because a multiple of the displayed campaign cost/conversion can fall below the displayed
+    term cost/conversion that met the exact maximum. Each value is rounded half-even at the
+    minor unit, and rounding is monotone, so the displayed term cost/conversion never exceeds
+    the displayed value it is said to stay within.
+    """
+    days = _counted(_number(evidence.window["days"]), "day", "days")
+    conversions = _counted(
+        _number(evidence.metric("conversions").value), "conversion", "conversions"
+    )
     cpa = _render(evidence.metric("cost_per_conversion"))
     currency = evidence.metric("spend").currency
-    campaign_cpa = _number(_baseline(evidence, "campaign_cost_per_conversion").value)
     ratio = _number(evidence.extra["max_cpa_ratio"])
     label = evidence.extra["adjacent_terms_label"]
-    reason = (
-        f"{conversions} conversions at {cpa} per conversion over {days} days, at or below "
-        f"{_number_text(ratio)}x the campaign's {_money_text(campaign_cpa, currency)} per "
-        "conversion."
-    )
+    if ratio == 1:
+        campaign_cpa = _number(_baseline(evidence, "campaign_cost_per_conversion").value)
+        maximum = (
+            f"{_number_text(ratio)}x the campaign's {_money_text(campaign_cpa, currency)} per "
+            "conversion"
+        )
+    else:
+        highest = _number(_baseline(evidence, "max_cost_per_conversion").value)
+        maximum = (
+            f"the highest qualifying cost/conversion of {_money_text(highest, currency)} "
+            f"({_number_text(ratio)}x the campaign's cost/conversion)"
+        )
+    reason = f"{conversions} at {cpa} per conversion over {days}, at or below {maximum}."
     terms = [str(item["term"]) for item in evidence.extra["adjacent_terms"]]
     if terms:
         reason += f" Adjacent terms to try, {label}: {', '.join(terms)}."
@@ -1958,9 +2084,10 @@ def _qs_labels(basis: _QsBasis | None, span: int) -> tuple[str, str]:
             "Quality score at window start (keyword snapshot)",
             "Quality score at window end (keyword snapshot)",
         )
+    days = _counted(span, "day", "days")
     return (
-        f"Quality score, first {span} days (mean of daily scores)",
-        f"Quality score, last {span} days (mean of daily scores)",
+        f"Quality score, first {days} (mean of daily scores)",
+        f"Quality score, last {days} (mean of daily scores)",
     )
 
 
@@ -2234,7 +2361,7 @@ def _evaluate_k3(
                     rule_id=K3,
                     section=KEYWORDS,
                     entity=None,
-                    reason=f"window {window.days} days of {required} required",
+                    reason=f"window {_counted(window.days, 'day', 'days')} of {required} required",
                     observed=window.days,
                     required=required,
                     unit="days",
@@ -2305,8 +2432,9 @@ def _evaluate_k3(
                     section=KEYWORDS,
                     entity=_keyword_ref(ctx, keyword),
                     reason=(
-                        f"quality score on {observed} of {cfg.k3_min_qs_days} required days in "
-                        f"the {span_name} {cfg.k3_span_days} days"
+                        f"quality score on {observed} of "
+                        f"{_counted(cfg.k3_min_qs_days, 'required day', 'required days')} in "
+                        f"the {span_name} {_counted(cfg.k3_span_days, 'day', 'days')}"
                     ),
                     observed=observed,
                     required=cfg.k3_min_qs_days,

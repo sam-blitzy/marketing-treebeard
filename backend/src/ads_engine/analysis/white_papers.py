@@ -64,6 +64,7 @@ from ads_engine.analysis.attribution import (
     CostValue,
     CountValue,
     attribution_for,
+    bounded_decimal,
 )
 from ads_engine.analysis.context import (
     W1,
@@ -177,12 +178,6 @@ _CENT: Final = Decimal("0.01")
 _RATIO_PLACES: Final = Decimal("0.0001")
 """Precision of a displayed ratio or multiple; trailing zeros are dropped (``10``, ``2.5``)."""
 
-_STORED_PLACES: Final = Decimal("0.000001")
-"""Finest stored money precision (``numeric(18, 6)``); derived costs are bounded to it."""
-
-_STORED_EXPONENT: Final = -6
-"""The exponent of :data:`_STORED_PLACES`."""
-
 _HUNDRED: Final = Decimal(100)
 _PERCENT_PLACES: Final = Decimal("0.1")
 _DASH: Final = "—"
@@ -239,12 +234,12 @@ def _bounded(value: Decimal) -> Decimal:
     """Bound a derived amount to the stored money precision without padding coarser values.
 
     ``Decimal("10.00")`` stays ``10.00``; ``2766 / 31`` becomes ``89.225806``, so evidence never
-    carries a 28-digit quotient.
+    carries a 28-digit quotient. It delegates to
+    :func:`~ads_engine.analysis.attribution.bounded_decimal`, the rule the attribution JSON in
+    ``extra.costs``, ``extra.rows`` and ``extra.orphan_deals`` applies, so a metric and its
+    detail always cite one value.
     """
-    exponent = value.as_tuple().exponent
-    if isinstance(exponent, int) and exponent < _STORED_EXPONENT:
-        return value.quantize(_STORED_PLACES, rounding=ROUND_HALF_EVEN)
-    return value
+    return bounded_decimal(value)
 
 
 def _fixed(amount: Decimal) -> str:
@@ -300,9 +295,12 @@ def _count_text(count: CountValue, singular: str) -> str:
 
 
 def _mql_label(row: AssetRow) -> str:
-    """Return the MQL column header with its bound stage label: ``MQL (First meeting booked)``."""
+    """Return the MQL column header with its bound stage label: ``MQL (First meeting booked)``.
+
+    A label that only repeats the stage name ("MQL", in any case) is not parenthesised.
+    """
     label = (row.mql_label or "").strip()
-    return f"MQL ({label})" if label else "MQL"
+    return f"MQL ({label})" if label and label.casefold() != "mql" else "MQL"
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +728,8 @@ def _w2_guards(ctx: AnalysisContext, row: AssetRow, settings: _Settings) -> tupl
     days = ctx.window.days
     if days < settings.retire_min_days:
         withhold(
-            f"window of {days} days is below the {settings.retire_min_days} days W2 needs",
+            f"window of {_plural(days, 'day')} is below the "
+            f"{_plural(settings.retire_min_days, 'day')} W2 needs",
             days,
             settings.retire_min_days,
             "days",
@@ -830,8 +829,9 @@ def _decide_without_ql(
         W2,
         ACTION_RETIRE,
         (
-            f"No Qualified Lead after {spend_text} of spend over {ctx.window.days} days: "
-            f"{ratio_text} (W2 retires at {multiple_text} x, {_money(retire_at, currency)})."
+            f"No Qualified Lead after {spend_text} of spend over "
+            f"{_plural(ctx.window.days, 'day')}: {ratio_text} (W2 retires at {multiple_text} x, "
+            f"{_money(retire_at, currency)})."
         ),
         sample=Sample(ctx.window.days, settings.retire_min_days, "days"),
         extra=extra,

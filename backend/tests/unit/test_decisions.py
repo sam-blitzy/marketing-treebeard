@@ -72,6 +72,8 @@ from ads_engine.decisions import (
     apply_patch,
     compare,
     decision_shape,
+    describe_expected,
+    describe_snapshot,
     expected_state_from_snapshot,
     from_micros,
     is_valid_amount,
@@ -1167,8 +1169,8 @@ def test_a_linkedin_budget_one_minor_unit_apart_is_a_budget_mismatch() -> None:
     assert compare(snapshot, decision, state=state) == [
         Mismatch(
             kind="budget",
-            decided_value={"daily_budget": "100.00", "total_budget": None, "currency": "USD"},
-            platform_value={"daily_budget": "100.01", "total_budget": None, "currency": "USD"},
+            decided_value={"daily_budget": "100.000000", "total_budget": None, "currency": "USD"},
+            platform_value={"daily_budget": "100.010000", "total_budget": None, "currency": "USD"},
         )
     ]
 
@@ -1362,6 +1364,123 @@ def test_expected_state_from_snapshot_materialises_each_shape(
     assert materialised == expected
     tracked, baseline = _tracked(state, materialised)
     assert compare(snapshot, baseline, state=tracked) == []
+
+
+@pytest.mark.parametrize(
+    ("state", "intended", "value"),
+    [
+        pytest.param(
+            _google_campaign("DAILY"),
+            {"status": "active", "daily_budget": Decimal("125")},
+            {
+                "status": "active",
+                "daily_budget": "125.000000",
+                "total_budget": None,
+                "currency": "USD",
+                "amount_micros": 125_000_000,
+            },
+            id="google-own-budget-whole",
+        ),
+        pytest.param(
+            _google_shared_budget("DAILY"),
+            {"daily_budget": Decimal("2.5E+2")},
+            {
+                "daily_budget": "250.000000",
+                "total_budget": None,
+                "currency": "USD",
+                "amount_micros": 250_000_000,
+            },
+            id="google-shared-budget-exponent",
+        ),
+        pytest.param(
+            _google_campaign("CUSTOM_PERIOD"),
+            {"status": "paused", "total_budget": Decimal("120.000000")},
+            {
+                "status": "paused",
+                "daily_budget": None,
+                "total_budget": "120.000000",
+                "currency": "USD",
+                "amount_micros": 120_000_000,
+            },
+            id="google-already-at-scale",
+        ),
+        pytest.param(
+            _linkedin_campaign(daily=True, total=True),
+            {"status": "active", "daily_budget": Decimal("90.5"), "total_budget": Decimal("9000")},
+            {
+                "status": "active",
+                "daily_budget": "90.500000",
+                "total_budget": "9000.000000",
+                "currency": "USD",
+            },
+            id="linkedin-both-amounts",
+        ),
+    ],
+)
+def test_an_intended_state_describes_its_amounts_at_the_stored_scale(
+    state: SubjectState, intended: Mapping[str, object], value: dict[str, object]
+) -> None:
+    """AAP 0.5.2 (money is ``numeric(18, 6)``): ``record_intended``'s decided side matches.
+
+    The submitted amount keeps its own exponent (``125``, ``2.5E+2``); the decided side
+    stored on the discrepancy shows it at the six places the platform side and every value
+    read back from the database show, and Google's ``amount_micros`` is the same number.
+    """
+    expected = parse_intended_state(state, intended)
+
+    assert describe_expected(expected, state=state) == value
+
+
+@pytest.mark.parametrize(
+    ("state", "snapshot", "value"),
+    [
+        pytest.param(
+            _google_campaign("DAILY"),
+            _snapshot(
+                _google_campaign("DAILY"), budget_id=OWN_BUDGET, budget_amount_micros=120_000_000
+            ),
+            {
+                "status": "active",
+                "daily_budget": "120.000000",
+                "total_budget": None,
+                "currency": "USD",
+                "amount_micros": 120_000_000,
+            },
+            id="google-micros",
+        ),
+        pytest.param(
+            _linkedin_campaign(),
+            _snapshot(_linkedin_campaign(), budget_daily=Decimal("90.000000")),
+            {
+                "status": "active",
+                "daily_budget": "90.000000",
+                "total_budget": None,
+                "currency": "USD",
+            },
+            id="linkedin-at-scale",
+        ),
+    ],
+)
+def test_a_snapshot_at_the_stored_scale_is_described_unchanged(
+    state: SubjectState, snapshot: Any, value: dict[str, object]
+) -> None:
+    """AAP 0.5.2: a platform amount already at six places keeps exactly that text."""
+    assert describe_snapshot(snapshot, state=state) == value
+
+
+def test_an_amount_finer_than_a_micro_keeps_every_digit_when_described() -> None:
+    """AAP 0.5.4.4 (C0 has no tolerance): describing an amount never rounds it.
+
+    Only an amount that is a whole number of micros is brought to six places; a finer one,
+    which no decision can hold, is shown with every digit rather than rounded to the scale.
+    """
+    state = _linkedin_campaign()
+    fine = Decimal("1.0000005")
+
+    decided = describe_expected(_own("active", daily=fine), state=state)
+    platform = describe_snapshot(_snapshot(state, budget_daily=fine), state=state)
+
+    assert decided["daily_budget"] == platform["daily_budget"] == "1.0000005"
 
 
 # ---------------------------------------------------------------------------------------

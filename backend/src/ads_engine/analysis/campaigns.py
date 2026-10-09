@@ -30,7 +30,7 @@ evidence values. Comparisons stay within one source, objective group and currenc
 Example:
     >>> result = evaluate(ctx)  # doctest: +SKIP
     >>> [item.action for item in result.candidates]  # doctest: +SKIP
-    ['Pause', 'Scale', "Create ad group or campaign for 'alternative hubspot'"]
+    ['Pause', 'Scale', "Create ad group or campaign for 'hubspot alternative'"]
 """
 
 from __future__ import annotations
@@ -400,6 +400,11 @@ def _singular(label: str) -> str:
     return label[:-1] if label.endswith("s") else label
 
 
+def _days(count: int) -> str:
+    """A day count with its unit in number: ``1 day``, ``13 days``."""
+    return "1 day" if count == 1 else f"{count} days"
+
+
 # ---------------------------------------------------------------------------
 # Entities, subjects and datasets
 # ---------------------------------------------------------------------------
@@ -691,7 +696,11 @@ def _veto_metrics(
     """The pipeline counts, side by side and never blended (AAP 0.5.4.1, 0.5.4.4).
 
     Leads, matured, matched and unresolved matured leads, eligible contacts, MQL, QL and
-    meetings each get their own metric; LinkedIn adds the young, not-judged cohort.
+    meetings each get their own metric, followed by the young, not-judged cohort and the
+    Qualified Leads it already reached. For Google, leads are every touch-date contact in the
+    window (or on the shared budget's member days) and the young cohort is the population's
+    own (``young_leads``, ``young_ql``); for LinkedIn it comes from the window leads
+    (:func:`_young_cohort`).
     """
     veto = view.veto
     if veto is None:
@@ -736,7 +745,24 @@ def _veto_metrics(
         Metric("ql", "Qualified Leads", veto.ql, "contacts"),
         Metric("meetings", "Meetings", veto.meetings, "meetings"),
     ]
-    if not google:
+    if google:
+        metrics.append(
+            Metric(
+                "young_leads",
+                f"Touch-date contacts younger than {settings.maturity_days} days (not judged)",
+                veto.young_leads,
+                "contacts",
+            )
+        )
+        metrics.append(
+            Metric(
+                "young_ql",
+                "Qualified Leads from those contacts (not judged)",
+                veto.young_ql,
+                "contacts",
+            )
+        )
+    else:
         young, young_ql = _young_cohort(ctx, settings, veto.campaign_id)
         metrics.append(
             Metric(
@@ -1030,7 +1056,7 @@ def _scale_entry(
         return ScaleWithheld(
             subject,
             entity,
-            f"window {ctx.window.days} days of {settings.sustained_min} required",
+            f"window {_days(ctx.window.days)} of {settings.sustained_min} required",
             ctx.window.days,
             settings.sustained_min,
             "days",
@@ -1145,7 +1171,9 @@ class _Notes:
         pipeline: Per campaign entity key, the entity and the unavailable or floored
             population an item or withheld line referred to; one finding each.
         no_crm_link: The Google link gap, once any Google item carries ``no_crm_link``.
-        no_crm_items: How many Google items carry ``no_crm_link``.
+        no_crm_items: How many Google items the rules built carry ``no_crm_link``.
+            ``precedence.py`` recounts the finding's ``items`` over the section's stored
+            items carrying the flag, C0 included, after G1, P2 and feedback suppression.
     """
 
     pipeline: dict[str, tuple[EntityRef, VetoPopulation, tuple[Flag, ...]]] = field(
@@ -1476,7 +1504,7 @@ def _window_withheld(rule_id: str, days: int, required: int) -> Withheld:
         rule_id=rule_id,
         section=CAMPAIGNS,
         entity=None,
-        reason=f"window {days} days of {required} required",
+        reason=f"window {_days(days)} of {required} required",
         observed=days,
         required=required,
         unit="days",
@@ -2306,8 +2334,8 @@ def _c3b_candidate(
         },
     )
     reason = (
-        f"{_value(evidence, 'members')} converting search terms share '{cluster.label}' with "
-        f"{_count(_value(evidence, 'conversions'))} conversions at "
+        f"{_value(evidence, 'members')} converting search terms cluster around the words "
+        f"'{cluster.label}' with {_count(_value(evidence, 'conversions'))} conversions at "
         f"{_money_of(evidence, 'cost_per_conversion')} per conversion; no keyword, ad group "
         "or campaign name contains those words."
     )
@@ -2344,8 +2372,10 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     Findings: ``segment_window_unavailable`` (C3a), one ``pipeline_unavailable`` per campaign
     whose pipeline could not be judged (QL stage unresolved, unknown CRM evidence or an
     attribution floor) and ``no_crm_link`` once any Google item (C1, C2 or C3b) lacks the
-    verified CRM link; its ``items`` counts the C1, C2 and C3b items that carry the flag (C0
-    items, built by ``discrepancy.py``, carry it too but are not counted here).
+    verified CRM link; here its ``items`` counts the C1, C2 and C3b items built with the flag.
+    ``precedence.py`` recounts ``items`` over the section's stored items that carry the flag,
+    C0 items from ``discrepancy.py`` and held items included, after G1, P2 and feedback
+    suppression.
 
     Threshold keys: :data:`C1_THRESHOLD_KEYS`, :data:`C1B_THRESHOLD_KEYS`,
     :data:`C2_THRESHOLD_KEYS`, :data:`VETO_THRESHOLD_KEYS`, :data:`C3A_THRESHOLD_KEYS` and

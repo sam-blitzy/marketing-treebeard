@@ -704,6 +704,8 @@ describe('formatWindowChip', () => {
       { source: 'google', start: '2026-09-04', end: '2026-10-01', boundary: 'America/New_York' },
       { source: 'linkedin', start: '2026-09-04', end: '2026-10-01', boundary: 'UTC' },
     ],
+    boundaries_differ: true,
+    description: 'Google 2026-09-04 to 2026-10-01 (America/New_York); LinkedIn same dates (UTC)',
   };
 
   it('renders the card chip example exactly', () => {

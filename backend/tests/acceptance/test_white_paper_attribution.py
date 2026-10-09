@@ -1213,6 +1213,12 @@ def test_mql_resolves_from_its_stage_label_or_renders_unavailable(
     assert resolved.table.mql_label == row.mql_label == label
     assert known(row.mql) == 10
     assert resolved.item(row).evidence.metric("mql").label == f"MQL ({label})"
+    # One input across: a bound label that only repeats the stage name is not parenthesised.
+    repeated = dataclasses.replace(
+        resolved.crm.bindings, mql=dataclasses.replace(binding, label="MQL")
+    )
+    bare = rerun(resolved, with_crm(resolved.ctx, bindings=repeated))
+    assert bare.item(bare.row()).evidence.metric("mql").label == "MQL"
 
     missing = run_scenario(make_context, "wp.mql_label.does_not_fire")
     assert not missing.crm.bindings.mql.available
@@ -1257,7 +1263,9 @@ def test_a_skipped_stage_is_reported_and_not_counted(make_context: MakeContext) 
     assert dict(run.item(row).evidence.extra["skipped"]) == {"mql": 10, "ql": 0}
     findings = [f for f in run.result.findings if f.code == FINDING_SKIPPED_STAGE]
     assert len(findings) == 1
-    assert "10 contacts skipped this stage (not counted)" in findings[0].message
+    assert findings[0].message == (
+        "MQL (First meeting booked): 10 contacts skipped this stage (not counted)"
+    )
     assert findings[0].evidence["stage"] == "MQL"
     assert findings[0].entity == row.entity
 
@@ -1304,6 +1312,14 @@ def test_costs_divide_spend_by_ql_and_by_booked_meetings(make_context: MakeConte
     evidence = run.item(row).evidence
     assert evidence.metric("cost_per_ql").value == Decimal(100)
     assert evidence.metric("cost_per_ql").currency == row.currency == "USD"
+    # One value per cited number (AAP 0.5.4.8): the metric, extra.costs and the creative row
+    # cite 1000/13 at the stored six decimals, never as a 28-digit quotient.
+    rendered = evidence.to_json()
+    metrics = {metric["key"]: metric["value"] for metric in rendered["metrics"]}
+    (credit,) = rendered["extra"]["rows"]
+    for key in ("cost_per_ql", "cost_per_meeting"):
+        assert metrics[key] == rendered["extra"]["costs"][key]["value"] == credit[key]["value"]
+    assert (metrics["cost_per_ql"], metrics["cost_per_meeting"]) == ("100.00", "76.923077")
 
     no_ql = run_scenario(make_context, "wp.costs.does_not_fire").row()
     assert known(no_ql.ql) == 0
@@ -1637,7 +1653,8 @@ def test_an_orphan_fetch_with_an_unread_target_is_not_assessed(make_context: Mak
     share = run.table.orphan_deals
     assert (share.assessed, share.orphans, share.not_assessed) == (9, 0, 1)
     assert share.unknown
-    assert share.label == "unknown (1 deals not assessed)"
+    assert share.label == "unknown (1 deal not assessed)"
+    assert share.reason == "1 deal-to-contact fetch unknown"
     row = run.row()
     assert row.has_flag(FLAG_DEAL_FLOOR)
     assert row.deals_after_touch.render() == "≥ 10"
@@ -1815,6 +1832,8 @@ def test_the_orphan_deal_share_is_measured_over_the_assessed_deals(
     )
     assert row.deals_after_touch.render() == "≥ 10"
     assert dict(run.item(row).evidence.extra["orphan_deals"])["orphans"] == 3
+    # The evidence cites 3/13 at the stored six decimals; the floor compared the exact share.
+    assert dict(run.item(row).evidence.extra["orphan_deals"])["share"] == "0.230769"
 
     below = run_scenario(make_context, "wp.target_read_partial.case")
     assert below.table.orphan_deals.share == 0
@@ -1839,7 +1858,9 @@ def test_an_incomplete_deal_search_makes_the_orphan_share_unknown(
     assert share.unknown
     assert share.share is not None
     assert re.fullmatch(
-        r"unknown \(deal search incomplete(; at least [1-9]\d* deals not assessed)?\)",
+        # N >= 1 agrees with its noun: "1 deal", "2 deals", "10 deals".
+        r"unknown \(deal search incomplete(; at least (1 deal|([2-9]|1\d)\d* deals) not "
+        r"assessed)?\)",
         share.label,
     )
     assert "0 deals not assessed" not in share.label
@@ -2173,6 +2194,11 @@ def test_repeat_touches_give_one_mql_and_one_ql_per_asset(make_context: MakeCont
     row = run.row()
     assert (row.linkedin_leads, row.matched_contacts) == (3, 1)
     assert known(row.mql) == 1
+    # The one contact without a QL date is reported once, in the singular, and the QL label
+    # that equals its stage name is not repeated.
+    assert [f.message for f in run.result.findings if f.code == FINDING_SKIPPED_STAGE] == [
+        "Qualified Lead: 1 contact skipped this stage (not counted)"
+    ]
     [hs_id] = row_contacts(run, row)
     anchor = anchors(run, row)[hs_id]
     qualified = rerun(

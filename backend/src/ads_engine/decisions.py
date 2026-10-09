@@ -1368,13 +1368,38 @@ def _budget_external_id(budget_id: int | None, state: SubjectState) -> str | Non
     return None
 
 
+def _stored_amount_text(amount: Decimal | None) -> str | None:
+    """Render an amount as decimal text at the ``numeric(18, 6)`` stored scale, or ``None``.
+
+    A finite amount that is a whole number of micros is quantized to six places, which only
+    pads or strips trailing zeros and so is exact: ``Decimal("125")`` and ``Decimal("2.5E+2")``
+    give ``"125.000000"`` and ``"250.000000"``, the text an amount read back from a money
+    column gives. Any other amount keeps every digit, as :func:`_decimal_text` renders it:
+    C0 has no tolerance, so rendering never rounds.
+    """
+    if amount is None:
+        return None
+    if (
+        amount.is_finite()
+        and _is_whole_at(amount, _MICRO_PLACES)
+        and amount.adjusted() + 1 + _MICRO_PLACES <= _EXACT.prec
+    ):
+        amount = amount.quantize(Decimal(1).scaleb(-_MICRO_PLACES, context=_EXACT), context=_EXACT)
+    return format(amount, "f")
+
+
 def _money_value(
     daily: Decimal | None, total: Decimal | None, *, state: SubjectState, micros: int | None
 ) -> dict[str, Any]:
-    """Return the JSON of an amount pair; Google values also carry ``amount_micros``."""
+    """Return the JSON of an amount pair; Google values also carry ``amount_micros``.
+
+    Both amounts are rendered by :func:`_stored_amount_text`, so the decided and platform
+    sides of a discrepancy show the same scale whether an amount was just submitted
+    (``"125"``) or read from the database (``125.000000``).
+    """
     value: dict[str, Any] = {
-        "daily_budget": _decimal_text(daily),
-        "total_budget": _decimal_text(total),
+        "daily_budget": _stored_amount_text(daily),
+        "total_budget": _stored_amount_text(total),
         "currency": state.currency,
     }
     if state.source == "google":
@@ -1396,10 +1421,10 @@ def _assignment_value(budget_id: int | None, state: SubjectState) -> dict[str, A
 def describe_expected(expected: ExpectedState, *, state: SubjectState) -> dict[str, Any]:
     """Return the JSON of a complete expected state, as discrepancy values store it.
 
-    ``own_budget`` gives ``status`` plus the amounts (with ``currency``, and
-    ``amount_micros`` on Google); ``shared_member`` gives ``status``, ``budget_id`` and
-    ``budget_external_id``; ``budget`` gives the amounts. A tombstone adds
-    ``"tombstone": true``.
+    ``own_budget`` gives ``status`` plus the amounts, as decimal text at the
+    ``numeric(18, 6)`` stored scale (with ``currency``, and ``amount_micros`` on Google);
+    ``shared_member`` gives ``status``, ``budget_id`` and ``budget_external_id``; ``budget``
+    gives the amounts. A tombstone adds ``"tombstone": true``.
 
     Args:
         expected: The expected state.

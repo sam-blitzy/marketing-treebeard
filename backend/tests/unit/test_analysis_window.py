@@ -593,6 +593,11 @@ def test_bound_custom_equals_the_class_level_custom(
                 "boundary": UTC_BOUNDARY,
             },
         ],
+        "boundaries_differ": True,
+        "description": (
+            f"Google {start.isoformat()} to {end.isoformat()} (America/New_York); "
+            "LinkedIn same dates (UTC)"
+        ),
     }
 
 
@@ -1128,9 +1133,50 @@ def test_to_json_is_exactly_the_evidence_window(shipped: Thresholds) -> None:
     ]
 
     assert window.source_days_json() == source_days
-    assert window.to_json() == {
+    payload = window.to_json()
+    assert payload == {
         "start": "2026-09-07",
         "end": "2026-10-04",
         "days": 28,
         "source_days": source_days,
+        "boundaries_differ": True,
+        "description": (
+            "Google 2026-09-07 to 2026-10-04 (America/New_York); LinkedIn same dates (UTC)"
+        ),
     }
+    assert list(payload) == [
+        "start",
+        "end",
+        "days",
+        "source_days",
+        "boundaries_differ",
+        "description",
+    ]
+
+
+@pytest.mark.parametrize("google_timezone", [None, UTC_BOUNDARY])
+def test_to_json_states_when_the_boundaries_are_the_same(
+    shipped: Thresholds, google_timezone: str | None
+) -> None:
+    # Google without a known account zone is treated as UTC, the same boundary as LinkedIn.
+    window = AnalysisWindow.default(shipped, SourceDayInfo(google_timezone), now=NOW)
+
+    payload = window.to_json()
+
+    assert payload["boundaries_differ"] is False
+    assert payload["description"] == (
+        f"Google {window.start.isoformat()} to {window.end.isoformat()} (UTC); "
+        "LinkedIn same dates (UTC)"
+    )
+    assert [day["boundary"] for day in payload["source_days"]] == [UTC_BOUNDARY, UTC_BOUNDARY]
+
+
+def test_to_json_names_a_single_source_without_claiming_a_difference(
+    shipped: Thresholds,
+) -> None:
+    window = _custom(shipped, 1, sources=SourceDayInfo(NEW_YORK, ("google",)))
+
+    payload = window.to_json()
+
+    assert payload["boundaries_differ"] is False
+    assert payload["description"] == "Google 2026-10-04 to 2026-10-04 (America/New_York)"

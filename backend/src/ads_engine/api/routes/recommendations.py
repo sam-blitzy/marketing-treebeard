@@ -701,11 +701,14 @@ async def get_recommendations(
     one; ``run_id`` addresses any run by id, such as a custom window (``/actions?run=<id>``).
     The five sections are always present, in the order ``keywords``, ``campaigns``,
     ``budget``, ``creative``, ``white_papers``, each with every static group even when empty.
+    The run header and its short-window banner read the window settings the run stored when
+    it was computed, so they agree with the run's frozen ``short_window`` flags.
 
     Args:
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; only read.
-        thresholds: The loaded configuration (window minimums and freshness limits).
+        thresholds: The loaded configuration the overlay reads (freshness limits and the
+            K1 baseline length).
         settings: The application's settings (``DISPLAY_TIMEZONE`` for the run header).
         now: The read time the overlay is computed for.
         run_id: The run to show, or ``None`` for the latest succeeded default run.
@@ -726,9 +729,7 @@ async def get_recommendations(
         session, run, recommendations, now, findings=findings, thresholds=thresholds
     )
     page = schemas.RecommendationsPage(
-        run=schemas.Run.from_row(
-            run, thresholds=thresholds, display_timezone=settings.display_timezone
-        ),
+        run=schemas.Run.from_row(run, display_timezone=settings.display_timezone),
         overlay=_overlay_view(result),
         banners=_banners(result),
         sections=_sections(recommendations, findings, withheld, suppressions, result.items),

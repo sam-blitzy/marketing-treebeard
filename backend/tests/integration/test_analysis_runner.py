@@ -280,6 +280,8 @@ async def _insert_run(kind: str, status: str, finished: datetime | None) -> int:
             data_modes={},
             dataset_ids={},
             config_hash="0" * 64,
+            default_days=28,
+            trusted_min_days=14,
             status=status,
             started_at=NOW,
             finished_at=finished,
@@ -507,6 +509,10 @@ async def test_run_reads_one_snapshot_and_records_what_it_read(
     assert run.finished_at is not None
     assert (run.window_start, run.window_end) == (window.start, window.end)
     assert run.source_day_boundaries == window.source_days_json()
+    assert (run.default_days, run.trusted_min_days) == (
+        window.default_days,
+        window.trusted_min_days,
+    )
     assert run.dataset_ids == {
         "google": world.google,
         "linkedin": world.linkedin,
@@ -590,6 +596,41 @@ async def test_changed_default_days_give_a_run_of_that_length(app_db: str) -> No
     run = await runner.run_analysis(window, "default", "scheduled", thresholds=config, now=NOW)
     assert (run.window_end - run.window_start).days + 1 == 21
     assert run.config_hash == config.config_hash
+    assert (run.default_days, run.trusted_min_days) == (21, config.trusted_min_days)
+
+
+@pytest.mark.anyio
+async def test_a_run_stores_the_window_settings_it_was_computed_with(app_db: str) -> None:
+    """AAP 0.5.3 "Where outputs are frozen": the row keeps the window's ``window.*`` values.
+
+    A 20-day custom run under ``window.trusted_min_days: 21`` stores 21 and the configured
+    ``default_days``: the minimum its short window was judged against. A later run of the same
+    window under the shipped configuration stores 14 and leaves the earlier row as it was.
+    """
+    await _seed()
+    config = Thresholds.load(resolve_config_dir(), overrides={"window.trusted_min_days": 21})
+    shipped = Thresholds.load(resolve_config_dir())
+    assert (config.trusted_min_days, shipped.trusted_min_days) == (21, 14)
+    window = await runner.custom_window(END - timedelta(days=19), END, now=NOW, thresholds=config)
+    assert (window.days, window.short_window) == (20, True)
+    judged = await runner.run_analysis(window, "custom", "manual", thresholds=config, now=NOW)
+    later = await runner.run_analysis(
+        await runner.custom_window(END - timedelta(days=19), END, now=NOW, thresholds=shipped),
+        "custom",
+        "manual",
+        thresholds=shipped,
+        now=NOW,
+    )
+    async with session_scope() as session:
+        stored = {
+            run.id: (run.default_days, run.trusted_min_days)
+            for run in (await session.execute(select(AnalysisRun))).scalars()
+        }
+    assert stored == {
+        judged.id: (config.default_days, 21),
+        later.id: (shipped.default_days, 14),
+    }
+    assert (judged.default_days, judged.trusted_min_days) == (config.default_days, 21)
 
 
 @pytest.mark.anyio
@@ -675,7 +716,7 @@ async def test_default_world_persists_all_five_sections_deterministically(
         assert all(message for message in extra["flag_messages"].values())
         entity = extra["entity"]
         assert entity["type"] == row.entity_type
-        assert row.entity_id.startswith(f"{entity['source']}:{entity['type']}:")
+        assert row.entity_id == f"{entity['source']}:{entity['type']}:{entity['id']}"
         assert entity["name"]
         # The pure context's ids name no stored row, so every typed key stays NULL.
         assert all(getattr(row, column) is None for column in _KEY_COLUMNS)
@@ -692,6 +733,17 @@ async def test_default_world_persists_all_five_sections_deterministically(
     assert findings
     assert withheld
     assert all(isinstance(row.observed, Decimal | None) for row in withheld)
+    # Findings and withheld lines name their entity by the external id items use, so the
+    # stored entity rebuilds the item key and a withheld pattern can be tied to its entity.
+    output_keys: set[str] = set()
+    for output in (*findings, *withheld):
+        if output.entity is not None:
+            assert isinstance(output.entity["id"], str), output.entity
+            assert output.entity["id"], output.entity
+            output_keys.add(
+                f"{output.entity['source']}:{output.entity['type']}:{output.entity['id']}"
+            )
+    assert output_keys & {row.entity_id for row in items}
     suppressions = await _rows(RunSuppression, first.id)
     assert all(row.count > 0 for row in suppressions)
 

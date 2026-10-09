@@ -245,7 +245,8 @@ def test_halves_split_a_28_day_window_into_two_14_day_halves(thresholds: Thresho
 
 
 def test_to_json_is_the_evidence_window_shape(ny_default: AnalysisWindow) -> None:
-    """AAP 0.5.3: ``window`` is {start, end, days, source_days[{source, start, end, boundary}]}."""
+    """AAP 0.5.3 and 0.5.4.1: ``window`` is {start, end, days, source_days[{source, start, end,
+    boundary}], boundaries_differ, description}: when the boundaries differ, it says so."""
     start = ny_default.start.isoformat()
     end = ny_default.end.isoformat()
 
@@ -259,6 +260,8 @@ def test_to_json_is_the_evidence_window_shape(ny_default: AnalysisWindow) -> Non
             {"source": "google", "start": start, "end": end, "boundary": NEW_YORK},
             {"source": "linkedin", "start": start, "end": end, "boundary": "UTC"},
         ],
+        "boundaries_differ": True,
+        "description": f"Google {start} to {end} (America/New_York); LinkedIn same dates (UTC)",
     }
     assert json.loads(json.dumps(payload)) == payload
     assert ny_default.source_days_json() == payload["source_days"]

@@ -180,13 +180,13 @@ def _seed(connection: Connection) -> None:
     connection.execute(
         text(
             "INSERT INTO analysis_run (id, kind, window_start, window_end, "
-            "source_day_boundaries, trigger, data_modes, dataset_ids, config_hash, status, "
-            "started_at, finished_at) "
+            "source_day_boundaries, trigger, data_modes, dataset_ids, config_hash, "
+            "default_days, trusted_min_days, status, started_at, finished_at) "
             "SELECT i, "
             "CASE WHEN i % :custom_every = 0 THEN 'custom' ELSE 'default' END, "
             "DATE '2026-07-01', DATE '2026-09-28', '[]'::jsonb, "
             "CASE WHEN i % :custom_every = 0 THEN 'manual' ELSE 'scheduled' END, "
-            "'{}'::jsonb, '{}'::jsonb, 'run-' || i, "
+            "'{}'::jsonb, '{}'::jsonb, 'run-' || i, 28, 14, "
             "CASE WHEN i = :total THEN 'running' "
             "WHEN i % :failed_every = 0 THEN 'failed' ELSE 'succeeded' END, "
             "TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(mins => i), "

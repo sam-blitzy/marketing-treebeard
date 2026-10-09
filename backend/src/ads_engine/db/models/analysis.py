@@ -4,7 +4,8 @@ AAP 0.5.2 assigns these tables to this module:
 
 * ``analysis_run``: one computation of the five sections over one window, ``default``
   (the worker's run of the configured default window) or ``custom`` (``POST /runs`` or
-  ``ads-engine analyze``). At most one run is ``running`` at a time.
+  ``ads-engine analyze``), with the ``window.default_days`` and ``window.trusted_min_days``
+  it was computed with. At most one run is ``running`` at a time.
 * ``analysis_request``: the queue the worker coalesces (within 60 s) into default-window
   runs after every sync, dataset activation, decision, discrepancy or feedback write.
 * ``recommendation``: the ranked action items of a run, each with its frozen evidence.
@@ -167,6 +168,11 @@ class AnalysisRun(IdPkMixin, Base):
     purge of those datasets; the overlay compares them with the current active datasets to
     mark items historical-only (AAP 0.3.2).
 
+    ``default_days`` and ``trusted_min_days`` freeze the window settings the run was computed
+    with, so its ``Run`` metadata (``short_window`` included) and its short-window banner
+    keep judging the window against the minimum its items were flagged against, even after
+    ``config/thresholds.yaml`` changes (AAP 0.5.3 "Where outputs are frozen").
+
     Attributes:
         kind: ``default`` or ``custom`` (:data:`RUN_KINDS`).
         window_start: First calendar date of the window, applied to each source's native
@@ -179,6 +185,11 @@ class AnalysisRun(IdPkMixin, Base):
         data_modes: Mode per source, as ``{google, linkedin, hubspot}``.
         dataset_ids: Dataset ids the run read, per source and role; no foreign key.
         config_hash: Hash of the threshold, mapping and registry configuration used.
+        default_days: The ``window.default_days`` the run was computed with; returned as
+            ``Run.default_days``.
+        trusted_min_days: The ``window.trusted_min_days`` the run was computed with, the
+            minimum its items' ``short_window`` flags were judged against; returned as
+            ``Run.trusted_min_days`` and quoted by the short-window banner.
         status: ``running``, ``succeeded`` or ``failed`` (:data:`RUN_STATUSES`).
         started_at: When the run started.
         finished_at: When the run finished; ``None`` while ``running``.
@@ -195,6 +206,8 @@ class AnalysisRun(IdPkMixin, Base):
     data_modes: Mapped[dict[str, Any]]
     dataset_ids: Mapped[dict[str, Any]]
     config_hash: Mapped[str]
+    default_days: Mapped[int]
+    trusted_min_days: Mapped[int]
     status: Mapped[str]
     started_at: Mapped[datetime]
     finished_at: Mapped[datetime | None]
@@ -364,8 +377,9 @@ class RunFinding(IdPkMixin, _RunEntityKeysMixin, Base):
         run_id: The :class:`AnalysisRun` that recorded the finding.
         section: The section the finding is shown in (:data:`RECOMMENDATION_SECTIONS`).
         code: The finding code.
-        entity: The entity the finding is about, denormalised (for example
-            ``{source, type, id, name}``); ``None`` for a section- or account-wide finding.
+        entity: The entity the finding is about, denormalised as ``EntityRef.to_json()``
+            (``{source, type, id, name}``, ``id`` the platform external id or composite key,
+            as items carry it); ``None`` for a section- or account-wide finding.
         message: The rendered message.
         evidence: The numbers behind the message (server default ``'{}'::jsonb``).
     """
@@ -398,8 +412,10 @@ class RunWithheld(IdPkMixin, _RunEntityKeysMixin, Base):
         run_id: The :class:`AnalysisRun` that recorded the withheld pattern.
         section: The section the pattern is listed in (:data:`RECOMMENDATION_SECTIONS`).
         rule_id: The rule whose pattern was withheld, for example ``B4``.
-        entity: The entity the pattern is about, denormalised; ``None`` for an account-wide
-            withholding such as K1 without a usable baseline.
+        entity: The entity the pattern is about, denormalised as ``EntityRef.to_json()``
+            (``{source, type, id, name}``, ``id`` the platform external id or composite key,
+            as items carry it); ``None`` for an account-wide withholding such as K1 without a
+            usable baseline.
         reason: Why the pattern was withheld.
         observed: The sample observed, in ``unit``; ``None`` when no sample applies.
         required: The minimum sample required, in ``unit``; ``None`` when no sample applies.

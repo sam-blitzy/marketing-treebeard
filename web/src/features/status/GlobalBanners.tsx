@@ -26,8 +26,9 @@
  *   operable from the keyboard.
  * - **Text**: every other banner's title is the API's own message. No threshold, count, window
  *   length or source name is written into the client; the short-window message already names
- *   the configured `trusted_min_days`, and the simulated-sources message names each simulated
- *   source with its reason, such as "credentials not configured".
+ *   the run's `trusted_min_days`, the minimum the run was computed with, and the
+ *   simulated-sources message names each simulated source with its reason, such as
+ *   "credentials not configured".
  *
  * Presentational only: the page passes `banners` and `overlay` from one `GET /recommendations`
  * response, and this module calls no data hook. UI comes only from the design-system index:

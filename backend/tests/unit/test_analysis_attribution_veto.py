@@ -7,7 +7,9 @@ They pin the matured population behind the C1b pause and the C2 pipeline veto (A
 never stands in. Maturity is measured from the window end (for Google, the end of the
 account's native day, which also bounds the touch-date population); unresolved leads stay in the
 share's denominator; eligible contacts are de-duplicated at their earliest matured touch; QL,
-MQL and meetings count only at or after that touch and never after the run. The pipeline is
+MQL and meetings count only at or after that touch and never after the run. Google leads are
+every touch-date contact in the window (or on a shared budget's member days); the young ones
+are counted beside the veto with their Qualified Leads, never in it. The pipeline is
 unavailable when the Qualified Lead stage is unbound, an eligible contact's refresh,
 association fetch or target read failed, or the unresolved share reaches the floor; an
 unbound MQL never blocks the veto. ``attribution_for`` memoises the table under
@@ -1111,8 +1113,9 @@ def test_google_population_is_the_matured_touch_date_contacts_of_the_primary_dat
         _contact(f"g-{n}", google_campaign_ref=" 20001 ", google_touch_at=MATURED)
         for n in range(1, 21)
     ]
+    # In the window but too young: one of the campaign's touch-date contacts, never judged.
+    young = _contact("g-young", google_campaign_ref="20001", google_touch_at=G_CUTOFF + ONE_SECOND)
     excluded = [
-        _contact("g-young", google_campaign_ref="20001", google_touch_at=G_CUTOFF + ONE_SECOND),
         _contact(
             "g-early", google_campaign_ref="20001", google_touch_at=G_WINDOW_START - ONE_SECOND
         ),
@@ -1144,7 +1147,7 @@ def test_google_population_is_the_matured_touch_date_contacts_of_the_primary_dat
         # record (with its QL entry) is the one the Google population reads.
         [_contact("g-dup")],
         bindings=_bindings(google=GOOGLE_LINK),
-        google_contacts=[*discovered, *excluded, *repeat],
+        google_contacts=[*discovered, young, *excluded, *repeat],
     )
     # The companion holds LinkedIn contacts with the same ids and QL entries after the touch;
     # none of them may reach the Google population.
@@ -1160,7 +1163,10 @@ def test_google_population_is_the_matured_touch_date_contacts_of_the_primary_dat
 
     first = table.veto[G_A]
     assert first.source == "google"
-    assert first.leads == first.matured_leads == first.matched_leads == 20
+    # Every window touch-date contact is a lead; the young one is shown, never judged.
+    assert first.leads == 21
+    assert first.matured_leads == first.matched_leads == 20
+    assert (first.young_leads, first.young_ql) == (1, 0)
     assert first.eligible_contacts == 20
     assert first.unresolved_leads == 0
     assert first.unresolved_share == Decimal(0)
@@ -1170,15 +1176,86 @@ def test_google_population_is_the_matured_touch_date_contacts_of_the_primary_dat
     assert first.veto_fires
 
     second = table.veto[G_B]
-    assert second.eligible_contacts == 2
+    assert second.leads == second.eligible_contacts == 2
+    assert (second.young_leads, second.young_ql) == (0, 0)
     assert second.ql == 1
     assert not second.veto_fires
 
     empty = table.veto[G_C]
-    assert empty.matured_leads == empty.eligible_contacts == 0
+    assert empty.leads == empty.matured_leads == empty.eligible_contacts == 0
+    assert (empty.young_leads, empty.young_ql) == (0, 0)
     assert empty.unresolved_share is None
     assert empty.available
     assert not empty.veto_fires
+
+
+def test_young_google_contacts_are_counted_beside_the_veto_and_never_judged(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # Twenty matured zero-QL contacts make the veto fire; the young contacts' Qualified
+    # Leads and failed reads must not clear or block it (AAP 0.5.4.1 veto counts).
+    matured = [_discovered(f"g-{n}", "20001", MATURED) for n in range(1, 21)]
+    young = [
+        # Reached QL after its touch and by the run: counted among the young QL.
+        _discovered("g-young-ql", "20001", YOUNG, ql_at=YOUNG + ONE_DAY),
+        # Reached QL before its touch, or only after the run: not counted.
+        _discovered("g-young-ql-before", "20001", YOUNG, ql_at=YOUNG - ONE_SECOND),
+        _discovered("g-young-ql-later", "20001", YOUNG, ql_at=NOW + ONE_SECOND),
+        # A young contact whose deal fetch failed: its evidence never enters the veto.
+        _discovered("g-young-broken", "20001", G_CUTOFF + ONE_SECOND),
+    ]
+    broken = AssociationFetchInfo("contact", "g-young-broken", "deal", "error")
+    google_crm = _crm(
+        HUBSPOT,
+        [],
+        bindings=_bindings(google=GOOGLE_LINK),
+        fetches={("contact", "g-young-broken", "deal"): broken},
+        google_contacts=[*young, *matured],
+    )
+    ctx = _context(thresholds, window, linkedin_crm=None, google_crm=google_crm)
+    population = build_attribution(ctx).veto[G_A]
+    assert (population.leads, population.matured_leads, population.matched_leads) == (24, 20, 20)
+    assert (population.young_leads, population.young_ql) == (4, 1)
+    assert (population.eligible_contacts, population.ql, population.meetings) == (20, 0, 0)
+    assert population.unknown_evidence_contacts == 0
+    assert (population.available, population.veto_fires) == (True, True)
+    assert population.to_json()["young_ql"] == 1
+
+    # Without a resolved Qualified Lead stage the young QL is unavailable, never 0.
+    unbound = _crm(
+        HUBSPOT,
+        [],
+        bindings=_bindings(ql=QL_MISSING, google=GOOGLE_LINK),
+        google_contacts=[*young, *matured],
+    )
+    population = build_attribution(
+        _context(thresholds, window, linkedin_crm=None, google_crm=unbound)
+    ).veto[G_A]
+    assert (population.leads, population.young_leads, population.young_ql) == (24, 4, None)
+    assert (population.ql, population.available) == (None, False)
+
+
+def test_a_google_contact_with_matured_and_young_touches_counts_once_as_matured(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # One person, two discovered records for the same campaign: the young record first. The
+    # contact is one lead, judged at its earliest (matured) touch, and never young.
+    both = [
+        _discovered("g-both", "20001", YOUNG, ql_at=MATURED + ONE_DAY),
+        _discovered("g-both", "20001", MATURED, ql_at=MATURED + ONE_DAY),
+    ]
+    zero_ql = [_discovered(f"g-{n}", "20001", MATURED) for n in range(1, 20)]
+    google_crm = _crm(
+        HUBSPOT, [], bindings=_bindings(google=GOOGLE_LINK), google_contacts=[*both, *zero_ql]
+    )
+    population = build_attribution(
+        _context(thresholds, window, linkedin_crm=None, google_crm=google_crm)
+    ).veto[G_A]
+    assert population.leads == population.matured_leads == population.eligible_contacts == 20
+    assert (population.young_leads, population.young_ql) == (0, 0)
+    # Its QL lies after its matured touch, so it is the population's QL and clears the veto.
+    assert population.ql == 1
+    assert not population.veto_fires
 
 
 def test_google_evidence_and_bindings_come_from_the_primary_dataset(
@@ -1484,7 +1561,11 @@ def test_a_shared_budget_population_holds_only_touches_on_member_days(
     population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
     assert population is not None
     assert (population.source, population.campaign_id) == ("google", G_A)
-    assert population.leads == population.matured_leads == population.matched_leads == 19
+    # g-young and g-at-window-end (20:00 on 2026-10-04 in New York) touched G_B on member
+    # days: leads of the budget, shown young, never judged.
+    assert population.leads == 21
+    assert population.matured_leads == population.matched_leads == 19
+    assert (population.young_leads, population.young_ql) == (2, 0)
     assert (population.eligible_contacts, population.unresolved_leads) == (19, 0)
     assert (population.mql, population.ql, population.meetings) == (0, 0, 0)
     assert population.available
@@ -1575,7 +1656,10 @@ def test_shared_budget_maturity_is_measured_back_from_the_native_window_end(
     ctx = _shared_context(thresholds, window, discovered)
     population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
     assert population is not None
-    assert population.leads == population.matured_leads == population.eligible_contacts
+    # g-last is one of the budget's leads either way; matured or young decides the veto.
+    assert population.leads == 20
+    assert population.matured_leads == population.eligible_contacts
+    assert population.young_leads == 20 - eligible
     assert (population.eligible_contacts, population.ql) == (eligible, 0)
     assert population.available
     assert population.veto_fires is fires
@@ -1605,12 +1689,14 @@ def test_shared_budget_population_follows_native_days_in_a_zone_east_of_utc(
     ctx = _shared_context(thresholds, window, discovered)
     population = shared_budget_veto(ctx, member_days, tokyo)
     assert population is not None
-    assert population.eligible_contacts == population.leads == 2
+    assert population.eligible_contacts == 2
+    # g-young-natively is on a member day but young against the native end: a lead, not judged.
+    assert (population.leads, population.young_leads) == (3, 1)
     # A member date outside the window is not a member day of this run.
     outside = {G_A: (window.start - ONE_DAY,)}
     population = shared_budget_veto(ctx, outside, tokyo)
     assert population is not None
-    assert population.eligible_contacts == 0
+    assert population.eligible_contacts == population.leads == population.young_leads == 0
 
 
 def test_a_contact_found_through_two_members_counts_once_at_its_earliest_touch(
@@ -1643,8 +1729,66 @@ def test_a_contact_found_through_two_members_counts_once_at_its_earliest_touch(
     # One eligible contact per person; its QL lies after its earliest touch (via G_B) though
     # before its touch via G_A; the meeting both contacts share counts once.
     assert population.leads == population.matured_leads == population.eligible_contacts == 2
+    assert population.young_leads == 0
     assert (population.ql, population.meetings) == (1, 1)
     assert population.unknown_evidence_contacts == 0
+
+
+def test_a_shared_budget_counts_member_day_leads_and_its_young_cohort(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    zero_ql = [_discovered(f"g-{n}", "20001", ON_BOTH) for n in range(1, 21)]
+    # Young through G_B on a member day and matured through G_A: one matured lead, whose QL
+    # after its matured touch is the budget's.
+    both = [
+        _discovered("g-both", "20002", YOUNG, ql_at=YOUNG + ONE_DAY),
+        _discovered("g-both", "20001", ON_BOTH, ql_at=YOUNG + ONE_DAY),
+    ]
+    young = [
+        # Young on G_B's member days, one of them already a Qualified Lead.
+        _discovered("g-young-ql", "20002", YOUNG, ql_at=YOUNG + ONE_DAY),
+        _discovered("g-young", "20002", YOUNG),
+        # Young, but G_A had left the budget by then: not one of the budget's leads.
+        _discovered("g-young-after-leaving", "20001", YOUNG, ql_at=YOUNG + ONE_DAY),
+        # Without a campaign reference or a touch date: never a lead.
+        _contact("g-no-ref", google_campaign_ref=None, google_touch_at=YOUNG),
+        _contact("g-no-touch", google_campaign_ref="20002", google_touch_at=None),
+    ]
+    ctx = _shared_context(thresholds, window, [*zero_ql, *both, *young])
+    population = shared_budget_veto(ctx, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.leads, population.matured_leads, population.eligible_contacts) == (
+        23,
+        21,
+        21,
+    )
+    assert (population.young_leads, population.young_ql) == (2, 1)
+    assert population.ql == 1
+    assert (population.available, population.veto_fires) == (True, False)
+
+    # Without g-both the twenty matured contacts reached no QL: the veto fires although a
+    # young contact already has, because young outcomes never enter it.
+    fired = shared_budget_veto(
+        _shared_context(thresholds, window, [*zero_ql, *young]), MEMBER_DAYS, NEW_YORK
+    )
+    assert fired is not None
+    assert (fired.leads, fired.eligible_contacts, fired.young_leads, fired.young_ql) == (
+        22,
+        20,
+        2,
+        1,
+    )
+    assert (fired.ql, fired.veto_fires) == (0, True)
+
+    unbound = _shared_context(
+        thresholds,
+        window,
+        [*zero_ql, *both, *young],
+        bindings=_bindings(ql=QL_MISSING, google=GOOGLE_LINK),
+    )
+    population = shared_budget_veto(unbound, MEMBER_DAYS, NEW_YORK)
+    assert population is not None
+    assert (population.leads, population.young_leads, population.young_ql) == (23, 2, None)
 
 
 @pytest.mark.parametrize(
@@ -1836,8 +1980,12 @@ def test_veto_population_invariants_and_json() -> None:
         "reason": None,
         "veto_fires": True,
         "attribution_floor": False,
+        "young_leads": None,
+        "young_ql": None,
     }
     assert _population(unresolved_share=None).to_json()["unresolved_share"] is None
+    google = _population(source="google", young_leads=5, young_ql=2).to_json()
+    assert (google["young_leads"], google["young_ql"]) == (5, 2)
 
 
 @pytest.mark.parametrize(

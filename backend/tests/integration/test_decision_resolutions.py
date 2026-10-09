@@ -14,6 +14,10 @@ Covered (AAP 0.5.4.4 "C0 resolutions by kind and subject type", AAP 0.5.2 shapes
 * **An own budget whose period changed**: a patch over a decided daily budget of a
   campaign whose budget is now ``CUSTOM_PERIOD`` is refused with 422 ``budget_changed``
   and writes nothing; resolving the budget discrepancy makes it decidable again.
+* **An intended state's amounts**: ``record_intended`` on an untracked own-budget campaign
+  and an untracked shared budget stores the decided amounts at the ``numeric(18, 6)``
+  scale of the platform side, whatever exponent the submitted text had, and keeps that
+  text through the next sync's refresh until the platform matches.
 
 The database tests run against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``). The module creates a private
@@ -1023,3 +1027,101 @@ async def test_a_patch_over_a_daily_decision_of_a_now_custom_period_budget_is_re
         None,
         Decimal(200),
     )
+
+
+# ---------------------------------------------------------------------------------------
+# An intended state's amounts at the stored money scale (QAPI2-F02)
+# ---------------------------------------------------------------------------------------
+
+
+async def _untracked(sessions: Sessions, ref: SubjectRef) -> Discrepancy:
+    """Return the subject's one ``untracked`` discrepancy, whatever its state."""
+    async with sessions() as session:
+        (row,) = await session.scalars(
+            select(Discrepancy).where(
+                Discrepancy.subject_type == ref.type,
+                Discrepancy.subject_id == ref.id,
+                Discrepancy.kind == "untracked",
+            )
+        )
+        return row
+
+
+def _google_money(amount: str, micros: int) -> dict[str, object]:
+    """Return a Google daily amount as a discrepancy value stores it."""
+    return {
+        "daily_budget": amount,
+        "total_budget": None,
+        "currency": "USD",
+        "amount_micros": micros,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_an_intended_state_is_stored_at_the_scale_of_the_platform_side(
+    sessions: Sessions,
+) -> None:
+    # AAP 0.5.2: money is numeric(18, 6). record_intended stores the submitted amounts
+    # ("125", "2.6E+2") at the six places the platform side shows, and the next sync's
+    # refresh from the stored decisions keeps exactly that text.
+    world = await _google_world(sessions)
+    await _sync(sessions, world, _placements(world), at=_at(0))
+    async with sessions() as session, session.begin():
+        newcomer = await _campaign(
+            session, world.dataset_id, world.account_id, "13", world.spare_budget
+        )
+        pool = await _budget(session, world.dataset_id, "505", 250_000_000, shared=True)
+    campaign = SubjectRef(type="campaign", id=newcomer)
+    budget = SubjectRef(type="budget", id=pool.id)
+    placements = {**_placements(world), newcomer: ("active", world.spare_budget)}
+    budgets = (*world.budgets, pool)
+    seen = await _sync(sessions, world, placements, at=_at(3), budgets=budgets)
+    assert seen.report.raised["untracked"] == 2
+    on_campaign = await _untracked(sessions, campaign)
+    on_budget = await _untracked(sessions, budget)
+    assert on_campaign.platform_value == {
+        "status": "active",
+        **_google_money("80.000000", 80_000_000),
+    }
+    assert on_budget.platform_value == _google_money("250.000000", 250_000_000)
+
+    intended_campaign = await _resolve(
+        sessions,
+        on_campaign.id,
+        "record_intended",
+        _at(4),
+        {"status": "active", "daily_budget": "125"},
+    )
+    intended_budget = await _resolve(
+        sessions, on_budget.id, "record_intended", _at(4), {"daily_budget": "2.6E+2"}
+    )
+
+    campaign_decided = {"status": "active", **_google_money("125.000000", 125_000_000)}
+    budget_decided = _google_money("260.000000", 260_000_000)
+    assert intended_campaign.decided_value == campaign_decided
+    assert intended_budget.decided_value == budget_decided
+    for ref, decided in ((campaign, campaign_decided), (budget, budget_decided)):
+        stored = await _untracked(sessions, ref)
+        assert (stored.state, stored.decided_value) == ("awaiting_platform", decided)
+
+    # The platform has not changed yet: the waiting rows are refreshed from the stored
+    # decisions, and their decided sides keep the same text.
+    await _sync(sessions, world, placements, at=_at(6), budgets=budgets)
+    for ref, decided in ((campaign, campaign_decided), (budget, budget_decided)):
+        refreshed = await _untracked(sessions, ref)
+        assert (refreshed.state, refreshed.decided_value) == ("awaiting_platform", decided)
+
+    # The platform reaches both intended amounts and each row closes.
+    applied_spare = replace(world.spare_budget, micros=125_000_000)
+    applied_pool = replace(pool, micros=260_000_000)
+    await _sync(
+        sessions,
+        world,
+        {**_placements(world), newcomer: ("active", applied_spare)},
+        at=_at(9),
+        budgets=(world.own_budget, world.shared_budget, applied_spare, applied_pool),
+    )
+    for ref in (campaign, budget):
+        closed = await _untracked(sessions, ref)
+        assert (closed.state, closed.resolution) == ("resolved", "record_intended")

@@ -518,6 +518,9 @@ def test_formatting_helpers_render_amounts_counts_and_shares() -> None:
     assert campaigns._singular("conversions") == "conversion"
     assert campaigns._singular("leads") == "lead"
     assert campaigns._singular("spend") == "spend"
+    assert campaigns._days(1) == "1 day"
+    assert campaigns._days(0) == "0 days"
+    assert campaigns._days(13) == "13 days"
 
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1415,7 @@ def test_a_shared_budget_holds_on_its_members_combined_google_veto() -> None:
         20,
     )
     assert (metrics["mql"], metrics["ql"], metrics["meetings"]) == (0, 0, 0)
-    assert "young_leads" not in metrics
+    assert (metrics["young_leads"], metrics["young_ql"]) == (0, 0)
     assert item.evidence.metric("leads").label == "Google touch-date contacts"
     assert item.evidence.metric("mql").label == "MQL"
     assert item.evidence.metric("matured_leads").unit == "contacts"
@@ -1427,6 +1430,68 @@ def test_a_shared_budget_holds_on_its_members_combined_google_veto() -> None:
     assert (entry.kind, entry.crm_scope) == ("hold", "google")
     assert entry.veto is not None
     assert entry.veto.campaign_id == m1
+
+
+def test_google_cards_show_every_touch_date_contact_and_the_young_cohort_apart() -> None:
+    scenario, ctx = _built("shared.poor_member.does_not_fire")
+    pool = scenario.ids.id("google", "budget", "pool")
+    m1 = _campaign_id(scenario, "google", "m1")
+    m1_ref = scenario.ids.external_id("google", "campaign", "m1")
+    native_end = AnalysisWindow.day_bounds(ctx.window.end, native_day_zone(ctx, "google"))[1]
+    young_touch = native_end - timedelta(days=7)
+    # Twenty matured zero-QL contacts make the veto fire; three younger contacts, one of them
+    # already a Qualified Lead after its touch, are shown beside it and never judged.
+    crm = _touch_crm([*[(m1_ref, MATURED_TOUCH)] * 20, *[(m1_ref, young_touch)] * 3])
+    people = (*crm.google_contacts[:-1], replace(crm.google_contacts[-1], ql_at=native_end))
+    assert native_end <= ctx.now
+    linked = _with_google_crm(ctx, replace(crm, google_contacts=people))
+    item = _only(campaigns.evaluate(linked), C2)
+    assert (item.entity_ref.id, item.action) == (pool, HOLD_ACTION)
+    metrics = _metrics(item)
+    assert list(metrics)[-12:] == [
+        "leads",
+        "matured_leads",
+        "matched_leads",
+        "unresolved",
+        "unresolved_share",
+        "eligible_contacts",
+        "unknown_evidence_share",
+        "mql",
+        "ql",
+        "meetings",
+        "young_leads",
+        "young_ql",
+    ]
+    assert (metrics["leads"], metrics["matured_leads"], metrics["matched_leads"]) == (23, 20, 20)
+    assert (metrics["eligible_contacts"], metrics["ql"]) == (20, 0)
+    assert (metrics["young_leads"], metrics["young_ql"]) == (3, 1)
+    assert item.evidence.metric("leads").label == "Google touch-date contacts"
+    young = item.evidence.metric("young_leads")
+    young_ql = item.evidence.metric("young_ql")
+    assert (young.label, young.unit) == (
+        "Touch-date contacts younger than 14 days (not judged)",
+        "contacts",
+    )
+    assert (young_ql.label, young_ql.unit) == (
+        "Qualified Leads from those contacts (not judged)",
+        "contacts",
+    )
+    # The campaign's own population counts the same contacts.
+    own = attribution_for(linked).veto[m1]
+    assert (own.leads, own.matured_leads, own.young_leads, own.young_ql) == (23, 20, 3, 1)
+
+    # Without a resolved Qualified Lead stage the pipeline is unavailable (Scale, flagged) and
+    # the young cohort's QL is unavailable too, never 0.
+    unresolved = replace(
+        LINKED, ql=ResolvedBinding(available=False, reason="stage label not in options")
+    )
+    unbound = _with_google_crm(ctx, replace(crm, bindings=unresolved, google_contacts=people))
+    item = _only(campaigns.evaluate(unbound), C2)
+    assert item.action == SCALE_ACTION
+    assert item.has_flag(FLAG_PIPELINE_UNAVAILABLE)
+    metrics = _metrics(item)
+    assert (metrics["leads"], metrics["young_leads"], metrics["young_ql"]) == (23, 3, None)
+    assert metrics["ql"] is None
 
 
 def test_a_hold_on_a_g1_blocked_subject_is_not_a_scale_candidate() -> None:
@@ -1527,6 +1592,34 @@ def test_c2_is_withheld_below_the_sustained_window() -> None:
     assert (entry.history, entry.gate) == (None, None)
     (line,) = _withheld(campaigns.evaluate(ctx), C2)
     assert line.reason == "window 6 days of 7 required"
+
+
+def test_a_one_day_window_reads_in_the_singular() -> None:
+    """A one-day custom run withholds C1, C1b, C2 and B1 with "window 1 day of N required".
+
+    The unit field stays "days" and observed and required stay the bare counts.
+    """
+    scenario = SCENARIOS["p5.sustained_min.does_not_fire"]
+    one_day = replace(scenario, context=replace(scenario.context, window=(-1, -1)))
+    ctx = one_day.build_context()
+    assert ctx.window.days == 1
+    result = campaigns.evaluate(ctx)
+    for rule_id, required in ((C1, 14), (C1B, 28), (C2, 7)):
+        (line,) = _withheld(result, rule_id)
+        assert (line.reason, line.observed, line.required, line.unit) == (
+            f"window 1 day of {required} required",
+            1,
+            required,
+            "days",
+        ), rule_id
+        assert _items(result, rule_id) == []
+    (b1,) = _withheld(budget.evaluate(ctx), B1)
+    assert (b1.reason, b1.observed, b1.required, b1.unit) == (
+        "window 1 day of 7 required",
+        1,
+        7,
+        "days",
+    )
 
 
 def test_an_uncapped_or_inefficient_subject_is_no_scale_candidate() -> None:
@@ -2217,10 +2310,12 @@ def test_c3b_launches_an_uncovered_converting_cluster() -> None:
     search = _campaign_id(scenario, "google", "search")
     result = campaigns.evaluate(ctx)
     item = _only(result, C3B)
-    assert item.action == "Create ad group or campaign for 'alternative hubspot'"
+    assert item.action == "Create ad group or campaign for 'hubspot alternative'"
     assert item.group == GROUP_LAUNCH
     assert item.entity_ref.type == ENTITY_TERM_CLUSTER
-    assert item.entity_ref.name == "Search-term cluster 'alternative hubspot'"
+    assert item.entity_ref.name == "Search-term cluster 'hubspot alternative'"
+    # The label follows the searched word order; the entity key stays the sorted head tokens.
+    assert item.entity_ref.external_id == "alternative hubspot"
     assert (item.decision_subject, item.increases_spend_on) == (None, ())
     # A Google item without a verified Google-to-CRM link carries no_crm_link (AAP 0.3.3).
     assert [(flag.code, flag.message) for flag in item.flags] == [
@@ -2244,8 +2339,9 @@ def test_c3b_launches_an_uncovered_converting_cluster() -> None:
         "cost_per_conversion": Decimal("10.000000"),
     }
     assert item.reason == (
-        "3 converting search terms share 'alternative hubspot' with 6 conversions at USD 10.00 "
-        "per conversion; no keyword, ad group or campaign name contains those words."
+        "3 converting search terms cluster around the words 'hubspot alternative' with 6 "
+        "conversions at USD 10.00 per conversion; no keyword, ad group or campaign name contains "
+        "those words."
     )
     assert item.depends_on[0] == DecisionSubject("campaign", search)
     assert set(item.evidence.thresholds) == set(C3B_THRESHOLD_KEYS)
@@ -2303,7 +2399,7 @@ def test_c3b_withholds_an_uncovered_cluster_below_its_minimums(
         unit,
     )
     assert line.entity is not None
-    assert line.entity.name == "Search-term cluster 'alternative hubspot'"
+    assert line.entity.name == "Search-term cluster 'hubspot alternative'"
 
 
 def test_c3b_reads_only_converting_google_terms() -> None:
@@ -2374,17 +2470,17 @@ def test_c3b_coverage_tokens_are_the_union_of_the_coverage_text_tokens(name: str
 @pytest.mark.parametrize(
     ("name", "themes", "launched"),
     [
-        ("c3b.cluster.fires", (), ["alternative hubspot"]),
+        ("c3b.cluster.fires", (), ["hubspot alternative"]),
         ("c3b.cluster.does_not_fire", (), []),
         (
             "c3b.cluster.fires",
             _C3B_EXTRA_THEMES,
-            ["alternative hubspot", "migration salesforce", "pipedrive pricing"],
+            ["hubspot alternative", "pipedrive pricing", "salesforce migration"],
         ),
         (
             "c3b.cluster.does_not_fire",
             _C3B_EXTRA_THEMES,
-            ["migration salesforce", "pipedrive pricing"],
+            ["pipedrive pricing", "salesforce migration"],
         ),
     ],
 )

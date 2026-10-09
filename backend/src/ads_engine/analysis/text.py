@@ -10,9 +10,9 @@ text primitives those rules share:
   (:func:`adjacent_terms`).
 * C3b launch ideas group converting search terms by single linkage at ``c3b.jaccard``
   (:func:`cluster_terms`) and name each cluster by its head tokens, the tokens present in at
-  least ``c3b.head_token_share`` of its members (:func:`head_tokens`). The idea is raised
-  only when no head token appears in any keyword text, ad group name or campaign name
-  (:func:`contains_tokens`).
+  least ``c3b.head_token_share`` of its members (:func:`head_tokens`), listed in the order
+  the members phrase them (:attr:`TermCluster.label`). The idea is raised only when no head
+  token appears in any keyword text, ad group name or campaign name (:func:`contains_tokens`).
 
 Design constraints:
 
@@ -39,7 +39,7 @@ Example:
     >>> [cluster.members for cluster in clusters]
     [('crm tool', 'crm tool pricing', 'tool pricing guide'), ('project management',)]
     >>> clusters[0].label
-    'crm pricing tool'
+    'crm tool pricing'
     >>> contains_tokens(["Brand", "CRM Tool Ad Group"], clusters[0].head_tokens)
     True
 """
@@ -194,6 +194,22 @@ def tokenize(text: str) -> frozenset[str]:
         token
         for token in _NON_ALPHANUMERIC_RUN.split(_normalise(text))
         if token and token not in STOPWORDS
+    )
+
+
+def _ordered_tokens(text: str) -> tuple[str, ...]:
+    """Return the distinct tokens of ``text`` in the order the text first uses them.
+
+    The normalisation, split and :data:`STOPWORDS` are exactly those of :func:`tokenize`, so
+    ``frozenset(_ordered_tokens(text)) == tokenize(text)``; this form also keeps the word
+    order, which :attr:`TermCluster.label` reads. A repeated word keeps its first position.
+    """
+    return tuple(
+        dict.fromkeys(
+            token
+            for token in _NON_ALPHANUMERIC_RUN.split(_normalise(text))
+            if token and token not in STOPWORDS
+        )
     )
 
 
@@ -352,6 +368,18 @@ class TermCluster:
         ('crm tool', 'crm tool pricing')
         >>> cluster.label
         'crm tool'
+        >>> forecasting = TermCluster(
+        ...     (
+        ...         "revenue forecasting tool",
+        ...         "b2b revenue forecasting",
+        ...         "revenue forecasting software",
+        ...     ),
+        ...     frozenset({"forecasting", "revenue"}),
+        ... )
+        >>> forecasting.sorted_head
+        ('forecasting', 'revenue')
+        >>> forecasting.label
+        'revenue forecasting'
     """
 
     members: tuple[str, ...]
@@ -378,16 +406,34 @@ class TermCluster:
 
     @property
     def sorted_head(self) -> tuple[str, ...]:
-        """Head tokens in alphabetical order, the stable form used in evidence."""
+        """Head tokens in alphabetical order, the stable form used in evidence and entity keys.
+
+        Unlike :attr:`label` it ignores word order, so the same head tokens always give the
+        same key however the member terms phrase them.
+        """
         return tuple(sorted(self.head_tokens))
 
     @property
     def label(self) -> str:
-        """Space-joined sorted head tokens, as in "Create ad group or campaign for '{label}'".
+        """Head tokens in the members' word order: "Create ad group or campaign for '{label}'".
+
+        Each member term is read in its own word order, tokenised as :func:`tokenize` does.
+        For every pair of head tokens a member contains, the one it uses first earns a point;
+        a member lacking one of the pair gives neither a point. Head tokens are listed by
+        points, most first, then alphabetically (code-point order) on a tie, so the label
+        follows how the terms are searched ("revenue forecasting", not the alphabetical
+        "forecasting revenue") and depends only on the cluster's fields, never on hash order.
 
         Empty when the cluster has no head token; C3b never names such a cluster.
         """
-        return " ".join(self.sorted_head)
+        if not self.head_tokens:
+            return ""
+        points: Counter[str] = Counter()
+        for member in self.members:
+            used = [token for token in _ordered_tokens(member) if token in self.head_tokens]
+            for position, token in enumerate(used):
+                points[token] += len(used) - 1 - position
+        return " ".join(sorted(self.head_tokens, key=lambda token: (-points[token], token)))
 
 
 class _DisjointSet:

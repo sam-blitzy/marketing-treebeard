@@ -40,7 +40,8 @@ completion rate = leads / form opens. Non-lead-gen campaigns use only click rate
 Every item reads ``linkedin.analytics_daily`` and ``linkedin.entities``, depends on its
 campaign (P1 holds) and offers "Mark done" only (no decision subject). Within a campaign group
 (:func:`~ads_engine.analysis.context.creative_group`) the CR3 item ranks first, then the CR1
-pairs by adjusted p-value; ``precedence.py`` orders the campaign groups by campaign spend.
+pairs by adjusted p-value; ``precedence.py`` orders the campaign groups by campaign spend
+within each account currency.
 
 Purity: no database, network, settings or logging access. Threshold values come only from
 ``config/thresholds.yaml`` through :class:`CreativeConfig`, and every rendered number in text

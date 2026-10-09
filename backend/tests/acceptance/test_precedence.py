@@ -32,7 +32,10 @@ order and pass the ``RuleResult`` values to ``precedence.apply_precedence``. Dat
 store the scenario's world through ``sync.mode.bootstrap_sources`` (the simulator serving every
 source on an ``httpx.MockTransport``), persist runs with ``runner.run_analysis`` and read them
 back through ``GET /api/v1/recommendations`` and ``analysis.overlay.overlay``. Worlds, syncs
-and runs share the catalogue's fixed clock. The API reads the time only through its request
+and runs share the catalogue's fixed clock, except in the shared-budget read-time test: budget
+items need days of snapshot history, so it builds the ``default`` world's Google dataset with
+``SourceModeController.ensure_dataset`` and syncs it on the worker's schedule on a clock that
+moves forward to :data:`FIXED_NOW`. The API reads the time only through its request
 clock (``ads_engine.api.deps.get_now``): a test whose API assertions depend on the request
 time (feedback ``until`` and ``hidden_by``) fixes that clock through
 ``api_app.dependency_overrides[get_now]`` before logging in; other read-time checks
@@ -140,6 +143,7 @@ from ads_engine.analysis.precedence import TRACKING_ABSENT_MESSAGE, PrecedenceOu
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.api.deps import get_now
 from ads_engine.api.security import CSRF_HEADER, CSRF_VALUE
+from ads_engine.db.models.accounts import Budget, Campaign
 from ads_engine.db.models.analysis import (
     AnalysisRun,
     Recommendation,
@@ -158,7 +162,8 @@ from ads_engine.simulation.scenarios import (
     FreshnessOverride,
     Scenario,
 )
-from ads_engine.sync import freshness
+from ads_engine.sync import freshness, scheduler
+from ads_engine.sync.jobs import JOB_ENTITIES, run_source_jobs
 from ads_engine.sync.mode import SourceModeController, bootstrap_sources
 
 pytestmark = pytest.mark.anyio
@@ -210,6 +215,14 @@ FEEDBACK_DAYS: dict[FeedbackKind, int] = {"dismiss": 30, "snooze": 7, "done": 30
 
 ALLOCATION_SCENARIO = "b3.allocation.case"
 """Two B3 donors free 300 and 200 against one receiver's B1 increase of 400 (AAP 0.11.2)."""
+
+SCHEDULED_SYNC_DAYS = 10
+"""Days of scheduled Google syncs before the shared-budget read-time test's default run.
+
+Days before a dataset's first snapshot are unknown, so the syncs must start early enough for
+the default window to hold the 7 whole-day known budget-active days the budget gates require
+(AAP 0.5.4.1).
+"""
 
 STALE_AFTER_KEY = "sources.stale_after_hours"
 """The threshold P4 judges each required dataset's age against (AAP 0.5.4.2 P4)."""
@@ -522,6 +535,71 @@ async def _bootstrap(
     return controller
 
 
+class _ForwardClock:
+    """A settable clock that only moves forward, shared by a world, its controller and writes.
+
+    Entity reads return the world's state at this instant, so every sync observes the
+    platform after each decision written before it (AAP 0.5.4.4 "a later snapshot").
+    """
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        """Return the current instant."""
+        return self.at
+
+    def move(self, to: datetime) -> datetime:
+        """Advance to ``to`` and return it.
+
+        Raises:
+            AssertionError: When ``to`` is not later than the current instant.
+        """
+        assert to > self.at, f"the clock only moves forward ({to} <= {self.at})"
+        self.at = to
+        return to
+
+
+async def _sync_google_on_schedule(
+    controller: SourceModeController, clock: _ForwardClock, until: datetime
+) -> int:
+    """Run Google's scheduled sync jobs at every slot after the clock, up to ``until``.
+
+    Slots follow the ``entities`` cadence of ``scheduler.SCHEDULE`` from the clock's latest
+    slot, and each slot runs exactly the Google jobs the schedule puts on it in
+    ``DISPLAY_TIMEZONE`` (entities every 3 h, metrics every 6 h, the restatement once a day),
+    as the worker's due-jobs step would. Entity snapshots, daily metrics and restated days
+    therefore accumulate as in production, which the budget day classification needs (AAP
+    0.5.4.1: known days come from bracketing snapshots, spend from completed metric days).
+
+    Returns:
+        The number of slots run.
+
+    Raises:
+        AssertionError: When a slot's jobs did not all succeed.
+    """
+    entries = [
+        entry
+        for entry in scheduler.SCHEDULE
+        if "google" in entry.sources and entry.job != scheduler.JOB_PURGE
+    ]
+    entities = next(entry for entry in entries if entry.job == JOB_ENTITIES)
+    assert entities.every_hours is not None
+    step = timedelta(hours=entities.every_hours)
+    tz = controller.settings.display_tz
+    slots = 0
+    while (slot := scheduler.latest_slot(entities, clock.at, tz) + step) <= until:
+        clock.move(slot)
+        due = [entry.job for entry in entries if scheduler.latest_slot(entry, slot, tz) == slot]
+        assert JOB_ENTITIES in due, (slot, due)
+        report = await run_source_jobs(
+            "google", trigger="scheduled", jobs=due, controller=controller, now=slot
+        )
+        assert report.ok, (slot, [result.to_json() for result in report.results])
+        slots += 1
+    return slots
+
+
 async def _default_run(now: datetime = FIXED_NOW) -> AnalysisRun:
     """Compute and store the default-window run at ``now``."""
     window = await runner.default_window(now=now)
@@ -726,20 +804,27 @@ def test_p1_items_depending_on_a_discrepant_campaign_are_held_and_others_unverif
     assert len(_candidates(out, CAMPAIGNS, C0)) == 2
 
 
+@pytest.mark.parametrize(
+    ("scenario", "rule_id"), [("shared.poor_member.does_not_fire", B1), ("default", B3)]
+)
 @pytest.mark.parametrize("subject", ["member campaign", "shared budget"])
 def test_p1_a_shared_budget_is_held_by_a_discrepancy_on_it_or_on_a_member(
-    subject: str, make_context: ContextFactory
+    subject: str, scenario: str, rule_id: str, make_context: ContextFactory
 ) -> None:
     """P1: the shared budget containing a discrepant campaign, or itself discrepant, is held.
 
     ``shared.poor_member.does_not_fire`` proposes a budget-level Scale and B1 on an explicitly
-    shared budget. A ``status`` discrepancy on one member campaign, or a ``budget``
-    discrepancy on the shared budget itself, holds those items; the partner without a
-    discrepancy holds none.
+    shared budget; the ``default`` world at :data:`FIXED_NOW` proposes a B3 on its explicitly
+    shared budget, which as a donor funds another campaign's B1. Each item takes the budget as
+    its decision subject, and its frozen ``evidence.extra.depends_on`` names the budget and
+    every member campaign, which is what the read-time overlay holds it on. A ``status``
+    discrepancy on one member campaign, or a ``budget`` discrepancy on the shared budget
+    itself, holds those items; the partner without a discrepancy holds none.
     """
-    base = make_context("shared.poor_member.does_not_fire")
+    base = make_context(scenario, now=FIXED_NOW)
     shared = next(item for item in base.budgets.values() if item.explicitly_shared)
-    member = min(c.id for c in base.campaigns.values() if c.budget_id == shared.id)
+    members = sorted(c.id for c in base.campaigns.values() if c.budget_id == shared.id)
+    member = members[0]
 
     def budget_items(out: PrecedenceOutput) -> list[Candidate]:
         return [
@@ -750,9 +835,22 @@ def test_p1_a_shared_budget_is_held_by_a_discrepancy_on_it_or_on_a_member(
             and candidate.entity_ref.id == shared.id
         ]
 
-    partner = budget_items(_precede(base))
-    assert B1 in {candidate.rule_id for candidate in partner}
+    unheld = _precede(base)
+    partner = budget_items(unheld)
+    assert len(members) == 2
+    assert rule_id in {candidate.rule_id for candidate in partner}
     assert not any(candidate.held for candidate in partner)
+    for candidate in partner:
+        assert candidate.decision_subject is not None
+        assert (candidate.decision_subject.type, candidate.decision_subject.id) == (
+            "budget",
+            shared.id,
+        )
+        assert {("budget", shared.id), *(("campaign", m) for m in members)} <= set(
+            _frozen_subjects(candidate)
+        ), candidate.rule_id
+    if rule_id == B3:
+        assert ("budget", shared.id) in {allocation.donor for allocation in unheld.allocations}
 
     if subject == "member campaign":
         info = _status_discrepancy(
@@ -1022,6 +1120,8 @@ async def test_p1_a_discrepancy_on_an_allocation_partner_after_the_run_holds_at_
             data_modes={},
             dataset_ids={},
             config_hash=ctx.thresholds.config_hash,
+            default_days=ctx.window.default_days,
+            trusted_min_days=ctx.window.trusted_min_days,
             status="succeeded",
             started_at=ctx.now,
             finished_at=ctx.now + timedelta(minutes=1),
@@ -1071,6 +1171,135 @@ async def test_p1_a_discrepancy_on_an_allocation_partner_after_the_run_holds_at_
     stored_after = await _stored(db, run.id)
     assert {row.id: _frozen(row.evidence) for row in stored_after} == stored_before
     assert all(not row.held for row in stored_after)
+
+
+@pytest.mark.parametrize("discrepant", ["member campaign", "shared budget"])
+async def test_p1_a_discrepancy_after_the_run_holds_the_shared_budget_item_at_read_time(
+    discrepant: str,
+    db: async_sessionmaker[AsyncSession],
+    set_env: EnvSetter,
+    make_world: WorldFactory,
+    authed_client: httpx.AsyncClient,
+) -> None:
+    """P1 at read time: a post-run discrepancy on a shared budget or a member holds its item.
+
+    The ``default`` world, anchored on :data:`FIXED_ANCHOR`, is built as a simulated Google
+    dataset :data:`SCHEDULED_SYNC_DAYS` days before :data:`FIXED_NOW` and synced on the
+    worker's schedule up to it; the default run at :data:`FIXED_NOW` then proposes a B3 on
+    the explicitly shared budget, with the budget as decision subject and its frozen
+    ``depends_on`` naming the budget and both members. After the run the user decides a
+    member paused, or the shared budget at 400 while the platform keeps 500, and the next
+    scheduled entity sync detects the ``status`` or ``budget`` discrepancy. At once, without
+    a rerun, ``GET /recommendations`` shows the B3 ``held_now`` with "Resolve discrepancy
+    first", the overlay counts one open discrepancy and the banner shows it; items resting on
+    neither the budget nor a member stay actionable, and every stored row is byte-identical
+    and unheld. Resolving the discrepancy with ``platform_correct`` clears the hold and the
+    count at once.
+    """
+    set_env(DATA_MODE="simulated")
+    default = SCENARIOS["default"]
+    scenario = replace(default, spec=default.spec.with_(anchor=FIXED_ANCHOR))
+    clock = _ForwardClock(FIXED_NOW - timedelta(days=SCHEDULED_SYNC_DAYS))
+    controller = SourceModeController(world=make_world(scenario, clock=clock), clock=clock)
+    outcome = await controller.ensure_dataset("google")
+    assert outcome is not None, "the google dataset was not built"
+    assert (outcome.activated, outcome.mode) == (True, "simulated"), outcome
+    assert await _sync_google_on_schedule(controller, clock, FIXED_NOW) == SCHEDULED_SYNC_DAYS * 8
+    assert clock.at == FIXED_NOW
+    run = await _default_run()
+
+    async with db() as session:
+        shared_id, shared_external = (
+            await session.execute(
+                select(Budget.id, Budget.external_id).where(Budget.explicitly_shared.is_(True))
+            )
+        ).one()
+        members = sorted(
+            await session.scalars(select(Campaign.id).where(Campaign.budget_id == shared_id))
+        )
+    assert len(members) == 2
+    pool = {("budget", shared_id), *(("campaign", member) for member in members)}
+
+    def shared_item(page: Mapping[str, Any]) -> dict[str, Any]:
+        """The page's one B3 item on the shared budget (API entity ids are platform ids)."""
+        (item,) = [
+            item
+            for item in _page_items(page, B3)
+            if item["entity"]["type"] == ENTITY_BUDGET and item["entity"]["id"] == shared_external
+        ]
+        return item
+
+    def unrelated(page: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """The items whose decision subject and frozen dependencies avoid the pool."""
+        found: list[dict[str, Any]] = []
+        for item in _page_items(page):
+            depends_on = item["evidence"]["extra"].get("depends_on", ())
+            subjects = {(entry["type"], entry["id"]) for entry in depends_on}
+            if (own := item.get("decision_subject")) is not None:
+                subjects.add((own["type"], own["id"]))
+            if not subjects & pool:
+                found.append(item)
+        return found
+
+    before = await _page(authed_client, run.id)
+    b3 = shared_item(before)
+    assert b3["rule_id"] == B3
+    assert b3["decision_subject"] == {"type": "budget", "id": shared_id}
+    assert pool <= {(entry["type"], entry["id"]) for entry in b3["evidence"]["extra"]["depends_on"]}
+    assert b3["held"] is False
+    assert b3["current"]["held_now"] is False
+    assert before["overlay"]["open_discrepancies"] == 0
+    assert _banner(before, BANNER_OPEN_DISCREPANCIES) is None
+    assert unrelated(before)
+    stored_before = {row.id: (_frozen(row.evidence), row.held) for row in await _stored(db, run.id)}
+    assert not any(held for _, held in stored_before.values())
+
+    if discrepant == "member campaign":
+        subject = decisions.SubjectRef("campaign", members[0])
+        patch = decisions.DecisionPatch(status="paused")
+        kind = "status"
+    else:
+        subject = decisions.SubjectRef("budget", shared_id)
+        patch = decisions.DecisionPatch(daily_budget=Decimal("400"))
+        kind = "budget"
+    decided_at = clock.move(FIXED_NOW + timedelta(hours=1))
+    await decisions.record_decision(subject, patch, "user", now=decided_at)
+    assert await _sync_google_on_schedule(controller, clock, FIXED_NOW + timedelta(hours=3)) == 1
+    async with db() as session:
+        (raised,) = await session.scalars(
+            select(Discrepancy).where(Discrepancy.state != "resolved")
+        )
+    assert (raised.subject_type, raised.subject_id, raised.kind) == (subject.type, subject.id, kind)
+    assert raised.detected_at > run.started_at
+
+    after = await _page(authed_client, run.id)
+    assert after["run"]["id"] == run.id
+    held = shared_item(after)
+    assert held["id"] == b3["id"]
+    assert held["held"] is False
+    assert held["current"]["held_now"] is True
+    assert held["current"]["held_reason_now"] == HELD_DISCREPANCY_REASON
+    assert held["current"]["historical"] is False
+    assert after["overlay"]["open_discrepancies"] == 1
+    banner = _banner(after, BANNER_OPEN_DISCREPANCIES)
+    assert banner is not None
+    assert banner["count"] == 1
+    for item in unrelated(after):
+        assert item["current"]["held_now"] is False, (item["rule_id"], item["entity"])
+    assert _frozen(held["evidence"]) == _frozen(b3["evidence"])
+    stored_after = {row.id: (_frozen(row.evidence), row.held) for row in await _stored(db, run.id)}
+    assert stored_after == stored_before
+
+    resolved = await decisions.resolve_discrepancy(
+        raised.id, "platform_correct", None, now=clock.move(FIXED_NOW + timedelta(hours=4))
+    )
+    assert resolved.state == "resolved"
+    cleared = await _page(authed_client, run.id)
+    released = shared_item(cleared)
+    assert released["current"]["held_now"] is False
+    assert released["current"].get("held_reason_now") is None
+    assert cleared["overlay"]["open_discrepancies"] == 0
+    assert _banner(cleared, BANNER_OPEN_DISCREPANCIES) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1842,6 +2071,65 @@ async def test_p5_the_short_window_banner_uses_the_configured_trusted_minimum(
         else:
             assert banner is None
             assert not any(flagged)
+
+
+async def test_p5_a_stored_run_keeps_the_trusted_minimum_it_was_computed_with(
+    db: async_sessionmaker[AsyncSession],
+    set_env: EnvSetter,
+    make_world: WorldFactory,
+    make_thresholds: ThresholdsFactory,
+    authed_client: httpx.AsyncClient,
+) -> None:
+    """P5 frozen: a run's metadata and banner follow its stored minimum, not today's config.
+
+    A 20-day run computed under ``window.trusted_min_days: 21`` stores 21. Read from an API
+    serving the shipped configuration (14), as after an edit to ``config/thresholds.yaml``,
+    ``GET /runs/{id}`` and the page's ``run`` still report ``trusted_min_days`` 21 and
+    ``short_window``, and the page shows "Window of 20 days is below the 21-day trusted
+    minimum", agreeing with every frozen item flag (AAP 0.5.3 "Where outputs are frozen").
+    Conversely a 20-day run computed under the shipped 14 shows no short-window banner when
+    the overlay is read under 21.
+    """
+    scenario = _scenario("p5.configured_min.case")
+    config = make_thresholds({"window.trusted_min_days": 21})
+    shipped = Thresholds.load()
+    assert (shipped.trusted_min_days, config.trusted_min_days) == (14, 21)
+    set_env(DATA_MODE="simulated")
+    await _bootstrap(make_world(scenario), force_simulated=True)
+    served = await authed_client.get("/api/v1/config")
+    assert served.status_code == 200, served.text
+    assert served.json()["window"]["trusted_min_days"] == shipped.trusted_min_days
+
+    judged = await _custom_run(20, thresholds=config)
+    assert (judged.default_days, judged.trusted_min_days) == (config.default_days, 21)
+    message = "Window of 20 days is below the 21-day trusted minimum"
+    response = await authed_client.get(f"/api/v1/runs/{judged.id}")
+    assert response.status_code == 200, response.text
+    page = await _page(authed_client, judged.id)
+    for view in (response.json(), page["run"]):
+        assert (view["days"], view["short_window"]) == (20, True)
+        assert (view["default_days"], view["trusted_min_days"]) == (config.default_days, 21)
+    banner = _banner(page, BANNER_SHORT_WINDOW)
+    assert banner is not None
+    assert banner["message"] == message
+    items = _page_items(page)
+    assert items
+    for item in items:
+        assert FLAG_SHORT_WINDOW in {flag["code"] for flag in item["flags"]}, item["rule_id"]
+    _, read_under_shipped = await _overlay_at(db, judged, READ_AT, shipped)
+    assert [b.message for b in read_under_shipped.banners if b.code == BANNER_SHORT_WINDOW] == [
+        message
+    ]
+
+    trusted = await _custom_run(20, thresholds=shipped)
+    assert trusted.trusted_min_days == 14
+    rows, read_under_changed = await _overlay_at(db, trusted, READ_AT, config)
+    assert rows
+    assert not any(FLAG_SHORT_WINDOW in row.flags for row in rows)
+    assert all(b.code != BANNER_SHORT_WINDOW for b in read_under_changed.banners)
+    page = await _page(authed_client, trusted.id)
+    assert (page["run"]["short_window"], page["run"]["trusted_min_days"]) == (False, 14)
+    assert _banner(page, BANNER_SHORT_WINDOW) is None
 
 
 def test_p5_sustained_rules_evaluate_at_the_sustained_minimum_and_are_withheld_below(

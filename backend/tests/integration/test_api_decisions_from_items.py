@@ -380,6 +380,8 @@ async def _world(sessions: Sessions, manager: DatasetManager, scenario: str) -> 
             data_modes={},
             dataset_ids={},
             config_hash="decisions-from-items-test",
+            default_days=28,
+            trusted_min_days=14,
             status="succeeded",
             started_at=NOW - timedelta(hours=2),
             finished_at=NOW - timedelta(hours=2) + timedelta(minutes=1),

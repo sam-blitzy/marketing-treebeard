@@ -9,10 +9,12 @@ Native-day policy (AAP 0.5.4.1):
   the customer account's ``customer.time_zone``; LinkedIn daily rows are UTC dates. Daily rows
   are never relabelled or rebucketed.
 * A window is **one calendar-date range applied to each source's own dates**. Evidence lists
-  each source's range and boundary, for example "Google 2026-09-04 to 2026-10-01
-  (America/New_York); LinkedIn same dates (UTC)" (:meth:`AnalysisWindow.describe`), and when
-  the boundaries differ the evidence says so (:attr:`AnalysisWindow.boundaries_differ`), so
-  misaligned buckets are never presented as one common day.
+  each source's range and boundary in ``source_days`` and as the sentence ``description``, for
+  example "Google 2026-09-04 to 2026-10-01 (America/New_York); LinkedIn same dates (UTC)"
+  (:meth:`AnalysisWindow.describe`), and when the boundaries differ the evidence says so in
+  ``boundaries_differ`` (:attr:`AnalysisWindow.boundaries_differ`), so misaligned buckets are
+  never presented as one common day. :meth:`AnalysisWindow.to_json` freezes all four into
+  ``Evidence.window``.
 * No computation combines two sources' daily rows into one daily series. Cross-source joins
   work on instants: LinkedIn leads count when ``submittedAt`` falls in
   ``[start 00:00 UTC, end + 1 day 00:00 UTC)`` (:meth:`AnalysisWindow.utc_bounds`), and HubSpot
@@ -783,7 +785,7 @@ class AnalysisWindow:
 
     @property
     def boundaries_differ(self) -> bool:
-        """Whether the sources' day boundaries differ, which evidence must state."""
+        """Whether the sources' day boundaries differ, which evidence states (:meth:`to_json`)."""
         return len({item.boundary for item in self.source_days}) > 1
 
     def is_segment_window(self) -> bool:
@@ -934,10 +936,23 @@ class AnalysisWindow:
         return [item.to_json() for item in self.source_days]
 
     def to_json(self) -> dict[str, Any]:
-        """Return ``{"start", "end", "days", "source_days"}``: exactly ``Evidence.window``."""
+        """Return exactly ``Evidence.window``.
+
+        Keys, in order: ``start``, ``end``, ``days``, ``source_days``, ``boundaries_differ``
+        (:attr:`boundaries_differ`) and ``description`` (:meth:`describe`), so evidence states
+        whether the sources' day boundaries differ and never presents misaligned buckets as
+        one common day (AAP 0.5.4.1).
+
+        Example:
+            With Google on ``America/New_York`` and LinkedIn on UTC, ``boundaries_differ`` is
+            ``True`` and ``description`` reads "Google 2026-09-04 to 2026-10-01
+            (America/New_York); LinkedIn same dates (UTC)". With both on UTC it is ``False``.
+        """
         return {
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "days": self.days,
             "source_days": self.source_days_json(),
+            "boundaries_differ": self.boundaries_differ,
+            "description": self.describe(),
         }

@@ -908,6 +908,25 @@ def test_k1_ten_baseline_conversions_evaluate_k1_normally(make_context: ContextF
     assert all(line.entity is not None for line in run.withheld(K1))
 
 
+def test_k1_no_baseline_finding_names_one_conversion_in_the_singular(
+    make_context: ContextFactory,
+) -> None:
+    """K1 unusable baseline: 1 baseline conversion reads "1 conversion", never "1 conversions"."""
+    run = _run(make_context, "k3.conversions_fell.fires")
+    baseline = run.ctx.k1_baseline
+    assert baseline is not None
+    assert baseline.conversions == 1
+    assert baseline.clicks > 1
+    (finding,) = run.findings(FINDING_K1_NO_BASELINE)
+    assert f"has 1 conversion over {baseline.clicks:,} clicks, below the " in finding.message
+    assert "1 conversions" not in finding.message
+    minimum = run.ctx.thresholds.decimal("k1.min_baseline_conversions")
+    assert minimum > 1
+    assert f"needs at least {minimum:f} baseline conversions and a rate above 0" in (
+        finding.message
+    )
+
+
 # ---------------------------------------------------------------------------------------------
 # K1 non-firing cases and ADDED terms
 # ---------------------------------------------------------------------------------------------
@@ -1777,20 +1796,76 @@ def test_k1_spend_floor_multiple_is_read_from_configuration(
     (item,) = run.items(K1)
     assert item.evidence.thresholds["k1.min_spend_cpa_multiple"] == 0.5
     assert item.evidence.extra["min_spend_cpa_multiple"] == Decimal("0.5")
-    assert "at least 0.5x the account cost/conversion" in item.reason
+    floor = _cents(Fraction(1, 2) * _account_cost_per_conversion(run.ctx))
+    assert _baseline(item, "min_spend") == floor
+    assert (
+        f"at or above the spend floor of USD {floor:,} (0.5x the account cost/conversion)."
+        in item.reason
+    )
+
+
+def test_k1_reason_cites_the_spend_floor_it_compared_under_a_multiple_other_than_one(
+    make_context: ContextFactory, make_thresholds: ThresholdsFactory
+) -> None:
+    """K1 reason (AAP 0.5.4): at 14x a 1.43 cost/conversion the reason cites the 20.00 floor.
+
+    The account spends 200.00 for 140 conversions, so 14 x the exact cost/conversion is
+    exactly the term's 20.00, while 14 x the displayed 1.43 would be 20.02, above the spend.
+    """
+    configured = make_thresholds({"k1.min_spend_cpa_multiple": 14})
+    run = _run(make_context, "k1.many_per_click.fires", thresholds=configured)
+    (item,) = run.items(K1)
+    floor = _baseline(item, "min_spend")
+    assert floor == Decimal("20.00")
+    assert floor == _cents(14 * _account_cost_per_conversion(run.ctx))
+    assert evidence_metric(item, "spend") >= floor
+    assert (
+        ", and at or above the spend floor of USD 20.00 (14x the account cost/conversion). "
+        in item.reason
+    )
+    assert "the account cost/conversion of" not in item.reason
+    assert "(conversions ÷ clicks)" in item.reason
+    assert "Matched keyword: " in item.reason
+
+
+def test_k1_reason_at_the_default_multiple_cites_one_account_cost_per_conversion(
+    make_context: ContextFactory,
+) -> None:
+    """K1 reason: at the default multiple of 1 it cites the account cost/conversion itself."""
+    run = _run(make_context, "k1.many_per_click.fires")
+    assert run.ctx.thresholds.ratio("k1.min_spend_cpa_multiple") == 1
+    (item,) = run.items(K1)
+    cost_per_conversion = _baseline(item, "account_cost_per_conversion")
+    assert _baseline(item, "min_spend") == cost_per_conversion
+    assert (
+        f", and at least 1x the account cost/conversion of USD {cost_per_conversion:,}."
+        in item.reason
+    )
+    assert "spend floor" not in item.reason
 
 
 def test_k2_efficiency_ratio_is_read_from_configuration(
     make_context: ContextFactory, make_thresholds: ThresholdsFactory
 ) -> None:
-    """K2: a configured k2.max_cpa_ratio of 1.5 admits the term 1.49x the campaign's CPA."""
+    """K2: a configured k2.max_cpa_ratio of 1.5 admits the term 1.49x the campaign's CPA.
+
+    The reason cites the highest qualifying cost/conversion it was compared with, never 1.5x
+    the displayed campaign cost/conversion (AAP 0.5.4).
+    """
     configured = make_thresholds({"k2.max_cpa_ratio": 1.5})
     run = _run(make_context, "k2.cpa_above_campaign.does_not_fire", thresholds=configured)
     item, row = _k2_target(run)
     _assert_k2_item(run, item, row)
-    assert _baseline(item, "max_cost_per_conversion") == _cents(
+    highest = _baseline(item, "max_cost_per_conversion")
+    assert highest == _cents(
         Fraction(3, 2) * _campaign_cost_per_conversion(run.ctx, row.campaign_id)
     )
+    assert evidence_metric(item, "cost_per_conversion") <= highest
+    assert (
+        f", at or below the highest qualifying cost/conversion of USD {highest:,} "
+        "(1.5x the campaign's cost/conversion)."
+    ) in item.reason
+    assert "x the campaign's USD" not in item.reason
 
 
 def test_k3_window_minimum_is_read_from_configuration(
@@ -1835,6 +1910,47 @@ def test_search_term_coverage_minimum_is_read_from_configuration(
     (finding,) = run.findings(FINDING_SEARCH_TERM_COVERAGE)
     assert finding.evidence["below_minimum"] is True
     assert finding.evidence["min_share"] == Decimal("0.81")
+
+
+def test_search_term_coverage_text_stays_below_a_minimum_set_just_above_the_share(
+    make_context: ContextFactory, make_thresholds: ThresholdsFactory
+) -> None:
+    """Coverage (AAP 0.5.4): a share below a finer minimum never shows at or above it.
+
+    The minimum is set at the next four-place decimal above the default world's share, where
+    one place rounds the percentage up to the minimum or past it ("cover 88.5% ... below the
+    88.5% minimum"). The finding, its evidence, each item's flag and ``evidence.extra`` show
+    the same percentage, with as many places as keep it below the minimum, and the minimum
+    exactly as configured.
+    """
+    terms, keyword_spend = _coverage_spends(_run(make_context, _DEFAULT_SCENARIO).ctx)
+    share = Fraction(terms) / Fraction(keyword_spend)
+    limit = Decimal(math.floor(share * 10_000) + 1) / 10_000
+    minimum = Fraction(limit)
+    assert share < minimum
+    assert round(share * 100, 1) >= minimum * 100, "one place would not reach the minimum"
+    assert round(share, 4) >= minimum, "four places would not reach the minimum"
+
+    configured = make_thresholds({COVERAGE_THRESHOLD_KEY: limit})
+    run = _run(make_context, _DEFAULT_SCENARIO, thresholds=configured)
+    (finding,) = run.findings(FINDING_SEARCH_TERM_COVERAGE)
+    evidence = finding.evidence
+    assert evidence["below_minimum"] is True
+    assert evidence["min_share"] == limit
+    percent = evidence["coverage_percent"]
+    assert Fraction(percent) < minimum * 100
+    assert abs(Fraction(percent) - share * 100) < Fraction(1, 20)
+    assert Fraction(evidence["coverage_share"]) < minimum
+    assert abs(Fraction(evidence["coverage_share"]) - share) < Fraction(1, 20_000)
+    assert finding.message.startswith(f"Search terms cover {percent:f}% of keyword spend (")
+    assert f" Coverage is below the {(limit * 100).normalize():f}% minimum, " in finding.message
+
+    items = run.keyword_items()
+    assert items
+    for item in items:
+        (flag,) = (flag for flag in item.flags if flag.code == FLAG_SEARCH_TERM_COVERAGE)
+        assert flag.message == f"Low search-term coverage: {percent:f}% of keyword spend"
+        assert item.evidence.extra["search_term_coverage"]["percent"] == percent
 
 
 def test_keywords_section_is_empty_without_google(make_context: ContextFactory) -> None:

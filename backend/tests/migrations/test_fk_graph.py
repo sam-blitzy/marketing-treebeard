@@ -1081,6 +1081,8 @@ def _run(ledger: Ledger, conn: Connection, label: str, dataset_ids: dict[str, in
         data_modes={"google": "live", "linkedin": "simulated", "hubspot": "simulated"},
         dataset_ids=dataset_ids,
         config_hash="0" * 64,
+        default_days=28,
+        trusted_min_days=14,
         status="succeeded",
         started_at=T0,
         finished_at=T0 + timedelta(seconds=5),
@@ -1983,6 +1985,8 @@ def _analysis_run_values(status: str) -> dict[str, object]:
         "data_modes": {},
         "dataset_ids": {},
         "config_hash": "0" * 64,
+        "default_days": 28,
+        "trusted_min_days": 14,
         "status": status,
         "started_at": T0,
     }

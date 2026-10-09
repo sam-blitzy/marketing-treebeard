@@ -2315,9 +2315,10 @@ def test_c3b_launches_a_converting_cluster_no_campaign_covers(make_context: Cont
     ctx = make_context(scenario)
     item = _only(campaigns.evaluate(ctx), C3B)
     extra = item.evidence.extra
-    head = " ".join(extra["head_tokens"])
     assert (item.group, item.decision_subject) == (GROUP_LAUNCH, None)
-    assert item.action == f"Create ad group or campaign for '{head}'"
+    # The suggested name lists the head tokens in the order the member terms are searched;
+    # the evidence keeps them alphabetical, the stable form.
+    assert item.action == "Create ad group or campaign for 'hubspot alternative'"
     assert tuple(extra["head_tokens"]) == scenario.expect.values["head_tokens"]
     members = list(extra["members"])
     assert len(members) == evidence_metrics(item)["members"]

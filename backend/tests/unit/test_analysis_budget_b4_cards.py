@@ -8,8 +8,10 @@ reasons are the AAP's exact words with their counts in the sample; every B4 card
 budget history of its budget subject (the shared budget for a member campaign, "n/a"
 utilization for a lifetime or custom-period budget) with the keys and labels B1-B3 use, and
 records every ``budget.*`` key; known zero spend on either or both sides is withheld "no
-exposure" while absent facts say nothing; and a p-value is never rendered on the wrong side
-of alpha, nor recorded in evidence as 0 when it lies below 0.000001.
+exposure" while absent facts say nothing; sample shortfalls, the not-distinguishable line and
+the item reason put a count's noun in the singular only at exactly 1; and a p-value is never
+rendered on the wrong side of alpha, nor recorded in evidence as 0 when it lies below
+0.000001.
 
 Contexts come from the scenario catalogue (``SCENARIOS[name].build_context()``); a few cases
 copy a built context with :func:`dataclasses.replace` (always with a fresh ``cache``, so no
@@ -164,6 +166,39 @@ def _weekend_days(ctx: AnalysisContext, campaign_id: int, **changes: Any) -> Ana
         for day in ctx.campaign_days[campaign_id]
     )
     return _fresh(ctx, campaign_days={**ctx.campaign_days, campaign_id: days})
+
+
+def _shaped(
+    ctx: AnalysisContext, campaign_id: int, weekend_days: int, weekdays: int, outcomes: int
+) -> AnalysisContext:
+    """Copy ``ctx`` with one LinkedIn campaign's sample sizes set exactly.
+
+    Spend stays on the first ``weekend_days`` Saturdays and Sundays and the first ``weekdays``
+    weekdays of the window, and every other day has zero spend; the ``outcomes`` leads are dealt
+    one at a time to the spending days in date order, and every other day has 0 leads.
+    """
+    window = ctx.window
+    days = sorted(
+        (day for day in ctx.campaign_days[campaign_id] if window.start <= day.date <= window.end),
+        key=lambda day: day.date,
+    )
+    weekend = [day.date for day in days if day.date.weekday() >= 5][:weekend_days]
+    weekday = [day.date for day in days if day.date.weekday() < 5][:weekdays]
+    assert (len(weekend), len(weekday)) == (weekend_days, weekdays)
+    spending = sorted({*weekend, *weekday})
+    each, extra = divmod(outcomes, len(spending))
+    leads = {date: each + (1 if n < extra else 0) for n, date in enumerate(spending)}
+    shaped = tuple(
+        replace(
+            day,
+            cost=day.cost if day.date in leads else Decimal(0),
+            leads=leads.get(day.date, 0),
+        )
+        for day in days
+    )
+    assert sum(day.leads or 0 for day in shaped) == outcomes
+    assert all(day.cost > 0 for day in shaped if day.date in spending)
+    return _fresh(ctx, campaign_days={**ctx.campaign_days, campaign_id: shaped})
 
 
 def _b4_items(result: RuleResult) -> list[Candidate]:
@@ -397,6 +432,103 @@ def test_outcomes_missing_on_some_days_are_withheld_with_the_reported_days() -> 
     line = _only_line(_weekend_days(ctx, 1, leads=None))
     assert line.reason == "leads unavailable on 8 of 28 days"
     assert (line.observed, line.required, line.unit) == (20, 28, "days with leads reported")
+
+
+# ---------------------------------------------------------------------------
+# Sample sizes in number: a count's noun is singular only at exactly 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sizes", "reason", "sample"),
+    [
+        (
+            (3, 20, 6),
+            "3 weekend days of 4 required; 6 outcomes of 10 required",
+            (3, 4, "weekend days"),
+        ),
+        ((1, 20, 10), "1 weekend day of 4 required", (1, 4, "weekend days")),
+        ((8, 1, 10), "1 weekday of 10 required", (1, 10, "weekdays")),
+        ((8, 20, 1), "1 outcome of 10 required", (1, 10, "outcomes")),
+        ((8, 20, 0), "0 outcomes of 10 required", (0, 10, "outcomes")),
+        (
+            (1, 1, 1),
+            "1 weekend day of 4 required; 1 weekday of 10 required; 1 outcome of 10 required",
+            (1, 4, "weekend days"),
+        ),
+        (
+            (2, 9, 2),
+            "2 weekend days of 4 required; 9 weekdays of 10 required; 2 outcomes of 10 required",
+            (2, 4, "weekend days"),
+        ),
+    ],
+)
+def test_a_sample_shortfall_states_each_count_with_its_noun_in_number(
+    sizes: tuple[int, int, int], reason: str, sample: tuple[int, int, str]
+) -> None:
+    """AAP 0.5.4.5 B4: "3 weekend days of 4 required; 6 outcomes of 10 required" word for word.
+
+    A count of exactly 1 reads "1 weekend day", "1 weekday" or "1 outcome"; 0 and every other
+    count keep the plural. The sample is the first shortfall, and its ``unit`` stays the plural
+    label whatever the count.
+    """
+    _scenario, ctx = _built(LINKEDIN_FIRES)
+    line = _only_line(_shaped(ctx, 1, *sizes))
+    assert line.reason == reason
+    assert (line.observed, line.required, line.unit) == sample
+
+
+@pytest.mark.parametrize(
+    ("sizes", "counts"),
+    [
+        ((1, 1, 1), "1 weekend day, 1 weekday, 1 outcome"),
+        ((2, 2, 2), "2 weekend days, 2 weekdays, 2 outcomes"),
+        ((1, 3, 2), "1 weekend day, 3 weekdays, 2 outcomes"),
+    ],
+)
+def test_indistinguishable_rates_state_each_count_with_its_noun_in_number(
+    sizes: tuple[int, int, int], counts: str
+) -> None:
+    """With every ``b4.*`` minimum tuned to 1, the p >= alpha line ends with counts in number."""
+    scenario, ctx = _built(LINKEDIN_FIRES)
+    tuned = _tuned(
+        scenario,
+        _shaped(ctx, 1, *sizes),
+        {"b4.min_weekend_days": 1, "b4.min_weekdays": 1, "b4.min_outcomes": 1},
+    )
+    line = _only_line(tuned)
+    assert line.reason.startswith("weekend and weekday rates not distinguishable")
+    assert line.reason.endswith(f"): {counts}"), line.reason
+    assert (line.observed, line.required, line.unit) == (sizes[2], 1, "outcomes")
+
+
+def test_a_b4_item_states_its_day_counts_with_their_nouns_in_number() -> None:
+    """The item reason reads "over 1 weekend day" and "over 1 weekday" at exactly 1 day each.
+
+    One spending Saturday with 30 leads against one spending Friday with 1 lead differ at
+    p < 0.05 once every ``b4.*`` minimum is tuned to 1; the catalogue card's 8 weekend days and
+    20 weekdays keep the plural.
+    """
+    scenario, ctx = _built(LINKEDIN_FIRES)
+    plural = _only_item(ctx)
+    assert " over 8 weekend days vs weekday " in plural.reason, plural.reason
+    assert " over 20 weekdays (" in plural.reason, plural.reason
+
+    shaped = _shaped(ctx, 1, 1, 1, 0)
+    days = tuple(
+        replace(day, leads=(30 if day.date.weekday() >= 5 else 1) if day.cost > 0 else 0)
+        for day in shaped.campaign_days[1]
+    )
+    tuned = _tuned(
+        scenario,
+        _fresh(shaped, campaign_days={**shaped.campaign_days, 1: days}),
+        {"b4.min_weekend_days": 1, "b4.min_weekdays": 1, "b4.min_outcomes": 1},
+    )
+    item = _only_item(tuned)
+    metrics = _metrics(item)
+    assert (metrics["weekend_days"].value, metrics["weekdays"].value) == (1, 1)
+    assert " over 1 weekend day vs weekday " in item.reason, item.reason
+    assert " over 1 weekday (30 weekend and 1 weekday leads; " in item.reason, item.reason
 
 
 # ---------------------------------------------------------------------------

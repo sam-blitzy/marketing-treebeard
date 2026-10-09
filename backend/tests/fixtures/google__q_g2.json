@@ -102,7 +102,7 @@
             "status": "ENABLED"
           },
           "campaignBudget": {
-            "amountMicros": "250000000",
+            "amountMicros": "500000000",
             "explicitlyShared": true,
             "id": "990100000005",
             "period": "DAILY",
@@ -118,7 +118,7 @@
             "status": "ENABLED"
           },
           "campaignBudget": {
-            "amountMicros": "250000000",
+            "amountMicros": "500000000",
             "explicitlyShared": true,
             "id": "990100000005",
             "period": "DAILY",

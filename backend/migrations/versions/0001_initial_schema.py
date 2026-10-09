@@ -1421,7 +1421,9 @@ def _create_analysis_tables() -> None:
     None is dataset-scoped. ``analysis_run`` keeps ``source_day_boundaries``, ``data_modes``
     and ``dataset_ids`` in ``jsonb`` with no foreign key, and the run tables reference
     entities through nullable ``ON DELETE SET NULL`` keys, so frozen run history still
-    renders after the datasets it read are purged (AAP 0.3.3).
+    renders after the datasets it read are purged (AAP 0.3.3). ``analysis_run`` also keeps
+    the ``window.default_days`` and ``window.trusted_min_days`` it was computed with, so its
+    run metadata and short-window banner stay frozen with the run (AAP 0.5.3).
     """
     op.create_table(
         "analysis_run",
@@ -1434,6 +1436,8 @@ def _create_analysis_tables() -> None:
         sa.Column("data_modes", postgresql.JSONB(), nullable=False),
         sa.Column("dataset_ids", postgresql.JSONB(), nullable=False),
         sa.Column("config_hash", sa.Text(), nullable=False),
+        sa.Column("default_days", sa.BigInteger(), nullable=False),
+        sa.Column("trusted_min_days", sa.BigInteger(), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),

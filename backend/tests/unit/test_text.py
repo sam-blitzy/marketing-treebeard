@@ -275,11 +275,130 @@ def test_term_clusters_built_differently_compare_and_hash_equal() -> None:
     assert len({first, second}) == 1
 
 
-def test_term_cluster_label_is_the_space_joined_sorted_head_tokens() -> None:
+def test_term_cluster_label_lists_the_head_tokens_in_the_members_word_order() -> None:
+    # "tool pricing guide" lacks "crm", so it votes only on the (tool, pricing) pair; the
+    # points are crm 3, tool 2, pricing 0. ``sorted_head`` stays alphabetical.
     cluster = TermCluster((A, B, C), frozenset({"tool", "pricing", "crm"}))
 
     assert cluster.sorted_head == ("crm", "pricing", "tool")
-    assert cluster.label == "crm pricing tool"
+    assert cluster.label == "crm tool pricing"
+
+
+@pytest.mark.parametrize(
+    ("members", "head", "label", "alphabetical"),
+    [
+        pytest.param(
+            ("revenue forecasting tool", "b2b revenue forecasting", "revenue forecasting software"),
+            {"revenue", "forecasting"},
+            "revenue forecasting",
+            ("forecasting", "revenue"),
+            id="revenue-forecasting",
+        ),
+        pytest.param(
+            ("hubspot alternative", "hubspot alternative free", "cheap hubspot alternative"),
+            {"hubspot", "alternative"},
+            "hubspot alternative",
+            ("alternative", "hubspot"),
+            id="hubspot-alternative",
+        ),
+        pytest.param(
+            ("revenue intelligence", "revenue intelligence platform", "b2b revenue intelligence"),
+            {"revenue", "intelligence"},
+            "revenue intelligence",
+            ("intelligence", "revenue"),
+            id="revenue-intelligence",
+        ),
+        pytest.param(
+            ("crème brûlée planner", "crème brûlée planner app", "Crème Brûlée Planner Pro"),
+            {"crème", "brûlée", "planner"},
+            "crème brûlée planner",
+            ("brûlée", "crème", "planner"),
+            id="accented",
+        ),
+        pytest.param(
+            ("project management",),
+            {"project", "management"},
+            "project management",
+            ("management", "project"),
+            id="single-member",
+        ),
+    ],
+)
+def test_term_cluster_label_follows_how_the_terms_are_searched(
+    members: tuple[str, ...], head: set[str], label: str, alphabetical: tuple[str, ...]
+) -> None:
+    cluster = TermCluster(members, frozenset(head))
+
+    assert cluster.label == label
+    assert cluster.sorted_head == alphabetical
+
+
+def test_term_cluster_label_reads_each_member_with_tokenize_rules() -> None:
+    # Stopwords, punctuation and case do not move a head token: "the" and "for" are dropped,
+    # "Revenue-Forecasting" splits as tokenize splits it, and a repeated word keeps its first
+    # position, so every member places "revenue" before "forecasting".
+    members = (
+        "the Revenue-Forecasting tool",
+        "best software for revenue forecasting",
+        "revenue forecasting revenue",
+    )
+    cluster = TermCluster(members, frozenset({"revenue", "forecasting"}))
+
+    assert cluster.label == "revenue forecasting"
+
+
+def test_term_cluster_label_breaks_a_tie_in_points_alphabetically() -> None:
+    # One member puts "crm" first and the other "tool" first: one point each.
+    tied = TermCluster(("tool crm", "crm tool"), frozenset({"crm", "tool"}))
+    # A head token no member contains earns no point and ties with the last-placed token.
+    absent = TermCluster(("pricing guide",), frozenset({"pricing", "demo", "guide"}))
+
+    assert tied.label == "crm tool"
+    assert absent.label == "pricing demo guide"
+
+
+def test_term_cluster_label_ranks_by_points_across_members_lacking_some_head_tokens() -> None:
+    # "zeta" leads in two members, "alpha" in one, and the third member lacks "zeta": points
+    # are zeta 2, alpha 1, beta 0, so word order beats alphabetical order.
+    cluster = TermCluster(
+        ("zeta alpha", "zeta beta", "alpha beta"), frozenset({"alpha", "beta", "zeta"})
+    )
+
+    assert cluster.label == "zeta alpha beta"
+    assert cluster.sorted_head == ("alpha", "beta", "zeta")
+
+
+def test_term_cluster_label_is_independent_of_the_order_members_are_given_in() -> None:
+    labels = {
+        TermCluster(order, frozenset({"tool", "pricing", "crm"})).label
+        for order in itertools.permutations([A, B, C])
+    }
+
+    assert labels == {"crm tool pricing"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Best B2B Attribution Software",
+        "CRM-tool_pricing (2026)!",
+        "CRM crm Crm tool TOOL",
+        "the and for",
+        "",
+        "\uff23\uff32\uff2d Tool",
+        "nai\u0308ve bayes",
+        "Women's leadership",
+    ],
+)
+def test_ordered_tokens_are_the_tokenize_set_in_first_use_order(value: str) -> None:
+    ordered = text._ordered_tokens(value)
+
+    assert len(ordered) == len(set(ordered))
+    assert frozenset(ordered) == tokenize(value)
+
+
+def test_ordered_tokens_keep_the_word_order_and_the_first_position_of_a_repeat() -> None:
+    assert text._ordered_tokens("Tool for CRM, tool pricing") == ("tool", "crm", "pricing")
 
 
 def test_term_cluster_without_head_tokens_has_an_empty_label() -> None:
@@ -319,8 +438,8 @@ def test_cluster_terms_links_a_chain_by_single_linkage_at_an_inclusive_threshold
         TermCluster((D,), frozenset({"project", "management"})),
     ]
     assert clusters[0].size == 3
-    assert clusters[0].label == "crm pricing tool"
-    assert clusters[1].label == "management project"
+    assert clusters[0].label == "crm tool pricing"
+    assert clusters[1].label == "project management"
 
 
 def test_cluster_terms_breaks_the_chain_when_the_link_falls_below_the_threshold() -> None:

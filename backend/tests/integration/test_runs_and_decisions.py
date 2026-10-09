@@ -940,6 +940,8 @@ async def test_crashed_running_row_marked_failed(
             window_end=default.window_end,
             source_day_boundaries=default.source_day_boundaries,
             config_hash=default.config_hash,
+            default_days=default.default_days,
+            trusted_min_days=default.trusted_min_days,
             started_at=NOW - timedelta(hours=1),
             finished_at=None,
             data_modes={},
@@ -1497,6 +1499,13 @@ def _items(page: Mapping[str, Any]) -> dict[int, Mapping[str, Any]]:
     }
 
 
+def _sample_size(value: Decimal | None) -> int | str | None:
+    """A stored ``numeric`` sample size as the API returns it: whole numbers as integers."""
+    if value is None:
+        return None
+    return int(value) if value == value.to_integral_value() else format(value, "f")
+
+
 async def test_findings_withheld_suppressions_read_from_storage(
     seeded: Seed,
     client: httpx.AsyncClient,
@@ -1599,8 +1608,8 @@ async def test_findings_withheld_suppressions_read_from_storage(
             (
                 row.rule_id,
                 row.reason,
-                None if row.observed is None else format(row.observed, "f"),
-                None if row.required is None else format(row.required, "f"),
+                _sample_size(row.observed),
+                _sample_size(row.required),
                 row.unit,
             )
             for row in stored_withheld

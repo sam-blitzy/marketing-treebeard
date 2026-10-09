@@ -57,9 +57,10 @@
  * serialised as a fixed-point decimal string such as `"120.500000"`, never in exponent
  * notation and never as a JSON number.
  *
- * Requests send amounts the same way (`"120.50"`); the API refuses a JSON number with a
- * fraction, because it has already lost precision. Validation to the currency's minor unit is
- * server-side (AAP 0.5.2).
+ * Requests send amounts as plain decimal strings (`"120.50"`): ASCII digits with an optional
+ * fraction, and no sign, spaces or exponent, exactly the published pattern. The API refuses any
+ * other string with 422, and a JSON number with a fraction, because it has already lost
+ * precision. Validation to the currency's minor unit is server-side (AAP 0.5.2).
  */
 export type Money = string;
 
@@ -84,6 +85,13 @@ export type IsoDateTime = string;
  * "unavailable", never `0` (AAP 0.11.1).
  */
 export type MetricValue = string | number | boolean | null;
+
+/**
+ * A withheld pattern's observed or required sample size (`schemas.SampleSize`): an integer for a
+ * whole-number size, as {@link Sample} carries counts, a fixed-point decimal string for a
+ * fractional one (`"2.900000"`), or `null` when no sample applies (never `0`). Never a boolean.
+ */
+export type SampleSize = number | string | null;
 
 // ---------------------------------------------------------------------------------------------
 // Vocabularies (each equal to its `Literal` in schemas.py and the database tuple behind it)
@@ -407,9 +415,12 @@ export interface Run {
   display_timezone: string;
   /** Whether `days` is below `trusted_min_days` (AAP 0.5.4.1). */
   short_window: boolean;
-  /** The configured `window.default_days`. */
+  /** The `window.default_days` the run was computed with, frozen with the run. */
   default_days: number;
-  /** The configured `window.trusted_min_days`; the short-window banner quotes it. */
+  /**
+   * The `window.trusted_min_days` the run was computed with, frozen with the run; the
+   * short-window banner quotes it.
+   */
   trusted_min_days: number;
   /** `scheduled`, `event` or `manual`. */
   trigger: RunTrigger;
@@ -453,9 +464,10 @@ export interface Flag {
 
 /**
  * The entity an item, finding or withheld pattern is about (`schemas.EntityView`). `id` is an
- * opaque string: the platform's external id for items, and the identifier recorded at compute
- * time for findings and withheld patterns. Every field is `null` for an account-wide or
- * composite entity without one.
+ * opaque string in one namespace for items, findings and withheld patterns: the platform's
+ * external id, or the composite key of an entity without a table row, so a withheld pattern or
+ * finding names its entity exactly as that entity's items do. A field is `null` when the stored
+ * entity does not carry it.
  */
 export interface EntityView {
   /** The entity's source. */
@@ -468,7 +480,11 @@ export interface EntityView {
   name: string | null;
 }
 
-/** The exact window an item was computed over (`schemas.EvidenceWindow`; AAP 0.5.4.8). */
+/**
+ * The exact window an item was computed over (`schemas.EvidenceWindow`; AAP 0.5.4.8). When the
+ * sources' day boundaries differ, `boundaries_differ` says so, so misaligned buckets are never
+ * presented as one common day (AAP 0.5.4.1).
+ */
 export interface EvidenceWindow {
   /** First calendar date. */
   start: IsoDate;
@@ -478,6 +494,17 @@ export interface EvidenceWindow {
   days: number;
   /** Each day source's range and native day boundary. */
   source_days: SourceDay[];
+  /**
+   * Whether the sources' day boundaries differ, for example Google on `America/New_York` and
+   * LinkedIn on `UTC`; `null` on evidence frozen by a run that predates this key.
+   */
+  boundaries_differ: boolean | null;
+  /**
+   * Each source's range and boundary as one sentence, for example "Google 2026-09-04 to
+   * 2026-10-01 (America/New_York); LinkedIn same dates (UTC)"; `null` on evidence frozen by a run
+   * that predates this key.
+   */
+  description: string | null;
 }
 
 /**
@@ -717,13 +744,15 @@ export interface Finding {
 
 /**
  * The sample a withheld pattern saw against the minimum it needed (`schemas.WithheldSample`).
- * Both sizes are `null` when no sample applies.
+ * Each size is a {@link SampleSize}: an integer when it is a whole number, as `Sample` carries
+ * counts, and a fixed-point decimal string when it is fractional. Both sizes are `null` when no
+ * sample applies.
  */
 export interface WithheldSample {
   /** The sample observed. */
-  observed: MetricValue;
+  observed: SampleSize;
   /** The minimum required. */
-  required: MetricValue;
+  required: SampleSize;
   /** The sample's unit, for example `clicks` or `days`. */
   unit: string | null;
 }

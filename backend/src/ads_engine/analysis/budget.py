@@ -438,6 +438,20 @@ def _singular(label: str) -> str:
     return label[:-1] if label.endswith("s") else label
 
 
+def _days(count: int) -> str:
+    """A day count with its unit in number: ``1 day``, ``6 days``."""
+    return "1 day" if count == 1 else f"{count} days"
+
+
+def _counted(count: int, plural: str) -> str:
+    """A count with its noun in number: ``1 weekend day``, ``0 outcomes``, ``3 weekdays``.
+
+    Only a count of exactly 1 takes the singular (:func:`_singular` of ``plural``); 0 and every
+    other count keep ``plural``.
+    """
+    return f"{count} {_singular(plural) if count == 1 else plural}"
+
+
 def _require_amount(value: object, what: str) -> Decimal:
     """Require a finite, non-negative ``Decimal`` amount.
 
@@ -1100,12 +1114,16 @@ def _ordinal(value: Decimal) -> str:
 
 
 def _window_withheld(rule_id: str, days: int, required: int) -> Withheld:
-    """A rule withheld for the whole run: the window is below ``window.sustained_min_days``."""
+    """A rule withheld for the whole run: the window is below ``window.sustained_min_days``.
+
+    The reason reads "window 6 days of 7 required", or "window 1 day of 7 required" for a
+    one-day window, as C1, C1b, C2 and B1 state theirs; ``unit`` stays ``days``.
+    """
     return Withheld(
         rule_id=rule_id,
         section=BUDGET,
         entity=None,
-        reason=f"window {days} days of {required} required",
+        reason=f"window {_days(days)} of {required} required",
         observed=days,
         required=required,
         unit="days",
@@ -1665,7 +1683,8 @@ def _b4(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
     4. **Sample minimums**: at least ``b4.min_weekend_days`` (4) weekend days and
        ``b4.min_weekdays`` (10) weekdays with spend, and ``b4.min_outcomes`` (10) outcomes in
        total; shortfalls are withheld with their sample sizes, for example "3 weekend days of
-       4 required; 6 outcomes of 10 required".
+       4 required; 6 outcomes of 10 required" (a count of exactly 1 takes the singular noun:
+       "1 weekend day of 4 required").
     5. **Test**: the two-sample Poisson rate test of outcomes per unit of spend
        (:func:`~ads_engine.analysis.stats.poisson_rate_test`); the pattern is an item when
        p < ``b4.alpha`` (0.05), and otherwise withheld with its p-value and sample sizes.
@@ -1762,7 +1781,9 @@ def _b4_campaign(
         observed, required, unit = shortfalls[0]
         return _b4_withheld(
             entity,
-            "; ".join(f"{have} {what} of {need} required" for have, need, what in shortfalls),
+            "; ".join(
+                f"{_counted(have, what)} of {need} required" for have, need, what in shortfalls
+            ),
             observed,
             required,
             unit,
@@ -1781,7 +1802,8 @@ def _b4_campaign(
             entity,
             f"weekend and weekday rates not distinguishable ({B4_TEST_NAME} "
             f"{_p_value(test.p_value, settings.b4_alpha)}, alpha {_number(settings.b4_alpha)}): "
-            f"{weekend.spend_days} weekend days, {weekday.spend_days} weekdays, {total} outcomes",
+            f"{_counted(weekend.spend_days, 'weekend days')}, "
+            f"{_counted(weekday.spend_days, 'weekdays')}, {_counted(total, 'outcomes')}",
             total,
             settings.b4_min_outcomes,
             "outcomes",
@@ -1969,8 +1991,9 @@ def _b4_candidate(
     p_value = test.p_value if recorded is None or recorded.p_value is None else recorded.p_value
     alpha = settings.b4_alpha if recorded is None else recorded.alpha
     reason = (
-        f"Weekend cost per {singular} {weekend_text} over {_value(evidence, 'weekend_days')} "
-        f"weekend days vs weekday {weekday_text} over {_value(evidence, 'weekdays')} weekdays "
+        f"Weekend cost per {singular} {weekend_text} over "
+        f"{_counted(weekend.spend_days, 'weekend days')} vs weekday {weekday_text} over "
+        f"{_counted(weekday.spend_days, 'weekdays')} "
         f"({_value(evidence, 'weekend_outcomes')} weekend and "
         f"{_value(evidence, 'weekday_outcomes')} weekday {label}; {B4_TEST_NAME} "
         f"{_p_value(p_value, alpha)}, below alpha {_number(alpha)}); "
@@ -2005,7 +2028,10 @@ def _findings(ctx: AnalysisContext, result: RuleResult) -> tuple[Finding, ...]:
     """The Budget section's ``no_crm_link`` finding, once any Google item lacks the CRM link.
 
     AAP 0.3.3: without the verified Google-to-CRM link no Google Qualified Lead count is
-    computed for budget cards, and a LinkedIn-derived subset never stands in.
+    computed for budget cards, and a LinkedIn-derived subset never stands in. Its ``items``
+    counts the budget items built with the flag; ``precedence.py`` recounts it over the
+    section's stored items that carry the flag, held items included, after G1, P2 and
+    feedback suppression.
     """
     flagged = sum(1 for item in result.candidates if item.has_flag(FLAG_NO_CRM_LINK))
     gap = google_link_gap(ctx)

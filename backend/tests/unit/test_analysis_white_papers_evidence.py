@@ -27,6 +27,7 @@ from typing import Final
 import pytest
 
 from ads_engine.analysis import white_papers
+from ads_engine.analysis.attribution import attribution_for, bounded_decimal
 from ads_engine.analysis.context import (
     W1,
     AnalysisContext,
@@ -364,3 +365,79 @@ def test_no_contributing_campaign_withholds_w1_without_g1_keys() -> None:
         (W1, "no campaign with window spend feeds this white paper")
     ]
     assert not set(G1_THRESHOLD_KEYS) & set(item.evidence.thresholds)
+
+
+def _places(text: str) -> int:
+    """Return the number of decimals a serialised amount or share carries."""
+    exponent = Decimal(text).as_tuple().exponent
+    assert isinstance(exponent, int)
+    return max(0, -exponent)
+
+
+def _cited(value: Decimal | None) -> str | None:
+    """Return the serialised form of an exact value as every evidence field cites it."""
+    return None if value is None else format(bounded_decimal(value), "f")
+
+
+@pytest.mark.parametrize("name", [*CATALOGUE, *CUSTOM])
+def test_every_cited_cost_and_share_carries_one_value_at_six_decimals(name: str) -> None:
+    """AAP 0.5.4.8: a number cited in a metric and in ``extra`` is one value (``numeric(18, 6)``).
+
+    The cost metrics equal ``extra.costs``; each ``extra.rows`` cost, each completeness share and
+    the orphan-deal share is its exact value bounded by
+    :func:`~ads_engine.analysis.attribution.bounded_decimal`, so none carries a 28-digit
+    quotient.
+    """
+    ctx, result = _evaluated(name)
+    table = attribution_for(ctx)
+    rows = {row.external_id: row for row in table.rows()}
+    for item in result.candidates:
+        rendered = item.evidence.to_json()
+        metrics = {metric["key"]: metric["value"] for metric in rendered["metrics"]}
+        extra = rendered["extra"]
+        row = rows[item.entity_ref.external_id]
+        for key, cost in (
+            ("cost_per_ql", row.cost_per_ql),
+            ("cost_per_meeting", row.cost_per_meeting),
+        ):
+            cited = extra["costs"][key]["value"]
+            assert cited == _cited(cost.value)
+            if cost.value is not None:
+                assert metrics[key] == cited
+        assert len(extra["rows"]) == len(row.creative_rows)
+        for credit, serialised in zip(row.creative_rows, extra["rows"], strict=True):
+            assert serialised["cost_per_ql"]["value"] == _cited(credit.cost_per_ql.value)
+            assert serialised["cost_per_meeting"]["value"] == _cited(credit.cost_per_meeting.value)
+        assert extra["orphan_deals"]["share"] == _cited(table.orphan_deals.share)
+        numbers = [
+            *(extra["costs"][key]["value"] for key in ("cost_per_ql", "cost_per_meeting")),
+            *(
+                credit[key]["value"]
+                for credit in extra["rows"]
+                for key in ("cost_per_ql", "cost_per_meeting")
+            ),
+            *(share["share"] for share in extra["shares"].values()),
+            extra["orphan_deals"]["share"],
+        ]
+        assert all(_places(text) <= 6 for text in numbers if text is not None)
+
+
+def test_a_non_terminating_cost_is_cited_at_one_precision() -> None:
+    """Guide A: USD 2,766 over 31 QL is cited as 89.225806 in the metric and in ``extra``.
+
+    Its second creative's USD 2,716 over 26 QL is cited as 104.461538, never as the exact
+    quotient; the display and every comparison keep the exact value.
+    """
+    ctx, result = _evaluated("w1.unblocked_only.case")
+    item = _item(result, "guide-a")
+    rendered = item.evidence.to_json()
+    metric = next(m for m in rendered["metrics"] if m["key"] == "cost_per_ql")
+    assert _cost_per_ql(item) == Decimal("89.225806")
+    assert metric["value"] == rendered["extra"]["costs"]["cost_per_ql"]["value"] == "89.225806"
+    assert [credit["cost_per_ql"]["value"] for credit in rendered["extra"]["rows"]] == [
+        "10.00",
+        "104.461538",
+    ]
+    (row,) = (row for row in attribution_for(ctx).rows() if row.slug == "guide-a")
+    assert row.cost_per_ql.value == Decimal(2766) / Decimal(31)
+    assert row.cost_per_ql.render() == "89.23"
