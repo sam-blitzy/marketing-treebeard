@@ -1,0 +1,599 @@
+/**
+ * Component tests for `SettingsPage`, the read-only `/settings` screen (AAP 0.5.5 "Other screens
+ * → `/settings`"; AAP 0.5.3 `GET /config`).
+ *
+ * The page renders inside the providers of `../../test/render`, and the network is stubbed with
+ * `../../test/mockApi`, so the real `useConfig` hook reads `GET /config` through the real client.
+ * The cases cover:
+ *
+ * - the analysis window: default, trusted minimum, the presets with the default marked (also
+ *   after the default changes), maximum and sustained-pattern minimum, all from the response;
+ * - every threshold as a dotted, sorted key with its configured value verbatim;
+ * - the HubSpot mapping: MQL and Qualified Lead bound separately, the meeting rules, and the
+ *   bindings resolved against the primary and the companion CRM dataset, an unresolved one
+ *   reading "unavailable" with its reason and never `0`;
+ * - the white paper registry and `config_hash`;
+ * - the read-only contract (no control, no request but `GET /config`), loading, failure, and a
+ *   failed background refresh that keeps the last configuration.
+ *
+ * @packageDocumentation
+ */
+import { apiError, json, mockApi } from '../../test/mockApi';
+import type { MockHandler, MockResponse } from '../../test/mockApi';
+import { renderWithProviders } from '../../test/render';
+import { act, screen, waitFor, within } from '@testing-library/react';
+import { describe, expect, it } from 'vitest';
+
+import { queryKeys } from '../../api/queries';
+import type { ConfigView, CrmBindingsView, WindowConfig } from '../../api/types';
+import { FIXTURE_CONFIG_HASH, makeConfig } from '../../test/fixtures';
+import { SettingsPage } from './SettingsPage';
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+/** Why the Google-to-CRM link is unavailable in the fixture world. */
+const GOOGLE_LINK_UNCONFIGURED =
+  'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured';
+
+/** Stubs `GET /config`, the page's only request. */
+function stubConfig(config: MockHandler = json(200, makeConfig())) {
+  return mockApi({ 'GET /config': config });
+}
+
+/** Renders the page at `/settings` and waits for the loaded configuration. */
+async function renderLoaded() {
+  const result = await renderWithProviders(<SettingsPage />, { path: '/settings' });
+  await screen.findByRole('region', { name: 'Analysis window' });
+  return result;
+}
+
+/** A configuration with the window settings replaced. */
+function withWindow(window: Partial<WindowConfig>): ConfigView {
+  return makeConfig({ window: { ...makeConfig().window, ...window } });
+}
+
+/** A table by its caption. */
+function table(caption: string, scope: HTMLElement = document.body): HTMLElement {
+  return within(scope).getByRole('table', { name: caption });
+}
+
+/** The text of every cell of every body row, row by row. */
+function bodyRows(tableElement: HTMLElement): string[][] {
+  return within(tableElement)
+    .getAllByRole('row')
+    .slice(1)
+    .map((row) => Array.from(row.children, (cell) => cell.textContent ?? ''));
+}
+
+/** The column headers of a table, in order. */
+function headers(tableElement: HTMLElement): string[] {
+  return within(tableElement)
+    .getAllByRole('columnheader')
+    .map((cell) => cell.textContent ?? '');
+}
+
+/** The window table's row for one setting, by its row header. */
+function windowRow(setting: string): string[] {
+  const row = bodyRows(table('Analysis window settings')).find(([label]) => label === setting);
+  if (row === undefined) {
+    throw new Error(`The window table has no "${setting}" row.`);
+  }
+  return row;
+}
+
+/** The items of the "Window presets" list, as text. */
+function presetItems(): string[] {
+  const list = screen.getByRole('list', { name: 'Window presets' });
+  return within(list)
+    .getAllByRole('listitem')
+    .map((item) => item.textContent ?? '');
+}
+
+/** The thresholds table as `{dotted key: value}` pairs, in table order. */
+function thresholdPairs(): [string, string][] {
+  return bodyRows(table('Thresholds')).map(([key, value]): [string, string] => [
+    key ?? '',
+    value ?? '',
+  ]);
+}
+
+/** One meeting rule's line: its label followed by its values. */
+function meetingRule(label: string): string {
+  const group = screen.getByLabelText('Meeting rules');
+  return within(group).getByText(label).parentElement?.textContent ?? '';
+}
+
+/**
+ * A level-3 section, found by its heading. The companion's table carries the same caption as its
+ * section heading, so the two regions share a name and the section is reached from its heading.
+ */
+function subsection(title: string): HTMLElement {
+  const section = screen.getByRole('heading', { level: 3, name: title }).closest('section');
+  if (section === null) {
+    throw new Error(`The heading "${title}" is not inside a section.`);
+  }
+  return section;
+}
+
+/** The fixture's resolved bindings with `changes` applied (shallow per binding). */
+function bindings(changes: Partial<CrmBindingsView>): CrmBindingsView {
+  const base = makeConfig().crm_bindings;
+  if (base === null) {
+    throw new Error('The fixture configuration has no resolved bindings.');
+  }
+  return { ...base, ...changes };
+}
+
+/** A response a test releases by hand, to hold the request pending in between. */
+function heldResponse(): {
+  promise: Promise<MockResponse>;
+  release: (response: MockResponse) => void;
+} {
+  let release: (response: MockResponse) => void = () => undefined;
+  const promise = new Promise<MockResponse>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------------------------
+
+describe('SettingsPage', () => {
+  describe('layout and read-only contract', () => {
+    it('renders the five sections in order under the read-only note', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeTruthy();
+      expect(
+        screen.getByText('Read-only. Change the files in config/ and restart the services.'),
+      ).toBeTruthy();
+      expect(
+        screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
+      ).toEqual([
+        'Analysis window',
+        'Thresholds',
+        'HubSpot mapping',
+        'White paper registry',
+        'Configuration hash',
+      ]);
+    });
+
+    it('renders no control and sends no request but GET /config', async () => {
+      const api = stubConfig();
+      await renderLoaded();
+
+      for (const role of ['button', 'textbox', 'combobox', 'checkbox', 'spinbutton'] as const) {
+        expect(screen.queryAllByRole(role)).toHaveLength(0);
+      }
+      expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual(['GET /config']);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  });
+
+  describe('analysis window', () => {
+    it('shows every window setting with its key and value from the response', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const windowTable = table('Analysis window settings');
+      expect(headers(windowTable)).toEqual(['Setting', 'Key', 'Value']);
+      expect(windowRow('Default window')).toEqual([
+        'Default window',
+        'window.default_days',
+        '28 days',
+      ]);
+      expect(windowRow('Trusted minimum')).toEqual([
+        'Trusted minimum',
+        'window.trusted_min_days',
+        '14 days',
+      ]);
+      expect(windowRow('Presets').slice(0, 2)).toEqual(['Presets', 'window.presets']);
+      expect(windowRow('Maximum window')).toEqual([
+        'Maximum window',
+        'window.max_days',
+        '180 days',
+      ]);
+      expect(windowRow('Sustained-pattern minimum')).toEqual([
+        'Sustained-pattern minimum',
+        'window.sustained_min_days',
+        '7 days',
+      ]);
+      expect(presetItems()).toEqual(['14 days', '28 days default', '56 days', '90 days']);
+    });
+
+    it('marks the configured default when it changes', async () => {
+      stubConfig(json(200, withWindow({ default_days: 21, presets: [14, 21, 28, 56, 90] })));
+      await renderLoaded();
+
+      expect(windowRow('Default window')[2]).toBe('21 days');
+      expect(presetItems()).toEqual([
+        '14 days',
+        '21 days default',
+        '28 days',
+        '56 days',
+        '90 days',
+      ]);
+    });
+
+    it('marks at most one preset, and none when no preset equals the default', async () => {
+      stubConfig(json(200, withWindow({ default_days: 28, presets: [28, 28, 56] })));
+      const { unmount } = await renderLoaded();
+
+      expect(presetItems()).toEqual(['28 days default', '28 days', '56 days']);
+      unmount();
+
+      stubConfig(json(200, withWindow({ default_days: 30, presets: [14, 28] })));
+      await renderLoaded();
+
+      expect(presetItems()).toEqual(['14 days', '28 days']);
+    });
+
+    it('says "1 day" for a single day and "none" for an empty preset list', async () => {
+      stubConfig(
+        json(
+          200,
+          withWindow({ default_days: 1, trusted_min_days: 1, presets: [], sustained_min_days: 1 }),
+        ),
+      );
+      await renderLoaded();
+
+      expect(windowRow('Default window')[2]).toBe('1 day');
+      expect(windowRow('Trusted minimum')[2]).toBe('1 day');
+      expect(windowRow('Sustained-pattern minimum')[2]).toBe('1 day');
+      expect(windowRow('Presets')[2]).toBe('none');
+      expect(screen.queryByRole('list', { name: 'Window presets' })).toBeNull();
+    });
+  });
+
+  describe('thresholds', () => {
+    it('lists every configured threshold as a dotted key, sorted, with its value verbatim', async () => {
+      const config = makeConfig();
+      stubConfig(json(200, config));
+      await renderLoaded();
+
+      expect(headers(table('Thresholds'))).toEqual(['Key', 'Value']);
+      const pairs = thresholdPairs();
+      const keys = pairs.map(([key]) => key);
+      // The fixture tree has two levels: every namespace key counts once.
+      const leaves = Object.values(config.thresholds).reduce<number>(
+        (count, namespace) => count + Object.keys(namespace as object).length,
+        0,
+      );
+      expect(pairs).toHaveLength(leaves);
+      expect(keys).toEqual([...keys].sort());
+      expect(keys[0]).toBe('attribution.floor_share');
+      const values = new Map(pairs);
+      // Ratios stay ratios: 0.95 is never shown as 95%.
+      expect(values.get('budget.capped_day_ratio')).toBe('0.95');
+      expect(values.get('k1.min_clicks_floor')).toBe('10');
+      expect(values.get('window.presets')).toBe('14, 28, 56, 90');
+      expect(values.get('crm.booking_sources')).toBe('MEETINGS_PUBLIC');
+      expect(values.get('sources.stale_after_hours')).toBe('24');
+    });
+
+    it('renders every kind of configured value without dropping a key', async () => {
+      stubConfig(
+        json(
+          200,
+          makeConfig({
+            thresholds: {
+              top_scalar: 3,
+              nested: { 'already.dotted': 5, deeper: { leaf: 'text' } },
+              limits: {
+                objects: [{ a: 1 }],
+                none_yet: null,
+                mixed: [1, 'two', true, null],
+                empty_list: [],
+              },
+              flags: { strict: false, enabled: true },
+              empty_namespace: {},
+            },
+          }),
+        ),
+      );
+      await renderLoaded();
+
+      expect(thresholdPairs()).toEqual([
+        ['empty_namespace', 'none'],
+        ['flags.enabled', 'true'],
+        ['flags.strict', 'false'],
+        ['limits.empty_list', 'none'],
+        ['limits.mixed', '1, two, true, none'],
+        ['limits.none_yet', 'none'],
+        ['limits.objects', '{"a":1}'],
+        ['nested.already.dotted', '5'],
+        ['nested.deeper.leaf', 'text'],
+        ['top_scalar', '3'],
+      ]);
+    });
+
+    it('says so when no threshold is configured', async () => {
+      stubConfig(json(200, makeConfig({ thresholds: {} })));
+      await renderLoaded();
+
+      expect(bodyRows(table('Thresholds'))).toEqual([['No thresholds configured.']]);
+    });
+  });
+
+  describe('HubSpot mapping', () => {
+    it('shows the MQL and Qualified Lead bindings separately, never combined', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const mapping = table('MQL and Qualified Lead bindings');
+      expect(headers(mapping)).toEqual(['Count', 'Mode', 'Stage label(s)', 'Property']);
+      expect(bodyRows(mapping)).toEqual([
+        ['MQL', 'stage_label', 'First meeting booked', '—'],
+        ['Qualified Lead', 'stage_label', 'Qualified Lead, Sales Qualified Lead', '—'],
+      ]);
+      expect(
+        screen.getByText('MQL and Qualified Lead are bound separately and never combined.'),
+      ).toBeTruthy();
+      expect(meetingRule('Booking sources')).toBe('Booking sourcesMEETINGS_PUBLIC');
+      expect(meetingRule('Meeting outcome exclusions')).toBe(
+        'Meeting outcome exclusionsCANCELED',
+      );
+    });
+
+    it('shows a property binding by its property and skips blank labels and values', async () => {
+      const base = makeConfig().hubspot_mapping;
+      stubConfig(
+        json(
+          200,
+          makeConfig({
+            hubspot_mapping: {
+              ...base,
+              mql: { mode: 'property', stage_labels: [], property: 'mql_date' },
+              ql: { mode: 'stage_label', stage_labels: ['Qualified Lead', '  '], property: null },
+              booking_sources: ['MEETINGS_PUBLIC', 'CRM_UI', ' '],
+              meeting_outcome_exclusions: [],
+            },
+          }),
+        ),
+      );
+      await renderLoaded();
+
+      expect(bodyRows(table('MQL and Qualified Lead bindings'))).toEqual([
+        ['MQL', 'property', '—', 'mql_date'],
+        ['Qualified Lead', 'stage_label', 'Qualified Lead', '—'],
+      ]);
+      expect(meetingRule('Booking sources')).toBe('Booking sourcesMEETINGS_PUBLIC, CRM_UI');
+      expect(meetingRule('Meeting outcome exclusions')).toBe('Meeting outcome exclusionsnone');
+    });
+
+    it('shows the bindings resolved against the primary and the companion CRM dataset', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const primary = table('Resolved stage properties (HubSpot)');
+      expect(headers(primary)).toEqual([
+        'Binding',
+        'Status',
+        'Matched label',
+        'Stage id',
+        'Property',
+        'Reason',
+      ]);
+      expect(bodyRows(primary)).toEqual([
+        [
+          'MQL',
+          'resolved',
+          'First meeting booked',
+          '1084512345',
+          'hs_v2_date_entered_1084512345',
+          '—',
+        ],
+        [
+          'Qualified Lead',
+          'resolved',
+          'Qualified Lead',
+          '1084512399',
+          'hs_v2_date_entered_1084512399',
+          '—',
+        ],
+        ['Google campaign property', 'unavailable', '—', '—', '—', GOOGLE_LINK_UNCONFIGURED],
+        [
+          'Google touch-date property',
+          'unavailable',
+          '—',
+          '—',
+          '—',
+          GOOGLE_LINK_UNCONFIGURED,
+        ],
+      ]);
+      const primarySection = subsection('Resolved stage properties');
+      const verified = within(primarySection).getByText('2026-10-01T08:10:00Z');
+      expect(verified.getAttribute('datetime')).toBe('2026-10-01T08:10:00Z');
+
+      const companionSection = subsection('Resolved stage properties (simulated companion)');
+      expect(
+        within(companionSection).getByText(
+          'Used for LinkedIn-attributed evidence while LinkedIn data is simulated.',
+        ),
+      ).toBeTruthy();
+      expect(
+        bodyRows(table('Resolved stage properties (simulated companion)', companionSection)),
+      ).toHaveLength(4);
+      expect(within(companionSection).getByText('2026-10-01T08:11:00Z')).toBeTruthy();
+    });
+
+    it('reads "unavailable" with its reason for an unresolved binding, never 0', async () => {
+      stubConfig(
+        json(
+          200,
+          makeConfig({
+            crm_bindings: bindings({
+              mql: {
+                available: false,
+                property: 'hs_v2_date_entered_stale',
+                stage_id: '1084512345',
+                label: 'First meeting booked',
+                reason: 'MQL stage "First meeting booked" not resolved',
+              },
+              ql: { available: false, property: null, stage_id: null, label: null, reason: '' },
+              google: {
+                available: true,
+                campaign_property: 'google_campaign_id',
+                touch_date_property: '  ',
+                reason: null,
+              },
+            }),
+            companion_crm_bindings: null,
+          }),
+        ),
+      );
+      await renderLoaded();
+
+      const primary = table('Resolved stage properties (HubSpot)');
+      expect(bodyRows(primary)).toEqual([
+        [
+          'MQL',
+          'unavailable',
+          '—',
+          '—',
+          '—',
+          'MQL stage "First meeting booked" not resolved',
+        ],
+        ['Qualified Lead', 'unavailable', '—', '—', '—', 'No reason recorded'],
+        ['Google campaign property', 'resolved', '—', '—', 'google_campaign_id', '—'],
+        ['Google touch-date property', 'resolved', '—', '—', '—', '—'],
+      ]);
+      expect(within(primary).queryByText('0')).toBeNull();
+      // No companion CRM dataset is active, so its section is absent.
+      expect(
+        screen.queryByRole('heading', { name: 'Resolved stage properties (simulated companion)' }),
+      ).toBeNull();
+    });
+
+    it('says the bindings are not resolved yet before HubSpot has verified them', async () => {
+      stubConfig(json(200, makeConfig({ crm_bindings: null, companion_crm_bindings: null })));
+      await renderLoaded();
+
+      const primarySection = subsection('Resolved stage properties');
+      expect(
+        within(primarySection).getByText(
+          'Not resolved yet. The HubSpot dataset records them when it verifies its properties at startup.',
+        ),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole('table', { name: 'Resolved stage properties (HubSpot)' }),
+      ).toBeNull();
+    });
+  });
+
+  describe('white paper registry and configuration hash', () => {
+    it('lists every white paper in file order with its lead forms and creative overrides', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const registry = table('White paper registry');
+      expect(headers(registry)).toEqual(['Slug', 'Title', 'Lead forms', 'Creative overrides']);
+      expect(bodyRows(registry).map((row) => [row[0], row[1], row[3]])).toEqual([
+        ['b2b-pipeline-report-2026', 'The 2026 B2B Pipeline Report', '—'],
+        ['paid-media-benchmarks-2026', 'Paid Media Benchmarks 2026', '—'],
+        ['attribution-playbook', 'The Attribution Playbook', 'urn:li:sponsoredCreative:990001301'],
+      ]);
+      const forms = screen.getByRole('list', { name: 'Lead forms of b2b-pipeline-report-2026' });
+      expect(within(forms).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        'urn:li:leadGenForm:990000101',
+        'urn:li:leadGenForm:990000102',
+      ]);
+      const overrides = screen.getByRole('list', {
+        name: 'Creative overrides of attribution-playbook',
+      });
+      expect(within(overrides).getAllByRole('listitem')).toHaveLength(1);
+    });
+
+    it('shows a dash for an asset without lead forms and says so for an empty registry', async () => {
+      stubConfig(
+        json(
+          200,
+          makeConfig({
+            content_assets: [
+              { slug: 'draft-guide', title: 'Draft Guide', lead_forms: [], creative_overrides: [] },
+            ],
+          }),
+        ),
+      );
+      const { unmount } = await renderLoaded();
+
+      expect(bodyRows(table('White paper registry'))).toEqual([
+        ['draft-guide', 'Draft Guide', '—', '—'],
+      ]);
+      unmount();
+
+      stubConfig(json(200, makeConfig({ content_assets: [] })));
+      await renderLoaded();
+
+      expect(bodyRows(table('White paper registry'))).toEqual([['No white papers registered.']]);
+    });
+
+    it('shows config_hash with what it is for', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const hashSection = screen.getByRole('region', { name: 'Configuration hash' });
+      expect(within(hashSection).getByText(FIXTURE_CONFIG_HASH)).toBeTruthy();
+      expect(
+        within(hashSection).getByText(
+          "Stored on every analysis run, so a run's evidence can be traced to this configuration.",
+        ),
+      ).toBeTruthy();
+    });
+  });
+
+  describe('page states', () => {
+    it('shows a spinner until the configuration arrives', async () => {
+      const response = heldResponse();
+      stubConfig(() => response.promise);
+      await renderWithProviders(<SettingsPage />, { path: '/settings' });
+
+      expect(screen.getByText('Loading settings')).toBeTruthy();
+      expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeTruthy();
+      expect(screen.queryByRole('region', { name: 'Analysis window' })).toBeNull();
+
+      response.release(json(200, makeConfig()));
+
+      expect(await screen.findByRole('region', { name: 'Analysis window' })).toBeTruthy();
+      expect(screen.queryByText('Loading settings')).toBeNull();
+    });
+
+    it("announces a failed read with the API's message in a polite status region", async () => {
+      const message = 'window.default_days (21) is not one of window.presets';
+      stubConfig(apiError(500, 'config_error', message));
+      await renderWithProviders(<SettingsPage />, { path: '/settings' });
+
+      const status = await waitFor(() => {
+        const region = screen.getByRole('status');
+        expect(within(region).getByText('Settings unavailable')).toBeTruthy();
+        return region;
+      });
+      expect(within(status).getByText(message)).toBeTruthy();
+      expect(screen.queryByText('Loading settings')).toBeNull();
+      expect(screen.queryByRole('region', { name: 'Analysis window' })).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      // The page has no controls, so the failure offers no action.
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+    });
+
+    it('keeps the last configuration when a background refresh fails', async () => {
+      const api = stubConfig();
+      const { queryClient } = await renderLoaded();
+      api.use({ 'GET /config': apiError(503, 'service_unavailable', 'Database unavailable') });
+
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.config });
+      });
+
+      expect(api.calls.filter((call) => call.path === '/config')).toHaveLength(2);
+      expect(screen.getByRole('region', { name: 'Analysis window' })).toBeTruthy();
+      expect(screen.queryByText('Settings unavailable')).toBeNull();
+      expect(screen.queryByText('Database unavailable')).toBeNull();
+    });
+  });
+});

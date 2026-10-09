@@ -114,9 +114,10 @@ The deadline must clear the slowest legitimate request: ``POST /runs`` computes 
 custom-window run synchronously, which the product's performance budget allows up to 30 s.
 It must also leave room for the answer to reach the client: cancelling a query that is in
 flight costs psycopg up to about 10 s more (a cancel request to the server, then a wait for
-it) before the 503 can be sent, and nginx gives up on an upstream after its default 60 s
+it) before the 503 can be sent, and nginx gives up on an upstream after its
 ``proxy_read_timeout`` with a bare 504 that has neither the error envelope nor an API log
-line. 45 s plus that unwind lands at about 55 s, inside nginx's limit.
+line. 45 s plus that unwind lands at about 55 s, inside the 120 s ``web/nginx.conf`` sets for
+``/api/`` and inside nginx's 60 s default as well.
 """
 
 _REQUEST_TIMEOUT_CODE: Final = "request_timeout"
