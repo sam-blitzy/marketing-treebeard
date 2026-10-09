@@ -164,7 +164,7 @@ call, so a younger one may still be in progress in another process (the CLI's
 ``seed-simulated`` while the worker runs)."""
 
 LINKEDIN_RETENTION_DAYS: Final = 180
-"""LinkedIn's 6-month daily retention, the cap on any LinkedIn backfill (AAP 0.2.4)."""
+"""LinkedIn's 6-month daily retention, the cap on every source's backfill (AAP 0.2.4, 0.3.2)."""
 
 ErrorDisposition = Literal["switched_to_simulated", "stale", "defect", "ignored"]
 """What :meth:`SourceModeController.on_error` decided for one classified connector error."""
@@ -1706,8 +1706,8 @@ class SourceModeController:
         3. HubSpot primary: when LinkedIn's active primary is live, stage a ``lead_match`` row
            for each of its leads in the backfill range (simulated leads are never staged
            against a primary).
-        4. Backfill (``sync/jobs.py``; ``BACKFILL_DAYS``, LinkedIn capped at 180 days). The
-           first entity sync writes the baseline decisions.
+        4. Backfill (``sync/jobs.py``; ``BACKFILL_DAYS``, capped at 180 days for every
+           source). The first entity sync writes the baseline decisions.
         5. Settle: re-stage the current lead/CRM pair (LinkedIn or HubSpot may have activated
            a new dataset meanwhile). Rows left pending in the build's own CRM dataset, or
            matched there with no association read of their contacts, mark its

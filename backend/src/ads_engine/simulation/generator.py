@@ -1939,7 +1939,8 @@ class StageSpec(_Replaceable):
     """A custom HubSpot lifecycle stage; custom stages have numeric ids.
 
     Attributes:
-        label: Stage label, matched exactly by ``config/hubspot_mapping.yaml``.
+        label: Stage label; ``config/hubspot_mapping.yaml`` labels match it after trimming and
+            case-folding, as against a live portal.
         id: Numeric stage id (the option value) from ``HUBSPOT_STAGE_IDS``.
     """
 
@@ -2097,9 +2098,10 @@ class HubSpotSpec(_Replaceable):
 
     Attributes:
         custom_stages: Custom lifecycle stages added to HubSpot's defaults.
-        removed_stage_labels: Labels deliberately absent from the portal, so a mapping that
-            names them stays unresolved ("unavailable", never 0). Any other label the mapping
-            names but the portal lacks is added as a custom stage.
+        removed_stage_labels: Labels of default or custom stages deliberately absent from the
+            portal. The portal's stages come from the spec alone, so a mapping label naming no
+            remaining stage, removed or never present, stays unresolved ("unavailable",
+            never 0).
         funnel: How people become contacts, MQL, QL, meetings and deals.
         orphan_deals: Deals with no associated contact, created over the recent history.
         bulk_deals: Lazily generated deals that overflow CRM Search partitions.
@@ -2133,8 +2135,10 @@ class HubSpotSpec(_Replaceable):
                 stage.label not in default_labels,
                 f"custom stage {stage.label!r} repeats a default stage label",
             )
+        portal_labels = default_labels | {stage.label for stage in self.custom_stages}
         for label in self.removed_stage_labels:
             _check_text("removed stage label", label)
+            _require(label in portal_labels, f"removed stage label {label!r} is not a portal stage")
         _check_int("orphan_deals", self.orphan_deals)
         _check_int("association_page_size", self.association_page_size, minimum=1)
         _check_decimal(
@@ -6115,7 +6119,7 @@ class _CrmModel:
         self.google_properties = google_properties
         if linkedin is not None:
             self._check_person_layout(linkedin)
-        self.options, self.added_labels = self._build_options()
+        self.options = self._build_options()
         self.option_order = {option.value: option.display_order for option in self.options}
         self.mql_target = self._target(mapping.mql)
         self.ql_target = self._target(mapping.ql)
@@ -6172,67 +6176,42 @@ class _CrmModel:
 
     # -- stages and properties ---------------------------------------------------------------------
 
-    def _build_options(self) -> tuple[tuple[PropertyOption, ...], tuple[str, ...]]:
+    def _build_options(self) -> tuple[PropertyOption, ...]:
         """The ``lifecyclestage`` options: defaults with the custom stages after ``lead``.
 
-        Labels the mapping names but the portal lacks are added as custom stages unless the
-        spec removes them deliberately (then the binding stays unresolved).
-
-        Raises:
-            ValueError: When a removed label is neither a stage nor a label the mapping names.
+        The options come from the spec alone, less its removed labels. A label the mapping
+        names but the portal lacks is never added, so its binding stays unresolved
+        ("unavailable", never 0), as it does against a live portal.
         """
         removed = set(self.spec.removed_stage_labels)
-        mapping_labels: list[str] = []
-        for binding in (self.mapping.mql, self.mapping.ql):
-            if binding.mode == "stage_label":
-                mapping_labels.extend(binding.stage_labels)
-        known = {label for _value, label in DEFAULT_LIFECYCLE_STAGES}
-        known |= {stage.label for stage in self.spec.custom_stages}
-        for label in removed:
-            _require(
-                label in known or label in mapping_labels,
-                f"removed stage label {label!r} is neither a portal stage nor a mapping label",
-            )
         entries: list[tuple[str, str]] = []
         for value, label in DEFAULT_LIFECYCLE_STAGES[:2]:
             entries.append((value, label))
         entries.extend((stage.id, stage.label) for stage in self.spec.custom_stages)
         entries.extend(DEFAULT_LIFECYCLE_STAGES[2:])
         entries = [(value, label) for value, label in entries if label not in removed]
-        labels = {label for _value, label in entries}
-        used_ids = {stage.id for stage in self.spec.custom_stages}
-        added: list[str] = []
-        for binding in (self.mapping.mql, self.mapping.ql):
-            if binding.mode != "stage_label" or any(
-                label in labels for label in binding.stage_labels
-            ):
-                continue
-            candidates = [label for label in binding.stage_labels if label not in removed]
-            if not candidates:
-                continue
-            offset = 0
-            while str(HUBSPOT_STAGE_IDS.at(offset)) in used_ids:
-                offset += 1
-            stage_id = str(HUBSPOT_STAGE_IDS.at(offset))
-            used_ids.add(stage_id)
-            entries.insert(len(entries) - 1, (stage_id, candidates[0]))
-            labels.add(candidates[0])
-            added.append(candidates[0])
-        options = tuple(
+        return tuple(
             PropertyOption(label=label, value=value, display_order=order)
             for order, (value, label) in enumerate(entries)
         )
-        return options, tuple(added)
 
     def _target(self, binding: StageBinding) -> tuple[str, str] | None:
-        """Where a binding's event is recorded: ``("stage", value)``, ``("property", name)``."""
+        """Where a binding's event is recorded: ``("stage", value)``, ``("property", name)``.
+
+        A ``stage_label`` binding records into the stage ``HubSpotClient.verify_bindings``
+        resolves it to: its first label that equals an option's label after trimming and
+        case-folding, preferring the exact label, then a visible option over a hidden one, then
+        the earlier option. A binding none of whose labels names a stage returns ``None``: the
+        world records no event for it, and its count is unavailable.
+        """
         if binding.mode == "property":
             return ("property", cast(str, binding.property))
-        by_label = {option.label: option.value for option in self.options}
         for label in binding.stage_labels:
-            value = by_label.get(label)
-            if value is not None:
-                return ("stage", value)
+            key = label.strip().casefold()
+            matches = [option for option in self.options if option.label.strip().casefold() == key]
+            if matches:
+                option = min(matches, key=lambda item: (item.label != label, item.hidden))
+                return ("stage", option.value)
         return None
 
     def _build_properties(self) -> Mapping[tuple[str, str], PropertyRecord]:
@@ -7037,10 +7016,10 @@ class SimulatedWorld:
 
     Raises:
         ValueError: When an explicitly passed content asset lies outside the reserved LinkedIn
-            ranges, an asset form or override creative is missing from the spec, a platform
-            change names an unknown entity, or a removed stage label is unknown; and, in a
-            world with LinkedIn and HubSpot parts, when a lead creative (one with a lead form
-            and a profile) sits at position :data:`PERSON_CREATIVE_POSITIONS` or beyond in
+            ranges, an asset form or override creative is missing from the spec, or a platform
+            change names an unknown entity; and, in a world with LinkedIn and HubSpot parts,
+            when a lead creative (one with a lead form and a profile) sits at position
+            :data:`PERSON_CREATIVE_POSITIONS` or beyond in
             ``linkedin.creatives``, or an ``ExplicitDays`` day of a lead creative states
             :data:`LEADS_PER_CREATIVE_DAY` leads or more.
         ConfigError: When the config files are needed and invalid.
@@ -7114,12 +7093,6 @@ class SimulatedWorld:
             faults=len(spec.faults),
             platform_changes=len(spec.platform_changes),
         )
-        if self._crm is not None and self._crm.added_labels:
-            _log.info(
-                "simulation.stages_added",
-                name=spec.name,
-                labels=list(self._crm.added_labels),
-            )
 
     @classmethod
     def from_settings(

@@ -37,7 +37,9 @@ Every rule runs in linear time, and redacting redacted text changes nothing. Ren
 fails closed: a value whose hook or ``repr`` raises becomes ``[UNRENDERABLE]``, a record
 that cannot be rendered becomes a minimal line naming only the error class, and a failed
 write is reported without the record. No path writes an unredacted record, including
-``logging.lastResort`` and handlers elsewhere in the logger tree.
+``logging.lastResort`` and handlers elsewhere in the logger tree. An exception that ends
+the process is written as one redacted JSON line too, or not at all when its owner already
+logged it, never as the interpreter's raw traceback (:func:`install_excepthook`).
 
 Call sites log structured key-value events and never interpolate personal data into the
 message::
@@ -64,9 +66,10 @@ import sys
 import threading
 import unicodedata
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from decimal import Decimal
+from types import TracebackType
 from typing import Any, Final, TextIO, override
 from urllib.parse import unquote, urlsplit
 
@@ -85,6 +88,7 @@ __all__ = [
     "URL_CREDENTIALS_RE",
     "configure_logging",
     "get_logger",
+    "install_excepthook",
     "logged_as",
     "mark_logged",
     "redact",
@@ -957,21 +961,28 @@ def redact(
     return redactor.value(value, 0)
 
 
+type _ExceptHook = Callable[[type[BaseException], BaseException, TracebackType | None], object]
+"""The signature of :data:`sys.excepthook`."""
+
+
 class _LoggingState:
     """Process-wide logging state, guarded by ``lock``.
 
     ``redactor`` is read by :func:`redact_processor` on every event, so reconfiguration
     takes effect even for loggers that structlog cached before it. ``handler`` is the root
     handler this module installed, which a later :func:`configure_logging` reconfigures
-    in place while it is still attached.
+    in place while it is still attached. ``previous_excepthook`` is the hook the first
+    :func:`install_excepthook` call replaced, which receives ``KeyboardInterrupt``.
     """
 
-    __slots__ = ("handler", "lock", "redactor")
+    __slots__ = ("handler", "lock", "previous_excepthook", "redactor")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.redactor = _build_redactor((), frozenset({_DEFAULT_SECRET_HEADER}))
         self.handler: _SafeStreamHandler | None = None
+        # The sys.excepthook that install_excepthook() replaced first; it handles Ctrl-C.
+        self.previous_excepthook: _ExceptHook | None = None
 
 
 _STATE: Final = _LoggingState()
@@ -1575,6 +1586,114 @@ class _OwnedExceptionFilter(logging.Filter):
 _OWNED_EXCEPTION_FILTER: Final = _OwnedExceptionFilter()
 """The one filter instance attached to ``uvicorn.error``, so attaching it again is a no-op."""
 
+_UNCAUGHT_EVENT: Final = "uncaught_exception"
+"""The CRITICAL event written for an exception that ends the process unlogged."""
+
+
+def _uncaught_fallback_line(exc_type: type[BaseException], error: BaseException) -> str:
+    """Return the JSON line written when an uncaught exception could not be logged.
+
+    It carries the event, the level, this module's logger name, a UTC timestamp, the
+    uncaught exception's class name and the logging failure's class name, each checked by
+    :func:`_safe_name`, and never either exception's text or traceback.
+    """
+    try:
+        error_type = _safe_name(exc_type.__name__)
+    # No-blind-except yields: a metaclass's __name__ can raise anything; fail closed.
+    except Exception:  # noqa: BLE001
+        error_type = "unknown"
+    line = {
+        "event": _UNCAUGHT_EVENT,
+        "level": "critical",
+        "logger": _safe_name(__name__),
+        "timestamp": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
+        "error_type": error_type,
+        "logging_error_type": _type_name(error),
+    }
+    return json.dumps(line, allow_nan=False)
+
+
+def _log_uncaught_exception(
+    exc_type: type[BaseException],
+    exc_value: BaseException,
+    exc_tb: TracebackType | None,
+) -> None:
+    """The :data:`sys.excepthook` :func:`install_excepthook` installs.
+
+    * An exception its owner already logged (:func:`logged_as` names an event, for example
+      ``api.startup_failed``) writes nothing more.
+    * ``KeyboardInterrupt`` goes to the hook that was installed before, so Ctrl-C in a
+      terminal reads as it always does.
+    * Any other exception is logged once as a CRITICAL ``uncaught_exception`` event with
+      its class (``error_type``) and its redacted, structured traceback.
+    * When that logging itself raises, one minimal JSON line naming only the two exception
+      classes is written to ``sys.stderr``. The previous hook is not called then: it would
+      print the exception's text unredacted.
+
+    The interpreter exits with status 1 afterwards, whatever this hook writes.
+
+    Args:
+        exc_type: The class of the uncaught exception.
+        exc_value: The uncaught exception.
+        exc_tb: Its traceback.
+    """
+    if logged_as(exc_value) is not None:
+        return
+    if issubclass(exc_type, KeyboardInterrupt):
+        previous = _STATE.previous_excepthook or sys.__excepthook__
+        previous(exc_type, exc_value, exc_tb)
+        return
+    try:
+        get_logger(__name__).critical(
+            _UNCAUGHT_EVENT,
+            error_type=exc_type.__name__,
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+    # No-blind-except yields: the pipeline already failed closed; report only the classes.
+    except Exception as error:  # noqa: BLE001
+        try:
+            sys.stderr.write(_uncaught_fallback_line(exc_type, error) + "\n")
+            sys.stderr.flush()
+        except OSError, ValueError, AttributeError:
+            # stderr itself is closed, broken or absent; nothing else can be written.
+            return
+
+
+def install_excepthook() -> None:
+    """Make an exception that ends the process a redacted JSON log line, not a raw traceback.
+
+    :func:`configure_logging` calls it, so every process that logs through this module has
+    it. Without it the interpreter's default hook prints the traceback of an uncaught
+    exception to stderr as plain text, unredacted, breaking the one-JSON-object-per-line
+    stream: for example a ``create_app()`` refusal, which uvicorn does not catch. With it:
+
+    * an exception its owner already logged in full (:func:`mark_logged`) writes nothing
+      more;
+    * ``KeyboardInterrupt`` is handed to the hook that was installed before;
+    * any other exception is written once as a CRITICAL ``uncaught_exception`` event,
+      with its class as ``error_type`` and its traceback rendered and redacted like every
+      other event's.
+
+    The interpreter still exits with status 1. Only the main thread's uncaught exceptions
+    reach :data:`sys.excepthook`.
+
+    Installing is idempotent: while the hook is installed a call changes nothing, so it is
+    never chained onto itself. The hook it hands ``KeyboardInterrupt`` to is always the one
+    present before the first call; a later call made after other code replaced the hook
+    installs it again in front of that same original hook.
+
+    Example::
+
+        install_excepthook()  # done by configure_logging(); harmless to repeat
+    """
+    with _STATE.lock:
+        current = sys.excepthook
+        if current is _log_uncaught_exception:
+            return
+        if _STATE.previous_excepthook is None:
+            _STATE.previous_excepthook = current
+        sys.excepthook = _log_uncaught_exception
+
 
 def _resolve_level(level: str) -> int:
     """Translate a level name such as ``"INFO"`` into its ``logging`` number.
@@ -1630,6 +1749,11 @@ def configure_logging(
     in full (:func:`mark_logged`): uvicorn logs every exception that leaves the application
     as "Exception in ASGI application", including one the API's catch-all handler has just
     logged with the same traceback, so each failure keeps one traceback.
+
+    :data:`sys.excepthook` is replaced through :func:`install_excepthook`, so an exception
+    that ends the process is written as one redacted CRITICAL ``uncaught_exception`` line,
+    or not at all when its owner already logged it (:func:`mark_logged`), instead of the
+    interpreter's raw traceback; ``KeyboardInterrupt`` keeps the previous hook.
 
     Calling it again reconfigures in place without duplicate handlers: while the handler
     it installed is still attached, its formatter and stream are swapped under the
@@ -1740,6 +1864,8 @@ def configure_logging(
             wrapper_class=structlog.stdlib.BoundLogger,
             cache_logger_on_first_use=True,
         )
+    # After the pipeline it writes through is in place; it takes the state lock itself.
+    install_excepthook()
 
     if settings_error is not None:
         get_logger(__name__).warning(

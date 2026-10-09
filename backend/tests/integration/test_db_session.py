@@ -42,6 +42,7 @@ from ads_engine.db.session import (
     get_engine,
     get_sessionmaker,
     json_dumps,
+    normalise_database_url,
     reset_engine,
     session_scope,
 )
@@ -385,7 +386,7 @@ def test_json_dumps_is_compact_and_keeps_non_ascii_text() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _normalise_url and _connect_options
+# normalise_database_url and _connect_options
 # ---------------------------------------------------------------------------
 
 
@@ -399,7 +400,7 @@ def test_json_dumps_is_compact_and_keeps_non_ascii_text() -> None:
 )
 def test_normalise_url_pins_the_psycopg_driver(raw: str) -> None:
     """Plain schemes are rewritten to postgresql+psycopg; everything else is kept."""
-    url = db_session._normalise_url(raw)
+    url = normalise_database_url(raw)
     assert url.drivername == "postgresql+psycopg"
     assert (url.username, url.password, url.host, url.port, url.database) == (
         "ads",
@@ -412,7 +413,7 @@ def test_normalise_url_pins_the_psycopg_driver(raw: str) -> None:
 
 def test_normalise_url_keeps_the_query_string() -> None:
     """Query parameters such as ``options`` survive normalisation."""
-    url = db_session._normalise_url("postgres://h/db?options=-c%20search_path%3Dx")
+    url = normalise_database_url("postgres://h/db?options=-c%20search_path%3Dx")
     assert url.drivername == "postgresql+psycopg"
     assert url.query == {"options": "-c search_path=x"}
 
@@ -429,7 +430,7 @@ def test_normalise_url_keeps_the_query_string() -> None:
 def test_normalise_url_rejects_any_other_driver_without_the_url(raw: str, driver: str) -> None:
     """Another backend or driver raises ValueError naming the driver, never the URL."""
     with pytest.raises(ValueError, match="must use the postgresql\\+psycopg driver") as excinfo:
-        db_session._normalise_url(raw)
+        normalise_database_url(raw)
     message = str(excinfo.value)
     assert repr(driver) in message
     assert "hunter2-secret" not in message
@@ -442,7 +443,7 @@ def test_normalise_url_rejects_any_other_driver_without_the_url(raw: str, driver
 def test_normalise_url_rejects_malformed_text_without_leaking_it(raw: str) -> None:
     """A malformed URL or port raises a fixed message with the parse error not chained."""
     with pytest.raises(ValueError, match="DATABASE_URL is not a valid") as excinfo:
-        db_session._normalise_url(raw)
+        normalise_database_url(raw)
 
     assert str(excinfo.value) == "DATABASE_URL is not a valid SQLAlchemy database URL"
     assert excinfo.value.__cause__ is None

@@ -11,7 +11,7 @@ Commands (``ads-engine <command> --help`` for each):
 ``ensure-admin``       Create or update the single admin login from ``APP_ADMIN_EMAIL`` and
                        ``APP_ADMIN_PASSWORD_HASH``, removing any other login; idempotent.
 ``sync --source S``    Run one source's sync jobs now, against its active dataset, and print the
-                       report as JSON.
+                       report as JSON; exits 0 only when every job ran and succeeded.
 ``analyze``            Compute a custom-window analysis run from stored data
                        (``--start YYYY-MM-DD --end YYYY-MM-DD``) under the shared analysis lock.
 ``seed-simulated``     Build, backfill and activate simulated datasets for every source, then
@@ -24,14 +24,23 @@ Exit codes: :data:`EXIT_OK` (0) success; :data:`EXIT_FAILURE` (1) a failure, inc
 expected domain error (configuration, settings validation, decision rejections and the
 connector errors ``AccessDenied``, ``TransientError`` and ``QueryDefect``); :data:`EXIT_USAGE`
 (2) a usage error, argparse's own or ours (an unparsable date, a window out of range, a
-missing ``alembic.ini`` or contracts directory); :data:`EXIT_LOCK_HELD` (3) another process
-holds the shared ``analysis`` lock.
+missing ``alembic.ini`` or contracts directory, or an empty, non-UTF-8 or never-entered
+``hash-password`` password); :data:`EXIT_LOCK_HELD` (3) another process holds the shared
+``analysis`` lock. ``sync`` exits 0 only when every job ran and succeeded,
+and 1 when no job ran (no active dataset, or a live dataset that may not be synced now) or
+any job failed, transient staleness and access denials included; the report says which.
 
-Streams: structured JSON logs go to **stderr** (``configure_logging(stream=sys.stderr)``), so
-stdout carries only command output: the password hash, JSON reports and written file paths.
-Neither stream ever carries a secret, a token or an email address. Usage errors are written
-before logging is configured, so they never repeat the supplied text: they name only the
-arguments, commands and choices the parser defines.
+Streams: once a command runs, **stderr** carries only JSON lines, one object per line: the
+structured logs (``configure_logging(stream=sys.stderr)``), one ``cli_error`` line per
+failure message (``{"event": "cli_error", "level": "error", "logger": "ads_engine.cli",
+"message": "ads-engine: …", "timestamp": "…Z"}``) and one ``cli_warning`` line, the same keys
+with ``"level": "warning"``, per note that is not a failure (each surface ``capture-fixtures``
+reports as not captured, which on its own leaves the exit 0). Both are written whatever
+``--log-level`` is. stdout carries only command output: the password hash, JSON reports and
+written file paths. Neither stream ever carries a secret, a token or an email address. The
+boundary is argparse: its usage errors are written before logging is configured and stay plain
+usage text, and they never repeat the supplied text: they name only the arguments, commands and
+choices the parser defines.
 
 Imports: the analysis, sync, connector, simulation and Alembic modules are imported inside the
 command that needs them, so ``hash-password`` runs in a minimal environment and ``--help``
@@ -65,7 +74,7 @@ from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from secrets import token_hex
-from typing import TYPE_CHECKING, Any, Final, NoReturn, Protocol, cast, overload
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Protocol, cast, overload
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode
 
 import httpx
@@ -104,13 +113,14 @@ EXIT_OK: Final = 0
 """The command succeeded."""
 
 EXIT_FAILURE: Final = 1
-"""The command failed: an expected domain error (one line on stderr) or an unexpected one
-(logged as ``cli_failed`` with its traceback, redacted, or naming the event that already
-logged that traceback)."""
+"""The command failed: an expected domain error (one ``cli_error`` JSON line on stderr) or an
+unexpected one (logged as ``cli_failed`` with its traceback, redacted, or naming the event that
+already logged that traceback, then one ``cli_error`` line)."""
 
 EXIT_USAGE: Final = 2
 """A usage error: argparse's own (its diagnostic names the argument, never the supplied value),
-or a bad date, an out-of-range window, or a missing ``alembic.ini`` or contracts directory."""
+or a bad date, an out-of-range window, a missing ``alembic.ini`` or contracts directory, or an
+empty, non-UTF-8 or never-entered ``hash-password`` password."""
 
 EXIT_LOCK_HELD: Final = 3
 """Another process holds the shared ``analysis`` lock (AAP 0.5.3: the CLI exits with 3)."""
@@ -172,13 +182,60 @@ def _emit_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), flush=True)
 
 
-def _error(message: str) -> None:
-    """Print one line to stderr: ``ads-engine: <message>``, whitespace collapsed.
+def _write_cli_line(level: Literal["error", "warning"], message: str) -> None:
+    """Write one ``cli_<level>`` JSON line to stderr carrying ``ads-engine: <message>``.
 
-    Messages the CLI writes itself are printed as written; text that comes from an exception
-    or a platform passes through :func:`_redacted` first.
+    The line has the keys of the configured log lines, sorted: ``event`` (``cli_error`` or
+    ``cli_warning``), ``level`` (``error`` or ``warning``), ``logger`` (``ads_engine.cli``),
+    ``message`` (the program prefix and ``message``, whitespace collapsed) and an ISO-8601 UTC
+    ``timestamp`` ending in ``Z``, so stderr stays one JSON object per line. It is written
+    directly, not logged: the message is part of the command's outcome, so ``--log-level``
+    never hides it, and the log redaction would rewrite the CLI's own hints (``make init
+    ADMIN_PASSWORD=…`` reads as a credential assignment). Messages the CLI writes itself are
+    therefore kept as written; text that comes from an exception or a platform passes through
+    :func:`_redacted` at the call site first.
+
+    Args:
+        level: ``error`` for a failure (:func:`_error`), ``warning`` for a note
+            (:func:`_warning`); the event is ``cli_`` followed by it.
+        message: The text, without the program prefix.
     """
-    print(f"{_PROG}: {' '.join(message.split())}", file=sys.stderr, flush=True)
+    line = {
+        "event": f"cli_{level}",
+        "level": level,
+        # Spelled out: `python -m ads_engine.cli` runs this module as `__main__`.
+        "logger": "ads_engine.cli",
+        "message": f"{_PROG}: {' '.join(message.split())}",
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    print(json.dumps(line, sort_keys=True), file=sys.stderr, flush=True)
+
+
+def _error(message: str) -> None:
+    """Write one ``cli_error`` line (``level`` ``error``) to stderr: a failure of the command.
+
+    Every call is followed by a non-zero exit. The line's shape and why it is written
+    directly are in :func:`_write_cli_line`.
+
+    Args:
+        message: The failure, without the program prefix.
+    """
+    _write_cli_line("error", message)
+
+
+def _warning(message: str) -> None:
+    """Write one ``cli_warning`` line (``level`` ``warning``) to stderr: a note, not a failure.
+
+    It reports something the command left undone that is not itself a failure: a surface
+    ``capture-fixtures`` did not capture, with why (the platform had no data for it, or an
+    earlier failure, reported in its own ``cli_error`` line, kept it from being sent). On its
+    own it never makes the exit non-zero. The line has the shape of :func:`_error`'s and is
+    written the same direct way (:func:`_write_cli_line`).
+
+    Args:
+        message: The note, without the program prefix.
+    """
+    _write_cli_line("warning", message)
 
 
 def _redacted(text: str) -> str:
@@ -277,17 +334,34 @@ def _as_source(value: str) -> Source:
 _DATE_FORMAT_REASON: Final = "not a date in YYYY-MM-DD form"
 """Why :func:`_iso_date` rejected a value; argparse prefixes the argument name."""
 
+_EXTENDED_CALENDAR_DATE_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+"""The one date form :func:`_iso_date` accepts; ``[0-9]`` refuses fullwidth and other digits."""
+
 
 def _iso_date(text: str) -> date:
-    """Parse an argparse ``YYYY-MM-DD`` value with :meth:`datetime.date.fromisoformat`.
+    """Parse an argparse date given in the ISO 8601 extended calendar form ``YYYY-MM-DD``.
+
+    Only that form is accepted, with surrounding whitespace ignored. The text must match
+    :data:`_EXTENDED_CALENDAR_DATE_RE` before :meth:`datetime.date.fromisoformat` reads it,
+    because ``fromisoformat`` alone also accepts the basic form (``20260901``) and week dates
+    (``2026-W37-4``). ``fromisoformat`` still rejects impossible dates such as ``2026-02-30``.
+
+    Args:
+        text: The value given to ``--start`` or ``--end``.
+
+    Returns:
+        The calendar date the text names.
 
     Raises:
-        argparse.ArgumentTypeError: When the text is not an ISO calendar date; argparse then
-            exits with :data:`EXIT_USAGE`. The message is :data:`_DATE_FORMAT_REASON` and never
-            repeats the text, which may be an email address or a pasted credential.
+        argparse.ArgumentTypeError: When the text is not a valid date in that form; argparse
+            then exits with :data:`EXIT_USAGE`. The message is :data:`_DATE_FORMAT_REASON` and
+            never repeats the text, which may be an email address or a pasted credential.
     """
+    value = text.strip()
+    if _EXTENDED_CALENDAR_DATE_RE.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(_DATE_FORMAT_REASON)
     try:
-        return date.fromisoformat(text.strip())
+        return date.fromisoformat(value)
     except ValueError:
         raise argparse.ArgumentTypeError(_DATE_FORMAT_REASON) from None
 
@@ -303,17 +377,41 @@ def _read_password() -> str:
     On an interactive terminal the password is read with :func:`getpass.getpass` instead, so
     it is not echoed; the prompt goes to the terminal, never to stdout.
 
+    The password must be valid UTF-8, the encoding its hash is computed over. Undecodable
+    input either fails the read (a strict stream) or arrives as lone surrogates that cannot
+    be encoded (``surrogateescape``: the C, POSIX and C.UTF-8 locales and Python's UTF-8
+    mode); both are rejected here, before the hasher sees them. No message repeats any part
+    of the password.
+
+    Returns:
+        The password, non-empty and encodable as UTF-8.
+
     Raises:
-        _UsageError: When the password is empty.
+        _UsageError: When end of input arrives at the prompt before a line is entered, when
+            the password is not valid UTF-8, or when it is empty.
     """
     if sys.stdin.isatty():
-        password = getpass.getpass("Password: ")
+        not_utf8 = "the password entered is not valid UTF-8"
+        try:
+            password = getpass.getpass("Password: ")
+        except EOFError:
+            raise _UsageError("no password was entered") from None
+        except UnicodeDecodeError:
+            raise _UsageError(not_utf8) from None
     else:
-        password = sys.stdin.read()
+        not_utf8 = "the password read from stdin is not valid UTF-8"
+        try:
+            password = sys.stdin.read()
+        except UnicodeDecodeError:
+            raise _UsageError(not_utf8) from None
         if password.endswith("\r\n"):
             password = password[:-2]
         elif password.endswith("\n"):
             password = password[:-1]
+    try:
+        password.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _UsageError(not_utf8) from None
     if not password:
         raise _UsageError("the password read from stdin is empty")
     return password
@@ -326,6 +424,13 @@ def _cmd_hash_password(_args: argparse.Namespace) -> int:
     parameters ``api/security.py`` verifies with, so a freshly initialised admin never needs
     a rehash. Only the hash and a newline reach stdout; ``make init`` captures it into
     ``.env`` as ``APP_ADMIN_PASSWORD_HASH``. No settings are loaded and no database is used.
+
+    Returns:
+        :data:`EXIT_OK` once the hash is printed.
+
+    Raises:
+        _UsageError: From :func:`_read_password`, for an empty, non-UTF-8 or never-entered
+            password; :func:`main` prints its message and exits with :data:`EXIT_USAGE`.
     """
     password = _read_password()
     print(PasswordHasher().hash(password), flush=True)
@@ -345,7 +450,10 @@ def _cmd_migrate(_args: argparse.Namespace) -> int:
     never placed in the Alembic config) and drives the async engine with ``asyncio.run``, so
     this runs synchronously, outside any event loop. ``configure_logger`` is switched off, so
     the ini's logging sections never replace the structlog JSON logging. A database already
-    at head is left unchanged, which makes the command idempotent.
+    at head is left unchanged, which makes the command idempotent. Concurrent runs against
+    one database are serialised by ``migrations/env.py``'s advisory lock: a later run logs
+    that it is waiting, then finds the database at head and changes nothing, so two
+    ``migrate`` one-shots started together both exit 0.
 
     Raises:
         _UsageError: When ``alembic.ini`` is not in the working directory.
@@ -549,22 +657,42 @@ async def _sync(source: Source) -> int:
     mode and reason, never a credential.
 
     Returns:
-        :data:`EXIT_FAILURE` when a job failed on a defect: a ``QueryDefect``, or a database
-        integrity violation (the job's ``integrity`` in the report names its kind, SQLSTATE,
-        table and constraint); :data:`EXIT_OK` otherwise, including when transient errors
-        left datasets stale (the report says so).
+        :data:`EXIT_OK` only when every job ran and succeeded (``report.ok``). Otherwise
+        :data:`EXIT_FAILURE`, with the report printed and one line on stderr saying why:
+
+        * a job failed on a defect: a ``QueryDefect``, or a database integrity violation (the
+          job's ``integrity`` in the report names its kind, SQLSTATE, table and constraint);
+        * no job ran: the source has no active dataset yet, or its live dataset may not be
+          synced now; the line carries the report's ``reason``;
+        * jobs failed otherwise (a transient error left their datasets stale, access was
+          denied, or the dataset could not be written): the line names each failed job and
+          its disposition, never the error text, and the failed datasets keep their last
+          good data.
     """
     from ads_engine.sync.jobs import run_source_jobs
 
     report = await run_source_jobs(source, trigger="manual")
     _emit_json(report.to_json())
+    if report.ok:
+        return EXIT_OK
     if report.has_defect:
         _error(
             f"sync {source}: a job failed on a defect (query or data integrity); "
             "see the report and the log"
         )
-        return EXIT_FAILURE
-    return EXIT_OK
+    elif report.reason is not None:
+        _error(f"sync {source}: no job ran: {_redacted(report.reason)}; see the report")
+    else:
+        failed = [result for result in report.results if result.status != "succeeded"]
+        total = len(report.results)
+        # Job names and disposition codes only: a job's error text stays in the report.
+        outcomes = ", ".join(f"{result.job}: {result.disposition or 'failed'}" for result in failed)
+        _error(
+            f"sync {source}: {len(failed)} of {total} job{'s' if total != 1 else ''} failed "
+            f"({outcomes}); the failed datasets keep their last good data; "
+            "see the report and the log"
+        )
+    return EXIT_FAILURE
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
@@ -2501,8 +2629,11 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
         captured with its data reason (such as no sponsored LinkedIn lead to re-fetch, or a
         Google query that answered with no rows), no call failed, no capture held a
         configured secret, and every capture satisfies its contract. A surface reported as
-        not captured is counted in ``capture_fixtures_finished`` ``skipped`` and does not by
-        itself make the exit non-zero.
+        not captured gets one ``cli_warning`` line (:func:`_warning`), not a ``cli_error``
+        line, is counted in ``capture_fixtures_finished`` ``skipped`` and does not by itself
+        make the exit non-zero. Every refusal and failure (a failed call, a capture left
+        unwritten, a contract break, nothing captured) is one ``cli_error`` line
+        (:func:`_error`).
         :data:`EXIT_FAILURE` when a refusal applies, a call failed (a Google call the shared
         budget refused or could not reserve included), nothing was captured, a capture still
         held a configured secret after redaction (that capture is not written), or a capture
@@ -2555,7 +2686,7 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
     for failure in run.failures:
         _error(f"capture-fixtures {source}: {_redacted(failure)}")
     for skipped in run.skipped:
-        _error(f"capture-fixtures {source}: not captured: {skipped}")
+        _warning(f"capture-fixtures {source}: not captured: {skipped}")
     for problem in problems:
         _error(f"capture-fixtures {source}: capture breaks its contract: {_redacted(problem)}")
     log.info(
@@ -2729,6 +2860,204 @@ class _RedactingArgumentParser(argparse.ArgumentParser):
         return generic
 
 
+# The `--help` epilogs: each command's environment, exit codes and an example. The parsers use
+# argparse.RawDescriptionHelpFormatter, which prints descriptions and epilogs verbatim, so their
+# line breaks and alignment hold; every line stays within 79 columns of an 80-column terminal.
+_HELP_EPILOG: Final = """\
+exit codes:
+  0  success
+  1  failure: the command failed or did no work; its message says why
+  2  usage error: argparse's, or one the command detects (see its --help)
+  3  another process holds the shared analysis lock (analyze, seed-simulated)
+
+environment:
+  DATABASE_URL  the PostgreSQL URL (postgresql+psycopg://...), read by every
+                command except hash-password (capture-fixtures: google only)
+  DATA_MODE     auto (the default) or simulated, which forces every source to
+                simulated data
+  live credentials, per source (a source without them is simulated):
+    google    N8N_GOOGLE_ADS_WEBHOOK_URL, N8N_WEBHOOK_SECRET and
+              GOOGLE_ADS_CUSTOMER_ID
+    linkedin  LINKEDIN_AD_ACCOUNT_IDS plus either LINKEDIN_CLIENT_ID,
+              LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN, or
+              LINKEDIN_ACCESS_TOKEN
+    hubspot   HUBSPOT_ACCESS_TOKEN
+  config/*.yaml are read from ./config, else ../config, relative to the
+  working directory; no variable selects the directory.
+
+output:
+  stdout carries only command output: the password hash, JSON reports and
+  written file paths. stderr carries JSON log lines, one object per line,
+  including the failing command's one-line message (event "cli_error", its
+  text in "message"). argparse usage errors are plain text.
+
+examples:
+  printf '%s' 'correct horse' | ads-engine hash-password
+  cd backend && ads-engine migrate && ads-engine ensure-admin
+  ads-engine sync --source google
+  ads-engine analyze --start 2026-09-01 --end 2026-09-28
+
+Run 'ads-engine COMMAND --help' for each command's environment, exit codes and
+an example.
+"""
+
+_HASH_EPILOG: Final = """\
+input:
+  the password is read from stdin, less one trailing newline (LF or CRLF); on
+  a terminal it is prompted for without echo
+
+environment:
+  none: no settings are loaded and no database is used, so make init can run
+  it before .env exists and store the hash as APP_ADMIN_PASSWORD_HASH
+
+exit codes:
+  0  the hash was printed to stdout, and nothing else
+  1  an unexpected error
+  2  the password is empty, is not valid UTF-8, or none was entered at the
+     prompt
+
+example:
+  printf '%s' 'correct horse' | ads-engine hash-password
+"""
+
+_MIGRATE_EPILOG: Final = """\
+environment:
+  DATABASE_URL  the database to upgrade
+
+Run it where alembic.ini is: backend/ on the host, /app in the image. A
+database already at head is left unchanged, so the command is idempotent.
+Concurrent runs on one database are serialised: a later run waits for the
+running one, then finds the schema at head and changes nothing.
+
+exit codes:
+  0  the schema is at the newest revision
+  1  the upgrade failed (the database is unreachable, for example)
+  2  alembic.ini is not in the working directory
+
+example:
+  cd backend && ads-engine migrate
+"""
+
+_ENSURE_ADMIN_EPILOG: Final = """\
+environment:
+  DATABASE_URL             the database holding the login
+  APP_ADMIN_EMAIL          the admin's email (default admin@example.com)
+  APP_ADMIN_PASSWORD_HASH  the argon2id hash written by make init, or printed
+                           by 'ads-engine hash-password'
+
+The hash is checked before anything is written, and it is never shown.
+
+exit codes:
+  0  the admin login matches the environment
+  1  APP_ADMIN_PASSWORD_HASH is unset or not a usable argon2 hash, a setting
+     is invalid, or the database write failed
+
+example:
+  cd backend && ads-engine migrate && ads-engine ensure-admin
+"""
+
+_SYNC_EPILOG: Final = """\
+environment:
+  DATABASE_URL   the database holding the source's active dataset
+  DATA_MODE      a live dataset is synced only under auto (the default)
+  config/*.yaml  read from ./config, else ../config
+  credentials    the source's live credentials (see 'ads-engine --help'),
+                 needed when its active dataset is live; google also reads
+                 GOOGLE_DAILY_CALL_BUDGET (default 1000 webhook calls per
+                 24 h) and N8N_WEBHOOK_SECRET_HEADER (default
+                 X-Webhook-Secret)
+
+The JSON report on stdout lists each job's outcome, or the reason none ran.
+
+exit codes:
+  0  every job ran and succeeded
+  1  no job ran (the source has no active dataset yet, or its live dataset may
+     not be synced now: DATA_MODE=simulated or credentials missing), or any
+     job failed: on a transient error (the datasets stay stale with their last
+     good data), access denied, a defect or otherwise; the report says which
+
+example:
+  ads-engine sync --source linkedin
+"""
+
+_ANALYZE_EPILOG: Final = """\
+environment:
+  DATABASE_URL   the database holding the synced data and the runs
+  config/*.yaml  read from ./config, else ../config; window.max_days is in
+                 config/thresholds.yaml
+
+window limits:
+  START and END are calendar dates in exactly YYYY-MM-DD form, applied to each
+  source's native days. END is no later than the default window end: the
+  earlier of yesterday in the Google account's time zone and yesterday UTC.
+  The span, START to END inclusive, is 1 to window.max_days days (180 as
+  shipped). The run is kind custom even when it equals the default window.
+
+exit codes:
+  0  the run succeeded; its summary is printed as JSON
+  1  the run failed, or the configuration or database could not be read
+  2  a date is not in YYYY-MM-DD form, or the window is out of range
+  3  another process holds the shared analysis lock; no run was started
+
+example:
+  ads-engine analyze --start 2026-09-01 --end 2026-09-28
+"""
+
+_SEED_SIMULATED_EPILOG: Final = """\
+environment:
+  DATABASE_URL   the database to seed
+  config/*.yaml  read from ./config, else ../config
+  No credentials are needed: every source is seeded with simulated data,
+  whatever DATA_MODE says.
+
+A source whose active dataset is already simulated keeps it. The JSON report
+on stdout gives each source's dataset and the default-window run.
+
+exit codes:
+  0  every source is seeded and the default-window run succeeded
+  1  a source failed to bootstrap (the others are seeded and analysed), or
+     the run failed
+  3  another process holds the shared analysis lock; the datasets stay seeded
+     and no run was computed
+
+example:
+  cd backend && ads-engine seed-simulated
+"""
+
+_CAPTURE_FIXTURES_EPILOG: Final = """\
+environment:
+  DATA_MODE      must not be simulated: only live traffic is recorded
+  DATABASE_URL   google only: each webhook call is reserved in the shared call
+                 budget (GOOGLE_DAILY_CALL_BUDGET, default 1000 per 24 h)
+  config/*.yaml  hubspot only, read from ./config, else ../config
+  the source's live credentials:
+    google    N8N_GOOGLE_ADS_WEBHOOK_URL, N8N_WEBHOOK_SECRET and
+              GOOGLE_ADS_CUSTOMER_ID (header name N8N_WEBHOOK_SECRET_HEADER,
+              default X-Webhook-Secret)
+    linkedin  LINKEDIN_AD_ACCOUNT_IDS plus either LINKEDIN_CLIENT_ID,
+              LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN, or
+              LINKEDIN_ACCESS_TOKEN as the alternative
+    hubspot   HUBSPOT_ACCESS_TOKEN
+
+Run it from backend/ (or /app in the image). It sends one minimal live request
+per contract surface, writes the redacted exchanges to
+tests/contracts/{source}/captured/ and prints each written path on stdout.
+
+exit codes:
+  0  every surface was captured, or reported as not captured in a
+     cli_warning line on stderr (it had no data to read, for example), and
+     every capture satisfies its contract
+  1  refused before sending (DATA_MODE=simulated, credentials missing, an
+     unsafe output directory, or google's call budget unreadable), a call
+     failed, nothing was captured, a capture still held a secret after
+     redaction (it is not written), or a capture breaks its contract
+  2  tests/contracts/{source}/ is not under the working directory
+
+example:
+  cd backend && DATA_MODE=auto ads-engine capture-fixtures --source hubspot
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``ads-engine`` argument parser: global options and the seven commands.
 
@@ -2736,15 +3065,22 @@ def build_parser() -> argparse.ArgumentParser:
     errors name arguments, commands and choices but never the supplied text
     (:class:`_RedactingArgumentParser`), and exit with :data:`EXIT_USAGE`.
 
+    Every parser's ``--help`` ends with an epilog naming the environment it reads, its exit
+    codes and an example (:data:`_HELP_EPILOG` and the per-command epilogs). Each parser uses
+    :class:`argparse.RawDescriptionHelpFormatter`, which sub-parsers do not inherit, so the
+    descriptions and epilogs print with their own line breaks; argument help is still wrapped.
+
     Returns:
         The parser.
     """
     parser = _RedactingArgumentParser(
         prog=_PROG,
         description=(
-            "Ads Action Engine administration: password hashing, migrations, the admin login, "
-            "syncs, analysis runs, simulated seeding and live contract captures."
+            "Ads Action Engine administration: password hashing, migrations, the admin\n"
+            "login, syncs, analysis runs, simulated seeding and live contract captures."
         ),
+        epilog=_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
@@ -2752,39 +3088,50 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_LOG_LEVELS,
         default="INFO",
         type=str.upper,
-        help="level of the JSON log lines written to stderr (default: INFO)",
+        help=(
+            "level of the JSON log lines written to stderr (default: INFO); a failing "
+            "command's cli_error line is written at every level"
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     hash_password = commands.add_parser(
         "hash-password",
         help="print the argon2id hash of the password read from stdin",
-        description="Read a password from stdin (one trailing newline is dropped) and print "
-        "only its argon2id hash. Loads no settings and uses no database.",
+        description="Read a password from stdin (one trailing newline is dropped) and print only\n"
+        "its argon2id hash. Loads no settings and uses no database.",
+        epilog=_HASH_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     hash_password.set_defaults(handler=_cmd_hash_password)
 
     migrate = commands.add_parser(
         "migrate",
         help="upgrade the database schema to the newest revision",
-        description="Run `alembic upgrade head` with backend/alembic.ini from the working "
+        description="Run `alembic upgrade head` with backend/alembic.ini from the working\n"
         "directory (backend/ on the host, /app in the image). Idempotent.",
+        epilog=_MIGRATE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     migrate.set_defaults(handler=_cmd_migrate)
 
     ensure_admin = commands.add_parser(
         "ensure-admin",
         help="create or update the admin login from the environment",
-        description="Upsert the admin from APP_ADMIN_EMAIL and APP_ADMIN_PASSWORD_HASH and "
+        description="Upsert the admin from APP_ADMIN_EMAIL and APP_ADMIN_PASSWORD_HASH and\n"
         "remove any other login. Idempotent.",
+        epilog=_ENSURE_ADMIN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ensure_admin.set_defaults(handler=_cmd_ensure_admin)
 
     sync = commands.add_parser(
         "sync",
         help="run one source's sync jobs now and print the report",
-        description="Run the source's sync jobs against its active dataset (live or "
-        "simulated) and print the JSON report.",
+        description="Run the source's sync jobs against its active dataset (live or simulated)\n"
+        "and print the JSON report.",
+        epilog=_SYNC_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sync.add_argument("--source", required=True, choices=SOURCES, help="the source to sync")
     sync.set_defaults(handler=_cmd_sync)
@@ -2793,7 +3140,9 @@ def build_parser() -> argparse.ArgumentParser:
         "analyze",
         help="compute a custom-window analysis run from stored data",
         description="Compute a custom run over [START, END] (calendar dates on each source's "
-        "native days) under the shared analysis lock. Exits 3 while another run holds it.",
+        "native\ndays) under the shared analysis lock. Exits 3 while another run holds it.",
+        epilog=_ANALYZE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     analyze.add_argument("--start", required=True, type=_iso_date, help="first date, YYYY-MM-DD")
     analyze.add_argument("--end", required=True, type=_iso_date, help="last date, YYYY-MM-DD")
@@ -2802,16 +3151,20 @@ def build_parser() -> argparse.ArgumentParser:
     seed = commands.add_parser(
         "seed-simulated",
         help="seed simulated datasets for every source and run the default analysis",
-        description="Build, backfill and activate a simulated dataset per source (an active "
+        description="Build, backfill and activate a simulated dataset per source (an active\n"
         "simulated one is kept), then compute the default-window run.",
+        epilog=_SEED_SIMULATED_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     seed.set_defaults(handler=_cmd_seed_simulated)
 
     capture = commands.add_parser(
         "capture-fixtures",
         help="record redacted live contract captures for one source",
-        description="Send one minimal live request per contract surface and write the "
-        "redacted exchanges to tests/contracts/{source}/captured/. Run from backend/.",
+        description="Send one minimal live request per contract surface and write the redacted\n"
+        "exchanges to tests/contracts/{source}/captured/. Run from backend/.",
+        epilog=_CAPTURE_FIXTURES_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     capture.add_argument("--source", required=True, choices=SOURCES, help="the source to capture")
     capture.set_defaults(handler=_cmd_capture_fixtures)

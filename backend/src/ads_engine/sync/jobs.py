@@ -17,9 +17,10 @@ Job                      What it reads and writes                               
                          discrepancy check, all in one transaction.
 :class:`MetricsSyncJob`  Daily facts on each source's native dates: incremental      6 h
                          (trailing 3 days), restatement (Google 30, LinkedIn 14      03:00
-                         days) or backfill (``BACKFILL_DAYS``, LinkedIn capped at
-                         180). Upserts overwrite, so restated data wins, and a
-                         complete re-fetch drops the rows it no longer returns.
+                         days) or backfill (``BACKFILL_DAYS``, capped at 180 for
+                         every source). Upserts overwrite, so restated data wins,
+                         and a complete re-fetch drops the rows it no longer
+                         returns.
 :class:`SegmentSyncJob`  LinkedIn demographic aggregates for each exact preset       04:00
                          window ending on the default window end; never summed from
                          daily rows. A complete re-fetch drops the values it no
@@ -804,10 +805,12 @@ class SourceSyncReport:
 
     @property
     def has_defect(self) -> bool:
-        """Whether a job failed on a defect (the CLI's non-zero exit).
+        """Whether a job failed on a defect, which ``ads-engine sync`` names in its message.
 
         A defect is a ``QueryDefect`` the connectors raised, or a database integrity
         violation that ended the job (:attr:`JobResult.integrity`); neither is retried.
+        ``ads-engine sync`` exits 1 for every report that is not :attr:`ok`, a defect or not;
+        this property only chooses the failure message it prints.
         """
         return any(
             result.disposition == "defect" or result.integrity is not None
@@ -929,16 +932,19 @@ def _zone(name: str | None) -> ZoneInfo:
         return ZoneInfo(_UTC_ZONE)
 
 
-def _span_days(settings: Settings, source: Source) -> int:
-    """The backfill span in days: ``BACKFILL_DAYS``, LinkedIn capped at its daily retention."""
-    if source == "linkedin":
-        return min(settings.backfill_days, LINKEDIN_RETENTION_DAYS)
-    return settings.backfill_days
+def _span_days(settings: Settings) -> int:
+    """The backfill span in days of every source: ``BACKFILL_DAYS`` capped at 180.
+
+    The cap is LinkedIn's 6-month daily retention (:data:`LINKEDIN_RETENTION_DAYS`), applied
+    to Google and HubSpot too: the initial backfill is 180 days at most (AAP 0.3.2), and a
+    longer one would read days no analysis window can reach (``window.max_days``).
+    """
+    return min(settings.backfill_days, LINKEDIN_RETENTION_DAYS)
 
 
 def _crm_span_days(settings: Settings) -> int:
     """The CRM scope in days: the lead staging range, ``BACKFILL_DAYS`` capped at 180."""
-    return min(settings.backfill_days, LINKEDIN_RETENTION_DAYS)
+    return _span_days(settings)
 
 
 def _failure_text(error: ConnectorError) -> str:
@@ -3323,13 +3329,14 @@ def _metrics_range(
     """Return the native ``[start, end]`` a metrics run reads for one freshness dataset.
 
     ``incremental``: the trailing :data:`INCREMENTAL_DAYS` days ending native today;
-    ``restatement``: :data:`RESTATEMENT_DAYS`; ``backfill``: ``BACKFILL_DAYS`` (LinkedIn capped
-    at its 180-day daily retention). With ``repair``, when the dataset's stored row needs
-    repair (deferred or interrupted pages), the start widens to the row's ``covered_from`` so
-    the shortfall is re-read and the row can turn complete
-    (:func:`~ads_engine.sync.freshness.needs_repair`). LinkedIn always repairs this way; a
-    Google dataset does only when its row holds no usable checkpoint, because a checkpoint's
-    unread scopes are read first instead (:class:`MetricsSyncJob`).
+    ``restatement``: :data:`RESTATEMENT_DAYS`; ``backfill``: ``BACKFILL_DAYS`` capped at 180
+    days for every source (:func:`_span_days`). With ``repair``, when the dataset's stored row
+    needs repair (deferred or interrupted pages), the start widens to the row's
+    ``covered_from`` so the shortfall is re-read and the row can turn complete
+    (:func:`~ads_engine.sync.freshness.needs_repair`). LinkedIn always repairs this way, never
+    reaching past its 180-day daily retention; a Google dataset does only when its row holds no
+    usable checkpoint, because a checkpoint's unread scopes are read first instead
+    (:class:`MetricsSyncJob`).
     """
     match kind:
         case "incremental":
@@ -3337,7 +3344,7 @@ def _metrics_range(
         case "restatement":
             days = RESTATEMENT_DAYS[source]
         case "backfill":
-            days = _span_days(settings, source)
+            days = _span_days(settings)
     start = today - timedelta(days=days - 1)
     if repair and freshness.needs_repair(row) and row is not None and row.covered_from is not None:
         start = min(start, row.covered_from)
@@ -4935,7 +4942,7 @@ class LeadSyncJob(_JobBase):
         async with ctx.sessionmaker() as session:
             row = (await freshness.load_freshness(session, ctx.dataset_id)).get(name)
             known = await lead_match.known_versions(session, ctx.dataset_id)
-        earliest = ctx.now - timedelta(days=_span_days(ctx.settings, "linkedin"))
+        earliest = ctx.now - timedelta(days=_span_days(ctx.settings))
         if self.backfill or row is None or row.last_success_at is None:
             start = earliest
         else:
@@ -6333,16 +6340,17 @@ async def backfill_dataset(
     """Backfill a building primary dataset: the contract ``sync/mode.py`` builds call.
 
     By the dataset's source (every job of the building dataset with ``active=False``, so no
-    analysis request; the activation queues one):
+    analysis request; the activation queues one). The backfill range is ``BACKFILL_DAYS``
+    capped at 180 days, for every source (:func:`_span_days`):
 
     * **Google**: entities (the first entity sync writes the baseline), then metrics over
-      ``BACKFILL_DAYS``.
-    * **LinkedIn**: entities, metrics (capped at 180 days), segments and leads over the
-      backfill range. Simulated: then the companion CRM dataset's sync with
-      ``backfill=True``. Live: then one matching pass of this dataset's leads in HubSpot's
-      active primary, so every staged row is attempted before the dataset activates, and on
-      success a CRM sync of that primary, so the new matches' evidence is read too. That
-      primary is active, so the sync's success queues its own analysis request.
+      the backfill range.
+    * **LinkedIn**: entities, metrics, segments and leads over the backfill range.
+      Simulated: then the companion CRM dataset's sync with ``backfill=True``. Live: then one
+      matching pass of this dataset's leads in HubSpot's active primary, so every staged row
+      is attempted before the dataset activates, and on success a CRM sync of that primary,
+      so the new matches' evidence is read too. That primary is active, so the sync's success
+      queues its own analysis request.
     * **HubSpot** primary: the CRM sync with ``backfill=True`` (``sync/mode.py`` staged the
       rows before calling this).
 

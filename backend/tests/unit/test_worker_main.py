@@ -9,10 +9,12 @@ database, a real signal, a sleep or the real scheduler:
   ``add_signal_handler`` is replaced by a recorder, so the real installation path runs and
   the registered stop callback is invoked as the loop invokes it when a signal arrives:
   graceful stop, a duplicate stop, external cancellation with and without a stop, an invalid
-  configuration from ``startup``, a failure before the scheduler task is awaited, and a
-  scheduler that returns;
+  configuration at process start (stubbed, and from the real loader reading a broken copy of
+  ``config/``) that exits before any scheduler exists, an invalid configuration from
+  ``startup``, a failure before the scheduler task is awaited, and a scheduler that returns;
 * ``main``: invalid settings, ``_run``'s exit code and a fatal error mapped to the process
-  exit, with ``configure_logging`` and ``_run`` replaced, so nothing is launched.
+  exit, with ``configure_logging`` and ``_run`` replaced, so nothing is launched; and the
+  invalid-settings line through the real logging pipeline, as one JSON object on stdout.
 
 Every wait on the code under test is bounded by :data:`STEP_TIMEOUT`, so a regression fails
 fast instead of hanging. The worker's ``worker_fatal`` ownership cases are in
@@ -20,13 +22,18 @@ fast instead of hanging. The worker's ``worker_fatal`` ownership cases are in
 """
 
 import asyncio
+import json
+import shutil
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import cast
+from pathlib import Path
+from typing import Any, NoReturn, cast
 
 import pytest
+import structlog
+import yaml
 from structlog.testing import capture_logs
 from structlog.typing import EventDict
 
@@ -44,9 +51,26 @@ INSTALLED = ["add SIGTERM", "add SIGINT"]
 REMOVED = ["remove SIGTERM", "remove SIGINT"]
 STOPPED: EventDict = {"event": "worker_stopped", "log_level": "info"}
 
-# Rejected by Settings validation; neither may appear in what the worker writes to stderr.
+REPO_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+"""The shipped ``config/`` directory, copied and broken by the process-start tests."""
+
+# Rejected by Settings validation; neither may appear in anything the worker writes or logs.
 SENTINEL_WEBHOOK_URL = "http://sentinel-workflow.example.invalid/webhook/do-not-echo"
 SENTINEL_CUSTOMER_ID = "SENTINEL-CUSTOMER-DO-NOT-ECHO"
+
+# The `errors` of `worker_settings_invalid` for BACKFILL_DAYS=0 and the two sentinels above.
+INVALID_ENVIRONMENT_ERRORS = [
+    {"variable": "BACKFILL_DAYS", "problem": "Input should be greater than or equal to 1"},
+    {
+        "variable": "N8N_GOOGLE_ADS_WEBHOOK_URL",
+        "problem": "Value error, N8N_GOOGLE_ADS_WEBHOOK_URL must use https:// unless it is a "
+        "localhost or 127.0.0.1 URL",
+    },
+    {
+        "variable": "GOOGLE_ADS_CUSTOMER_ID",
+        "problem": "Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits",
+    },
+]
 
 Handler = Callable[..., object]
 
@@ -581,6 +605,130 @@ async def test_an_external_cancellation_after_a_stop_signal_is_raised_not_a_grac
     assert captured == [_stopping(sig), STOPPED]
 
 
+def _scheduler_tasks() -> list[asyncio.Task[object]]:
+    """The running loop's tasks named :data:`~ads_engine.worker.main.SCHEDULER_TASK_NAME`."""
+    return [
+        task for task in asyncio.all_tasks() if task.get_name() == worker_main.SCHEDULER_TASK_NAME
+    ]
+
+
+def _config_without_the_default_preset(base: Path) -> Path:
+    """Copy the shipped ``config/*.yaml`` into ``base/config``, dropping the default preset.
+
+    ``window.default_days`` is removed from ``window.presets`` in ``thresholds.yaml``, which
+    the real loader rejects; every other file is copied unchanged.
+
+    Returns:
+        The broken copy's directory, ``base/config``.
+    """
+    directory = base / "config"
+    directory.mkdir()
+    sources = sorted(REPO_CONFIG_DIR.glob("*.yaml"))
+    assert [source.name for source in sources] == [
+        "content_assets.yaml",
+        "hubspot_mapping.yaml",
+        "thresholds.yaml",
+    ]
+    for source in sources:
+        shutil.copyfile(source, directory / source.name)
+    thresholds_file = directory / "thresholds.yaml"
+    tree: dict[str, Any] = yaml.safe_load(thresholds_file.read_text(encoding="utf-8"))
+    window: dict[str, Any] = tree["window"]
+    default_days = window["default_days"]
+    assert default_days in window["presets"]
+    window["presets"] = [days for days in window["presets"] if days != default_days]
+    thresholds_file.write_text(yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
+    return directory
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("key", ["window.presets", None], ids=["key", "whole-file"])
+async def test_an_invalid_configuration_at_process_start_exits_1_before_any_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    lifetime: Lifetime,
+    captured: list[EventDict],
+    key: str | None,
+) -> None:
+    signals = _record_loop_signals(monkeypatch, lifetime)
+    error = ConfigError("thresholds.yaml", key, "must contain window.default_days (28)")
+    loads: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class InvalidConfiguration:
+        """The worker's ``Thresholds``, whose load fails as an invalid ``config/`` does."""
+
+        @staticmethod
+        def load(*args: object, **kwargs: object) -> NoReturn:
+            loads.append((args, kwargs))
+            raise error
+
+    monkeypatch.setattr(worker_main, "Thresholds", InvalidConfiguration)
+
+    async with _running(Settings()) as run:
+        exit_code = await _bounded(run)
+        assert _scheduler_tasks() == []
+
+    assert exit_code == worker_main.EXIT_FAILURE
+    # Loaded once, with no path: the shared resolver (./config, else ../config) picks it.
+    assert loads == [((), {})]
+    # No scheduler was built or run, so no lock was tried; no stop handler was installed.
+    assert lifetime.schedulers == []
+    assert not lifetime.started.is_set()
+    assert signals.added == []
+    assert signals.removed == []
+    assert lifetime.events == ["dispose_engine"]
+    assert lifetime.logged_at_dispose == [["worker_config_invalid"]]
+    assert lifetime.scheduler_at_dispose == ["unknown"]
+    assert captured == [
+        {
+            "event": "worker_config_invalid",
+            "log_level": "error",
+            "config_file": "thresholds.yaml",
+            "config_key": key,
+            "detail": "must contain window.default_days (28)",
+            "error": str(error),
+        },
+        STOPPED,
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_config_dir_lacking_the_default_preset_stops_the_worker_before_the_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    lifetime: Lifetime,
+    captured: list[EventDict],
+    tmp_path: Path,
+) -> None:
+    signals = _record_loop_signals(monkeypatch, lifetime)
+    directory = _config_without_the_default_preset(tmp_path)
+    monkeypatch.chdir(tmp_path)  # ./config is now the broken copy, as /app/config in the image
+    shipped = yaml.safe_load((REPO_CONFIG_DIR / "thresholds.yaml").read_text(encoding="utf-8"))
+    default_days = shipped["window"]["default_days"]
+    remaining = tuple(days for days in shipped["window"]["presets"] if days != default_days)
+    detail = f"must contain window.default_days ({default_days}), found {remaining!r}"
+
+    async with _running(Settings()) as run:
+        exit_code = await _bounded(run)
+        assert _scheduler_tasks() == []
+
+    assert (directory / "thresholds.yaml").is_file()
+    assert exit_code == worker_main.EXIT_FAILURE
+    assert lifetime.schedulers == []
+    assert not lifetime.started.is_set()
+    assert signals.added == []
+    assert lifetime.events == ["dispose_engine"]
+    assert captured == [
+        {
+            "event": "worker_config_invalid",
+            "log_level": "error",
+            "config_file": "thresholds.yaml",
+            "config_key": "window.presets",
+            "detail": detail,
+            "error": f"thresholds.yaml: window.presets: {detail}",
+        },
+        STOPPED,
+    ]
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("key", ["window.presets", None], ids=["key", "whole-file"])
 async def test_an_invalid_configuration_from_startup_exits_1_after_cleanup(
@@ -773,20 +921,79 @@ def test_an_invalid_environment_exits_1_naming_each_variable_but_never_its_value
     # Raised `from None`: the ValidationError, which may quote the inputs, is not chained.
     assert exited.value.__cause__ is None
     assert exited.value.__suppress_context__ is True
-    out, err = capsys.readouterr()
-    assert out == ""
-    assert err.splitlines() == [
-        "ads-engine worker: invalid settings (3); not started",
-        "  BACKFILL_DAYS: Input should be greater than or equal to 1",
-        "  N8N_GOOGLE_ADS_WEBHOOK_URL: Value error, N8N_GOOGLE_ADS_WEBHOOK_URL must use "
-        "https:// unless it is a localhost or 127.0.0.1 URL",
-        "  GOOGLE_ADS_CUSTOMER_ID: Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits",
+    # Logging is configured on stdout (no stream given) from the documented defaults, so the
+    # environment that failed validation is not read again, before the one line is logged.
+    ((args, kwargs),) = entry.configure_logging
+    assert (args, list(kwargs)) == ((), ["settings"])
+    defaults = kwargs["settings"]
+    assert isinstance(defaults, Settings)
+    assert defaults.model_fields_set == set()
+    assert defaults == Settings.model_construct()
+    assert entry.logged_at_configure == [[]]
+    assert entry.log == [
+        {
+            "event": "worker_settings_invalid",
+            "log_level": "error",
+            "error_count": 3,
+            "errors": INVALID_ENVIRONMENT_ERRORS,
+        }
     ]
-    for leaked in (SENTINEL_WEBHOOK_URL, "sentinel-workflow", SENTINEL_CUSTOMER_ID, "SENTINEL"):
-        assert leaked not in err
-    assert entry.configure_logging == []
     assert entry.run == []
-    assert entry.log == []
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "")
+    for leaked in (SENTINEL_WEBHOOK_URL, "sentinel-workflow", SENTINEL_CUSTOMER_ID, "SENTINEL"):
+        assert leaked not in repr(entry.log)
+        assert leaked not in repr(defaults)
+
+
+def test_the_invalid_environment_line_is_one_redacted_json_object_on_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    set_env: Callable[..., None],
+    captured_logs: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Through the real logging pipeline, stdout holds the one JSON line and stderr nothing.
+
+    Every problem text survives the redaction unchanged, and no supplied value is written.
+    ``captured_logs`` is requested only to restore the global logging state afterwards.
+    """
+    real_configure_logging = worker_main.configure_logging
+
+    def configure_without_cache(**kwargs: Any) -> None:
+        real_configure_logging(**kwargs)
+        # A logger first used under this configuration must not keep it after the test.
+        structlog.configure(cache_logger_on_first_use=False)
+
+    async def refuse_to_run(settings: Settings) -> int:
+        raise AssertionError("the worker ran with an invalid environment")
+
+    monkeypatch.setattr(worker_main, "configure_logging", configure_without_cache)
+    monkeypatch.setattr(worker_main, "_log", get_logger("ads_engine.worker.main"))
+    monkeypatch.setattr(worker_main, "_run", refuse_to_run)
+    set_env(
+        BACKFILL_DAYS="0",
+        N8N_GOOGLE_ADS_WEBHOOK_URL=SENTINEL_WEBHOOK_URL,
+        GOOGLE_ADS_CUSTOMER_ID=SENTINEL_CUSTOMER_ID,
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        worker_main.main()
+
+    assert exited.value.code == worker_main.EXIT_FAILURE
+    out, err = capsys.readouterr()
+    assert err == ""
+    (record,) = [json.loads(line) for line in out.splitlines()]
+    assert record == {
+        "event": "worker_settings_invalid",
+        "level": "error",
+        "logger": "ads_engine.worker.main",
+        "timestamp": record["timestamp"],
+        "error_count": 3,
+        "errors": INVALID_ENVIRONMENT_ERRORS,
+    }
+    assert record["timestamp"].endswith("Z")
+    for leaked in (SENTINEL_WEBHOOK_URL, "sentinel-workflow", SENTINEL_CUSTOMER_ID, "SENTINEL"):
+        assert leaked not in out
 
 
 def test_a_graceful_run_returns_normally_after_logging_worker_starting(

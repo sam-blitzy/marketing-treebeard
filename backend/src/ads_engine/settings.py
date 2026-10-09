@@ -163,7 +163,8 @@ class Settings(BaseSettings):
         data_mode: ``DATA_MODE``, ``auto`` or ``simulated``.
         mock_seed: ``MOCK_SEED``, the seed of the simulated world.
         backfill_days: ``BACKFILL_DAYS``, the initial backfill length per dataset; the
-            sync jobs cap it at LinkedIn's daily retention.
+            sync jobs cap it at 180 days (LinkedIn's 6-month daily retention) for every
+            source.
         n8n_google_ads_webhook_url: ``N8N_GOOGLE_ADS_WEBHOOK_URL``, the n8n webhook that
             relays ``googleAds:search``. Must be ``https://``; plain ``http://`` loads only
             for a ``localhost`` or ``127.0.0.1`` host. Never logged.

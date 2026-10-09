@@ -11,8 +11,9 @@ analysis lock is held) and 0.11.2 ("First start"). Covered here:
   collaborators replaced, so exit codes and JSON reports are checked without PostgreSQL
   (``tests/integration/test_first_start.py`` and ``test_runs_and_decisions.py`` run them
   against the database);
-* error mapping: expected domain errors print one redacted line and exit 1, anything else is
-  logged as ``cli_failed`` and exits 1;
+* error mapping: expected domain errors write one redacted ``cli_error`` JSON line and exit 1,
+  anything else is logged as ``cli_failed`` and exits 1; after a failure every stderr line is
+  one JSON object, whatever ``--log-level`` is;
 * ``capture-fixtures``: its refusals, the redaction policy, the recording transport, and
   complete captures of every surface of all three sources, recorded from the simulator acting
   as the live platform and checked with ``payloads.validate_capture`` and for leaks;
@@ -28,8 +29,9 @@ analysis lock is held) and 0.11.2 ("First start"). Covered here:
   the calls refuses the capture before any request, or stops it at the failed reservation;
 * the Google capture's scopes: Q-G3 reads every campaign for 30 days, Q-G5 every campaign on
   the delivering campaign's latest day with impressions, Q-G6 and Q-G7 the ad group whose
-  keywords delivered most; a query that answers with no rows is reported as not captured,
-  with its scope in words, and the capture still exits 0;
+  keywords delivered most; a query that answers with no rows is reported as not captured in
+  a ``cli_warning`` line, never a ``cli_error`` one, with its scope in words, and the capture
+  still exits 0;
 * the capture output directory: overlapping and failed writes leave complete files and no
   temporaries, symbolic links are replaced or refused rather than followed, and a redirected
   or unwritable ``captured/`` is refused before any request is sent.
@@ -51,7 +53,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn
@@ -232,6 +234,214 @@ def test_help_lists_the_seven_commands(capsys: pytest.CaptureFixture[str]) -> No
         assert command in out
 
 
+def _help_text(capsys: pytest.CaptureFixture[str], argv: list[str]) -> str:
+    """Run ``argv`` (a ``--help`` request) and return its stdout; help writes nothing else."""
+    assert cli.main(argv) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    return captured.out
+
+
+def _listed_exit_codes(help_text: str) -> set[int]:
+    """The codes the ``exit codes:`` block of a help text lists, one ``  N  reason`` per code."""
+    _, found, rest = help_text.partition("\nexit codes:\n")
+    assert found, help_text
+    codes: set[int] = set()
+    for line in rest.split("\n\n", 1)[0].splitlines():
+        code, separator, _ = line.strip().partition("  ")
+        if line.startswith("  ") and separator and code.isdigit():
+            codes.add(int(code))
+    return codes
+
+
+def _block(help_text: str, heading: str) -> str:
+    """The lines under ``heading:`` up to the next blank line."""
+    _, found, rest = help_text.partition(f"\n{heading}:\n")
+    assert found, help_text
+    return rest.split("\n\n", 1)[0]
+
+
+def test_help_states_exit_codes_environment_output_and_examples(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = _help_text(capsys, ["--help"])
+    assert _listed_exit_codes(out) == {0, 1, 2, 3}
+    text = " ".join(out.split())
+    for phrase in (
+        "0 success",
+        "1 failure",
+        "2 usage error",
+        "3 another process holds the shared analysis lock",
+        "DATABASE_URL the PostgreSQL URL",
+        "read by every command except hash-password",
+        "DATA_MODE auto (the default) or simulated",
+        "google N8N_GOOGLE_ADS_WEBHOOK_URL, N8N_WEBHOOK_SECRET and GOOGLE_ADS_CUSTOMER_ID",
+        "linkedin LINKEDIN_AD_ACCOUNT_IDS plus either LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET "
+        "and LINKEDIN_REFRESH_TOKEN, or LINKEDIN_ACCESS_TOKEN",
+        "hubspot HUBSPOT_ACCESS_TOKEN",
+        "config/*.yaml are read from ./config, else ../config",
+        "no variable selects the directory",
+        "stderr carries JSON log lines, one object per line, including the failing command's "
+        'one-line message (event "cli_error"',
+        "argparse usage errors are plain text",
+    ):
+        assert phrase in text, phrase
+    assert "a failing command's cli_error line is written at every level" in text, text
+    examples = _block(out, "examples").splitlines()
+    assert examples == [
+        "  printf '%s' 'correct horse' | ads-engine hash-password",
+        "  cd backend && ads-engine migrate && ads-engine ensure-admin",
+        "  ads-engine sync --source google",
+        "  ads-engine analyze --start 2026-09-01 --end 2026-09-28",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "phrases", "codes", "example"),
+    [
+        pytest.param(
+            "hash-password",
+            (
+                "the password is read from stdin, less one trailing newline",
+                "no settings are loaded and no database is used",
+                "2 the password is empty, is not valid UTF-8, or none was entered at the prompt",
+            ),
+            {0, 1, 2},
+            "printf '%s' 'correct horse' | ads-engine hash-password",
+            id="hash-password",
+        ),
+        pytest.param(
+            "migrate",
+            (
+                "DATABASE_URL the database to upgrade",
+                "backend/ on the host, /app in the image",
+                "Concurrent runs on one database are serialised",
+                "2 alembic.ini is not in the working directory",
+            ),
+            {0, 1, 2},
+            "cd backend && ads-engine migrate",
+            id="migrate",
+        ),
+        pytest.param(
+            "ensure-admin",
+            (
+                "DATABASE_URL the database holding the login",
+                "APP_ADMIN_EMAIL the admin's email (default admin@example.com)",
+                "APP_ADMIN_PASSWORD_HASH the argon2id hash written by make init",
+            ),
+            {0, 1},
+            "cd backend && ads-engine migrate && ads-engine ensure-admin",
+            id="ensure-admin",
+        ),
+        pytest.param(
+            "sync",
+            (
+                "DATABASE_URL the database holding the source's active dataset",
+                "DATA_MODE a live dataset is synced only under auto",
+                "GOOGLE_DAILY_CALL_BUDGET (default 1000 webhook calls per 24 h)",
+                "0 every job ran and succeeded",
+                "1 no job ran (the source has no active dataset yet, or its live dataset may "
+                "not be synced now",
+                "or any job failed: on a transient error (the datasets stay stale with their "
+                "last good data), access denied, a defect or otherwise",
+            ),
+            {0, 1},
+            "ads-engine sync --source linkedin",
+            id="sync",
+        ),
+        pytest.param(
+            "analyze",
+            (
+                "DATABASE_URL the database holding the synced data and the runs",
+                "window.max_days is in config/thresholds.yaml",
+                "START and END are calendar dates in exactly YYYY-MM-DD form",
+                "END is no later than the default window end: the earlier of yesterday in the "
+                "Google account's time zone and yesterday UTC",
+                "1 to window.max_days days (180 as shipped)",
+                "The run is kind custom even when it equals the default window",
+                "2 a date is not in YYYY-MM-DD form, or the window is out of range",
+                "3 another process holds the shared analysis lock",
+            ),
+            {0, 1, 2, 3},
+            "ads-engine analyze --start 2026-09-01 --end 2026-09-28",
+            id="analyze",
+        ),
+        pytest.param(
+            "seed-simulated",
+            (
+                "DATABASE_URL the database to seed",
+                "config/*.yaml read from ./config, else ../config",
+                "No credentials are needed",
+                "1 a source failed to bootstrap",
+                "3 another process holds the shared analysis lock; the datasets stay seeded",
+            ),
+            {0, 1, 3},
+            "cd backend && ads-engine seed-simulated",
+            id="seed-simulated",
+        ),
+        pytest.param(
+            "capture-fixtures",
+            (
+                "DATA_MODE must not be simulated",
+                "DATABASE_URL google only",
+                "google N8N_GOOGLE_ADS_WEBHOOK_URL, N8N_WEBHOOK_SECRET and GOOGLE_ADS_CUSTOMER_ID",
+                "linkedin LINKEDIN_AD_ACCOUNT_IDS plus either LINKEDIN_CLIENT_ID, "
+                "LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN, or LINKEDIN_ACCESS_TOKEN as "
+                "the alternative",
+                "hubspot HUBSPOT_ACCESS_TOKEN",
+                "Run it from backend/",
+                "tests/contracts/{source}/captured/",
+                "2 tests/contracts/{source}/ is not under the working directory",
+            ),
+            {0, 1, 2},
+            "cd backend && DATA_MODE=auto ads-engine capture-fixtures --source hubspot",
+            id="capture-fixtures",
+        ),
+    ],
+)
+def test_command_help_states_environment_exit_codes_and_example(
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    phrases: tuple[str, ...],
+    codes: set[int],
+    example: str,
+) -> None:
+    out = _help_text(capsys, [command, "--help"])
+    assert _listed_exit_codes(out) == codes
+    text = " ".join(out.split())
+    for phrase in phrases:
+        assert phrase in text, phrase
+    # Every command but hash-password reads the database (capture-fixtures for Google).
+    assert ("DATABASE_URL" in out) is (command != "hash-password")
+    assert _block(out, "example").splitlines() == [f"  {example}"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "epilog"),
+    [
+        pytest.param(["--help"], cli._HELP_EPILOG, id="ads-engine"),
+        pytest.param(["hash-password", "--help"], cli._HASH_EPILOG, id="hash-password"),
+        pytest.param(["migrate", "--help"], cli._MIGRATE_EPILOG, id="migrate"),
+        pytest.param(["ensure-admin", "--help"], cli._ENSURE_ADMIN_EPILOG, id="ensure-admin"),
+        pytest.param(["sync", "--help"], cli._SYNC_EPILOG, id="sync"),
+        pytest.param(["analyze", "--help"], cli._ANALYZE_EPILOG, id="analyze"),
+        pytest.param(["seed-simulated", "--help"], cli._SEED_SIMULATED_EPILOG, id="seed"),
+        pytest.param(["capture-fixtures", "--help"], cli._CAPTURE_FIXTURES_EPILOG, id="capture"),
+    ],
+)
+def test_help_keeps_the_epilog_line_breaks(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    epilog: str,
+) -> None:
+    # On a 40-column terminal argparse's default formatter would refill every epilog line;
+    # RawDescriptionHelpFormatter prints the epilog verbatim as the end of the help.
+    monkeypatch.setenv("COLUMNS", "40")
+    assert _help_text(capsys, argv).endswith(epilog)
+    assert max(len(line) for line in epilog.splitlines()) <= 79
+
+
 def test_version_and_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
     assert (cli.EXIT_OK, cli.EXIT_FAILURE, cli.EXIT_USAGE, cli.EXIT_LOCK_HELD) == (0, 1, 2, 3)
     assert cli.main(["--version"]) == cli.EXIT_OK
@@ -370,6 +580,61 @@ def test_usage_errors_never_repeat_supplied_text(
     assert captured.err.startswith("usage: ")
     assert captured.err.endswith(f"\n{diagnostic}\n")
     _assert_redacted(captured.err, supplied)
+
+
+# Date-like values outside the ISO 8601 extended calendar form. date.fromisoformat accepts the
+# basic form and week dates, so analyze must refuse them itself.
+NOT_EXTENDED_CALENDAR_DATES = (
+    pytest.param("20260901", id="basic-form"),
+    pytest.param("2026-W37-4", id="week-date"),
+    pytest.param("2026-W37", id="week"),
+    pytest.param("2026-09-01T00:00", id="date-time"),
+    pytest.param("2026-9-1", id="unpadded"),
+    pytest.param("+2026-09-01", id="signed-year"),
+    pytest.param("\uff12\uff10\uff12\uff16-\uff10\uff19-\uff10\uff11", id="fullwidth-digits"),
+    pytest.param("2026-09-01Z", id="zone-suffix"),
+)
+
+
+@pytest.mark.parametrize("option", ["--start", "--end"])
+@pytest.mark.parametrize("value", NOT_EXTENDED_CALENDAR_DATES)
+def test_analyze_accepts_only_extended_calendar_dates(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    value: str,
+) -> None:
+    calls: list[str] = []
+
+    async def never_called(*args: Any, **kwargs: Any) -> NoReturn:
+        calls.append("runner")
+        raise AssertionError("analyze reached the runner")
+
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+    monkeypatch.setattr(runner, "custom_window", never_called)
+    monkeypatch.setattr(runner, "run_analysis", never_called)
+    dates = {"--start": "2026-09-10", "--end": "2026-10-07", option: value}
+    argv = ["analyze", "--start", dates["--start"], "--end", dates["--end"]]
+    assert cli.main(argv) == cli.EXIT_USAGE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.endswith(
+        f"\nads-engine analyze: error: argument {option}: not a date in YYYY-MM-DD form\n"
+    )
+    _assert_redacted(captured.err, (value,))
+    assert calls == []
+
+
+@pytest.mark.parametrize("text", ["2026-09-01", " 2026-09-01 ", "\t2026-09-01\n"])
+def test_iso_date_parses_the_extended_calendar_form(text: str) -> None:
+    assert cli._iso_date(text) == date(2026, 9, 1)
+
+
+@pytest.mark.parametrize("text", ["2026-02-30", "2026-13-01", "0000-01-01"])
+def test_iso_date_rejects_impossible_dates(text: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError) as rejected:
+        cli._iso_date(text)
+    assert str(rejected.value) == cli._DATE_FORMAT_REASON
 
 
 @pytest.mark.parametrize(
@@ -524,6 +789,81 @@ def test_hash_password_uses_getpass_on_a_terminal(
     assert PasswordHasher().verify(capsys.readouterr().out.strip(), "typed")
 
 
+# The ASCII part of every invalid password below: no stream may ever repeat it.
+_PASSWORD_PREFIX = "s3cret-"
+# What a strict UTF-8 stream refuses to decode: ab, then 0xFF 0xFE, then cd.
+_UNDECODABLE_PASSWORD = _PASSWORD_PREFIX.encode("ascii") + b"ab\xff\xfecd"
+# What surrogateescape (C, POSIX and C.UTF-8 locales, UTF-8 mode) decodes those bytes to.
+_SURROGATE_PASSWORD = _UNDECODABLE_PASSWORD.decode("utf-8", "surrogateescape")
+
+
+class _Terminal(io.StringIO):
+    """An interactive stdin, so ``hash-password`` reads the password with getpass."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _getpass_eof(prompt: str) -> NoReturn:
+    """Ctrl-D at the getpass prompt."""
+    raise EOFError
+
+
+def _getpass_undecodable(prompt: str) -> NoReturn:
+    """Non-UTF-8 bytes typed at the getpass prompt, read from the terminal strictly."""
+    start = _UNDECODABLE_PASSWORD.index(0xFF)
+    raise UnicodeDecodeError("utf-8", _UNDECODABLE_PASSWORD, start, start + 1, "invalid start byte")
+
+
+def _assert_hash_password_usage_error(capsys: pytest.CaptureFixture[str], message: str) -> None:
+    """Assert one usage message on stderr, nothing on stdout, and no traceback or password."""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert message in captured.err
+    assert "cli_failed" not in captured.err
+    assert "Traceback" not in captured.err
+    assert _PASSWORD_PREFIX not in captured.err
+
+
+@pytest.mark.parametrize("suffix", ["", "\n", "\r\n"])
+def test_hash_password_rejects_surrogates_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], suffix: str
+) -> None:
+    _stdin(monkeypatch, _SURROGATE_PASSWORD + suffix)
+    assert cli.main(["hash-password"]) == cli.EXIT_USAGE
+    _assert_hash_password_usage_error(capsys, "the password read from stdin is not valid UTF-8")
+
+
+def test_hash_password_rejects_stdin_that_fails_to_decode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    strict = io.TextIOWrapper(io.BytesIO(_UNDECODABLE_PASSWORD), encoding="utf-8")
+    monkeypatch.setattr(cli.sys, "stdin", strict)
+    assert cli.main(["hash-password"]) == cli.EXIT_USAGE
+    _assert_hash_password_usage_error(capsys, "the password read from stdin is not valid UTF-8")
+
+
+@pytest.mark.parametrize(
+    ("getpass_", "message"),
+    [
+        (_getpass_eof, "no password was entered"),
+        (_getpass_undecodable, "the password entered is not valid UTF-8"),
+        (lambda prompt: _SURROGATE_PASSWORD, "the password entered is not valid UTF-8"),
+    ],
+    ids=["eof", "undecodable", "surrogates"],
+)
+def test_hash_password_terminal_input_errors_are_usage_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    getpass_: Callable[[str], str],
+    message: str,
+) -> None:
+    monkeypatch.setattr(cli.sys, "stdin", _Terminal(""))
+    monkeypatch.setattr(cli.getpass, "getpass", getpass_)
+    assert cli.main(["hash-password"]) == cli.EXIT_USAGE
+    _assert_hash_password_usage_error(capsys, message)
+
+
 # ---------------------------------------------------------------------------
 # Error mapping
 # ---------------------------------------------------------------------------
@@ -561,6 +901,44 @@ def test_other_validation_errors_are_unexpected() -> None:
     assert cli._domain_error_message(caught.value) is None
 
 
+def _stderr_records(err: str) -> list[dict[str, Any]]:
+    """Parse the CLI's stderr after a command ran: every non-empty line is one JSON object.
+
+    Raises:
+        AssertionError: When a line is not a JSON object.
+    """
+    records: list[dict[str, Any]] = []
+    for number, line in enumerate(err.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"stderr line {number} is not JSON: {line!r}") from exc
+        assert isinstance(record, dict), f"stderr line {number} is not a JSON object: {line!r}"
+        records.append(record)
+    return records
+
+
+def _cli_errors(err: str) -> list[str]:
+    """The messages of the ``cli_error`` lines on stderr, every line of which must be JSON."""
+    return [
+        str(record["message"]) for record in _stderr_records(err) if record["event"] == "cli_error"
+    ]
+
+
+def _cli_warnings(err: str) -> list[str]:
+    """The messages of the ``cli_warning`` lines on stderr, every line of which must be JSON.
+
+    Raises:
+        AssertionError: When a ``cli_warning`` line is not a ``warning`` of ``ads_engine.cli``.
+    """
+    records = [record for record in _stderr_records(err) if record["event"] == "cli_warning"]
+    for record in records:
+        assert (record["level"], record["logger"]) == ("warning", "ads_engine.cli"), record
+    return [str(record["message"]) for record in records]
+
+
 def test_main_maps_domain_and_unexpected_errors(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -573,7 +951,9 @@ def test_main_maps_domain_and_unexpected_errors(
     monkeypatch.setattr(cli, "_cmd_migrate", domain)
     assert cli.main(["migrate"]) == cli.EXIT_FAILURE
     err = capsys.readouterr().err
-    assert "ads-engine: migrate: ConfigurationError: unsafe base URL for [REDACTED_EMAIL]" in err
+    assert _cli_errors(err) == [
+        "ads-engine: migrate: ConfigurationError: unsafe base URL for [REDACTED_EMAIL]"
+    ]
     assert "owner@example.com" not in err
 
     monkeypatch.setattr(cli, "_cmd_migrate", unexpected)
@@ -581,13 +961,12 @@ def test_main_maps_domain_and_unexpected_errors(
     err = capsys.readouterr().err
     assert '"event": "cli_failed"' in err
     assert '"command": "migrate"' in err
-    assert "ads-engine: migrate failed (RuntimeError)" in err
+    assert _cli_errors(err) == ["ads-engine: migrate failed (RuntimeError); see the log on stderr"]
 
 
 def _cli_failed_records(err: str) -> list[dict[str, Any]]:
-    """The ``cli_failed`` JSON lines among the CLI's stderr lines."""
-    records = [json.loads(line) for line in err.splitlines() if line.startswith("{")]
-    return [record for record in records if record.get("event") == "cli_failed"]
+    """The ``cli_failed`` records among the CLI's stderr lines, every one of which is JSON."""
+    return [record for record in _stderr_records(err) if record.get("event") == "cli_failed"]
 
 
 def test_main_reports_an_already_logged_failure_without_a_second_traceback(
@@ -609,7 +988,7 @@ def test_main_reports_an_already_logged_failure_without_a_second_traceback(
     assert (record["command"], record["error"]) == ("migrate", "RuntimeError")
     assert record["logged_as"] == "analysis_run_failed"
     assert "exception" not in record
-    assert "ads-engine: migrate failed (RuntimeError)" in err
+    assert _cli_errors(err) == ["ads-engine: migrate failed (RuntimeError); see the log on stderr"]
 
     monkeypatch.setattr(cli, "_cmd_migrate", unowned)
     assert cli.main(["migrate"]) == cli.EXIT_FAILURE
@@ -618,6 +997,160 @@ def test_main_reports_an_already_logged_failure_without_a_second_traceback(
     assert "logged_as" not in record
     (exception,) = record["exception"]
     assert exception["exc_type"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("case", "argv", "code", "message"),
+    [
+        pytest.param(
+            "no_alembic_ini",
+            ["migrate"],
+            cli.EXIT_USAGE,
+            "ads-engine: alembic.ini not found in the working directory; "
+            "run from backend/ (or /app in the image)",
+            id="usage-error",
+        ),
+        pytest.param(
+            "domain_error",
+            ["migrate"],
+            cli.EXIT_FAILURE,
+            "ads-engine: migrate: ConfigurationError: SESSION_SECRET is not set",
+            id="domain-error",
+        ),
+        pytest.param(
+            "unexpected_error",
+            ["migrate"],
+            cli.EXIT_FAILURE,
+            "ads-engine: migrate failed (RuntimeError); see the log on stderr",
+            id="unexpected-error",
+        ),
+        pytest.param(
+            "invalid_window",
+            ["analyze", "--start", "2025-09-01", "--end", "2026-09-28"],
+            cli.EXIT_USAGE,
+            "ads-engine: invalid window (too_long): Window of 393 days exceeds the 180-day maximum",
+            id="invalid-window",
+        ),
+        pytest.param(
+            "lock_held",
+            ["analyze", "--start", "2026-09-01", "--end", "2026-09-28"],
+            cli.EXIT_LOCK_HELD,
+            "ads-engine: an analysis run is in progress",
+            id="lock-held",
+        ),
+        pytest.param(
+            "bad_admin_hash",
+            ["ensure-admin"],
+            cli.EXIT_FAILURE,
+            "ads-engine: APP_ADMIN_PASSWORD_HASH is not an argon2 hash (it must start with "
+            "$argon2); write it with `ads-engine hash-password` or `make init ADMIN_PASSWORD=…`",
+            id="ensure-admin-hash-rejected",
+        ),
+    ],
+)
+def test_every_failure_writes_only_json_lines_with_one_cli_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    argv: list[str],
+    code: int,
+    message: str,
+) -> None:
+    """A failing command leaves stderr one JSON object per line, one of them its ``cli_error``.
+
+    The ``cli_error`` line carries the configured log lines' keys, sorted, and an ISO-8601 UTC
+    ``timestamp`` ending in ``Z`` taken while the command ran.
+    """
+
+    async def custom_window(start: date, end: date, **kwargs: Any) -> str:
+        if case == "invalid_window":
+            raise InvalidWindow("too_long", "Window of 393 days exceeds the 180-day maximum")
+        return "window"
+
+    async def run_analysis(window: str, kind: str, trigger: str, **kwargs: Any) -> Any:
+        raise RunInProgress
+
+    def configuration_error(_args: object) -> int:
+        raise ConfigurationError("SESSION_SECRET is not set")
+
+    def runtime_error(_args: object) -> int:
+        raise RuntimeError("kaboom")
+
+    match case:
+        case "no_alembic_ini":
+            monkeypatch.chdir(tmp_path)
+        case "domain_error":
+            monkeypatch.setattr(cli, "_cmd_migrate", configuration_error)
+        case "unexpected_error":
+            monkeypatch.setattr(cli, "_cmd_migrate", runtime_error)
+        case "bad_admin_hash":
+            monkeypatch.setenv("APP_ADMIN_PASSWORD_HASH", "plain-text-password")
+            get_settings.cache_clear()
+        case _:
+            monkeypatch.setattr(runner, "custom_window", custom_window)
+            monkeypatch.setattr(runner, "run_analysis", run_analysis)
+
+    before = datetime.now(UTC)
+    assert cli.main(argv) == code
+    after = datetime.now(UTC)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    records = _stderr_records(captured.err)
+    (line,) = [record for record in records if record["event"] == "cli_error"]
+    assert list(line) == sorted(line)
+    assert line == {
+        "event": "cli_error",
+        "level": "error",
+        "logger": "ads_engine.cli",
+        "message": message,
+        "timestamp": line["timestamp"],
+    }
+    assert line["timestamp"].endswith("Z")
+    assert before <= datetime.fromisoformat(line["timestamp"]) <= after
+    if case == "unexpected_error":
+        (failed,) = _cli_failed_records(captured.err)
+        assert (failed["level"], failed["command"]) == ("error", "migrate")
+
+
+def test_the_cli_error_line_is_written_whatever_the_log_level(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--log-level CRITICAL`` silences the logs, never the command's own failure line."""
+
+    async def custom_window(start: date, end: date, **kwargs: Any) -> str:
+        raise InvalidWindow("too_long", "Window of 393 days exceeds the 180-day maximum")
+
+    def runtime_error(_args: object) -> int:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(runner, "custom_window", custom_window)
+    argv = ["--log-level", "CRITICAL", "analyze", "--start", "2025-09-01", "--end", "2026-09-28"]
+    assert cli.main(argv) == cli.EXIT_USAGE
+    (line,) = _stderr_records(capsys.readouterr().err)
+    assert (line["event"], line["level"]) == ("cli_error", "error")
+    assert line["message"] == (
+        "ads-engine: invalid window (too_long): Window of 393 days exceeds the 180-day maximum"
+    )
+
+    monkeypatch.setattr(cli, "_cmd_migrate", runtime_error)
+    assert cli.main(["--log-level", "CRITICAL", "migrate"]) == cli.EXIT_FAILURE
+    err = capsys.readouterr().err
+    # cli_failed is an ERROR log line, below the level; the failure line is not a log line.
+    assert _cli_failed_records(err) == []
+    assert _cli_errors(err) == ["ads-engine: migrate failed (RuntimeError); see the log on stderr"]
+
+
+def test_the_make_init_hint_survives_intact_in_the_cli_error_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI's own hint bypasses the log redaction, which reads it as an assignment."""
+    hint = "APP_ADMIN_PASSWORD_HASH is not set; run `make init ADMIN_PASSWORD=…`"
+    assert str(ads_logging.redact(hint)) != hint
+    assert cli.main(["ensure-admin"]) == cli.EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert _cli_errors(err) == [f"ads-engine: {hint}"]
+    assert ads_logging.REDACTED not in err
 
 
 # ---------------------------------------------------------------------------
@@ -669,9 +1202,11 @@ def test_ensure_admin_rejects_a_missing_or_bad_hash(
     get_settings.cache_clear()
     assert cli.main(["ensure-admin"]) == cli.EXIT_FAILURE
     err = capsys.readouterr().err
-    assert message in err
+    (error,) = _cli_errors(err)
+    assert message in error
     if value is not None:
         assert value not in err
+        assert value not in error
 
 
 def _edited_hash(**fields: str) -> str:
@@ -779,15 +1314,18 @@ def test_ensure_admin_rejects_a_hash_argon2_cannot_verify(
     captured = capsys.readouterr()
     assert opened == []
     assert captured.out == ""
-    lines = captured.err.splitlines()
-    assert len(lines) == 1, captured.err
-    assert lines[0].startswith("ads-engine: APP_ADMIN_PASSWORD_HASH ")
-    assert message in lines[0]
-    assert lines[0].endswith("; write it again with `ads-engine hash-password`")
-    assert value not in captured.err
-    for part in value.split("$"):
-        if len(part) >= 8:
-            assert part not in captured.err
+    (record,) = _stderr_records(captured.err)
+    assert record["event"] == "cli_error"
+    error = record["message"]
+    assert error.startswith("ads-engine: APP_ADMIN_PASSWORD_HASH ")
+    assert message in error
+    assert error.endswith("; write it again with `ads-engine hash-password`")
+    # The raw line and the decoded message: JSON escapes a control or non-ASCII character.
+    for written in (captured.err, error):
+        assert value not in written
+        for part in value.split("$"):
+            if len(part) >= 8:
+                assert part not in written
 
 
 class _Result:
@@ -885,9 +1423,9 @@ def test_ensure_admin_accepts_every_hash_argon2_verifies(
 # ---------------------------------------------------------------------------
 
 
-def _job(disposition: str | None) -> jobs.JobResult:
+def _job(disposition: str | None, *, job: str = "entities") -> jobs.JobResult:
     return jobs.JobResult(
-        job="entities",
+        job=job,
         source="google",
         dataset_id=1,
         status="succeeded" if disposition is None else "failed",
@@ -900,13 +1438,29 @@ def _job(disposition: str | None) -> jobs.JobResult:
     )
 
 
-@pytest.mark.parametrize(("disposition", "code"), [(None, 0), ("stale", 0), ("defect", 1)])
+@pytest.mark.parametrize(
+    ("disposition", "code", "message"),
+    [
+        (None, 0, None),
+        ("stale", 1, "sync google: 1 of 1 job failed (entities: stale)"),
+        (
+            "switched_to_simulated",
+            1,
+            "sync google: 1 of 1 job failed (entities: switched_to_simulated)",
+        ),
+        ("ignored", 1, "sync google: 1 of 1 job failed (entities: ignored)"),
+        ("defect", 1, "sync google: a job failed on a defect (query or data integrity)"),
+    ],
+    ids=["succeeded", "stale", "switched_to_simulated", "ignored", "defect"],
+)
 def test_sync_prints_the_report(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     disposition: str | None,
     code: int,
+    message: str | None,
 ) -> None:
+    """Exit 0 only when every job succeeded; any failed job exits 1 with one stderr line."""
     seen: list[tuple[str, str]] = []
 
     async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
@@ -922,10 +1476,102 @@ def test_sync_prints_the_report(
     monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
     assert cli.main(["sync", "--source", "google"]) == code
     assert seen == [("google", "manual")]
-    report = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
     assert report["source"] == "google"
     assert report["mode"] == "simulated"
+    assert report["ok"] is (disposition is None)
     assert report["jobs"][0]["job"] == "entities"
+    if message is None:
+        assert "ads-engine:" not in captured.err
+    else:
+        assert captured.err.count("ads-engine:") == 1
+        assert message in captured.err
+    # The job's error text stays in the report; the stderr line never repeats it.
+    assert "bad query" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        jobs.SourceSyncReport("google", "manual", reason="google has no active dataset yet"),
+        jobs.SourceSyncReport(
+            "google",
+            "manual",
+            dataset_id=1,
+            mode="live",
+            reason="live dataset not synced: DATA_MODE=simulated",
+        ),
+        jobs.SourceSyncReport(
+            "google",
+            "manual",
+            dataset_id=1,
+            mode="live",
+            reason="live dataset not synced: credentials not configured",
+        ),
+    ],
+    ids=["no-active-dataset", "live-blocked-by-data-mode", "live-blocked-by-credentials"],
+)
+def test_sync_exits_failure_when_no_job_ran(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: jobs.SourceSyncReport,
+) -> None:
+    """A report without jobs is printed, then exits 1 with one line naming its reason."""
+
+    async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
+        return outcome
+
+    monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
+    assert cli.main(["sync", "--source", "google"]) == cli.EXIT_FAILURE
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["ok"] is False
+    assert report["reason"] == outcome.reason
+    assert report["jobs"] == []
+    assert captured.err.count("ads-engine:") == 1
+    assert f"sync google: no job ran: {outcome.reason}; see the report" in captured.err
+
+
+def test_sync_names_each_failed_job_and_its_disposition(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Failed jobs are named with their dispositions only; ``failed`` stands in for none."""
+    not_writable = jobs.JobResult(
+        job="restatement",
+        source="google",
+        dataset_id=1,
+        status="failed",
+        rows=0,
+        calls=0,
+        freshness={},
+        disposition=None,
+        error="dataset 1 is not writable",
+        duration_ms=5,
+    )
+
+    async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
+        return jobs.SourceSyncReport(
+            source="google",
+            trigger="manual",
+            results=(_job(None), _job("stale", job="metrics"), not_writable),
+            dataset_id=1,
+            mode="simulated",
+        )
+
+    monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
+    assert cli.main(["sync", "--source", "google"]) == cli.EXIT_FAILURE
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["ok"] is False
+    assert [job["status"] for job in report["jobs"]] == ["succeeded", "failed", "failed"]
+    assert captured.err.count("ads-engine:") == 1
+    assert (
+        "sync google: 2 of 3 jobs failed (metrics: stale, restatement: failed); "
+        "the failed datasets keep their last good data; see the report and the log"
+    ) in captured.err
+    assert "bad query" not in captured.err
+    assert "not writable" not in captured.err
 
 
 def test_sync_exits_failure_on_a_data_integrity_defect(
@@ -1133,9 +1779,9 @@ def test_capture_refused_without_credentials(
     get_settings.cache_clear()
     before = sorted(CONTRACTS.glob("*/captured/*"))
     assert cli.main(["capture-fixtures", "--source", source]) == cli.EXIT_FAILURE
-    assert (
+    assert _cli_errors(capsys.readouterr().err) == [
         f"ads-engine: capture-fixtures {source}: live credentials are not configured; set {names}"
-    ) in capsys.readouterr().err.splitlines()
+    ]
     assert sorted(CONTRACTS.glob("*/captured/*")) == before
 
 
@@ -1201,9 +1847,9 @@ def test_capture_refusal_names_the_linkedin_alternatives(
     before = sorted(CONTRACTS.glob("*/captured/*"))
     assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_FAILURE
     err = capsys.readouterr().err
-    assert (
+    assert _cli_errors(err) == [
         f"ads-engine: capture-fixtures linkedin: live credentials are not configured; set {names}"
-    ) in err.splitlines()
+    ]
     for value in configured.values():
         assert value not in err
     assert sorted(CONTRACTS.glob("*/captured/*")) == before
@@ -2430,18 +3076,22 @@ def test_capture_google_stops_at_a_reservation_the_database_cannot_make(
     assert len(seen) == failing - 1
     assert google_calls_24h() == (failing - 1 if failing > 1 else None)
     query_ids = list(QUERIES)
-    assert (
-        f"capture-fixtures google: search {query_ids[failing - 1]}: {BUDGET_UNAVAILABLE} "
-        "(OperationalError); no further webhook call was sent"
-    ) in err
-    for query_id in query_ids[failing:]:
-        assert (
-            f"not captured: search {query_id}: not sent, the shared call budget is unavailable"
-        ) in err
+    # The failed reservation is the error; the queries it kept from being sent are notes.
+    errors = [
+        f"ads-engine: capture-fixtures google: search {query_ids[failing - 1]}: "
+        f"{BUDGET_UNAVAILABLE} (OperationalError); no further webhook call was sent"
+    ]
+    if not surfaces:
+        errors.append("ads-engine: capture-fixtures google: no surface could be captured")
+    assert _cli_errors(err) == errors
+    assert _cli_warnings(err) == [
+        f"ads-engine: capture-fixtures google: not captured: search {query_id}: not sent, the "
+        "shared call budget is unavailable"
+        for query_id in query_ids[failing:]
+    ]
     # The calls made before the failure were counted, so their captures are kept.
     assert {Path(path).stem for path in _written(out)} == surfaces
     assert _google_captured(capture_dir) == surfaces
-    assert ("no surface could be captured" in err) == (not surfaces)
 
 
 # ---------------------------------------------------------------------------
@@ -2646,8 +3296,9 @@ def test_capture_google_reports_each_query_that_answered_with_no_rows(
 ) -> None:
     """A query that answers with no rows leaves its surface reported, not silently missing.
 
-    Each such surface gets one "not captured" line naming its query and the scope in words,
-    never an id, and counts in ``skipped``. Nothing failed, so the capture still exits 0
+    Each such surface gets one "not captured" ``cli_warning`` line naming its query and the
+    scope in words, never an id, and counts in ``skipped``. Nothing failed, so no
+    ``cli_error`` line is written and the capture still exits 0
     after one call per template. Without a delivering campaign the reads keep yesterday and
     the first ad group listed; with one but no keyword rows, Q-G6 reads the delivering
     campaign and Q-G7 its first ad group.
@@ -2667,8 +3318,11 @@ def test_capture_google_reports_each_query_that_answered_with_no_rows(
     missing = {QUERIES[query_id].row_surface for query_id in emptied}
     assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["google"] - missing
     assert _google_captured(capture_dir) == EXPECTED_SURFACES["google"] - missing
-    reported = [line for line in err.splitlines() if "not captured" in line]
+    # Each note is a warning, never an error: the run succeeded.
+    reported = _cli_warnings(err)
     assert reported == [f"ads-engine: {line}" for line in lines]
+    assert _cli_errors(err) == []
+    assert len([line for line in err.splitlines() if "not captured" in line]) == len(lines)
     record = _finished_record(err)
     assert record["skipped"] == len(lines)
     assert record["failed"] == 0
@@ -2775,10 +3429,12 @@ def test_capture_linkedin_says_when_the_one_response_read_is_a_test_lead(
     (element,) = documents["lead_form_responses"]["response"]["body"]["elements"]
     assert element["testLead"] is True
     validate_capture(documents["lead_form_responses"], root=capture_dir / "tests" / "contracts")
+    # A note on a run that succeeded: a warning, and no error line.
     assert (
-        "capture-fixtures linkedin: not captured: lead_form_responses_batch: the one lead "
-        "response read was a test lead, which is never re-fetched"
-    ) in err
+        "ads-engine: capture-fixtures linkedin: not captured: lead_form_responses_batch: the "
+        "one lead response read was a test lead, which is never re-fetched"
+    ) in _cli_warnings(err)
+    assert _cli_errors(err) == []
     assert NO_SPONSORED_LEAD not in err
 
 
@@ -2800,11 +3456,15 @@ def test_capture_linkedin_says_when_no_lead_response_was_read(
     expected = EXPECTED_SURFACES["linkedin"] - {"lead_form_responses_batch"}
     assert counts == dict.fromkeys(expected, 1), err[-2000:]
     assert {Path(path).stem for path in _written(out)} == expected - {"lead_form_responses"}
-    assert "capture-fixtures linkedin: lead_form_responses: " in err
+    # The failed listing is an error; the batch re-fetch it left nothing for is a note.
+    assert any(
+        message.startswith("ads-engine: capture-fixtures linkedin: lead_form_responses: ")
+        for message in _cli_errors(err)
+    ), err[-2000:]
     assert (
-        "capture-fixtures linkedin: not captured: lead_form_responses_batch: "
+        "ads-engine: capture-fixtures linkedin: not captured: lead_form_responses_batch: "
         "no lead response was read"
-    ) in err
+    ) in _cli_warnings(err)
     assert NO_SPONSORED_LEAD not in err
 
 
@@ -2822,8 +3482,18 @@ def test_capture_stops_when_the_credentials_are_refused(
     assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_FAILURE
     out, err = capsys.readouterr()
     assert _written(out) == []
-    assert "skipped after the credentials were refused" in err
-    assert "no surface could be captured" in err
+    # The refused call and the empty result are errors; the surfaces left uncaptured are notes.
+    warnings = _cli_warnings(err)
+    assert any(
+        message.endswith(": skipped after the credentials were refused") for message in warnings
+    ), err[-2000:]
+    assert all(
+        message.startswith("ads-engine: capture-fixtures linkedin: not captured: ")
+        for message in warnings
+    ), warnings
+    errors = _cli_errors(err)
+    assert errors[-1] == "ads-engine: capture-fixtures linkedin: no surface could be captured"
+    assert not any("not captured" in message for message in errors), errors
     assert not list((capture_dir / "tests" / "contracts" / "linkedin" / "captured").glob("*.json"))
 
 
@@ -3058,8 +3728,9 @@ def test_capture_refuses_a_redirected_output_directory_before_any_request(
     assert cli.main(["capture-fixtures", "--source", "google"]) == cli.EXIT_FAILURE
     out, err = capsys.readouterr()
     assert out == ""
-    assert f"capture-fixtures google: {reason}" in err
-    assert err.rstrip().endswith("; nothing was sent")
+    (error,) = _cli_errors(err)
+    assert f"capture-fixtures google: {reason}" in error
+    assert error.endswith("; nothing was sent")
     assert calls == []
     assert sorted(outside.rglob("*")) == before
 
@@ -3116,10 +3787,13 @@ def test_capture_refuses_an_unwritable_output_directory_before_any_request(
     out, err = capsys.readouterr()
     assert code == cli.EXIT_FAILURE
     assert out == ""
-    assert f"capture-fixtures hubspot: {reason}" in err
+    (error,) = _cli_errors(err)
+    assert f"capture-fixtures hubspot: {reason}" in error
     if how != "probe_read_only":
-        assert "in the backend image the runtime user owns only tests/contracts/*/captured/" in err
-    assert err.rstrip().endswith("; nothing was sent")
+        assert (
+            "in the backend image the runtime user owns only tests/contracts/*/captured/" in error
+        )
+    assert error.endswith("; nothing was sent")
     assert calls == []
     assert sorted(captured.parent.rglob("*")) == before
 

@@ -16,7 +16,7 @@ Every value is a server-side environment variable read by `backend/src/ads_engin
 | `GOOGLE_ADS_CUSTOMER_ID` | Yes | None (empty in `.env.example`) | The Google Ads customer id. Dashes are removed at load, and the result must be exactly 10 digits; it is sent with no dashes. |
 | `GOOGLE_DAILY_CALL_BUDGET` | No | `1000` | The product's own cap on webhook calls per sliding 24 h (see [Call budget and quotas](#call-budget-and-quotas)). At least 1. |
 | `DATA_MODE` | No | `auto` | `auto` uses live data when credentials work and falls back to simulated data otherwise. `simulated` forces simulated data for every source and never probes. |
-| `BACKFILL_DAYS` | No | `180` | Length of the initial backfill of every new dataset, in native days. |
+| `BACKFILL_DAYS` | No | `180` | Length of the initial backfill of every new dataset, in native days, capped at 180 days (LinkedIn's 6-month daily retention, applied to every source), so a larger value backfills Google 180 days. |
 | `DISPLAY_TIMEZONE` | No | `UTC` | Wall-clock zone of the sync schedule and of displayed instants. It never moves Google's day boundary. |
 
 When `N8N_GOOGLE_ADS_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET` or `GOOGLE_ADS_CUSTOMER_ID` is missing, Google runs on simulated data with the reason "credentials not configured". This is not an error.
@@ -130,7 +130,7 @@ Slots are wall-clock times in `DISPLAY_TIMEZONE`. Daily facts are upserted per n
 | Entity sync | Every 3 h (00:00, 03:00, 06:00, …) | Q-G1, Q-G2 then Q-G2b, Q-G4, Q-G7, Q-G8 | Full current state | `google.entities` |
 | Metrics, incremental | Every 6 h (00:00, 06:00, 12:00, 18:00) | Q-G3, Q-G5, Q-G6 | Trailing 3 native days, ending today in the account time zone | `google.metrics_daily` (Q-G3, Q-G5), `google.search_terms` (Q-G6) |
 | Metrics, restatement | Nightly at 03:00 | Q-G3, Q-G5, Q-G6 | Trailing 30 native days, to absorb conversion lag | As above |
-| Initial backfill | Every new dataset, including the first start | Entity sync, then Q-G3, Q-G5, Q-G6 | `BACKFILL_DAYS` (default 180) | As above |
+| Initial backfill | Every new dataset, including the first start | Entity sync, then Q-G3, Q-G5, Q-G6 | `BACKFILL_DAYS` (default 180) native days, capped at 180 days | As above |
 | Recovery probe | Every 30 min while Google is in automatic fallback | Q-G1 | — | — |
 
 When a run is interrupted, the scopes it did not read are kept as the dataset's checkpoint (`dataset_freshness.checkpoint`), in the transaction that records its freshness. Each scope is stored with `deferred_at`, the instant of the run that first deferred that work; a partition later deferred out of a stored scope, or merged in from a concurrent run, keeps that instant. The next metrics run reads the stored scopes of both `google.metrics_daily` and `google.search_terms` first, as stored (a narrowed campaign or ad-group range or a criterion keyset keeps its progress), oldest `deferred_at` first and then in dataset and query order, so neither dataset's fresh range spends a small window's calls before the other's older work. Then it reads its own ranges, Q-G3, Q-G5 and Q-G6, each without the native days a stored scope of the same query covers; the dataset turns `complete` only once nothing is pending. The next entity sync reads only the queries and enumeration scopes still outstanding. A checkpoint that cannot be read is logged and ignored, and a metrics run then widens its start back to the dataset's `covered_from`, so the shortfall is re-read.
@@ -215,7 +215,7 @@ What counts against that quota:
 
 Exceeding the quota returns `RESOURCE_EXHAUSTED`. The default cap of 1,000 calls sits below Explorer's 2,880 operations because the quota is shared. Lower the cap further when other n8n workflows draw heavily on the same credential.
 
-Google limits granular reporting data to 37 months from June 2026. The default 180-day backfill is well inside that limit.
+Google limits granular reporting data to 37 months from June 2026. The backfill, `BACKFILL_DAYS` capped at 180 days, is well inside that limit.
 
 ## Errors and fallback
 
@@ -301,6 +301,6 @@ uv run --frozen ads-engine capture-fixtures --source google
   - Q-G6 reads that day, and Q-G7 reads the keywords, of the ad group with the most impressions in Q-G5's rows. The delivering campaign's ad groups are preferred, then those of Search campaigns. Without a Q-G5 row, Q-G6 reads the delivering campaign and Q-G7 its first Q-G4 ad group, or else the first Q-G4 ad group.
   - When no campaign had impressions in those 30 days, Q-G5 and Q-G6 read yesterday, narrowed to the first Q-G4 ad group or else to the first Q-G2 campaign, and Q-G7 reads the first Q-G4 ad group. Q-G2b always looks up the first Q-G2 campaign.
 - The first call becomes `captured/search.json`, and the first row of each query becomes its `captured/row_*.json`. Each file is shaped `{surface, captured_at, request, response}`.
-- A query that answers with no rows leaves its `row_*` surface uncaptured. The command reports it on stderr as `capture-fixtures google: not captured: <surface>: search <query> returned no rows (<scope>)`, with the scope in words and never an id, and counts it in `capture_fixtures_finished` `skipped`. Such a surface does not by itself make the exit status non-zero; a failed call does (exit 1).
+- A query that answers with no rows leaves its `row_*` surface uncaptured. The command reports it on stderr as one `cli_warning` JSON line (`{"event": "cli_warning", "level": "warning", "logger": "ads_engine.cli", "message": …, "timestamp": "…Z"}`) whose `message` reads `ads-engine: capture-fixtures google: not captured: <surface>: search <query> returned no rows (<scope>)`, with the scope in words and never an id, and counts it in `capture_fixtures_finished` `skipped`. Such a surface does not by itself make the exit status non-zero; a failed call does (exit 1).
 - The secret header value, emails and names are replaced by `"<redacted>"`; the webhook URL is replaced by a reserved placeholder URL, and the customer id by zeros of the same length. Every configured secret is replaced in any string whatever its length, in plain text or in any percent-encoded spelling. A capture that still holds one, however many times it was percent-encoded, is not written, and the command exits with status 1.
 - The contract tests then run against the captured payloads as well as the contracts.

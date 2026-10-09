@@ -28,11 +28,14 @@ These entry points cover every caller:
   advisory lock survives the block.
 * :func:`dispose_engine` and :func:`reset_engine` end or forget the engine at process
   shutdown and between tests.
+* :func:`normalise_database_url` is the rule ``DATABASE_URL`` must meet (psycopg 3, plain
+  ``postgresql://`` and ``postgres://`` rewritten to it); the engine applies it, and the API
+  applies it at startup so that a URL the engine would refuse stops the API before it serves.
 
 The URL is a secret (it carries the database password). It is read from
-``Settings.database_url`` only where the engine is built, and the URL itself is never
-logged: only an allowlisted descriptor of its driver, host, port and database name is,
-never its credentials or query parameters.
+``Settings.database_url`` only where the engine is built and where the API checks it at
+startup, and the URL itself is never logged: only an allowlisted descriptor of its driver,
+host, port and database name is, never its credentials or query parameters.
 """
 
 import asyncio
@@ -64,6 +67,7 @@ __all__ = [
     "get_engine",
     "get_sessionmaker",
     "json_dumps",
+    "normalise_database_url",
     "reset_engine",
     "run_to_completion",
     "session_scope",
@@ -181,8 +185,18 @@ def json_dumps(value: object) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _normalise_url(raw: str) -> URL:
+def normalise_database_url(raw: str) -> URL:
     """Parse ``DATABASE_URL`` and pin it to the psycopg 3 driver.
+
+    This is the one rule for ``DATABASE_URL``: :func:`get_engine` applies it when it builds
+    the engine, and ``api/app.py:create_app()`` applies it at startup, so the API refuses a
+    URL the engine would refuse before it serves a request. It parses only and never
+    connects, so a well-formed URL of an unreachable server passes.
+
+    Example::
+
+        normalise_database_url("postgres://ads:ads@db:5432/ads_engine").drivername
+        # 'postgresql+psycopg'
 
     Args:
         raw: The secret URL text from ``Settings.database_url``.
@@ -193,8 +207,9 @@ def _normalise_url(raw: str) -> URL:
 
     Raises:
         ValueError: When the text is not a SQLAlchemy URL, or names any other backend or
-            driver (for example ``postgresql+asyncpg``). The message never contains the
-            URL, and the parse error is not chained, because the URL carries the password.
+            driver (for example ``postgresql+asyncpg``). The message names ``DATABASE_URL``
+            and at most the driver name, never the URL, and the parse error is not chained,
+            because the URL carries the password.
     """
     try:
         url = make_url(raw)
@@ -239,7 +254,7 @@ def _create_engine() -> AsyncEngine:
         ValueError: When ``DATABASE_URL`` is malformed or names another driver.
         pydantic.ValidationError: When the environment cannot be parsed into settings.
     """
-    url = _normalise_url(get_settings().database_url.get_secret_value())
+    url = normalise_database_url(get_settings().database_url.get_secret_value())
     engine = create_async_engine(
         url,
         pool_pre_ping=True,

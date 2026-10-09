@@ -8,10 +8,14 @@ uvicorn serves the factory, never a module-level application::
 
 * **Startup checks**: :meth:`Settings.check_api_startup` refuses a plain-``http``
   ``APP_BASE_URL`` on any host other than ``localhost`` or ``127.0.0.1``, and a missing
-  ``SESSION_SECRET``. That :class:`~ads_engine.settings.ConfigurationError`, or a
-  :class:`pydantic.ValidationError` from an unparseable environment value, is first logged
-  as one ``api.startup_failed`` ERROR event naming the error class and the settings at
-  fault, never their values. It then propagates, so uvicorn exits before it binds a socket.
+  ``SESSION_SECRET``; :func:`~ads_engine.db.session.normalise_database_url`, the engine's
+  own rule, refuses a ``DATABASE_URL`` that is malformed or names a driver other than
+  psycopg 3, without connecting. That :class:`~ads_engine.settings.ConfigurationError`, or
+  a :class:`pydantic.ValidationError` from an unparseable environment value, is logged as
+  one ``api.startup_failed`` ERROR event naming the error class, the settings at fault and
+  what is wrong, never their values, and marked as logged. It then propagates, so uvicorn
+  exits with status 1 before it binds a socket, and the ``sys.excepthook`` that
+  :func:`~ads_engine.logging.configure_logging` installs writes no raw traceback after it.
 * **Session cookie**: Starlette's ``SessionMiddleware`` signs ``ads_engine_session`` with
   ``SESSION_SECRET``. The cookie is always HttpOnly, ``SameSite=Lax`` and lives 12 h; it is
   ``Secure`` exactly when ``APP_BASE_URL`` is ``https://``.
@@ -41,12 +45,13 @@ import http
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, Final
+from typing import Any, Final, get_args
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from pydantic_core.core_schema import ErrorType
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -73,7 +78,7 @@ from ads_engine.api.routes import (
 )
 from ads_engine.api.schemas import ErrorDetail, ErrorResponse
 from ads_engine.db.repositories import DatasetNotWritable
-from ads_engine.db.session import dispose_engine
+from ads_engine.db.session import dispose_engine, normalise_database_url
 from ads_engine.decisions import DecisionError, SubjectRetired
 from ads_engine.logging import configure_logging, get_logger, logged_as, mark_logged
 from ads_engine.settings import ConfigurationError, Settings, get_settings
@@ -579,6 +584,55 @@ async def _serve_openapi(request: Request) -> JSONResponse:
 # Factory
 # ---------------------------------------------------------------------------
 
+# Error types whose message pydantic renders from its own template, which never quotes the
+# input. Any other type's message is a validator's own text (``value_error``,
+# ``assertion_error`` or a custom type), which may quote its input, as the DISPLAY_TIMEZONE
+# and LINKEDIN_AD_ACCOUNT_IDS validators do ("...; got 'x'").
+_TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(get_args(ErrorType)) - {
+    "value_error",
+    "assertion_error",
+}
+# A quoted literal in a validator's own message, as Python's repr quotes a string: single or
+# double quotes, with backslash escapes. Each is withheld, since it may be the input.
+_QUOTED_LITERAL_RE: Final = re.compile(r"'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"")
+_WITHHELD_VALUE: Final = "<value withheld>"
+
+
+def _startup_failure_message(exc: ConfigurationError | ValidationError) -> str:
+    """Return what a startup refusal tells the operator: what is wrong, never a value.
+
+    A :class:`~ads_engine.settings.ConfigurationError` keeps its own text: a fixed sentence
+    per check such as "SESSION_SECRET is not set; run make init", or the ``DATABASE_URL``
+    rule's, which names at most the driver. A
+    :class:`pydantic.ValidationError` gives one ``NAME: message`` per failure, joined by
+    ``"; "``, where ``NAME`` is the environment variable (the field's upper-case name) and
+    the message is pydantic's, built without the input, URL or context. In a validator's
+    own message every quoted literal becomes ``<value withheld>``, since a validator may
+    quote its input. The log pipeline then redacts the text like every other value.
+
+    Example::
+
+        _startup_failure_message(error)
+        # 'GOOGLE_DAILY_CALL_BUDGET: Input should be a valid integer, unable to parse
+        #  string as an integer'
+
+    Args:
+        exc: The refusal ``create_app`` caught.
+
+    Returns:
+        The message for the ``api.startup_failed`` event.
+    """
+    if isinstance(exc, ConfigurationError):
+        return str(exc)
+    details: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        name = ".".join(str(part) for part in error["loc"]).upper() or "SETTINGS"
+        message = error["msg"]
+        if error["type"] not in _TEMPLATE_ERROR_TYPES:
+            message = _QUOTED_LITERAL_RE.sub(_WITHHELD_VALUE, message)
+        details.append(f"{name}: {message}")
+    return "; ".join(details)
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the Ads Action Engine API application.
@@ -589,13 +643,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     Steps, in order:
 
-    1. Configure JSON logging on stdout, redacting the secrets of ``settings`` (idempotent).
-    2. Resolve the settings and run :meth:`Settings.check_api_startup`. A plain-``http``
-       ``APP_BASE_URL`` on a host other than ``localhost`` or ``127.0.0.1``, or a missing
-       ``SESSION_SECRET``, raises here, so uvicorn refuses to start. That error, or an
+    1. Configure JSON logging on stdout, redacting the secrets of ``settings``, and the
+       ``sys.excepthook`` that keeps an uncaught exception out of the stream as a raw
+       traceback (idempotent).
+    2. Resolve the settings, run :meth:`Settings.check_api_startup`, then parse
+       ``DATABASE_URL`` with :func:`~ads_engine.db.session.normalise_database_url`, which
+       never connects. A plain-``http`` ``APP_BASE_URL`` on a host other than ``localhost``
+       or ``127.0.0.1``, a missing ``SESSION_SECRET``, or a malformed or non-psycopg
+       ``DATABASE_URL`` (``fields`` ``["database_url"]``) raises here, so uvicorn refuses
+       to start; a well-formed URL of an unreachable server does not. That error, or an
        environment value that fails validation, is logged as one ``api.startup_failed``
-       ERROR event (``error_type`` and the names of the ``fields`` at fault, never their
-       values) before it propagates.
+       ERROR event before it propagates: ``error_type``, the names of the ``fields`` at
+       fault and a ``message`` saying what is wrong, never a value. The error is marked as
+       logged (:func:`~ads_engine.logging.mark_logged`), so when it ends the uvicorn
+       process (exit status 1) nothing else is written about it.
     3. Create the application with no Swagger UI, no ReDoc and no FastAPI schema route,
        which would answer without a session. The OpenAPI document is served at
        ``/api/v1/openapi.json`` once the routers are included, behind their CSRF guard and
@@ -622,16 +683,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         login rate limiter.
 
     Raises:
-        ads_engine.settings.ConfigurationError: When the base URL is unsafe or
-            ``SESSION_SECRET`` is not set, after ``api.startup_failed`` is logged.
+        ads_engine.settings.ConfigurationError: When the base URL is unsafe,
+            ``SESSION_SECRET`` is not set, or ``DATABASE_URL`` is malformed or names a
+            driver other than ``postgresql+psycopg``, after ``api.startup_failed`` is
+            logged and the error marked as logged.
         pydantic.ValidationError: When ``settings`` is ``None`` and an environment value
-            cannot be parsed, after ``api.startup_failed`` is logged.
+            cannot be parsed, after ``api.startup_failed`` is logged and the error marked
+            as logged.
     """
     configure_logging(settings=settings)
     try:
         if settings is None:
             settings = get_settings()
         settings.check_api_startup()
+        try:
+            # Parsed only, never connected: an unreachable server still lets the API start.
+            normalise_database_url(settings.database_url.get_secret_value())
+        except ValueError as err:
+            # The rule's message names DATABASE_URL and at most its driver, never the URL;
+            # the parse error is not chained, because the URL carries the password.
+            raise ConfigurationError(str(err), fields=("database_url",)) from None
         session_secret = settings.session_secret
         # check_api_startup has already refused a missing or blank SESSION_SECRET; this
         # repeats it so the signing key is typed as present and can never be an empty string.
@@ -640,8 +711,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "SESSION_SECRET is not set; run make init", fields=("session_secret",)
             )
     except (ConfigurationError, ValidationError) as exc:
-        # uvicorn reports a factory failure only as a raw traceback, so the refusal is
-        # logged first. Field names only: a validation message can echo the input.
+        # uvicorn catches only a factory's TypeError, so this error leaves the process
+        # through sys.excepthook. It is logged here in full, with a message that names what
+        # is wrong and never a value, and marked as logged: the hook configure_logging
+        # installed then writes nothing more, so no raw traceback follows this line.
         if isinstance(exc, ValidationError):
             fields = sorted(
                 {
@@ -651,7 +724,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         else:
             fields = sorted(exc.fields)
-        _log.error("api.startup_failed", error_type=type(exc).__name__, fields=fields)
+        _log.error(
+            "api.startup_failed",
+            error_type=type(exc).__name__,
+            fields=fields,
+            message=_startup_failure_message(exc),
+        )
+        mark_logged(exc, "api.startup_failed")
         raise
 
     app = FastAPI(

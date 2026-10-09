@@ -16,7 +16,7 @@ import statistics
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -105,6 +105,7 @@ from ads_engine.simulation.generator import (
     person_contact_id,
     person_object_id,
 )
+from ads_engine.simulation.scenarios import resolve_bindings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -2312,25 +2313,68 @@ def test_a_removed_stage_label_leaves_its_binding_unresolved() -> None:
     contacts = cast(tuple[ContactRecord, ...], removed.hubspot_search("contacts", ()))
     assert not any(MQL_STAGE in contact.stage_entered for contact in contacts)
     assert any(QL_STAGE in contact.stage_entered for contact in contacts)
-    with pytest.raises(ValueError, match="neither a portal stage nor a mapping label"):
+    with pytest.raises(ValueError, match="removed stage label 'Never heard of it' is not a portal"):
         build(SPEC.with_hubspot(removed_stage_labels=("Never heard of it",)))
 
 
-def test_a_mapping_label_the_portal_lacks_becomes_a_custom_stage() -> None:
-    accepted = HubSpotMapping(
-        mql=MAPPING.mql,
-        ql=StageBinding("stage_label", ("Sales Accepted Lead",), None),
+def mapped(mql: StageBinding) -> HubSpotMapping:
+    """The shipped mapping with its MQL binding replaced."""
+    return HubSpotMapping(
+        mql=mql,
+        ql=MAPPING.ql,
         booking_sources=MAPPING.booking_sources,
         meeting_outcome_exclusions=MAPPING.meeting_outcome_exclusions,
     )
-    added_world = build(mapping=accepted)
-    options = added_world.hubspot_lifecycle_options()
-    added = options[-2]
-    assert (added.label, added.value) == ("Sales Accepted Lead", str(HUBSPOT_STAGE_IDS.at(2)))
-    assert options[-1].label == "Other"
-    contacts = cast(tuple[ContactRecord, ...], added_world.hubspot_search("contacts", ()))
-    assert any(added.value in contact.stage_entered for contact in contacts)
-    assert added_world.self_check() == ()
+
+
+def test_a_mapping_label_the_portal_lacks_is_never_invented() -> None:
+    # AAP 0.3.3 "Startup property verification" and 0.5.4.7 "Neither resolves": a mistyped
+    # MQL label leaves MQL unavailable, as it would against a live portal, never counted.
+    mapping = mapped(StageBinding("stage_label", ("QA Missing Stage",), None))
+    missing = build(mapping=mapping)
+    options = missing.hubspot_lifecycle_options()
+    assert options == build().hubspot_lifecycle_options()
+    assert "QA Missing Stage" not in {option.label for option in options}
+    contacts = cast(tuple[ContactRecord, ...], missing.hubspot_search("contacts", ()))
+    assert contacts
+    assert {value for contact in contacts for value in contact.stage_entered} == {
+        "lead",
+        QL_STAGE,
+    }
+    assert not any(contact.bound_dates for contact in contacts)
+    staged = cast(tuple[ContactRecord, ...], build().hubspot_search("contacts", ()))
+    assert any(MQL_STAGE in contact.stage_entered for contact in staged)
+    thresholds = replace(Thresholds.load(CONFIG_DIR), mapping=mapping)
+    bindings = resolve_bindings(missing, thresholds, NOW)
+    assert (bindings.mql.available, bindings.mql.property, bindings.mql.stage_id) == (
+        False,
+        None,
+        None,
+    )
+    assert bindings.mql.reason == "stage 'QA Missing Stage' not found in lifecyclestage options"
+    assert bindings.ql.available
+    assert missing.self_check() == ()
+
+
+def test_a_case_variant_mapping_label_records_into_the_stage_it_resolves_to() -> None:
+    mapping = mapped(StageBinding("stage_label", (" FIRST MEETING BOOKED ",), None))
+    variant = build(mapping=mapping)
+    assert variant.hubspot_lifecycle_options() == build().hubspot_lifecycle_options()
+    thresholds = replace(Thresholds.load(CONFIG_DIR), mapping=mapping)
+    mql = resolve_bindings(variant, thresholds, NOW).mql
+    assert (mql.available, mql.stage_id, mql.label) == (True, MQL_STAGE, "First meeting booked")
+    assert mql.property == f"hs_v2_date_entered_{MQL_STAGE}"
+    contacts = cast(tuple[ContactRecord, ...], variant.hubspot_search("contacts", ()))
+    assert any(MQL_STAGE in contact.stage_entered for contact in contacts)
+    exact = {contact.id: contact for contact in build().hubspot_search("contacts", ())}
+    assert {contact.id for contact in contacts} == set(exact)
+    for contact in contacts:
+        # The same stage entries the exact label records, to the instant.
+        assert contact.stage_entered == cast(ContactRecord, exact[contact.id]).stage_entered
+        assert variant.hubspot_properties(contact)[mql.property] == contact.stage_entered.get(
+            MQL_STAGE
+        )
+    assert variant.self_check() == ()
 
 
 def test_a_configured_google_crm_link_adds_google_touch_contacts() -> None:

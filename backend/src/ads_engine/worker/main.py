@@ -13,21 +13,26 @@ and never migrates. On the host it runs from ``backend/``, where ``../config`` r
 
 Lifecycle:
 
-1. :func:`main` loads the settings (an invalid environment exits with code 1, naming the
-   variables but never their values), configures redacted JSON logging on stdout and runs
-   the event loop.
+1. :func:`main` loads the settings, configures redacted JSON logging on stdout and runs the
+   event loop. An invalid environment exits with code 1 after one ``worker_settings_invalid``
+   ERROR line on stdout, logged under the documented defaults, that names each variable and
+   its problem but never its value. Before the scheduler is built, every worker, a standby
+   included, loads and validates ``config/*.yaml`` (``./config``, else ``../config``): an
+   invalid file logs ``worker_config_invalid`` naming the file and key and exits with code 1
+   at once, without trying the scheduler lock.
 2. The scheduler (:class:`~ads_engine.sync.scheduler.Scheduler`) takes the scheduler
    advisory lock on a dedicated connection. A second worker waits as a standby and takes
    over when the active one's database session ends. After every acquisition the scheduler
    waits 20 s and proves the lock again before any work, and while work runs it proves the
    lock alive every 5 s, so two workers never run work at the same time.
-3. Holding the lock, the scheduler runs :func:`startup` as a task: content assets from
-   ``config/content_assets.yaml``, the changed-configuration check, the source bootstrap
-   (every source live or simulated, with an active dataset; with no credentials, all
-   simulated with the reason ``credentials not configured``) and the default-window
-   analysis. When the lock is lost meanwhile, startup is cancelled and awaited and runs
-   again from the start after the next acquisition. It completes once, before the first
-   wake, so the first default run exists before the first scheduled cycle.
+3. Holding the lock, the scheduler runs :func:`startup` as a task: the configuration
+   loaded again, since the files may have changed while the worker waited, content assets
+   from ``config/content_assets.yaml``, the changed-configuration check against that
+   reload, the source bootstrap (every source live or simulated, with an active dataset;
+   with no credentials, all simulated with the reason ``credentials not configured``) and
+   the default-window analysis. When the lock is lost meanwhile, startup is cancelled and
+   awaited and runs again from the start after the next acquisition. It completes once,
+   before the first wake, so the first default run exists before the first scheduled cycle.
 4. The scheduler then wakes at once, and every 30 s from that first wake, until SIGTERM or
    SIGINT cancels it. Each wake dispatches every idle lane as a task (``google``,
    ``linkedin_hubspot``, ``purge``, ``budget`` and ``analysis``, which coalesces pending
@@ -50,7 +55,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final
@@ -123,7 +127,11 @@ async def startup(settings: Settings | None = None) -> None:
     its first wake only after this returns, so it runs only on the single active worker
     (AAP 0.2.2) and the first default run always precedes the first scheduled cycle
     (AAP 0.11.2). When the lock is lost while it runs, it is cancelled and awaited and runs
-    again from the start after the next acquisition. In order:
+    again from the start after the next acquisition. :func:`_run` has already validated the
+    configuration at process start, before the lock was tried, so an invalid file stops
+    even a standby worker at once; step 1 loads it again because the files may have changed
+    while this worker waited, and the hash compared in step 2 must be the configuration
+    that holds at lock acquisition. In order:
 
     1. Load ``config/`` and replace the content-asset tables with the white paper registry.
     2. Compare the configuration hash with the latest succeeded default run's and enqueue a
@@ -420,6 +428,14 @@ def _cancelled_from_outside() -> bool:
 async def _run(settings: Settings) -> int:
     """Own the event loop's lifetime: the scheduler task, signal handling and engine disposal.
 
+    First the configuration is loaded and validated
+    (:meth:`~ads_engine.analysis.thresholds.Thresholds.load`, from ``./config``, else
+    ``../config``), before the scheduler is built: an invalid file logs
+    ``worker_config_invalid`` and returns :data:`EXIT_FAILURE` at once, with no scheduler,
+    no lock attempt and no stop handler, so a standby worker never waits behind the lock
+    with a configuration that would fail it at failover. :func:`startup` loads the
+    configuration again under the lock.
+
     The scheduler runs as the task :data:`SCHEDULER_TASK_NAME` with :func:`startup` as its
     ``on_start``. SIGTERM or SIGINT logs ``worker_stopping`` and cancels that task; a second
     signal while stopping only logs ``worker_stop_already_requested``.
@@ -439,7 +455,8 @@ async def _run(settings: Settings) -> int:
 
     Returns:
         :data:`EXIT_OK` after a signal-requested shutdown, :data:`EXIT_FAILURE` when a
-        configuration file is invalid (``worker_config_invalid``).
+        configuration file is invalid at process start or at the reload under the lock
+        (``worker_config_invalid``).
 
     Raises:
         asyncio.CancelledError: When this coroutine itself is cancelled, not by a signal.
@@ -465,6 +482,11 @@ async def _run(settings: Settings) -> int:
             task.cancel()
 
     try:
+        # Fail fast on an invalid config/ before the scheduler exists, so no lock is ever
+        # tried and a standby worker exits at once instead of failing only at failover.
+        # startup() loads it again under the lock: the files may change while this worker
+        # waits, and the config_changed comparison uses what holds at acquisition.
+        Thresholds.load()
         scheduler = Scheduler(settings)
         task = asyncio.create_task(
             scheduler.run_forever(on_start=_on_start), name=SCHEDULER_TASK_NAME
@@ -504,24 +526,35 @@ async def _run(settings: Settings) -> int:
     return EXIT_OK
 
 
-def _report_invalid_settings(exc: ValidationError) -> None:
-    """Write one line per invalid environment variable to stderr: its name and the problem.
+def _log_invalid_settings(exc: ValidationError) -> None:
+    """Log an invalid environment as one ``worker_settings_invalid`` ERROR line on stdout.
 
-    Built with ``include_input=False``, so a malformed secret is never echoed.
+    Logging is configured first from the documented defaults (``Settings.model_construct()``),
+    so the environment that failed validation is not read again, and the line is written to
+    stdout, the worker's log stream, as one redacted JSON object like every other worker line.
+    The event carries ``error_count`` and ``errors``: per error, the ``variable`` (the field
+    name upper-cased, as in the environment) and pydantic's ``problem`` text. The errors are
+    built with ``include_input=False`` and ``include_url=False``, so no value is ever echoed.
 
     Args:
         exc: The settings validation error.
     """
-    errors = exc.errors(include_input=False, include_url=False)
-    sys.stderr.write(f"ads-engine worker: invalid settings ({len(errors)}); not started\n")
-    for error in errors:
-        location = ".".join(str(part) for part in error["loc"]) or "settings"
-        sys.stderr.write(f"  {location.upper()}: {error['msg']}\n")
-    sys.stderr.flush()
+    configure_logging(settings=Settings.model_construct())
+    errors = [
+        {
+            "variable": (".".join(str(part) for part in error["loc"]) or "settings").upper(),
+            "problem": error["msg"],
+        }
+        for error in exc.errors(include_input=False, include_url=False)
+    ]
+    _log.error("worker_settings_invalid", error_count=exc.error_count(), errors=errors)
 
 
 def main() -> None:
     """Run the worker until SIGTERM or SIGINT; the ``worker`` container's command.
+
+    The worker reports through its JSON log on stdout, one object per line, an invalid
+    environment included (``worker_settings_invalid``, :func:`_log_invalid_settings`).
 
     Raises:
         SystemExit: With :data:`EXIT_FAILURE` when the environment is invalid, a
@@ -531,7 +564,7 @@ def main() -> None:
     try:
         settings = get_settings()
     except ValidationError as exc:
-        _report_invalid_settings(exc)
+        _log_invalid_settings(exc)
         raise SystemExit(EXIT_FAILURE) from None
     configure_logging(settings=settings)
     _log.info(

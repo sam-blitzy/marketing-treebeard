@@ -16,7 +16,9 @@ AAP 0.11.2 row ``integration/test_hubspot_client.py``; each guarantee maps to na
   :func:`test_contacts_by_email_not_found_vs_failed`,
   :func:`test_sim_invalid_never_sent_to_live_portal`, and the startup property verification
   of AAP 0.3.3 and 0.5.4.7: :func:`test_verify_bindings_resolves_stage_labels`,
-  :func:`test_unresolved_binding_is_unavailable`, :func:`test_property_mode_binding`.
+  :func:`test_unresolved_binding_is_unavailable`,
+  :func:`test_simulated_portal_leaves_a_mistyped_stage_label_unavailable`,
+  :func:`test_property_mode_binding`.
 * **Search overflow** (AAP 0.3.3 "Deal search"): :func:`test_day_over_10000_splits_to_hours`,
   :func:`test_hour_over_10000_read_to_ceiling_and_incomplete`,
   :func:`test_search_bodies_shape`.
@@ -113,6 +115,7 @@ from ads_engine.db.models.crm import ASSOCIATION_FETCH_STATUSES, CrmContact
 from ads_engine.db.models.ops import SourceDataset
 from ads_engine.settings import get_settings
 from ads_engine.simulation import SIM_EMAIL_DOMAIN, payloads
+from ads_engine.simulation.generator import DEFAULT_SPEC, SimulatedWorld
 from ads_engine.sync import freshness
 from ads_engine.sync.jobs import CrmSyncJob, JobContext
 from ads_engine.sync.mode import SourceModeController
@@ -1451,6 +1454,46 @@ async def test_unresolved_binding_is_unavailable(
     assert MQL_PROPERTY in missing_date.mql.reason
     assert MQL_PROPERTY in property_reads(portal)
     assert missing_date.ql.available is True
+
+
+async def test_simulated_portal_leaves_a_mistyped_stage_label_unavailable(
+    contract_checked_transport: TransportFactory,
+    mock_transport_for: Callable[..., httpx.MockTransport],
+    make_thresholds: Callable[..., Thresholds],
+) -> None:
+    """Target reads (stage binding): the simulated portal never invents a configured stage.
+
+    With ``mql.stage_label: "QA Missing Stage"``, a label the simulated portal lacks, the client
+    verifying against a world built with that mapping finds no such ``lifecyclestage`` option:
+    MQL is unavailable with a reason naming the stage, as against a live portal, and QL still
+    resolves on its own.
+    """
+    configured = make_thresholds({"mql.stage_label": "QA Missing Stage"})
+    world = SimulatedWorld(
+        42, DEFAULT_SPEC, content_assets=configured.content_assets, mapping=configured.mapping
+    )
+    handler = cast(
+        "Callable[[httpx.Request], Awaitable[httpx.Response]]",
+        mock_transport_for(SOURCE, world, strict=True).handler,
+    )
+    clock = FakeClock()
+    async with build_client(SOURCE, contract_checked_transport(SOURCE, handler)) as http:
+        client = HubSpotClient(
+            http,
+            SecretStr(TOKEN),
+            live=False,
+            retry=RetryPolicy(sleep=no_sleep),
+            limiter=fake_limiter(clock),
+        )
+        bindings = await client.verify_bindings(configured.mapping, get_settings())
+        bound = client.contact_properties
+
+    assert "QA Missing Stage" not in {option.label for option in world.hubspot_lifecycle_options()}
+    assert bindings.mql.available is False
+    assert (bindings.mql.property, bindings.mql.stage_id) == (None, None)
+    assert bindings.mql.reason == "stage 'QA Missing Stage' not found in lifecyclestage options"
+    assert bindings.ql.available is True
+    assert bound == ContactPropertyMap(mql_property=None, ql_property=bindings.ql.property)
 
 
 @pytest.mark.parametrize(

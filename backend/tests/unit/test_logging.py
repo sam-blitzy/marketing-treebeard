@@ -17,15 +17,18 @@ import logging
 import numbers
 import os
 import re
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 import uuid
 from collections import UserList, deque
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
-from types import MappingProxyType
-from typing import Any, cast
+from pathlib import Path
+from types import MappingProxyType, TracebackType
+from typing import Any, Final, cast
 from urllib.parse import quote, unquote
 
 import pytest
@@ -41,6 +44,7 @@ from ads_engine.logging import (
     URL_CREDENTIALS_RE,
     configure_logging,
     get_logger,
+    install_excepthook,
     logged_as,
     mark_logged,
     redact,
@@ -77,13 +81,20 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     The root handlers saved here include pytest's own session handlers, which
     ``configure_logging`` removes; they are re-attached, and the handler it installed is
     removed and closed, so other test modules see logging exactly as before. The
-    ``logging.lastResort`` handler it replaces is restored too, and so are the stream and
-    formatter of a handler installed before the test, which it reconfigures in place.
+    ``logging.lastResort`` handler and ``sys.excepthook`` it replaces are restored too, and
+    so are the stream and formatter of a handler installed before the test, which it
+    reconfigures in place.
     """
     for key in list(os.environ):
         if key.lower() in SETTINGS_ENV_NAMES:
             monkeypatch.delenv(key, raising=False)
     get_settings.cache_clear()
+    # configure_logging installs its sys.excepthook; the hook and the one it replaced are put
+    # back afterwards.
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(
+        ads_logging._STATE, "previous_excepthook", ads_logging._STATE.previous_excepthook
+    )
 
     root = logging.getLogger()
     root_handlers = list(root.handlers)
@@ -2470,6 +2481,271 @@ def test_safe_name_fails_closed_when_redaction_raises(monkeypatch: pytest.Monkey
     assert ads_logging._safe_name("ads_engine.sync") == "unknown"
     assert ads_logging._type_name(ValueError()) == "unknown"
     assert ads_logging._exc_info_type_name(ValueError()) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# install_excepthook(): an exception that ends the process
+# ---------------------------------------------------------------------------
+
+type _HookCall = tuple[type[BaseException], BaseException, TracebackType | None]
+
+
+class _RecordingHook:
+    """A stand-in for the interpreter's excepthook that records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[_HookCall] = []
+
+    def __call__(
+        self, exc_type: type[BaseException], value: BaseException, tb: TracebackType | None
+    ) -> None:
+        self.calls.append((exc_type, value, tb))
+
+
+@pytest.fixture
+def previous_hook(monkeypatch: pytest.MonkeyPatch) -> _RecordingHook:
+    """Make a recording hook ``sys.excepthook``, as if no hook had been installed yet."""
+    recorder = _RecordingHook()
+    monkeypatch.setattr(sys, "excepthook", recorder)
+    monkeypatch.setattr(ads_logging._STATE, "previous_excepthook", None)
+    return recorder
+
+
+def _uncaught(exc: BaseException) -> None:
+    """Hand ``exc`` to ``sys.excepthook`` as the interpreter does when it ends the process."""
+    sys.excepthook(type(exc), exc, exc.__traceback__)
+
+
+def test_configure_logging_installs_the_excepthook_once(previous_hook: _RecordingHook) -> None:
+    _configure()
+    assert sys.excepthook is ads_logging._log_uncaught_exception
+    assert ads_logging._STATE.previous_excepthook is previous_hook
+
+    # Repeating is a no-op: the hook never chains onto itself.
+    _configure()
+    install_excepthook()
+    assert sys.excepthook is ads_logging._log_uncaught_exception
+    assert ads_logging._STATE.previous_excepthook is previous_hook
+
+
+def test_a_replaced_excepthook_is_reinstalled_in_front_of_the_original(
+    monkeypatch: pytest.MonkeyPatch, previous_hook: _RecordingHook
+) -> None:
+    install_excepthook()
+    later = _RecordingHook()
+    monkeypatch.setattr(sys, "excepthook", later)
+
+    install_excepthook()
+    assert sys.excepthook is ads_logging._log_uncaught_exception
+    # The remembered hook is still the one present before the first install.
+    assert ads_logging._STATE.previous_excepthook is previous_hook
+
+
+def test_an_uncaught_exception_its_owner_logged_writes_nothing(
+    previous_hook: _RecordingHook, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = _configure()
+    error = _raised(f"refused for {LEAD_EMAIL}")
+    mark_logged(error, "api.startup_failed")
+
+    _uncaught(error)
+
+    assert stream.getvalue() == ""
+    assert capsys.readouterr() == ("", "")
+    assert previous_hook.calls == []
+
+
+def test_an_unowned_uncaught_exception_is_one_redacted_critical_line(
+    previous_hook: _RecordingHook, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
+    with pytest.raises(RuntimeError) as excinfo:
+        _raise_with_secret_local()
+
+    _uncaught(excinfo.value)
+
+    output = stream.getvalue()
+    (record,) = _lines(stream)
+    assert record["event"] == "uncaught_exception"
+    assert record["level"] == "critical"
+    assert record["logger"] == "ads_engine.logging"
+    assert record["error_type"] == "RuntimeError"
+    (exception,) = record["exception"]
+    assert exception["exc_type"] == "RuntimeError"
+    assert exception["exc_value"] == f"failed with {REDACTED} for {REDACTED_EMAIL} (25)"
+    assert exception["frames"]
+    assert all("locals" not in frame for frame in exception["frames"])
+    for value in (N8N_SECRET, LEAD_EMAIL, "test-unlisted-local-value"):
+        assert value not in output
+    assert capsys.readouterr() == ("", "")
+    assert previous_hook.calls == []
+
+
+def test_keyboard_interrupt_goes_to_the_previous_excepthook(
+    previous_hook: _RecordingHook,
+) -> None:
+    stream = _configure()
+    interrupt = KeyboardInterrupt()
+
+    _uncaught(interrupt)
+
+    assert previous_hook.calls == [(KeyboardInterrupt, interrupt, None)]
+    assert stream.getvalue() == ""
+
+
+def test_keyboard_interrupt_falls_back_to_the_interpreter_hook(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Called before any install, the hook hands Ctrl-C to ``sys.__excepthook__``."""
+    monkeypatch.setattr(ads_logging._STATE, "previous_excepthook", None)
+    ads_logging._log_uncaught_exception(KeyboardInterrupt, KeyboardInterrupt(), None)
+    assert capsys.readouterr().err == "KeyboardInterrupt\n"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [GeneratorExit(), BaseExceptionGroup("group", [KeyboardInterrupt()])],
+    ids=["generator-exit", "base-exception-group"],
+)
+def test_other_base_exceptions_are_logged_not_handed_on(
+    previous_hook: _RecordingHook, error: BaseException
+) -> None:
+    stream = _configure()
+
+    _uncaught(error)
+
+    (record,) = _lines(stream)
+    assert record["event"] == "uncaught_exception"
+    assert record["level"] == "critical"
+    assert record["error_type"] == type(error).__name__
+    assert previous_hook.calls == []
+
+
+class _FailingLogger:
+    """A logger whose every call raises, with a secret in the error's text."""
+
+    def critical(self, event: str, **values: object) -> None:
+        raise RecursionError(f"logging failed for {N8N_SECRET}")
+
+
+def test_an_uncaught_exception_that_cannot_be_logged_writes_a_minimal_line(
+    monkeypatch: pytest.MonkeyPatch,
+    previous_hook: _RecordingHook,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The fallback names both classes only; the previous hook would print the text raw."""
+    _configure(Settings(n8n_webhook_secret=SecretStr(N8N_SECRET)))
+    monkeypatch.setattr(ads_logging, "get_logger", lambda name=None: _FailingLogger())
+
+    _uncaught(_raised(f"failed with {N8N_SECRET} for {LEAD_EMAIL}"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.endswith("\n")
+    (line,) = captured.err.splitlines()
+    record = json.loads(line)
+    assert set(record) == {
+        "event",
+        "level",
+        "logger",
+        "timestamp",
+        "error_type",
+        "logging_error_type",
+    }
+    assert record["event"] == "uncaught_exception"
+    assert record["level"] == "critical"
+    assert record["logger"] == "ads_engine.logging"
+    assert record["error_type"] == "RuntimeError"
+    assert record["logging_error_type"] == "RecursionError"
+    assert N8N_SECRET not in captured.err
+    assert LEAD_EMAIL not in captured.err
+    assert previous_hook.calls == []
+
+
+class _BrokenStderr:
+    """A ``sys.stderr`` whose writes fail."""
+
+    def write(self, text: str) -> int:
+        raise OSError("stderr is closed")
+
+    def flush(self) -> None:
+        raise OSError("stderr is closed")
+
+
+def test_the_minimal_line_is_dropped_quietly_when_stderr_is_broken(
+    monkeypatch: pytest.MonkeyPatch, previous_hook: _RecordingHook
+) -> None:
+    _configure()
+    monkeypatch.setattr(ads_logging, "get_logger", lambda name=None: _FailingLogger())
+    monkeypatch.setattr(sys, "stderr", _BrokenStderr())
+
+    _uncaught(_raised("nothing can be written"))
+
+    assert previous_hook.calls == []
+
+
+def test_the_minimal_line_withholds_a_class_named_after_a_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure(Settings(n8n_webhook_secret=SecretStr("SecretClassName0451")))
+    secret_class = type("SecretClassName0451", (RuntimeError,), {})
+    monkeypatch.setattr(ads_logging, "get_logger", lambda name=None: _FailingLogger())
+
+    ads_logging._log_uncaught_exception(secret_class, secret_class("x"), None)
+
+    record = json.loads(capsys.readouterr().err)
+    assert record["error_type"] == "unknown"
+    assert record["logging_error_type"] == "RecursionError"
+
+
+_UNCAUGHT_PROGRAM: Final = textwrap.dedent(
+    f"""
+    import sys
+
+    from ads_engine.logging import configure_logging, mark_logged
+
+    configure_logging()
+    error = RuntimeError("uncaught with {N8N_SECRET} for {LEAD_EMAIL}")
+    if sys.argv[1] == "owned":
+        mark_logged(error, "owner_event")
+    raise error
+    """
+)
+"""Configures logging in a fresh interpreter, then ends it with an uncaught exception."""
+
+
+@pytest.mark.parametrize("ownership", ["unowned", "owned"])
+def test_an_uncaught_exception_ends_a_real_process_as_json_only(
+    monkeypatch: pytest.MonkeyPatch, ownership: str
+) -> None:
+    """The interpreter still exits 1, and writes no traceback text of its own."""
+    monkeypatch.setenv("N8N_WEBHOOK_SECRET", N8N_SECRET)
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and program, no user input
+        [sys.executable, "-c", _UNCAUGHT_PROGRAM, ownership],
+        cwd=Path(__file__).resolve().parents[2],
+        env=dict(os.environ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 1, completed.stderr
+    assert completed.stderr == ""
+    assert "Traceback" not in completed.stdout
+    for value in (N8N_SECRET, LEAD_EMAIL):
+        assert value not in completed.stdout
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+    if ownership == "owned":
+        assert records == []
+    else:
+        (record,) = records
+        assert record["event"] == "uncaught_exception"
+        assert record["level"] == "critical"
+        assert record["error_type"] == "RuntimeError"
+        assert record["exception"][0]["exc_value"] == (
+            f"uncaught with {REDACTED} for {REDACTED_EMAIL}"
+        )
 
 
 # ---------------------------------------------------------------------------

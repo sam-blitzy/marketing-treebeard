@@ -38,6 +38,16 @@ Event-loop constraint:
     in a worker thread with :func:`asyncio.to_thread`; otherwise :class:`RuntimeError` is
     raised before any connection is opened.
 
+Concurrency:
+    Online runs against one database are serialised by the PostgreSQL advisory lock
+    :data:`MIGRATION_LOCK_KEY`, taken on the migration connection before Alembic reads the
+    current revision. A run that finds it held logs one line and waits; once the earlier run
+    has committed and released it, the later one finds the database at head and changes
+    nothing, so two ``ads-engine migrate`` one-shots started together both succeed. On a
+    caller's connection that is already in a transaction the lock is transaction-level and
+    lasts until the caller's commit or rollback; otherwise it is session-level and released
+    when the run ends, after a failure too. Offline ``--sql`` rendering takes no lock.
+
 Example:
     Migrating on a shared connection from async code, as ``tests/conftest.py`` does::
 
@@ -57,13 +67,17 @@ Example:
 """
 
 import asyncio
+import hashlib
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from logging.config import fileConfig
 from typing import Final, TypedDict
 
 from alembic import context
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, text
 from sqlalchemy.engine import URL, Connection, make_url
-from sqlalchemy.exc import ArgumentError
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -79,6 +93,36 @@ _DRIVERNAME: Final = "postgresql+psycopg"
 # Driverless schemes rewritten to psycopg 3, exactly as ads_engine.db.session does for the
 # api and worker, so `ads-engine migrate` accepts every DATABASE_URL the processes accept.
 _PLAIN_SCHEMES: Final = frozenset({"postgresql", "postgres"})
+
+# The name the migration lock key is derived from. analysis.lock derives ANALYSIS_LOCK_KEY from
+# "ads_engine:analysis" and sync.scheduler derives SCHEDULER_LOCK_KEY from
+# "ads_engine:scheduler" the same way, so the three keys differ.
+_MIGRATION_LOCK_NAME: Final = "ads_engine:migrate"
+
+MIGRATION_LOCK_KEY: Final[int] = int.from_bytes(
+    hashlib.sha256(_MIGRATION_LOCK_NAME.encode()).digest()[:8], "big", signed=True
+)
+"""The advisory-lock key that serialises the online migration runs of one database.
+
+Derived as ``int.from_bytes(sha256(b"ads_engine:migrate").digest()[:8], "big",
+signed=True)``: deterministic in every process and release, and within PostgreSQL
+``bigint``. It is defined once, here, and must never equal the analysis lock key or the
+scheduler lock key, so a migration never waits on an analysis run or a running worker.
+Advisory locks are scoped to the database, so runs against different databases never wait
+for each other.
+"""
+
+# Lock statements. Each `pg_try_*` form returns at once with true or false; its blocking
+# counterpart waits until the holder releases the lock.
+_TRY_SESSION_LOCK: Final = text("SELECT pg_try_advisory_lock(:key)")
+_WAIT_SESSION_LOCK: Final = text("SELECT pg_advisory_lock(:key)")
+_SESSION_UNLOCK: Final = text("SELECT pg_advisory_unlock(:key)")
+_TRY_XACT_LOCK: Final = text("SELECT pg_try_advisory_xact_lock(:key)")
+_WAIT_XACT_LOCK: Final = text("SELECT pg_advisory_xact_lock(:key)")
+
+# Under `alembic`'s own logger tree, so the ini's `[logger_alembic]` level applies to the
+# standalone CLI, and the structlog JSON handler renders it under `ads-engine migrate`.
+_log = logging.getLogger("alembic.env")
 
 config = context.config
 
@@ -171,19 +215,116 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _acquire_migration_lock(connection: Connection, *, transactional: bool) -> None:
+    """Take the migration lock on ``connection``, waiting while another run holds it.
+
+    A free lock is taken at once. A held one is reported in one log line, which names no URL
+    or other connection detail, and is then waited for without a time limit: its holder is a
+    migration run, which releases it when the run finishes or its database session ends.
+
+    Args:
+        connection: The migration connection. The lock statements run in its current
+            transaction, or autobegin one.
+        transactional: ``True`` takes the transaction-level lock, which PostgreSQL releases
+            when that transaction commits or rolls back. ``False`` takes the session-level
+            lock, held until :func:`_release_migration_lock` or the end of the session.
+    """
+    if transactional:
+        try_lock, wait_lock = _TRY_XACT_LOCK, _WAIT_XACT_LOCK
+    else:
+        try_lock, wait_lock = _TRY_SESSION_LOCK, _WAIT_SESSION_LOCK
+    parameters = {"key": MIGRATION_LOCK_KEY}
+    if bool(connection.scalar(try_lock, parameters)):
+        return
+    _log.info("Another migration run holds the migration lock; waiting for it to finish.")
+    connection.execute(wait_lock, parameters)
+
+
+def _release_migration_lock(connection: Connection) -> None:
+    """Release the session-level migration lock and end the transaction that released it.
+
+    Args:
+        connection: The connection holding the lock, in no failed transaction.
+    """
+    connection.execute(_SESSION_UNLOCK, {"key": MIGRATION_LOCK_KEY})
+    connection.commit()
+
+
+def _release_migration_lock_after_failure(connection: Connection) -> None:
+    """Release the session-level migration lock after a failed run, without raising.
+
+    The failed run's transaction is rolled back first, so the unlock statement can run. A
+    database error on the way is logged by its class name only and swallowed, so the error
+    that ended the run stays the one reported; the lock then ends with the database session.
+
+    Args:
+        connection: The connection holding the lock.
+    """
+    try:
+        connection.rollback()
+        _release_migration_lock(connection)
+    except SQLAlchemyError as exc:
+        _log.warning(
+            "The migration lock was not released after the failed run (%s); "
+            "it ends with the database session.",
+            type(exc).__name__,
+        )
+
+
+@contextmanager
+def _migration_lock(connection: Connection) -> Iterator[None]:
+    """Hold the migration lock on ``connection`` for the duration of the block.
+
+    Without it, two runs against an empty database both find no ``alembic_version`` table,
+    both create it, and the later one fails with a unique violation. Under the lock the later
+    run reads the current revision only after the earlier one committed and released it, so
+    it finds the database at head and changes nothing.
+
+    * A connection already in a transaction belongs to a caller, and so does the
+      transaction. The transaction-level lock joins it and PostgreSQL releases it at the
+      caller's commit or rollback; nothing here commits it.
+    * Any other connection takes the session-level lock, then commits the transaction the
+      lock statements autobegan, so Alembic still finds no external transaction and commits
+      each revision itself. The lock is released when the block ends, after a failure too,
+      and a failed release never replaces the error that ended the block.
+
+    Args:
+        connection: The migration connection.
+
+    Yields:
+        Nothing; the block runs while the lock is held.
+    """
+    if connection.in_transaction():
+        _acquire_migration_lock(connection, transactional=True)
+        yield
+        return
+    _acquire_migration_lock(connection, transactional=False)
+    connection.commit()
+    try:
+        yield
+    except BaseException:
+        _release_migration_lock_after_failure(connection)
+        raise
+    _release_migration_lock(connection)
+
+
 def do_run_migrations(connection: Connection) -> None:
-    """Run the migrations on a synchronous connection.
+    """Run the migrations on a synchronous connection, holding the migration lock.
 
     Called inside ``AsyncConnection.run_sync`` by :func:`run_async_migrations`, or directly
-    with the connection a caller passed in ``Config.attributes["connection"]``.
+    with the connection a caller passed in ``Config.attributes["connection"]``. The lock is
+    taken before Alembic reads the current revision, so concurrent runs against one database
+    run one after the other (:func:`_migration_lock`).
 
     Args:
         connection: The connection to migrate through. When it is already in a
-            transaction, Alembic joins that transaction and leaves the commit to its owner.
+            transaction, Alembic joins that transaction and leaves the commit to its owner,
+            whose commit or rollback also releases the migration lock.
     """
-    context.configure(connection=connection, **_SHARED_OPTIONS)
-    with context.begin_transaction():
-        context.run_migrations()
+    with _migration_lock(connection):
+        context.configure(connection=connection, **_SHARED_OPTIONS)
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 async def run_async_migrations() -> None:

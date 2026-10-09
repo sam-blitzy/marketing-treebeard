@@ -13,9 +13,12 @@ test database; nothing reaches the network. The guarantees proven here:
   ``GET /healthz`` needs the session (401); every error status renders ``{"error": {"code",
   "message"}}`` and nothing else.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
-  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET``. Each refusal, and an
-  environment value that fails validation, is logged once as ``api.startup_failed`` with the
-  error class and the fields at fault, never their values, before the error propagates.
+  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET`` or on a ``DATABASE_URL``
+  the engine would refuse (malformed, or a driver other than psycopg 3), while an unreachable
+  database still starts it and ``/healthz`` answers 503. Each refusal, and an environment value
+  that fails validation, is logged once as ``api.startup_failed`` with the error class, the
+  fields at fault and what is wrong, never their values, before the error propagates; under
+  uvicorn the process then exits 1 with no line that is not JSON.
 * **Every route returns its schema** (AAP 0.5.3 endpoint table), on simulated data seeded the
   way the worker seeds a first start.
 * **Boundaries and redaction** (AAP 0.3.2, 0.11.1): a failed login is logged without the email,
@@ -67,6 +70,7 @@ from ads_engine.analysis.thresholds import CONFIG_FILES, ConfigError, Thresholds
 from ads_engine.api import app as api_app
 from ads_engine.api import deps, schemas, security
 from ads_engine.api.app import API_PREFIX, create_app
+from ads_engine.db import session as db_session
 from ads_engine.db.models.ops import DATASETS, SOURCES, AppUser
 from ads_engine.settings import ConfigurationError, Settings, get_settings
 from ads_engine.sync import mode
@@ -285,8 +289,8 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     the session and bypass ``structlog.testing.capture_logs`` in later modules, and a later
     module that restores logging would flush a stream pytest has closed. As
     ``tests/unit/test_cli.py`` does, every configuration made during the test runs with caching
-    off, and the handlers, levels, structlog configuration, redactor and last-resort handler
-    are put back afterwards.
+    off, and the handlers, levels, structlog configuration, redactor, last-resort handler and
+    ``sys.excepthook`` are put back afterwards.
     """
     real_configure = ads_logging.configure_logging
 
@@ -298,6 +302,12 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # create_app() binds the name at import; conftest imports it from the module at call time.
     monkeypatch.setattr(api_app, "configure_logging", configure_without_cache)
     monkeypatch.setattr(ads_logging, "configure_logging", configure_without_cache)
+    # configure_logging installs its sys.excepthook; the hook and the one it replaced are put
+    # back afterwards.
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(
+        ads_logging._STATE, "previous_excepthook", ads_logging._STATE.previous_excepthook
+    )
     root = logging.getLogger()
     root_handlers = list(root.handlers)
     root_level = root.level
@@ -1117,6 +1127,98 @@ def test_create_app_requires_session_secret(
         create_app()
 
 
+DATABASE_PASSWORD: Final = "pw-startup-db-0451"
+"""The password of every ``DATABASE_URL`` the startup tests set; it never reaches a log."""
+
+UNUSABLE_DATABASE_URLS: Final = (
+    pytest.param(
+        "not-a-url", "DATABASE_URL is not a valid SQLAlchemy database URL", id="malformed"
+    ),
+    pytest.param(
+        f"postgresql://ads:{DATABASE_PASSWORD}@db.example.test:port/ads_engine",
+        "DATABASE_URL is not a valid SQLAlchemy database URL",
+        id="malformed-port",
+    ),
+    pytest.param(
+        f"mysql://ads:{DATABASE_PASSWORD}@db.example.test/ads_engine",
+        "DATABASE_URL must use the postgresql+psycopg driver (psycopg 3); got 'mysql'",
+        id="mysql",
+    ),
+    pytest.param(
+        f"postgresql+asyncpg://ads:{DATABASE_PASSWORD}@db.example.test/ads_engine",
+        "DATABASE_URL must use the postgresql+psycopg driver (psycopg 3); got 'postgresql+asyncpg'",
+        id="asyncpg",
+    ),
+)
+"""``DATABASE_URL`` values the engine refuses, each with the refusal's exact message."""
+
+
+@pytest.mark.parametrize(("database_url", "message"), UNUSABLE_DATABASE_URLS)
+def test_create_app_refuses_a_database_url_the_engine_cannot_use(
+    set_env: Callable[..., None], database_url: str, message: str
+) -> None:
+    """The API stops at startup on a ``DATABASE_URL`` the engine would refuse, as the worker does.
+
+    The refusal is the engine's own rule (``normalise_database_url``), raised as a
+    ``ConfigurationError`` naming ``DATABASE_URL`` and at most the driver, never the URL; the
+    parse error is not chained, because the URL carries the password.
+    """
+    set_env(DATABASE_URL=database_url)
+    with pytest.raises(ConfigurationError) as excinfo:
+        create_app()
+
+    error = excinfo.value
+    assert str(error) == message
+    assert error.fields == ("database_url",)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert DATABASE_PASSWORD not in str(error)
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        f"postgresql://ads:{DATABASE_PASSWORD}@db.example.test:5432/ads_engine",
+        f"postgres://ads:{DATABASE_PASSWORD}@db.example.test:5432/ads_engine",
+        f"postgresql+psycopg://ads:{DATABASE_PASSWORD}@db.example.test:5432/ads_engine",
+    ],
+    ids=["postgresql", "postgres", "postgresql+psycopg"],
+)
+def test_create_app_accepts_every_postgres_scheme_the_engine_accepts(
+    set_env: Callable[..., None], database_url: str
+) -> None:
+    """``postgresql://`` and ``postgres://`` are rewritten to psycopg 3, so the API starts on them.
+
+    The host does not resolve: the startup check parses the URL and never connects.
+    """
+    set_env(DATABASE_URL=database_url)
+    app = create_app()
+    assert isinstance(app, FastAPI)
+    settings = app.state.settings
+    assert isinstance(settings, Settings)
+    assert settings.database_url.get_secret_value() == database_url
+
+
+async def test_unreachable_database_starts_the_api_and_healthz_answers_503(
+    set_env: Callable[..., None],
+) -> None:
+    """A well-formed URL of a server that refuses connections is not a startup refusal.
+
+    The API starts, and ``GET /healthz`` reports the database as 503 ``database_unavailable``
+    (AAP 0.5.3) rather than 500, so the Compose healthcheck keeps the stack waiting on it.
+    """
+    set_env(DATABASE_URL=f"postgresql://ads:{DATABASE_PASSWORD}@127.0.0.1:1/ads_engine")
+    await db_session.dispose_engine()
+    try:
+        app = create_app()
+        async with serve(app) as client:
+            response = await client.get(api("/healthz"))
+    finally:
+        await db_session.dispose_engine()
+    error = assert_error(response, 503, "database_unavailable")
+    assert error.error.message == "Database unavailable"
+
+
 # ---------------------------------------------------------------------------------------------
 # Startup failure logging (the refusals above as structured logs, AAP 0.11.1)
 # ---------------------------------------------------------------------------------------------
@@ -1144,8 +1246,14 @@ def startup_failures(output: str) -> list[dict[str, Any]]:
     return events
 
 
-def assert_one_startup_failure(output: str, *, error_type: str, fields: list[str]) -> None:
-    """Assert ``output`` holds exactly one ``api.startup_failed`` ERROR event, as given."""
+def assert_one_startup_failure(
+    output: str, *, error_type: str, fields: list[str], message: str
+) -> None:
+    """Assert ``output`` holds exactly one ``api.startup_failed`` ERROR event, as given.
+
+    ``message`` is what the event tells the operator: a ``ConfigurationError``'s own text, or
+    one ``NAME: message`` per failed setting for a ``ValidationError``.
+    """
     failures = startup_failures(output)
     assert len(failures) == 1, failures
     failure = failures[0]
@@ -1153,12 +1261,13 @@ def assert_one_startup_failure(output: str, *, error_type: str, fields: list[str
     assert failure["logger"] == "ads_engine.api.app"
     assert failure["error_type"] == error_type
     assert failure["fields"] == fields
+    assert failure["message"] == message
 
 
 def test_unsafe_base_url_logs_startup_failed(
     set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The base-URL refusal is logged once, naming its field and class but neither value.
+    """The base-URL refusal is logged once, naming its field, class and fix but neither value.
 
     ``ConfigurationError`` still propagates, so uvicorn refuses to start (AAP 0.3.2).
     """
@@ -1168,11 +1277,16 @@ def test_unsafe_base_url_logs_startup_failed(
     assert secret is not None
     capsys.readouterr()
 
-    with pytest.raises(ConfigurationError, match="APP_BASE_URL must use https://"):
+    with pytest.raises(ConfigurationError, match="APP_BASE_URL must use https://") as excinfo:
         create_app()
 
     output = capsys.readouterr().out
-    assert_one_startup_failure(output, error_type="ConfigurationError", fields=["app_base_url"])
+    assert_one_startup_failure(
+        output,
+        error_type="ConfigurationError",
+        fields=["app_base_url"],
+        message=str(excinfo.value),
+    )
     assert host not in output
     assert secret.get_secret_value() not in output
 
@@ -1190,7 +1304,12 @@ def test_missing_session_secret_logs_startup_failed(
         create_app()
 
     output = capsys.readouterr().out
-    assert_one_startup_failure(output, error_type="ConfigurationError", fields=["session_secret"])
+    assert_one_startup_failure(
+        output,
+        error_type="ConfigurationError",
+        fields=["session_secret"],
+        message="SESSION_SECRET is not set; run make init",
+    )
     assert host not in output
 
 
@@ -1209,8 +1328,15 @@ def test_session_secret_recheck_logs_startup_failed(
         create_app(settings)
 
     assert_one_startup_failure(
-        capsys.readouterr().out, error_type="ConfigurationError", fields=["session_secret"]
+        capsys.readouterr().out,
+        error_type="ConfigurationError",
+        fields=["session_secret"],
+        message="SESSION_SECRET is not set; run make init",
     )
+
+
+INT_PARSING_MESSAGE: Final = "Input should be a valid integer, unable to parse string as an integer"
+"""Pydantic's message for an integer setting whose text is not a number."""
 
 
 def test_unparseable_environment_logs_startup_failed(
@@ -1218,7 +1344,9 @@ def test_unparseable_environment_logs_startup_failed(
 ) -> None:
     """An environment value that fails validation is logged once by field name, then raised.
 
-    Neither input reaches the log, although a validation message may quote its input.
+    The message names each variable with pydantic's own message, in the order the settings
+    declare them. Neither input reaches the log, although a validation message may quote its
+    input.
     """
     seed, budget = "seed-not-a-number-0451", "budget-not-a-number-0451"
     set_env(MOCK_SEED=seed, GOOGLE_DAILY_CALL_BUDGET=budget)
@@ -1229,10 +1357,176 @@ def test_unparseable_environment_logs_startup_failed(
 
     output = capsys.readouterr().out
     assert_one_startup_failure(
-        output, error_type="ValidationError", fields=["google_daily_call_budget", "mock_seed"]
+        output,
+        error_type="ValidationError",
+        fields=["google_daily_call_budget", "mock_seed"],
+        message=(
+            f"MOCK_SEED: {INT_PARSING_MESSAGE}; GOOGLE_DAILY_CALL_BUDGET: {INT_PARSING_MESSAGE}"
+        ),
     )
     assert seed not in output
     assert budget not in output
+
+
+def test_startup_failed_withholds_the_input_a_validator_quotes(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A validator's own message keeps its text but not the input it quotes (``got '...'``).
+
+    ``DISPLAY_TIMEZONE`` and ``LINKEDIN_AD_ACCOUNT_IDS`` quote the rejected value; each quoted
+    literal of a validator's message becomes ``<value withheld>``. Pydantic's own template
+    messages never quote the input, so ``DATA_MODE`` keeps the allowed values it lists.
+    """
+    zone, account, mode = "Mars/Olympus-0451", "acct-not-numeric-0451", "bogus-mode-0451"
+    set_env(DISPLAY_TIMEZONE=zone, LINKEDIN_AD_ACCOUNT_IDS=account, DATA_MODE=mode)
+    capsys.readouterr()
+
+    with pytest.raises(ValidationError):
+        create_app()
+
+    output = capsys.readouterr().out
+    (failure,) = startup_failures(output)
+    assert failure["error_type"] == "ValidationError"
+    assert failure["fields"] == ["data_mode", "display_timezone", "linkedin_ad_account_ids"]
+    message = failure["message"]
+    # One entry per failure, in the order the settings declare the fields.
+    assert message.index("DISPLAY_TIMEZONE: Value error, DISPLAY_TIMEZONE must be") == 0
+    assert message.index("; DATA_MODE: Input should be 'auto' or 'simulated'") > 0
+    assert message.index(
+        "; LINKEDIN_AD_ACCOUNT_IDS: Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be"
+    ) > message.index("; DATA_MODE: ")
+    assert message.count("got <value withheld>") == 2
+    for value in (zone, account, mode):
+        assert value not in output
+
+
+@pytest.mark.parametrize(("database_url", "message"), UNUSABLE_DATABASE_URLS)
+def test_unusable_database_url_logs_startup_failed(
+    set_env: Callable[..., None],
+    capsys: pytest.CaptureFixture[str],
+    database_url: str,
+    message: str,
+) -> None:
+    """A ``DATABASE_URL`` the engine refuses is logged once by field name, never by value."""
+    set_env(DATABASE_URL=database_url)
+    capsys.readouterr()
+
+    with pytest.raises(ConfigurationError, match="DATABASE_URL"):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(
+        output, error_type="ConfigurationError", fields=["database_url"], message=message
+    )
+    assert database_url not in output
+    assert DATABASE_PASSWORD not in output
+
+
+@pytest.mark.parametrize(
+    ("variables", "error_type"),
+    [
+        ({"SESSION_SECRET": None}, ConfigurationError),
+        ({"DATABASE_URL": "not-a-url"}, ConfigurationError),
+        ({"MOCK_SEED": "seed-not-a-number-0451"}, ValidationError),
+    ],
+    ids=["session-secret", "database-url", "validation-error"],
+)
+def test_startup_refusal_is_marked_as_logged(
+    set_env: Callable[..., None],
+    variables: Mapping[str, str | None],
+    error_type: type[Exception],
+) -> None:
+    """Each refusal leaves ``create_app()`` marked as logged by ``api.startup_failed``.
+
+    The ``sys.excepthook`` that ``configure_logging`` installs therefore writes nothing more
+    when the refusal ends the uvicorn process.
+    """
+    set_env(**variables)
+
+    with pytest.raises(error_type) as excinfo:
+        create_app()
+
+    assert ads_logging.logged_as(excinfo.value) == STARTUP_FAILED_EVENT
+    assert sys.excepthook is ads_logging._log_uncaught_exception
+
+
+UVICORN_FACTORY_COMMAND: Final = (
+    sys.executable,
+    "-m",
+    "uvicorn",
+    "ads_engine.api.app:create_app",
+    "--factory",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+)
+"""The ``api`` container's command, on an ephemeral port; a refusal exits before it binds."""
+
+
+@pytest.mark.parametrize(
+    ("variables", "error_type", "fields", "withheld"),
+    [
+        (
+            {"APP_BASE_URL": "http://ads-startup.example.com"},
+            "ConfigurationError",
+            ["app_base_url"],
+            "ads-startup.example.com",
+        ),
+        ({"SESSION_SECRET": None}, "ConfigurationError", ["session_secret"], None),
+        (
+            {"GOOGLE_DAILY_CALL_BUDGET": "budget-not-a-number-0451"},
+            "ValidationError",
+            ["google_daily_call_budget"],
+            "budget-not-a-number-0451",
+        ),
+        ({"DATABASE_URL": "not-a-url"}, "ConfigurationError", ["database_url"], "not-a-url"),
+        (
+            {"DATABASE_URL": f"mysql://ads:{DATABASE_PASSWORD}@db.example.test/ads_engine"},
+            "ConfigurationError",
+            ["database_url"],
+            DATABASE_PASSWORD,
+        ),
+    ],
+    ids=["unsafe-base-url", "no-session-secret", "unparseable-budget", "malformed-db", "mysql-db"],
+)
+def test_uvicorn_startup_refusal_writes_only_json_lines(
+    set_env: Callable[..., None],
+    variables: Mapping[str, str | None],
+    error_type: str,
+    fields: list[str],
+    withheld: str | None,
+) -> None:
+    """uvicorn exits 1 on a refusal, and its whole output is JSON with one ``api.startup_failed``.
+
+    uvicorn catches only a factory's ``TypeError``, so the refusal ends the interpreter; the
+    excepthook ``configure_logging`` installed writes no raw traceback after the logged event.
+    The process runs in this test's isolated environment, never with host credentials.
+    """
+    set_env(**variables)
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and program, no user input
+        UVICORN_FACTORY_COMMAND,
+        cwd=BACKEND_DIR,
+        env=dict(os.environ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 1, output
+    assert "Traceback" not in output
+    for line in output.splitlines():
+        if line.strip():
+            assert isinstance(json.loads(line), dict), line
+    (failure,) = startup_failures(output)
+    assert failure["level"] == "error"
+    assert failure["error_type"] == error_type
+    assert failure["fields"] == fields
+    assert failure["message"]
+    if withheld is not None:
+        assert withheld not in output
 
 
 # ---------------------------------------------------------------------------------------------
