@@ -12,6 +12,8 @@ What this module does, and what it leaves to the domain:
   primary datasets, so decisions about replaced data never reappear in the log. The
   newest-first page is drawn from one bounded index probe per active dataset
   (:func:`_newest_decision_ids`), so its cost does not grow with the log's history.
+  ``POST`` answers with the same statement over the committed row, re-read from the
+  database, so both routes render an amount at its stored scale (``"120.000000"``).
 * **Writing** delegates every rule to :func:`ads_engine.decisions.record_decision`: the
   decision shape, the per-shape field rules, the currency's minor unit, empty and no-op
   patches, retired subjects and the rerun request all live there (AAP 0.5.2, 0.3.2). The
@@ -44,6 +46,7 @@ Example:
 """
 
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Query
@@ -82,6 +85,10 @@ _SHARED_BUDGET_NAME: Final = "Shared budget {external_id}"
 
 # The subject types an item's stored ``decision_subject`` may name (AAP 0.5.2 ``decision``).
 _SUBJECT_TYPES: Final[frozenset[str]] = frozenset({"campaign", "budget"})
+
+# The scale of the decision amount columns, ``numeric(18,6)``: PostgreSQL reads every stored
+# amount back with exactly six fraction digits, so "187.65" is stored as "187.650000".
+_STORED_QUANTUM: Final = Decimal("0.000001")
 
 # Aliases for the budget-currency subqueries. They must differ from the outer statement's
 # ``ad_account`` and ``campaign``: SQLAlchemy auto-correlates a scalar subquery with any
@@ -295,6 +302,22 @@ async def _read_views(
         )
         for row, campaign_name, budget_external_id, currency in result
     ]
+
+
+def _stored_amount(amount: Decimal | None) -> Decimal | None:
+    """Return ``amount`` at the scale its ``numeric(18,6)`` column stores and reads it back.
+
+    The domain accepts only amounts no finer than the currency's minor unit, at most six
+    fraction digits, so the quantization pads and never rounds: ``Decimal("187.65")``
+    becomes ``Decimal("187.650000")``, the value ``GET /decisions`` reads for the same row.
+
+    Args:
+        amount: An amount of a decision row not yet read back from the database.
+
+    Returns:
+        The amount with exactly six fraction digits, or ``None`` when there is none.
+    """
+    return None if amount is None else amount.quantize(_STORED_QUANTUM)
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +584,10 @@ async def create_decision(
             them because a dataset it read was retired meanwhile, or the subject's dataset
             is not active.
         ads_engine.decisions.DecisionError: Propagated to the error handlers:
-            ``PatchRejected`` (422), ``SubjectRetired`` (409), ``SubjectNotFound`` (404).
+            ``PatchRejected`` (422, ``untracked_subject`` among its codes for a reported
+            subject with no decision yet), ``SubjectRetired`` (409),
+            ``PlatformStateUnknown`` (409 ``platform_state_unknown`` for a subject with no
+            decision that no entity sync has reported) and ``SubjectNotFound`` (404).
     """
     recommendation_id = body.recommendation_id
     if recommendation_id is not None:
@@ -592,12 +618,28 @@ async def create_decision(
         shape=decision.shape,
         origin=decision.origin,
     )
-    views = await _read_views(session, _decision_query().where(DecisionRow.id == decision.id))
+    # The answer renders the row as stored, exactly as GET /decisions does. Sessions keep
+    # loaded attributes after commit, so without populate_existing this read would return
+    # the identity-mapped row still holding the submitted amount ("187.65"), not the stored
+    # numeric(18,6) value ("187.650000").
+    views = await _read_views(
+        session,
+        _decision_query()
+        .where(DecisionRow.id == decision.id)
+        .execution_options(populate_existing=True),
+    )
     if views:
         return views[0]
     # Unreachable unless the dataset was purged between the commit and this read: the row
-    # is still in hand, so answer with it rather than fail a committed write.
-    return schemas.Decision.from_row(
+    # is still in hand, so answer with it, its amounts at the stored scale, rather than fail
+    # a committed write.
+    view = schemas.Decision.from_row(
         decision,
         subject=_subject_view(decision, campaign_name=None, budget_external_id=None, currency=None),
+    )
+    return view.model_copy(
+        update={
+            "daily_budget": _stored_amount(view.daily_budget),
+            "total_budget": _stored_amount(view.total_budget),
+        }
     )

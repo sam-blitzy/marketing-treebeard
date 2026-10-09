@@ -11,6 +11,10 @@ error shape, never a database error rendered as 500:
   email or a decision note is refused before any SQL runs, and the message never repeats
   it, while an ordinary note, non-ASCII included, is stored exactly as sent.
 
+One stored amount also has one rendering: ``POST /decisions`` answers from the committed
+row at its ``numeric(18,6)`` scale, exactly as a later ``POST`` carries it over and
+``GET /decisions`` lists it, while ``patch`` echoes the amount as submitted.
+
 The application is assembled here as ``api/app.py`` assembles it: the auth and decisions
 routers under ``/api/v1`` behind the CSRF guard, Starlette's ``SessionMiddleware`` with the
 product's cookie name, one login limiter on ``app.state``, and handlers that render
@@ -573,3 +577,87 @@ async def test_an_ordinary_note_with_non_ascii_text_is_stored_exactly(
         {"status": "paused"},
     )
     assert await _decision_count(sessions, world.campaign_id) == 2
+
+
+# ---------------------------------------------------------------------------------------
+# One stored amount, one rendering
+# ---------------------------------------------------------------------------------------
+
+
+def _patch_body(world: World, patch: dict[str, str]) -> dict[str, Any]:
+    """Return a ``POST /decisions`` body applying ``patch`` to the seeded campaign."""
+    return {"subject": {"type": "campaign", "id": world.campaign_id}, "patch": patch}
+
+
+@pytest.mark.anyio
+async def test_a_recorded_amount_renders_at_the_stored_scale_in_every_response(
+    world: World, client: httpx.AsyncClient
+) -> None:
+    """``POST`` answers "187.650000" like the carried-over row and the log; ``patch`` echoes."""
+    await _sign_in(client, world)
+    budget = await client.post(
+        "/api/v1/decisions",
+        json=_patch_body(world, {"daily_budget": "187.65"}),
+        headers=CSRF,
+    )
+    assert budget.status_code == 201, budget.text
+    recorded = budget.json()
+    assert (recorded["daily_budget"], recorded["total_budget"], recorded["patch"]) == (
+        "187.650000",
+        None,
+        {"daily_budget": "187.65"},
+    )
+
+    status = await client.post(
+        "/api/v1/decisions", json=_patch_body(world, {"status": "paused"}), headers=CSRF
+    )
+    assert status.status_code == 201, status.text
+    carried = status.json()
+    assert (carried["status"], carried["daily_budget"], carried["patch"]) == (
+        "paused",
+        "187.650000",
+        {"status": "paused"},
+    )
+
+    log = await client.get(
+        "/api/v1/decisions",
+        params={"subject_type": "campaign", "subject_id": world.campaign_id},
+    )
+    assert log.status_code == 200, log.text
+    listed = {row["id"]: row for row in log.json()}
+    assert list(listed) == [carried["id"], recorded["id"], world.baseline_id]
+    # Every field of each POST answer, the amount included, reads exactly as the log lists it.
+    assert listed[recorded["id"]] == recorded
+    assert listed[carried["id"]] == carried
+    assert listed[world.baseline_id]["daily_budget"] == "25.000000"
+
+
+@pytest.mark.anyio
+async def test_the_answer_without_a_read_back_row_keeps_the_stored_scale(
+    world: World, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the post-commit read finds no row, the row in hand answers at the stored scale."""
+
+    async def no_rows(session: AsyncSession, statement: object) -> list[schemas.Decision]:
+        """Stand in for a read that runs after the decision's dataset was purged."""
+        return []
+
+    await _sign_in(client, world)
+    monkeypatch.setattr(decisions, "_read_views", no_rows)
+    response = await client.post(
+        "/api/v1/decisions",
+        json=_patch_body(world, {"daily_budget": "187.65"}),
+        headers=CSRF,
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert (body["daily_budget"], body["total_budget"], body["patch"]) == (
+        "187.650000",
+        None,
+        {"daily_budget": "187.65"},
+    )
+    assert (body["status"], body["subject"]["id"], body["subject"]["name"]) == (
+        "active",
+        world.campaign_id,
+        None,
+    )

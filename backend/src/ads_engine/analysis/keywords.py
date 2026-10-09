@@ -20,6 +20,13 @@ privacy, so search-term totals fall below keyword totals; below
 ``keywords.min_search_term_coverage`` every K1, K2 and K3 item of the account carries the
 ``search_term_coverage`` flag.
 
+Every K1, K2 and K3 item is a Google item, so without the verified Google-to-CRM link it also
+carries ``no_crm_link``, after its other flags (AAP 0.3.3, 0.5.4.1). The gap is decided once
+per run by :func:`~ads_engine.analysis.context.google_link_gap`, the same definition every
+Google item reads. The section emits no ``no_crm_link`` finding: AAP 0.5.4.3 defines its
+section finding as search-term coverage, and the ``no_crm_link`` finding belongs to the
+Campaigns and Budget sections.
+
 Adjacent terms (K2) come from the account's own search-term report, because Google's Keyword
 Planner is not reachable through the n8n webhook (AAP 0.2.4, 0.7.2), and are labelled so.
 
@@ -84,7 +91,9 @@ from ads_engine.analysis.context import (
     Sample,
     SearchTermRow,
     Withheld,
+    google_link_gap,
     keyword_external_id,
+    no_crm_link_flag,
     search_term_external_id,
 )
 from ads_engine.analysis.metrics import Totals, window_totals
@@ -1110,11 +1119,14 @@ def _k1_candidate(
     n_star: int,
     coverage: _Coverage,
     baseline_coverage: _BaselineCoverage,
+    crm_link: Flag | None,
 ) -> Candidate:
     """Build one K1 item: a zero-conversion term that cleared the click and spend gates.
 
     ``baseline_coverage`` is the run's assessment of the baseline span: when it is not fully
     assessed the item carries the ``incomplete`` flag and the baseline label says so.
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended last; ``None`` while the
+    Google-to-CRM link is verified.
     """
     currency = coverage.account.currency
     spend = _money(row.cost, currency)
@@ -1184,7 +1196,11 @@ def _k1_candidate(
         reason=_k1_reason(evidence),
         evidence=evidence,
         rank_key=(-row.cost,),
-        flags=(*_flags(coverage.flag()), *_flags(baseline_coverage.flag())),
+        flags=(
+            *_flags(coverage.flag()),
+            *_flags(baseline_coverage.flag()),
+            *_flags(crm_link),
+        ),
         required_datasets=K1_DATASETS,
         increases_spend_on=(),
         # Keyword items offer "Mark done", never "Record decision" (AAP 0.5.5).
@@ -1263,6 +1279,7 @@ def _evaluate_k1(
     cfg: _Config,
     accounts: Mapping[int, _Account],
     coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
 ) -> RuleResult:
     """Rule K1 Block / negative candidate: spend with exactly zero conversions.
 
@@ -1300,6 +1317,9 @@ def _evaluate_k1(
     uncovered days. A missing freshness row or an unknown covered date counts as not assessed,
     never as complete (AAP 0.3.2, 0.5.4.8). The ``k1_no_baseline`` finding carries the same
     assessment as ``baseline_coverage``.
+
+    CRM link: without the verified Google-to-CRM link every K1 item also carries
+    ``crm_link``, the run's ``no_crm_link`` flag (AAP 0.3.3, 0.5.4.1).
 
     Returns:
         Items in group ``block`` ranked by spend descending (``rank_key = (-spend,)``), the
@@ -1360,6 +1380,7 @@ def _evaluate_k1(
                 n_star,
                 coverage[account.id],
                 baseline_coverage,
+                crm_link,
             )
         )
     return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
@@ -1491,8 +1512,13 @@ def _k2_candidate(
     campaign_totals: Totals,
     adjacent: Sequence[_TermTotals],
     coverage: _Coverage,
+    crm_link: Flag | None,
 ) -> Candidate:
-    """Build one K2 item: a converting ``NONE`` term at or better than campaign efficiency."""
+    """Build one K2 item: a converting ``NONE`` term at or better than campaign efficiency.
+
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
+    while the Google-to-CRM link is verified.
+    """
     currency = coverage.account.currency
     term_cpa = _exact(row.cost) / _exact(row.conversions)
     outcomes = campaign_totals.outcomes if campaign_totals.outcomes is not None else Decimal(0)
@@ -1565,7 +1591,7 @@ def _k2_candidate(
         reason=_k2_reason(evidence),
         evidence=evidence,
         rank_key=(-row.conversions, _to_decimal(term_cpa)),
-        flags=_flags(coverage.flag()),
+        flags=(*_flags(coverage.flag()), *_flags(crm_link)),
         required_datasets=K2_DATASETS,
         increases_spend_on=(),
         decision_subject=None,
@@ -1578,6 +1604,7 @@ def _evaluate_k2(
     cfg: _Config,
     accounts: Mapping[int, _Account],
     coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
 ) -> RuleResult:
     """Rule K2 Expansion candidate: a converting term at or better than campaign efficiency.
 
@@ -1603,6 +1630,9 @@ def _evaluate_k2(
     observed and required, for example "conversions 2 of 3 required" (fractional conversions
     shown exactly, such as 2.5). Terms above the campaign's cost/conversion, and terms with no
     conversions, are not K2 patterns and are not listed.
+
+    CRM link: without the verified Google-to-CRM link every K2 item also carries
+    ``crm_link``, the run's ``no_crm_link`` flag (AAP 0.3.3, 0.5.4.1).
 
     Returns:
         Items in group ``expand`` ranked by conversions descending, then cost/conversion
@@ -1650,7 +1680,7 @@ def _evaluate_k2(
             pools[account.id] = _adjacent_pool(ctx, cfg, account)
         adjacent = _adjacent(pools[account.id], cfg, row.search_term)
         candidates.append(
-            _k2_candidate(ctx, cfg, row, campaign, totals, adjacent, coverage[account.id])
+            _k2_candidate(ctx, cfg, row, campaign, totals, adjacent, coverage[account.id], crm_link)
         )
     return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
 
@@ -2009,8 +2039,13 @@ def _k3_candidate(
     quality: _QualityScore,
     cpc: _CpcRise,
     coverage: _Coverage,
+    crm_link: Flag | None,
 ) -> Candidate:
-    """Build one K3 item from the branches that fired, with its account's coverage flag."""
+    """Build one K3 item from the branches that fired, with its account's coverage flag.
+
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
+    while the Google-to-CRM link is verified.
+    """
     currency = ctx.account_currency(campaign.id)
     whole = _half(days, ctx.window.start, ctx.window.end)
     first, second = halves
@@ -2126,7 +2161,7 @@ def _k3_candidate(
         reason=_k3_reason(evidence),
         evidence=evidence,
         rank_key=(-whole.cost,),
-        flags=_flags(coverage.flag()),
+        flags=(*_flags(coverage.flag()), *_flags(crm_link)),
         required_datasets=K3_DATASETS,
         increases_spend_on=(),
         decision_subject=None,
@@ -2144,6 +2179,7 @@ def _evaluate_k3(
     cfg: _Config,
     accounts: Mapping[int, _Account],
     coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
 ) -> RuleResult:
     """Rule K3 Review: declining quality score, or CPC rising without a matching conversion rise.
 
@@ -2162,7 +2198,8 @@ def _evaluate_k3(
       ``k3.min_first_half_conversions`` in the first half.
 
     Each item carries the ``search_term_coverage`` flag when its account's search-term coverage
-    is below ``keywords.min_search_term_coverage``.
+    is below ``keywords.min_search_term_coverage``, and ``crm_link``, the run's ``no_crm_link``
+    flag, without the verified Google-to-CRM link (AAP 0.3.3, 0.5.4.1).
 
     Sample withholding (P6): a keyword with fewer than ``k3.min_clicks_per_half`` clicks in
     either half is withheld when a branch would otherwise fire, with the smaller half's clicks
@@ -2257,6 +2294,7 @@ def _evaluate_k3(
                     quality,
                     cpc,
                     coverage[account.id],
+                    crm_link,
                 )
             )
         elif quality.shortfall is not None:
@@ -2293,6 +2331,12 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     :func:`_evaluate_k2`, :func:`_evaluate_k3`). Precedence (holds, P2 suppression,
     stale/incomplete/short-window flags, feedback and ranking) is applied by the runner.
 
+    The Google-to-CRM link gap is decided once here
+    (:func:`~ads_engine.analysis.context.google_link_gap`): while the link is not verified,
+    every K1, K2 and K3 item carries the ``no_crm_link`` flag after its other flags, and while
+    it is verified none does (AAP 0.3.3, 0.5.4.1). The section emits no ``no_crm_link``
+    finding: AAP 0.5.4.3 defines its section finding as search-term coverage.
+
     Args:
         ctx: The analysis context.
 
@@ -2307,9 +2351,11 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     cfg = _Config.load(ctx.thresholds)
     accounts = _google_accounts(ctx)
     coverage = _coverage(ctx, cfg, accounts)
+    gap = google_link_gap(ctx)
+    crm_link = None if gap is None else no_crm_link_flag(gap)
     findings = tuple(_coverage_finding(ctx, cfg, item) for item in coverage.values())
     return RuleResult(findings=findings).merge(
-        _evaluate_k1(ctx, cfg, accounts, coverage),
-        _evaluate_k2(ctx, cfg, accounts, coverage),
-        _evaluate_k3(ctx, cfg, accounts, coverage),
+        _evaluate_k1(ctx, cfg, accounts, coverage, crm_link),
+        _evaluate_k2(ctx, cfg, accounts, coverage, crm_link),
+        _evaluate_k3(ctx, cfg, accounts, coverage, crm_link),
     )

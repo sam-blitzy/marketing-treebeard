@@ -327,8 +327,16 @@ VIOLATIONS: Final = {
 and the refused value that must appear nowhere."""
 
 
+async def _call_google(ctx: jobs.JobContext, times: int) -> None:
+    """Send ``times`` real webhook calls (Q-G1) through the context's simulated Google client."""
+    client = ctx.clients.require_google()
+    for _ in range(times):
+        await client.run_query("Q-G1")
+
+
 class _Violates(jobs._JobBase):
-    """Completes :data:`ENTITIES`, notes an interruption, then writes a row PostgreSQL refuses.
+    """Completes :data:`ENTITIES`, makes three calls, notes an interruption, then writes a row
+    PostgreSQL refuses.
 
     The refused row references a campaign the seeded dataset does not store, so the database
     raises a genuine ``ForeignKeyViolation``. ``google.metrics_daily`` has no freshness row
@@ -353,7 +361,7 @@ class _Violates(jobs._JobBase):
             await self._complete(
                 session, {ENTITIES: jobs._success(ctx.now, covered=None, reasons=())}
             )
-        self._calls += 3
+        await _call_google(ctx, 3)
         if self.interruption is not None:
             self._interrupted(self.interruption, dataset=SEARCH_TERMS)
         async with ctx.sessionmaker() as session, session.begin():
@@ -374,7 +382,7 @@ class _Violates(jobs._JobBase):
 
 
 class _Raises(jobs._JobBase):
-    """Raises a given error from its execution, after counting rows and calls."""
+    """Raises a given error from its execution, after counting rows and making two calls."""
 
     job = jobs.JOB_ENTITIES
 
@@ -387,9 +395,9 @@ class _Raises(jobs._JobBase):
         return (ENTITIES,)
 
     async def _execute(self) -> None:
-        """Count, then raise."""
+        """Count, call, then raise."""
         self._count(ENTITIES, 4)
-        self._calls += 2
+        await _call_google(self.ctx, 2)
         raise self.error
 
 
@@ -509,10 +517,11 @@ async def test_violation_in_a_real_job_returns_a_failed_result_and_records_the_a
         "constraint": expected.constraint,
     }
     finish = _one(entries, "sync.job.finish")
-    assert (finish["status"], finish["error"], finish["log_level"]) == (
+    assert (finish["status"], finish["error"], finish["error_type"], finish["log_level"]) == (
         "failed",
-        None,
-        "warning",
+        reason,
+        "IntegrityError",
+        "error",
     )
     assert set(finish["datasets"]) == set(GOOGLE_METRICS)
 
@@ -616,7 +625,8 @@ async def test_non_integrity_errors_still_propagate_unchanged(
 
     assert raised.value is error
     assert _events(entries, "sync.job.integrity_failed") == []
-    assert _one(entries, "sync.job.finish")["error"] == type(error).__name__
+    finish = _one(entries, "sync.job.finish")
+    assert (finish["error"], finish["error_type"]) == (expected, type(error).__name__)
     runs = await lab.runs(jobs.JOB_ENTITIES)
     assert [(row.status, row.error) for row in runs.values()] == [("failed", expected)]
     assert await lab.freshness(dataset_id, ENTITIES) is None
@@ -647,7 +657,11 @@ async def test_failure_while_recording_the_violation_propagates(
     assert isinstance(raised.value.__context__, IntegrityError)
     assert len(_events(entries, "sync.job.integrity_failed")) == 1
     finish = _one(entries, "sync.job.finish")
-    assert (finish["status"], finish["error"]) == ("failed", "OperationalError")
+    assert (finish["status"], finish["error"], finish["error_type"]) == (
+        "failed",
+        UNEXPECTED,
+        "OperationalError",
+    )
     runs = await lab.runs(jobs.JOB_METRICS)
     assert {name: row.status for name, row in runs.items()} == {
         ENTITIES: "succeeded",

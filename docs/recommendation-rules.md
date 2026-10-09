@@ -487,6 +487,11 @@ terms for privacy, so search-term totals fall below keyword totals. When coverag
 carries the `search_term_coverage` flag ("Low search-term coverage: {percent}% of keyword
 spend").
 
+**CRM link**: without the verified Google-to-CRM link
+([CRM pipeline link and veto](#crm-pipeline-link-and-veto)), every `K1`, `K2` and `K3` item also
+carries the `no_crm_link` flag, after its other flags. The section emits no `no_crm_link`
+finding.
+
 ### K1 Block / negative candidate
 
 - **Section and group**: `keywords` → `block`.
@@ -639,6 +644,8 @@ listed below as "the CRM datasets".
   `resolutions`, exactly the resolutions valid for its kind and decision shape (below).
 - **Ranking**: pinned first in Campaigns, oldest `detected_at` first.
 - **Withheld or suppressed**: never held, never hidden by feedback, never suppressed.
+- **Flags**: the item of a Google subject carries `no_crm_link` without the verified
+  Google-to-CRM link; a LinkedIn subject's item never does.
 - **Required datasets**: `google.entities` or `linkedin.entities`, the subject source's entity
   dataset.
 - **Decision subject**: no. The card shows its resolver instead of "Record decision".
@@ -879,6 +886,8 @@ subject, and never one on its members.
 - **Ranking**: cluster conversions, descending.
 - **Withheld or suppressed**: an uncovered cluster below a minimum is withheld with its size, for
   example "converting search terms 2 of 3 required" or "conversions 4 of 5 required".
+- **Flags**: without the verified Google-to-CRM link the item carries `no_crm_link` and counts
+  in the Campaigns `no_crm_link` finding.
 - **Required datasets**: `google.search_terms`, `google.entities`.
 - **Decision subject**: no ("Mark done").
 - **Acceptance tests**: `backend/tests/acceptance/test_campaign_rules.py`.
@@ -1499,7 +1508,7 @@ A finding is a non-action observation shown at the top of its section.
 
 | Code | Emitted by | Meaning |
 |------|------------|---------|
-| `no_crm_link` | `C1`, `C2` (Campaigns), budget rules (Budget) | Google items have no CRM link; no Google QL counts or veto |
+| `no_crm_link` | `C1`, `C2`, `C3b` (Campaigns), budget rules (Budget) | Google items have no CRM link; no Google QL counts or veto |
 | `search_term_coverage` | Keywords section | Search-term spend ÷ keyword spend per Google account |
 | `k1_no_baseline` | `K1` | `K1` withheld account-wide: no usable conversion-rate baseline |
 | `segment_window_unavailable` | `C3a` | No segment data matches the run's window |

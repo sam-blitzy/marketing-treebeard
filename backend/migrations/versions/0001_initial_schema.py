@@ -571,6 +571,9 @@ def _create_ops_tables() -> None:
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("active_dataset_id", sa.BigInteger(), nullable=True),
         sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True),
+        # The instant a failed call last marked the connection; last_attempt_at moves on
+        # every attempt, so the return of a stale or error status to ok is judged by this.
+        sa.Column("last_failure_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("calls_24h", sa.BigInteger(), server_default=sa.text(ZERO), nullable=False),
         sa.Column(
             "calls_by_minute",

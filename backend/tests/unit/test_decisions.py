@@ -18,12 +18,17 @@ What is proven here, with no database, no session and no network:
   amount only; ``expected_state_from_snapshot`` materialises each shape.
 * **The resolution matrix** (AAP 0.5.4.4 "C0 resolutions by kind and subject type"): exactly
   eleven (kind, shape) pairs.
+* **Refusals in words** (AAP 0.5.5 shows 409 and 422 messages as they are): a refusal names
+  the subject once and its shape, kind, resolutions and period in words, never by API key;
+  ``details`` keep the keys.
 
 The database-backed paths (``record_decision``, ``resolve_discrepancy`` and the 409
 ``subject_retired`` refusal through the API) are proven in
 ``tests/integration/test_runs_and_decisions.py``.
 """
 
+import re
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -40,6 +45,10 @@ from ads_engine.db.models.decisions import (
     SUBJECT_TYPES,
     Decision,
 )
+from ads_engine.decisions import _KIND_LABELS as KIND_LABELS
+from ads_engine.decisions import _PERIOD_LABELS as PERIOD_LABELS
+from ads_engine.decisions import _RESOLUTION_LABELS as RESOLUTION_LABELS
+from ads_engine.decisions import _SHAPE_LABELS as SHAPE_LABELS
 from ads_engine.decisions import (
     RESOLUTIONS,
     BudgetPeriod,
@@ -67,9 +76,11 @@ from ads_engine.decisions import (
     from_micros,
     is_valid_amount,
     minor_unit_exponent,
+    parse_intended_state,
     round_to_minor_unit,
     to_micros,
 )
+from ads_engine.decisions import _resolution_not_allowed as resolution_not_allowed
 
 # ---------------------------------------------------------------------------------------
 # Fixed identifiers. Every subject, snapshot and decision belongs to one active dataset.
@@ -563,7 +574,9 @@ def test_a_google_daily_campaign_rejects_a_total_budget() -> None:
 
     assert (error.status_code, error.code) == (422, "field_not_allowed")
     assert error.details == {"field": "total_budget"}
-    assert "DAILY budget, which takes daily_budget, not total_budget" in error.message
+    assert error.message == (
+        "Campaign 11 has a daily budget, which takes daily_budget, not total_budget."
+    )
 
 
 def test_a_google_custom_period_campaign_accepts_a_total_budget() -> None:
@@ -587,7 +600,9 @@ def test_a_google_custom_period_campaign_rejects_a_daily_budget() -> None:
 
     assert (error.status_code, error.code) == (422, "field_not_allowed")
     assert error.details == {"field": "daily_budget"}
-    assert "CUSTOM_PERIOD budget, which takes total_budget, not daily_budget" in error.message
+    assert error.message == (
+        "Campaign 11 has a custom-period budget, which takes total_budget, not daily_budget."
+    )
 
 
 @pytest.mark.parametrize(
@@ -683,14 +698,44 @@ def test_a_non_positive_or_unstorable_amount_is_rejected(
 def test_a_shared_member_rejects_any_amount_naming_the_owning_budget(
     patch: DecisionPatch,
 ) -> None:
-    """AAP 0.5.2: a member owns no amount; the error names the shared budget that does."""
+    """AAP 0.5.2: a member owns no amount; the error names the shared budget that does.
+
+    The message is shown as it is, so it names the budget by its Google id only; the
+    database id stays in ``details``.
+    """
     error = _rejected(_google_member(), _member("active"), patch)
 
     assert (error.status_code, error.code) == (422, "shared_budget_amount")
-    assert SHARED_BUDGET_EXTERNAL in error.message
-    assert str(SHARED_BUDGET) in error.message
-    assert error.details["budget_id"] == SHARED_BUDGET
-    assert error.details["budget_external_id"] == SHARED_BUDGET_EXTERNAL
+    assert error.message == (
+        f"Amounts are set on shared budget {SHARED_BUDGET_EXTERNAL}; record the decision on "
+        "that budget."
+    )
+    assert "budget id" not in error.message
+    assert str(SHARED_BUDGET) not in error.message
+    assert error.details == {
+        "fields": sorted(patch.fields_set() - {"status"}),
+        "budget_id": SHARED_BUDGET,
+        "budget_external_id": SHARED_BUDGET_EXTERNAL,
+    }
+
+
+def test_a_member_of_a_shared_budget_with_no_known_google_id_is_refused_in_words() -> None:
+    """A member whose shared budget has no known Google id is refused in words alone."""
+    state = replace(_google_member(), budget_external_id=None)
+
+    error = _rejected(state, _member("active"), DecisionPatch(daily_budget=Decimal(80)))
+
+    assert (error.status_code, error.code) == (422, "shared_budget_amount")
+    assert error.message == (
+        "Amounts are set on the shared budget this campaign draws from; record the decision "
+        "on that budget."
+    )
+    assert str(SHARED_BUDGET) not in error.message
+    assert error.details == {
+        "fields": ["daily_budget"],
+        "budget_id": SHARED_BUDGET,
+        "budget_external_id": None,
+    }
 
 
 def test_a_shared_member_status_patch_keeps_its_budget_assignment() -> None:
@@ -767,7 +812,59 @@ def test_a_custom_period_shared_budget_rejects_a_daily_amount() -> None:
 
     assert (error.status_code, error.code) == (422, "field_not_allowed")
     assert error.details == {"field": "daily_budget"}
-    assert "CUSTOM_PERIOD period, which takes total_budget, not daily_budget" in error.message
+    assert error.message == (
+        f"Shared budget {SHARED_BUDGET_EXTERNAL} is a custom-period budget, which takes "
+        "total_budget, not daily_budget."
+    )
+
+
+@pytest.mark.parametrize(
+    ("period", "patch", "message"),
+    [
+        pytest.param(
+            "DAILY",
+            DecisionPatch(total_budget=Decimal(600)),
+            "is a daily budget, which takes daily_budget, not total_budget.",
+            id="total-on-daily",
+        ),
+        pytest.param(
+            "CUSTOM_PERIOD",
+            DecisionPatch(daily_budget=Decimal(60)),
+            "is a custom-period budget, which takes total_budget, not daily_budget.",
+            id="daily-on-custom-period",
+        ),
+    ],
+)
+def test_the_shared_budget_period_refusal_names_the_budget_once_in_words(
+    period: BudgetPeriod, patch: DecisionPatch, message: str
+) -> None:
+    """AAP 0.5.5: the 422 is shown as it is, so it names the budget once and its period in words."""
+    current = _budget(daily=Decimal(50)) if period == "DAILY" else _budget(total=Decimal(500))
+
+    error = _rejected(_google_shared_budget(period), current, patch)
+
+    assert error.message == f"Shared budget {SHARED_BUDGET_EXTERNAL} {message}"
+    assert error.message.count("Shared budget") == 1
+    assert period not in error.message
+
+
+def test_a_shared_budget_without_a_known_period_refuses_any_amount_in_words() -> None:
+    """A budget whose period no sync reports owns no known amount field; the 422 says so."""
+    state = _state(
+        ref=SubjectRef(type="budget", id=SHARED_BUDGET),
+        source="google",
+        shape="budget",
+        name=f"Shared budget {SHARED_BUDGET_EXTERNAL}",
+    )
+
+    error = _rejected(state, _budget(daily=Decimal(50)), DecisionPatch(daily_budget=Decimal(60)))
+
+    assert (error.status_code, error.code) == (422, "field_not_allowed")
+    assert error.details == {"field": "daily_budget"}
+    assert error.message == (
+        f"Shared budget {SHARED_BUDGET_EXTERNAL} has no budget period; daily_budget cannot be "
+        "decided."
+    )
 
 
 def test_a_tombstoned_subject_takes_no_further_patch() -> None:
@@ -787,6 +884,10 @@ def test_a_patch_after_the_shape_changed_is_rejected() -> None:
 
     assert (error.status_code, error.code) == (422, "shape_changed")
     assert error.details == {"decided_shape": "own_budget", "current_shape": "shared_member"}
+    assert error.message == (
+        "Campaign 11 is now a campaign on a shared budget but was decided as a campaign with "
+        "its own budget; resolve its budget discrepancy first."
+    )
 
 
 def test_a_patch_from_submitted_fields_carries_exactly_those_fields() -> None:
@@ -1337,3 +1438,341 @@ def test_the_vocabulary_matches_the_model_check_values(
 ) -> None:
     """AAP 0.5.2: the decision vocabulary is the one the ``decision`` CHECK constraints admit."""
     assert set(get_args(alias)) == set(values)
+
+
+# ---------------------------------------------------------------------------------------
+# Phase 6: refusals in words (AAP 0.5.5: the UI shows 409 and 422 messages as they are)
+# ---------------------------------------------------------------------------------------
+
+_API_KEYS: Final[tuple[str, ...]] = (
+    "own_budget",
+    "shared_member",
+    "platform_correct",
+    "decision_correct",
+    "adopt_platform",
+    "record_intended",
+    "acknowledge_removal",
+    "DAILY",
+    "CUSTOM_PERIOD",
+)
+"""API keys a refusal message must never show; its ``details`` carry them instead."""
+
+_A_BEFORE_A_VOWEL: Final = re.compile(r"\ba [aeiou]")
+"""The article "a" before a vowel, as in "a own_budget" or "a untracked"."""
+
+_SUBJECTS: Final[dict[DecisionShape, SubjectState]] = {
+    "own_budget": _google_campaign("DAILY"),
+    "shared_member": _google_member(),
+    "budget": _google_shared_budget("DAILY"),
+}
+"""One subject of each decision shape."""
+
+
+def _assert_in_words(message: str) -> None:
+    """Assert a refusal message shows no API key and no "a" before a vowel."""
+    for key in _API_KEYS:
+        assert key not in message, message
+    assert _A_BEFORE_A_VOWEL.search(message) is None, message
+
+
+@pytest.mark.parametrize(
+    ("labels", "alias"),
+    [
+        pytest.param(SHAPE_LABELS, DecisionShape, id="shapes"),
+        pytest.param(KIND_LABELS, DiscrepancyKind, id="kinds"),
+        pytest.param(RESOLUTION_LABELS, Resolution, id="resolutions"),
+        pytest.param(PERIOD_LABELS, BudgetPeriod, id="periods"),
+    ],
+)
+def test_every_api_key_a_refusal_names_has_a_label(
+    labels: Mapping[str, str], alias: object
+) -> None:
+    """Each shape, kind, resolution and period has the words its refusals use."""
+    assert set(labels) == set(get_args(alias))
+    for label in labels.values():
+        _assert_in_words(label)
+
+
+def test_a_resolution_refused_on_an_own_budget_status_discrepancy_reads_in_words() -> None:
+    """AAP 0.5.4.4: the 422 names the resolutions as the resolver offers them."""
+    error = resolution_not_allowed("adopt_platform", "status", _SUBJECTS["own_budget"])
+
+    assert (error.status_code, error.code) == (422, "resolution_not_allowed")
+    assert error.details == {
+        "kind": "status",
+        "shape": "own_budget",
+        "valid": ["platform_correct", "decision_correct"],
+    }
+    assert error.message == (
+        "Adopt platform state is not valid for a status discrepancy on Campaign 11; the valid "
+        "resolutions are Platform is correct, Decision is correct."
+    )
+
+
+def test_a_resolution_refused_on_an_untracked_budget_discrepancy_takes_an() -> None:
+    """AAP 0.5.4.4: an untracked shared budget offers Adopt and Record intended state."""
+    error = resolution_not_allowed("platform_correct", "untracked", _SUBJECTS["budget"])
+
+    assert error.details == {
+        "kind": "untracked",
+        "shape": "budget",
+        "valid": ["adopt_platform", "record_intended"],
+    }
+    assert error.message == (
+        "Platform is correct is not valid for an untracked discrepancy on Shared budget "
+        f"{SHARED_BUDGET_EXTERNAL}; the valid resolutions are Adopt platform state, Record "
+        "intended state."
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "shape", "resolution"),
+    [
+        pytest.param(kind, shape, resolution, id=f"{resolution}-on-{kind}-{shape}")
+        for kind in get_args(DiscrepancyKind)
+        for shape in get_args(DecisionShape)
+        for resolution in get_args(Resolution)
+        if resolution not in RESOLUTIONS.get((kind, shape), frozenset())
+    ],
+)
+def test_every_refused_resolution_reads_in_words_and_keeps_its_keys(
+    kind: DiscrepancyKind, shape: DecisionShape, resolution: Resolution
+) -> None:
+    """AAP 0.5.4.4: every refusal names the subject in words; ``details`` keep the keys."""
+    state = _SUBJECTS[shape]
+    allowed = RESOLUTIONS.get((kind, shape), frozenset())
+    offered = [key for key in DISCREPANCY_RESOLUTIONS if key in allowed]
+
+    error = resolution_not_allowed(resolution, kind, state)
+
+    assert isinstance(error, InvalidResolution)
+    assert error.details == {"kind": kind, "shape": shape, "valid": offered}
+    assert error.message.startswith(
+        f"{RESOLUTION_LABELS[resolution]} is not valid for {KIND_LABELS[kind]} discrepancy on "
+        f"{state.name}; "
+    )
+    if offered:
+        assert error.message.endswith(
+            f"the valid resolutions are {', '.join(RESOLUTION_LABELS[key] for key in offered)}."
+        )
+    else:
+        assert error.message.endswith("; no resolution applies.")
+    _assert_in_words(error.message)
+
+
+@pytest.mark.parametrize(
+    ("shape", "intended", "required", "message"),
+    [
+        pytest.param(
+            "own_budget",
+            {"status": "active"},
+            ["daily_budget", "status"],
+            "The intended state of Campaign 11, a campaign with its own budget, takes exactly "
+            "these fields: daily_budget, status.",
+            id="own-budget-without-its-daily-budget",
+        ),
+        pytest.param(
+            "shared_member",
+            {"status": "active", "daily_budget": "10"},
+            ["status"],
+            "The intended state of Campaign 11, a campaign on a shared budget, takes exactly "
+            "these fields: status.",
+            id="shared-member-with-an-amount",
+        ),
+        pytest.param(
+            "budget",
+            {"status": "active"},
+            ["daily_budget"],
+            f"The intended state of Shared budget {SHARED_BUDGET_EXTERNAL}, a shared budget, "
+            "takes exactly these fields: daily_budget.",
+            id="budget-with-a-status",
+        ),
+    ],
+)
+def test_an_intended_state_that_does_not_fit_the_shape_is_refused_in_words(
+    shape: DecisionShape, intended: dict[str, object], required: list[str], message: str
+) -> None:
+    """AAP 0.5.4.4: ``record_intended`` follows the subject's shape; the 422 names it in words."""
+    with pytest.raises(InvalidResolution) as refused:
+        parse_intended_state(_SUBJECTS[shape], intended)
+
+    error = refused.value
+    assert (error.status_code, error.code) == (422, "intended_state_invalid")
+    assert error.details == {"required": required, "received": sorted(intended)}
+    assert error.message == message
+    _assert_in_words(error.message)
+
+
+def _assert_a_sentence(message: str) -> None:
+    """Assert a refusal message is a capitalised sentence in words, shown as it is."""
+    assert message[:1].isupper(), message
+    assert message.endswith("."), message
+    _assert_in_words(message)
+
+
+@pytest.mark.parametrize(
+    ("data", "code", "details", "message"),
+    [
+        pytest.param(
+            {"budget_id": SHARED_BUDGET},
+            "unknown_field",
+            {"fields": ["budget_id"]},
+            "The patch carries unknown fields: budget_id.",
+            id="unknown-field",
+        ),
+        pytest.param(
+            {"status": None, "daily_budget": None},
+            "invalid_value",
+            {"fields": ["daily_budget", "status"]},
+            "Decided fields cannot be null: daily_budget, status.",
+            id="null-fields",
+        ),
+        pytest.param(
+            {"status": "archived"},
+            "invalid_value",
+            {"field": "status"},
+            "Status must be one of active, paused, ended.",
+            id="unknown-status",
+        ),
+        pytest.param(
+            {"total_budget": 12.5},
+            "invalid_value",
+            {"field": "total_budget"},
+            "The total_budget must be an exact decimal amount.",
+            id="float-amount",
+        ),
+    ],
+)
+def test_a_submitted_patch_is_refused_in_a_capitalised_sentence(
+    data: dict[str, object], code: str, details: dict[str, object], message: str
+) -> None:
+    """AAP 0.5.5: the UI shows a 422 as it is, so each patch refusal reads as a sentence."""
+    with pytest.raises(PatchRejected) as rejected:
+        DecisionPatch.from_mapping(data)
+
+    error = rejected.value
+    assert (error.status_code, error.code, error.details) == (422, code, details)
+    assert error.message == message
+    _assert_a_sentence(error.message)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        pytest.param(
+            "status", "archived", "Status must be one of active, paused, ended.", id="status"
+        ),
+        pytest.param(
+            "daily_budget",
+            "twelve",
+            "The daily_budget must be an exact decimal amount.",
+            id="amount",
+        ),
+    ],
+)
+def test_a_patch_built_directly_is_refused_in_a_capitalised_sentence(
+    field: str, value: object, message: str
+) -> None:
+    """The constructor's own checks read as the same sentences as :meth:`from_mapping`'s."""
+    with pytest.raises(PatchRejected) as rejected:
+        DecisionPatch(**{field: value})  # type: ignore[arg-type]  # the refusal under test
+
+    error = rejected.value
+    assert (error.status_code, error.code, error.details) == (
+        422,
+        "invalid_value",
+        {"field": field},
+    )
+    assert error.message == message
+    _assert_a_sentence(error.message)
+
+
+@pytest.mark.parametrize(
+    ("state", "amount", "code", "message"),
+    [
+        pytest.param(
+            _google_campaign("DAILY"),
+            Decimal(0),
+            "invalid_amount",
+            "The daily_budget must be a positive amount below 10^12.",
+            id="not-positive",
+        ),
+        pytest.param(
+            _google_campaign("DAILY"),
+            Decimal("12.3456789"),
+            "sub_minor_unit",
+            "The daily_budget must be a whole number of micros (at most 6 decimal places).",
+            id="google-finer-than-a-micro",
+        ),
+        pytest.param(
+            _linkedin_campaign(currency="USD"),
+            Decimal("12.345"),
+            "sub_minor_unit",
+            "The daily_budget must not be finer than the USD minor unit (2 places).",
+            id="linkedin-finer-than-a-cent",
+        ),
+    ],
+)
+def test_an_amount_refusal_reads_as_a_capitalised_sentence(
+    state: SubjectState, amount: Decimal, code: str, message: str
+) -> None:
+    """AAP 0.5.2 amount rules: each 422 names the request's field in a capitalised sentence."""
+    error = _rejected(
+        state, _own("active", daily=Decimal(1000)), DecisionPatch(daily_budget=amount)
+    )
+
+    assert (error.status_code, error.code, error.details) == (422, code, {"field": "daily_budget"})
+    assert error.message == message
+    _assert_a_sentence(error.message)
+
+
+@pytest.mark.parametrize(
+    ("intended", "details", "message"),
+    [
+        pytest.param(
+            {"status": "active", "daily_budget": "10", "budget_id": SHARED_BUDGET},
+            {"fields": ["budget_id"]},
+            "The intended state carries unknown fields: budget_id.",
+            id="unknown-field",
+        ),
+        pytest.param(
+            {"status": None, "daily_budget": "10"},
+            {"fields": ["status"]},
+            "Intended-state fields cannot be null: status.",
+            id="null-field",
+        ),
+        pytest.param(
+            {"status": "archived", "daily_budget": "10"},
+            {"field": "status"},
+            "Status must be one of active, paused, ended.",
+            id="unknown-status",
+        ),
+        pytest.param(
+            {"status": "active", "daily_budget": 12.5},
+            {"field": "daily_budget"},
+            "The daily_budget must be an exact decimal amount.",
+            id="float-amount",
+        ),
+        pytest.param(
+            {"status": "active", "daily_budget": "0"},
+            {"field": "daily_budget", "rule": "invalid_amount"},
+            "The daily_budget must be a positive amount below 10^12.",
+            id="not-positive",
+        ),
+    ],
+)
+def test_an_intended_state_refusal_reads_as_a_capitalised_sentence(
+    intended: dict[str, object], details: dict[str, object], message: str
+) -> None:
+    """AAP 0.5.4.4: a ``record_intended`` 422 is shown as it is, so it reads as a sentence."""
+    with pytest.raises(InvalidResolution) as refused:
+        parse_intended_state(_SUBJECTS["own_budget"], intended)
+
+    error = refused.value
+    assert (error.status_code, error.code, error.details) == (
+        422,
+        "intended_state_invalid",
+        details,
+    )
+    assert error.message == message
+    _assert_a_sentence(error.message)

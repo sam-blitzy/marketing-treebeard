@@ -37,6 +37,7 @@ from ads_engine.analysis.context import (
     FEEDBACK_SUPPRESSION,
     FINDING_CODES,
     FLAG_CODES,
+    FLAG_NO_CRM_LINK,
     FULL_STATE_DATASETS,
     GROUP_ORDER,
     GROUP_TITLES,
@@ -84,15 +85,17 @@ from ads_engine.analysis.context import (
     creative_group,
     creative_group_campaign,
     creative_pair_external_id,
+    google_link_gap,
     json_value,
     keyword_external_id,
+    no_crm_link_flag,
     objective_group,
     search_term_external_id,
     segment_external_id,
     term_cluster_external_id,
     unverified_message,
 )
-from ads_engine.analysis.thresholds import CrmBindings, Thresholds
+from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, Thresholds
 from ads_engine.analysis.window import AnalysisWindow, SourceDayInfo
 from ads_engine.db.models.analysis import DATA_STATUSES, FEEDBACK_KINDS, RECOMMENDATION_SECTIONS
 from ads_engine.db.models.ops import DATASETS
@@ -1817,6 +1820,53 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
     assert missing.provenance == ()
     with pytest.raises(ValueError, match="dataset name"):
         context.make_evidence(required_datasets=("google.facts",), crm_scope=None, metrics=())
+
+
+# -- the Google-to-CRM link (AAP 0.3.3, 0.5.4.1) ---------------------------------------------
+
+
+def test_google_link_gap_names_why_google_items_have_no_crm_link(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """No Google CRM dataset, an unverified link and a verified link, decided in one place."""
+    assert "google_link_gap" in ctx_module.__all__
+    without = _context(thresholds, window, google_crm=None)
+    assert google_link_gap(without) == "no active HubSpot dataset"
+    # An unavailable link names its own reason: here every binding is unverified.
+    assert google_link_gap(_context(thresholds, window)) == "CRM stage bindings not verified"
+    not_configured = GoogleCrmBinding(
+        available=False, reason="HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured"
+    )
+    unverified = CrmData(HUBSPOT, dataclasses.replace(_bindings(), google=not_configured))
+    assert google_link_gap(_context(thresholds, window, google_crm=unverified)) == (
+        "HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured"
+    )
+    linked = GoogleCrmBinding(
+        available=True,
+        campaign_property="google_campaign_id",
+        touch_date_property="google_touch_at",
+    )
+    verified = CrmData(HUBSPOT, dataclasses.replace(_bindings(), google=linked))
+    assert google_link_gap(_context(thresholds, window, google_crm=verified)) is None
+    # A LinkedIn-derived CRM dataset never stands in for the Google link, even when verified.
+    companion = CrmData(COMPANION, dataclasses.replace(_bindings(), google=linked))
+    stand_in = _context(thresholds, window, linkedin_crm=companion, google_crm=None)
+    assert google_link_gap(stand_in) == "no active HubSpot dataset"
+
+
+def test_no_crm_link_flag_renders_the_gap_and_rejects_a_blank_reason() -> None:
+    """Every Google item's no_crm_link badge reads "No CRM link for Google campaigns: {gap}"."""
+    assert "no_crm_link_flag" in ctx_module.__all__
+    flag = no_crm_link_flag("no active HubSpot dataset")
+    message = "No CRM link for Google campaigns: no active HubSpot dataset"
+    assert flag == Flag(FLAG_NO_CRM_LINK, message)
+    assert flag.to_json() == {
+        "code": "no_crm_link",
+        "message": message,
+    }
+    for blank in ("", "   "):
+        with pytest.raises(ValueError, match="no_crm_link reason must be a non-blank string"):
+            no_crm_link_flag(blank)
 
 
 def test_module_doctests() -> None:

@@ -7,7 +7,12 @@ one named dataset as a :class:`FreshnessOutcome`, and :func:`record_freshness` f
 outcome into the stored row:
 
 * ``last_attempt_at`` moves on every later attempt; ``last_success_at`` only on a later
-  success.
+  success that was not cut short. A success cut short by a transient error that outlived its
+  retries, or by a Google call-budget deferral (:attr:`FreshnessOutcome.cut_short`), records
+  what it read (its coverage, ``incomplete`` and its reason) but is no full refresh, so
+  ``last_success_at`` stands and the dataset turns stale once that last full refresh is older
+  than ``sources.stale_after_hours`` (AAP 0.3.3: after a transient error or a deferral "the
+  affected datasets keep their last good data and turn stale"; AAP 0.3.2 stale rule).
 * ``covered_from`` / ``covered_through`` are the native dates the stored data covers. A
   success extends the stored range when the new range overlaps or touches it, and a later
   success replaces it otherwise, so a gap in coverage is never hidden behind one wide range.
@@ -23,9 +28,11 @@ outcome into the stored row:
 * Outcomes are folded in the order their attempts started, whatever order they commit
   in. Both timestamps only move forward. A failure that started before the stored latest
   attempt is obsolete and changes nothing. A success that started before the stored
-  latest success is merged conservatively: it never makes the row look better or newer,
-  and a range that leaves a gap to the stored one changes nothing. A success that started
-  before a stored failed attempt keeps that newer failure's reason.
+  latest success, or before a stored cut-short attempt, is merged conservatively: it never
+  makes the row look better or newer (it moves ``last_success_at`` only to its own start,
+  and only past an earlier one), and a range that leaves a gap to the stored one changes
+  nothing. A success that started before a stored failed attempt keeps that newer
+  failure's reason.
 
 Consumers (the analysis runner and the current-state overlay) derive the per-item
 ``stale`` and ``incomplete`` flags from these rows and the item's required datasets. This
@@ -51,13 +58,15 @@ Example:
             complete=False,
             reason=f"{REASON_DEFERRED}; 3 partitions deferred",
             repairable=True,
+            cut_short=True,
         )
         await write_checkpoint(session, dataset_id, "google.metrics_daily", checkpoint)
         await record_freshness(session, dataset_id, "google.metrics_daily", outcome)
 
-    Its next run reads the stored scopes first, so the deferred pages finish in a later 24 h
-    window, and the row turns ``complete`` once nothing is left. A dataset with no usable
-    checkpoint falls back to :func:`needs_repair` and re-reads its whole recorded range.
+    The row keeps its ``last_success_at``. Its next run reads the stored scopes first, so the
+    deferred pages finish in a later 24 h window, and the row turns ``complete``, with a new
+    ``last_success_at``, once nothing is left. A dataset with no usable checkpoint falls back
+    to :func:`needs_repair` and re-reads its whole recorded range.
 """
 
 import copy
@@ -231,6 +240,13 @@ class FreshnessOutcome:
     full-state read, such as an entity sync that re-reads every campaign: its completeness
     replaces the stored one and the stored coverage is left as it is.
 
+    A success whose read a transient error (after its retries) or a Google call-budget
+    deferral stopped before it finished is ``cut_short``: what it read is recorded like any
+    incomplete success, but it is no successful refresh, so :func:`record_freshness` keeps
+    the stored ``last_success_at`` and the dataset turns stale once that is too old (AAP
+    0.3.3 transient row and "Timeouts and budget"). A shortfall the platform's own limits
+    cause (a result limit, a page limit) is not cut short: the read finished.
+
     Attributes:
         attempted_at: When the attempt started; timezone-aware.
         succeeded: Whether the attempt finished, completely or not.
@@ -244,6 +260,11 @@ class FreshnessOutcome:
             ``True`` requires an ``incomplete`` success whose reason starts with a
             prefix in :data:`REPAIRABLE_REASONS`, which is what :func:`needs_repair` reads
             back from the stored row.
+        cut_short: Whether a transient error that outlived its retries, or a call-budget
+            deferral, stopped the read before it finished; ``last_success_at`` then stands.
+            ``True`` requires an ``incomplete`` success, which always carries its reason. It
+            is set by the job that saw the interruption, never inferred from the reason,
+            because not every source's interruption reason carries a repairable prefix.
     """
 
     attempted_at: datetime
@@ -253,6 +274,7 @@ class FreshnessOutcome:
     completeness: Completeness = "unknown"
     reason: str | None = None
     repairable: bool = False
+    cut_short: bool = False
 
     def __post_init__(self) -> None:
         """Validate the outcome.
@@ -260,8 +282,9 @@ class FreshnessOutcome:
         Raises:
             ValueError: If ``attempted_at`` is naive, a coverage end is a ``datetime`` or
                 is given without the other, the range is reversed, the completeness does
-                not fit the success flag, a required reason is missing or blank, or
-                ``repairable`` contradicts the completeness or the reason.
+                not fit the success flag, a required reason is missing or blank,
+                ``repairable`` contradicts the completeness or the reason, or ``cut_short``
+                is set on anything but an incomplete success.
         """
         if self.attempted_at.tzinfo is None or self.attempted_at.utcoffset() is None:
             raise ValueError("attempted_at must be a timezone-aware datetime")
@@ -304,6 +327,10 @@ class FreshnessOutcome:
                 "repairable needs an incomplete success whose reason starts with one of "
                 f"{list(REPAIRABLE_REASONS)!r}"
             )
+        if self.cut_short and (
+            not self.succeeded or self.completeness != "incomplete" or self.reason is None
+        ):
+            raise ValueError("cut_short needs an incomplete success with its reason")
 
     @classmethod
     def success(
@@ -315,6 +342,7 @@ class FreshnessOutcome:
         complete: bool,
         reason: str | None = None,
         repairable: bool = False,
+        cut_short: bool = False,
     ) -> Self:
         """Build the outcome of an attempt that finished, completely or not.
 
@@ -325,13 +353,16 @@ class FreshnessOutcome:
             complete: Whether everything in the range was read.
             reason: Why the read is incomplete; required when ``complete`` is false.
             repairable: Whether a refetch can repair the shortfall (see the class).
+            cut_short: Whether a transient error or a call-budget deferral stopped the read
+                early, so the attempt is no successful refresh (see the class); requires
+                ``complete`` false.
 
         Returns:
             The validated outcome.
 
         Raises:
-            ValueError: If ``complete`` is false and no reason is given, or any other
-                check in :meth:`__post_init__` fails.
+            ValueError: If ``complete`` is false and no reason is given, ``cut_short`` is
+                set on a complete read, or any other check in :meth:`__post_init__` fails.
         """
         return cls(
             attempted_at=attempted_at,
@@ -341,6 +372,7 @@ class FreshnessOutcome:
             completeness="complete" if complete else "incomplete",
             reason=reason,
             repairable=repairable,
+            cut_short=cut_short,
         )
 
     @classmethod
@@ -451,6 +483,29 @@ def _newer_failure_reason(stored: _State, attempted_at: datetime) -> str | None:
     return (note if marker else shortfall) or None
 
 
+def _newer_cut_short(stored: _State, attempted_at: datetime) -> bool:
+    """Return whether the stored latest attempt is a cut-short success after ``attempted_at``.
+
+    A cut-short success moves ``last_attempt_at`` but not ``last_success_at`` and always
+    records ``incomplete`` with its reason, while a failure on an incomplete row appends its
+    reason after :data:`_FAILURE_MARKER` (:func:`_failure_reason`). So a stored latest attempt
+    that started after ``attempted_at`` and after the stored latest success (or with none
+    stored), on an ``incomplete`` row whose reason carries no failure note, was cut short. Its
+    completeness and reason are then newer than the attempt being merged, which must not
+    replace them, and it is no failure whose reason the merge appends.
+    """
+    last_attempt, last_success = stored.last_attempt_at, stored.last_success_at
+    if last_attempt is None or last_attempt <= attempted_at:
+        return False
+    if last_success is not None and last_success >= last_attempt:
+        return False
+    return (
+        stored.completeness == "incomplete"
+        and stored.reason is not None
+        and _FAILURE_MARKER not in stored.reason
+    )
+
+
 def _ranges_touch(
     first_from: date, first_through: date, second_from: date, second_through: date
 ) -> bool:
@@ -535,17 +590,21 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
     one), so the merge is chronological on ``attempted_at`` rather than on commit order:
 
     * Timestamps never move back: ``last_attempt_at`` becomes the later of the stored value
-      and ``attempted_at``, and on success so does ``last_success_at``.
+      and ``attempted_at``, and on a success that was not cut short so does
+      ``last_success_at``. A cut-short success keeps the stored ``last_success_at``.
     * A failure that started before the stored latest attempt is obsolete: a later attempt
       already recorded the dataset's health, so the stored state is returned unchanged.
       Otherwise the failure moves only ``last_attempt_at`` and ``reason``.
-    * A success that started before the stored latest success is obsolete for the data and
-      never makes the row look better or newer. A range that leaves a gap to the stored one
-      changes nothing; otherwise the coverage merges with :func:`_merge_coverage` and the
-      completeness and reason come from :func:`_worse`.
+    * A success that started before the stored latest success, or before a stored cut-short
+      attempt (:func:`_newer_cut_short`), is obsolete for the data and never makes the row
+      look better or newer. A range that leaves a gap to the stored one changes nothing;
+      otherwise the coverage merges with :func:`_merge_coverage` and the completeness and
+      reason come from :func:`_worse`. One that started after the stored latest success
+      still moves ``last_success_at`` to its own start, as in start order.
     * Any other success merges coverage with :func:`_merge_coverage` and takes the
       attempt's completeness when it re-read the whole stored range, or :func:`_worse`
-      otherwise.
+      otherwise. A cut-short success merges its coverage, completeness and reason the same
+      way.
     * A success that started before a stored failed attempt keeps that failure's reason
       (:func:`_failure_reason`), so the row reads as if both had committed in start order.
     """
@@ -560,7 +619,10 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
             last_attempt_at=last_attempt_at,
             reason=_failure_reason(stored, failure),
         )
-    if stored.last_success_at is not None and attempted_at < stored.last_success_at:
+    newer_cut_short = _newer_cut_short(stored, attempted_at)
+    if newer_cut_short or (
+        stored.last_success_at is not None and attempted_at < stored.last_success_at
+    ):
         if _disjoint(stored, outcome):
             # The older range must neither replace the newer one nor be united with it
             # across the gap, so the stored coverage, completeness and reason stand.
@@ -575,12 +637,19 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
             completeness, reason = _worse(stored, outcome)
     merged = _State(
         last_attempt_at=last_attempt_at,
-        last_success_at=_later(stored.last_success_at, attempted_at),
+        last_success_at=(
+            stored.last_success_at
+            if outcome.cut_short
+            else _later(stored.last_success_at, attempted_at)
+        ),
         covered_from=covered_from,
         covered_through=covered_through,
         completeness=completeness,
         reason=reason,
     )
+    if newer_cut_short:
+        # The newer attempt was a cut-short success, not a failure: no failure note to keep.
+        return merged
     newer_failure = _newer_failure_reason(stored, attempted_at)
     if newer_failure is not None:
         return replace(merged, reason=_failure_reason(merged, newer_failure))
@@ -632,15 +701,24 @@ async def record_freshness(
       stored range; otherwise the worse of stored and new is kept, so a trailing-days
       refresh never turns a backfill-incomplete row complete. ``unknown`` is never
       written on success.
+    * **Cut-short success** (:attr:`FreshnessOutcome.cut_short`: a transient error or a
+      call-budget deferral stopped the read): merged like any success, so its coverage,
+      ``incomplete`` and reason are recorded and a repairable reason still drives
+      :func:`needs_repair`, except that ``last_success_at`` stands. The dataset therefore
+      keeps its last good data and turns stale once its last full refresh is older than
+      ``sources.stale_after_hours`` (AAP 0.3.3, 0.3.2); the next success that is not cut
+      short moves ``last_success_at`` again.
     * **Chronology**: outcomes fold in the order their attempts started, not the order
       they commit in, and ``last_attempt_at`` and ``last_success_at`` never move back. A
       failure that started before the stored ``last_attempt_at`` is obsolete and leaves
-      the row unchanged. A success that started before the stored ``last_success_at`` is
-      merged conservatively and never makes the row look better or newer: a range that
-      leaves a gap to the stored one changes nothing, and otherwise the coverage merges as
-      above while the worse completeness and its reason are kept. A success that started
-      before a stored failed attempt keeps that failure's reason, as if the two had
-      committed in start order. Recording the same outcome again changes nothing.
+      the row unchanged. A success that started before the stored ``last_success_at``, or
+      before a stored cut-short attempt, is merged conservatively and never makes the row
+      look better or newer: a range that leaves a gap to the stored one changes nothing,
+      and otherwise the coverage merges as above while the worse completeness and its
+      reason are kept (one that started after the stored ``last_success_at`` still moves it
+      to its own start). A success that started before a stored failed attempt keeps that
+      failure's reason, as if the two had committed in start order. Recording the same
+      outcome again changes nothing.
 
     Concurrent writers of the same row serialize: an empty row is first inserted with
     ``ON CONFLICT DO NOTHING`` so that the following ``SELECT ... FOR UPDATE`` always has
@@ -715,6 +793,7 @@ async def record_freshness(
         "dataset_id": dataset_id,
         "dataset": dataset,
         "succeeded": outcome.succeeded,
+        "cut_short": outcome.cut_short,
         "completeness": written.completeness,
         "covered_from": written.covered_from,
         "covered_through": written.covered_through,

@@ -32,13 +32,24 @@ structlog events (``structlog.testing.capture_logs``):
   credentials); ``ProbeReport.endpoint`` names the first failing check's endpoint, and
   the automatic fallback the failed probe causes logs it on ``sync.fallback``.
 
+AAP 0.5.2 (source mode and health "updated on every attempt"). Covered:
+
+* every sync job attempt, simulated included, and every probe that sends live requests,
+  passing or failing, stamps ``last_attempt_at`` and changes nothing else (no mode, status
+  or reason, no transition log, no rerun); a probe that sends nothing stamps nothing;
+* ``last_attempt_at`` never moves back;
+* ``last_failure_at`` records the failure a transient or defective call marks, so a
+  ``stale`` or ``error`` connection still returns to ``ok`` once every freshness row has
+  succeeded since that failure, even when later attempts moved ``last_attempt_at`` past
+  the successes.
+
 The database tests run against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``). The module creates a private
 schema, builds every table of the model metadata in it, points every connection's
 ``search_path`` at it alone, and drops it with ``CASCADE`` at teardown, so the ``public``
 schema and every other schema stay untouched. Each test starts from empty dataset,
-connection and request tables in that schema. An unreachable database fails the tests; it
-never skips them.
+connection, request and sync-run tables in that schema, so no test sees another's probe
+history. An unreachable database fails the tests; it never skips them.
 """
 
 import os
@@ -46,7 +57,7 @@ import sys
 import types
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -67,13 +78,16 @@ from ads_engine.connectors.errors import AccessDenied, ConnectorError, QueryDefe
 from ads_engine.connectors.http import RetryPolicy
 from ads_engine.db.base import Base
 from ads_engine.db.models.analysis import AnalysisRequest
-from ads_engine.db.models.ops import SourceConnection
+from ads_engine.db.models.ops import SourceConnection, SourceDataset
 from ads_engine.settings import Settings, Source
+from ads_engine.simulation.generator import SimulatedWorld
+from ads_engine.simulation.transport import mock_transport
 from ads_engine.sync import jobs
 from ads_engine.sync.datasets import DatasetManager, Mode
 from ads_engine.sync.freshness import FreshnessOutcome, record_freshness
 from ads_engine.sync.mode import (
     REASON_FORCED,
+    REASON_LIVE,
     REASON_NO_CREDENTIALS,
     REASON_RECOVERED,
     REASON_SEEDED,
@@ -88,6 +102,11 @@ pytestmark = pytest.mark.integration
 
 T0 = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
 """The fixed instant of every controller and dataset manager in this module."""
+
+# Later instants, for the attempts that follow a dataset built at T0.
+T1 = T0 + timedelta(hours=1)
+T2 = T0 + timedelta(hours=2)
+T3 = T0 + timedelta(hours=3)
 
 SOURCES: tuple[Source, ...] = ("google", "linkedin", "hubspot")
 
@@ -127,14 +146,19 @@ def _denied(source: Source = "hubspot") -> AccessDenied:
     )
 
 
-def _auto_with_google() -> Settings:
-    """Return ``auto`` settings carrying fake n8n webhook credentials, so Google may run live."""
+def _auto_with_google(customer_id: str = "1234567890") -> Settings:
+    """Return ``auto`` settings carrying fake n8n webhook credentials, so Google may run live.
+
+    Args:
+        customer_id: The Google Ads customer id; the simulated world's lets the simulator
+            answer as the live platform.
+    """
     fake = SecretStr("-".join(("test", "webhook", "secret", uuid.uuid4().hex[:8])))
     return Settings(
         data_mode="auto",
         n8n_google_ads_webhook_url="https://n8n.example.test/webhook/google-ads",
         n8n_webhook_secret=fake,
-        google_ads_customer_id="1234567890",
+        google_ads_customer_id=customer_id,
     )
 
 
@@ -214,7 +238,12 @@ def database() -> Iterator[tuple[URL, str]]:
 
 @pytest.fixture
 async def sessions(database: tuple[URL, str]) -> AsyncIterator[Sessions]:
-    """Yield a session factory on empty dataset, connection and request tables.
+    """Yield a session factory on empty dataset, connection, request and sync-run tables.
+
+    ``sync_run`` is listed by name because no foreign key ties it to ``source_dataset``, so
+    the ``CASCADE`` never reaches it. The controllers here run on fixed clocks from
+    :data:`T0`, so a ``probe`` row an earlier test left would fall inside this test's probe
+    spacing (``PROBE_INTERVAL``) and skip its probe.
 
     The engine is created and disposed inside this test's loop.
     """
@@ -223,7 +252,9 @@ async def sessions(database: tuple[URL, str]) -> AsyncIterator[Sessions]:
     try:
         async with engine.begin() as connection:
             await connection.execute(
-                text("TRUNCATE source_dataset, source_connection, analysis_request CASCADE")
+                text(
+                    "TRUNCATE source_dataset, source_connection, analysis_request, sync_run CASCADE"
+                )
             )
         yield async_sessionmaker(engine, expire_on_commit=False)
     finally:
@@ -325,9 +356,44 @@ async def _store_connection(
     status: str = "ok",
     reason: str | None = None,
 ) -> None:
-    """Commit a ``source_connection`` row as an earlier process left it."""
+    """Commit a ``source_connection`` row as an earlier process left it, with no dataset.
+
+    A ``live`` row stored here is a placeholder that never verified live access, as the
+    live path of ``resolve`` or the Google call budget leaves it; see
+    :func:`_store_live_connection` for a source established live.
+    """
     async with sessions() as session, session.begin():
         session.add(SourceConnection(source=source, mode=mode, status=status, reason=reason))
+
+
+async def _store_live_connection(sessions: Sessions, source: Source) -> int:
+    """Commit a live connection as an activation leaves it, pointing at its active live primary.
+
+    Returns:
+        The id of the active live primary dataset.
+    """
+    async with sessions() as session, session.begin():
+        dataset = SourceDataset(
+            source=source,
+            mode="live",
+            state="active",
+            role="primary",
+            reason=REASON_LIVE,
+            created_at=T0,
+            activated_at=T0,
+        )
+        session.add(dataset)
+        await session.flush()
+        session.add(
+            SourceConnection(
+                source=source,
+                mode="live",
+                status="ok",
+                reason=REASON_LIVE,
+                active_dataset_id=dataset.id,
+            )
+        )
+        return dataset.id
 
 
 async def _connection(sessions: Sessions, source: Source) -> SourceConnection | None:
@@ -368,12 +434,14 @@ async def _active_live_hubspot(sessions: Sessions) -> int:
     return dataset_id
 
 
-async def _freshen(sessions: Sessions, manager: DatasetManager, dataset_id: int) -> None:
-    """Record every freshness row ``dataset_id`` requires as a complete success at T0."""
+async def _freshen(
+    sessions: Sessions, manager: DatasetManager, dataset_id: int, *, at: datetime = T0
+) -> None:
+    """Record every freshness row ``dataset_id`` requires as a complete success at ``at``."""
     async with sessions() as session, session.begin():
         for name in await manager.required_freshness(dataset_id):
             outcome = FreshnessOutcome.success(
-                T0, covered_from=None, covered_through=None, complete=True
+                at, covered_from=None, covered_through=None, complete=True
             )
             await record_freshness(session, dataset_id, name, outcome)
 
@@ -403,7 +471,7 @@ def _events(entries: list[dict[str, Any]], event: str) -> list[dict[str, Any]]:
 async def test_forced_simulation_of_a_live_connection_queues_one_rerun(
     sessions: Sessions, source: Source
 ) -> None:
-    await _store_connection(sessions, source, mode="live")
+    await _store_live_connection(sessions, source)
 
     resolved = await _controller(_forced(), sessions).resolve(source)
 
@@ -425,7 +493,7 @@ async def test_forced_simulation_of_a_live_connection_queues_one_rerun(
 async def test_missing_credentials_on_a_live_connection_queue_one_rerun(
     sessions: Sessions,
 ) -> None:
-    await _store_connection(sessions, "hubspot", mode="live")
+    await _store_live_connection(sessions, "hubspot")
 
     resolved = await _controller(_auto_without_hubspot(), sessions).resolve("hubspot")
 
@@ -436,7 +504,7 @@ async def test_missing_credentials_on_a_live_connection_queue_one_rerun(
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_repeated_resolutions_queue_no_further_rerun(sessions: Sessions) -> None:
-    await _store_connection(sessions, "linkedin", mode="live")
+    await _store_live_connection(sessions, "linkedin")
     controller = _controller(_forced(), sessions)
 
     for _ in range(3):
@@ -577,7 +645,7 @@ async def test_transient_and_defective_calls_on_live_data_queue_nothing(
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_rerun_rolls_back_with_the_mode_change(sessions: Sessions) -> None:
-    await _store_connection(sessions, "google", mode="live")
+    await _store_live_connection(sessions, "google")
     controller = _controller(_forced(), sessions)
 
     async with sessions() as session:
@@ -719,7 +787,7 @@ async def test_a_first_start_into_simulated_data_logs_info_with_no_endpoint(
 async def test_switching_a_live_connection_to_simulated_logs_a_warning(
     sessions: Sessions,
 ) -> None:
-    await _store_connection(sessions, "linkedin", mode="live")
+    await _store_live_connection(sessions, "linkedin")
 
     with capture_logs() as entries:
         await _controller(_forced(), sessions).resolve("linkedin")
@@ -860,13 +928,12 @@ async def test_an_activation_that_changes_the_mode_logs_its_level_and_no_endpoin
     reason: str,
     level: str,
 ) -> None:
-    await _store_connection(
-        sessions,
-        "google",
-        mode=stored_mode,
-        status=stored_status,
-        reason=DENIAL_REASON if stored_status == "denied" else None,
-    )
+    if stored_mode == "live":
+        await _store_live_connection(sessions, "google")
+    else:
+        await _store_connection(
+            sessions, "google", mode=stored_mode, status=stored_status, reason=DENIAL_REASON
+        )
 
     with capture_logs() as entries:
         outcome = await _controller(_auto_with_google(), sessions).build_dataset(
@@ -888,10 +955,22 @@ async def test_an_activation_that_changes_the_mode_logs_its_level_and_no_endpoin
 
 @pytest.mark.anyio
 @pytest.mark.db
+@pytest.mark.parametrize(
+    ("established", "from_mode"),
+    [
+        # The first live build: resolve's live path left a placeholder that never verified
+        # live access, so the fallback is a change from no mode.
+        pytest.param(False, None, id="first-live-build"),
+        pytest.param(True, "live", id="established-live"),
+    ],
+)
 async def test_a_failed_live_build_logs_its_failing_endpoint_on_the_fallback(
-    sessions: Sessions, backfill: _Backfill
+    sessions: Sessions, backfill: _Backfill, established: bool, from_mode: str | None
 ) -> None:
-    await _store_connection(sessions, "google", mode="live")
+    if established:
+        await _store_live_connection(sessions, "google")
+    else:
+        await _store_connection(sessions, "google", mode="live")
     backfill.live_failure = TransientError(
         "n8n returned 503", source="google", endpoint="search Q-G2", http_status=503
     )
@@ -914,7 +993,9 @@ async def test_a_failed_live_build_logs_its_failing_endpoint_on_the_fallback(
         change["to_mode"],
         change["status"],
         change["endpoint"],
-    ) == ("warning", "live", "simulated", "denied", "search Q-G2")
+    ) == ("warning", from_mode, "simulated", "denied", "search Q-G2")
+    # Only a source established live has a mode change to rerun for.
+    assert await _mode_changes(sessions, "google") == (1 if established else 0)
     [fallback] = _events(entries, "sync.fallback")
     assert (fallback["log_level"], fallback["endpoint"]) == ("warning", "search Q-G2")
     assert fallback["reason"].startswith("live build failed: ")
@@ -1018,3 +1099,315 @@ def test_the_probe_report_endpoint_is_the_first_failing_checks() -> None:
     assert passing.endpoint is None
     assert partial.endpoint == "leadForms"
     assert unconfigured.endpoint is None
+
+
+# ---------------------------------------------------------------------------------------
+# last_attempt_at: every attempt stamps it; last_failure_at decides a return to ok
+# ---------------------------------------------------------------------------------------
+
+
+def _clocked(sessions: Sessions, instant: datetime) -> SourceModeController:
+    """Return a forced-simulation controller on the private schema, its clock at ``instant``."""
+    return SourceModeController(_forced(), sessionmaker=sessions, clock=lambda: instant)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_every_job_attempt_stamps_last_attempt_at_and_nothing_else(
+    sessions: Sessions,
+) -> None:
+    dataset_id = await _active_dataset(sessions, "google", "simulated", REASON_FORCED)
+    seeded = await _connection(sessions, "google")
+    assert seeded is not None
+    assert seeded.last_attempt_at is None
+
+    with capture_logs() as entries:
+        report = await jobs.run_source_jobs(
+            "google",
+            trigger="manual",
+            jobs=[jobs.JOB_ENTITIES],
+            controller=_clocked(sessions, T1),
+        )
+
+    assert report.ok, report
+    connection = await _connection(sessions, "google")
+    assert connection is not None
+    assert connection.last_attempt_at == T1
+    # A successful attempt is no failure, and no transition of any kind.
+    assert connection.last_failure_at is None
+    assert (
+        connection.mode,
+        connection.status,
+        connection.reason,
+        connection.active_dataset_id,
+    ) == ("simulated", "ok", REASON_FORCED, dataset_id)
+    assert _events(entries, "sync.mode.change") == []
+    assert _events(entries, "sync.connection") == []
+    assert await _mode_changes(sessions, "google") == 0
+
+    # An attempt that started earlier, in a slower process, never moves the stamp back.
+    await _clocked(sessions, T0).record_attempt("google", T0)
+    connection = await _connection(sessions, "google")
+    assert connection is not None
+    assert connection.last_attempt_at == T1
+
+    # The next attempt moves it on.
+    again = await jobs.run_source_jobs(
+        "google", trigger="manual", jobs=[jobs.JOB_ENTITIES], controller=_clocked(sessions, T2)
+    )
+    assert again.ok, again
+    connection = await _connection(sessions, "google")
+    assert connection is not None
+    assert (connection.last_attempt_at, connection.status) == (T2, "ok")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_record_attempt_creates_a_missing_row_and_rejects_a_naive_instant(
+    sessions: Sessions,
+) -> None:
+    controller = _clocked(sessions, T1)
+
+    with capture_logs() as entries:
+        await controller.record_attempt("linkedin", T1)
+
+    connection = await _connection(sessions, "linkedin")
+    assert connection is not None
+    # Created as every new row is under forced simulation, with nothing but the stamp set.
+    assert (connection.mode, connection.status, connection.reason) == ("simulated", "ok", None)
+    assert (connection.last_attempt_at, connection.last_failure_at) == (T1, None)
+    assert entries == []
+    assert await _requests(sessions) == []
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await controller.record_attempt("linkedin", T1.replace(tzinfo=None))
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_live_probe_stamps_last_attempt_at_whatever_its_verdict(
+    sessions: Sessions,
+) -> None:
+    world = SimulatedWorld.from_settings(_forced(), clock=lambda: T1)
+    settings = _auto_with_google(world.google_customer_id)
+    passing = SourceModeController(
+        settings,
+        sessionmaker=sessions,
+        world=world,
+        clock=lambda: T1,
+        transports={"google": mock_transport("google", world, settings=settings)},
+        retry=RetryPolicy(sleep=_no_sleep),
+    )
+
+    with capture_logs() as entries:
+        report = await passing.probe("google")
+
+    assert report.passed, report
+    google = await _connection(sessions, "google")
+    assert google is not None
+    assert (google.last_attempt_at, google.last_failure_at) == (T1, None)
+    assert (google.status, google.reason) == ("ok", None)
+    assert _events(entries, "sync.mode.change") == []
+    assert _events(entries, "sync.connection") == []
+
+    # A failing probe called the source too; only the fallback it may lead to marks a failure.
+    refused = SourceModeController(
+        _auto_with_hubspot(),
+        sessionmaker=sessions,
+        clock=lambda: T2,
+        transports={"hubspot": httpx.MockTransport(_forbidden)},
+        retry=RetryPolicy(sleep=_no_sleep),
+    )
+    assert (await refused.probe("hubspot")).passed is False
+    hubspot = await _connection(sessions, "hubspot")
+    assert hubspot is not None
+    assert (hubspot.last_attempt_at, hubspot.last_failure_at, hubspot.status) == (T2, None, "ok")
+
+    # A probe that sends no request is no attempt.
+    assert (await _clocked(sessions, T3).probe("linkedin")).passed is False
+    assert await _connection(sessions, "linkedin") is None
+    assert await _requests(sessions) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("error", "datasets", "marked"),
+    [
+        pytest.param(
+            TransientError(
+                "HubSpot returned 503",
+                source="hubspot",
+                endpoint="contacts batch read",
+                http_status=503,
+            ),
+            ("hubspot.contacts",),
+            "stale",
+            id="transient",
+        ),
+        pytest.param(
+            QueryDefect(
+                "HubSpot rejected the request",
+                source="hubspot",
+                endpoint="deals search",
+                http_status=400,
+            ),
+            (),
+            "error",
+            id="defect",
+        ),
+    ],
+)
+async def test_a_marked_connection_returns_to_ok_once_caught_up_despite_later_attempts(
+    sessions: Sessions, error: ConnectorError, datasets: tuple[str, ...], marked: str
+) -> None:
+    dataset_id = await _active_dataset(sessions, "hubspot", "simulated", REASON_FORCED)
+    failing = _clocked(sessions, T1)
+
+    await failing.on_error("hubspot", error, dataset_id=dataset_id, datasets=datasets)
+
+    connection = await _connection(sessions, "hubspot")
+    assert connection is not None
+    assert (connection.status, connection.last_attempt_at, connection.last_failure_at) == (
+        marked,
+        T1,
+        T1,
+    )
+    # Not caught up: no freshness row has succeeded since the failure.
+    assert await failing.ensure_dataset("hubspot") is None
+    connection = await _connection(sessions, "hubspot")
+    assert connection is not None
+    assert connection.status == marked
+
+    # Every row succeeds at T2; a later attempt of a job with a slower cadence (nightly,
+    # not yet due again) then moves last_attempt_at past those successes.
+    await _freshen(sessions, failing.datasets, dataset_id, at=T2)
+    later = _clocked(sessions, T3)
+    await later.record_attempt("hubspot", T3)
+
+    with capture_logs() as entries:
+        assert await later.ensure_dataset("hubspot") is None
+
+    connection = await _connection(sessions, "hubspot")
+    assert connection is not None
+    assert (connection.status, connection.last_attempt_at, connection.last_failure_at) == (
+        "ok",
+        T3,
+        T1,
+    )
+    [returned] = _events(entries, "sync.connection")
+    assert (returned["from_status"], returned["status"]) == (marked, "ok")
+
+
+# ---------------------------------------------------------------------------------------
+# First resolutions: a placeholder live row establishes no mode
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_first_live_activation_logs_a_change_from_no_mode_to_live(
+    sessions: Sessions, backfill: _Backfill
+) -> None:
+    world = SimulatedWorld.from_settings(_forced(), clock=lambda: T0)
+    settings = _auto_with_google(world.google_customer_id)
+    controller = SourceModeController(
+        settings,
+        sessionmaker=sessions,
+        world=world,
+        clock=lambda: T0,
+        transports={"google": mock_transport("google", world, settings=settings)},
+        retry=RetryPolicy(sleep=_no_sleep),
+    )
+
+    with capture_logs() as entries:
+        outcome = await controller.ensure_dataset("google")
+
+    assert outcome is not None
+    assert (outcome.activated, outcome.mode, outcome.reason) == (True, "live", REASON_LIVE)
+    assert backfill.calls == [outcome.dataset_id]
+    [change] = _events(entries, "sync.mode.change")
+    assert (
+        change["log_level"],
+        change["from_mode"],
+        change["to_mode"],
+        change["reason"],
+        change["dataset_id"],
+        change["endpoint"],
+    ) == ("info", None, "live", REASON_LIVE, outcome.dataset_id, None)
+    # The activation queues its own rerun; a first resolution is no mode change to rerun for.
+    assert await _reasons(sessions) == ["dataset_activated:google"]
+
+    # Established live now: a later denial is a change from live, and queues its rerun.
+    denial = AccessDenied(
+        "n8n answered PERMISSION_DENIED",
+        source="google",
+        endpoint="search Q-G2",
+        code="PERMISSION_DENIED",
+        http_status=200,
+    )
+    with capture_logs() as later:
+        disposition = await controller.on_error("google", denial, dataset_id=outcome.dataset_id)
+
+    assert disposition == "switched_to_simulated"
+    [denied] = _events(later, "sync.mode.change")
+    assert (denied["log_level"], denied["from_mode"], denied["to_mode"], denied["status"]) == (
+        "warning",
+        "live",
+        "simulated",
+        "denied",
+    )
+    assert await _mode_changes(sessions, "google") == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_first_start_denial_logs_a_change_from_no_mode_to_simulated(
+    sessions: Sessions, backfill: _Backfill
+) -> None:
+    with capture_logs() as entries:
+        outcome = await _refused_controller(sessions).ensure_dataset("hubspot")
+
+    assert outcome is not None
+    assert (outcome.activated, outcome.mode) == (True, "simulated")
+    # Live access was never established: the denial is the source's first mode, and the
+    # simulated activation that follows keeps it, so it logs no second change.
+    [change] = _events(entries, "sync.mode.change")
+    assert (
+        change["log_level"],
+        change["from_mode"],
+        change["to_mode"],
+        change["status"],
+        change["endpoint"],
+    ) == ("warning", None, "simulated", "denied", PROBE_ENDPOINT)
+    assert await _reasons(sessions) == ["dataset_activated:hubspot"]
+    connection = await _connection(sessions, "hubspot")
+    assert connection is not None
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "simulated",
+        "denied",
+        outcome.dataset_id,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_first_start_without_credentials_logs_one_change_from_no_mode(
+    sessions: Sessions, backfill: _Backfill
+) -> None:
+    with capture_logs() as entries:
+        outcome = await _controller(_auto_without_hubspot(), sessions).ensure_dataset("hubspot")
+
+    assert outcome is not None
+    assert (outcome.activated, outcome.mode, outcome.reason) == (
+        True,
+        "simulated",
+        REASON_NO_CREDENTIALS,
+    )
+    [change] = _events(entries, "sync.mode.change")
+    assert (
+        change["log_level"],
+        change["from_mode"],
+        change["to_mode"],
+        change["reason"],
+        change["missing_credentials"],
+    ) == ("info", None, "simulated", REASON_NO_CREDENTIALS, ["HUBSPOT_ACCESS_TOKEN"])

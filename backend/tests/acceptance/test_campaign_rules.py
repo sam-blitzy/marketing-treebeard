@@ -44,7 +44,13 @@ import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from tests.support import evidence_metrics, numeric
+from tests.support import (
+    GOOGLE_LINK_UNVERIFIED_REASON,
+    GoogleLinkState,
+    evidence_metrics,
+    numeric,
+    with_google_link,
+)
 
 from ads_engine.analysis import budget, campaigns, discrepancy
 from ads_engine.analysis.attribution import attribution_for
@@ -319,11 +325,14 @@ def test_c0_catalogue_expectation_holds(scenario: Scenario, make_context: Contex
     assert bool(items) is scenario.expect.fires
     assert len(items) == len(ctx.discrepancies)
     assert (result.findings, result.withheld, dict(result.suppressed)) == ((), (), {})
+    google_linked = ctx.google_crm is not None and ctx.google_crm.bindings.google.available
     for item in items:
         extra = item.evidence.extra
         assert (item.section, item.group, item.pinned) == (CAMPAIGNS, GROUP_DISCREPANCIES, True)
         assert item.decision_subject is None
-        assert item.flags == ()
+        # AAP 0.3.3: a Google item carries no_crm_link without the verified Google-to-CRM link.
+        unlinked_google = item.entity_ref.source == "google" and not google_linked
+        assert item.flag_codes == ((FLAG_NO_CRM_LINK,) if unlinked_google else ())
         platform = item.evidence.metric("platform").value
         decided = item.evidence.metric("decided").value
         assert item.action == f"Resolve: platform shows {platform}, last decided {decided}"
@@ -1272,10 +1281,26 @@ async def test_untracked_shared_budget_and_member_accept_only_their_shape_throug
         on_member.id: list(expect["resolutions"]),
     }
 
-    for resolution in ("platform_correct", "decision_correct", "acknowledge_removal"):
-        _assert_refused(
-            await _resolve_api(authed_client, on_budget, resolution), "resolution_not_allowed"
+    # The UI shows the 422 as it is, so it names the resolutions in words (AAP 0.5.5).
+    for resolution, label in (
+        ("platform_correct", "Platform is correct"),
+        ("decision_correct", "Decision is correct"),
+        ("acknowledge_removal", "Acknowledge removal"),
+    ):
+        response = await _resolve_api(authed_client, on_budget, resolution)
+        _assert_refused(response, "resolution_not_allowed")
+        assert response.json()["error"]["message"] == (
+            f"{label} is not valid for an untracked discrepancy on {pool.name}; the valid "
+            "resolutions are Adopt platform state, Record intended state."
         )
+    response = await _resolve_api(
+        authed_client, on_budget, "adopt_platform", {"daily_budget": "250.00"}
+    )
+    _assert_refused(response, "intended_state_invalid")
+    assert response.json()["error"]["message"] == (
+        f"An intended_state for {pool.name} is sent only with Record intended state, not with "
+        "Adopt platform state."
+    )
     amount = "250.00"
     rejected = cast(tuple[str, ...], expect["record_intended_rejects"])
     assert rejected == ("status", "total_budget")
@@ -1292,11 +1317,13 @@ async def test_untracked_shared_budget_and_member_accept_only_their_shape_throug
             await _resolve_api(authed_client, on_budget, "record_intended", refused),
             "intended_state_invalid",
         )
-    _assert_refused(
-        await _resolve_api(
-            authed_client, on_member, "record_intended", {"status": "active", "daily_budget": "10"}
-        ),
-        "intended_state_invalid",
+    response = await _resolve_api(
+        authed_client, on_member, "record_intended", {"status": "active", "daily_budget": "10"}
+    )
+    _assert_refused(response, "intended_state_invalid")
+    assert response.json()["error"]["message"] == (
+        f"The intended state of {member.name}, a campaign on a shared budget, takes exactly "
+        "these fields: status."
     )
 
     accepted_budget = dict.fromkeys(
@@ -1343,10 +1370,12 @@ async def test_untracked_own_budget_campaign_needs_a_complete_intended_state(
         ),
         "intended_state_invalid",
     )
-    _assert_refused(
-        await _resolve_api(authed_client, row, "record_intended"), "intended_state_invalid"
-    )
     late = await google.subject("campaign", "late")
+    response = await _resolve_api(authed_client, row, "record_intended")
+    _assert_refused(response, "intended_state_invalid")
+    assert response.json()["error"]["message"] == (
+        f"Record intended state needs an intended_state for {late.name}."
+    )
     assert await google.decisions_of(late) == []
     response = await _resolve_api(authed_client, row, "record_intended", complete)
     assert response.status_code == 200, response.text
@@ -2303,6 +2332,66 @@ def test_c3b_launches_a_converting_cluster_no_campaign_covers(make_context: Cont
     assert conversions == sum(member["conversions"] for member in members)
     assert conversions >= _threshold(ctx, "c3b.min_conversions")
     assert _items(campaigns.evaluate(make_context("c3b.cluster.does_not_fire")), C3B) == []
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("absent", "no active HubSpot dataset"),
+        ("unverified", GOOGLE_LINK_UNVERIFIED_REASON),
+        ("verified", None),
+    ],
+)
+def test_c3b_carries_no_crm_link_and_counts_in_the_finding_without_the_verified_link(
+    make_context: ContextFactory, state: GoogleLinkState, reason: str | None
+) -> None:
+    """C3b is a Google item: without the verified Google-to-CRM link it carries no_crm_link and
+    the Campaigns no_crm_link finding counts it (AAP 0.3.3) / with the link it carries neither."""
+    ctx = with_google_link(make_context("c3b.cluster.fires"), state)
+    result = campaigns.evaluate(ctx)
+    item = _only(result, C3B)
+    assert [candidate.rule_id for candidate in result.candidates] == [C3B]
+    found = [finding for finding in result.findings if finding.code == FINDING_NO_CRM_LINK]
+    if reason is None:
+        assert item.flags == ()
+        assert found == []
+        return
+    assert [(flag.code, flag.message) for flag in item.flags] == [
+        (FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")
+    ]
+    (finding,) = found
+    assert (finding.section, finding.entity) == (CAMPAIGNS, None)
+    assert finding.evidence == {"reason": reason, "items": 1}
+
+
+@pytest.mark.parametrize("state", ["absent", "unverified", "verified"])
+def test_every_google_campaigns_item_carries_no_crm_link_only_without_the_verified_link(
+    make_context: ContextFactory, state: GoogleLinkState
+) -> None:
+    """AAP 0.3.3: Google items carry no_crm_link while the link is unavailable; LinkedIn items
+    never do; the finding counts every flagged item, C3b included / the verified link flags none.
+    """
+    scenario = SCENARIOS["default"]
+    built = make_context(scenario, now=None if scenario.fixed_time else FIXED_NOW)
+    ctx = with_google_link(built, state)
+    result = campaigns.evaluate(ctx)
+    sources = {item.entity_ref.source for item in result.candidates}
+    assert sources == {"google", "linkedin"}, "the default world has items of both sources"
+    google = [item for item in result.candidates if item.entity_ref.source == "google"]
+    google_rules = {item.rule_id for item in google}
+    assert C3B in google_rules
+    unlinked = state != "verified"
+    flagged = [item for item in result.candidates if item.has_flag(FLAG_NO_CRM_LINK)]
+    for item in result.candidates:
+        expected = unlinked and item.entity_ref.source == "google"
+        assert item.has_flag(FLAG_NO_CRM_LINK) is expected, (item.rule_id, item.entity_ref.key)
+    found = [finding for finding in result.findings if finding.code == FINDING_NO_CRM_LINK]
+    if not unlinked:
+        assert (flagged, found) == ([], [])
+        return
+    (finding,) = found
+    assert finding.evidence["items"] == len(flagged)
+    assert {item.rule_id for item in flagged} == google_rules
 
 
 @pytest.mark.parametrize("scenario", CAMPAIGN_SCENARIOS, ids=lambda scenario: scenario.name)

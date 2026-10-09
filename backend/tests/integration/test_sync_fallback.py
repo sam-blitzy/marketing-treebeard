@@ -24,8 +24,17 @@ guarantee of that row it proves:
 * **Isolation**: simulated HubSpot contacts never collide with live ids and leave every
   computation when the live dataset activates.
 * **Transient and defects**: 429/5xx/timeout retry three times, then stale, never mock; a 400
-  fails the job; the Google call budget defers what it cannot pay for, and the next runs read
-  the deferred scopes first (metrics) or only the outstanding reads (entities).
+  fails the job; a first-start probe that meets a defect (a Q-G1 400, an ``adAnalytics``
+  validation error with every endpoint HTTP 200) and no denial is an ``error`` with no
+  fallback and no mock, logged with its query id, while a denial in the same probe still
+  switches the source; a probe that meets only transient failures (a Q-G1 503, a ``leadForms``
+  listing a 503 cut short) leaves the source ``stale`` with no fallback and no mock, an active
+  simulated dataset as it was, and its next probe 30 minutes later, while a denial in the same
+  probe, or one recorded while it ran, still switches the source; the Google call budget
+  defers what it cannot pay for, and the next runs read the deferred scopes first (metrics)
+  or only the outstanding reads (entities); a read that a transient error or the budget cut
+  short (Google or LinkedIn entities, Google metrics) keeps the dataset's last success, so the
+  dataset turns stale.
 
 How "live" is exercised without a network (AAP 0.3.3 "Contract fidelity"): each source's live
 client is built exactly as in production, through
@@ -39,11 +48,14 @@ Every clock is fixed (:data:`ads_engine.simulation.scenarios.FIXED_NOW`, or a fi
 instant for a later step); retries record their waits instead of sleeping, and the HubSpot
 throttle grants every start at once, so no test sleeps. Dataset state is asserted on database
 rows and on the report objects the product returns (``BootstrapReport``, ``ProbeReport``,
-``BuildOutcome``, ``JobResult``), never on log text.
+``BuildOutcome``, ``JobResult``), never on log text; the one logging guarantee checked, a
+failed probe's classification (a defect with its query id, a transient failure) logged with
+its check, is read from the structured event (``structlog.testing.capture_logs``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 from collections.abc import Callable, Mapping, Sequence
@@ -55,8 +67,11 @@ import httpx
 import pytest
 from sqlalchemy import Table, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from ads_engine.analysis import metrics, runner
+from ads_engine.analysis.context import Freshness
+from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.connectors.errors import AccessDenied, CallBudgetExhausted
 from ads_engine.connectors.google_n8n.partition import FetchOutcome, scope_from_json
 from ads_engine.connectors.google_n8n.queries import END, INT64_MAX, START, parse_query
@@ -98,15 +113,19 @@ from ads_engine.sync import freshness, jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.datasets import RETENTION, DatasetManager
 from ads_engine.sync.mode import (
+    JOB_PROBE,
+    PROBE_INTERVAL,
     REASON_FORCED,
     REASON_LIVE,
     REASON_NO_CREDENTIALS,
     REASON_RECOVERED,
     BuildOutcome,
     ProbeCheck,
+    ProbeReport,
     SourceModeController,
     bootstrap_sources,
 )
+from ads_engine.sync.scheduler import Scheduler
 
 pytestmark = pytest.mark.anyio
 
@@ -163,6 +182,11 @@ T2: Final = FIXED_NOW + timedelta(hours=2)
 
 T3: Final = FIXED_NOW + timedelta(hours=3)
 """A fourth step's instant."""
+
+DAY_AFTER: Final = FIXED_NOW + timedelta(hours=24, minutes=30)
+"""Half an hour past the shipped 24 h ``sources.stale_after_hours`` after :data:`T0`, the
+live build's instant, but 23.5 h after :data:`T1`: a dataset whose last success is the
+build's is stale then, one that succeeded at :data:`T1` or later is not."""
 
 BACKFILL_DAYS: Final = 35
 """``BACKFILL_DAYS`` of every test: covers the default 28-day window and every lead of the
@@ -612,6 +636,32 @@ async def _connection_states(rig: Rig) -> dict[str, tuple[str, str, str | None]]
     """``(mode, status, reason)`` of every ``source_connection`` row, by source."""
     rows = await rig.all(SourceConnection)
     return {row.source: (row.mode, row.status, row.reason) for row in rows}
+
+
+def _stale_at(row: DatasetFreshness, at: datetime) -> bool:
+    """Whether items reading ``row``'s dataset are flagged stale at ``at`` (P4, AAP 0.3.2).
+
+    The analysis's own rule (:meth:`Freshness.is_stale`) with the shipped
+    ``sources.stale_after_hours``. The window ends where the row's coverage does (a
+    full-state entity row has none), so only the age of its last success can make it stale.
+    """
+    thresholds = Thresholds.load()
+    view = Freshness(
+        dataset_id=row.dataset_id,
+        dataset=row.dataset,
+        last_attempt_at=row.last_attempt_at,
+        last_success_at=row.last_success_at,
+        covered_from=row.covered_from,
+        covered_through=row.covered_through,
+        completeness=freshness._as_completeness(row.completeness),
+        reason=row.reason,
+    )
+    window_end = row.covered_through if row.covered_through is not None else at.date()
+    return view.is_stale(
+        now=at,
+        stale_after=timedelta(hours=thresholds.int("sources.stale_after_hours")),
+        window_end=window_end,
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1183,6 +1233,11 @@ async def test_recovery_builds_live_dataset_activated_after_backfill(
             "google search Q-G3",
             id="403-mid-backfill",
         ),
+        pytest.param(
+            Fault("google", "search", "http_status", status=503, match={"query_id": "Q-G4"}),
+            "not ready: backfill incomplete: google.entities (interrupted: ",
+            id="interrupted-entity-backfill",
+        ),
     ],
 )
 async def test_build_failure_discards_building_dataset(
@@ -1191,10 +1246,12 @@ async def test_build_failure_discards_building_dataset(
     """Recovery: a build failure discards the building dataset and leaves the simulated one active.
 
     AAP 0.3.3 "Recovery readiness": the probe (Q-G1) passes, so a live dataset is built; its
-    metrics backfill (Q-G3) then keeps failing (a persistent 5xx) or is refused (a 403). The
-    building dataset is discarded with every row it wrote, the simulated dataset stays the
-    active one, nothing of the discarded build is visible through the active-dataset filter,
-    and the source stays in automatic fallback for the next recovery probe.
+    metrics backfill (Q-G3) then keeps failing (a persistent 5xx) or is refused (a 403), or
+    its entity backfill's ad-group scan (Q-G4) keeps failing, so the backfill never completes
+    although every other query succeeds. The building dataset is discarded with every row it
+    wrote, the simulated dataset stays the active one and no live dataset is activated,
+    nothing of the discarded build is visible through the active-dataset filter, and the
+    source stays in automatic fallback for the next recovery probe.
 
     The catalogue's LinkedIn build-failure world (``fallback.build_failure``) fails
     ``adAnalytics``, which the LinkedIn recovery probe also calls, so it can never reach a build;
@@ -1230,7 +1287,8 @@ async def test_build_failure_discards_building_dataset(
         "denied",
         simulated_id,
     )
-    # A persistent 5xx leaves the metrics freshness unrecorded, so the build is not ready and
+    # A persistent 5xx leaves the metrics freshness unrecorded, and a Q-G4 scan cut short
+    # leaves google.entities incomplete with its unread work, so the build is not ready and
     # enters fallback as a failed live build; a 403 is recorded as the denial itself.
     assert connection.reason is not None
     assert reason in connection.reason
@@ -1238,6 +1296,168 @@ async def test_build_failure_discards_building_dataset(
     assert reason in outcome.reason
     assert await recovering.in_fallback("google") is True
     assert [row.id for row in await rig.datasets("google")] == [simulated_id]
+
+
+async def _probe_rows(rig: Rig, source: Source = "google") -> list[SyncRun]:
+    """Every ``probe`` ``sync_run`` row of ``source``, oldest first."""
+    return await rig.all(
+        SyncRun,
+        SyncRun.source == source,
+        SyncRun.job == JOB_PROBE,
+        order_by=(SyncRun.started_at, SyncRun.id),
+    )
+
+
+async def test_bootstrap_probe_is_recorded_and_spaces_the_first_recovery_probe(rig: Rig) -> None:
+    """Recovery: the first recovery probe follows a bootstrap probe's fallback 30 minutes later.
+
+    AAP 0.3.2 ("Source-mode recovery probe: every 30 min while a source is in automatic
+    fallback") and AAP 0.2.4 (every rejected Google call still spends the developer-token
+    quota other n8n workflows share). The worker's bootstrap probes Google once (Q-G1, refused
+    with ``PERMISSION_DENIED`` in an HTTP 200) and enters automatic fallback; that probe is a
+    ``probe`` ``sync_run`` started at the bootstrap and closed ``failed`` with the denial, so
+    the scheduler's next recovery probe is not due 5 minutes later and is due 31 minutes
+    later.
+    """
+    rig.go_live("google")
+    journal: list[JournalEntry] = []
+    refusing = rig.live("google", rig.world(N8N_DENIED), journal=journal)
+    controller = rig.controller({"google": refusing})
+
+    report = await bootstrap_sources(controller.settings, controller=controller)
+
+    assert report.failures == {}
+    assert report.modes["google"].fallback is True
+    assert [entry.surface for entry in journal] == ["search"], "one Q-G1 request"
+    (row,) = await _probe_rows(rig)
+    assert (row.started_at, row.finished_at, row.status, row.dataset) == (T0, T0, "failed", None)
+    assert row.error is not None
+    assert row.error.startswith("Q-G1: google search Q-G1: ")
+    assert "PERMISSION_DENIED" in row.error
+    for source in ("hubspot", "linkedin"):
+        assert await _probe_rows(rig, source) == [], f"{source} has no credentials: no probe"
+    for after, due in ((timedelta(minutes=5), False), (timedelta(minutes=31), True)):
+        at = T0 + after
+        scheduler = Scheduler(
+            controller=rig.controller({"google": refusing}, at=at), clock=_Clock(at)
+        )
+        assert await scheduler._probe_due("google", at) is due, after
+    assert len(journal) == 1, "deciding due-ness sends nothing"
+
+
+async def test_probe_in_the_defect_state_runs_once_per_interval_and_records_each_outcome(
+    rig: Rig,
+) -> None:
+    """Recovery: a source left in the defect state is probed again only every 30 minutes.
+
+    AAP 0.3.2 (probe cadence) and AAP 0.3.3 (a defect is never retried or mocked). A Q-G1 400
+    leaves Google live with status ``error`` and no data, so it resolves live with a probe
+    needed on every wake. Its first probe's ``probe`` row spaces the next: a wake 5 minutes and
+    another 29 min 59 s later send nothing and change nothing; 30 minutes later Google is
+    probed again. Once the platform answers, the next due probe passes, the live dataset
+    activates, and that probe's row ends ``succeeded``.
+    """
+    rig.go_live("google")
+    journal: list[JournalEntry] = []
+    defect = Fault("google", "search", "http_status", status=400, match={"query_id": "Q-G1"})
+    defective = rig.live("google", rig.world(faults=(defect,)), journal=journal)
+    assert await rig.controller({"google": defective}).ensure_dataset("google") is None
+    connection = await rig.connection("google")
+    assert connection.status == "error"
+    attempted = (connection.status, connection.reason, connection.last_attempt_at)
+
+    for after in (timedelta(minutes=5), PROBE_INTERVAL - timedelta(seconds=1)):
+        spaced = rig.controller({"google": defective}, at=T0 + after)
+        assert await spaced.ensure_dataset("google") is None
+    assert len(journal) == 1, "no probe inside the interval"
+    connection = await rig.connection("google")
+    assert (connection.status, connection.reason, connection.last_attempt_at) == attempted
+    assert [row.started_at for row in await _probe_rows(rig)] == [T0]
+
+    again = T0 + PROBE_INTERVAL
+    assert await rig.controller({"google": defective}, at=again).ensure_dataset("google") is None
+    assert [entry.status for entry in journal] == [400, 400]
+    assert (await rig.connection("google")).last_attempt_at == again
+    assert await rig.datasets() == [], "still no mock"
+
+    healed = T0 + 2 * PROBE_INTERVAL
+    healthy = rig.controller({"google": rig.live("google")}, at=healed)
+    live = _activated(await healthy.ensure_dataset("google"), "live")
+
+    assert live.reason == REASON_LIVE
+    connection = await rig.connection("google")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "live",
+        "ok",
+        live.dataset_id,
+    )
+    rows = await _probe_rows(rig)
+    assert [(row.started_at, row.status) for row in rows] == [
+        (T0, "failed"),
+        (again, "failed"),
+        (healed, "succeeded"),
+    ]
+    assert rows[-1].error is None
+    assert all(row.error is not None and "Q-G1" in row.error for row in rows[:-1])
+
+
+async def test_first_live_probe_row_fails_with_the_failed_builds_reason(rig: Rig) -> None:
+    """Recovery: a first-start probe that passes ends its row ``failed`` when the build fails.
+
+    AAP 0.3.3 "Recovery readiness" ("a failure during the build discards the building
+    dataset"): Q-G1 passes but every metrics read (Q-G3) answers 503, so the live build is not
+    ready, is discarded, and Google falls back. The probe's row is ``succeeded`` only for a
+    live dataset that activated, so it ends ``failed`` with the build's reason.
+    """
+    rig.go_live("google")
+    fault = Fault("google", "search", "http_status", status=503, match={"query_id": "Q-G3"})
+    controller = rig.controller({"google": rig.live("google", rig.world(faults=(fault,)))})
+
+    outcome = _activated(await controller.ensure_dataset("google"), "simulated")
+
+    assert await controller.in_fallback("google") is True
+    (row,) = await _probe_rows(rig)
+    assert (row.started_at, row.status) == (T0, "failed")
+    assert row.error is not None
+    assert outcome.reason is not None
+    assert row.error == outcome.reason
+    assert row.error.startswith("live build failed: not ready: ")
+
+
+@pytest.mark.parametrize("raised", [RuntimeError, asyncio.CancelledError])
+async def test_first_live_probe_row_closes_failed_when_its_build_raises(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, raised: type[BaseException]
+) -> None:
+    """Recovery: a probe whose live build raises, or is cancelled, leaves no ``running`` row.
+
+    The ``probe`` row is committed before the probe; an error out of the live build (a broken
+    backfill here) closes it ``failed`` with the error's class name, a cancellation with
+    ``probe cancelled``, and the error then propagates unchanged; the build is discarded.
+    """
+    rig.go_live("google")
+    controller = rig.controller({"google": rig.live("google")})
+
+    async def broken(
+        controller: SourceModeController, dataset_id: int, *, now: datetime | None = None
+    ) -> jobs.SourceSyncReport:
+        """Fail the backfill the way an unexpected error or a cancellation would."""
+        del controller, dataset_id, now  # Nothing is backfilled.
+        raise raised()
+
+    monkeypatch.setattr(jobs, "backfill_dataset", broken)
+
+    with pytest.raises(raised):
+        await controller.ensure_dataset("google")
+
+    (row,) = await _probe_rows(rig)
+    expected = "probe cancelled" if raised is asyncio.CancelledError else raised.__name__
+    assert (row.started_at, row.finished_at, row.status, row.error) == (
+        T0,
+        T0,
+        "failed",
+        expected,
+    )
+    assert await rig.datasets() == [], "the building dataset was discarded"
 
 
 async def test_frozen_run_renders_after_purge(rig: Rig, authed_client: httpx.AsyncClient) -> None:
@@ -2217,6 +2437,167 @@ async def test_transient_errors_retry_then_stale_never_mock(rig: Rig, scenario: 
     )
 
 
+_GOOGLE_ENTITY_QUERIES: Final = ("Q-G1", "Q-G2", "Q-G4", "Q-G7", "Q-G8")
+"""The queries an entity sync of a dataset with a stored account sends; Q-G2b only follows a
+complete Q-G2 scan, so a failing scan sends none."""
+
+
+async def test_a_google_entity_sync_whose_every_read_fails_turns_stale(rig: Rig) -> None:
+    """Transient: an entity sync whose every read fails keeps its last success and turns stale.
+
+    AAP 0.3.3 fallback table row 3 ("then the affected datasets turn stale ... Last good data
+    is kept. Never mock") with "Safe absence": Q-G1, Q-G2, Q-G4, Q-G7 and Q-G8 each answer 503
+    on all three attempts. The sync infers nothing (no snapshot, no ``missing`` discrepancy)
+    and records ``google.entities`` ``incomplete`` with the interruption's repairable reason.
+    It read nothing, so it is no successful refresh: ``last_success_at`` stays the build's and
+    only ``last_attempt_at`` moves, which makes the dataset stale 24 h after the build
+    although the failed sync ran an hour later (AAP 0.3.2). The source stays live with a
+    ``stale`` connection and no simulated dataset; the next healthy sync reads the
+    outstanding work and moves ``last_success_at`` again.
+    """
+    assert Thresholds.load().int("sources.stale_after_hours") == 24, "DAY_AFTER assumes 24 h"
+    dataset_id = await _live_google(rig)
+    before = await rig.freshness_row(dataset_id, "google.entities")
+    assert before is not None
+    assert (before.last_success_at, before.completeness) == (T0, "complete")
+    discrepancies_before = await rig.count(Discrepancy)
+    datasets_before = [(row.id, row.state) for row in await rig.datasets()]
+    faults = tuple(
+        Fault(
+            source="google",
+            surface="search",
+            kind="http_status",
+            status=503,
+            match={"query_id": query_id},
+        )
+        for query_id in _GOOGLE_ENTITY_QUERIES
+    )
+    journal: list[JournalEntry] = []
+    failing = rig.live("google", rig.world(faults=faults), journal=journal)
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"google": failing}, at=T1),
+    )
+
+    (result,) = report.results
+    assert (result.status, result.completeness, result.disposition) == (
+        "succeeded",
+        "incomplete",
+        "stale",
+    )
+    assert len(journal) == 3 * len(_GOOGLE_ENTITY_QUERIES), "three attempts per query"
+    assert {entry.status for entry in journal} == {503}
+    row = await rig.freshness_row(dataset_id, "google.entities")
+    assert row is not None
+    assert (row.last_attempt_at, row.last_success_at) == (T1, T0), "the last success stands"
+    assert row.completeness == "incomplete"
+    assert row.reason is not None
+    assert row.reason.startswith(freshness.REASON_INTERRUPTED)
+    assert freshness.needs_repair(row)
+    assert not _stale_at(row, T1)
+    assert _stale_at(row, DAY_AFTER), "stale 24 h after the last success, not the attempt"
+    assert await _snapshots_at(rig, dataset_id, "campaign", T1) == 0, "nothing was read"
+    assert await rig.count(Discrepancy) == discrepancies_before, "nothing was inferred"
+    connection = await rig.connection("google")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "live",
+        "stale",
+        dataset_id,
+    )
+    assert [(row.id, row.state) for row in await rig.datasets()] == datasets_before, "never mock"
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"google": rig.live("google")}, at=T2),
+    )
+
+    (recovered,) = report.results
+    assert (recovered.status, recovered.completeness) == ("succeeded", "complete")
+    row = await rig.freshness_row(dataset_id, "google.entities")
+    assert row is not None
+    assert (row.last_attempt_at, row.last_success_at, row.completeness, row.checkpoint) == (
+        T2,
+        T2,
+        "complete",
+        None,
+    )
+    assert not _stale_at(row, DAY_AFTER)
+
+
+async def test_a_linkedin_entity_sync_cut_short_by_lead_sync_turns_stale(rig: Rig) -> None:
+    """Transient: a Lead Sync 503 cuts the LinkedIn entity sync short; its last success stands.
+
+    AAP 0.3.3 fallback table row 3: ``leadForms`` answering 503 on all three attempts stops
+    the lead-form listing. What was read is stored, and ``linkedin.entities`` is
+    ``incomplete`` with the platform error's own reason, which, unlike Google's, carries no
+    repairable prefix. The read is still no successful refresh: ``last_success_at`` stays
+    the build's, so the dataset is stale 24 h after it (AAP 0.3.2). The source stays live
+    with a ``stale`` connection and no simulated dataset; the next healthy entity sync moves
+    ``last_success_at`` again.
+    """
+    dataset_id = await _live_linkedin(rig)
+    before = await rig.freshness_row(dataset_id, "linkedin.entities")
+    assert before is not None
+    assert (before.last_success_at, before.completeness) == (T0, "complete")
+    datasets_before = [(row.id, row.state) for row in await rig.datasets()]
+    lead_forms_down = Fault(source="linkedin", surface="lead_forms", kind="http_status", status=503)
+    journal: list[JournalEntry] = []
+    failing = rig.live("linkedin", rig.world(faults=(lead_forms_down,)), journal=journal)
+
+    report = await jobs.run_source_jobs(
+        "linkedin",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"linkedin": failing}, at=T1),
+    )
+
+    (result,) = report.results
+    assert (result.status, result.completeness, result.disposition) == (
+        "succeeded",
+        "incomplete",
+        "stale",
+    )
+    form_calls = [entry for entry in journal if entry.surface == "lead_forms"]
+    assert form_calls, "the lead-form listing was requested"
+    assert len(form_calls) % 3 == 0, "three attempts per account"
+    assert {entry.status for entry in form_calls} == {503}
+    row = await rig.freshness_row(dataset_id, "linkedin.entities")
+    assert row is not None
+    assert (row.last_attempt_at, row.last_success_at) == (T1, T0), "the last success stands"
+    assert row.completeness == "incomplete"
+    assert row.reason is not None
+    assert "lead_forms" in row.reason
+    assert not freshness.is_repairable_reason(row.reason), "LinkedIn states the error itself"
+    assert not _stale_at(row, T1)
+    assert _stale_at(row, DAY_AFTER), "stale 24 h after the last success, not the attempt"
+    connection = await rig.connection("linkedin")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "live",
+        "stale",
+        dataset_id,
+    )
+    assert [(row.id, row.state) for row in await rig.datasets()] == datasets_before, "never mock"
+
+    report = await jobs.run_source_jobs(
+        "linkedin",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES],
+        controller=rig.controller({"linkedin": rig.live("linkedin")}, at=T2),
+    )
+
+    (recovered,) = report.results
+    assert (recovered.status, recovered.completeness) == ("succeeded", "complete")
+    row = await rig.freshness_row(dataset_id, "linkedin.entities")
+    assert row is not None
+    assert (row.last_attempt_at, row.last_success_at, row.completeness) == (T2, T2, "complete")
+    assert not _stale_at(row, DAY_AFTER)
+
+
 async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
     """Defects: a 400 fails the job with its query id, with no retry and no mock.
 
@@ -2257,6 +2638,7 @@ async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
     assert query_id in result.error
     assert report.has_defect
     assert [entry.status for entry in journal].count(400) == 1, "never retried"
+    assert result.calls == len(journal) == 1, "the defective call is the job's call"
     assert rig.waits.seconds == []
     runs = await rig.all(SyncRun, SyncRun.job == jobs.JOB_METRICS, SyncRun.started_at == T1)
     assert runs, "the job recorded its sync_run rows"
@@ -2281,6 +2663,509 @@ async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("source", "job", "fault"),
+    [
+        pytest.param(
+            "google",
+            jobs.JOB_METRICS,
+            Fault("google", "search", "http_status", status=400, match={"query_id": "Q-G6"}),
+            id="google-metrics-q-g6",
+        ),
+        pytest.param(
+            "linkedin",
+            jobs.JOB_ENTITIES,
+            Fault("linkedin", "creatives", "http_status", status=400),
+            id="linkedin-entities-creatives",
+        ),
+    ],
+)
+async def test_defect_mid_job_counts_every_call_it_made(
+    rig: Rig, source: Source, job: str, fault: Fault
+) -> None:
+    """Defects: a job a defect fails mid-run reports every call it made, the defect's included.
+
+    AAP 0.11.1 logging points (sync job finish "with source, job, rows, calls and duration"):
+    Google's metrics job meets the 400 on Q-G6 after Q-G3 and Q-G5 answered, and LinkedIn's
+    entity sync on its creatives after the account, campaign groups and campaigns answered.
+    The job's result and the report's totals count exactly the calls the platform received
+    (LinkedIn's token exchange is no API call of the job), not only those of the reads that
+    returned.
+    """
+    if source == "google":
+        await _live_google(rig)
+    else:
+        await _live_linkedin(rig)
+    journal: list[JournalEntry] = []
+    defective = rig.live(source, rig.world(faults=(fault,)), journal=journal)
+    controller = rig.controller({source: defective}, at=T1)
+
+    report = await jobs.run_source_jobs(source, trigger="manual", jobs=[job], controller=controller)
+
+    (result,) = report.results
+    assert (result.job, result.status, result.disposition) == (job, "failed", "defect")
+    received = [entry for entry in journal if entry.surface != "access_token"]
+    assert [entry.status for entry in received].count(400) == 1, "the defect, never retried"
+    assert len(received) > 1, "calls answered before the defect"
+    assert result.calls == len(received)
+    assert report.to_json()["jobs"][0]["calls"] == result.calls
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ProbeFault:
+    """How the live platform answers Google's first-start probe (Q-G1), and what follows.
+
+    Attributes:
+        status: The HTTP status Q-G1 answers with, in Google's error body.
+        attempts: The Q-G1 requests the probe sends (a transient error is retried).
+        connection_status: The ``source_connection`` status the failure leaves: ``denied``
+            (automatic fallback with simulated data), ``error`` (a defect) or ``stale``
+            (transient failures); only ``denied`` falls back.
+        error_kind: The failed check's classification.
+        disposition: The ``disposition`` of the probe's ``sync.classification`` event;
+            ``None`` for a denial, whose fallback is no job classification.
+        log_level: The level of that event.
+        query_id: The ``query_id`` that event carries (a defect's only).
+    """
+
+    status: int
+    attempts: int
+    connection_status: str
+    error_kind: str
+    disposition: str | None = None
+    log_level: str | None = None
+    query_id: str | None = None
+
+    @property
+    def fallback(self) -> bool:
+        """Whether the failure enters automatic fallback with simulated data."""
+        return self.connection_status == "denied"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(
+            _ProbeFault(400, 1, "error", "defect", "defect", "error", "Q-G1"), id="defect-400"
+        ),
+        pytest.param(_ProbeFault(403, 1, "denied", "access_denied"), id="denied-403"),
+        pytest.param(
+            _ProbeFault(503, 3, "stale", "transient", "stale", "warning"), id="transient-503"
+        ),
+    ],
+)
+async def test_first_start_probe_failure_follows_its_classification(
+    rig: Rig, fault: _ProbeFault
+) -> None:
+    """Defects and transients: a probe failing with either builds no mock; a denial falls back.
+
+    AAP 0.3.3 fallback table: HTTP 400 (like a GAQL ``QueryError``) is a Defect, "the job fails
+    and is logged with the query id. No mock, no retry"; HTTP 503 is Transient, "3 attempts
+    ... then the affected datasets turn stale ... Last good data is kept. Never mock"; only a
+    denial (401/403, a permission body) switches the source to simulated data. So a first-start
+    probe whose Q-G1 is refused with a 400 is sent once and leaves ``source_connection`` live
+    with status ``error``; one answered 503 is sent three times and leaves it live with status
+    ``stale``. Either way the failing check (``Q-G1``, its endpoint ``search Q-G1``) is the
+    reason, no access generation is advanced, no dataset is built, nothing is put in automatic
+    fallback, the ``probe`` row ends ``failed`` with that reason, and ``sync.classification``
+    is logged (``defect`` at error level with the query id, ``stale`` at warning level) for job
+    ``probe``. A 403 on the same probe still enters automatic fallback with simulated data.
+    """
+    rig.go_live("google")
+    journal: list[JournalEntry] = []
+    probe_fault = Fault(
+        "google", "search", "http_status", status=fault.status, match={"query_id": "Q-G1"}
+    )
+    platform = rig.live("google", rig.world(faults=(probe_fault,)), journal=journal)
+    controller = rig.controller({"google": platform})
+
+    with capture_logs() as entries:
+        outcome = await controller.ensure_dataset("google")
+
+    assert [entry.status for entry in journal] == [fault.status] * fault.attempts
+    connection = await rig.connection("google")
+    assert connection.reason is not None
+    assert connection.reason.startswith("Q-G1: google search Q-G1: ")
+    assert connection.last_attempt_at == T0
+    (probe_row,) = await _probe_rows(rig)
+    assert (probe_row.started_at, probe_row.status, probe_row.error) == (
+        T0,
+        "failed",
+        connection.reason,
+    )
+    classified = [entry for entry in entries if entry.get("event") == "sync.classification"]
+    if not fault.fallback:
+        assert outcome is None, "no dataset is built, simulated data included"
+        assert (connection.mode, connection.status, connection.access_generation) == (
+            "live",
+            fault.connection_status,
+            0,
+        )
+        assert await rig.datasets() == [], "no mock"
+        assert await controller.in_fallback("google") is False
+        resolved = await controller.resolve("google")
+        assert (resolved.mode, resolved.fallback, resolved.needs_probe) == ("live", False, True)
+        (classification,) = classified
+        assert (
+            classification["disposition"],
+            classification["log_level"],
+            classification["query_id"],
+        ) == (fault.disposition, fault.log_level, fault.query_id)
+        assert (
+            classification["source"],
+            classification["endpoint"],
+            classification["error_kind"],
+            classification["check"],
+            classification["job"],
+        ) == ("google", "search Q-G1", fault.error_kind, "Q-G1", JOB_PROBE)
+        assert not [entry for entry in entries if entry.get("event") == "sync.fallback"]
+        return
+    simulated = _activated(outcome, "simulated")
+    assert (connection.mode, connection.status, connection.access_generation) == (
+        "simulated",
+        "denied",
+        1,
+    )
+    assert simulated.reason == connection.reason
+    assert "PERMISSION_DENIED" in connection.reason, "the platform's code is the reason"
+    assert await controller.in_fallback("google") is True
+    assert classified == [], "the probe's fallback is no job classification"
+
+
+def _q_g1_unavailable() -> Fault:
+    """Q-G1, Google's whole probe, answering HTTP 503: a transient failure on every attempt."""
+    return Fault("google", "search", "http_status", status=503, match={"query_id": "Q-G1"})
+
+
+def _freshness_state(rows: Sequence[DatasetFreshness]) -> list[tuple[object, ...]]:
+    """Every column of ``rows`` a freshness write could change, by dataset name."""
+    return sorted(
+        (
+            row.dataset,
+            row.last_attempt_at,
+            row.last_success_at,
+            row.covered_from,
+            row.covered_through,
+            row.completeness,
+            row.reason,
+        )
+        for row in rows
+    )
+
+
+async def test_a_transient_probe_keeps_the_active_simulated_dataset_and_builds_nothing(
+    rig: Rig,
+) -> None:
+    """Transient: a probe that cannot reach the platform leaves the simulated data as it was.
+
+    AAP 0.3.3 fallback table row 3 (Transient: "Last good data is kept. Never mock") and
+    "Transitions" (until a new dataset activates, the previous one stays active and labelled).
+    Google runs on simulated data while its credentials are missing. Once they are configured,
+    the first probe's Q-G1 answers 503 on all three attempts: the simulated dataset stays the
+    active one with its facts and freshness rows unchanged, no dataset is built, and the
+    connection keeps its mode, its dataset and its access generation while its status turns
+    ``stale`` with the failing check as reason. Google is not in automatic fallback: it still
+    resolves live, due a probe of its own.
+    """
+    unconfigured = rig.controller()
+    simulated_id = _activated(await unconfigured.ensure_dataset("google"), "simulated").dataset_id
+    assert simulated_id is not None
+    datasets_before = [(row.id, row.mode, row.state, row.reason) for row in await rig.datasets()]
+    freshness_before = _freshness_state(
+        await rig.all(DatasetFreshness, DatasetFreshness.dataset_id == simulated_id)
+    )
+    assert freshness_before, "the simulated backfill recorded its freshness"
+    facts_before = await rig.facts(FactCampaignDaily, simulated_id)
+    assert facts_before, "the simulated backfill stored daily campaign facts"
+    before = await rig.connection("google")
+    assert (before.mode, before.status, before.reason) == ("simulated", "ok", REASON_NO_CREDENTIALS)
+
+    rig.go_live("google")
+    journal: list[JournalEntry] = []
+    platform = rig.live("google", rig.world(faults=(_q_g1_unavailable(),)), journal=journal)
+    controller = rig.controller({"google": platform}, at=T1)
+
+    assert await controller.ensure_dataset("google") is None
+
+    assert [entry.status for entry in journal] == [503] * 3, "3 attempts, then stale"
+    datasets_after = [(row.id, row.mode, row.state, row.reason) for row in await rig.datasets()]
+    assert datasets_after == datasets_before, "never mock, nothing built"
+    active = await rig.active("google")
+    assert active is not None
+    assert active.id == simulated_id, "the last good data stays active"
+    assert (
+        _freshness_state(
+            await rig.all(DatasetFreshness, DatasetFreshness.dataset_id == simulated_id)
+        )
+        == freshness_before
+    )
+    assert await rig.facts(FactCampaignDaily, simulated_id) == facts_before
+    connection = await rig.connection("google")
+    assert (
+        connection.mode,
+        connection.status,
+        connection.access_generation,
+        connection.active_dataset_id,
+        connection.last_attempt_at,
+    ) == ("simulated", "stale", before.access_generation, simulated_id, T1)
+    assert connection.reason is not None
+    assert connection.reason.startswith("Q-G1: google search Q-G1: ")
+    assert await controller.in_fallback("google") is False
+    resolved = await controller.resolve("google")
+    assert (resolved.mode, resolved.fallback, resolved.needs_probe) == ("live", False, True)
+    (row,) = await _probe_rows(rig)
+    assert (row.started_at, row.status, row.error) == (T1, "failed", connection.reason)
+
+
+async def test_a_transient_probe_is_repeated_one_interval_later_and_then_goes_live(
+    rig: Rig,
+) -> None:
+    """Transient: the source left stale by a probe is probed again after 30 minutes, then live.
+
+    AAP 0.3.3 fallback table row 3 (Transient: no mock, the source is not switched) and AAP
+    0.3.2 (probes 30 minutes apart; every probe spends the developer-token quota other n8n
+    workflows share, AAP 0.2.4). A first-start Q-G1 answering 503 leaves Google live and
+    ``stale``, outside automatic fallback, so the scheduler owes it no recovery probe. Its own
+    ``probe`` row spaces the next probe: wakes 5 minutes and 29 min 59 s later send nothing and
+    change nothing. 30 minutes later the platform answers, the probe passes, the live dataset
+    is built and activated, and that probe's row ends ``succeeded``.
+    """
+    rig.go_live("google")
+    journal: list[JournalEntry] = []
+    unavailable = rig.live("google", rig.world(faults=(_q_g1_unavailable(),)), journal=journal)
+    assert await rig.controller({"google": unavailable}).ensure_dataset("google") is None
+    connection = await rig.connection("google")
+    assert (connection.mode, connection.status) == ("live", "stale")
+    attempted = (
+        connection.mode,
+        connection.status,
+        connection.reason,
+        connection.last_attempt_at,
+        connection.access_generation,
+    )
+
+    for after in (timedelta(minutes=5), PROBE_INTERVAL - timedelta(seconds=1)):
+        at = T0 + after
+        spaced = rig.controller({"google": unavailable}, at=at)
+        assert await spaced.ensure_dataset("google") is None
+        scheduler = Scheduler(controller=spaced, clock=_Clock(at))
+        assert await scheduler._probe_due("google", at) is False, "not in automatic fallback"
+    assert len(journal) == 3, "no probe inside the interval"
+    connection = await rig.connection("google")
+    assert (
+        connection.mode,
+        connection.status,
+        connection.reason,
+        connection.last_attempt_at,
+        connection.access_generation,
+    ) == attempted
+    assert [row.started_at for row in await _probe_rows(rig)] == [T0]
+    assert await rig.datasets() == [], "still no mock"
+
+    again = T0 + PROBE_INTERVAL
+    healthy = rig.controller({"google": rig.live("google")}, at=again)
+    live = _activated(await healthy.ensure_dataset("google"), "live")
+
+    assert live.reason == REASON_LIVE
+    connection = await rig.connection("google")
+    assert (connection.mode, connection.status, connection.active_dataset_id) == (
+        "live",
+        "ok",
+        live.dataset_id,
+    )
+    assert [(row.started_at, row.status) for row in await _probe_rows(rig)] == [
+        (T0, "failed"),
+        (again, "succeeded"),
+    ]
+
+
+async def test_a_transient_probe_keeps_a_denial_recorded_while_it_ran(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transient: a probe's transient verdict never ends a fallback that a denial began meanwhile.
+
+    AAP 0.3.3 fallback table rows 2 and 3, and the sticky ``denied`` marker of automatic
+    fallback, which the recovery probes rely on. While the first-start probe's Q-G1 answers
+    503, another controller's live call is denied (``on_error`` enters automatic fallback).
+    The probe's transient verdict then keeps the ``denied`` status and the denial's reason
+    instead of writing ``stale`` and its own check, so Google stays in automatic fallback and
+    its next wake builds simulated data with the denial as reason.
+    """
+    rig.go_live("google")
+    platform = rig.live("google", rig.world(faults=(_q_g1_unavailable(),)))
+    other = rig.controller({"google": platform})
+    denial = AccessDenied(
+        "The caller does not have permission",
+        source="google",
+        endpoint="search Q-G3",
+        code="PERMISSION_DENIED",
+        http_status=403,
+    )
+    probe = SourceModeController.probe
+    denied: list[Source] = []
+
+    async def probe_while_denied(self: SourceModeController, source: Source) -> ProbeReport:
+        """Run the real probe, then let the other controller record its denial, once."""
+        report = await probe(self, source)
+        if not denied:
+            denied.append(source)
+            assert await other.on_error(source, denial) == "switched_to_simulated"
+        return report
+
+    monkeypatch.setattr(SourceModeController, "probe", probe_while_denied)
+
+    assert await rig.controller({"google": platform}).ensure_dataset("google") is None
+
+    assert denied == ["google"]
+    connection = await rig.connection("google")
+    assert (
+        connection.mode,
+        connection.status,
+        connection.reason,
+        connection.access_generation,
+    ) == ("simulated", "denied", denial.reason, 1)
+    assert await other.in_fallback("google") is True
+    assert await rig.datasets() == [], "the probe itself builds nothing"
+    (row,) = await _probe_rows(rig)
+    assert row.status == "failed"
+    assert row.error is not None
+    assert row.error.startswith("Q-G1: google search Q-G1: ")
+
+    simulated = _activated(
+        await rig.controller({"google": platform}).ensure_dataset("google"), "simulated"
+    )
+    assert simulated.reason == denial.reason
+
+
+class _BrokenAnalytics(httpx.AsyncBaseTransport):
+    """The live LinkedIn stand-in whose ``adAnalytics`` answers HTTP 200 off its contract.
+
+    Every other request is the simulator's. ``adAnalytics`` answers HTTP 200 with a body
+    holding no ``elements`` list, which the parser rejects as a ``validation`` defect, as it
+    rejected the live analytics in the QA run (every endpoint HTTP 200).
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+        self.analytics_calls = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Answer ``adAnalytics`` with a contract-breaking body, anything else as simulated."""
+        if request.url.path.endswith("/adAnalytics"):
+            self.analytics_calls += 1
+            return httpx.Response(200, json={"paging": {"start": 0, "count": 1}}, request=request)
+        return await self._inner.handle_async_request(request)
+
+
+@pytest.mark.parametrize("lead_sync_denied", [False, True], ids=["defect-only", "defect-and-403"])
+async def test_linkedin_validation_defect_in_probe_is_an_error_unless_a_check_is_denied(
+    rig: Rig, lead_sync_denied: bool
+) -> None:
+    """Defects: an ``adAnalytics`` validation defect in the probe is no denial and builds no mock.
+
+    AAP 0.3.3 fallback table row 4 ("validation error": Defect, no mock) and "Granularity" (a
+    403 on any LinkedIn endpoint switches all of LinkedIn). Every endpoint answers HTTP 200,
+    but the probe's one-day ``adAnalytics`` breaks its contract: LinkedIn stays live with
+    status ``error`` and the failing check as reason, and neither a LinkedIn dataset nor its
+    companion CRM dataset is built. When Lead Sync also answers 403, the denial decides:
+    all of LinkedIn switches to simulated data with the denied check, not the defect, as
+    reason.
+    """
+    rig.go_live("linkedin")
+    (account,) = get_settings().linkedin_ad_account_ids
+    scenario = LEADSYNC_403 if lead_sync_denied else BASE
+    platform = _BrokenAnalytics(rig.live("linkedin", rig.world(scenario)))
+    controller = rig.controller({"linkedin": platform})
+
+    outcome = await controller.ensure_dataset("linkedin")
+
+    assert platform.analytics_calls == 1, "a defect is never retried"
+    connection = await rig.connection("linkedin")
+    assert connection.reason is not None
+    if not lead_sync_denied:
+        assert outcome is None
+        assert (connection.mode, connection.status) == ("live", "error")
+        assert connection.reason.startswith(f"adAnalytics {account}: linkedin ad_analytics: ")
+        assert "validation" in connection.reason
+        assert await rig.datasets() == [], "no LinkedIn dataset and no companion"
+        assert await controller.in_fallback("linkedin") is False
+        return
+    simulated = _activated(outcome, "simulated")
+    assert simulated.companion_id is not None
+    assert (connection.mode, connection.status) == ("simulated", "denied")
+    assert connection.reason.startswith(f"leadFormResponses {account}: ")
+    assert f"linkedin {LEAD_SYNC_SURFACE}" in connection.reason
+    assert await controller.in_fallback("linkedin") is True
+
+
+@pytest.mark.parametrize(
+    "lead_sync_denied", [False, True], ids=["transient-only", "transient-and-403"]
+)
+async def test_linkedin_probe_cut_short_by_a_transient_error_is_stale_unless_a_check_is_denied(
+    rig: Rig, lead_sync_denied: bool
+) -> None:
+    """Transient: a probe listing cut short by a 503 is no denial and builds no mock.
+
+    AAP 0.3.3 fallback table row 3 (Transient: "Never mock") and "Granularity" (a 403 on any
+    LinkedIn endpoint switches all of LinkedIn). The probe's one-page ``leadForms`` answers 503
+    on all three attempts, so the listing is cut short and its check fails as transient:
+    LinkedIn stays live with status ``stale`` and that check as reason, its access generation
+    stays, and neither a LinkedIn dataset nor its companion CRM dataset is built. When Lead
+    Sync also answers 403, the denial decides although the transient check failed first: all
+    of LinkedIn switches to simulated data with the denied check, not the transient one, as
+    reason.
+    """
+    rig.go_live("linkedin")
+    (account,) = get_settings().linkedin_ad_account_ids
+    scenario = LEADSYNC_403 if lead_sync_denied else BASE
+    outage = Fault("linkedin", "lead_forms", "http_status", status=503)
+    journal: list[JournalEntry] = []
+    platform = rig.live("linkedin", rig.world(scenario, faults=(outage,)), journal=journal)
+    controller = rig.controller({"linkedin": platform})
+
+    with capture_logs() as entries:
+        outcome = await controller.ensure_dataset("linkedin")
+
+    form_calls = [entry for entry in journal if entry.surface == "lead_forms"]
+    assert [entry.status for entry in form_calls] == [503] * 3, "3 attempts, then cut short"
+    connection = await rig.connection("linkedin")
+    assert connection.reason is not None
+    (probe_row,) = await _probe_rows(rig, "linkedin")
+    assert (probe_row.status, probe_row.error) == ("failed", connection.reason)
+    classified = [entry for entry in entries if entry.get("event") == "sync.classification"]
+    if not lead_sync_denied:
+        assert outcome is None
+        assert (connection.mode, connection.status, connection.access_generation) == (
+            "live",
+            "stale",
+            0,
+        )
+        assert connection.reason.startswith(f"leadForms {account}: linkedin lead_forms: ")
+        assert await rig.datasets() == [], "no LinkedIn dataset and no companion"
+        assert await controller.in_fallback("linkedin") is False
+        (classification,) = classified
+        assert (
+            classification["disposition"],
+            classification["log_level"],
+            classification["error_kind"],
+            classification["check"],
+            classification["job"],
+        ) == ("stale", "warning", "transient", f"leadForms {account}", JOB_PROBE)
+        return
+    simulated = _activated(outcome, "simulated")
+    assert simulated.companion_id is not None
+    assert (connection.mode, connection.status, connection.access_generation) == (
+        "simulated",
+        "denied",
+        1,
+    )
+    assert connection.reason.startswith(f"leadFormResponses {account}: ")
+    assert f"linkedin {LEAD_SYNC_SURFACE}" in connection.reason
+    assert simulated.reason == connection.reason
+    assert await controller.in_fallback("linkedin") is True
+    assert classified == [], "the probe's fallback is no job classification"
+
+
 async def test_call_budget_deferral(rig: Rig) -> None:
     """Transient: calls beyond GOOGLE_DAILY_CALL_BUDGET are deferred; the datasets stay incomplete.
 
@@ -2288,8 +3173,11 @@ async def test_call_budget_deferral(rig: Rig) -> None:
     sliding 24 h. With the cap one call above what the live build already spent, the next
     metrics run makes that one call, defers the rest and records the affected datasets
     ``incomplete`` with a reason that starts with the deferral prefix, so the next window
-    finishes them. The source stays live and ``source_connection.calls_24h`` shows the cap
-    reached. The facts already stored are kept, proved on values: the one call is the
+    finishes them. A deferred read is no successful refresh ("The affected datasets keep their
+    last good data and turn stale"): each deferred dataset's ``last_success_at`` stays the
+    build's, so it is stale 24 h after the build. The source stays live and
+    ``source_connection.calls_24h`` shows the cap reached. The facts already stored are kept,
+    proved on values: the one call is the
     incremental Q-G3 read, so only the campaign days inside its range are rewritten, with
     their ids and the platform's same values under a later ``fetched_at``; every other stored
     campaign day, and every keyword and search-term day the deferred Q-G5 and Q-G6 would have
@@ -2352,6 +3240,10 @@ async def test_call_budget_deferral(rig: Rig) -> None:
         assert row.reason.startswith(freshness.REASON_DEFERRED)
         assert freshness.needs_repair(row), "the shortfall is repairable by a later read"
         assert row.checkpoint is not None, "the deferred scopes are kept for the next run"
+        # "The affected datasets keep their last good data and turn stale": a deferred read is
+        # no successful refresh, so only the attempt moves.
+        assert (row.last_attempt_at, row.last_success_at) == (T1, T0), name
+        assert _stale_at(row, DAY_AFTER), name
     connection = await rig.connection("google")
     assert (connection.mode, connection.active_dataset_id) == ("live", dataset_id)
     assert connection.calls_24h == cap
@@ -2437,11 +3329,14 @@ async def test_call_budget_deferral_is_read_first_by_the_next_metrics_run(rig: R
     ``incomplete`` until they finish. A 30-day restatement with the cap one call above what
     the build spent reads Q-G3 and keeps Q-G5 and Q-G6 as unread scopes in each dataset's
     checkpoint, tagged with the run's instant, so nothing restarts from the same prefix. The
-    next incremental run, under a raised cap, first reads both stored scopes as stored
-    (``google.metrics_daily``'s before ``google.search_terms``', both deferred at T1), then
-    its own range without the native days a stored scope of the same query covered: Q-G3 in
-    full, nothing more of Q-G5 or Q-G6. Both datasets end ``complete`` with the checkpoint
-    cleared, over the stored range.
+    deferred run is no successful refresh of either dataset ("The affected datasets keep
+    their last good data and turn stale"): both keep the build's ``last_success_at``,
+    ``google.search_terms`` although it got no call at all. The next incremental run, under
+    a raised cap, first reads both stored scopes as stored (``google.metrics_daily``'s
+    before ``google.search_terms``', both deferred at T1), then its own range without the
+    native days a stored scope of the same query covered: Q-G3 in full, nothing more of Q-G5
+    or Q-G6. Both datasets end ``complete`` with the checkpoint cleared, over the stored
+    range, and that resume moves their ``last_success_at``.
     """
     dataset_id = await _live_google(rig)
     built = {
@@ -2478,6 +3373,11 @@ async def test_call_budget_deferral_is_read_first_by_the_next_metrics_run(rig: R
         }
         assert row.completeness == "incomplete"
         assert row.reason == f"{freshness.REASON_DEFERRED}; 1 partition deferred"
+        before = built[row.dataset]
+        assert before is not None
+        # Deferred (Q-G6 got no call at all): no successful refresh, so only the attempt moves.
+        assert (row.last_attempt_at, row.last_success_at) == (T1, before.last_success_at)
+        assert _stale_at(row, DAY_AFTER), row.dataset
 
     await _cap_google_calls(rig, T2, allowed=100)
     resumed = rig.recording(rig.live("google"))
@@ -2512,6 +3412,8 @@ async def test_call_budget_deferral_is_read_first_by_the_next_metrics_run(rig: R
             daily.covered_through,
         ), "the drained checkpoint vouches for the whole stored range"
         assert not freshness.needs_repair(row)
+        assert (row.last_attempt_at, row.last_success_at) == (T2, T2), "the resume refreshed it"
+        assert not _stale_at(row, DAY_AFTER), name
 
 
 async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstanding_reads(
@@ -2525,6 +3427,9 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
     and Q-G8; nothing is read twice, and no snapshot, removal or ``missing`` discrepancy is
     inferred from a read that did not happen. The dataset stays ``incomplete`` with the total
     still outstanding, and turns ``complete`` with the checkpoint cleared once the cycle drains.
+    Until then no sync is a successful refresh ("The affected datasets keep their last good
+    data and turn stale"): ``last_success_at`` stays the build's through both deferred syncs
+    and moves only with the sync that drains the cycle.
     """
     dataset_id = await _live_google(rig)
     discrepancies_before = await rig.count(Discrepancy)
@@ -2550,6 +3455,7 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
         "incomplete",
         f"{freshness.REASON_DEFERRED}; 4 partitions deferred",
     )
+    assert (row.last_attempt_at, row.last_success_at) == (T1, T0), "deferred: no refresh"
 
     def unread(query_id: str, scope: dict[str, int]) -> dict[str, object]:
         return {
@@ -2592,6 +3498,8 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
         "incomplete",
         f"{freshness.REASON_DEFERRED}; 2 partitions deferred",
     )
+    assert (row.last_attempt_at, row.last_success_at) == (T2, T0), "still deferred: no refresh"
+    assert _stale_at(row, DAY_AFTER)
     assert row.checkpoint == {
         "version": 1,
         "started_at": T1.isoformat(),
@@ -2621,6 +3529,7 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
     row = await rig.freshness_row(dataset_id, "google.entities")
     assert row is not None
     assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
+    assert (row.last_attempt_at, row.last_success_at) == (T3, T3), "the drained cycle refreshed"
     assert await _checkpoint_is_sql_null(rig, dataset_id, "google.entities"), "drained to SQL NULL"
     assert await _snapshots_at(rig, dataset_id, "keyword", T3) > 0
     assert await _snapshots_at(rig, dataset_id, "campaign", T3) == 0

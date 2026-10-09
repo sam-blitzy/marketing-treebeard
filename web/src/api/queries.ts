@@ -779,9 +779,11 @@ export function useCreateRun() {
  *
  * Status codes: 201; 404 `not_found` for an unknown subject or `recommendation_id`; 409
  * `subject_retired` when the subject's dataset, or a dataset the item read, is no longer
- * active; 422 for the patch rules, among them `empty_patch`, `no_change`, `sub_minor_unit`,
- * `field_not_allowed`, `shared_budget_amount`, `budget_changed`, `untracked_subject`,
- * `decision_not_offered` and `subject_mismatch`.
+ * active, and `platform_state_unknown` for a subject with no decision that no entity sync
+ * has reported yet; 422 for the patch rules, among them `empty_patch`, `no_change`,
+ * `sub_minor_unit`, `field_not_allowed`, `shared_budget_amount`, `budget_changed`,
+ * `untracked_subject` (a reported subject with no decision yet), `decision_not_offered` and
+ * `subject_mismatch`.
  *
  * @returns The mutation; call `mutate({ subject, patch, recommendation_id?, note? })`.
  */

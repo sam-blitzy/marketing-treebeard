@@ -403,7 +403,12 @@ class SourceConnection(IdPkMixin, Base):
         reason: Why the source is in its mode or status, for example "credentials not
             configured" or the platform's error code and failing endpoint.
         active_dataset_id: The source's active primary dataset, if any.
-        last_attempt_at: When a job last called the source.
+        last_attempt_at: When a job or a live probe last called the source, successful or
+            not; it never moves back.
+        last_failure_at: When a transient, defective or denied call last marked the
+            connection, or a live probe or build last failed into automatic fallback; it
+            never moves back. A ``stale`` or ``error`` status returns to ``ok`` only once
+            every freshness row of the active dataset has succeeded at or after it.
         calls_24h: Call bookings in the counted window described above, a tight upper
             bound on the calls in the trailing 24 hours (server default ``0``).
         calls_by_minute: Call counts keyed by UTC minute, ``"YYYY-MM-DDTHH:MM"`` (server
@@ -426,6 +431,7 @@ class SourceConnection(IdPkMixin, Base):
         sa.ForeignKey("source_dataset.id", ondelete="SET NULL"),
     )
     last_attempt_at: Mapped[datetime | None]
+    last_failure_at: Mapped[datetime | None]
     calls_24h: Mapped[int] = mapped_column(server_default=sa.text("0"))
     # Per-minute buckets rather than a single counter: a sliding 24 h window needs to drop
     # the oldest minute as time passes, which a lone running total cannot do.

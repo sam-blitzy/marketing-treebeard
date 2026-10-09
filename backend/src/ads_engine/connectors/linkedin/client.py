@@ -1003,6 +1003,9 @@ class LinkedInClient:
         self._http = http
         self._tokens = tokens
         self._retry = retry
+        # Calls sent over the client's lifetime, counted as each operation's tally counts them,
+        # so a caller still knows the calls of an operation that raised.
+        self._calls = 0
         # Ad account currencies learned by get_ad_account, keyed by account URN; a currency
         # never changes for an account, and bare campaign-group budgets need it.
         self._currencies: dict[str, str] = {}
@@ -1032,6 +1035,17 @@ class LinkedInClient:
     def __repr__(self) -> str:
         """Return the class name only; the token source is never shown."""
         return f"{type(self).__name__}()"
+
+    @property
+    def calls(self) -> int:
+        """LinkedIn calls made over the client's lifetime; a retry sequence counts once.
+
+        Every call is counted when it is sent, as the operation's own ``calls`` counts it, so
+        the total also holds the calls of an operation that raised (a defect, a denial) and
+        returned no listing. ``sync`` derives a job's calls from the difference before and
+        after it.
+        """
+        return self._calls
 
     # -- request core -------------------------------------------------------------------
 
@@ -1086,6 +1100,7 @@ class LinkedInClient:
             return self._http.build_request("GET", url, headers=headers)
 
         tally.calls += 1
+        self._calls += 1
         return await send_json(
             self._http, build, source=SOURCE, endpoint=surface, policy=self._retry, secrets=secrets
         )

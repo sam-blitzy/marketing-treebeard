@@ -2004,7 +2004,7 @@ class Source(ApiModel):
         companion_dataset: HubSpot only: the active companion CRM dataset.
         datasets: Freshness of the active dataset's named datasets.
         companion_datasets: Freshness of the companion's named datasets.
-        last_attempt_at: When a job last called the source.
+        last_attempt_at: When a sync job or a live probe last called the source.
         calls_24h: Google webhook calls counted in the trailing 24 h.
         call_cap: The product's Google webhook call cap.
         sync_pending: Whether a "Sync now" request is pending.

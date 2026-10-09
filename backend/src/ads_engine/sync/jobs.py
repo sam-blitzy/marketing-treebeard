@@ -73,18 +73,24 @@ recorded as an ``incomplete`` success whose reason starts with
 freshness row's checkpoint in the same transaction, so the dataset's next run reads those
 scopes first and the dataset stays ``incomplete`` until they finish (AAP 0.3.3 "Budget");
 calls beyond the cap therefore move to a later 24 h window instead of re-reading the same
-prefix. Any other interruption of a dated dataset or of a CRM dataset (search, contact
-refresh, associations, target reads) is recorded as a failed attempt, so the dataset keeps
-its last good data and turns stale (AAP 0.3.3 transient row); what was read is still
+prefix. That success is cut short (``FreshnessOutcome.cut_short``), so it is no successful
+refresh: ``last_success_at`` stands until a run reads the dataset in full, and the dataset
+turns stale once that is more than ``sources.stale_after_hours`` ago (AAP 0.3.3 "The affected
+datasets keep their last good data and turn stale"). Any other interruption of a dated
+dataset or of a CRM dataset (search, contact refresh, associations, target reads) is
+recorded as a failed attempt, so the dataset keeps its last good data and turns stale (AAP
+0.3.3 transient row); what was read is still
 written, with its per-object unknown state, in the transaction that records the failed
 attempt and queues the rerun, and a Google dataset's unread scopes are kept the same way.
 The error is then handed to ``on_error``, which folds the same failure into those rows
 (only ``last_attempt_at`` and the reason can move) and decides its consequence. An
 interrupted matching pass is handed over with no dataset, its rows already
 retried ``error``, also when a later batch of the pass raises (before the raised error,
-whose consequence stands). An interrupted full-state entity read is ``incomplete`` with its
-reason: no removal or disappearance is inferred from it (AAP 0.3.3 "Safe absence"), and
-the next entity sync reads only what is still outstanding.
+whose consequence stands). An interrupted or deferred full-state entity read is
+``incomplete`` with its reason: no removal or disappearance is inferred from it (AAP 0.3.3
+"Safe absence"), and it is cut short too, so the entity dataset's ``last_success_at``
+stands and the dataset turns stale the same way. The next Google entity sync reads only
+what is still outstanding.
 
 Google checkpoints (``dataset_freshness.checkpoint``, version 1; scopes are
 :func:`~ads_engine.connectors.google_n8n.partition.scope_to_json` objects)::
@@ -177,6 +183,7 @@ from ads_engine.connectors.errors import (
     QueryDefect,
     TransientError,
 )
+from ads_engine.connectors.google_n8n.client import GoogleAdsWebhookClient
 from ads_engine.connectors.google_n8n.parser import (
     AdGroupRow,
     CampaignRow,
@@ -516,7 +523,9 @@ class JobContext:
         thresholds: The configuration snapshot the job runs on (window presets and default
             days); the entry points read it once per run and share it with every context the
             run builds.
-        now: The run's instant, timezone-aware; every attempt of the run is stamped with it.
+        now: The run's instant, timezone-aware; every freshness attempt of the run is stamped
+            with it and every data range is anchored on it. Each job's ``sync_run`` rows
+            start at the job's own start on the controller's clock instead.
         sessionmaker: The session factory every write goes through.
     """
 
@@ -706,7 +715,11 @@ class JobResult:
             (complete or incomplete); ``failed`` when the job raised, a dataset's refresh
             failed and kept its last good data, or a database integrity violation ended it.
         rows: Rows written (entities, facts, leads, contacts, associations, …).
-        calls: Connector calls made.
+        calls: Connector calls the job made, read from its clients' own counters however the
+            job ended, so the calls of an operation that raised (a defect, a denial) or of a
+            failed or cancelled run count too: Google webhook POST attempts (retries and next
+            pages included), LinkedIn and HubSpot calls (a retry sequence once), a CRM job's
+            LinkedIn lead re-fetches included.
         freshness: The outcome recorded per freshness dataset name; a dataset whose refresh
             failed carries the failure outcome recorded for it (by ``on_error`` for a
             transient error, by the job otherwise).
@@ -901,6 +914,7 @@ def _success(
     *,
     covered: tuple[date, date] | None,
     reasons: Iterable[str | None],
+    cut_short: bool = False,
 ) -> FreshnessOutcome:
     """Build a success outcome: complete without reasons, else incomplete with them joined.
 
@@ -908,6 +922,14 @@ def _success(
     (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` or ``REASON_INTERRUPTED``): the
     shortfall is unread work a later run can still read (a Google checkpoint's scopes, or the
     recorded range :func:`~ads_engine.sync.freshness.needs_repair` re-reads otherwise).
+
+    ``cut_short`` is the caller's: ``True`` when a transient error that outlived its retries,
+    or a call-budget deferral, left part of the read unread. The outcome is then no successful
+    refresh, so the dataset's ``last_success_at`` stands and it turns stale (AAP 0.3.3). Such a
+    read always reports its shortfall among ``reasons``.
+
+    Raises:
+        ValueError: If ``cut_short`` is set while ``reasons`` hold no reason.
     """
     reason = _join_reasons(reasons)
     covered_from, covered_through = covered if covered is not None else (None, None)
@@ -918,6 +940,7 @@ def _success(
         complete=reason is None,
         reason=reason,
         repairable=reason is not None and freshness.is_repairable_reason(reason),
+        cut_short=cut_short,
     )
 
 
@@ -1115,6 +1138,51 @@ class _Interruption:
     datasets: tuple[str, ...]
 
 
+type _MeteredClient = GoogleAdsWebhookClient | LinkedInClient | HubSpotClient
+"""A connector client whose own lifetime counter :class:`_CallMeter` reads."""
+
+
+def _lifetime_calls(client: _MeteredClient) -> int:
+    """The calls ``client`` made over its lifetime, by its own counter.
+
+    Google counts every webhook POST attempt (retries and next pages included,
+    :attr:`GoogleAdsWebhookClient.calls_made`); LinkedIn and HubSpot count each call once,
+    its retry sequence included (:attr:`LinkedInClient.calls`, :attr:`HubSpotClient.calls`).
+    """
+    if isinstance(client, GoogleAdsWebhookClient):
+        return client.calls_made
+    return client.calls
+
+
+class _CallMeter:
+    """The connector calls one job made, read from its clients' own lifetime counters.
+
+    Each client's counter is read once when the meter starts tracking it and again whenever
+    the total is read, so the total holds every call sent in between, however the job then
+    ended: the calls of an operation that raised (a defect, a denial, an exhausted retry), or
+    of a job that failed, was cancelled or met an unexpected error, count as the platform
+    received them. A client named again is tracked once, so no call counts twice. A job
+    runs its clients alone (each sync call opens its own), so no other job's calls enter.
+    """
+
+    __slots__ = ("_tracked",)
+
+    def __init__(self) -> None:
+        """Track no client yet."""
+        self._tracked: dict[int, tuple[_MeteredClient, int]] = {}
+
+    def track(self, client: _MeteredClient | None) -> None:
+        """Count ``client``'s calls from now on; ``None`` or a tracked client changes nothing."""
+        if client is None or id(client) in self._tracked:
+            return
+        self._tracked[id(client)] = (client, _lifetime_calls(client))
+
+    @property
+    def calls(self) -> int:
+        """Every call the tracked clients made since each was tracked."""
+        return sum(_lifetime_calls(client) - base for client, base in self._tracked.values())
+
+
 class _JobBase(ABC):
     """The plumbing every job shares (module docstring, "Shared plumbing").
 
@@ -1137,11 +1205,13 @@ class _JobBase(ABC):
         self._freshness: dict[str, FreshnessOutcome] = {}
         self._rows: dict[str, int] = {}
         self._total_rows = 0
-        self._calls = 0
+        self._meter = _CallMeter()
         self._runs: dict[str | None, list[int]] = {}
+        self._started_at: datetime | None = None
         self._closed: set[str | None] = set()
         self._disposition: ErrorDisposition | None = None
         self._error: str | None = None
+        self._error_type: str | None = None
         self._integrity: IntegrityFailure | None = None
 
     # -- what subclasses declare ---------------------------------------------------------
@@ -1164,7 +1234,8 @@ class _JobBase(ABC):
         """Run the job once and return what it did.
 
         Every run logs one ``sync.job.start`` and exactly one ``sync.job.finish``, whether it
-        returns, raises or is cancelled (:meth:`_result`). Every interruption noted while the
+        returns, raises or is cancelled (:meth:`_result`); a failed run's finish is logged at
+        error level with its failure text and error type. Every interruption noted while the
         job ran is handed to ``on_error`` on every exit but a cancellation: after a normal
         finish, before a raised connector error, on a retired dataset, before a database
         integrity violation is recorded, and on a best-effort basis before any other
@@ -1188,8 +1259,9 @@ class _JobBase(ABC):
                 noted interruptions were handed to ``on_error`` (best effort: a database
                 error doing so is logged, never raised in its place), the job's still-open
                 ``sync_run`` rows were closed as failed (best effort) and ``sync.job.finish``
-                was logged ``failed`` with the error's class name; the scheduler logs its
-                traceback and the next slot retries.
+                was logged ``failed`` at error level with ``job failed unexpectedly`` as its
+                error and the error's class name as its error type, never the error's text;
+                the scheduler logs its traceback and the next slot retries.
             asyncio.CancelledError: Unchanged, when the task running the job is cancelled (a
                 lost scheduler lock, the worker's graceful shutdown), wherever the job then
                 was (:meth:`_close_cancelled`). It is logged as ``sync.job.cancelled``, and
@@ -1198,10 +1270,17 @@ class _JobBase(ABC):
                 with ``job cancelled``; nothing else is written. Bookkeeping that times out or
                 fails is logged as ``sync.job.close_failed`` and abandoned, and a further
                 cancellation while it runs propagates at once. ``sync.job.finish`` is then
-                logged ``cancelled``.
+                logged ``cancelled`` at warning level, with ``job cancelled`` as its error.
         """
         ctx = self.ctx
         started = time.perf_counter()
+        # The job's own start on the controller's clock; ``ctx.now`` stays the run's instant,
+        # the anchor of the job's data ranges and freshness stamps.
+        self._started_at = ctx.controller.now()
+        # Calls are counted from the clients' own counters, so a call made before the job
+        # raised, failed or was cancelled still counts.
+        for client in (ctx.clients.google, ctx.clients.linkedin, ctx.clients.hubspot):
+            self._meter.track(client)
         _log.info(
             "sync.job.start",
             source=ctx.source,
@@ -1253,7 +1332,7 @@ class _JobBase(ABC):
             job=self.job,
             dataset_id=ctx.dataset_id,
             rows=self._total_rows,
-            calls=self._calls,
+            calls=self._meter.calls,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         try:
@@ -1272,6 +1351,10 @@ class _JobBase(ABC):
     async def _attempt(self) -> None:
         """Open the ``sync_run`` rows, execute, and settle what the run may return (:meth:`run`).
 
+        Once the rows are open, the attempt is stamped on the source's connection
+        (:meth:`SourceModeController.record_attempt`), so ``last_attempt_at`` moves on every
+        attempt, simulated or live, whatever its outcome (AAP 0.5.2).
+
         A ``ConnectorError`` is handed to ``on_error``, a retired dataset ends the job, and a
         database integrity violation is recorded as a failed attempt
         (:meth:`_settle_integrity`); all three close the rows here and return. Anything else
@@ -1280,6 +1363,7 @@ class _JobBase(ABC):
         ctx = self.ctx
         try:
             await self._open_runs(self.freshness_datasets())
+            await ctx.controller.record_attempt(ctx.source, ctx.controller.now())
             await self._execute()
         except ConnectorError as exc:
             pending = tuple(
@@ -1292,6 +1376,7 @@ class _JobBase(ABC):
             self._disposition = await self._hand_over(exc, pending)
             text = _failure_text(exc)
             self._error = text
+            self._error_type = type(exc).__name__
             failures = {name: FreshnessOutcome.failure(ctx.now, reason=text) for name in pending}
             if self._disposition != "stale":
                 # ``on_error`` records a transient's failure on the named rows itself; a
@@ -1307,6 +1392,7 @@ class _JobBase(ABC):
         except repositories.DatasetNotWritable as exc:
             # Retired (or discarded) while the job ran: its rows are read-only history now.
             self._error = str(exc)
+            self._error_type = type(exc).__name__
             _log.info("sync.job.not_writable", source=ctx.source, job=self.job, reason=self._error)
             # The interruptions noted before still happened: ``on_error`` records the
             # connection's health and skips the read-only dataset's freshness rows.
@@ -1373,6 +1459,7 @@ class _JobBase(ABC):
             self._failed[name] = reason
             self._freshness[name] = outcome
         self._error = reason
+        self._error_type = type(error).__name__
         self._integrity = failure
         await self._close_remaining(reason)
 
@@ -1381,20 +1468,34 @@ class _JobBase(ABC):
 
         Every path of :meth:`run` ends here exactly once, so the event has one shape: source,
         job, dataset, status, rows, calls, completeness, the outcome per freshness dataset,
-        disposition, duration and error. Outcomes are those committed (or, for a failure,
-        recorded); the event carries counts, names and an exception's class, never an email,
-        a secret, a token or an exception's text.
+        disposition, duration, error and error type. Outcomes are those committed (or, for a
+        failure, recorded). The level follows the status: ``info`` for ``succeeded``,
+        ``error`` for ``failed`` (a defect, a denial, a transient error whose retries ran out,
+        an integrity violation, a retired dataset or an unexpected error), so every job
+        failure, a persistent outage included, has an error-level line; ``warning`` for
+        ``cancelled``.
+
+        ``error`` is the failure text the job recorded, the same sanitized reasons it writes
+        to ``sync_run.error`` and truncated as those are (a connector's reason with its query
+        id, :attr:`IntegrityFailure.reason`, a retired dataset's reason, the reasons of the
+        datasets whose refresh failed); for a raised run, ``job failed unexpectedly`` or
+        ``job cancelled`` (the reason its open rows close with) joins them. ``error_type`` is
+        the class name of the exception that ended the job: the one :meth:`run` re-raises,
+        else the connector error, integrity violation or retirement :meth:`_attempt`
+        settled; ``None`` when no exception ended it. The event never carries an email, a
+        secret, a token or an exception's own text.
 
         Args:
             started: ``time.perf_counter()`` when the run started.
             raised: The exception :meth:`run` re-raises after this, if any: the status logged
-                is ``cancelled`` for a cancellation and ``failed`` otherwise, and ``error``
-                is its class name (``None`` when the run returns).
+                is ``cancelled`` for a cancellation and ``failed`` otherwise, and
+                ``error_type`` is its class name.
 
         Returns:
             The result :meth:`run` returns; discarded when ``raised`` is given.
         """
         ctx = self.ctx
+        cancelled = isinstance(raised, asyncio.CancelledError)
         status: Literal["succeeded", "failed"] = (
             "failed"
             if raised is not None or self._error is not None or self._failed
@@ -1406,27 +1507,37 @@ class _JobBase(ABC):
             dataset_id=ctx.dataset_id,
             status=status,
             rows=self._total_rows,
-            calls=self._calls,
+            calls=self._meter.calls,
             freshness=MappingProxyType(dict(self._freshness)),
             disposition=self._disposition,
             error=self._error if self._error is not None else _join_reasons(self._failed.values()),
             duration_ms=int((time.perf_counter() - started) * 1000),
             integrity=self._integrity,
         )
-        log = _log.warning if status == "failed" else _log.info
+        error = result.error
+        if raised is not None:
+            closed_with = _REASON_CANCELLED if cancelled else _REASON_UNEXPECTED
+            error = _join_reasons((error, closed_with))
+        if cancelled:
+            log = _log.warning
+        elif status == "failed":
+            log = _log.error
+        else:
+            log = _log.info
         log(
             "sync.job.finish",
             source=ctx.source,
             job=self.job,
             dataset_id=ctx.dataset_id,
-            status="cancelled" if isinstance(raised, asyncio.CancelledError) else status,
+            status="cancelled" if cancelled else status,
             rows=result.rows,
             calls=result.calls,
             completeness=result.completeness,
             datasets={name: outcome.completeness for name, outcome in self._freshness.items()},
             disposition=result.disposition,
             duration_ms=result.duration_ms,
-            error=None if raised is None else type(raised).__name__,
+            error=None if error is None else _truncate(error),
+            error_type=type(raised).__name__ if raised is not None else self._error_type,
         )
         return result
 
@@ -1438,6 +1549,15 @@ class _JobBase(ABC):
         if dataset is not None:
             self._rows[dataset] = self._rows.get(dataset, 0) + rows
 
+    def _count_calls_of(self, client: _MeteredClient) -> None:
+        """Count the calls of a client the job uses beyond its context's, from now on.
+
+        The context's own client is counted from the start of :meth:`run`; a client the job
+        opens or is handed later (the LinkedIn client a matching pass re-fetches leads with)
+        is counted from the moment it is named here, once however often it is named.
+        """
+        self._meter.track(client)
+
     def _interrupted(
         self, error: TransientError, *, dataset: str | None, datasets: Sequence[str] = ()
     ) -> None:
@@ -1447,8 +1567,9 @@ class _JobBase(ABC):
             error: The interruption.
             dataset: The freshness dataset whose refresh it failed, so ``on_error`` records
                 the failure and the dataset keeps its last good data and turns stale; or
-                ``None`` when the shortfall is recorded as an ``incomplete`` success (a
-                call-budget deferral, an incomplete full-state read) or lives outside
+                ``None`` when the shortfall is recorded as a cut-short ``incomplete`` success
+                (a call-budget deferral, an interrupted full-state read), which keeps the
+                dataset's ``last_success_at`` so it turns stale the same way, or lives outside
                 ``dataset_freshness`` (lead matching's retried ``lead_match`` rows), and only
                 the connection's health is reported.
             datasets: Further freshness datasets the same interruption failed; all of them
@@ -1651,9 +1772,16 @@ class _JobBase(ABC):
     async def _open_runs(self, datasets: Sequence[str | None]) -> None:
         """Insert ``running`` ``sync_run`` rows, one per dataset and job name, and commit.
 
-        A job writing no freshness dataset gets one row with no dataset.
+        A job writing no freshness dataset gets one row with no dataset. Every row of one run,
+        those a job opens later (:class:`CrmSyncJob`'s discovery dataset) included, starts at
+        the instant :meth:`run` started, read from the controller's clock; it is not
+        ``ctx.now``, the instant every job of one sync call shares. The scheduler's due check
+        and any duration read from ``sync_run`` therefore see when the job really began.
         """
         ctx = self.ctx
+        if self._started_at is None:
+            self._started_at = ctx.controller.now()
+        started_at = self._started_at
         names: Sequence[str | None] = datasets if datasets else (None,)
         async with ctx.sessionmaker() as session, session.begin():
             for name in names:
@@ -1664,7 +1792,7 @@ class _JobBase(ABC):
                         source=ctx.source,
                         job=job,
                         dataset=name,
-                        started_at=ctx.now,
+                        started_at=started_at,
                         status=SYNC_RUN_RUNNING,
                     )
                     for job in self.sync_run_jobs()
@@ -2452,6 +2580,13 @@ class EntitySyncJob(_JobBase):
     deferral starts with :data:`~ads_engine.sync.freshness.REASON_DEFERRED`), raises no
     ``missing`` discrepancy and leaves the previous snapshots standing.
 
+    Staleness: a sync that a transient error (after its retries) or a call-budget deferral
+    cut short, on any read of either source, records its ``incomplete`` outcome as cut short
+    (:attr:`~ads_engine.sync.freshness.FreshnessOutcome.cut_short`). The entity dataset's
+    ``last_success_at`` then stands, so a persistent outage or an exhausted budget turns it
+    stale (AAP 0.3.3); a sync that reads everything outstanding moves it again. A shortfall a
+    finished read reports (a page limit, a result limit) is not cut short.
+
     Google cycles: an interrupted sync stores its outstanding work as the
     ``google.entities`` checkpoint (module docstring) in the entity transaction, and the
     following syncs read only that work, in the order Q-G1, Q-G2 (with Q-G2b), Q-G4, Q-G7,
@@ -2460,8 +2595,8 @@ class EntitySyncJob(_JobBase):
     snapshots what it read. A missing campaign or a removed ad group or keyword is inferred
     in the sync in which its enumeration finishes, from the absences accumulated over the
     cycle; a shared budget snapshotted earlier in the cycle counts as returned. The dataset
-    stays ``incomplete`` while any work is outstanding and turns ``complete`` once the cycle
-    drains without a permanent shortfall.
+    stays ``incomplete``, with its ``last_success_at`` standing, while any work is
+    outstanding, and turns ``complete`` once the cycle drains without a permanent shortfall.
     """
 
     job = JOB_ENTITIES
@@ -2495,7 +2630,6 @@ class EntitySyncJob(_JobBase):
         name = DATASET_GOOGLE_ENTITIES
         client = ctx.clients.require_google()
         fetcher = PartitionedFetcher(client)
-        calls_before = client.calls_made
         async with ctx.sessionmaker() as session:
             tracked = await _google_tracked(session, ctx.dataset_id)
             stored_account = await _account_row(session, ctx.dataset_id, "google")
@@ -2544,7 +2678,6 @@ class EntitySyncJob(_JobBase):
         actions = (
             await _read_google_scopes(fetcher, "Q-G8", action_scopes) if action_scopes else None
         )
-        self._calls += client.calls_made - calls_before
 
         customer_rows = [] if customer is None else [parse_customer(row) for row in customer.rows]
         if not customer_rows and stored_account_id is None:
@@ -2659,7 +2792,15 @@ class EntitySyncJob(_JobBase):
                 ),
                 actions=action_rows,
             )
-            await self._finish_entities(session, rows, enumeration, sealed=sealed, reasons=reasons)
+            # Outstanding work is exactly what an interruption or a deferral left unread.
+            await self._finish_entities(
+                session,
+                rows,
+                enumeration,
+                sealed=sealed,
+                reasons=reasons,
+                cut_short=outstanding > 0,
+            )
             # After the freshness write, so the row is locked in record_freshness's order.
             await freshness.write_checkpoint(
                 session, ctx.dataset_id, name, cycle.to_json() if outstanding else None
@@ -2955,11 +3096,15 @@ class EntitySyncJob(_JobBase):
         *,
         sealed: bool,
         reasons: Iterable[str | None],
+        cut_short: bool,
     ) -> None:
         """Snapshots, baseline, discrepancy check and freshness, in the entity transaction.
 
         ``sealed`` was read in this transaction before the freshness write, as
-        :func:`~ads_engine.sync.snapshots.baseline_sealed` requires.
+        :func:`~ads_engine.sync.snapshots.baseline_sealed` requires. ``cut_short`` says a
+        transient error or a call-budget deferral left part of the entity state unread: the
+        read is recorded ``incomplete`` with its reasons and is no successful refresh, so the
+        entity dataset's ``last_success_at`` stands and it turns stale (AAP 0.3.3).
         """
         ctx = self.ctx
         distinct = list({row.key: row for row in rows}.values())
@@ -2984,7 +3129,12 @@ class EntitySyncJob(_JobBase):
             discrepancies_resolved=report.auto_resolved,
         )
         await self._complete(
-            session, {f"{ctx.source}.entities": _success(ctx.now, covered=None, reasons=reasons)}
+            session,
+            {
+                f"{ctx.source}.entities": _success(
+                    ctx.now, covered=None, reasons=reasons, cut_short=cut_short
+                )
+            },
         )
 
     # -- LinkedIn --------------------------------------------------------------------------
@@ -3006,8 +3156,6 @@ class EntitySyncJob(_JobBase):
             post_urns = sorted({row.post_urn for row in creatives.rows if row.post_urn})
             posts = await client.get_posts(post_urns)
             forms = await client.list_lead_forms(account_id)
-            self._calls += 1 + groups.calls + campaigns.calls + creatives.calls + posts.calls
-            self._calls += forms.calls
             reads.append(
                 _LinkedInAccountRead(
                     external_id=account.external_id,
@@ -3073,7 +3221,15 @@ class EntitySyncJob(_JobBase):
                 missing_campaign_ids=missing,
                 reason=None if complete else (enumeration_reason or "campaign listing incomplete"),
             )
-            await self._finish_entities(session, rows, enumeration, sealed=sealed, reasons=reasons)
+            # An interrupted listing or post batch is incomplete with its error's reason.
+            await self._finish_entities(
+                session,
+                rows,
+                enumeration,
+                sealed=sealed,
+                reasons=reasons,
+                cut_short=bool(interruptions),
+            )
         if interruptions:
             self._interrupted(interruptions[0], dataset=None)
 
@@ -4127,9 +4283,11 @@ class MetricsSyncJob(_JobBase):
         transaction:
 
         * nothing pending: a success, ``complete`` unless a result limit was met;
-        * work pending after a call-budget deferral: an ``incomplete`` success, repairable,
-          its reason (:data:`~ads_engine.sync.freshness.REASON_DEFERRED` prefix) counting
-          every pending scope, followed by the permanent shortfalls;
+        * work pending after a call-budget deferral: an ``incomplete`` success, repairable
+          and cut short, its reason (:data:`~ads_engine.sync.freshness.REASON_DEFERRED`
+          prefix) counting every pending scope, followed by the permanent shortfalls; the
+          dataset's ``last_success_at`` stands until the pending scopes are read, so the
+          dataset turns stale meanwhile (AAP 0.3.3 "Timeouts and budget");
         * any other transient interruption fails the refresh instead: the checkpoint is
           still written, the failed attempt is recorded with the rows read, so the dataset
           keeps its last good standing and turns stale, and the rerun is queued when those
@@ -4175,7 +4333,6 @@ class MetricsSyncJob(_JobBase):
                 )
             ),
         )
-        self._calls += sum(read.calls for read in reads)
         writes = {read.query_id: read.write for read in reads}
 
         async with ctx.sessionmaker() as session, session.begin():
@@ -4200,7 +4357,12 @@ class MetricsSyncJob(_JobBase):
                     if merged.total
                     else None
                 )
-                outcome = _success(ctx.now, covered=recorded, reasons=(deferred, *merged.reasons))
+                outcome = _success(
+                    ctx.now,
+                    covered=recorded,
+                    reasons=(deferred, *merged.reasons),
+                    cut_short=deferred is not None,
+                )
             else:
                 outcome = FreshnessOutcome.failure(ctx.now, reason=failure.reason)
             await self._complete(
@@ -4500,7 +4662,6 @@ class MetricsSyncJob(_JobBase):
             listing = await client.analytics_daily(
                 account_id, (start, end), expected_creatives=len(scope) or None
             )
-            self._calls += listing.calls
             listings.append((listing, scope))
             if listing.interrupted_by is not None and failure is None:
                 failure = listing.interrupted_by
@@ -4739,7 +4900,6 @@ class SegmentSyncJob(_JobBase):
             for pivot in SEGMENT_PIVOTS:
                 for window in windows:
                     listing = await client.analytics_segments(account_id, pivot, window)
-                    self._calls += listing.calls
                     listings.append((listing, window, SEGMENT_FACETS[pivot], scope))
                     if listing.interrupted_by is not None:
                         failure = failure or listing.interrupted_by
@@ -4956,7 +5116,6 @@ class LeadSyncJob(_JobBase):
             listing = await client.list_lead_responses(
                 account_id, (start, ctx.now), known_versions=known
             )
-            self._calls += listing.calls
             skipped_tests += listing.test_leads_skipped
             reads.append((_account_external(account_id), listing.leads))
             versions.extend(listing.versions)
@@ -5181,7 +5340,8 @@ async def _match_leads(
     companion, whose rows are its parent's simulated leads, live for a primary, which only
     ever holds live leads (``sync/lead_match.py`` isolation rule). A live re-fetch needs
     LinkedIn credentials under ``DATA_MODE=auto``; without them no live lead can exist, and
-    the pass is skipped.
+    the pass is skipped. The re-fetch client's calls count toward ``job``'s calls, with its
+    HubSpot client's.
 
     ``interruptions`` receives the pass's first exhausted ``TransientError`` per source as
     soon as it is observed (``run_matching``), so the caller still has them when the pass
@@ -5202,6 +5362,8 @@ async def _match_leads(
     lead_mode: Mode = "simulated" if ctx.role == "companion" else "live"
 
     async def run(client: LinkedInClient) -> lead_match.MatchReport:
+        # The re-fetches are calls of this job too.
+        job._count_calls_of(client)
         clients = lead_match.MatchClients(
             # Every lead of one CRM dataset is of one mode, so one client re-fetches them all.
             linkedin_for=lambda _lead_dataset_id: client,
@@ -5304,7 +5466,6 @@ class LeadMatchJob(_JobBase):
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
         """
         hubspot = self.ctx.clients.require_hubspot()
-        calls_before = hubspot.calls
         bindings = await _crm_bindings(self.ctx)
         props = hubspot.bind_contact_properties(bindings, self.ctx.settings)
         interruptions: list[TransientError] = []
@@ -5318,7 +5479,6 @@ class LeadMatchJob(_JobBase):
                 interruptions=interruptions,
             )
         finally:
-            self._calls += hubspot.calls - calls_before
             for error in _matching_interruptions(interruptions, report):
                 # The rows already ended retried ``error``; the source's mode decides the
                 # rest. Noted on every exit: when a later batch raised, ``run`` hands these
@@ -5515,47 +5675,37 @@ class CrmSyncJob(_JobBase):
         """Run the five steps of the class docstring."""
         ctx = self.ctx
         client = ctx.clients.require_hubspot()
-        calls_before = client.calls
-        try:
-            bindings = await _crm_bindings(ctx)
-            props = client.bind_contact_properties(bindings, ctx.settings)
-            async with ctx.sessionmaker() as session:
-                rows = await freshness.load_freshness(session, ctx.dataset_id)
-                end = await default_window_end(session, now=ctx.now, thresholds=ctx.thresholds)
-            scope_start = ctx.now - timedelta(days=_crm_span_days(ctx.settings))
-            if self.backfill:
-                search_start = scope_start
-            else:
-                search_start = _utc_midnight(end - timedelta(days=ctx.thresholds.default_days - 1))
-            search_start = min(search_start, ctx.now)
+        bindings = await _crm_bindings(ctx)
+        props = client.bind_contact_properties(bindings, ctx.settings)
+        async with ctx.sessionmaker() as session:
+            rows = await freshness.load_freshness(session, ctx.dataset_id)
+            end = await default_window_end(session, now=ctx.now, thresholds=ctx.thresholds)
+        scope_start = ctx.now - timedelta(days=_crm_span_days(ctx.settings))
+        if self.backfill:
+            search_start = scope_start
+        else:
+            search_start = _utc_midnight(end - timedelta(days=ctx.thresholds.default_days - 1))
+        search_start = min(search_start, ctx.now)
 
-            discovery: _Discovery | None = None
-            campaign_property = props.google_campaign_property
-            touch_property = props.google_touch_property
-            if (
-                ctx.role == "primary"
-                and campaign_property is not None
-                and touch_property is not None
-            ):
-                self._discovery = True
-                await self._open_runs((DATASET_HUBSPOT_GOOGLE_CONTACTS,))
-                discovery = await self._discover(
-                    client,
-                    props,
-                    (campaign_property, touch_property),
-                    _widened(search_start, rows.get(DATASET_HUBSPOT_GOOGLE_CONTACTS)),
-                )
+        discovery: _Discovery | None = None
+        campaign_property = props.google_campaign_property
+        touch_property = props.google_touch_property
+        if ctx.role == "primary" and campaign_property is not None and touch_property is not None:
+            self._discovery = True
+            await self._open_runs((DATASET_HUBSPOT_GOOGLE_CONTACTS,))
+            discovery = await self._discover(
+                client,
+                props,
+                (campaign_property, touch_property),
+                _widened(search_start, rows.get(DATASET_HUBSPOT_GOOGLE_CONTACTS)),
+            )
 
-            await self._match(props)
-            refreshed = await self._refresh_contacts(client, props, rows, scope_start, discovery)
-            deal_ids = await self._search_deals(
-                client, _widened(search_start, rows.get(DATASET_HUBSPOT_DEAL_SEARCH))
-            )
-            await self._associations(
-                client, props, rows, scope_start, refreshed, discovery, deal_ids
-            )
-        finally:
-            self._calls += client.calls - calls_before
+        await self._match(props)
+        refreshed = await self._refresh_contacts(client, props, rows, scope_start, discovery)
+        deal_ids = await self._search_deals(
+            client, _widened(search_start, rows.get(DATASET_HUBSPOT_DEAL_SEARCH))
+        )
+        await self._associations(client, props, rows, scope_start, refreshed, discovery, deal_ids)
 
     # -- steps -----------------------------------------------------------------------------
 

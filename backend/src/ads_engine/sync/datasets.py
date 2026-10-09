@@ -12,8 +12,10 @@ ids never join within one source. :class:`DatasetManager` owns every state chang
   LinkedIn dataset and which holds the generated contacts, meetings, deals, associations
   and ``lead_match`` rows its leads are attributed through.
 * :meth:`DatasetManager.readiness` decides whether a backfilled dataset may activate: every
-  required freshness row is recorded and ``complete``, or ``incomplete`` with a reason, and
-  never ``unknown``; every staged ``lead_match`` row has been attempted at least once;
+  required freshness row is recorded, its latest attempt succeeded, and it is ``complete``,
+  or ``incomplete`` with a reason that is not unread work (an interrupted or call-budget
+  deferred fetch: the backfill did not complete), and never ``unknown``; every staged
+  ``lead_match`` row has been attempted at least once;
   every lead of a LinkedIn dataset, live or simulated, has a ``lead_match`` row in its
   effective CRM dataset (the companion of a simulated one), and a live one with leads has
   such a dataset; a simulated LinkedIn dataset's companion is ready too. Staging the rows
@@ -84,13 +86,19 @@ from ads_engine.db.models.ops import (
     DATASET_ROLES,
     DATASET_STATES,
     MODES,
+    DatasetFreshness,
     SourceConnection,
     SourceDataset,
 )
 from ads_engine.db.session import get_sessionmaker
 from ads_engine.logging import get_logger
 from ads_engine.settings import SOURCES, Source
-from ads_engine.sync.freshness import SOURCE_DATASETS, load_freshness
+from ads_engine.sync.freshness import (
+    SOURCE_DATASETS,
+    is_repairable_reason,
+    load_freshness,
+    recorded_shortfall,
+)
 
 __all__ = [
     "RETENTION",
@@ -267,14 +275,66 @@ def _plural(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
+def _unread_work(row: DatasetFreshness) -> str | None:
+    """Return the repairable shortfall of an ``incomplete`` freshness row, if it has one.
+
+    A repairable shortfall (:func:`~ads_engine.sync.freshness.is_repairable_reason`) is work
+    a fetch left unread: a transient error outlived its retries part-way through it
+    (``interrupted``), or the Google call budget deferred its remaining pages (``call budget
+    exhausted``, a transient condition in AAP 0.3.3). The backfill that wrote the row did
+    not complete. A permanent shortfall (a platform result limit that no refetch removes)
+    is not unread work.
+
+    Args:
+        row: A stored freshness row.
+
+    Returns:
+        The shortfall as recorded, without a later failed attempt's note, or ``None`` when
+        the row is not ``incomplete`` or its reason is not repairable.
+    """
+    if row.completeness != "incomplete" or not is_repairable_reason(row.reason):
+        return None
+    return recorded_shortfall(row) or row.reason
+
+
+def _failed_latest_attempt(row: DatasetFreshness) -> str | None:
+    """Return why a freshness row's latest attempt did not succeed, if it did not.
+
+    The latest attempt did not succeed when no success is recorded at all, or when
+    ``last_attempt_at`` is later than ``last_success_at``: a failed or cut-short attempt
+    moves only ``last_attempt_at``, so the row's data is not what the latest read returned.
+
+    Args:
+        row: A stored freshness row.
+
+    Returns:
+        The row's reason (``"attempt failed"`` when it records none), prefixed with ``"no
+        successful attempt"`` when no success is recorded; ``None`` when the latest attempt
+        succeeded.
+    """
+    reason = row.reason.strip() if row.reason is not None else ""
+    if row.last_success_at is None:
+        return f"no successful attempt: {reason}" if reason else "no successful attempt"
+    if row.last_attempt_at is not None and row.last_attempt_at > row.last_success_at:
+        return reason or "attempt failed"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Readiness:
     """Whether a backfilled dataset may activate, and what still stands in the way.
 
-    AAP 0.3.3 ("Readiness"). A dataset is ready only when all of these hold:
+    AAP 0.3.3 ("Readiness", "Recovery readiness"). A dataset is ready only when all of these
+    hold:
 
     * every required freshness row (:meth:`DatasetManager.required_freshness`) exists and is
       ``complete``, or ``incomplete`` with a recorded reason; never ``unknown``;
+    * every source, HubSpot primary and companion included: the backfill completed, so no
+      required row is ``incomplete`` for a repairable reason (an ``interrupted`` or ``call
+      budget exhausted`` fetch, whose unread work is still outstanding), and the latest
+      attempt of every required row succeeded (``last_success_at`` is recorded and
+      ``last_attempt_at`` is not later). A permanent shortfall (a platform result limit no
+      refetch removes) whose latest attempt succeeded is accepted;
     * HubSpot, primary or companion: no ``lead_match`` row of this CRM dataset is still
       ``pending``, so every staged row was attempted at least once. Rows of leads whose
       LinkedIn dataset has retired are not counted: matching never attempts them;
@@ -307,6 +367,12 @@ class Readiness:
             ``lead_match`` row in its effective CRM dataset (the companion of a simulated
             one), or all the leads of a live dataset that has none (HubSpot has no active
             primary); always 0 for the other datasets.
+        unfinished_freshness: Required freshness datasets, ``complete`` or ``incomplete``
+            with a reason, that the backfill did not complete: ``incomplete`` with unread
+            work (reported as "backfill incomplete"), or with a latest attempt that did not
+            succeed (reported as "latest attempt failed"). A dataset listed under
+            ``missing_freshness``, ``unknown_freshness`` or ``incomplete_without_reason`` is
+            not repeated here.
     """
 
     dataset_id: int
@@ -318,6 +384,7 @@ class Readiness:
     companion: Readiness | None = None
     reasons: tuple[str, ...] = ()
     unstaged_leads: int = 0
+    unfinished_freshness: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -791,6 +858,12 @@ class DatasetManager:
         Readiness only counts; it stages nothing and changes no row. Staging the
         ``lead_match`` rows a build must attempt is ``sync/lead_match.py``'s job.
 
+        A backfill cut short is never ready: a required freshness row ``incomplete`` with
+        unread work (an interrupted or call-budget deferred fetch) is reported as "backfill
+        incomplete: <dataset> (<shortfall>)", and one whose latest attempt did not succeed
+        as "latest attempt failed: <dataset> (<reason>)"; ``sync/mode.py`` then discards the
+        build and the previous dataset stays active (AAP 0.3.3, "Recovery readiness").
+
         Args:
             dataset_id: The dataset to assess, normally a ``building`` primary.
             session: Read in the caller's session.
@@ -818,23 +891,45 @@ class DatasetManager:
         return result
 
     async def _readiness(self, session: AsyncSession, dataset: SourceDataset) -> Readiness:
-        """Assess a loaded dataset inside ``session``; see :class:`Readiness`."""
+        """Assess a loaded dataset inside ``session``; see :class:`Readiness`.
+
+        Each required freshness row falls short at most once, in this order: missing,
+        ``unknown``, ``incomplete`` without a reason, then (for a ``complete`` row or a
+        reasoned ``incomplete`` one) unread work before a failed latest attempt. The same
+        rules apply to every source, and to a simulated LinkedIn dataset's companion through
+        its own assessment.
+        """
         rows = await load_freshness(session, dataset.id)
         missing: list[str] = []
         unknown: list[str] = []
         without_reason: list[str] = []
+        unfinished: list[str] = []
+        unread: list[str] = []
+        failed: list[str] = []
         for name in self._required(dataset):
             row = rows.get(name)
             if row is None:
                 missing.append(name)
-            elif row.completeness == "complete":
                 continue
-            elif row.completeness == "incomplete":
+            if row.completeness == "incomplete":
                 if row.reason is None or not row.reason.strip():
                     without_reason.append(name)
-            else:
+                    continue
+            elif row.completeness != "complete":
                 # "unknown", and defensively any value outside the two a success writes.
                 unknown.append(name)
+                continue
+            # The backfill must have completed (AAP 0.3.3 "Recovery readiness"): unread work
+            # still outstanding, or a latest attempt that did not succeed, holds the build.
+            shortfall = _unread_work(row)
+            if shortfall is not None:
+                unfinished.append(name)
+                unread.append(f"{name} ({shortfall})")
+                continue
+            failure = _failed_latest_attempt(row)
+            if failure is not None:
+                unfinished.append(name)
+                failed.append(f"{name} ({failure})")
 
         reasons: list[str] = []
         if missing:
@@ -843,6 +938,10 @@ class DatasetManager:
             reasons.append(f"freshness unknown: {', '.join(unknown)}")
         if without_reason:
             reasons.append(f"incomplete with no recorded reason: {', '.join(without_reason)}")
+        if unread:
+            reasons.append(f"backfill incomplete: {', '.join(unread)}")
+        if failed:
+            reasons.append(f"latest attempt failed: {', '.join(failed)}")
 
         pending = 0
         unstaged = 0
@@ -908,6 +1007,7 @@ class DatasetManager:
             companion=companion,
             reasons=tuple(reasons),
             unstaged_leads=unstaged,
+            unfinished_freshness=tuple(unfinished),
         )
 
     @staticmethod

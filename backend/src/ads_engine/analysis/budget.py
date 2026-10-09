@@ -103,6 +103,8 @@ from ads_engine.analysis.context import (
     SubjectKey,
     TestResult,
     Withheld,
+    google_link_gap,
+    no_crm_link_flag,
 )
 from ads_engine.analysis.metrics import (
     B2_THRESHOLD_KEYS,
@@ -681,22 +683,6 @@ class BudgetCrm:
         return cls(scope, veto.eligible_contacts, veto.ql, tuple(flags))
 
 
-def _google_link_gap(ctx: AnalysisContext) -> str | None:
-    """Why Google subjects have no CRM link, or ``None`` when the link is verified (AAP 0.3.3)."""
-    crm = ctx.google_crm
-    if crm is None:
-        return "no active HubSpot dataset"
-    link = crm.bindings.google
-    if link.available:
-        return None
-    return link.reason or "the Google-to-CRM link is not verified"
-
-
-def _no_crm_link_flag(reason: str) -> Flag:
-    """The ``no_crm_link`` flag of a Google item."""
-    return Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")
-
-
 def _population_flags(population: VetoPopulation) -> tuple[Flag, ...]:
     """The flags explaining why a population's counts cannot be fully trusted.
 
@@ -757,9 +743,9 @@ def budget_crm(ctx: AnalysisContext, subject: SubjectKey) -> BudgetCrm:
         source = "google"
     scope: CrmScope = "linkedin" if source == "linkedin" else "google"
     if scope == "google":
-        gap = _google_link_gap(ctx)
+        gap = google_link_gap(ctx)
         if gap is not None:
-            return BudgetCrm(None, None, None, (_no_crm_link_flag(gap),))
+            return BudgetCrm(None, None, None, (no_crm_link_flag(gap),))
     population = (
         attribution_for(ctx).veto.get(subject_id)
         if subject_type == "campaign"
@@ -2008,7 +1994,7 @@ def _findings(ctx: AnalysisContext, result: RuleResult) -> tuple[Finding, ...]:
     computed for budget cards, and a LinkedIn-derived subset never stands in.
     """
     flagged = sum(1 for item in result.candidates if item.has_flag(FLAG_NO_CRM_LINK))
-    gap = _google_link_gap(ctx)
+    gap = google_link_gap(ctx)
     if not flagged or gap is None:
         return ()
     return (

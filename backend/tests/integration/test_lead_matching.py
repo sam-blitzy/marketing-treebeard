@@ -1409,10 +1409,11 @@ async def test_activation_swaps_matching_state_atomically(harness: Harness) -> N
     """Staged CRM recovery: one activation swaps the matching state; no lead is reset.
 
     Once every building row is attempted and each ``hubspot.*`` freshness row is
-    ``complete`` (or ``incomplete`` with a reason), the build is ready. One transaction
-    activates it and retires the simulated dataset with its matches: the active dataset
-    then has no ``pending`` row, its rows are exactly those its build wrote, and the retired
-    rows still exist unchanged until the purge.
+    ``complete`` (or ``incomplete`` with a reason that is no unread work, from a successful
+    latest attempt), the build is ready. One transaction activates it and retires the
+    simulated dataset with its matches: the active dataset then has no ``pending`` row, its
+    rows are exactly those its build wrote, and the retired rows still exist unchanged until
+    the purge.
     """
     setup = await _staged_recovery(harness)
     building = await _begin_live_build(harness, setup)
@@ -1989,9 +1990,11 @@ async def test_unplaceable_leads_fail_the_attempt_and_keep_the_cursor(harness: H
         row.completeness,
         row.reason,
     ) == (later, later, later.date(), "complete", None)
+    # A ``sync_run`` row starts when its job started, on the controller's clock (still at T0
+    # here); the run's ``now`` (``later``) anchors the range and the freshness row above.
     assert await _lead_runs(harness.sessions) == [
         ("failed", reason, T0),
-        ("succeeded", None, later),
+        ("succeeded", None, T0),
     ]
 
 

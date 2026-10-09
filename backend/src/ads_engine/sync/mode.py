@@ -17,9 +17,13 @@ Access denied       401/403 (LinkedIn: 401 after one token refresh), or a Google
                     reason.
 Transient           429, 5xx, timeout, ``RESOURCE_EXHAUSTED``, call budget: the
                     affected datasets turn stale and keep their last good data. Never
-                    mock.
+                    mock. A probe that meets only these
+                    (:meth:`SourceModeController.ensure_dataset`) turns the source
+                    ``stale``: no fallback, the active dataset kept.
 Defect              400, GAQL ``QueryError``, validation: the job fails. No mock, no
-                    retry.
+                    retry. A probe that meets one and no denial
+                    (:meth:`SourceModeController.ensure_dataset`) fails the same way:
+                    status ``error``, logged with the query id, no fallback.
 ==================  ================================================================
 
 Modes (``DATA_MODE``):
@@ -40,9 +44,12 @@ State of record. ``source_connection`` holds each source's resolved mode, health
 ``mode='simulated', status='denied'`` under ``DATA_MODE=auto`` with credentials present:
 only such a source gets recovery probes (every 30 minutes, driven by the scheduler), and the
 ``denied`` status is sticky while it lasts (activation of the fallback dataset and transient
-errors on simulated data do not clear it). ``source_dataset`` holds the data itself:
-switching mode always means building, backfilling and atomically activating a new dataset
-(``sync/datasets.py``); until then the previous dataset stays active and labelled.
+errors on simulated data do not clear it). Every probe, the scheduler's recovery probes and
+the probes of :meth:`SourceModeController.ensure_dataset` alike, is recorded as a ``probe``
+``sync_run`` whose start spaces the source's next probe by :data:`PROBE_INTERVAL`.
+``source_dataset`` holds the data itself: switching mode always means building, backfilling
+and atomically activating a new dataset (``sync/datasets.py``); until then the previous
+dataset stays active and labelled.
 
 Import direction: ``sync/jobs.py`` imports this module, so the backfill is reached through
 one deferred import inside the build that :meth:`SourceModeController.build_dataset` runs.
@@ -57,6 +64,7 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -68,13 +76,19 @@ from typing import Final, Literal, get_args
 
 import httpx
 from pydantic import SecretStr
-from sqlalchemy import Row, select, text, update
+from sqlalchemy import Row, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.analysis.thresholds import ConfigError, CrmBindings, Thresholds
-from ads_engine.connectors.errors import AccessDenied, ConnectorError, QueryDefect, TransientError
+from ads_engine.connectors.errors import (
+    AccessDenied,
+    ConnectorError,
+    ErrorKind,
+    QueryDefect,
+    TransientError,
+)
 from ads_engine.connectors.google_n8n.client import (
     SIMULATED_SECRET,
     SIMULATED_WEBHOOK_URL,
@@ -96,8 +110,12 @@ from ads_engine.db.models.ops import (
     DATASET_ROLES,
     DATASET_STATES,
     MODES,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCEEDED,
     SourceConnection,
     SourceDataset,
+    SyncRun,
 )
 from ads_engine.db.session import get_sessionmaker
 from ads_engine.logging import get_logger
@@ -112,7 +130,9 @@ __all__ = [
     "ABANDONED_BUILD_AFTER",
     "BOOTSTRAP_ORDER",
     "CONNECTION_STATUSES",
+    "JOB_PROBE",
     "LINKEDIN_RETENTION_DAYS",
+    "PROBE_INTERVAL",
     "REASON_FORCED",
     "REASON_LIVE",
     "REASON_NO_CREDENTIALS",
@@ -165,6 +185,19 @@ call, so a younger one may still be in progress in another process (the CLI's
 
 LINKEDIN_RETENTION_DAYS: Final = 180
 """LinkedIn's 6-month daily retention, the cap on every source's backfill (AAP 0.2.4, 0.3.2)."""
+
+PROBE_INTERVAL: Final = timedelta(minutes=30)
+"""The least time between two probes of a source (AAP 0.3.2: the recovery probe runs every 30
+minutes while a source is in automatic fallback).
+
+Every probe is recorded as a :data:`JOB_PROBE` ``sync_run`` whose ``started_at`` spaces the
+next one: the scheduler's recovery probes and the probes
+:meth:`SourceModeController.ensure_dataset` runs alike, so a fallback entered by a probe gets
+its first recovery probe 30 minutes later, and each probe spends live calls (on Google, the
+developer-token quota other n8n workflows share) at most once per interval."""
+
+JOB_PROBE: Final = "probe"
+"""The ``sync_run.job`` of every probe; its ``started_at`` spaces the probes."""
 
 ErrorDisposition = Literal["switched_to_simulated", "stale", "defect", "ignored"]
 """What :meth:`SourceModeController.on_error` decided for one classified connector error."""
@@ -255,7 +288,7 @@ class ResolvedMode:
 
 @dataclass(frozen=True, slots=True)
 class ProbeCheck:
-    """One capability check of a recovery probe.
+    """One capability check of a probe.
 
     Attributes:
         name: What was checked, for example ``Q-G1`` or ``leadFormResponses 123``.
@@ -263,17 +296,30 @@ class ProbeCheck:
         reason: The classified error's reason when it failed; ``None`` when it passed.
         endpoint: The failing call's endpoint, from the classified error (its contract
             surface name); ``None`` for a passing check or a configuration check.
+        kind: The classification of the error that failed the check: ``access_denied``,
+            ``transient`` (a listing cut short by a transient error included) or
+            ``defect``. ``None`` for a passing check or a configuration check (forced
+            simulation, missing credentials, no ad account), which sends no request.
+        query_id: The failing request's query id (``Q-G1``) when the error is a defect that
+            carries one; ``None`` otherwise.
     """
 
     name: str
     ok: bool
     reason: str | None = None
     endpoint: str | None = None
+    kind: ErrorKind | None = None
+    query_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ProbeReport:
     """The result of one probe of a source's full capability set (AAP 0.3.3 "Probe set").
+
+    A failed probe is acted on by the classification of its failed checks: a :attr:`denial`
+    switches the source to simulated data, else a :attr:`defect` fails without mock data,
+    else (transient failures only) the source turns stale with no fallback and no mock data
+    (:meth:`SourceModeController.ensure_dataset`).
 
     Attributes:
         source: The source probed.
@@ -335,6 +381,32 @@ class ProbeReport:
             if not check.ok:
                 return check.endpoint
         return None
+
+    @property
+    def denial(self) -> ProbeCheck | None:
+        """The first check that failed with an access denial, or ``None``.
+
+        One denied check is enough to switch the whole source to simulated data, whatever
+        the other checks returned (AAP 0.3.3 "Granularity").
+        """
+        return self._first_failed("access_denied")
+
+    @property
+    def defect(self) -> ProbeCheck | None:
+        """The first check that failed with a defect (400, ``QueryError``, validation), or None."""
+        return self._first_failed("defect")
+
+    def _first_failed(self, kind: ErrorKind) -> ProbeCheck | None:
+        """Return the first failed check classified ``kind``, or ``None``."""
+        for check in self.checks:
+            if not check.ok and check.kind == kind:
+                return check
+        return None
+
+
+_NOTHING_CHECKED: Final = ProbeCheck(JOB_PROBE, False, "no capability was checked")
+"""The deciding check of a failed probe whose report holds no check at all: nothing verified
+access and nothing refused it, so it gets the Transient consequence, never a fallback."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,14 +664,15 @@ def _awaits_matching(readiness: Readiness) -> bool:
     """Whether a build that is not ready falls short only by lead matches not yet attempted.
 
     Such a build settles again: its pending rows were staged after the settle attempted the
-    earlier ones. A freshness shortfall, an unstaged lead or a missing CRM dataset is not
-    cured by another round, so it ends the build.
+    earlier ones. A freshness shortfall (an unfinished backfill included), an unstaged lead
+    or a missing CRM dataset is not cured by another round, so it ends the build.
     """
     assessed = (readiness,) if readiness.companion is None else (readiness, readiness.companion)
     if any(
         part.missing_freshness
         or part.unknown_freshness
         or part.incomplete_without_reason
+        or part.unfinished_freshness
         or part.unstaged_leads
         for part in assessed
     ):
@@ -620,6 +693,32 @@ def _own_crm_dataset(source: Source, dataset_id: int, companion_id: int | None) 
 def _utcnow() -> datetime:
     """Return the current instant in UTC."""
     return datetime.now(UTC)
+
+
+def _later(stored: datetime | None, instant: datetime) -> datetime:
+    """Return the later of a stored instant and a new one, so the stored one never moves back."""
+    return instant if stored is None or stored < instant else stored
+
+
+def _established_mode(mode: str, active_dataset_id: int | None) -> Mode | None:
+    """The mode a ``source_connection`` row has established, or ``None`` when it has none.
+
+    Only an activation (``DatasetManager.activate``) stores ``live`` together with the
+    active dataset. A row created before any live access was verified (the live path of
+    :meth:`SourceModeController.resolve`, the default mode of a new row, the Google call
+    budget's first metered call) holds ``live`` with no active dataset: a placeholder, so no
+    mode transition reports it as the mode the source came from or went to.
+
+    Args:
+        mode: The row's stored mode.
+        active_dataset_id: The row's active dataset, if any.
+
+    Returns:
+        ``mode``, or ``None`` for a ``live`` row with no active dataset.
+    """
+    if mode == "live" and active_dataset_id is None:
+        return None
+    return _as_mode(mode)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -888,6 +987,37 @@ class SourceModeController:
 
     # -- source_connection -------------------------------------------------------------------
 
+    async def record_attempt(self, source: Source, attempted_at: datetime) -> None:
+        """Stamp ``source_connection.last_attempt_at`` for an attempt to call ``source``.
+
+        AAP 0.5.2 keeps source health current on every attempt. Every sync job attempt,
+        simulated or live and whatever its outcome, and every probe that sends live requests
+        calls this. The stamp commits in a transaction of its own, which locks only the
+        connection row: a caller must hold no ``source_dataset`` lock, since activation
+        locks the connection first. The stored instant never moves back: the later of the
+        stored and the given one is kept, so concurrent attempts settle on the latest.
+
+        Nothing else changes: no mode, status or reason, no transition is logged and no
+        ``analysis_request`` is queued. A missing row is created as
+        :meth:`_lock_connection` creates one, in the mode a new row starts with
+        (:meth:`_default_mode`).
+
+        Args:
+            source: The source the attempt calls.
+            attempted_at: When the attempt started, timezone-aware.
+
+        Raises:
+            ValueError: When ``source`` is unknown or ``attempted_at`` is naive.
+        """
+        checked = _as_source(source)
+        if attempted_at.tzinfo is None or attempted_at.utcoffset() is None:
+            raise ValueError("record_attempt needs a timezone-aware attempted_at")
+        async with self._transaction() as session:
+            row, _ = await self._lock_connection(
+                session, checked, insert_mode=self._default_mode(checked)
+            )
+            row.last_attempt_at = _later(row.last_attempt_at, attempted_at)
+
     async def _lock_connection(
         self, session: AsyncSession, source: Source, *, insert_mode: Mode
     ) -> tuple[SourceConnection, bool]:
@@ -941,7 +1071,9 @@ class SourceModeController:
             status: The health status to store (``ok``, ``stale``, ``denied``, ``error``);
                 kept when omitted.
             reason: The reason to store; kept when omitted.
-            attempted_at: Stored as ``last_attempt_at`` when given.
+            attempted_at: The instant of the failed call (or failed probe or build) this
+                write records; when given, it is stored as ``last_attempt_at`` and as
+                ``last_failure_at``, neither of which moves back.
             clear_denied: Replace a stored ``denied`` with ``ok``; used when the source
                 cannot be in fallback (forced simulation, no credentials).
             sticky_denied: Keep a stored ``denied`` of a simulated source instead of the new
@@ -1003,6 +1135,11 @@ class SourceModeController:
         with the change. A newly created row and a resolution that keeps the mode (a status or
         reason change only) queue nothing, so repeated resolutions never flood the queue.
 
+        Modes are compared as established (:func:`_established_mode`): a ``live`` row with no
+        active dataset never verified live access, so it counts as a row with no mode yet,
+        like a newly created one. Leaving the mode as it is (``mode`` omitted) never changes
+        it, so a status write on such a placeholder logs no mode change.
+
         Every transition is logged with its reason and ``endpoint``: ``sync.mode.change``
         when the mode changes, else ``sync.connection`` when the status or reason does. A
         degradation is a ``WARNING``: ``sync.mode.change`` to simulated from live or on a
@@ -1014,7 +1151,7 @@ class SourceModeController:
             raise ValueError(f"unknown connection status {status!r}")
         insert_mode: Mode = mode if not isinstance(mode, _Keep) else self._default_mode(source)
         row, created = await self._lock_connection(session, source, insert_mode=insert_mode)
-        previous_mode = None if created else row.mode
+        previous_mode = None if created else _established_mode(row.mode, row.active_dataset_id)
         previous_status = row.status
 
         new_mode = row.mode if isinstance(mode, _Keep) else mode
@@ -1037,13 +1174,19 @@ class SourceModeController:
         row.status = new_status
         row.reason = new_reason
         if attempted_at is not None:
-            row.last_attempt_at = attempted_at
+            # Successful attempts stamp last_attempt_at too (record_attempt), so the failure
+            # instant _reconcile_status judges a recovery by is kept on its own.
+            row.last_attempt_at = _later(row.last_attempt_at, attempted_at)
+            row.last_failure_at = _later(row.last_failure_at, attempted_at)
         await session.flush()
-        if previous_mode is not None and previous_mode != new_mode:
+        # This write never sets the active dataset, so a placeholder stays one.
+        to_mode = _established_mode(new_mode, row.active_dataset_id)
+        mode_changed = to_mode is not None and previous_mode != to_mode
+        if mode_changed and previous_mode is not None:
             await repositories.enqueue_analysis_request(session, reason=f"mode_changed:{source}")
 
-        if previous_mode != new_mode:
-            degraded = new_mode == "simulated" and (
+        if mode_changed:
+            degraded = to_mode == "simulated" and (
                 previous_mode == "live" or new_status == _STATUS_DENIED
             )
             log_change = _log.warning if degraded else _log.info
@@ -1051,7 +1194,7 @@ class SourceModeController:
                 "sync.mode.change",
                 source=source,
                 from_mode=previous_mode,
-                to_mode=new_mode,
+                to_mode=to_mode,
                 status=new_status,
                 reason=new_reason,
                 endpoint=endpoint,
@@ -1070,7 +1213,11 @@ class SourceModeController:
             )
 
     def _default_mode(self, source: Source) -> Mode:
-        """The mode a newly created connection row starts with, before anything is resolved."""
+        """The mode a newly created connection row starts with, before anything is resolved.
+
+        A ``live`` default establishes no mode: until an activation sets the row's active
+        dataset, no transition reports it (:func:`_established_mode`).
+        """
         return "live" if self._fallback_possible(source) else "simulated"
 
     async def _connection_reason(self, source: Source) -> str | None:
@@ -1138,9 +1285,11 @@ class SourceModeController:
         """Return a ``stale`` or ``error`` connection to ``ok`` once its data has caught up.
 
         AAP 0.5.2 keeps source health current on every attempt. A transient or defective
-        call marks the connection when it fails (:meth:`on_error`); this clears the mark
-        once every freshness row of the active primary has succeeded at or after that
-        failure and no later attempt of it has failed. ``denied`` is never cleared here.
+        call marks the connection when it fails (:meth:`on_error`) and records that instant
+        as ``last_failure_at``; this clears the mark once every freshness row of the active
+        primary has succeeded at or after that failure and no later attempt of it has
+        failed. ``last_attempt_at`` is not the failure instant: successful attempts move it
+        too. ``denied`` is never cleared here.
         """
         async with self._transaction() as session:
             row = await session.scalar(
@@ -1151,7 +1300,7 @@ class SourceModeController:
             rows = await freshness.load_freshness(session, active.id)
             if not rows:
                 return
-            failed_at = row.last_attempt_at
+            failed_at = row.last_failure_at
             for entry in rows.values():
                 succeeded = entry.last_success_at
                 if succeeded is None:
@@ -1300,11 +1449,17 @@ class SourceModeController:
         * HubSpot: a one-email contacts batch read, a one-result deals search and a
           one-input associations read (``HubSpotClient.probe``).
 
-        Each check catches only classified connector errors, and a LinkedIn listing cut short
-        by a transient error fails its check. Partial success (for example LinkedIn ads
-        readable while Lead Sync returns 403) is a failed probe and changes nothing, so a
-        source never flips back and forth. Under ``DATA_MODE=simulated``, or without
-        credentials, no request is sent and the report fails with that reason.
+        Each check catches only classified connector errors and records their
+        classification (:attr:`ProbeCheck.kind`) and a defect's query id, and a LinkedIn
+        listing cut short by a transient error fails its check as transient. The probe acts
+        on no verdict: :meth:`ensure_dataset` and :meth:`recover` act on the report. Partial
+        success (for example LinkedIn ads readable while Lead Sync returns 403) is a failed
+        probe, so a source never flips back and forth. Under ``DATA_MODE=simulated``, or
+        without credentials, no request is sent and the report fails with that reason. A
+        probe that sends live requests is an attempt to call the source, whatever its
+        verdict: its start is stamped as ``source_connection.last_attempt_at``
+        (:meth:`record_attempt`) before the first request goes out, and that stamp is the
+        only write the probe itself makes.
 
         The verdict is logged as ``sync.probe`` with the first failing check's endpoint: a
         ``WARNING`` when live calls were sent and a check failed, else ``INFO`` (a passing
@@ -1324,6 +1479,7 @@ class SourceModeController:
             checks = (ProbeCheck("credentials", False, REASON_NO_CREDENTIALS),)
         else:
             sent = True
+            await self.record_attempt(checked, self.now())
             async with self.open_clients(checked, "live") as clients:
                 match checked:
                     case "google":
@@ -1352,7 +1508,7 @@ class SourceModeController:
         try:
             await google.run_query("Q-G1")
         except ConnectorError as exc:
-            return (ProbeCheck("Q-G1", False, exc.reason, exc.endpoint),)
+            return (_failed_check("Q-G1", exc),)
         return (ProbeCheck("Q-G1", True),)
 
     async def _probe_linkedin(self, clients: SourceClients) -> tuple[ProbeCheck, ...]:
@@ -1367,7 +1523,7 @@ class SourceModeController:
             try:
                 await linkedin.get_ad_account(account)
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
+                checks.append(_failed_check(name, exc))
             else:
                 checks.append(ProbeCheck(name, True))
 
@@ -1377,7 +1533,7 @@ class SourceModeController:
                     account, (yesterday, yesterday), expected_creatives=1
                 )
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
+                checks.append(_failed_check(name, exc))
             else:
                 checks.append(_listing_check(name, analytics.interrupted_by))
 
@@ -1385,7 +1541,7 @@ class SourceModeController:
             try:
                 forms = await linkedin.list_lead_forms(account, page_size=1, max_pages=1)
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
+                checks.append(_failed_check(name, exc))
             else:
                 checks.append(_listing_check(name, forms.interrupted_by))
 
@@ -1395,7 +1551,7 @@ class SourceModeController:
                     account, submitted, known_versions={}, page_size=1, max_pages=1
                 )
             except ConnectorError as exc:
-                checks.append(ProbeCheck(name, False, exc.reason, exc.endpoint))
+                checks.append(_failed_check(name, exc))
             else:
                 checks.append(_listing_check(name, responses.interrupted_by))
         if not checks:
@@ -1409,7 +1565,7 @@ class SourceModeController:
         try:
             await hubspot.probe()
         except ConnectorError as exc:
-            return (ProbeCheck("crm", False, exc.reason, exc.endpoint),)
+            return (_failed_check("crm", exc),)
         return (ProbeCheck("crm", True),)
 
     # -- error consequences ------------------------------------------------------------------
@@ -1518,6 +1674,66 @@ class SourceModeController:
             **fields,
         )
         return "defect"
+
+    async def _record_probe_failure(
+        self, source: Source, check: ProbeCheck, *, disposition: Literal["defect", "stale"]
+    ) -> None:
+        """Apply the Defect or the Transient consequence to a failed probe that met no denial.
+
+        AAP 0.3.3 fallback table: a defect (row 4) fails the probe, logged with its query id,
+        with no mock and no retry; transient failures (row 3), after their 3 attempts, turn
+        the source stale, keep its last good data and never mock. Either way the source
+        neither enters automatic fallback nor gets simulated data: its mode and
+        ``access_generation`` stay, and its active dataset, if any, is left untouched.
+        ``source_connection`` records the status (``error`` for ``defect``, ``stale`` for
+        ``stale``), the attempt, and ``"<check>: <reason>"`` (the failing check, its endpoint
+        and, for a Google defect, the query id) as the reason: the probe's verdict is why
+        live data is not active, whatever reason the stored row held before a probe ran
+        (``credentials not configured`` until credentials were added). A row in automatic
+        fallback keeps its ``denied`` status and denial reason, as :meth:`on_error` keeps
+        them. The classification is logged as ``sync.classification`` with ``disposition``,
+        at the level :meth:`on_error` logs it at (error for a defect, warning for stale), with
+        the check, its ``endpoint`` and ``query_id``, and ``job`` :data:`JOB_PROBE`.
+
+        Args:
+            source: The probed source.
+            check: The deciding check: the first that failed with a defect for ``defect``,
+                the first failing check for ``stale``.
+            disposition: ``defect`` or ``stale``, the consequence applied.
+        """
+        defect = disposition == "defect"
+        reason = _check_reason(check)
+        async with self._transaction() as session:
+            row, _ = await self._lock_connection(
+                session, source, insert_mode=self._default_mode(source)
+            )
+            fallback = row.mode == "simulated" and row.status == _STATUS_DENIED
+            await self._record_connection(
+                source,
+                status=_STATUS_ERROR if defect else _STATUS_STALE,
+                reason=_KEEP if fallback else reason,
+                attempted_at=self.now(),
+                sticky_denied=True,
+                endpoint=check.endpoint,
+                session=session,
+            )
+        fields: dict[str, object] = {
+            "error_kind": check.kind,
+            "source": source,
+            "error_source": source,
+            "endpoint": check.endpoint,
+            "query_id": check.query_id,
+            "reason": _truncate(reason),
+            "check": check.name,
+            "job": JOB_PROBE,
+            "dataset_id": None,
+            "datasets": [],
+        }
+        if defect:
+            # As on_error logs a defect; a probe check's defect is never of an unexpected kind.
+            fields["unexpected_kind"] = False
+        log_classification = _log.error if defect else _log.warning
+        log_classification("sync.classification", disposition=disposition, **fields)
 
     async def _context_mode(self, source: Source, dataset_id: int | None) -> Mode:
         """The mode of the data a failed call was serving.
@@ -1981,14 +2197,15 @@ class SourceModeController:
     @staticmethod
     async def _lock_connections(
         session: AsyncSession, sources: Sequence[Source]
-    ) -> Sequence[Row[str, str, str, int]]:
+    ) -> Sequence[Row[str, str, str, int, int | None]]:
         """Lock the existing ``source_connection`` rows of ``sources``, in source order.
 
         Rows are locked in one fixed order (``ORDER BY source``), so two transactions taking
         overlapping sets never deadlock. A missing row is not created.
 
         Returns:
-            Each locked row's ``source``, ``mode``, ``status`` and ``access_generation``.
+            Each locked row's ``source``, ``mode``, ``status``, ``access_generation`` and
+            ``active_dataset_id``.
         """
         result = await session.execute(
             select(
@@ -1996,6 +2213,7 @@ class SourceModeController:
                 SourceConnection.mode,
                 SourceConnection.status,
                 SourceConnection.access_generation,
+                SourceConnection.active_dataset_id,
             )
             .where(SourceConnection.source.in_(sources))
             .order_by(SourceConnection.source)
@@ -2044,6 +2262,11 @@ class SourceModeController:
            ``status='ok'``; a simulated dataset activated while the source is in automatic
            fallback keeps ``denied``, or recovery probes would stop. Both writes share the
            transaction, so no reader sees the gap.
+
+        Once committed, an activation that changes the source's established mode logs
+        ``sync.mode.change`` with the dataset's reason. A row this activation created, and a
+        ``live`` row with no active dataset (:func:`_established_mode`), had no mode before
+        it, so a source's first live activation logs a change from none to ``live``.
         """
         locked_sources: tuple[Source, ...] = (
             _PAIRED_SOURCES if source in _PAIRED_SOURCES else (source,)
@@ -2132,8 +2355,13 @@ class SourceModeController:
                     .where(SourceConnection.source == source)
                     .values(status=_STATUS_DENIED)
                 )
-        # A row created by this activation had no mode before it: the change is from none.
-        prior_mode = None if created is not None or prior is None else prior.mode
+        # A row created by this activation had no mode before it, and a live row with no
+        # active dataset only holds the mode a new row starts with: the change is from none.
+        prior_mode = (
+            None
+            if created is not None or prior is None
+            else _established_mode(prior.mode, prior.active_dataset_id)
+        )
         if prior_mode != mode:
             # An activation is no failing call, so the transition names no endpoint; switching
             # live data off is a degradation, every other activation a healthy change.
@@ -2515,8 +2743,34 @@ class SourceModeController:
         * an active primary of the resolved mode: nothing to build (``None``);
         * simulated resolved: build simulated with the resolution's reason;
         * live resolved: probe the full capability set first and build live only when it
-          passes. A failed probe enters automatic fallback with the failing check as reason
-          and builds simulated data when none is active.
+          passes. A failed probe is acted on by the classification of its failed checks
+          (AAP 0.3.3 fallback table):
+
+          - a denial on any check: automatic fallback, with that check as reason. The
+            fallback builds simulated data when none is active;
+          - else a defect (400, GAQL ``QueryError``, validation): the Defect consequence,
+            never a fallback. ``source_connection`` records ``status='error'`` with the
+            failing check as reason, the defect is logged with its query id, no simulated
+            data is built and ``None`` is returned;
+          - else (transient failures only: 429, 5xx, timeout, ``RESOURCE_EXHAUSTED``, call
+            budget, after their attempts, or a listing they cut short): the Transient
+            consequence, never a fallback and never mock. ``source_connection`` records
+            ``status='stale'`` with the first failing check as reason; the mode and the
+            ``access_generation`` stay, an active dataset stays active and untouched, no
+            dataset is built and ``None`` is returned.
+
+          Every such probe is recorded as a :data:`JOB_PROBE` ``sync_run`` started when the
+          probe starts and committed before it sends anything. It ends ``succeeded`` only
+          when the probe passed and the live dataset built from it activated, else
+          ``failed`` with the deciding check, or the build's reason, as error; a probe or
+          build that raises or is cancelled ends it ``failed`` too (best effort). Its
+          ``started_at`` spaces probes by :data:`PROBE_INTERVAL`: no probe runs while the
+          source's latest ``probe`` row (this method's or a scheduler recovery probe's) is
+          younger, and ``None`` is returned with nothing changed. A first start, and a
+          restart long after the last probe, probe at once; a fallback entered by a probe
+          gets its first recovery probe one interval later; a source left in the defect or
+          stale state still resolves live, outside the scheduler's recovery probes, and is
+          probed again here at most once per interval.
 
         Building primaries abandoned by a crashed build are discarded first, and a
         ``stale``/``error`` connection whose data has caught up returns to ``ok``.
@@ -2527,7 +2781,14 @@ class SourceModeController:
                 (``ads-engine seed-simulated``); an active simulated dataset is kept.
 
         Returns:
-            The build's outcome, or ``None`` when no build was needed.
+            The build's outcome, or ``None`` when no build was needed, the probe met a
+            defect or transient failures only, or the probe was not yet due.
+
+        Raises:
+            Exception: Any error of the probe or the live build, unchanged, once its
+                ``probe`` row was closed ``failed`` with the error's class name.
+            asyncio.CancelledError: Unchanged, once the ``probe`` row was closed ``failed``
+                with ``probe cancelled`` within ``jobs.CANCEL_CLOSE_TIMEOUT``.
         """
         return await self._ensure(
             _as_source(source), force_simulated=force_simulated, allow_live=True
@@ -2536,7 +2797,12 @@ class SourceModeController:
     async def _ensure(
         self, source: Source, *, force_simulated: bool, allow_live: bool
     ) -> BuildOutcome | None:
-        """Run :meth:`ensure_dataset`; ``allow_live=False`` after a failed live build."""
+        """Run :meth:`ensure_dataset`; ``allow_live=False`` after a failed live build.
+
+        With ``allow_live=False`` nothing is probed, so no ``probe`` row is written: the
+        fallback that follows a failed live build or a denied probe builds simulated data
+        only, under the row of the probe that preceded it.
+        """
         await self._discard_abandoned_builds(source)
         resolved = await self.resolve(source)
         if force_simulated and resolved.mode == "live":
@@ -2551,18 +2817,186 @@ class SourceModeController:
             # Unreachable after _enter_fallback (the source then resolves simulated); kept so
             # a failed live build can never recurse into another one.
             return None
+        started = self.now()
+        last_probe = await self._probe_started_since(source, started - PROBE_INTERVAL)
+        if last_probe is not None:
+            # Probes are spaced like the scheduler's recovery probes: a source left in the
+            # defect or stale state resolves live again on every 30-second wake.
+            _log.debug(
+                "sync.probe.spaced",
+                source=source,
+                last_probe_at=last_probe.isoformat(),
+                next_probe_at=(last_probe + PROBE_INTERVAL).isoformat(),
+            )
+            return None
         # Read before the probe: a denial recorded while the probe or the build runs voids
         # the build, so a live dataset activates only on access verified after the last one.
         generation = await self._access_generation(source)
+        run_id = await self._open_probe_run(source, started)
+        try:
+            return await self._probe_and_build(source, active, generation, run_id)
+        except asyncio.CancelledError:
+            # Also a cancellation that lands in a close, whose transaction rolled back.
+            await self._close_cancelled_probe_run(source, run_id)
+            raise
+        except Exception as exc:
+            await self._close_probe_run_quietly(run_id, error=type(exc).__name__)
+            raise
+
+    async def _probe_and_build(
+        self, source: Source, active: _DatasetRef | None, generation: int, run_id: int
+    ) -> BuildOutcome | None:
+        """Probe a source resolved live, act on the verdict, and close its ``probe`` row.
+
+        Args:
+            source: The source, resolved live with no active live dataset.
+            active: Its active primary dataset (simulated), or ``None``.
+            generation: The ``access_generation`` read before the probe; the live build is
+                bound to it.
+            run_id: The probe's open ``sync_run`` row.
+
+        Returns:
+            The live build's outcome (for a failed live build, the simulated build that
+            followed it), the simulated build of a denial's fallback when no dataset was
+            active, or ``None`` (a fallback with a dataset active, a defect, or transient
+            failures only).
+        """
         report = await self.probe(source)
         if not report.passed:
-            await self._enter_fallback(
-                source, report.reason or "live probe failed", endpoint=report.endpoint
-            )
+            denial = report.denial
+            defect = report.defect
+            failed = report.failed
+            # Precedence: a denial decides over every other failure, with its own code and
+            # endpoint as the reason, whichever check failed first (AAP 0.3.3 fallback table,
+            # row 2; "Granularity"). Else a defect decides, else the first failing check: a
+            # transient one, since every check of a live probe sends its request.
+            if denial is not None:
+                deciding = denial
+            elif defect is not None:
+                deciding = defect
+            else:
+                deciding = failed[0] if failed else _NOTHING_CHECKED
+            reason = _check_reason(deciding)
+            await self._close_probe_run(run_id, SYNC_RUN_FAILED, error=reason)
+            if denial is None:
+                # A defect is the product's own fault and a transient failure a passing
+                # outage, not unavailable access: no fallback, no mock. The source keeps its
+                # mode and still resolves live, so its next probe runs here one
+                # PROBE_INTERVAL after this one (AAP 0.3.3 fallback table, rows 3 and 4).
+                await self._record_probe_failure(
+                    source, deciding, disposition="defect" if defect is not None else "stale"
+                )
+                return None
+            await self._enter_fallback(source, reason, endpoint=denial.endpoint)
             if active is None:
                 return await self._ensure(source, force_simulated=False, allow_live=False)
             return None
-        return await self._build(source, "live", reason=REASON_LIVE, generation=generation)
+        outcome = await self._build(source, "live", reason=REASON_LIVE, generation=generation)
+        if outcome.activated and outcome.mode == "live":
+            await self._close_probe_run(run_id, SYNC_RUN_SUCCEEDED)
+        else:
+            await self._close_probe_run(
+                run_id, SYNC_RUN_FAILED, error=outcome.reason or "live dataset was not activated"
+            )
+        return outcome
+
+    async def _probe_started_since(self, source: Source, after: datetime) -> datetime | None:
+        """Return the latest ``started_at`` of ``source``'s ``probe`` rows later than ``after``.
+
+        Every probe's row counts, whatever its status and whoever wrote it: this controller's
+        (:meth:`ensure_dataset`) and the scheduler's recovery probes. Bounding the read by
+        ``after`` keeps it to the recent end of the ``(source, started_at)`` index however
+        long ``sync_run`` grows.
+
+        Returns:
+            That instant, or ``None`` when no probe started after ``after``.
+        """
+        async with self._transaction() as session:
+            latest: datetime | None = await session.scalar(
+                select(func.max(SyncRun.started_at)).where(
+                    SyncRun.source == source,
+                    SyncRun.job == JOB_PROBE,
+                    SyncRun.started_at > after,
+                )
+            )
+        return latest
+
+    async def _open_probe_run(self, source: Source, started: datetime) -> int:
+        """Insert and commit a ``running`` ``probe`` ``sync_run`` row; return its id.
+
+        The row is committed before the probe sends anything, so it spaces the next probe
+        (here and in the scheduler) even when the probe or its build never ends normally. A
+        cancellation that lands once the row has its id (in the commit, which may or may not
+        have reached the server) closes it as cancelled before it propagates; one that lands
+        earlier rolls the insert back.
+        """
+        run_id: int | None = None
+        try:
+            async with self._transaction() as session:
+                row = SyncRun(
+                    source=source,
+                    job=JOB_PROBE,
+                    dataset=None,
+                    started_at=started,
+                    status=SYNC_RUN_RUNNING,
+                )
+                session.add(row)
+                await session.flush()
+                run_id = row.id
+            return run_id
+        except asyncio.CancelledError:
+            if run_id is not None:
+                await self._close_cancelled_probe_run(source, run_id)
+            raise
+
+    async def _close_probe_run(self, run_id: int, status: str, *, error: str | None = None) -> None:
+        """Close a still-``running`` ``probe`` row; a row a committed close ended is kept.
+
+        ``status`` is ``succeeded`` (the probe passed and the live dataset built from it
+        activated) or ``failed``, with ``error`` cut to the stored length.
+        """
+        async with self._transaction() as session:
+            await session.execute(
+                update(SyncRun)
+                .where(SyncRun.id == run_id, SyncRun.status == SYNC_RUN_RUNNING)
+                .values(
+                    status=status,
+                    finished_at=self.now(),
+                    error=None if error is None else _truncate(error),
+                )
+                .execution_options(synchronize_session=False)
+            )
+
+    async def _close_probe_run_quietly(self, run_id: int, *, error: str) -> None:
+        """Close a ``probe`` row ``failed`` while another error propagates.
+
+        A database error doing so is logged as ``sync.probe.close_failed``, never raised in
+        place of the error that ended the probe.
+        """
+        try:
+            await self._close_probe_run(run_id, SYNC_RUN_FAILED, error=error)
+        except SQLAlchemyError as exc:
+            _log.error("sync.probe.close_failed", run_id=run_id, error=type(exc).__name__)
+
+    async def _close_cancelled_probe_run(self, source: Source, run_id: int) -> None:
+        """Log ``sync.probe.cancelled`` and close the probe's row as cancelled, bounded.
+
+        The scheduler waits a bounded time for cancelled work after losing its lock, so this
+        bookkeeping is abandoned after ``jobs.CANCEL_CLOSE_TIMEOUT``, the bound the scheduler
+        checks its own stop timeout against, or at once when it fails, and logged as
+        ``sync.probe.close_failed``; a further cancellation propagates at once. Only a row
+        still ``running`` is closed: ``failed`` with ``probe cancelled``.
+        """
+        # Deferred import: sync/jobs.py imports this module at its top (see _build).
+        from ads_engine.sync.jobs import CANCEL_CLOSE_TIMEOUT
+
+        _log.warning("sync.probe.cancelled", source=source, run_id=run_id)
+        try:
+            async with asyncio.timeout(CANCEL_CLOSE_TIMEOUT.total_seconds()):
+                await self._close_probe_run_quietly(run_id, error="probe cancelled")
+        except TimeoutError as exc:
+            # Best effort: the cancellation must end the probe within the lock-loss bound.
+            _log.error("sync.probe.close_failed", run_id=run_id, error=type(exc).__name__)
 
     async def recover(self, source: Source) -> BuildOutcome | None:
         """Try to bring a source in automatic fallback back to live data.
@@ -2574,7 +3008,8 @@ class SourceModeController:
         dataset stays active. A partial success changes nothing. The build is bound to the
         ``access_generation`` read before the probe, so a denial or fallback entry recorded
         meanwhile by any controller voids it: promotion always follows a full probe that
-        passed after the latest denial.
+        passed after the latest denial. It writes no ``probe`` ``sync_run`` itself: the
+        scheduler records each call as one, which also spaces it.
 
         Args:
             source: The source.
@@ -2632,11 +3067,29 @@ class SourceModeController:
 def _listing_check(name: str, interrupted_by: TransientError | None) -> ProbeCheck:
     """Turn a probe listing into a check: a listing cut short by a transient error fails.
 
-    A one-page probe listing is normally incomplete ("page limit"); that is a pass.
+    A one-page probe listing is normally incomplete ("page limit"); that is a pass. A cut-short
+    listing fails as ``transient``, the kind of the error that interrupted it.
     """
     if interrupted_by is not None:
-        return ProbeCheck(name, False, interrupted_by.reason, interrupted_by.endpoint)
+        return _failed_check(name, interrupted_by)
     return ProbeCheck(name, True)
+
+
+def _check_reason(check: ProbeCheck) -> str:
+    """Return a failed check as ``"<name>: <reason>"``, the form :attr:`ProbeReport.reason` uses."""
+    return f"{check.name}: {check.reason}" if check.reason else check.name
+
+
+def _failed_check(name: str, error: ConnectorError) -> ProbeCheck:
+    """Return the failed check ``name`` with ``error``'s reason, endpoint, kind and query id."""
+    return ProbeCheck(
+        name,
+        False,
+        error.reason,
+        error.endpoint,
+        kind=error.kind,
+        query_id=error.query_id if isinstance(error, QueryDefect) else None,
+    )
 
 
 # ---------------------------------------------------------------------------------------------

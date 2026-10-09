@@ -13,7 +13,7 @@ never leave its rows ``running``. On ``asyncio.CancelledError``, ``_JobBase.run`
 * **Bounded bookkeeping**: a close that hangs is abandoned after ``CANCEL_CLOSE_TIMEOUT`` and
   one that fails at once is abandoned too; both are logged as ``sync.job.close_failed``.
 * **One finish**: after the close, logs the run's one ``sync.job.finish``, as every run does,
-  with status ``cancelled`` and error ``CancelledError``.
+  with status ``cancelled``, error ``job cancelled`` and error type ``CancelledError``.
 * **Cancellation wins**: the cancellation is always re-raised, and a second cancellation while
   the rows are being closed propagates at once.
 
@@ -260,7 +260,8 @@ async def test_cancelled_job_closes_its_rows_as_failed(
         "completeness": "unknown",
         "datasets": {},
         "disposition": None,
-        "error": "CancelledError",
+        "error": _CANCELLED,
+        "error_type": "CancelledError",
     }
     duration_ms = finish["duration_ms"]
     assert isinstance(duration_ms, int)

@@ -415,6 +415,10 @@ throughout.
     a recorded reason, and never `unknown`. The required rows are `hubspot.contacts`,
     `hubspot.associations` and `hubspot.deal_search`, plus `hubspot.google_contacts` for a
     primary whose Google link is verified;
+  - the backfill completed, as for every source: no required row is `incomplete` with unread
+    work (an `interrupted` read), and the latest attempt of each required row succeeded. A
+    permanent shortfall, such as a search partition read up to its result ceiling, is
+    accepted;
   - for a simulated LinkedIn dataset, its companion is ready too.
 - **Activation** (`DatasetManager.activate`): one transaction, serialised on the source's
   `source_connection` row, activates the building dataset (with its companion) and retires
@@ -924,10 +928,13 @@ seeded simulated portal (`MOCK_SEED`, default `42`).
   transient error cut short, and `sync.classification`. `sync.classification` is the sync
   layer's one record of the error: `on_error` in `sync/mode.py` logs it with the
   disposition (`ignored`, `switched_to_simulated`, `stale` or `defect`) and, for a sync
-  job, the job's name. A job's outcome is its one `sync.job.finish`, whose `disposition` is
-  the classification of the last error the job handed to `on_error`, and whose `error`
-  holds only the class name of an exception the run raised, never its text. A connector
-  error goes to `on_error` and is not raised, so it leaves `error` null.
+  job, the job's name. A job's outcome is its one `sync.job.finish`, logged at `error` level
+  when the job failed (`warning` when it was cancelled, `info` when it succeeded). Its
+  `disposition` is the classification of the last error the job handed to `on_error`; its
+  `error` is the sanitized failure text the job's failed `sync_run` rows record (a connector
+  error's `reason`), never an unexpected exception's own text; its `error_type` is the class
+  name of the exception that ended the job (the connector error handed to `on_error`, or one
+  the run raised), null when none did.
 - `reason` holds HubSpot's error message only after `sanitize_message`: emails become
   `[REDACTED_EMAIL]`; configured secrets, `Bearer` tokens and credential assignments become
   `[REDACTED]`; the message is cut to 300 characters inside a `reason` of at most 500.

@@ -15,7 +15,11 @@ test's docstring names the guarantee it proves:
   an earlier committed completion of the same job as it committed.
 * **Logging points** (AAP 0.11.1): ``sync.job.start`` and exactly one ``sync.job.finish`` per
   run, both with source, job, rows, calls and duration, on success, on an unexpected error
-  (re-raised unchanged) and on cancellation (re-raised, the open rows closed failed).
+  (re-raised unchanged) and on cancellation (re-raised, the open rows closed failed); a failed
+  job's finish is at error level with the failure text its ``sync_run`` rows record (a
+  defect's names its query id) and the error's class, a persistent outage's included.
+* **Job starts** (AAP 0.5.2): each job's ``sync_run`` rows start when that job started, on the
+  controller's clock, while the run's ``now`` anchors the freshness attempts.
 * **Stand-alone matching** (AAP 0.5.1): a ``LeadMatchJob`` pass that attempts rows in an active
   CRM dataset queues one request; an inactive pass, or one with nothing due, queues none.
 
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import itertools
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -52,8 +57,8 @@ from ads_engine.db.models import (
     SyncRun,
 )
 from ads_engine.settings import Source, get_settings
-from ads_engine.simulation.generator import SimulatedWorld
-from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW
+from ads_engine.simulation.generator import Fault, SimulatedWorld
+from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW, SCENARIOS
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.freshness import FreshnessOutcome
@@ -148,13 +153,27 @@ class Lab:
     sessions: Sessions
     world: SimulatedWorld
 
-    def controller(self, at: datetime) -> SourceModeController:
-        """A controller whose clock stands at ``at`` and whose clients never wait."""
+    def controller(
+        self,
+        at: datetime,
+        *,
+        world: SimulatedWorld | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> SourceModeController:
+        """A controller whose clock stands at ``at`` and whose clients never wait.
+
+        Args:
+            at: The fixed instant of its clock.
+            world: The world its simulated clients answer from; :attr:`world` when omitted.
+            clock: A clock read instead of the fixed instant (one that moves on).
+        """
         settings = get_settings()
         tick = [0.0]
 
-        def clock() -> datetime:
+        def fixed() -> datetime:
             return at
+
+        read = clock if clock is not None else fixed
 
         async def advance(seconds: float) -> None:
             tick[0] += seconds
@@ -162,9 +181,9 @@ class Lab:
         return SourceModeController(
             settings,
             sessionmaker=self.sessions,
-            world=self.world,
-            clock=clock,
-            budget=GoogleCallBudget(settings, sessionmaker=self.sessions, clock=clock),
+            world=world if world is not None else self.world,
+            clock=read,
+            budget=GoogleCallBudget(settings, sessionmaker=self.sessions, clock=read),
             retry=RetryPolicy(sleep=_no_sleep),
             hubspot_limiter=RateLimiter(4.0, clock=lambda: tick[0], sleep=advance),
         )
@@ -209,7 +228,12 @@ class Lab:
 
     @asynccontextmanager
     async def context(
-        self, source: Source, dataset_id: int, *, active: bool = True
+        self,
+        source: Source,
+        dataset_id: int,
+        *,
+        active: bool = True,
+        world: SimulatedWorld | None = None,
     ) -> AsyncIterator[jobs.JobContext]:
         """The context of ``dataset_id`` at :data:`T1` on simulated clients of ``source``.
 
@@ -217,8 +241,10 @@ class Lab:
             source: The dataset's source.
             dataset_id: The dataset the job writes.
             active: ``False`` gives the backfill's inactive context (``jobs._inactive``).
+            world: The world the clients answer from (one with a fault); :attr:`world` when
+                omitted.
         """
-        controller = self.controller(T1)
+        controller = self.controller(T1, world=world)
         async with controller.open_clients(source, "simulated") as clients:
             ctx = await jobs.JobContext.for_dataset(controller, dataset_id, clients, now=T1)
             yield ctx if active else jobs._inactive(ctx)
@@ -311,6 +337,25 @@ def lab(
     return Lab(sessions=db, world=make_world(SCENARIO, clock=FIXED_CLOCK))
 
 
+def _faulted_world(*faults: Fault) -> SimulatedWorld:
+    """The :data:`SCENARIO` world with ``faults`` added: the same entities, misbehaving."""
+    entry = SCENARIOS[SCENARIO]
+    return dataclasses.replace(entry, spec=entry.spec.adding(faults=faults)).world(
+        42, clock=FIXED_CLOCK
+    )
+
+
+DEFECT_Q_G6: Final = Fault(
+    "google", "search", "http_status", status=400, match={"query_id": "Q-G6"}
+)
+"""Q-G6 (search terms) answers HTTP 400, a defect, after Q-G3 and Q-G5 answered."""
+
+OUTAGE_Q_G5: Final = Fault(
+    "google", "search", "http_status", status=503, match={"query_id": "Q-G5"}
+)
+"""Q-G5 (keyword days) answers HTTP 503 on every attempt: a persistent outage."""
+
+
 # ---------------------------------------------------------------------------------------------
 # Stand-in jobs and failure injection
 # ---------------------------------------------------------------------------------------------
@@ -377,8 +422,15 @@ class _CompleteThenFail(jobs._JobBase):
                 event.listen(session.sync_session, "before_commit", _commit_refused)
 
 
+async def _call_google(ctx: jobs.JobContext, times: int) -> None:
+    """Send ``times`` real webhook calls (Q-G1) through the context's simulated Google client."""
+    client = ctx.clients.require_google()
+    for _ in range(times):
+        await client.run_query("Q-G1")
+
+
 class _Raises(jobs._JobBase):
-    """Counts rows and calls, then raises an error no connector raises (a bug)."""
+    """Counts rows, makes two calls, then raises an error no connector raises (a bug)."""
 
     job = jobs.JOB_ENTITIES
 
@@ -391,9 +443,9 @@ class _Raises(jobs._JobBase):
         return (ENTITIES,)
 
     async def _execute(self) -> None:
-        """Count, then raise."""
+        """Count, call, then raise."""
         self._count(ENTITIES, 4)
-        self._calls += 2
+        await _call_google(self.ctx, 2)
         raise self.error
 
 
@@ -417,7 +469,7 @@ class _Hangs(jobs._JobBase):
             await self._complete(
                 session, {ENTITIES: jobs._success(self.ctx.now, covered=None, reasons=())}
             )
-        self._calls += 1
+        await _call_google(self.ctx, 1)
         self.waiting.set()
         await asyncio.Event().wait()
 
@@ -538,7 +590,12 @@ async def test_failed_enqueue_rolls_back_only_its_own_completion(
     assert len(await lab.requests(reason)) == 1, "only the committed transaction's request"
     finish = _one(entries, "sync.job.finish")
     assert set(finish["datasets"]) == {"google.metrics_daily"}
-    assert (finish["status"], finish["error"]) == ("failed", "OperationalError")
+    assert (finish["log_level"], finish["status"], finish["error"], finish["error_type"]) == (
+        "error",
+        "failed",
+        UNEXPECTED,
+        "OperationalError",
+    )
 
 
 @pytest.mark.parametrize("failure", ["statement", "commit"])
@@ -572,9 +629,10 @@ async def test_failure_after_completion_rolls_it_back(
     )
     assert await lab.sync_requests() == []
     finish = _one(entries, "sync.job.finish")
-    assert (finish["status"], finish["datasets"], finish["error"]) == (
+    assert (finish["status"], finish["datasets"], finish["error"], finish["error_type"]) == (
         "failed",
         {},
+        UNEXPECTED,
         expected.__name__,
     )
 
@@ -617,16 +675,16 @@ async def test_success_logs_start_and_one_finish(lab: Lab) -> None:
         "calls": result.calls,
         "duration_ms": result.duration_ms,
     }
-    assert finish["error"] is None
+    assert (finish["log_level"], finish["error"], finish["error_type"]) == ("info", None, None)
     assert set(finish["datasets"]) == set(GOOGLE_METRICS)
 
 
 async def test_unexpected_error_logs_one_failed_finish_and_propagates(lab: Lab) -> None:
-    """Logging: an unexpected error logs one ``failed`` finish with its class, then propagates.
+    """Logging: an unexpected error logs one ``failed`` finish at error level, then propagates.
 
     The error is re-raised as the same object; the finish carries the run's rows, calls and
-    duration and the error's class name, never its text or a traceback; the open row is
-    closed ``failed``.
+    duration, the reason its open row closes with as ``error`` and the error's class name as
+    ``error_type``, never its text or a traceback; the open row is closed ``failed``.
     """
     dataset_id = await lab.seed("google")
     error = RuntimeError("a bug whose text stays out of the finish event")
@@ -648,7 +706,11 @@ async def test_unexpected_error_logs_one_failed_finish_and_propagates(lab: Lab) 
         "rows": 4,
         "calls": 2,
     }
-    assert finish["error"] == "RuntimeError"
+    assert (finish["log_level"], finish["error"], finish["error_type"]) == (
+        "error",
+        UNEXPECTED,
+        "RuntimeError",
+    )
     assert isinstance(finish["duration_ms"], int)
     assert finish["duration_ms"] >= 0
     assert "exc_info" not in finish
@@ -678,11 +740,15 @@ async def test_cancellation_logs_one_cancelled_finish_and_propagates(lab: Lab) -
                 await task
 
     finish = _one(entries, "sync.job.finish")
-    assert {key: finish[key] for key in ("status", "rows", "calls", "error")} == {
+    assert {
+        key: finish[key] for key in ("log_level", "status", "rows", "calls", "error", "error_type")
+    } == {
+        "log_level": "warning",
         "status": "cancelled",
         "rows": 2,
         "calls": 1,
-        "error": "CancelledError",
+        "error": CANCELLED,
+        "error_type": "CancelledError",
     }
     assert set(finish["datasets"]) == {ENTITIES}
     runs = await lab.runs(jobs.JOB_ENTITIES)
@@ -691,6 +757,136 @@ async def test_cancellation_logs_one_cancelled_finish_and_propagates(lab: Lab) -
         "google.metrics_daily": ("failed", CANCELLED),
     }
     assert all(row.finished_at is not None for row in runs.values())
+
+
+async def test_defect_logs_one_error_finish_with_its_failure_text(lab: Lab) -> None:
+    """Logging: a job failed by a defect logs its finish at error level, with its failure text.
+
+    Q-G6 answers HTTP 400 once ``google.metrics_daily`` is recorded. The finish is the run's
+    error-level line: its ``error`` is the sanitized text the failed ``sync_run`` row and the
+    result record (naming the query id, AAP 0.3.3 "logged with the query id"), and its
+    ``error_type`` the defect's class. The result and the finish count every call the job's
+    client sent, Q-G3's, Q-G5's and the defective Q-G6 call included.
+    """
+    dataset_id, _ = await lab.build("google")
+
+    with capture_logs() as entries:
+        async with lab.context("google", dataset_id, world=_faulted_world(DEFECT_Q_G6)) as ctx:
+            result = await jobs.MetricsSyncJob(ctx).run()
+            sent = ctx.clients.require_google().calls_made
+
+    assert (result.status, result.disposition) == ("failed", "defect")
+    assert result.calls == sent >= 3
+    runs = await lab.runs(jobs.JOB_METRICS)
+    assert runs["google.metrics_daily"].status == "succeeded"
+    failed = runs["google.search_terms"]
+    assert failed.status == "failed"
+    assert failed.error is not None
+    assert "Q-G6" in failed.error
+    assert result.error == failed.error
+    finish = _one(entries, "sync.job.finish")
+    assert {
+        key: finish[key]
+        for key in ("log_level", "status", "disposition", "calls", "error", "error_type")
+    } == {
+        "log_level": "error",
+        "status": "failed",
+        "disposition": "defect",
+        "calls": sent,
+        "error": failed.error,
+        "error_type": "QueryDefect",
+    }
+
+
+async def test_persistent_outage_logs_one_error_finish_with_its_failure_text(lab: Lab) -> None:
+    """Logging: a transient outage whose retries ran out logs the job's finish at error level.
+
+    Q-G5 answers HTTP 503 on all three attempts, so ``google.metrics_daily`` keeps its last
+    good data and turns stale while ``google.search_terms`` succeeds. The job failed without
+    raising: its finish is an error-level line whose ``error`` is the reason its failed
+    ``sync_run`` row records, with no ``error_type``.
+    """
+    dataset_id, _ = await lab.build("google")
+
+    with capture_logs() as entries:
+        async with lab.context("google", dataset_id, world=_faulted_world(OUTAGE_Q_G5)) as ctx:
+            result = await jobs.MetricsSyncJob(ctx).run()
+
+    assert (result.status, result.disposition) == ("failed", "stale")
+    runs = await lab.runs(jobs.JOB_METRICS)
+    assert runs["google.search_terms"].status == "succeeded"
+    failed = runs["google.metrics_daily"]
+    assert failed.status == "failed"
+    assert failed.error is not None
+    assert "503" in failed.error
+    finish = _one(entries, "sync.job.finish")
+    assert {
+        key: finish[key] for key in ("log_level", "status", "disposition", "error", "error_type")
+    } == {
+        "log_level": "error",
+        "status": "failed",
+        "disposition": "stale",
+        "error": failed.error,
+        "error_type": None,
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# Job starts (AAP 0.5.2: sync_run started_at and finished_at)
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_each_job_records_its_own_start(lab: Lab) -> None:
+    """``sync_run.started_at``: each job's rows start when that job started, not at ``now``.
+
+    One ``run_source_jobs`` call at ``now`` :data:`T1` runs Google's entity and metrics jobs on
+    a controller whose clock moves on a second at every reading. Every row of one job shares
+    one start read from that clock, later than ``now``; the metrics job starts after the entity
+    job finished; ``now`` stays the anchor of the freshness attempts.
+    """
+    dataset_id, _ = await lab.build("google")
+    readings = itertools.count(1)
+
+    def clock() -> datetime:
+        return T1 + timedelta(seconds=next(readings))
+
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_ENTITIES, jobs.JOB_METRICS],
+        controller=lab.controller(T1, clock=clock),
+        now=T1,
+    )
+
+    assert [(result.job, result.status) for result in report.results] == [
+        (jobs.JOB_ENTITIES, "succeeded"),
+        (jobs.JOB_METRICS, "succeeded"),
+    ]
+    async with lab.sessions() as session:
+        rows = list(
+            await session.scalars(
+                select(SyncRun).where(SyncRun.started_at > T1).order_by(SyncRun.id)
+            )
+        )
+    by_job: dict[str, list[SyncRun]] = {}
+    for row in rows:
+        by_job.setdefault(row.job, []).append(row)
+    assert {job: sorted(str(row.dataset) for row in found) for job, found in by_job.items()} == {
+        jobs.JOB_ENTITIES: [ENTITIES],
+        jobs.JOB_METRICS: sorted(GOOGLE_METRICS),
+    }
+    (entities_start,) = {row.started_at for row in by_job[jobs.JOB_ENTITIES]}
+    (metrics_start,) = {row.started_at for row in by_job[jobs.JOB_METRICS]}
+    entities_finish = max(row.finished_at for row in by_job[jobs.JOB_ENTITIES] if row.finished_at)
+    assert T1 < entities_start < entities_finish < metrics_start
+    assert all(
+        row.finished_at is not None and row.finished_at > metrics_start
+        for row in by_job[jobs.JOB_METRICS]
+    )
+    for name in (ENTITIES, *GOOGLE_METRICS):
+        row = await lab.freshness(dataset_id, name)
+        assert row is not None
+        assert row.last_attempt_at == T1, f"{name}: freshness stays anchored on now"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -728,3 +924,31 @@ async def test_standalone_matching_queues_one_request_when_it_attempts_rows(lab:
     assert (idle.status, idle.rows) == ("succeeded", 0)
     assert len(await lab.requests(reason)) == 1
     assert await lab.sync_requests() == [reason]
+
+
+async def test_matching_counts_the_calls_of_both_its_clients_once(lab: Lab) -> None:
+    """Calls (AAP 0.11.1): a pass counts its HubSpot calls and its LinkedIn re-fetches, once.
+
+    The pass is handed a LinkedIn client that already made a call for earlier work, as a live
+    backfill hands its own; the job's calls are every HubSpot call of the pass plus only the
+    re-fetches this pass sent, each read from the client's own counter.
+    """
+    _, companion_id = await lab.build("linkedin")
+    assert companion_id is not None
+    assert await lab.make_matches_due(companion_id) > 0
+
+    async with lab.controller(T1).open_clients("linkedin", "simulated") as linkedin:
+        lead_client = linkedin.require_linkedin()
+        await lead_client.get_ad_account(linkedin.linkedin_account_ids[0])
+        earlier = lead_client.calls
+        assert earlier == 1
+        async with lab.context("hubspot", companion_id) as ctx:
+            hubspot = ctx.clients.require_hubspot()
+            result = await jobs.LeadMatchJob(ctx, lead_client=lead_client).run()
+            lookups = hubspot.calls
+        refetches = lead_client.calls - earlier
+
+    assert (result.status, result.rows > 0) == ("succeeded", True)
+    assert lookups > 0
+    assert refetches > 0
+    assert result.calls == lookups + refetches

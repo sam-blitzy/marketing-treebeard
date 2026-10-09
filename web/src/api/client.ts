@@ -230,7 +230,8 @@ export type ApiErrorCode =
   | 'discrepancy_resolved'
   /**
    * 409: the platform state of the subject is not known yet (for example a snapshot without a
-   * budget amount), so it cannot be adopted as a decision until a later sync observes it.
+   * budget amount, or a subject with no decision that no entity sync has reported), so it
+   * cannot be adopted or decided until a later sync observes it.
    */
   | 'platform_state_unknown'
   /** 409: a conflict raised by the framework itself rather than by a route. */
@@ -277,7 +278,10 @@ export type ApiErrorCode =
   | 'field_not_allowed'
   /** 422: a budget amount on a shared-budget member; the message names the shared budget. */
   | 'shared_budget_amount'
-  /** 422: a decision on a subject with no decision yet; resolve its `untracked` discrepancy. */
+  /**
+   * 422: a decision on a reported subject with no decision yet; the message says whether its
+   * `untracked` discrepancy is open to resolve or not raised yet.
+   */
   | 'untracked_subject'
   /** 422: a decision on a subject whose removal was acknowledged. */
   | 'subject_removed'

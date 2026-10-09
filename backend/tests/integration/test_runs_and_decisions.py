@@ -15,6 +15,11 @@ per guarantee of that row:
   row left by a crashed process is marked ``failed``.
 * **Decision patches**, **Budget-subject patches** and **Shared-member patches** (AAP 0.5.2
   "Decisions: patch model" and the shapes table): every 422 rule, through ``POST /decisions``.
+* **Subjects without a decision** (AAP 0.5.2 "Decisions: later writes", 0.5.4.4 C0
+  ``untracked``): ``POST /decisions`` on a campaign no entity sync has reported answers 409
+  ``platform_state_unknown``, and on a reported one 422 ``untracked_subject`` whose message
+  matches whether its ``untracked`` discrepancy exists; neither writes a decision or queues a
+  rerun, and the discrepancy it names resolves into a decision the next patch applies over.
 * **Retired subjects** (AAP 0.3.2): ``POST /decisions`` and ``POST /discrepancies/{id}/resolve``
   on a subject of a retired dataset answer 409 ``subject_retired``.
 * **Stored outputs** (AAP 0.5.3 "Where outputs are frozen"): findings, withheld patterns and
@@ -1132,7 +1137,10 @@ async def test_budget_subject_rejects_total_on_daily(
         422,
         "field_not_allowed",
     )
-    assert "DAILY" in message
+    assert message == (
+        f"Shared budget {seeded.shared_budget_external_id} is a daily budget, which takes "
+        "daily_budget, not total_budget."
+    )
     assert await _decisions_of(db, "budget", subject) == before
 
 
@@ -1163,7 +1171,8 @@ async def test_shared_member_rejects_any_amount_naming_budget(
 ) -> None:
     """Shared-member patches: any amount on a shared member is a 422 naming the budget.
 
-    The amount belongs to the shared budget, so the message names the budget that owns it.
+    The amount belongs to the shared budget, so the message names the budget that owns it by
+    its Google id; the UI shows the message as it is, so no database id appears in it.
     """
     subject = seeded.member_campaign_id
     before = await _decisions_of(db, "campaign", subject)
@@ -1171,7 +1180,11 @@ async def test_shared_member_rejects_any_amount_naming_budget(
         message = _error(
             await _decide(client, "campaign", subject, patch), 422, "shared_budget_amount"
         )
-        assert seeded.shared_budget_external_id in message
+        assert message == (
+            f"Amounts are set on shared budget {seeded.shared_budget_external_id}; record the "
+            "decision on that budget."
+        )
+        assert "budget id" not in message
     assert await _decisions_of(db, "campaign", subject) == before
 
 
@@ -1187,6 +1200,205 @@ async def test_shared_member_status_patch_keeps_budget_id(
     assert decided.budget_id == seeded.shared_budget_id
     assert decided.daily_budget is None
     assert decided.total_budget is None
+
+
+# ---------------------------------------------------------------------------------------------
+# Subjects without a decision (AAP 0.5.2 "Decisions: later writes"; 0.5.4.4 C0 untracked)
+# ---------------------------------------------------------------------------------------------
+
+FIRST_DECISION_PATHS: Final = (
+    "its platform state is recorded as a baseline decision or raised as an untracked "
+    "discrepancy to resolve (Adopt platform state / Record intended state)."
+)
+"""How a subject without a decision gets its first one; both refusals below end with it."""
+
+
+async def _add_unreported_campaign(
+    db: async_sessionmaker[AsyncSession], seed: Seed, external_id: str
+) -> int:
+    """Add a campaign known only from metrics to the active Google dataset; return its id.
+
+    It is the stand-in the metrics job writes for spend of a campaign no entity sync has
+    stored (``sync.jobs``): ``ended``, raw status ``UNKNOWN``, named ``Campaign
+    {external_id}``, on no budget, with no snapshot, no decision and no discrepancy.
+    """
+    async with db() as session, session.begin():
+        template = await session.get(Campaign, seed.google_campaign_id)
+        assert template is not None
+        stub = Campaign(
+            source="google",
+            dataset_id=seed.google_dataset_id,
+            account_id=template.account_id,
+            external_id=external_id,
+            name=f"Campaign {external_id}",
+            status="ended",
+            raw_status="UNKNOWN",
+            objective_or_channel=None,
+            campaign_group_id=None,
+            budget_id=None,
+            daily_budget=None,
+            total_budget=None,
+            budget_period=None,
+        )
+        session.add(stub)
+        await session.flush()
+        return stub.id
+
+
+async def _add_reported_campaign(
+    db: async_sessionmaker[AsyncSession], seed: Seed, name: str
+) -> tuple[int, int]:
+    """Add a LinkedIn campaign an entity sync has reported but nobody has decided.
+
+    The campaign copies the seeded LinkedIn own-budget campaign's row, and its one snapshot,
+    captured at :data:`NOW`, copies that campaign's newest snapshot, the shape metadata of its
+    payload included, so the subject is what detection would raise as ``untracked``. Neither
+    a decision nor a discrepancy is added.
+
+    Returns:
+        The new campaign's id and its snapshot's id.
+    """
+    async with db() as session, session.begin():
+        template = await session.get(Campaign, seed.linkedin_campaign_id)
+        assert template is not None
+        observed = await session.scalar(
+            select(EntitySnapshot)
+            .where(
+                EntitySnapshot.entity_type == "campaign",
+                EntitySnapshot.entity_id == template.id,
+            )
+            .order_by(EntitySnapshot.captured_at.desc(), EntitySnapshot.id.desc())
+            .limit(1)
+        )
+        assert observed is not None
+        campaign = Campaign(
+            source=template.source,
+            dataset_id=template.dataset_id,
+            account_id=template.account_id,
+            external_id="urn:li:sponsoredCampaign:990000099010",
+            name=name,
+            status=template.status,
+            raw_status=template.raw_status,
+            objective_or_channel=template.objective_or_channel,
+            campaign_group_id=template.campaign_group_id,
+            budget_id=None,
+            daily_budget=template.daily_budget,
+            total_budget=template.total_budget,
+            budget_period=None,
+        )
+        session.add(campaign)
+        await session.flush()
+        snapshot = EntitySnapshot(
+            source=observed.source,
+            dataset_id=observed.dataset_id,
+            entity_type="campaign",
+            entity_id=campaign.id,
+            captured_at=NOW,
+            status=observed.status,
+            budget_daily=observed.budget_daily,
+            budget_total=observed.budget_total,
+            budget_amount_micros=observed.budget_amount_micros,
+            budget_id=None,
+            quality_score=None,
+            payload=dict(observed.payload),
+        )
+        session.add(snapshot)
+        await session.flush()
+        return campaign.id, snapshot.id
+
+
+async def test_decision_on_unreported_campaign_409_platform_state_unknown(
+    seeded: Seed, client: httpx.AsyncClient, db: async_sessionmaker[AsyncSession]
+) -> None:
+    """Subjects without a decision: a metrics-only campaign is a 409, and nothing is written.
+
+    No entity sync has reported it, so it has no platform state and no ``untracked``
+    discrepancy. The refusal says so instead of sending the user to a discrepancy that does
+    not exist, and no decision, discrepancy or ``analysis_request`` is written.
+    """
+    external_id = "990000099009"
+    subject = await _add_unreported_campaign(db, seeded, external_id)
+    requests_before = await _count(db, AnalysisRequest)
+    for patch in ({"status": "paused"}, {"status": "active"}):
+        response = await _decide(client, "campaign", subject, patch)
+        message = _error(response, 409, "platform_state_unknown")
+        assert message == (
+            f"Campaign {external_id} has not been reported by an entity sync yet, so its "
+            "platform state is unknown and it has no decision to change. Once an entity sync "
+            f"reports it, {FIRST_DECISION_PATHS}"
+        )
+    assert await _decisions_of(db, "campaign", subject) == 0
+    assert await _count(db, AnalysisRequest) == requests_before
+    discrepancies = await _count(
+        db, Discrepancy, Discrepancy.subject_type == "campaign", Discrepancy.subject_id == subject
+    )
+    assert discrepancies == 0
+
+
+async def test_decision_on_reported_undecided_campaign_422_names_its_real_discrepancy(
+    seeded: Seed, client: httpx.AsyncClient, db: async_sessionmaker[AsyncSession]
+) -> None:
+    """Subjects without a decision: a reported campaign is a 422 matching its discrepancy.
+
+    Before any ``untracked`` discrepancy exists, the refusal says none has been raised yet;
+    once one is open, the refusal sends the user to it. Neither writes a decision or queues a
+    rerun. Resolving that discrepancy with "Adopt platform state" then gives the campaign the
+    decision a later patch applies over.
+    """
+    name = "Reported, never decided"
+    subject, snapshot_id = await _add_reported_campaign(db, seeded, name)
+    requests_before = await _count(db, AnalysisRequest)
+
+    not_raised = _error(
+        await _decide(client, "campaign", subject, {"status": "paused"}), 422, "untracked_subject"
+    )
+    assert not_raised == (
+        f"{name} has no decision yet, and no untracked discrepancy has been raised for it. "
+        f"Once a later entity sync reports it, {FIRST_DECISION_PATHS}"
+    )
+
+    async with db() as session, session.begin():
+        campaign = await session.get(Campaign, subject)
+        assert campaign is not None
+        untracked = Discrepancy(
+            source=campaign.source,
+            dataset_id=campaign.dataset_id,
+            subject_type="campaign",
+            subject_id=subject,
+            kind="untracked",
+            decided_value=None,
+            platform_value={"status": campaign.status},
+            snapshot_id=snapshot_id,
+            decision_id=None,
+            detected_at=NOW,
+            state="open",
+            resolved_at=None,
+            resolution=None,
+        )
+        session.add(untracked)
+        await session.flush()
+        discrepancy_id = untracked.id
+
+    raised = _error(
+        await _decide(client, "campaign", subject, {"status": "paused"}), 422, "untracked_subject"
+    )
+    assert raised == (
+        f"{name} has no decision yet; resolve its untracked discrepancy first "
+        "(Adopt platform state / Record intended state)."
+    )
+    assert await _decisions_of(db, "campaign", subject) == 0
+    assert await _count(db, AnalysisRequest) == requests_before
+
+    # The discrepancy the refusal names is real: adopting the platform state closes it with
+    # the campaign's first decision, and the same patch is then accepted over it.
+    resolved = await client.post(
+        f"{API}/discrepancies/{discrepancy_id}/resolve", json={"resolution": "adopt_platform"}
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["state"] == "resolved"
+    paused = _decision(await _decide(client, "campaign", subject, {"status": "paused"}))
+    assert (paused.subject.id, paused.status, paused.origin) == (subject, "paused", "user")
+    assert await _decisions_of(db, "campaign", subject) == 2
 
 
 # ---------------------------------------------------------------------------------------------

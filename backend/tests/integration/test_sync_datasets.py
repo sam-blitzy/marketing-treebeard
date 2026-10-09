@@ -52,7 +52,7 @@ from ads_engine.sync.datasets import (
     DatasetStateError,
     Readiness,
 )
-from ads_engine.sync.freshness import FreshnessOutcome, record_freshness
+from ads_engine.sync.freshness import FreshnessOutcome, is_repairable_reason, record_freshness
 
 type Sessions = async_sessionmaker[AsyncSession]
 
@@ -72,6 +72,15 @@ LINKEDIN_NAMES = (
     "linkedin.leads",
 )
 HUBSPOT_NAMES = ("hubspot.contacts", "hubspot.associations", "hubspot.deal_search")
+
+INTERRUPTED_QG4 = "interrupted: google search Q-G4: HTTP 500 after 3 attempts; 1 partition deferred"
+"""The shortfall an entity backfill records when Q-G4 keeps failing after its retries."""
+
+DEFERRED_METRICS = "call budget exhausted; 3 partitions deferred"
+"""The shortfall a metrics backfill records when the Google call budget runs out."""
+
+FAILED_ATTEMPT = "HTTP 503 after 3 attempts"
+"""The reason :func:`_record` gives a failed attempt."""
 
 
 class Clock:
@@ -280,12 +289,46 @@ async def _record(
     async with sessions() as session, session.begin():
         for name in names:
             if failed:
-                outcome = FreshnessOutcome.failure(at, reason="HTTP 503 after 3 attempts")
+                outcome = FreshnessOutcome.failure(at, reason=FAILED_ATTEMPT)
             else:
                 outcome = FreshnessOutcome.success(
                     at, covered_from=None, covered_through=None, complete=complete, reason=reason
                 )
             await record_freshness(session, dataset_id, name, outcome)
+
+
+async def _shortfall(
+    sessions: Sessions, dataset_id: int, name: str, reason: str, *, at: datetime = T0
+) -> None:
+    """Record a successful attempt of one freshness row that fell short for ``reason``.
+
+    The outcome is repairable exactly when the reason names unread work (an interrupted or
+    call-budget deferred fetch), as the sync jobs record it.
+    """
+    outcome = FreshnessOutcome.success(
+        at,
+        covered_from=None,
+        covered_through=None,
+        complete=False,
+        reason=reason,
+        repairable=is_repairable_reason(reason),
+    )
+    async with sessions() as session, session.begin():
+        await record_freshness(session, dataset_id, name, outcome)
+
+
+async def _attempted_since(sessions: Sessions, dataset_id: int, name: str, at: datetime) -> None:
+    """Move only ``last_attempt_at`` of one freshness row to ``at``.
+
+    This is what a later attempt that was no successful refresh leaves behind (a read cut
+    short by a transient error keeps ``last_success_at``), whatever reason it recorded.
+    """
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(DatasetFreshness.dataset_id == dataset_id, DatasetFreshness.dataset == name)
+            .values(last_attempt_at=at)
+        )
 
 
 async def _make_fresh(manager: DatasetManager, sessions: Sessions, dataset_id: int) -> None:
@@ -820,7 +863,9 @@ async def test_google_readiness_reads_freshness_only(
         "incomplete with no recorded reason: google.search_terms",
     )
 
-    # incomplete with a recorded reason is accepted; unknown never is.
+    # A recorded reason alone does not make the row acceptable: the row was written with no
+    # attempt at all, and the backfill completes only once a recorded attempt succeeded
+    # (AAP 0.3.3 "Recovery readiness": activate only once the backfill completes).
     await _record(sessions, google, ["google.entities"], at=T0 + timedelta(hours=1))
     async with sessions() as session, session.begin():
         await session.execute(
@@ -832,14 +877,239 @@ async def test_google_readiness_reads_freshness_only(
             .values(reason="result limit reached at finest partition")
         )
     readiness = await manager.readiness(google)
+    assert not readiness.ready
+    assert readiness.unfinished_freshness == ("google.search_terms",)
+    assert readiness.reasons == (
+        "latest attempt failed: google.search_terms (no successful attempt: result limit "
+        "reached at finest partition)",
+    )
+
+    # incomplete with a recorded permanent reason, from a successful attempt, is accepted;
+    # unknown never is.
+    await _record(
+        sessions,
+        google,
+        ["google.search_terms"],
+        at=T0 + timedelta(hours=1),
+        complete=False,
+        reason="result limit reached at finest partition",
+    )
+    readiness = await manager.readiness(google)
     assert readiness.ready
     assert readiness.reasons == ()
+    assert readiness.unfinished_freshness == ()
     assert (readiness.pending_matches, readiness.companion) == (0, None)
 
     async with sessions() as session:
         assert (await manager.readiness(google, session=session)).ready
     with pytest.raises(DatasetNotFoundError):
         await manager.readiness(MISSING_ID)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("name", "shortfall"),
+    [
+        pytest.param("google.entities", INTERRUPTED_QG4, id="interrupted-entities"),
+        pytest.param("google.metrics_daily", DEFERRED_METRICS, id="budget-deferred-metrics"),
+    ],
+)
+async def test_backfill_left_with_unread_work_is_not_ready(
+    manager: DatasetManager, sessions: Sessions, name: str, shortfall: str
+) -> None:
+    """A required row ``incomplete`` with unread work holds the build until it is read.
+
+    AAP 0.3.3 "Recovery readiness": a live dataset activates only once its backfill
+    completes. A fetch cut short by a transient error that outlived its retries
+    (``interrupted``) or by the Google call budget (``call budget exhausted``, transient in
+    the fallback table) records a repairable ``incomplete``: the backfill did not complete,
+    so activation is refused and the build stays ``building``, even with every attempt
+    timestamp in order. A later failed attempt appends its note to the row; the recorded
+    shortfall is still what the refusal names. Once a later read finishes, the build is ready.
+    """
+    google = await manager.begin("google", "live", reason="recovered")
+    await _record(sessions, google, [other for other in GOOGLE_NAMES if other != name])
+    await _shortfall(sessions, google, name, shortfall)
+    expected = f"backfill incomplete: {name} ({shortfall})"
+
+    readiness = await manager.readiness(google)
+    assert readiness == Readiness(
+        dataset_id=google,
+        ready=False,
+        pending_matches=0,
+        missing_freshness=(),
+        unknown_freshness=(),
+        incomplete_without_reason=(),
+        reasons=(expected,),
+        unfinished_freshness=(name,),
+    )
+    with pytest.raises(DatasetStateError, match="backfill incomplete") as excinfo:
+        await manager.activate(google)
+    assert excinfo.value.readiness == readiness
+    assert await _state(sessions, google) == "building"
+    assert await _connection(sessions, "google") is None
+
+    await _record(sessions, google, [name], at=T0 + timedelta(minutes=30), failed=True)
+    readiness = await manager.readiness(google)
+    assert (readiness.ready, readiness.unfinished_freshness) == (False, (name,))
+    assert readiness.reasons == (expected,)
+
+    await _record(sessions, google, [name], at=T0 + timedelta(hours=1))
+    readiness = await manager.readiness(google)
+    assert (readiness.ready, readiness.reasons, readiness.unfinished_freshness) == (True, (), ())
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_permanent_shortfall_from_a_successful_attempt_is_ready(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    """A permanent shortfall whose latest attempt succeeded is accepted, for every source.
+
+    AAP 0.3.3: a Q-G6 partition at the finest split ("result limit reached at finest
+    partition") and a one-hour CRM Search partition above 10,000 results are read up to the
+    platform's limit and marked ``incomplete``; refetching cannot remove them, so the
+    backfill is complete and the dataset may activate. Any other reasoned shortfall that is
+    not unread work is accepted the same way.
+    """
+    google = await manager.begin("google", "live", reason="recovered")
+    await _record(sessions, google, ["google.entities", "google.metrics_daily"])
+    await _shortfall(
+        sessions,
+        google,
+        "google.search_terms",
+        "result limit reached at finest partition (2026-09-14, ad group 123)",
+    )
+    readiness = await manager.readiness(google)
+    assert (readiness.ready, readiness.reasons, readiness.unfinished_freshness) == (True, (), ())
+
+    hubspot = await manager.begin("hubspot", "live", reason="recovered")
+    await _record(sessions, hubspot, ["hubspot.contacts"])
+    await _shortfall(sessions, hubspot, "hubspot.associations", "1 contact not read")
+    await _shortfall(
+        sessions,
+        hubspot,
+        "hubspot.deal_search",
+        "search result ceiling reached (2026-09-14T10:00Z)",
+    )
+    readiness = await manager.readiness(hubspot)
+    assert (readiness.ready, readiness.reasons, readiness.unfinished_freshness) == (True, (), ())
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_latest_attempt_that_did_not_succeed_is_not_ready(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    """A required row whose latest attempt did not succeed holds the build.
+
+    AAP 0.3.3 "Recovery readiness": the backfill completes only when the latest attempt of
+    each required row succeeded. Three ways it did not: a complete row whose later attempt
+    failed (``last_attempt_at`` after ``last_success_at``); a row recorded with no success
+    at all (``last_success_at`` null); and a permanent shortfall whose later attempt
+    failed. Each is named once, with its reason, in required-row order; each later
+    successful attempt clears its row.
+    """
+    google = await manager.begin("google", "live", reason="recovered")
+    await _record(sessions, google, ["google.entities"])
+    await _record(sessions, google, ["google.entities"], at=T0 + timedelta(hours=1), failed=True)
+    async with sessions() as session, session.begin():
+        session.add(
+            DatasetFreshness(
+                source="google",
+                dataset_id=google,
+                dataset="google.metrics_daily",
+                completeness="complete",
+                last_attempt_at=T0,
+            )
+        )
+    finest = "result limit reached at finest partition"
+    await _shortfall(sessions, google, "google.search_terms", finest)
+    await _record(
+        sessions, google, ["google.search_terms"], at=T0 + timedelta(hours=1), failed=True
+    )
+
+    readiness = await manager.readiness(google)
+    assert not readiness.ready
+    assert readiness.unfinished_freshness == GOOGLE_NAMES
+    assert (
+        readiness.missing_freshness,
+        readiness.unknown_freshness,
+        readiness.incomplete_without_reason,
+    ) == ((), (), ())
+    assert readiness.reasons == (
+        f"latest attempt failed: google.entities ({FAILED_ATTEMPT}), "
+        "google.metrics_daily (no successful attempt), "
+        f"google.search_terms ({finest}; last attempt failed: {FAILED_ATTEMPT})",
+    )
+    with pytest.raises(DatasetStateError, match="latest attempt failed"):
+        await manager.activate(google)
+    assert await _state(sessions, google) == "building"
+
+    later = T0 + timedelta(hours=2)
+    await _record(sessions, google, ["google.entities", "google.metrics_daily"], at=later)
+    await _shortfall(sessions, google, "google.search_terms", finest, at=later)
+    readiness = await manager.readiness(google)
+    assert (readiness.ready, readiness.reasons, readiness.unfinished_freshness) == (True, (), ())
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_unfinished_backfill_holds_every_source(
+    manager: DatasetManager, sessions: Sessions
+) -> None:
+    """LinkedIn, a HubSpot primary and a companion are held exactly as Google is.
+
+    AAP 0.3.3 "Recovery readiness" requires a completed backfill of every live build, and a
+    HubSpot build must also pass the staged-matching test. A live LinkedIn entity read cut
+    short by a Lead Sync 503 keeps its earlier ``last_success_at`` while its later attempt
+    moves on, with a reason that carries no repairable prefix: it is caught by its failed
+    latest attempt. An interrupted HubSpot deal search holds a HubSpot primary, and a failed
+    association refresh holds a simulated LinkedIn dataset through its companion.
+    """
+    linkedin = await manager.begin("linkedin", "live", reason="recovered")
+    await _make_fresh(manager, sessions, linkedin)
+    cut_short = "campaign search cut short: HTTP 503 after 3 attempts"
+    await _shortfall(sessions, linkedin, "linkedin.entities", cut_short)
+    await _attempted_since(sessions, linkedin, "linkedin.entities", T0 + timedelta(hours=1))
+    readiness = await manager.readiness(linkedin)
+    assert (readiness.ready, readiness.unfinished_freshness) == (False, ("linkedin.entities",))
+    assert readiness.reasons == (f"latest attempt failed: linkedin.entities ({cut_short})",)
+
+    hubspot = await manager.begin("hubspot", "live", reason="recovered")
+    await _make_fresh(manager, sessions, hubspot)
+    interrupted = "interrupted: hubspot deals search: HTTP 502 after 3 attempts"
+    await _shortfall(sessions, hubspot, "hubspot.deal_search", interrupted)
+    readiness = await manager.readiness(hubspot)
+    assert (readiness.ready, readiness.unfinished_freshness) == (False, ("hubspot.deal_search",))
+    assert readiness.reasons == (f"backfill incomplete: hubspot.deal_search ({interrupted})",)
+    with pytest.raises(DatasetStateError, match="backfill incomplete"):
+        await manager.activate(hubspot)
+
+    parent = await manager.begin("linkedin", "simulated", reason="credentials not configured")
+    companion = await manager.begin("hubspot", "simulated", "companion", parent)
+    await _make_fresh(manager, sessions, parent)
+    await _make_fresh(manager, sessions, companion)
+    await _record(
+        sessions, companion, ["hubspot.associations"], at=T0 + timedelta(hours=1), failed=True
+    )
+    companion_reason = f"latest attempt failed: hubspot.associations ({FAILED_ATTEMPT})"
+    readiness = await manager.readiness(parent)
+    assert not readiness.ready
+    assert readiness.unfinished_freshness == ()
+    assert readiness.companion is not None
+    assert readiness.companion.unfinished_freshness == ("hubspot.associations",)
+    assert readiness.companion.reasons == (companion_reason,)
+    assert readiness.reasons == (
+        f"companion CRM dataset {companion} not ready: {companion_reason}",
+    )
+    with pytest.raises(DatasetStateError, match="latest attempt failed"):
+        await manager.activate(parent)
+    assert (await _state(sessions, parent), await _state(sessions, companion)) == (
+        "building",
+        "building",
+    )
 
 
 @pytest.mark.anyio

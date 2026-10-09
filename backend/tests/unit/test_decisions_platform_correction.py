@@ -507,6 +507,50 @@ def test_a_snapshot_observed_before_a_shape_or_period_change_is_refused(
     assert "was observed before" in error.message
     assert "budget shape or period changed" in error.message
     assert "next entity sync" in error.message
+    for key in ("own_budget", "shared_member", "DAILY", "CUSTOM_PERIOD"):
+        assert key not in error.message
+    # The UI shows the message as it is: the snapshot's database id stays in ``details``.
+    assert str(SNAPSHOT) not in error.message
+
+
+def test_the_shape_change_refusal_names_both_shapes_in_words() -> None:
+    snapshot = _google_campaign(budget_id=OWN_A, period="DAILY", shared=False)
+
+    with pytest.raises(PlatformStateUnknown) as refused:
+        check_observed_shape(
+            snapshot, _state("shared_member", budget_id=SHARED_B), discrepancy_id=DISCREPANCY
+        )
+
+    assert refused.value.message == (
+        "The platform state this discrepancy compared was observed before Campaign 11's budget "
+        "shape or period changed: it shows a campaign with its own daily budget, and the "
+        f"subject is now a campaign on shared budget {SHARED_B}. The next entity sync that "
+        "compares Campaign 11 again refreshes or closes this discrepancy; resolve it after that."
+    )
+    assert refused.value.details["snapshot_id"] == SNAPSHOT
+
+
+def test_an_observed_budget_without_a_known_google_id_is_named_in_words() -> None:
+    # The state knows only the Google id of the budget drawn from now, so the observed one
+    # is named in words; its database id stays in ``details``.
+    snapshot = _google_campaign(budget_id=SHARED_B, period="DAILY", shared=True)
+
+    with pytest.raises(PlatformStateUnknown) as refused:
+        check_observed_shape(
+            snapshot, _state("shared_member", budget_id=SHARED_C), discrepancy_id=DISCREPANCY
+        )
+
+    error = refused.value
+    assert error.message == (
+        "The platform state this discrepancy compared was observed before Campaign 11's budget "
+        "shape or period changed: it shows a campaign on a shared budget, and the subject is "
+        f"now a campaign on shared budget {SHARED_C}. The next entity sync that compares "
+        "Campaign 11 again refreshes or closes this discrepancy; resolve it after that."
+    )
+    assert "budget id" not in error.message
+    assert str(SHARED_B) not in error.message
+    assert str(SNAPSHOT) not in error.message
+    assert error.details["observed_budget_id"] == SHARED_B
 
 
 def test_a_snapshot_without_metadata_is_refused() -> None:
@@ -519,5 +563,11 @@ def test_a_snapshot_without_metadata_is_refused() -> None:
     assert (error.status_code, error.code) == (409, "platform_state_unknown")
     assert error.details["observed_shape"] is None
     assert error.details["current_shape"] == "own_budget"
-    assert "does not record the budget shape" in error.message
-    assert "next entity sync" in error.message
+    assert error.details["snapshot_id"] == SNAPSHOT
+    assert error.message == (
+        "The platform state this discrepancy compared does not record the budget shape it was "
+        "observed in, so it cannot be adopted for Campaign 11, which is now a campaign with its "
+        "own daily budget. The next entity sync that compares Campaign 11 again refreshes or "
+        "closes this discrepancy; resolve it after that."
+    )
+    assert str(SNAPSHOT) not in error.message

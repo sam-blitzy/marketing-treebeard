@@ -22,8 +22,9 @@ Coverage of the guarantees:
 * K2 conversions and efficiency gates, adjacent terms (cap, Jaccard, exclusions, order, label).
 * K3 quality-score drop, quality-score days, snapshot fallback, and the CPC rise with
   cost/conversion rising or with conversions falling to 0.
-* Search-term coverage, the output fields every item shows, ranking, thresholds read from
-  configuration, and an empty section without Google.
+* Search-term coverage, the ``no_crm_link`` flag without the verified Google-to-CRM link, the
+  output fields every item shows, ranking, thresholds read from configuration, and an empty
+  section without Google.
 
 Ranking needs several items of one rule, which only the catalogue's ``default`` world has, so
 the ranking checks read it at the fixed catalogue instant.
@@ -42,14 +43,21 @@ from functools import cached_property
 from typing import Any
 
 import pytest
-from tests.support import evidence_metric
+from tests.support import (
+    GOOGLE_LINK_UNVERIFIED_REASON,
+    GoogleLinkState,
+    evidence_metric,
+    with_google_link,
+)
 
 from ads_engine.analysis import keywords
 from ads_engine.analysis.context import (
     ENTITY_ACCOUNT,
     ENTITY_KEYWORD,
     FINDING_K1_NO_BASELINE,
+    FINDING_NO_CRM_LINK,
     FINDING_SEARCH_TERM_COVERAGE,
+    FLAG_NO_CRM_LINK,
     FLAG_SEARCH_TERM_COVERAGE,
     GROUP_BLOCK,
     GROUP_EXPAND,
@@ -61,6 +69,7 @@ from ads_engine.analysis.context import (
     AnalysisContext,
     Candidate,
     Finding,
+    Flag,
     KeywordDay,
     KeywordInfo,
     RuleResult,
@@ -1591,6 +1600,52 @@ def test_search_term_coverage_below_80_percent_flags_every_keyword_item(
     fires_share = fires.findings(FINDING_SEARCH_TERM_COVERAGE)[0].evidence["coverage_percent"]
     held_share = held.findings(FINDING_SEARCH_TERM_COVERAGE)[0].evidence["coverage_percent"]
     assert fires_share < 80 <= held_share
+
+
+def _relinked(run: _Run, state: GoogleLinkState) -> _Run:
+    """``run`` evaluated again with its context's Google-to-CRM link in ``state``."""
+    ctx = with_google_link(run.ctx, state)
+    return _Run(run.scenario, ctx, keywords.evaluate(ctx))
+
+
+def _flags_by_item(run: _Run) -> dict[tuple[str, str], tuple[Flag, ...]]:
+    """Each keyword item's flags, keyed by its rule and entity key."""
+    flags = {(item.rule_id, item.entity_ref.key): item.flags for item in run.keyword_items()}
+    assert len(flags) == len(run.keyword_items()), "one item per rule and entity"
+    return flags
+
+
+@pytest.mark.parametrize("scenario", [_DEFAULT_SCENARIO, "keywords.coverage.fires"])
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [("absent", "no active HubSpot dataset"), ("unverified", GOOGLE_LINK_UNVERIFIED_REASON)],
+)
+def test_every_keyword_item_carries_no_crm_link_without_the_verified_google_link(
+    make_context: ContextFactory, scenario: str, state: GoogleLinkState, reason: str
+) -> None:
+    """CRM link: Google items carry no_crm_link while the Google-to-CRM link is not verified.
+
+    AAP 0.3.3 and 0.5.4.1. Every K1, K2 and K3 item carries it last, after exactly the flags it
+    carries once the link is verified, when it carries no ``no_crm_link``. The section records
+    no ``no_crm_link`` finding either way: AAP 0.5.4.3 defines its section finding as
+    search-term coverage, and its findings are the same in every link state.
+    """
+    base = _run(make_context, scenario)
+    unlinked, linked = _relinked(base, state), _relinked(base, "verified")
+    expected = Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")
+    with_link, without_link = _flags_by_item(linked), _flags_by_item(unlinked)
+    assert without_link.keys() == with_link.keys()
+    for key, flags in with_link.items():
+        assert FLAG_NO_CRM_LINK not in {flag.code for flag in flags}, key
+        assert without_link[key] == (*flags, expected), key
+    if scenario == _DEFAULT_SCENARIO:
+        assert {rule for rule, _ in without_link} == set(_KEYWORD_RULES)
+    else:
+        assert any(with_link.values()), "an item with flags of its own keeps them first"
+    for run in (unlinked, linked):
+        assert run.findings(FINDING_NO_CRM_LINK) == ()
+    assert unlinked.result.findings == linked.result.findings
+    assert unlinked.result.withheld == linked.result.withheld
 
 
 def _all_keyword_runs(make_context: ContextFactory) -> Iterator[_Run]:

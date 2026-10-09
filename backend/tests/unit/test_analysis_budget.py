@@ -73,6 +73,7 @@ from ads_engine.analysis.context import (
     RuleResult,
     SubjectKey,
     Withheld,
+    google_link_gap,
 )
 from ads_engine.analysis.metrics import (
     BUDGET_THRESHOLD_KEYS,
@@ -1425,7 +1426,7 @@ def test_budget_crm_gives_google_no_crm_link_without_a_verified_link() -> None:
     unverified = _fresh(ctx, google_crm=_google_crm((), 0, linked=False))
     (flag,) = budget_crm(unverified, pool).flags
     assert (flag.code, UNLINKED_REASON in flag.message) == (FLAG_NO_CRM_LINK, True)
-    assert budget._google_link_gap(unverified) == UNLINKED_REASON
+    assert google_link_gap(unverified) == UNLINKED_REASON
     with pytest.raises(KeyError, match="not in the analysis context"):
         budget_crm(ctx, ("budget", 999_999))
 
@@ -1437,7 +1438,7 @@ def test_budget_crm_combines_the_members_of_a_linked_shared_budget() -> None:
     members = subject_campaigns(ctx, pool)
     externals = [ctx.campaigns[cid].external_id for cid in members]
     linked = _fresh(ctx, google_crm=_google_crm(externals, 3))
-    assert budget._google_link_gap(linked) is None
+    assert google_link_gap(linked) is None
     view = budget_crm(linked, pool)
     veto = attribution_for(linked).veto
     assert view.scope == "google"

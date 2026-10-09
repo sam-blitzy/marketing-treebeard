@@ -90,6 +90,8 @@ from ads_engine.analysis.context import (
     Source,
     SubjectKey,
     Withheld,
+    google_link_gap,
+    no_crm_link_flag,
     segment_external_id,
     term_cluster_external_id,
 )
@@ -544,27 +546,6 @@ class _CrmView:
         return _CRM_DATASETS[self.scope]
 
 
-def _google_link_gap(ctx: AnalysisContext) -> str | None:
-    """Why Google campaigns have no CRM link, or ``None`` when the link is verified.
-
-    AAP 0.3.3: the Google-to-CRM link exists only when both Google contact properties are
-    configured and confirmed. Without it no Google QL count or veto is computed, and a
-    LinkedIn-derived subset never stands in.
-    """
-    crm = ctx.google_crm
-    if crm is None:
-        return "no active HubSpot dataset"
-    link = crm.bindings.google
-    if link.available:
-        return None
-    return link.reason or "the Google-to-CRM link is not verified"
-
-
-def _no_crm_link_flag(reason: str) -> Flag:
-    """The ``no_crm_link`` flag of a Google item."""
-    return Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")
-
-
 def _veto_flags(veto: VetoPopulation) -> tuple[Flag, ...]:
     """The flags explaining why a population's pipeline cannot be judged."""
     flags: list[Flag] = []
@@ -595,9 +576,9 @@ def _campaign_crm(
     if campaign.source == "linkedin":
         veto = attribution.veto.get(campaign.id)
         return _CrmView(veto, "linkedin", () if veto is None else _veto_flags(veto))
-    gap = _google_link_gap(ctx)
+    gap = google_link_gap(ctx)
     if gap is not None:
-        return _CrmView(None, None, (_no_crm_link_flag(gap),))
+        return _CrmView(None, None, (no_crm_link_flag(gap),))
     veto = attribution.veto.get(campaign.id)
     return _CrmView(veto, "google", () if veto is None else _veto_flags(veto))
 
@@ -619,9 +600,9 @@ def _subject_crm(
     subject_type, subject_id = subject
     if subject_type == "campaign":
         return _campaign_crm(ctx, attribution, ctx.campaigns[subject_id])
-    gap = _google_link_gap(ctx)
+    gap = google_link_gap(ctx)
     if gap is not None:
-        return _CrmView(None, None, (_no_crm_link_flag(gap),))
+        return _CrmView(None, None, (no_crm_link_flag(gap),))
     veto = shared_budget_veto(ctx, history.members, native_day_zone(ctx, "google"))
     return _CrmView(veto, "google", () if veto is None else _veto_flags(veto))
 
@@ -1176,7 +1157,7 @@ class _Notes:
     def note_view(self, ctx: AnalysisContext, entity: EntityRef, view: _CrmView) -> None:
         """Record what an item's pipeline evidence implies for the section's findings."""
         if any(flag.code == FLAG_NO_CRM_LINK for flag in view.flags):
-            self.no_crm_link = _google_link_gap(ctx)
+            self.no_crm_link = google_link_gap(ctx)
             self.no_crm_items += 1
         veto = view.veto
         if veto is not None and (not veto.available or veto.attribution_floor):
@@ -2182,7 +2163,7 @@ def _google_currency(ctx: AnalysisContext, campaign_ids: Sequence[int]) -> str:
     return ""
 
 
-def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
+def _c3b(ctx: AnalysisContext, settings: _Settings, notes: _Notes) -> RuleResult:
     """C3b Launch: a converting search-term cluster no keyword, ad group or campaign covers.
 
     AAP 0.5.4.4 C3b. The window's converting search terms (conversions > 0; any fractional
@@ -2193,6 +2174,10 @@ def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
     whose head tokens appear in no keyword text, ad group name or campaign name. Those texts
     are tokenised once per evaluation into one token union (:func:`_coverage_tokens`), and
     each cluster's head tokens are tested against that union.
+
+    A C3b item is a Google item, so without the verified Google-to-CRM link it carries
+    ``no_crm_link`` (AAP 0.3.3, 0.5.4.1) and ``notes`` counts it in the section's
+    ``no_crm_link`` finding.
 
     Rationale: "a keyword cluster with no matching campaign" is the data gap the user named.
     Several converting queries sharing words the account never targets is demand the account
@@ -2215,6 +2200,9 @@ def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
         converting, threshold=settings.c3b_jaccard, min_head_share=settings.c3b_head_share
     )
     covered = _coverage_tokens(ctx)
+    gap = google_link_gap(ctx)
+    # C3b reads no pipeline evidence; the view carries only the Google link gap.
+    crm = _CrmView(None, None, () if gap is None else (no_crm_link_flag(gap),))
     candidates: list[Candidate] = []
     withheld: list[Withheld] = []
     for cluster in clusters:
@@ -2257,7 +2245,10 @@ def _c3b(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
                 )
             )
             continue
-        candidates.append(_c3b_candidate(ctx, settings, cluster, entity, by_term, conversions))
+        notes.note_view(ctx, entity, crm)
+        candidates.append(
+            _c3b_candidate(ctx, settings, cluster, entity, by_term, conversions, crm.flags)
+        )
     return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
 
 
@@ -2268,8 +2259,9 @@ def _c3b_candidate(
     entity: EntityRef,
     by_term: Mapping[str, _TermTotals],
     conversions: Decimal,
+    flags: tuple[Flag, ...],
 ) -> Candidate:
-    """The C3b launch idea of one uncovered converting cluster."""
+    """The C3b launch idea of one uncovered converting cluster, carrying ``flags``."""
     members = sorted(
         cluster.members, key=lambda term: (-by_term[term].conversions, -by_term[term].clicks, term)
     )
@@ -2328,7 +2320,7 @@ def _c3b_candidate(
         reason=reason,
         evidence=evidence,
         rank_key=(-conversions,),
-        flags=(),
+        flags=flags,
         required_datasets=_C3B_DATASETS,
         increases_spend_on=(),
         decision_subject=None,
@@ -2351,7 +2343,9 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
 
     Findings: ``segment_window_unavailable`` (C3a), one ``pipeline_unavailable`` per campaign
     whose pipeline could not be judged (QL stage unresolved, unknown CRM evidence or an
-    attribution floor) and ``no_crm_link`` once any Google item lacks the CRM link.
+    attribution floor) and ``no_crm_link`` once any Google item (C1, C2 or C3b) lacks the
+    verified CRM link; its ``items`` counts the C1, C2 and C3b items that carry the flag (C0
+    items, built by ``discrepancy.py``, carry it too but are not counted here).
 
     Threshold keys: :data:`C1_THRESHOLD_KEYS`, :data:`C1B_THRESHOLD_KEYS`,
     :data:`C2_THRESHOLD_KEYS`, :data:`VETO_THRESHOLD_KEYS`, :data:`C3A_THRESHOLD_KEYS` and
@@ -2372,7 +2366,7 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
         _c1b(ctx, settings, attribution, notes),
         _c2(ctx, settings, attribution, notes),
         _c3a(ctx, settings),
-        _c3b(ctx, settings),
+        _c3b(ctx, settings, notes),
     )
     findings = notes.findings()
     if not findings:

@@ -282,6 +282,43 @@ _AMOUNT_FIELDS: Final[tuple[str, str]] = ("daily_budget", "total_budget")
 _AUTO_RESOLVABLE_KINDS: Final[frozenset[str]] = frozenset({"status", "budget", "untracked"})
 """Kinds that close as soon as a later snapshot matches the current decision (AAP 0.5.4.4)."""
 
+# Refusal messages are shown to the user as they are (AAP 0.5.5), so they name shapes,
+# kinds, resolutions and periods in words; the API keys stay in each refusal's ``details``.
+_SHAPE_LABELS: Final[Mapping[DecisionShape, str]] = MappingProxyType(
+    {
+        "own_budget": "a campaign with its own budget",
+        "shared_member": "a campaign on a shared budget",
+        "budget": "a shared budget",
+    }
+)
+"""Each decision shape as a refusal message names it, with its indefinite article."""
+
+_KIND_LABELS: Final[Mapping[DiscrepancyKind, str]] = MappingProxyType(
+    {
+        "status": "a status",
+        "budget": "a budget",
+        "untracked": "an untracked",
+        "missing": "a missing",
+    }
+)
+"""Each discrepancy kind with its indefinite article, completed by "discrepancy"."""
+
+_RESOLUTION_LABELS: Final[Mapping[Resolution, str]] = MappingProxyType(
+    {
+        "platform_correct": "Platform is correct",
+        "decision_correct": "Decision is correct",
+        "adopt_platform": "Adopt platform state",
+        "record_intended": "Record intended state",
+        "acknowledge_removal": "Acknowledge removal",
+    }
+)
+"""Each resolution as the resolver offers it to the user (AAP 0.5.5)."""
+
+_PERIOD_LABELS: Final[Mapping[BudgetPeriod, str]] = MappingProxyType(
+    {"DAILY": "daily", "CUSTOM_PERIOD": "custom-period"}
+)
+"""Each Google budget period as the adjective of a budget, as in "a daily budget"."""
+
 
 def _is_subject_type(value: object) -> TypeIs[SubjectType]:
     """Return whether ``value`` is a decision subject type."""
@@ -427,7 +464,10 @@ class PlatformStateUnknown(DecisionError):  # noqa: N818 - name fixed by the dec
     ``budget`` or ``own_budget`` decision can be written for it until a later sync
     observes it (``Budget`` model contract). Also raised when the snapshot a resolution
     would adopt was observed in another budget shape or period than the subject has now;
-    a later entity sync refreshes the comparison. Code ``platform_state_unknown``.
+    a later entity sync refreshes the comparison. :func:`record_decision` raises it too
+    for a subject that has no decision and no snapshot: no entity sync has reported it, so
+    there is no platform state and no ``untracked`` discrepancy yet. Code
+    ``platform_state_unknown``.
     """
 
     status_code: ClassVar[int] = 409
@@ -527,7 +567,7 @@ class DecisionPatch:
         if self.status is not None and not _is_campaign_status(self.status):
             raise PatchRejected(
                 "invalid_value",
-                f"status must be one of {', '.join(CAMPAIGN_STATUSES)}",
+                f"Status must be one of {', '.join(CAMPAIGN_STATUSES)}.",
                 details={"field": "status"},
             )
         for name in _AMOUNT_FIELDS:
@@ -538,7 +578,7 @@ class DecisionPatch:
             if amount is None:
                 raise PatchRejected(
                     "invalid_value",
-                    f"{name} must be an exact decimal amount",
+                    f"The {name} must be an exact decimal amount.",
                     details={"field": name},
                 )
             object.__setattr__(self, name, amount)
@@ -562,21 +602,21 @@ class DecisionPatch:
         if unknown:
             raise PatchRejected(
                 "unknown_field",
-                f"unknown patch fields: {', '.join(unknown)}",
+                f"The patch carries unknown fields: {', '.join(unknown)}.",
                 details={"fields": unknown},
             )
         nulls = sorted(name for name, value in data.items() if value is None)
         if nulls:
             raise PatchRejected(
                 "invalid_value",
-                f"decided fields cannot be null: {', '.join(nulls)}",
+                f"Decided fields cannot be null: {', '.join(nulls)}.",
                 details={"fields": nulls},
             )
         status = data.get("status")
         if status is not None and not _is_campaign_status(status):
             raise PatchRejected(
                 "invalid_value",
-                f"status must be one of {', '.join(CAMPAIGN_STATUSES)}",
+                f"Status must be one of {', '.join(CAMPAIGN_STATUSES)}.",
                 details={"field": "status"},
             )
         amounts: dict[str, Decimal | None] = {}
@@ -586,7 +626,7 @@ class DecisionPatch:
             if raw is not None and amount is None:
                 raise PatchRejected(
                     "invalid_value",
-                    f"{name} must be an exact decimal amount",
+                    f"The {name} must be an exact decimal amount.",
                     details={"field": name},
                 )
             amounts[name] = amount
@@ -1127,7 +1167,7 @@ def expected_state_from_snapshot(
             raise PlatformStateUnknown(
                 "platform_state_unknown",
                 "Google did not report the amount or period of the campaign's budget; no "
-                "own_budget state can be materialised until a sync observes it.",
+                "decision can be materialised from its platform state until a sync observes it.",
                 details={"snapshot_id": snapshot.id},
             )
         daily, total = _google_amounts(snapshot.budget_amount_micros, budget_period)
@@ -1201,11 +1241,38 @@ def _observed_shape(snapshot: EntitySnapshot) -> _Observation | None:
     )
 
 
-def _shape_text(shape: DecisionShape, period: BudgetPeriod | None, budget_id: int | None) -> str:
-    """Describe a budget shape for a refusal message, for example ``own_budget (DAILY)``."""
+def _shape_text(
+    shape: DecisionShape, period: BudgetPeriod | None, budget_id: int | None, state: SubjectState
+) -> str:
+    """Describe a budget shape for a refusal message, in words rather than API keys.
+
+    Args:
+        shape: The observed or current decision shape.
+        period: The Google budget period observed or current; ``None`` on LinkedIn and for
+            a Google campaign whose budget is not reported.
+        budget_id: For a ``shared_member``, the shared budget drawn from.
+        state: The subject, whose source and known shared budgets name the budget.
+
+    Returns:
+        A noun phrase with its indefinite article and no API key or database id, for
+        example "a campaign with its own daily budget" or "a campaign on shared budget
+        9876543210"; a shared budget whose Google id the state does not know is "a
+        campaign on a shared budget".
+    """
     if shape == "shared_member":
-        return f"shared_member of budget id {budget_id}"
-    return shape if period is None else f"{shape} ({period})"
+        external = _budget_external_id(budget_id, state)
+        if external is None:
+            return _SHAPE_LABELS[shape]
+        return f"a campaign on shared budget {external}"
+    if shape == "budget":
+        if period is None:
+            return _SHAPE_LABELS[shape]
+        return f"a {_PERIOD_LABELS[period]} shared budget"
+    if period is not None:
+        return f"a campaign with its own {_PERIOD_LABELS[period]} budget"
+    if state.source == "google":
+        return "a campaign with no reported budget"
+    return _SHAPE_LABELS[shape]
 
 
 def _check_observed_shape(
@@ -1243,7 +1310,7 @@ def _check_observed_shape(
             compares the subject again and refreshes or closes the discrepancy.
     """
     observed = _observed_shape(snapshot)
-    current_text = _shape_text(state.shape, state.budget_period, state.budget_id)
+    current_text = _shape_text(state.shape, state.budget_period, state.budget_id, state)
     details: dict[str, object] = {
         "discrepancy_id": discrepancy_id,
         "snapshot_id": snapshot.id,
@@ -1261,9 +1328,9 @@ def _check_observed_shape(
     if observed is None:
         raise PlatformStateUnknown(
             "platform_state_unknown",
-            f"The platform state this discrepancy compared (snapshot {snapshot.id}) does not "
-            "record the budget shape it was observed in, so it cannot be adopted as "
-            f"{state.name}'s current {current_text} state. {refresh}",
+            "The platform state this discrepancy compared does not record the budget shape it "
+            f"was observed in, so it cannot be adopted for {state.name}, which is now "
+            f"{current_text}. {refresh}",
             details=details,
         )
     if observed.shape != state.shape:
@@ -1274,11 +1341,11 @@ def _check_observed_shape(
         coherent = observed.budget_period == state.budget_period
     if coherent:
         return
-    observed_text = _shape_text(observed.shape, observed.budget_period, observed.budget_id)
+    observed_text = _shape_text(observed.shape, observed.budget_period, observed.budget_id, state)
     raise PlatformStateUnknown(
         "platform_state_unknown",
-        f"The platform state this discrepancy compared (snapshot {snapshot.id}) was observed "
-        f"before {state.name}'s budget shape or period changed: it shows {observed_text}, "
+        "The platform state this discrepancy compared was observed before "
+        f"{state.name}'s budget shape or period changed: it shows {observed_text}, "
         f"and the subject is now {current_text}. {refresh}",
         details=details,
     )
@@ -1409,13 +1476,16 @@ def describe_snapshot(snapshot: EntitySnapshot, *, state: SubjectState) -> dict[
 def _missing_budget_message(state: SubjectState, field: str) -> str:
     """Explain why an own-budget campaign cannot take ``field``."""
     if state.source == "google":
-        if state.budget_period is None:
-            return f"{state.name} has no budget; {field} cannot be decided"
+        period = state.budget_period
+        if period is None:
+            return f"{state.name} has no budget; {field} cannot be decided."
         other = "total_budget" if field == "daily_budget" else "daily_budget"
-        return f"{state.name} has a {state.budget_period} budget, which takes {other}, not {field}"
+        return (
+            f"{state.name} has a {_PERIOD_LABELS[period]} budget, which takes {other}, not {field}."
+        )
     if field == "daily_budget":
-        return f"{state.name} has no daily budget; daily_budget cannot be decided"
-    return f"{state.name} has no lifetime budget; total_budget cannot be decided"
+        return f"{state.name} has no daily budget; daily_budget cannot be decided."
+    return f"{state.name} has no lifetime budget; total_budget cannot be decided."
 
 
 def _check_shape_fields(state: SubjectState, fields: frozenset[str]) -> None:
@@ -1439,10 +1509,16 @@ def _check_shape_fields(state: SubjectState, fields: frozenset[str]) -> None:
         return
     if state.shape == "shared_member":
         if amounts:
+            # The message names the budget by its Google id only; the database ids stay in
+            # ``details``, since the UI shows this message as it is.
+            owner = (
+                "the shared budget this campaign draws from"
+                if state.budget_external_id is None
+                else f"shared budget {state.budget_external_id}"
+            )
             raise PatchRejected(
                 "shared_budget_amount",
-                f"Amounts are set on shared budget {state.budget_external_id} (budget id "
-                f"{state.budget_id}); record the decision on that budget.",
+                f"Amounts are set on {owner}; record the decision on that budget.",
                 details={
                     "fields": amounts,
                     "budget_id": state.budget_id,
@@ -1463,14 +1539,17 @@ def _check_shape_fields(state: SubjectState, fields: frozenset[str]) -> None:
             details={"fields": amounts},
         )
     allowed_field = "daily_budget" if state.has_daily_budget else "total_budget"
+    period = state.budget_period
     for field in amounts:
         if field != allowed_field or not (state.has_daily_budget or state.has_total_budget):
-            raise PatchRejected(
-                "field_not_allowed",
-                f"Shared budget {state.name} has a {state.budget_period} period, which takes "
-                f"{allowed_field}, not {field}.",
-                details={"field": field},
+            # state.name is the budget's display name, "Shared budget {external_id}".
+            message = (
+                f"{state.name} has no budget period; {field} cannot be decided."
+                if period is None
+                else f"{state.name} is a {_PERIOD_LABELS[period]} budget, which takes "
+                f"{allowed_field}, not {field}."
             )
+            raise PatchRejected("field_not_allowed", message, details={"field": field})
 
 
 def _check_amount(amount: Decimal, *, field: str, state: SubjectState) -> None:
@@ -1483,13 +1562,13 @@ def _check_amount(amount: Decimal, *, field: str, state: SubjectState) -> None:
     if issue is None:
         return
     if issue == "invalid_amount":
-        message = f"{field} must be a positive amount below 10^12"
+        message = f"The {field} must be a positive amount below 10^12."
     elif state.source == "google":
-        message = f"{field} must be a whole number of micros (at most 6 decimal places)"
+        message = f"The {field} must be a whole number of micros (at most 6 decimal places)."
     else:
         places = minor_unit_exponent(state.currency)
         message = (
-            f"{field} must not be finer than the {state.currency} minor unit ({places} places)"
+            f"The {field} must not be finer than the {state.currency} minor unit ({places} places)."
         )
     raise PatchRejected(issue, message, details={"field": field})
 
@@ -1547,8 +1626,9 @@ def _check_budget_ownership(state: SubjectState, result: ExpectedState) -> None:
     obsolete = [field for field in decided if field not in current]
     missing = [field for field in current if field not in decided]
     sentences = [f"{state.name}'s budget changed after it was decided"]
-    if state.source == "google":
-        sentences[0] += f": it now has a {state.budget_period} budget"
+    period = state.budget_period
+    if state.source == "google" and period is not None:
+        sentences[0] += f": it now has a {_PERIOD_LABELS[period]} budget"
     sentences[0] += "."
     if obsolete:
         sentences.append(
@@ -1621,8 +1701,8 @@ def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatc
     if current.shape != state.shape:
         raise PatchRejected(
             "shape_changed",
-            f"{state.name} is now a {state.shape} subject but was decided as "
-            f"{current.shape}; resolve its budget discrepancy first.",
+            f"{state.name} is now {_SHAPE_LABELS[state.shape]} but was decided as "
+            f"{_SHAPE_LABELS[current.shape]}; resolve its budget discrepancy first.",
             details={"decided_shape": current.shape, "current_shape": state.shape},
         )
     fields = patch.fields_set()
@@ -1694,12 +1774,12 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
     unknown = sorted(keys - _PATCH_FIELDS)
     if unknown:
         raise _intended_invalid(
-            f"unknown intended-state fields: {', '.join(unknown)}", fields=unknown
+            f"The intended state carries unknown fields: {', '.join(unknown)}.", fields=unknown
         )
     nulls = sorted(name for name, value in intended.items() if value is None)
     if nulls:
         raise _intended_invalid(
-            f"intended-state fields cannot be null: {', '.join(nulls)}", fields=nulls
+            f"Intended-state fields cannot be null: {', '.join(nulls)}.", fields=nulls
         )
 
     required: set[str]
@@ -1716,10 +1796,11 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
     elif state.has_total_budget:
         required = {"total_budget"}
     else:
-        raise _intended_invalid(f"{state.name} has no budget period; no amount can be intended")
+        raise _intended_invalid(f"{state.name} has no budget period; no amount can be intended.")
     if keys != required:
         raise _intended_invalid(
-            f"a {state.shape} intended state takes exactly {', '.join(sorted(required))}",
+            f"The intended state of {state.name}, {_SHAPE_LABELS[state.shape]}, takes exactly "
+            f"these fields: {', '.join(sorted(required))}.",
             required=sorted(required),
             received=sorted(keys),
         )
@@ -1729,7 +1810,7 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
     if "status" in required:
         if not _is_campaign_status(status_value):
             raise _intended_invalid(
-                f"status must be one of {', '.join(CAMPAIGN_STATUSES)}", field="status"
+                f"Status must be one of {', '.join(CAMPAIGN_STATUSES)}.", field="status"
             )
         status = status_value
     amounts: dict[str, Decimal | None] = {"daily_budget": None, "total_budget": None}
@@ -1738,7 +1819,7 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
             continue
         amount = _as_decimal(intended[field])
         if amount is None:
-            raise _intended_invalid(f"{field} must be an exact decimal amount", field=field)
+            raise _intended_invalid(f"The {field} must be an exact decimal amount.", field=field)
         try:
             _check_amount(amount, field=field, state=state)
         except PatchRejected as exc:
@@ -2455,7 +2536,9 @@ def _build_state(ref: SubjectRef, rows: _StateRows) -> SubjectState:
         budget_external_id = None
 
     if not _is_decision_source(source):
-        raise SubjectNotFound("not_found", f"{ref.type} {ref.id} is not a decision subject.")
+        raise SubjectNotFound(
+            "not_found", f"{ref.type.capitalize()} {ref.id} is not a decision subject."
+        )
     period = raw_period if _is_period(raw_period) else None
     dataset = rows.datasets.get(dataset_id)
     if dataset is None:
@@ -2594,8 +2677,8 @@ def _ensure_active(state: SubjectState) -> None:
     if state.dataset_state != "active":
         raise SubjectRetired(
             "subject_retired",
-            f"{state.name} belongs to a {state.dataset_state} dataset; decisions apply only "
-            "to the active dataset's subjects.",
+            f"{state.name} does not belong to an active dataset; decisions apply only to the "
+            "active dataset's subjects.",
             details={"dataset_id": state.dataset_id, "dataset_state": state.dataset_state},
         )
 
@@ -2673,8 +2756,12 @@ async def record_decision(
     before the row commits. The checks run in this order:
 
     1. the subject's dataset must be ``active`` (:class:`SubjectRetired`, 409);
-    2. the subject must have a decision (``untracked_subject``: resolve its ``untracked``
-       discrepancy first) that is not a tombstone (``subject_removed``);
+    2. the subject must have a decision that is not a tombstone (``subject_removed``).
+       Without a decision, a subject no entity sync has reported has no platform state
+       (:class:`PlatformStateUnknown`, 409 ``platform_state_unknown``), and one that was
+       reported is ``untracked_subject`` (422), which sends the user to its unresolved
+       ``untracked`` discrepancy when one exists and otherwise says that none has been
+       raised yet (:func:`_undecided_subject`);
     3. then :func:`apply_patch`: shape still current, non-empty patch, per-shape field
        rules, amount precision, materialisation, the budget fields the campaign has now
        (``budget_changed``) and ``no_change``.
@@ -2705,7 +2792,10 @@ async def record_decision(
     Raises:
         SubjectNotFound: If the subject does not exist (404).
         SubjectRetired: If its dataset is not active (409 ``subject_retired``).
-        PatchRejected: If the patch breaks a rule of AAP 0.5.2 (422).
+        PlatformStateUnknown: If the subject has no decision and no entity sync has
+            reported it, so it has no platform state (409 ``platform_state_unknown``).
+        PatchRejected: If the patch breaks a rule of AAP 0.5.2, or the subject has no
+            decision but was reported (``untracked_subject``) (422).
         ValueError: If ``origin`` is not ``user`` or ``recommendation``,
             ``recommendation`` comes without a ``recommendation_id``, or ``now`` is naive.
     """
@@ -2745,11 +2835,7 @@ async def _record_decision(
     _ensure_active(state)
     current = state.current_expected
     if current is None:
-        raise PatchRejected(
-            "untracked_subject",
-            f"{state.name} has no decision yet; resolve its untracked discrepancy first "
-            "(Adopt platform state / Record intended state).",
-        )
+        raise await _undecided_subject(session, state)
     expected = apply_patch(state, current, patch)
     decision = await _insert_decision(
         session,
@@ -2773,6 +2859,67 @@ async def _record_decision(
         fields=sorted(patch.fields_set()),
     )
     return decision
+
+
+_FIRST_DECISION_PATHS: Final = (
+    "its platform state is recorded as a baseline decision or raised as an untracked "
+    "discrepancy to resolve (Adopt platform state / Record intended state)."
+)
+"""How a subject without a decision gets its first one, ending the messages that refuse it."""
+
+
+async def _undecided_subject(session: AsyncSession, state: SubjectState) -> DecisionError:
+    """Return the refusal of a patch on a subject that has no decision yet.
+
+    A patch applies over the subject's last decided state, so a subject gets its first
+    decision only from the baseline or from resolving its ``untracked`` discrepancy (AAP
+    0.5.2, 0.5.4.4). The refusal names what the user can do now, from what is known:
+
+    * **No snapshot**: no entity sync has reported the subject, for example a stand-in
+      campaign that metrics referenced before any entity sync stored it. It has no
+      platform state, so no ``untracked`` discrepancy exists either:
+      :class:`PlatformStateUnknown` (409 ``platform_state_unknown``).
+    * **A snapshot and an unresolved** ``untracked`` **discrepancy**: 422
+      ``untracked_subject`` sending the user to that discrepancy, whose id is in
+      ``details``.
+    * **A snapshot and no such discrepancy**: detection has not raised one, because the
+      subject's baseline still waits for a value the platform did not report or no
+      detection has judged it yet. 422 ``untracked_subject`` saying so, so the user is
+      never sent to a discrepancy that does not exist.
+
+    ``state`` was loaded with ``lock``, so the subject row is locked and no detection pass
+    can raise or resolve its discrepancy between this read and the refusal.
+
+    Args:
+        session: The caller's session, holding the subject's locks.
+        state: The subject's state; it has no current decision.
+
+    Returns:
+        The error for the caller to raise; nothing is written.
+    """
+    subject = {"subject_type": state.ref.type, "subject_id": state.ref.id}
+    if state.latest_snapshot is None:
+        return PlatformStateUnknown(
+            "platform_state_unknown",
+            f"{state.name} has not been reported by an entity sync yet, so its platform "
+            "state is unknown and it has no decision to change. Once an entity sync reports "
+            f"it, {_FIRST_DECISION_PATHS}",
+            details={**subject, "dataset_id": state.dataset_id},
+        )
+    untracked = await _unresolved(session, state.ref, "untracked")
+    if untracked:
+        return PatchRejected(
+            "untracked_subject",
+            f"{state.name} has no decision yet; resolve its untracked discrepancy first "
+            "(Adopt platform state / Record intended state).",
+            details={**subject, "discrepancy_id": untracked[0].id},
+        )
+    return PatchRejected(
+        "untracked_subject",
+        f"{state.name} has no decision yet, and no untracked discrepancy has been raised for "
+        f"it. Once a later entity sync reports it, {_FIRST_DECISION_PATHS}",
+        details=subject,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -2815,6 +2962,40 @@ def _already_resolved(discrepancy_id: int) -> DiscrepancyClosed:
     """Return the 409 refusing a resolution of an already resolved discrepancy."""
     return DiscrepancyClosed(
         "discrepancy_resolved", f"Discrepancy {discrepancy_id} is already resolved."
+    )
+
+
+def _resolution_not_allowed(
+    resolution: Resolution, kind: DiscrepancyKind, state: SubjectState
+) -> InvalidResolution:
+    """Return the 422 refusing a resolution that :data:`RESOLUTIONS` does not offer.
+
+    The message names the resolutions, the kind and the subject in words; ``details``
+    keeps the API keys: ``kind``, ``shape`` and ``valid``, the offered resolution keys in
+    :data:`DISCREPANCY_RESOLUTIONS` order.
+
+    Args:
+        resolution: The refused resolution.
+        kind: The discrepancy's kind.
+        state: The discrepancy's subject, in its current shape.
+
+    Returns:
+        The ``resolution_not_allowed`` error for the caller to raise.
+    """
+    allowed = RESOLUTIONS.get((kind, state.shape), frozenset())
+    offered = [key for key in DISCREPANCY_RESOLUTIONS if key in allowed]
+    valid = [_RESOLUTION_LABELS[key] for key in offered if _is_resolution(key)]
+    message = (
+        f"{_RESOLUTION_LABELS[resolution]} is not valid for {_KIND_LABELS[kind]} discrepancy "
+        f"on {state.name}; "
+    )
+    message += (
+        f"the valid resolutions are {', '.join(valid)}." if valid else "no resolution applies."
+    )
+    return InvalidResolution(
+        "resolution_not_allowed",
+        message,
+        details={"kind": kind, "shape": state.shape, "valid": offered},
     )
 
 
@@ -3051,17 +3232,13 @@ async def _resolve_discrepancy(
         # A concurrent resolver, or a sync's auto-resolution, closed it meanwhile.
         raise _already_resolved(discrepancy_id)
     discrepancy = locked
-    allowed = RESOLUTIONS.get((kind, state.shape), frozenset())
-    if resolution not in allowed:
-        offered = [key for key in DISCREPANCY_RESOLUTIONS if key in allowed]
-        raise InvalidResolution(
-            "resolution_not_allowed",
-            f"{resolution} is not valid for a {kind} discrepancy on a {state.shape} subject; "
-            f"valid: {', '.join(offered)}.",
-            details={"kind": kind, "shape": state.shape, "valid": offered},
-        )
+    if resolution not in RESOLUTIONS.get((kind, state.shape), frozenset()):
+        raise _resolution_not_allowed(resolution, kind, state)
     if intended_state is not None and resolution != "record_intended":
-        raise _intended_invalid("intended_state applies only to record_intended")
+        raise _intended_invalid(
+            f"An intended_state for {state.name} is sent only with Record intended state, not "
+            f"with {_RESOLUTION_LABELS[resolution]}."
+        )
 
     current = state.current_expected
     written: Decision | None = None
@@ -3109,7 +3286,9 @@ async def _resolve_discrepancy(
         _close(discrepancy, resolution, instant)
     elif resolution == "record_intended":
         if intended_state is None:
-            raise _intended_invalid("record_intended needs an intended_state")
+            raise _intended_invalid(
+                f"Record intended state needs an intended_state for {state.name}."
+            )
         expected = parse_intended_state(state, intended_state)
         written = await write(expected)
         discrepancy.state = "awaiting_platform"

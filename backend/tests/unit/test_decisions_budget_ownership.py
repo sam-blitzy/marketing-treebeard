@@ -387,7 +387,7 @@ def test_the_refusal_names_the_new_google_period_and_the_resolution() -> None:
         apply_patch(_google("CUSTOM_PERIOD"), DAILY_100, DecisionPatch(total_budget=Decimal(200)))
 
     assert refused.value.message == (
-        "Campaign 11's budget changed after it was decided: it now has a CUSTOM_PERIOD budget. "
+        "Campaign 11's budget changed after it was decided: it now has a custom-period budget. "
         "The decision still holds daily_budget, which the campaign no longer has. "
         "Resolve its budget discrepancy first."
     )
@@ -426,7 +426,7 @@ def test_an_amount_for_a_google_budget_no_longer_reported_is_still_refused() -> 
     error = refused.value
     assert (error.status_code, error.code) == (422, "field_not_allowed")
     assert error.details == {"field": "daily_budget"}
-    assert error.message == "Campaign 11 has no budget; daily_budget cannot be decided"
+    assert error.message == "Campaign 11 has no budget; daily_budget cannot be decided."
 
 
 @pytest.mark.parametrize(

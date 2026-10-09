@@ -86,6 +86,7 @@ from ads_engine.analysis.context import (
     Source,
     SubjectKey,
     Withheld,
+    google_link_gap,
 )
 from ads_engine.analysis.metrics import cap_constrained, native_day_zone
 from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
@@ -696,8 +697,8 @@ def test_an_unverified_google_link_names_its_reason() -> None:
         f"No CRM link for Google campaigns: {UNLINKED_REASON}. No Google Qualified Lead counts "
         "or pipeline veto are computed."
     )
-    assert campaigns._google_link_gap(unlinked) == UNLINKED_REASON
-    assert campaigns._google_link_gap(_fresh(ctx, google_crm=_google_crm(external, 0))) is None
+    assert google_link_gap(unlinked) == UNLINKED_REASON
+    assert google_link_gap(_fresh(ctx, google_crm=_google_crm(external, 0))) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2220,7 +2221,11 @@ def test_c3b_launches_an_uncovered_converting_cluster() -> None:
     assert item.group == GROUP_LAUNCH
     assert item.entity_ref.type == ENTITY_TERM_CLUSTER
     assert item.entity_ref.name == "Search-term cluster 'alternative hubspot'"
-    assert (item.decision_subject, item.increases_spend_on, item.flags) == (None, (), ())
+    assert (item.decision_subject, item.increases_spend_on) == (None, ())
+    # A Google item without a verified Google-to-CRM link carries no_crm_link (AAP 0.3.3).
+    assert [(flag.code, flag.message) for flag in item.flags] == [
+        (FLAG_NO_CRM_LINK, "No CRM link for Google campaigns: no active HubSpot dataset")
+    ]
     assert item.rank_key == (-Decimal(6),)
     extra = item.evidence.extra
     assert extra["head_tokens"] == ("alternative", "hubspot")
@@ -2245,7 +2250,10 @@ def test_c3b_launches_an_uncovered_converting_cluster() -> None:
     assert item.depends_on[0] == DecisionSubject("campaign", search)
     assert set(item.evidence.thresholds) == set(C3B_THRESHOLD_KEYS)
     assert item.required_datasets == ("google.search_terms", "google.entities")
-    assert result.findings == ()
+    # The only finding is the section's no_crm_link, which counts the C3b item.
+    (finding,) = result.findings
+    assert (finding.code, finding.section, finding.entity) == (FINDING_NO_CRM_LINK, CAMPAIGNS, None)
+    assert finding.evidence == {"reason": "no active HubSpot dataset", "items": 1}
 
 
 def test_c3b_does_not_fire_when_a_name_already_holds_a_head_token() -> None:
@@ -2302,11 +2310,13 @@ def test_c3b_reads_only_converting_google_terms() -> None:
     _, ctx = _built("c3b.cluster.fires")
     settings = campaigns._Settings.of(ctx)
     flat = tuple(replace(row, conversions=Decimal(0)) for row in ctx.search_terms)
-    assert campaigns._c3b(_fresh(ctx, search_terms=flat), settings) == RuleResult()
+    assert campaigns._c3b(_fresh(ctx, search_terms=flat), settings, campaigns._Notes()) == (
+        RuleResult()
+    )
     linkedin = _linkedin_campaign(500)
     moved = tuple(replace(row, campaign_id=500) for row in ctx.search_terms)
     elsewhere = _fresh(ctx, campaigns={**ctx.campaigns, 500: linkedin}, search_terms=moved)
-    assert campaigns._c3b(elsewhere, settings) == RuleResult()
+    assert campaigns._c3b(elsewhere, settings, campaigns._Notes()) == RuleResult()
 
 
 def test_c3b_currency_falls_back_to_the_google_account_then_to_none() -> None:
@@ -2314,7 +2324,7 @@ def test_c3b_currency_falls_back_to_the_google_account_then_to_none() -> None:
     assert campaigns._google_currency(ctx, [999_999]) == "USD"
     bare = _fresh(ctx, campaigns={}, accounts={})
     assert campaigns._google_currency(bare, [1]) == ""
-    result = campaigns._c3b(bare, campaigns._Settings.of(bare))
+    result = campaigns._c3b(bare, campaigns._Settings.of(bare), campaigns._Notes())
     item = _only(result, C3B)
     assert item.evidence.metric("spend").currency is None
     assert "at 10.00 per conversion" in item.reason

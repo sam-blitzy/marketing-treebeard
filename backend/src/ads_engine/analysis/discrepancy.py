@@ -43,8 +43,11 @@ from ads_engine.analysis.context import (
     DiscrepancyInfo,
     DiscrepancyKind,
     EntityRef,
+    Flag,
     Metric,
     RuleResult,
+    google_link_gap,
+    no_crm_link_flag,
 )
 from ads_engine.decisions import RESOLUTIONS, Resolution, from_micros, minor_unit_exponent
 
@@ -435,8 +438,12 @@ def _reason(item: DiscrepancyInfo) -> str:
     return reason
 
 
-def _candidate(ctx: AnalysisContext, item: DiscrepancyInfo) -> Candidate:
+def _candidate(ctx: AnalysisContext, item: DiscrepancyInfo, crm_link: Flag | None) -> Candidate:
     """Build the pinned C0 item of one unresolved discrepancy.
+
+    ``crm_link`` is the run's ``no_crm_link`` flag, or ``None`` while the Google-to-CRM link is
+    verified. A Google subject's item carries it (AAP 0.3.3: Google items carry
+    ``no_crm_link``); a LinkedIn subject's never does.
 
     Raises:
         ValueError: When the subject's source has no decision subjects, or the (kind, shape)
@@ -509,7 +516,7 @@ def _candidate(ctx: AnalysisContext, item: DiscrepancyInfo) -> Candidate:
         reason=_reason(item),
         evidence=evidence,
         rank_key=(item.detected_at, item.id),
-        flags=(),
+        flags=(crm_link,) if crm_link is not None and item.source == "google" else (),
         required_datasets=(f"{item.source}.entities",),
         increases_spend_on=(),
         # C0 offers its resolver instead of "Record decision" (AAP 0.5.5).
@@ -541,6 +548,11 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
     ``ads_engine.decisions.RESOLUTIONS`` allows for its (kind, shape) pair, in
     :data:`RESOLUTION_ORDER`, so the resolver renders the row for its discrepancy.
 
+    CRM link: the Google-to-CRM link gap is decided once per run
+    (:func:`~ads_engine.analysis.context.google_link_gap`). While it is not verified, the item
+    of every Google subject carries the ``no_crm_link`` flag (AAP 0.3.3, 0.5.4.1); LinkedIn
+    subjects' items never do.
+
     Args:
         ctx: The analysis context.
 
@@ -553,4 +565,6 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
             shape) pair has no defined resolution; detection never produces either.
     """
     ordered = sorted(ctx.discrepancies, key=lambda item: (item.detected_at, item.id))
-    return RuleResult(candidates=tuple(_candidate(ctx, item) for item in ordered))
+    gap = google_link_gap(ctx)
+    crm_link = None if gap is None else no_crm_link_flag(gap)
+    return RuleResult(candidates=tuple(_candidate(ctx, item, crm_link) for item in ordered))

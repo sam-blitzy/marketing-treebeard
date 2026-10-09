@@ -10,6 +10,7 @@ mismatch. Pure: no database and no network.
 """
 
 import doctest
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -21,18 +22,21 @@ from ads_engine.analysis import discrepancy as discrepancy_module
 from ads_engine.analysis.context import (
     C0,
     CAMPAIGNS,
+    FLAG_NO_CRM_LINK,
     GROUP_DISCREPANCIES,
     AccountInfo,
     AnalysisContext,
     BudgetInfo,
     CampaignInfo,
     Candidate,
+    CrmData,
     DatasetRef,
     DatasetStatus,
     DecisionShape,
     DecisionSubject,
     DiscrepancyInfo,
     DiscrepancyKind,
+    Flag,
     Freshness,
     ProvenanceEntry,
     RuleResult,
@@ -51,7 +55,7 @@ from ads_engine.analysis.discrepancy import (
     offered_resolutions,
     render_value,
 )
-from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, Thresholds
 from ads_engine.analysis.window import AnalysisWindow, SourceDayInfo
 from ads_engine.decisions import RESOLUTIONS, Resolution, to_micros
 
@@ -79,6 +83,14 @@ BLANK_ID_CAMPAIGN = 11
 SHARED_BUDGET = 30
 NON_SHARED_BUDGET = 31
 OTHER_SHARED_BUDGET = 32
+
+UNLINKED_REASON = "HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY not configured"
+"""Why the Google-to-CRM link is unavailable in the unverified-link contexts."""
+
+UNLINKED_FLAG = Flag(
+    FLAG_NO_CRM_LINK, "No CRM link for Google campaigns: no active HubSpot dataset"
+)
+"""The ``no_crm_link`` flag of a Google item in a context without a Google CRM dataset."""
 
 PLATFORM_OR_DECISION: tuple[Resolution, ...] = ("platform_correct", "decision_correct")
 ADOPT_OR_INTEND: tuple[Resolution, ...] = ("adopt_platform", "record_intended")
@@ -866,7 +878,8 @@ def test_one_pinned_item_per_unresolved_discrepancy_oldest_first(
         assert candidate.decision_subject is None
         assert candidate.depends_on == (subject,)
         assert candidate.increases_spend_on == ()
-        assert candidate.flags == ()
+        # No Google CRM dataset: Google items carry no_crm_link, LinkedIn items never do.
+        assert candidate.flags == ((UNLINKED_FLAG,) if item.source == "google" else ())
         assert candidate.rank_key == (item.detected_at, item.id)
         assert candidate.required_datasets == (f"{item.source}.entities",)
         assert candidate.entity_ref.source == item.source
@@ -897,6 +910,85 @@ def test_evaluate_is_deterministic_for_any_input_order(
     assert forward == backward
     keys = [candidate.rank_key for candidate in forward.candidates]
     assert keys == sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# The Google-to-CRM link (AAP 0.3.3, 0.5.4.1)
+# ---------------------------------------------------------------------------
+
+
+def _google_crm(*, linked: bool) -> CrmData:
+    """HubSpot's primary dataset with the Google-to-CRM link verified, or not configured."""
+    google = (
+        GoogleCrmBinding(
+            available=True,
+            campaign_property="google_campaign_id",
+            touch_date_property="google_touch_at",
+        )
+        if linked
+        else GoogleCrmBinding(available=False, reason=UNLINKED_REASON)
+    )
+    bindings = CrmBindings.unavailable("CRM stage bindings not verified", at=NOW)
+    return CrmData(HUBSPOT, replace(bindings, google=google))
+
+
+def _sourced_discrepancies() -> tuple[DiscrepancyInfo, ...]:
+    """A Google campaign, a Google shared budget and a LinkedIn campaign, one discrepancy each."""
+    return (
+        _discrepancy(1),
+        _discrepancy(
+            2,
+            subject_type="budget",
+            subject_id=SHARED_BUDGET,
+            subject_name="Pool A",
+            shape="budget",
+            kind="budget",
+            decided_value=_google_money("100.000000"),
+            platform_value=_google_money("120.000000"),
+        ),
+        _discrepancy(
+            3, subject_id=LINKEDIN_CAMPAIGN, subject_name="Lead gen EU", source="linkedin"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("google_crm", "expected"),
+    [
+        pytest.param(None, UNLINKED_FLAG, id="no-google-crm-dataset"),
+        pytest.param(
+            _google_crm(linked=False),
+            Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {UNLINKED_REASON}"),
+            id="link-not-configured",
+        ),
+    ],
+)
+def test_google_c0_items_carry_no_crm_link_without_the_verified_link(
+    thresholds: Thresholds, window: AnalysisWindow, google_crm: CrmData | None, expected: Flag
+) -> None:
+    """AAP 0.3.3: Google items, C0 included, carry no_crm_link; LinkedIn items never do."""
+    ctx = _context(thresholds, window, *_sourced_discrepancies(), google_crm=google_crm)
+    result = evaluate(ctx)
+    flags = {item.evidence.extra["discrepancy_id"]: item.flags for item in result.candidates}
+    assert flags == {1: (expected,), 2: (expected,), 3: ()}
+    # C0 counts no section finding; the Campaigns rules own the no_crm_link finding.
+    assert result.findings == ()
+
+
+def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """AAP 0.5.4.1: with both Google CRM properties verified no item carries no_crm_link."""
+    ctx = _context(
+        thresholds, window, *_sourced_discrepancies(), google_crm=_google_crm(linked=True)
+    )
+    result = evaluate(ctx)
+    assert [item.entity_ref.source for item in result.candidates] == [
+        "google",
+        "google",
+        "linkedin",
+    ]
+    assert all(item.flags == () for item in result.candidates)
 
 
 @pytest.mark.parametrize(

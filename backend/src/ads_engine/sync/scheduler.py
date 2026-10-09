@@ -68,9 +68,10 @@ Due-ness. A job is due when its latest slot (:func:`latest_slot`) is later than 
 history lives in the database, so due-ness survives restarts; slots missed during downtime run
 once, not once per missed slot; and the jobs a dataset backfill records (``entities``,
 ``metrics`` and ``restatement`` for a metrics backfill, ``segments``, ``leads``, ``crm``)
-satisfy their slots, so a fresh start does not repeat them on its first tick. Recovery probes
-and the purge keep their own ``sync_run`` rows (jobs ``probe`` and ``purge``) for the same
-reason.
+satisfy their slots, so a fresh start does not repeat them on its first tick. Probes and the
+purge keep their own ``sync_run`` rows (jobs ``probe`` and ``purge``) for the same reason;
+``probe`` rows record the recovery probes run here and the probes ``ensure_dataset`` runs
+alike, so one spacing of :data:`PROBE_INTERVAL` covers both.
 
 Wakes and lanes. The worker wakes at once after the grace and the startup, then every
 :data:`WAKE_INTERVAL` (30 s) from that first wake on absolute deadlines of a monotonic clock,
@@ -157,7 +158,13 @@ from ads_engine.settings import SOURCES, Settings, Source, get_settings
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.datasets import DatasetManager, DatasetStateError
-from ads_engine.sync.mode import BOOTSTRAP_ORDER, BuildOutcome, SourceModeController
+from ads_engine.sync.mode import (
+    BOOTSTRAP_ORDER,
+    JOB_PROBE,
+    PROBE_INTERVAL,
+    BuildOutcome,
+    SourceModeController,
+)
 
 __all__ = [
     "COALESCE_WINDOW",
@@ -263,14 +270,12 @@ request, so the run starts about 60 s after the first request (AAP 0.3.2: "coale
 60 s"); :meth:`Scheduler.tick` never waits and serves the backlog at a tick once it is due.
 """
 
-PROBE_INTERVAL: Final = timedelta(minutes=30)
-"""The least time between two recovery probes of a source in automatic fallback."""
-
 STANDBY_RETRY: Final = timedelta(seconds=30)
 """How often a standby worker retries the lock, and a lost connection is re-established."""
 
-JOB_PROBE: Final = "probe"
-"""The ``sync_run.job`` of a recovery probe; its ``started_at`` spaces the probes."""
+# PROBE_INTERVAL and JOB_PROBE (re-exported above) are defined once, in sync/mode.py: every
+# probe is spaced by them, the ones SourceModeController.ensure_dataset runs included, and that
+# module cannot import this one.
 
 JOB_PURGE: Final = "purge"
 """The ``sync_run.job`` of the nightly purge of retired datasets."""
@@ -1638,7 +1643,12 @@ class Scheduler:
         """Whether ``source`` is in automatic fallback and its last probe is old enough.
 
         Due when no ``probe`` ``sync_run`` of the source started within
-        :data:`PROBE_INTERVAL` of ``now``. Only reads.
+        :data:`PROBE_INTERVAL` of ``now``. Those rows record every probe: this scheduler's
+        recovery probes and the probes ``ensure_dataset`` runs (the worker's bootstrap, a wake
+        that resolves live without live data). A fallback entered by such a probe therefore
+        gets its first recovery probe 30 minutes after it, not at the next wake. A fallback
+        entered by a denial during a live job has no probe of its own: it is probed once the
+        source's latest probe, if any, is that old. Only reads.
         """
         if not await self._controller.in_fallback(source):
             return False

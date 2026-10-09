@@ -63,6 +63,8 @@ T0 = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
 
 DEFERRED = f"{REASON_DEFERRED}; 3 partitions deferred"
 INTERRUPTED = f"{REASON_INTERRUPTED}: HTTP 503 after 3 attempts"
+LINKEDIN_503 = "linkedin lead_forms: HTTP 503 after 3 attempts"
+"""A LinkedIn interruption's reason: the error's own text, with no repairable prefix."""
 FAILURE_MARKER = freshness._FAILURE_MARKER
 METRICS = "google.metrics_daily"
 
@@ -91,6 +93,7 @@ def _success(
     complete: bool = True,
     reason: str | None = None,
     repairable: bool = False,
+    cut_short: bool = False,
 ) -> FreshnessOutcome:
     """Build a successful outcome attempted at ``_at(hour)`` over ``span``."""
     covered_from, covered_through = _span(span)
@@ -101,12 +104,29 @@ def _success(
         complete=complete,
         reason=reason,
         repairable=repairable,
+        cut_short=cut_short,
     )
 
 
 def _deferred(hour: int, span: Span) -> FreshnessOutcome:
     """Build an incomplete success whose pages were deferred by the call budget."""
     return _success(hour, span, complete=False, reason=DEFERRED, repairable=True)
+
+
+def _cut_short(hour: int, span: Span, reason: str = INTERRUPTED) -> FreshnessOutcome:
+    """Build an incomplete success a transient error or a deferral stopped before it finished.
+
+    ``repairable`` follows the reason, as the jobs set it: a Google interruption or deferral
+    carries a repairable prefix, a LinkedIn interruption (:data:`LINKEDIN_503`) does not.
+    """
+    return _success(
+        hour,
+        span,
+        complete=False,
+        reason=reason,
+        repairable=is_repairable_reason(reason),
+        cut_short=True,
+    )
 
 
 def _stored(
@@ -320,6 +340,32 @@ def test_success_builds_an_incomplete_outcome_with_its_reason() -> None:
     )
 
 
+def test_success_marks_a_cut_short_read_only_when_asked() -> None:
+    """``cut_short`` is explicit: off by default, and set whatever the reason's prefix.
+
+    A deferral or an interruption the job saw is cut short, a LinkedIn one (no repairable
+    prefix) included; neither a complete read, a permanent shortfall nor a failure is.
+    """
+    assert not _success(0, (1, 28)).cut_short
+    assert not _deferred(0, (1, 28)).cut_short
+    assert not _success(0, (1, 28), complete=False, reason=REASON_FINEST_PARTITION).cut_short
+    assert not FreshnessOutcome.failure(T0, reason="timeout").cut_short
+    google = _cut_short(0, (1, 28), DEFERRED)
+    assert (google.completeness, google.reason, google.repairable, google.cut_short) == (
+        "incomplete",
+        DEFERRED,
+        True,
+        True,
+    )
+    linkedin = _cut_short(0, None, LINKEDIN_503)
+    assert (linkedin.completeness, linkedin.reason, linkedin.repairable, linkedin.cut_short) == (
+        "incomplete",
+        LINKEDIN_503,
+        False,
+        True,
+    )
+
+
 def test_success_accepts_a_full_state_read_and_any_aware_time_zone() -> None:
     """A full-state read has no range, and any timezone-aware instant is accepted."""
     eastern = datetime(2026, 10, 1, 2, 0, tzinfo=timezone(timedelta(hours=-4)))
@@ -492,6 +538,23 @@ class _NoOffset(tzinfo):
             ),
             "repairable needs an incomplete success",
             id="repairable-failure",
+        ),
+        pytest.param(
+            lambda: _success(0, (1, 2), cut_short=True),
+            "cut_short needs an incomplete success",
+            id="cut-short-complete",
+        ),
+        pytest.param(
+            lambda: _success(0, None, reason="nothing short", cut_short=True),
+            "cut_short needs an incomplete success",
+            id="cut-short-complete-with-reason",
+        ),
+        pytest.param(
+            lambda: FreshnessOutcome(
+                attempted_at=T0, succeeded=False, reason="HTTP 503", cut_short=True
+            ),
+            "cut_short needs an incomplete success",
+            id="cut-short-failure",
         ),
     ],
 )
@@ -729,6 +792,75 @@ def test_merge_of_a_partial_re_read_keeps_the_worse_completeness() -> None:
     """A trailing-days success never turns an incomplete row complete."""
     merged = freshness._merge(_stored((1, 28), "incomplete", DEFERRED), _success(1, (26, 30)))
     assert merged == freshness._State(_at(1), _at(1), _day(1), _day(30), "incomplete", DEFERRED)
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "complete"),
+            _cut_short(1, (26, 30)),
+            freshness._State(_at(1), _at(0), _day(1), _day(30), "incomplete", INTERRUPTED),
+            id="interrupted-trailing-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete"),
+            _cut_short(1, (1, 30), DEFERRED),
+            freshness._State(_at(1), _at(0), _day(1), _day(30), "incomplete", DEFERRED),
+            id="deferred-full-re-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", REASON_FINEST_PARTITION),
+            _cut_short(1, (26, 30), DEFERRED),
+            freshness._State(_at(1), _at(0), _day(1), _day(30), "incomplete", DEFERRED),
+            id="repairable-still-beats-permanent",
+        ),
+        pytest.param(
+            _stored(None, "complete"),
+            _cut_short(1, None, LINKEDIN_503),
+            freshness._State(_at(1), _at(0), None, None, "incomplete", LINKEDIN_503),
+            id="linkedin-full-state-read",
+        ),
+        pytest.param(
+            _stored(None, "complete"),
+            _cut_short(1, None),
+            freshness._State(_at(1), _at(0), None, None, "incomplete", INTERRUPTED),
+            id="google-full-state-read",
+        ),
+        pytest.param(
+            freshness._State.of(None),
+            _cut_short(1, (1, 28), DEFERRED),
+            freshness._State(_at(1), None, _day(1), _day(28), "incomplete", DEFERRED),
+            id="first-ever-attempt",
+        ),
+    ],
+)
+def test_merge_of_a_cut_short_read_keeps_the_last_success(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """A read a transient error or a deferral cut short is no successful refresh.
+
+    AAP 0.3.3: after a transient error or a call-budget deferral "the affected datasets keep
+    their last good data and turn stale" (AAP 0.3.2: stale once the last success is older
+    than ``sources.stale_after_hours``). Only ``last_attempt_at`` moves; the coverage, the
+    ``incomplete`` completeness and the reason merge exactly as for any other success.
+    """
+    assert freshness._merge(stored, outcome) == expected
+
+
+def test_a_full_read_after_a_cut_short_one_moves_the_last_success_again() -> None:
+    """The next read that is not cut short refreshes the dataset: last success and completeness.
+
+    A failure in between keeps the cut-short read's shortfall first (so ``needs_repair`` still
+    reads its repairable prefix) and moves nothing but the attempt.
+    """
+    cut = freshness._merge(_stored((1, 28), "complete"), _cut_short(1, (26, 30)))
+    failed = freshness._merge(cut, FreshnessOutcome.failure(_at(2), reason="timeout"))
+    assert failed == freshness._State(
+        _at(2), _at(0), _day(1), _day(30), "incomplete", f"{INTERRUPTED}{FAILURE_MARKER}timeout"
+    )
+    repaired = freshness._merge(failed, _success(3, (1, 30)))
+    assert repaired == freshness._State(_at(3), _at(3), _day(1), _day(30), "complete", None)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1030,6 +1162,168 @@ def test_merge_treats_an_attempt_at_the_stored_instant_as_current() -> None:
     # A success that started with the failure did not start before it, so it clears it.
     cleared = freshness._merge(failed, _success(2, (29, 30)))
     assert cleared == freshness._State(_at(2), _at(2), _day(1), _day(30), "complete", None)
+
+
+@pytest.mark.parametrize(
+    ("stored", "attempt", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "incomplete", INTERRUPTED, attempt=2), 1, True, id="cut-short"
+        ),
+        pytest.param(
+            _stored(None, "incomplete", LINKEDIN_503, attempt=2), 1, True, id="cut-short-full-state"
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", DEFERRED, attempt=2, success=None),
+            1,
+            True,
+            id="cut-short-never-succeeded",
+        ),
+        pytest.param(_stored((1, 28), "incomplete", INTERRUPTED, attempt=2), 2, False, id="tie"),
+        pytest.param(
+            _stored((1, 28), "incomplete", INTERRUPTED, attempt=2), 3, False, id="older-attempt"
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", NOTED, attempt=2), 1, False, id="noted-failure"
+        ),
+        pytest.param(
+            _stored((1, 28), "complete", "timeout", attempt=2), 1, False, id="failure-on-complete"
+        ),
+        pytest.param(
+            _stored(None, "unknown", "HTTP 502", attempt=2, success=None),
+            1,
+            False,
+            id="first-failure",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", DEFERRED, attempt=2, success=2),
+            1,
+            False,
+            id="latest-is-a-success",
+        ),
+    ],
+)
+def test_newer_cut_short_reads_a_later_cut_short_attempt_only(
+    stored: freshness._State, attempt: int, expected: bool
+) -> None:
+    """A later attempt with no success and no failure note on an incomplete row was cut short."""
+    assert freshness._newer_cut_short(stored, _at(attempt)) is expected
+
+
+@pytest.mark.parametrize(
+    ("first", "earlier", "later"),
+    [
+        pytest.param(
+            None, _success(1, (1, 28)), _cut_short(2, (1, 28)), id="first-success-then-cut-short"
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            _success(1, (26, 30)),
+            _cut_short(2, (26, 30)),
+            id="partial-success-then-cut-short",
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            _success(1, (1, 30)),
+            _cut_short(2, (1, 30), DEFERRED),
+            id="full-success-then-cut-short",
+        ),
+        pytest.param(
+            _success(0, None),
+            _success(1, None),
+            _cut_short(2, None, LINKEDIN_503),
+            id="full-state-success-then-cut-short",
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            _cut_short(1, (26, 30)),
+            FreshnessOutcome.failure(_at(2), reason="timeout"),
+            id="cut-short-then-failure",
+        ),
+        pytest.param(
+            _success(0, (1, 28)),
+            FreshnessOutcome.failure(_at(1), reason="timeout"),
+            _cut_short(2, (26, 30)),
+            id="failure-then-cut-short",
+        ),
+        pytest.param(
+            None,
+            _cut_short(1, (1, 28)),
+            _cut_short(2, (1, 28), DEFERRED),
+            id="cut-short-then-cut-short",
+        ),
+    ],
+)
+def test_merge_with_a_newer_cut_short_read_is_independent_of_commit_order(
+    first: FreshnessOutcome | None, earlier: FreshnessOutcome, later: FreshnessOutcome
+) -> None:
+    """A cut-short read and an earlier attempt leave the same row whichever commits first.
+
+    An earlier success committing after a newer cut-short read moves ``last_success_at`` to its
+    own start but never takes back the newer read's ``incomplete``, and the newer read is no
+    failed attempt, so no failure note is appended.
+    """
+    start = freshness._State.of(None)
+    if first is not None:
+        start = freshness._merge(start, first)
+    in_start_order = freshness._merge(freshness._merge(start, earlier), later)
+    in_reverse_order = freshness._merge(freshness._merge(start, later), earlier)
+    assert in_reverse_order == in_start_order
+    assert in_start_order.last_attempt_at == _at(2)
+    assert FAILURE_MARKER not in (in_start_order.reason or "") or not later.succeeded
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "complete", attempt=2, success=2),
+            _cut_short(1, (26, 30)),
+            freshness._State(_at(2), _at(2), _day(1), _day(30), "incomplete", INTERRUPTED),
+            id="obsolete-cut-short-downgrades-but-never-moves-a-timestamp",
+        ),
+        pytest.param(
+            _stored((12, 15), "complete", attempt=2, success=2),
+            _cut_short(1, (1, 5)),
+            _stored((12, 15), "complete", attempt=2, success=2),
+            id="obsolete-disjoint-cut-short-changes-nothing",
+        ),
+        pytest.param(
+            _stored((1, 30), "incomplete", DEFERRED, attempt=2, success=0),
+            _success(1, (1, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "incomplete", DEFERRED),
+            id="older-full-success-keeps-the-newer-shortfall",
+        ),
+        pytest.param(
+            _stored((12, 15), "incomplete", DEFERRED, attempt=2, success=0),
+            _success(1, (1, 5)),
+            _stored((12, 15), "incomplete", DEFERRED, attempt=2, success=0),
+            id="older-disjoint-success-changes-nothing",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", DEFERRED, attempt=2, success=0),
+            _cut_short(1, (1, 28)),
+            freshness._State(_at(2), _at(0), _day(1), _day(28), "incomplete", DEFERRED),
+            id="older-cut-short-moves-nothing",
+        ),
+        pytest.param(
+            _stored(None, "incomplete", LINKEDIN_503, attempt=2, success=0),
+            _success(1, None),
+            freshness._State(_at(2), _at(1), None, None, "incomplete", LINKEDIN_503),
+            id="older-full-state-success-keeps-the-newer-linkedin-shortfall",
+        ),
+    ],
+)
+def test_merge_never_lets_an_older_attempt_outdate_a_cut_short_row(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """Chronology with cut-short reads: no timestamp moves back and no row looks newer.
+
+    An obsolete cut-short read moves neither timestamp; an older success committing after a
+    newer cut-short read keeps that read's shortfall, and a range that leaves a gap to the
+    stored one changes nothing.
+    """
+    assert freshness._merge(stored, outcome) == expected
 
 
 # ---------------------------------------------------------------------------------------
@@ -1338,6 +1632,40 @@ async def test_failure_keeps_the_last_good_state(sessions: Sessions) -> None:
 
     succeeded = await _record(sessions, dataset_id, METRICS, _success(2, (1, 28)))
     assert _state(succeeded) == _expected(2, 2, (1, 28), "complete")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_cut_short_read_keeps_the_last_success_until_a_full_read(
+    sessions: Sessions,
+) -> None:
+    """A deferred or interrupted read records its shortfall but never moves ``last_success_at``.
+
+    AAP 0.3.3: transient errors (after their retries) and calls beyond the call budget leave
+    the last good data, and the dataset turns stale (AAP 0.3.2). Recorded through
+    :func:`record_freshness`: after a complete success at hour 0, a deferral at hour 1 moves
+    only ``last_attempt_at``, merges its coverage and records ``incomplete`` with its
+    repairable reason (so ``needs_repair`` widens the next read); an interrupted full-state
+    read of another dataset does the same. The next full read moves ``last_success_at`` again
+    and clears the shortfall.
+    """
+    dataset_id = await _create_dataset(sessions)
+    await _record(sessions, dataset_id, METRICS, _success(0, (1, 28)))
+    await _record(sessions, dataset_id, "google.entities", _success(0, None))
+
+    deferred = await _record(sessions, dataset_id, METRICS, _cut_short(1, (26, 30), DEFERRED))
+    assert _state(deferred) == _expected(1, 0, (1, 30), "incomplete", DEFERRED)
+    assert needs_repair(deferred) is True
+    interrupted = await _record(sessions, dataset_id, "google.entities", _cut_short(1, None))
+    assert _state(interrupted) == _expected(1, 0, None, "incomplete", INTERRUPTED)
+
+    again = await _record(sessions, dataset_id, METRICS, _cut_short(1, (26, 30), DEFERRED))
+    assert _state(again) == _state(deferred), "recording the same outcome again changes nothing"
+
+    repaired = await _record(sessions, dataset_id, METRICS, _success(2, (1, 30)))
+    assert _state(repaired) == _expected(2, 2, (1, 30), "complete")
+    entities = await _record(sessions, dataset_id, "google.entities", _success(2, None))
+    assert _state(entities) == _expected(2, 2, None, "complete")
 
 
 @pytest.mark.anyio

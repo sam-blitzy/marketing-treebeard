@@ -23,7 +23,9 @@ The module holds four kinds of definitions:
   discrepancies and feedback a rule reads, already aggregated by ``metrics.load_context``.
 * :class:`AnalysisContext`: one immutable bundle of those inputs for one run, plus
   :meth:`AnalysisContext.make_evidence`, through which every rule builds its evidence so the
-  window, thresholds, dataset statuses and frozen provenance are recorded identically.
+  window, thresholds, dataset statuses and frozen provenance are recorded identically, and
+  :func:`google_link_gap` with :func:`no_crm_link_flag`, through which every rule decides
+  whether its Google items carry ``no_crm_link`` and with which text (AAP 0.3.3, 0.5.4.1).
 
 Value conventions (decision 6): money, conversions, rates and shares are ``Decimal``; instants
 are tz-aware ``datetime``; daily facts carry each source's native ``date`` (Google in the
@@ -243,8 +245,10 @@ __all__ = [
     "creative_group",
     "creative_group_campaign",
     "creative_pair_external_id",
+    "google_link_gap",
     "json_value",
     "keyword_external_id",
+    "no_crm_link_flag",
     "objective_group",
     "search_term_external_id",
     "segment_external_id",
@@ -3344,7 +3348,7 @@ class AnalysisContext:
             companion while LinkedIn is simulated, else HubSpot's active primary.
         google_crm: HubSpot's active primary dataset, which the Google-to-CRM link always
             reads. ``None``, or ``bindings.google.available`` false, means Google items carry
-            ``no_crm_link``.
+            ``no_crm_link`` (:func:`google_link_gap`).
         freshness: ``dataset_freshness`` rows keyed ``(dataset_id, dataset name)``.
         accounts: Ad accounts by id.
         campaign_groups: LinkedIn campaign groups by id.
@@ -3627,3 +3631,53 @@ class AnalysisContext:
             provenance=tuple(provenance.values()),
             extra={} if extra is None else dict(extra),
         )
+
+
+# ---------------------------------------------------------------------------
+# The Google-to-CRM link (AAP 0.3.3, 0.5.4.1)
+# ---------------------------------------------------------------------------
+
+
+def google_link_gap(ctx: AnalysisContext) -> str | None:
+    """Return why Google items have no CRM link, or ``None`` when the link is verified.
+
+    AAP 0.3.3 and 0.5.4.1: the Google-to-CRM link exists only when both
+    ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY`` and ``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`` are
+    configured and confirmed against HubSpot's active primary dataset
+    (:attr:`AnalysisContext.google_crm`). Without it the Google pipeline link is unavailable:
+    every Google item carries ``no_crm_link`` (:func:`no_crm_link_flag`), no Google Qualified
+    Lead count or pipeline veto is computed, and a LinkedIn-derived subset never stands in.
+    Every rule reads the gap here, so one definition decides it for every Google item.
+
+    Args:
+        ctx: The analysis context.
+
+    Returns:
+        ``"no active HubSpot dataset"`` when the run has no Google CRM dataset; while the link
+        is unavailable, the binding's own reason (for example
+        "HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY not configured"), else "the Google-to-CRM link is
+        not verified"; ``None`` once the link is verified.
+    """
+    crm = ctx.google_crm
+    if crm is None:
+        return "no active HubSpot dataset"
+    link = crm.bindings.google
+    if link.available:
+        return None
+    return link.reason or "the Google-to-CRM link is not verified"
+
+
+def no_crm_link_flag(reason: str) -> Flag:
+    """Return the ``no_crm_link`` flag a Google item carries without the verified CRM link.
+
+    AAP 0.3.3 and 0.5.4.1. ``reason`` is :func:`google_link_gap`'s, so every Google item's
+    badge reads "No CRM link for Google campaigns: {reason}".
+
+    Args:
+        reason: Why the link is missing, from :func:`google_link_gap`.
+
+    Raises:
+        ValueError: When ``reason`` is blank.
+    """
+    _require_text(reason, "no_crm_link reason")
+    return Flag(FLAG_NO_CRM_LINK, f"No CRM link for Google campaigns: {reason}")

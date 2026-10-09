@@ -351,9 +351,12 @@ const SEARCH_TERMS_INCOMPLETE = 'result limit reached at finest partition';
 /** The signed-in admin (AAP 0.6.2 `APP_ADMIN_EMAIL` default). */
 const ADMIN_EMAIL = 'admin@example.com';
 
-/** Why the optional Google-to-CRM link is unavailable in the fixture world (AAP 0.3.3). */
+/**
+ * Why the optional Google-to-CRM link is unavailable in the fixture world (AAP 0.3.3): the
+ * binding reason `connectors/hubspot/client.py` records when neither property is set.
+ */
 const GOOGLE_LINK_UNCONFIGURED =
-  'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY are not configured';
+  'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured';
 
 /** Why an unavailable MQL count is unavailable in the fixture. */
 const MQL_UNAVAILABLE_REASON = 'MQL stage "First meeting booked" not resolved';
@@ -687,8 +690,8 @@ type CatalogueFlag<K extends FlagCode> = Readonly<Flag & { code: K }>;
  * - The nine codes the default page carries reuse its texts, and the page's cards draw them from
  *   here: `simulated`, `incomplete` (`google.search_terms`), `unverified_discrepancies` (one
  *   open discrepancy), `attribution_floor` (the EUR white paper), `pipeline_unavailable` (the
- *   unresolved MQL stage), `no_crm_link`, `not_distinguishable` (the CR1 pair),
- *   `search_term_coverage` (74%) and `shared_budget` (the B3 donor).
+ *   unresolved MQL stage), `no_crm_link` (every Google card), `not_distinguishable` (the CR1
+ *   pair), `search_term_coverage` (74%) and `shared_budget` (the B3 donor).
  * - `stale`: `google.metrics_daily` last succeeded at 2026-10-04 05:31 UTC, more than
  *   `sources.stale_after_hours` (24) before the run, and covers only through 2026-10-03
  *   (`precedence._stale_flag`).
@@ -749,7 +752,7 @@ export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.
   } satisfies Flag),
   no_crm_link: Object.freeze({
     code: 'no_crm_link',
-    message: `No CRM link: ${GOOGLE_LINK_UNCONFIGURED}`,
+    message: `No CRM link for Google campaigns: ${GOOGLE_LINK_UNCONFIGURED}`,
   } satisfies Flag),
   not_distinguishable: Object.freeze({
     code: 'not_distinguishable',
@@ -1682,7 +1685,7 @@ function keywordsSection(): Section {
         search_term_coverage: coverageExtra(),
       },
     }),
-    flags: [simulatedFlag(), coverageFlag()],
+    flags: [simulatedFlag(), noCrmLinkFlag(), coverageFlag()],
     current: currentFor(['google'], { incomplete: true }),
   });
 
@@ -1760,7 +1763,7 @@ function keywordsSection(): Section {
         search_term_coverage: coverageExtra(),
       },
     }),
-    flags: [simulatedFlag(), coverageFlag()],
+    flags: [simulatedFlag(), noCrmLinkFlag(), coverageFlag()],
     current: currentFor(['google'], { incomplete: true }),
   });
 
@@ -1841,7 +1844,7 @@ function keywordsSection(): Section {
         search_term_coverage: coverageExtra(),
       },
     }),
-    flags: [simulatedFlag(), coverageFlag()],
+    flags: [simulatedFlag(), noCrmLinkFlag(), coverageFlag()],
     current: currentFor(['google'], { incomplete: true }),
   });
 
@@ -1860,7 +1863,11 @@ function keywordsSection(): Section {
 // Default page: Campaigns to pause or launch
 // ---------------------------------------------------------------------------------------------
 
-/** The `no_crm_link` flag of Google items while the Google-to-CRM link is not configured. */
+/**
+ * The `no_crm_link` flag of Google items while the Google-to-CRM link is not configured
+ * (`context.no_crm_link_flag`; AAP 0.3.3). Every Google card of the default page carries it
+ * (K1, K2, K3, C0, C1, C3b, B1, B3), right after `simulated`; LinkedIn cards never do.
+ */
 function noCrmLinkFlag(): Flag {
   return makeFlag('no_crm_link');
 }
@@ -1976,7 +1983,7 @@ function campaignsSection(): Section {
         resolutions: [...FIXTURE_RESOLUTIONS.status],
       },
     }),
-    flags: [simulatedFlag()],
+    flags: [simulatedFlag(), noCrmLinkFlag()],
     // C0 offers its resolver instead of "Record decision" (AAP 0.5.5).
     decision_subject: null,
     current: currentFor(['google'], { c0: true }),
@@ -2128,7 +2135,7 @@ function campaignsSection(): Section {
         source_label: 'from your search-term report',
       },
     }),
-    flags: [simulatedFlag()],
+    flags: [simulatedFlag(), noCrmLinkFlag()],
     current: currentFor(['google'], { incomplete: true }),
   });
 
