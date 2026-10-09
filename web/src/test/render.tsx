@@ -51,8 +51,9 @@ import type { Run } from '../api/types';
  * outlives it; data always stale and never refetched on window focus, so only the component's
  * own behaviour triggers requests.
  *
- * It is the client `src/router.test.tsx` passes to `createAppRouter`, and the one
- * {@link renderWithProviders} creates when none is given.
+ * It is the one {@link renderWithProviders} creates when no `queryClient` is given. A test that
+ * needs the client before the render, as `src/features/decisions/DecisionForm.test.tsx` does to
+ * spy on its `invalidateQueries`, creates one here and passes it as `options.queryClient`.
  *
  * @returns A new, empty client.
  */
