@@ -123,6 +123,9 @@ describe('Button', () => {
     const slot = button.querySelector('.ds-button__spinner');
     expect(slot?.getAttribute('aria-hidden')).toBe('true');
     expect(slot?.previousElementSibling?.className).toBe('ds-button__label');
+    const spinner = button.querySelector('.ds-spinner');
+    expect(spinner).not.toBeNull();
+    expect(spinner?.closest('[aria-hidden="true"]')).toBe(slot);
     // The Spinner is rendered but sits outside the accessibility tree.
     expect(screen.queryByRole('status')).toBeNull();
     expect(screen.getByRole('status', { hidden: true }).textContent).toBe('Loading');
@@ -141,6 +144,20 @@ describe('Button', () => {
     expect(button.hasAttribute('disabled')).toBe(false);
     expect(button.hasAttribute('aria-busy')).toBe(false);
     expect(button.querySelector('.ds-button__spinner')).toBeNull();
+  });
+
+  it('renders boolean ARIA states as the strings "true" and "false"', () => {
+    // Toggle callers (DateRangePicker presets) and disclosures pass booleans; both values must
+    // reach the DOM, because aria-expanded="false" is a state, not an absent attribute.
+    render(
+      <Button aria-pressed={true} aria-expanded={false}>
+        Custom range
+      </Button>,
+    );
+
+    const button = screen.getByRole('button', { name: 'Custom range' });
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.getAttribute('aria-expanded')).toBe('false');
   });
 
   it('forwards native attributes, ARIA states and ref', () => {
