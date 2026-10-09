@@ -8,7 +8,7 @@
  * `ol`, `role="group"` on a `div` only when it has a non-empty `aria-label`, and the `id`
  * forwarded.
  */
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { SPACE_STEPS } from '../tokens';
@@ -143,15 +143,17 @@ describe('Inline', () => {
       <Inline as={as} gap={1} aria-label="Flags">
         <li>Simulated data</li>
         <li>Stale</li>
+        <li>Short window</li>
       </Inline>,
     );
 
     const list = screen.getByRole('list', { name: 'Flags' });
     expect(list.tagName).toBe(as.toUpperCase());
     expect(list.getAttribute('role')).toBe('list');
-    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+    expect(within(list).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
       'Simulated data',
       'Stale',
+      'Short window',
     ]);
   });
 
