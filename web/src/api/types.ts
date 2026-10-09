@@ -281,8 +281,8 @@ export type DatasetName =
 
 /**
  * The five sections of `/actions`, in the fixed order the API returns them and the UI renders
- * them: Keywords to adjust, Campaigns to pause or launch, Budget changes, Copy / creative
- * changes, White papers (AAP 0.5.5).
+ * them: Keywords to adjust, Campaigns to pause or launch, Budget changes, Copy/creative changes,
+ * White papers (AAP 0.5.5).
  *
  * Must equal `RECOMMENDATION_SECTIONS` in `backend/src/ads_engine/db/models/analysis.py`, in
  * order; `schemas.py` checks its own `SectionKey` against that tuple at import.
@@ -1198,6 +1198,14 @@ export interface Source {
   status: ConnectionStatus | null;
   /** Why the source is in its mode or status. */
   reason: string | null;
+  /**
+   * The IANA zone whose midnight ends the native dates of this source's freshness rows
+   * (`covered_from` and `covered_through`, primary and companion), so they can be labelled
+   * (AAP 0.5.4.1, 0.5.5): for Google the active Google dataset's account time zone
+   * (`customer.time_zone`), for LinkedIn and HubSpot `UTC`. `null` while Google has no active
+   * dataset or no account row with a zone; the display time zone never stands in for it.
+   */
+  day_boundary: string | null;
   /** The active primary dataset. */
   active_dataset: DatasetView | null;
   /** HubSpot only: the active companion CRM dataset. */

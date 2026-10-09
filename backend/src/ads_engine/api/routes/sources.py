@@ -7,12 +7,13 @@ dependency, so the ``POST`` needs ``X-Requested-With: ads-engine`` without this 
 repeating the check.
 
 * ``GET /sources`` reports, per source in display order (google, linkedin, hubspot): mode,
-  health status and reason from ``source_connection``; the active primary dataset with the
-  freshness, coverage and completeness of each of its named datasets; for HubSpot, the
-  active companion CRM dataset of a simulated LinkedIn dataset with its own freshness rows
-  (AAP 0.3.3); the Google webhook calls counted in the trailing 24 h against the product's
-  own cap (``GOOGLE_DAILY_CALL_BUDGET``); whether a "Sync now" request is pending; and the
-  newest :data:`RECENT_RUNS_PER_SOURCE` ``sync_run`` rows. It is read-only.
+  health status and reason from ``source_connection``; the native day boundary of its
+  coverage dates; the active primary dataset with the freshness, coverage and completeness of
+  each of its named datasets; for HubSpot, the active companion CRM dataset of a simulated
+  LinkedIn dataset with its own freshness rows (AAP 0.3.3); the Google webhook calls counted
+  in the trailing 24 h against the product's own cap (``GOOGLE_DAILY_CALL_BUDGET``); whether
+  a "Sync now" request is pending; and the newest :data:`RECENT_RUNS_PER_SOURCE`
+  ``sync_run`` rows. It is read-only.
 * ``POST /sources/{source}/sync`` queues a ``sync_request`` row. The worker picks it up on
   its next 30 s wake (AAP 0.3.2); the API itself never calls LinkedIn, n8n or HubSpot. The
   partial unique index ``uq_sync_request_pending`` allows one pending request per source,
@@ -30,9 +31,17 @@ Decisions taken in this module, each stated where its code lives:
   coverage as stored beside the age verdict.
 * **A source with no ``source_connection`` row yet** (before the worker's first attempt)
   reports ``mode`` and ``status`` as ``None``, never an invented ``live``.
-* **Fixed query count**: the handler issues at most six statements whatever the data: the
-  connections, the active primaries, the active companion, the freshness rows of those
-  datasets, the pending requests and the recent runs (one ``LATERAL`` statement served by
+* **Native day boundaries** (AAP 0.5.4.1, 0.5.5 "Daily dates are shown as stored, labelled
+  with their source's day boundary"): each source reports the IANA zone whose midnight ends
+  the ``covered_from`` and ``covered_through`` dates of its freshness rows, so the screen
+  labels them. Google's is its account's ``customer.time_zone``, chosen by
+  :func:`_google_day_boundary` with ``analysis.runner.window_inputs``' rule, and ``None``
+  while it is unknown: an unknown boundary is never reported as UTC. LinkedIn days are UTC,
+  and so are HubSpot's coverage dates (:func:`_day_boundary`).
+* **Fixed query count**: the handler issues at most seven statements whatever the data: the
+  connections, the active primaries, the Google account time zone (only while Google has an
+  active dataset), the active companion, the freshness rows of those datasets, the pending
+  requests and the recent runs (one ``LATERAL`` statement served by
   ``ix_sync_run_source_started``), so the screen stays fast as ``sync_run`` grows.
 
 Nothing here exposes a secret or whether a credential is present beyond the stored
@@ -43,8 +52,9 @@ Example::
 
     GET /api/v1/sources
     200 [{"source": "google", "mode": "simulated", "status": "ok", ...,
-          "calls_24h": 12, "call_cap": 1000, "sync_pending": false, "recent_runs": [...]},
-         {"source": "linkedin", ...}, {"source": "hubspot", ...}]
+          "day_boundary": "America/New_York", ..., "calls_24h": 12, "call_cap": 1000,
+          "sync_pending": false, "recent_runs": [...]},
+         {"source": "linkedin", ..., "day_boundary": "UTC", ...}, {"source": "hubspot", ...}]
 
     POST /api/v1/sources/google/sync      (X-Requested-With: ads-engine)
     202 {"id": 7, "source": "google", "requested_at": "...", "picked_at": null}
@@ -61,6 +71,7 @@ from sqlalchemy import Text, column, select, true, values
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ads_engine.analysis.window import UTC_BOUNDARY
 from ads_engine.api import schemas
 from ads_engine.api.deps import (
     NowDep,
@@ -70,6 +81,7 @@ from ads_engine.api.deps import (
     UserDep,
     conflict,
 )
+from ads_engine.db.models.accounts import AdAccount
 from ads_engine.db.models.ops import (
     DATASETS,
     SOURCES,
@@ -178,6 +190,43 @@ async def _connections(session: AsyncSession) -> dict[str, SourceConnection]:
     return {row.source: row for row in result}
 
 
+async def _google_day_boundary(session: AsyncSession, google: SourceDataset | None) -> str | None:
+    """Return the time zone that ends Google's native days: its account's, when known.
+
+    Google's ``segments.date`` days end at midnight in the account's ``customer.time_zone``
+    (AAP 0.5.4.1), stored as ``ad_account.timezone``. The zone is chosen with the rule of
+    ``analysis.runner.window_inputs``, so this screen names the boundary the analysis windows
+    use: the Google account rows of the active Google dataset that hold a zone, lowest id
+    first, and the first value that is not blank, stripped. ``window_inputs`` itself is not
+    called: it loads the configuration again and raises on a zone ``zoneinfo`` cannot load,
+    which would fail the whole health screen; this read reports the stored zone as it is.
+
+    Args:
+        session: The request's session.
+        google: Google's active primary dataset, if any.
+
+    Returns:
+        The IANA zone, or ``None`` when Google has no active dataset (no statement runs) or
+        no account row with a zone yet.
+    """
+    if google is None:
+        return None
+    result = await session.scalars(
+        select(AdAccount.timezone)
+        .where(
+            AdAccount.dataset_id == google.id,
+            AdAccount.source == _GOOGLE,
+            AdAccount.timezone.is_not(None),
+        )
+        .order_by(AdAccount.id)
+    )
+    for zone in result:
+        stripped = "" if zone is None else zone.strip()
+        if stripped:
+            return stripped
+    return None
+
+
 async def _active_companion(
     session: AsyncSession, linkedin: SourceDataset | None
 ) -> SourceDataset | None:
@@ -281,10 +330,33 @@ async def _recent_runs(session: AsyncSession) -> dict[str, list[SyncRun]]:
 # ---------------------------------------------------------------------------
 
 
+def _day_boundary(source: str, google_day_boundary: str | None) -> str | None:
+    """Return the native day boundary of one source's coverage dates (AAP 0.5.4.1).
+
+    Google's dates are days of its account's time zone, unknown (``None``) until an account
+    row of the active dataset holds one. LinkedIn days are UTC. HubSpot holds instants, and
+    the sync jobs record its coverage as UTC dates: the CRM job's current-state range
+    (``CrmSyncJob._state_range``), its deal search and its Google-touch discovery each take
+    ``astimezone(UTC).date()`` of their start and of the run's instant. The companion CRM
+    dataset is written by the same job, so its rows share HubSpot's boundary.
+
+    Args:
+        source: The source.
+        google_day_boundary: Google's account time zone, if known.
+
+    Returns:
+        The IANA zone, or ``None`` while Google's is unknown.
+    """
+    if source == _GOOGLE:
+        return google_day_boundary
+    return UTC_BOUNDARY
+
+
 def _source_view(
     source: str,
     *,
     connection: SourceConnection | None,
+    google_day_boundary: str | None,
     active: SourceDataset | None,
     companion: SourceDataset | None,
     freshness: Mapping[int, Sequence[DatasetFreshness]],
@@ -300,6 +372,8 @@ def _source_view(
         source: The source.
         connection: Its ``source_connection`` row; ``None`` before the worker's first
             attempt, in which case mode, status, reason and last attempt are ``None``.
+        google_day_boundary: Google's account time zone, if known; it is the Google entry's
+            ``day_boundary`` (:func:`_day_boundary`).
         active: Its active primary dataset, if any.
         companion: HubSpot only: the active companion CRM dataset, if any.
         freshness: Freshness rows keyed by dataset id.
@@ -329,6 +403,7 @@ def _source_view(
             "mode": None if connection is None else connection.mode,
             "status": None if connection is None else connection.status,
             "reason": None if connection is None else connection.reason,
+            "day_boundary": _day_boundary(source, google_day_boundary),
             "active_dataset": None if active is None else schemas.DatasetView.from_row(active),
             "companion_dataset": (
                 None if shown_companion is None else schemas.DatasetView.from_row(shown_companion)
@@ -396,13 +471,15 @@ async def list_sources(
     """List every source's mode, health, datasets, freshness, call budget and recent syncs.
 
     One entry per source, in the order google, linkedin, hubspot. Each carries the mode,
-    status and reason the worker recorded (``null`` before its first attempt), the active
-    primary dataset with the freshness, coverage and completeness of each named dataset
-    (``stale`` when it last succeeded more than ``sources.stale_after_hours`` ago or never;
-    ``incomplete`` when not ``complete``), whether a "Sync now" request is pending, and the
-    newest sync runs. Google adds the webhook calls counted in the trailing 24 h against the
-    product's own cap; HubSpot adds the active companion CRM dataset of a simulated LinkedIn
-    dataset, with its own freshness rows. Read-only: nothing is written or synced.
+    status and reason the worker recorded (``null`` before its first attempt), the native day
+    boundary of its coverage dates (Google's account time zone, ``null`` while unknown;
+    ``UTC`` for LinkedIn and HubSpot), the active primary dataset with the freshness,
+    coverage and completeness of each named dataset (``stale`` when it last succeeded more
+    than ``sources.stale_after_hours`` ago or never; ``incomplete`` when not ``complete``),
+    whether a "Sync now" request is pending, and the newest sync runs. Google adds the webhook
+    calls counted in the trailing 24 h against the product's own cap; HubSpot adds the active
+    companion CRM dataset of a simulated LinkedIn dataset, with its own freshness rows.
+    Read-only: nothing is written or synced.
 
     Args:
         user: The signed-in user; the dependency enforces the session.
@@ -417,6 +494,7 @@ async def list_sources(
     stale_after = timedelta(hours=thresholds.int(_STALE_AFTER_KEY))
     connections = await _connections(session)
     primaries = {dataset.source: dataset for dataset in (await active_datasets(session)).values()}
+    google_day_boundary = await _google_day_boundary(session, primaries.get(_GOOGLE))
     companion = await _active_companion(session, primaries.get(_LINKEDIN))
     dataset_ids = [dataset.id for dataset in primaries.values()]
     if companion is not None:
@@ -428,6 +506,7 @@ async def list_sources(
         _source_view(
             source,
             connection=connections.get(source),
+            google_day_boundary=google_day_boundary,
             active=primaries.get(source),
             companion=companion,
             freshness=freshness,

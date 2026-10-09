@@ -1,4 +1,4 @@
-"""Rules CR1, CR2 and CR3: Copy / creative changes for LinkedIn creatives.
+"""Rules CR1, CR2 and CR3: Copy/creative changes for LinkedIn creatives.
 
 AAP 0.5.4.6, 0.2.4 (small-sample methods), 0.5.4.2 P6/P7 and FR-7. The user asked three things
 of the copy section: which ad variants are statistically distinguishable yet (not just
@@ -1517,7 +1517,7 @@ def _campaign_result(
 
 
 def evaluate(ctx: AnalysisContext) -> RuleResult:
-    """Rules CR1, CR2 and CR3: Copy / creative changes for every LinkedIn campaign.
+    """Rules CR1, CR2 and CR3: Copy/creative changes for every LinkedIn campaign.
 
     AAP 0.5.4.6, FR-7. Variants are a campaign's creatives with at least
     ``cr.min_impressions`` window impressions; only campaigns with at least

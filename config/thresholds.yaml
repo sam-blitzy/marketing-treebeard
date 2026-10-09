@@ -243,7 +243,7 @@ b4:
   # p < this.
   alpha: 0.05
 
-# --- CR1-CR3 Copy / creative changes (LinkedIn) -----------------------------------------------
+# --- CR1-CR3 Copy/creative changes (LinkedIn) -------------------------------------------------
 cr:
   # A variant is a creative with window impressions >= this; see cr.min_variants.
   min_impressions: 1000

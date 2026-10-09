@@ -12,6 +12,9 @@
  * - the Google webhook calls of the last 24 h against the product's own cap;
  * - the active primary and companion datasets, and each dataset's freshness, coverage and
  *   completeness exactly as stored;
+ * - each source's native day boundary above its freshness tables and on every covered date
+ *   (Google's account zone, LinkedIn and HubSpot UTC, "not yet known" without one), apart from
+ *   the display time zone of instants;
  * - the recent sync runs, finished, running and failed;
  * - "Sync now": the POST with its CSRF header, the 202, 409 `sync_pending` and failure outcomes
  *   kept to their own section, the pending hint, and focus returned to the button;
@@ -22,6 +25,7 @@
 import { apiError, json, mockApi } from '../../test/mockApi';
 import type { MockHandler, MockHandlers, MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
+import type { QueryClient } from '@tanstack/react-query';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
@@ -49,6 +53,15 @@ const ACTIVATED_UTC = 'Oct 1, 2026, 8:12 AM UTC';
 
 /** Why every fixture source is simulated (AAP 0.3.3). */
 const NO_CREDENTIALS = 'credentials not configured';
+
+/** The label of a Google covered date: the fixture account's time zone ends Google's days. */
+const GOOGLE_DAY = '(Google day, America/New_York)';
+
+/** The label of a LinkedIn covered date: LinkedIn days are UTC (AAP 0.5.4.1). */
+const LINKEDIN_DAY = '(LinkedIn day, UTC)';
+
+/** The label of a HubSpot covered date, primary and companion: HubSpot records UTC dates. */
+const HUBSPOT_DAY = '(HubSpot day, UTC)';
 
 /** The queued request `POST /sources/{source}/sync` answers with (202). */
 function syncRequest(source: Source['source']): SyncRequestView {
@@ -400,13 +413,14 @@ describe('SourcesPage', () => {
         'Last attempt',
         'Reason',
       ]);
+      // Covered dates are the stored strings, labelled with Google's native day boundary.
       expect(bodyRows(freshness)).toEqual([
         ['google.entities', 'complete', '—', '—', LAST_SYNC_UTC, LAST_SYNC_UTC, '—'],
         [
           'google.metrics_daily',
           'complete',
-          '2026-04-09',
-          '2026-10-05',
+          `2026-04-09 ${GOOGLE_DAY}`,
+          `2026-10-05 ${GOOGLE_DAY}`,
           LAST_SYNC_UTC,
           LAST_SYNC_UTC,
           '—',
@@ -414,8 +428,8 @@ describe('SourcesPage', () => {
         [
           'google.search_terms',
           'incomplete',
-          '2026-04-09',
-          '2026-10-05',
+          `2026-04-09 ${GOOGLE_DAY}`,
+          `2026-10-05 ${GOOGLE_DAY}`,
           LAST_SYNC_UTC,
           LAST_SYNC_UTC,
           'result limit reached at finest partition',
@@ -492,6 +506,121 @@ describe('SourcesPage', () => {
         ['Primary', '21', 'live', 'building', 'Not yet activated', '—'],
       ]);
     });
+  });
+
+  describe('native day boundaries', () => {
+    /** The "Dataset freshness" subsection of a source's section, named by its level-3 heading. */
+    function freshnessSection(label: string): HTMLElement {
+      return within(section(label)).getByRole('region', { name: 'Dataset freshness' });
+    }
+
+    /** The Covered from and Covered through cells of every body row of a table. */
+    function coveredCells(tableElement: HTMLElement): string[][] {
+      return bodyRows(tableElement).map((row) => row.slice(2, 4));
+    }
+
+    /** Whether `first` comes before `second` in document order. */
+    function precedes(first: Node, second: Node): boolean {
+      return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    }
+
+    it('opens each freshness subsection with its own source boundary, before the tables', async () => {
+      stubPage();
+      await renderLoaded();
+
+      for (const [label, line] of [
+        ['Google', 'Google days: America/New_York'],
+        ['LinkedIn', 'LinkedIn days: UTC'],
+        ['HubSpot', 'HubSpot days: UTC'],
+      ] as const) {
+        const freshness = freshnessSection(label);
+        const boundary = within(freshness).getByText(line);
+        const [firstTable] = within(freshness).getAllByRole('table');
+        if (firstTable === undefined) {
+          throw new Error(`The ${label} freshness subsection has no table.`);
+        }
+        expect(precedes(boundary, firstTable)).toBe(true);
+        // One boundary line per source, and none borrowed from another source.
+        expect(within(section(label)).getAllByText(/ days: /u)).toEqual([boundary]);
+      }
+    });
+
+    it("labels every covered date with its source's boundary, the companion's with HubSpot's", async () => {
+      stubPage();
+      await renderLoaded();
+
+      expect(coveredCells(table(section('LinkedIn'), 'LinkedIn dataset freshness'))).toEqual([
+        ['—', '—'],
+        [`2026-04-09 ${LINKEDIN_DAY}`, `2026-10-05 ${LINKEDIN_DAY}`],
+        [`2026-04-09 ${LINKEDIN_DAY}`, `2026-10-05 ${LINKEDIN_DAY}`],
+        [`2026-04-09 ${LINKEDIN_DAY}`, `2026-10-05 ${LINKEDIN_DAY}`],
+      ]);
+      const hubspot = section('HubSpot');
+      expect(coveredCells(table(hubspot, 'HubSpot dataset freshness'))).toEqual([
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+        // Never refreshed: no coverage, so nothing to label.
+        ['—', '—'],
+      ]);
+      expect(
+        coveredCells(table(hubspot, 'HubSpot companion dataset freshness (simulated LinkedIn)')),
+      ).toEqual([
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+        [`2026-04-09 ${HUBSPOT_DAY}`, `2026-10-05 ${HUBSPOT_DAY}`],
+      ]);
+    });
+
+    it('keeps the display time zone of instants apart from the day boundaries', async () => {
+      mockApi({
+        'GET /sources': json(200, makeSources()),
+        'GET /runs/latest': json(200, makeRun({ display_timezone: 'Europe/Berlin' })),
+      });
+      await renderLoaded();
+
+      const zoneLine = await screen.findByText('Times shown in Europe/Berlin');
+      // The instants line names no day boundary and sits outside every source section.
+      expect(zoneLine.closest('section')).toBeNull();
+      expect(zoneLine.textContent).toBe('Times shown in Europe/Berlin');
+      // DISPLAY_TIMEZONE formats instants only: it never moves or relabels a native day.
+      const google = freshnessSection('Google');
+      expect(within(google).getByText('Google days: America/New_York')).toBeTruthy();
+      expect(within(freshnessSection('LinkedIn')).getByText('LinkedIn days: UTC')).toBeTruthy();
+      expect(screen.queryByText(/days: Europe\/Berlin/u)).toBeNull();
+      const [, metrics] = bodyRows(table(section('Google'), 'Google dataset freshness'));
+      expect(metrics?.slice(2, 5)).toEqual([
+        `2026-04-09 ${GOOGLE_DAY}`,
+        `2026-10-05 ${GOOGLE_DAY}`,
+        'Oct 6, 2026, 7:30 AM Europe/Berlin',
+      ]);
+    });
+
+    it.each<[string, string | null]>([
+      ['null', null],
+      ['blank', '   '],
+    ])(
+      'says the Google boundary is not yet known when the API reports it %s, inventing no zone',
+      async (_case, dayBoundary) => {
+        stubPage(
+          json(200, [makeSource('google', { day_boundary: dayBoundary }), makeSource('linkedin')]),
+        );
+        await renderLoaded();
+
+        expect(await screen.findByText('Times shown in UTC')).toBeTruthy();
+        const freshness = freshnessSection('Google');
+        expect(within(freshness).getByText('Google days: day boundary not yet known')).toBeTruthy();
+        expect(coveredCells(table(section('Google'), 'Google dataset freshness'))).toEqual([
+          ['—', '—'],
+          ['2026-04-09 (Google day)', '2026-10-05 (Google day)'],
+          ['2026-04-09 (Google day)', '2026-10-05 (Google day)'],
+        ]);
+        // Neither the display zone (UTC here) nor LinkedIn's boundary stands in for Google's.
+        expect(within(section('Google')).queryByText(/Google day, /u)).toBeNull();
+        expect(within(freshness).queryByText(/Google days: UTC/u)).toBeNull();
+        expect(within(freshnessSection('LinkedIn')).getByText('LinkedIn days: UTC')).toBeTruthy();
+      },
+    );
   });
 
   describe('recent sync runs', () => {
@@ -781,6 +910,56 @@ describe('SourcesPage', () => {
   });
 
   describe('page states', () => {
+    /**
+     * The page's polite notice region: the one `aria-live="polite"` element outside every source
+     * section, which announces the loading, failure and refresh-failure messages.
+     */
+    function noticeRegion(): HTMLElement {
+      const regions = Array.from(
+        document.querySelectorAll<HTMLElement>('[aria-live="polite"]'),
+      ).filter((element) => element.closest('section') === null);
+      expect(regions).toHaveLength(1);
+      const [region] = regions;
+      if (region === undefined) {
+        throw new Error('The page has no polite notice region.');
+      }
+      return region;
+    }
+
+    /** Reads every active query again, as the hooks' polling would. */
+    async function refetchActive(queryClient: QueryClient): Promise<void> {
+      // Addressing all active queries keeps the tests free of the hooks' private query keys.
+      await act(async () => {
+        await queryClient.refetchQueries({ type: 'active' });
+      });
+    }
+
+    it('keeps one polite notice region from the first render, with the sources outside it', async () => {
+      const response = heldResponse();
+      const api = stubPage(() => response.promise);
+      await renderWithProviders(<SourcesPage />, { path: '/sources' });
+
+      // Loading: the region holds the Spinner, which stays the page's one status element.
+      const region = noticeRegion();
+      expect(within(region).getByRole('status').textContent).toBe('Loading sources');
+      expect(screen.getAllByRole('status')).toHaveLength(1);
+
+      // The failure replaces the spinner inside the same region, so it is announced.
+      response.release(apiError(500, 'internal_error', 'Database unavailable'));
+      expect(await within(region).findByText('Sources unavailable')).toBeTruthy();
+      expect(within(region).getByText('Database unavailable')).toBeTruthy();
+      expect(noticeRegion()).toBe(region);
+
+      // Once the sources load, the region stays, empty, and the sections follow outside it.
+      api.use({ 'GET /sources': json(200, makeSources()) });
+      fireEvent.click(within(region).getByRole('button', { name: 'Retry' }));
+      await screen.findByRole('region', { name: 'Google' });
+      expect(noticeRegion()).toBe(region);
+      expect(region.childNodes).toHaveLength(0);
+      expect(region.contains(section('Google'))).toBe(false);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
     it('shows a spinner until the sources arrive', async () => {
       const response = heldResponse();
       stubPage(() => response.promise);
@@ -853,23 +1032,60 @@ describe('SourcesPage', () => {
     it('keeps the last loaded sources under a notice when a refresh fails', async () => {
       const api = stubPage();
       const { queryClient } = await renderLoaded();
+      const region = noticeRegion();
+      expect(region.childNodes).toHaveLength(0);
       api.use({
         'GET /sources': apiError(503, 'service_unavailable', 'Database unavailable'),
       });
 
-      // Every active query is read again, as the hooks' polling would: `GET /sources` fails while
-      // `GET /runs/latest` still answers. Addressing all active queries keeps this test free of
-      // the hooks' private query keys.
-      await act(async () => {
-        await queryClient.refetchQueries({ type: 'active' });
+      // `GET /sources` fails while `GET /runs/latest` still answers.
+      await refetchActive(queryClient);
+
+      // The notice lands in the region that existed before the failure, so it is announced.
+      expect(await within(region).findByText('Sources could not be refreshed')).toBeTruthy();
+      expect(
+        within(region).getByText('Database unavailable Showing the last loaded state.'),
+      ).toBeTruthy();
+      expect(noticeRegion()).toBe(region);
+      // Only the notice is announced: the sections, their tables and buttons stay outside it.
+      expect(within(region).queryByRole('table')).toBeNull();
+      expect(within(region).queryByRole('button')).toBeNull();
+      expect(region.contains(section('Google'))).toBe(false);
+      expect(within(section('Google')).getAllByRole('table').length).toBeGreaterThan(0);
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(screen.queryByText('Sources unavailable')).toBeNull();
+
+      // A later successful read clears the notice; the region itself stays.
+      api.use({ 'GET /sources': json(200, makeSources()) });
+      await refetchActive(queryClient);
+
+      await waitFor(() => {
+        expect(region.childNodes).toHaveLength(0);
+      });
+      expect(noticeRegion()).toBe(region);
+      expect(screen.queryByText('Sources could not be refreshed')).toBeNull();
+      expect(section('Google')).toBeTruthy();
+    });
+
+    it('keeps an empty source list under the notice when a refresh fails', async () => {
+      const api = stubPage(json(200, []));
+      const { queryClient } = await renderWithProviders(<SourcesPage />, { path: '/sources' });
+      await screen.findByText('No sources configured');
+      const region = noticeRegion();
+      expect(region.childNodes).toHaveLength(0);
+      api.use({
+        'GET /sources': apiError(503, 'service_unavailable', 'Database unavailable'),
       });
 
-      expect(await screen.findByText('Sources could not be refreshed')).toBeTruthy();
+      await refetchActive(queryClient);
+
+      expect(await within(region).findByText('Sources could not be refreshed')).toBeTruthy();
       expect(
-        screen.getByText('Database unavailable Showing the last loaded state.'),
+        within(region).getByText('Database unavailable Showing the last loaded state.'),
       ).toBeTruthy();
-      expect(section('Google')).toBeTruthy();
-      expect(screen.queryByText('Sources unavailable')).toBeNull();
+      expect(noticeRegion()).toBe(region);
+      expect(region.contains(screen.getByText('No sources configured'))).toBe(false);
+      expect(screen.queryByRole('alert')).toBeNull();
     });
   });
 });

@@ -15,9 +15,11 @@
  *    workflows share (AAP 0.2.4, 0.3.3);
  * 4. the active datasets: the primary dataset and, for HubSpot while LinkedIn is simulated, the
  *    companion CRM dataset (AAP 0.3.3);
- * 5. "Dataset freshness": one table per dataset, primary and companion kept apart, with each
- *    named dataset's completeness, covered range, last success, last attempt and reason
- *    (AAP 0.3.2);
+ * 5. "Dataset freshness": the source's native day boundary ("Google days: America/New_York",
+ *    "LinkedIn days: UTC", or "day boundary not yet known" while the API reports none), then one
+ *    table per dataset, primary and companion kept apart, with each named dataset's completeness,
+ *    covered range, last success, last attempt and reason (AAP 0.3.2). The covered dates are
+ *    labelled with that boundary (AAP 0.5.5);
  * 6. "Recent sync runs": the newest `sync_run` rows, newest first;
  * 7. a "Sync now" button beside the section heading (`POST /sources/{source}/sync`).
  *
@@ -30,9 +32,10 @@
  * - **Values from the API, verbatim**: dataset names, stored dates, completeness values, dataset
  *   modes and states, run statuses and reasons are printed as returned. Only the status line's
  *   badges carry display labels for enum values. Stored native dates are never passed through
- *   `Date`, which could shift a day (AAP 0.5.4.1); instants are formatted in the display time
- *   zone. No call cap, poll interval, window length or time zone other than the documented UTC
- *   fallback is written here.
+ *   `Date`, which could shift a day (AAP 0.5.4.1): they are printed as stored, labelled with the
+ *   day boundary `Source.day_boundary` reports, which the display time zone never replaces;
+ *   instants are formatted in the display time zone. No call cap, poll interval, window length
+ *   or time zone other than the documented UTC fallback for instants is written here.
  * - **No alert**: nothing here carries `role="alert"`, which AAP 0.5.5 reserves for discrepancies.
  * - **No router import**: `src/router.tsx` imports this page and renders the `PageShell` frame
  *   around it.
@@ -51,6 +54,7 @@ import type {
   DatasetFreshnessView,
   DatasetView,
   Source,
+  SourceName,
   SyncRunView,
 } from '../../api/types';
 import {
@@ -65,7 +69,13 @@ import {
   Stack,
 } from '../../design-system';
 import type { DataTableColumn, Tone } from '../../design-system';
-import { EM_DASH, formatCount, formatInstant, sourceLabel } from '../../lib/format';
+import {
+  EM_DASH,
+  formatCount,
+  formatInstant,
+  formatSourceDate,
+  sourceLabel,
+} from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // Texts and label maps
@@ -137,6 +147,12 @@ const RUNNING_TEXT = 'Running';
 
 /** Empty message of a freshness table. */
 const NO_FRESHNESS_TEXT = 'No freshness recorded yet';
+
+/**
+ * Stands in for the zone in a source's day-boundary line while the API reports none (Google
+ * before its account time zone is stored), so no zone is invented for the covered dates.
+ */
+const UNKNOWN_BOUNDARY_TEXT = 'day boundary not yet known';
 
 /** Empty message of the recent sync runs table. */
 const NO_RUNS_TEXT = 'No sync runs yet';
@@ -389,17 +405,56 @@ function freshnessInstant(instant: string | null, displayTimezone: string): stri
 }
 
 /**
+ * A covered date of a freshness row, as stored and labelled with its source's day (AAP 0.5.5:
+ * "Daily dates are shown as stored, labelled with their source's day boundary"), for example
+ * `"2026-10-05 (Google day, America/New_York)"`. Without a known boundary the label names the
+ * source's day only (`"2026-10-05 (Google day)"`), never a guessed zone. A missing date is
+ * {@link EM_DASH}.
+ *
+ * @param date - the stored native date
+ * @param source - the source whose day it is
+ * @param dayBoundary - the IANA zone that ends the source's days, or `null` while unknown
+ * @returns the cell text
+ */
+function coveredDate(date: string | null, source: SourceName, dayBoundary: string | null): string {
+  return visibleText(date) === null ? EM_DASH : formatSourceDate(date, source, dayBoundary);
+}
+
+/**
+ * The day-boundary line above a source's freshness tables, worded as the status bar words a
+ * boundary (`"{Label} days: {boundary}"`, for example "Google days: America/New_York" or
+ * "HubSpot days: UTC"), or "{Label} days: day boundary not yet known" while the API reports
+ * none. The boundary comes from the API only.
+ *
+ * @param source - the source whose dates the tables hold
+ * @param dayBoundary - the IANA zone that ends the source's days, or `null` while unknown
+ * @returns the line's text
+ */
+function dayBoundaryLine(source: SourceName, dayBoundary: string | null): string {
+  return `${sourceLabel(source)} days: ${dayBoundary ?? UNKNOWN_BOUNDARY_TEXT}`;
+}
+
+/**
  * The columns of a dataset-freshness table, in the order AAP 0.3.2 lists the fields.
  *
- * The dataset name and the covered dates are printed exactly as stored: a native date is never
- * parsed through `Date`, which reads `"2026-10-01"` as UTC midnight and can shift the day in
- * another zone (AAP 0.5.4.1). A stale row carries a "Stale" badge beside its name.
+ * The dataset name is printed exactly as stored, and so are the covered dates, each labelled
+ * with the source's native day boundary ({@link coveredDate}): a native date is never parsed
+ * through `Date`, which reads `"2026-10-01"` as UTC midnight and can shift the day in another
+ * zone, and the display time zone never moves it (AAP 0.5.4.1). A stale row carries a "Stale"
+ * badge beside its name. A source's primary and companion tables share its boundary: the
+ * companion is a HubSpot dataset too.
  *
  * @param displayTimezone - the IANA zone instants are shown in
+ * @param source - the source whose datasets the table lists
+ * @param dayBoundary - the IANA zone that ends the source's days, or `null` while unknown
  * @returns Dataset (row header), Completeness, Covered from, Covered through, Last success,
  *   Last attempt and Reason
  */
-function freshnessColumns(displayTimezone: string): DataTableColumn<DatasetFreshnessView>[] {
+function freshnessColumns(
+  displayTimezone: string,
+  source: SourceName,
+  dayBoundary: string | null,
+): DataTableColumn<DatasetFreshnessView>[] {
   return [
     {
       key: 'dataset',
@@ -423,12 +478,12 @@ function freshnessColumns(displayTimezone: string): DataTableColumn<DatasetFresh
     {
       key: 'covered_from',
       header: 'Covered from',
-      render: (row) => visibleText(row.covered_from) ?? EM_DASH,
+      render: (row) => coveredDate(row.covered_from, source, dayBoundary),
     },
     {
       key: 'covered_through',
       header: 'Covered through',
-      render: (row) => visibleText(row.covered_through) ?? EM_DASH,
+      render: (row) => coveredDate(row.covered_through, source, dayBoundary),
     },
     {
       key: 'last_success_at',
@@ -557,6 +612,8 @@ interface SourceSectionProps {
 /**
  * One source's section of `/sources`: status line, "Sync now" outcome, Google's call budget, the
  * active datasets, dataset freshness and recent sync runs, with "Sync now" beside the heading.
+ * "Dataset freshness" opens with the source's native day boundary, and its covered dates carry
+ * the same label.
  *
  * The section is a `<section>` region named by its `<h2>`, the source's display name
  * (`source-{name}`), so assistive technology and tests reach it as the region "Google",
@@ -588,7 +645,8 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
 
   const datasetRows = activeDatasetRows(source);
   const hasCompanion = source.companion_dataset !== null || source.companion_datasets.length > 0;
-  const freshness = freshnessColumns(displayTimezone);
+  const dayBoundary = visibleText(source.day_boundary);
+  const freshness = freshnessColumns(displayTimezone, name, dayBoundary);
 
   const syncNow = (
     <Button
@@ -653,6 +711,11 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
 
         <PageShell.Section id={`${sectionId}-freshness`} title="Dataset freshness" headingLevel={3}>
           <Stack gap={4}>
+            {/*
+              The native day boundary of every covered date below, primary and companion; the
+              page-level "Times shown in" line names the zone of instants, never of these dates.
+            */}
+            <div>{dayBoundaryLine(name, dayBoundary)}</div>
             <DataTable
               caption={`${label} dataset freshness`}
               columns={freshness}
@@ -698,18 +761,23 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
  *
  * States, in precedence order:
  * - **Data**: one section per source in API order, never re-sorted; "No sources configured" for
- *   an empty list. A background refetch that fails keeps the last response on screen under a
- *   "Sources could not be refreshed" notice, because TanStack Query keeps `data` on a failed
- *   refetch, and the hook's own polling recovers by itself.
+ *   an empty list. A background refetch that fails keeps the last response on screen, the
+ *   sections or the empty list alike, under a "Sources could not be refreshed" notice that ends
+ *   "Showing the last loaded state.", because TanStack Query keeps `data` on a failed refetch.
+ *   The hook's own polling recovers by itself, and the notice goes once a refetch succeeds.
  * - **Loading**: a `Spinner` labelled "Loading sources".
  * - **Failure** before any response: "Sources unavailable" with the API's message and a "Retry"
  *   button that reads the sources again. The failure stays on screen while the read runs again,
  *   by poll or by Retry, so it never flickers to the spinner, and focus returns to Retry once a
  *   retry the user started has settled.
  *
- * The loading and failure states share one polite live region, so the failure replacing the
- * spinner is announced (WCAG 2.2 SC 4.1.3). The page renders inside the router's authenticated
- * `PageShell` layout and its `QueryClientProvider`; it takes no props and renders no frame.
+ * One polite live region (`aria-live="polite"`) sits under the title in every state and stays
+ * the same element from the first render. It holds the spinner, the failure with its Retry, or
+ * the refresh notice, so the failure that replaces the spinner and a refresh failure while data
+ * is on screen are both announced (WCAG 2.2 SC 4.1.3); it is empty while the sources are current.
+ * The sections, with their tables and their own "Sync now" status regions, render outside it.
+ * The page renders inside the router's authenticated `PageShell` layout and its
+ * `QueryClientProvider`; it takes no props and renders no frame.
  *
  * @returns the `/sources` page content
  *
@@ -747,55 +815,47 @@ export function SourcesPage(): ReactElement {
     }
   };
 
-  let content: ReactNode;
+  // What the page's polite region holds (`notice`) and what follows it outside the region
+  // (`content`): only short state messages are announced, never the sources' tables.
+  let notice: ReactNode = null;
+  let content: ReactNode = null;
   if (sources.data !== undefined) {
     const list = sources.data;
+    if (sources.error !== null) {
+      notice = (
+        <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
+          {`${failureReason(sources.error)} Showing the last loaded state.`}
+        </Banner>
+      );
+    }
     content =
       list.length === 0 ? (
         <EmptyState title={NO_SOURCES_TITLE} />
       ) : (
-        <>
-          {sources.error !== null && (
-            <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
-              {`${failureReason(sources.error)} Showing the last loaded state.`}
-            </Banner>
-          )}
-          {list.map((source) => (
-            <SourceSection
-              key={source.source}
-              source={source}
-              displayTimezone={displayTimezone}
-            />
-          ))}
-        </>
+        list.map((source) => (
+          <SourceSection key={source.source} source={source} displayTimezone={displayTimezone} />
+        ))
       );
+  } else if (failure === null) {
+    notice = <Spinner label={LOADING_LABEL} />;
   } else {
-    content = (
-      // One polite region for the loading and failure states, kept from the first render, so the
-      // failure that replaces the spinner is announced. It is not a `status` role: the Spinner
-      // inside it is the page's one status element while loading.
-      <div aria-live="polite">
-        {failure === null ? (
-          <Spinner label={LOADING_LABEL} />
-        ) : (
-          <EmptyState
-            title={LOAD_ERROR_TITLE}
-            action={
-              <Button
-                ref={retryButtonRef}
-                loading={retrying}
-                onClick={() => {
-                  void retry();
-                }}
-              >
-                {RETRY_LABEL}
-              </Button>
-            }
+    notice = (
+      <EmptyState
+        title={LOAD_ERROR_TITLE}
+        action={
+          <Button
+            ref={retryButtonRef}
+            loading={retrying}
+            onClick={() => {
+              void retry();
+            }}
           >
-            {failureReason(failure)}
-          </EmptyState>
-        )}
-      </div>
+            {RETRY_LABEL}
+          </Button>
+        }
+      >
+        {failureReason(failure)}
+      </EmptyState>
     );
   }
 
@@ -810,6 +870,16 @@ export function SourcesPage(): ReactElement {
         */}
         <div>{zoneLine}</div>
       </Stack>
+      {/*
+        The page's one polite region, at the same place in every state, so React keeps the same
+        element from the first render: the failure that replaces the spinner, and a refresh
+        failure while the sources are on screen, land in a region that already exists and are
+        announced (WCAG 2.2 SC 4.1.3). It holds only those messages; the sources, their tables
+        and their "Sync now" regions follow outside it. It is not a `status` role, because the
+        Spinner inside it is the page's one status element while loading, and never an alert
+        (AAP 0.5.5). While it is empty, Stack takes it out of the column, so it adds no space.
+      */}
+      <div aria-live="polite">{notice}</div>
       {content}
     </Stack>
   );

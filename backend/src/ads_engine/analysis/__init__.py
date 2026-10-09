@@ -2,7 +2,7 @@
 
 The package turns the stored daily facts, entity snapshots, leads and CRM data of each
 source's active dataset into the five ranked sections the product shows, in this fixed order:
-Keywords to adjust, Campaigns to pause or launch, Budget changes, Copy / creative changes, and
+Keywords to adjust, Campaigns to pause or launch, Budget changes, Copy/creative changes, and
 White papers. Every item carries its evidence: the exact window with each source's native day
 boundary, every number its reason cites, the baselines it was compared against, the sample
 size against its minimum, any statistical test, the thresholds applied, and the datasets it

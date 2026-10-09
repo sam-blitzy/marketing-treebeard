@@ -1,5 +1,5 @@
 /**
- * `CreativeSection`: the "Copy / creative changes" section of `/actions` (AAP 0.5.5, 0.5.4.6,
+ * `CreativeSection`: the "Copy/creative changes" section of `/actions` (AAP 0.5.5, 0.5.4.6,
  * FR-7).
  *
  * The section shows one block per LinkedIn campaign. The analysis groups every copy item by its
@@ -222,7 +222,7 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
 }
 
 /**
- * The "Copy / creative changes" section (AAP 0.5.5): one block per LinkedIn campaign, each with
+ * The "Copy/creative changes" section (AAP 0.5.5): one block per LinkedIn campaign, each with
  * its variants table followed by its cards in API order (the CR3 next test with the CR2 weak
  * stage first, then the CR1 pair labels), inside the shared {@link SectionFrame}, which adds
  * the section's findings, held disclosure, empty state, withheld lines and suppression counts.

@@ -3,9 +3,9 @@
  * simulated mode (`DATA_MODE=simulated`, no source credentials).
  *
  * What the spec proves, test by test:
- * 1. The five sections render in the user's fixed order (Keywords, Campaigns, Budget, Copy /
- *    creative, White papers), titled as the API titles them, and each "Sections" navigation link
- *    counts the section's items that feedback has not hidden.
+ * 1. The five sections render in the user's fixed order (Keywords, Campaigns, Budget,
+ *    Copy/creative, White papers), titled as the API titles them, and each "Sections" navigation
+ *    link counts the section's items that feedback has not hidden.
  * 2. A card in every section shows its evidence table, the window chip (window, day count and
  *    each source's day boundary) and its flags, including the "Simulated data" label of an item
  *    computed from simulated data; a white-paper row shows the same in its expanded details.

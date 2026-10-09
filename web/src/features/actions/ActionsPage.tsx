@@ -11,7 +11,7 @@
  * 4. the {@link GlobalBanners}, in their fixed order, open discrepancies first;
  * 5. the {@link SectionNav}: anchor links with item counts for the five sections;
  * 6. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
- *    Campaigns to pause or launch, Budget changes, Copy / creative changes, White papers, each
+ *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
  *
  * Run selection (AAP 0.5.3): without `runId` the page shows the latest succeeded **default** run,

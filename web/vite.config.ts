@@ -59,7 +59,8 @@ const PROXY_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:']);
  * `https://` URL fails the config load at once with an error naming the variable, rather than
  * every proxied request failing later with an opaque proxy error. The message names at most the
  * value's scheme, never the value itself, so a URL carrying credentials is never echoed to the
- * terminal.
+ * terminal. For the same reason the URL parser's own error is deliberately not attached as
+ * `cause`: Node's invalid-URL error keeps the raw input, and Vite prints the whole error chain.
  *
  * @param value - The raw environment value, `undefined` when the variable is not set.
  * @returns The proxy target, trimmed.
@@ -76,8 +77,8 @@ function resolveApiProxyTarget(value: string | undefined): string {
   let url: URL;
   try {
     url = new URL(candidate);
-  } catch (error) {
-    throw new Error(`${expected}; the value set is not a URL`, { cause: error });
+  } catch {
+    throw new Error(`${expected}; the value set is not a URL`);
   }
   if (!PROXY_PROTOCOLS.has(url.protocol)) {
     // A value without a scheme, such as localhost:8080, parses with "localhost:" as its scheme.

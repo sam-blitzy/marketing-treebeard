@@ -64,8 +64,9 @@ const ACTIONS_PATH = '/actions';
 /** The default admin login, the `APP_ADMIN_EMAIL` default in `.env.example`. */
 const DEFAULT_ADMIN_EMAIL = 'admin@example.com';
 
-// Traces stay off for this file only: a trace records every action's arguments, the password
-// among them, and a retained trace is copied into the HTML report that CI uploads.
+// Traces stay off for this file in every run, including local runs, where playwright.config.ts
+// otherwise retains a trace on failure: a trace records every action's arguments, the password
+// among them, and a retained trace is copied into the HTML report.
 setup.use({ trace: 'off' });
 
 /**

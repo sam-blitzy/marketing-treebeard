@@ -4,8 +4,8 @@
  *
  * They hold the component to its TSDoc contract:
  * - one `navigation` landmark named "Sections", with one in-page link per section in
- *   `SECTION_ORDER` (Keywords to adjust, Campaigns to pause or launch, Budget changes, Copy /
- *   creative changes, White papers), each pointing at `#section-{key}`, the region
+ *   `SECTION_ORDER` (Keywords to adjust, Campaigns to pause or launch, Budget changes,
+ *   Copy/creative changes, White papers), each pointing at `#section-{key}`, the region
  *   `SectionFrame` anchors;
  * - each link's text is the API title followed by the count of cards the section shows now:
  *   held items count, items hidden by feedback since the run do not, and a 0 is shown;
@@ -67,7 +67,7 @@ describe('SectionNav', () => {
       ['Keywords to adjust 3', '#section-keywords'],
       ['Campaigns to pause or launch 5', '#section-campaigns'],
       ['Budget changes 2', '#section-budget'],
-      ['Copy / creative changes 2', '#section-creative'],
+      ['Copy/creative changes 2', '#section-creative'],
       ['White papers 3', '#section-white_papers'],
     ]);
     // Every link targets the anchor SectionFrame gives that section's region.
@@ -151,7 +151,7 @@ describe('SectionNav', () => {
     expect(visibleItemCount(allHidden)).toBe(0);
     expect(linkSummary()).toEqual([
       ['Budget changes 0', '#section-budget'],
-      ['Copy / creative changes 0', '#section-creative'],
+      ['Copy/creative changes 0', '#section-creative'],
     ]);
     const count = navLinks()[0]?.querySelector('.ds-sidenav__count');
     expect(count?.textContent).toBe('0');

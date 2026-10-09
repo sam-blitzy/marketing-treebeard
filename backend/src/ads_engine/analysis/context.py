@@ -407,7 +407,7 @@ CAMPAIGNS: Final = "campaigns"
 BUDGET: Final = "budget"
 """Section: Budget changes."""
 CREATIVE: Final = "creative"
-"""Section: Copy / creative changes (LinkedIn)."""
+"""Section: Copy/creative changes (LinkedIn)."""
 WHITE_PAPERS: Final = "white_papers"
 """Section: White papers."""
 
@@ -419,7 +419,7 @@ SECTION_TITLES: Final[Mapping[str, str]] = MappingProxyType(
         KEYWORDS: "Keywords to adjust",
         CAMPAIGNS: "Campaigns to pause or launch",
         BUDGET: "Budget changes",
-        CREATIVE: "Copy / creative changes",
+        CREATIVE: "Copy/creative changes",
         WHITE_PAPERS: "White papers",
     }
 )

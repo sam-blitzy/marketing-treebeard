@@ -302,7 +302,7 @@ MODULE_CAMPAIGNS: Final = "acceptance/test_campaign_rules.py"
 MODULE_BUDGET: Final = "acceptance/test_budget_rules.py"
 """Acceptance module of the Budget section (AAP 0.5.4.5)."""
 MODULE_CREATIVE: Final = "acceptance/test_creative_rules.py"
-"""Acceptance module of the Copy / creative section (AAP 0.5.4.6)."""
+"""Acceptance module of the Copy/creative section (AAP 0.5.4.6)."""
 MODULE_WHITE_PAPERS: Final = "acceptance/test_white_paper_attribution.py"
 """Acceptance module of the White papers section (AAP 0.5.4.7)."""
 MODULE_PRECEDENCE: Final = "acceptance/test_precedence.py"
@@ -5912,7 +5912,7 @@ def _b4_scenarios(module: str) -> Iterator[Scenario]:
 
 
 # ---------------------------------------------------------------------------
-# Copy / creative changes (AAP 0.5.4.6; acceptance/test_creative_rules.py)
+# Copy/creative changes (AAP 0.5.4.6; acceptance/test_creative_rules.py)
 # ---------------------------------------------------------------------------
 
 

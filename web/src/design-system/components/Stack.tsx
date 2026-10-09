@@ -11,8 +11,9 @@
  * - `ds-stack--align-{start|center|end|stretch}`: only when `align` is set;
  * - `ds-stack--break-long-words`: only when `breakLongWords` is `true`.
  *
- * `Stack.css` also takes an empty `role="status"` child out of the column, so a polite live
- * region rendered ahead of its first message adds no space and no gap (see {@link Stack}).
+ * `Stack.css` also takes an empty `role="status"` or `aria-live="polite"` child out of the
+ * column, so a polite live region rendered ahead of its first message adds no space and no gap
+ * (see {@link Stack}).
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
@@ -80,7 +81,8 @@ export interface StackProps {
   'aria-label'?: string;
   /**
    * The stacked content. With `as="ul"` or `as="ol"`, `<li>` elements only. A direct child with
-   * `role="status"` and no child nodes adds no space or gap until it has content.
+   * `role="status"` or `aria-live="polite"` and no child nodes adds no space or gap until it has
+   * content.
    */
   children?: ReactNode;
 }
@@ -96,12 +98,14 @@ export interface StackProps {
  * role. `breakLongWords` lets long unbroken text anywhere inside the stack break so it wraps
  * within the column.
  *
- * Empty live regions: a direct child with `role="status"` and no child nodes adds no space or
- * gap until it has content. A polite status region can therefore be rendered ahead of its
- * first message, as WCAG 2.2 SC 4.1.3 needs for that message to be announced, without leaving a
- * blank gap in the column. Render nothing inside it, not even whitespace, while there is no
- * message; it stays in the accessibility tree and takes its place in the column, spaced by
- * `gap`, as soon as it has content.
+ * Empty live regions: a direct child with `role="status"` or `aria-live="polite"` and no child
+ * nodes adds no space or gap until it has content. A polite live region can therefore be
+ * rendered ahead of its first message, as WCAG 2.2 SC 4.1.3 needs for that message to be
+ * announced, without leaving a blank gap in the column. `aria-live="polite"` without a role
+ * suits a region that at times holds a `Spinner`, which carries its own `role="status"`. Render
+ * nothing inside it, not even whitespace, while there is no message; it stays in the
+ * accessibility tree and takes its place in the column, spaced by `gap`, as soon as it has
+ * content.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *

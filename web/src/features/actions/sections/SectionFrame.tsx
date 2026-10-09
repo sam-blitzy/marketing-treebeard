@@ -2,7 +2,7 @@
  * `SectionFrame`: the behaviour the five `/actions` sections share (AAP 0.5.5), so no section
  * file duplicates it.
  *
- * Each section (Keywords, Campaigns, Budget, Copy / creative, White papers) renders its cards
+ * Each section (Keywords, Campaigns, Budget, Copy/creative, White papers) renders its cards
  * through one `SectionFrame`, which owns everything that is the same for all five:
  *
  * 1. the section region: a `PageShell.Section` with the anchor id `section-{key}` (the target of
@@ -26,7 +26,7 @@
  * The frame never renders a card itself: each section passes `renderItem`, which is how it
  * receives `RecommendationCard` without this file importing it (that import would close a cycle,
  * because the card imports {@link DISCREPANCY_GROUP_ANCHOR} from here). `renderGroup` replaces
- * one group's body (Copy / creative, White papers) and `renderGroups` the whole groups area
+ * one group's body (Copy/creative, White papers) and `renderGroups` the whole groups area
  * (Keywords renders one tab set across its groups).
  *
  * Presentation rules this file keeps:

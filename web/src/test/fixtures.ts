@@ -220,7 +220,7 @@ export const FIXTURE_SECTION_TITLES: Readonly<Record<SectionKey, string>> = Obje
   keywords: 'Keywords to adjust',
   campaigns: 'Campaigns to pause or launch',
   budget: 'Budget changes',
-  creative: 'Copy / creative changes',
+  creative: 'Copy/creative changes',
   white_papers: 'White papers',
 });
 
@@ -1317,11 +1317,23 @@ const PRIMARY_DATASET_IDS: Readonly<Record<SourceName, number>> = Object.freeze(
 });
 
 /**
+ * The native day boundary `GET /sources` reports for each source's coverage dates: Google's
+ * account time zone, the same zone {@link FIXTURE_SOURCE_DAYS} names, and UTC for LinkedIn and
+ * HubSpot (AAP 0.5.4.1).
+ */
+const SOURCE_DAY_BOUNDARIES: Readonly<Record<SourceName, string>> = Object.freeze({
+  google: 'America/New_York',
+  linkedin: 'UTC',
+  hubspot: 'UTC',
+});
+
+/**
  * One source of `GET /sources`: simulated because credentials are not configured, status `ok`,
- * an active simulated primary dataset with a freshness row per dataset (none stale;
- * `google.search_terms` incomplete), no pending "Sync now" and its two newest sync runs. Google
- * also reports 112 webhook calls in the last 24 h against the product's cap of 1,000; HubSpot
- * also carries LinkedIn's companion CRM dataset, because LinkedIn is simulated.
+ * its native day boundary ({@link SOURCE_DAY_BOUNDARIES}), an active simulated primary dataset
+ * with a freshness row per dataset (none stale; `google.search_terms` incomplete), no pending
+ * "Sync now" and its two newest sync runs. Google also reports 112 webhook calls in the last
+ * 24 h against the product's cap of 1,000; HubSpot also carries LinkedIn's companion CRM
+ * dataset, because LinkedIn is simulated.
  *
  * @param source - the source
  * @param overrides - fields to replace (shallow), for example `{ sync_pending: true }`
@@ -1334,6 +1346,7 @@ export function makeSource(source: SourceName, overrides: Partial<Source> = {}):
     mode: 'simulated',
     status: 'ok',
     reason: NO_CREDENTIALS,
+    day_boundary: SOURCE_DAY_BOUNDARIES[source],
     active_dataset: datasetView(
       PRIMARY_DATASET_IDS[source],
       'primary',
@@ -2441,7 +2454,7 @@ function budgetSection(): Section {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Default page: Copy / creative changes (LinkedIn, EUR)
+// Default page: Copy/creative changes (LinkedIn, EUR)
 // ---------------------------------------------------------------------------------------------
 
 /** The campaign summary every creative item freezes (`creative._Campaign.summary`). */
@@ -2455,7 +2468,7 @@ function pipelineEmeaSummary(): Record<string, unknown> {
 }
 
 /**
- * Copy / creative changes: one block for "Lead Gen — Pipeline Report EMEA" with the CR3 next
+ * Copy/creative changes: one block for "Lead Gen — Pipeline Report EMEA" with the CR3 next
  * test first (CR2's weak stage as its reason, the variants table in `extra.variants`), then the
  * CR1 pair, which was computed from a LinkedIn dataset that has since been replaced, so it is
  * historical and every action on it is disabled.

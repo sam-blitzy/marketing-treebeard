@@ -2384,14 +2384,36 @@ async def test_discrepancy_routes_list_and_resolve(seeded: Seeded) -> None:
     assert (adopted.origin, adopted.status) == ("resolution", "active")
 
 
-async def test_sources_route_returns_every_source_in_order(seeded: Seeded) -> None:
+_ACTIVE_GOOGLE_ZONE: Final = text(
+    """
+    SELECT a.timezone
+    FROM ad_account AS a
+    JOIN source_dataset AS d ON d.id = a.dataset_id
+    WHERE d.source = 'google' AND d.role = 'primary' AND d.state = 'active'
+      AND a.source = 'google' AND a.timezone IS NOT NULL
+    ORDER BY a.id
+    LIMIT 1
+    """
+)
+"""The stored time zone of the active Google dataset's account, which ends Google's days."""
+
+
+async def test_sources_route_returns_every_source_in_order(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
     """AAP 0.5.3 ``GET /sources`` → ``Source[]``, ordered google, linkedin, hubspot.
 
-    Each entry carries the source's mode, health status, reason, active dataset and the
-    freshness of each of its named datasets; Google adds its webhook calls in the last 24 h
-    against the product's cap of 1,000, and HubSpot the companion CRM dataset of the simulated
-    LinkedIn dataset.
+    Each entry carries the source's mode, health status, reason, native day boundary, active
+    dataset and the freshness of each of its named datasets; Google adds its webhook calls in
+    the last 24 h against the product's cap of 1,000, and HubSpot the companion CRM dataset of
+    the simulated LinkedIn dataset. Google's day boundary is the stored time zone of the active
+    Google dataset's account; LinkedIn's and HubSpot's are UTC (AAP 0.5.4.1).
     """
+    with sync_engine.connect() as connection:
+        google_zone = connection.execute(_ACTIVE_GOOGLE_ZONE).scalar_one()
+    assert isinstance(google_zone, str)
+    assert google_zone.strip()
+
     response = await seeded.client.get(api("/sources"))
     assert response.status_code == 200, response.text
     entries = TypeAdapter(list[schemas.Source]).validate_python(response.json())
@@ -2414,6 +2436,8 @@ async def test_sources_route_returns_every_source_in_order(seeded: Seeded) -> No
         assert entry.sync_pending is False
 
     google, linkedin, hubspot = entries
+    assert google.day_boundary == google_zone.strip()
+    assert (linkedin.day_boundary, hubspot.day_boundary) == ("UTC", "UTC")
     assert isinstance(google.calls_24h, int)
     assert google.calls_24h >= 0
     assert google.call_cap == GOOGLE_CALL_CAP
@@ -2425,6 +2449,56 @@ async def test_sources_route_returns_every_source_in_order(seeded: Seeded) -> No
         "simulated",
     )
     assert all(row.dataset.startswith("hubspot.") for row in hubspot.companion_datasets)
+
+
+async def test_sources_route_google_day_boundary_follows_the_stored_account_zone(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
+    """Google's ``day_boundary`` is chosen as ``runner.window_inputs`` chooses its zone.
+
+    The account rows of the active Google dataset are read lowest id first and the first zone
+    that is not blank is reported stripped. A blank zone is no zone: the boundary is then
+    ``None``, never UTC, while LinkedIn's and HubSpot's stay UTC.
+    """
+
+    async def boundaries(zone: str) -> dict[str, str | None]:
+        with sync_engine.begin() as connection:
+            updated = connection.execute(
+                text(
+                    "UPDATE ad_account SET timezone = :zone WHERE source = 'google' "
+                    "AND dataset_id = (SELECT id FROM source_dataset WHERE source = 'google' "
+                    "AND role = 'primary' AND state = 'active')"
+                ),
+                {"zone": zone},
+            ).rowcount
+        assert updated >= 1
+        response = await seeded.client.get(api("/sources"))
+        assert response.status_code == 200, response.text
+        return {entry["source"]: entry["day_boundary"] for entry in response.json()}
+
+    assert await boundaries("  Europe/Berlin ") == {
+        "google": "Europe/Berlin",
+        "linkedin": "UTC",
+        "hubspot": "UTC",
+    }
+    assert await boundaries("   ") == {"google": None, "linkedin": "UTC", "hubspot": "UTC"}
+
+
+async def test_sources_route_google_day_boundary_unknown_without_a_dataset(
+    authed_client: httpx.AsyncClient,
+) -> None:
+    """Before Google has an active dataset its day boundary is ``None``, never a guessed zone.
+
+    On an empty database (no dataset of any source yet) LinkedIn's and HubSpot's boundaries
+    are still UTC: they do not depend on stored data.
+    """
+    response = await authed_client.get(api("/sources"))
+    assert response.status_code == 200, response.text
+    assert {entry["source"]: entry["day_boundary"] for entry in response.json()} == {
+        "google": None,
+        "linkedin": "UTC",
+        "hubspot": "UTC",
+    }
 
 
 async def test_sync_request_202_then_409(authed_client: httpx.AsyncClient) -> None:

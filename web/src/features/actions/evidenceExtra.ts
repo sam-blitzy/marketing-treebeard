@@ -1091,7 +1091,7 @@ export function dayCounts(source: MaybeSource): readonly DayCount[] {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Copy / creative changes: CR1, CR2, CR3 (LinkedIn)
+// Copy/creative changes: CR1, CR2, CR3 (LinkedIn)
 // ---------------------------------------------------------------------------------------------
 
 /** One creative variant of a campaign (AAP 0.5.4.6). */

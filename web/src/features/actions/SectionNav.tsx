@@ -4,7 +4,7 @@
  *
  * It renders one design-system `SideNav` landmark named "Sections", holding one in-page link per
  * section in the user's order: Keywords to adjust, Campaigns to pause or launch, Budget changes,
- * Copy / creative changes, White papers ({@link SECTION_ORDER}). Each link points at the section
+ * Copy/creative changes, White papers ({@link SECTION_ORDER}). Each link points at the section
  * region `SectionFrame` anchors (`#section-{key}`, see `sectionAnchorId`) and shows how many
  * cards that section holds now.
  *

@@ -788,7 +788,7 @@ describe('SectionFrame', () => {
         }),
       });
 
-      const region = screen.getByRole('region', { name: 'Copy / creative changes' });
+      const region = screen.getByRole('region', { name: 'Copy/creative changes' });
       const empty = region.querySelector('.ds-emptystate');
       expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
         'No actions in this section',

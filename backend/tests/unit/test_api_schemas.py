@@ -2832,6 +2832,7 @@ SOURCE_KEYS = {
     "mode",
     "status",
     "reason",
+    "day_boundary",
     "active_dataset",
     "companion_dataset",
     "datasets",
@@ -2850,6 +2851,7 @@ def test_source_carries_health_mode_active_dataset_and_freshness() -> None:
         mode="simulated",
         status="ok",
         reason="credentials not configured",
+        day_boundary="America/New_York",
         active_dataset=DatasetView.from_row(_dataset_row(id=1, source="google")),
         companion_dataset=None,
         datasets=[DatasetFreshnessView.from_row(_freshness_row(), stale=False)],
@@ -2862,6 +2864,7 @@ def test_source_carries_health_mode_active_dataset_and_freshness() -> None:
     )
     dumped = source.model_dump(mode="json")
     assert set(dumped) == SOURCE_KEYS
+    assert dumped["day_boundary"] == "America/New_York"
     assert dumped["active_dataset"]["id"] == 1
     assert dumped["datasets"][0]["dataset"] == "google.metrics_daily"
     assert (dumped["calls_24h"], dumped["call_cap"], dumped["sync_pending"]) == (12, 25, True)
@@ -2875,6 +2878,7 @@ def test_source_before_the_first_attempt_has_no_mode_status_or_datasets() -> Non
             "mode": None,
             "status": None,
             "reason": None,
+            "day_boundary": "UTC",
             "active_dataset": None,
             "companion_dataset": DatasetView.from_row(_dataset_row(id=8, role="companion")),
             "datasets": [],
@@ -2892,6 +2896,35 @@ def test_source_before_the_first_attempt_has_no_mode_status_or_datasets() -> Non
     with pytest.raises(ValidationError) as error:
         Source.model_validate({**source.model_dump(), "status": "throttled"})
     assert _error_types(error) == ["literal_error"]
+
+
+def test_source_day_boundary_is_required_and_may_be_unknown() -> None:
+    """``day_boundary`` has no default: the route always states it, ``None`` when unknown."""
+    known = Source.model_validate(
+        {
+            "source": "google",
+            "mode": None,
+            "status": None,
+            "reason": None,
+            "day_boundary": "America/New_York",
+            "active_dataset": None,
+            "companion_dataset": None,
+            "datasets": [],
+            "companion_datasets": [],
+            "last_attempt_at": None,
+            "calls_24h": 0,
+            "call_cap": 25,
+            "sync_pending": False,
+            "recent_runs": [],
+        }
+    )
+    unknown = Source.model_validate({**known.model_dump(), "day_boundary": None})
+    assert unknown.day_boundary is None
+    assert unknown.model_dump(mode="json")["day_boundary"] is None
+    without = {key: value for key, value in known.model_dump().items() if key != "day_boundary"}
+    with pytest.raises(ValidationError) as error:
+        Source.model_validate(without)
+    assert _error_types(error) == ["missing"]
 
 
 # ---------------------------------------------------------------------------

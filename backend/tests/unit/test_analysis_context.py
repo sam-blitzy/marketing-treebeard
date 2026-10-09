@@ -180,7 +180,7 @@ def test_section_order_matches_the_model_and_the_aap_order() -> None:
     for section, groups in GROUP_ORDER.items():
         assert tuple(GROUP_TITLES[section]) == groups
     assert GROUP_ORDER[CAMPAIGNS] == ("discrepancies", "pause", "scale", "launch")
-    assert SECTION_TITLES["creative"] == "Copy / creative changes"
+    assert SECTION_TITLES["creative"] == "Copy/creative changes"
 
 
 def test_status_and_feedback_constants_equal_the_model_enumerations() -> None:

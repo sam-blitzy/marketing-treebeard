@@ -40,7 +40,7 @@ notes for [Google Ads via n8n](integrations/google-ads-n8n.md),
 | Docker Engine | 29 or newer (`ENGINE_MIN` in the `Makefile`) | Every container |
 | Docker Compose plugin | 5.5.1 or newer, below 6 (`COMPOSE_MIN`, `COMPOSE_MAX`) | The stack in `docker-compose.yml` |
 | GNU make | 4.0 or newer, with bash | Every `make` target. On macOS, `brew install make` and run `gmake` |
-| POSIX tools | `awk`, `od`, `mktemp`, `sort -V`, and `curl` or `wget` | `make init` and the health poll of `make up` and `make e2e` |
+| POSIX tools | `awk`, `od`, `mktemp`, and `curl` or `wget` | `make init` and the health poll of `make up` and `make e2e` |
 | git | Any current release | Cloning, and `make secret-scan` |
 | uv | Exactly 0.12.21 (`required-version` in `backend/pyproject.toml`) | Host-side backend tests and lint only |
 | Python | 3.14 (`requires-python = ">=3.14,<3.15"`) | Host-side backend tests and lint only |
@@ -510,7 +510,10 @@ What the labels mean:
   and, for HubSpot while LinkedIn is simulated, the companion CRM dataset.
 - **Dataset freshness**: per dataset, its completeness (`complete`, `incomplete` or `unknown`),
   covered range (`covered_from` to `covered_through`, native dates), last success, last attempt and
-  reason. The eleven datasets are:
+  reason. Covered dates are shown as stored, labelled with the source's day boundary, which also
+  heads the tables ("Google days: America/New_York"): Google's is the account time zone ("day
+  boundary not yet known" until the account is synced), LinkedIn's and HubSpot's are UTC. The
+  display time zone applies to the instants only. The eleven datasets are:
 
   | Source | Datasets |
   |--------|----------|

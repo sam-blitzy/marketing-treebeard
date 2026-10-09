@@ -18,7 +18,8 @@
 #   open http://localhost:8080 and sign in as admin@example.com with that password
 #
 # Overridable variables (command line or environment):
-#   COMPOSE             the Compose command (default: docker compose); add -p/-f flags here
+#   COMPOSE             the Compose command (default: docker compose); add -p/-f flags here;
+#                       empty means the default
 #   APP_URL             origin of the web service that up/e2e poll and Playwright targets
 #   HEALTH_TIMEOUT      seconds up/e2e wait for /api/v1/healthz to answer 200
 #   TEST_DB_PORT        host port of the disposable test database (127.0.0.1 only)
@@ -33,7 +34,7 @@
 # reach awk through its environment) and only ever written to .env, mode 600, which is
 # gitignored. Recipes print "written" instead of a value.
 #
-# Requirements: GNU make 4.0 or newer and bash; POSIX awk, od, mktemp and `sort -V`; curl or
+# Requirements: GNU make 4.0 or newer and bash; POSIX awk, od and mktemp; curl or
 # wget for the health poll. Every recipe runs as one bash script (.ONESHELL) with -eu and
 # pipefail, so any failing command stops it. Inside recipes no line may begin with `-`, `+` or
 # `@` once indented: GNU make strips those prefix characters from every .ONESHELL line, so long
@@ -54,10 +55,16 @@ SHELL := /bin/bash
 # Variables
 # -----------------------------------------------------------------------------------------------
 
-COMPOSE := docker compose
+# The environment and the command line override COMPOSE (the command line wins); an empty or
+# blank value means the default.
+COMPOSE ?= docker compose
+ifeq ($(strip $(COMPOSE)),)
+override COMPOSE := docker compose
+endif
 
-# Tool bounds: Compose >=COMPOSE_MIN and of a major version below COMPOSE_MAX; Engine major
-# version >=ENGINE_MIN. CI installs Compose at exactly COMPOSE_MIN and runs `make check-tools`.
+# Tool bounds: Compose >=COMPOSE_MIN (a release MAJOR.MINOR[.PATCH]) and of a major version below
+# COMPOSE_MAX; Engine major version >=ENGINE_MIN. check-tools compares numerically and accepts
+# release versions only. CI installs Compose at exactly COMPOSE_MIN and runs `make check-tools`.
 COMPOSE_MIN := 5.5.1
 COMPOSE_MAX := 6
 ENGINE_MIN := 29
@@ -159,6 +166,31 @@ help: ## List the targets
 check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 	@compose_range='>=$(COMPOSE_MIN),<$(COMPOSE_MAX)'
 	engine_range='>=$(ENGINE_MIN)'
+	# Release versions only: [v]MAJOR.MINOR[.PATCH][+BUILD[~BACKPORT]], a missing patch counting
+	# as 0. Each component is 0 or up to nine digits without a leading zero, so bash arithmetic
+	# never reads octal or overflows. +BUILD is SemVer 2.0.0 build metadata: nonempty
+	# dot-separated identifiers of [0-9A-Za-z-]. ~BACKPORT is a Debian/Ubuntu backport tail of
+	# nonempty dot-separated alphanumeric identifiers. Together they admit two distribution builds
+	# of a release: Debian docker.io (28.5.2+dfsg4) and Ubuntu docker-compose-v2
+	# (2.40.3+ds1-0ubuntu1~24.04.1). Refused: prereleases (5.5.1-rc.1, which SemVer ranks below
+	# 5.5.1), a bare Debian revision (2.40.3-3, indistinguishable from a prerelease), development
+	# builds (v5.6.0-24-g4e1cd3f4e) and any other text. parse_release sets release_major,
+	# release_minor and release_patch.
+	release_re='^v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8}))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*(~[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?)?$$'
+	major_re='^(0|[1-9][0-9]{0,8})$$'
+	parse_release() {
+		[[ $$1 =~ $$release_re ]] || return 1
+		release_major="$${BASH_REMATCH[1]}"
+		release_minor="$${BASH_REMATCH[2]}"
+		release_patch="$${BASH_REMATCH[4]:-0}"
+	}
+	if ! parse_release '$(COMPOSE_MIN)' || ! [[ '$(COMPOSE_MAX)' =~ $$major_re ]] || ! [[ '$(ENGINE_MIN)' =~ $$major_re ]]; then
+		echo "Malformed tool bounds in the Makefile: COMPOSE_MIN must be a release version MAJOR.MINOR[.PATCH], COMPOSE_MAX and ENGINE_MIN major versions; found $$compose_range, Engine $$engine_range" >&2
+		exit 1
+	fi
+	min_major="$$release_major"
+	min_minor="$$release_minor"
+	min_patch="$$release_patch"
 	if ! command -v docker >/dev/null 2>&1; then
 		echo "docker not found on PATH; required: Docker Engine $$engine_range with the Compose plugin $$compose_range" >&2
 		exit 1
@@ -167,16 +199,15 @@ check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 		echo "Docker Compose not found ('$(COMPOSE) version --short' failed); required $$compose_range" >&2
 		exit 1
 	fi
+	if ! parse_release "$$compose_version"; then
+		echo "Docker Compose $$compose_version is not a release version (prereleases and development builds are not accepted); required $$compose_range" >&2
+		exit 1
+	fi
 	compose_version="$${compose_version#v}"
-	compose_major="$${compose_version%%.*}"
-	case "$$compose_major" in
-		''|*[!0-9]*)
-			echo "Unrecognised Docker Compose version '$$compose_version'; required $$compose_range" >&2
-			exit 1
-			;;
-	esac
-	lowest="$$(printf '%s\n%s\n' '$(COMPOSE_MIN)' "$$compose_version" | sort -V | sed -n 1p)"
-	if [ "$$lowest" != '$(COMPOSE_MIN)' ] || [ "$$compose_major" -ge '$(COMPOSE_MAX)' ]; then
+	if (( release_major < min_major
+		|| (release_major == min_major && release_minor < min_minor)
+		|| (release_major == min_major && release_minor == min_minor && release_patch < min_patch)
+		|| release_major >= $(COMPOSE_MAX) )); then
 		echo "Docker Compose $$compose_version found; required $$compose_range" >&2
 		exit 1
 	fi
@@ -184,14 +215,11 @@ check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 		echo "Docker Engine not reachable (is the daemon running, and may this user use it?); required $$engine_range" >&2
 		exit 1
 	fi
-	engine_major="$${engine_version%%.*}"
-	case "$$engine_major" in
-		''|*[!0-9]*)
-			echo "Unrecognised Docker Engine version '$$engine_version'; required $$engine_range" >&2
-			exit 1
-			;;
-	esac
-	if [ "$$engine_major" -lt '$(ENGINE_MIN)' ]; then
+	if ! parse_release "$$engine_version"; then
+		echo "Docker Engine $$engine_version is not a release version (prereleases and development builds are not accepted); required $$engine_range" >&2
+		exit 1
+	fi
+	if (( release_major < $(ENGINE_MIN) )); then
 		echo "Docker Engine $$engine_version found; required $$engine_range" >&2
 		exit 1
 	fi
@@ -205,6 +233,7 @@ check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 # - the file is rebuilt through a temporary file and mv rather than sed -i, whose syntax
 #   differs between GNU and BSD, and every other line of the template is kept as it is, so
 #   APP_ADMIN_EMAIL stays admin@example.com and every other variable keeps its default.
+init: export CHECKOUT_DIR := $(CURDIR)
 init: check-tools ## First start: write .env with SESSION_SECRET and the admin hash (make init ADMIN_PASSWORD=<value>)
 	@if [ -z "$${ADMIN_PASSWORD:-}" ]; then
 		echo "usage: make init ADMIN_PASSWORD=<value>" >&2
@@ -215,11 +244,11 @@ init: check-tools ## First start: write .env with SESSION_SECRET and the admin h
 		exit 1
 	fi
 	if [ ! -f .env.example ]; then
-		echo ".env.example not found in $(CURDIR)" >&2
+		echo ".env.example not found in $$CHECKOUT_DIR" >&2
 		exit 1
 	fi
-	# From here on a failure, or Ctrl-C, removes the .env this run created, so a re-run starts
-	# clean; an .env created by anything else is never touched.
+	# Once the reservation below has created .env, a failure, or Ctrl-C, removes it, so a re-run
+	# starts clean; an .env created by anything else is never touched.
 	created=0
 	tmp_env=''
 	cleanup_init() {
@@ -235,9 +264,16 @@ init: check-tools ## First start: write .env with SESSION_SECRET and the admin h
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	umask 077
-	# noclobber makes the copy itself refuse an .env that appeared after the check above.
-	(set -o noclobber; cat .env.example > .env)
+	# Reserve, own, then copy. With noclobber the empty reservation is created exclusively, so it
+	# refuses, untouched, an .env (a symlink included) that appeared after the check above; the
+	# regular-file test refuses one it could still open, such as a link to a device. The file is
+	# this run's from the reservation on, so a failed or interrupted copy is removed, not left.
+	if ! (set -o noclobber; : > .env) || [ -L .env ] || [ ! -f .env ]; then
+		echo "make init did not create .env; an existing .env is never overwritten" >&2
+		exit 1
+	fi
 	created=1
+	cat .env.example > .env
 	echo "Copied .env.example to .env"
 	session_secret="$$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 	case "$$session_secret" in
@@ -366,11 +402,15 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 # `gitleaks git` scans every commit: the committed history is the gate. The image's git refuses
 # a mounted repository owned by another uid ("dubious ownership"), so /repo is declared safe
 # first. A linked worktree keeps its git data in the main checkout, which is mounted read-only
-# at its own path so the worktree's .git file still resolves inside the container.
+# at its own path so the worktree's .git file still resolves inside the container. The checkout
+# directory reaches bash as the environment variable CHECKOUT_DIR and is expanded in double
+# quotes, never spliced into the script as make text, so a path with spaces, quotes or dollar
+# signs is passed through as data.
+secret-scan: export CHECKOUT_DIR := $(CURDIR)
 secret-scan: ## gitleaks v8.30.1 (pinned image) over every commit with .gitleaks.toml; a finding fails
-	@scan_args=(run --rm --volume '$(CURDIR):/repo:ro' --workdir /repo --entrypoint sh)
-	git_common_dir="$$(git -C '$(CURDIR)' rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-	if [ -n "$$git_common_dir" ] && [ "$$git_common_dir" != '$(CURDIR)/.git' ]; then
+	@scan_args=(run --rm --volume "$$CHECKOUT_DIR:/repo:ro" --workdir /repo --entrypoint sh)
+	git_common_dir="$$(git -C "$$CHECKOUT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+	if [ -n "$$git_common_dir" ] && [ "$$git_common_dir" != "$$CHECKOUT_DIR/.git" ]; then
 		scan_args+=(--volume "$$git_common_dir:$$git_common_dir:ro")
 	fi
 	scan_args+=('$(GITLEAKS_IMAGE)' -c 'git config --global --add safe.directory /repo && exec gitleaks git /repo --config /repo/.gitleaks.toml --redact --exit-code 1 --verbose')

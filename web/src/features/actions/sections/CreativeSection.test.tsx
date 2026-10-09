@@ -1,5 +1,5 @@
 /**
- * Component tests for `CreativeSection`, the "Copy / creative changes" section of `/actions`
+ * Component tests for `CreativeSection`, the "Copy/creative changes" section of `/actions`
  * (AAP 0.5.5 Copy; AAP 0.5.4.6 rules CR1–CR3; AAP 0.5.4.2 P7; FR-7).
  *
  * They hold the section to its TSDoc contract and to the AAP's field set:
@@ -170,7 +170,7 @@ describe('CreativeSection', () => {
     it('renders the block of a campaign: variants table, then the CR3 next test, then the CR1 pairs', async () => {
       await renderCreative(defaultCreative());
 
-      const section = screen.getByRole('region', { name: 'Copy / creative changes' });
+      const section = screen.getByRole('region', { name: 'Copy/creative changes' });
       const block = within(section).getByRole('region', { name: PIPELINE_EMEA });
       expect(within(block).getByRole('heading', { level: 3 }).textContent).toBe(PIPELINE_EMEA);
 
@@ -463,7 +463,7 @@ describe('CreativeSection', () => {
     it('shows the empty state, and no block, when no rule fired', async () => {
       await renderCreative(makeSection('creative'));
 
-      const section = screen.getByRole('region', { name: 'Copy / creative changes' });
+      const section = screen.getByRole('region', { name: 'Copy/creative changes' });
       expect(within(section).queryByRole('table')).toBeNull();
       expect(within(section).getByText('No actions in this section')).toBeTruthy();
       expect(within(section).getByText('No rule fired for this window')).toBeTruthy();

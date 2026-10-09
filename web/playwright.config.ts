@@ -14,7 +14,8 @@
  *   read one value; worker processes inherit the runner's environment.
  * - `E2E_ADMIN_PASSWORD`: the `ADMIN_PASSWORD` given to `make init`. Required, no default:
  *   loading this config fails at once without it, instead of every test failing with a 401.
- * - `CI`: when set, `test.only` is forbidden, failed tests are retried once, and the HTML
+ * - `CI`: when set, `test.only` is forbidden, failed tests are retried once, no trace is
+ *   recorded (a trace would carry the session cookie into the uploaded artifact), and the HTML
  *   report is written to `playwright-report/` for upload.
  *
  * Login rate limit: the API accepts 5 login attempts per minute per IP and answers the 6th with
@@ -90,7 +91,9 @@ export default defineConfig({
 
   use: {
     baseURL,
-    trace: 'retain-on-failure',
+    // A trace stores every request's headers, the session cookie included, and CI uploads
+    // test-results/ and playwright-report/ (which copies traces) on failure, so CI records none.
+    trace: process.env.CI ? 'off' : 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'off',
   },

@@ -2105,6 +2105,12 @@ class Source(ApiModel):
         mode: ``live`` or ``simulated``; ``None`` before the worker's first attempt.
         status: ``ok``, ``stale``, ``denied`` or ``error``; ``None`` before the first attempt.
         reason: Why the source is in its mode or status.
+        day_boundary: The IANA zone whose midnight ends the native dates of this source's
+            freshness rows (``covered_from`` and ``covered_through``, primary and companion),
+            so the UI can label them (AAP 0.5.4.1, 0.5.5): for Google the active Google
+            dataset's account time zone (``customer.time_zone``), for LinkedIn and HubSpot
+            ``UTC``. ``None`` while Google has no active dataset or no account row with a
+            zone; the display time zone never stands in for it.
         active_dataset: The active primary dataset.
         companion_dataset: HubSpot only: the active companion CRM dataset.
         datasets: Freshness of the active dataset's named datasets.
@@ -2120,6 +2126,7 @@ class Source(ApiModel):
     mode: Mode | None
     status: ConnectionStatus | None
     reason: str | None
+    day_boundary: str | None
     active_dataset: DatasetView | None
     companion_dataset: DatasetView | None
     datasets: list[DatasetFreshnessView]

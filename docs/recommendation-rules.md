@@ -28,7 +28,7 @@ Related documents: [architecture](architecture.md) (components, schedule, data f
 - [Keywords to adjust (Google)](#keywords-to-adjust-google)
 - [Campaigns to pause or launch](#campaigns-to-pause-or-launch)
 - [Budget changes](#budget-changes)
-- [Copy / creative changes (LinkedIn)](#copy--creative-changes-linkedin)
+- [Copy/creative changes (LinkedIn)](#copycreative-changes-linkedin)
 - [White papers](#white-papers)
 - [Evidence, flags, findings and banners](#evidence-flags-findings-and-banners)
 - [Traceability](#traceability)
@@ -45,7 +45,7 @@ groups appear in the order shown.
 | `keywords` | Keywords to adjust | `block` (Block / negative-keyword candidates), `expand` (Expansion candidates), `review` (Review) | `K1`, `K2`, `K3` |
 | `campaigns` | Campaigns to pause or launch | `discrepancies` (Discrepancies), `pause` (Pause), `scale` (Scale), `launch` (Launch ideas) | `C0`, `C1`, `C1b`, `C2`, `C3a`, `C3b` |
 | `budget` | Budget changes | `changes` (Budget changes) | `B1`, `B2`, `B3`, `B4` |
-| `creative` | Copy / creative changes | One group per campaign, keyed `campaign:{id}` | `CR1`, `CR2`, `CR3` |
+| `creative` | Copy/creative changes | One group per campaign, keyed `campaign:{id}` | `CR1`, `CR2`, `CR3` |
 | `white_papers` | White papers | One group per currency cohort, keyed `cohort:{currency}` | `W1`, `W2`, `W` |
 
 `G1` is a guard, not a card. It removes spend increases from other rules
@@ -1126,7 +1126,7 @@ member days.
 - **Decision subject**: no ("Mark done"). With no proposed amount, `B4` has no amount decision
   to record.
 
-## Copy / creative changes (LinkedIn)
+## Copy/creative changes (LinkedIn)
 
 Section `creative`, one group per campaign (`campaign:{id}`). Amounts are never compared
 across currencies, so groups are partitioned by the campaign's account currency, in

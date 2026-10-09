@@ -326,8 +326,9 @@ async function sectionNavCount(page: Page, key: SectionKey): Promise<number> {
 // ---------------------------------------------------------------------------------------------
 
 // Start with no session, because the first-start sign-in is what this file asserts. Traces stay
-// off: a trace records every action's arguments, the password among them, and a retained trace
-// is copied into the HTML report that CI uploads. Screenshots on failure still apply.
+// off in every run, including local runs, where playwright.config.ts otherwise retains a trace
+// on failure: a trace records every action's arguments, the password among them, and a retained
+// trace is copied into the HTML report. Screenshots on failure still apply.
 test.use({ storageState: { cookies: [], origins: [] }, trace: 'off' });
 
 test('first start: sign in and see five populated sections on simulated data', async ({

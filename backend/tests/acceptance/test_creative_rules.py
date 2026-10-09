@@ -1,4 +1,4 @@
-"""Acceptance tests for Copy / creative changes: rules CR1, CR2 and CR3 on LinkedIn creatives.
+"""Acceptance tests for Copy/creative changes: rules CR1, CR2 and CR3 on LinkedIn creatives.
 
 AAP 0.11.2 row ``acceptance/test_creative_rules.py``, rules AAP 0.5.4.6 and FR-7, with P6
 (sample-size withholding) and P7 ("no premature winners", AAP 0.5.4.2). The user asked three

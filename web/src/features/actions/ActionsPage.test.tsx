@@ -193,7 +193,7 @@ describe('ActionsPage', () => {
         'Keywords to adjust 3',
         'Campaigns to pause or launch 5',
         'Budget changes 2',
-        'Copy / creative changes 2',
+        'Copy/creative changes 2',
         'White papers 3',
       ]);
 
