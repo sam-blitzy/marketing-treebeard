@@ -173,6 +173,11 @@ function buildTestRouter(ui: ReactElement, queryClient: QueryClient, path: strin
     history: createMemoryHistory({ initialEntries: [path] }),
     context: { queryClient },
     defaultPendingMinMs: 0,
+    // jsdom implements neither `window.scrollTo` nor `Element.scrollIntoView`, which the
+    // router's scroll reset calls after every render, so each render would log a jsdom
+    // "Not implemented" error. A predicate that declines every location skips that step, and no
+    // component test depends on scroll position.
+    scrollRestoration: () => false,
   });
 }
 

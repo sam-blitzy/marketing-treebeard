@@ -28,7 +28,8 @@ const EMPTY_SLOTS: readonly [string, ReactNode][] = [
 ];
 
 /**
- * Renders the frame the router layout renders: a `TopBar`, the primary `SideNav` and a page.
+ * Renders the frame the router layout renders: a `TopBar`, the primary `SideNav`, named
+ * "Primary" as in `src/router.tsx`, and a page.
  *
  * @param children - the page content
  * @returns the render result
@@ -39,7 +40,7 @@ function renderShell(children: ReactNode) {
       topBar={<TopBar productName="Ads Action Engine" />}
       sideNav={
         <SideNav
-          label="Main"
+          label="Primary"
           items={[
             { key: 'actions', label: 'Actions', href: '/actions', current: true },
             { key: 'decisions', label: 'Decisions', href: '/decisions' },
@@ -68,7 +69,7 @@ describe('PageShell', () => {
     expect(banner.tagName).toBe('HEADER');
     expect(within(banner).getByText('Ads Action Engine')).toBeDefined();
 
-    const nav = screen.getByRole('navigation', { name: 'Main' });
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
     expect(nav.parentElement?.className).toBe('ds-pageshell__sidenav');
 
     const main = screen.getByRole('main');
@@ -84,6 +85,85 @@ describe('PageShell', () => {
 
     expect(screen.getAllByRole('banner')).toHaveLength(1);
     expect(screen.getAllByRole('main')).toHaveLength(1);
+  });
+
+  it('composes the top bar, primary navigation, title and anchored sections into one page', () => {
+    render(
+      <PageShell
+        topBar={<TopBar productName="Ads Action Engine" />}
+        sideNav={
+          <SideNav
+            label="Primary"
+            items={[{ key: 'actions', label: 'Actions', href: '/actions', current: true }]}
+          />
+        }
+      >
+        <PageShell.Title actions={<span>Run 42</span>}>Actions</PageShell.Title>
+        <PageShell.Section id="section-keywords" title="Keywords to adjust">
+          <p>Body</p>
+        </PageShell.Section>
+        <PageShell.Section id="group-keywords-block" title="Block" headingLevel={3}>
+          <p>Group</p>
+        </PageShell.Section>
+      </PageShell>,
+    );
+
+    // Landmarks: the shell owns the one banner and the one main; SideNav owns the navigation,
+    // which sits outside both.
+    expect(screen.getAllByRole('banner')).toHaveLength(1);
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    const banner = screen.getByRole('banner');
+    const main = screen.getByRole('main');
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    expect(banner.contains(nav)).toBe(false);
+    expect(main.contains(nav)).toBe(false);
+    expect(within(nav).getByRole('link', { name: 'Actions' }).getAttribute('aria-current')).toBe(
+      'page',
+    );
+    expect(main.id).toBe('ds-main');
+    expect(main.getAttribute('tabindex')).toBe('-1');
+
+    // The skip link is the first link in the document, ahead of the navigation's links, and
+    // activating it moves focus to main.
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    expect(skip.getAttribute('href')).toBe('#ds-main');
+    expect(screen.getAllByRole('link')[0]).toBe(skip);
+    fireEvent.click(skip);
+    expect(document.activeElement).toBe(main);
+
+    // The page title is the single h1, inside main, with its actions rendered beside it.
+    const h1s = screen.getAllByRole('heading', { level: 1 });
+    expect(h1s).toHaveLength(1);
+    expect(h1s[0]?.textContent).toBe('Actions');
+    expect(main.contains(h1s[0] ?? null)).toBe(true);
+    expect(within(main).getByText('Run 42').parentElement?.className).toBe(
+      'ds-pageshell__actions',
+    );
+
+    // The section anchor (section-{key}) is a region named by its level-2 heading.
+    const region = screen.getByRole('region', { name: 'Keywords to adjust' });
+    expect(region.id).toBe('section-keywords');
+    expect(region.getAttribute('aria-labelledby')).toBe('section-keywords-title');
+    const sectionHeading = within(region).getByRole('heading', { name: 'Keywords to adjust' });
+    expect(sectionHeading.tagName).toBe('H2');
+    expect(sectionHeading.id).toBe('section-keywords-title');
+    expect(within(region).getByText('Body')).toBeDefined();
+
+    // The group anchor (group-{section}-{group}) carries a level-3 heading.
+    const groupHeading = screen.getByRole('heading', { level: 3, name: 'Block' });
+    expect(groupHeading.id).toBe('group-keywords-block-title');
+    const group = screen.getByRole('region', { name: 'Block' });
+    expect(group.id).toBe('group-keywords-block');
+    expect(group.getAttribute('aria-labelledby')).toBe('group-keywords-block-title');
+    expect(within(group).getByText('Group')).toBeDefined();
+
+    // Every heading lives in main, in document order, with no level skipped.
+    expect(screen.getAllByRole('heading').map((heading) => heading.tagName)).toEqual([
+      'H1',
+      'H2',
+      'H3',
+    ]);
+    expect(within(main).getAllByRole('heading')).toHaveLength(3);
   });
 
   it('puts the skip link first, targeting main', () => {
