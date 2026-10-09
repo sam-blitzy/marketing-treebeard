@@ -246,8 +246,11 @@ pivot in `SEGMENT_PIVOTS`, for each preset in `window.presets` (`[14, 28, 56, 90
 | `MEMBER_INDUSTRY` | `industry` | `urn:li:industry:<id>` |
 
 Each preset of `n` days covers `[end - n + 1, end]`, where `end` is the default window end: the
-earlier of yesterday in the Google account's time zone and yesterday UTC. Segment windows
-therefore always equal the default run's window, first start included.
+earlier of yesterday in the Google account's time zone and yesterday UTC. Every preset window
+therefore ends on the default window end; only its start differs. The preset of
+`window.default_days` (28 by default, always in `window.presets`) equals the default run's window
+exactly, first start included. A run over any other preset length that ends on the default end
+matches that preset's fetched window.
 
 **Flagged risk, and the form the client uses.** The contracted request (the plan and
 `ad_analytics_statistics.json`) is the Statistics Finder:
@@ -548,7 +551,7 @@ in [architecture](../architecture.md).
 |-----------|----------------|--------------------------|
 | `LINKEDIN_AD_ACCOUNT_IDS` missing, or neither the complete trio nor `LINKEDIN_ACCESS_TOKEN` set | Access unavailable | Simulated, reason "credentials not configured" |
 | A 401 after one token refresh, a 401 with a static token, any 403 on any LinkedIn endpoint, or a rejected token exchange | Access denied | All of LinkedIn switches to simulated, with the failing endpoint and LinkedIn's code in the reason |
-| 429, 5xx, timeout or network failure | Transient | 3 attempts, then the affected datasets turn stale and keep their last good data. Never simulated |
+| 429, 5xx, timeout or network failure | Transient | 3 attempts, then the connection becomes `stale` at once and a failed attempt is recorded on the freshness row of each dataset whose refresh the error failed; that dataset keeps its last good data, and its `last_success_at`, coverage and completeness stand. An entity listing cut short is instead recorded as an `incomplete` read (see Safe absence under [Endpoints](#endpoints)). A failed attempt alone flags no item: items reading the dataset are flagged stale once its last success is older than `sources.stale_after_hours` (24) or its coverage stops short of the window end ([P4](../recommendation-rules.md#p3-to-p8)). Never simulated |
 | 400 or another 4xx, or a response that breaks its contract | Defect | The job fails and is logged. No retry, no simulation |
 
 - **One source, one mode**: a source's active dataset is entirely live or entirely simulated, so
@@ -682,12 +685,21 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
   `DATA_MODE=simulated`, without LinkedIn credentials, or when
   `tests/contracts/linkedin/captured/` is not writable by the user running it or is a symbolic
   link.
-- **Bounds**: each surface costs one request. The capture calls the same client methods as sync,
-  with capture-only bounds that sync never passes: `max_pages=1` on `list_campaign_groups`,
-  `list_campaigns`, `list_creatives` (one campaign), `analytics_daily` and
-  `analytics_segments`, and `max_campaigns=1` on `analytics_segments`. No later `pageToken` or
-  `next` link is followed, so those listings end incomplete with the reason "page limit" by
-  design; lead forms and responses read one page of `count=1`.
+- **Bounds**: each surface is bounded to one request. Only the transport retries of a transient
+  failure, the token exchange and one retry that follow a 401 in refresh mode, and the
+  `adAccounts/{id}` read that `list_campaign_groups` makes when the `ad_account` call failed
+  send more. The capture calls the same client methods as sync, with capture-only bounds that
+  sync never passes: `max_pages=1` on `list_campaign_groups`, `list_campaigns`,
+  `list_creatives` (one campaign), `analytics_daily` and `analytics_segments`, and
+  `max_campaigns=1` on `analytics_segments`; lead forms and responses read one page of
+  `count=1`. No later `pageToken` or `next` link is followed. A bounded listing ends incomplete
+  with the reason "page limit" only when the bound leaves work unread: its page still carries a
+  next page token or a `next` link, its `count=1` Lead Sync page holds an element (more may
+  follow), or the segment fallback found more delivering campaigns than `max_campaigns`. A
+  search page without a next page token, an `adAnalytics` response without a `next` link and
+  an empty Lead Sync page end the listing complete, except that an `adAnalytics` response at
+  the 15,000-element cap ends it incomplete with its result-limit reason (see
+  [Limits and retention](#limits-and-retention)).
 - **Segment fallback**: when LinkedIn rejects the Statistics Finder with HTTP 400, the segment
   call sends one `ad_analytics_campaign_delivery` discovery request and one
   `ad_analytics_member_segments` request for the first delivering campaign. Both are captured

@@ -4386,8 +4386,13 @@ def _c0_world(
     faults: Iterable[Fault] = (),
     late: Sequence[GoogleCampaignSpec] = (),
     late_budgets: Sequence[GoogleBudgetSpec] = (),
+    hubspot: HubSpotSpec | None = None,
 ) -> WorldSpec:
-    """Google own-budget, shared-budget and LinkedIn campaigns for discrepancy cases."""
+    """Google own-budget, shared-budget and LinkedIn campaigns for discrepancy cases.
+
+    ``hubspot`` adds a CRM portal, which a simulated LinkedIn dataset needs to activate (its
+    companion CRM dataset is synced from it), so a case can run the real LinkedIn entity sync.
+    """
     google = GoogleSpec(
         budgets=(_BRAND_BUDGET, _POOL, _POOL_B, *late_budgets),
         campaigns=(
@@ -4403,7 +4408,9 @@ def _c0_world(
     linkedin = _linkedin(
         (_li_campaign("li-brand", "Brand - LinkedIn", daily="50.00"),), (creative,), forms=()
     )
-    return _world(name, google=google, linkedin=linkedin, changes=changes, faults=faults)
+    return _world(
+        name, google=google, linkedin=linkedin, hubspot=hubspot, changes=changes, faults=faults
+    )
 
 
 def _change(
@@ -4628,16 +4635,21 @@ def _c0_scenarios(module: str) -> Iterator[Scenario]:
         "linkedin", "campaign", "li-brand", at_offset_hours=-30, disappear=True
     )
     li_short = Fault("linkedin", "ad_campaigns", "http_status", status=503)
+    # Both twins carry the same portal, so the simulated LinkedIn dataset (and its companion
+    # CRM dataset) activates and the persisted tests can run the real LinkedIn entity sync.
+    li_portal = HubSpotSpec(funnel=_FLAT_FUNNEL)
     yield from _pair(
         "c0.linkedin_cut_short",
         module,
         "C0 missing: LinkedIn's all-status search cut short raises no missing",
         fires=(
-            _c0_world("c0.linkedin_cut_short", changes=(li_gone,)),
+            _c0_world("c0.linkedin_cut_short", changes=(li_gone,), hubspot=li_portal),
             Expectation(C0, True, {"kind": "missing", "source": "linkedin"}),
         ),
         does_not_fire=(
-            _c0_world("c0.linkedin_cut_short", changes=(li_gone,), faults=(li_short,)),
+            _c0_world(
+                "c0.linkedin_cut_short", changes=(li_gone,), faults=(li_short,), hubspot=li_portal
+            ),
             Expectation(C0, False, {"open": 0, "linkedin.entities": "incomplete"}),
         ),
     )

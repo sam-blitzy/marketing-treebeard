@@ -113,6 +113,8 @@ from ads_engine.db.models import (
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation.payloads import (
     Contract,
+    ContractViolation,
+    RequestShape,
     load_contract,
     validate_capture,
     validate_documented_sample,
@@ -162,6 +164,17 @@ _CUSTOMER_ID_RE: Final = re.compile(r"[0-9]{10}")
 
 # Headers a direct Google Ads API call would need; the webhook path must never send them.
 GOOGLE_API_HEADERS: Final = ("Authorization", "developer-token", "login-customer-id")
+
+# What `ads-engine capture-fixtures` writes in place of a credential: the whole value of the
+# configured secret header, and the credential after the scheme `Authorization` keeps.
+CAPTURE_MARKER: Final = "<redacted>"
+# The placeholder URL every redacted Google capture records for the capability webhook URL.
+REDACTED_WEBHOOK_URL: Final = "https://redacted.invalid/webhook/redacted"
+# The configured customer id as a redacted capture records it: the same number of zeros.
+REDACTED_CUSTOMER_ID: Final = "0000000000"
+# Recorded headers whose value never names the secret header: `Authorization` keeps its scheme
+# before the marker, and `Content-Type` is never redacted.
+_UNMARKED_HEADERS: Final = frozenset({"authorization", "content-type"})
 
 # Each template's rows come from one in-memory table of the fake account.
 _TABLE_OF: Final[Mapping[str, str]] = {
@@ -2291,44 +2304,222 @@ async def test_documented_sample_parses(
         assert [parse(row) for row in page.rows]
 
 
+def _recorded_settings(capture: dict[str, Any]) -> Settings:
+    """Return the settings a redacted capture was recorded with, as far as its headers name them.
+
+    ``ads-engine capture-fixtures`` records request header names verbatim and drops framing
+    headers. It writes the bare marker ``<redacted>`` as the whole value of the configured
+    secret header, keeps ``Authorization``'s scheme before the marker and never redacts
+    ``Content-Type``. So the one recorded header besides those two whose value is exactly the
+    marker names the ``N8N_WEBHOOK_SECRET_HEADER`` of the capture's run, such as the deployed
+    ``X-Webhook-Token``, which may differ from the name these tests configure. With no such
+    header the current settings apply, so a capture that lost its secret header still fails
+    validation; two or more are ambiguous and fail the test. A secret header named
+    ``Authorization`` cannot be told apart from a Bearer credential and is held to the current
+    settings too.
+
+    Args:
+        capture: A decoded capture ``{surface, captured_at, request, response}``.
+
+    Returns:
+        Settings naming the recorded secret header, or :func:`get_settings` when the capture
+        names none.
+    """
+    request = capture.get("request")
+    headers = request.get("headers") if isinstance(request, Mapping) else None
+    if not isinstance(headers, Mapping):
+        return get_settings()
+    marked = sorted(
+        str(name)
+        for name, value in headers.items()
+        if value == CAPTURE_MARKER and str(name).lower() not in _UNMARKED_HEADERS
+    )
+    assert len(marked) <= 1, f"the capture's secret header is ambiguous: {', '.join(marked)}"
+    if not marked:
+        return get_settings()
+    return Settings(n8n_webhook_secret_header=marked[0])
+
+
+async def _check_capture(capture: dict[str, Any], recording_transport: RecordingFactory) -> int:
+    """Hold one redacted Google capture to its contracts, then parse every row it recorded.
+
+    ``payloads.validate_capture`` runs under :func:`_recorded_settings`, so the recorded
+    request is held to the secret header it was sent with, and the response and its rows to
+    ``search.json`` and their ``row_*`` contracts exactly as for any other capture. Then, by
+    surface:
+
+    * ``google.search``: the response is replayed verbatim through the live client for its
+      captured GAQL under the fake test credentials; the request the client sends is held to
+      ``search.json`` under the current settings, and every row of the page is parsed;
+    * ``google.row_*``, the first row of one query's page: its query must be a template whose
+      rows follow that contract, the recorded request is held to ``search.json`` under its
+      recorded header (``validate_capture`` checks only the row of a row capture), and the
+      row is parsed with that contract's parser.
+
+    Args:
+        capture: A decoded capture ``{surface, captured_at, request, response}``.
+        recording_transport: Conftest's ``recording_transport`` factory, for the replay.
+
+    Returns:
+        The number of rows parsed.
+
+    Raises:
+        ContractViolation: When the capture breaks a contract under its recorded header, or
+            the replayed request breaks ``search.json``.
+    """
+    surface = capture.get("surface")
+    assert isinstance(surface, str), "a capture names its surface"
+    source, _dot, name = surface.partition(".")
+    assert source == "google", f"{surface}: not a Google capture"
+    recorded = _recorded_settings(capture)
+    validate_capture(capture, settings=recorded)
+    body = capture["request"]["body"]
+    decoded = json.loads(body) if isinstance(body, str) else body
+    assert isinstance(decoded, dict), "a captured webhook body is a JSON object"
+    query = decoded["query"]
+    assert isinstance(query, str), "a captured webhook body carries its GAQL as a string"
+    query_id = query_id_for(query)
+    assert query_id is not None, "a captured query is one of the GAQL templates"
+    template = QUERIES[query_id]
+    response = capture["response"]
+    if name == SEARCH_CONTRACT:
+        sent: list[httpx.Request] = []
+        transport = recording_transport(_serve(int(response["status"]), response["body"], sent))
+        async with webhook_client(transport) as client:
+            page = await client.search_page(query_id, query)
+        assert len(sent) == 1, "the replay sends the captured query once"
+        contract_used = search_contract()
+        for outgoing in sent:
+            validate_request(contract_used, outgoing)
+        parse = PARSERS[template.row_surface]
+        for row in page.rows:
+            parse(row)
+        return len(page.rows)
+    assert name in ROW_CONTRACTS, f"{surface}: neither the search nor a row contract"
+    assert template.row_surface == name, f"{surface}: {query_id} rows follow {template.row_surface}"
+    validate_request(
+        search_contract(), RequestShape.from_capture(capture["request"]), settings=recorded
+    )
+    PARSERS[name](response["body"])
+    return 1
+
+
+def _redacted_customer_capture(name: str, headers: Mapping[str, str]) -> dict[str, Any]:
+    """Build in memory a redacted Q-G1 capture shaped as ``ads-engine capture-fixtures`` writes.
+
+    ``name`` is ``search``, whose response is the webhook's success envelope, or
+    ``row_customer``, whose response is that page's first row, as the command adds one row
+    capture per query that answered. Every credential and id is a redaction marker: the
+    placeholder webhook URL, the zero customer id, and whatever ``headers`` carry. The capture
+    is never written to disk.
+    """
+    template = QUERIES["Q-G1"]
+    row = customer_row()
+    row["customer"].update(
+        resourceName=f"customers/{REDACTED_CUSTOMER_ID}", id=REDACTED_CUSTOMER_ID
+    )
+    envelope = {"results": [row], "fieldMask": field_mask(template)}
+    return {
+        "surface": f"google.{name}",
+        "captured_at": T0.isoformat(),
+        "request": {
+            "method": "POST",
+            "url": REDACTED_WEBHOOK_URL,
+            "headers": dict(headers),
+            "body": {
+                "customer_id": REDACTED_CUSTOMER_ID,
+                "query": template.render(),
+                "page_token": None,
+            },
+        },
+        "response": {"status": 200, "body": envelope if name == SEARCH_CONTRACT else row},
+    }
+
+
 async def test_captured_payloads_parse(
     google_credentials: Mapping[str, str],
     captured_payloads: Callable[[str], list[dict[str, Any]]],
     recording_transport: RecordingFactory,
 ) -> None:
-    """Traceability: every redacted live capture validates and replays through the client.
+    """Traceability: every redacted live capture validates under its recorded header and parses.
 
     ``ads-engine capture-fixtures`` writes ``tests/contracts/google/captured/*.json`` once
-    credentials work. Each capture is validated by ``payloads.validate_capture`` (request and
-    response against ``search.json`` and its row contract); its response is replayed verbatim
-    through the client for its captured GAQL, and every row is parsed. No capture exists until
-    that command runs, and an empty directory is a pass, not a skip.
+    credentials work: the ``google.search`` webhook exchange and a ``google.row_*`` capture of
+    the first row of each query that answered. :func:`_check_capture` validates each with
+    ``payloads.validate_capture`` under the secret header it was recorded with, keeping the
+    response and row contracts; it replays a search capture verbatim through the client under
+    the fake test credentials and parses every row, and parses a row capture's row with its
+    contract's parser. No capture exists until that command runs, and an empty directory is
+    a pass, not a skip (AAP 0.11.2).
     """
     captures = captured_payloads("google")
-    replayed = 0
+    handled = 0
     for capture in captures:
+        await _check_capture(capture, recording_transport)
+        handled += 1
+    assert handled == len(captures)
+
+
+async def test_capture_under_a_custom_secret_header_validates_and_replays(
+    google_credentials: Mapping[str, str],
+    recording_transport: RecordingFactory,
+) -> None:
+    """Traceability: a capture recorded under ``X-Webhook-Token`` passes the capture check.
+
+    ``.env.example`` deploys ``N8N_WEBHOOK_SECRET_HEADER=X-Webhook-Token``, so a live capture
+    records that header as ``<redacted>``, while these tests send the default
+    ``X-Webhook-Secret``. A synthetic redacted Q-G1 search capture and its row capture, made of
+    redaction markers only, pass :func:`_check_capture`, the check every redacted live
+    capture gets: validation under the recorded header, the response, row contract and parser,
+    and a replay through the client under the fake test credentials (AAP 0.11.2: the contract
+    tests also run against redacted live captures).
+    """
+    assert get_settings().n8n_webhook_secret_header == "X-Webhook-Secret"
+    headers = {"Content-Type": "application/json", "X-Webhook-Token": CAPTURE_MARKER}
+    search = _redacted_customer_capture(SEARCH_CONTRACT, headers)
+    row = _redacted_customer_capture("row_customer", headers)
+
+    assert _recorded_settings(search).n8n_webhook_secret_header == "X-Webhook-Token"
+    assert await _check_capture(search, recording_transport) == 1
+    assert await _check_capture(row, recording_transport) == 1
+
+
+async def test_capture_is_held_to_its_recorded_secret_header(
+    google_credentials: Mapping[str, str],
+    recording_transport: RecordingFactory,
+) -> None:
+    """Traceability: a capture's request is held to its recorded header; a missing one fails.
+
+    Validated under the current settings, a valid ``X-Webhook-Token`` capture is rejected for
+    lacking ``X-Webhook-Secret``, so the recorded header is required. The same capture with its
+    secret header removed is still rejected, under the current settings and under
+    ``X-Webhook-Token`` alike, naming the missing header; two marked headers are ambiguous and
+    fail the check. Required-header validation is never weakened (AAP 0.11.2: a test fails
+    when a request omits a required parameter).
+    """
+    content_type = {"Content-Type": "application/json"}
+    capture = _redacted_customer_capture(
+        SEARCH_CONTRACT, {**content_type, "X-Webhook-Token": CAPTURE_MARKER}
+    )
+    with pytest.raises(ContractViolation) as current:
         validate_capture(capture)
-        request = capture["request"]
-        body = request["body"]
-        decoded = json.loads(body) if isinstance(body, str) else body
-        assert isinstance(decoded, dict), "a captured webhook body is a JSON object"
-        query = decoded["query"]
-        assert isinstance(query, str)
-        query_id = query_id_for(query)
-        assert query_id is not None, "a captured query is one of the GAQL templates"
-        response = capture["response"]
-        sent: list[httpx.Request] = []
-        transport = recording_transport(_serve(int(response["status"]), response["body"], sent))
-        async with webhook_client(transport) as client:
-            page = await client.search_page(query_id, query)
-        contract_used = search_contract()
-        for outgoing in sent:
-            validate_request(contract_used, outgoing)
-        parse = PARSERS[QUERIES[query_id].row_surface]
-        for row in page.rows:
-            parse(row)
-        replayed += 1
-    assert replayed == len(captures)
+    assert "header X-Webhook-Secret: missing or empty" in current.value.errors
+
+    stripped = _redacted_customer_capture(SEARCH_CONTRACT, content_type)
+    with pytest.raises(ContractViolation) as missing:
+        await _check_capture(stripped, recording_transport)
+    assert "header X-Webhook-Secret: missing or empty" in missing.value.errors
+    custom = Settings(n8n_webhook_secret_header="X-Webhook-Token")
+    with pytest.raises(ContractViolation) as missing_custom:
+        validate_capture(stripped, settings=custom)
+    assert "header X-Webhook-Token: missing or empty" in missing_custom.value.errors
+
+    ambiguous = _redacted_customer_capture(
+        SEARCH_CONTRACT,
+        {**content_type, "X-Webhook-Token": CAPTURE_MARKER, "X-Webhook-Secret": CAPTURE_MARKER},
+    )
+    with pytest.raises(AssertionError, match="ambiguous: X-Webhook-Secret, X-Webhook-Token"):
+        await _check_capture(ambiguous, recording_transport)
 
 
 async def test_logs_redact_secret(

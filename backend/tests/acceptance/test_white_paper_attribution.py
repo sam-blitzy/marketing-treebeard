@@ -1967,6 +1967,198 @@ def test_a_meeting_associated_with_two_contacts_counts_once(make_context: MakeCo
     assert partitions(row)
 
 
+def event_instants(run: _Run, meetings: Iterable[str], deals: Iterable[str]) -> list[datetime]:
+    """Credit instants: each meeting's earlier of creation and start, and each deal's creation.
+
+    Every meeting and deal of the derived two-contact world records these instants, so none is
+    left out of the oracle.
+    """
+    instants: list[datetime] = []
+    for meeting_id in meetings:
+        meeting = run.crm.meetings[meeting_id]
+        assert meeting.created_at is not None
+        assert meeting.start_at is not None
+        instants.append(min(meeting.created_at, meeting.start_at))
+    for deal_id in deals:
+        created = run.crm.deals[deal_id].created_at
+        assert created is not None
+        instants.append(created)
+    return instants
+
+
+def latest_touch_across(
+    run: _Run, row: AssetRow, contacts: Iterable[str], at: datetime | None = None
+) -> str | None:
+    """The spec key of the creative of the latest touch across ``contacts`` at or before ``at``.
+
+    Without ``at`` it is the contacts' latest touch overall: the one a selector ignoring the
+    event time would credit.
+    """
+    members = set(contacts)
+    touches = [
+        lead
+        for lead in row_leads(run, row)
+        if lead.matched
+        and lead.contact_hs_id in members
+        and (at is None or lead.submitted_at <= at)
+    ]
+    assert touches, (members, at)
+    latest = max(touches, key=lambda lead: (lead.submitted_at, lead.id))
+    return run.creative_key(latest.creative_id)
+
+
+def placed[K, V](stored: Mapping[K, V], added: Mapping[K, V], *, first: bool) -> dict[K, V]:
+    """``stored`` with the new keys of ``added`` inserted before it (``first``) or after it."""
+    assert not added.keys() & stored.keys()
+    return {**added, **stored} if first else {**stored, **added}
+
+
+def share_with_second_contact(
+    run: _Run, *, winner_above: bool, reverse: bool
+) -> tuple[AnalysisContext, str, str]:
+    """Split the one contact of ``wp.credit_latest_touch`` in two that share every event.
+
+    The catalogue contact A touches the asset through cr-a1 on day -28 and cr-a2 on day -25,
+    and its two booked meetings, its deal and its MQL and QL dates follow both touches. The
+    derived context moves the cr-a2 lead to a new contact B (A's record and stage dates under a
+    new id, matched and read like A), associates B with the same meetings and deal through
+    known fetches (and the deal with B), and gives A a later cr-a1 lead a day after the last
+    event, still inside the window. B's id sorts just above A's when ``winner_above`` and just
+    below it otherwise; ``reverse`` stores B's contact, fetches and associations before A's,
+    B's targets and the deal's contacts in reverse order, and the leads reversed.
+
+    Returns:
+        The derived context, A's HubSpot id and B's.
+    """
+    crm, row = run.crm, run.row()
+    [hs_a] = row_contacts(run, row)
+    early, middle = sorted(row_leads(run, row), key=lambda lead: lead.submitted_at)
+    assert [run.creative_key(lead.creative_id) for lead in (early, middle)] == ["cr-a1", "cr-a2"]
+    hs_b = str(int(hs_a) + (1 if winner_above else -1))
+    assert (hs_b > hs_a) == winner_above
+    assert hs_b not in crm.contacts
+    assert all(lead.contact_hs_id != hs_b for lead in run.ctx.leads)
+
+    meetings = crm.targets("contact", hs_a, "meeting")
+    deals = crm.targets("contact", hs_a, "deal")
+    assert meetings
+    assert deals
+    later_at = max(event_instants(run, meetings, deals)) + timedelta(days=1)
+    assert later_at <= run.ctx.now
+    assert later_at.date() <= run.ctx.window.end
+    later = dataclasses.replace(
+        early,
+        id=max(lead.id for lead in run.ctx.leads) + 1,
+        external_id=f"{early.external_id}-later",
+        submitted_at=later_at,
+    )
+    assert all(lead.external_id != later.external_id for lead in run.ctx.leads)
+    leads = (
+        *(
+            dataclasses.replace(lead, contact_hs_id=hs_b) if lead.id == middle.id else lead
+            for lead in run.ctx.leads
+        ),
+        later,
+    )
+
+    added: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    added_fetches: dict[tuple[str, str, str], AssociationFetchInfo] = {}
+    for to_type in ("meeting", "deal"):
+        fetch = crm.fetch("contact", hs_a, to_type)
+        assert fetch is not None
+        assert fetch.known
+        assert not fetch.is_empty
+        targets = crm.targets("contact", hs_a, to_type)
+        added[("contact", hs_b, to_type)] = targets[::-1] if reverse else targets
+        added_fetches[("contact", hs_b, to_type)] = dataclasses.replace(fetch, object_id=hs_b)
+    relinked: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    for deal_id in deals:
+        key = ("deal", deal_id, "contact")
+        assert crm.association_known(*key)
+        linked = crm.targets(*key)
+        relinked[key] = (hs_b, *linked) if reverse else (*linked, hs_b)
+
+    ctx = with_crm(
+        derive(run.ctx, leads=leads[::-1] if reverse else leads),
+        contacts=placed(
+            crm.contacts, {hs_b: dataclasses.replace(crm.contacts[hs_a], hs_id=hs_b)}, first=reverse
+        ),
+        associations=placed({**crm.associations, **relinked}, added, first=reverse),
+        fetches=placed(crm.fetches, added_fetches, first=reverse),
+    )
+    return ctx, hs_a, hs_b
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["stored-order", "reversed-order"])
+@pytest.mark.parametrize("winner_above", [False, True], ids=["winner-id-below", "winner-id-above"])
+def test_a_shared_meeting_and_deal_go_to_the_latest_touch_across_their_contacts(
+    make_context: MakeContext, winner_above: bool, reverse: bool
+) -> None:
+    """Credit: an event of two contacts counts once, to the latest qualifying touch across them.
+
+    Contact A touches the asset through cr-a1 before the shared events and again a day after
+    them; contact B touches it through cr-a2 between A's first touch and the events. Each
+    booked meeting and the deal is one object of both contacts, credited once to B's cr-a2
+    touch: not to the touch of the contact that sorts first, and not to A's last touch, which
+    follows the events. Each contact's own MQL and QL go to its own latest touch at or before
+    its date. The credit is identical whichever contact sorts first and in whatever order the
+    contacts, leads and associations are stored, and the per-creative rows sum to the asset
+    total.
+    """
+    base = run_scenario(make_context, "wp.credit_latest_touch.case")
+    ctx, hs_a, hs_b = share_with_second_contact(base, winner_above=winner_above, reverse=reverse)
+    run = rerun(base, ctx)
+    row = run.row()
+    contacts = tuple(sorted((hs_a, hs_b)))
+    assert row_contacts(run, row) == contacts
+
+    # The oracle: every shared event's latest qualifying touch is B's cr-a2 touch, while the
+    # latest touch overall, and with A sorting first the first contact's touch, is cr-a1.
+    meetings = associated(run, contacts, "meeting")
+    deals = associated(run, contacts, "deal")
+    assert (len(meetings), len(deals)) == (2, 1)
+    assert {*meetings.values(), *deals.values()} == {contacts}
+    instants = event_instants(run, meetings, deals)
+    assert {latest_touch_across(run, row, contacts, at) for at in instants} == {"cr-a2"}
+    assert latest_touch_across(run, row, contacts) == "cr-a1"
+    assert {latest_touch_across(run, row, contacts[:1], at) for at in instants} == {
+        "cr-a1" if winner_above else "cr-a2"
+    }
+
+    assert not any(credit.is_unknown for credit in row.creative_rows)
+    assert len(row.creative_rows) == 2
+    winner, loser = credit_for(run, row, "cr-a2"), credit_for(run, row, "cr-a1")
+    assert (known(winner.meetings_booked), known(winner.deals)) == (2, 1)
+    assert (known(loser.meetings_booked), known(loser.deals)) == (0, 0)
+    assert (known(winner.other_meetings), known(loser.other_meetings)) == (0, 0)
+    assert (known(row.meetings_booked), known(row.deals_after_touch)) == (2, 1)
+    assert (known(winner.mql), known(winner.ql), known(loser.mql), known(loser.ql)) == (1, 1, 1, 1)
+    assert (known(row.mql), known(row.ql)) == (2, 2)
+    assert (winner.leads, loser.leads, row.linkedin_leads, row.matched_contacts) == (1, 2, 3, 2)
+    assert row.unknown_evidence_share == 0
+    assert partitions(row)
+
+    extra_rows = run.item(row).evidence.extra["rows"]
+    for key, total in (
+        ("mql", row.mql),
+        ("ql", row.ql),
+        ("meetings_booked", row.meetings_booked),
+        ("deals", row.deals_after_touch),
+    ):
+        assert sum(credit[key]["value"] for credit in extra_rows) == known(total), key
+    assert sum(credit["leads"] for credit in extra_rows) == row.linkedin_leads
+    assert {
+        run.creative_key(credit["creative_id"]): (
+            credit["meetings_booked"]["value"],
+            credit["deals"]["value"],
+        )
+        for credit in extra_rows
+    } == {"cr-a2": (2, 1), "cr-a1": (0, 0)}
+
+    stored = share_with_second_contact(base, winner_above=False, reverse=False)[0]
+    assert row.creative_rows == rerun(base, stored).row().creative_rows
+
+
 def test_repeat_touches_give_one_mql_and_one_ql_per_asset(make_context: MakeContext) -> None:
     """De-duplication: a contact with three touches contributes one MQL and one QL."""
     run = run_scenario(make_context, "wp.repeat_touch_one_mql.case")
@@ -2216,6 +2408,58 @@ def test_w1_doubles_down_at_or_below_the_ceiling(make_context: MakeContext) -> N
     assert "USD 24.00" in twin.item(above).reason
 
 
+@pytest.mark.parametrize(
+    ("spend", "cost_per_ql", "fires"),
+    [(Decimal("120.00"), Decimal("24.00"), True), (Decimal("120.05"), Decimal("24.01"), False)],
+    ids=["at-24.00", "above-24.01"],
+)
+def test_w1_ceiling_is_inclusive_at_exactly_the_ceiling(
+    make_context: MakeContext, spend: Decimal, cost_per_ql: Decimal, fires: bool
+) -> None:
+    """W1 (AAP 0.5.4.7) needs cost per QL <= 0.8 x the cohort median: equality doubles down.
+
+    Derived from the W1 cohort with only guide-a's window spend moved: 120.00 over its 5 QL
+    is exactly the 24.00 ceiling (0.8 x the median of 30) and doubles down; 120.05 is 24.01,
+    one cent above it, and is "No change warranted". guide-a stays below guide-b's 30, so the
+    median over A, B and C stays 30 on both sides.
+    """
+    base = run_scenario(make_context, "w1.cohort.fires")
+    run = rerun(base, with_creative_costs(base, {"cr-a": spend}))
+    thresholds = run.ctx.thresholds
+    assert thresholds.int("w.min_ql") == AAP_W1_MIN_QL
+    row = run.row("guide-a")
+    median = cohort_of(run, row).median_cost_per_ql
+    assert median is not None
+    assert median == cohort_of(base, base.row("guide-a")).median_cost_per_ql == Decimal(30)
+    ceiling = thresholds.ratio("w.double_down_ratio") * median
+    assert row.spend == spend
+    assert known(row.ql) == 5
+    assert row.cost_per_ql.value == cost_per_ql
+    assert not row.cost_per_ql.ceiling
+    assert cost_per_ql - ceiling == (Decimal(0) if fires else Decimal("0.01"))
+    item = run.item(row)
+    assert item.evidence.sample is not None
+    assert (item.evidence.sample.observed, item.evidence.sample.required) == (5, AAP_W1_MIN_QL)
+    assert [baseline.value for baseline in item.evidence.baselines] == [median]
+    assert dict(item.evidence.extra["cohort"])["double_down_ceiling"] == ceiling
+    assert not run.withheld(W1)
+    judged = f"Cost per Qualified Lead USD {money(cost_per_ql)}"
+    against = f"the double-down ceiling of USD {money(ceiling)}"
+    if fires:
+        assert (item.rule_id, item.action) == (
+            W1,
+            ACTION_DOUBLE_DOWN_PREFIX + "Pipeline Report - Lead gen",
+        )
+        assert run.items(W1) == (item,)
+        assert item.spend_targets == {("campaign", cid) for cid in row.campaign_ids}
+        assert f"{judged} is at or below {against}" in item.reason
+    else:
+        assert (item.rule_id, item.action) == (W, ACTION_NO_CHANGE)
+        assert not run.items(W1)
+        assert not item.increases_spend_on
+        assert f"{judged} is above {against}" in item.reason
+
+
 @pytest.mark.parametrize(("ql", "fires"), [(3, True), (2, False)], ids=["ql-3", "ql-2"])
 def test_w1_needs_three_qualified_leads(make_context: MakeContext, ql: int, fires: bool) -> None:
     """W1 needs QL >= 3: at QL 2 the cost pattern still holds, yet W1 is withheld.
@@ -2347,6 +2591,64 @@ def test_w2_retires_a_zero_ql_paper_at_the_spend_multiple(make_context: MakeCont
     assert twin.item(kept).action == ACTION_NO_CHANGE
     assert twin.item(kept).evidence.extra["spend_to_median"] == Decimal(2)
     assert not twin.withheld(W2)
+
+
+@pytest.mark.parametrize(
+    ("spend", "spend_to_median", "fires"),
+    [(Decimal("90.00"), Decimal(3), True), (Decimal("87.00"), Decimal("2.9"), False)],
+    ids=["at-3x", "below-2.9x"],
+)
+def test_w2_retires_at_exactly_the_spend_multiple(
+    make_context: MakeContext, spend: Decimal, spend_to_median: Decimal, fires: bool
+) -> None:
+    """W2 (AAP 0.5.4.7) needs QL 0 and spend / median cost per QL >= 3: exactly 3 x retires.
+
+    Derived from the W2 cohort with only guide-d's window spend moved: 90.00 is exactly 3 x
+    the cohort median of 30 and retires; 87.00 is 2.9 x, below the multiple, and is "No change
+    warranted" without any W2 line withheld. guide-d has no QL, so the median over A, B and C
+    stays 30 on both sides.
+    """
+    base = run_scenario(make_context, "w2.cohort.fires")
+    run = rerun(base, with_creative_costs(base, {"cr-d": spend}))
+    thresholds = run.ctx.thresholds
+    assert thresholds.int("w.retire_min_window_days") == AAP_W2_MIN_WINDOW_DAYS
+    assert run.ctx.window.days == AAP_W2_MIN_WINDOW_DAYS
+    row = run.row("guide-d")
+    median = cohort_of(run, row).median_cost_per_ql
+    assert median is not None
+    assert median == cohort_of(base, base.row("guide-d")).median_cost_per_ql == Decimal(30)
+    multiple = thresholds.ratio("w.retire_spend_multiple")
+    retire_at = multiple * median
+    assert known(row.ql) == 0
+    assert row.spend == spend
+    assert spend / median == spend_to_median
+    assert spend_to_median == (multiple if fires else multiple - Decimal("0.1"))
+    assert (spend == retire_at) is fires
+    item = run.item(row)
+    assert item.evidence.extra["spend_to_median"] == spend_to_median
+    assert dict(item.evidence.extra["cohort"])["retire_spend_floor"] == retire_at
+    assert not run.withheld(W2)
+    assert not item.increases_spend_on
+    compared = (
+        f"{spend_to_median} x the USD cohort median cost per Qualified Lead of USD {money(median)}"
+    )
+    multiple_text = format(multiple.normalize(), "f")
+    retire_text = f"USD {money(retire_at)}"
+    if fires:
+        assert (item.rule_id, item.action) == (W2, ACTION_RETIRE)
+        assert run.items(W2) == (item,)
+        assert item.decision_subject is None
+        assert item.evidence.sample is not None
+        assert (item.evidence.sample.observed, item.evidence.sample.unit) == (28, "days")
+        assert item.evidence.sample.required == AAP_W2_MIN_WINDOW_DAYS
+        assert f"{compared} (W2 retires at {multiple_text} x, {retire_text})" in item.reason
+    else:
+        assert (item.rule_id, item.action) == (W, ACTION_NO_CHANGE)
+        assert not run.items(W2)
+        assert item.evidence.sample is None
+        below = f"below the {multiple_text} x ({retire_text}) at which W2 retires"
+        assert f"{compared}, {below}" in item.reason
+        assert "withheld" not in item.reason
 
 
 def test_w2_needs_a_window_of_at_least_28_days(make_context: MakeContext) -> None:

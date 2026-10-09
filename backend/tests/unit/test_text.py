@@ -621,12 +621,95 @@ def test_thresholds_must_be_finite_and_in_the_half_open_unit_interval(
         _THRESHOLD_PARAMETERS[case](Decimal(value))
 
 
+# Inputs on which the distinct accepted thresholds 1, 1E-30 and 0.5 give three different
+# outputs. TOOL_CRM respells A, so J(A, TOOL_CRM) = 1 is the only pair a threshold of 1 links.
+# J(B, C) and J(A, "crm") are exactly 1/2. CRM_DEMO shares one token with A, TOOL_CRM and B
+# (J = 1/3, 1/3 and 1/4) and none with C, so only the tiny threshold links it. D shares no
+# token with any other term, so no threshold links it.
+TOOL_CRM = "tool crm"
+CRM_DEMO = "crm demo"
+_THRESHOLD_TERMS = (A, TOOL_CRM, B, C, D, CRM_DEMO)
+# The cluster those terms form at 0.5: "tool" is in all 4 members, "crm" in 3, "pricing" in
+# exactly 2 and "guide" in 1.
+_HALF_CLUSTER = (A, B, TOOL_CRM, C)
+_ADJACENT_CANDIDATES = (TOOL_CRM, B, "crm", C, D)
+
+# "<function>-<parameter>" -> a call passing the value as that parameter over the inputs above.
+_ACCEPTED_THRESHOLD_CALLS: dict[str, Callable[[Decimal], object]] = {
+    "cluster_terms-threshold": lambda value: cluster_terms(
+        _THRESHOLD_TERMS, threshold=value, min_head_share=HALF
+    ),
+    "cluster_terms-min_head_share": lambda value: cluster_terms(
+        _THRESHOLD_TERMS, threshold=HALF, min_head_share=value
+    ),
+    "head_tokens-min_share": lambda value: head_tokens(_HALF_CLUSTER, min_share=value),
+    "adjacent_terms-threshold": lambda value: adjacent_terms(
+        A, _ADJACENT_CANDIDATES, threshold=value
+    ),
+}
+
+# (case, value) -> the exact output of that call at that threshold.
+_ACCEPTED_THRESHOLD_OUTPUTS: dict[tuple[str, str], object] = {
+    ("cluster_terms-threshold", "1"): [
+        TermCluster((A, TOOL_CRM), frozenset({"crm", "tool"})),
+        TermCluster((CRM_DEMO,), frozenset({"crm", "demo"})),
+        TermCluster((B,), frozenset({"crm", "tool", "pricing"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+        TermCluster((C,), frozenset({"tool", "pricing", "guide"})),
+    ],
+    ("cluster_terms-threshold", "1E-30"): [
+        TermCluster((CRM_DEMO, A, B, TOOL_CRM, C), frozenset({"crm", "tool"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+    ],
+    ("cluster_terms-threshold", "0.5"): [
+        TermCluster(_HALF_CLUSTER, frozenset({"crm", "tool", "pricing"})),
+        TermCluster((CRM_DEMO,), frozenset({"crm", "demo"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+    ],
+    ("cluster_terms-min_head_share", "1"): [
+        TermCluster(_HALF_CLUSTER, frozenset({"tool"})),
+        TermCluster((CRM_DEMO,), frozenset({"crm", "demo"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+    ],
+    ("cluster_terms-min_head_share", "1E-30"): [
+        TermCluster(_HALF_CLUSTER, frozenset({"crm", "tool", "pricing", "guide"})),
+        TermCluster((CRM_DEMO,), frozenset({"crm", "demo"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+    ],
+    ("cluster_terms-min_head_share", "0.5"): [
+        TermCluster(_HALF_CLUSTER, frozenset({"crm", "tool", "pricing"})),
+        TermCluster((CRM_DEMO,), frozenset({"crm", "demo"})),
+        TermCluster((D,), frozenset({"project", "management"})),
+    ],
+    ("head_tokens-min_share", "1"): frozenset({"tool"}),
+    ("head_tokens-min_share", "1E-30"): frozenset({"crm", "tool", "pricing", "guide"}),
+    ("head_tokens-min_share", "0.5"): frozenset({"crm", "tool", "pricing"}),
+    ("adjacent_terms-threshold", "1"): [TOOL_CRM],
+    ("adjacent_terms-threshold", "1E-30"): [TOOL_CRM, B, "crm", C],
+    ("adjacent_terms-threshold", "0.5"): [TOOL_CRM, B, "crm"],
+}
+# "1.000" is the threshold 1 written with trailing zeros, so it is held to the output of "1".
+_ACCEPTED_THRESHOLD_OUTPUTS |= {
+    (case, "1.000"): _ACCEPTED_THRESHOLD_OUTPUTS[case, "1"] for case in _ACCEPTED_THRESHOLD_CALLS
+}
+
+
 @pytest.mark.parametrize("value", ["1", "1.000", "1E-30", "0.5"])
 @pytest.mark.parametrize("case", sorted(_THRESHOLD_PARAMETERS))
-def test_thresholds_accept_every_decimal_in_the_half_open_unit_interval(
+def test_thresholds_accept_every_decimal_in_the_half_open_unit_interval_and_apply_it_exactly(
     case: str, value: str
 ) -> None:
-    _THRESHOLD_PARAMETERS[case](Decimal(value))
+    """Every accepted C3b and K2 threshold is applied inclusively, at its exact value.
+
+    A threshold of 1 links only terms with identical token sets and keeps only the head tokens
+    every member has; ``1.000`` is the same threshold and gives the same output. At 0.5 a pair
+    at Jaccard exactly 1/2 links and a token in exactly half the members is a head token. As a
+    link threshold the tiny positive 1E-30 links any two terms that share a token, yet no two
+    that share none; as a head share it makes every member token a head token.
+    """
+    output = _ACCEPTED_THRESHOLD_CALLS[case](Decimal(value))
+
+    assert output == _ACCEPTED_THRESHOLD_OUTPUTS[case, value]
 
 
 def test_threshold_validation_does_not_depend_on_the_input() -> None:

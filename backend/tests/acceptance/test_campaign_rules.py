@@ -16,6 +16,11 @@ pipeline link and its veto), the decision shapes of 0.5.2 and safe absence (0.3.
   entity sync's stored ``discrepancy`` rows are checked: the baseline, drift, resolutions by
   kind and decision shape (domain and ``POST /discrepancies/{id}/resolve``), safe absence,
   tombstones, auto-resolution, and C0's exemption from holds and feedback in a stored run.
+  LinkedIn safe absence is proven the same way: the LinkedIn source of the
+  ``c0.linkedin_cut_short`` twins (with its companion CRM dataset) is bootstrapped and run
+  through the real LinkedIn entity sync, so an all-status campaign search cut short raises
+  no ``missing``, leaves ``linkedin.entities`` incomplete and keeps the previous snapshot,
+  while a complete search raises ``missing`` on the absent tracked campaign.
 * **C1, C1b, the veto cohort and unresolved matured leads**, **C2 Scale or Hold with its cap
   evidence and budget-day classification**, and **launch ideas (C3a, C3b)**, on the
   catalogue's contexts, with thresholds read from ``ctx.thresholds``.
@@ -81,12 +86,14 @@ from ads_engine.analysis.context import (
 )
 from ads_engine.analysis.discrepancy import RESOLUTION_ORDER
 from ads_engine.analysis.runner import default_window, run_analysis
+from ads_engine.connectors.hubspot.client import RateLimiter
 from ads_engine.db.models.analysis import Recommendation
 from ads_engine.db.models.decisions import Decision, Discrepancy
 from ads_engine.db.models.ops import DatasetFreshness, SourceDataset
 from ads_engine.db.models.snapshots import EntitySnapshot
 from ads_engine.decisions import (
     RESOLUTIONS,
+    DecisionSource,
     SubjectRef,
     SubjectState,
     compare,
@@ -686,7 +693,7 @@ def test_c0_turns_awaiting_platform_discrepancies_into_items(make_context: Conte
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: the C0 lifecycle, persisted (simulated Google source on PostgreSQL)
+# Phase 3: the C0 lifecycle, persisted (simulated Google and LinkedIn sources on PostgreSQL)
 # ---------------------------------------------------------------------------
 
 
@@ -717,15 +724,39 @@ async def _no_sleep(seconds: float) -> None:
     del seconds
 
 
+class _PaceClock:
+    """Monotonic seconds that only the HubSpot throttle's own sleeps advance (virtual time)."""
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def __call__(self) -> float:
+        return self.seconds
+
+    async def sleep(self, seconds: float) -> None:
+        """Advance by ``seconds`` at once instead of waiting for them."""
+        self.seconds += max(seconds, 0.0)
+
+
 def _controller(world: SimulatedWorld, clock: _Clock, db: Sessions) -> SourceModeController:
     """A source-mode controller serving ``world`` on the test database, with no backoff sleeps.
 
     The retry policy is the product's own (three attempts) with an instant sleep, so a
-    scenario ``Fault`` is classified exactly as in production without slowing the suite.
+    scenario ``Fault`` is classified exactly as in production without slowing the suite. The
+    HubSpot throttle is the product's own 4 requests/second limiter on virtual time: the
+    companion CRM backfill a simulated LinkedIn dataset needs before it activates (one CRM
+    Search call per backfill day) keeps its request spacing without sleeping through it.
     """
     plain = SourceModeController(world=world, clock=clock, sessionmaker=db)
     fast = dataclasses.replace(plain.retry, sleep=_no_sleep)
-    return SourceModeController(world=world, clock=clock, sessionmaker=db, retry=fast)
+    pace = _PaceClock()
+    return SourceModeController(
+        world=world,
+        clock=clock,
+        sessionmaker=db,
+        retry=fast,
+        hubspot_limiter=RateLimiter(clock=pace, sleep=pace.sleep),
+    )
 
 
 def _comparable(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -737,7 +768,10 @@ def _comparable(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
 @dataclasses.dataclass(slots=True)
 class PersistedGoogle:
-    """One scenario's Google source, bootstrapped into the test database and synced on demand.
+    """One scenario's source, bootstrapped into the test database and synced on demand.
+
+    The source is Google unless ``source`` names LinkedIn, whose safe absence the LinkedIn
+    cut-short twins prove through the same real entity sync.
 
     Attributes:
         scenario: The catalogue scenario whose world the source serves.
@@ -745,6 +779,7 @@ class PersistedGoogle:
         db: The application's session factory on the test database.
         controller: The controller serving the bootstrap world.
         make_world: The root ``make_world`` fixture, for syncs against a twin's world.
+        source: The bootstrapped and synced source: ``google`` or ``linkedin``.
     """
 
     scenario: Scenario
@@ -752,9 +787,10 @@ class PersistedGoogle:
     db: Sessions
     controller: SourceModeController
     make_world: WorldFactory
+    source: DecisionSource = "google"
 
     async def sync(self, offset_hours: int, *, world_of: str | None = None) -> JobResult:
-        """Run one Google entity sync at ``offset_hours``.
+        """Run one entity sync of the source at ``offset_hours``.
 
         Args:
             offset_hours: The sync instant, after the anchor's UTC midnight.
@@ -767,7 +803,7 @@ class PersistedGoogle:
             world = self.make_world(world_of, clock=self.clock)
             controller = _controller(world, self.clock, self.db)
         report = await run_source_jobs(
-            "google",
+            self.source,
             trigger="manual",
             jobs=(JOB_ENTITIES,),
             controller=controller,
@@ -818,9 +854,9 @@ class PersistedGoogle:
         """The stored subject a spec key names: a campaign by name, a shared budget by id."""
         ids = self.scenario.ids
         if entity == "campaign":
-            name = ids.name("google", "campaign", key)
+            name = ids.name(self.source, "campaign", key)
         else:
-            name = f"Shared budget {ids.external_id('google', 'budget', key)}"
+            name = f"Shared budget {ids.external_id(self.source, 'budget', key)}"
         found = [state for state in (await self.states()).values() if state.name == name]
         assert len(found) == 1, (name, [state.name for state in (await self.states()).values()])
         return found[0]
@@ -839,12 +875,12 @@ class PersistedGoogle:
             return list(rows.scalars())
 
     async def freshness(self, dataset: str) -> DatasetFreshness:
-        """The active Google dataset's freshness row of ``dataset``."""
+        """The source's active primary dataset's freshness row of ``dataset``."""
         async with self.db() as session:
             active = (
                 await session.execute(
                     select(SourceDataset.id).where(
-                        SourceDataset.source == "google",
+                        SourceDataset.source == self.source,
                         SourceDataset.state == "active",
                         SourceDataset.role == "primary",
                     )
@@ -859,29 +895,44 @@ class PersistedGoogle:
                 )
             ).scalar_one()
 
+    async def campaign_snapshots_at(self, offset_hours: int) -> list[EntitySnapshot]:
+        """Every stored campaign snapshot captured at ``offset_hours``, of any dataset."""
+        async with self.db() as session:
+            rows = await session.execute(
+                select(EntitySnapshot).where(
+                    EntitySnapshot.entity_type == "campaign",
+                    EntitySnapshot.captured_at == _at(offset_hours),
+                )
+            )
+            return list(rows.scalars())
+
 
 type Persist = Callable[..., Any]
 
 
 @pytest.fixture
 def persist(db: Sessions, make_world: WorldFactory, set_env: SetEnv) -> Persist:
-    """Return ``await persist(scenario, at, *, world_of=None) -> PersistedGoogle``.
+    """Return ``await persist(scenario, at, *, world_of=None, source="google")``.
 
-    Under ``DATA_MODE=simulated`` the scenario's Google source is built, backfilled and
-    activated by ``SourceModeController.ensure_dataset`` at ``at`` hours; its first entity
-    sync writes the baseline decisions. ``world_of`` bootstraps from another scenario's world
-    (the fault-free twin of a scenario whose ``Fault`` would otherwise stop the baseline).
+    Under ``DATA_MODE=simulated`` the scenario's ``source`` (Google by default, or LinkedIn
+    with its companion CRM dataset) is built, backfilled and activated by
+    ``SourceModeController.ensure_dataset`` at ``at`` hours; its first entity sync writes the
+    baseline decisions. ``world_of`` bootstraps from another scenario's world (the fault-free
+    twin of a scenario whose ``Fault`` would otherwise stop the baseline). The result is a
+    :class:`PersistedGoogle` serving that source.
     """
 
-    async def _persist(name: str, at: int, *, world_of: str | None = None) -> PersistedGoogle:
+    async def _persist(
+        name: str, at: int, *, world_of: str | None = None, source: DecisionSource = "google"
+    ) -> PersistedGoogle:
         set_env(DATA_MODE="simulated")
         scenario = SCENARIOS[name]
         clock = _Clock(at)
         controller = _controller(make_world(world_of or name, clock=clock), clock, db)
-        outcome = await controller.ensure_dataset("google")
-        assert outcome is not None, "the Google dataset was not built"
+        outcome = await controller.ensure_dataset(source)
+        assert outcome is not None, f"the {source} dataset was not built"
         assert (outcome.activated, outcome.mode) == (True, "simulated"), outcome
-        return PersistedGoogle(scenario, clock, db, controller, make_world)
+        return PersistedGoogle(scenario, clock, db, controller, make_world, source)
 
     return _persist
 
@@ -893,6 +944,41 @@ def _names(states: Mapping[tuple[str, int], SubjectState]) -> dict[tuple[str, in
 def _identity(row: tuple[Any, ...]) -> tuple[Any, ...]:
     """Sort key of a compared discrepancy: subject name, kind and state (values are dicts)."""
     return row[:3]
+
+
+async def _stored_and_replayed(
+    persisted: PersistedGoogle, make_context: ContextFactory
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    """The unresolved stored discrepancies and those the catalogue's replay computes.
+
+    Both lists hold ``(subject name, kind, state, decided value, platform value)`` without
+    internal row ids, sorted by subject, kind and state, so the real entity sync's rows can
+    be compared with the replay of the scenario the source serves.
+    """
+    names = _names(await persisted.states())
+    stored = [
+        (
+            names[(row.subject_type, row.subject_id)],
+            row.kind,
+            row.state,
+            _comparable(row.decided_value),
+            _comparable(row.platform_value),
+        )
+        for row in await persisted.discrepancies()
+    ]
+    stored.sort(key=_identity)
+    replayed = [
+        (
+            info.subject_name,
+            info.kind,
+            info.state,
+            _comparable(info.decided_value),
+            _comparable(info.platform_value),
+        )
+        for info in make_context(persisted.scenario).discrepancies
+    ]
+    replayed.sort(key=_identity)
+    return stored, replayed
 
 
 DETECTION_CASES: Final[tuple[tuple[str, str | None, int, tuple[int, ...]], ...]] = (
@@ -915,7 +1001,10 @@ DETECTION_CASES: Final[tuple[tuple[str, str | None, int, tuple[int, ...]], ...]]
 )
 """Google C0 scenarios whose history needs no resolution: (scenario, bootstrap world, bootstrap
 hour, sync hours). The bootstrap precedes every platform change; a scenario carrying a
-``Fault`` is bootstrapped from its fault-free twin and synced against its own world."""
+``Fault`` is bootstrapped from its fault-free twin and synced against its own world. The
+LinkedIn cut-short twins (``c0.linkedin_cut_short.*``) run the same way through the real
+LinkedIn entity sync, in the LinkedIn safe-absence tests below, which add the snapshot and
+freshness checks of an interrupted all-status search."""
 
 
 @pytest.mark.parametrize(
@@ -939,7 +1028,6 @@ async def test_persisted_detection_matches_the_catalogue(
     for offset in sync_at:
         await google.sync(offset, world_of=name if bootstrap_world is not None else None)
     stored = await google.discrepancies()
-    names = _names(await google.states())
     scenario = SCENARIOS[name]
     values = scenario.expect.values
     assert bool(stored) is scenario.expect.fires
@@ -953,29 +1041,7 @@ async def test_persisted_detection_matches_the_catalogue(
     if "detected_at_offset_hours" in values:
         offset = cast(int, values["detected_at_offset_hours"])
         assert {row.detected_at for row in stored} == {_at(offset)}
-    persisted = [
-        (
-            names[(row.subject_type, row.subject_id)],
-            row.kind,
-            row.state,
-            _comparable(row.decided_value),
-            _comparable(row.platform_value),
-        )
-        for row in stored
-    ]
-    persisted.sort(key=_identity)
-    ctx = make_context(scenario)
-    replayed = [
-        (
-            info.subject_name,
-            info.kind,
-            info.state,
-            _comparable(info.decided_value),
-            _comparable(info.platform_value),
-        )
-        for info in ctx.discrepancies
-    ]
-    replayed.sort(key=_identity)
+    persisted, replayed = await _stored_and_replayed(google, make_context)
     assert persisted == replayed
 
 
@@ -1357,6 +1423,107 @@ async def test_missing_is_raised_only_after_a_complete_enumeration(
     assert missing.decided_value is not None
     assert missing.decided_value["status"] == "active"
     assert (await google.freshness("google.entities")).completeness == "complete"
+
+
+LINKEDIN_FIRES: Final = "c0.linkedin_cut_short.fires"
+"""``li-brand`` leaves LinkedIn's all-status campaign list at -30 h; every search completes."""
+
+LINKEDIN_CUT_SHORT: Final = "c0.linkedin_cut_short.does_not_fire"
+"""The same world, with every ``adCampaigns`` search failing 503 through the retries."""
+
+
+async def _linkedin_baseline(persist: Persist, name: str) -> tuple[PersistedGoogle, SubjectState]:
+    """Bootstrap ``name``'s LinkedIn source from the fault-free world at -36 h.
+
+    The bootstrap precedes ``li-brand``'s disappearance at -30 h, so its first entity sync
+    snapshots and baselines the campaign as active and raises nothing (C0 lifecycle).
+
+    Returns:
+        The persisted LinkedIn source and ``li-brand``'s subject state after the baseline.
+    """
+    linkedin = await persist(name, -36, world_of=LINKEDIN_FIRES, source="linkedin")
+    assert await linkedin.discrepancies(include_resolved=True) == []
+    brand = await linkedin.subject("campaign", "li-brand")
+    assert brand.source == "linkedin"
+    assert brand.latest_snapshot is not None
+    assert brand.latest_snapshot.captured_at == _at(-36)
+    (decision,) = await linkedin.decisions_of(brand)
+    assert (decision.origin, decision.status) == ("baseline", "active")
+    return linkedin, brand
+
+
+async def test_linkedin_search_cut_short_raises_no_missing_until_a_complete_search(
+    persist: Persist, make_context: ContextFactory
+) -> None:
+    """C0 missing (LinkedIn safe absence): an all-status campaign search cut short by a
+    transient error raises no missing, leaves linkedin.entities incomplete with the
+    interruption as its reason and keeps the previous snapshot; the next complete search
+    raises missing on the absent tracked campaign."""
+    linkedin, brand = await _linkedin_baseline(persist, LINKEDIN_CUT_SHORT)
+    baseline = brand.latest_snapshot
+    assert baseline is not None
+    assert [row.id for row in await linkedin.campaign_snapshots_at(-36)] == [baseline.id]
+    result = await linkedin.sync(NOW_OFFSET, world_of=LINKEDIN_CUT_SHORT)
+    # The interrupted listing is recorded as an incomplete success of the job, not a failure.
+    assert (result.source, result.status, result.completeness) == (
+        "linkedin",
+        "succeeded",
+        "incomplete",
+    )
+    row = await linkedin.freshness("linkedin.entities")
+    expected = linkedin.scenario.expect.values["linkedin.entities"]
+    assert row.completeness == expected == "incomplete"
+    assert row.reason is not None
+    assert row.reason.startswith("linkedin ad_campaigns: SERVICE_UNAVAILABLE")
+    assert await linkedin.discrepancies(include_resolved=True) == []
+    assert await _stored_and_replayed(linkedin, make_context) == ([], [])
+    # The previous snapshot stands: nothing was observed of any campaign at this sync.
+    kept = (await linkedin.subject("campaign", "li-brand")).latest_snapshot
+    assert kept is not None
+    assert (kept.id, kept.captured_at) == (baseline.id, _at(-36))
+    assert await linkedin.campaign_snapshots_at(NOW_OFFSET) == []
+
+    complete = await linkedin.sync(NOW_OFFSET + 3)
+    assert complete.completeness == "complete"
+    (missing,) = await linkedin.discrepancies()
+    assert (missing.subject_type, missing.subject_id, missing.kind, missing.state) == (
+        "campaign",
+        brand.ref.id,
+        "missing",
+        "open",
+    )
+    assert missing.platform_value is None
+    assert missing.decided_value is not None
+    assert missing.decided_value["status"] == "active"
+    assert missing.detected_at == _at(NOW_OFFSET + 3)
+    row = await linkedin.freshness("linkedin.entities")
+    assert (row.completeness, row.reason) == ("complete", None)
+
+
+async def test_linkedin_complete_search_raises_missing_as_the_catalogue_replays(
+    persist: Persist, make_context: ContextFactory
+) -> None:
+    """C0 missing (LinkedIn): a tracked campaign absent from a complete all-status search
+    raises one missing discrepancy, as the scenario expects and the catalogue replays."""
+    linkedin, brand = await _linkedin_baseline(persist, LINKEDIN_FIRES)
+    result = await linkedin.sync(NOW_OFFSET)
+    assert (result.source, result.completeness) == ("linkedin", "complete")
+    (row,) = await linkedin.discrepancies()
+    values = linkedin.scenario.expect.values
+    assert (row.kind, brand.source) == (values["kind"], values["source"]) == ("missing", "linkedin")
+    assert (row.subject_type, row.subject_id, row.state, row.platform_value) == (
+        "campaign",
+        brand.ref.id,
+        "open",
+        None,
+    )
+    assert row.decided_value is not None
+    assert row.decided_value["status"] == "active"
+    freshness = await linkedin.freshness("linkedin.entities")
+    assert (freshness.completeness, freshness.reason) == ("complete", None)
+    stored, replayed = await _stored_and_replayed(linkedin, make_context)
+    assert len(stored) == 1
+    assert stored == replayed
 
 
 @pytest.mark.parametrize(

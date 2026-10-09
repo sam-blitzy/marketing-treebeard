@@ -18,7 +18,9 @@ guarantee of that row it proves:
   rows; purging a retired LinkedIn dataset removes its leads and every match referencing them;
   a companion is purged with its parent; no foreign-key error at any step.
 * **Companion CRM dataset**: LinkedIn simulated while HubSpot is live reads the companion; the
-  Google-to-CRM link reads the live primary; the companion activates and retires with its parent.
+  Google-to-CRM link reads the live primary, whose later CRM sync commits its Google-touch
+  discovery with the contact refresh and queues one rerun per publication transaction; the
+  companion activates and retires with its parent.
 * **Isolation**: simulated HubSpot contacts never collide with live ids and leave every
   computation when the live dataset activates.
 * **Transient and defects**: 429/5xx/timeout retry three times, then stale, never mock; a 400
@@ -72,6 +74,8 @@ from ads_engine.db.models import (
     EntitySnapshot,
     FactCampaignDaily,
     FactCreativeDaily,
+    FactKeywordDaily,
+    FactSearchTermDaily,
     Keyword,
     Lead,
     LeadMatch,
@@ -451,6 +455,25 @@ class Rig:
         async with self.sessions() as session:
             statement = select(model).where(*where).order_by(*(order_by or (model.id,)))
             return list(await session.scalars(statement))
+
+    async def facts(self, model: Any, dataset_id: int) -> dict[tuple[Any, ...], dict[str, Any]]:
+        """Every column of one fact table's rows in ``dataset_id``, by natural key.
+
+        Args:
+            model: The fact model; its ``__natural_key__`` names the key columns.
+            dataset_id: The dataset whose rows are read.
+
+        Returns:
+            Each row's whole column mapping, read from the model's table (``id``, the native
+            date, money, impressions, clicks, outcome and value metrics, ``fetched_at``), keyed
+            by its natural-key tuple; comparing two of them catches a rewritten value, a moved
+            date or a re-stamped ``fetched_at`` that an equal row count would hide.
+        """
+        table = _table(model)
+        key: tuple[str, ...] = model.__natural_key__
+        async with self.sessions() as session:
+            result = await session.execute(select(table).where(table.c.dataset_id == dataset_id))
+            return {tuple(row[column] for column in key): dict(row) for row in result.mappings()}
 
     async def matches(self, *where: Any) -> list[LeadMatch]:
         """``lead_match`` rows matching ``where``, by lead and CRM dataset."""
@@ -1656,6 +1679,69 @@ async def test_google_to_crm_reads_live_primary(rig: Rig) -> None:
     assert google_contacts <= {row.hs_id for row in discovered}
 
 
+async def test_google_discovery_commits_with_the_contact_refresh_one_rerun_per_transaction(
+    rig: Rig,
+) -> None:
+    """Companion CRM dataset: the live primary's later CRM sync commits its Google discovery.
+
+    AAP 0.3.3 "Google-to-CRM link" and 0.3.2 "Events that trigger a rerun": with both Google
+    contact properties configured and verified, a later CRM sync of HubSpot's active live
+    primary runs Google-touch discovery again and records ``hubspot.google_contacts`` as a
+    success together with contacts, the deal search and associations. Discovery's contacts
+    and outcome commit in the contact refresh's transaction, so the four datasets are
+    published in three transactions, and the sync queues three pending default-window
+    requests, one per transaction (:func:`_crm_requests`), which the worker coalesces into
+    one run.
+    """
+    rig.set_env(
+        HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY=GOOGLE_CAMPAIGN_PROPERTY,
+        HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY=GOOGLE_TOUCH_PROPERTY,
+    )
+    rig.go_live("hubspot")
+    link: dict[str, Any] = {
+        "google_crm_properties": (GOOGLE_CAMPAIGN_PROPERTY, GOOGLE_TOUCH_PROPERTY),
+        "google_touch_contacts": 20,
+    }
+    rig.simulated = rig.world(COMPANION, **link)
+    controller = rig.controller({"hubspot": rig.live("hubspot", rig.world(COMPANION, **link))})
+    report = await bootstrap_sources(controller.settings, controller=controller)
+    assert report.failures == {}
+    crm = report.active["hubspot"]
+    assert crm is not None
+    primary = await rig.dataset(crm.dataset_id)
+    assert primary is not None
+    assert (primary.mode, primary.role, primary.state) == ("live", "primary", "active")
+    bindings = await controller.datasets.load_crm_bindings(crm.dataset_id)
+    assert bindings is not None
+    assert bindings.google.available, "both properties verified"
+    earlier = {row.id for row in await rig.all(AnalysisRequest)}
+    later = rig.controller({"hubspot": rig.live("hubspot", rig.world(COMPANION, **link))}, at=T1)
+
+    result = await jobs.refresh_crm_dataset(later, crm.dataset_id)
+
+    assert result is not None
+    assert (result.job, result.dataset_id, result.status) == (
+        jobs.JOB_CRM,
+        crm.dataset_id,
+        "succeeded",
+    )
+    succeeded = {name for name, outcome in result.freshness.items() if outcome.succeeded}
+    assert succeeded == {
+        "hubspot.contacts",
+        "hubspot.google_contacts",
+        "hubspot.deal_search",
+        "hubspot.associations",
+    }
+    for name in sorted(succeeded):
+        row = await rig.freshness_row(crm.dataset_id, name)
+        assert row is not None, name
+        assert row.last_success_at == T1, name
+    requests = await _new_requests(rig, earlier)
+    assert requests == _crm_requests(result)
+    # Four datasets succeeded in three publication transactions: three requests, not four.
+    assert requests == [(f"sync:hubspot.{jobs.JOB_CRM}", None, None)] * 3
+
+
 async def test_companion_activates_and_retires_with_parent(rig: Rig) -> None:
     """Companion CRM dataset: the companion activates and retires with its parent.
 
@@ -1810,19 +1896,37 @@ async def _new_requests(
     ]
 
 
+_CRM_PUBLICATIONS: Final[tuple[tuple[str, ...], ...]] = (
+    ("hubspot.contacts", "hubspot.google_contacts"),
+    ("hubspot.deal_search",),
+    ("hubspot.associations",),
+)
+"""The CRM sync's publication transactions, in step order, by the freshness datasets each
+records: the contact refresh (with Google-touch discovery's outcome when discovery runs), the
+deal search, and the associations with their target reads."""
+
+
 def _crm_requests(result: jobs.JobResult) -> list[tuple[str, datetime | None, int | None]]:
     """The pending ``sync:hubspot.crm`` requests a CRM sync of an active primary queued.
 
-    AAP 0.3.2 "Events that trigger a rerun": the CRM sync commits each freshness dataset in
-    a transaction of its own (contacts, the deal search, associations and, when configured,
-    Google-touch contacts), and every transaction that records a success queues its own
-    default-window request with that write; the worker coalesces them into one run. So
-    there is one request per success in ``result.freshness``, which holds only committed
-    outcomes, and at least the three datasets every CRM sync refreshes.
+    AAP 0.3.2 "Events that trigger a rerun": a completed CRM sync queues a default-window
+    request, and the worker coalesces the requests that arrive within 60 s into one run. The
+    sync publishes in three transactions (:data:`_CRM_PUBLICATIONS`): the contact refresh
+    records ``hubspot.contacts`` and, when Google-touch discovery runs,
+    ``hubspot.google_contacts`` in the same commit; the deal search records
+    ``hubspot.deal_search``; the associations record ``hubspot.associations``. Each
+    transaction that records a success queues one request with its write, and the matching
+    step queues none. A success reaches ``result.freshness`` only once its transaction
+    commits, so the requests count the publication transactions with a success there, never
+    the datasets: four datasets but three requests when discovery runs. The helper serves
+    syncs that refreshed contacts, the deal search and associations (asserted), so each of
+    the three transactions recorded a success.
     """
-    completed = {name for name, outcome in result.freshness.items() if outcome.succeeded}
-    assert {"hubspot.contacts", "hubspot.associations", "hubspot.deal_search"} <= completed
-    return [(f"sync:hubspot.{jobs.JOB_CRM}", None, None)] * len(completed)
+    succeeded = {name for name, outcome in result.freshness.items() if outcome.succeeded}
+    assert {"hubspot.contacts", "hubspot.associations", "hubspot.deal_search"} <= succeeded
+    assert succeeded <= {name for group in _CRM_PUBLICATIONS for name in group}, succeeded
+    published = [group for group in _CRM_PUBLICATIONS if succeeded.intersection(group)]
+    return [(f"sync:hubspot.{jobs.JOB_CRM}", None, None)] * len(published)
 
 
 async def test_crm_refresh_hydrates_a_live_linkedin_datasets_matches_in_the_active_primary(
@@ -1835,10 +1939,10 @@ async def test_crm_refresh_hydrates_a_live_linkedin_datasets_matches_in_the_acti
     runs that primary's CRM sync, so the matched contacts get their contact refresh,
     associations and target reads before the LinkedIn dataset activates. The primary is
     active, so the completed sync queues its default-window analysis requests, one per
-    dataset it commits (AAP 0.3.2 "Events that trigger a rerun"; :func:`_crm_requests`); a
-    building HubSpot dataset's sync queues none. A live HubSpot dataset that may not be
-    synced now (no HubSpot credentials) is left alone, and a dataset of another source is
-    refused.
+    publication transaction it commits (AAP 0.3.2 "Events that trigger a rerun";
+    :func:`_crm_requests`); a building HubSpot dataset's sync queues none. A live HubSpot
+    dataset that may not be synced now (no HubSpot credentials) is left alone, and a dataset
+    of another source is refused.
     """
     rig.go_live("linkedin")
     real_emails = _RealLeadEmails(rig.live("linkedin", rig.world(ISOLATION)))
@@ -1898,9 +2002,9 @@ async def test_active_crm_sync_queues_its_rerun_when_the_linkedin_recovery_build
     denial recorded right after that sync voids the build: it is discarded, the previous
     simulated LinkedIn dataset stays active and the connection's mode does not change, so
     neither an activation nor a mode change queues a rerun. The completed CRM sync has
-    queued its own pending default-window ``analysis_request`` rows, one per dataset it
-    committed (:func:`_crm_requests`), so the current recommendations do not keep the CRM
-    evidence it replaced. The build's matching passes queue none.
+    queued its own pending default-window ``analysis_request`` rows, one per publication
+    transaction it committed (:func:`_crm_requests`), so the current recommendations do not
+    keep the CRM evidence it replaced. The build's matching passes queue none.
     """
     rig.go_live("linkedin")
     refusing = rig.controller({"linkedin": rig.live("linkedin", rig.world(LEADSYNC_403))})
@@ -2042,7 +2146,10 @@ async def test_transient_errors_retry_then_stale_never_mock(rig: Rig, scenario: 
     AAP 0.3.3 fallback table row 3: a transient failure gets 3 attempts with exponential
     backoff (``Retry-After`` honoured), then the affected dataset turns stale: its last success,
     coverage and facts stay, the failed attempt and its reason are recorded, the connection is
-    ``stale``, the source stays live and no simulated dataset is built.
+    ``stale``, the source stays live and no simulated dataset is built. "Facts stay" is proved
+    on values, not counts: every stored creative-day row keeps its key, id, spend,
+    impressions, clicks, lead and conversion outcomes and ``fetched_at``, so nothing was
+    rewritten.
     """
     fault = _on_linkedin_analytics(scenario)
     attempts = SCENARIOS[scenario].expect.values["attempts"]
@@ -2052,6 +2159,10 @@ async def test_transient_errors_retry_then_stale_never_mock(rig: Rig, scenario: 
     assert before.last_success_at == T0
     facts_before = await rig.count(FactCreativeDaily, FactCreativeDaily.dataset_id == dataset_id)
     assert facts_before, "the live backfill stored daily creative facts"
+    stored_before = await rig.facts(FactCreativeDaily, dataset_id)
+    assert len(stored_before) == facts_before
+    assert any(row["cost"] for row in stored_before.values()), "spend to keep"
+    assert any(row["leads"] for row in stored_before.values()), "lead outcomes to keep"
     datasets_before = [(row.id, row.state) for row in await rig.datasets()]
     rig.waits.seconds.clear()
     journal: list[JournalEntry] = []
@@ -2101,6 +2212,9 @@ async def test_transient_errors_retry_then_stale_never_mock(rig: Rig, scenario: 
         await rig.count(FactCreativeDaily, FactCreativeDaily.dataset_id == dataset_id)
         == facts_before
     )
+    assert await rig.facts(FactCreativeDaily, dataset_id) == stored_before, (
+        "the last good creative facts stand, every key and value unchanged"
+    )
 
 
 async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
@@ -2109,12 +2223,24 @@ async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
     AAP 0.3.3 fallback table row 4: HTTP 400 (a GAQL ``QueryError``) is a defect in the
     product. The job fails and its ``sync_run`` rows record the query id; the request is sent
     exactly once; the source stays live (its status ``error``) and no simulated data appears.
+    The defect fails every metrics dataset of the run, so every dated fact table it writes
+    (campaign, keyword and search-term days) keeps each stored row's key, id, spend,
+    impressions, clicks, conversion outcomes and ``fetched_at`` exactly.
     """
     query_id = SCENARIOS[DEFECT_400].expect.values["query_id"]
     assert isinstance(query_id, str)
     dataset_id = await _live_google(rig)
     facts_before = await rig.count(FactCampaignDaily, FactCampaignDaily.dataset_id == dataset_id)
     assert facts_before
+    stored_before = {
+        model: await rig.facts(model, dataset_id)
+        for model in (FactCampaignDaily, FactKeywordDaily, FactSearchTermDaily)
+    }
+    assert len(stored_before[FactCampaignDaily]) == facts_before
+    for model, rows in stored_before.items():
+        assert rows, f"the live build stored {model.__tablename__} rows"
+        assert any(row["cost"] for row in rows.values()), f"{model.__tablename__} spend to keep"
+    assert any(row["conversions"] for row in stored_before[FactCampaignDaily].values())
     datasets_before = [(row.id, row.state) for row in await rig.datasets()]
     rig.waits.seconds.clear()
     journal: list[JournalEntry] = []
@@ -2149,6 +2275,10 @@ async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
         await rig.count(FactCampaignDaily, FactCampaignDaily.dataset_id == dataset_id)
         == facts_before
     )
+    for model, rows in stored_before.items():
+        assert await rig.facts(model, dataset_id) == rows, (
+            f"{model.__tablename__}: every key and value of the last good facts unchanged"
+        )
 
 
 async def test_call_budget_deferral(rig: Rig) -> None:
@@ -2158,8 +2288,12 @@ async def test_call_budget_deferral(rig: Rig) -> None:
     sliding 24 h. With the cap one call above what the live build already spent, the next
     metrics run makes that one call, defers the rest and records the affected datasets
     ``incomplete`` with a reason that starts with the deferral prefix, so the next window
-    finishes them. The source stays live, the facts already stored are kept, and
-    ``source_connection.calls_24h`` shows the cap reached.
+    finishes them. The source stays live and ``source_connection.calls_24h`` shows the cap
+    reached. The facts already stored are kept, proved on values: the one call is the
+    incremental Q-G3 read, so only the campaign days inside its range are rewritten, with
+    their ids and the platform's same values under a later ``fetched_at``; every other stored
+    campaign day, and every keyword and search-term day the deferred Q-G5 and Q-G6 would have
+    refreshed, stays exactly as stored, ``fetched_at`` included.
     """
     dataset_id = await _live_google(rig)
     spent = await GoogleCallBudget(
@@ -2170,9 +2304,21 @@ async def test_call_budget_deferral(rig: Rig) -> None:
     rig.set_env(GOOGLE_DAILY_CALL_BUDGET=str(cap))
     facts_before = await rig.count(FactCampaignDaily, FactCampaignDaily.dataset_id == dataset_id)
     assert facts_before
+    campaign_days = await rig.facts(FactCampaignDaily, dataset_id)
+    assert len(campaign_days) == facts_before
+    unread_before = {
+        model: await rig.facts(model, dataset_id)
+        for model in (FactKeywordDaily, FactSearchTermDaily)
+    }
+    for model, rows in unread_before.items():
+        assert rows, f"the live build stored {model.__tablename__} rows"
+        assert any(row["cost"] for row in rows.values()), f"{model.__tablename__} spend to keep"
+    built_daily = await rig.freshness_row(dataset_id, "google.metrics_daily")
+    assert built_daily is not None
     datasets_before = [(row.id, row.state) for row in await rig.datasets()]
     journal: list[JournalEntry] = []
-    controller = rig.controller({"google": rig.live("google", journal=journal)}, at=T1)
+    capped = rig.recording(rig.live("google", journal=journal))
+    controller = rig.controller({"google": capped}, at=T1)
     assert controller.settings.google_daily_call_budget == cap
 
     report = await jobs.run_source_jobs(
@@ -2182,6 +2328,16 @@ async def test_call_budget_deferral(rig: Rig) -> None:
     (result,) = report.results
     assert result.completeness == "incomplete"
     assert len(journal) == 1, "only the call the cap still allowed was sent"
+    # The one paid call is Q-G3 over the incremental range, whole native days with no
+    # campaign bounds: the only facts this run may rewrite are the campaign days it read.
+    ((query_id, read),) = _google_reads(capped)
+    assert query_id == "Q-G3"
+    assert set(read) == {START, END}
+    first_day, last_day = read[START], read[END]
+    assert isinstance(first_day, date)
+    assert isinstance(last_day, date)
+    assert last_day == built_daily.covered_through, "the native day the build covered through"
+    assert last_day - first_day == timedelta(days=jobs.INCREMENTAL_DAYS - 1)
     deferred = {
         name: outcome
         for name, outcome in result.freshness.items()
@@ -2204,6 +2360,26 @@ async def test_call_budget_deferral(rig: Rig) -> None:
         await rig.count(FactCampaignDaily, FactCampaignDaily.dataset_id == dataset_id)
         == facts_before
     )
+    campaign_days_after = await rig.facts(FactCampaignDaily, dataset_id)
+    assert campaign_days_after.keys() == campaign_days.keys(), "no campaign day added or removed"
+    refreshed = {key for key, row in campaign_days.items() if first_day <= row["date"] <= last_day}
+    untouched = campaign_days.keys() - refreshed
+    assert refreshed, "stored campaign days lie inside the paid read"
+    assert any(campaign_days[key]["cost"] for key in refreshed), "spend inside the paid read"
+    assert untouched, "stored campaign days lie outside the paid read"
+    for key in refreshed:
+        was, now = campaign_days[key], campaign_days_after[key]
+        assert now["fetched_at"] > was["fetched_at"], f"{key}: rewritten by the paid read"
+        assert {**now, "fetched_at": was["fetched_at"]} == was, (
+            f"{key}: the same row, holding the platform's same values"
+        )
+    assert {key: campaign_days_after[key] for key in untouched} == {
+        key: campaign_days[key] for key in untouched
+    }, "campaign days outside the paid read are untouched, fetched_at included"
+    for model, rows in unread_before.items():
+        assert await rig.facts(model, dataset_id) == rows, (
+            f"{model.__tablename__}: its deferred read rewrote nothing"
+        )
     # A deferral is a transient shortfall: the run succeeded with what it could pay for, and
     # the connection reports the source stale until the deferred pages are finished.
     assert (result.status, result.disposition, connection.status) == (

@@ -1294,10 +1294,14 @@ async def test_findings_withheld_suppressions_read_from_storage(
     """Stored outputs: findings, withheld lines and suppression counts come from storage.
 
     A dismissal makes the next default run store a suppression count. Then every analysis
-    entry point (the runner, context loading, precedence and each rule module) is replaced by
-    a function that fails the test, and ``GET /recommendations`` still returns, per section,
-    exactly the stored ``run_finding``, ``run_withheld`` and ``run_suppression`` rows, and
-    every item's stored evidence.
+    entry point (the runner, context loading, precedence and each rule module's ``evaluate``)
+    is replaced by a sentry that fails the test when called. The runner binds each rule
+    module's evaluator into ``runner._RULES`` at import, so replacing a module's ``evaluate``
+    does not reach it; ``runner._RULES`` is therefore replaced as well, with the same module
+    names each bound to the sentry. A control calls the runner's own evaluation step and proves
+    it reaches the sentry. ``GET /recommendations`` still returns, per section, exactly the stored
+    ``run_finding``, ``run_withheld`` and ``run_suppression`` rows, and every item's stored
+    evidence.
     """
     first = await client.get(f"{API}/recommendations")
     assert first.status_code == 200, first.text
@@ -1347,6 +1351,20 @@ async def test_findings_withheld_suppressions_read_from_storage(
     )
     for target in targets:
         monkeypatch.setattr(target, _refuse_recompute)
+    monkeypatch.setattr(
+        runner, "_RULES", tuple((name, _refuse_recompute) for name, _ in runner._RULES)
+    )
+    # Control: every rule module the runner evaluates is bound to the sentry, and the runner's
+    # own evaluation step calls it, so a read path that re-ran a rule could not pass unnoticed.
+    assert [name for name, _ in runner._RULES] == list(runner.EVALUATION_ORDER)
+    assert all(evaluate is _refuse_recompute for _, evaluate in runner._RULES)
+    stand_in: Any = object()
+    with pytest.raises(
+        AssertionError,
+        match=re.escape("GET /recommendations re-ran analysis instead of reading stored outputs"),
+    ) as reached:
+        runner._evaluate(stand_in, lambda: None)
+    assert "raised by analysis rule module 'discrepancy'" in reached.value.__notes__
 
     response = await client.get(f"{API}/recommendations")
     assert response.status_code == 200, response.text

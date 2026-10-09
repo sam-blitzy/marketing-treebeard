@@ -233,10 +233,17 @@ placeholders:
   to mean "First meeting booked". MQL uses it only when the configuration names it.
 - **Independence**: QL is resolved and observed from its own property, never derived from
   MQL. MQL and QL are shown side by side and never blended in any field, total or sort key.
-- **Skipped stages**: an empty stage-date property means the contact skipped that stage. The
-  contact is not counted, even when its current lifecycle stage is later, and the
-  `skipped_stage` finding reports "N contacts skipped this stage (not counted)". No other date
-  stands in, so every count is an observed stage entry.
+- **Skipped stages**: an empty stage-date property is never counted, even when the contact's
+  current lifecycle stage is later. No other date stands in, so every count is an observed
+  stage entry. Only some of these contacts are reported as skipped: those whose latest refresh
+  succeeded (`contact_read_status` is `ok` on every matched `lead_match` row of the contact)
+  and whose current `lifecyclestage` is set and is neither `subscriber` nor `lead`, the entry
+  stages that precede every bound stage. The `skipped_stage` finding reports them per stage,
+  for example "MQL (First meeting booked): N contacts skipped this stage (not counted)". A
+  contact still at `subscriber` or `lead` (awaiting qualification), with no lifecycle stage,
+  or whose refresh failed or was never recorded is not counted and not reported as skipped.
+  Without a successful refresh its current stage is not known, and its CRM evidence is
+  unknown instead.
 - **Causal order**: a bound date counts only at or after the contact's touch with the content
   (the lead's `submittedAt`). Earlier entries are reported as "already MQL/QL before this
   touch".
@@ -304,8 +311,8 @@ without touching the active dataset's. Its columns:
 
 | Status | Meaning | Retried |
 |--------|---------|---------|
-| `pending` | Staged, never attempted; always due | Not yet attempted |
-| `matched` | A contact of `crm_dataset_id` was found; `contact_id` is set and `contact_read_status` is `ok` | No (terminal) |
+| `pending` | Staged and not yet attempted; due from its `next_attempt_at` (the staging instant), or at once when that is empty, but not while a claim's lease holds it, until the lease expires | Not yet attempted |
+| `matched` | A contact of `crm_dataset_id` was found and `contact_id` is set; `contact_read_status` starts `ok`, and each later [contact refresh](#contact-refresh) sets it to `ok` or `error` without changing the match | No (terminal) |
 | `no_match` | HubSpot has no contact with this email yet | Yes |
 | `error` | The attempt got no answer, or failed terminally (outcomes below) | Only when the failure was transient |
 | `no_email` | The lead response carries no decodable email | No (terminal) |
@@ -320,9 +327,11 @@ than `pending` counts as attempted for the staged-matching readiness test.
    row in its effective CRM dataset: the companion while LinkedIn is simulated, HubSpot's
    active primary otherwise. A live lead also gets a row in every `building` HubSpot primary.
 2. **Claim**: the HubSpot CRM job takes up to 100 due rows (`BATCH_SIZE`) in one short
-   transaction, `pending` first and then the longest-overdue retries. It selects them
-   `FOR UPDATE OF lead_match SKIP LOCKED`, so concurrent runs take disjoint rows, leases them
-   by writing the lease instant to `next_attempt_at` (`CLAIM_LEASE`, 30 min), and commits.
+   transaction, in due-time order whatever their status: `next_attempt_at` ascending, empty
+   first, then `lead_id`. A retry due before a `pending` row's staging instant therefore
+   comes ahead of it. It selects them `FOR UPDATE OF lead_match SKIP LOCKED`, so concurrent
+   runs take disjoint rows, leases them by writing the lease instant to `next_attempt_at`
+   (`CLAIM_LEASE`, 30 min), and commits.
 3. **Re-fetch**, with no transaction or row lock held: the job re-reads the lead responses
    from LinkedIn by plain response id and decodes each email with the response's own
    form-version map ([linkedin.md](linkedin.md)).
@@ -635,16 +644,19 @@ Each fetch row records `target_read_status`:
 
 | `target_read_status` | When |
 |----------------------|------|
-| `ok` | Every associated id was returned (also when there was nothing to read) |
+| `ok` | Every associated id was returned; also an `ok` fetch that yielded no target id, so there was nothing to read |
 | `partial` | Some ids were missing, or one of the calls failed |
 | `error` | None of the ids were read |
-| `null` | The fetch is `ok_empty` |
+| `null` | Nothing to read: the fetch is `ok_empty` (a known zero), or it is `partial` or `error` and collected no target id (unknown) |
 
 `missing_target_ids` lists every associated id that was not read, whether HubSpot omitted it
 or its call failed.
 
-- **Known evidence**: an association is known only when its fetch is `ok` or `ok_empty` and
-  its target reads are `ok`. An empty successful result is a genuine zero.
+- **Known evidence**: an association is known in exactly two cases: its fetch is `ok_empty`,
+  whose target reads are `null`; or its fetch is `ok` and its target reads are `ok`. Anything
+  else is unknown: a `partial` or `error` fetch whatever its target reads, `null` included, and
+  an `ok` fetch whose target reads are `partial`, `error` or `null`. An empty successful result
+  is a genuine zero.
 - **Unknown, never absent**: an associated but unread meeting or deal is never treated as
   absent. A failed or partial step on a contact's meetings or deals makes that contact's
   evidence unknown, which withholds W2 and C1b and makes the C2 veto unavailable.
@@ -712,8 +724,11 @@ the range as a sequence of narrower queries whose union is the range.
   share then displays as "unknown (N deals not assessed)" and deal counts carry `deal_floor`.
   An interrupted search (step 6) is a failed attempt: the deals read are stored and their
   deals-to-contacts associations still read, but no success is recorded, and the error is
-  handed to `sync/mode.py`. The dataset keeps its last good data (`last_success_at` and its
-  coverage stand) and turns stale, and the connection becomes `stale`.
+  handed to `sync/mode.py`. The connection becomes `stale` at once and the failed attempt is
+  recorded, while the dataset keeps its last good data (`last_success_at` and its coverage
+  stand). Items reading the dataset are flagged stale once its last success is older than
+  `sources.stale_after_hours` (24) or its coverage stops short of the window end
+  ([P4](../recommendation-rules.md#p3-to-p8)).
 - **Defects**: a page that breaks the paging contract raises a defect before another request:
   a record without a usable `id`, a cursor on an empty page, a cursor that repeats an earlier
   one, or a numeric cursor that does not advance.
@@ -811,7 +826,7 @@ platform-wide table is in [architecture.md](../architecture.md); for HubSpot:
 |-----------|----------------|-----------|
 | `HUBSPOT_ACCESS_TOKEN` unset or blank | Access unavailable | HubSpot runs on simulated data, reason `credentials not configured` |
 | HTTP 401 or 403, including 403 `MISSING_SCOPES` | Access denied | The whole source switches to simulated data; the reason records the platform code and the failing endpoint |
-| HTTP 429 (`RATE_LIMIT`), 5xx, timeout, network failure | Transient | 3 attempts with backoff, `Retry-After` honoured; afterwards the affected datasets turn stale and keep their last good data. Never mock |
+| HTTP 429 (`RATE_LIMIT`), 5xx, timeout, network failure | Transient | 3 attempts with backoff, `Retry-After` honoured; afterwards the connection becomes `stale` at once and a failed attempt is recorded on each affected dataset's freshness row; the dataset keeps its last good data, and its `last_success_at`, coverage and completeness stand. A failed attempt alone flags no item: items reading the dataset are flagged stale once its last success is older than `sources.stale_after_hours` (24) or its coverage stops short of the window end ([P4](../recommendation-rules.md#p3-to-p8)). Never mock |
 | HTTP 400 or another 4xx, a response that breaks its contract, a body the client refuses to send | Defect | The job fails and is logged. No retry, no mock |
 
 - **Per input, not per call**: inside a sync, the batch methods record per input or per id a
@@ -821,13 +836,15 @@ platform-wide table is in [architecture.md](../architecture.md); for HubSpot:
   ids). Access denied and defects always propagate. The first transient failure of a batch
   method call, or the one that stopped a partitioned search, is also returned in the result's
   `interrupted_by`, and the sync hands it to `sync/mode.py`, which fails that dataset's
-  refresh: a failed attempt is recorded, `last_success_at` and the coverage stand, the dataset
-  turns stale and the connection becomes `stale`. A batch status other than `COMPLETE` and a
-  207 error entry stay per-input outcomes only. A matching re-fetch or lookup failure
-  (`MatchReport.interrupted_by`) is handed over with no dataset, its rows already `error` and
-  due for a retry: by the CRM sync, the matching job and a build's own matching pass alike.
-  `run_matching` hands each one to its caller as soon as it is observed, so one met before a
-  later batch raises is handed over too, ahead of the raised error, whose consequence stands.
+  refresh: the connection becomes `stale` at once and a failed attempt is recorded, while
+  `last_success_at` and the coverage stand; items reading the dataset are flagged stale once
+  its last success is older than `sources.stale_after_hours` (24) or its coverage stops short
+  of the window end. A batch status other than `COMPLETE` and a 207 error entry stay per-input
+  outcomes only. A matching re-fetch or lookup failure (`MatchReport.interrupted_by`) is
+  handed over with no dataset, its rows already `error` and due for a retry: by the CRM sync,
+  the matching job and a build's own matching pass alike. `run_matching` hands each one to its
+  caller as soon as it is observed, so one met before a later batch raises is handed over too,
+  ahead of the raised error, whose consequence stands.
 - **Stale**: an item is flagged stale when a dataset it reads last succeeded more than
   `sources.stale_after_hours` (24) ago or covers less than the window end.
 
@@ -901,7 +918,13 @@ seeded simulated portal (`MOCK_SEED`, default `42`).
 - A failed call is also logged with the error kind, code, HTTP status, endpoint and
   `reason`: in `connector.error`, `hubspot.batch_read.call_failed`,
   `hubspot.associations.call_failed`, `hubspot.search_failed`, a `hubspot.search` that a
-  transient error cut short, `sync.classification` and `sync.job.connector_error`.
+  transient error cut short, and `sync.classification`. `sync.classification` is the sync
+  layer's one record of the error: `on_error` in `sync/mode.py` logs it with the
+  disposition (`ignored`, `switched_to_simulated`, `stale` or `defect`) and, for a sync
+  job, the job's name. A job's outcome is its one `sync.job.finish`, whose `disposition` is
+  the classification of the last error the job handed to `on_error`, and whose `error`
+  holds only the class name of an exception the run raised, never its text. A connector
+  error goes to `on_error` and is not raised, so it leaves `error` null.
 - `reason` holds HubSpot's error message only after `sanitize_message`: emails become
   `[REDACTED_EMAIL]`; configured secrets, `Bearer` tokens and credential assignments become
   `[REDACTED]`; the message is cut to 300 characters inside a `reason` of at most 500.

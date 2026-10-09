@@ -11,8 +11,10 @@ hashes. Each test names the AAP 0.11.2 guarantee it proves:
 * **Staged CRM recovery**: a building HubSpot dataset stages a row for every backfill-range
   lead and matches it while the active dataset's matches stay in use; activation is refused
   while a building row is ``pending`` or a ``hubspot.*`` freshness row is ``unknown``; one
-  activation then swaps the matching state without resetting any lead to ``pending``; a
-  LinkedIn activation during the build, and a new live LinkedIn dataset, are staged too.
+  activation then swaps the matching state without resetting any lead to ``pending``; when
+  LinkedIn activates a new dataset during a real live HubSpot build, the build itself
+  stages, attempts and hydrates the new leads before it activates; and a new live LinkedIn
+  dataset is staged against HubSpot's active primary.
 * **Versioned forms**: a response whose answered question ids are missing from its own
   decorated questions ends ``no_email`` "form map mismatch" and is never retried.
 * **Terminal cases**: an unknown form version ends ``no_email``; an email LinkedIn no longer
@@ -33,10 +35,13 @@ handlers (:class:`Platforms`) wrapped in the suite's contract checks
 against ``tests/contracts/linkedin/lead_form_responses.json``,
 ``lead_form_responses_batch.json`` and ``tests/contracts/hubspot/objects_batch_read.json``;
 the handlers hold plaintext emails only in test memory. A simulated HubSpot portal is the
-simulator's own transport (``SourceModeController.open_clients``). Every clock is fixed:
-``run_matching`` gets an explicit ``now``, the controller and dataset manager stand at
-:data:`T0`, the retry policy keeps its production attempts with its sleep replaced, and the
-HubSpot throttle runs on a virtual clock, so no test sleeps in real time.
+simulator's own transport (``SourceModeController.open_clients``). So is the live portal of
+the one case that runs a whole live HubSpot build (property verification, matching,
+contact refresh, deal search, associations and target reads), in strict mode, so a request
+that breaks its contract raises. Every clock is fixed: ``run_matching`` gets an explicit
+``now``, the controllers and dataset manager stand at :data:`T0`, the retry policy keeps its
+production attempts with its sleep replaced, and the HubSpot throttle runs on a virtual
+clock, so no test sleeps in real time.
 
 The tests run against the PostgreSQL 18 test database of ``tests/conftest.py`` (``db`` and
 ``sync_engine``); nothing is skipped without it.
@@ -82,6 +87,8 @@ from ads_engine.db.models.ops import DatasetFreshness, SourceConnection, SourceD
 from ads_engine.settings import Settings, Source, get_settings
 from ads_engine.simulation import HUBSPOT_HASHED_CONTACT_IDS, SIM_EMAIL_DOMAIN
 from ads_engine.simulation.generator import SimulatedWorld
+from ads_engine.simulation.scenarios import SCENARIOS
+from ads_engine.sync import jobs
 from ads_engine.sync.datasets import DatasetManager, DatasetStateError
 from ads_engine.sync.freshness import (
     FreshnessOutcome,
@@ -104,7 +111,7 @@ from ads_engine.sync.lead_match import (
     run_matching,
     stage_rows,
 )
-from ads_engine.sync.mode import SourceModeController
+from ads_engine.sync.mode import REASON_RECOVERED, SourceModeController
 
 pytestmark = pytest.mark.anyio
 
@@ -114,6 +121,8 @@ type CheckedTransportFactory = Callable[[str, Handler], httpx.MockTransport]
 type RecordingFactory = Callable[[httpx.MockTransport], Any]
 """``recording_transport``: wraps a transport and keeps its ``requests``."""
 type WorldFactory = Callable[..., SimulatedWorld]
+type SimulatorFactory = Callable[..., httpx.MockTransport]
+"""``mock_transport_for``: the simulator's transport of one source, answering from a world."""
 type CredentialsFactory = Callable[[str], Mapping[str, str]]
 """``live_credentials``: configures one source's fake credentials."""
 type Decoration = Literal["full", "mismatch", "none"]
@@ -1443,51 +1452,187 @@ async def test_activation_swaps_matching_state_atomically(harness: Harness) -> N
 
 async def test_linkedin_activation_during_hubspot_build_stages_new_leads(
     harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    make_world: WorldFactory,
+    mock_transport_for: SimulatorFactory,
+    contract_checked_transport: CheckedTransportFactory,
+    recording_transport: RecordingFactory,
 ) -> None:
     """Staged CRM recovery: a LinkedIn activation during the build stages its new leads.
 
-    A new live LinkedIn dataset is backfilled and attempted against HubSpot's active
-    (simulated) primary, then activates while the live HubSpot build, already attempted for
-    the previous LinkedIn dataset's leads, is still building. The build stages a row for
-    every lead of the newly active dataset and is not ready until each one is attempted.
+    A real live HubSpot build runs as recovery runs it
+    (``SourceModeController.build_dataset`` with the ``recovered`` reason) while a new live
+    LinkedIn dataset, already backfilled and attempted against HubSpot's active (simulated)
+    primary, is still building. The live portal is the simulator's HubSpot transport, strict,
+    with a contact for every real lead email; LinkedIn is the hand-written platform.
+
+    The seam is the build's backfill (``jobs.backfill_dataset``). After the first run every
+    backfill-range lead of the previous LinkedIn dataset is attempted in the build and it
+    would be ready; the new LinkedIn dataset then activates. The build holds no row for the
+    new leads, and readiness, which counts only rows that exist, still reads ready: only the
+    build's own restaging stands between it and an activation without them. Before the
+    second run the build has staged a ``pending`` row for every new lead and marked its
+    contact and association freshness ``unknown``; the rerun attempts, matches and hydrates
+    them, and only then does the build activate, retiring the simulated primary, whose
+    matches stay unchanged. The test stages no row itself.
     """
     setup = await _staged_recovery(harness)
     newer, newer_leads = await _new_live_linkedin(harness)
-    building = await _begin_live_build(harness, setup)
-    await harness.match(building, now=T0)
-    await _record(harness.sessions, building, HUBSPOT_NAMES)
-    assert (await harness.manager.readiness(building)).ready
-
     report = await harness.match(setup.hubspot, now=T0, hubspot="simulated", lead_dataset_id=newer)
     assert (report.attempted, report.pending_left) == (len(newer_leads), 0)
     await _record(harness.sessions, newer, LINKEDIN_NAMES)
-    activation = await harness.manager.activate(newer, reason="recovered")
-    assert (activation.activated, activation.retired) == ((newer,), (setup.linkedin,))
+    active_rows = await _rows(harness.sessions, setup.hubspot)
+    newer_ids = set(newer_leads.values())
+    assert set(active_rows) == set(setup.active_rows) | newer_ids
+    previous_responses = {
+        response_id
+        for response_id, lead in (await _leads(harness.sessions, setup.linkedin)).items()
+        if lead.id in setup.in_range
+    }
 
-    async with harness.sessions() as session, session.begin():
-        staged = await stage_rows(session, building, newer, since=BACKFILL_START, now=T0)
-    assert staged == len(newer_leads)
-    rows = await _rows(harness.sessions, building)
-    assert {lead_id for lead_id, row in rows.items() if row.status == "pending"} == set(
-        newer_leads.values()
+    entry = SCENARIOS[STAGED_RECOVERY_SCENARIO]
+    portal_world = make_world(
+        dataclasses.replace(entry, spec=entry.spec.with_hubspot(live_lead_match_share=Decimal(1))),
+        7,
+        clock=_clock,
     )
-    readiness = await harness.manager.readiness(building)
-    assert not readiness.ready
-    assert readiness.pending_matches == len(newer_leads)
-    with pytest.raises(DatasetStateError, match="not ready"):
-        await harness.manager.activate(building, reason="recovered")
+    builder = _controller(
+        harness.settings,
+        harness.sessions,
+        world=harness.controller.world,
+        transports={
+            "linkedin": recording_transport(
+                contract_checked_transport("linkedin", harness.platforms.linkedin)
+            ),
+            "hubspot": recording_transport(
+                mock_transport_for("hubspot", portal_world, strict=True)
+            ),
+        },
+    )
+    backfilled: list[int] = []
+    backfill = jobs.backfill_dataset
 
-    report = await harness.match(building, now=T0)
-    assert (report.attempted, report.pending_left) == (len(newer_leads), 0)
-    assert (await harness.manager.readiness(building)).ready
-    activation = await harness.manager.activate(building, reason="recovered")
-    assert (activation.activated, activation.retired) == ((building,), (setup.hubspot,))
+    async def activate_linkedin(building: int) -> None:
+        """After the first backfill the build is complete for the old leads; LinkedIn activates."""
+        rows = await _rows(harness.sessions, building)
+        assert set(rows) == set(setup.in_range)
+        assert all((row.status, row.attempts) == ("matched", 1) for row in rows.values()), rows
+        assert (await harness.manager.readiness(building)).ready
+        activation = await harness.manager.activate(newer, reason=REASON_RECOVERED)
+        assert (activation.activated, activation.retired) == ((newer,), (setup.linkedin,))
+        assert set(await _rows(harness.sessions, building)).isdisjoint(newer_ids)
+        # Readiness counts only staged rows, so it still reads ready without the new leads.
+        assert (await harness.manager.readiness(building)).ready
+
+    async def assert_restaged(building: int) -> None:
+        """Before the rerun: every new lead is staged and the CRM evidence is withdrawn."""
+        rows = await _rows(harness.sessions, building)
+        staged = MatchRow("pending", 0, T0, None, None, None, None)
+        assert {lead_id: rows.get(lead_id) for lead_id in newer_ids} == dict.fromkeys(
+            newer_ids, staged
+        )
+        async with harness.sessions() as session:
+            freshness = await load_freshness(session, building)
+        withdrawn = ("hubspot.associations", "hubspot.contacts")
+        for name in withdrawn:
+            assert freshness[name].completeness == "unknown", name
+            assert f"{len(newer_ids)} lead matches staged" in (freshness[name].reason or ""), name
+        readiness = await harness.manager.readiness(building)
+        assert not readiness.ready
+        assert readiness.pending_matches == len(newer_ids)
+        assert sorted(readiness.unknown_freshness) == list(withdrawn)
+
+    async def at_seam(
+        controller: SourceModeController, dataset_id: int, *, now: datetime | None = None
+    ) -> jobs.SourceSyncReport:
+        """The build's backfill: LinkedIn activates after the first run; the second is checked."""
+        assert controller is builder
+        backfilled.append(dataset_id)
+        if len(backfilled) == 1:
+            assert await _state(harness.sessions, dataset_id) == "building"
+            report = await backfill(controller, dataset_id, now=now)
+            await activate_linkedin(dataset_id)
+            return report
+        assert backfilled == [dataset_id, dataset_id], f"unexpected backfills {backfilled}"
+        await assert_restaged(dataset_id)
+        return await backfill(controller, dataset_id, now=now)
+
+    monkeypatch.setattr(jobs, "backfill_dataset", at_seam)
+    harness.platforms.reset_calls()
+    outcome = await builder.build_dataset("hubspot", "live", reason=REASON_RECOVERED)
+
+    assert outcome.activated, outcome.reason
+    building = outcome.dataset_id
+    assert building is not None
+    assert (outcome.source, outcome.mode, outcome.reason, outcome.retired) == (
+        "hubspot",
+        "live",
+        REASON_RECOVERED,
+        (setup.hubspot,),
+    )
+    assert backfilled == [building, building]
+    states = {
+        dataset_id: await _state(harness.sessions, dataset_id)
+        for dataset_id in (building, setup.hubspot, setup.linkedin, newer)
+    }
+    assert states == {
+        building: "active",
+        setup.hubspot: "retired",
+        setup.linkedin: "retired",
+        newer: "active",
+    }
+    async with harness.sessions() as session:
+        connection = await session.scalar(
+            select(SourceConnection).where(SourceConnection.source == "hubspot")
+        )
+    assert connection is not None
+    assert (connection.mode, connection.active_dataset_id) == ("live", building)
     assert await harness.manager.effective_crm_dataset(newer) == building
-    assert all(
-        row.status != "pending"
-        for lead_id, row in (await _rows(harness.sessions, building)).items()
-        if lead_id in set(newer_leads.values())
-    )
+
+    # The rerun attempted every new lead against the live portal and matched it to the
+    # portal's contact for its own email, stored in the build's dataset with its associations
+    # read. The simulator's seeded contacts for real emails carry no email, so they are told
+    # apart by id: the one the portal answers for the lead's email hash.
+    rows = await _rows(harness.sessions, building)
+    assert set(rows) == set(setup.in_range) | newer_ids
+    for lead_id in newer_ids:
+        row = rows[lead_id]
+        assert (row.status, row.attempts, row.last_checked_at, row.contact_read_status) == (
+            "matched",
+            1,
+            T0,
+            "ok",
+        ), lead_id
+    async with harness.sessions() as session:
+        contacts = {
+            contact.id: (contact.dataset_id, contact.hs_id)
+            for contact in await session.scalars(
+                select(CrmContact).where(
+                    CrmContact.id.in_([rows[lead_id].contact_id for lead_id in newer_ids])
+                )
+            )
+        }
+        freshness = await load_freshness(session, building)
+    for lead in (await _leads(harness.sessions, newer)).values():
+        contact_id = rows[lead.id].contact_id
+        assert contact_id is not None
+        assert lead.email_sha256 is not None
+        expected = portal_world.hashed_contact_for(lead.email_sha256)
+        assert expected is not None
+        assert contacts[contact_id] == (building, expected.id), lead.external_id
+    assert await harness.manager.unhydrated_matches(building) == 0
+    crm_freshness = {name: row for name, row in freshness.items() if name.startswith("hubspot.")}
+    assert set(HUBSPOT_NAMES) <= set(crm_freshness)
+    for name, recorded in crm_freshness.items():
+        assert recorded.completeness == "complete" or (
+            recorded.completeness == "incomplete" and bool(recorded.reason)
+        ), (name, recorded.completeness, recorded.reason)
+    assert await _rows(harness.sessions, setup.hubspot) == active_rows
+    # The first run re-fetched the previous dataset's leads, the rerun the new dataset's.
+    assert [set(call) for call in harness.platforms.refetch_calls] == [
+        previous_responses,
+        set(newer_leads),
+    ]
 
 
 async def test_new_live_linkedin_dataset_staged_against_active_crm(harness: Harness) -> None:

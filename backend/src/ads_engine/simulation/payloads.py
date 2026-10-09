@@ -4705,7 +4705,9 @@ def render(
     return response
 
 
-def validate_capture(raw: JSONValue, *, root: Path | None = None) -> Contract:
+def validate_capture(
+    raw: JSONValue, *, root: Path | None = None, settings: Settings | None = None
+) -> Contract:
     """Validate a recorded live exchange ``{surface, captured_at, request, response}``.
 
     ``request`` is ``{method, url, headers, body}`` (see :meth:`RequestShape.from_capture`);
@@ -4716,6 +4718,9 @@ def validate_capture(raw: JSONValue, *, root: Path | None = None) -> Contract:
     Args:
         raw: The decoded capture file.
         root: The contracts directory; :func:`contracts_root` when ``None``.
+        settings: The settings the capture was recorded with, which name the webhook secret
+            header; :func:`~ads_engine.settings.get_settings` when ``None``, read only when
+            a contract names that header.
 
     Returns:
         The contract the capture satisfies.
@@ -4748,7 +4753,7 @@ def validate_capture(raw: JSONValue, *, root: Path | None = None) -> Contract:
         identified = identify_surface(source, shape)
         if identified != name:
             raise UnknownSurface(f"the captured request addresses {source}.{identified}")
-        validate_request(contract, shape)
+        validate_request(contract, shape, settings=settings)
     answer = cast(JSONObject, response)
     status = cast(int, answer["status"])
     body = answer.get("body")

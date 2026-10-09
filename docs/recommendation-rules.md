@@ -229,13 +229,32 @@ Worked examples:
 - 5 capped days of 7 known-budget active days (71%), with at least 5 spending days, is
   cap-constrained; 4 known-budget active days is a short history.
 
-**Short history**: when any gate check falls short, the rule is withheld with every shortfall,
-observed against required, for example "spending days 3 of 5 required; known-budget days 9 of
-7".
+**Short history**: `C2`/`B1`, `B2` and `B3` judge only subjects active now: an active campaign,
+or a shared budget an active campaign currently draws from. Any other subject gets neither an
+item nor a withheld line. The history is short when known-budget active days fall below
+`budget.min_known_days` (default 7) or spending days below `budget.min_spending_days` (default
+5). A failed gate becomes a withheld line, with every shortfall observed against required (for
+example "spending days 3 of 5 required; known-budget days 9 of 7"), only for a near pattern:
 
-Every budget card (`C2`, `B1`–`B4`) shows, observed against required: known-budget active days,
-spending days and their share, days meeting the rule's predicate and their share, known idle
-days, changed-intraday days and unobserved days.
+- `C2`/`B1`: an efficient subject (cost per outcome ≤ `scale.max_cpa_ratio` (default 1.0) ×
+  baseline) whose history is short, or that was capped on at least one day;
+- `B2`: a subject that meets `B2`'s poor-efficiency condition and whose history is short;
+- `B3`: a subject whose history is short, with at least one spending day and at least one
+  under-utilized day.
+
+Every other gate failure is not a near pattern and yields neither an item nor a withheld line:
+an efficient subject with a full history and no capped day, a `B2` subject whose efficiency is
+not poor, a `B3` subject with no spending day or no under-utilized day, and a share check
+(`B2`'s spending or high-utilization days, `B3`'s under-utilized days) that falls short over a
+history meeting both day minimums.
+
+Every budget card (`C2`, `B1`–`B4`) shows known-budget active days, spending days, known idle
+days, changed-intraday days and unobserved days; `B1`–`B4` add the spending days' share. `C2`
+and `B1`–`B3` also show the days meeting the rule's predicate (with their share on `B1`–`B3`),
+and `extra.gate` holds each check of their gate observed against required. `B4` is not gated
+on budget history: its card has no predicate-day count, and `extra.budget_history` shows its
+known-budget and spending days beside `budget.min_known_days` and `budget.min_spending_days`,
+which do not gate it.
 
 ### CRM pipeline link and veto
 
@@ -656,8 +675,16 @@ Effects:
 - `acknowledge_removal` (`missing`): writes a tombstone decision (`tombstone=true`; a campaign
   also gets status `ended`) and resolves at once, never waiting for a snapshot, because a removed
   entity may never produce one. While the entity stays absent, no new `missing` discrepancy is
-  raised. If a complete enumeration later returns it, a `status` discrepancy is raised against
-  the tombstone.
+  raised. A reappearance is a complete enumeration that later returns the entity, in a snapshot
+  captured after the tombstone; it raises one discrepancy against the tombstone, resolved through
+  the `status` or `budget` row of the table above. No snapshot ever matches a tombstone:
+  `platform_correct` writes the whole platform state, which clears the tombstone, and an `open`
+  or `awaiting_platform` reappearance closes by itself when a later complete enumeration again
+  omits the entity. The kind follows the subject:
+  - a campaign (`own_budget` or `shared_member`) raises a `status` discrepancy whatever status it
+    is returned with, `ended` included, or with no status reported;
+  - a shared budget (`budget`) has no status, so it raises a `budget` discrepancy that compares
+    the tombstoned amount with the platform's amount.
 - **Auto-resolution**: every `status`, `budget` and `untracked` discrepancy in `open` or
   `awaiting_platform` closes by itself when a later snapshot matches the current decision,
   re-checked on every entity sync. `missing` closes only through `acknowledge_removal`, or
@@ -803,12 +830,14 @@ subject, and never one on its members.
 
 - **Section and group**: `campaigns` → `launch`.
 - **Fires when** a demographic value (job function, seniority or industry) inside an active
-  LinkedIn campaign has all of:
+  LinkedIn campaign with the `LEAD_GENERATION` objective has all of:
   - segment leads ≥ `c3a.min_leads` (default 5);
   - segment cost per lead ≤ `c3a.max_cpl_ratio` (default 0.8) × the campaign's cost per lead;
   - segment impression share of the campaign < `c3a.max_impression_share` (default 0.15).
 
-  It does not fire when the pivot returns no lead metric.
+  It does not fire when the pivot returns no lead metric. Only lead-generation campaigns are
+  evaluated, because the campaign's cost per lead is its window spend ÷ its `oneClickLeads`:
+  segments of a campaign with any other objective are skipped, with no card and no withheld line.
 - **Segment windows**: LinkedIn approximates and privacy-thresholds demographic values, so
   segments are fetched as aggregates for each preset in `window.presets`, each ending on the
   default window end. `C3a` is evaluated only when the run window equals one of those fetched
@@ -862,11 +891,15 @@ withheld patterns follow the items.
 
 - utilization: the window percentage plus every day count from
   [Utilization and history gates](#utilization-and-history-gates), each observed against
-  required (known-budget or budget-active days, spending days, days meeting the rule's
-  predicate, idle days, changed-intraday days, unobserved days);
+  required where the rule's gate sets a requirement (known-budget or budget-active days,
+  spending days, days meeting the rule's predicate, idle days, changed-intraday days,
+  unobserved days). `B4` shows the same counts beside its pattern but no days meeting a
+  predicate, because it is not gated on budget history;
 - efficiency: cost per outcome against the account baseline;
 - outcomes, and CRM Qualified Leads where linked;
-- the daily budget, the proposed amount, and the exact window with each source's day boundary.
+- the latest effective daily budget and the exact window with each source's day boundary. `B1`
+  and `B3` cards also show the proposed daily budget, and a `B2` card shows it only when the
+  latest effective daily budget is known; `B4` proposes no amount.
 
 **Required datasets of every budget rule**: the subject source's entity dataset (snapshots and,
 for Google, conversion-action settings) and daily metrics dataset, plus the CRM datasets when
@@ -939,7 +972,9 @@ member days.
 ### B2 Do not increase: high utilization, poor efficiency
 
 - **Section and group**: `budget` → `changes`.
-- **Fires when** the window has at least `window.sustained_min_days` (default 7) days and:
+- **Fires when**, for an active subject (an active campaign, or a shared budget an active
+  campaign currently draws from), the window has at least `window.sustained_min_days` (default 7)
+  days and:
   - the high-utilization gate passes: at least `budget.min_known_days` (default 7) known-budget
     active days, at least `budget.min_spending_days` (default 5) spending days making up ≥
     `budget.sustained_share` (default 0.70) of them, and high-utilization days (u_d ≥
@@ -957,9 +992,12 @@ member days.
   appear.
 - **Ranking**: window spend, descending.
 - **Withheld or suppressed**:
-  - a gate shortfall is withheld with every shortfall, for example "spending days 4 of 5
-    required";
-  - high-utilization days on 4 of 7 (57%) do not fire; 5 of 7 (71%) do;
+  - a failed high-utilization gate is withheld, with every shortfall, only when efficiency is
+    poor (either branch) and the history is short (known-budget active days or spending days
+    below their minimums), for example "spending days 4 of 5 required";
+  - acceptable efficiency, or a history meeting both day minimums that misses the spending
+    share or the high-utilization share, yields neither an item nor a withheld line;
+  - high-utilization days on 4 of 7 (57%) do not fire and are not withheld; 5 of 7 (71%) do;
   - P2 suppresses the zero-outcome branch for a source with no recorded outcomes.
 - **Required datasets**: see the section rules above.
 - **Decision subject**: yes, prefilled with the lowered daily budget.
@@ -967,11 +1005,17 @@ member days.
 ### B3 Under-utilized
 
 - **Section and group**: `budget` → `changes`.
-- **Fires when** the window has at least `window.sustained_min_days` (default 7) days and the
-  under-utilized gate passes: at least `budget.min_known_days` (default 7) known-budget active
-  days, at least `budget.min_spending_days` (default 5) spending days, and under-utilized days
-  (u_d ≤ `budget.under_utilization`, default 0.50, idle known days included) on ≥
-  `budget.sustained_share` (default 0.70) of them.
+- **Fires when**, for an active subject (an active campaign, or a shared budget an active
+  campaign currently draws from), the window has at least `window.sustained_min_days` (default 7)
+  days and:
+  - the under-utilized gate passes: at least `budget.min_known_days` (default 7) known-budget
+    active days, at least `budget.min_spending_days` (default 5) spending days, and
+    under-utilized days (u_d ≤ `budget.under_utilization`, default 0.50, idle known days
+    included) on ≥ `budget.sustained_share` (default 0.70) of them;
+  - and 0 < {proposed} < {current}, where {current} is the latest daily budget and {proposed} is
+    the rounded proposal below. `B3` never proposes a zero, unchanged or higher budget: when
+    the latest daily budget or the spend percentile is unavailable, or {proposed} falls outside
+    that range, there is neither an item nor a withheld line.
 - **Action**: "Lower daily budget to {proposed}", where {proposed} is the
   `b3.spend_percentile` (default 90) percentile of daily spend over the known-budget active days
   × `b3.headroom` (default 1.1), rounded to the currency's minor unit.
@@ -980,9 +1024,14 @@ member days.
   its text "Move {allocation} to fund {receiver}'s recommended increase (B1)". With no receiver
   the freed amount stays a plain decrease.
 - **Ranking**: window spend, descending.
-- **Withheld or suppressed**: a gate shortfall is withheld with its observed and required counts.
-  Ten known idle days and no spending day never make a `B3` donor; ten known days with six
-  spending days, four idle days and u_d ≤ 0.50 on eight of them fire.
+- **Withheld or suppressed**: a failed under-utilized gate is withheld, with every shortfall,
+  only when the history is short (known-budget active days or spending days below their
+  minimums) and the subject has at least one spending day and at least one under-utilized day,
+  for example "known-budget days 6 of 7 required". Any other gate failure, such as
+  under-utilized days below the share over a history meeting both day minimums, yields neither
+  an item nor a withheld line. Ten known idle days and no spending day never make a `B3` donor
+  and list no withheld line; ten known days with six spending days, four idle days and u_d ≤
+  0.50 on eight of them fire.
 - **Required datasets**: see the section rules above.
 - **Decision subject**: yes, prefilled with the proposed daily budget.
 
@@ -1006,11 +1055,17 @@ member days.
      outcomes in total.
   5. **Test**: a two-sample Poisson rate test on outcomes per unit of spend with p <
      `b4.alpha` (default 0.05).
-- **Action**: "Adjust weekend schedule or bids: weekend cost/outcome {x} vs weekday {y}".
+- **Action**: "Adjust weekend schedule or bids: weekend cost/outcome {x} vs weekday {y}", a
+  schedule or bid-pattern observation rather than a budget change: it proposes no daily budget.
 - **Reason and extra output**: day counts, outcome counts and the p-value of the "two-sample
   Poisson rate test", the source's day boundary and, for Google, the counting contract ("all
-  included actions last-click on all {N} days"). The card also shows the utilization block every
-  budget card shows.
+  included actions last-click on all {N} days"). The evidence sample is the outcome total against
+  `b4.min_outcomes` and the test line carries the p-value against `b4.alpha`; `extra.gate` holds
+  weekend days, weekdays and outcomes, each observed against required. Beside the pattern the
+  card shows the utilization block of the campaign's budget history (the shared budget's for a
+  Google campaign on an explicitly shared budget) with its latest effective daily budget,
+  efficiency against the account baseline, outcomes and CRM Qualified Leads where linked. `B4`
+  is not gated on that history (`extra.budget_history`), so the block has no predicate-day count.
 - **Ranking**: window spend, descending.
 - **Withheld or suppressed**: the pattern goes to the withheld lines with its sample sizes:
   - "weighted attribution: rate test not valid" when any included action is data-driven or
@@ -1023,7 +1078,8 @@ member days.
   - a test with p ≥ `b4.alpha`, with its p-value and sample sizes.
 - **Required datasets**: see the section rules above. For Google, `google.entities` carries the
   conversion-action snapshots the counting contract reads.
-- **Decision subject**: no ("Mark done").
+- **Decision subject**: no ("Mark done"). With no proposed amount, `B4` has no amount decision
+  to record.
 
 ## Copy / creative changes (LinkedIn)
 
@@ -1067,14 +1123,21 @@ baseline".
   - a pair is distinguishable when its adjusted p < `cr.alpha` (default 0.05);
   - the impressions still needed are estimated at `cr.power` (default 0.8) for the observed
     difference.
-- **Action**: "{A} vs {B}: {label}", where {label} is one of:
+- **Action**: "{A} vs {B}: {label}", where {A} is the variant with the higher observed rate, or the
+  first by name when neither is ahead, and {label} is one of:
   - "Distinguishable (adjusted p = …)";
+  - "Not yet distinguishable; comparison not estimable ({reason})" when the pair cannot be
+    tested, so it has no p-value. The reason is "a variant has zero impressions", "{outcome} not
+    reported" or "inconsistent counts: {outcome} exceed impressions", where {outcome} is leads,
+    or clicks outside lead generation;
+  - "Level, not yet distinguishable (adjusted p = …); more impressions per variant needed: not
+    estimable (no observed difference)" when the observed rates are identical, so neither
+    variant is ahead;
   - "{A} ahead, not yet distinguishable (adjusted p = …); about {n} more impressions per variant
     needed at the observed difference";
-  - the figure replaced by "not estimable" with its reason when the observed rates are identical
-    ("no observed difference"), a variant has zero impressions ("a variant has zero
-    impressions"), or the target power cannot be reached ("target power unreachable at the
-    observed difference").
+  - "{A} ahead, not yet distinguishable (adjusted p = …); more impressions per variant needed:
+    not estimable (target power unreachable at the observed difference)" when no sample reaches
+    `cr.power` at the observed difference.
 - **Reason and extra output**: each variant's rate with its counts, the test, its raw p-value,
   the Holm-adjusted p-value across the campaign's pairs and `cr.alpha`, also recorded in
   `evidence.test`. A pair that is not distinguishable carries `not_distinguishable`; no other
@@ -1112,23 +1175,35 @@ baseline".
   the baseline at `cr.alpha` (default 0.05) and `cr.power` (default 0.8), in the stage's own
   denominator: impressions for click and open rate, form opens for completion rate.
 - **Action**: "Next test: change only {variable}; keep everything else identical; 2 variants;
-  {n} {unit} per variant to detect a 20% lift (α 0.05, power 0.8)", followed by:
+  {n} {unit} per variant to detect a {lift} lift (α {alpha}, power {power})", where {lift} is
+  `cr.target_lift` as a percentage and {alpha} and {power} are `cr.alpha` and `cr.power`, each
+  written without trailing zeros. At the shipped defaults, for example, the sample clause reads
+  "{n} {unit} per variant to detect a 20% lift (α 0.05, power 0.8)". Each further part follows
+  after "; ", in this order:
   - for completion rate, "≈ {n ÷ observed open rate} impressions per variant (projected through
     the observed open rate)";
-  - "≈ {days} days at current per-variant delivery (projection)".
-- **Not estimable**: the sample is replaced by "sample per variant not estimable ({reason})" when
-  the stage has "zero exposure", the "baseline rate is 0", the target is above 100% ("target
-  above 100%": baseline × (1 + `cr.target_lift`) exceeds 100%), or the "account baseline
-  unavailable".
+  - "≈ {days} days at current per-variant delivery (projection)", or "delivery projection not
+    estimable (zero exposure)" when the current per-variant delivery is zero or unknown, or, for
+    completion rate, when the observed open rate is zero or unavailable, which also leaves out
+    the impressions projection.
+- **Not estimable**: the sample and its projections are replaced by "sample per variant not
+  estimable ({reason})". The reasons, in the order they are checked: "zero exposure" (the
+  stage's own denominator is 0 across the variants), "account baseline unavailable", "baseline
+  rate is 0", "target above 100%" (baseline × (1 + `cr.target_lift`) exceeds 100%) and "target
+  power unreachable at the observed difference" (no sample attains `cr.power`).
 - **Reason and extra output**: the `CR2` sentence; `extra.weak_stage` and `extra.next_test` (stage,
   variable, elements kept unchanged, unit, baseline, target, sample needed, projections).
 - **Ranking**: first in its campaign group.
 
 ## White papers
 
-Section `white_papers`, one group per LinkedIn account currency (`cohort:{currency}`). Every
-asset row of every cohort yields exactly one item, `W1`, `W2` or `W`, so the table lists every
-white paper.
+Section `white_papers`, one group per LinkedIn account currency (`cohort:{currency}`). An asset
+row exists for each asset and currency that asset resolution maps a window input to: a creative
+with daily LinkedIn creative rows in the window (even at zero spend), or a lead submitted in the
+window, each in its campaign's account currency. Every asset row of every cohort yields exactly one
+item, `W1`, `W2` or `W`. A registered white paper that no window creative row or lead resolves to
+has no row: it is absent from the table, not listed with zeros. An asset appears only in the
+currency cohorts its inputs fall in.
 
 **Every white paper item**: depends on every campaign whose spend feeds the row (P1 holds), has
 no decision subject ("Mark done"), and is tested in
@@ -1230,23 +1305,35 @@ The event time is specific to each event type:
   in the stage before the anchor are excluded and reported as "N already MQL/QL before this
   touch".
 - **Meetings**: HubSpot records no booking instant, so booking time is proxied by the meeting
-  record's creation (`hs_createdate`), labelled "booked (record created)". A meeting counts as
-  booked after the touch only when:
-  - its creation and its `hs_meeting_start_time` are both at or after the anchor;
+  record's creation (`hs_createdate`), labelled "booked (record created)". A meeting's
+  **resolved start** is its `hs_meeting_start_time`, or its `hs_timestamp` when that property is
+  empty (HubSpot sets `hs_timestamp` to a meeting's start). A meeting counts as booked after the
+  touch only when:
+  - its creation and its resolved start are both at or after the anchor, so a meeting created
+    after the touch but starting before it is excluded;
   - its outcome is not in `crm.meeting_outcome_exclusions` (default [CANCELED]);
   - its source is in `crm.booking_sources` (default [MEETINGS_PUBLIC]); for these sources the
     booking itself creates the record.
 
-  Meetings from other sources (imported, synced or logged) pass the same time checks but go to
-  "Other meetings (ordering unverified)", carry `meeting_time_proxy`, and are excluded from cost
-  per meeting.
+  A meeting with no creation time or no resolved start is not counted, nor is one created after
+  the run; a resolved start after the run time does not exclude a meeting. A meeting that
+  fails the time check for every contact it is associated with is excluded and reported
+  once, in `extra.already_before.meetings` of the currency row of the earliest anchor among
+  those contacts.
+
+  Meetings from other sources (imported, synced or logged) pass the same time and outcome checks
+  (only the booking-source condition differs) but go to "Other meetings (ordering unverified)",
+  carry `meeting_time_proxy`, and are excluded from cost per meeting.
 - **Deals** count only when `createdate`, the deal's creation time, is at or after the anchor.
 
 ### Credit and de-duplication
 
 - Every event (MQL, QL, meeting, deal) is credited once per asset, to the creative of the
-  contact's latest touch with that asset at or before the event time. A touch without a creative
-  is credited to the "unknown creative" row.
+  contact's latest touch with that asset at or before the event's credit time: the bound stage
+  date for MQL and QL, the creation (`createdate`) for a deal, and for a meeting the earlier of
+  its creation and its resolved start. A touch after either the meeting's creation or its
+  resolved start therefore never receives that meeting, even when it precedes the other instant.
+  A touch without a creative is credited to the "unknown creative" row.
 - A contact contributes at most one MQL and one QL per asset. Meetings and deals count once per
   distinct object; an event associated with several contacts counts once, credited to the latest
   qualifying touch across those contacts.
@@ -1266,13 +1353,19 @@ Each asset row, and each of its per-creative rows, shows these metrics in this c
 | MQL ({bound label}) | `mql` | Contacts entering the MQL stage at or after the anchor |
 | Qualified Lead | `ql` | Contacts entering the QL stage at or after the anchor |
 | Meetings booked | `meetings_booked` | Booking-source meetings that pass the causal check |
-| Other meetings (ordering unverified) | `other_meetings` | Other-source meetings that pass the time checks |
+| Other meetings (ordering unverified) | `other_meetings` | Other-source meetings that pass the time and outcome checks |
 | Deals after touch | `deals_after_touch` | Deals created at or after the anchor |
 | Cost per Qualified Lead | `cost_per_ql` | Spend ÷ QL |
 | Cost per meeting | `cost_per_meeting` | Spend ÷ meetings booked |
 
 - When the known denominator is 0, the cost is "—" with "no QL yet" or "no meetings yet". It is
   never a finite value or a "≤ X" ceiling.
+- When the QL or meetings-booked count is unavailable, the cost is "unavailable", never "—" or a
+  value, with the note "Qualified Lead count unavailable" or "meeting count unavailable".
+- **Unknown creative**: spend is attributed only to known creatives, so the "unknown creative"
+  row has no spend and its costs are never computed, whatever its QL or meeting count. Each cost
+  shows "—" with the note "spend is attributed only to known creatives", or "unavailable" with
+  the note above when its count is unavailable. It is never a zero cost or a "≤ X" ceiling.
 - **Never blended**: MQL and QL are separate columns, and no field, total or sort key combines
   them. LinkedIn leads are labelled a platform count. Cost per lead is computed only against QL.
 
@@ -1333,8 +1426,9 @@ a "≥ N" floor.
 
 ### W No change warranted or insufficient data
 
-`W` is the rule id of an asset row with no `W1` or `W2` action, so the table always lists every
-white paper with its numbers.
+`W` is the rule id of an asset row with no `W1` or `W2` action, so such a row still gets an item
+showing its numbers. A registered white paper without an asset row (no window creative row or
+lead resolves to it) has no item and is absent rather than listed with zeros.
 
 - **"Insufficient data"**: every row of a cohort shows it when the cohort's assets together have
   fewer than `w.cohort_min_total_ql` (default 3) QL, the QL count is unavailable, or no asset

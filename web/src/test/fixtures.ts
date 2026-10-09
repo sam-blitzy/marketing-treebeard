@@ -30,13 +30,21 @@
  *   `backend/src/ads_engine/analysis/*.py` and `api/routes/*.py` render, for example
  *   "Raise daily budget from USD 200.00 to USD 240.00", so a component test asserts on text the
  *   API really sends.
+ * - **Page items carry the thresholds precedence freezes.** Every item's `evidence.thresholds`
+ *   lists its rule's own keys, then `sources.stale_after_hours` and `window.trusted_min_days`,
+ *   which precedence records on every item whether or not it comes out stale or short (C0
+ *   carries only those two). A bare `makeEvidence()` records none, for tests of absent fields;
+ *   findings and withheld lines never pass precedence and keep only their rule's keys.
  *
  * The default recommendations page ({@link makeRecommendationsPage}) carries every card variant
  * the `/actions` sections render: the K1/K2/K3 keyword cards, the pinned C0 discrepancy, a pause
  * card, a held card, a C2 "Hold", a C3b launch idea, a B1 increase funded partly by a B3
  * reallocation from a shared budget, a CR3 next-test card, a historical CR1 pair, and white-paper
- * rows under a floor, without a decision, and with an unavailable count. Tests find cards by
- * {@link FIXTURE_ITEM_IDS}, never by array position.
+ * rows under a floor (with a meeting of unverified ordering), without a decision, and with an
+ * unavailable count. Tests find cards by {@link FIXTURE_ITEM_IDS}, never by array position.
+ * Beside the page, {@link FIXTURE_FLAGS} holds one flag of each of the fifteen codes
+ * ({@link makeFlag}), and {@link makeCompletionRateTestItem} builds the completion-rate CR3 card,
+ * whose sample in form opens carries a labelled projection ({@link makeProjectedSample}).
  *
  * @example
  * ```ts
@@ -71,6 +79,7 @@ import type {
   FeedbackKind,
   Finding,
   Flag,
+  FlagCode,
   Group,
   Item,
   ItemOverlay,
@@ -82,6 +91,7 @@ import type {
   RecommendationsPage,
   Resolution,
   Run,
+  Sample,
   Section,
   SectionKey,
   Source,
@@ -159,8 +169,8 @@ export const FIXTURE_DATASET_IDS = Object.freeze({
 
 /**
  * Internal campaign ids (`campaign.id`) used by decision subjects, discrepancies and evidence.
- * Google campaigns are in USD; LinkedIn campaigns are in EUR (`pipelineEmea`, `attributionEmea`)
- * and USD (`benchmarksUs`).
+ * Google campaigns are in USD; LinkedIn campaigns are in EUR (`pipelineEmea`, `attributionEmea`,
+ * `benchmarksEmea`) and USD (`benchmarksUs`).
  */
 export const FIXTURE_CAMPAIGN_IDS = Object.freeze({
   /** Google "Brand Search — US": the C0 discrepancy subject, own daily budget. */
@@ -183,6 +193,11 @@ export const FIXTURE_CAMPAIGN_IDS = Object.freeze({
   pipelineEmea: 501,
   /** LinkedIn "Lead Gen — Attribution EMEA" (EUR): the "No change warranted" white paper. */
   attributionEmea: 502,
+  /**
+   * LinkedIn "Lead Gen — Benchmarks EMEA" (EUR): the completion-rate next test of
+   * {@link makeCompletionRateTestItem}; no default-page item names it.
+   */
+  benchmarksEmea: 503,
   /** LinkedIn "Lead Gen — Benchmarks US" (USD): the C2 "Hold" and the USD white paper. */
   benchmarksUs: 601,
 } as const);
@@ -245,6 +260,13 @@ export const FIXTURE_ITEM_IDS = Object.freeze({
   /** W "Insufficient data" on "Paid Media Benchmarks 2026", USD cohort, MQL unavailable. */
   wUsd: 1403,
 } as const);
+
+/**
+ * The id of {@link makeCompletionRateTestItem}, the completion-rate CR3 card. It is outside
+ * {@link FIXTURE_ITEM_IDS} and the {@link makeItem} default, so the card can join the default
+ * page without a collision.
+ */
+export const FIXTURE_COMPLETION_TEST_ITEM_ID: Item['id'] = 1303;
 
 /**
  * The resolutions offered for each discrepancy kind, in the fixed display order
@@ -332,6 +354,9 @@ const ADMIN_EMAIL = 'admin@example.com';
 /** Why the optional Google-to-CRM link is unavailable in the fixture world (AAP 0.3.3). */
 const GOOGLE_LINK_UNCONFIGURED =
   'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY are not configured';
+
+/** Why an unavailable MQL count is unavailable in the fixture. */
+const MQL_UNAVAILABLE_REASON = 'MQL stage "First meeting booked" not resolved';
 
 /**
  * When the 03:00 entity syncs finished: Google's run detected the fixture discrepancy then
@@ -437,7 +462,7 @@ function flag(code: Flag['code'], message: string): Flag {
 
 /** The `simulated` flag the run records on every item of a simulated dataset (P3). */
 function simulatedFlag(): Flag {
-  return flag('simulated', 'Simulated data');
+  return makeFlag('simulated');
 }
 
 /** Which read-time states {@link currentFor} adds to an item. */
@@ -463,12 +488,10 @@ function currentFor(sources: readonly SourceName[], options: CurrentOptions = {}
     ),
   ];
   if (options.incomplete === true) {
-    flagsNow.push(
-      flag('incomplete', `Incomplete: google.search_terms (${SEARCH_TERMS_INCOMPLETE})`),
-    );
+    flagsNow.push(makeFlag('incomplete'));
   }
   if (options.c0 !== true) {
-    flagsNow.push(flag('unverified_discrepancies', 'Unverified while 1 discrepancies are open'));
+    flagsNow.push(makeFlag('unverified_discrepancies'));
   }
   return makeItemOverlay({
     held_now: options.held === true,
@@ -571,7 +594,9 @@ function thresholdsTree(): Record<string, Record<string, unknown>> {
 
 /**
  * `{dotted key: configured value}` for exactly `keys`, as a rule copies them into
- * `evidence.thresholds` (`Thresholds.subset`).
+ * `evidence.thresholds` (`Thresholds.subset`). This is a rule's own record, before precedence:
+ * findings and withheld lines keep it as it is, while a page item's evidence is built with
+ * {@link itemThresholds}, which adds the policy keys precedence freezes.
  *
  * @throws RangeError when a key is not in {@link thresholdsTree}, so a misspelt key fails the
  *   first test that builds the page instead of rendering an empty threshold.
@@ -593,6 +618,164 @@ function thresholdSubset(...keys: readonly string[]): Record<string, unknown> {
   return subset;
 }
 
+/**
+ * The policy thresholds precedence freezes into every item's `evidence.thresholds`, in the order
+ * it appends them: P4 judges each required dataset against `sources.stale_after_hours`
+ * (`precedence._apply_data_state`, on every item that reads a dataset) and P5 the window against
+ * `window.trusted_min_days` (`precedence._apply_short_window`, on every item), whether or not the
+ * item comes out stale or short.
+ */
+const PRECEDENCE_THRESHOLD_KEYS: readonly string[] = Object.freeze([
+  'sources.stale_after_hours',
+  'window.trusted_min_days',
+]);
+
+/**
+ * A page item's `evidence.thresholds`: the rule's own `keys` ({@link thresholdSubset}) in their
+ * order, followed by each of {@link PRECEDENCE_THRESHOLD_KEYS} the rule did not record, with its
+ * configured value from {@link thresholdsTree}. A key the rule already records keeps its place,
+ * as `precedence._with_applied_thresholds` leaves it.
+ *
+ * @throws RangeError when a key is not in {@link thresholdsTree}
+ */
+function itemThresholds(...keys: readonly string[]): Record<string, unknown> {
+  const thresholds = thresholdSubset(...keys);
+  for (const [key, value] of Object.entries(thresholdSubset(...PRECEDENCE_THRESHOLD_KEYS))) {
+    if (!Object.hasOwn(thresholds, key)) {
+      thresholds[key] = value;
+    }
+  }
+  return thresholds;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flag catalogue
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every flag code, in the backend's badge order (`analysis.context.FLAG_CODES`; AAP 0.5.3
+ * `Flag`): data state, discrepancies, attribution, pipeline and statistics, then budget scope.
+ * Deep-frozen; equal to the keys of {@link FIXTURE_FLAGS}, in the same order.
+ */
+export const FIXTURE_FLAG_CODES: readonly FlagCode[] = Object.freeze([
+  'simulated',
+  'stale',
+  'incomplete',
+  'short_window',
+  'unverified_discrepancies',
+  'attribution_floor',
+  'creative_floor',
+  'deal_floor',
+  'unknown_crm_evidence',
+  'meeting_time_proxy',
+  'pipeline_unavailable',
+  'no_crm_link',
+  'not_distinguishable',
+  'search_term_coverage',
+  'shared_budget',
+] as const);
+
+/** A catalogue entry: a flag filed under its own code. */
+type CatalogueFlag<K extends FlagCode> = Readonly<Flag & { code: K }>;
+
+/**
+ * One deep-frozen flag per code, with the message the backend renders for it in the fixture
+ * world (window {@link FIXTURE_WINDOW}, computed at {@link FIXTURE_COMPUTED_AT}). A missing code,
+ * or an entry filed under another code, fails `npm run typecheck`. Shares render as
+ * `attribution._percent` does: at most one decimal, trailing zeros dropped.
+ *
+ * - The nine codes the default page carries reuse its texts, and the page's cards draw them from
+ *   here: `simulated`, `incomplete` (`google.search_terms`), `unverified_discrepancies` (one
+ *   open discrepancy), `attribution_floor` (the EUR white paper), `pipeline_unavailable` (the
+ *   unresolved MQL stage), `no_crm_link`, `not_distinguishable` (the CR1 pair),
+ *   `search_term_coverage` (74%) and `shared_budget` (the B3 donor).
+ * - `stale`: `google.metrics_daily` last succeeded at 2026-10-04 05:31 UTC, more than
+ *   `sources.stale_after_hours` (24) before the run, and covers only through 2026-10-03
+ *   (`precedence._stale_flag`).
+ * - `short_window`: a 10-day window, the same text as the short-window banner of
+ *   {@link FIXTURE_BANNERS} (`precedence._apply_short_window`).
+ * - `creative_floor`: 12 of 96 leads without a creative (12.5%).
+ * - `deal_floor`: 1 of 4 assessed deals without a contact (25%); an incomplete deal search
+ *   renders the share "unknown (N deals not assessed)" instead (`attribution._orphan_deals`).
+ * - `unknown_crm_evidence`: the white-paper form, 2 of 20 matched contacts (10%). Campaign and
+ *   budget cards, judged on the pipeline-veto population, word it "Unknown CRM evidence for {n}
+ *   of {m} eligible contacts" (`campaigns._veto_flags`).
+ * - `meeting_time_proxy`: the EUR white paper's one other meeting (ordering unverified).
+ */
+export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.freeze({
+  simulated: Object.freeze({ code: 'simulated', message: 'Simulated data' } satisfies Flag),
+  stale: Object.freeze({
+    code: 'stale',
+    message: 'Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+  } satisfies Flag),
+  incomplete: Object.freeze({
+    code: 'incomplete',
+    message: `Incomplete: google.search_terms (${SEARCH_TERMS_INCOMPLETE})`,
+  } satisfies Flag),
+  short_window: Object.freeze({
+    code: 'short_window',
+    message: 'Window of 10 days is below the 14-day trusted minimum',
+  } satisfies Flag),
+  unverified_discrepancies: Object.freeze({
+    code: 'unverified_discrepancies',
+    message: 'Unverified while 1 discrepancies are open',
+  } satisfies Flag),
+  attribution_floor: Object.freeze({
+    code: 'attribution_floor',
+    message: 'Floor: 12% of leads unmatched in HubSpot',
+  } satisfies Flag),
+  creative_floor: Object.freeze({
+    code: 'creative_floor',
+    message: 'Per-creative breakdown is a floor: 12.5% of leads have no creative',
+  } satisfies Flag),
+  deal_floor: Object.freeze({
+    code: 'deal_floor',
+    message: 'Deal counts are a floor: orphan-deal share 25% (1 of 4 deals without a contact)',
+  } satisfies Flag),
+  unknown_crm_evidence: Object.freeze({
+    code: 'unknown_crm_evidence',
+    message: 'Floor: CRM evidence unknown for 10% of matched contacts (2 of 20)',
+  } satisfies Flag),
+  meeting_time_proxy: Object.freeze({
+    code: 'meeting_time_proxy',
+    message:
+      '1 other meetings (ordering unverified): booking time is proxied by record creation, so ' +
+      'they are excluded from cost per meeting',
+  } satisfies Flag),
+  pipeline_unavailable: Object.freeze({
+    code: 'pipeline_unavailable',
+    message: `Pipeline unavailable: ${MQL_UNAVAILABLE_REASON}`,
+  } satisfies Flag),
+  no_crm_link: Object.freeze({
+    code: 'no_crm_link',
+    message: `No CRM link: ${GOOGLE_LINK_UNCONFIGURED}`,
+  } satisfies Flag),
+  not_distinguishable: Object.freeze({
+    code: 'not_distinguishable',
+    message: 'Not yet distinguishable (adjusted p = 0.21)',
+  } satisfies Flag),
+  search_term_coverage: Object.freeze({
+    code: 'search_term_coverage',
+    message: 'Low search-term coverage: 74% of keyword spend',
+  } satisfies Flag),
+  shared_budget: Object.freeze({
+    code: 'shared_budget',
+    message: 'Shared budget across 2 campaigns: decided at budget level',
+  } satisfies Flag),
+} satisfies { readonly [K in FlagCode]: CatalogueFlag<K> });
+
+/**
+ * The {@link FIXTURE_FLAGS} flag of `code`, for example `makeFlag('stale')` on a card whose
+ * data is stale, or `makeFlag('short_window')` on every item of a short-window page.
+ *
+ * @param code - the flag code
+ * @param overrides - fields to replace (shallow), typically `message`
+ * @returns a fresh `Flag`
+ */
+export function makeFlag(code: FlagCode, overrides: Partial<Flag> = {}): Flag {
+  const base = { ...FIXTURE_FLAGS[code] } satisfies Flag;
+  return { ...base, ...overrides };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Scalar builders
@@ -1422,7 +1605,7 @@ function coverageExtra(): Record<string, unknown> {
 
 /** The low-coverage flag every keyword item of the account carries (below 80%). */
 function coverageFlag(): Flag {
-  return flag('search_term_coverage', 'Low search-term coverage: 74% of keyword spend');
+  return makeFlag('search_term_coverage');
 }
 
 /** The money metrics of the Google account, in USD. */
@@ -1475,7 +1658,7 @@ function keywordsSection(): Section {
         baseline('baseline_clicks', 'Baseline clicks', 5000),
       ],
       sample: { observed: 64, required: 37, unit: 'clicks', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'k1.baseline_days',
         'k1.min_clicks_floor',
         'k1.rule_of_three',
@@ -1531,7 +1714,7 @@ function keywordsSection(): Section {
         baseline('max_cost_per_conversion', 'Highest qualifying cost/conversion (USD)', '84.00'),
       ],
       sample: { observed: '4', required: '3', unit: 'conversions', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'k2.min_conversions',
         'k2.max_cpa_ratio',
         'k2.adjacent_jaccard',
@@ -1623,7 +1806,7 @@ function keywordsSection(): Section {
         metric('clicks_second_half', 'Clicks, second half', 270, 'clicks'),
       ],
       sample: { observed: 250, required: 30, unit: 'clicks per half', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'k3.min_window_days',
         'window.sustained_min_days',
         'k3.min_clicks_per_half',
@@ -1678,7 +1861,7 @@ function keywordsSection(): Section {
 
 /** The `no_crm_link` flag of Google items while the Google-to-CRM link is not configured. */
 function noCrmLinkFlag(): Flag {
-  return flag('no_crm_link', `No CRM link: ${GOOGLE_LINK_UNCONFIGURED}`);
+  return makeFlag('no_crm_link');
 }
 
 /** What a C1 pause card shows (`campaigns._c1_candidate`). */
@@ -1702,7 +1885,7 @@ interface PauseSpec {
 function pauseItem(spec: PauseSpec): Item {
   const flags = [simulatedFlag(), noCrmLinkFlag()];
   if (spec.held) {
-    flags.push(flag('unverified_discrepancies', 'Unverified while 1 discrepancies are open'));
+    flags.push(makeFlag('unverified_discrepancies'));
   }
   return makeItem({
     id: spec.id,
@@ -1740,7 +1923,7 @@ function pauseItem(spec: PauseSpec): Item {
         unit: 'expected conversions',
         projected: null,
       },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'c1.min_window_days',
         'c1.min_spend_day_share',
         'c1.min_expected_outcomes',
@@ -1776,6 +1959,9 @@ function campaignsSection(): Section {
         metric('platform', 'Platform', 'paused', 'status'),
         metric('decided', 'Last decided', 'active', 'status'),
       ],
+      // C0 records no threshold of its own; precedence still freezes the policy keys, because
+      // the discrepancy reads google.entities.
+      thresholds: itemThresholds(),
       datasets: coverage('google.entities'),
       // mirrors backend/src/ads_engine/analysis/discrepancy.py (_candidate)
       extra: {
@@ -1869,7 +2055,7 @@ function campaignsSection(): Section {
         ),
       ],
       sample: { observed: 26, required: 20, unit: 'eligible contacts', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'scale.min_outcomes',
         'scale.max_cpa_ratio',
         'b1.step',
@@ -1922,7 +2108,7 @@ function campaignsSection(): Section {
         metric('cost_per_conversion', 'Cluster cost per conversion', '41.00', 'currency', USD),
       ],
       sample: { observed: '7', required: 5, unit: 'conversions', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'c3b.jaccard',
         'c3b.min_terms',
         'c3b.min_conversions',
@@ -2029,7 +2215,7 @@ function budgetSection(): Section {
         baseline('max_cost_per_outcome', 'Highest cost per outcome allowed to scale', '95.00'),
       ],
       sample: { observed: 26, required: 7, unit: 'known-budget days', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         ...BUDGET_GATE_KEYS,
         'b1.step',
         'scale.min_outcomes',
@@ -2146,7 +2332,7 @@ function budgetSection(): Section {
         ),
       ],
       sample: { observed: 24, required: 7, unit: 'budget-active days', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         ...BUDGET_GATE_KEYS,
         'b3.spend_percentile',
         'b3.headroom',
@@ -2216,7 +2402,7 @@ function budgetSection(): Section {
     flags: [
       simulatedFlag(),
       noCrmLinkFlag(),
-      flag('shared_budget', 'Shared budget across 2 campaigns: decided at budget level'),
+      makeFlag('shared_budget'),
     ],
     // A shared budget's decision is written on the budget subject, never on its members.
     decision_subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.display },
@@ -2294,7 +2480,7 @@ function creativeSection(): Section {
         baseline('completion_rate_baseline', 'Account completion rate baseline', '0.34'),
       ],
       sample: { observed: 12400, required: 1000, unit: 'impressions', projected: null },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'cr.min_impressions',
         'cr.min_variants',
         'cr.alpha',
@@ -2425,7 +2611,7 @@ function creativeSection(): Section {
       ],
       sample: { observed: 1200, required: 1000, unit: 'impressions', projected: null },
       test: { name: 'fisher_exact', p_value: '0.21', p_adjusted: '0.21', alpha: '0.05' },
-      thresholds: thresholdSubset(
+      thresholds: itemThresholds(
         'cr.min_impressions',
         'cr.alpha',
         'cr.power',
@@ -2462,10 +2648,7 @@ function creativeSection(): Section {
         currency: 'EUR',
       },
     }),
-    flags: [
-      simulatedFlag(),
-      flag('not_distinguishable', 'Not yet distinguishable (adjusted p = 0.21)'),
-    ],
+    flags: [simulatedFlag(), makeFlag('not_distinguishable')],
     current: {
       ...currentFor(['linkedin']),
       held_now: true,
@@ -2485,6 +2668,284 @@ function creativeSection(): Section {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Off the default page: a completion-rate next test (LinkedIn, EUR)
+// ---------------------------------------------------------------------------------------------
+
+/** How CR3 projects a form-open sample to impressions (`creative.NextTestPlan.to_json`). */
+const OPEN_RATE_BASIS = 'projected through the observed open rate';
+
+/**
+ * The figures of the completion-rate next test for "Lead Gen — Benchmarks EMEA", computed with
+ * `creative.plan_next_test` at the shipped `cr.*` values (α 0.05, power 0.8, lift 20%). Its two
+ * variants pooled 976 form opens over 81,200 impressions (observed open rate 0.012020); detecting
+ * a lift of the account completion baseline 0.34 to 0.408 needs 794 form opens per variant
+ * (`stats.required_n`), which is ⌈794 × 81,200 ÷ 976⌉ = 66,059 impressions per variant, and
+ * ⌈66,059 ÷ 1,450⌉ = 46 days at the current 1,450 impressions per variant per day.
+ */
+const COMPLETION_TEST = Object.freeze({
+  pooledFormOpens: 976,
+  formOpensPerVariant: 794,
+  impressionsPerVariant: 66059,
+  days: 46,
+});
+
+/**
+ * A completion-rate sample in the tested stage's own denominator, form opens, with its labelled
+ * projection to impressions (AAP 0.5.3 `Evidence.sample.projected`, 0.5.4.6 CR3, 0.5.4.8): the
+ * 976 form opens the variants pooled against the 794 form opens per variant the next test needs,
+ * and "≈ 66,059 impressions (projected through the observed open rate)", the figures of
+ * {@link makeCompletionRateTestItem}. The projection is a fresh object on every call.
+ *
+ * @param overrides - fields to replace (shallow), for example `{ projected: null }`
+ * @returns a fresh `Sample`
+ */
+export function makeProjectedSample(overrides: Partial<Sample> = {}): Sample {
+  const base = {
+    observed: COMPLETION_TEST.pooledFormOpens,
+    required: COMPLETION_TEST.formOpensPerVariant,
+    unit: 'form opens',
+    projected: {
+      value: COMPLETION_TEST.impressionsPerVariant,
+      unit: 'impressions',
+      basis: OPEN_RATE_BASIS,
+    },
+  } satisfies Sample;
+  return { ...base, ...overrides };
+}
+
+/**
+ * A CR3 next-test card (with CR2's weak stage as its reason) whose tested stage is the
+ * completion rate, on "Lead Gen — Benchmarks EMEA" ({@link FIXTURE_CAMPAIGN_IDS}.benchmarksEmea,
+ * EUR, simulated): change only the number of form questions, 794 form opens per variant,
+ * projected to ≈ 66,059 impressions and ≈ 46 days. Every text and figure is what
+ * `analysis/creative.py` (`_test_candidate`, `NextTestPlan.action` and `to_json`) renders for
+ * these variants, and the sample, metrics and `extra.next_test` cite the same figures.
+ *
+ * Its `evidence.sample` is the tested stage's sample in form opens with the labelled projection
+ * ({@link makeProjectedSample}), so the card's sample line renders the projection. The analysis
+ * module's CR3 instead freezes its variant minimum (the smallest variant's impressions against
+ * `cr.min_impressions`) as `sample`, and carries the same projection in its metrics
+ * (`projected_impressions_per_variant`) and in `extra.next_test.projected`.
+ *
+ * The card is not on the default page. Its id ({@link FIXTURE_COMPLETION_TEST_ITEM_ID}),
+ * campaign and entity name are used by no default-page item, so it can join one.
+ *
+ * @example
+ * ```ts
+ * // Add the card to the creative section in its own campaign block (ranked by spend: first).
+ * const page = makeRecommendationsPage();
+ * page.sections
+ *   .find((section) => section.key === 'creative')
+ *   ?.groups.unshift(
+ *     makeGroup({
+ *       key: `campaign:${String(FIXTURE_CAMPAIGN_IDS.benchmarksEmea)}`,
+ *       title: 'Lead Gen — Benchmarks EMEA',
+ *       items: [makeCompletionRateTestItem()],
+ *     }),
+ *   );
+ * ```
+ *
+ * @param overrides - fields to replace (shallow)
+ * @returns a fresh `Item`
+ */
+export function makeCompletionRateTestItem(overrides: Partial<Item> = {}): Item {
+  const base = {
+    id: FIXTURE_COMPLETION_TEST_ITEM_ID,
+    rank: 1,
+    rule_id: 'CR3',
+    action:
+      'Next test: change only number of form questions; keep everything else identical; 2 ' +
+      'variants; 794 form opens per variant to detect a 20% lift (α 0.05, power 0.8); ' +
+      `≈ 66,059 impressions per variant (${OPEN_RATE_BASIS}); ≈ 46 days at current ` +
+      'per-variant delivery (projection)',
+    reason: 'Completion rate is below account baseline: 24.18% [21.60%–26.96%] vs 34.00%',
+    entity: entity('linkedin', 'campaign', '700000503', 'Lead Gen — Benchmarks EMEA'),
+    evidence: makeEvidence({
+      metrics: [
+        metric('click_rate', 'Click rate', '0.006158', 'ratio'),
+        metric('open_rate', 'Open rate', '0.012020', 'ratio'),
+        metric('completion_rate', 'Completion rate', '0.241803', 'ratio'),
+        metric('completion_rate_ci_low', 'Completion rate interval low', '0.215987', 'ratio'),
+        metric('completion_rate_ci_high', 'Completion rate interval high', '0.269644', 'ratio'),
+        metric(
+          'sample_per_variant',
+          'Form opens per variant for the next test',
+          COMPLETION_TEST.formOpensPerVariant,
+          'form opens',
+        ),
+        metric(
+          'projected_impressions_per_variant',
+          `Impressions per variant (${OPEN_RATE_BASIS})`,
+          COMPLETION_TEST.impressionsPerVariant,
+          'impressions',
+        ),
+        metric(
+          'projected_days',
+          'Days at current per-variant delivery (projection)',
+          COMPLETION_TEST.days,
+          'days',
+        ),
+        metric('variants', 'Variants', 2, 'variants'),
+        metric('campaign_spend', 'Campaign spend', '3996.00', 'currency', EUR),
+      ],
+      baselines: [
+        baseline('click_rate_baseline', 'Account click rate baseline', '0.006100'),
+        baseline('open_rate_baseline', 'Account open rate baseline', '0.011500'),
+        baseline('completion_rate_baseline', 'Account completion rate baseline', '0.340000'),
+      ],
+      sample: makeProjectedSample(),
+      // creative.CR3_THRESHOLD_KEYS, in its order
+      thresholds: itemThresholds(
+        'cr.min_impressions',
+        'cr.min_variants',
+        'cr.ci_level',
+        'cr.alpha',
+        'cr.power',
+        'cr.target_lift',
+      ),
+      datasets: coverage('linkedin.analytics_daily', 'linkedin.entities'),
+      provenance: linkedinProvenance(false),
+      // mirrors backend/src/ads_engine/analysis/creative.py (_test_candidate, _variant_row,
+      // _Measure.to_json, _weak_stage_json, NextTestPlan.to_json)
+      extra: {
+        campaign: {
+          id: FIXTURE_CAMPAIGN_IDS.benchmarksEmea,
+          external_id: '700000503',
+          name: 'Lead Gen — Benchmarks EMEA',
+          objective_group: 'linkedin_lead_gen',
+        },
+        variant_count: 2,
+        variants: [
+          {
+            creative_id: 1701,
+            urn: 'urn:li:sponsoredCreative:990001701',
+            name: 'Benchmarks Variant A',
+            headline: 'Benchmark your paid media against 300 EMEA teams',
+            cta_label: 'Download',
+            impressions: 42000,
+            clicks: 264,
+            form_opens: 504,
+            leads: 126,
+            click_rate: '0.006286',
+            open_rate: '0.012000',
+            completion_rate: '0.250000',
+            cost: '2016.00',
+            currency: 'EUR',
+            outcomes: 126,
+            cost_per_outcome: '16.00',
+            delivery_days: 28,
+          },
+          {
+            creative_id: 1702,
+            urn: 'urn:li:sponsoredCreative:990001702',
+            name: 'Benchmarks Variant B',
+            headline: 'Paid Media Benchmarks 2026: the EMEA edition',
+            cta_label: 'Download',
+            impressions: 39200,
+            clicks: 236,
+            form_opens: 472,
+            leads: 110,
+            click_rate: '0.006020',
+            open_rate: '0.012041',
+            completion_rate: '0.233051',
+            cost: '1980.00',
+            currency: 'EUR',
+            outcomes: 110,
+            cost_per_outcome: '18.00',
+            delivery_days: 28,
+          },
+        ],
+        excluded: [],
+        stages: [
+          {
+            stage: 'click_rate',
+            label: 'Click rate',
+            successes: 500,
+            trials: 81200,
+            unit: 'impressions',
+            rate: '0.006158',
+            ci_low: '0.005642',
+            ci_high: '0.006720',
+            baseline: '0.006100',
+            weak: false,
+            shortfall: '-0.009508',
+            unmeasured: null,
+          },
+          {
+            stage: 'open_rate',
+            label: 'Open rate',
+            successes: COMPLETION_TEST.pooledFormOpens,
+            trials: 81200,
+            unit: 'impressions',
+            rate: '0.012020',
+            ci_low: '0.011293',
+            ci_high: '0.012793',
+            baseline: '0.011500',
+            weak: false,
+            shortfall: '-0.045217',
+            unmeasured: null,
+          },
+          {
+            stage: 'completion_rate',
+            label: 'Completion rate',
+            successes: 236,
+            trials: COMPLETION_TEST.pooledFormOpens,
+            unit: 'form opens',
+            rate: '0.241803',
+            ci_low: '0.215987',
+            ci_high: '0.269644',
+            baseline: '0.340000',
+            weak: true,
+            shortfall: '0.288815',
+            unmeasured: null,
+          },
+        ],
+        weak_stage: {
+          stage: 'completion_rate',
+          label: 'Completion rate',
+          rate: '0.241803',
+          interval: ['0.215987', '0.269644'],
+          baseline: '0.340000',
+          shortfall: '0.288815',
+          weak: true,
+          exploratory: false,
+        },
+        next_test: {
+          stage: 'completion_rate',
+          variable: 'form_questions',
+          variable_label: 'number of form questions',
+          keep_unchanged: ['headline', 'intro text', 'call-to-action label', 'offer'],
+          variants: 2,
+          unit: 'form opens',
+          baseline: '0.340000',
+          target: '0.408000',
+          sample_needed: COMPLETION_TEST.formOpensPerVariant,
+          not_estimable_reason: null,
+          projected: {
+            value: COMPLETION_TEST.impressionsPerVariant,
+            unit: 'impressions',
+            basis: OPEN_RATE_BASIS,
+          },
+          projected_unit: 'impressions',
+          observed_open_rate: '0.012020',
+          days: COMPLETION_TEST.days,
+          projection_reason: null,
+          exploratory: false,
+        },
+        campaign_spend: '3996.00',
+        currency: 'EUR',
+      },
+    }),
+    flags: [simulatedFlag()],
+    data_status: 'simulated',
+    held: false,
+    held_reason: null,
+    decision_subject: null,
+    current: currentFor(['linkedin']),
+  } satisfies Item;
+  return { ...base, ...overrides };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Default page: White papers (LinkedIn, one table per currency cohort)
@@ -2577,9 +3038,6 @@ interface CreditSpec {
   /** Whether the counts are attribution floors (and the costs ceilings). */
   readonly floor: boolean;
 }
-
-/** Why an unavailable MQL count is unavailable in the fixture. */
-const MQL_UNAVAILABLE_REASON = 'MQL stage "First meeting booked" not resolved';
 
 /** One row of `evidence.extra.rows` (`attribution.CreditRow.to_json`); MQL and QL stay apart. */
 function creditRow(
@@ -2701,7 +3159,7 @@ function whitePapersSection(): Section {
         ),
       ],
       sample: { observed: 6, required: 3, unit: 'Qualified Leads', projected: null },
-      thresholds: thresholdSubset(...WHITE_PAPER_THRESHOLD_KEYS),
+      thresholds: itemThresholds(...WHITE_PAPER_THRESHOLD_KEYS),
       datasets: coverage(...WHITE_PAPER_DATASETS),
       provenance: linkedinProvenance(true),
       // mirrors backend/src/ads_engine/analysis/white_papers.py (_row_extra, _decide_with_ql)
@@ -2773,7 +3231,8 @@ function whitePapersSection(): Section {
         blocked_campaigns: [],
       },
     }),
-    flags: [simulatedFlag(), flag('attribution_floor', 'Floor: 12% of leads unmatched in HubSpot')],
+    // Its one other meeting (ordering unverified) carries meeting_time_proxy (P8).
+    flags: [simulatedFlag(), makeFlag('attribution_floor'), makeFlag('meeting_time_proxy')],
     current: currentFor(['linkedin', 'hubspot']),
   });
 
@@ -2813,7 +3272,7 @@ function whitePapersSection(): Section {
       ],
       // P6: a QL count below W1's minimum is a failed gate, never the item's sample.
       sample: null,
-      thresholds: thresholdSubset(...WHITE_PAPER_THRESHOLD_KEYS),
+      thresholds: itemThresholds(...WHITE_PAPER_THRESHOLD_KEYS),
       datasets: coverage(...WHITE_PAPER_DATASETS),
       provenance: linkedinProvenance(true),
       // mirrors backend/src/ads_engine/analysis/white_papers.py (_row_extra, _no_change)
@@ -2886,7 +3345,7 @@ function whitePapersSection(): Section {
         floor: false,
       }),
       sample: null,
-      thresholds: thresholdSubset(...WHITE_PAPER_THRESHOLD_KEYS),
+      thresholds: itemThresholds(...WHITE_PAPER_THRESHOLD_KEYS),
       datasets: coverage(...WHITE_PAPER_DATASETS),
       provenance: linkedinProvenance(true),
       // mirrors backend/src/ads_engine/analysis/white_papers.py (_row_extra, _insufficiency)
@@ -2941,10 +3400,7 @@ function whitePapersSection(): Section {
         },
       },
     }),
-    flags: [
-      simulatedFlag(),
-      flag('pipeline_unavailable', `Pipeline unavailable: ${MQL_UNAVAILABLE_REASON}`),
-    ],
+    flags: [simulatedFlag(), makeFlag('pipeline_unavailable')],
     current: currentFor(['linkedin', 'hubspot']),
   });
 
@@ -3013,11 +3469,12 @@ const SECTION_BUILDERS: Readonly<Record<SectionKey, () => Section>> = Object.fre
  *
  * @example
  * ```ts
- * // A short custom window: add the short-window banner and flag the run.
- * makeRecommendationsPage({
+ * // A short custom window: flag the run, add the short-window banner, and flag every item (P5).
+ * const page = makeRecommendationsPage({
  *   run: makeRun({ id: CUSTOM_RUN_ID, kind: 'custom', days: 10, short_window: true }),
  *   banners: [...FIXTURE_BANNERS],
  * });
+ * pageItems(page).forEach((item) => item.flags.push(makeFlag('short_window')));
  * ```
  *
  * @param overrides - fields to replace (shallow)

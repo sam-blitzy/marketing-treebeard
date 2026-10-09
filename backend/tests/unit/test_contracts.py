@@ -18,6 +18,14 @@ guards the files themselves:
   without one must accept the minimal body built from its required members), and adding an
   undeclared top-level key, dropping a required one or answering with an unlisted status
   raises ``ContractViolation``, because ``additionalProperties`` defaults to false;
+* request omissions: every surface a client calls (all but the virtual Google ``row_*``
+  contracts) has a valid baseline request, rebuilt from the fixture manifest or, where the
+  manifest records none, from its contract's URL template, that passes ``validate_request`` and
+  is identified as its surface. Removing any one required header, query parameter or body
+  member its contract file lists, nested members inside objects and array items included
+  (``$.inputs[0].id``), raises ``ContractViolation`` naming that field, and
+  ``contract_checked_transport`` refuses the request before its handler runs, while the intact
+  baseline reaches the handler once;
 * cross-checks with code: the Google row contracts select exactly the GAQL templates' fields
   and declare each of them, the webhook body is exactly ``{customer_id, query, page_token}``
   with the documented limits, the Lead Sync projection equals the client's ``LEAD_FIELDS`` and
@@ -26,18 +34,22 @@ guards the files themselves:
 * captures: every redacted live capture under ``captured/`` names its surface, satisfies its
   contract and holds no email address in plaintext. Zero captures pass.
 
-Files are read from disk only: no test touches the network or a database.
+Files are read from disk only and requests go to an in-process ``MockTransport``: no test
+touches the network or a database.
 """
 
 import copy
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from datetime import date, datetime
+from functools import cache
 from pathlib import Path
 from typing import Any, Final
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode
 
+import httpx
 import pytest
 
 from ads_engine.connectors.google_n8n.queries import (
@@ -48,13 +60,16 @@ from ads_engine.connectors.google_n8n.queries import (
     rest_path,
 )
 from ads_engine.connectors.linkedin.client import LEAD_FIELDS
+from ads_engine.settings import Source, get_settings
 from ads_engine.simulation.payloads import (
     SURFACES,
     Contract,
     ContractViolation,
     check_schema,
+    identify_surface,
     validate_documented_sample,
     validate_google_rows,
+    validate_request,
     validate_response,
 )
 
@@ -164,6 +179,46 @@ UNDECLARED_KEY: Final = "undeclaredByTheContract"
 UNLISTED_STATUS: Final = 418
 """An HTTP status no contract lists for a successful call."""
 
+FIXTURES_DIR: Final = BACKEND_DIR / "tests" / "fixtures"
+MANIFEST_PATH: Final = FIXTURES_DIR / "manifest.json"
+"""The seeded fixture manifest: one recorded wire request per committed snapshot."""
+
+JSON_MEDIA: Final = "application/json"
+FORM_MEDIA: Final = "application/x-www-form-urlencoded"
+LINKEDIN_REST_BASE: Final = "https://api.linkedin.com/rest/"
+"""The base of LinkedIn's relative REST URL templates."""
+
+SECRET_HEADER_PLACEHOLDER: Final = "{N8N_WEBHOOK_SECRET_HEADER}"
+WEBHOOK_SECRET_HEADER: Final = "X-Webhook-Secret"
+"""The webhook secret header name the test settings give the placeholder: their default."""
+
+TEMPLATE_DONORS: Final[Mapping[tuple[str, str], tuple[str, str]]] = {
+    ("linkedin", "ad_analytics_campaign_delivery"): ("linkedin", "ad_analytics"),
+    ("linkedin", "ad_analytics_member_segments"): ("linkedin", "ad_analytics"),
+}
+"""The request surfaces no manifest entry records, each mapped to the recorded surface of the
+same endpoint, whose URL and headers its baseline reuses; the query is the contract's own."""
+
+TEMPLATE_VALUES: Final[Mapping[str, str]] = {
+    "acct": "urn%3Ali%3AsponsoredAccount%3A990000001",
+    "campaign": "urn%3Ali%3AsponsoredCampaign%3A990010000",
+    "member_pivot": "MEMBER_JOB_FUNCTION",
+}
+"""Wire values of the URL-template placeholders: the manifest's first account and campaign,
+URNs percent-encoded once as inside a Rest.li ``List(...)``, and a segment pivot. ``{y}``,
+``{m}`` and ``{d}`` take the manifest's day, and ``{fields}`` the contract's projection."""
+
+TEMPLATE_PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
+
+JSON_IDENTIFIER: Final = re.compile(r"[A-Za-z_@$][A-Za-z0-9_@$\-]*")
+"""A member name ``check_schema`` writes as ``.name`` in a JSON path; any other is
+``["name"]``, JSON-quoted."""
+
+EXPECTED_OMISSION_COUNTS: Final[Mapping[str, int]] = {"header": 47, "query": 51, "body": 21}
+"""Required request members across the 18 request surfaces' contract files, per kind (body:
+14 top-level members and 7 nested inside objects and array items), so the omission matrix
+cannot shrink unnoticed when a contract loses one."""
+
 
 def _param(source: str, name: str) -> Any:
     """One ``(source, name)`` parameter with the readable id ``source/name``."""
@@ -178,8 +233,19 @@ VERSIONED_LINKEDIN_NAMES: Final = tuple(
     name for name in EXPECTED_SURFACES["linkedin"] if name not in UNVERSIONED_LINKEDIN
 )
 LEAD_RESPONSE_NAMES: Final = ("lead_form_responses", "lead_form_responses_batch")
+REQUEST_PAIRS: Final[tuple[tuple[Source, str], ...]] = tuple(
+    (source, name)
+    for source, names in SURFACES.items()
+    for name in names
+    if not (source == "google" and name.startswith("row_"))
+)
+"""Every surface a client sends a request to: all but the virtual Google ``row_*`` contracts."""
+REQUEST_PARAMS: Final = [_param(source, name) for source, name in REQUEST_PAIRS]
 
 ContractLoader = Callable[..., Contract]
+Handler = Callable[[httpx.Request], httpx.Response]
+CheckedTransport = Callable[[str, Handler], httpx.MockTransport]
+BodySteps = tuple[str | int, ...]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -487,6 +553,455 @@ def test_a_status_the_contract_does_not_list_is_rejected(
     assert UNLISTED_STATUS not in loaded.response.status
     with pytest.raises(ContractViolation, match=f"HTTP {UNLISTED_STATUS}"):
         validate_response(loaded, _valid_body(loaded), status=UNLISTED_STATUS)
+
+
+# ---------------------------------------------------------------------------------------------
+# Request validation: baselines and the omission matrix
+# ---------------------------------------------------------------------------------------------
+
+
+@cache
+def _manifest() -> dict[str, Any]:
+    """The fixture manifest, decoded once; callers deep-copy whatever they change."""
+    raw = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict), f"{MANIFEST_PATH} must hold a JSON object"
+    assert isinstance(raw.get("entries"), list), f"{MANIFEST_PATH} must list its entries"
+    return raw
+
+
+@cache
+def _recorded_entries() -> dict[tuple[str, str], dict[str, Any]]:
+    """The first manifest entry of each surface it records, keyed by ``(source, name)``."""
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in _manifest()["entries"]:
+        source, _dot, name = entry["surface"].partition(".")
+        assert source == entry["source"], f"{entry['file']}: surface and source disagree"
+        entries.setdefault((source, name), entry)
+    return entries
+
+
+def _media_type(headers: Mapping[str, str]) -> str | None:
+    """The media type of a recorded ``Content-Type`` header (any letter case), or ``None``."""
+    for name, value in headers.items():
+        if name.lower() == "content-type":
+            return value.split(";", 1)[0].strip().lower()
+    return None
+
+
+def _build_request(recorded: Mapping[str, Any]) -> httpx.Request:
+    """Rebuild a recorded ``{method, url, query, headers, body}`` request as its client sends it.
+
+    The reconstruction ``test_fixtures_determinism.build_request`` uses, repeated here because
+    test modules never import one another: the URL carries no query string, and the
+    ``[name, wire_value]`` pairs, already in wire form, are joined and attached unchanged (a
+    second encoding pass would turn ``%3A`` into ``%253A``). A JSON body is sent as compact
+    JSON, the LinkedIn token exchange as the form its ``Content-Type`` names, and headers as
+    recorded, credentials redacted in place.
+    """
+    url = recorded["url"]
+    assert isinstance(url, str), "a recorded url is a string"
+    assert "?" not in url, f"{url}: the query travels as pairs, not in the url"
+    assert "#" not in url, f"{url}: a request carries no fragment"
+    raw = "&".join(f"{name}={value}" for name, value in recorded["query"])
+    target = httpx.URL(url, query=raw.encode("ascii")) if raw else httpx.URL(url)
+    headers = dict(recorded["headers"])
+    body = recorded["body"]
+    content: bytes | None = None
+    if body is not None:
+        assert isinstance(body, dict), f"{url}: a recorded body is a JSON object or a form"
+        media = _media_type(headers)
+        if media == FORM_MEDIA:
+            assert all(isinstance(value, str) for value in body.values()), "form values: strings"
+            content = urlencode(body).encode("ascii")
+        else:
+            assert media == JSON_MEDIA, f"{url}: a body needs a JSON or form Content-Type"
+            content = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    request = httpx.Request(recorded["method"], target, headers=headers, content=content)
+    assert request.url.query == raw.encode("ascii"), f"{url}: the query was re-encoded"
+    return request
+
+
+def _fill_template(text: str, values: Mapping[str, str]) -> str:
+    """Replace every ``{placeholder}`` in a contract URL-template value with its wire value."""
+
+    def _value(match: re.Match[str]) -> str:
+        """The wire value of one placeholder; an unknown one fails the test."""
+        name = match.group(1)
+        assert name in values, f"no template value for {{{name}}}"
+        return values[name]
+
+    return TEMPLATE_PLACEHOLDER.sub(_value, text)
+
+
+def _template_request(source: str, name: str, donor: Mapping[str, Any]) -> dict[str, Any]:
+    """A recorded-form request built from a contract's own URL template.
+
+    The template's query is split on ``&`` and each part's first ``=``, and its placeholders
+    are filled (:data:`TEMPLATE_VALUES`, the manifest's day and the contract's ``fields``). It
+    must name every required query parameter and nothing outside the contract. URL and
+    headers come from ``donor``, the recorded request of the same endpoint.
+    """
+    spec = _read_raw(source, name)["request"]
+    path, _mark, template_query = spec["url"].partition("?")
+    url = LINKEDIN_REST_BASE + path
+    assert url == donor["url"], f"{source}/{name}: the donor addresses another endpoint"
+    day = date.fromisoformat(_manifest()["day"])
+    values = {
+        **TEMPLATE_VALUES,
+        "y": str(day.year),
+        "m": str(day.month),
+        "d": str(day.day),
+        "fields": spec["fields"],
+    }
+    pairs = [
+        [key, _fill_template(value, values)]
+        for key, _eq, value in (part.partition("=") for part in template_query.split("&"))
+    ]
+    names = [key for key, _value in pairs]
+    assert len(set(names)) == len(names), f"{source}/{name}: the template repeats a parameter"
+    assert set(spec["required_query"]) <= set(names), f"{source}/{name}: template incomplete"
+    assert set(names) <= set(spec["required_query"]) | set(spec["optional_query"]), names
+    return {
+        "method": spec["method"],
+        "url": url,
+        "query": pairs,
+        "headers": dict(donor["headers"]),
+        "body": None,
+    }
+
+
+@cache
+def _baselines() -> dict[tuple[str, str], dict[str, Any]]:
+    """One valid recorded-form request per surface, keyed by ``(source, name)``.
+
+    The manifest's first entry of a surface where it records one, otherwise the contract
+    template of :data:`TEMPLATE_DONORS`. Never mutated: :func:`_baseline` hands out copies.
+    """
+    recorded = _recorded_entries()
+    baselines = {key: entry["request"] for key, entry in recorded.items()}
+    for key, donor in TEMPLATE_DONORS.items():
+        assert key not in recorded, f"{key}: the manifest records it; drop its template donor"
+        assert donor in recorded, f"{key}: the donor {donor} is not recorded in the manifest"
+        baselines[key] = _template_request(*key, recorded[donor]["request"])
+    return baselines
+
+
+def _baseline(source: str, name: str) -> dict[str, Any]:
+    """A fresh copy of a surface's baseline request in recorded form, safe to mutate."""
+    baselines = _baselines()
+    if (source, name) not in baselines:
+        pytest.fail(
+            f"{source}/{name}: no baseline request; record one in the fixture manifest or add "
+            "a TEMPLATE_DONORS entry",
+            pytrace=False,
+        )
+    return copy.deepcopy(baselines[(source, name)])
+
+
+def _control_response(loaded: Contract) -> httpx.Response:
+    """A contract-valid answer to a surface's baseline, for a transport handler to return.
+
+    A recorded baseline gets its committed snapshot's response: the simulator's rendering,
+    which the fixture tests hold to the contract, Google rows included. A template baseline
+    gets the documented sample (else the minimal body) at the first listed status.
+    """
+    entry = _recorded_entries().get((loaded.source, loaded.name))
+    if entry is None:
+        return httpx.Response(loaded.response.status[0], json=_valid_body(loaded))
+    snapshot = json.loads((FIXTURES_DIR / entry["file"]).read_text(encoding="utf-8"))
+    response = snapshot["response"]
+    return httpx.Response(response["status"], json=response["body"])
+
+
+def _resolve_header(name: str) -> str:
+    """A contract's required header name as the request carries it.
+
+    ``{N8N_WEBHOOK_SECRET_HEADER}`` takes the current settings' name, which the isolated test
+    environment leaves at its default; no other placeholder exists.
+    """
+    if name == SECRET_HEADER_PLACEHOLDER:
+        resolved = get_settings().n8n_webhook_secret_header
+        assert resolved == WEBHOOK_SECRET_HEADER
+        return resolved
+    assert not name.startswith("{"), f"unknown header placeholder {name}"
+    return name
+
+
+def _json_child(path: str, key: str) -> str:
+    """The JSON path of member ``key`` under ``path``, written as ``check_schema`` writes it."""
+    if JSON_IDENTIFIER.fullmatch(key):
+        return f"{path}.{key}"
+    return f"{path}[{json.dumps(key, ensure_ascii=False)}]"
+
+
+def _required_body_paths(
+    schema: Mapping[str, Any], steps: BodySteps = (), path: str = "$"
+) -> Iterator[tuple[BodySteps, str]]:
+    """Yield ``(steps, path)`` for every required member of a request body schema.
+
+    An object schema's own ``required`` names come first, then, depth-first in declaration
+    order, those of each object schema reachable through ``properties`` and array ``items``,
+    so the top-level members lead and nested ones such as ``$.inputs[0].id`` follow.
+    ``steps`` leads from the body to the member: member names, and index 0 for an array item.
+    ``path`` is the member's JSON path as ``check_schema`` reports it.
+    """
+    for member in schema.get("required") or ():
+        yield (*steps, member), _json_child(path, member)
+    for key, sub in (schema.get("properties") or {}).items():
+        yield from _required_body_paths(sub, (*steps, key), _json_child(path, key))
+    items = schema.get("items")
+    if isinstance(items, dict):
+        yield from _required_body_paths(items, (*steps, 0), f"{path}[0]")
+
+
+def _body_member(path: str) -> str:
+    """A body omission's member: its JSON path below ``$``, e.g. ``inputs[0].id``."""
+    return path.removeprefix("$").removeprefix(".")
+
+
+def _required_members(request: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
+    """Yield ``(kind, member)`` for each required header, query name and body member.
+
+    ``request`` is a contract file's ``request`` object as written; kinds are ``header``,
+    ``query`` and ``body``, in that order. A body member is named by its path
+    (:func:`_body_member`), nested members inside objects and array items included.
+    """
+    for header in request["required_headers"]:
+        yield "header", header
+    for parameter in request["required_query"]:
+        yield "query", parameter
+    for _steps, path in _required_body_paths(request["body"] or {}):
+        yield "body", _body_member(path)
+
+
+def _body_requirement(source: str, name: str, member: str) -> tuple[BodySteps, str]:
+    """The ``(steps, path)`` of one required body member of a surface's contract file."""
+    schema = _read_raw(source, name)["request"]["body"] or {}
+    found = [
+        (steps, path)
+        for steps, path in _required_body_paths(schema)
+        if _body_member(path) == member
+    ]
+    assert len(found) == 1, f"{source}/{name}: {member} is not one required body member"
+    return found[0]
+
+
+def _holder(body: dict[str, Any], steps: BodySteps, surface: str) -> tuple[dict[str, Any], str]:
+    """The object inside a recorded body that holds the member ``steps`` leads to, and its name.
+
+    Every parent on the way must be held (an object member, or the array item at its index)
+    and so must the member, so removing it is a real omission: a baseline lacking any of them
+    fails the case instead of skipping it.
+    """
+    node: Any = body
+    path = "$"
+    for step in steps[:-1]:
+        if isinstance(step, int):
+            held = isinstance(node, list) and step < len(node)
+            path = f"{path}[{step}]"
+        else:
+            held = isinstance(node, dict) and step in node
+            path = _json_child(path, step)
+        assert held, f"{surface}: the baseline body holds no {path}; record one that does"
+        node = node[step]
+    member = steps[-1]
+    assert isinstance(member, str), f"{surface}: a required member is named, not indexed"
+    assert isinstance(node, dict), f"{surface}: the baseline's {path} is not an object"
+    assert member in node, f"{surface}: the baseline body lacks {_json_child(path, member)}"
+    return node, member
+
+
+def _omission_id(source: str, name: str, kind: str, member: str) -> str:
+    """The readable case id ``source/name-kind-member``, placeholder braces dropped."""
+    return f"{source}/{name}-{kind}-{member.strip('{}')}"
+
+
+# Enumerated from the contract files at collection, so a required member a contract adds is
+# a new case at once; EXPECTED_OMISSION_COUNTS catches one a contract loses.
+OMISSION_CASES: Final[tuple[tuple[Source, str, str, str], ...]] = tuple(
+    (source, name, kind, member)
+    for source, name in REQUEST_PAIRS
+    for kind, member in _required_members(_read_raw(source, name)["request"])
+)
+OMISSION_PARAMS: Final = [pytest.param(*case, id=_omission_id(*case)) for case in OMISSION_CASES]
+
+
+def _omitted(source: str, name: str, kind: str, member: str) -> tuple[httpx.Request, str]:
+    """A surface's baseline with one required member removed, and the error that must name it.
+
+    A header is removed from the rebuilt request in any letter case, so the body keeps the
+    encoding its recorded ``Content-Type`` names even when that header is the one removed. A
+    query parameter is dropped from the recorded pairs, and a body member, at its path (index
+    0 of an array), from a copy of the recorded body, which is then re-encoded.
+    """
+    recorded = _baseline(source, name)
+    if kind == "header":
+        resolved = _resolve_header(member)
+        request = _build_request(recorded)
+        headers = request.headers.copy()
+        assert resolved in headers, f"{source}/{name}: the baseline lacks {resolved}"
+        del headers[resolved]
+        omitted = httpx.Request(
+            request.method, request.url, headers=headers, content=request.content
+        )
+        assert all(key.lower() != resolved.lower() for key in omitted.headers), resolved
+        return omitted, f"header {resolved}: missing or empty"
+    if kind == "query":
+        pairs = recorded["query"]
+        kept = [pair for pair in pairs if pair[0] != member]
+        assert len(kept) == len(pairs) - 1, f"{source}/{name}: {member} must be sent once"
+        recorded["query"] = kept
+        return _build_request(recorded), f"query parameter {member}: missing (required)"
+    assert kind == "body", f"unknown omission kind {kind}"
+    body = recorded["body"]
+    assert isinstance(body, dict), f"{source}/{name}: the baseline has no body"
+    steps, path = _body_requirement(source, name, member)
+    holder, key = _holder(body, steps, f"{source}/{name}")
+    del holder[key]
+    return _build_request(recorded), f"body {path}: missing required field"
+
+
+def test_every_request_surface_has_one_baseline() -> None:
+    request_surfaces = {
+        (source, name)
+        for source, names in SURFACES.items()
+        for name in names
+        if not (source == "google" and name.startswith("row_"))
+    }
+    assert len(request_surfaces) == 18
+    assert set(REQUEST_PAIRS) == request_surfaces
+    assert set(_baselines()) == request_surfaces
+    assert set(_baselines()) - set(_recorded_entries()) == set(TEMPLATE_DONORS)
+
+
+@pytest.mark.parametrize(("source", "name"), REQUEST_PARAMS)
+def test_the_baseline_request_passes_its_contract_and_names_its_surface(
+    contract: ContractLoader, source: Source, name: str
+) -> None:
+    request = _build_request(_baseline(source, name))
+    assert identify_surface(source, request) == name
+    validate_request(contract(source, name), request)
+
+
+def test_the_omission_matrix_is_every_required_request_member(contract: ContractLoader) -> None:
+    derived: list[tuple[str, str, str, str]] = []
+    for source, name in REQUEST_PAIRS:
+        spec = contract(source, name).request
+        derived.extend((source, name, "header", header) for header in spec.required_headers)
+        derived.extend((source, name, "query", parameter) for parameter in spec.required_query)
+        # The loaded body schema, walked here with an explicit stack rather than through
+        # _required_body_paths: each object schema's required names, then depth-first those of
+        # every schema below it. A map's value schema has no fixed path, so a required member
+        # there must fail here rather than leave the matrix without its omission.
+        pending: list[tuple[Mapping[str, Any], str, bool]] = (
+            [(spec.body, "$", False)] if spec.body is not None else []
+        )
+        while pending:
+            schema, path, in_map = pending.pop()
+            required = schema.get("required") or []
+            assert isinstance(required, list)
+            assert not (in_map and required), f"{source}/{name} {path}: no omission path"
+            derived.extend(
+                (source, name, "body", _body_member(_json_child(path, str(member))))
+                for member in required
+            )
+            properties = schema.get("properties") or {}
+            assert isinstance(properties, dict)
+            children = [(sub, _json_child(path, key), in_map) for key, sub in properties.items()]
+            items = schema.get("items")
+            if isinstance(items, dict):
+                children.append((items, f"{path}[0]", in_map))
+            extra = schema.get("additionalProperties")
+            if isinstance(extra, dict):
+                children.append((extra, f"{path}.*", True))
+            pending.extend(reversed(children))
+    assert list(OMISSION_CASES) == derived
+    assert len(set(OMISSION_CASES)) == len(OMISSION_CASES)
+    assert Counter(kind for _source, _name, kind, _member in OMISSION_CASES) == (
+        EXPECTED_OMISSION_COUNTS
+    )
+    assert {(source, name) for source, name, _kind, _member in OMISSION_CASES} == set(REQUEST_PAIRS)
+    ids = [_omission_id(*case) for case in OMISSION_CASES]
+    assert len(set(ids)) == len(ids)
+
+
+def test_the_webhook_secret_header_placeholder_resolves_to_the_settings_name() -> None:
+    headers = _read_raw("google", "search")["request"]["required_headers"]
+    assert SECRET_HEADER_PLACEHOLDER in headers
+    assert get_settings().n8n_webhook_secret_header == WEBHOOK_SECRET_HEADER
+    assert _resolve_header(SECRET_HEADER_PLACEHOLDER) == WEBHOOK_SECRET_HEADER
+    assert WEBHOOK_SECRET_HEADER in _baseline("google", "search")["headers"]
+
+
+@pytest.mark.parametrize(("source", "name", "kind", "member"), OMISSION_PARAMS)
+def test_omitting_a_required_request_member_raises_a_field_specific_violation(
+    contract: ContractLoader, source: Source, name: str, kind: str, member: str
+) -> None:
+    loaded = contract(source, name)
+    validate_request(loaded, _build_request(_baseline(source, name)))
+    request, expected = _omitted(source, name, kind, member)
+    with pytest.raises(ContractViolation) as caught:
+        validate_request(loaded, request)
+    assert caught.value.surface == f"{source}.{name}"
+    assert expected in caught.value.errors, caught.value.errors
+
+
+@pytest.mark.parametrize(("source", "name"), REQUEST_PARAMS)
+def test_the_contract_checked_transport_hands_a_baseline_to_its_handler_once(
+    contract: ContractLoader,
+    contract_checked_transport: CheckedTransport,
+    source: Source,
+    name: str,
+) -> None:
+    loaded = contract(source, name)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the call and answer with a contract-valid body."""
+        calls.append(request)
+        return _control_response(loaded)
+
+    request = _build_request(_baseline(source, name))
+    with httpx.Client(transport=contract_checked_transport(source, handler)) as client:
+        response = client.send(request)
+    assert len(calls) == 1
+    assert (calls[0].method, calls[0].url, calls[0].content) == (
+        request.method,
+        request.url,
+        request.content,
+    )
+    expected = _control_response(loaded)
+    assert response.status_code == expected.status_code
+    assert response.json() == expected.json()
+
+
+@pytest.mark.parametrize(("source", "name", "kind", "member"), OMISSION_PARAMS)
+def test_the_contract_checked_transport_refuses_an_omission_before_its_handler(
+    contract: ContractLoader,
+    contract_checked_transport: CheckedTransport,
+    source: Source,
+    name: str,
+    kind: str,
+    member: str,
+) -> None:
+    loaded = contract(source, name)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the call; the transport must never get this far."""
+        calls.append(request)
+        return _control_response(loaded)
+
+    request, _expected = _omitted(source, name, kind, member)
+    # Removing a routing selector (pivot, q, ids) may address another surface or none, so the
+    # refusal is asserted, not the surface it names.
+    refused = rf"^(request breaks the {source}\.\w+ contract|{source}: the request matches no)"
+    with (
+        httpx.Client(transport=contract_checked_transport(source, handler)) as client,
+        pytest.raises(AssertionError, match=refused),
+    ):
+        client.send(request)
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------------------------
