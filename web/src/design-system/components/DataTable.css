@@ -94,6 +94,19 @@ th.ds-datatable__cell {
 }
 
 /*
+ * A status chip in a cell, such as "resolved" or "unavailable" on /settings, keeps its words
+ * whole. Badge.css lets a chip break anywhere so a flex or grid track can shrink it, but in a
+ * table that also lowers the column's min-content width, so table layout squeezes the column
+ * until the label breaks mid-word ("unavail / able"). A table wider than its container scrolls
+ * inside its region instead (SC 1.4.10), so here the chip wraps only between words and its
+ * longest word sets the column's minimum width. The selector's two classes outrank Badge.css's
+ * one, whatever the stylesheet order.
+ */
+.ds-datatable__cell .ds-badge {
+  overflow-wrap: normal;
+}
+
+/*
  * The expand column shrinks to its toggle button. Table layout never sizes a column below its
  * min-content width, so a zero preferred inline size shrinks the column to the toggle button,
  * whose nowrap label sets that width. 0 is a keyword exception, not a design value.
