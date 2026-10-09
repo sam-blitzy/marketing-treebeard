@@ -1,0 +1,161 @@
+# Ads Action Engine: the local stack.
+#
+# Compose Specification, with no top-level `version:` key. Requires Docker Compose >=5.5.1,<6
+# and Docker Engine >=29, which `make check-tools` verifies before `make init` and `make up`.
+#
+# First start (docs/runbook.md):
+#   make init ADMIN_PASSWORD=<value>   copies .env.example to .env (never overwrites one) and
+#                                      writes SESSION_SECRET and APP_ADMIN_PASSWORD_HASH
+#   docker compose up -d --build
+#   open http://localhost:8080         sign in as APP_ADMIN_EMAIL; /actions lists the five
+#                                      sections (simulated data until credentials are set)
+#
+# Startup order:
+#   db       postgres:18.6. Healthy once pg_isready answers over TCP, which the image's
+#            socket-only initialisation server never does, so first-run init is complete.
+#   migrate  One-shot, once db is healthy: `ads-engine migrate && ads-engine ensure-admin`.
+#            Both are idempotent, so it runs again on every `up`.
+#   api      Once migrate exited 0. Healthy once GET /api/v1/healthz answers 200, which needs
+#            a database round trip.
+#   worker   Once migrate exited 0. Resolves each source live or simulated (simulated with
+#            the reason "credentials not configured" when its credentials are blank), builds
+#            and backfills datasets and runs the default analysis before its first cycle.
+#   web      Once api is healthy. nginx serves the SPA on 8080 and proxies /api/ to api:8000
+#            (web/nginx.conf).
+#
+# Secrets and environment:
+#   - .env (gitignored, written by `make init`) reaches migrate, api and worker only. It is
+#     required: a missing .env stops Compose before any container starts.
+#   - db receives only POSTGRES_DB, POSTGRES_USER and POSTGRES_PASSWORD, interpolated from
+#     the shell, else from .env, else the local defaults below.
+#   - web receives no environment: the SPA bundle holds no configuration and no secret.
+#   - DATA_MODE set in the shell overrides .env, as `make e2e` and CI use it:
+#       DATA_MODE=simulated docker compose up -d
+#   - This file holds no secret value. Source credentials go in .env only.
+#
+# Ports: only web is published, on 8080, matching APP_BASE_URL=http://localhost:8080. db and
+# api are reachable only on the project's default network: backend tests use their own
+# disposable database, and a published 5432 could collide with a local PostgreSQL.
+#
+# Data: the named volume pgdata keeps the database across `docker compose down` and
+# `docker compose up`; `docker compose down -v` deletes it.
+#
+# Configuration: ./config is bind-mounted read-only at /app/config, the backend's working
+# directory, so `docker compose restart api worker` picks up edited YAML. The worker compares
+# config_hash at startup and re-runs the default analysis when it changed.
+#
+# Logging: Docker's default json-file driver. The api and worker write structured JSON lines
+# (structlog, with secrets redacted) to stdout: `docker compose logs -f worker`.
+#
+# Out of scope here: TLS, image publishing and monitoring. Any host other than this machine
+# terminates TLS in front of nginx and sets an https:// APP_BASE_URL (docs/runbook.md).
+
+name: ads-engine
+
+# The one backend image behind migrate, api and worker. Each service's `command:` selects
+# the process. `image:` is a local tag only, never pushed, so the three services share one
+# build instead of producing three identical images.
+x-backend: &backend
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  image: ads-engine-backend:local
+  env_file: .env
+  environment:
+    # Precedence: shell, then .env (Compose interpolation), then auto. `environment:`
+    # outranks `env_file:`, so the shell value wins inside the container too.
+    DATA_MODE: "${DATA_MODE:-auto}"
+  volumes:
+    - ./config:/app/config:ro
+
+services:
+  db:
+    image: postgres:18.6
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ads_engine}"
+      POSTGRES_USER: "${POSTGRES_USER:-ads}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ads}"
+    volumes:
+      # PostgreSQL 18 images keep PGDATA at /var/lib/postgresql/18/docker and declare
+      # VOLUME /var/lib/postgresql, so the volume mounts at the parent and PGDATA is never
+      # overridden. A mount at /var/lib/postgresql/data would hold no data directory.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # $$ defers expansion to the container's shell, where the POSTGRES_* values are set.
+      # -h 127.0.0.1 probes TCP, which only the final server (not the init server) accepts.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    command: ["sh", "-c", "ads-engine migrate && ads-engine ensure-admin"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    # Behind nginx. The login limit (5 attempts per minute per IP) keys on the client address
+    # uvicorn takes from X-Forwarded-For. `--forwarded-allow-ips *` overrides the image's
+    # loopback-only FORWARDED_ALLOW_IPS, so that address is the client nginx served, not
+    # nginx's own container address, which every client would otherwise share as one key.
+    # Trusting every peer is safe only because api publishes no port, so nginx is its only
+    # client-facing peer, and nginx overwrites X-Forwarded-For with exactly one entry,
+    # $remote_addr. Never publish port 8000 with this command: a client could then write its
+    # own X-Forwarded-For and claim a fresh address on every attempt.
+    command:
+      - uvicorn
+      - ads_engine.api.app:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The slim Python base has no curl; the image's own Python probes the endpoint.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "ads_engine.worker.main"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Time after SIGTERM to cancel the lanes, finish the batch commit in flight and release
+    # the advisory locks before Docker sends SIGKILL.
+    stop_grace_period: 30s
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}
