@@ -13,6 +13,7 @@
  *   `X-Requested-With: ads-engine`;
  * - success: the signed-in user seeded into `queryKeys.me` and `/login` replaced by the
  *   `redirect` path, honoured only when it is a same-origin path, otherwise `/actions`;
+ * - Enter submitting natively, because the fields and the submit button share one form;
  * - validation of empty fields, with nothing sent and focus on the first empty field;
  * - 401 `invalid_credentials`, 429 `rate_limited` with and without a usable `Retry-After`, any
  *   other API failure, and the pending state that blocks a second submission.
@@ -103,9 +104,11 @@ describe('LoginPage', () => {
     expect(screen.getByText('Ads Action Engine')).toBeTruthy();
     const { email, password, submit } = controls();
     expect(email.type).toBe('email');
+    expect(email.name).toBe('email');
     expect(email.autocomplete).toBe('username');
     expect(email.required).toBe(true);
     expect(password.type).toBe('password');
+    expect(password.name).toBe('password');
     expect(password.autocomplete).toBe('current-password');
     expect(password.required).toBe(true);
     expect(submit.type).toBe('submit');
@@ -157,6 +160,8 @@ describe('LoginPage', () => {
 
   it('keeps the search of a same-origin redirect path', async () => {
     mockApi({ 'POST /auth/login': json(200, makeMe()) });
+    // `/actions` keeps `run` only as a positive integer run id (as `src/router.tsx` does), so the
+    // redirect carries a real run id rather than a free-form string such as `run-123`.
     const target = `/actions?run=${String(CUSTOM_RUN_ID)}`;
     const { router } = await renderWithProviders(<LoginPage redirectTo={target} />, {
       path: `/login?redirect=${encodeURIComponent(target)}`,
@@ -193,6 +198,37 @@ describe('LoginPage', () => {
     });
   });
 
+  it('submits on Enter: the fields and the submit button share one form', async () => {
+    const api = mockApi({ 'POST /auth/login': json(200, makeMe()) });
+    const { router } = await renderWithProviders(<LoginPage redirectTo="/actions" />, {
+      path: '/login',
+    });
+    const { email, password, submit } = controls();
+
+    // Enter in a text field submits natively when the field's form holds a submit button. jsdom
+    // performs no implicit submission on an Enter keydown, so the structure that makes Enter
+    // work is asserted, and the submission it triggers is dispatched on the form itself.
+    const form = password.form;
+    if (!(form instanceof HTMLFormElement)) {
+      throw new Error('The Password field is not inside a form.');
+    }
+    expect(email.form).toBe(form);
+    expect(submit.form).toBe(form);
+    expect(submit.type).toBe('submit');
+
+    fireEvent.change(email, { target: { value: ADMIN_EMAIL } });
+    fireEvent.change(password, { target: { value: TYPED_PASSWORD } });
+    fireEvent.submit(form);
+
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe('/actions');
+    });
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0]?.method).toBe('POST');
+    expect(api.calls[0]?.path).toBe('/auth/login');
+    expect(api.calls[0]?.body).toEqual({ email: ADMIN_EMAIL, password: TYPED_PASSWORD });
+  });
+
   it('reports both empty fields beside them, sends nothing and focuses the email field', async () => {
     const api = mockApi({});
     const { router } = await renderWithProviders(<LoginPage redirectTo="/actions" />, {
@@ -223,11 +259,34 @@ describe('LoginPage', () => {
 
     const { email, password } = controls();
     expect(descriptionOf(email)).toEqual(['Enter your email']);
+    expect(email.getAttribute('aria-invalid')).toBe('true');
     expect(password.getAttribute('aria-invalid')).toBeNull();
     await waitFor(() => {
       expect(document.activeElement).toBe(email);
     });
     expect(api.calls).toHaveLength(0);
+  });
+
+  it('with only the password filled, reports the email and focuses it', async () => {
+    const api = mockApi({});
+    const { router } = await renderWithProviders(<LoginPage redirectTo="/actions" />, {
+      path: '/login',
+    });
+
+    signIn('', TYPED_PASSWORD);
+
+    const { email, password } = controls();
+    expect(descriptionOf(email)).toEqual(['Enter your email']);
+    expect(email.getAttribute('aria-invalid')).toBe('true');
+    expect(password.getAttribute('aria-invalid')).toBeNull();
+    expect(screen.queryByText('Enter your password')).toBeNull();
+    // The password stays as typed, ready for the corrected attempt.
+    expect(password.value).toBe(TYPED_PASSWORD);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(email);
+    });
+    expect(api.calls).toHaveLength(0);
+    expect(router.state.location.pathname).toBe('/login');
   });
 
   it('with only the email filled, reports the password and focuses it', async () => {
