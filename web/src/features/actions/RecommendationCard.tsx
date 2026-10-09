@@ -492,7 +492,9 @@ function hasContent(node: ReactNode): boolean {
  *
  * <RecommendationCard
  *   item={c0Item}
- *   resolver={({ disabled }) => <DiscrepancyResolver item={c0Item} disabled={disabled} />}
+ *   resolver={({ disabled }) => (
+ *     <DiscrepancyResolution discrepancy={discrepancy} disabled={disabled} />
+ *   )}
  * />
  * ```
  */
