@@ -1,0 +1,19 @@
+<!doctype html>
+<!--
+  Vite entry document for the Ads Action Engine SPA. It holds markup only: nginx serves the app
+  with Content-Security-Policy default-src 'self', so no inline script, inline style, style
+  attribute or external resource belongs here. src/main.tsx imports the global styles (tokens.css
+  first) and renders the app into #root.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Ranked ad actions with their evidence" />
+    <title>Ads Action Engine</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
