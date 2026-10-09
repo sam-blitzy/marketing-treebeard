@@ -14,7 +14,14 @@ import { screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import type { Run } from '../../api/types';
-import { makeConfig, makeOverlay, makeRun, makeSources } from '../../test/fixtures';
+import { formatSourceBoundaries } from '../../lib/format';
+import {
+  FIXTURE_SOURCE_DAYS,
+  makeConfig,
+  makeOverlay,
+  makeRun,
+  makeSources,
+} from '../../test/fixtures';
 import { StatusBar } from './StatusBar';
 
 /** Stubs every read the bar's children make, with the fixture world. */
@@ -66,6 +73,43 @@ describe('StatusBar', () => {
       within(picker).getByRole('button', { name: '28 days (default)' }).getAttribute('aria-pressed'),
     ).toBe('true');
     expect(within(chips).getAllByRole('listitem')).toHaveLength(3);
+  });
+
+  it('shows the boundary line formatSourceBoundaries builds from the run’s source days', async () => {
+    const run = makeRun();
+    await renderBar(run);
+
+    const expected = formatSourceBoundaries(run.source_days);
+    // The default fixture is AAP 0.5.5's own example: Google on its account zone, LinkedIn on UTC.
+    expect(expected).toBe('Google days: America/New_York · LinkedIn days: UTC');
+    expect(within(statusRegion()).getByText(expected)).toBeTruthy();
+  });
+
+  it('follows the run’s data when a source’s day boundary changes', async () => {
+    const run = makeRun({
+      source_days: FIXTURE_SOURCE_DAYS.map((day) =>
+        day.source === 'google' ? { ...day, boundary: 'Europe/Berlin' } : { ...day },
+      ),
+    });
+    await renderBar(run);
+
+    const region = statusRegion();
+    const expected = formatSourceBoundaries(run.source_days);
+    expect(expected).toContain('Google days: Europe/Berlin');
+    expect(within(region).getByText(expected)).toBeTruthy();
+    // No zone is kept from the default fixture: the line is built from this run alone.
+    expect(within(region).queryByText(/America\/New_York/u)).toBeNull();
+    expect(within(region).getByText('Day boundaries differ between sources')).toBeTruthy();
+  });
+
+  it('names the run’s display time zone, whatever it is', async () => {
+    await renderBar(makeRun({ display_timezone: 'America/Chicago' }));
+
+    const region = statusRegion();
+    expect(within(region).getByText('Times shown in America/Chicago')).toBeTruthy();
+    // The chips' instants use the same zone, and it is no source's day boundary.
+    expect(within(region).getAllByText(/^Last sync .+ America\/Chicago$/u)).toHaveLength(3);
+    expect(within(region).queryByText(/Chicago days/u)).toBeNull();
   });
 
   it('says when the sources end their days at different boundaries, and names the display time zone', async () => {

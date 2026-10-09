@@ -20,11 +20,24 @@ import { describe, expect, it } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { DatasetFreshnessView, Overlay, Source } from '../../api/types';
+import { formatInstant } from '../../lib/format';
 import { makeOverlay, makeSource, makeSources } from '../../test/fixtures';
 import { SOURCE_CHIP_ORDER, SourceChips, latestSuccess } from './SourceChips';
 
-/** "Last sync" of the fixture's 05:30 UTC sync cycle, in UTC. */
-const LAST_SYNC_UTC = 'Last sync Oct 6, 2026, 5:30 AM UTC';
+/** The last success of every fixture freshness row: the fixtures' 05:30 UTC sync cycle. */
+const FIXTURE_SYNC_AT = '2026-10-06T05:30:00Z';
+
+/**
+ * The last-sync text the chips show for `iso` in `displayTimezone`. Expected texts are
+ * always computed through `formatInstant`, never written out, so the tests follow the shared
+ * formatter rather than one ICU version's date wording.
+ */
+function lastSyncText(iso: string, displayTimezone: string): string {
+  return `Last sync ${formatInstant(iso, displayTimezone)}`;
+}
+
+/** "Last sync" of the fixtures' sync cycle, in UTC. */
+const LAST_SYNC_UTC = lastSyncText(FIXTURE_SYNC_AT, 'UTC');
 
 /** The list items of the chips, in document order. */
 function chipItems(): HTMLElement[] {
@@ -70,7 +83,7 @@ describe('SOURCE_CHIP_ORDER', () => {
 
 describe('latestSuccess', () => {
   it('returns the newest success of the active primary dataset, exactly as sent', () => {
-    expect(latestSuccess(makeSource('google'))).toBe('2026-10-06T05:30:00Z');
+    expect(latestSuccess(makeSource('google'))).toBe(FIXTURE_SYNC_AT);
   });
 
   it('compares instants by time, not as strings, across UTC offsets', () => {
@@ -136,6 +149,27 @@ describe('SourceChips', () => {
     expect(items.map(badges)).toEqual([['Simulated', 'Incomplete'], ['Simulated'], ['Simulated']]);
   });
 
+  it('marks every source Simulated and none Live when every source is simulated', async () => {
+    mockApi({ 'GET /sources': json(200, makeSources()) });
+    await renderChips(
+      makeOverlay({
+        source_modes: { google: 'simulated', linkedin: 'simulated', hubspot: 'simulated' },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText(LAST_SYNC_UTC)).toHaveLength(3);
+    });
+    // The same reading as the simulated-mode end-to-end spec: per list item, by text.
+    const items = chipItems();
+    expect(items).toHaveLength(3);
+    for (const item of items) {
+      expect(within(item).getByText('Simulated')).toBeTruthy();
+      expect(within(item).queryByText('Live')).toBeNull();
+      expect(item.textContent).not.toContain('Live');
+    }
+  });
+
   it('shows Live, Simulated and "No data yet" from the overlay, never from the sources list', async () => {
     mockApi({ 'GET /sources': json(200, makeSources()) });
     await renderChips(
@@ -178,15 +212,85 @@ describe('SourceChips', () => {
     });
   });
 
-  it('formats the last sync in the display time zone it is given', async () => {
+  it('shows Stale only on Google and Incomplete only on HubSpot for their own datasets', async () => {
     mockApi({ 'GET /sources': json(200, makeSources()) });
-    await renderChips(makeOverlay(), 'America/New_York');
+    await renderChips(
+      makeOverlay({
+        stale_datasets: ['google.metrics_daily'],
+        incomplete_datasets: ['hubspot.deal_search'],
+      }),
+    );
 
     await waitFor(() => {
-      expect(
-        within(chipItem('Google')).getByText('Last sync Oct 6, 2026, 1:30 AM America/New_York'),
-      ).toBeTruthy();
+      expect(screen.getAllByText(LAST_SYNC_UTC)).toHaveLength(3);
     });
+    const google = chipItem('Google');
+    const linkedin = chipItem('LinkedIn');
+    const hubspot = chipItem('HubSpot');
+    expect(within(google).getByText('Stale')).toBeTruthy();
+    expect(within(google).queryByText('Incomplete')).toBeNull();
+    expect(within(hubspot).getByText('Incomplete')).toBeTruthy();
+    expect(within(hubspot).queryByText('Stale')).toBeNull();
+    expect(within(linkedin).queryByText('Stale')).toBeNull();
+    expect(within(linkedin).queryByText('Incomplete')).toBeNull();
+    expect([google, linkedin, hubspot].map(badges)).toEqual([
+      ['Simulated', 'Stale'],
+      ['Simulated'],
+      ['Simulated', 'Incomplete'],
+    ]);
+  });
+
+  it('shows the newest of two successes, formatted in the display time zone it is given', async () => {
+    const zone = 'America/New_York';
+    const older = '2026-10-05T22:15:00Z';
+    const newer = '2026-10-06T04:45:00Z';
+    // The zone must change the text, or the test could not show that the zone was used.
+    expect(formatInstant(newer, zone)).not.toBe(formatInstant(newer, 'UTC'));
+    const sources: Source[] = [
+      // The newest row comes last for Google and first for LinkedIn, so neither "first row" nor
+      // "last row" passes for both.
+      makeSource('google', {
+        datasets: [
+          freshnessRow('google.entities', older),
+          freshnessRow('google.metrics_daily', newer),
+        ],
+      }),
+      makeSource('linkedin', {
+        datasets: [
+          freshnessRow('linkedin.leads', newer),
+          freshnessRow('linkedin.entities', older),
+        ],
+      }),
+      makeSource('hubspot'),
+    ];
+    mockApi({ 'GET /sources': json(200, sources) });
+    await renderChips(makeOverlay(), zone);
+
+    await waitFor(() => {
+      expect(within(chipItem('Google')).getByText(lastSyncText(newer, zone))).toBeTruthy();
+    });
+    expect(within(chipItem('LinkedIn')).getByText(lastSyncText(newer, zone))).toBeTruthy();
+    expect(
+      within(chipItem('HubSpot')).getByText(lastSyncText(FIXTURE_SYNC_AT, zone)),
+    ).toBeTruthy();
+    expect(screen.queryByText(lastSyncText(older, zone))).toBeNull();
+    expect(screen.queryByText(lastSyncText(newer, 'UTC'))).toBeNull();
+  });
+
+  it('carries no alert role, even while Stale and Incomplete chips show', async () => {
+    mockApi({ 'GET /sources': json(200, makeSources()) });
+    await renderChips(
+      makeOverlay({
+        stale_datasets: ['google.metrics_daily'],
+        incomplete_datasets: ['hubspot.deal_search'],
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText(LAST_SYNC_UTC)).toHaveLength(3);
+    });
+    // AAP 0.5.5 reserves role="alert" for discrepancies; the chips are static content.
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('shows no last sync until GET /sources answers', async () => {

@@ -42,7 +42,13 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-/** The page's handlers: the default run, one open discrepancy and two subjects' decisions. */
+/**
+ * The page's handlers: the default run, one open discrepancy and two subjects' decisions.
+ *
+ * The log carries two subjects (a campaign and a shared budget) rather than one, so the
+ * heading-nesting test sees more than one `<h3>` under "Decision log"; each subject still names
+ * its own "Decisions for {name}" table.
+ */
 function pageHandlers(): MockHandlers {
   return {
     'GET /runs/latest': json(200, makeRun()),
@@ -93,6 +99,10 @@ describe('DecisionsPage', () => {
     const log = section('decision-log');
     const card = await within(discrepancies).findByRole('article', { name: 'Brand Search — US' });
     expect(within(card).getByText('Platform shows Paused, last decided Active')).toBeTruthy();
+    // A status discrepancy offers exactly its two resolutions, each as a button on its card.
+    expect(within(card).getByRole('button', { name: 'Platform is correct' })).toBeTruthy();
+    expect(within(card).getByRole('button', { name: 'Decision is correct' })).toBeTruthy();
+    expect(within(card).getAllByRole('button')).toHaveLength(2);
     expect(
       await within(log).findByRole('table', { name: 'Decisions for Brand Search — US' }),
     ).toBeTruthy();

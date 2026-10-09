@@ -545,6 +545,27 @@ const CELLS: readonly CellCase[] = [
     }),
     { 3: 'daily budget: €100.00', 4: 'Active · daily budget €100.00 · total budget €3,000.00' },
   ],
+  [
+    'a status and daily budget patch on a LinkedIn EUR campaign',
+    makeDecision('own_budget', {
+      subject: subject({
+        id: FIXTURE_CAMPAIGN_IDS.pipelineEmea,
+        name: 'Lead Gen — Pipeline Report EMEA',
+        source: 'linkedin',
+        currency: 'EUR',
+      }),
+      origin: 'user',
+      decided_by: 'admin@example.com',
+      status: 'paused',
+      daily_budget: '120.00',
+      patch: { status: 'paused', daily_budget: '120.00' },
+    }),
+    {
+      1: 'User',
+      3: 'status: paused; daily budget: €120.00',
+      4: 'Paused · daily budget €120.00',
+    },
+  ],
 ];
 
 describe('DecisionLog cells', () => {

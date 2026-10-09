@@ -3,8 +3,8 @@
  * (AAP 0.5.5 routes; AAP 0.1.1 "The UI requires a login"; AAP 0.5.3 session endpoints).
  *
  * Each test builds the real app router with `createAppRouter` on a memory history and renders it
- * inside a `QueryClientProvider` of the same {@link createTestQueryClient}, exactly as
- * `src/main.tsx` does. The network is stubbed with `./test/mockApi`, so the real API client and
+ * inside a `QueryClientProvider` of the same {@link createQueryClient}, exactly as `src/main.tsx`
+ * does. The network is stubbed with `./test/mockApi`, so the real API client and
  * TanStack Query hooks run, and every request a screen makes must be answered. The cases cover
  * the module's TSDoc contract:
  *
@@ -25,13 +25,11 @@
  */
 // mockApi registers an afterEach hook that fails a test with an unmatched request. Vitest skips
 // the remaining afterEach hooks once one throws and runs them in reverse order of registration,
-// so this import comes before Testing Library's (directly and through ./test/render), whose
-// cleanup must still run.
+// so this import comes before Testing Library's, whose cleanup must still run.
 import { apiError, json, mockApi } from './test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from './test/mockApi';
 
-import { QueryClientProvider } from '@tanstack/react-query';
-import type { QueryClient } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createMemoryHistory } from '@tanstack/react-router';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { RenderResult } from '@testing-library/react';
@@ -41,11 +39,31 @@ import { queryKeys } from './api/queries';
 import { createAppRouter } from './router';
 import type { AppRouter } from './router';
 import { makeConfig, makeMe, makeRun, makeSources } from './test/fixtures';
-import { createTestQueryClient } from './test/render';
 
 // ---------------------------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * A query client for one test, with the options of the component tests' client. It is built here
+ * so the suite takes nothing from `./test/render`, whose memory router stands in for the route
+ * tree that these tests exercise through `./router`.
+ *
+ * - Nothing retries, so a stubbed failure (the guard's 401 or 503, a failed sign-out) settles at
+ *   once instead of after the hooks' backoff.
+ * - `gcTime: Infinity` starts no garbage-collection timer that could outlive the test.
+ * - `staleTime: 0` and no refetch on window focus keep every request one the test caused.
+ *
+ * @returns A fresh client.
+ */
+function createQueryClient(): QueryClient {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: Infinity, staleTime: 0, refetchOnWindowFocus: false },
+      mutations: { retry: false },
+    },
+  });
+}
 
 /** The signed-in admin's email, as `makeMe()` returns it. */
 const ADMIN_EMAIL = makeMe().email;
@@ -94,7 +112,7 @@ interface AppHarness extends RenderResult {
  * @returns The harness.
  */
 function renderApp(path: string): AppHarness {
-  const queryClient = createTestQueryClient();
+  const queryClient = createQueryClient();
   const router = createAppRouter(queryClient, {
     history: createMemoryHistory({ initialEntries: [path] }),
   });
@@ -191,6 +209,22 @@ describe('auth guard', () => {
     // The guard runs before the page, so nothing of the signed-in screen is requested.
     expect(callsTo(api, 'GET', '/recommendations')).toHaveLength(0);
     expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
+  });
+
+  it('sends a signed-out visitor at /actions to the sign-in form, keeping /actions', async () => {
+    mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/actions');
+
+    await waitForPath(router, '/login');
+    expect(router.state.location.search).toEqual({ redirect: '/actions' });
+    await findTitle('Sign in');
+    // Both fields are required, so each label also holds an aria-hidden asterisk: the email
+    // field is found by its accessible name, the password field, which has no role, by its label.
+    const email = screen.getByRole('textbox', { name: 'Email' });
+    expect(email.getAttribute('type')).toBe('email');
+    const password = screen.getByLabelText(/^Password/u);
+    expect(password.getAttribute('type')).toBe('password');
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
   });
 
   it('returns to the requested page after sign-in without asking GET /auth/me again', async () => {
@@ -649,6 +683,8 @@ describe('sign out', () => {
     const api = mockApi({
       ...pageReads(),
       ...SIGNED_IN,
+      // The stub answers as the API does, 200 with the signed-out `{email}` (routes/auth.py),
+      // not with a 204: the test exercises the response the client really receives.
       'POST /auth/logout': json(200, makeMe()),
     });
     const { router, queryClient } = renderApp('/settings');
