@@ -20,6 +20,10 @@ into an :class:`~ads_engine.api.deps.ApiError`:
 * 401 ``unauthenticated`` on logout and ``/auth/me`` without a valid session, from
   :func:`~ads_engine.api.deps.require_user`.
 
+Sign-out revokes server-side: logout increments ``app_user.session_generation``, which every
+session cookie must match, so it ends every session of the admin, on every browser and API
+replica, and a cookie saved before the sign-out is refused with 401 afterwards.
+
 Logging (AAP 0.11.1, "authentication failures"): events carry a reason and, where known, the
 user id. No email, password, hash, cookie or client IP is ever logged or placed in an error
 message.
@@ -37,12 +41,15 @@ Example:
         POST /api/v1/auth/logout
         X-Requested-With: ads-engine
         -> 200 {"email": "admin@example.com"}, Set-Cookie: ads_engine_session=null; expires=...
+
+        GET /api/v1/auth/me, Cookie: <the ads_engine_session value saved before logout>
+        -> 401 unauthenticated (logout revoked it)
 """
 
 from typing import Final
 
 from fastapi import APIRouter, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -117,8 +124,9 @@ async def login(
     6th within 60 s gets 429 before any account is looked up. The email arrives trimmed and
     lowercased by :class:`~ads_engine.api.schemas.LoginRequest`, the form ``ads-engine
     ensure-admin`` stores. An unknown email and a wrong password return the same 401 after
-    the same argon2 work. On success the session holds the user id, the email and the
-    sign-in instant (``now``), and ``SessionMiddleware`` writes the cookie.
+    the same argon2 work. On success the session holds the user id, the email, the
+    sign-in instant (``now``) and the user's current session generation, and
+    ``SessionMiddleware`` writes the cookie.
 
     Args:
         body: The submitted ``{email, password}``.
@@ -156,6 +164,7 @@ async def login(
     # Read before any rollback in the rehash step could expire the row's attributes.
     user_id = user.id
     email = user.email
+    generation = user.session_generation
 
     check = await run_in_threadpool(security.verify_password, user.password_hash, body.password)
     if not check.ok:
@@ -165,7 +174,7 @@ async def login(
     if check.needs_rehash:
         await _store_rehash(session, user, body.password, user_id)
 
-    security.start_session(request, user_id=user_id, email=email, now=now)
+    security.start_session(request, user_id=user_id, email=email, generation=generation, now=now)
     _log.info("auth.login_succeeded", user_id=user_id)
     return schemas.Me(email=email)
 
@@ -176,23 +185,42 @@ async def login(
     status_code=200,
     responses=schemas.ERROR_RESPONSES,
 )
-async def logout(request: Request, user: UserDep) -> schemas.Me:
-    """Sign out by clearing the session cookie.
+async def logout(request: Request, user: UserDep, session: SessionDep) -> schemas.Me:
+    """Sign out, ending every session of the admin, and clear the session cookie.
 
-    Requires a valid session. The session is cleared, so ``SessionMiddleware`` sends the
-    cookie back already expired, which removes it from the browser. The response names
-    the admin who signed out, the same ``{email}`` as login and ``/auth/me`` (AAP 0.5.3).
+    Requires a valid session. The user's ``app_user.session_generation`` is incremented
+    in one atomic ``UPDATE`` and committed. Every session cookie carries the generation it
+    was issued with, and ``require_user`` refuses one that no longer matches, so signing
+    out ends every session of the admin, on every browser and every API replica,
+    including a copy of the cookie saved before the sign-out. The session cookie stays
+    signed and stateless, and the next login issues a cookie with the new generation.
+
+    Only after the commit is the session cleared, so ``SessionMiddleware`` sends the
+    cookie back already expired, which removes it from the browser. When the commit
+    fails, the database error propagates and the cookie is kept, so the admin can retry
+    the sign-out rather than be left with a session that was never revoked. The response
+    names the admin who signed out, the same ``{email}`` as login and ``/auth/me`` (AAP
+    0.5.3).
 
     Args:
         request: The current request; carries the session.
         user: The signed-in user, verified by ``require_user``.
+        session: The request's database session.
 
     Returns:
         The signed-out admin's ``{email}``.
 
     Raises:
         ApiError: 401 ``unauthenticated`` without a valid session (from ``require_user``).
+        sqlalchemy.exc.SQLAlchemyError: When the generation cannot be stored; the session
+            cookie is then left in place.
     """
+    await session.execute(
+        update(AppUser)
+        .where(AppUser.id == user.id)
+        .values(session_generation=AppUser.session_generation + 1)
+    )
+    await session.commit()
     security.end_session(request)
     _log.info("auth.logged_out", user_id=user.id)
     return schemas.Me(email=user.email)

@@ -1042,6 +1042,41 @@ async def test_daily_rows_are_utc_dates(
     assert listing.complete
 
 
+async def test_probe_analytics_request_parses_live_costs_beyond_six_decimal_places(
+    serve: Callable[[Responder], Served], sample: Callable[[str], dict[str, Any]]
+) -> None:
+    """Analytics: live 202609 costs with up to 17 decimal places pass the recovery probe.
+
+    The probe sends ``analytics_daily(acct, (d, d), expected_creatives=1)``. Live responses
+    carry ``costInLocalCurrency`` with float residue, such as ``19.918330000000001``. The
+    contract-checked response parses, each cost rounded half-even to six places for
+    ``numeric(18, 6)`` (residue of a zero cost becomes an unsigned zero), so the probe no
+    longer fails with a validation defect.
+    """
+    documented = sample("ad_analytics")
+    day = date(2024, 5, 28)
+    live_costs = ("19.918330000000001", "0.00000000000000355")
+    for index, (element, cost) in enumerate(zip(documented["elements"], live_costs, strict=True)):
+        element["pivotValues"] = [f"urn:li:sponsoredCreative:{990001000 + index}"]
+        element["dateRange"] = {"start": day_stamp(day), "end": day_stamp(day)}
+        element["costInLocalCurrency"] = cost
+    served = serve(lambda _request: ok(documented))
+    async with open_client(served) as client:
+        listing = await client.analytics_daily("990000001", (day, day), expected_creatives=1)
+
+    (request,) = served.requests
+    assert requested_range(request) == (day, day)
+    costs = {row.creative_urn: row.cost for row in listing.rows}
+    assert {urn: str(cost) for urn, cost in costs.items()} == {
+        "urn:li:sponsoredCreative:990001000": "19.918330",
+        "urn:li:sponsoredCreative:990001001": "0.000000",
+    }
+    assert all(cost is not None and not cost.is_signed() for cost in costs.values())
+    assert all(row.date == day for row in listing.rows)
+    assert listing.complete
+    assert listing.interrupted_by is None
+
+
 # ---------------------------------------------------------------------------------------------
 # Lead Sync (AAP 0.3.3 "Lead forms", "Lead responses", "Email re-fetch", "Form identity")
 # ---------------------------------------------------------------------------------------------
@@ -2508,6 +2543,18 @@ def parse_body(
             raise AssertionError(f"no parser for linkedin.{surface}")
 
 
+def account_key(account_id: str) -> str:
+    """The comparable form of a LinkedIn ad account id: an all-digit id by numeric value.
+
+    Capture redaction zeroes ids keeping their source width, so a captured account reads
+    ``"id": 0`` in its body (``external_id`` ``"0"``) but ``adAccounts/000000000`` in a
+    request path; comparing numeric values matches the two. Any other id is kept as it is.
+    """
+    if account_id.isascii() and account_id.isdigit():
+        return str(int(account_id))
+    return account_id
+
+
 def segment_selector(url: httpx.URL) -> tuple[str, str | None]:
     """The demographic pivot and, for the Analytics Finder form, the campaign of a request."""
     pairs = url_pairs(url)
@@ -2643,7 +2690,7 @@ async def test_captured_payloads_parse(
         response = capture["response"]
         if capture["surface"] == "linkedin.ad_account" and 200 <= response["status"] < 300:
             account = parse_ad_account(response["body"])
-            currencies[account.external_id] = account.currency
+            currencies[account_key(account.external_id)] = account.currency
     for capture in captures:
         loaded = validate_capture(capture)
         assert loaded.source == "linkedin"
@@ -2664,5 +2711,5 @@ async def test_captured_payloads_parse(
             response["body"],
             pivot=pivot,
             campaign_urn=campaign,
-            account_currency=currencies.get(account_id),
+            account_currency=currencies.get(account_key(account_id)),
         )

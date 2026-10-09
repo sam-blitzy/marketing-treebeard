@@ -456,6 +456,33 @@ def test_the_associations_contract_records_its_reference_page_date() -> None:
     )
 
 
+@pytest.mark.parametrize("field", ["fromObjectTypeId", "toObjectTypeId"])
+def test_association_object_type_ids_admit_the_live_null_and_reject_an_integer(
+    contract: ContractLoader, field: str
+) -> None:
+    """Live 2026-09 responses carry null where the reference gives a string: both pass."""
+    loaded = contract("hubspot", "associations_batch_read")
+
+    def body(value: object) -> dict[str, Any]:
+        spec = {"category": "HUBSPOT_DEFINED", "typeId": 200, "label": None, field: value}
+        target = {"toObjectId": 99100000001, "associationTypes": [spec]}
+        return {
+            "status": "COMPLETE",
+            "results": [{"from": {"id": "99000000001"}, "to": [target]}],
+            "startedAt": "2026-10-08T12:00:00.100Z",
+            "completedAt": "2026-10-08T12:00:00.250Z",
+        }
+
+    validate_response(loaded, body(None), status=200)
+    validate_response(loaded, body("0-1"), status=200)
+    with pytest.raises(ContractViolation) as caught:
+        validate_response(loaded, body(1), status=200)
+    assert caught.value.surface == "hubspot.associations_batch_read"
+    assert caught.value.errors == (
+        f"$.results[0].to[0].associationTypes[0].{field}: expected string or null, got integer",
+    )
+
+
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_method_statuses_and_gaql_placement(source: str, name: str) -> None:
     raw = _read_raw(source, name)

@@ -15,11 +15,14 @@ Contents:
 * **Passwords**: :func:`hash_password`, :func:`verify_password` and :func:`verify_dummy`
   over one argon2id :class:`argon2.PasswordHasher` with the library defaults, the same
   parameters ``ads-engine hash-password`` uses.
-* **Sessions**: :func:`start_session`, :func:`read_session` and :func:`end_session` over
+* **Sessions**: :func:`start_session`, :func:`read_session`, :func:`end_session` and
+  :func:`session_cookie_unverified` (a cookie the middleware refused) over
   Starlette's ``request.session``, a signed (not encrypted) cookie written by
   ``SessionMiddleware``, which ``api/app.py`` installs with :data:`SESSION_COOKIE` and
-  :data:`SESSION_MAX_AGE`. The session holds only the user id, the email and the issue
-  time; nothing secret is ever stored in it.
+  :data:`SESSION_MAX_AGE`. The session holds only the user id, the email, the issue time
+  and the session generation (``app_user.session_generation`` at sign-in, which sign-out
+  increments so ``api/deps.py`` revokes every earlier cookie); nothing secret is ever
+  stored in it.
 * **CSRF**: :func:`csrf_ok` requires ``X-Requested-With: ads-engine`` on mutating methods.
 * **Client identity and brute-force protection**: :func:`client_ip` and
   :class:`LoginRateLimiter`.
@@ -36,7 +39,13 @@ Example:
             ...  # 429 with Retry-After: decision.retry_after
         check = verify_password(user.password_hash, password)
         if check.ok:
-            start_session(request, user_id=user.id, email=user.email, now=now)
+            start_session(
+                request,
+                user_id=user.id,
+                email=user.email,
+                generation=user.session_generation,
+                now=now,
+            )
 """
 
 import functools
@@ -73,6 +82,7 @@ __all__ = [
     "end_session",
     "hash_password",
     "read_session",
+    "session_cookie_unverified",
     "start_session",
     "verify_dummy",
     "verify_password",
@@ -109,10 +119,12 @@ LOGIN_WINDOW_SECONDS: Final = 60
 """Length of the sliding login rate-limit window, in seconds. The 6th attempt gets 429."""
 
 # Session keys. Short names keep the signed cookie small; it is readable by the client,
-# which is why it carries only the user's own id and email.
+# which is why it carries only the user's own id and email, the issue time and the
+# session generation.
 _SESSION_UID: Final = "uid"
 _SESSION_EMAIL: Final = "email"
 _SESSION_IAT: Final = "iat"
+_SESSION_GEN: Final = "gen"
 
 _log = get_logger(__name__)
 
@@ -286,11 +298,15 @@ class SessionClaims:
         email: The user's email at sign-in; ``deps.require_user`` compares it with the
             current row, so replacing the admin invalidates older sessions.
         issued_at: Sign-in instant, in epoch seconds.
+        generation: ``app_user.session_generation`` at sign-in, a non-negative integer;
+            ``deps.require_user`` compares it with the current row, so signing out, which
+            increments the column, revokes every session issued before it.
     """
 
     user_id: int
     email: str
     issued_at: int
+    generation: int
 
 
 def _epoch_seconds(now: datetime, parameter: str) -> int:
@@ -317,7 +333,9 @@ def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def start_session(request: Request, *, user_id: int, email: str, now: datetime) -> None:
+def start_session(
+    request: Request, *, user_id: int, email: str, generation: int, now: datetime
+) -> None:
     """Sign a user in by replacing the session's contents with fresh claims.
 
     The session is cleared first, so nothing from an earlier session carries over. A
@@ -326,37 +344,49 @@ def start_session(request: Request, *, user_id: int, email: str, now: datetime) 
     writes the cookie (HttpOnly, SameSite=Lax, ``Max-Age`` :data:`SESSION_MAX_AGE`,
     Secure for an ``https://`` ``APP_BASE_URL``) when the response starts.
 
+    The session holds the user id, the email, the issue time and the session generation.
+    The generation is the user's ``app_user.session_generation`` at sign-in: sign-out
+    increments the column, and ``deps.require_user`` refuses a cookie whose generation no
+    longer matches it, so a copy of the cookie saved before the sign-out stops working.
+
     Args:
         request: The current request; ``SessionMiddleware`` must be installed.
         user_id: ``app_user.id`` of the authenticated user; a positive integer.
         email: The user's stored email.
+        generation: The user's stored ``session_generation``; a non-negative integer.
         now: The sign-in instant, timezone-aware (the route's ``NowDep``).
 
     Raises:
-        ValueError: When ``user_id`` is not a positive integer, ``email`` is empty or
-            ``now`` is naive.
+        ValueError: When ``user_id`` is not a positive integer, ``email`` is empty,
+            ``generation`` is not a non-negative integer or ``now`` is naive.
     """
     if not _is_int(user_id) or user_id <= 0:
         raise ValueError("user_id must be a positive integer")
     if not email:
         raise ValueError("email must not be empty")
+    if not _is_int(generation) or generation < 0:
+        raise ValueError("generation must be a non-negative integer")
     issued_at = _epoch_seconds(now, "now")
     session = request.session
     session.clear()
     session[_SESSION_UID] = user_id
     session[_SESSION_EMAIL] = email
     session[_SESSION_IAT] = issued_at
+    session[_SESSION_GEN] = generation
 
 
 def read_session(request: Request, *, now: datetime) -> SessionClaims | None:
     """Return the signed-in user's claims, or ``None`` when there is no valid session.
 
     A session is valid when it holds a positive integer ``uid``, a non-empty string
-    ``email`` and a non-negative integer ``iat`` that is not later than ``now``, and fewer
-    than :data:`SESSION_MAX_AGE` seconds have passed since ``iat``. The cookie's signature
-    already proves the data was written by this application; its timestamp only says when
-    the cookie was last written, so checking ``iat`` keeps the 12 h lifetime absolute from
-    sign-in, and makes it testable through the injected clock.
+    ``email``, a non-negative integer ``iat`` that is not later than ``now`` and a
+    non-negative integer ``gen`` (the session generation), and fewer than
+    :data:`SESSION_MAX_AGE` seconds have passed since ``iat``. Whether ``gen`` still
+    equals the user's stored generation is checked by ``deps.require_user``, which reads
+    the row; this function reads no database. The cookie's signature already proves the
+    data was written by this application; its timestamp only says when the cookie was
+    last written, so checking ``iat`` keeps the 12 h lifetime absolute from sign-in, and
+    makes it testable through the injected clock.
 
     An ``iat`` later than ``now`` is rejected with no clock-skew allowance.
     ``SessionMiddleware`` verifies the cookie with itsdangerous'
@@ -368,7 +398,9 @@ def read_session(request: Request, *, now: datetime) -> SessionClaims | None:
     clocks.
 
     An expired, future-issued or malformed session is cleared, so ``SessionMiddleware``
-    expires the cookie on the response. An empty session is left untouched.
+    expires the cookie on the response. A session without a valid ``gen``, such as one
+    written before sessions carried a generation, is malformed. An empty session is left
+    untouched.
 
     Args:
         request: The current request; ``SessionMiddleware`` must be installed.
@@ -388,26 +420,56 @@ def read_session(request: Request, *, now: datetime) -> SessionClaims | None:
     uid = session.get(_SESSION_UID)
     email = session.get(_SESSION_EMAIL)
     iat = session.get(_SESSION_IAT)
+    gen = session.get(_SESSION_GEN)
     if (
         not _is_int(uid)
         or not isinstance(email, str)
         or not email
         or not _is_int(iat)
+        or not _is_int(gen)
         or uid <= 0
         or iat < 0
+        or gen < 0
         or iat > current
         or current - iat >= SESSION_MAX_AGE
     ):
         session.clear()
         return None
-    return SessionClaims(user_id=uid, email=email, issued_at=iat)
+    return SessionClaims(user_id=uid, email=email, issued_at=iat, generation=gen)
+
+
+def session_cookie_unverified(request: Request) -> bool:
+    """Whether the request presented a session cookie that ``SessionMiddleware`` refused.
+
+    Starlette's ``SessionMiddleware`` verifies the cookie's signature and age with
+    itsdangerous before the application runs. When that fails (a tampered or forged
+    value, a cookie signed with another ``SESSION_SECRET``, or a signature older than
+    :data:`SESSION_MAX_AGE`) it silently installs an empty session, so the request looks
+    exactly like one that sent no cookie. A :data:`SESSION_COOKIE` that is present while
+    the session is empty is therefore one the middleware could not verify. The
+    application never signs an empty session, so a cookie it wrote never decodes to one.
+
+    The decision is made here and logged by ``deps.require_user``; this function logs
+    nothing and leaves the session untouched. Call it before :func:`read_session`, which
+    clears a verified but malformed session and would make that session look refused.
+
+    Args:
+        request: The current request; ``SessionMiddleware`` must be installed.
+
+    Returns:
+        ``True`` when the session cookie is present and the session is empty; ``False``
+        when no session cookie was sent or its contents were verified.
+    """
+    return SESSION_COOKIE in request.cookies and not request.session
 
 
 def end_session(request: Request) -> None:
     """Sign out by clearing the session.
 
     ``SessionMiddleware`` then sends the cookie back with an expiry date in the past,
-    which removes it from the browser.
+    which removes it from the browser. Clearing the cookie does not revoke a copy of it
+    kept elsewhere; ``POST /auth/logout`` first increments ``app_user.session_generation``,
+    which does.
 
     Args:
         request: The current request; ``SessionMiddleware`` must be installed.
@@ -444,12 +506,16 @@ def csrf_ok(request: Request) -> bool:
 def client_ip(request: Request) -> str:
     """Return the client IP address used as the login rate-limit key.
 
-    The value is the ASGI peer address. Behind nginx, the real client address arrives
-    there because uvicorn runs with ``--proxy-headers --forwarded-allow-ips *`` and nginx
-    sets ``X-Forwarded-For`` (root ``docker-compose.yml``, ``web/nginx.conf``); uvicorn
-    rewrites the peer from that header before the app sees the request. This function
-    never parses ``X-Forwarded-For`` itself, because a client-supplied header would let
-    an attacker pick a fresh rate-limit key on every attempt.
+    The value is the ASGI peer address. uvicorn (``--proxy-headers``) rewrites that peer
+    from ``X-Forwarded-For`` before the app sees the request, but only when the connecting
+    peer is listed in ``FORWARDED_ALLOW_IPS``, which the backend image sets to loopback
+    only; it then takes the rightmost entry that is not itself listed, and from any other
+    peer it ignores the header. Behind a reverse proxy, the real client address therefore
+    arrives here only when ``FORWARDED_ALLOW_IPS`` names the proxy's address or network and
+    the proxy overwrites ``X-Forwarded-For`` with the address of the peer connected to it.
+    ``FORWARDED_ALLOW_IPS=*`` would trust every peer and take the leftmost, client-written
+    entry. This function never parses ``X-Forwarded-For`` itself, because a client-supplied
+    header would let an attacker pick a fresh rate-limit key on every attempt.
 
     Args:
         request: The current request.

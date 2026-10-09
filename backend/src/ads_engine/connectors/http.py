@@ -642,8 +642,10 @@ async def send_json(
     first occurrence. Every classified error is logged as ``connector.error`` (source,
     endpoint, kind, code, HTTP status, attempt, retryability, the sanitised reason,
     ``retry_after``, ``query_id`` and ``will_retry``) before it is raised; headers and
-    bodies never are. An attempt that will be retried is logged at debug level and the
-    error raised at info level; the owner of its consequence logs the terminal record.
+    bodies never are. An attempt that will be retried is logged at debug level and its
+    retry as ``http.retry`` at warning level; a raised ``TransientError`` is logged at
+    warning level, and a raised ``AccessDenied`` or ``QueryDefect`` at info level, because
+    the owner of its consequence logs the terminal record (:func:`_log_error`).
 
     No error of the call carries one of its credentials, even one the settings do not
     know. Each attempt runs inside :func:`~ads_engine.connectors.errors.holding_secrets`,
@@ -795,13 +797,18 @@ class _RetryWait:
 
 
 def _retry_logger(source: Source, endpoint: str) -> Callable[[RetryCallState], None]:
-    """Build tenacity's ``before_sleep`` hook, which logs ``http.retry``."""
+    """Build tenacity's ``before_sleep`` hook, which logs ``http.retry`` at warning level.
+
+    Each retry is a transient failure the call has not yet given up on, so it is a warning.
+    The failed attempt's own ``connector.error`` stays at debug level (:func:`_log_error`),
+    which leaves this event its one record above debug.
+    """
 
     def log_retry(retry_state: RetryCallState) -> None:
         """Log the failed attempt and the wait before the next one; never a body."""
         error = _failed_with(retry_state)
         connector_error = error if isinstance(error, ConnectorError) else None
-        _log.info(
+        _log.warning(
             "http.retry",
             source=source,
             endpoint=endpoint,
@@ -1231,13 +1238,26 @@ def _log_error(error: ConnectorError, attempt_number: int, policy: RetryPolicy) 
     ``secrets`` and its requests' credentials); headers and bodies are never logged.
 
     ``will_retry`` says whether :func:`send_json` sends another attempt, by the retry test
-    and attempt limit its retry loop applies under ``policy``. An attempt that will be
-    retried is logged at debug level, and the error :func:`send_json` raises at info level:
-    the owner of its consequence (``ads_engine.sync.mode``'s ``on_error``, or the connector
-    or CLI code that catches it) logs the failure's terminal record.
+    and attempt limit its retry loop applies under ``policy``. The level follows from it:
+
+    * an attempt that will be retried is logged at debug level, because the ``http.retry``
+      warning that follows already reports it;
+    * a ``TransientError`` :func:`send_json` raises (its attempts ran out, or the platform
+      asked for a wait beyond ``policy.max_retry_after_seconds``) is logged at warning
+      level, as the transient failure that ended the call;
+    * any other error :func:`send_json` raises, an ``AccessDenied`` or a ``QueryDefect``, is
+      logged at info level: the owner of its consequence (``ads_engine.sync.mode``'s
+      ``on_error``, which logs ``sync.classification`` at warning or error level, or the
+      connector or CLI code that catches it) logs the failure's terminal record, so one
+      failure never yields two records above info.
     """
     will_retry = attempt_number < policy.attempts and _retry_predicate(policy)(error)
-    log = _log.debug if will_retry else _log.info
+    if will_retry:
+        log = _log.debug
+    elif isinstance(error, TransientError):
+        log = _log.warning
+    else:
+        log = _log.info
     log(
         "connector.error",
         source=error.source,

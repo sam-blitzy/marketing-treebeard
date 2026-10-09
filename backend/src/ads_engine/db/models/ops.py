@@ -360,6 +360,12 @@ class AppUser(IdPkMixin, Base):
     Attributes:
         email: The login email, unique.
         password_hash: The argon2id hash of the password; the plaintext is never stored.
+        session_generation: The generation of this user's sessions (server default ``0``).
+            Every session cookie carries the value it was issued with, and
+            ``api/deps.py`` accepts a cookie only while it still equals this column.
+            ``POST /auth/logout`` increments it, which revokes every session issued
+            before the sign-out, on every browser and every API replica.
+            ``ensure-admin`` never writes it, so updating the password hash keeps it.
     """
 
     __tablename__ = "app_user"
@@ -367,6 +373,7 @@ class AppUser(IdPkMixin, Base):
 
     email: Mapped[str] = mapped_column(unique=True)
     password_hash: Mapped[str]
+    session_generation: Mapped[int] = mapped_column(server_default=sa.text("0"))
 
 
 class SourceConnection(IdPkMixin, Base):

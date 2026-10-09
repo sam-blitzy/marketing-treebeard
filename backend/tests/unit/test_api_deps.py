@@ -12,8 +12,8 @@ Each test asserts behaviour the module's docstrings document:
   :func:`get_login_limiter`: the UTC clock, the application's own settings, and the
   configuration and login limiter created once per application, also when first requests
   race;
-* :func:`require_user`: one 401 for an absent, invalid, expired or orphaned session, the
-  rejection reasons logged without any email, and the verified user;
+* :func:`require_user`: one 401 for an absent, invalid, expired, orphaned or revoked
+  session, the rejection reasons logged without any email, and the verified user;
 * :func:`require_csrf`: safe methods pass, mutating methods need ``X-Requested-With:
   ads-engine`` exactly;
 * the dependencies wired into a FastAPI app behind Starlette's ``SessionMiddleware``.
@@ -86,7 +86,15 @@ SIGNING_KEY = "test-signing-key"
 T0 = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 T0_EPOCH = int(T0.timestamp())
 
-VALID_CLAIMS: dict[str, object] = {"uid": USER_ID, "email": ADMIN_EMAIL, "iat": T0_EPOCH}
+GENERATION = 0
+"""The session generation of the test user's row and of the sessions it signs in with."""
+
+VALID_CLAIMS: dict[str, object] = {
+    "uid": USER_ID,
+    "email": ADMIN_EMAIL,
+    "iat": T0_EPOCH,
+    "gen": GENERATION,
+}
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -280,9 +288,17 @@ class _UserLookup:
         return self.user
 
 
-def _user(email: str = ADMIN_EMAIL) -> AppUser:
-    """Build a transient ``app_user`` row with the test user's id."""
-    return AppUser(id=USER_ID, email=email, password_hash="not-a-real-password-hash")
+def _user(email: str = ADMIN_EMAIL, generation: int = GENERATION) -> AppUser:
+    """Build a transient ``app_user`` row with the test user's id.
+
+    A transient row gets no server default, so the session generation is set explicitly.
+    """
+    return AppUser(
+        id=USER_ID,
+        email=email,
+        password_hash="not-a-real-password-hash",
+        session_generation=generation,
+    )
 
 
 async def _require(lookup: _UserLookup, session: Session, now: datetime = T0) -> CurrentUser:
@@ -737,6 +753,27 @@ async def test_require_user_without_a_session_is_401_and_not_logged(
 
 
 @pytest.mark.anyio
+async def test_require_user_logs_a_session_cookie_the_middleware_refused(
+    log_events: _LogRecorder,
+) -> None:
+    """A present cookie with an empty session is 401 and one ``invalid_signature`` warning."""
+    session = Session()
+    lookup = _UserLookup(_user())
+    request = _request(session=session, headers=[(b"cookie", b"ads_engine_session=garbage")])
+
+    with pytest.raises(ApiError) as raised:
+        await require_user(request, cast(AsyncSession, lookup), T0)
+
+    _assert_unauthenticated(raised.value)
+    assert lookup.calls == []
+    assert session.modified is False
+    assert log_events.events == [
+        ("warning", "auth.session_rejected", {"reason": "invalid_signature"}),
+    ]
+    assert "garbage" not in log_events.text()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("claims", "now"),
     [
@@ -744,9 +781,17 @@ async def test_require_user_without_a_session_is_401_and_not_logged(
         ({**VALID_CLAIMS, "iat": T0_EPOCH - SESSION_MAX_AGE}, T0),
         ({**VALID_CLAIMS, "iat": T0_EPOCH + 1}, T0),
         ({**VALID_CLAIMS, "uid": str(USER_ID)}, T0),
-        ({"uid": USER_ID, "iat": T0_EPOCH}, T0),
+        ({"uid": USER_ID, "iat": T0_EPOCH, "gen": GENERATION}, T0),
+        ({"uid": USER_ID, "email": ADMIN_EMAIL, "iat": T0_EPOCH}, T0),
     ],
-    ids=["expired-at-now", "issued-12h-ago", "issued-ahead", "malformed-uid", "missing-email"],
+    ids=[
+        "expired-at-now",
+        "issued-12h-ago",
+        "issued-ahead",
+        "malformed-uid",
+        "missing-email",
+        "missing-generation",
+    ],
 )
 async def test_require_user_rejects_an_invalid_or_expired_session(
     log_events: _LogRecorder, claims: dict[str, object], now: datetime
@@ -791,6 +836,32 @@ async def test_require_user_ends_a_session_whose_user_no_longer_matches(
     ]
     assert ADMIN_EMAIL not in log_events.text()
     assert REPLACED_EMAIL not in log_events.text()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("claimed", "stored"),
+    [(0, 1), (4, 5), (1, 0)],
+    ids=["signed-out-once", "signed-out-again", "generation-ahead"],
+)
+async def test_require_user_ends_a_session_revoked_by_a_sign_out(
+    log_events: _LogRecorder, claimed: int, stored: int
+) -> None:
+    """A generation other than the row's is 401, clears the session and logs the user id."""
+    session = Session({**VALID_CLAIMS, "gen": claimed})
+    lookup = _UserLookup(_user(generation=stored))
+
+    with pytest.raises(ApiError) as raised:
+        await _require(lookup, session)
+
+    _assert_unauthenticated(raised.value)
+    assert lookup.calls == [(AppUser, USER_ID)]
+    assert dict(session) == {}
+    assert session.modified is True
+    assert log_events.events == [
+        ("warning", "auth.session_rejected", {"reason": "session_revoked", "user_id": USER_ID}),
+    ]
+    assert ADMIN_EMAIL not in log_events.text()
 
 
 @pytest.mark.anyio
@@ -884,7 +955,7 @@ def _api_app(lookup: _UserLookup, clock: list[datetime]) -> FastAPI:
     @app.post("/login", dependencies=[Depends(require_csrf)])
     async def login(request: Request, now: NowDep) -> dict[str, str]:
         """Sign the test user in at the injected instant."""
-        start_session(request, user_id=USER_ID, email=ADMIN_EMAIL, now=now)
+        start_session(request, user_id=USER_ID, email=ADMIN_EMAIL, generation=GENERATION, now=now)
         return {"email": ADMIN_EMAIL}
 
     @app.get("/me")
@@ -967,3 +1038,52 @@ async def test_dependencies_guard_routes_behind_the_session_middleware(
     ]
     assert ADMIN_EMAIL not in log_events.text()
     assert REPLACED_EMAIL not in log_events.text()
+
+
+def _tampered(value: str) -> str:
+    """Return ``value`` with its last two characters replaced by two different ones."""
+    replacement = "AA" if value[-2:] != "AA" else "BB"
+    return f"{value[:-2]}{replacement}"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("presented", ["tampered", "garbage"])
+async def test_a_refused_session_cookie_is_logged_once_behind_the_session_middleware(
+    log_events: _LogRecorder, presented: str
+) -> None:
+    """A tampered or garbage cookie the real middleware refuses is 401 and logged once."""
+    lookup = _UserLookup(_user())
+    transport = httpx.ASGITransport(app=_api_app(lookup, [T0]))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        assert (await client.post("/login", headers={CSRF_HEADER: CSRF_VALUE})).status_code == 200
+        valid = client.cookies.get(SESSION_COOKIE)
+        assert valid
+        client.cookies.clear()
+        value = _tampered(valid) if presented == "tampered" else "garbage"
+
+        refused = await client.get("/me", headers={"Cookie": f"{SESSION_COOKIE}={value}"})
+
+    assert refused.status_code == 401
+    assert refused.json() == {"error": {"code": "unauthenticated", "message": "Sign in required"}}
+    assert lookup.calls == []
+    assert log_events.events == [
+        ("warning", "auth.session_rejected", {"reason": "invalid_signature"}),
+    ]
+    assert value not in log_events.text()
+    assert ADMIN_EMAIL not in log_events.text()
+
+
+@pytest.mark.anyio
+async def test_a_request_without_a_session_cookie_logs_no_rejection(
+    log_events: _LogRecorder,
+) -> None:
+    """No session cookie, with or without other cookies, is a routine 401 and not logged."""
+    lookup = _UserLookup(_user())
+    transport = httpx.ASGITransport(app=_api_app(lookup, [T0]))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        anonymous = await client.get("/me", headers={"Cookie": "unrelated=value"})
+        assert anonymous.status_code == 401
+        assert (await client.get("/me")).status_code == 401
+
+    assert lookup.calls == []
+    assert log_events.events == []

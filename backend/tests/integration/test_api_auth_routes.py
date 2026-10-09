@@ -3,7 +3,9 @@
 AAP 0.5.3, Authentication: ``POST /auth/login``, ``POST /auth/logout`` and ``GET /auth/me``
 each answer ``{email}``; every endpoint except login requires the session cookie (401
 ``unauthenticated``); mutating requests also require ``X-Requested-With: ads-engine`` (403
-``csrf_header_missing``); errors use ``{"error": {"code", "message"}}``.
+``csrf_header_missing``); errors use ``{"error": {"code", "message"}}``. Logout revokes
+server-side: it increments ``app_user.session_generation``, so every session cookie issued
+before it, a saved copy included, gets 401 afterwards, while the next login works.
 
 The routes run in a minimal FastAPI app assembled the way ``create_app`` mounts them:
 Starlette's ``SessionMiddleware`` with the product's cookie name and 12 h lifetime (not
@@ -19,17 +21,21 @@ request's database session comes from that schema through ``app.dependency_overr
 unreachable database fails the database tests; it never skips them.
 """
 
+import base64
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
+import itsdangerous
 import pytest
 from fastapi import Depends, FastAPI
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
@@ -37,7 +43,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ads_engine.api import security
+from ads_engine.api import deps, security
 from ads_engine.api.deps import ApiError, get_session, require_csrf
 from ads_engine.api.routes import auth
 from ads_engine.db.base import Base
@@ -233,10 +239,30 @@ async def client(sessions: Sessions, admin_id: int) -> AsyncIterator[httpx.Async
 
 
 @pytest.fixture
+async def replica(sessions: Sessions, admin_id: int) -> AsyncIterator[httpx.AsyncClient]:
+    """Yield a client of a second auth app on the same schema and signing key.
+
+    It stands for another API replica reached by another browser: its cookie jar is its own,
+    so replaying a saved cookie through it never touches the jar of :func:`client`.
+    """
+    transport = httpx.ASGITransport(app=_auth_app(sessions))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as http:
+        yield http
+
+
+@pytest.fixture
 def log_events(monkeypatch: pytest.MonkeyPatch) -> _LogRecorder:
     """Replace the auth module's logger with a recorder for the duration of one test."""
     recorder = _LogRecorder()
     monkeypatch.setattr(auth, "_log", recorder)
+    return recorder
+
+
+@pytest.fixture
+def deps_log_events(monkeypatch: pytest.MonkeyPatch) -> _LogRecorder:
+    """Replace ``require_user``'s logger with a recorder for the duration of one test."""
+    recorder = _LogRecorder()
+    monkeypatch.setattr(deps, "_log", recorder)
     return recorder
 
 
@@ -248,6 +274,35 @@ async def _sign_in(client: httpx.AsyncClient) -> httpx.Response:
     assert response.status_code == 200
     assert client.cookies.get(security.SESSION_COOKIE)
     return response
+
+
+def _saved_cookie(client: httpx.AsyncClient) -> str:
+    """Return the client's current session cookie value, as an attacker would copy it."""
+    value = client.cookies.get(security.SESSION_COOKIE)
+    assert value
+    return value
+
+
+def _replayed(saved: str) -> dict[str, str]:
+    """Build the request header that presents ``saved`` as the session cookie."""
+    return {"Cookie": f"{security.SESSION_COOKIE}={saved}"}
+
+
+def _cookie_claims(value: str) -> dict[str, Any]:
+    """Verify a session cookie with the test signing key and decode its JSON claims."""
+    signer = itsdangerous.TimestampSigner(SIGNING_KEY)
+    payload = signer.unsign(value.encode("utf-8"), max_age=security.SESSION_MAX_AGE)
+    return cast(dict[str, Any], json.loads(base64.b64decode(payload)))
+
+
+async def _stored_generation(sessions: Sessions, user_id: int) -> int:
+    """Read ``app_user.session_generation`` of ``user_id`` through a fresh session."""
+    async with sessions() as session:
+        generation = await session.scalar(
+            select(AppUser.session_generation).where(AppUser.id == user_id)
+        )
+    assert generation is not None
+    return generation
 
 
 # ---------------------------------------------------------------------------------------
@@ -330,6 +385,147 @@ async def test_logout_logs_the_user_id_and_never_the_email(
 
     assert ("info", "auth.logged_out", {"user_id": admin_id}) in log_events.events
     assert ADMIN_EMAIL not in log_events.text()
+
+
+# ---------------------------------------------------------------------------------------
+# Server-side revocation on logout
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_a_cookie_saved_before_logout_is_refused_after_it(
+    client: httpx.AsyncClient,
+    sessions: Sessions,
+    admin_id: int,
+    deps_log_events: _LogRecorder,
+) -> None:
+    """Logout revokes the session itself: a copy of the cookie saved before it gets 401."""
+    await _sign_in(client)
+    saved = _saved_cookie(client)
+    assert _cookie_claims(saved)["gen"] == 0
+    assert await _stored_generation(sessions, admin_id) == 0
+
+    assert (await client.post(LOGOUT, headers=CSRF)).status_code == 200
+    assert client.cookies.get(security.SESSION_COOKIE) is None
+    assert await _stored_generation(sessions, admin_id) == 1
+
+    cleared_jar = await client.get(ME)
+    assert cleared_jar.status_code == 401
+    assert cleared_jar.json() == UNAUTHENTICATED
+
+    replayed = await client.get(ME, headers=_replayed(saved))
+    assert replayed.status_code == 401
+    assert replayed.json() == UNAUTHENTICATED
+    assert EXPIRED_COOKIE in replayed.headers["set-cookie"]
+    replayed_logout = await client.post(LOGOUT, headers={**CSRF, **_replayed(saved)})
+    assert replayed_logout.status_code == 401
+    assert replayed_logout.json() == UNAUTHENTICATED
+    assert await _stored_generation(sessions, admin_id) == 1
+
+    revoked = (
+        "warning",
+        "auth.session_rejected",
+        {"reason": "session_revoked", "user_id": admin_id},
+    )
+    assert deps_log_events.events == [revoked, revoked]
+    assert ADMIN_EMAIL not in deps_log_events.text()
+    assert saved not in deps_log_events.text()
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_signing_in_after_logout_issues_a_cookie_of_the_new_generation(
+    client: httpx.AsyncClient, replica: httpx.AsyncClient, sessions: Sessions, admin_id: int
+) -> None:
+    """The next login works and carries the incremented generation; the old copy stays dead."""
+    await _sign_in(client)
+    saved = _saved_cookie(client)
+    assert (await client.post(LOGOUT, headers=CSRF)).status_code == 200
+
+    login = await _sign_in(client)
+    assert login.json() == {"email": ADMIN_EMAIL}
+    fresh = _saved_cookie(client)
+    assert _cookie_claims(fresh)["gen"] == 1
+    me = await client.get(ME)
+    assert me.status_code == 200
+    assert me.json() == {"email": ADMIN_EMAIL}
+    assert (await replica.get(ME, headers=_replayed(saved))).status_code == 401
+    assert (await replica.get(ME, headers=_replayed(fresh))).status_code == 200
+
+    assert (await client.post(LOGOUT, headers=CSRF)).status_code == 200
+    assert await _stored_generation(sessions, admin_id) == 2
+    assert (await replica.get(ME, headers=_replayed(fresh))).status_code == 401
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_logout_ends_every_session_of_the_admin(sessions: Sessions, admin_id: int) -> None:
+    """Two sessions on two browsers and replicas are both revoked by one logout."""
+    signed_in_at = datetime.now(UTC) - timedelta(minutes=1)
+    clock = [signed_in_at]
+    first_app, second_app = _auth_app(sessions), _auth_app(sessions)
+    for app in (first_app, second_app):
+        app.dependency_overrides[deps.get_now] = lambda: clock[0]
+    first_transport = httpx.ASGITransport(app=first_app)
+    second_transport = httpx.ASGITransport(app=second_app)
+    async with (
+        httpx.AsyncClient(transport=first_transport, base_url="http://localhost") as first,
+        httpx.AsyncClient(transport=second_transport, base_url="http://localhost") as second,
+    ):
+        await _sign_in(first)
+        clock[0] = signed_in_at + timedelta(seconds=30)
+        await _sign_in(second)
+        first_cookie, second_cookie = _saved_cookie(first), _saved_cookie(second)
+        assert _cookie_claims(first_cookie)["iat"] < _cookie_claims(second_cookie)["iat"]
+        for browser in (first, second):
+            assert (await browser.get(ME)).status_code == 200
+
+        logout = await second.post(LOGOUT, headers=CSRF)
+        assert logout.status_code == 200
+        assert logout.json() == {"email": ADMIN_EMAIL}
+        assert await _stored_generation(sessions, admin_id) == 1
+
+        other_browser = await first.get(ME)
+        assert other_browser.status_code == 401
+        assert other_browser.json() == UNAUTHENTICATED
+        assert first.cookies.get(security.SESSION_COOKIE) is None
+        for cookie in (first_cookie, second_cookie):
+            refused = await first.get(ME, headers=_replayed(cookie))
+            assert refused.status_code == 401
+            assert refused.json() == UNAUTHENTICATED
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_a_logout_whose_commit_fails_keeps_the_cookie_and_the_session(
+    sessions: Sessions, admin_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the generation cannot be stored, the cookie is not cleared, so sign-out can retry."""
+    transport = httpx.ASGITransport(app=_auth_app(sessions), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as http:
+        await _sign_in(http)
+        saved = _saved_cookie(http)
+
+        async def failing_commit(self: AsyncSession) -> None:
+            """Fail the way a commit on a dropped connection does."""
+            raise OperationalError("COMMIT", {}, ConnectionError("connection lost"))
+
+        with monkeypatch.context() as patched:
+            patched.setattr(AsyncSession, "commit", failing_commit)
+            failed = await http.post(LOGOUT, headers=CSRF)
+
+        assert failed.status_code == 500
+        assert "set-cookie" not in failed.headers
+        assert _saved_cookie(http) == saved
+        assert await _stored_generation(sessions, admin_id) == 0
+        assert (await http.get(ME)).json() == {"email": ADMIN_EMAIL}
+
+        retried = await http.post(LOGOUT, headers=CSRF)
+        assert retried.status_code == 200
+        assert EXPIRED_COOKIE in retried.headers["set-cookie"]
+        assert await _stored_generation(sessions, admin_id) == 1
+        assert (await http.get(ME, headers=_replayed(saved))).status_code == 401
 
 
 # ---------------------------------------------------------------------------------------

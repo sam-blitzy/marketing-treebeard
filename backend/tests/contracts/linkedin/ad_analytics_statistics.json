@@ -57,7 +57,7 @@
               },
               "costInLocalCurrency": {
                 "type": "string",
-                "description": "BigDecimal as a decimal string, in the account currency; parsed to numeric(18,6) into `fact_segment_window.cost`. The schema page notes that cost is not adjusted for over-delivery with a member demographic pivot."
+                "description": "BigDecimal as a decimal string, in the account currency; parsed to numeric(18,6) into `fact_segment_window.cost`. Live 202609 responses carry up to 17 decimal places of float residue (for example \"19.918330000000001\"), so the parser rounds a value with more than 6 decimal places half-even to 6 places; a value that rounds to 10^12 or more is a defect. The schema page notes that cost is not adjusted for over-delivery with a member demographic pivot."
               },
               "impressions": {
                 "type": "integer",

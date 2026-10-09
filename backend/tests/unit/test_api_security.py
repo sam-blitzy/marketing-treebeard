@@ -8,9 +8,11 @@ Each test asserts behaviour the module's docstrings document:
   exception; a lone surrogate in the candidate never raises; :func:`verify_dummy` spends one
   verification against a current-parameter hash that can never match; a cold process's
   first failure performs the same argon2 operations for an unknown and a known email;
-* sessions: :func:`start_session`, :func:`read_session` and :func:`end_session` over a
-  hand-built ASGI scope and through Starlette's ``SessionMiddleware``, covering the absolute
-  12 h lifetime, issue times ahead of the clock, malformed claims and naive datetimes;
+* sessions: :func:`start_session`, :func:`read_session`, :func:`end_session` and
+  :func:`session_cookie_unverified` over a hand-built ASGI scope and through Starlette's
+  ``SessionMiddleware``, covering the absolute 12 h lifetime, issue times ahead of the clock,
+  the session generation, malformed claims, naive datetimes and cookies the middleware
+  refuses (tampered, garbage, signed with another key);
 * :func:`csrf_ok` on safe and mutating methods, and :func:`client_ip`, which reads only the
   ASGI peer;
 * :class:`LoginRateLimiter` on an injected clock: the sliding window, ``retry_after`` bounds,
@@ -59,6 +61,7 @@ from ads_engine.api.security import (
     end_session,
     hash_password,
     read_session,
+    session_cookie_unverified,
     start_session,
     verify_dummy,
     verify_password,
@@ -76,7 +79,15 @@ PEER = "203.0.113.7"
 PEER_V6 = "2001:db8::7"
 FORWARDED = "198.51.100.9"
 
-VALID_CLAIMS: dict[str, object] = {"uid": 7, "email": ADMIN_EMAIL, "iat": T0_EPOCH}
+GENERATION = 3
+"""The session generation the tests sign in with; any non-negative integer is valid."""
+
+VALID_CLAIMS: dict[str, object] = {
+    "uid": 7,
+    "email": ADMIN_EMAIL,
+    "iat": T0_EPOCH,
+    "gen": GENERATION,
+}
 
 MISMATCH = PasswordCheck(ok=False, needs_rehash=False)
 
@@ -451,16 +462,27 @@ def test_first_failure_performs_the_same_operations_for_unknown_and_known_emails
 
 
 def test_start_session_replaces_the_session_with_fresh_claims() -> None:
-    """Signing in drops everything an earlier session held and stores uid, email and iat."""
+    """Signing in drops everything an earlier session held and stores uid, email, iat, gen."""
     request, session = _session_request(
-        {"uid": 99, "email": "old@example.com", "iat": 1, "stale": "x"}
+        {"uid": 99, "email": "old@example.com", "iat": 1, "gen": 0, "stale": "x"}
     )
-    start_session(request, user_id=7, email=ADMIN_EMAIL, now=T0)
+    start_session(request, user_id=7, email=ADMIN_EMAIL, generation=GENERATION, now=T0)
     assert dict(session) == VALID_CLAIMS
     assert session.modified is True
     assert read_session(request, now=T0) == SessionClaims(
-        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH
+        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH, generation=GENERATION
     )
+
+
+@pytest.mark.parametrize("generation", [0, 1, 2**62])
+def test_start_session_stores_the_session_generation_as_given(generation: int) -> None:
+    """The generation the user row holds at sign-in is stored unchanged under ``gen``."""
+    request, session = _session_request()
+    start_session(request, user_id=7, email=ADMIN_EMAIL, generation=generation, now=T0)
+    assert session["gen"] == generation
+    claims = read_session(request, now=T0)
+    assert claims is not None
+    assert claims.generation == generation
 
 
 @pytest.mark.parametrize(
@@ -476,28 +498,46 @@ def test_start_session_stores_whole_epoch_seconds_truncated_toward_the_past(
 ) -> None:
     """The issue time is the instant in whole epoch seconds, rounded down."""
     request, session = _session_request()
-    start_session(request, user_id=7, email=ADMIN_EMAIL, now=now)
+    start_session(request, user_id=7, email=ADMIN_EMAIL, generation=GENERATION, now=now)
     assert session["iat"] == expected
 
 
+_GEN_MESSAGE = "generation must be a non-negative integer"
+
+
 @pytest.mark.parametrize(
-    ("user_id", "email", "now", "message"),
+    ("user_id", "email", "generation", "now", "message"),
     [
-        pytest.param(0, ADMIN_EMAIL, T0, "user_id must be a positive integer", id="uid-zero"),
-        pytest.param(-3, ADMIN_EMAIL, T0, "user_id must be a positive integer", id="uid-neg"),
-        pytest.param(True, ADMIN_EMAIL, T0, "user_id must be a positive integer", id="uid-bool"),
-        pytest.param("7", ADMIN_EMAIL, T0, "user_id must be a positive integer", id="uid-str"),
-        pytest.param(7, "", T0, "email must not be empty", id="email-empty"),
-        pytest.param(7, ADMIN_EMAIL, NAIVE_T0, "now must be a timezone-aware datetime", id="naive"),
+        pytest.param(0, ADMIN_EMAIL, 0, T0, "user_id must be a positive integer", id="uid-zero"),
+        pytest.param(-3, ADMIN_EMAIL, 0, T0, "user_id must be a positive integer", id="uid-neg"),
+        pytest.param(True, ADMIN_EMAIL, 0, T0, "user_id must be a positive integer", id="uid-bool"),
+        pytest.param("7", ADMIN_EMAIL, 0, T0, "user_id must be a positive integer", id="uid-str"),
+        pytest.param(7, "", 0, T0, "email must not be empty", id="email-empty"),
+        pytest.param(7, ADMIN_EMAIL, -1, T0, _GEN_MESSAGE, id="gen-negative"),
+        pytest.param(7, ADMIN_EMAIL, True, T0, _GEN_MESSAGE, id="gen-bool"),
+        pytest.param(7, ADMIN_EMAIL, 1.0, T0, _GEN_MESSAGE, id="gen-float"),
+        pytest.param(7, ADMIN_EMAIL, "1", T0, _GEN_MESSAGE, id="gen-str"),
+        pytest.param(7, ADMIN_EMAIL, None, T0, _GEN_MESSAGE, id="gen-none"),
+        pytest.param(
+            7, ADMIN_EMAIL, 0, NAIVE_T0, "now must be a timezone-aware datetime", id="naive"
+        ),
     ],
 )
 def test_start_session_rejects_invalid_arguments(
-    user_id: object, email: str, now: datetime, message: str
+    user_id: object, email: str, generation: object, now: datetime, message: str
 ) -> None:
-    """A non-positive or non-int user id, an empty email or a naive instant raises."""
-    request, _session = _session_request()
+    """A bad user id, an empty email, a bad generation or a naive instant raises unchanged."""
+    request, session = _session_request()
     with pytest.raises(ValueError, match=message):
-        start_session(request, user_id=cast("int", user_id), email=email, now=now)
+        start_session(
+            request,
+            user_id=cast("int", user_id),
+            email=email,
+            generation=cast("int", generation),
+            now=now,
+        )
+    assert dict(session) == {}
+    assert session.modified is False
 
 
 def test_read_session_returns_none_for_an_empty_session_and_leaves_it_untouched() -> None:
@@ -513,7 +553,7 @@ def test_read_session_enforces_the_absolute_lifetime_from_sign_in() -> None:
     request, session = _session_request(VALID_CLAIMS)
     last_valid = T0 + timedelta(seconds=SESSION_MAX_AGE - 1)
     assert read_session(request, now=last_valid) == SessionClaims(
-        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH
+        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH, generation=GENERATION
     )
     assert read_session(request, now=T0 + timedelta(seconds=SESSION_MAX_AGE)) is None
     assert dict(session) == {}
@@ -543,7 +583,7 @@ def test_read_session_accepts_an_issue_time_equal_to_the_current_second(now: dat
     """An iat in the current whole second is the sign-in instant itself and stays valid."""
     request, session = _session_request(VALID_CLAIMS)
     assert read_session(request, now=now) == SessionClaims(
-        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH
+        user_id=7, email=ADMIN_EMAIL, issued_at=T0_EPOCH, generation=GENERATION
     )
     assert dict(session) == VALID_CLAIMS
     assert session.modified is False
@@ -572,6 +612,12 @@ def _without(key: str) -> dict[str, object]:
         pytest.param({**VALID_CLAIMS, "iat": T0_EPOCH + 0.5}, id="iat-float"),
         pytest.param({**VALID_CLAIMS, "iat": -1}, id="iat-negative"),
         pytest.param(_without("iat"), id="iat-missing"),
+        pytest.param({**VALID_CLAIMS, "gen": str(GENERATION)}, id="gen-str"),
+        pytest.param({**VALID_CLAIMS, "gen": True}, id="gen-bool"),
+        pytest.param({**VALID_CLAIMS, "gen": float(GENERATION)}, id="gen-float"),
+        pytest.param({**VALID_CLAIMS, "gen": -1}, id="gen-negative"),
+        pytest.param({**VALID_CLAIMS, "gen": None}, id="gen-null"),
+        pytest.param(_without("gen"), id="gen-missing"),
         pytest.param({"unrelated": "x"}, id="unrelated-only"),
     ],
 )
@@ -594,6 +640,32 @@ def test_read_session_rejects_a_naive_clock(claims: dict[str, object]) -> None:
         read_session(request, now=NAIVE_T0)
 
 
+_COOKIE_HEADER = f"{SESSION_COOKIE}=garbage".encode()
+
+
+@pytest.mark.parametrize(
+    ("headers", "claims", "expected"),
+    [
+        pytest.param(((b"cookie", _COOKIE_HEADER),), {}, True, id="cookie-refused"),
+        pytest.param(
+            ((b"cookie", f"{SESSION_COOKIE}=".encode()),), {}, True, id="empty-cookie-refused"
+        ),
+        pytest.param((), {}, False, id="no-cookie"),
+        pytest.param(((b"cookie", b"other=value"),), {}, False, id="other-cookie-only"),
+        pytest.param(((b"cookie", _COOKIE_HEADER),), VALID_CLAIMS, False, id="cookie-verified"),
+    ],
+)
+def test_session_cookie_unverified_flags_a_present_cookie_with_an_empty_session(
+    headers: tuple[tuple[bytes, bytes], ...], claims: dict[str, object], expected: bool
+) -> None:
+    """Only a session cookie the middleware left as an empty session counts as unverified."""
+    session = Session(claims)
+    request = _request(headers=headers, session=session)
+    assert session_cookie_unverified(request) is expected
+    assert dict(session) == claims
+    assert session.modified is False
+
+
 def test_end_session_clears_the_session() -> None:
     """Signing out empties the session and marks it for the middleware to expire."""
     request, session = _session_request(VALID_CLAIMS)
@@ -608,12 +680,15 @@ def test_end_session_clears_the_session() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _app(clock: list[datetime]) -> Starlette:
-    """Build a minimal app that runs this module's helpers behind ``SessionMiddleware``."""
+def _app(clock: list[datetime], secret_key: str = SIGNING_KEY) -> Starlette:
+    """Build a minimal app that runs this module's helpers behind ``SessionMiddleware``.
+
+    ``secret_key`` signs the cookie; another key stands for another deployment's secret.
+    """
 
     async def login(request: Request) -> JSONResponse:
         """Sign the admin in at the current fake instant."""
-        start_session(request, user_id=7, email=ADMIN_EMAIL, now=clock[0])
+        start_session(request, user_id=7, email=ADMIN_EMAIL, generation=GENERATION, now=clock[0])
         return JSONResponse({"signed_in": True})
 
     async def me(request: Request) -> JSONResponse:
@@ -622,7 +697,12 @@ def _app(clock: list[datetime]) -> Starlette:
         if claims is None:
             return JSONResponse(None)
         return JSONResponse(
-            {"user_id": claims.user_id, "email": claims.email, "issued_at": claims.issued_at}
+            {
+                "user_id": claims.user_id,
+                "email": claims.email,
+                "issued_at": claims.issued_at,
+                "generation": claims.generation,
+            }
         )
 
     async def logout(request: Request) -> JSONResponse:
@@ -634,17 +714,22 @@ def _app(clock: list[datetime]) -> Starlette:
         """Report the CSRF decision for this request."""
         return JSONResponse({"csrf_ok": csrf_ok(request)})
 
+    async def check(request: Request) -> JSONResponse:
+        """Report whether the middleware refused the presented session cookie."""
+        return JSONResponse({"unverified": session_cookie_unverified(request)})
+
     return Starlette(
         routes=[
             Route("/login", login, methods=["POST"]),
             Route("/me", me, methods=["GET"]),
             Route("/logout", logout, methods=["POST"]),
             Route("/mutate", mutate, methods=["POST"]),
+            Route("/check", check, methods=["GET"]),
         ],
         middleware=[
             Middleware(
                 SessionMiddleware,
-                secret_key=SIGNING_KEY,
+                secret_key=secret_key,
                 session_cookie=SESSION_COOKIE,
                 max_age=SESSION_MAX_AGE,
             )
@@ -652,10 +737,10 @@ def _app(clock: list[datetime]) -> Starlette:
     )
 
 
-def _client(clock: list[datetime]) -> httpx.AsyncClient:
+def _client(clock: list[datetime], secret_key: str = SIGNING_KEY) -> httpx.AsyncClient:
     """Return an in-process HTTP client for :func:`_app`; it keeps cookies between requests."""
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=_app(clock)), base_url="http://testserver"
+        transport=httpx.ASGITransport(app=_app(clock, secret_key)), base_url="http://testserver"
     )
 
 
@@ -672,6 +757,7 @@ async def test_session_claims_survive_the_signed_cookie_until_they_expire() -> N
             "user_id": 7,
             "email": ADMIN_EMAIL,
             "issued_at": T0_EPOCH,
+            "generation": GENERATION,
         }
 
         clock[0] = T0 + timedelta(seconds=SESSION_MAX_AGE)
@@ -713,6 +799,36 @@ async def test_end_session_makes_the_middleware_expire_the_cookie() -> None:
         logout = await client.post("/logout")
         assert EXPIRED_COOKIE in logout.headers["set-cookie"]
         assert (await client.get("/me")).json() is None
+
+
+def _tampered(value: str) -> str:
+    """Return ``value`` with its last two characters replaced by two different ones."""
+    replacement = "AA" if value[-2:] != "AA" else "BB"
+    return f"{value[:-2]}{replacement}"
+
+
+@pytest.mark.anyio
+async def test_session_cookie_unverified_through_the_middleware() -> None:
+    """A tampered, garbage or foreign-key cookie is unverified; none and a valid one are not."""
+    async with _client([T0]) as client:
+        assert (await client.get("/check")).json() == {"unverified": False}
+        assert (await client.post("/login")).status_code == 200
+        valid = client.cookies.get(SESSION_COOKIE)
+        assert valid
+        assert (await client.get("/check")).json() == {"unverified": False}
+        client.cookies.clear()
+
+        async with _client([T0], secret_key="another-signing-key") as foreign:
+            assert (await foreign.post("/login")).status_code == 200
+            foreign_cookie = foreign.cookies.get(SESSION_COOKIE)
+        assert foreign_cookie
+
+        for presented in (_tampered(valid), "garbage", foreign_cookie):
+            response = await client.get(
+                "/check", headers={"Cookie": f"{SESSION_COOKIE}={presented}"}
+            )
+            assert response.json() == {"unverified": True}, presented
+            assert "set-cookie" not in response.headers
 
 
 @pytest.mark.anyio

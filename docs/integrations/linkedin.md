@@ -721,9 +721,13 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
   - any email address, and every configured secret, `LINKEDIN_CLIENT_ID` included, in any
     string whatever its length, in plain text or in any percent-encoded spelling.
 
-  Configured ad account ids become zeros of the same length. A capture that still holds a
-  configured secret, however many times it was percent-encoded, is not written, and the
-  command exits with status 1. The `LEAD_FIELDS` projection does not request `submitter`,
-  the member URN, so captures of lead responses do not carry it.
+  Configured ad account ids become zeros of the same length, and so does the id of every
+  organization URN (`urn:li:organization:`, `urn:li:organizationBrand:` and `urn:li:company:`,
+  plain or percent-encoded), such as an account's `reference`, a campaign group's
+  `beneficiaryReference`, a campaign's `associatedEntity` and employer targeting, and a post's
+  `author`. The URN prefix is kept, and a bare number is never changed. A capture that still
+  holds a configured secret, however many times it was percent-encoded, is not written, and
+  the command exits with status 1. The `LEAD_FIELDS` projection does not request
+  `submitter`, the member URN, so captures of lead responses do not carry it.
 - **Use in tests**: the contract tests then validate the parsers against the captured payloads
   as well as the documented samples.

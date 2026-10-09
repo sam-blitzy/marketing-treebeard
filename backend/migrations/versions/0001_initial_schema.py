@@ -555,6 +555,9 @@ def _create_ops_tables() -> None:
         _id(),
         sa.Column("email", sa.Text(), nullable=False),
         sa.Column("password_hash", sa.Text(), nullable=False),
+        sa.Column(
+            "session_generation", sa.BigInteger(), server_default=sa.text(ZERO), nullable=False
+        ),
         _pk("app_user"),
         _unique("app_user", "email"),
     )

@@ -426,12 +426,20 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
     dependency through :data:`UserDep` (AAP 0.5.3). A session is accepted when
     :func:`ads_engine.api.security.read_session` validates it at ``now``, which enforces
     the absolute 12 h lifetime from sign-in, and its user still exists with the same
-    email. Replacing the admin with ``ads-engine ensure-admin`` (a new row, or a changed
-    email) therefore invalidates every earlier session: the session is cleared, so the
-    response also expires the cookie.
+    email and the same session generation. Replacing the admin with ``ads-engine
+    ensure-admin`` (a new row, or a changed email) therefore invalidates every earlier
+    session, and so does signing out, which increments ``app_user.session_generation``:
+    a copy of the cookie saved before the sign-out no longer matches. In each case the
+    session is cleared, so the response also expires the cookie.
 
     Every failure returns the same 401, so the response never reveals why a session was
-    refused. The log records only the reason and, where known, the user id.
+    refused. The log records only the reason and, where known, the user id: a warning
+    ``invalid_signature`` for a session cookie ``SessionMiddleware`` could not verify
+    (:func:`ads_engine.api.security.session_cookie_unverified`), an info
+    ``invalid_or_expired`` for a verified session that is expired, issued in the future
+    or malformed, and a warning ``user_missing``, ``user_replaced`` or
+    ``session_revoked`` with the user id. A request without a session cookie is routine
+    and not logged.
 
     Args:
         request: The current request; ``SessionMiddleware`` must be installed.
@@ -442,9 +450,16 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
         The verified user.
 
     Raises:
-        ApiError: 401 ``unauthenticated`` when there is no valid session or its user no
-            longer matches.
+        ApiError: 401 ``unauthenticated`` when there is no valid session, its user no
+            longer matches or it was revoked by a sign-out.
     """
+    if security.session_cookie_unverified(request):
+        # SessionMiddleware could not verify the cookie (tampered, forged, signed with
+        # another secret or older than its signature limit) and left the session empty,
+        # so read_session would see no cookie at all. Neither the cookie value nor the
+        # client address is logged.
+        _log.warning("auth.session_rejected", reason="invalid_signature")
+        raise _unauthenticated()
     had_session = bool(request.session)
     claims = security.read_session(request, now=now)
     if claims is None:
@@ -461,6 +476,11 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
             reason="user_missing" if user is None else "user_replaced",
             user_id=claims.user_id,
         )
+        raise _unauthenticated()
+    if user.session_generation != claims.generation:
+        # A sign-out has incremented the generation since this cookie was issued.
+        security.end_session(request)
+        _log.warning("auth.session_rejected", reason="session_revoked", user_id=claims.user_id)
         raise _unauthenticated()
     return CurrentUser(id=user.id, email=user.email)
 

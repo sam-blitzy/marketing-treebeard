@@ -1090,7 +1090,7 @@ async def test_a_503_then_200_returns_after_one_backoff_wait(captured: list[Even
     (logged_retry,) = _events(captured, "http.retry")
     assert logged_retry == {
         "event": "http.retry",
-        "log_level": "info",
+        "log_level": "warning",
         "source": "google",
         "endpoint": "search Q-G2",
         "attempt": 1,
@@ -1120,12 +1120,11 @@ async def test_three_429s_raise_the_last_transient_error_after_three_sends(
     assert [event["attempt"] for event in _events(captured, "http.retry")] == [1, 2]
 
 
-async def test_retried_attempts_log_at_debug_and_the_raised_error_at_info(
+async def test_retried_attempts_log_at_debug_and_the_raised_transient_error_at_warning(
     captured: list[EventDict],
 ) -> None:
-    # Only the error send_json raises is logged above debug, and below warning: the owner of
-    # its consequence (sync.mode on_error, or the code that catches it) logs the terminal
-    # record, so one failure never yields a warning per attempt.
+    # A retried attempt's connector.error stays at debug, since its http.retry warning
+    # reports it; the transient error send_json raises once the attempts run out is a warning.
     harness = Harness(
         *(_json(429, {"status": 429, "message": f"throttled {n}"}) for n in ("one", "two", "three"))
     )
@@ -1138,13 +1137,13 @@ async def test_retried_attempts_log_at_debug_and_the_raised_error_at_info(
     assert logged == [
         (1, "debug", True, "linkedin ad_analytics: HTTP 429: throttled one"),
         (2, "debug", True, "linkedin ad_analytics: HTTP 429: throttled two"),
-        (3, "info", False, excinfo.value.reason),
+        (3, "warning", False, excinfo.value.reason),
     ]
     assert all(event["retryable"] for event in _events(captured, "connector.error"))
-    assert [event["log_level"] for event in _events(captured, "http.retry")] == ["info"] * 2
+    assert [event["log_level"] for event in _events(captured, "http.retry")] == ["warning"] * 2
 
 
-async def test_an_error_beyond_the_policys_attempts_or_retry_test_logs_at_info(
+async def test_a_transient_error_beyond_the_policys_attempts_or_retry_test_logs_at_warning(
     captured: list[EventDict],
 ) -> None:
     # One attempt allowed: the retryable 503 is raised at once, so it is not retried.
@@ -1162,7 +1161,36 @@ async def test_an_error_beyond_the_policys_attempts_or_retry_test_logs_at_info(
         (event["attempt"], event["log_level"], event["retryable"], event["will_retry"])
         for event in _events(captured, "connector.error")
     ]
-    assert logged == [(1, "info", True, False), (1, "info", True, False)]
+    assert logged == [(1, "warning", True, False), (1, "warning", True, False)]
+    assert _events(captured, "http.retry") == []
+
+
+async def test_a_raised_access_denial_or_defect_logs_at_info(
+    captured: list[EventDict],
+) -> None:
+    # sync.mode's on_error logs a denial's or a defect's terminal classification at warning
+    # or error, so the HTTP layer's record of either stays at info, even after a retry.
+    denied = Harness(
+        _json(403, {"status": "error", "message": "Missing scopes", "category": "MISSING_SCOPES"})
+    )
+    with pytest.raises(AccessDenied):
+        await denied.call(source="hubspot")
+    bad_field = _google_error(
+        400, "INVALID_ARGUMENT", "Unrecognized field segments.week", "queryError", "BAD_FIELD"
+    )
+    defect = Harness(httpx.Response(503), _json(400, bad_field))
+    with pytest.raises(QueryDefect):
+        await defect.call()
+    logged = [
+        (event["kind"], event["attempt"], event["log_level"], event["will_retry"])
+        for event in _events(captured, "connector.error")
+    ]
+    assert logged == [
+        ("access_denied", 1, "info", False),
+        ("transient", 1, "debug", True),
+        ("defect", 2, "info", False),
+    ]
+    assert [event["log_level"] for event in _events(captured, "http.retry")] == ["warning"]
 
 
 async def test_each_attempt_builds_a_fresh_request() -> None:
@@ -1769,7 +1797,7 @@ async def test_a_transient_error_log_carries_the_requested_retry_after(
     (logged_error,) = _events(captured, "connector.error")
     assert logged_error == {
         "event": "connector.error",
-        "log_level": "info",
+        "log_level": "warning",
         "source": "linkedin",
         "endpoint": "ad_analytics",
         "kind": "transient",

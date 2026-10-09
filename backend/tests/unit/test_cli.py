@@ -26,6 +26,10 @@ analysis lock is held) and 0.11.2 ("First start"). Covered here:
   ``GoogleCallBudget`` on the test database (the ``db`` fixture) and counted in
   ``source_connection.calls_24h``; a full window sends nothing; a database that cannot meter
   the calls refuses the capture before any request, or stops it at the failed reservation;
+* the Google capture's scopes: Q-G3 reads every campaign for 30 days, Q-G5 every campaign on
+  the delivering campaign's latest day with impressions, Q-G6 and Q-G7 the ad group whose
+  keywords delivered most; a query that answers with no rows is reported as not captured,
+  with its scope in words, and the capture still exits 0;
 * the capture output directory: overlapping and failed writes leave complete files and no
   temporaries, symbolic links are replaced or refused rather than followed, and a redirected
   or unwritable ``captured/`` is refused before any request is sent.
@@ -41,12 +45,13 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn
@@ -69,7 +74,17 @@ from ads_engine.analysis.lock import RunInProgress
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.analysis.window import InvalidWindow
 from ads_engine.connectors.errors import AccessDenied, QueryDefect
-from ads_engine.connectors.google_n8n.queries import QUERIES
+from ads_engine.connectors.google_n8n.queries import (
+    AD_GROUP_HI,
+    AD_GROUP_LO,
+    CAMPAIGN_HI,
+    CAMPAIGN_LO,
+    END,
+    QUERIES,
+    START,
+    ParsedQuery,
+    parse_query,
+)
 from ads_engine.connectors.hubspot.client import STAGE_DATE_PROPERTY_PREFIX
 from ads_engine.db import session as db_session
 from ads_engine.decisions import SubjectRetired
@@ -1103,7 +1118,11 @@ def test_capture_refused_under_simulated_mode(
     [
         ("google", "N8N_GOOGLE_ADS_WEBHOOK_URL, N8N_WEBHOOK_SECRET, GOOGLE_ADS_CUSTOMER_ID"),
         ("hubspot", "HUBSPOT_ACCESS_TOKEN"),
-        ("linkedin", "LINKEDIN_AD_ACCOUNT_IDS"),
+        (
+            "linkedin",
+            "LINKEDIN_AD_ACCOUNT_IDS and either LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and "
+            "LINKEDIN_REFRESH_TOKEN, or LINKEDIN_ACCESS_TOKEN",
+        ),
     ],
 )
 def test_capture_refused_without_credentials(
@@ -1114,7 +1133,79 @@ def test_capture_refused_without_credentials(
     get_settings.cache_clear()
     before = sorted(CONTRACTS.glob("*/captured/*"))
     assert cli.main(["capture-fixtures", "--source", source]) == cli.EXIT_FAILURE
-    assert f"live credentials are not configured; set {names}" in capsys.readouterr().err
+    assert (
+        f"ads-engine: capture-fixtures {source}: live credentials are not configured; set {names}"
+    ) in capsys.readouterr().err.splitlines()
+    assert sorted(CONTRACTS.glob("*/captured/*")) == before
+
+
+@pytest.mark.parametrize(
+    ("configured", "names"),
+    [
+        pytest.param(
+            {},
+            "LINKEDIN_AD_ACCOUNT_IDS and either LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and "
+            "LINKEDIN_REFRESH_TOKEN, or LINKEDIN_ACCESS_TOKEN",
+            id="nothing-set",
+        ),
+        pytest.param(
+            {"LINKEDIN_AD_ACCOUNT_IDS": "507404993"},
+            "either LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN, "
+            "or LINKEDIN_ACCESS_TOKEN",
+            id="account-ids-only",
+        ),
+        pytest.param(
+            {"LINKEDIN_CLIENT_ID": LINKEDIN_CLIENT_ID},
+            "LINKEDIN_AD_ACCOUNT_IDS and either LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN "
+            "(to complete the refresh-token trio), or LINKEDIN_ACCESS_TOKEN",
+            id="partial-trio",
+        ),
+        pytest.param(
+            {
+                "LINKEDIN_AD_ACCOUNT_IDS": "507404993",
+                "LINKEDIN_CLIENT_ID": LINKEDIN_CLIENT_ID,
+                "LINKEDIN_CLIENT_SECRET": LINKEDIN_CLIENT_SECRET,
+            },
+            "either LINKEDIN_REFRESH_TOKEN (to complete the refresh-token trio), "
+            "or LINKEDIN_ACCESS_TOKEN",
+            id="account-ids-and-partial-trio",
+        ),
+        pytest.param(
+            {
+                "LINKEDIN_CLIENT_ID": LINKEDIN_CLIENT_ID,
+                "LINKEDIN_CLIENT_SECRET": LINKEDIN_CLIENT_SECRET,
+                "LINKEDIN_REFRESH_TOKEN": LINKEDIN_REFRESH,
+            },
+            "LINKEDIN_AD_ACCOUNT_IDS",
+            id="refresh-trio-without-account-ids",
+        ),
+        pytest.param(
+            {"LINKEDIN_ACCESS_TOKEN": LINKEDIN_STATIC},
+            "LINKEDIN_AD_ACCOUNT_IDS",
+            id="access-token-without-account-ids",
+        ),
+    ],
+)
+def test_capture_refusal_names_the_linkedin_alternatives(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    configured: dict[str, str],
+    names: str,
+) -> None:
+    """LinkedIn needs its account ids plus either the refresh-token trio or an access token."""
+    monkeypatch.chdir(BACKEND)
+    monkeypatch.setenv("DATA_MODE", "auto")
+    for name, value in configured.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    before = sorted(CONTRACTS.glob("*/captured/*"))
+    assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert (
+        f"ads-engine: capture-fixtures linkedin: live credentials are not configured; set {names}"
+    ) in err.splitlines()
+    for value in configured.values():
+        assert value not in err
     assert sorted(CONTRACTS.glob("*/captured/*")) == before
 
 
@@ -1251,6 +1342,104 @@ def test_policy_url_headers_and_form() -> None:
         "grant_type=refresh_token&refresh_token=%3Credacted%3E&client_id=%3Credacted%3E"
         "&client_secret=%3Credacted%3E"
     )
+
+
+# Organization ids no setting holds, as LinkedIn's documented samples write them; one has
+# four digits, so a bare number equal to it is an ordinary metric.
+ORGANIZATION_ID = "2414183"
+EMPLOYER_ID = "1035"
+
+
+def test_policy_zeroes_organization_urn_ids_in_every_string() -> None:
+    """Each organization URN id becomes same-length zeros; the prefix stays as written."""
+    policy = _policy()
+    assert policy.text(f"urn:li:organization:{ORGANIZATION_ID}") == "urn:li:organization:0000000"
+    assert (
+        policy.text(f"urn:li:organizationBrand:{ORGANIZATION_ID}")
+        == "urn:li:organizationBrand:0000000"
+    )
+    assert policy.text(f"urn:li:company:{EMPLOYER_ID}") == "urn:li:company:0000"
+    assert (
+        policy.text(f"by urn:li:organization:{ORGANIZATION_ID}, urn:li:company:{EMPLOYER_ID}.")
+        == "by urn:li:organization:0000000, urn:li:company:0000."
+    )
+    body = {
+        "reference": f"urn:li:organization:{ORGANIZATION_ID}",
+        "beneficiaryReference": {"organization": f"urn:li:organization:{ORGANIZATION_ID}"},
+        "targetingCriteria": {
+            "exclude": {
+                "or": {
+                    "urn:li:adTargetingFacet:employers": [
+                        f"urn:li:organization:{EMPLOYER_ID}",
+                        "urn:li:organization:77001234",
+                    ]
+                }
+            }
+        },
+        "results": {f"urn:li:organization:{ORGANIZATION_ID}": {"vanityName": "acme"}},
+    }
+    assert policy.value(body, cli._CREDENTIAL_KEYS | cli._PERSON_KEYS) == {
+        "reference": "urn:li:organization:0000000",
+        "beneficiaryReference": {"organization": "urn:li:organization:0000000"},
+        "targetingCriteria": {
+            "exclude": {
+                "or": {
+                    "urn:li:adTargetingFacet:employers": [
+                        "urn:li:organization:0000",
+                        "urn:li:organization:00000000",
+                    ]
+                }
+            }
+        },
+        "results": {"urn:li:organization:0000000": {"vanityName": "acme"}},
+    }
+    assert policy.headers([("X-Context", f"urn:li:organization:{ORGANIZATION_ID}")]) == {
+        "X-Context": "urn:li:organization:0000000"
+    }
+
+
+def test_policy_zeroes_percent_encoded_organization_urn_ids() -> None:
+    """Encoded colons, in either hex case and encoded more than once, are matched too."""
+    policy = _policy()
+    url = (
+        "https://api.linkedin.com/rest/posts?q=author"
+        f"&author=urn%3Ali%3Aorganization%3A{ORGANIZATION_ID}"
+        f"&ids=List(urn%3ali%3acompany%3a{EMPLOYER_ID},"
+        f"urn%3Ali%3AorganizationBrand%3a{ORGANIZATION_ID})"
+        f"&next=urn%253Ali%253Aorganization%253A{ORGANIZATION_ID}"
+    )
+    assert policy.url(url, "linkedin") == (
+        "https://api.linkedin.com/rest/posts?q=author"
+        "&author=urn%3Ali%3Aorganization%3A0000000"
+        "&ids=List(urn%3ali%3acompany%3a0000,urn%3Ali%3AorganizationBrand%3a0000000)"
+        "&next=urn%253Ali%253Aorganization%253A0000000"
+    )
+    assert unquote(policy.text(quote(f"urn:li:organization:{ORGANIZATION_ID}", safe=""))) == (
+        "urn:li:organization:0000000"
+    )
+
+
+def test_policy_keeps_other_urns_and_bare_numbers() -> None:
+    """Only the organization URN context is zeroed; account URNs follow the configured ids."""
+    policy = _policy()
+    kept = (
+        "urn:li:sponsoredCampaign:123456",
+        "urn:li:sponsoredCampaignGroup:654321",
+        "urn:li:share:6778045555198214144",
+        "urn:li:person:Ab3dEf",
+        "urn:li:geo:103644278",
+        "urn:li:adTargetingFacet:employers",
+        "urn:li:organization:",
+        ORGANIZATION_ID,
+        f"{EMPLOYER_ID} impressions",
+    )
+    for value in kept:
+        assert policy.text(value) == value
+    assert policy.text("urn:li:sponsoredAccount:512345678") == "urn:li:sponsoredAccount:000000000"
+    assert policy.value(int(ORGANIZATION_ID), frozenset()) == int(ORGANIZATION_ID)
+    assert policy.value({"impressions": int(EMPLOYER_ID)}, frozenset()) == {
+        "impressions": int(EMPLOYER_ID)
+    }
 
 
 # A configured secret far shorter than any real token: settings accept it, so capture
@@ -1829,6 +2018,109 @@ def test_capture_writes_every_surface_redacted(
             assert "<redacted>" in json.dumps(answer["answerDetails"])
 
 
+# Where the live account's organization id was found in LinkedIn captures.
+ORGANIZATION_SURFACES = frozenset({"ad_account", "ad_campaign_groups", "ad_campaigns", "posts"})
+# Every organization URN id in a capture's JSON text, its colons literal or percent-encoded.
+ORGANIZATION_URN_ID = re.compile(
+    r"urn(?::|%(?:25)*3[Aa])li(?::|%(?:25)*3[Aa])(?:organization(?:Brand)?|company)"
+    r"(?::|%(?:25)*3[Aa])([0-9]+)"
+)
+
+
+def _organization_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve the CLI from the simulator, with organization URNs where live LinkedIn has them.
+
+    The simulator authors posts as the (configured, so already zeroed) ad account. This puts
+    organization ids no setting holds in the account's ``reference``, each campaign group's
+    ``beneficiaryReference``, each campaign's ``associatedEntity`` and employer exclusions,
+    and each post's ``author``, as a live account returns them.
+    """
+    from ads_engine.simulation.payloads import identify_surface
+
+    settings = get_settings()
+    inner = mock_transport("linkedin", _capture_world(settings), settings=settings)
+    organization = f"urn:li:organization:{ORGANIZATION_ID}"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = await inner.handle_async_request(request)
+        surface = identify_surface("linkedin", request)
+        if response.status_code != 200 or surface not in ORGANIZATION_SURFACES:
+            return response
+        body = json.loads(await response.aread())
+        if surface == "ad_account":
+            body["reference"] = organization
+        elif surface == "ad_campaign_groups":
+            for element in body["elements"]:
+                element["beneficiaryReference"] = {"organization": organization}
+        elif surface == "ad_campaigns":
+            for element in body["elements"]:
+                element["associatedEntity"] = organization
+                element["targetingCriteria"] = {
+                    "include": {
+                        "and": [
+                            {"or": {"urn:li:adTargetingFacet:locations": ["urn:li:geo:103644278"]}}
+                        ]
+                    },
+                    "exclude": {
+                        "or": {
+                            "urn:li:adTargetingFacet:employers": [
+                                f"urn:li:organization:{EMPLOYER_ID}",
+                                "urn:li:organization:77001234",
+                            ]
+                        }
+                    },
+                }
+        else:
+            for post in body["results"].values():
+                post["author"] = organization
+        return httpx.Response(response.status_code, json=body)
+
+    _live(monkeypatch, httpx.MockTransport(handler))
+
+
+def test_capture_linkedin_zeroes_every_organization_id(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No organization id survives in a written capture, and each still meets its contract."""
+    _organization_live(monkeypatch)
+    code = cli.main(["capture-fixtures", "--source", "linkedin"])
+    out, err = capsys.readouterr()
+    assert code == cli.EXIT_OK, err[-2000:]
+    documents: dict[str, dict[str, Any]] = {}
+    zeroed = 0
+    for path in _written(out):
+        text = (capture_dir / path).read_text(encoding="utf-8")
+        for organization_id in ORGANIZATION_URN_ID.findall(text):
+            assert set(organization_id) == {"0"}, (path, organization_id)
+            zeroed += 1
+        document = json.loads(text)
+        validate_capture(document, root=capture_dir / "tests" / "contracts")
+        documents[Path(path).stem] = document
+    assert set(documents) == EXPECTED_SURFACES["linkedin"]
+    organization = "urn:li:organization:0000000"
+    assert documents["ad_account"]["response"]["body"]["reference"] == organization
+    groups = documents["ad_campaign_groups"]["response"]["body"]["elements"]
+    campaigns = documents["ad_campaigns"]["response"]["body"]["elements"]
+    posts = documents["posts"]["response"]["body"]["results"]
+    assert groups
+    assert campaigns
+    assert posts
+    for group in groups:
+        assert group["beneficiaryReference"] == {"organization": organization}
+    for campaign in campaigns:
+        assert campaign["associatedEntity"] == organization
+        targeting = campaign["targetingCriteria"]
+        assert targeting["exclude"]["or"]["urn:li:adTargetingFacet:employers"] == [
+            "urn:li:organization:0000",
+            "urn:li:organization:00000000",
+        ]
+        locations = targeting["include"]["and"][0]["or"]["urn:li:adTargetingFacet:locations"]
+        assert locations == ["urn:li:geo:103644278"]
+    for post in posts.values():
+        assert post["author"] == organization
+    assert zeroed == 1 + len(groups) + 3 * len(campaigns) + len(posts)
+
+
 # ---------------------------------------------------------------------------
 # capture-fixtures: one request per surface on accounts with more pages
 # ---------------------------------------------------------------------------
@@ -2152,6 +2444,261 @@ def test_capture_google_stops_at_a_reservation_the_database_cannot_make(
     assert ("no surface could be captured" in err) == (not surfaces)
 
 
+# ---------------------------------------------------------------------------
+# capture-fixtures: Google queries pointed at data that delivered
+# ---------------------------------------------------------------------------
+
+YESTERDAY = FIXED_CLOCK().date() - timedelta(days=1)
+"""The day every Google capture window ends on."""
+
+GoogleAnswers = dict[str, tuple[Any, list[dict[str, Any]]]]
+"""Per query id: the scope it was sent with and the rows the CLI received."""
+
+
+def _google_answered(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[tuple[ParsedQuery, dict[str, Any]]]:
+    """Serve the CLI's Google calls from the simulator, each 200 body edited by ``answer``.
+
+    ``answer`` receives the query id and the simulator's envelope, and edits it in place.
+
+    Returns:
+        ``(parsed query, envelope the CLI received)`` per request, in arrival order; it
+        grows as the CLI runs.
+    """
+    settings = get_settings()
+    inner = mock_transport("google", _capture_world(settings), settings=settings)
+    seen: list[tuple[ParsedQuery, dict[str, Any]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        parsed = parse_query(json.loads(request.content)["query"])
+        response = await inner.handle_async_request(request)
+        body = json.loads(await response.aread())
+        if answer is not None and response.status_code == 200:
+            answer(parsed.query_id, body)
+        seen.append((parsed, body))
+        return httpx.Response(response.status_code, json=body)
+
+    _live(monkeypatch, httpx.MockTransport(handler))
+    return seen
+
+
+def _keep_rows(body: dict[str, Any], keep: Callable[[dict[str, Any]], bool]) -> None:
+    """Keep the envelope rows ``keep`` accepts, omitting ``results`` as Google does when empty."""
+    rows = [row for row in body.pop("results", []) if keep(row)]
+    if rows:
+        body["results"] = rows
+
+
+def _google_answers(seen: list[tuple[ParsedQuery, dict[str, Any]]]) -> GoogleAnswers:
+    """The scope and the received rows of each query, by query id."""
+    return {parsed.query_id: (dict(parsed.scope), body.get("results", [])) for parsed, body in seen}
+
+
+def _impressions_by(rows: list[dict[str, Any]], resource: str) -> dict[int, int]:
+    """Impressions summed per ``{resource}.id`` over GoogleAdsRows."""
+    totals: dict[int, int] = {}
+    for row in rows:
+        key = int(row[resource]["id"])
+        totals[key] = totals.get(key, 0) + int(row["metrics"]["impressions"])
+    return totals
+
+
+def _latest_delivery(rows: list[dict[str, Any]], campaign_id: int) -> date:
+    """The latest ``segments.date`` with impressions of ``campaign_id`` in Q-G3 rows."""
+    return max(
+        date.fromisoformat(row["segments"]["date"])
+        for row in rows
+        if int(row["campaign"]["id"]) == campaign_id and int(row["metrics"]["impressions"]) > 0
+    )
+
+
+def _finished_record(err: str) -> dict[str, Any]:
+    """The one ``capture_fixtures_finished`` JSON line among the CLI's stderr lines."""
+    records = [json.loads(line) for line in err.splitlines() if line.startswith("{")]
+    (record,) = [record for record in records if record.get("event") == "capture_fixtures_finished"]
+    return record
+
+
+def test_capture_google_reads_where_a_later_search_campaign_delivered(
+    capture_dir: Path,
+    google_calls_24h: Callable[[], int | None],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The first campaign and ad group never delivered; a later Search campaign did.
+
+    Q-G3 answers only for the later campaign and Q-G5/Q-G6 never for the first ad group, so
+    scoping to the first ids would capture neither. Q-G3 reads every campaign for 30 days,
+    Q-G5 every campaign on the later campaign's latest day with impressions, and Q-G6 and
+    Q-G7 that campaign's ad group, although another campaign's ad group had more keyword
+    impressions that day. Every surface is captured with one call per template.
+    """
+    world = _capture_world(get_settings())
+    campaigns = sorted(world.google_campaigns(world.now()), key=lambda record: record.id)
+    ad_groups = sorted(world.google_ad_groups(world.now()), key=lambda record: record.id)
+    (later,) = [record for record in campaigns if record.name == "Competitor - Conquest"]
+    (later_group,) = [record for record in ad_groups if record.campaign_id == later.id]
+    assert later.channel == "SEARCH"
+    assert later.id != campaigns[0].id
+    assert later_group.id != ad_groups[0].id
+
+    def answer(query_id: str, body: dict[str, Any]) -> None:
+        if query_id == "Q-G3":
+            _keep_rows(body, lambda row: int(row["campaign"]["id"]) == later.id)
+        elif query_id in ("Q-G5", "Q-G6"):
+            _keep_rows(body, lambda row: int(row["adGroup"]["id"]) != ad_groups[0].id)
+
+    seen = _google_answered(monkeypatch, answer)
+    code = cli.main(["capture-fixtures", "--source", "google"])
+    out, err = capsys.readouterr()
+    assert code == cli.EXIT_OK, err[-2000:]
+    assert [parsed.query_id for parsed, _body in seen] == list(QUERIES)
+    assert google_calls_24h() == len(QUERIES)
+    assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["google"]
+    assert "not captured" not in err
+    answers = _google_answers(seen)
+    assert answers["Q-G3"][0] == {START: YESTERDAY - timedelta(days=29), END: YESTERDAY}
+    day = _latest_delivery(answers["Q-G3"][1], later.id)
+    assert answers["Q-G5"][0] == {START: day, END: day}
+    keyword_impressions = _impressions_by(answers["Q-G5"][1], "adGroup")
+    assert 0 < keyword_impressions[later_group.id] < max(keyword_impressions.values())
+    group = {AD_GROUP_LO: later_group.id, AD_GROUP_HI: later_group.id}
+    assert answers["Q-G6"][0] == {START: day, END: day, **group}
+    assert answers["Q-G7"][0] == group
+    assert answers["Q-G6"][1]
+    assert answers["Q-G7"][1]
+    # Q-G2b still looks up the first Q-G2 campaign.
+    assert answers["Q-G2b"][0] == {"ids": (campaigns[0].id,)}
+
+
+def test_capture_google_takes_keywords_from_a_search_ad_group_when_the_top_campaign_has_none(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Search campaign with the most impressions has no keyword traffic that day.
+
+    Q-G5 still reads every campaign on that campaign's latest day with impressions, so Q-G6
+    and Q-G7 read the Search ad group with the most keyword impressions in Q-G5's rows.
+    """
+    seen = _google_answered(monkeypatch)
+    assert cli.main(["capture-fixtures", "--source", "google"]) == cli.EXIT_OK
+    out, err = capsys.readouterr()
+    assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["google"], err
+    answers = _google_answers(seen)
+    channels = {
+        int(row["campaign"]["id"]): row["campaign"]["advertisingChannelType"]
+        for row in answers["Q-G2"][1]
+    }
+    owners = {int(row["adGroup"]["id"]): int(row["campaign"]["id"]) for row in answers["Q-G4"][1]}
+    delivery = _impressions_by(answers["Q-G3"][1], "campaign")
+    top = max(
+        (campaign_id for campaign_id in delivery if channels.get(campaign_id) == "SEARCH"),
+        key=lambda campaign_id: delivery[campaign_id],
+    )
+    day = _latest_delivery(answers["Q-G3"][1], top)
+    assert answers["Q-G5"][0] == {START: day, END: day}
+    keyword_impressions = _impressions_by(answers["Q-G5"][1], "adGroup")
+    assert top not in {owners[ad_group_id] for ad_group_id in keyword_impressions}
+    chosen = max(keyword_impressions, key=lambda ad_group_id: keyword_impressions[ad_group_id])
+    assert channels[owners[chosen]] == "SEARCH"
+    group = {AD_GROUP_LO: chosen, AD_GROUP_HI: chosen}
+    assert answers["Q-G6"][0] == {START: day, END: day, **group}
+    assert answers["Q-G7"][0] == group
+
+
+EMPTY_DELIVERY_LINES = (
+    "capture-fixtures google: not captured: row_campaign_daily: search Q-G3 returned no rows "
+    "(every campaign, the 30 days ending yesterday)",
+    "capture-fixtures google: not captured: row_keyword_view: search Q-G5 returned no rows "
+    "(the first ad group listed, yesterday)",
+    "capture-fixtures google: not captured: row_search_term_view: search Q-G6 returned no "
+    "rows (the first ad group listed, yesterday)",
+    "capture-fixtures google: not captured: row_ad_group_criterion: search Q-G7 returned no "
+    "rows (the first ad group listed)",
+)
+TOP_CAMPAIGN = "the Search campaign with the most impressions in the last 30 days"
+EMPTY_KEYWORD_LINES = (
+    "capture-fixtures google: not captured: row_keyword_view: search Q-G5 returned no rows "
+    f"(every campaign, the latest day with impressions of {TOP_CAMPAIGN})",
+    "capture-fixtures google: not captured: row_search_term_view: search Q-G6 returned no "
+    f"rows ({TOP_CAMPAIGN}, its latest day with impressions)",
+    "capture-fixtures google: not captured: row_ad_group_criterion: search Q-G7 returned no "
+    f"rows (the first ad group listed for {TOP_CAMPAIGN})",
+)
+
+
+@pytest.mark.parametrize(
+    ("emptied", "lines"),
+    [
+        (("Q-G3", "Q-G5", "Q-G6", "Q-G7"), EMPTY_DELIVERY_LINES),
+        (("Q-G5", "Q-G6", "Q-G7"), EMPTY_KEYWORD_LINES),
+    ],
+    ids=["no-delivery", "no-keyword-rows"],
+)
+def test_capture_google_reports_each_query_that_answered_with_no_rows(
+    capture_dir: Path,
+    google_calls_24h: Callable[[], int | None],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    emptied: tuple[str, ...],
+    lines: tuple[str, ...],
+) -> None:
+    """A query that answers with no rows leaves its surface reported, not silently missing.
+
+    Each such surface gets one "not captured" line naming its query and the scope in words,
+    never an id, and counts in ``skipped``. Nothing failed, so the capture still exits 0
+    after one call per template. Without a delivering campaign the reads keep yesterday and
+    the first ad group listed; with one but no keyword rows, Q-G6 reads the delivering
+    campaign and Q-G7 its first ad group.
+    """
+    world = _capture_world(get_settings())
+
+    def answer(query_id: str, body: dict[str, Any]) -> None:
+        if query_id in emptied:
+            body.pop("results", None)
+
+    seen = _google_answered(monkeypatch, answer)
+    code = cli.main(["capture-fixtures", "--source", "google"])
+    out, err = capsys.readouterr()
+    assert code == cli.EXIT_OK, err[-2000:]
+    assert [parsed.query_id for parsed, _body in seen] == list(QUERIES)
+    assert google_calls_24h() == len(QUERIES)
+    missing = {QUERIES[query_id].row_surface for query_id in emptied}
+    assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["google"] - missing
+    assert _google_captured(capture_dir) == EXPECTED_SURFACES["google"] - missing
+    reported = [line for line in err.splitlines() if "not captured" in line]
+    assert reported == [f"ads-engine: {line}" for line in lines]
+    record = _finished_record(err)
+    assert record["skipped"] == len(lines)
+    assert record["failed"] == 0
+    assert record["written"] == len(EXPECTED_SURFACES["google"]) - len(missing)
+    assert world.google_customer_id not in err
+    answers = _google_answers(seen)
+    ids = {row["campaign"]["id"] for row in answers["Q-G2"][1]} | {
+        row["adGroup"]["id"] for row in answers["Q-G4"][1]
+    }
+    for line in reported:
+        assert not any(value in line for value in ids), line
+    first_group = int(answers["Q-G4"][1][0]["adGroup"]["id"])
+    if "Q-G3" in emptied:
+        group = {AD_GROUP_LO: first_group, AD_GROUP_HI: first_group}
+        assert answers["Q-G5"][0] == {START: YESTERDAY, END: YESTERDAY, **group}
+        assert answers["Q-G6"][0] == {START: YESTERDAY, END: YESTERDAY, **group}
+        assert answers["Q-G7"][0] == group
+    else:
+        (campaign_id,) = {answers["Q-G6"][0][CAMPAIGN_LO], answers["Q-G6"][0][CAMPAIGN_HI]}
+        owners = [
+            int(row["adGroup"]["id"])
+            for row in answers["Q-G4"][1]
+            if int(row["campaign"]["id"]) == campaign_id
+        ]
+        assert answers["Q-G7"][0] == {AD_GROUP_LO: owners[0], AD_GROUP_HI: owners[0]}
+        day = _latest_delivery(answers["Q-G3"][1], campaign_id)
+        assert answers["Q-G5"][0] == {START: day, END: day}
+        assert answers["Q-G6"][0][START] == answers["Q-G6"][0][END] == day
+
+
 def test_capture_continues_past_a_forbidden_surface(
     capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2313,6 +2860,48 @@ def test_capture_reports_a_capture_that_breaks_its_contract(
     out, err = capsys.readouterr()
     assert "properties" in {Path(path).stem for path in _written(out)}
     assert "capture breaks its contract: properties:" in err
+
+
+def test_capture_hubspot_keeps_the_live_null_association_object_type_ids(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live 2026-09 association types carry ``fromObjectTypeId`` and ``toObjectTypeId`` null.
+
+    The capture records them as sent and still satisfies its contract, so the command exits 0.
+    """
+    settings = get_settings()
+    inner = mock_transport("hubspot", _capture_world(settings), settings=settings)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = await inner.handle_async_request(request)
+        if "/crm/associations/" not in request.url.path or not response.is_success:
+            return response
+        body = json.loads(await response.aread())
+        for result in body["results"]:
+            for target in result["to"]:
+                for spec in target["associationTypes"]:
+                    spec.update(fromObjectTypeId=None, toObjectTypeId=None)
+        return httpx.Response(response.status_code, json=body)
+
+    _live(monkeypatch, httpx.MockTransport(handler))
+    assert cli.main(["capture-fixtures", "--source", "hubspot"]) == cli.EXIT_OK
+    out, err = capsys.readouterr()
+    assert "capture breaks its contract" not in err, err[-2000:]
+    documents = _captured_documents(capture_dir, "hubspot")
+    assert {Path(path).stem for path in _written(out)} == set(documents)
+    assert set(documents) == EXPECTED_SURFACES["hubspot"]
+    body = documents["associations_batch_read"]["response"]["body"]
+    specs = [
+        spec
+        for result in body["results"]
+        for target in result["to"]
+        for spec in target["associationTypes"]
+    ]
+    assert specs
+    assert all(spec["fromObjectTypeId"] is None for spec in specs)
+    assert all(spec["toObjectTypeId"] is None for spec in specs)
+    for document in documents.values():
+        validate_capture(document, root=capture_dir / "tests" / "contracts")
 
 
 # ---------------------------------------------------------------------------

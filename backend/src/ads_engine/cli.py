@@ -976,6 +976,17 @@ _INSERTED_TEXT: Final = re.compile(
 # secret encoded any number of times, or in a spelling the secret pattern does not match, is
 # found.
 _DECODERS: Final[tuple[Callable[[str], str], ...]] = (unquote, unquote_plus)
+# One colon of a URN: literal, or percent-encoded any number of times in either hex case
+# (`%3A`, `%3a`, `%253A`, …), as request URLs and `next` links carry it.
+_URN_COLON: Final = r"(?::|%(?:25)*3[Aa])"
+# A LinkedIn organization URN, `urn:li:organization:{id}`, with the other spellings of the
+# same id space: `urn:li:organizationBrand:{id}` and `urn:li:company:{id}` (the other member
+# of the campaign-group beneficiary union). Group 1 is the prefix as written, group 2 the id.
+# The organization id is a host secret, yet no setting holds it, so it is found by this URN
+# context only: a bare number equal to an id is a metric or another id and is kept.
+_ORGANIZATION_URN: Final = re.compile(
+    rf"(urn{_URN_COLON}li{_URN_COLON}(?:organization(?:Brand)?|company){_URN_COLON})([0-9]+)"
+)
 
 
 def _hex_digit(digit: str) -> str:
@@ -1011,6 +1022,14 @@ def _secret_spelling(secret: str) -> str:
     return "".join(characters)
 
 
+def _zero_organization_id(match: re.Match[str]) -> str:
+    """Keep one :data:`_ORGANIZATION_URN` match's prefix as written; zero its id, same length.
+
+    Zeros keep the URN well-formed, so a redacted capture still satisfies its contract.
+    """
+    return match.group(1) + "0" * len(match.group(2))
+
+
 def _blank(node: JSONValue, *, numbers: bool) -> JSONValue:
     """Replace every string leaf of ``node`` with the marker, keeping its structure.
 
@@ -1043,7 +1062,10 @@ class _RedactionPolicy:
     or dict key, in plain text or in any percent-encoded spelling, and as a JSON number equal
     to it. Capture fidelity gives way to that guarantee, and :meth:`holds_secret` confirms it
     on each finished document, percent-decoded however many times it was encoded too, so a
-    capture that still holds a secret is never written.
+    capture that still holds a secret is never written. The id of every LinkedIn
+    organization URN (``urn:li:organization:``, ``urn:li:organizationBrand:`` and
+    ``urn:li:company:``, plain or percent-encoded) becomes zeros of the same length in any
+    string or dict key, whatever organization it names (:data:`_ORGANIZATION_URN`).
 
     Attributes:
         secrets: The plaintext of every configured secret, the n8n webhook URL and the
@@ -1098,17 +1120,19 @@ class _RedactionPolicy:
         )
 
     def text(self, value: str) -> str:
-        """Redact one string: configured secrets, account ids, then email addresses.
+        """Redact one string: secrets, account ids, organization URN ids, then email addresses.
 
         Every configured secret is replaced wherever it occurs, whatever its length: its exact
         plaintext by ``<redacted>``, and any percent-encoded spelling (either hex case, encoded
         or literal characters in any mix, ``+`` for a space) by ``%3Credacted%3E``, so a URL
-        or form body stays parseable.
+        or form body stays parseable. Configured account ids, and the id of every LinkedIn
+        organization URN, become zeros of the same length.
         """
         if self.secret_pattern is not None:
             value = self.secret_pattern.sub(self._secret_marker, value)
         for pattern, replacement in self.identifiers:
             value = pattern.sub(replacement, value)
+        value = _ORGANIZATION_URN.sub(_zero_organization_id, value)
         return EMAIL_RE.sub(_MARKER, value)
 
     def _secret_marker(self, match: re.Match[str]) -> str:
@@ -1334,7 +1358,10 @@ def _redact_capture(
       in plain text or in any percent-encoded spelling (the latter as ``%3Credacted%3E``); a
       JSON number equal to a secret becomes the marker too;
     * the n8n webhook URL (a placeholder URL) and the configured Google customer id and
-      LinkedIn ad account ids (same-length zeros).
+      LinkedIn ad account ids (same-length zeros);
+    * the id of every LinkedIn organization URN (``urn:li:organization:``,
+      ``urn:li:organizationBrand:`` and ``urn:li:company:``), plain or percent-encoded, in
+      any body string, dict key, URL or header value (same-length zeros, prefix kept).
 
     :func:`_build_captures` then checks the result with
     :meth:`_RedactionPolicy.holds_secret` and never writes one that still holds a secret,
@@ -1382,6 +1409,11 @@ def _redact_capture(
 # Lead responses and deals are looked for over the last 30 days; every call reads one page.
 _LEAD_LOOKBACK: Final = timedelta(days=30)
 _DEAL_LOOKBACK: Final = timedelta(days=30)
+# Google's campaign days (Q-G3) are read for the 30 days ending yesterday, account-wide, so
+# the keyword and search-term reads can be pointed at a campaign, day and ad group that
+# delivered. Keywords and search terms exist only in Search campaigns, which are preferred.
+_GOOGLE_LOOKBACK: Final = timedelta(days=30)
+_SEARCH_CHANNEL: Final = "SEARCH"
 # One demographic pivot is enough to record the segment surfaces (any of the three works).
 _SEGMENT_PIVOT: Final = "MEMBER_SENIORITY"
 # Capture-only bounds: each request reads one page (no further page token, next link or
@@ -1398,10 +1430,11 @@ _DEALS: Final = "deals"
 def _capture_now() -> datetime:
     """The instant a capture's request windows end at: the current instant in UTC.
 
-    Each source's capture reads it once, so all of its windows (Google's and LinkedIn's
-    "yesterday", the 30-day lead and deal look-backs) end at the same instant. Tests replace
-    it with the clock of the simulated world they serve, so the windows select the same
-    records whatever the host clock reads. ``captured_at`` stays the response's arrival time.
+    Each source's capture reads it once, so all of its windows (Google's 30 days ending
+    yesterday and the day read within them, LinkedIn's "yesterday", the 30-day lead and deal
+    look-backs) end at the same instant. Tests replace it with the clock of the simulated
+    world they serve, so the windows select the same records whatever the host clock reads.
+    ``captured_at`` stays the response's arrival time.
     """
     return datetime.now(UTC)
 
@@ -1416,7 +1449,8 @@ class _CaptureRun:
         failures: ``"<surface>: <reason>"`` for each call that failed, where reasons are the
             connectors' sanitised reasons, and for each capture left unwritten because a
             configured secret survived its redaction.
-        skipped: Surfaces not called, with why.
+        skipped: Surfaces not called, or (Google) whose every answered query returned no
+            rows, with why.
         rows: Google only: ``(row surface, exchange)`` of each GAQL query that answered.
         stopped: Set when the platform refused the credentials outright (HTTP 401, or a
             failed LinkedIn token exchange); later calls are skipped.
@@ -1471,15 +1505,188 @@ class _CaptureRun:
             self.failures.append(f"{surface}: {error}")
 
 
+def _row_id(row: Mapping[str, Any], resource: str) -> int | None:
+    """``{resource}.id`` of one GoogleAdsRow (``campaign``, ``adGroup``), sent as a string.
+
+    Returns:
+        The id, or ``None`` when the row lacks it or it is not a plain decimal number.
+    """
+    entity = row.get(resource)
+    if isinstance(entity, Mapping):
+        raw = entity.get("id")
+        if isinstance(raw, str | int) and not isinstance(raw, bool):
+            text = str(raw)
+            if text.isascii() and text.isdigit():
+                return int(text)
+    return None
+
+
 def _first_id(rows: Sequence[Mapping[str, Any]], resource: str) -> int | None:
     """The id of the first GoogleAdsRow carrying ``resource`` (``campaign``, ``adGroup``)."""
     for row in rows:
-        entity = row.get(resource)
-        if isinstance(entity, Mapping):
-            raw = entity.get("id")
-            if isinstance(raw, str | int) and not isinstance(raw, bool) and str(raw).isdigit():
-                return int(raw)
+        found = _row_id(row, resource)
+        if found is not None:
+            return found
     return None
+
+
+def _impressions(row: Mapping[str, Any]) -> int:
+    """``metrics.impressions`` of one GoogleAdsRow, used only to choose a capture's scope.
+
+    The int64 arrives as a string. An absent or unreadable value counts as no impressions:
+    it only ranks candidates, and nothing derived from it is stored or reported.
+    """
+    metrics = row.get("metrics")
+    raw = metrics.get("impressions") if isinstance(metrics, Mapping) else None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return max(raw, 0)
+    if isinstance(raw, str) and raw.isascii() and raw.isdigit():
+        return int(raw)
+    return 0
+
+
+def _row_day(row: Mapping[str, Any]) -> date | None:
+    """``segments.date`` of one GoogleAdsRow, or ``None`` when absent or not an ISO date."""
+    segments = row.get("segments")
+    raw = segments.get("date") if isinstance(segments, Mapping) else None
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+@dataclasses.dataclass(slots=True)
+class _GoogleTargets:
+    """What a Google capture has read so far that points its later queries at data.
+
+    Attributes:
+        yesterday: The day before the capture instant (UTC); every window ends on it.
+        campaign_id: The first Q-G2 campaign: Q-G2b's id, and the fallback campaign range.
+        ad_group_id: The first Q-G4 ad group: the fallback ad-group range.
+        channels: Q-G2's ``advertisingChannelType`` by campaign id.
+        ad_group_campaigns: Q-G4's ``campaign.id`` by ad-group id, in the order listed.
+        delivering: The campaign with the most impressions in Q-G3's 30 days, a Search
+            campaign when any Search campaign had impressions; ``None`` when none had any.
+        delivering_is_search: Whether ``delivering`` is a Search campaign.
+        day: The latest day ``delivering`` had impressions.
+        keyword_ad_group: The ad group with the most impressions in Q-G5's rows, taken from
+            ``delivering``'s ad groups first, then from Search campaigns', then from any;
+            the first row's ad group when none had impressions; ``None`` without a row.
+        keyword_words: ``keyword_ad_group`` in words, without the day Q-G5 read.
+    """
+
+    yesterday: date
+    campaign_id: int | None = None
+    ad_group_id: int | None = None
+    channels: dict[int, str] = dataclasses.field(default_factory=dict)
+    ad_group_campaigns: dict[int, int] = dataclasses.field(default_factory=dict)
+    delivering: int | None = None
+    delivering_is_search: bool = False
+    day: date | None = None
+    keyword_ad_group: int | None = None
+    keyword_words: str = ""
+
+    def observe(self, query_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Take what the later queries are narrowed by from one answered query's rows."""
+        if query_id == "Q-G2":
+            self.campaign_id = _first_id(rows, "campaign")
+            for row in rows:
+                campaign_id, campaign = _row_id(row, "campaign"), row.get("campaign")
+                if campaign_id is not None and isinstance(campaign, Mapping):
+                    channel = campaign.get("advertisingChannelType")
+                    if isinstance(channel, str):
+                        self.channels[campaign_id] = channel
+        elif query_id == "Q-G3":
+            self._choose_campaign(rows)
+        elif query_id == "Q-G4":
+            self.ad_group_id = _first_id(rows, "adGroup")
+            for row in rows:
+                ad_group_id, campaign_id = _row_id(row, "adGroup"), _row_id(row, "campaign")
+                if ad_group_id is not None and campaign_id is not None:
+                    self.ad_group_campaigns.setdefault(ad_group_id, campaign_id)
+        elif query_id == "Q-G5":
+            self._choose_ad_group(rows)
+
+    def top_campaign(self) -> str:
+        """``delivering`` in words."""
+        kind = "Search campaign" if self.delivering_is_search else "campaign"
+        return f"the {kind} with the most impressions in the last {_GOOGLE_LOOKBACK.days} days"
+
+    def keyword_day(self) -> tuple[date, str]:
+        """The one day Q-G5 and Q-G6 read, with that day in words."""
+        if self.delivering is not None and self.day is not None:
+            return self.day, f"the latest day with impressions of {self.top_campaign()}"
+        return self.yesterday, "yesterday"
+
+    def first_ad_group_of(self, campaign_id: int | None) -> int | None:
+        """The first Q-G4 ad group of ``campaign_id``, or ``None``."""
+        if campaign_id is None:
+            return None
+        for ad_group_id, owner in self.ad_group_campaigns.items():
+            if owner == campaign_id:
+                return ad_group_id
+        return None
+
+    def _is_search(self, campaign_id: int | None) -> bool:
+        """Whether Q-G2 listed ``campaign_id`` as a Search campaign."""
+        return campaign_id is not None and self.channels.get(campaign_id) == _SEARCH_CHANNEL
+
+    def _choose_campaign(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Choose ``delivering`` and ``day`` from Q-G3's campaign-day rows.
+
+        Impressions are summed per campaign over the rows; a row without a campaign id or a
+        date counts for nothing. Ties go to the lower campaign id.
+        """
+        totals: dict[int, int] = {}
+        latest: dict[int, date] = {}
+        for row in rows:
+            campaign_id, day = _row_id(row, "campaign"), _row_day(row)
+            impressions = _impressions(row)
+            if campaign_id is None or day is None or impressions == 0:
+                continue
+            totals[campaign_id] = totals.get(campaign_id, 0) + impressions
+            if campaign_id not in latest or day > latest[campaign_id]:
+                latest[campaign_id] = day
+        search = [campaign_id for campaign_id in totals if self._is_search(campaign_id)]
+        candidates = search or list(totals)
+        if not candidates:
+            return
+        chosen = max(candidates, key=lambda campaign_id: (totals[campaign_id], -campaign_id))
+        self.delivering = chosen
+        self.delivering_is_search = bool(search)
+        self.day = latest[chosen]
+
+    def _choose_ad_group(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Choose ``keyword_ad_group`` from Q-G5's keyword-day rows.
+
+        With a delivering campaign Q-G5 reads every campaign, so the ad groups of
+        ``delivering`` come first, then those of Search campaigns (owners from Q-G4, channels
+        from Q-G2), then any; within the first of these sets that had impressions the most
+        impressions win, ties going to the lower ad-group id.
+        """
+        totals: dict[int, int] = {}
+        for row in rows:
+            ad_group_id = _row_id(row, "adGroup")
+            if ad_group_id is not None:
+                totals[ad_group_id] = totals.get(ad_group_id, 0) + _impressions(row)
+        if not totals:
+            return
+        owners = self.ad_group_campaigns
+        tiers = (
+            [a for a in totals if self.delivering is not None and owners.get(a) == self.delivering],
+            [a for a in totals if self._is_search(owners.get(a))],
+            list(totals),
+        )
+        for tier in tiers:
+            delivered = [ad_group_id for ad_group_id in tier if totals[ad_group_id] > 0]
+            if delivered:
+                self.keyword_ad_group = max(delivered, key=lambda a: (totals[a], -a))
+                self.keyword_words = "the ad group with the most keyword impressions"
+                return
+        self.keyword_ad_group = next(iter(totals))
+        self.keyword_words = "the first ad group of the keyword rows read"
 
 
 def _first_row(body: JSONValue) -> JSONValue | None:
@@ -1492,14 +1699,25 @@ def _first_row(body: JSONValue) -> JSONValue | None:
     return None
 
 
-def _google_scope(
-    query_id: str, day: date, campaign_id: int | None, ad_group_id: int | None
-) -> dict[str, object] | None:
-    """The tiniest scope each GAQL template accepts, derived from the template's grammar.
+def _google_scope(query_id: str, targets: _GoogleTargets) -> tuple[dict[str, object], str] | None:
+    """The scope one GAQL template is sent with, and that scope in words, never in ids.
 
-    Keyset templates start at id 0, dated templates read one day, and ranges narrow to the
-    first campaign or ad group already read. Q-G2b needs an id list, so without a campaign it
-    is skipped (``None``).
+    Derived from the template's grammar and from what the earlier queries returned
+    (``targets``), so each query reads where data was seen:
+
+    * Q-G2 and Q-G4 start their keyset at id 0; Q-G2b looks up the first Q-G2 campaign, and
+      is skipped (``None``) when none was read. Q-G1 and Q-G8 are not narrowed.
+    * Q-G3 reads every campaign over the 30 days ending yesterday. Its rows choose the
+      delivering campaign (:meth:`_GoogleTargets.observe`).
+    * Q-G5 reads every campaign on the latest day the delivering campaign had impressions.
+      Its rows choose the keyword ad group.
+    * Q-G6 reads that day for the keyword ad group, or else for the delivering campaign.
+    * Q-G7 reads the keyword ad group, or else the delivering campaign's first Q-G4 ad group.
+    * Without a delivering campaign, Q-G5 and Q-G6 read yesterday and every range falls back
+      to the first Q-G4 ad group, then to the first Q-G2 campaign.
+
+    Returns:
+        ``(scope, words)`` for :meth:`QueryTemplate.render`, or ``None`` to skip the query.
     """
     from ads_engine.connectors.google_n8n.queries import (
         AD_GROUP_HI,
@@ -1517,22 +1735,57 @@ def _google_scope(
     allowed = template.allowed_scope_keys
     required = template.required_scope_keys
     scope: dict[str, object] = {}
+    words: list[str] = []
     if LAST_ID in required:
         scope[LAST_ID] = 0
+        words.append("the first keyset page")
     if IDS in required:
-        if campaign_id is None:
+        if targets.campaign_id is None:
             return None
-        scope[IDS] = [campaign_id]
-    if START in required:
-        scope[START] = day
+        scope[IDS] = [targets.campaign_id]
+        words.append("the first campaign listed")
+    dated = START in required
+    day, day_words = targets.keyword_day()
+    if query_id == "Q-G3" or (query_id == "Q-G5" and targets.delivering is not None):
+        # Account-wide: Q-G3 to find the delivering campaign, Q-G5 to find its keywords.
+        ranges: list[tuple[str, str, int | None, str]] = []
+        words.append("every campaign")
+    else:
+        top = targets.top_campaign()
+        # Undated (Q-G7), the keyword ad group is named with the day it was chosen on.
+        keyword_words = targets.keyword_words
+        if not dated:
+            keyword_words += " yesterday" if day_words == "yesterday" else f" on {day_words}"
+        ranges = [
+            (AD_GROUP_LO, AD_GROUP_HI, targets.keyword_ad_group, keyword_words),
+            (CAMPAIGN_LO, CAMPAIGN_HI, targets.delivering, top),
+            (
+                AD_GROUP_LO,
+                AD_GROUP_HI,
+                targets.first_ad_group_of(targets.delivering),
+                f"the first ad group listed for {top}",
+            ),
+            (AD_GROUP_LO, AD_GROUP_HI, targets.ad_group_id, "the first ad group listed"),
+            (CAMPAIGN_LO, CAMPAIGN_HI, targets.campaign_id, "the first campaign listed"),
+        ]
+    for low, high, entity_id, entity_words in ranges:
+        if low in allowed and entity_id is not None:
+            scope[low] = entity_id
+            scope[high] = entity_id
+            words.append(entity_words)
+            if entity_id == targets.delivering and low == CAMPAIGN_LO:
+                day_words = "its latest day with impressions"
+            break
+    if dated:
+        if query_id == "Q-G3":
+            day = targets.yesterday
+            scope[START] = day - _GOOGLE_LOOKBACK + timedelta(days=1)
+            day_words = f"the {_GOOGLE_LOOKBACK.days} days ending yesterday"
+        else:
+            scope[START] = day
         scope[END] = day
-    if AD_GROUP_LO in allowed and ad_group_id is not None:
-        scope[AD_GROUP_LO] = ad_group_id
-        scope[AD_GROUP_HI] = ad_group_id
-    elif CAMPAIGN_LO in allowed and campaign_id is not None:
-        scope[CAMPAIGN_LO] = campaign_id
-        scope[CAMPAIGN_HI] = campaign_id
-    return scope
+        words.append(day_words)
+    return scope, ", ".join(words) or "the whole account"
 
 
 async def _google_budget(settings: Settings) -> _CaptureCallBudget:
@@ -1560,6 +1813,21 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
     The first call becomes ``search.json``; the first row of each query becomes its
     ``row_*`` capture. Only the first page is read: a capture records shapes, not data.
 
+    Each query is pointed at data the earlier ones returned (:func:`_google_scope`). Q-G3
+    reads every campaign over the 30 days ending yesterday. The campaign with the most
+    impressions there is the delivering campaign; a Search campaign is preferred whenever
+    one had impressions, because keywords and search terms exist only there. Q-G5 reads
+    every campaign on that campaign's latest day with impressions. Q-G6 reads that day, and
+    Q-G7 reads the keywords, of the ad group with the most impressions in Q-G5's rows,
+    preferring the delivering campaign's ad groups, then those of Search campaigns. Without
+    a delivering campaign the reads fall back to yesterday and to the first ad group or
+    campaign listed. Q-G2b looks up the first Q-G2 campaign.
+
+    A row surface whose every answered query returned no rows is added to ``run.skipped`` as
+    ``"<surface>: search <query> returned no rows (<scope in words>)"``. The scope is
+    described, never quoted, so no id reaches the report. A query that failed or was not
+    sent is reported as such and adds no such entry.
+
     Every POST attempt is reserved in the shared call budget first. When a reservation fails
     on the database, that query and every later one are not sent and the failure is
     recorded; the captures already made are kept, because their calls were counted.
@@ -1574,9 +1842,10 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
 
     # One call per template, each reserved in the shared budget before its POST.
     budget = await _google_budget(settings)
-    day = _capture_now().date() - timedelta(days=1)
-    campaign_id: int | None = None
-    ad_group_id: int | None = None
+    targets = _GoogleTargets(yesterday=_capture_now().date() - timedelta(days=1))
+    # Row surfaces some answered query returned a row for, and the empty answers of the rest.
+    with_rows: set[str] = set()
+    empty: dict[str, list[str]] = {}
     async with build_client("google", run.recorder, settings=settings) as http:
         client = GoogleAdsWebhookClient.from_settings(settings, http, budget)
         for query_id, template in QUERIES.items():
@@ -1584,10 +1853,11 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
             if budget.failure is not None:
                 run.skipped.append(f"{surface}: not sent, the shared call budget is unavailable")
                 continue
-            scope = _google_scope(query_id, day, campaign_id, ad_group_id)
-            if scope is None:
+            chosen = _google_scope(query_id, targets)
+            if chosen is None:
                 run.skipped.append(f"{surface}: no campaign id was read to look up")
                 continue
+            scope, scope_words = chosen
             query = template.render(**scope)
             try:
                 page = await run.step(surface, partial(client.search_page, query_id, query))
@@ -1598,10 +1868,16 @@ async def _capture_google(settings: Settings, run: _CaptureRun) -> None:
                 continue
             # search_page returned, so the last exchange is this query's successful POST.
             run.rows.append((template.row_surface, run.recorder.exchanges[-1]))
-            if query_id == "Q-G2":
-                campaign_id = _first_id(page.rows, "campaign")
-            elif query_id == "Q-G4":
-                ad_group_id = _first_id(page.rows, "adGroup")
+            if page.rows:
+                with_rows.add(template.row_surface)
+            else:
+                empty.setdefault(template.row_surface, []).append(
+                    f"{surface} returned no rows ({scope_words})"
+                )
+            targets.observe(query_id, page.rows)
+    for row_surface, answers in empty.items():
+        if row_surface not in with_rows:
+            run.skipped.append(f"{row_surface}: {'; '.join(answers)}")
 
 
 async def _capture_linkedin(settings: Settings, run: _CaptureRun) -> None:
@@ -1842,7 +2118,8 @@ def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dic
 
     Surfaces are identified with ``payloads.identify_surface``, the router the simulator
     uses. For Google, the first row of each query's page is added as its ``row_*`` capture;
-    queries that returned no rows are skipped.
+    a query that returned no rows adds none (:func:`_capture_google` reports its surface in
+    ``run.skipped``).
 
     Each redacted capture is checked with :meth:`_RedactionPolicy.holds_secret`, failing
     closed: one that still holds a configured secret is left out, so it is never written, and
@@ -2161,6 +2438,51 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
+# The names Settings.missing_credentials("linkedin") reports around the refresh-token trio's
+# unset members: the account ids first, and the static access token last whenever neither
+# authentication alternative is complete. The trio is LINKEDIN_CLIENT_ID,
+# LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN.
+_LINKEDIN_ACCOUNTS_NAME: Final = "LINKEDIN_AD_ACCOUNT_IDS"
+_LINKEDIN_STATIC_NAME: Final = "LINKEDIN_ACCESS_TOKEN"
+_LINKEDIN_REFRESH_TRIO_SIZE: Final = 3
+
+
+def _missing_credentials_text(settings: Settings, source: Source) -> str:
+    """Name the variables ``source`` still needs to run live, as the capture refusal says it.
+
+    Every Google and HubSpot credential is required, so their unset names are listed as
+    :meth:`Settings.missing_credentials` reports them. LinkedIn needs
+    ``LINKEDIN_AD_ACCOUNT_IDS`` plus either the refresh-token trio or
+    ``LINKEDIN_ACCESS_TOKEN``, so its text states the alternative and names only the trio
+    members still unset, for example ``LINKEDIN_AD_ACCOUNT_IDS and either LINKEDIN_CLIENT_ID,
+    LINKEDIN_CLIENT_SECRET and LINKEDIN_REFRESH_TOKEN, or LINKEDIN_ACCESS_TOKEN``. A list of
+    any other shape is listed as it is. Only names appear, never a value.
+
+    Args:
+        settings: The settings to check.
+        source: The source to check.
+
+    Returns:
+        The text that follows ``set`` in the refusal; empty when ``source`` is fully
+        configured.
+    """
+    missing = settings.missing_credentials(source)
+    listed = ", ".join(missing)
+    if source != "linkedin":
+        return listed
+    authentication = [name for name in missing if name != _LINKEDIN_ACCOUNTS_NAME]
+    trio = authentication[:-1]
+    if not trio or authentication[-1] != _LINKEDIN_STATIC_NAME:
+        return listed
+    trio_text = trio[0] if len(trio) == 1 else f"{', '.join(trio[:-1])} and {trio[-1]}"
+    if len(trio) < _LINKEDIN_REFRESH_TRIO_SIZE:
+        trio_text += " (to complete the refresh-token trio)"
+    alternatives = f"either {trio_text}, or {_LINKEDIN_STATIC_NAME}"
+    if _LINKEDIN_ACCOUNTS_NAME in missing:
+        return f"{_LINKEDIN_ACCOUNTS_NAME} and {alternatives}"
+    return alternatives
+
+
 def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
     """``capture-fixtures --source S``: record redacted live contract captures.
 
@@ -2175,7 +2497,12 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
     ``backend/``.
 
     Returns:
-        :data:`EXIT_OK` when every surface was captured and satisfies its contract;
+        :data:`EXIT_OK` when every surface was either captured or reported on stderr as not
+        captured with its data reason (such as no sponsored LinkedIn lead to re-fetch, or a
+        Google query that answered with no rows), no call failed, no capture held a
+        configured secret, and every capture satisfies its contract. A surface reported as
+        not captured is counted in ``capture_fixtures_finished`` ``skipped`` and does not by
+        itself make the exit non-zero.
         :data:`EXIT_FAILURE` when a refusal applies, a call failed (a Google call the shared
         budget refused or could not reserve included), nothing was captured, a capture still
         held a configured secret after redaction (that capture is not written), or a capture
@@ -2196,7 +2523,7 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
         )
         return EXIT_FAILURE
     if not settings.has_credentials(source):
-        missing = ", ".join(settings.missing_credentials(source))
+        missing = _missing_credentials_text(settings, source)
         _error(f"capture-fixtures {source}: live credentials are not configured; set {missing}")
         return EXIT_FAILURE
     root = contracts_root()

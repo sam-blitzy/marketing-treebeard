@@ -760,6 +760,36 @@ def test_association_inputs_named_only_by_errors_keep_their_own_outcome() -> Non
     assert dict(batch.error_ids) == {"14": "VALIDATION_ERROR"}
 
 
+def test_association_types_with_null_object_type_ids_conform_and_decode() -> None:
+    # Live 2026-09 responses carry fromObjectTypeId and toObjectTypeId as null, where the
+    # reference schema and sample give strings. The contract admits both, and the parser
+    # reads neither, so a live-shaped result decodes exactly like a string-typed one.
+    typed = _association(CONTACT_ID, [99100000001, "99100000002"], after="MTAw")
+    live = copy.deepcopy(typed)
+    for target in live["to"]:
+        for spec in target["associationTypes"]:
+            spec.update(fromObjectTypeId=None, toObjectTypeId=None)
+    batch = parse_association_batch(_batch_body("associations_batch_read", [live]))
+    assert batch.is_complete is True
+    assert dict(batch.results) == {
+        CONTACT_ID: AssociationResult(
+            from_id=CONTACT_ID, targets=("99100000001", "99100000002"), after="MTAw"
+        )
+    }
+    assert (batch.empty_ids, dict(batch.error_ids)) == (frozenset(), {})
+    assert batch == parse_association_batch(_batch_body("associations_batch_read", [typed]))
+
+
+@pytest.mark.parametrize("field", ["fromObjectTypeId", "toObjectTypeId"])
+def test_an_integer_association_object_type_id_breaks_the_contract(field: str) -> None:
+    result = _association(CONTACT_ID, [99100000001])
+    result["to"][0]["associationTypes"][0][field] = 1
+    item_schema = _schema("associations_batch_read", "properties", "results", "items")
+    assert _schema_errors(result, item_schema, "result") == [
+        f"result.to[0].associationTypes[0].{field}: int is not ['string', 'null']"
+    ]
+
+
 # ---------------------------------------------------------------------------------------------
 # CRM Search pages
 # ---------------------------------------------------------------------------------------------

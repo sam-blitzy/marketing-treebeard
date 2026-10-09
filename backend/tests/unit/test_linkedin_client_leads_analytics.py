@@ -1554,6 +1554,49 @@ async def test_analytics_segments_fall_back_to_one_analytics_call_per_campaign(
 
 
 @pytest.mark.anyio
+async def test_analytics_segments_round_live_costs_beyond_six_decimal_places() -> None:
+    """Live 202609 segment costs carry up to 17 decimal places; both finders still parse.
+
+    The Statistics Finder response and the Analytics Finder fallback's per-campaign response
+    each carry float residue in ``costInLocalCurrency``. Each cost is rounded half-even to six
+    places for ``fact_segment_window.cost`` instead of failing the listing with a defect.
+    """
+    value, _facet = SEGMENT_VALUES["MEMBER_SENIORITY"]
+    statistics = Server(
+        _sequence(
+            _json(
+                _statistics_body(
+                    [_segment([CAMPAIGN_LOW, value], costInLocalCurrency="19.918330000000001")]
+                )
+            )
+        )
+    )
+    async with _linkedin(statistics) as client:
+        direct = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    def member_reply() -> httpx.Response:
+        """The per-campaign fallback response, a half-even tie in its cost."""
+        return _json(_member_body([_segment([value], costInLocalCurrency="0.00000150000000000")]))
+
+    fallback = Server(
+        _fallback_handler(
+            [_discovery(CAMPAIGN_LOW, 7)], campaign_replies={CAMPAIGN_LOW: member_reply}
+        )
+    )
+    async with _linkedin(fallback) as client:
+        per_campaign = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    assert [(row.campaign_urn, str(row.cost)) for row in direct.rows] == [
+        (CAMPAIGN_LOW, "19.918330")
+    ]
+    assert [(row.campaign_urn, str(row.cost)) for row in per_campaign.rows] == [
+        (CAMPAIGN_LOW, "0.000002")
+    ]
+    assert direct.complete is True
+    assert per_campaign.complete is True
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("discovery", "message"),
     [

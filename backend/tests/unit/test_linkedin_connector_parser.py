@@ -21,7 +21,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal, Inexact, Rounded, localcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -1529,8 +1529,9 @@ def _amount_of(budget: Money | None) -> Decimal | None:
 
 
 # Every amount the parser reads is stored as numeric(18, 6): (surface, the field a defect names,
-# a documented element carrying the amount, the parsed amount).
-AMOUNT_SITES = [
+# a documented element carrying the amount, the parsed amount). Reported spend is rounded
+# half-even to six decimal places; budgets are exact, so a finer digit there is a defect.
+COST_SITES = [
     pytest.param(
         "ad_analytics",
         "costInLocalCurrency",
@@ -1545,6 +1546,8 @@ AMOUNT_SITES = [
         lambda element: parse_segment(element, "MEMBER_SENIORITY").cost,
         id="segment-cost",
     ),
+]
+BUDGET_SITES = [
     pytest.param(
         "ad_campaign_groups",
         "dailyBudget",
@@ -1578,31 +1581,56 @@ AMOUNT_SITES = [
         id="campaign-total-budget",
     ),
 ]
+AMOUNT_SITES = [*COST_SITES, *BUDGET_SITES]
 AMOUNT_SITE_ARGS = ("surface", "field_name", "place", "read")
 
 OUT_OF_RANGE = "is out of range"
 TOO_PRECISE = "has more than 6 decimal places"
 
-# Amounts numeric(18, 6) cannot hold exactly, each with a fragment no message may echo: 10**12
-# or more overflows the column, and a nonzero digit beyond the sixth place would be rounded.
-UNSTORABLE_AMOUNTS: list[tuple[str | int | Decimal, str, str]] = [
-    ("1000000000000", OUT_OF_RANGE, "1000000000000"),  # 10**12, thirteen integral digits
-    ("1000000000000.000000", OUT_OF_RANGE, "1000000000000"),
-    ("1e12", OUT_OF_RANGE, "1e12"),
-    (Decimal("1E+12"), OUT_OF_RANGE, "1E+12"),
-    (10**12, OUT_OF_RANGE, "1000000000000"),
-    ("9999999999999999999.99", OUT_OF_RANGE, "99999999"),  # just below the old 10**19 bound
-    (Decimal("9.999E+18"), OUT_OF_RANGE, "9.999E+18"),
-    (10**19 - 1, OUT_OF_RANGE, "99999999"),
-    ("0.0000001", TOO_PRECISE, "0000001"),
-    ("0.00000010", TOO_PRECISE, "0000001"),
-    ("1e-7", TOO_PRECISE, "1e-7"),
-    (Decimal("1E-7"), TOO_PRECISE, "1E-7"),
-    ("12.3456789", TOO_PRECISE, "3456789"),
-    ("999999999999.9999999", TOO_PRECISE, "9999999"),  # storage would round it up to 10**12
-    ("0." + "1" * 62, TOO_PRECISE, "1111111"),  # exactly 64 characters
+# Amounts of 10**12 or more, which overflow numeric(18, 6) at every amount field, each with a
+# fragment no message may echo.
+OUT_OF_RANGE_AMOUNTS: list[tuple[str | int | Decimal, str]] = [
+    ("1000000000000", "1000000000000"),  # 10**12, thirteen integral digits
+    ("1000000000000.000000", "1000000000000"),
+    ("1000000000000.0000001", "1000000000000"),  # out of range before any rounding
+    ("1e12", "1e12"),
+    (Decimal("1E+12"), "1E+12"),
+    (10**12, "1000000000000"),
+    ("9999999999999999999.99", "99999999"),  # just below the old 10**19 bound
+    (Decimal("9.999E+18"), "9.999E+18"),
+    (10**19 - 1, "99999999"),
+]
+
+# Amounts below 10**12 with a nonzero digit beyond the sixth decimal place, each with the cost
+# it rounds to half-even and a fragment no budget defect may echo.
+EXCESS_PLACE_AMOUNTS: list[tuple[str | Decimal, str, str]] = [
+    ("0.0000001", "0.000000", "0000001"),
+    ("0.00000010", "0.000000", "0000001"),
+    ("1e-7", "0.000000", "1e-7"),
+    (Decimal("1E-7"), "0.000000", "1E-7"),
+    ("12.3456789", "12.345679", "3456789"),
+    ("0." + "1" * 62, "0.111111", "1111111"),  # exactly 64 characters
     # 64 characters with a 1 in the 62nd place: rounding to the 28-digit context would hide it.
-    ("1." + "0" * 61 + "1", TOO_PRECISE, "0000001"),
+    ("1." + "0" * 61 + "1", "1.000000", "0000001"),
+    # Live 202609 float residue: costInLocalCurrency carries up to 17 decimal places.
+    ("19.91833000000000123", "19.918330", "91833"),
+    ("19.918330000000001", "19.918330", "91833"),
+    (Decimal("19.91833000000000123"), "19.918330", "91833"),
+    ("1.991833000000000123E+1", "19.918330", "991833"),
+    ("0.00000000000000355", "0.000000", "355"),  # residue of a zero cost: an unsigned zero
+    # Ties round to the even sixth digit; anything above a tie rounds up.
+    ("0.0000005", "0.000000", "0000005"),
+    ("0.0000015", "0.000002", "0000015"),
+    ("0.0000025", "0.000002", "0000025"),
+    ("0.00000050000000000000001", "0.000001", "00000050"),
+    ("999999999999.9999994", "999999999999.999999", "9999994"),  # the largest still in range
+]
+
+# Amounts below 10**12 that round half-even to 10**12, which numeric(18, 6) cannot hold.
+ROUNDING_OUT_OF_RANGE_AMOUNTS: list[tuple[str | Decimal, str]] = [
+    ("999999999999.9999995", "9999995"),  # a tie, and the sixth digit 9 is odd: rounds up
+    ("999999999999.9999999", "9999999"),
+    (Decimal("999999999999.99999950"), "99999950"),
 ]
 
 # Amounts numeric(18, 6) holds exactly, at both bounds, each with Decimal's string form of it.
@@ -1623,21 +1651,110 @@ STORABLE_AMOUNTS: list[tuple[str | int | Decimal, str]] = [
 
 
 @pytest.mark.parametrize(AMOUNT_SITE_ARGS, AMOUNT_SITES)
-@pytest.mark.parametrize(("value", "fragment", "raw"), UNSTORABLE_AMOUNTS)
+@pytest.mark.parametrize(("value", "raw"), OUT_OF_RANGE_AMOUNTS)
 def test_an_amount_numeric_18_6_cannot_hold_is_a_defect_at_every_amount_field(
     surface: str,
     field_name: str,
     place: Callable[[object], dict[str, Any]],
     read: Callable[[dict[str, Any]], Decimal | None],
     value: str | int | Decimal,
-    fragment: str,
     raw: str,
 ) -> None:
     element = place(value)
     if isinstance(value, str):
         _conforming(surface, element)  # a contract-valid BigDecimal string
-    error = _expect_defect(lambda: read(element), surface, f"field '{field_name}' {fragment}")
+    error = _expect_defect(lambda: read(element), surface, f"field '{field_name}' {OUT_OF_RANGE}")
     _assert_not_echoed(error, raw)
+
+
+@pytest.mark.parametrize(AMOUNT_SITE_ARGS, BUDGET_SITES)
+@pytest.mark.parametrize(
+    ("value", "raw"),
+    [
+        *((value, raw) for value, _rounded, raw in EXCESS_PLACE_AMOUNTS),
+        *ROUNDING_OUT_OF_RANGE_AMOUNTS,
+    ],
+)
+def test_a_budget_with_a_digit_beyond_the_sixth_place_is_a_defect_never_rounded(
+    surface: str,
+    field_name: str,
+    place: Callable[[object], dict[str, Any]],
+    read: Callable[[dict[str, Any]], Decimal | None],
+    value: str | Decimal,
+    raw: str,
+) -> None:
+    """A budget numeric(18, 6) would round is rejected: C0 compares budgets at the minor unit."""
+    element = place(value)
+    if isinstance(value, str):
+        _conforming(surface, element)  # a contract-valid BigDecimal string
+    error = _expect_defect(lambda: read(element), surface, f"field '{field_name}' {TOO_PRECISE}")
+    _assert_not_echoed(error, raw)
+
+
+@pytest.mark.parametrize(AMOUNT_SITE_ARGS, COST_SITES)
+@pytest.mark.parametrize(
+    ("value", "rounded"), [(value, rounded) for value, rounded, _raw in EXCESS_PLACE_AMOUNTS]
+)
+def test_a_cost_with_a_digit_beyond_the_sixth_place_is_rounded_half_even_to_six_places(
+    surface: str,
+    field_name: str,
+    place: Callable[[object], dict[str, Any]],
+    read: Callable[[dict[str, Any]], Decimal | None],
+    value: str | Decimal,
+    rounded: str,
+) -> None:
+    """Live 202609 costs carry up to 17 decimal places; each is stored at numeric(18, 6)."""
+    del field_name  # no defect is raised, so no field is named
+    element = place(value)
+    if isinstance(value, str):
+        _conforming(surface, element)  # a contract-valid BigDecimal string
+    cost = read(element)
+    assert cost is not None
+    assert str(cost) == rounded
+    assert cost.as_tuple().exponent == -6  # exactly six places
+    assert not cost.is_signed()
+
+
+@pytest.mark.parametrize(AMOUNT_SITE_ARGS, COST_SITES)
+@pytest.mark.parametrize(("value", "raw"), ROUNDING_OUT_OF_RANGE_AMOUNTS)
+def test_a_cost_that_rounds_to_10_12_is_out_of_range(
+    surface: str,
+    field_name: str,
+    place: Callable[[object], dict[str, Any]],
+    read: Callable[[dict[str, Any]], Decimal | None],
+    value: str | Decimal,
+    raw: str,
+) -> None:
+    """The range is checked after rounding: a cost rounding to 10**12 overflows the column."""
+    element = place(value)
+    if isinstance(value, str):
+        _conforming(surface, element)  # a contract-valid BigDecimal string
+    error = _expect_defect(lambda: read(element), surface, f"field '{field_name}' {OUT_OF_RANGE}")
+    _assert_not_echoed(error, raw)
+
+
+def test_cost_rounding_is_independent_of_the_callers_decimal_context() -> None:
+    """A narrow, truncating, trapping caller context changes neither the result nor the flow."""
+    with localcontext() as context:
+        context.prec = 3
+        context.rounding = ROUND_DOWN
+        context.traps[Inexact] = True
+        context.traps[Rounded] = True
+        daily = parse_analytics_daily(_analytics_cost("19.91833000000000123")).cost
+        segment = parse_segment(_segment_cost("0.0000015"), "MEMBER_SENIORITY").cost
+    assert str(daily) == "19.918330"
+    assert str(segment) == "0.000002"
+
+
+def test_parse_analytics_daily_rounds_a_live_cost_and_keeps_every_other_metric() -> None:
+    """A live-shaped element (17-decimal float residue) parses like the documented one."""
+    documented = parse_analytics_daily(_daily(1))
+    live = parse_analytics_daily(_daily(1, costInLocalCurrency="19.91833000000000123"))
+    assert documented.cost is not None
+    assert str(documented.cost) == "19.91833"  # within six places: returned as sent
+    assert live.cost is not None
+    assert str(live.cost) == "19.918330"
+    assert dataclasses.replace(live, cost=None) == dataclasses.replace(documented, cost=None)
 
 
 @pytest.mark.parametrize(AMOUNT_SITE_ARGS, AMOUNT_SITES)
@@ -1824,6 +1941,35 @@ def test_parse_segment_documented_sample_with_a_demographic_value(
         website_conversions=None,
     )
     assert SEGMENT_FACETS[pivot] == facet
+
+
+@pytest.mark.parametrize(
+    ("pivot_values", "surface", "campaign_urn"),
+    [
+        pytest.param(
+            [SAMPLE_SEGMENT_CAMPAIGN, "urn:li:seniority:7"],
+            "ad_analytics_statistics",
+            None,
+            id="statistics-finder",
+        ),
+        pytest.param(
+            ["urn:li:seniority:7"],
+            "ad_analytics_member_segments",
+            SAMPLE_SEGMENT_CAMPAIGN,
+            id="analytics-finder-fallback",
+        ),
+    ],
+)
+def test_parse_segment_rounds_a_live_cost_with_17_decimal_places(
+    pivot_values: list[str], surface: str, campaign_urn: str | None
+) -> None:
+    """Both segment forms round a live-shaped cost half-even to six places."""
+    element = _segment(pivot_values, costInLocalCurrency="4.25000000000000355")
+    row = parse_segment(element, "MEMBER_SENIORITY", campaign_urn=campaign_urn, surface=surface)
+    assert row.cost is not None
+    assert str(row.cost) == "4.250000"
+    assert (row.campaign_urn, row.value) == (SAMPLE_SEGMENT_CAMPAIGN, "urn:li:seniority:7")
+    assert (row.impressions, row.clicks) == (54494, 177)
 
 
 @pytest.mark.parametrize(("pivot", "value", "facet"), SEGMENT_CASES)

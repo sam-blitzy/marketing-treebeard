@@ -149,12 +149,18 @@
                             "description": "Association label. Null for an unlabeled association, as the associations guide's examples and simulated responses return it; a string for a labeled one."
                           },
                           "fromObjectTypeId": {
-                            "type": "string",
-                            "description": "Object type id of the source record."
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Object type id of the source record. The reference schema and sample give a string; live 2026-09 responses return null (observed by a live capture, 2026-10). Both are admitted, and the parser does not read it."
                           },
                           "toObjectTypeId": {
-                            "type": "string",
-                            "description": "Object type id of the target record."
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Object type id of the target record. The reference schema and sample give a string; live 2026-09 responses return null (observed by a live capture, 2026-10). Both are admitted, and the parser does not read it."
                           }
                         }
                       }

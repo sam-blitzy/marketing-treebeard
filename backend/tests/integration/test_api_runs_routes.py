@@ -15,7 +15,8 @@ AAP 0.5.3 (``GET /runs/latest``, ``GET /runs/{id}``, ``GET /runs?kind=custom&lim
 * a window date sent as a UNIX timestamp or a datetime string is a 422 ``validation_error``
   naming the field, and no run is written, while the same dates as ``YYYY-MM-DD`` compute it;
 * a changed ``window.default_days`` shows in ``Run.default_days`` and in the default run;
-* every route needs a session (401) and ``POST /runs`` the CSRF header (403).
+* every route needs a session (401) and ``POST /runs`` the CSRF header (403); a session
+  cookie saved before logout cannot create a run afterwards (401).
 
 The application is assembled as ``api/app.py`` assembles it for these routes: the auth and
 runs routers under ``/api/v1`` behind the CSRF guard, Starlette's ``SessionMiddleware`` with
@@ -383,6 +384,37 @@ async def test_every_route_needs_a_session(app_db: str, thresholds: Thresholds) 
         ):
             _assert_error(response, 401, "unauthenticated")
     assert await _run_count() == 0
+
+
+@pytest.mark.anyio
+async def test_a_cookie_saved_before_logout_cannot_create_a_run(
+    app_db: str, thresholds: Thresholds
+) -> None:
+    """Logout revokes the session server-side, so a replayed cookie cannot mutate (CWE-613)."""
+    email = await _seed()
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        saved = client.cookies.get(security.SESSION_COOKIE)
+        assert saved
+        replay = {**CSRF, "Cookie": f"{security.SESSION_COOKIE}={saved}"}
+        created = await client.post(f"{API}/runs", json=_window(28), headers=CSRF)
+        assert created.status_code == 201, created.text
+
+        logout = await client.post(f"{API}/auth/logout", headers=CSRF)
+        assert logout.status_code == 200, logout.text
+        assert client.cookies.get(security.SESSION_COOKIE) is None
+
+        _assert_error(
+            await client.post(f"{API}/runs", json=_window(28), headers=replay),
+            401,
+            "unauthenticated",
+        )
+        _assert_error(
+            await client.get(f"{API}/auth/me", headers={"Cookie": replay["Cookie"]}),
+            401,
+            "unauthenticated",
+        )
+    assert await _run_count() == 1
 
 
 @pytest.mark.anyio

@@ -24,11 +24,15 @@ Days and instants:
     through integer arithmetic, never float division.
 
 Money:
-    Amounts are exact :class:`~decimal.Decimal` values in the ad account's currency and are
-    never rounded here; the minor-unit check on decisions belongs to ``ads_engine.decisions``.
-    Every amount must be losslessly representable in its ``numeric(18, 6)`` column: below
-    ``10**12``, with no nonzero digit beyond the sixth decimal place. Any other amount is a
-    defect, never rounded.
+    Amounts are :class:`~decimal.Decimal` values in the ad account's currency, stored as
+    ``numeric(18, 6)``: below ``10**12``, with at most six decimal places. Budgets are exact
+    and never rounded here, because the discrepancy check compares them at the currency's
+    minor unit; the minor-unit check on decisions belongs to ``ads_engine.decisions``. A budget
+    with a nonzero digit beyond the sixth decimal place is a defect. Reported spend
+    (``costInLocalCurrency``) is different: live 202609 analytics carry up to 17 decimal
+    places of float residue, such as ``19.918330000000001``, so a cost with a nonzero digit
+    there is rounded half-even to six places. Any amount of ``10**12`` or more, after that
+    rounding, is a defect.
 
 Personal data:
     A lead email is normalised (trimmed, lowercased) and hashed with SHA-256. The plaintext
@@ -56,7 +60,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Final, Literal, overload
 
@@ -194,9 +198,17 @@ _MAX_INT_DIGITS: Final = len(str(_INT64_MAX))  # 19
 # The longest BigDecimal string accepted, far above any amount LinkedIn returns.
 _MAX_DECIMAL_CHARS: Final = 64
 # Every amount is stored as numeric(18, 6): 18 significant digits, 6 of them after the point,
-# so an amount holds at most 12 integral digits (below 10**12) and 6 decimal places.
+# so an amount holds at most 12 integral digits (below 10**12) and 6 decimal places. A budget
+# with a nonzero digit beyond the sixth place is a defect; a reported cost is rounded
+# half-even to the sixth place (_to_decimal's round_excess).
 _AMOUNT_INTEGRAL_DIGITS: Final = 12
 _AMOUNT_SCALE: Final = 6
+# The quantum of the sixth decimal place, built without a context: Decimal("0.000001").
+_AMOUNT_QUANTUM: Final = Decimal((0, (1,), -_AMOUNT_SCALE))
+# A private context makes cost rounding independent of the caller's decimal context: 64
+# digits hold every numeral up to the 64-character cap, and more than the 19 digits of the
+# largest amount rounding can produce (1000000000000.000000); an invalid result raises.
+_AMOUNT_CONTEXT: Final = Context(prec=64, rounding=ROUND_HALF_EVEN, traps=[InvalidOperation])
 _VERSIONED_FORM_RE: Final = re.compile(
     r"urn:li:versionedLeadGenForm:\(urn:li:leadGenForm:([0-9]+),([0-9]+)\)"
 )
@@ -522,20 +534,41 @@ def _bool(parent: JsonObject, key: str, surface: str, *, required: bool) -> bool
     return value
 
 
-def _to_decimal(value: object, what: str, surface: str) -> Decimal:
+def _to_decimal(value: object, what: str, surface: str, *, round_excess: bool = False) -> Decimal:
     """Convert a BigDecimal string, an int or a Decimal to a finite, non-negative Decimal.
 
     Floats are rejected: a binary float cannot carry an exact money amount, and LinkedIn
     serialises BigDecimal values as strings. A string longer than 64 characters is a defect
     before it reaches ``Decimal()``, as is one whose exponent the decimal module cannot hold.
 
-    Every caller's amount is stored as ``numeric(18, 6)``, so the amount must be exactly
-    representable there: below ``10**12``, in any input form, and with no nonzero digit beyond
-    the sixth decimal place. An amount outside either bound is a defect, never rounded, so
-    ``1000000000000`` is out of range and ``0.0000001`` has more than 6 decimal places.
-    Trailing zeros beyond the sixth place change no value: ``100.500000000`` is accepted and
-    returned unchanged, never rescaled. A zero such as ``0E+19`` or ``-0E+19`` fits whatever
-    its exponent, and is returned unsigned.
+    Every caller's amount is stored as ``numeric(18, 6)``, so the amount must be below
+    ``10**12``, in any input form: ``1000000000000`` is out of range. A nonzero digit beyond
+    the sixth decimal place is a defect by default, so a budget such as ``0.0000001`` has
+    more than 6 decimal places: budgets are compared at the currency's minor unit, and
+    rounding must neither cause nor hide a mismatch there. Trailing zeros beyond the sixth
+    place change no value: ``100.500000000`` is accepted and returned unchanged, never
+    rescaled. A zero such as ``0E+19`` or ``-0E+19`` fits whatever its exponent, and is
+    returned unsigned.
+
+    Args:
+        value: The decoded JSON value.
+        what: The field, as defects name it.
+        surface: The contract surface, for defects.
+        round_excess: For reported spend only. An amount with a nonzero digit beyond the sixth
+            decimal place is then rounded half-even to exactly six places instead of being a
+            defect, because live 202609 analytics carry up to 17 decimal places of float
+            residue: ``19.918330000000001`` becomes ``19.918330``, the tie ``0.0000015``
+            becomes ``0.000002``, and ``0.00000000000000355`` becomes an unsigned
+            ``0.000000``. The range is checked again after rounding, so
+            ``999999999999.9999995``, which rounds to ``10**12``, is out of range. Every
+            other amount is returned exactly as it is without the option.
+
+    Returns:
+        The amount, unchanged unless ``round_excess`` rounded it.
+
+    Raises:
+        QueryDefect: When the value is not a finite, non-negative decimal that
+            ``numeric(18, 6)`` can hold under the rules above.
     """
     if isinstance(value, bool):
         raise _defect(f"{what} must be a decimal, not a boolean", surface)
@@ -574,22 +607,48 @@ def _to_decimal(value: object, what: str, surface: str) -> Decimal:
     last_digit_exponent = amount.adjusted() - len(digits) + 1
     excess_places = -last_digit_exponent - _AMOUNT_SCALE
     if excess_places > 0 and any(digits[-excess_places:]):
-        raise _defect(f"{what} has more than {_AMOUNT_SCALE} decimal places", surface)
+        if not round_excess:
+            raise _defect(f"{what} has more than {_AMOUNT_SCALE} decimal places", surface)
+        # quantize rounds the exact value once, whatever its length: the amount is below
+        # 10**12 here, so the result has at most 19 digits, within the private context. A
+        # positive amount never rounds to a signed zero.
+        amount = amount.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN, context=_AMOUNT_CONTEXT)
+        if amount.adjusted() >= _AMOUNT_INTEGRAL_DIGITS:
+            raise _defect(f"{what} is out of range", surface)
     return amount
 
 
 @overload
-def _decimal(parent: JsonObject, key: str, surface: str, *, required: Literal[True]) -> Decimal: ...
+def _decimal(
+    parent: JsonObject,
+    key: str,
+    surface: str,
+    *,
+    required: Literal[True],
+    round_excess: bool = False,
+) -> Decimal: ...
 @overload
 def _decimal(
-    parent: JsonObject, key: str, surface: str, *, required: Literal[False]
+    parent: JsonObject,
+    key: str,
+    surface: str,
+    *,
+    required: Literal[False],
+    round_excess: bool = False,
 ) -> Decimal | None: ...
-def _decimal(parent: JsonObject, key: str, surface: str, *, required: bool) -> Decimal | None:
-    """Read a non-negative decimal field (spend, budget amounts)."""
+def _decimal(
+    parent: JsonObject, key: str, surface: str, *, required: bool, round_excess: bool = False
+) -> Decimal | None:
+    """Read a non-negative decimal field (spend, budget amounts).
+
+    Budgets keep the default: a nonzero digit beyond the sixth decimal place is a defect.
+    Spend passes ``round_excess=True``, which rounds such an amount half-even to six places
+    (:func:`_to_decimal`).
+    """
     value = _present(parent, key, surface, required=required)
     if value is None:
         return None
-    return _to_decimal(value, f"field '{key}'", surface)
+    return _to_decimal(value, f"field '{key}'", surface, round_excess=round_excess)
 
 
 def _epoch_ms_to_utc(value: int, what: str, surface: str) -> datetime:
@@ -1206,7 +1265,8 @@ class CreativeDailyRow:
     Attributes:
         creative_urn: The creative URN (``pivotValues``).
         date: The UTC calendar day as returned, never rebucketed.
-        cost: ``costInLocalCurrency`` in the ad account's currency.
+        cost: ``costInLocalCurrency`` in the ad account's currency, rounded half-even to six
+            decimal places when LinkedIn returns more.
         impressions: ``impressions``.
         clicks: ``clicks``.
         landing_page_clicks: ``landingPageClicks``.
@@ -1240,7 +1300,8 @@ class SegmentRow:
         value: The demographic value URN, such as ``urn:li:seniority:5``.
         impressions: ``impressions``, or ``None`` when unavailable.
         clicks: ``clicks``, or ``None`` when unavailable.
-        cost: ``costInLocalCurrency``, or ``None`` when unavailable.
+        cost: ``costInLocalCurrency``, rounded half-even to six decimal places when LinkedIn
+            returns more, or ``None`` when unavailable.
         leads: ``oneClickLeads``, or ``None`` when the pivot does not return it.
         website_conversions: ``externalWebsiteConversions``, or ``None``.
     """
@@ -1274,6 +1335,10 @@ def parse_analytics_daily(element: object) -> CreativeDailyRow:
     which is therefore rejected; tests check metric and date decoding on that sample with its
     pivot value replaced by a creative URN.
 
+    ``costInLocalCurrency`` with more than six decimal places, as live 202609 responses carry
+    (up to 17, such as ``19.918330000000001``), is rounded half-even to six places for its
+    ``numeric(18, 6)`` column; a cost that rounds to ``10**12`` or more is a defect.
+
     Args:
         element: One element of the analytics response.
 
@@ -1297,7 +1362,7 @@ def parse_analytics_daily(element: object) -> CreativeDailyRow:
     return CreativeDailyRow(
         creative_urn=creative_urn,
         date=day,
-        cost=_decimal(obj, "costInLocalCurrency", surface, required=False),
+        cost=_decimal(obj, "costInLocalCurrency", surface, required=False, round_excess=True),
         impressions=_int(obj, "impressions", surface, required=False),
         clicks=_int(obj, "clicks", surface, required=False),
         landing_page_clicks=_int(obj, "landingPageClicks", surface, required=False),
@@ -1326,6 +1391,10 @@ def parse_segment(
       the demographic value; the caller passes the requested campaign as ``campaign_urn``.
       LinkedIn 202609 rejects ``MEMBER_*`` values in ``pivots``, so this is the form that
       works live.
+
+    ``costInLocalCurrency`` with more than six decimal places, as live 202609 responses carry,
+    is rounded half-even to six places for ``fact_segment_window.cost``, as in
+    :func:`parse_analytics_daily`.
 
     Args:
         element: One element of the response.
@@ -1375,7 +1444,7 @@ def parse_segment(
         value=value,
         impressions=_int(obj, "impressions", surface, required=False),
         clicks=_int(obj, "clicks", surface, required=False),
-        cost=_decimal(obj, "costInLocalCurrency", surface, required=False),
+        cost=_decimal(obj, "costInLocalCurrency", surface, required=False, round_excess=True),
         leads=_int(obj, "oneClickLeads", surface, required=False),
         website_conversions=_int(obj, "externalWebsiteConversions", surface, required=False),
     )

@@ -5,7 +5,8 @@
 # Build context: ./backend (root docker-compose.yml builds it once). The Compose `command:`
 # selects the process; the default CMD below is the API:
 #   migrate  sh -c "ads-engine migrate && ads-engine ensure-admin"
-#   api      uvicorn ads_engine.api.app:create_app --factory --host 0.0.0.0 --port 8000 ...
+#   api      uvicorn ads_engine.api.app:create_app --factory --host 0.0.0.0 --port 8000
+#            --proxy-headers (proxy headers trusted only from FORWARDED_ALLOW_IPS; see the CMD)
 #   worker   python -m ads_engine.worker.main
 #   init     `make init` pipes the admin password into `ads-engine hash-password` in this
 #            image with stdin attached (`docker compose run --rm -T ...` or `docker run -i`)
@@ -101,8 +102,23 @@ USER 10001:10001
 
 EXPOSE 8000
 
-# No ENTRYPOINT, so a Compose `command:` replaces this CMD directly. Proxy headers from nginx
-# give the login rate limiter the real client IP.
+# Proxy-header trust for the API. uvicorn takes the client address and scheme from
+# X-Forwarded-For and X-Forwarded-Proto only when the connecting peer is listed in
+# FORWARDED_ALLOW_IPS (comma-separated addresses or CIDR networks); from any other peer it
+# ignores both headers, and from a listed peer it takes the rightmost X-Forwarded-For entry
+# that is not itself listed. The login rate limiter keys on that address. The default trusts
+# loopback only, so a client reaching a published port 8000 directly is always keyed on its own
+# address, whatever header it sends. A deployment behind a reverse proxy sets
+# FORWARDED_ALLOW_IPS to the proxy's address or network at run time (`docker run -e`, a Compose
+# `environment:` entry), and that proxy must overwrite X-Forwarded-For with the address of the
+# peer connected to it (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`) rather than
+# append to the client's value. Never set `*` where clients can reach the API port: uvicorn
+# then trusts every peer and takes the leftmost entry, which the client writes, so each attempt
+# could claim a fresh address and escape the per-IP login limit.
+ENV FORWARDED_ALLOW_IPS=127.0.0.1,::1
+
+# No ENTRYPOINT, so a Compose `command:` replaces this CMD directly. `--forwarded-allow-ips` is
+# deliberately absent: uvicorn reads FORWARDED_ALLOW_IPS (above) instead, so the trusted proxies
+# are set at run time without replacing the command.
 CMD ["uvicorn", "ads_engine.api.app:create_app", "--factory", \
-  "--host", "0.0.0.0", "--port", "8000", \
-  "--proxy-headers", "--forwarded-allow-ips", "*"]
+  "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
