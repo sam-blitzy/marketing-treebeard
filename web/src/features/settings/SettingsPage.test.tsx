@@ -266,6 +266,12 @@ describe('SettingsPage', () => {
       );
       expect(pairs).toHaveLength(leaves);
       expect(keys).toEqual([...keys].sort());
+      // The dotted keys are the table's row headers (`<th scope="row">`), in the same order.
+      expect(
+        within(table('Thresholds'))
+          .getAllByRole('rowheader')
+          .map((cell) => cell.textContent),
+      ).toEqual(keys);
       expect(keys[0]).toBe('attribution.floor_share');
       const values = new Map(pairs);
       // Ratios stay ratios: 0.95 is never shown as 95%.
@@ -464,9 +470,12 @@ describe('SettingsPage', () => {
         ['Google touch-date property', 'resolved', '—', '—', '—', '—'],
       ]);
       expect(within(primary).queryByText('0')).toBeNull();
-      // No companion CRM dataset is active, so its section is absent.
+      // No companion CRM dataset is active, so its section and its table are absent.
       expect(
         screen.queryByRole('heading', { name: 'Resolved stage properties (simulated companion)' }),
+      ).toBeNull();
+      expect(
+        screen.queryByRole('table', { name: 'Resolved stage properties (simulated companion)' }),
       ).toBeNull();
     });
 
@@ -488,7 +497,8 @@ describe('SettingsPage', () => {
 
   describe('white paper registry and configuration hash', () => {
     it('lists every white paper in file order with its lead forms and creative overrides', async () => {
-      stubConfig();
+      const config = makeConfig();
+      stubConfig(json(200, config));
       await renderLoaded();
 
       const registry = table('White paper registry');
@@ -498,11 +508,24 @@ describe('SettingsPage', () => {
         ['paid-media-benchmarks-2026', 'Paid Media Benchmarks 2026', '—'],
         ['attribution-playbook', 'The Attribution Playbook', 'urn:li:sponsoredCreative:990001301'],
       ]);
-      const forms = screen.getByRole('list', { name: 'Lead forms of b2b-pipeline-report-2026' });
-      expect(within(forms).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
-        'urn:li:leadGenForm:990000101',
-        'urn:li:leadGenForm:990000102',
-      ]);
+      // Each slug is its row's header, and every lead form of the asset is listed in that row.
+      expect(
+        within(registry)
+          .getAllByRole('rowheader')
+          .map((cell) => cell.textContent),
+      ).toEqual(config.content_assets.map((asset) => asset.slug));
+      const rows = within(registry).getAllByRole('row').slice(1);
+      expect(rows).toHaveLength(config.content_assets.length);
+      config.content_assets.forEach((asset, index) => {
+        const row = rows[index];
+        if (row === undefined) {
+          throw new Error(`The registry has no row for "${asset.slug}".`);
+        }
+        const forms = within(row).getByRole('list', { name: `Lead forms of ${asset.slug}` });
+        expect(within(forms).getAllByRole('listitem').map((item) => item.textContent)).toEqual(
+          asset.lead_forms,
+        );
+      });
       const overrides = screen.getByRole('list', {
         name: 'Creative overrides of attribution-playbook',
       });
@@ -576,9 +599,23 @@ describe('SettingsPage', () => {
       expect(within(status).getByText(message)).toBeTruthy();
       expect(screen.queryByText('Loading settings')).toBeNull();
       expect(screen.queryByRole('region', { name: 'Analysis window' })).toBeNull();
+      expect(screen.queryAllByRole('table')).toHaveLength(0);
       expect(screen.queryByRole('alert')).toBeNull();
       // The page has no controls, so the failure offers no action.
       expect(screen.queryAllByRole('button')).toHaveLength(0);
+    });
+
+    it('never shows a blank reason: a whitespace-only API message gets the generic one', async () => {
+      stubConfig(apiError(500, 'config_error', '   '));
+      await renderWithProviders(<SettingsPage />, { path: '/settings' });
+
+      const status = await waitFor(() => {
+        const region = screen.getByRole('status');
+        expect(within(region).getByText('Settings unavailable')).toBeTruthy();
+        return region;
+      });
+      expect(within(status).getByText('The configuration could not be loaded.')).toBeTruthy();
+      expect(screen.queryAllByRole('table')).toHaveLength(0);
     });
 
     it('keeps the last configuration when a background refresh fails', async () => {

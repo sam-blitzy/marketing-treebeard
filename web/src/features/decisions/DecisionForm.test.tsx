@@ -475,17 +475,42 @@ describe('DecisionForm', () => {
 
   describe('prefill and amounts as the API sends them', () => {
     it('starts a C1 decision at the proposed paused status, which is a change', async () => {
-      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': json(
+          201,
+          makeDecision('own_budget', {
+            id: 905,
+            status: 'paused',
+            origin: 'recommendation',
+            recommendation_id: FIXTURE_ITEM_IDS.c1,
+            patch: { status: 'paused' },
+          }),
+        ),
+      });
       await renderForm({
         subject: OWN_BUDGET,
         recommendationId: FIXTURE_ITEM_IDS.c1,
         prefill: { status: 'paused' },
+        onDone,
       });
 
       expect(statusSelect()).toHaveProperty('value', 'paused');
       expect(amountInput('Daily budget')).toHaveProperty('value', '200.00');
       expect(saveButton()).toHaveProperty('disabled', false);
       expect(screen.queryByText('No change from the last decided state')).toBeNull();
+
+      // Submitted without any edit: the prefill alone is the patch, tied to its item.
+      fireEvent.click(saveButton());
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      expect(onlyCall(api, 'POST', '/decisions').body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.brandSearch },
+        patch: { status: 'paused' },
+        recommendation_id: FIXTURE_ITEM_IDS.c1,
+      });
     });
 
     it('treats a prefill equal to the decided state as no change', async () => {
@@ -639,6 +664,8 @@ describe('DecisionForm', () => {
       await renderForm({ subject: OWN_BUDGET });
 
       // The same amount written differently, and a note alone, change nothing decided.
+      typeInto(amountInput('Daily budget'), '200');
+      expect(saveButton()).toHaveProperty('disabled', true);
       typeInto(amountInput('Daily budget'), '200.0');
       typeInto(noteField(), 'Checked, nothing to change');
       expect(saveButton()).toHaveProperty('disabled', true);
@@ -647,6 +674,40 @@ describe('DecisionForm', () => {
       fireEvent.submit(formOf(saveButton()));
       expect(callsTo(api, 'POST', '/decisions')).toHaveLength(0);
       expect(api.calls).toHaveLength(1);
+    });
+
+    it('posts a typed daily budget alone, keeping the decided status out of the patch', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': json(
+          201,
+          makeDecision('own_budget', {
+            id: 906,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            daily_budget: '150.00',
+            patch: { daily_budget: '150.00' },
+          }),
+        ),
+      });
+      await renderForm({ subject: OWN_BUDGET, onDone });
+
+      typeInto(amountInput('Daily budget'), '150.00');
+      expect(statusSelect()).toHaveProperty('value', 'active');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.brandSearch },
+        patch: { daily_budget: '150.00' },
+      });
+      // The server keeps the decided status; the form never resends an unchanged field.
+      expect(post.body).not.toHaveProperty('patch.status');
     });
 
     it('posts only changed fields with the CSRF header, then calls onDone', async () => {

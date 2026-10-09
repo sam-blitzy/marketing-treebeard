@@ -25,7 +25,6 @@ import { renderWithProviders } from '../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { queryKeys } from '../../api/queries';
 import type {
   ConnectionStatus,
   DataMode,
@@ -34,6 +33,7 @@ import type {
   Source,
   SyncRequestView,
 } from '../../api/types';
+import { formatCount } from '../../lib/format';
 import { makeRun, makeSource, makeSources } from '../../test/fixtures';
 import { SourcesPage } from './SourcesPage';
 
@@ -186,6 +186,13 @@ describe('SourcesPage', () => {
       stubPage();
       await renderLoaded();
 
+      // makeSources() answers Google, LinkedIn, HubSpot; each section is the region named by its
+      // level-2 heading, so the headings give the sections' document order.
+      expect(
+        screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
+      ).toEqual(['Google', 'LinkedIn', 'HubSpot']);
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
+
       for (const label of ['Google', 'LinkedIn', 'HubSpot']) {
         const line = statusLine(section(label));
         expect(badges(line)).toEqual(['Simulated (info)', 'OK (success)']);
@@ -336,6 +343,26 @@ describe('SourcesPage', () => {
       );
       for (const label of ['LinkedIn', 'HubSpot']) {
         expect(within(section(label)).queryByText(/Google calls in the last 24 h/u)).toBeNull();
+      }
+    });
+
+    it('formats the call count and the cap with thousands separators', async () => {
+      stubPage(
+        json(200, [
+          makeSource('google', { calls_24h: 1234, call_cap: 2880 }),
+          makeSource('linkedin'),
+          makeSource('hubspot'),
+        ]),
+      );
+      await renderLoaded();
+
+      const calls = formatCount(1234);
+      const cap = formatCount(2880);
+      expect(
+        within(section('Google')).getByText(`Google calls in the last 24 h: ${calls} of ${cap}`),
+      ).toBeTruthy();
+      for (const label of ['LinkedIn', 'HubSpot']) {
+        expect(within(section(label)).queryByText(/Google calls/u)).toBeNull();
       }
     });
 
@@ -759,7 +786,8 @@ describe('SourcesPage', () => {
       stubPage(() => response.promise);
       await renderWithProviders(<SourcesPage />, { path: '/sources' });
 
-      expect(screen.getByText('Loading sources')).toBeTruthy();
+      // The Spinner is the page's one status element while loading; its label is its text.
+      expect(screen.getByRole('status').textContent).toBe('Loading sources');
       expect(screen.getByRole('heading', { level: 1, name: 'Sources' })).toBeTruthy();
       expect(screen.queryByRole('region', { name: 'Google' })).toBeNull();
 
@@ -785,10 +813,14 @@ describe('SourcesPage', () => {
       expect(screen.getByText('Database unavailable')).toBeTruthy();
       expect(screen.queryByText('Loading sources')).toBeNull();
 
+      const sourceReads = (): number =>
+        api.calls.filter((call) => call.method === 'GET' && call.path === '/sources').length;
+      const readsBefore = sourceReads();
       api.use({ 'GET /sources': json(200, makeSources()) });
       fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
       expect(await screen.findByRole('region', { name: 'Google' })).toBeTruthy();
+      expect(sourceReads()).toBeGreaterThan(readsBefore);
       expect(screen.queryByText('Sources unavailable')).toBeNull();
     });
 
@@ -825,8 +857,11 @@ describe('SourcesPage', () => {
         'GET /sources': apiError(503, 'service_unavailable', 'Database unavailable'),
       });
 
+      // Every active query is read again, as the hooks' polling would: `GET /sources` fails while
+      // `GET /runs/latest` still answers. Addressing all active queries keeps this test free of
+      // the hooks' private query keys.
       await act(async () => {
-        await queryClient.refetchQueries({ queryKey: queryKeys.sources });
+        await queryClient.refetchQueries({ type: 'active' });
       });
 
       expect(await screen.findByText('Sources could not be refreshed')).toBeTruthy();

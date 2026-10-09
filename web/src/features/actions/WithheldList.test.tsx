@@ -16,14 +16,16 @@
  *   withheld.
  *
  * Withheld patterns come from `makeWithheld` (K1: 30 of 37 clicks) or are built in the test in
- * the backend's shape (`schemas.Withheld`). The component makes no request, so it renders
- * without providers.
+ * the backend's shape (`schemas.Withheld`). The component makes no request, but it renders
+ * through `renderWithProviders`, inside the query client and router every section that hosts it
+ * runs under, so the list is checked in the tree it actually ships in.
  */
-import { render, screen, within } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EntityView, Withheld } from '../../api/types';
 import { makeWithheld } from '../../test/fixtures';
+import { renderWithProviders } from '../../test/render';
 import { WithheldList, withheldLine } from './WithheldList';
 
 /** The default title, when the caller passes none or a blank one. */
@@ -161,13 +163,31 @@ describe('withheldLine', () => {
 });
 
 describe('WithheldList', () => {
-  it('lists each withheld pattern under the default title, in API order', () => {
+  it('renders a B4 line with rule, entity, reason and sample, as withheldLine', async () => {
+    const b4 = makeWithheld({
+      rule_id: 'B4',
+      entity: entity(),
+      reason: 'weekend days',
+      sample: { observed: 3, required: 4, unit: 'weekend days' },
+    });
+    await renderWithProviders(<WithheldList withheld={[b4]} title={BUDGET_TITLE} />);
+
+    const [line] = lineTexts(BUDGET_TITLE);
+    expect(line).toContain('B4 ·');
+    expect(line).toContain('Brand search');
+    expect(line).toContain('weekend days');
+    expect(line).toContain('3 / 4 weekend days');
+    expect(line).toBe(withheldLine(b4));
+    expect(line).toBe('B4 · Brand search: weekend days — 3 / 4 weekend days');
+  });
+
+  it('lists each withheld pattern under the default title, in API order', async () => {
     const withheld = [
       makeWithheld(),
       b4Withheld(),
       makeWithheld({ entity: null, reason: 'k1_no_baseline' }),
     ];
-    render(<WithheldList withheld={withheld} />);
+    await renderWithProviders(<WithheldList withheld={withheld} />);
 
     const title = screen.getByText(DEFAULT_TITLE);
     expect(title.tagName).toBe('STRONG');
@@ -177,8 +197,19 @@ describe('WithheldList', () => {
     );
   });
 
-  it('shows and names the list with the title the caller passes', () => {
-    render(<WithheldList withheld={[b4Withheld()]} title={BUDGET_TITLE} />);
+  it('keeps two entries in the order given, whichever comes first', async () => {
+    const first = b4Withheld();
+    const second = makeWithheld();
+    const { unmount } = await renderWithProviders(<WithheldList withheld={[first, second]} />);
+    expect(lineTexts(DEFAULT_TITLE)).toEqual([withheldLine(first), withheldLine(second)]);
+
+    unmount();
+    await renderWithProviders(<WithheldList withheld={[second, first]} />);
+    expect(lineTexts(DEFAULT_TITLE)).toEqual([withheldLine(second), withheldLine(first)]);
+  });
+
+  it('shows and names the list with the title the caller passes', async () => {
+    await renderWithProviders(<WithheldList withheld={[b4Withheld()]} title={BUDGET_TITLE} />);
 
     expect(screen.getByText(BUDGET_TITLE).tagName).toBe('STRONG');
     expect(lineTexts(BUDGET_TITLE)).toEqual([
@@ -187,26 +218,31 @@ describe('WithheldList', () => {
     expect(screen.queryByText(DEFAULT_TITLE)).toBeNull();
   });
 
-  it('falls back to the default title when the given one is blank', () => {
-    render(<WithheldList withheld={[makeWithheld()]} title="   " />);
+  it('falls back to the default title when the given one is blank', async () => {
+    await renderWithProviders(<WithheldList withheld={[makeWithheld()]} title="   " />);
 
     expect(screen.getByRole('list', { name: DEFAULT_TITLE })).toBeDefined();
     expect(screen.getByText(DEFAULT_TITLE)).toBeDefined();
   });
 
-  it('renders repeated rule ids as separate lines without key warnings', () => {
+  it('renders repeated rule ids as separate lines without key warnings', async () => {
     const consoleError = vi.spyOn(console, 'error');
     const withheld = [makeWithheld(), makeWithheld({ reason: 'clicks 12 of 37 required' })];
-    render(<WithheldList withheld={withheld} />);
+    await renderWithProviders(<WithheldList withheld={withheld} />);
 
     expect(lineTexts(DEFAULT_TITLE)).toHaveLength(2);
     expect(consoleError).not.toHaveBeenCalled();
   });
 
-  it('renders nothing, neither title nor list, when nothing is withheld', () => {
-    const { container } = render(<WithheldList withheld={[]} title={BUDGET_TITLE} />);
+  it('renders nothing, neither title nor list, when nothing is withheld', async () => {
+    const { container } = await renderWithProviders(
+      <WithheldList withheld={[]} title={BUDGET_TITLE} />,
+    );
 
-    expect(container.childElementCount).toBe(0);
     expect(screen.queryByText(BUDGET_TITLE)).toBeNull();
+    expect(screen.queryByText(DEFAULT_TITLE)).toBeNull();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(container.textContent).toBe('');
   });
 });

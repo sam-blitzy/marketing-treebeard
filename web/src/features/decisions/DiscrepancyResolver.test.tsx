@@ -236,6 +236,14 @@ describe('DiscrepancyResolver list', () => {
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
 
+    const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+    expect(
+      within(list)
+        .getAllByRole('heading', { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual(['Brand Search — US', 'Search Shared Budget']);
+
     const status = await findCard('Brand Search — US');
     expect(within(status).getByText('Google · Campaign · Status mismatch')).toBeTruthy();
     expect(within(status).getByText('Open')).toBeTruthy();
@@ -643,8 +651,9 @@ describe('DiscrepancyResolution resolutions offered', () => {
 
   it('keeps the order the API lists, adding and dropping nothing', async () => {
     mockApi({});
+    // The reverse of FIXTURE_RESOLUTIONS.budget, so only the API's order can produce it.
     const { container } = await renderResolution(
-      makeDiscrepancy('status', { resolutions: ['decision_correct', 'platform_correct'] }),
+      makeDiscrepancy('budget', { resolutions: ['decision_correct', 'platform_correct'] }),
     );
 
     expect(buttonLabels(container)).toEqual(['Decision is correct', 'Platform is correct']);
@@ -731,7 +740,7 @@ describe('DiscrepancyResolution posting', () => {
     expect(buttonNamed('Platform is correct').disabled).toBe(false);
   });
 
-  it('acknowledges a removal at once', async () => {
+  it('acknowledges a removal at once, with no dialog', async () => {
     const api = mockApi({
       [RESOLVE_KEY]: json(
         200,
@@ -742,12 +751,18 @@ describe('DiscrepancyResolution posting', () => {
 
     fireEvent.click(buttonNamed('Acknowledge removal'));
 
+    // The click itself posts: no dialog opens and nothing waits for confirmation.
+    expect(screen.queryByRole('dialog')).toBeNull();
     await waitFor(() => {
       expect(outcomeRegion().textContent).toBe('Resolved');
     });
-    expect(resolveCalls(api).map((call) => call.body)).toEqual([
-      { resolution: 'acknowledge_removal' },
-    ]);
+    const calls = resolveCalls(api);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe(`/discrepancies/${String(FIXTURE_DISCREPANCY_ID)}/resolve`);
+    expect(calls[0]?.headers.get('X-Requested-With')).toBe('ads-engine');
+    expect(calls[0]?.body).toEqual({ resolution: 'acknowledge_removal' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(onResolved).toHaveBeenCalledTimes(1);
     expect(onResolved.mock.calls[0]?.[0].state).toBe('resolved');
   });
 
@@ -774,6 +789,9 @@ describe('DiscrepancyResolution posting', () => {
 // Errors
 // ---------------------------------------------------------------------------------------------
 
+// The codes are the ones the API sends (`decisions.py`): 409 `discrepancy_resolved` for a closed
+// discrepancy and 422 `resolution_not_allowed` / `intended_state_invalid` for a refused one. The
+// API has no `discrepancy_closed` or `invalid_resolution`, so those are never stubbed here.
 describe('DiscrepancyResolution errors', () => {
   it('reads "Computed from replaced data" on 409 subject_retired and locks all', async () => {
     const api = mockApi({

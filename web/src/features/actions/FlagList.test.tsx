@@ -15,8 +15,11 @@
  *   backend's own message, and renders nothing when no flag applies.
  *
  * Flags come from `FIXTURE_FLAGS`, whose messages are the ones the backend renders for each of
- * the fifteen codes, and from the default page's C1 card. The component makes no request, so it
- * renders without providers.
+ * the fifteen codes, and from the default page's C1 card. The component makes no request, so
+ * most cases render it without providers. One block renders it through `renderWithProviders`,
+ * inside the Query client and router every recommendation card sits in, with `Flag` literals
+ * written out in full: the "Simulated data" label it checks is the one the simulated-mode
+ * end-to-end spec looks for on each affected card (AAP 0.3.3).
  */
 import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
@@ -30,6 +33,7 @@ import {
   makeFlag,
   makeRecommendationsPage,
 } from '../../test/fixtures';
+import { renderWithProviders } from '../../test/render';
 import { FlagList, WARNING_FLAG_CODES, flagTone, mergeFlags } from './FlagList';
 
 /** The codes AAP 0.5.5 lists as trust warnings: data state, discrepancies, floors, pipeline. */
@@ -211,5 +215,69 @@ describe('FlagList', () => {
 
     expect(container.childElementCount).toBe(0);
     expect(screen.queryByRole('list', { name: 'Flags' })).toBeNull();
+  });
+});
+
+describe('FlagList inside the app providers', () => {
+  /**
+   * A simulated card's flags as its run recorded them, when one discrepancy was open.
+   */
+  const RECORDED = [
+    { code: 'simulated', message: 'Simulated data' } satisfies Flag,
+    {
+      code: 'unverified_discrepancies',
+      message: 'Unverified while 1 discrepancies are open',
+    } satisfies Flag,
+  ];
+
+  /**
+   * The same card's overlay at read time: a second discrepancy has opened since the run, and a
+   * dataset it reads has turned stale.
+   */
+  const CURRENT = [
+    {
+      code: 'unverified_discrepancies',
+      message: 'Unverified while 2 discrepancies are open',
+    } satisfies Flag,
+    { code: 'stale', message: 'Stale' } satisfies Flag,
+  ];
+
+  it('merges recorded and current flags into one badge per code, showing the live count', async () => {
+    await renderWithProviders(<FlagList flags={RECORDED} current={CURRENT} />);
+
+    const items = flagItems();
+    expect(items).toHaveLength(3);
+    expect(items.map((item) => item.textContent)).toEqual([
+      'Simulated data',
+      'Unverified while 2 discrepancies are open',
+      'Stale',
+    ]);
+    expect(items.map((item) => item.firstElementChild?.getAttribute('class'))).toEqual([
+      'ds-badge ds-badge--info',
+      'ds-badge ds-badge--warning',
+      'ds-badge ds-badge--warning',
+    ]);
+    // The code both sets carry appears once, with the overlay's message; the frozen count is gone.
+    expect(screen.getAllByText(/^Unverified while /u)).toHaveLength(1);
+    expect(screen.queryByText('Unverified while 1 discrepancies are open')).toBeNull();
+  });
+
+  it('shows the "Simulated data" label inside the list named "Flags"', async () => {
+    await renderWithProviders(<FlagList flags={RECORDED} current={CURRENT} />);
+
+    const list = screen.getByRole('list', { name: 'Flags' });
+    const label = screen.getByText('Simulated data');
+    expect(list.contains(label)).toBe(true);
+    expect(within(list).getByText('Simulated data')).toBe(label);
+    expect(label.getAttribute('class')).toBe('ds-badge ds-badge--info');
+  });
+
+  it('renders no "Flags" list when neither set carries a flag', async () => {
+    expect(mergeFlags([], [])).toEqual([]);
+
+    await renderWithProviders(<FlagList flags={[]} current={[]} />);
+
+    expect(screen.queryByRole('list', { name: 'Flags' })).toBeNull();
+    expect(screen.queryByRole('listitem')).toBeNull();
   });
 });
