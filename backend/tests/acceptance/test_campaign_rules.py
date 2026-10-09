@@ -37,13 +37,14 @@ PostgreSQL 18 test database.
 import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Final, cast
 
 import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from tests.support import evidence_metrics, numeric
 
 from ads_engine.analysis import budget, campaigns, discrepancy
 from ads_engine.analysis.attribution import attribution_for
@@ -245,35 +246,15 @@ def _only_withheld(result: RuleResult, rule_id: str) -> Withheld:
     return lines[0]
 
 
-def _metrics(item: Candidate) -> dict[str, object]:
-    return {metric.key: metric.value for metric in item.evidence.metrics}
-
-
 def _codes(result: RuleResult) -> list[str]:
     return [finding.code for finding in result.findings]
-
-
-def _normalised(value: object) -> object:
-    """Compare numbers by value: ``"3.0"``, ``3`` and ``Decimal("3.000000")`` are equal."""
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int | Decimal):
-        return Decimal(value)
-    if isinstance(value, str):
-        try:
-            return Decimal(value)
-        except InvalidOperation:
-            return value
-    if isinstance(value, list | tuple):
-        return tuple(_normalised(item) for item in value)
-    return value
 
 
 def _evidence_value(item: Candidate, key: str, expected: object) -> object:
     """An expectation value's counterpart on a card: a metric, else ``evidence.extra``."""
     if isinstance(expected, tuple) and key in DATE_LISTS:
         return item.evidence.extra[DATE_LISTS[key]]
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     if key in metrics:
         return metrics[key]
     return item.evidence.extra[key]
@@ -423,7 +404,7 @@ def test_campaign_rule_catalogue_expectation_holds(
         assert not item.pinned
         for key, expected in expect.values.items():
             actual = _evidence_value(item, key, expected)
-            assert _normalised(actual) == _normalised(expected), (key, actual, expected)
+            assert numeric(actual) == numeric(expected), (key, actual, expected)
         assert set(expect.flags) <= set(item.flag_codes)
     else:
         assert items == []
@@ -1710,7 +1691,7 @@ def test_c1_fires_at_three_expected_outcomes_and_not_at_two_point_nine(
     assert (item.section, item.group, item.action) == (CAMPAIGNS, GROUP_PAUSE, PAUSE_ACTION)
     assert item.decision_subject == DecisionSubject("campaign", dud)
     assert item.increases_spend_on == ()
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     assert metrics["outcomes"] == 0
     assert metrics["spend_days"] == metrics["window_days"] == ctx.window.days
     expected = cast(Decimal, metrics["expected_outcomes"])
@@ -1748,12 +1729,49 @@ def test_c1_fires_at_three_expected_outcomes_and_not_at_two_point_nine(
     assert line.reason == f"expected conversions 2.9 of {minimum} required"
 
 
+@pytest.mark.parametrize("unreported", ["known_zero", "one_day", "every_day"])
+def test_c1_never_pauses_a_campaign_whose_outcomes_are_unreported(
+    make_context: ContextFactory, unreported: str
+) -> None:
+    """C1 and unknown outcomes: unreported conversions are unavailable, never 0 (AAP 0.11.1).
+
+    ``c1.expected.fires`` pauses dud, which spends on every window day with a known 0
+    conversions at 3.0 expected. With dud's conversions unreported (``None``) on its first
+    window day, or on every day, and 0 on the rest, its spend and spending days are unchanged
+    but its outcomes are unavailable: C1 neither pauses it nor lists it as withheld. dud is
+    part of its own account baseline, so that baseline is unavailable as well.
+    """
+    scenario = SCENARIOS["c1.expected.fires"]
+    base = make_context(scenario)
+    dud = scenario.ids.id("google", "campaign", "dud")
+    days = sorted(base.campaign_days[dud], key=lambda day: day.date)
+    assert len(days) == base.window.days
+    assert all(day.conversions == 0 and day.cost > 0 for day in days)
+    count = {"known_zero": 0, "one_day": 1, "every_day": len(days)}[unreported]
+    changed = tuple(
+        dataclasses.replace(day, conversions=None) if n < count else day
+        for n, day in enumerate(days)
+    )
+    ctx = dataclasses.replace(base, campaign_days={**base.campaign_days, dud: changed}, cache={})
+    result = campaigns.evaluate(ctx)
+    paused = [item for item in _items(result, C1) if item.entity_ref.id == dud]
+    if not count:
+        (item,) = paused
+        assert item.action == PAUSE_ACTION
+        assert evidence_metrics(item)["outcomes"] == 0
+        assert _withheld(result, C1) == []
+        return
+    assert paused == []
+    assert _withheld(result, C1) == []
+    assert [day.conversions for day in ctx.campaign_days[dud]].count(None) == count
+
+
 def test_c1_needs_spend_on_seventy_percent_of_window_days(make_context: ContextFactory) -> None:
     """C1: spend on 70% of the window's days fires / 60% does not."""
     ctx = make_context("c1.spend_days.fires")
     share = _threshold(ctx, "c1.min_spend_day_share")
     item = _only(campaigns.evaluate(ctx), C1)
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     assert metrics["window_days"] == ctx.window.days == 20
     assert Decimal(cast(int, metrics["spend_days"])) / ctx.window.days >= share
     assert metrics["spend_day_share"] == Decimal("0.7000")
@@ -1806,7 +1824,7 @@ def test_c1b_fires_on_twenty_eligible_contacts_without_ql_or_meetings(
     campaign = scenario.ids.id("linkedin", "campaign", "li-pipeline")
     assert (item.group, item.action) == (GROUP_PAUSE, PIPELINE_PAUSE_ACTION)
     assert item.decision_subject == DecisionSubject("campaign", campaign)
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     assert [key for key in VETO_COUNT_METRICS if key in metrics] == list(VETO_COUNT_METRICS)
     assert (metrics["eligible_contacts"], metrics["ql"], metrics["meetings"]) == (minimum, 0, 0)
     assert metrics["matured_leads"] == metrics["matched_leads"] == minimum
@@ -1828,7 +1846,7 @@ def test_c1b_is_withheld_at_the_attribution_floor(make_context: ContextFactory) 
     ctx = make_context("c1b.floor.fires")
     floor = _threshold(ctx, "attribution.floor_share")
     item = _only(campaigns.evaluate(ctx), C1B)
-    assert cast(Decimal, _metrics(item)["unresolved_share"]) < floor
+    assert cast(Decimal, evidence_metrics(item)["unresolved_share"]) < floor
 
     twin = make_context("c1b.floor.does_not_fire")
     result = campaigns.evaluate(twin)
@@ -1884,7 +1902,7 @@ def test_veto_cohort_young_leads_reaching_ql_never_enter_the_veto(
     result = campaigns.evaluate(ctx)
     hold = _only(result, C2)
     assert (hold.action, hold.evidence.extra["outcome"]) == (HOLD_ACTION, values["outcome"])
-    metrics = _metrics(hold)
+    metrics = evidence_metrics(hold)
     assert (metrics["ql"], metrics["young_leads"], metrics["young_ql"]) == (
         values["matured_ql"],
         2,
@@ -1922,9 +1940,9 @@ def test_unresolved_matured_leads_stay_in_the_veto_denominator(
     assert veto.available is available
     result = campaigns.evaluate(ctx)
     item = _only(result, C2)
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     for key in ("matured_leads", "matched_leads", "unresolved", "unresolved_share"):
-        assert _normalised(metrics[key]) == _normalised(values[key]), key
+        assert numeric(metrics[key]) == numeric(values[key]), key
     assert item.evidence.extra["outcome"] == values["outcome"]
     if available:
         assert veto.veto_fires
@@ -1988,14 +2006,14 @@ def test_c2_scale_is_linked_to_the_b1_item_carrying_the_amount(
     proposed = cast(Decimal, link["proposed_daily_budget"])
     assert proposed == (current * (1 + step)).quantize(Decimal("0.01"))
     assert proposed == Decimal(cast(str, values["proposed_daily_budget"]))
-    assert _metrics(scale)["proposed_daily_budget"] == proposed
+    assert evidence_metrics(scale)["proposed_daily_budget"] == proposed
     (b1,) = _b1_items(ctx)
     assert (b1.section, b1.decision_subject, b1.increases_spend_on) == (
         BUDGET,
         subject,
         (subject,),
     )
-    assert _metrics(b1)["proposed_daily_budget"] == proposed
+    assert evidence_metrics(b1)["proposed_daily_budget"] == proposed
     assert b1.action == f"Raise daily budget from USD {current:,.2f} to USD {proposed:,.2f}"
     (outcome,) = scale_outcomes(ctx)
     assert isinstance(outcome, ScaleOutcome)
@@ -2016,7 +2034,7 @@ def test_c2_holds_with_no_b1_when_the_veto_fires(make_context: ContextFactory) -
     assert (hold.evidence.extra["outcome"], hold.evidence.extra["b1"]) == (values["outcome"], False)
     assert "b1_link" not in hold.evidence.extra
     assert (hold.decision_subject, hold.increases_spend_on) == (None, ())
-    metrics = _metrics(hold)
+    metrics = evidence_metrics(hold)
     assert (metrics["eligible_contacts"], metrics["ql"]) == (
         values["eligible_contacts"],
         values["ql"],
@@ -2040,7 +2058,7 @@ def test_c2_scales_flagged_pipeline_unavailable_when_the_ql_stage_is_unresolved(
     scale = _only(result, C2)
     assert scale.action == SCALE_ACTION
     assert FLAG_PIPELINE_UNAVAILABLE in scale.flag_codes
-    assert _metrics(scale)["ql"] is None
+    assert evidence_metrics(scale)["ql"] is None
     assert FINDING_PIPELINE_UNAVAILABLE in _codes(result)
     (b1,) = _b1_items(ctx)
     assert FLAG_PIPELINE_UNAVAILABLE in b1.flag_codes
@@ -2057,7 +2075,7 @@ def test_c2_scales_a_google_subject_without_a_crm_link_flagged_no_crm_link(
     scale = _only(result, C2)
     assert (scale.entity_ref.source, scale.action) == ("google", SCALE_ACTION)
     assert {FLAG_NO_CRM_LINK, FLAG_SHARED_BUDGET} <= set(scale.flag_codes)
-    assert "eligible_contacts" not in _metrics(scale)
+    assert "eligible_contacts" not in evidence_metrics(scale)
     assert FINDING_NO_CRM_LINK in _codes(result)
     assert scale.decision_subject is not None
     assert scale.decision_subject.type == scale.entity_ref.type == "budget"
@@ -2081,7 +2099,7 @@ def test_c2_cap_evidence_five_capped_of_seven_known_days_is_eligible(
     scenario = SCENARIOS["c2.cap_evidence.fires"]
     ctx = make_context(scenario)
     item = _only(campaigns.evaluate(ctx), C2)
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     for key, value in scenario.expect.values.items():
         assert metrics[key] == value, key
     gate = _gate(item)
@@ -2139,7 +2157,7 @@ def test_intraday_budget_uncertainty_shows_in_the_c2_and_budget_day_counts(
     ctx = make_context(scenario)
     values = scenario.expect.values
     item = _only(campaigns.evaluate(ctx), C2)
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     extra = item.evidence.extra
     for key, expected in values.items():
         if isinstance(expected, tuple):
@@ -2193,7 +2211,7 @@ def test_c3a_launches_an_underused_proven_segment_on_a_preset_window(
         scenario.expect.values["value"],
     )
     assert dict(extra["segment_window"]) == {"start": ctx.window.start, "end": ctx.window.end}
-    metrics = _metrics(item)
+    metrics = evidence_metrics(item)
     assert cast(int, metrics["segment_leads"]) >= ctx.thresholds.int("c3a.min_leads")
     assert cast(Decimal, metrics["cpl_ratio"]) <= _threshold(ctx, "c3a.max_cpl_ratio")
     assert cast(Decimal, metrics["impression_share"]) < _threshold(ctx, "c3a.max_impression_share")
@@ -2203,7 +2221,7 @@ def test_c3a_launches_an_underused_proven_segment_on_a_preset_window(
 def test_c3a_needs_an_impression_share_below_fifteen_percent(make_context: ContextFactory) -> None:
     """C3a: a 14% impression share fires / a 16% share does not."""
     item = _only(campaigns.evaluate(make_context("c3a.share.fires")), C3A)
-    assert _metrics(item)["impression_share"] == Decimal("0.1400")
+    assert evidence_metrics(item)["impression_share"] == Decimal("0.1400")
     assert _items(campaigns.evaluate(make_context("c3a.share.does_not_fire")), C3A) == []
 
 
@@ -2273,7 +2291,7 @@ def test_c3b_launches_a_converting_cluster_no_campaign_covers(make_context: Cont
     assert item.action == f"Create ad group or campaign for '{head}'"
     assert tuple(extra["head_tokens"]) == scenario.expect.values["head_tokens"]
     members = list(extra["members"])
-    assert len(members) == _metrics(item)["members"]
+    assert len(members) == evidence_metrics(item)["members"]
     assert len(members) >= ctx.thresholds.int("c3b.min_terms")
     assert {member["term"] for member in members} == {
         "hubspot alternative",
@@ -2281,7 +2299,7 @@ def test_c3b_launches_a_converting_cluster_no_campaign_covers(make_context: Cont
         "cheap hubspot alternative",
     }
     assert all(member["spend"] > 0 and member["conversions"] > 0 for member in members)
-    conversions = cast(Decimal, _metrics(item)["conversions"])
+    conversions = cast(Decimal, evidence_metrics(item)["conversions"])
     assert conversions == sum(member["conversions"] for member in members)
     assert conversions >= _threshold(ctx, "c3b.min_conversions")
     assert _items(campaigns.evaluate(make_context("c3b.cluster.does_not_fire")), C3B) == []

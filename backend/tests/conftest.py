@@ -68,6 +68,7 @@ from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 
 if TYPE_CHECKING:
     from coverage import Coverage
+    from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from ads_engine.analysis.context import AnalysisContext
@@ -743,17 +744,19 @@ def test_identity() -> AdminIdentity:
 
 
 @pytest.fixture
-async def api_client(
-    db: async_sessionmaker[AsyncSession],
-) -> AsyncIterator[httpx.AsyncClient]:
-    """An unauthenticated client on a fresh application, served in process.
+async def api_app(db: async_sessionmaker[AsyncSession]) -> AsyncIterator[FastAPI]:
+    """A fresh application on the emptied test database: the one :func:`api_client` serves.
 
     A fresh ``create_app()`` per test means a fresh in-memory login rate limiter. The app is
     built after the environment baseline is in place, so it reads the test settings.
-    ``ASGITransport`` runs no lifespan; the engine is disposed by :func:`db`. Tests of 401 and
-    403 responses use this client directly. ``create_app()`` configures logging, so it runs
-    with structlog's logger caching switched off afterwards (:func:`_without_logger_caching`)
-    and logging is restored to its pre-test state on teardown (:func:`_restored_logging`).
+    ``create_app()`` configures logging, so it runs with structlog's logger caching switched
+    off afterwards (:func:`_without_logger_caching`) and logging is restored to its pre-test
+    state when the app is torn down (:func:`_restored_logging`).
+
+    The API reads the time only through ``ads_engine.api.deps.get_now``. A test whose
+    assertions depend on the request time fixes it with
+    ``api_app.dependency_overrides[get_now] = lambda: instant`` before logging in, so the
+    session's issue time, feedback ``until`` and the read-time overlay all follow that clock.
     """
     del db  # Requested for the emptied database and the per-test engine lifecycle.
     from ads_engine.api.app import create_app
@@ -761,10 +764,21 @@ async def api_client(
     with _restored_logging():
         app = create_app()
         _without_logger_caching()
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://localhost"
-        ) as client:
-            yield client
+        yield app
+
+
+@pytest.fixture
+async def api_client(api_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """An unauthenticated client on :func:`api_app`, served in process.
+
+    ``ASGITransport`` runs no lifespan; the engine is disposed by :func:`db`. Tests of 401 and
+    403 responses use this client directly. A test that fixes the request clock sets
+    ``api_app.dependency_overrides[get_now]`` before logging this client in.
+    """
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api_app), base_url="http://localhost"
+    ) as client:
+        yield client
 
 
 type LoginFunction = Callable[..., Awaitable[httpx.Response]]

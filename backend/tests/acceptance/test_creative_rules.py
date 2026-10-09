@@ -42,6 +42,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 import pytest
+from tests.support import evidence_metric
 
 from ads_engine.analysis import creative, stats
 from ads_engine.analysis.context import (
@@ -321,11 +322,6 @@ def _daily_delivery(variants: Sequence[CreativeTotals]) -> Decimal:
     return (sum(rates, Decimal(0)) / Decimal(len(rates))).quantize(RATE_PLACES)
 
 
-def _metric(item: Candidate, key: str) -> object:
-    """The value of one evidence metric."""
-    return item.evidence.metric(key).value
-
-
 def _stage_rows(item: Candidate) -> dict[str, Mapping[str, Any]]:
     """``evidence.extra.stages`` of a CR3 item, keyed by stage."""
     return {row["stage"]: row for row in item.evidence.extra["stages"]}
@@ -545,8 +541,14 @@ def _end_to_end(run: _Run, item: Candidate) -> tuple[int, int, int, int]:
         totals = run.ctx.creative_totals[by_urn[urn]]
         counts.extend((int(getattr(totals, noun)), totals.impressions))
     x_a, n_a, x_b, n_b = counts
-    assert (_metric(item, f"{noun}_a"), _metric(item, "impressions_a")) == (x_a, n_a)
-    assert (_metric(item, f"{noun}_b"), _metric(item, "impressions_b")) == (x_b, n_b)
+    assert (evidence_metric(item, f"{noun}_a"), evidence_metric(item, "impressions_a")) == (
+        x_a,
+        n_a,
+    )
+    assert (evidence_metric(item, f"{noun}_b"), evidence_metric(item, "impressions_b")) == (
+        x_b,
+        n_b,
+    )
     return x_a, n_a, x_b, n_b
 
 
@@ -604,7 +606,7 @@ def test_cr1_ahead_but_not_distinguishable_states_the_impressions_still_needed(
     assert extra["label"] == label
     assert item.action == f"{leader} vs {other}: {label}"
     assert extra["sample_needed"] == needed
-    assert _metric(item, "additional_impressions_per_variant") == needed
+    assert evidence_metric(item, "additional_impressions_per_variant") == needed
     assert item.flag_codes == (FLAG_NOT_DISTINGUISHABLE,)
     assert item.reason.endswith("the gap is not yet distinguishable from noise.")
     # The twin moves one input across the threshold: cr-b's leads.
@@ -676,7 +678,7 @@ def test_cr1_uses_fisher_below_five_expected_and_the_z_test_otherwise(
     item = run.single_pair()
     test = item.evidence.test
     assert test is not None
-    expected_min = _metric(item, "expected_min_cell")
+    expected_min = evidence_metric(item, "expected_min_cell")
     assert isinstance(expected_min, Decimal)
     assert (expected_min < cr.fisher_min_expected) is below_minimum
     recomputed = stats.compare_proportions(
@@ -705,7 +707,7 @@ def test_cr1_identical_rates_leave_the_impressions_needed_not_estimable(
     assert "about" not in extra["label"]
     assert extra["sample_needed"] == NOT_ESTIMABLE
     assert extra["not_estimable_reason"] == NOT_ESTIMABLE_NO_DIFFERENCE
-    assert _metric(item, "additional_impressions_per_variant") == NOT_ESTIMABLE
+    assert evidence_metric(item, "additional_impressions_per_variant") == NOT_ESTIMABLE
     assert item.has_flag(FLAG_NOT_DISTINGUISHABLE)
 
 
@@ -811,7 +813,7 @@ def test_cr2_stage_rates_use_each_stage_own_denominator_against_the_account_base
         assert row["rate"] == _rate(successes, trials)
         assert row["baseline"] == _rate(*_pooled(account, numerator, denominator))
         assert row["unit"] == ("form opens" if denominator == "form_opens" else "impressions")
-        assert _metric(item, stage) == row["rate"]
+        assert evidence_metric(item, stage) == row["rate"]
     baselines = {entry.key: entry.value for entry in item.evidence.baselines}
     assert baselines == {f"{stage}_baseline": rows[stage]["baseline"] for stage in rows}
 
@@ -871,8 +873,8 @@ def test_cr2_weak_stage_has_its_wilson_upper_bound_below_the_account_baseline(
     assert interval.high < row["baseline"] == weak["baseline"]
     assert row["weak"] is weak["weak"] is True
     assert weak["exploratory"] is False
-    assert _metric(item, f"{weak['stage']}_ci_low") == interval.low
-    assert _metric(item, f"{weak['stage']}_ci_high") == interval.high
+    assert evidence_metric(item, f"{weak['stage']}_ci_low") == interval.low
+    assert evidence_metric(item, f"{weak['stage']}_ci_high") == interval.high
 
     shown = WEAK_STAGE_REASON.fullmatch(item.reason)
     assert shown is not None, item.reason
@@ -1037,7 +1039,7 @@ def test_cr3_click_and_open_rate_tests_are_sized_in_impressions_per_variant(
     assert item.action.endswith(f"; ≈ {days:,} days at current per-variant delivery (projection)")
     sample = item.evidence.metric("sample_per_variant")
     assert (sample.value, sample.unit) == (needed, "impressions")
-    assert _metric(item, "projected_days") == days
+    assert evidence_metric(item, "projected_days") == days
 
 
 def test_cr3_completion_rate_test_is_sized_in_form_opens_and_projected_to_impressions(
@@ -1115,7 +1117,7 @@ def test_cr3_sample_is_not_estimable_with_its_reason(
     assert next_test["projected"] is None
     assert next_test["days"] is None
     assert f"; sample per variant {NOT_ESTIMABLE} ({reason})" in item.action
-    assert _metric(item, "sample_per_variant") == NOT_ESTIMABLE
+    assert evidence_metric(item, "sample_per_variant") == NOT_ESTIMABLE
     assert "projected_days" not in {metric.key for metric in item.evidence.metrics}
 
 
@@ -1371,7 +1373,7 @@ def test_unreported_form_opens_leave_their_stages_unmeasured_never_zero(
             None,
             False,
         )
-        assert _metric(item, stage) is None
+        assert evidence_metric(item, stage) is None
     # The account baseline pools only the creatives that reported the stage's counts.
     reported = [row for row in run.baseline_totals() if row.form_opens is not None]
     assert rows["open_rate"]["baseline"] == _rate(*_pooled(reported, "form_opens", "impressions"))
@@ -1403,7 +1405,7 @@ def test_unreported_leads_make_the_pair_untestable_and_say_why(
     assert f"{run.name('cr-b')} unavailable" in item.reason
     assert item.reason.endswith("the pair could not be tested (leads not reported).")
     assert item.flag_codes == (FLAG_NOT_DISTINGUISHABLE,)
-    assert _metric(item, "rate_b") is None
+    assert evidence_metric(item, "rate_b") is None
 
 
 def test_inconsistent_counts_are_never_compared(make_context: ContextFactory) -> None:
@@ -1451,7 +1453,7 @@ def test_delivery_projection_is_not_estimable_without_delivery_days(
     assert item.action.endswith(
         f"; delivery projection {NOT_ESTIMABLE} ({NOT_ESTIMABLE_ZERO_EXPOSURE})"
     )
-    assert _metric(item, "projected_days") == NOT_ESTIMABLE
+    assert evidence_metric(item, "projected_days") == NOT_ESTIMABLE
 
 
 def test_cr3_sample_is_not_estimable_when_no_sample_reaches_the_power(

@@ -21,7 +21,8 @@ Covered, in the order of the AAP row:
   budget subject, mixed objective groups and, against the database, a shared-budget decision
   that raises no discrepancy on any member at the next entity sync.
 * **B3 allocation** (AAP 0.5.4.2): 300 and 200 against a 400 increase, the deterministic
-  orders, the over-allocation assertion and the plain decrease without a receiver.
+  orders, the over-allocation assertion, the plain decrease without a receiver, and no
+  funding across sources or currencies, for campaign and shared-budget receivers alike.
 * **B4**: the rate test on unweighted counts only, and every withholding reason.
 * **Lifetime and custom-period budgets**: utilization "n/a" and no cap rule.
 
@@ -36,13 +37,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any, Final
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from tests.support import evidence_metrics, numeric
 
 from ads_engine.analysis import budget, campaigns, precedence, white_papers
 from ads_engine.analysis.context import (
@@ -71,6 +73,7 @@ from ads_engine.analysis.context import (
     EntityRef,
     Metric,
     RuleResult,
+    Source,
     SubjectKey,
     Withheld,
     cohort_group,
@@ -78,12 +81,14 @@ from ads_engine.analysis.context import (
 )
 from ads_engine.analysis.metrics import (
     BudgetHistory,
+    Totals,
     assess_b2,
     budget_history,
     budget_subjects,
     member_poor_efficiency,
     spend_increase_blocked,
     subject_campaigns,
+    window_totals,
 )
 from ads_engine.analysis.precedence import Allocation, PrecedenceInvariantError, PrecedenceOutput
 from ads_engine.analysis.stats import percentile, poisson_rate_test
@@ -234,11 +239,6 @@ def _lines(out: PrecedenceOutput, rule_id: str, entity_id: int | None = None) ->
     ]
 
 
-def _metrics(item: Candidate) -> dict[str, Any]:
-    """An item's evidence metrics by key."""
-    return {metric.key: metric.value for metric in item.evidence.metrics}
-
-
 def _campaign_id(scenario: Scenario, key: str, source: str = "linkedin") -> int:
     """The internal id the catalogue assigns to a campaign key."""
     return scenario.ids.id(source, "campaign", key)
@@ -275,22 +275,6 @@ def _on(items: Iterable[Candidate], subject: SubjectKey) -> list[Candidate]:
     return [
         item for item in items if (item.entity_ref.type, item.entity_ref.id) == (entity, subject_id)
     ]
-
-
-def _number(value: object) -> object:
-    """Compare numbers by value: ``"3.0"``, ``3`` and ``Decimal("3.000000")`` are equal."""
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int | Decimal):
-        return Decimal(value)
-    if isinstance(value, str):
-        try:
-            return Decimal(value)
-        except InvalidOperation:
-            return value
-    if isinstance(value, list | tuple):
-        return tuple(_number(item) for item in value)
-    return value
 
 
 def _money(amount: Decimal, currency: str = "USD") -> str:
@@ -352,7 +336,7 @@ def _fired_value(
         return expected
     if key == "unknown_days":
         return tuple(extra["unknown_dates"])
-    metrics_by_key = _metrics(item)
+    metrics_by_key = evidence_metrics(item)
     if key in metrics_by_key:
         return metrics_by_key[key]
     assert key in extra, f"{scenario.name}: no counterpart for expectation key {key!r}"
@@ -403,12 +387,12 @@ def _check_rule_case(scenario: Scenario, ctx: AnalysisContext, out: PrecedenceOu
             assert set(expect.flags) <= set(item.flag_codes), item.flag_codes
         for key, expected in expect.values.items():
             actual = _fired_value(scenario, out, rule_id, items, key)
-            assert _number(actual) == _number(expected), (key, actual, expected)
+            assert numeric(actual) == numeric(expected), (key, actual, expected)
     else:
         assert _on(items, _focus(scenario)) == [], [item.action for item in items]
         for key, expected in expect.values.items():
             actual = _silent_value(scenario, ctx, out, rule_id, key)
-            assert _number(actual) == _number(expected), (key, actual, expected)
+            assert numeric(actual) == numeric(expected), (key, actual, expected)
     if expect.withheld_reason is not None:
         reasons = [line.reason for line in _lines(out, rule_id)]
         assert any(reason.startswith(expect.withheld_reason) for reason in reasons), reasons
@@ -441,7 +425,7 @@ def _check_g1_case(scenario: Scenario, ctx: AnalysisContext, out: PrecedenceOutp
             actual = expected
         else:
             pytest.fail(f"{scenario.name}: unknown G1 expectation key {key!r}", pytrace=False)
-        assert _number(actual) == _number(expected), (key, actual, expected)
+        assert numeric(actual) == numeric(expected), (key, actual, expected)
 
 
 def _check_c0_case(scenario: Scenario, ctx: AnalysisContext, out: PrecedenceOutput) -> None:
@@ -465,7 +449,7 @@ def _check_c0_case(scenario: Scenario, ctx: AnalysisContext, out: PrecedenceOutp
             )
         else:
             pytest.fail(f"{scenario.name}: unknown C0 expectation key {key!r}", pytrace=False)
-        assert _number(actual) == _number(expected), (key, actual, expected)
+        assert numeric(actual) == numeric(expected), (key, actual, expected)
 
 
 def test_every_budget_rule_and_the_g1_guard_fire_and_stay_silent_in_the_catalogue() -> None:
@@ -651,7 +635,7 @@ def test_b1_raises_the_latest_effective_daily_budget_by_the_configured_step(
     proposed = round_to_minor_unit(current * (1 + step), currency)
     assert proposed != current * (1 + step)
     item = _only(out, BUDGET, B1)
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert shown["daily_budget"] == current == item.evidence.extra["current"]
     assert shown["proposed_daily_budget"] == proposed == item.evidence.extra["proposed"]
     assert shown["increase"] == proposed - current == item.evidence.extra["increase"]
@@ -679,12 +663,12 @@ def test_b1_step_comes_from_the_configuration(
     tuned = make_thresholds({"b1.step": Decimal("0.25")})
     ctx = make_context(scenario.name, thresholds=tuned)
     item = _only(_run(ctx), BUDGET, B1)
-    current = _metrics(item)["daily_budget"]
+    current = evidence_metrics(item)["daily_budget"]
     assert item.evidence.extra["step"] == Decimal("0.25")
-    assert _metrics(item)["proposed_daily_budget"] == round_to_minor_unit(
+    assert evidence_metrics(item)["proposed_daily_budget"] == round_to_minor_unit(
         current * Decimal("1.25"), "USD"
     )
-    assert _metrics(item)["proposed_daily_budget"] == Decimal("104.16")
+    assert evidence_metrics(item)["proposed_daily_budget"] == Decimal("104.16")
 
 
 def test_b1_example_amount_rounds_to_the_cent() -> None:
@@ -705,7 +689,7 @@ def test_b1_rounds_the_proposal_to_each_currencys_minor_unit(
     campaign_id = _campaign_id(scenario, "li-cap")
     ctx = _in_currency(make_context(scenario.name), campaign_id, currency)
     item = _only(_run(ctx), BUDGET, B1)
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert shown["proposed_daily_budget"] == proposed
     assert shown["proposed_daily_budget"].as_tuple().exponent == -minor_unit_exponent(currency)
     assert item.action.endswith(f"to {_money(proposed, currency)}")
@@ -899,7 +883,7 @@ def test_b3_fires_on_eight_under_utilized_of_ten_known_days_with_four_idle(
     current = history.latest_daily_budget
     assert current is not None
     item = _only(_run(ctx), BUDGET, B3)
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert shown["spend_percentile"] == observed
     assert shown["proposed_daily_budget"] == proposed == Decimal("88.00")
     assert item.action == f"Lower daily budget to {_money(proposed)}"
@@ -957,7 +941,7 @@ def test_b2_needs_high_utilization_on_the_sustained_share_of_known_days(
     )
     assert item.action == "Do not increase. Lower daily budget by 20% or fix efficiency first"
     assert item.evidence.extra["branch"] == "poor_efficiency"
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert shown["high_utilization_days"] == high_days
     assert shown["proposed_daily_budget"] == round_to_minor_unit(
         shown["daily_budget"] * (1 - step), "USD"
@@ -982,12 +966,144 @@ def test_b2_zero_outcome_branch_needs_the_expected_outcome_minimum(
     ctx = _fresh(base, campaign_days={**base.campaign_days, hot: days})
     out = _run(ctx)
     (item,) = _on(_items(out, BUDGET, B2), ("campaign", hot))
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert item.evidence.extra["branch"] == "zero_outcomes"
     assert shown["outcomes"] == 0
     assert shown["cost_per_outcome"] is None
     assert shown["expected_outcomes"] >= ctx.thresholds.ratio("b2.min_expected_outcomes")
     assert ("campaign", hot) in spend_increase_blocked(ctx)
+
+
+def _zero_outcome_target(
+    scenario: Scenario, base: AnalysisContext, first_day_leads: int
+) -> AnalysisContext:
+    """``g1.b2_target.fires`` with hot at 0 leads and an account baseline set by its peer.
+
+    hot keeps its spend (97.00 a day of its 100.00 budget), so its budget history and
+    high-utilization gate are the catalogue's, day for day. The efficient peer spends 873.00 a
+    day, nine times hot's, so the account spends exactly ten times what hot does, and it
+    reports 1 lead a day except ``first_day_leads`` on the window's first day: 30 account
+    leads make hot's spend worth exactly 3 expected leads, 29 make it 2.9. That day's leads
+    are the single input the twins move.
+    """
+    hot = _campaign_id(scenario, "hot")
+    efficient = _campaign_id(scenario, "efficient")
+    first = base.window.start
+    peer = tuple(
+        replace(day, cost=Decimal("873.00"), leads=first_day_leads if day.date == first else 1)
+        for day in base.campaign_days[efficient]
+    )
+    target = tuple(replace(day, leads=0) for day in base.campaign_days[hot])
+    return _fresh(base, campaign_days={**base.campaign_days, hot: target, efficient: peer})
+
+
+def _account_totals(ctx: AnalysisContext, campaign_id: int) -> Totals:
+    """Window totals of every campaign in ``campaign_id``'s account and objective group."""
+    campaign = ctx.campaigns[campaign_id]
+    return window_totals(
+        ctx,
+        [
+            other.id
+            for other in ctx.campaigns.values()
+            if (other.account_id, other.objective_group)
+            == (campaign.account_id, campaign.objective_group)
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_day_leads", "expected", "fires"),
+    [(3, Decimal(3), True), (2, Decimal("2.9"), False)],
+)
+def test_b2_zero_outcome_branch_fires_at_three_expected_outcomes_and_not_at_two_point_nine(
+    make_context: ContextFactory, first_day_leads: int, expected: Decimal, fires: bool
+) -> None:
+    """B2 and G1, zero-outcome branch: 3.0 expected outcomes fire / 2.9 do not.
+
+    Both twins keep hot's high-utilization history and its 0 leads; only the peer's leads on
+    one day move the account baseline (:func:`_zero_outcome_target`), so hot's spend is worth
+    exactly ``b2.min_expected_outcomes`` (3) expected leads in one twin and 2.9 in the other.
+    At 3.0 B2 fires on its ``zero_outcomes`` branch and G1 removes every increase naming hot
+    (C2 Scale, B1, W1); at 2.9 hot meets neither branch: no B2 item, no withheld line, no
+    block, and every increase on it stands.
+    """
+    scenario = SCENARIOS["g1.b2_target.fires"]
+    base = make_context(scenario.name)
+    hot = _campaign_id(scenario, "hot")
+    efficient = _campaign_id(scenario, "efficient")
+    subject: SubjectKey = ("campaign", hot)
+    ctx = _zero_outcome_target(scenario, base, first_day_leads)
+    assert ctx.thresholds.ratio("b2.min_expected_outcomes") == 3
+    assert budget_history(ctx, subject).counts() == budget_history(base, subject).counts()
+    assessment = assess_b2(ctx, subject)
+    assert assessment.gate.passed
+    assert assessment.outcomes == 0
+    account = _account_totals(ctx, hot)
+    assert account.spend == 10 * assessment.spend
+    assert account.outcomes == ctx.window.days - 1 + first_day_leads
+    # Expected outcomes = spend ÷ (account spend ÷ account outcomes), exactly (AAP 0.5.4.1).
+    assert assessment.spend * account.outcomes / account.spend == expected
+    assert assessment.expected is not None
+    assert assessment.expected.quantize(Decimal("0.000001")) == expected
+    out = _run(ctx, _increases_on(ctx, hot, efficient))
+    found = _on(_items(out, BUDGET, B2), subject)
+    assert _lines(out, B2, hot) == []
+    if not fires:
+        assert (assessment.meets, assessment.branch) == (False, None)
+        assert found == []
+        assert subject not in spend_increase_blocked(ctx)
+        assert subject in _increase_targets(_survivors(out))
+        assert out.suppressed_total(SUPPRESS_G1_BLOCKED) == 0
+        return
+    assert (assessment.meets, assessment.branch) == (True, "zero_outcomes")
+    (item,) = found
+    shown = evidence_metrics(item)
+    assert item.evidence.extra["branch"] == "zero_outcomes"
+    assert (shown["outcomes"], shown["cost_per_outcome"]) == (0, None)
+    assert shown["expected_outcomes"] == expected
+    assert "with 0 leads where 3 were expected" in item.reason
+    assert subject in spend_increase_blocked(ctx)
+    assert subject not in _increase_targets(_survivors(out))
+    assert out.suppressed_total(SUPPRESS_G1_BLOCKED) == 3
+
+
+@pytest.mark.parametrize("unreported", ["known_zero", "one_day", "every_day"])
+def test_b2_never_reads_unreported_outcomes_as_zero(
+    make_context: ContextFactory, unreported: str
+) -> None:
+    """B2 and G1, unknown outcomes: unreported leads are unavailable, never 0 (AAP 0.11.1).
+
+    hot at a known 0 leads on every day (the context of
+    :func:`test_b2_zero_outcome_branch_needs_the_expected_outcome_minimum`) fires B2 on its
+    ``zero_outcomes`` branch and is blocked. With its leads unreported (``None``) on one day, or
+    on every day, and 0 on the rest, hot's outcomes are unavailable while its spend and
+    utilization are unchanged: neither branch is judged, so there is no B2 item, no withheld
+    line and no G1 block. hot belongs to its own account baseline, so that is unavailable too.
+    """
+    scenario = SCENARIOS["g1.b2_target.fires"]
+    base = make_context(scenario.name)
+    hot = _campaign_id(scenario, "hot")
+    subject: SubjectKey = ("campaign", hot)
+    days = sorted(base.campaign_days[hot], key=lambda day: day.date)
+    count = {"known_zero": 0, "one_day": 1, "every_day": len(days)}[unreported]
+    leads = tuple(replace(day, leads=None if n < count else 0) for n, day in enumerate(days))
+    ctx = _fresh(base, campaign_days={**base.campaign_days, hot: leads})
+    assert window_totals(ctx, (hot,)).unreported_days == count
+    assessment = assess_b2(ctx, subject)
+    assert assessment.gate.passed
+    out = _run(ctx)
+    found = _on(_items(out, BUDGET, B2), subject)
+    assert _lines(out, B2, hot) == []
+    if not count:
+        assert (assessment.outcomes, assessment.branch) == (0, "zero_outcomes")
+        assert [item.evidence.extra["branch"] for item in found] == ["zero_outcomes"]
+        assert subject in spend_increase_blocked(ctx)
+        return
+    assert assessment.outcomes is None
+    assert (assessment.meets, assessment.branch) == (False, None)
+    assert (assessment.cpo, assessment.baseline, assessment.expected) == (None, None, None)
+    assert found == []
+    assert subject not in spend_increase_blocked(ctx)
 
 
 def test_unknown_days_are_never_counted_as_idle(make_context: ContextFactory) -> None:
@@ -1019,8 +1135,8 @@ def test_unknown_days_are_never_counted_as_idle(make_context: ContextFactory) ->
     extra = item.evidence.extra
     assert extra["changed_intraday_dates"] == ("2026-09-27",)
     assert extra["idle_dates"] == ()
-    assert _metrics(item)["changed_intraday_days"] == 1
-    assert _metrics(item)["idle_days"] == 0
+    assert evidence_metrics(item)["changed_intraday_days"] == 1
+    assert evidence_metrics(item)["idle_days"] == 0
 
 
 def test_budget_rules_are_withheld_below_the_sustained_window_minimum(
@@ -1097,7 +1213,7 @@ def test_every_budget_card_shows_utilization_beside_efficiency(
             sample = item.evidence.sample
             assert sample is not None
             assert sample.required == ctx.thresholds.int("budget.min_known_days")
-            assert sample.observed == _metrics(item)["known_days"]
+            assert sample.observed == evidence_metrics(item)["known_days"]
             gate = item.evidence.extra["gate"]
             assert gate, (name, item.rule_id)
             assert all({"observed", "required"} <= set(check) for check in gate.values())
@@ -1202,12 +1318,144 @@ def test_a_good_efficiency_member_leaves_the_budget_level_increase(
     assert spend_increase_blocked(ctx) == frozenset()
     item = _only(_run(ctx), BUDGET, B1)
     step = ctx.thresholds.ratio("b1.step")
-    current = _metrics(item)["daily_budget"]
-    assert _metrics(item)["proposed_daily_budget"] == round_to_minor_unit(
+    current = evidence_metrics(item)["daily_budget"]
+    assert evidence_metrics(item)["proposed_daily_budget"] == round_to_minor_unit(
         current * (1 + step), "USD"
     )
-    assert _metrics(item)["proposed_daily_budget"] == Decimal("1200.00")
+    assert evidence_metrics(item)["proposed_daily_budget"] == Decimal("1200.00")
     assert item.decision_subject == DecisionSubject("budget", pool_id)
+
+
+def _zero_outcome_member(
+    scenario: Scenario,
+    base: AnalysisContext,
+    *,
+    solo_first_day: int = 1,
+    m2_first_day: Decimal | None = Decimal(0),
+) -> AnalysisContext:
+    """``shared.poor_member.fires`` with member m2 converting nothing and a tuned baseline.
+
+    The members keep their spend (m1 700.00 and m2 270.00 a day of the 1,000.00 pool), so the
+    pool's budget-active days and high-utilization gate are the catalogue's. The own-budget
+    campaign solo spends 1,730.00 a day, so the account spends exactly ten times m2's
+    7,560.00. m1 and solo convert once a day on the window's first 15 days, solo's first day
+    reporting ``solo_first_day`` instead: 30 account conversions make m2's spend worth exactly
+    3 expected conversions, 29 make it 2.9, while m1, solo and the pool's aggregate stay
+    efficient. m2 reports 0 conversions on every day but the first, which reports
+    ``m2_first_day`` (``None`` leaves that day unreported).
+    """
+    solo, m1, m2 = (_campaign_id(scenario, key, "google") for key in ("solo", "m1", "m2"))
+    first = base.window.start
+    converting = frozenset(first + timedelta(days=offset) for offset in range(15))
+
+    def once_a_day(day: date) -> Decimal:
+        """One conversion on each of the window's first 15 days, none after."""
+        return Decimal(1 if day in converting else 0)
+
+    solo_days = tuple(
+        replace(
+            day,
+            cost=Decimal("1730.00"),
+            conversions=Decimal(solo_first_day) if day.date == first else once_a_day(day.date),
+        )
+        for day in base.campaign_days[solo]
+    )
+    m1_days = tuple(
+        replace(day, conversions=once_a_day(day.date)) for day in base.campaign_days[m1]
+    )
+    m2_days = tuple(
+        replace(day, conversions=m2_first_day if day.date == first else Decimal(0))
+        for day in base.campaign_days[m2]
+    )
+    return _fresh(
+        base, campaign_days={**base.campaign_days, solo: solo_days, m1: m1_days, m2: m2_days}
+    )
+
+
+@pytest.mark.parametrize(
+    ("solo_first_day", "expected", "blocked"),
+    [(1, Decimal(3), True), (0, Decimal("2.9"), False)],
+)
+def test_a_zero_outcome_member_blocks_the_pool_at_three_expected_outcomes_not_at_two_point_nine(
+    make_context: ContextFactory, solo_first_day: int, expected: Decimal, blocked: bool
+) -> None:
+    """Member safety predicate, zero-outcome branch: 3.0 expected outcomes block / 2.9 do not.
+
+    m2 converts nothing over its member days inside the high-utilization pool, and only the
+    peer's conversions on one day move the account baseline (:func:`_zero_outcome_member`), so
+    m2's spend is worth exactly ``b2.min_expected_outcomes`` (3) expected conversions in one
+    twin and 2.9 in the other. The pool's aggregate is efficient in both, so the member
+    predicate alone decides: at 3.0 G1 blocks the pool and its members and removes the pool's
+    own C2 "Scale" and B1; at 2.9 nothing is blocked and the B1 raises the pool to 1,200.00.
+    """
+    scenario = SCENARIOS["shared.poor_member.fires"]
+    base = make_context(scenario.name)
+    pool_id = _budget_id(scenario, "pool")
+    pool: SubjectKey = ("budget", pool_id)
+    m1, m2 = (_campaign_id(scenario, key, "google") for key in ("m1", "m2"))
+    ctx = _zero_outcome_member(scenario, base, solo_first_day=solo_first_day)
+    assert ctx.thresholds.ratio("b2.min_expected_outcomes") == 3
+    history = budget_history(ctx, pool)
+    assert history.counts() == budget_history(base, pool).counts()
+    aggregate = assess_b2(ctx, pool)
+    assert aggregate.gate.passed
+    assert not aggregate.meets
+    member = window_totals(ctx, (m2,), dates=history.members[m2])
+    account = _account_totals(ctx, m2)
+    assert member.outcomes == 0
+    assert account.spend == 10 * member.spend
+    # Expected outcomes = spend ÷ (account spend ÷ account outcomes), exactly (AAP 0.5.4.1).
+    assert account.outcomes is not None
+    assert member.spend * account.outcomes / account.spend == expected
+    assert member_poor_efficiency(ctx, pool_id, m2) is blocked
+    assert member_poor_efficiency(ctx, pool_id, m1) is False
+    out = _run(ctx)
+    if blocked:
+        assert {pool, ("campaign", m1), ("campaign", m2)} <= spend_increase_blocked(ctx)
+        assert _on(_items(out, BUDGET, B1), pool) == []
+        assert pool not in _increase_targets(_survivors(out))
+        assert out.suppressed[BUDGET][SUPPRESS_G1_BLOCKED] == 1
+        assert out.suppressed[CAMPAIGNS][SUPPRESS_G1_BLOCKED] == 1
+        return
+    assert spend_increase_blocked(ctx) == frozenset()
+    (item,) = _on(_items(out, BUDGET, B1), pool)
+    assert evidence_metrics(item)["proposed_daily_budget"] == Decimal("1200.00")
+    assert out.suppressed_total(SUPPRESS_G1_BLOCKED) == 0
+
+
+@pytest.mark.parametrize("m2_first_day", [Decimal(0), None])
+def test_unreported_member_outcomes_never_meet_the_member_safety_predicate(
+    make_context: ContextFactory, m2_first_day: Decimal | None
+) -> None:
+    """Member safety predicate, unknown outcomes: an unreported day is never a zero.
+
+    The 3.0-expected-outcome pool of
+    :func:`test_a_zero_outcome_member_blocks_the_pool_at_three_expected_outcomes_not_at_two_point_nine`
+    with m2's first member day known at 0 conversions meets the predicate and blocks the pool.
+    With that one day unreported (``None``), m2's outcomes over its member days are
+    unavailable, so the predicate is not met and G1 does not block the pool; the pool's own
+    outcomes are unavailable as well, so no rule proposes an increase on it either.
+    """
+    scenario = SCENARIOS["shared.poor_member.fires"]
+    base = make_context(scenario.name)
+    pool_id = _budget_id(scenario, "pool")
+    pool: SubjectKey = ("budget", pool_id)
+    m2 = _campaign_id(scenario, "m2", "google")
+    ctx = _zero_outcome_member(scenario, base, m2_first_day=m2_first_day)
+    history = budget_history(ctx, pool)
+    assert history.counts() == budget_history(base, pool).counts()
+    assert assess_b2(ctx, pool).gate.passed
+    member = window_totals(ctx, (m2,), dates=history.members[m2])
+    if m2_first_day is not None:
+        assert member.outcomes == 0
+        assert member_poor_efficiency(ctx, pool_id, m2)
+        assert pool in spend_increase_blocked(ctx)
+        return
+    assert (member.outcomes, member.unreported_days) == (None, 1)
+    assert not member_poor_efficiency(ctx, pool_id, m2)
+    assert not assess_b2(ctx, pool).meets
+    assert pool not in spend_increase_blocked(ctx)
+    assert pool not in _increase_targets(_survivors(_run(ctx)))
 
 
 def test_an_aggregate_b2_blocks_the_shared_budget(make_context: ContextFactory) -> None:
@@ -1252,7 +1500,7 @@ def test_shared_budget_items_are_decided_at_budget_level(
         }
         assert set(listed) == members
         assert listed == {cid: len(history.members.get(cid, ())) for cid in members}
-        assert _metrics(item)["known_days"] == history.known_active
+        assert evidence_metrics(item)["known_days"] == history.known_active
     assert ("budget", pool[1]) in budget_subjects(ctx)
     assert not any(("campaign", cid) in budget_subjects(ctx) for cid in members)
 
@@ -1309,7 +1557,7 @@ def test_members_spanning_objective_groups_withhold_b1_b2_and_b3(
     same_group = SCENARIOS["shared.mixed_objectives.case"]
     item = _only(_run(make_context(same_group.name)), BUDGET, B1)
     assert item.evidence.extra["objective_groups"] == ("google",)
-    assert _metrics(item)["cost_per_outcome"] is not None
+    assert evidence_metrics(item)["cost_per_outcome"] is not None
 
 
 class _Clock:
@@ -1474,10 +1722,8 @@ def test_b3_allocation_funds_the_b1_increase_and_never_more(make_context: Contex
         assert extra["allocated"] + extra["unallocated"] == extra["freed"]
         assert text in donors[donor].reason
         assert donors[donor].increases_spend_on == ()
-    assert (
-        donors[donor_b].action
-        == f"Lower daily budget to {_money(_metrics(donors[donor_b])['proposed_daily_budget'])}"
-    )
+    lowered = evidence_metrics(donors[donor_b])["proposed_daily_budget"]
+    assert donors[donor_b].action == f"Lower daily budget to {_money(lowered)}"
 
 
 def _ordered_parties(
@@ -1702,6 +1948,333 @@ def test_without_a_surviving_receiver_every_b3_stays_a_plain_decrease(
         assert item.action.startswith("Lower daily budget to ")
 
 
+_AD_DATASETS: Final[Mapping[Source, tuple[str, str]]] = {
+    "google": ("google.entities", "google.metrics_daily"),
+    "linkedin": ("linkedin.entities", "linkedin.analytics_daily"),
+}
+"""Each ad source's entity and daily metrics datasets: what a budget item of that source reads."""
+
+type _Presented = list[tuple[list[SubjectKey], list[SubjectKey]]]
+"""The donors and receivers of each cohort precedence presented to ``allocate_b3``."""
+
+
+def _on_own_account(ctx: AnalysisContext, campaign_id: int) -> AnalysisContext:
+    """Copy ``ctx`` with one campaign moved onto a copy of its account, as its only campaign.
+
+    An ad account has one currency, so :func:`_in_currency` moves a campaign together with its
+    whole account. On an account of its own the campaign changes currency alone, and the
+    campaigns it shared the account with keep theirs.
+    """
+    campaign = ctx.campaigns[campaign_id]
+    account = ctx.accounts[campaign.account_id]
+    own = max(ctx.accounts) + 1
+    copy = replace(account, id=own, external_id=f"{account.external_id}-{own}")
+    return _fresh(
+        ctx,
+        accounts={**ctx.accounts, own: copy},
+        campaigns={**ctx.campaigns, campaign_id: replace(campaign, account_id=own)},
+    )
+
+
+def _cohort_party(
+    ctx: AnalysisContext, rule_id: str, source: Source, entity_id: int, name: str, amount: str
+) -> Candidate:
+    """A rule-shaped USD campaign party of ``source``: a B3 donor or a B1 receiver.
+
+    A B3 donor frees ``amount``; a B1 receiver has ``amount`` as its increase (its headroom)
+    and a cost per outcome of 20. It is built as :func:`_candidate` builds every rule-shaped
+    party, with the evidence a budget item of ``source`` carries: the entity is of ``source``
+    and the required datasets are that source's entity and daily metrics datasets.
+    """
+    subject: SubjectKey = ("campaign", entity_id)
+    entity = EntityRef(source, ENTITY_CAMPAIGN, entity_id, str(entity_id), name)
+    if rule_id == B3:
+        party = _candidate(
+            ctx,
+            B3,
+            BUDGET,
+            GROUP_CHANGES,
+            entity,
+            subject=subject,
+            extra={"freed": Decimal(amount), "currency": "USD"},
+        )
+    else:
+        party = _candidate(
+            ctx,
+            B1,
+            BUDGET,
+            GROUP_CHANGES,
+            entity,
+            targets=(subject,),
+            subject=subject,
+            extra={"increase": Decimal(amount), "currency": "USD"},
+            metrics_shown=(
+                Metric("cost_per_outcome", "Cost per outcome", Decimal("20"), "currency", "USD"),
+            ),
+        )
+    datasets = _AD_DATASETS[source]
+    evidence = ctx.make_evidence(
+        required_datasets=datasets,
+        crm_scope=None,
+        metrics=party.evidence.metrics,
+        extra=party.evidence.extra,
+    )
+    return replace(party, evidence=evidence, required_datasets=datasets)
+
+
+def _spy_on_allocation(monkeypatch: pytest.MonkeyPatch) -> _Presented:
+    """Record each cohort's donors and receivers as precedence presents them to ``allocate_b3``.
+
+    Precedence presents a (source, currency) cohort to the allocation step only when the
+    cohort has both donors and receivers. An empty record therefore shows that the cohort
+    split itself kept every donor from a receiver: no allocation was attempted, so neither the
+    allocation step nor the runner assertion (``PrecedenceInvariantError``) refused one.
+    """
+    presented: _Presented = []
+    allocate = precedence.allocate_b3
+
+    def spy(
+        donor_amounts: list[tuple[SubjectKey, Decimal]],
+        receiver_amounts: list[tuple[SubjectKey, Decimal]],
+    ) -> tuple[Allocation, ...]:
+        presented.append(([key for key, _ in donor_amounts], [key for key, _ in receiver_amounts]))
+        return allocate(donor_amounts, receiver_amounts)
+
+    monkeypatch.setattr(precedence, "allocate_b3", spy)
+    return presented
+
+
+def _by_subject(items: Iterable[Candidate]) -> dict[SubjectKey, Candidate]:
+    """Budget items by their decision subject."""
+    return {item.decision_subject.key: item for item in items if item.decision_subject is not None}
+
+
+def _built(ctx: AnalysisContext, rule_id: str) -> dict[SubjectKey, Candidate]:
+    """The ``rule_id`` items ``budget.evaluate`` builds, before precedence, by subject."""
+    return _by_subject(item for item in budget.evaluate(ctx).candidates if item.rule_id == rule_id)
+
+
+def _check_plain_decrease(item: Candidate, built: Candidate, receiver: SubjectKey) -> None:
+    """A B3 donor left exactly as its rule built it: a plain decrease that funds no B1.
+
+    Nothing is allocated, listed or rendered, the whole freed amount stays unallocated, and
+    the card neither names nor depends on ``receiver``.
+    """
+    extra = item.evidence.extra
+    assert item.action == built.action
+    assert item.reason == built.reason
+    assert "to fund" not in item.reason
+    assert extra.get("allocations") == built.evidence.extra.get("allocations")
+    assert not extra.get("allocations")
+    assert extra["allocated"] == 0
+    assert extra["unallocated"] == extra["freed"] == built.evidence.extra["freed"]
+    assert receiver not in {subject.key for subject in item.depends_on}
+    assert item.increases_spend_on == ()
+
+
+def _check_all_new_budget(
+    item: Candidate, built: Candidate, funding: str, donors: Iterable[SubjectKey]
+) -> None:
+    """A surviving B1 receiver none of whose increase is funded by reallocation.
+
+    ``funding`` is the card's exact sentence, with all of the increase from new budget; the
+    reason and action stay the rule's own, and the card depends on none of ``donors``.
+    """
+    extra = item.evidence.extra
+    increase = extra["increase"]
+    assert increase == built.evidence.extra["increase"]
+    assert funding == budget.render_b1_funding(increase, [], extra["currency"])
+    assert extra["funding"] == funding
+    assert extra["allocations"] == ()
+    assert extra["funded_by_reallocation"] == 0
+    assert extra["from_new_budget"] == increase
+    assert item.reason == built.reason
+    assert item.action == built.action
+    assert not {subject.key for subject in item.depends_on} & set(donors)
+
+
+def test_b3_never_funds_a_receiver_in_another_currency(
+    make_context: ContextFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B3 cohort: a receiver is in its donor's currency (AAP 0.5.4.2), never in another one.
+
+    ``b3.allocation``'s receiver is moved onto an account of its own (:func:`_on_own_account`).
+    Still in USD, its donors' currency, it is funded 300 and 100 exactly as in
+    :func:`test_b3_allocation_funds_the_b1_increase_and_never_more` (the control). Moved to
+    EUR, the single input that changes, the budget rules still build its B1, now an increase of
+    EUR 400.00, and it survives; but its cohort is (linkedin, EUR) and its donors' is
+    (linkedin, USD). No cohort is presented for allocation, nothing is allocated, each donor
+    stays the plain decrease the B3 rule built, and the B1 increase is all new budget.
+    """
+    scenario = SCENARIOS["b3.allocation.case"]
+    donor_a: SubjectKey = ("campaign", _campaign_id(scenario, "donor-a"))
+    donor_b: SubjectKey = ("campaign", _campaign_id(scenario, "donor-b"))
+    receiver: SubjectKey = ("campaign", _campaign_id(scenario, "receiver"))
+    alone = _on_own_account(make_context(scenario.name), receiver[1])
+    presented = _spy_on_allocation(monkeypatch)
+
+    assert alone.account_currency(receiver[1]) == "USD"
+    out = _run(alone)
+    assert presented == [([donor_a, donor_b], [receiver])]
+    assert out.allocations == (
+        Allocation(donor_a, receiver, Decimal("300.00")),
+        Allocation(donor_b, receiver, Decimal("100.00")),
+    )
+    assert _only(out, BUDGET, B1).evidence.extra["from_new_budget"] == Decimal("0.00")
+
+    ctx = _in_currency(alone, receiver[1], "EUR")
+    assert ctx.account_currency(receiver[1]) == "EUR"
+    assert {ctx.account_currency(donor[1]) for donor in (donor_a, donor_b)} == {"USD"}
+    presented.clear()
+    out = _run(ctx)
+    assert out.allocations == ()
+    assert presented == []
+    b1 = _only(out, BUDGET, B1)
+    assert b1.decision_subject == DecisionSubject.of(receiver)
+    assert b1.evidence.extra["currency"] == "EUR"
+    assert evidence_metrics(b1)["increase"] == Decimal("400.00")
+    _check_all_new_budget(
+        b1,
+        _built(ctx, B1)[receiver],
+        "Raise by EUR 400.00: EUR 0.00 funded by reallocation, EUR 400.00 from new budget",
+        (donor_a, donor_b),
+    )
+    built = _built(ctx, B3)
+    donors = _by_subject(_items(out, BUDGET, B3))
+    assert set(donors) == {donor_a, donor_b}
+    for donor, freed in ((donor_a, Decimal("300.00")), (donor_b, Decimal("200.00"))):
+        assert donors[donor].evidence.extra["freed"] == freed
+        _check_plain_decrease(donors[donor], built[donor], receiver)
+
+
+def test_b3_never_funds_a_receiver_of_another_source(
+    make_context: ContextFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B3 cohort: a receiver is of its donor's source (AAP 0.5.4.2), never of another one.
+
+    ``b3.no_receiver`` builds the LinkedIn donors freeing USD 300.00 and 200.00, and no B1. A
+    rule-shaped B1 receiver (:func:`_cohort_party`) with an increase of USD 400.00 is presented
+    beside them. As a LinkedIn campaign it is funded 300 and 100 (the control). As a Google
+    campaign, the single input that changes, with the same currency and headroom, no cohort is
+    presented for allocation, nothing is allocated, each donor stays the plain decrease the B3
+    rule built, and the B1 increase is all new budget.
+    """
+    scenario = SCENARIOS["b3.no_receiver.case"]
+    ctx = make_context(scenario.name)
+    donor_a: SubjectKey = ("campaign", _campaign_id(scenario, "donor-a"))
+    donor_b: SubjectKey = ("campaign", _campaign_id(scenario, "donor-b"))
+    names = {donor: ctx.campaigns[donor[1]].name for donor in (donor_a, donor_b)}
+    receiver: SubjectKey = ("campaign", 9_000)
+    presented = _spy_on_allocation(monkeypatch)
+
+    linkedin = _cohort_party(ctx, B1, "linkedin", receiver[1], "Receiver", "400.00")
+    out = _run(ctx, RuleResult(candidates=(linkedin,)))
+    assert presented == [([donor_a, donor_b], [receiver])]
+    assert out.allocations == (
+        Allocation(donor_a, receiver, Decimal("300.00")),
+        Allocation(donor_b, receiver, Decimal("100.00")),
+    )
+    assert _only(out, BUDGET, B1).evidence.extra["funding"] == (
+        f"Raise by USD 400.00: USD 400.00 funded by reallocation from {names[donor_a]}, "
+        f"{names[donor_b]}, USD 0.00 from new budget"
+    )
+
+    google = _cohort_party(ctx, B1, "google", receiver[1], "Receiver", "400.00")
+    presented.clear()
+    out = _run(ctx, RuleResult(candidates=(google,)))
+    assert out.allocations == ()
+    assert presented == []
+    b1 = _only(out, BUDGET, B1)
+    assert b1.entity_ref.source == "google"
+    assert b1.decision_subject == DecisionSubject.of(receiver)
+    _check_all_new_budget(
+        b1,
+        google,
+        "Raise by USD 400.00: USD 0.00 funded by reallocation, USD 400.00 from new budget",
+        (donor_a, donor_b),
+    )
+    built = _built(ctx, B3)
+    donors = _by_subject(_items(out, BUDGET, B3))
+    assert set(donors) == {donor_a, donor_b}
+    for donor, item in donors.items():
+        assert item.entity_ref.source == "linkedin"
+        _check_plain_decrease(item, built[donor], receiver)
+
+
+def test_b3_funds_a_shared_budget_receiver_only_from_its_own_source(
+    make_context: ContextFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B3 cohort with a budget subject: a shared budget's B1 is funded only within its cohort.
+
+    ``shared.poor_member.does_not_fire`` builds a surviving Google B1 on the shared budget
+    ``pool``, decided as ``("budget", id)``, raising USD 1,000.00 to 1,200.00, and no B3. A
+    rule-shaped B3 donor (:func:`_cohort_party`) freeing USD 150.00 is presented beside it. As
+    a Google campaign it gives 150 of the 200 increase, which leaves 50 from new budget (the
+    control). As a LinkedIn campaign, the single input that changes, with the same currency,
+    nothing is presented for allocation or allocated, the donor stays a plain decrease, and
+    the budget's increase is all new budget.
+    """
+    scenario = SCENARIOS["shared.poor_member.does_not_fire"]
+    ctx = make_context(scenario.name)
+    pool: SubjectKey = ("budget", _budget_id(scenario, "pool"))
+    pool_name = ctx.budgets[pool[1]].name
+    donor: SubjectKey = ("campaign", 9_100)
+    assert ctx.budgets[pool[1]].currency == "USD"
+    assert _built(ctx, B3) == {}
+    presented = _spy_on_allocation(monkeypatch)
+
+    google = _cohort_party(ctx, B3, "google", donor[1], "Donor", "150.00")
+    out = _run(ctx, RuleResult(candidates=(google,)))
+    assert presented == [([donor], [pool])]
+    assert out.allocations == (Allocation(donor, pool, Decimal("150.00")),)
+    b1 = _only(out, BUDGET, B1)
+    assert b1.decision_subject == DecisionSubject.of(pool)
+    assert b1.entity_ref.source == "google"
+    extra = b1.evidence.extra
+    assert extra["increase"] == Decimal("200.00")
+    funding = budget.render_b1_funding(extra["increase"], [("Donor", Decimal("150.00"))], "USD")
+    assert funding == (
+        "Raise by USD 200.00: USD 150.00 funded by reallocation from Donor, "
+        "USD 50.00 from new budget"
+    )
+    assert extra["funding"] == funding
+    assert extra["funded_by_reallocation"] == Decimal("150.00")
+    assert extra["from_new_budget"] == Decimal("50.00")
+    assert funding in b1.reason
+    assert donor in {subject.key for subject in b1.depends_on}
+    (given,) = _items(out, BUDGET, B3)
+    text = budget.render_b3_allocation(Decimal("150.00"), pool_name, "USD")
+    assert text == f"Move USD 150.00 to fund {pool_name}'s recommended increase (B1)"
+    assert given.evidence.extra["allocations"] == (
+        {
+            "receiver": {"type": "budget", "id": pool[1]},
+            "receiver_name": pool_name,
+            "amount": Decimal("150.00"),
+            "text": text,
+        },
+    )
+    assert given.evidence.extra["unallocated"] == 0
+    assert text in given.reason
+    assert pool in {subject.key for subject in given.depends_on}
+
+    linkedin = _cohort_party(ctx, B3, "linkedin", donor[1], "Donor", "150.00")
+    presented.clear()
+    out = _run(ctx, RuleResult(candidates=(linkedin,)))
+    assert out.allocations == ()
+    assert presented == []
+    b1 = _only(out, BUDGET, B1)
+    assert b1.decision_subject == DecisionSubject.of(pool)
+    _check_all_new_budget(
+        b1,
+        _built(ctx, B1)[pool],
+        "Raise by USD 200.00: USD 0.00 funded by reallocation, USD 200.00 from new budget",
+        (donor,),
+    )
+    (plain,) = _items(out, BUDGET, B3)
+    assert plain.entity_ref.source == "linkedin"
+    _check_plain_decrease(plain, linkedin, pool)
+
+
 # ---------------------------------------------------------------------------
 # Phase 6: B4 weekday / weekend pattern (AAP 0.5.4.5 B4 row)
 # ---------------------------------------------------------------------------
@@ -1715,7 +2288,7 @@ def _b4_item(scenario: Scenario, ctx: AnalysisContext, source: str, key: str) ->
 
 def _check_rate_test(ctx: AnalysisContext, item: Candidate) -> None:
     """The B4 card's test is the Poisson rate test on its own counts, below ``b4.alpha``."""
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     recorded = item.evidence.test
     assert recorded is not None
     assert recorded.name == budget.B4_TEST_NAME
@@ -1753,7 +2326,7 @@ def test_b4_runs_the_rate_test_on_linkedin_leads(make_context: ContextFactory) -
     scenario = SCENARIOS["b4.linkedin.fires"]
     ctx = make_context(scenario.name)
     item = _b4_item(scenario, ctx, "linkedin", "li-cap")
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert (shown["weekend_days"], shown["weekdays"]) == (8, 20)
     assert item.action == (
         "Adjust weekend schedule or bids: weekend cost/outcome "
@@ -1963,6 +2536,66 @@ def test_b4_is_withheld_never_rounded_when_the_counts_are_not_valid(
     assert scenario.expect.withheld_reason == reason
 
 
+@pytest.mark.parametrize(
+    ("name", "source", "key", "field", "label"),
+    [
+        ("b4.linkedin.fires", "linkedin", "li-cap", "leads", "leads"),
+        ("b4.google_last_click.fires", "google", "weekly", "conversions", "conversions"),
+    ],
+)
+def test_b4_is_withheld_never_zeroed_when_a_day_left_its_outcome_unreported(
+    make_context: ContextFactory, name: str, source: str, key: str, field: str, label: str
+) -> None:
+    """B4 withholds, never zeroes or rounds, an unreported outcome (AAP 0.11.1).
+
+    Every other gate of the two firing patterns holds: spend on both sides, unweighted counts
+    (LinkedIn leads by definition; Google last-click on every day with whole values), the day
+    and outcome minimums and p < ``b4.alpha``, so the catalogue twin is an item. With the
+    window's first day reporting no outcome (``None``) instead of its count, the pattern is
+    withheld "{label} unavailable on 1 of 28 days", with the reported days against the
+    window's days as its sample, and is no item. With no day reporting one there is nothing
+    to compare: no item and no line, never the "0 outcomes of 10 required" a known 0 on every
+    day is withheld with.
+    """
+    scenario = SCENARIOS[name]
+    base = make_context(scenario.name)
+    campaign = _campaign_id(scenario, key, source)
+    window = base.window
+    _check_rate_test(base, _b4_item(scenario, base, source, key))
+    known = base.campaign_days[campaign]
+    assert sorted(day.date for day in known) == [
+        window.start + timedelta(days=offset) for offset in range(window.days)
+    ]
+    assert all(getattr(day, field) is not None for day in known)
+
+    def with_outcomes(value: Callable[[date], int | Decimal | None]) -> PrecedenceOutput:
+        """Run the Budget rules with each window day's outcome set to ``value(date)``."""
+        days = tuple(replace(day, **{field: value(day.date)}) for day in known)
+        return _run(_fresh(base, campaign_days={**base.campaign_days, campaign: days}))
+
+    reported = {day.date: getattr(day, field) for day in known}
+    one_day = with_outcomes(lambda day: None if day == window.start else reported[day])
+    assert _on(_items(one_day, BUDGET, B4), ("campaign", campaign)) == []
+    (line,) = _lines(one_day, B4, campaign)
+    assert line.reason == f"{label} unavailable on 1 of {window.days} days"
+    assert line.reason == f"{label} unavailable on 1 of 28 days"
+    assert (line.observed, line.required, line.unit) == (
+        window.days - 1,
+        window.days,
+        f"days with {label} reported",
+    )
+
+    every_day = with_outcomes(lambda day: None)
+    assert _on(_items(every_day, BUDGET, B4), ("campaign", campaign)) == []
+    assert _lines(every_day, B4, campaign) == []
+
+    # Google conversions are decimal amounts, LinkedIn leads whole counts.
+    zero: int | Decimal = Decimal(0) if source == "google" else 0
+    known_zero = with_outcomes(lambda day: zero)
+    (line,) = _lines(known_zero, B4, campaign)
+    assert line.reason == f"0 outcomes of {base.thresholds.int('b4.min_outcomes')} required"
+
+
 def test_a_shared_members_b4_card_shows_the_shared_budgets_history(
     make_context: ContextFactory,
 ) -> None:
@@ -1990,7 +2623,7 @@ def test_a_shared_members_b4_card_shows_the_shared_budgets_history(
     assert extra["budget_history"]["subject"] == {"type": "budget", "id": pool[1]}
     assert extra["budget_history"]["shared"] is True
     assert {entry["campaign_id"] for entry in extra["members"]} == set(subject_campaigns(ctx, pool))
-    shown = _metrics(item)
+    shown = evidence_metrics(item)
     assert shown["window_utilization"] == history.window_utilization.quantize(Decimal("0.0001"))
     assert shown["known_days"] == history.known_active
     assert shown["daily_budget"] == history.latest_daily_budget
@@ -2095,7 +2728,7 @@ def test_a_custom_period_budget_shows_utilization_na_and_gets_no_cap_rule(
         assert _items(out, BUDGET, rule_id) == []
         assert _lines(out, rule_id) == []
     (card,) = _on(_items(out, BUDGET, B4), subject)
-    shown = _metrics(card)
+    shown = evidence_metrics(card)
     assert shown["window_utilization"] == "n/a"
     assert shown["known_days"] == 0
     assert shown["daily_budget"] is None

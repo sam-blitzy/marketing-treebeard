@@ -32,16 +32,18 @@ order and pass the ``RuleResult`` values to ``precedence.apply_precedence``. Dat
 store the scenario's world through ``sync.mode.bootstrap_sources`` (the simulator serving every
 source on an ``httpx.MockTransport``), persist runs with ``runner.run_analysis`` and read them
 back through ``GET /api/v1/recommendations`` and ``analysis.overlay.overlay``. Worlds, syncs
-and runs share the catalogue's fixed clock; the API answers on the request's real clock, so
-checks that depend on the read time (``data_status_now``, the short-window banner) call the
-overlay directly at :data:`READ_AT`, and the API is asserted only on clock-independent state
-(holds, historical marking, counts, refusals). Database tests need the PostgreSQL 18 test
-database, which fails the test when unreachable, never skips it. No test reaches a real
-network.
+and runs share the catalogue's fixed clock. The API reads the time only through its request
+clock (``ads_engine.api.deps.get_now``): a test whose API assertions depend on the request
+time (feedback ``until`` and ``hidden_by``) fixes that clock through
+``api_app.dependency_overrides[get_now]`` before logging in; other read-time checks
+(``data_status_now``, the short-window banner) call the overlay directly at :data:`READ_AT`;
+every other API assertion is on clock-independent state (holds, historical marking, counts,
+refusals). Database tests need the PostgreSQL 18 test database, which fails the test when
+unreachable, never skips it. No test reaches a real network.
 """
 
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -49,6 +51,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -135,6 +138,8 @@ from ads_engine.analysis.context import (
 )
 from ads_engine.analysis.precedence import TRACKING_ABSENT_MESSAGE, PrecedenceOutput
 from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.api.deps import get_now
+from ads_engine.api.security import CSRF_HEADER, CSRF_VALUE
 from ads_engine.db.models.analysis import (
     AnalysisRun,
     Recommendation,
@@ -142,7 +147,7 @@ from ads_engine.db.models.analysis import (
     RunSuppression,
 )
 from ads_engine.db.models.decisions import Discrepancy
-from ads_engine.db.models.ops import SourceDataset
+from ads_engine.db.models.ops import AppUser, SourceDataset
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.scenarios import (
     FIXED_ANCHOR,
@@ -170,6 +175,8 @@ type CredentialSetter = Callable[[Source], Mapping[str, str]]
 """The ``live_credentials`` fixture: fake credentials making one source live."""
 type TransportFactory = Callable[..., httpx.MockTransport]
 """The ``mock_transport_for`` fixture: the simulator acting as one live platform."""
+type LoginFunction = Callable[..., Awaitable[httpx.Response]]
+"""The ``login`` fixture: ``login(client)`` signs the test admin in on the app's clock."""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1245,6 +1252,184 @@ def test_p2_absent_lead_tracking_suppresses_w2_of_that_source_only(
     assert all(SUPPRESS_TRACKING_ABSENT not in counts for counts in kept.suppressed.values())
 
 
+TRACKING_SECTIONS: dict[str, tuple[str, ...]] = {
+    "google": (KEYWORDS, CAMPAIGNS, BUDGET),
+    "linkedin": (CAMPAIGNS, BUDGET, WHITE_PAPERS),
+}
+"""The sections a source's ``conversion_tracking_absent`` lands in: those of its K1, C1, B2, W2."""
+
+
+def _unreported_outcomes(ctx: AnalysisContext, source: str) -> AnalysisContext:
+    """``ctx`` with every outcome of ``source``'s campaigns unreported (``None``), spend unchanged.
+
+    No day keeps a reported floor either, so nothing about the source's outcomes was recorded.
+    """
+    unknown: dict[int, tuple[DayFact, ...]] = dict(ctx.campaign_days)
+    for campaign in ctx.campaigns.values():
+        if campaign.source != source:
+            continue
+        unknown[campaign.id] = tuple(
+            replace(day, leads=None, website_conversions=None, conversions=None, reported_floors=())
+            for day in ctx.campaign_days.get(campaign.id, ())
+        )
+    return replace(ctx, campaign_days=unknown, cache={})
+
+
+def _zero_outcome_probes(intact: AnalysisContext, source: str) -> RuleResult:
+    """A genuine card of ``source`` copied under each zero-outcome rule P2 suppresses for it.
+
+    Google's is its K1 card, kept as it is and copied as C1 and as B2's zero-outcome branch;
+    LinkedIn's is its first card, copied as C1, as B2's zero-outcome branch and as a W2 retire
+    card on a white paper. As in the tests above, no world makes these rules fire while their
+    source records no outcome, so the copies probe the P2 step itself.
+    """
+    card = next(
+        candidate
+        for result in _evaluate(intact)
+        for candidate in result.candidates
+        if candidate.entity_ref.source == source
+    )
+    plain = replace(card, increases_spend_on=())
+    probes = [
+        replace(plain, rule_id=C1, section=CAMPAIGNS, group=GROUP_PAUSE),
+        replace(
+            plain,
+            rule_id=B2,
+            section=BUDGET,
+            group=GROUP_CHANGES,
+            evidence=card.evidence.with_extra(branch="zero_outcomes"),
+        ),
+    ]
+    if source == "google":
+        assert card.rule_id == K1
+        probes.append(card)
+    else:
+        probes.append(
+            replace(
+                plain,
+                rule_id=W2,
+                section=WHITE_PAPERS,
+                group=cohort_group("USD"),
+                entity_ref=EntityRef("linkedin", ENTITY_CONTENT_ASSET, None, "guide|USD", "Guide"),
+                decision_subject=None,
+            )
+        )
+    return RuleResult(candidates=tuple(probes))
+
+
+def _zero_outcome_candidates(results: Iterable[RuleResult], source: str) -> list[Candidate]:
+    """The K1, C1, zero-outcome B2 and W2 candidates of ``source`` that the rules emitted."""
+    return [
+        candidate
+        for result in results
+        for candidate in result.candidates
+        if candidate.entity_ref.source == source
+        and (
+            candidate.rule_id in (K1, C1, W2)
+            or (
+                candidate.rule_id == B2
+                and candidate.evidence.extra.get("branch") == "zero_outcomes"
+            )
+        )
+    ]
+
+
+@pytest.mark.parametrize("source", ["google", "linkedin"])
+def test_p2_unreported_outcomes_record_nothing_yet_never_feed_a_zero_outcome_rule(
+    make_context: ContextFactory, source: str
+) -> None:
+    """P2 and unknown outcomes: nothing recorded is absent tracking; it is never a zero count.
+
+    ``fallback.recovery_all_pass.case`` holds every source, each recording outcomes. With one
+    source's outcomes unreported (``None``) on every day and no partial count kept, its spend
+    stands with no outcome recorded, so, exactly as with a known 0 on every day, that source
+    records ``conversion_tracking_absent`` in each section it affects and its K1, C1,
+    zero-outcome B2 and W2 cards are suppressed there, while the other source records nothing.
+    Unknown still differs from zero before P2: no rule turns the unreported days into a K1, C1,
+    zero-outcome B2 or W2 candidate, and Google's account-wide K1 line says its conversions are
+    unavailable on every day, where a known 0 says "0 conversions".
+    """
+    intact = make_context("fallback.recovery_all_pass.case")
+    probes = _zero_outcome_probes(intact, source)
+    days = intact.window.days
+    k1_lines = {
+        "unreported": (
+            "account cost/conversion unavailable: conversions unavailable on "
+            f"{days} of {days} days in the {days}-day window"
+        ),
+        "known_zero": (
+            f"account cost/conversion unavailable: 0 conversions in the {days}-day window"
+        ),
+    }
+    for case, ctx in (
+        ("unreported", _unreported_outcomes(intact, source)),
+        ("known_zero", _without_outcomes(intact, source)),
+    ):
+        results = _evaluate(ctx)
+        assert _zero_outcome_candidates(results, source) == [], case
+        out = precedence.apply_precedence([*results, probes], ctx)
+        for section in SECTION_ORDER:
+            found = [
+                f for f in out.findings[section] if f.code == FINDING_CONVERSION_TRACKING_ABSENT
+            ]
+            if section not in TRACKING_SECTIONS[source]:
+                assert found == [], (case, section)
+                continue
+            (finding,) = found
+            assert finding.message == TRACKING_ABSENT_MESSAGE
+            assert (finding.evidence["source"], finding.evidence["outcomes"]) == (source, 0)
+            assert all(amount > 0 for amount in finding.evidence["spend"].values())
+            assert out.suppressed[section].get(SUPPRESS_TRACKING_ABSENT) == 1, (case, section)
+        for probe in probes.candidates:
+            kept = [c.entity_ref.key for c in _candidates(out, probe.section, probe.rule_id)]
+            assert probe.entity_ref.key not in kept, (case, probe.rule_id)
+        if source == "google":
+            (line,) = _withheld_lines(out, K1)
+            assert line.entity is not None
+            assert line.reason == k1_lines[case], case
+
+
+def test_p2_a_partially_reported_day_records_its_floor_and_suppresses_nothing(
+    make_context: ContextFactory,
+) -> None:
+    """P2 and partial reports: a day's reported floor is a recorded outcome, never a zero.
+
+    LinkedIn sums its creatives' rows per campaign day; when one row of a day reports 1 lead and
+    another reports none, the day's leads stay unavailable for every count, rate and efficiency,
+    and the reporting rows' 1 lead is kept as the day's floor. With LinkedIn otherwise unreported
+    (the context of the test above), that one floor means a lead was recorded: no
+    ``conversion_tracking_absent`` finding, and the C1, zero-outcome B2 and W2 probes all
+    stand. The day itself still counts as unreported, so no rule reads it as a zero either.
+    """
+    intact = make_context("fallback.recovery_all_pass.case")
+    probes = _zero_outcome_probes(intact, "linkedin")
+    unknown = _unreported_outcomes(intact, "linkedin")
+    ctx = _with_outcome(unknown, "linkedin", reported_floors=(("leads", 1),))
+    floored = [
+        (campaign, day)
+        for campaign in ctx.campaigns.values()
+        if campaign.source == "linkedin"
+        for day in ctx.campaign_days.get(campaign.id, ())
+        if day.reported_floors
+    ]
+    ((campaign, day),) = floored
+    assert day.outcome(campaign.objective_group) is None
+    assert day.recorded_outcome(campaign.objective_group) == 1
+
+    results = _evaluate(ctx)
+    assert _zero_outcome_candidates(results, "linkedin") == []
+    out = precedence.apply_precedence([*results, probes], ctx)
+    assert all(
+        f.code != FINDING_CONVERSION_TRACKING_ABSENT
+        for section in SECTION_ORDER
+        for f in out.findings[section]
+    )
+    assert all(SUPPRESS_TRACKING_ABSENT not in counts for counts in out.suppressed.values())
+    for probe in probes.candidates:
+        kept = [c.entity_ref.key for c in _candidates(out, probe.section, probe.rule_id)]
+        assert kept == [probe.entity_ref.key], (probe.rule_id, kept)
+
+
 @pytest.mark.parametrize(
     ("name", "absent"),
     [("p2.tracking_absent.fires", True), ("p2.tracking_absent.does_not_fire", False)],
@@ -1911,25 +2096,63 @@ async def test_feedback_counts_are_stored_with_the_next_run_and_served_from_stor
     db: async_sessionmaker[AsyncSession],
     set_env: EnvSetter,
     make_world: WorldFactory,
-    authed_client: httpx.AsyncClient,
+    api_app: FastAPI,
+    api_client: httpx.AsyncClient,
+    admin_user: AppUser,
+    login: LoginFunction,
     thresholds: Thresholds,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Feedback: a POSTed dismiss, snooze or done is stored, suppresses, and is served stored.
+    """Feedback: a POSTed dismiss, snooze or done suppresses until ``until``, served stored.
 
-    ``POST /recommendations/{id}/feedback`` on the K1 card records the item's rule and entity
-    until ``feedback.{kind}_days`` after the request. The next run drops the card and stores
-    the count in ``run_suppression`` for Keywords; ``GET /recommendations`` returns that count
-    with every rule module, precedence and the runner disabled, so nothing is re-run on read.
-    The earlier run's card shows ``hidden_by`` at once.
+    One controlled clock drives the request, every run and the overlay: the API's
+    ``get_now`` is fixed before logging in, so nothing depends on the host's date.
+    ``POST /recommendations/{id}/feedback`` on the K1 card at :data:`READ_AT` records the
+    item's rule and entity until exactly ``feedback.{kind}_days`` later. The next default run
+    drops the card and stores the count in ``run_suppression`` for Keywords. Feedback is in
+    force only while ``until`` is after the run or read instant: a run over the first run's
+    window one second before ``until`` still drops and counts the card, and one at ``until``
+    keeps it with no suppression row. ``GET /recommendations`` returns each run's stored
+    count with every rule module, precedence and the runner disabled, so nothing is re-run
+    on read; the first run's card shows ``hidden_by`` at once and one second before
+    ``until``, and none at ``until``.
     """
+    del admin_user  # Requested so the admin row exists before logging in.
+    clock = [READ_AT]
+    api_app.dependency_overrides[get_now] = lambda: clock[0]
+
+    async def sign_in(at: datetime) -> None:
+        """Move the request clock to ``at`` and log in afresh: a session lasts 12 h on it."""
+        clock[0] = at
+        api_client.cookies.clear()
+        response = await login(api_client)
+        assert response.status_code == 200, response.text
+
+    async def window_run(base: AnalysisRun, now: datetime) -> AnalysisRun:
+        """A custom run at ``now`` over exactly the window dates of ``base``."""
+        window = await runner.custom_window(base.window_start, base.window_end, now=now)
+        return await runner.run_analysis(window, "custom", "manual", now=now)
+
+    async def suppressions(run: AnalysisRun) -> list[tuple[str, str, int]]:
+        """The ``run_suppression`` rows stored for ``run``, in write order."""
+        async with db() as session:
+            rows = await session.scalars(
+                select(RunSuppression)
+                .where(RunSuppression.run_id == run.id)
+                .order_by(RunSuppression.id)
+            )
+            return [(row.section, row.reason, row.count) for row in rows]
+
+    await sign_in(READ_AT)
+    api_client.headers[CSRF_HEADER] = CSRF_VALUE
     scenario = _scenario(f"feedback.{kind}.case")
     set_env(DATA_MODE="simulated")
     await _bootstrap(make_world(scenario), force_simulated=True)
     first = await _default_run()
-    (card,) = _page_items(await _page(authed_client, first.id), K1)
+    (card,) = _page_items(await _page(api_client, first.id), K1)
+    (stored_card,) = [row for row in await _stored(db, first.id) if row.rule_id == K1]
 
-    response = await authed_client.post(
+    response = await api_client.post(
         f"/api/v1/recommendations/{card['id']}/feedback", json={"kind": kind}
     )
     assert response.status_code == 201, response.text
@@ -1939,34 +2162,64 @@ async def test_feedback_counts_are_stored_with_the_next_run_and_served_from_stor
         K1,
         kind,
     )
-    until = datetime.fromisoformat(feedback["until"])
+    days = timedelta(days=thresholds.int(f"feedback.{kind}_days"))
+    assert days == timedelta(days=FEEDBACK_DAYS[kind])
+    until = READ_AT + days
     created = datetime.fromisoformat(feedback["created_at"])
-    assert until - created == timedelta(days=thresholds.int(f"feedback.{kind}_days"))
-
-    second = await _default_run(FIXED_NOW + timedelta(hours=2))
+    assert created == READ_AT
+    assert datetime.fromisoformat(feedback["until"]) == created + days == until
     async with db() as session:
-        rows = list(
-            await session.scalars(
-                select(RunSuppression)
-                .where(RunSuppression.run_id == second.id)
-                .order_by(RunSuppression.id)
-            )
-        )
+        (stored_feedback,) = (await session.scalars(select(RecommendationFeedback))).all()
+    assert (stored_feedback.rule_id, stored_feedback.entity_type, stored_feedback.entity_id) == (
+        K1,
+        stored_card.entity_type,
+        stored_card.entity_id,
+    )
+    assert (stored_feedback.created_at, stored_feedback.until) == (READ_AT, until)
+
+    second = await _default_run(READ_AT + timedelta(hours=1))
+    in_force = await window_run(first, until - timedelta(seconds=1))
+    expired = await window_run(first, until)
     reason = FEEDBACK_SUPPRESSION[kind]
-    assert [(row.section, row.reason, row.count) for row in rows] == [(KEYWORDS, reason, 1)]
-    assert not [row for row in await _stored(db, second.id) if row.rule_id == K1]
+    for run in (second, in_force):
+        assert await suppressions(run) == [(KEYWORDS, reason, 1)], run.id
+        assert not [row for row in await _stored(db, run.id) if row.rule_id == K1], run.id
+    assert await suppressions(expired) == []
+    (back,) = [row for row in await _stored(db, expired.id) if row.rule_id == K1]
+    assert (back.entity_type, back.entity_id) == (stored_card.entity_type, stored_card.entity_id)
 
     _forbid_rule_evaluation(monkeypatch)
-    page = await _page(authed_client)
+    page = await _page(api_client)
     assert page["run"]["id"] == second.id
     assert _page_section(page, KEYWORDS)["suppressed"] == {reason: 1}
     assert not _page_items(page, K1)
     for key in SECTION_ORDER:
         if key != KEYWORDS:
             assert _page_section(page, key)["suppressed"] == {}, key
-
-    (old,) = _page_items(await _page(authed_client, first.id), K1)
+    (old,) = _page_items(await _page(api_client, first.id), K1)
     assert old["current"]["hidden_by"] == kind
+
+    for at, run, hidden_by in (
+        (until - timedelta(seconds=1), in_force, kind),
+        (until, expired, None),
+    ):
+        await sign_in(at)
+        page = await _page(api_client, run.id)
+        assert page["run"]["id"] == run.id
+        keyword_items = _page_items(page, K1)
+        if hidden_by is None:
+            assert _page_section(page, KEYWORDS)["suppressed"] == {}
+            (shown,) = keyword_items
+            assert shown["id"] == back.id
+            assert shown["current"]["hidden_by"] is None
+        else:
+            assert _page_section(page, KEYWORDS)["suppressed"] == {reason: 1}
+            assert not keyword_items
+        for key in SECTION_ORDER:
+            if key != KEYWORDS:
+                assert _page_section(page, key)["suppressed"] == {}, (at, key)
+        (old,) = _page_items(await _page(api_client, first.id), K1)
+        assert old["current"]["hidden_by"] == hidden_by, at
 
 
 # ---------------------------------------------------------------------------

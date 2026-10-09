@@ -34,16 +34,19 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 from decimal import Decimal
 from fractions import Fraction
 from functools import cached_property
 from typing import Any
 
 import pytest
+from tests.support import evidence_metric
 
 from ads_engine.analysis import keywords
 from ads_engine.analysis.context import (
+    ENTITY_ACCOUNT,
     ENTITY_KEYWORD,
     FINDING_K1_NO_BASELINE,
     FINDING_SEARCH_TERM_COVERAGE,
@@ -169,11 +172,6 @@ def _run(
     now = None if entry.fixed_time else FIXED_NOW
     ctx = make_context(entry, thresholds=thresholds, now=now)
     return _Run(entry, ctx, keywords.evaluate(ctx))
-
-
-def _metric(item: Candidate, key: str) -> Any:
-    """The value of an item's evidence metric ``key``."""
-    return item.evidence.metric(key).value
 
 
 def _baseline(item: Candidate, key: str) -> Any:
@@ -431,13 +429,13 @@ class _Probe:
 
 def _item_metric_or(probe: _Probe, key: str, fallback: Callable[[], Any]) -> Any:
     """The item's metric ``key`` when the rule emitted an item, else ``fallback()``."""
-    return _metric(probe.item, key) if probe.item is not None else fallback()
+    return evidence_metric(probe.item, key) if probe.item is not None else fallback()
 
 
 def _resolve_conversions(probe: _Probe) -> Any:
     """Item conversions, else the withheld line's observed conversions, else the term's."""
     if probe.item is not None:
-        return _metric(probe.item, "conversions")
+        return evidence_metric(probe.item, "conversions")
     if probe.line is not None and probe.line.unit == "conversions":
         return probe.line.observed
     return probe.row().conversions
@@ -446,7 +444,7 @@ def _resolve_conversions(probe: _Probe) -> Any:
 def _resolve_cost_per_conversion(probe: _Probe) -> Any:
     """Item cost/conversion, else the term's window cost ÷ conversions at the cent."""
     if probe.item is not None:
-        return _metric(probe.item, "cost_per_conversion")
+        return evidence_metric(probe.item, "cost_per_conversion")
     row = probe.row()
     return _cents(Fraction(row.cost) / Fraction(row.conversions))
 
@@ -678,7 +676,7 @@ def test_k1_gate_fires_at_n_star_clicks_and_is_withheld_one_click_below(
     sample = item.evidence.sample
     assert sample is not None
     assert (sample.observed, sample.required, sample.unit) == (n_star, n_star, "clicks")
-    assert _metric(item, "clicks") == _metric(item, "min_clicks") == n_star
+    assert evidence_metric(item, "clicks") == evidence_metric(item, "min_clicks") == n_star
     assert fires.withheld(K1) == ()
 
     assert held.items(K1) == ()
@@ -767,7 +765,7 @@ def test_k1_low_baseline_rates_raise_n_star_without_a_cap(
     sample = item.evidence.sample
     assert sample is not None
     assert (sample.required, sample.unit) == (n_star, "clicks")
-    assert _metric(item, "min_clicks") == n_star
+    assert evidence_metric(item, "min_clicks") == n_star
     assert _baseline(item, "baseline_rate") == Decimal(rate)
 
     assert held.items(K1) == ()
@@ -789,8 +787,8 @@ def test_k1_fractional_data_driven_baseline_gives_n_star_64(make_context: Contex
     assert Fraction(3) / Fraction(baseline.rate) == Fraction(3000, 47)
     assert _n_star(ctx) == 64
     (item,) = fires.items(K1)
-    assert _metric(item, "min_clicks") == 64
-    assert _metric(item, "clicks") == 64
+    assert evidence_metric(item, "min_clicks") == 64
+    assert evidence_metric(item, "clicks") == 64
     (line,) = held.withheld(K1)
     assert (line.observed, line.required, line.unit) == (63, 64, "clicks")
 
@@ -817,7 +815,7 @@ def test_k1_rates_at_or_above_one_give_the_ten_click_floor(
     floor = ctx.thresholds.int("k1.min_clicks_floor")
     assert _n_star(ctx) == floor == 10
     (item,) = fires.items(K1)
-    assert _metric(item, "min_clicks") == floor
+    assert evidence_metric(item, "min_clicks") == floor
     assert _baseline(item, "baseline_rate") == Decimal(rate)
     (line,) = held.withheld(K1)
     assert (line.observed, line.required, line.unit) == (floor - 1, floor, "clicks")
@@ -922,7 +920,7 @@ def test_k1_a_fractional_conversion_counts_as_converting(make_context: ContextFa
     fires, held = _twin_runs(make_context, "k1.fractional_conversion")
     term = _k1_target(fires)
     assert _term_row(fires.ctx, term).conversions == 0
-    assert _metric(fires.items(K1)[0], "conversions") == 0
+    assert evidence_metric(fires.items(K1)[0], "conversions") == 0
 
     row = _term_row(held.ctx, term)
     assert row.conversions == Decimal("0.3")
@@ -952,6 +950,70 @@ def test_k1_spend_below_one_account_cost_per_conversion_does_not_fire(
     assert held_row.conversions == 0
     assert held.items(K1) == ()
     assert held.withheld(K1) == ()
+
+
+@pytest.mark.parametrize("first_day", [Decimal(0), None])
+def test_k1_spend_floor_needs_a_known_account_cost_per_conversion(
+    make_context: ContextFactory, first_day: Decimal | None
+) -> None:
+    """K1 and unknown outcomes: the spend floor reads a known account cost/conversion only.
+
+    ``k1.gate.fires`` blocks its term, which spends more than one account cost/conversion,
+    taken from the account campaign's daily conversions. With the window's first day at a
+    known 0 conversions instead of its 10, that cost/conversion rises but stays below the
+    term's spend, so K1 still fires. With that day unreported (``None``) the account's window
+    conversions are unknown, never the 270 the other days add up to: no K1 item, and one
+    account-wide withheld line naming the unreported days against the days with metrics.
+
+    A search term's own conversions are never unknown: ``SearchTermRow.conversions`` is a
+    number by contract, because the Google parser reads an omitted additive metric as 0 and
+    rejects an explicit ``null`` as a defect. The unknown input K1 can meet is therefore the
+    account's daily conversions, which a campaign day may leave unreported.
+    """
+    fires = _run(make_context, "k1.gate.fires")
+    term = _k1_target(fires)
+    window = fires.ctx.window
+    (campaign_id,) = [c.id for c in fires.ctx.campaigns.values() if c.source == "google"]
+    known = fires.ctx.campaign_days[campaign_id]
+    assert all(day.conversions is not None and day.conversions > 0 for day in known)
+    days = tuple(
+        replace(day, conversions=first_day) if day.date == window.start else day for day in known
+    )
+    ctx = replace(fires.ctx, campaign_days={**fires.ctx.campaign_days, campaign_id: days}, cache={})
+    run = _Run(fires.scenario, ctx, keywords.evaluate(ctx))
+    row = _term_row(ctx, term)
+    assert (row.term_status, row.conversions) == ("NONE", 0)
+    assert row.clicks >= _n_star(ctx)
+    if first_day is not None:
+        multiple = Fraction(ctx.thresholds.ratio("k1.min_spend_cpa_multiple"))
+        assert Fraction(row.cost) >= multiple * _account_cost_per_conversion(ctx)
+        (item,) = run.items(K1)
+        assert item.entity_ref.name == term
+        assert _baseline(item, "account_cost_per_conversion") == _cents(
+            _account_cost_per_conversion(ctx)
+        )
+        assert run.withheld(K1) == ()
+        return
+    totals = window_totals(ctx, (campaign_id,))
+    assert (totals.outcomes, totals.unreported_days, totals.days) == (None, 1, window.days)
+    assert run.items(K1) == ()
+    (line,) = run.withheld(K1)
+    assert line.reason == (
+        f"account cost/conversion unavailable: conversions unavailable on 1 of {window.days} "
+        f"days in the {window.days}-day window"
+    )
+    assert line.reason == (
+        "account cost/conversion unavailable: conversions unavailable on 1 of 28 days in the "
+        "28-day window"
+    )
+    assert (line.observed, line.required, line.unit) == (
+        window.days - 1,
+        window.days,
+        "days with conversions reported",
+    )
+    assert line.entity is not None
+    assert line.entity.type == ENTITY_ACCOUNT
+    assert run.findings(FINDING_K1_NO_BASELINE) == ()
 
 
 @pytest.mark.parametrize(
@@ -1009,15 +1071,17 @@ def test_k1_evidence_shows_wasted_spend_clicks_matched_keyword_and_n_star(
             row = _term_row(run.ctx, item.entity_ref.name)
             sample = item.evidence.sample
             assert sample is not None
-            assert _metric(item, "wasted_spend") == _metric(item, "spend")
-            assert _exact(_metric(item, "spend")) == Fraction(_cents(Fraction(row.cost)))
-            assert _metric(item, "clicks") == row.clicks == sample.observed
-            assert _metric(item, "min_clicks") == sample.required == _n_star(run.ctx)
+            assert evidence_metric(item, "wasted_spend") == evidence_metric(item, "spend")
+            assert _exact(evidence_metric(item, "spend")) == Fraction(_cents(Fraction(row.cost)))
+            assert evidence_metric(item, "clicks") == row.clicks == sample.observed
+            assert evidence_metric(item, "min_clicks") == sample.required == _n_star(run.ctx)
             assert sample.unit == "clicks"
-            assert _metric(item, "conversions") == 0
-            assert _metric(item, "cost_per_conversion") == "—"
+            assert evidence_metric(item, "conversions") == 0
+            assert evidence_metric(item, "cost_per_conversion") == "—"
             assert row.matched_keyword_text is not None
-            assert str(_metric(item, "matched_keyword")).startswith(row.matched_keyword_text)
+            assert str(evidence_metric(item, "matched_keyword")).startswith(
+                row.matched_keyword_text
+            )
             assert item.rank_key == (-row.cost,)
     firing = [s for s in _MODULE_SCENARIOS if s.expect.rule_id == K1 and s.expect.fires]
     assert checked > len(firing), "every firing K1 scenario and the default world were checked"
@@ -1048,7 +1112,7 @@ def _assert_k2_item(run: _Run, item: Candidate, row: SearchTermRow) -> None:
     term_cpa = Fraction(row.cost) / Fraction(row.conversions)
     campaign_cpa = _campaign_cost_per_conversion(ctx, row.campaign_id)
     assert term_cpa <= Fraction(ctx.thresholds.ratio("k2.max_cpa_ratio")) * campaign_cpa
-    assert _metric(item, "cost_per_conversion") == _cents(term_cpa)
+    assert evidence_metric(item, "cost_per_conversion") == _cents(term_cpa)
     assert _baseline(item, "campaign_cost_per_conversion") == _cents(campaign_cpa)
 
 
@@ -1057,7 +1121,7 @@ def test_k2_fires_at_three_conversions_and_is_withheld_at_two(make_context: Cont
     fires, held = _twin_runs(make_context, "k2.min_conversions")
     item, row = _k2_target(fires)
     _assert_k2_item(fires, item, row)
-    assert row.conversions == 3 == _metric(item, "conversions")
+    assert row.conversions == 3 == evidence_metric(item, "conversions")
     sample = item.evidence.sample
     assert sample is not None
     assert (sample.observed, sample.unit) == (3, "conversions")
@@ -1177,8 +1241,8 @@ def _assert_k3_gates(run: _Run, item: Candidate) -> None:
     assert item.entity_ref.type == ENTITY_KEYWORD
     assert run.ctx.window.days >= thresholds.int("k3.min_window_days")
     minimum = thresholds.int("k3.min_clicks_per_half")
-    assert _metric(item, "clicks_first_half") >= minimum
-    assert _metric(item, "clicks_second_half") >= minimum
+    assert evidence_metric(item, "clicks_first_half") >= minimum
+    assert evidence_metric(item, "clicks_second_half") >= minimum
     sample = item.evidence.sample
     assert sample is not None
     assert (sample.required, sample.unit) == (minimum, "clicks per half")
@@ -1198,7 +1262,7 @@ def test_k3_a_one_point_quality_score_drop_fires_and_half_a_point_does_not(
     first, last = _quality_score_means(fires.ctx, keyword)
     assert (first, last) == (Fraction(7), Fraction(6))
     assert first - last == 1 >= drop
-    assert (_metric(item, "qs_first"), _metric(item, "qs_last")) == (7, 6)
+    assert (evidence_metric(item, "qs_first"), evidence_metric(item, "qs_last")) == (7, 6)
     minimum = fires.ctx.thresholds.int("k3.min_qs_days_per_span")
     assert extra["qs_days_first"] >= minimum
     assert extra["qs_days_last"] >= minimum
@@ -1245,7 +1309,7 @@ def test_k3_compares_quality_score_snapshots_when_daily_scores_are_absent(
     extra = item.evidence.extra
     assert extra["qs_basis"] == "snapshots"
     assert "quality_score" in extra["triggers"]
-    assert (_metric(item, "qs_first"), _metric(item, "qs_last")) == (7, 6)
+    assert (evidence_metric(item, "qs_first"), evidence_metric(item, "qs_last")) == (7, 6)
     snapshots = extra["qs_snapshots"]
     lower, _ = fires.ctx.window.day_bounds(
         fires.ctx.window.start, fires.ctx.window.boundary("google")
@@ -1277,8 +1341,8 @@ def test_k3_cpc_rise_without_a_matching_conversion_rise_fires(make_context: Cont
     extra = item.evidence.extra
     assert "cpc" in extra["triggers"]
     assert extra["conversions_fell"] is False
-    assert _exact(_metric(item, "cpc_ratio")) == halves.cpc_ratio
-    assert _exact(_metric(item, "cpa_ratio")) == halves.cpa_ratio
+    assert _exact(evidence_metric(item, "cpc_ratio")) == halves.cpc_ratio
+    assert _exact(evidence_metric(item, "cpa_ratio")) == halves.cpa_ratio
     assert "CPC rose from" in item.reason
     assert "while cost/conversion rose from" in item.reason
 
@@ -1314,9 +1378,9 @@ def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: Contex
     assert "cpc" in extra["triggers"]
     assert "quality_score" not in extra["triggers"]
     assert extra["conversions_fell"] is True
-    assert _exact(_metric(item, "cpc_ratio")) == halves.cpc_ratio
-    assert _exact(_metric(item, "conversions_first_half")) == halves.first_conversions
-    assert _exact(_metric(item, "conversions_second_half")) == 0
+    assert _exact(evidence_metric(item, "cpc_ratio")) == halves.cpc_ratio
+    assert _exact(evidence_metric(item, "conversions_first_half")) == halves.first_conversions
+    assert _exact(evidence_metric(item, "conversions_second_half")) == 0
     (first_start, first_end), _ = fires.ctx.window.halves()
     first_cost = sum(
         (
@@ -1326,15 +1390,15 @@ def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: Contex
         ),
         Fraction(0),
     )
-    assert _metric(item, "cost_per_conversion_first_half") == _cents(
+    assert evidence_metric(item, "cost_per_conversion_first_half") == _cents(
         first_cost / halves.first_conversions
     )
     second_cpa = item.evidence.metric("cost_per_conversion_second_half")
     assert (second_cpa.value, second_cpa.unit) == ("—", "currency")
     assert "unavailable" not in second_cpa.to_json(), "a known 0 shows '—', never unavailable"
-    assert _metric(item, "cpa_ratio") is None
+    assert evidence_metric(item, "cpa_ratio") is None
     assert "CPC rose from" in item.reason
-    fell = f"while conversions fell from {_metric(item, 'conversions_first_half')} to 0."
+    fell = f"while conversions fell from {evidence_metric(item, 'conversions_first_half')} to 0."
     assert item.reason.endswith(fell)
     assert "while cost/conversion rose" not in item.reason
 
@@ -1346,6 +1410,88 @@ def test_k3_cpc_rise_with_conversions_falling_to_zero_fires(make_context: Contex
     assert _conversions_fell(held.ctx, held_halves) is False
     assert held.items(K3) == ()
     assert held.withheld(K3) == ()
+
+
+def _keyword_conversions(
+    run: _Run, keyword: KeywordInfo, when: date, conversions: Decimal | None
+) -> _Run:
+    """``run`` evaluated again with ``keyword``'s conversions on ``when`` set to ``conversions``.
+
+    Moves exactly one input; ``None`` leaves that day's conversions unreported. The context is
+    copied with an empty cache, so nothing memoised on the original carries over.
+    """
+    days = tuple(
+        replace(day, conversions=conversions) if day.date == when else day
+        for day in run.ctx.keyword_days[keyword.id]
+    )
+    assert days != run.ctx.keyword_days[keyword.id], f"{keyword.text!r} has no day {when}"
+    ctx = replace(run.ctx, keyword_days={**run.ctx.keyword_days, keyword.id: days}, cache={})
+    return _Run(run.scenario, ctx, keywords.evaluate(ctx))
+
+
+def test_k3_unreported_second_half_conversions_never_read_as_a_fall_to_zero(
+    make_context: ContextFactory,
+) -> None:
+    """K3 and unknown outcomes: conversions fell to 0 only when every second-half day says so.
+
+    ``k3.conversions_fell.fires`` reviews its keyword: CPC up 20% while conversions fell from 1
+    to a known 0. With the window's last day reporting no conversions (``None``) instead of its
+    known 0, the second half's conversions are unavailable rather than 0: they did not fall,
+    and there is no second-half cost/conversion to compare, so K3 neither fires nor withholds.
+    """
+    fires = _run(make_context, "k3.conversions_fell.fires")
+    item, keyword = _k3_target(fires)
+    assert item.evidence.extra["conversions_fell"] is True
+    last = fires.ctx.window.end
+    assert [day.conversions for day in _window_days(fires.ctx, keyword) if day.date == last] == [0]
+
+    unknown = _keyword_conversions(fires, keyword, last, None)
+    _, (second_start, second_end) = unknown.ctx.window.halves()
+    second = [
+        day for day in _window_days(unknown.ctx, keyword) if second_start <= day.date <= second_end
+    ]
+    assert [day.conversions for day in second].count(None) == 1
+    assert all(day.conversions == 0 for day in second if day.conversions is not None)
+    assert unknown.items(K3) == ()
+    assert unknown.withheld(K3) == ()
+
+
+def test_k3_item_with_unreported_conversions_shows_its_cost_per_conversion_unavailable(
+    make_context: ContextFactory,
+) -> None:
+    """K3 output and unknown outcomes: unreported conversions are unavailable, never "—" or 0.
+
+    ``k3.qs_drop.fires`` reviews its keyword on the quality-score branch, which reads no
+    conversions. With the window's first day reporting no conversions (``None``) the item still
+    fires, but the window's and the first half's conversions are unavailable, and so are their
+    cost/conversion and the cost/conversion ratio, while the fully reported second half keeps
+    its figures. With that day at a known 0 instead, every figure is a number.
+    """
+    fires = _run(make_context, "k3.qs_drop.fires")
+    _, keyword = _k3_target(fires)
+    start = fires.ctx.window.start
+    count_keys = ("conversions", "conversions_first_half")
+    cost_keys = ("cost_per_conversion", "cost_per_conversion_first_half")
+    for conversions in (Decimal(0), None):
+        run = _keyword_conversions(fires, keyword, start, conversions)
+        item, _ = _k3_target(run)
+        _assert_k3_gates(run, item)
+        assert tuple(item.evidence.extra["triggers"]) == ("quality_score",)
+        _, (second_start, second_end) = run.ctx.window.halves()
+        second = [
+            day for day in _window_days(run.ctx, keyword) if second_start <= day.date <= second_end
+        ]
+        reported = [day.conversions for day in second if day.conversions is not None]
+        assert len(reported) == len(second), "the second half reports every day"
+        assert evidence_metric(item, "conversions_second_half") == sum(reported, Decimal(0))
+        assert evidence_metric(item, "cost_per_conversion_second_half") is not None
+        shown = [evidence_metric(item, key) for key in (*count_keys, *cost_keys, "cpa_ratio")]
+        if conversions is not None:
+            assert all(value is not None for value in shown), shown
+            continue
+        assert shown == [None] * len(shown)
+        for key in (*count_keys, *cost_keys):
+            assert item.evidence.metric(key).to_json()["unavailable"] is True, key
 
 
 def test_k3_evidence_shows_quality_score_cpc_and_cost_per_conversion_by_half(
@@ -1361,7 +1507,7 @@ def test_k3_evidence_shows_quality_score_cpc_and_cost_per_conversion_by_half(
             keyword = _keyword(run.ctx, item.entity_ref.name)
             halves = _halves(run.ctx, keyword)
             # The ratio is shown to four places: within half a unit of the fourth place.
-            shown = _exact(_metric(item, "cpc_ratio"))
+            shown = _exact(evidence_metric(item, "cpc_ratio"))
             assert abs(shown - halves.cpc_ratio) <= Fraction(1, 20_000)
             for key in ("cpc_first_half", "cpc_second_half"):
                 assert item.evidence.metric(key).value is not None, f"{name}: {key} unavailable"
@@ -1377,15 +1523,15 @@ def test_k3_evidence_shows_quality_score_cpc_and_cost_per_conversion_by_half(
                 # unavailable only when the half's conversions are unreported.
                 cost = item.evidence.metric(key)
                 assert cost.unit == "currency"
-                half_conversions = _metric(item, conversions_key)
+                half_conversions = evidence_metric(item, conversions_key)
                 if half_conversions == 0:
                     assert cost.value == "—", f"{name}: {key}"
                     assert "unavailable" not in cost.to_json()
                 elif half_conversions is None:
                     assert cost.to_json()["unavailable"] is True, f"{name}: {key}"
-            assert _metric(item, "clicks_first_half") + _metric(item, "clicks_second_half") == (
-                _metric(item, "clicks")
-            )
+            assert evidence_metric(item, "clicks_first_half") + evidence_metric(
+                item, "clicks_second_half"
+            ) == evidence_metric(item, "clicks")
             first, second = run.ctx.window.halves()
             assert item.evidence.extra["halves"] == {
                 "first": {"start": first[0], "end": first[1]},
@@ -1448,17 +1594,30 @@ def test_search_term_coverage_below_80_percent_flags_every_keyword_item(
 
 
 def _all_keyword_runs(make_context: ContextFactory) -> Iterator[_Run]:
-    """Every scenario of this module, then the default world."""
+    """Every scenario of this module, the default world, then one item with unknown conversions.
+
+    The last run is ``k3.qs_drop.fires`` with its keyword's conversions unreported on the
+    window's first day: K1 and K2 items show search-term conversions, which are always a number,
+    so only a K3 item, reading its keyword's daily conversions, can carry unknown conversions.
+    """
     for scenario in _MODULE_SCENARIOS:
         yield _run(make_context, scenario)
     yield _run(make_context, _DEFAULT_SCENARIO)
+    qs_drop = _run(make_context, "k3.qs_drop.fires")
+    _, keyword = _k3_target(qs_drop)
+    yield _keyword_conversions(qs_drop, keyword, qs_drop.ctx.window.start, None)
 
 
 def test_every_keyword_item_shows_term_spend_conversions_cost_and_its_window(
     make_context: ContextFactory,
 ) -> None:
-    """Output fields: term, spend, conversions, cost/conversion and reason, campaign, ad group."""
+    """Output fields: term, spend, conversions, cost/conversion and reason, campaign, ad group.
+
+    Cost/conversion shows "—" at a known 0 conversions, a number above it, and unavailable only
+    when conversions are unreported; each of the three is met by at least one item.
+    """
     seen: set[str] = set()
+    branches: set[str] = set()
     for run in _all_keyword_runs(make_context):
         ctx = run.ctx
         google = [account for account in ctx.accounts.values() if account.source == "google"]
@@ -1471,21 +1630,24 @@ def test_every_keyword_item_shows_term_spend_conversions_cost_and_its_window(
             evidence = item.evidence
             keys = tuple(metric.key for metric in evidence.metrics[: len(_OUTPUT_FIELDS)])
             assert keys == _OUTPUT_FIELDS, f"{what}: leading metrics {keys}"
-            assert _metric(item, "term") == item.entity_ref.name
+            assert evidence_metric(item, "term") == item.entity_ref.name
             assert evidence.metric("spend").unit == "currency"
             assert evidence.metric("spend").currency == google[0].currency
             assert item.reason.strip(), f"{what}: empty reason"
-            conversions = _metric(item, "conversions")
+            conversions = evidence_metric(item, "conversions")
             cost = evidence.metric("cost_per_conversion")
             if conversions == 0:
                 # A known zero denominator renders "—", never "unavailable".
                 assert cost.value == "—"
                 assert "unavailable" not in cost.to_json()
+                branches.add("known_zero")
             elif conversions is not None:
                 assert cost.value is not None
+                branches.add("converting")
             else:
                 # Unreported conversions alone leave the cost/conversion unavailable.
                 assert cost.to_json()["unavailable"] is True
+                branches.add("unreported")
             extra = evidence.extra
             assert extra["campaign"], f"{what}: campaign or ad group missing"
             assert extra["ad_group"], f"{what}: campaign or ad group missing"
@@ -1503,10 +1665,11 @@ def test_every_keyword_item_shows_term_spend_conversions_cost_and_its_window(
             assert item.decision_subject is None, "keyword items offer Mark done, not decisions"
             assert item.increases_spend_on == ()
     assert seen == set(_KEYWORD_RULES)
+    assert branches == {"known_zero", "converting", "unreported"}
 
 
 def _spend(item: Candidate) -> Fraction:
-    return _exact(_metric(item, "spend"))
+    return _exact(evidence_metric(item, "spend"))
 
 
 def test_keyword_items_are_ranked_by_their_rule_order(make_context: ContextFactory) -> None:
@@ -1515,7 +1678,7 @@ def test_keyword_items_are_ranked_by_their_rule_order(make_context: ContextFacto
     orders: dict[str, Callable[[Candidate], tuple[Any, ...]]] = {
         K1: lambda item: (-_spend(item), item.entity_ref.name),
         K2: lambda item: (
-            -_exact(_metric(item, "conversions")),
+            -_exact(evidence_metric(item, "conversions")),
             Fraction(_term_row(run.ctx, item.entity_ref.name).cost)
             / Fraction(_term_row(run.ctx, item.entity_ref.name).conversions),
             item.entity_ref.name,
@@ -1529,7 +1692,7 @@ def test_keyword_items_are_ranked_by_their_rule_order(make_context: ContextFacto
         expected = [item.entity_ref.name for item in sorted(items, key=order)]
         assert ranked == expected, f"{rule} ranking"
     k2 = sorted(run.items(K2), key=lambda c: c.sort_key)
-    conversions = [_exact(_metric(item, "conversions")) for item in k2]
+    conversions = [_exact(evidence_metric(item, "conversions")) for item in k2]
     assert len(set(conversions)) < len(conversions), "a conversions tie exercises the CPA order"
 
 
