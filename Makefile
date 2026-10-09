@@ -22,8 +22,8 @@
 #                       empty means the default
 #   APP_URL             origin of the web service that up/e2e poll and Playwright targets
 #   HEALTH_TIMEOUT      seconds up/e2e wait for /api/v1/healthz to answer 200
-#   TEST_DB_PORT        host port of the disposable test database (127.0.0.1 only)
-#   TEST_DATABASE_URL   database the backend tests use (read by backend/tests/conftest.py)
+#   TEST_DB_PORT        127.0.0.1 port of the disposable test database (default 55432); 0 lets
+#                       Docker choose a free port. make test points TEST_DATABASE_URL at it
 #   PYTEST_ARGS         extra pytest arguments for `make test`, such as tests/unit
 #   PLAYWRIGHT_INSTALL  browser install step of `make e2e`; empty skips it
 #   ADMIN_EMAIL         e2e login, the APP_ADMIN_EMAIL of .env
@@ -72,14 +72,21 @@ ENGINE_MIN := 29
 # Pinned by tag, never `latest`.
 GITLEAKS_IMAGE := zricethezav/gitleaks:v8.30.1
 
-# The disposable database of `make test`: published on 127.0.0.1 only and removed, with its
-# anonymous volume, whenever the recipe ends. TEST_DATABASE_URL is exported, never written into
-# a command line, so a URL carrying a real password stays out of process listings.
+# The disposable database of `make test`. Every run creates its own container, named
+# TEST_DB_NAME-<random token> and labelled TEST_DB_LABEL=<token>, and removes, with its anonymous
+# volume, only what carries that token: it never adopts or deletes a container it did not create,
+# so concurrent runs cannot share or remove each other's database. It is published on
+# 127.0.0.1:TEST_DB_PORT only (0 lets Docker choose a free port; a port in use fails the run).
+# The recipe exports TEST_DATABASE_URL for the port Docker actually bound, replacing any
+# inherited value, because the tests drop and recreate schema public in that database; the URL
+# is never written into a command line. TEST_DB_PORT is exported and read by the recipe as data,
+# never pasted into its shell source. TEST_DB_READY_TIMEOUT is wall-clock seconds.
 TEST_DB_IMAGE := postgres:18.6
 TEST_DB_PORT ?= 55432
+export TEST_DB_PORT
 TEST_DB_NAME := ads-engine-testdb
-TEST_DATABASE_URL ?= postgresql+psycopg://ads:ads@localhost:$(TEST_DB_PORT)/ads_engine_test
-export TEST_DATABASE_URL
+TEST_DB_LABEL := com.ads-engine.make-test
+TEST_DB_READY_TIMEOUT := 60
 
 ADMIN_EMAIL ?= admin@example.com
 APP_URL ?= http://localhost:8080
@@ -336,37 +343,220 @@ seed-simulated: ## Seed simulated datasets for every source and compute the defa
 # run with `uv run --frozen` here and in lint, so a run never re-resolves or rewrites uv.lock:
 # the lock is used exactly as committed, as `uv sync --frozen` installed it.
 test: ## Backend tests on a disposable postgres:18.6 (always removed), then the web unit tests
-	@remove_test_db() {
+	@test_db_port=''
+	case "$${TEST_DB_PORT:-}" in
+		'' | *[!0-9]*) ;;
+		*)
+			# Leading zeros are dropped first, so no digit string can overflow bash arithmetic
+			# or be read as octal.
+			port_digits="$${TEST_DB_PORT#"$${TEST_DB_PORT%%[!0]*}"}"
+			if [ "$${#port_digits}" -le 5 ] && [ "$$(( $${port_digits:-0} ))" -le 65535 ]; then
+				test_db_port="$$(( $${port_digits:-0} ))"
+			fi
+			;;
+	esac
+	if [ -z "$$test_db_port" ]; then
+		echo "TEST_DB_PORT must be a port number from 0 to 65535 (0 lets Docker choose a free port), not '$${TEST_DB_PORT:-}'" >&2
+		exit 1
+	fi
+	if [ "$$test_db_port" -eq 0 ]; then
+		requested_endpoint='127.0.0.1 (a free port Docker chooses)'
+	else
+		requested_endpoint="127.0.0.1:$$test_db_port"
+	fi
+	# A random token per run names and labels the container, so neither a concurrent run nor a
+	# container something else called $(TEST_DB_NAME) can be taken for this run's database.
+	token="$$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+	case "$$token" in
+		*[!0-9a-f]*) token='' ;;
+	esac
+	if [ "$${#token}" -ne 16 ]; then
+		echo "Could not read 8 random bytes from /dev/urandom for the test database name" >&2
+		exit 1
+	fi
+	db_name='$(TEST_DB_NAME)'"-$$token"
+	db_label='$(TEST_DB_LABEL)'"=$$token"
+	# The cleanup state is set and the traps are installed before anything is created: from
+	# here on every exit, Ctrl-C included, removes what this run created and nothing else.
+	db_id=''
+	db_volumes=''
+	create_attempted=0
+	# Adds the anonymous volumes of container $$1 to db_volumes, once each.
+	record_volumes() {
+		volume_format='{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}'
+		mounts="$$(docker container inspect --format "$$volume_format" "$$1")" || return 1
+		for vol in $$mounts; do
+			case " $$db_volumes " in
+				*" $$vol "*) ;;
+				*) db_volumes="$${db_volumes:+$$db_volumes }$$vol" ;;
+			esac
+		done
+	}
+	# Succeeds only when Docker reports the object absent: $$1 is container or volume, $$2 its
+	# ID or name. An existing object, or any other error such as an unreachable daemon, leaves
+	# the removal unconfirmed; absent_error then says why.
+	is_absent() {
+		if absent_error="$$(docker "$$1" inspect "$$2" 2>&1 >/dev/null)"; then
+			absent_error='it still exists'
+			return 1
+		fi
+		case "$$(printf '%s' "$$absent_error" | tr '[:upper:]' '[:lower:]')" in
+			*"no such $$1"*) return 0 ;;
+			*) return 1 ;;
+		esac
+	}
+	# Runs the removal command that follows $$1 (container or volume) and $$2 (its ID or name),
+	# then succeeds once Docker reports the object absent. The container is created with --rm,
+	# so once it stops the daemon removes it itself: a second removal is refused as already in
+	# progress, and the anonymous volume goes only after the container. An object still there
+	# is therefore re-checked, and its removal retried, once a second until removal_deadline,
+	# a wall-clock time as in the readiness wait. It fails when the object still exists or is
+	# still unconfirmed (an unreachable daemon, say) at the deadline, with removal_error
+	# holding the last attempt's error. A first check that confirms the removal ends it at once.
+	remove_until_absent() {
+		removal_kind="$$1"
+		removal_name="$$2"
+		shift 2
+		removal_error="$$("$$@" 2>&1 >/dev/null)" || true
+		until is_absent "$$removal_kind" "$$removal_name"; do
+			# A clock that cannot be read counts as no time left, so the wait always ends.
+			if ! [ "$$(date +%s)" -lt "$$removal_deadline" ] 2>/dev/null; then
+				return 1
+			fi
+			sleep 1
+			removal_error="$$("$$@" 2>&1 >/dev/null)" || true
+		done
+	}
+	# Removes only this run's containers: the ID docker create printed and any container with
+	# this run's label, which covers one created just before a Ctrl-C stopped its ID being
+	# recorded. An owned container already gone counts as removed; anything left, or not
+	# confirmed gone, when the removal wait ends is reported with the command that removes it
+	# and fails the run, keeping a failing test status. Each docker command's failure is
+	# handled where it runs (if or ||), so errexit cannot cut the cleanup short.
+	remove_test_db() {
 		status=$$?
-		docker rm --force --volumes '$(TEST_DB_NAME)' >/dev/null 2>&1 || true
-		echo "Removed the test database container $(TEST_DB_NAME)"
+		if [ "$$create_attempted" -eq 0 ]; then
+			exit "$$status"
+		fi
+		cleanup_failed=0
+		owned_ids="$$db_id"
+		if labelled_ids="$$(docker container ls --all --quiet --no-trunc --filter "label=$$db_label")"; then
+			for id in $$labelled_ids; do
+				case " $$owned_ids " in
+					*" $$id "*) ;;
+					*) owned_ids="$${owned_ids:+$$owned_ids }$$id" ;;
+				esac
+			done
+		else
+			echo "Could not list the containers labelled $$db_label; one may remain" >&2
+			echo "  find them with: docker container ls --all --filter label=$$db_label" >&2
+			cleanup_failed=1
+		fi
+		# One 10-second window covers every container and volume, so the cleanup ends about
+		# 10 s from here whatever remains; a clock that cannot be read leaves no wait.
+		removal_deadline=$$(( $$(date +%s) + 10 )) || removal_deadline=0
+		for id in $$owned_ids; do
+			record_volumes "$$id" 2>/dev/null || true
+			if ! remove_until_absent container "$$id" docker rm --force --volumes "$$id"; then
+				echo "Could not confirm the removal of the test database container $$db_name ($$id): $$absent_error" >&2
+				if [ -n "$$removal_error" ]; then echo "  docker rm: $$removal_error" >&2; fi
+				echo "  remove it with: docker rm --force --volumes $$id" >&2
+				cleanup_failed=1
+			fi
+		done
+		for vol in $$db_volumes; do
+			if is_absent volume "$$vol"; then continue; fi
+			if ! remove_until_absent volume "$$vol" docker volume rm "$$vol"; then
+				echo "Could not confirm the removal of the test database volume $$vol: $$absent_error" >&2
+				if [ -n "$$removal_error" ]; then echo "  docker volume rm: $$removal_error" >&2; fi
+				echo "  remove it with: docker volume rm $$vol" >&2
+				cleanup_failed=1
+			fi
+		done
+		if [ "$$cleanup_failed" -ne 0 ]; then
+			if [ "$$status" -eq 0 ]; then status=1; fi
+		elif [ -n "$$owned_ids" ]; then
+			case "$$db_volumes" in
+				'') removed_volumes='' ;;
+				*' '*) removed_volumes=' and its volumes' ;;
+				*) removed_volumes=' and its volume' ;;
+			esac
+			echo "Removed the test database container $$db_name$$removed_volumes"
+		fi
 		exit "$$status"
 	}
 	trap remove_test_db EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
-	db_state="$$(docker container inspect --format '{{.State.Running}}' '$(TEST_DB_NAME)' 2>/dev/null || true)"
-	if [ "$$db_state" = true ]; then
-		echo "Reusing the running $(TEST_DB_NAME); it is removed when the tests finish"
-	else
-		if [ -n "$$db_state" ]; then docker rm --force --volumes '$(TEST_DB_NAME)' >/dev/null; fi
-		db_args=(run --detach --rm --name '$(TEST_DB_NAME)')
-		db_args+=(--env POSTGRES_USER=ads --env POSTGRES_PASSWORD=ads --env POSTGRES_DB=ads_engine_test)
-		db_args+=(--publish '127.0.0.1:$(TEST_DB_PORT):5432' '$(TEST_DB_IMAGE)')
-		echo "Starting $(TEST_DB_NAME) ($(TEST_DB_IMAGE)) on 127.0.0.1:$(TEST_DB_PORT)"
-		docker "$${db_args[@]}" >/dev/null
+	db_args=(create --rm --name "$$db_name" --label "$$db_label")
+	db_args+=(--env POSTGRES_USER=ads --env POSTGRES_PASSWORD=ads --env POSTGRES_DB=ads_engine_test)
+	db_args+=(--publish "127.0.0.1:$$test_db_port:5432" '$(TEST_DB_IMAGE)')
+	echo "Creating $$db_name ($(TEST_DB_IMAGE)) on $$requested_endpoint"
+	create_attempted=1
+	if ! db_id="$$(docker "$${db_args[@]}")"; then
+		db_id=''
+		echo "Could not create $$db_name from $(TEST_DB_IMAGE)" >&2
+		exit 1
 	fi
+	case "$$db_id" in
+		'' | *[!0-9a-f]*)
+			echo "docker create printed '$$db_id' instead of the ID of $$db_name" >&2
+			db_id=''
+			exit 1
+			;;
+	esac
+	if ! record_volumes "$$db_id"; then
+		echo "Could not read the volumes of $$db_name" >&2
+		exit 1
+	fi
+	if ! docker start "$$db_id" >/dev/null; then
+		echo "Could not start $$db_name on $$requested_endpoint; if the port is in use, set TEST_DB_PORT to a free port, or TEST_DB_PORT=0 to let Docker choose one" >&2
+		exit 1
+	fi
+	# Docker reports the address it bound; with TEST_DB_PORT=0 that is the only way to learn it.
+	if ! db_bindings="$$(docker port "$$db_id" 5432/tcp)"; then
+		echo "Could not read the port Docker published for $$db_name" >&2
+		exit 1
+	fi
+	db_port=''
+	for binding in $$db_bindings; do
+		case "$$binding" in
+			127.0.0.1:*) db_port="$${binding#127.0.0.1:}" ;;
+		esac
+	done
+	case "$$db_port" in
+		*[!0-9]*) db_port='' ;;
+	esac
+	if [ -z "$$db_port" ] || { [ "$$test_db_port" -ne 0 ] && [ "$$db_port" -ne "$$test_db_port" ]; }; then
+		echo "$$db_name is not published on $$requested_endpoint (docker port reported: $${db_bindings:-nothing})" >&2
+		exit 1
+	fi
+	# The tests drop and recreate schema public, so they must reach this container and nothing
+	# else: the URL replaces any inherited TEST_DATABASE_URL, and it names 127.0.0.1, where the
+	# port is published, rather than localhost, which may resolve to ::1 and another server.
+	export TEST_DATABASE_URL="postgresql+psycopg://ads:ads@127.0.0.1:$$db_port/ads_engine_test"
+	echo "Backend tests use $$db_name on 127.0.0.1:$$db_port"
 	# TCP readiness (-h 127.0.0.1): the image's first-run initialisation server listens on the
 	# socket only, so a socket probe could report ready before the final server starts.
-	waited=0
-	until docker exec '$(TEST_DB_NAME)' pg_isready -q -h 127.0.0.1 -U ads -d ads_engine_test; do
-		if [ "$$waited" -ge 60 ]; then
-			echo "$(TEST_DB_NAME) did not accept connections within 60 s" >&2
-			docker logs --tail 50 '$(TEST_DB_NAME)' >&2 || true
+	# The deadline is wall-clock time, as in STACK_UP, so slow probes count against it: each
+	# probe's connection timeout (-t) and each pause are capped by the time that remains, and
+	# the timeout never reaches 0, which pg_isready reads as "wait forever".
+	echo "Waiting up to $(TEST_DB_READY_TIMEOUT) s for $$db_name to accept connections"
+	deadline=$$(( $$(date +%s) + $(TEST_DB_READY_TIMEOUT) ))
+	while :; do
+		remaining=$$(( deadline - $$(date +%s) ))
+		if [ "$$remaining" -le 0 ]; then
+			echo "$$db_name did not accept connections within $(TEST_DB_READY_TIMEOUT) s" >&2
+			docker logs --tail 50 "$$db_id" >&2 || true
 			exit 1
 		fi
-		sleep 1
-		waited=$$((waited + 1))
+		probe_timeout=$$(( remaining < 3 ? remaining : 3 ))
+		if docker exec "$$db_id" pg_isready -q -t "$$probe_timeout" -h 127.0.0.1 -U ads -d ads_engine_test; then
+			break
+		fi
+		if [ "$$(( deadline - $$(date +%s) ))" -gt 0 ]; then
+			sleep 1
+		fi
 	done
 	echo "Backend: uv sync --frozen, then uv run --frozen pytest$(if $(strip $(PYTEST_ARGS)), $(PYTEST_ARGS))"
 	(cd backend && uv sync --frozen && uv run --frozen pytest $(PYTEST_ARGS))

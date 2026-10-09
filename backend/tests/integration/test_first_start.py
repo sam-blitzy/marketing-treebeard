@@ -15,7 +15,9 @@ a browser; this module proves the backend half in process:
   naming the variable, without a hash.
 * **Environment defaults** (AAP 0.6.2; AAP 0.3.3 "A blank value is read as unset"): blank
   values take the documented defaults and blank secrets count as unset, and ``.env.example``
-  lists exactly the variables ``Settings`` reads, with empty secrets and the code defaults.
+  lists exactly the variables ``Settings`` reads, with empty secrets and the code defaults,
+  plus the ``POSTGRES_*`` values and resource limits only Compose reads, the limits at their
+  ``docker-compose.yml`` defaults.
 * **Worker startup with no credentials**: every source simulated with an active dataset (and
   the companion CRM dataset of simulated LinkedIn) whose freshness is recorded; one baseline
   decision per subject in its shape and no discrepancy; the content-asset tables equal to
@@ -40,6 +42,7 @@ to :data:`BACKFILL_DAYS` to keep each startup to seconds rather than minutes.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -123,6 +126,9 @@ BACKEND_DIR: Final = Path(__file__).resolve().parents[2]
 ENV_EXAMPLE: Final = BACKEND_DIR.parent / ".env.example"
 """The root environment template ``make init`` copies to ``.env``."""
 
+COMPOSE_FILE: Final = BACKEND_DIR.parent / "docker-compose.yml"
+"""The root Compose file, whose ``deploy.resources.limits`` defaults the template repeats."""
+
 CONTENT_ASSETS_FILE: Final = BACKEND_DIR.parent / "config" / "content_assets.yaml"
 """The white paper registry the worker's startup loads into the content-asset tables."""
 
@@ -192,6 +198,24 @@ TEMPLATE_SECRETS: Final[frozenset[str]] = frozenset(
 )
 """Secrets that must be empty in ``.env.example`` (AAP 0.3.3 "Secrets handling")."""
 
+# Compose alone reads these, as each service's deploy.resources.limits ceiling; no process does,
+# so they are not Settings fields. The template carries the docker-compose.yml defaults.
+TEMPLATE_RESOURCE_LIMITS: Final[frozenset[str]] = frozenset(
+    {
+        "DB_CPU_LIMIT",
+        "DB_MEMORY_LIMIT",
+        "MIGRATE_CPU_LIMIT",
+        "MIGRATE_MEMORY_LIMIT",
+        "API_CPU_LIMIT",
+        "API_MEMORY_LIMIT",
+        "WORKER_CPU_LIMIT",
+        "WORKER_MEMORY_LIMIT",
+        "WEB_CPU_LIMIT",
+        "WEB_MEMORY_LIMIT",
+    }
+)
+"""The Compose-only resource limits ``.env.example`` lists (AAP 0.3.3 "lists every variable")."""
+
 SOURCE_SETTINGS: Final[tuple[str, ...]] = (
     "N8N_GOOGLE_ADS_WEBHOOK_URL",
     "N8N_WEBHOOK_SECRET",
@@ -210,6 +234,10 @@ SOURCE_SETTINGS: Final[tuple[str, ...]] = (
 # hubspot.google_contacts is written only when both Google CRM properties are configured and
 # verified (AAP 0.3.3), which a first start without credentials never has.
 _UNCONFIGURED_DATASETS: Final[frozenset[str]] = frozenset({"hubspot.google_contacts"})
+
+# A Compose interpolation with a default, `${NAME:-default}`: the shell, then .env, then the
+# default, which also applies when the variable is blank.
+_COMPOSE_INTERPOLATION: Final = re.compile(r"\$\{(?P<name>[A-Z][A-Z0-9_]*):-(?P<default>[^}]*)\}")
 
 # ---------------------------------------------------------------------------------------------
 # Logging isolation
@@ -346,6 +374,25 @@ def _parse_env_file(path: Path) -> dict[str, str]:
             value = value[1:-1]
         entries[key] = value
     return entries
+
+
+def _compose_limit_defaults(path: Path) -> dict[str, str]:
+    """Read every service's ``deploy.resources.limits`` in ``path``: variable -> Compose default.
+
+    Each limit must be a single ``${NAME:-default}`` interpolation, so ``.env`` can set it and a
+    blank value keeps the default, and no variable may set two limits.
+    """
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    defaults: dict[str, str] = {}
+    for service, spec in document["services"].items():
+        limits = ((spec.get("deploy") or {}).get("resources") or {}).get("limits") or {}
+        for limit, raw in limits.items():
+            match = _COMPOSE_INTERPOLATION.fullmatch(str(raw))
+            assert match, f"{path.name}: {service} {limit} {raw!r} is not ${{NAME:-default}}"
+            name = match["name"]
+            assert name not in defaults, f"{path.name}: {name} sets more than one limit"
+            defaults[name] = match["default"]
+    return defaults
 
 
 def _registry() -> dict[str, tuple[str, list[str], list[str]]]:
@@ -543,23 +590,40 @@ def test_blank_values_fall_back_to_defaults(set_env: SetEnv, blank: str) -> None
 
 
 def test_env_example_matches_settings(set_env: SetEnv) -> None:
-    """``.env.example`` lists exactly the variables ``Settings`` reads, with safe values.
+    """``.env.example`` lists every variable: those ``Settings`` reads and Compose's own.
 
-    Every key but the ``POSTGRES_*`` values of the ``db`` service is a ``Settings`` field and
-    every field is listed; each non-empty value is the code default (except the pinned n8n
-    header name); every secret is empty; ``DATABASE_URL`` matches the ``POSTGRES_*`` values;
-    and the template alone loads into settings with no source credentials, which is the first
-    start of AAP 0.11.2.
+    Every key but the ``POSTGRES_*`` values of the ``db`` service and the Compose-only resource
+    limits is a ``Settings`` field and every field is listed; each non-empty value is the code
+    default (except the pinned n8n header name); the resource limits are exactly
+    :data:`TEMPLATE_RESOURCE_LIMITS`, the variables of every ``deploy.resources.limits`` in
+    ``docker-compose.yml``, each at its Compose default; every secret is empty;
+    ``DATABASE_URL`` matches the ``POSTGRES_*`` values; and the template alone, resource limits
+    included, loads into settings with no source credentials, which is the first start of
+    AAP 0.11.2.
     """
     entries = _parse_env_file(ENV_EXAMPLE)
     postgres = {key: value for key, value in entries.items() if key.startswith("POSTGRES_")}
-    template = {key: value for key, value in entries.items() if key not in postgres}
+    resources = {
+        key: value
+        for key, value in entries.items()
+        if key.endswith(("_CPU_LIMIT", "_MEMORY_LIMIT"))
+    }
+    template = {
+        key: value for key, value in entries.items() if key not in postgres and key not in resources
+    }
     fields = Settings.model_fields
     env_names = {name.upper() for name in fields}
 
     assert sorted(template.keys() - env_names) == [], "template keys Settings does not read"
     assert sorted(env_names - template.keys()) == [], "Settings fields missing from the template"
     assert sorted(postgres) == ["POSTGRES_DB", "POSTGRES_PASSWORD", "POSTGRES_USER"]
+
+    compose_defaults = _compose_limit_defaults(COMPOSE_FILE)
+    assert sorted(resources) == sorted(TEMPLATE_RESOURCE_LIMITS), "template resource limits"
+    assert sorted(compose_defaults) == sorted(TEMPLATE_RESOURCE_LIMITS), "Compose resource limits"
+    for key, value in resources.items():
+        expected = compose_defaults[key]
+        assert value == expected, f"{key}: template {value!r}, Compose default {expected!r}"
 
     for key, value in template.items():
         if not value:
@@ -587,7 +651,7 @@ def test_env_example_matches_settings(set_env: SetEnv) -> None:
         f"@db:5432/{postgres['POSTGRES_DB']}"
     )
 
-    set_env(**template)
+    set_env(**template, **resources)
     loaded = get_settings()
     assert loaded.data_mode == "auto"
     assert (

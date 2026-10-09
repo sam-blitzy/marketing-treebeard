@@ -202,6 +202,16 @@ from `.env.example`.
 | `DATA_MODE` | Runtime | `auto` | No | `migrate`, `api`, `worker` | `auto`: each source live, with automatic simulated fallback. `simulated`: every source simulated, never probed |
 | `MOCK_SEED` | Runtime | `42` | No | `worker` | Seed of the simulated world, so simulated data reproduces exactly |
 | `BACKFILL_DAYS` | Runtime | `180` | No | `worker` | Initial backfill of every new dataset, in days; capped at 180 for every source (LinkedIn's 6-month daily retention) |
+| `DB_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `db`, in cores ([Resource limits](#resource-limits)) |
+| `DB_MEMORY_LIMIT` | Resources | `1g` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `db` |
+| `MIGRATE_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `migrate`, in cores |
+| `MIGRATE_MEMORY_LIMIT` | Resources | `512m` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `migrate` |
+| `API_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `api`, in cores |
+| `API_MEMORY_LIMIT` | Resources | `1g` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `api` |
+| `WORKER_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `worker`, in cores |
+| `WORKER_MEMORY_LIMIT` | Resources | `2g` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `worker` |
+| `WEB_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `web`, in cores |
+| `WEB_MEMORY_LIMIT` | Resources | `256m` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `web` |
 | `N8N_GOOGLE_ADS_WEBHOOK_URL` | Google | Unset | Sensitive, never logged | `worker` | Production URL of the existing n8n webhook. Must be `https://` except on `localhost` or `127.0.0.1` |
 | `N8N_WEBHOOK_SECRET_HEADER` | Google | `X-Webhook-Token` in `.env.example`; `X-Webhook-Secret` in code when blank | No | `worker` | Name of the header that carries the secret. Must equal the Name on the n8n Header Auth credential |
 | `N8N_WEBHOOK_SECRET` | Google | Unset | Yes | `worker` | Value of that header |
@@ -256,6 +266,48 @@ what each command needs.
 
   The scan reads committed history, not the working tree. A `gitleaks dir` scan of a working tree
   would also report the gitignored `.env` by design.
+
+### Resource limits
+
+Each service runs under a CPU and memory ceiling, `deploy.resources.limits` in
+`docker-compose.yml`. The limits are Compose variables, not product settings: `.env.example` lists
+them with the defaults below and no process reads them. Compose takes each one from the shell,
+else from `.env`, else the default below; a blank value keeps the default.
+
+| Service | CPU variable | CPU default | Memory variable | Memory default |
+|---------|--------------|-------------|-----------------|----------------|
+| `db` | `DB_CPU_LIMIT` | `1` | `DB_MEMORY_LIMIT` | `1g` |
+| `migrate` | `MIGRATE_CPU_LIMIT` | `1` | `MIGRATE_MEMORY_LIMIT` | `512m` |
+| `api` | `API_CPU_LIMIT` | `1` | `API_MEMORY_LIMIT` | `1g` |
+| `worker` | `WORKER_CPU_LIMIT` | `1` | `WORKER_MEMORY_LIMIT` | `2g` |
+| `web` | `WEB_CPU_LIMIT` | `1` | `WEB_MEMORY_LIMIT` | `256m` |
+
+- **Ceilings, not reservations**: an idle service holds nothing back. The memory defaults leave
+  several times the peak use of a simulated first start with a 180-day backfill and a 180-day
+  custom run. That start takes as long under the 1-core CPU defaults as with no limits: the worker
+  is one Python process that peaks at about one core, and PostgreSQL at about a tenth of one.
+- **CPU** is a number of cores and may be fractional (`0.5`). The 1-core defaults run on any host
+  Docker supports. Docker refuses to create a container whose value exceeds the CPUs it reports
+  (`docker info --format '{{.NCPU}}'`).
+- **Memory** is a size with a `k`, `m` or `g` suffix (`1536m`). An invalid size stops Compose
+  before any container starts. A service that exceeds its ceiling is killed with exit code 137
+  ([Troubleshooting](#troubleshooting)).
+- **One worker**: a higher limit gives the worker more room and never adds a second worker
+  process; the scheduler's advisory lock keeps a single active instance
+  ([Locks](architecture.md#locks)).
+
+To raise a limit, set its variable in `.env`, then run `docker compose up -d`, which recreates the
+services whose configuration changed. `docker inspect` shows the values in force, CPU in
+billionths of a core and memory in bytes:
+
+```dotenv
+WORKER_MEMORY_LIMIT=3g
+```
+
+```bash
+docker compose up -d
+docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$(docker compose ps -q worker)"
+```
 
 ## Connecting sources
 
@@ -558,6 +610,7 @@ How the freshness rows turn into item flags:
 | The worker exits at startup with `worker_config_invalid` | A configuration rule failed, for example `window.presets` lacks `window.default_days`, or a lead form or creative is listed under two assets | Fix the YAML named in the log, then `docker compose restart worker api` |
 | A card shows "Computed from replaced data", or an action answers 409 `subject_retired` | The item was computed from a dataset that has since been replaced | Wait for the rerun the activation queued, then reload |
 | `ads-engine analyze` exits 3, or a custom window answers 409 `run_in_progress` | Another run holds the shared analysis lock | Wait and retry |
+| A service keeps restarting under load, or `migrate` shows "Exited (137)" in `docker compose ps --all` | The service exceeded its memory ceiling and was killed. `docker events --since 1h --until 0s --filter event=oom` names each killed container. `docker inspect --format '{{.State.OOMKilled}}' <container>` prints `true` for `migrate`, but for a restarted service only until Docker starts it again | Raise that service's `<SERVICE>_MEMORY_LIMIT` in `.env`, for example `WORKER_MEMORY_LIMIT=3g` ([Resource limits](#resource-limits)), then run `docker compose up -d` |
 | Port 8080 is already in use | Another service on the host | Publish another host port with a `docker-compose.override.yml` as in [Hosting beyond localhost](#hosting-beyond-localhost), for example `"127.0.0.1:8081:8080"`, set `APP_BASE_URL=http://localhost:8081`, and run `make up APP_URL=http://localhost:8081` |
 
 ## Operating commands
@@ -771,13 +824,18 @@ and computes the first default run.
 These targets run tools on the host, so they need uv, Python and Node in addition to Docker
 ([Prerequisites](#prerequisites)).
 
-- **`make test`**: starts a disposable `postgres:18.6` container named `ads-engine-testdb` on
-  `127.0.0.1:55432` (`TEST_DB_PORT`), runs the backend tests (`uv sync --frozen`, then
+- **`make test`**: starts a disposable `postgres:18.6` container of its own, named
+  `ads-engine-testdb-<random token>`, on `127.0.0.1:TEST_DB_PORT` (default 55432;
+  `TEST_DB_PORT=0` lets Docker pick a free port, so several checkouts can run it at once) and
+  points `TEST_DATABASE_URL` at it. It runs the backend tests (`uv sync --frozen`, then
   `uv run --frozen pytest`), runs the web unit tests (`npm ci`, then `npm test`), and always
-  removes the test database. It never touches the stack's database.
+  removes the test database and its volume. A port already in use fails the run. It never reuses
+  or removes a container it did not create, and it fails when it cannot confirm that its own was
+  removed, printing the command that removes what is left. It never touches the stack's database.
 
   ```bash
   make test TEST_DB_PORT=55433 PYTEST_ARGS=tests/unit
+  make test TEST_DB_PORT=0
   ```
 
 - **`make lint`**: `ruff format --check`, `ruff check` and `mypy --strict src` for the backend;
@@ -812,11 +870,11 @@ at the first failing command.
 | `down` | `docker compose down`: stops and removes the containers and keeps the `pgdata` volume |
 | `migrate` | Requires `.env`; `docker compose run --rm migrate`, which runs `ads-engine migrate && ads-engine ensure-admin` |
 | `seed-simulated` | Requires `.env`; `docker compose run --rm migrate sh -c 'ads-engine migrate && ads-engine seed-simulated'` |
-| `test` | Backend pytest on a disposable `postgres:18.6` (`ads-engine-testdb` on `127.0.0.1:TEST_DB_PORT`, default 55432, always removed), then the web unit tests. `PYTEST_ARGS` passes extra pytest arguments |
+| `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; always removed, and a removal it cannot confirm fails the run; a container it did not create is never reused or removed), then the web unit tests. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
 | `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e`; leaves the stack running |
 | `secret-scan` | `zricethezav/gitleaks:v8.30.1` with `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
 
 Overridable variables, on the command line or in the environment: `COMPOSE` (default
 `docker compose`; add `-p` or `-f` flags here), `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`,
-`TEST_DATABASE_URL`, `PYTEST_ARGS`, `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD`.
+`PYTEST_ARGS`, `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD`.

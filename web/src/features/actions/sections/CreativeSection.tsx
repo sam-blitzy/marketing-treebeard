@@ -35,7 +35,7 @@ import type { ReactElement } from 'react';
 import type { Group } from '../../../api/types';
 import { DataTable, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
-import { NOT_APPLICABLE, formatCount, formatPercent } from '../../../lib/format';
+import { NOT_APPLICABLE, UNAVAILABLE, formatCount, formatPercent } from '../../../lib/format';
 import { RecommendationCard } from '../RecommendationCard';
 import { variants } from '../evidenceExtra';
 import type { VariantRow } from '../evidenceExtra';
@@ -55,24 +55,54 @@ import type { GroupParts, SectionComponentProps } from './SectionFrame';
 export const VARIANT_RATE_DIGITS = 2;
 
 /**
- * Formats one stage rate of a variant: a 0–1 ratio decimal string as a percentage at
- * {@link VARIANT_RATE_DIGITS} fraction digits (`"0.004377"` → `"0.44%"`).
+ * The text of a stage rate that applies but whose denominator is a known zero, such as the
+ * click rate of a variant with zero impressions: no rate exists to show, and it is not 0%. The
+ * same words as the backend's `creative.NOT_ESTIMABLE` for zero exposure (AAP 0.5.4.6).
+ */
+export const NOT_ESTIMABLE = 'not estimable';
+
+/**
+ * Formats one stage rate of a variant, telling a stage that does not apply apart from a rate
+ * that cannot be stated (AAP 0.5.4.6, AAP 0.11.1). In this order:
  *
- * `null` means the stage does not apply to the variant, such as the open and completion rates
- * of a campaign outside lead generation (AAP 0.5.4.6: non-lead-gen campaigns use only click
- * rate), so it renders {@link NOT_APPLICABLE} (`"n/a"`), never `"0%"`.
+ * 1. a stage that does not apply (`applies` is `false`: the open and completion rates of a
+ *    campaign outside lead generation, which uses only click rate) renders
+ *    {@link NOT_APPLICABLE} (`"n/a"`);
+ * 2. a rate renders as a percentage at {@link VARIANT_RATE_DIGITS} fraction digits
+ *    (`"0.004377"` → `"0.44%"`);
+ * 3. a missing rate whose denominator is a known zero (zero exposure) renders
+ *    {@link NOT_ESTIMABLE} (`"not estimable"`);
+ * 4. any other missing rate (unreported or inconsistent counts) renders `"unavailable"`.
+ *
+ * An unknown applicability (`applies` is `null`, the evidence names no objective) never yields
+ * `"n/a"`, and a missing rate never yields `"0%"`.
  *
  * @param rate - The rate as `variants()` read it: a ratio decimal string, or `null`.
- * @returns The formatted percentage, or `"n/a"`.
+ * @param applies - Whether the stage applies to the variant's campaign; `null` when unknown.
+ * @param denominator - The stage's own denominator (impressions for click and open rate, form
+ *   opens for completion rate); `null` when unreported.
+ * @returns The formatted percentage, `"n/a"`, `"not estimable"` or `"unavailable"`.
  *
  * @example
  * ```ts
- * formatVariantRate('0.395062'); // "39.51%"
- * formatVariantRate(null); // "n/a"
+ * formatVariantRate('0.395062', true, 162); // "39.51%"
+ * formatVariantRate(null, false, null); // "n/a"
+ * formatVariantRate(null, true, 0); // "not estimable"
+ * formatVariantRate(null, null, null); // "unavailable"
  * ```
  */
-export function formatVariantRate(rate: string | null): string {
-  return rate === null ? NOT_APPLICABLE : formatPercent(rate, VARIANT_RATE_DIGITS);
+export function formatVariantRate(
+  rate: string | null,
+  applies: boolean | null,
+  denominator: number | null,
+): string {
+  if (applies === false) {
+    return NOT_APPLICABLE;
+  }
+  if (rate !== null) {
+    return formatPercent(rate, VARIANT_RATE_DIGITS);
+  }
+  return denominator === 0 ? NOT_ESTIMABLE : UNAVAILABLE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -109,7 +139,11 @@ function keyedVariants(rows: readonly VariantRow[]): KeyedVariant[] {
  * The variants table's columns, in the order AAP 0.5.5 lists them: Creative (the row header),
  * Impressions, Click rate, Open rate, Completion rate and Leads. Numeric columns align to the
  * end. Counts render through `formatCount` (absent → "unavailable", never 0) and rates through
- * {@link formatVariantRate}.
+ * {@link formatVariantRate}, each against its own denominator: click rate applies to every
+ * objective, over impressions; open rate, over impressions, and completion rate, over form
+ * opens, apply as the variant's `leadGen` says. So a stage the campaign does not use renders
+ * "n/a", a missing rate over zero impressions or form opens "not estimable", and any other
+ * missing rate "unavailable".
  */
 const VARIANT_COLUMNS: readonly DataTableColumn<KeyedVariant>[] = [
   {
@@ -128,19 +162,21 @@ const VARIANT_COLUMNS: readonly DataTableColumn<KeyedVariant>[] = [
     key: 'click_rate',
     header: 'Click rate',
     align: 'end',
-    render: (row) => formatVariantRate(row.variant.clickRate),
+    render: (row) => formatVariantRate(row.variant.clickRate, true, row.variant.impressions),
   },
   {
     key: 'open_rate',
     header: 'Open rate',
     align: 'end',
-    render: (row) => formatVariantRate(row.variant.openRate),
+    render: (row) =>
+      formatVariantRate(row.variant.openRate, row.variant.leadGen, row.variant.impressions),
   },
   {
     key: 'completion_rate',
     header: 'Completion rate',
     align: 'end',
-    render: (row) => formatVariantRate(row.variant.completionRate),
+    render: (row) =>
+      formatVariantRate(row.variant.completionRate, row.variant.leadGen, row.variant.formOpens),
   },
   {
     key: 'leads',
@@ -164,9 +200,12 @@ export interface VariantsTableProps {
  *
  * A captioned `DataTable`, "Variants in {campaignName}", with one row per variant in stored
  * order and the columns Creative (row header), Impressions, Click rate, Open rate, Completion
- * rate and Leads. A rate that does not apply renders "n/a"; an absent count renders
- * "unavailable". The table states numbers only: which variant leads, and whether that lead is
- * distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
+ * rate and Leads. An open or completion rate of a campaign outside lead generation renders
+ * "n/a" (AAP 0.5.4.6: non-lead-gen campaigns use only click rate); a missing rate of a stage
+ * that applies, or whose applicability the evidence does not state, renders "not estimable"
+ * over a zero denominator and "unavailable" otherwise (AAP 0.11.1), never "n/a" or "0%"; an
+ * absent count renders "unavailable". The table states numbers only: which variant leads, and
+ * whether that lead is distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
  *
  * @param props - see {@link VariantsTableProps}
  * @returns the table, or `null` when there are no variants

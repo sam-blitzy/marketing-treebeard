@@ -29,8 +29,10 @@
 #   - db receives only POSTGRES_DB, POSTGRES_USER and POSTGRES_PASSWORD, interpolated from
 #     the shell, else from .env, else the local defaults below.
 #   - web receives no environment: the SPA bundle holds no configuration and no secret.
-#   - DATA_MODE set in the shell overrides .env, as `make e2e` and CI use it:
+#   - DATA_MODE set in the shell overrides .env. `make e2e` forces simulated data this way:
 #       DATA_MODE=simulated docker compose up -d
+#     CI's first start sets neither DATA_MODE nor a source credential, so under the default
+#     DATA_MODE=auto every source is simulated with the reason "credentials not configured".
 #   - This file holds no secret value. Source credentials go in .env only.
 #
 # Ports: only web is published, on 8080, matching APP_BASE_URL=http://localhost:8080. db and
@@ -46,6 +48,21 @@
 #
 # Logging: Docker's default json-file driver. The api and worker write structured JSON lines
 # (structlog, with secrets redacted) to stdout: `docker compose logs -f worker`.
+#
+# Resources: each service runs under a CPU and memory ceiling (deploy.resources.limits), set
+# from the shell, else from .env (Compose interpolation, as for POSTGRES_*), else the default
+# shown; a blank value keeps the default. .env.example lists them with these defaults; no
+# process reads them. CPU is in cores, memory takes a k, m or g suffix:
+#   db       DB_CPU_LIMIT (1)       DB_MEMORY_LIMIT (1g)
+#   migrate  MIGRATE_CPU_LIMIT (1)  MIGRATE_MEMORY_LIMIT (512m)
+#   api      API_CPU_LIMIT (1)      API_MEMORY_LIMIT (1g)
+#   worker   WORKER_CPU_LIMIT (1)   WORKER_MEMORY_LIMIT (2g)
+#   web      WEB_CPU_LIMIT (1)      WEB_MEMORY_LIMIT (256m)
+# They are ceilings, not reservations: an idle service holds nothing back. The 1-core CPU
+# defaults run on any host Docker supports. Docker refuses to create a container whose CPU
+# value exceeds the CPUs it reports (`docker info`), and kills a service that exceeds its
+# memory ceiling with exit code 137 (docs/runbook.md, Resource limits).
+# A higher limit never adds a worker; the advisory lock keeps the worker a single process.
 #
 # Out of scope here: TLS, image publishing and monitoring. Any host other than this machine
 # terminates TLS in front of nginx and sets an https:// APP_BASE_URL (docs/runbook.md).
@@ -82,13 +99,21 @@ services:
       - pgdata:/var/lib/postgresql
     healthcheck:
       # $$ defers expansion to the container's shell, where the POSTGRES_* values are set.
+      # Both values are double-quoted, so a name with spaces or glob characters stays one
+      # argument. The database goes through PGDATABASE rather than -d, because libpq reads a
+      # -d value containing "=" or a postgres:// or postgresql:// prefix as a connection string.
       # -h 127.0.0.1 probes TCP, which only the final server (not the init server) accepts.
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1"]
+      test: ["CMD-SHELL", 'PGDATABASE="$$POSTGRES_DB" pg_isready -U "$$POSTGRES_USER" -h 127.0.0.1']
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 20s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU_LIMIT:-1}"
+          memory: "${DB_MEMORY_LIMIT:-1g}"
 
   migrate:
     <<: *backend
@@ -97,6 +122,11 @@ services:
       db:
         condition: service_healthy
     restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "${MIGRATE_CPU_LIMIT:-1}"
+          memory: "${MIGRATE_MEMORY_LIMIT:-512m}"
 
   api:
     <<: *backend
@@ -134,6 +164,11 @@ services:
       retries: 12
       start_period: 15s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPU_LIMIT:-1}"
+          memory: "${API_MEMORY_LIMIT:-1g}"
 
   worker:
     <<: *backend
@@ -145,6 +180,11 @@ services:
     # Time after SIGTERM to cancel the lanes, finish the batch commit in flight and release
     # the advisory locks before Docker sends SIGKILL.
     stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-1}"
+          memory: "${WORKER_MEMORY_LIMIT:-2g}"
 
   web:
     build:
@@ -156,6 +196,11 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${WEB_CPU_LIMIT:-1}"
+          memory: "${WEB_MEMORY_LIMIT:-256m}"
 
 volumes:
   pgdata: {}

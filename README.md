@@ -200,6 +200,16 @@ Probes, failure handling, token bootstrap and HubSpot scopes:
 | Runtime | `DATA_MODE` | `auto` | `auto`: each source live with automatic simulated fallback; `simulated`: every source simulated |
 | Runtime | `MOCK_SEED` | `42` | Seed of the simulated data |
 | Runtime | `BACKFILL_DAYS` | `180` | Initial backfill of every new dataset, in days, capped at 180 |
+| Resources | `DB_CPU_LIMIT` | `1` | CPU ceiling of `db`, in cores; read by Compose only |
+| Resources | `DB_MEMORY_LIMIT` | `1g` | Memory ceiling of `db`; read by Compose only |
+| Resources | `MIGRATE_CPU_LIMIT` | `1` | CPU ceiling of `migrate`, in cores; read by Compose only |
+| Resources | `MIGRATE_MEMORY_LIMIT` | `512m` | Memory ceiling of `migrate`; read by Compose only |
+| Resources | `API_CPU_LIMIT` | `1` | CPU ceiling of `api`, in cores; read by Compose only |
+| Resources | `API_MEMORY_LIMIT` | `1g` | Memory ceiling of `api`; read by Compose only |
+| Resources | `WORKER_CPU_LIMIT` | `1` | CPU ceiling of `worker`, in cores; read by Compose only |
+| Resources | `WORKER_MEMORY_LIMIT` | `2g` | Memory ceiling of `worker`; read by Compose only |
+| Resources | `WEB_CPU_LIMIT` | `1` | CPU ceiling of `web`, in cores; read by Compose only |
+| Resources | `WEB_MEMORY_LIMIT` | `256m` | Memory ceiling of `web`; read by Compose only |
 | Google | `N8N_GOOGLE_ADS_WEBHOOK_URL` | Empty | Production URL of the n8n webhook; `https://` except on `localhost` or `127.0.0.1` |
 | Google | `N8N_WEBHOOK_SECRET_HEADER` | `X-Webhook-Token` | Header that carries the secret; must equal the Name on n8n's Header Auth credential. A blank value falls back to the code default `X-Webhook-Secret` |
 | Google | `N8N_WEBHOOK_SECRET` | Empty (secret) | Value of that header |
@@ -224,6 +234,11 @@ Probes, failure handling, token bootstrap and HubSpot scopes:
   `worker` only; `db` receives only the `POSTGRES_*` values.
 - **Secrets stay on the server**: they live only in server-side environment variables, never in
   the browser bundle. No `VITE_` variable exists, so no secret can reach the SPA.
+- **Resource limits are Compose variables**: `<SERVICE>_CPU_LIMIT` and `<SERVICE>_MEMORY_LIMIT`
+  for `db`, `migrate`, `api`, `worker` and `web` (for example `WORKER_MEMORY_LIMIT`) cap each
+  container; no process reads them. `.env.example` carries the `docker-compose.yml` defaults;
+  change one in `.env` or the shell, as [Resource limits](docs/runbook.md#resource-limits)
+  describes.
 
 Who reads each variable, and how to rotate secrets:
 [Environment and secrets](docs/runbook.md#environment-and-secrets) in the runbook.
@@ -246,8 +261,8 @@ Who reads each variable, and how to rotate secrets:
 | `seed-simulated` | Seeds simulated datasets for every source and computes the default-window run |
 | `secret-scan` | Runs the pinned `zricethezav/gitleaks:v8.30.1` image with `.gitleaks.toml` over every commit; a finding fails it |
 
-Overridable variables (`COMPOSE`, `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`,
-`TEST_DATABASE_URL`, `PYTEST_ARGS`, `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) are
+Overridable variables (`COMPOSE`, `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`, `PYTEST_ARGS`,
+`PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) are
 described at the top of the `Makefile` and in [Make targets](docs/runbook.md#make-targets) in the
 runbook.
 

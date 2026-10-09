@@ -1094,6 +1094,13 @@ export function dayCounts(source: MaybeSource): readonly DayCount[] {
 // Copy/creative changes: CR1, CR2, CR3 (LinkedIn)
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * The objective group of a LinkedIn lead-gen campaign, the one objective whose variants follow
+ * the open and completion stages (backend `analysis.context.OBJ_LINKEDIN_LEAD_GEN`). Every
+ * other objective group uses only click rate (AAP 0.5.4.6).
+ */
+const OBJECTIVE_LINKEDIN_LEAD_GEN = 'linkedin_lead_gen';
+
 /** One creative variant of a campaign (AAP 0.5.4.6). */
 export interface VariantRow {
   /** The creative's internal id as a string, else its URN. */
@@ -1104,28 +1111,55 @@ export interface VariantRow {
   readonly name: string;
   /** Window impressions. */
   readonly impressions: number | null;
-  /** Clicks ÷ impressions, a ratio decimal string. */
+  /**
+   * Clicks ÷ impressions, a ratio decimal string. `null` when the counts are unreported or
+   * inconsistent (more clicks than impressions), or the impressions are zero.
+   */
   readonly clickRate: string | null;
-  /** Lead form opens ÷ impressions; `null` for non-lead-gen campaigns or unreported opens. */
+  /**
+   * Lead form opens ÷ impressions, a ratio decimal string. `null` for a campaign outside lead
+   * generation, and otherwise when the counts are unreported or inconsistent, or the
+   * impressions are zero; {@link VariantRow.leadGen} says whether the stage applies.
+   */
   readonly openRate: string | null;
-  /** Leads ÷ form opens; `null` for non-lead-gen campaigns or unreported counts. */
+  /**
+   * Leads ÷ form opens, a ratio decimal string. `null` for a campaign outside lead generation,
+   * and otherwise when the counts are unreported or inconsistent, or the form opens are zero;
+   * {@link VariantRow.leadGen} says whether the stage applies.
+   */
   readonly completionRate: string | null;
   /** Window leads. */
   readonly leads: number | null;
+  /** Window lead form opens, the completion rate's denominator; `null` when unreported. */
+  readonly formOpens: number | null;
+  /**
+   * Whether the variant's campaign follows the lead-gen funnel, so its open and completion
+   * rates apply: `true` for the objective group `linkedin_lead_gen`, `false` for any other
+   * (only click rate applies, AAP 0.5.4.6), and `null` when the evidence does not name the
+   * objective group.
+   */
+  readonly leadGen: boolean | null;
 }
 
 /**
  * Reads a campaign's variants table (`creative._variant_row`, `extra.variants` of the CR3
- * item: `{creative_id, urn, name, impressions, leads, click_rate, open_rate, completion_rate,
- * …}`). Rates are ratio decimal strings (a number is converted with `String`); a rate the
- * campaign does not use is `null`.
+ * item: `{creative_id, urn, name, impressions, form_opens, leads, click_rate, open_rate,
+ * completion_rate, …}`), with the campaign's frozen objective (`extra.campaign.objective_group`,
+ * `creative._Campaign.summary`) stamped on every row as {@link VariantRow.leadGen}. Rates are
+ * ratio decimal strings (a number is converted with `String`). A `null` rate is either a stage
+ * the campaign does not use (open and completion outside lead generation) or one it cannot
+ * state (unreported or inconsistent counts, or a zero denominator); `leadGen` and the
+ * denominators (`impressions`, `formOpens`) tell the two apart.
  *
  * @param source - The CR3 item (the first item of a creative group) or its evidence.
  * @returns The variants in stored order; `[]` when absent.
  */
 export function variants(source: MaybeSource): readonly VariantRow[] {
   const rows: VariantRow[] = [];
-  for (const entry of readArray(readExtra(source)?.variants)) {
+  const extra = readExtra(source);
+  const objective = readString(extraRecord(extra, 'campaign')?.objective_group);
+  const leadGen = objective === null ? null : objective === OBJECTIVE_LINKEDIN_LEAD_GEN;
+  for (const entry of readArray(extra?.variants)) {
     if (!isRecord(entry)) {
       continue;
     }
@@ -1143,6 +1177,8 @@ export function variants(source: MaybeSource): readonly VariantRow[] {
       openRate: readDecimal(entry.open_rate),
       completionRate: readDecimal(entry.completion_rate),
       leads: readInteger(entry.leads),
+      formOpens: readInteger(entry.form_opens),
+      leadGen,
     });
   }
   return rows;

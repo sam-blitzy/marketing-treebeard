@@ -66,6 +66,14 @@ The local stack is `docker-compose.yml` (Compose project `ads-engine`).
 | `worker` | `ads-engine-backend:local` | `python -m ads_engine.worker.main` | `migrate` exited 0 | Owns all external I/O. `stop_grace_period: 30s` lets it cancel its work and release its advisory locks |
 | `web` | Built from `web/Dockerfile` (`node:24.21.0-slim` build stage, `nginx:1.30.5` runtime) | nginx | `api` is healthy | The only published port, `8080:8080`. Serves the SPA and proxies `/api/` to `api:8000` (`web/nginx.conf`). Receives no environment |
 
+Each service has its own CPU and memory ceiling (`deploy.resources.limits`), which bounds how much
+of the host a backfill, an analysis run, PostgreSQL or nginx can use. The defaults are `db` 1 CPU
+and 1 GiB, `migrate` 1 and 512 MiB, `api` 1 and 1 GiB, `worker` 1 and 2 GiB, and `web` 1 and
+256 MiB. Compose variables override them from the shell or `.env`: `<SERVICE>_CPU_LIMIT` and
+`<SERVICE>_MEMORY_LIMIT`, for example `WORKER_MEMORY_LIMIT`. Only Compose reads them, and
+`.env.example` lists them with these defaults ([runbook](runbook.md#resource-limits)). They are
+ceilings, not reservations, and never change the single worker instance.
+
 Startup order:
 
 ```text

@@ -1256,6 +1256,8 @@ describe('variants', () => {
         openRate: '0.012226',
         completionRate: '0.395062',
         leads: 64,
+        formOpens: 162,
+        leadGen: true,
       },
       {
         creativeId: '1102',
@@ -1266,6 +1268,8 @@ describe('variants', () => {
         openRate: '0.011935',
         completionRate: '0.331081',
         leads: 49,
+        formOpens: 148,
+        leadGen: true,
       },
     ]);
   });
@@ -1282,10 +1286,12 @@ describe('variants', () => {
     });
   });
 
-  it('leaves the open and completion rates null for a non-lead-gen variant', () => {
+  it('leaves the open and completion rates null for a non-lead-gen variant, marked not lead-gen', () => {
     // The row exactly as creative._variant_row writes it for a website-conversions campaign:
-    // only the click rate applies, so open_rate and completion_rate are None, never 0.
+    // only the click rate applies, so open_rate and completion_rate are None, never 0, and the
+    // frozen objective group (creative._Campaign.summary) says the stages do not apply.
     const nonLeadGen = withExtra({
+      campaign: { id: 2100, name: 'Webinar sign-ups', objective_group: 'linkedin_other' },
       variants: [
         {
           creative_id: 2101,
@@ -1316,7 +1322,72 @@ describe('variants', () => {
         openRate: null,
         completionRate: null,
         leads: null,
+        formOpens: null,
+        leadGen: false,
       },
+    ]);
+  });
+
+  it('reads a lead-gen variant with zero form opens as lead-gen, its opens a known zero', () => {
+    // creative._variant_row for a lead-gen creative that delivered but whose form was never
+    // opened: the completion rate's denominator is 0, so _ratio leaves the rate None.
+    const zeroOpens = withExtra({
+      campaign: { id: 2200, name: 'Lead Gen — Guide', objective_group: 'linkedin_lead_gen' },
+      variants: [
+        {
+          creative_id: 2201,
+          name: 'Guide Variant A',
+          impressions: 3100,
+          clicks: 9,
+          form_opens: 0,
+          leads: 0,
+          click_rate: '0.002903',
+          open_rate: '0.000000',
+          completion_rate: null,
+        },
+      ],
+    });
+    expect(variants(zeroOpens)).toEqual([
+      {
+        creativeId: '2201',
+        urn: null,
+        name: 'Guide Variant A',
+        impressions: 3100,
+        clickRate: '0.002903',
+        openRate: '0.000000',
+        completionRate: null,
+        leads: 0,
+        formOpens: 0,
+        leadGen: true,
+      },
+    ]);
+  });
+
+  it('leaves leadGen null when the evidence names no objective group, or a malformed one', () => {
+    const row = { creative_id: 2301, name: 'Variant', impressions: 1500, form_opens: '12' };
+    const unknown = [
+      withExtra({ variants: [row] }),
+      withExtra({ campaign: null, variants: [row] }),
+      withExtra({ campaign: 'linkedin_lead_gen', variants: [row] }),
+      withExtra({ campaign: { name: 'No objective' }, variants: [row] }),
+      withExtra({ campaign: { objective_group: 7 }, variants: [row] }),
+      withExtra({ campaign: { objective_group: true }, variants: [row] }),
+      withExtra({ campaign: { objective_group: ['linkedin_lead_gen'] }, variants: [row] }),
+      withExtra({ campaign: { objective_group: '  ' }, variants: [row] }),
+    ];
+    for (const evidence of unknown) {
+      expect(variants(evidence)).toEqual([
+        expect.objectContaining({ creativeId: '2301', formOpens: 12, leadGen: null }),
+      ]);
+    }
+    // The objective is the campaign's, so every row carries the same answer.
+    const twoRows = withExtra({
+      campaign: { objective_group: 'linkedin_other' },
+      variants: [row, { ...row, creative_id: 2302, form_opens: 2.5 }],
+    });
+    expect(variants(twoRows).map((each) => [each.leadGen, each.formOpens])).toEqual([
+      [false, 12],
+      [false, null],
     ]);
   });
 
@@ -1357,6 +1428,8 @@ describe('variants', () => {
         openRate: null,
         completionRate: null,
         leads: null,
+        formOpens: null,
+        leadGen: null,
       },
       {
         creativeId: '7',
@@ -1367,6 +1440,8 @@ describe('variants', () => {
         openRate: null,
         completionRate: null,
         leads: null,
+        formOpens: null,
+        leadGen: null,
       },
       {
         creativeId: 'c-9',
@@ -1377,6 +1452,8 @@ describe('variants', () => {
         openRate: null,
         completionRate: null,
         leads: null,
+        formOpens: null,
+        leadGen: null,
       },
     ]);
   });

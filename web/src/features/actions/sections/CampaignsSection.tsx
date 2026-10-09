@@ -14,9 +14,13 @@
  *   as the backend rendered them, and in the footer the resolution controls of the live
  *   discrepancy: exactly the resolutions `GET /discrepancies` lists for its kind and subject
  *   type, never derived here (AAP 0.5.4.4). C0 is exempt from dismiss, snooze and done, so the
- *   card shows these controls instead of feedback actions, disabled on a historical item. C0 is
- *   exempt from holds too, so a historical C0 stays pinned in place rather than collapsed with
- *   the held cards.
+ *   card shows these controls instead of feedback actions. A historical C0, computed from data
+ *   since replaced, shows instead the resolutions it froze with the run, all disabled, with
+ *   "Resolution disabled: this discrepancy belongs to data that has since been replaced"
+ *   (AAP 0.3.2, 0.5.5). C0 is exempt from holds too, so a historical C0 stays pinned in place
+ *   rather than collapsed with the held cards. Each card's resolver keeps one polite status
+ *   line, which carries every outcome of its reads and takes focus when the controls leave
+ *   while focus went with them.
  * - **C1 Pause, C1b Pipeline pause, C2 Scale or Hold**: a "Campaign evidence" list of spend,
  *   outcomes, expected outcomes and CRM Qualified Leads, each metric that the evidence carries.
  * - **C1b and C2 "Hold"**: a one-row "Pipeline evidence" table of matured leads, matched and
@@ -34,9 +38,14 @@
  *   `../evidenceExtra`: metric labels as the backend wrote them, values through `formatMetric`
  *   (floors "≥ N" and "≤ X", "unavailable" never 0), and no threshold or window length written
  *   into the client (AAP 0.5.4.1). A metric the evidence lacks is left out, never invented.
- * - Server state goes only through `../../../api/queries` (AAP 0.11.1). Only C0 cards read
- *   `GET /discrepancies`, so a section without a discrepancy sends no request; TanStack Query
- *   shares the one read across every C0 card.
+ * - Server state goes only through `../../../api/queries` (AAP 0.11.1). The discrepancy group
+ *   reads `GET /discrepancies` once for all its current C0 cards, indexed by id, and only when
+ *   it holds one, so a section without a current discrepancy sends no request; a historical C0
+ *   reads nothing, because the API lists only discrepancies of the active datasets. A
+ *   discrepancy missing from that unresolved list is called "Resolved since this run" only
+ *   when the resolved list (`GET /discrepancies?state=resolved`, read once for the group and
+ *   only then) holds it, because the API also leaves out a discrepancy whose subject it cannot
+ *   load.
  * - Built only on the design-system index (AAP 0.4.4): no raw buttons, headings or tables, no
  *   inline styles and no stylesheet. No `role="alert"`: the open-discrepancies banner in
  *   `GlobalBanners` is the only alert on the page (AAP 0.5.5 Behaviour).
@@ -48,15 +57,32 @@
  *
  * @packageDocumentation
  */
-import { Fragment } from 'react';
-import type { ReactElement } from 'react';
+import {
+  Fragment,
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { useDiscrepancies } from '../../../api/queries';
-import type { Group, Item, Metric, Overlay } from '../../../api/types';
-import { DataTable, Inline, Spinner, Stack } from '../../../design-system';
+import type {
+  Discrepancy,
+  DiscrepancyState,
+  Group,
+  Item,
+  Metric,
+  Overlay,
+  Resolution,
+} from '../../../api/types';
+import { Button, DataTable, Inline, Spinner, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import { formatCount, formatMetric, formatMoney } from '../../../lib/format';
-import { DiscrepancyResolution } from '../../decisions/DiscrepancyResolver';
+import { DiscrepancyResolution, RESOLUTION_LABELS } from '../../decisions/DiscrepancyResolver';
 import { RecommendationCard } from '../RecommendationCard';
 import {
   PAUSE_SCALE_METRIC_KEYS,
@@ -94,18 +120,41 @@ export const CLUSTER_GAP_LABEL = 'Cluster gap';
 export const LOADING_DISCREPANCY_LABEL = 'Loading discrepancy';
 
 /**
- * Shown in place of the resolution controls when the C0 card's discrepancy is no longer open
- * or awaiting the platform: it was resolved after the run was computed, so nothing is left to
- * resolve.
+ * The status line of a current C0 card whose discrepancy is no longer open or awaiting the
+ * platform and is listed as resolved (`GET /discrepancies?state=resolved`): it was resolved
+ * after the run was computed, so nothing is left to resolve.
  */
 export const RESOLVED_SINCE_RUN_TEXT = 'Resolved since this run';
+
+/**
+ * The status line of a current C0 card whose discrepancy is in neither the unresolved nor the
+ * resolved list. The API leaves out a discrepancy whose subject it cannot load, so its absence
+ * is not a resolution, and nothing can be resolved from the card.
+ */
+export const DISCREPANCY_NOT_LISTED_TEXT =
+  'This discrepancy is no longer listed, so it cannot be resolved here';
+
+/**
+ * The status line of a current C0 card while the resolved list is read, after the unresolved
+ * list came back without the card's discrepancy.
+ */
+export const DISCREPANCY_CHECKING_TEXT = 'Checking whether this discrepancy was resolved';
+
+/**
+ * The status line of a historical C0 card, shown with its frozen resolutions disabled: the
+ * subject's dataset was replaced, which neither resolves the discrepancy nor lets it be
+ * resolved, because the API refuses that write with 409 `subject_retired` (AAP 0.3.2, 0.5.5).
+ */
+export const HISTORICAL_RESOLUTION_NOTICE =
+  'Resolution disabled: this discrepancy belongs to data that has since been replaced';
 
 /** Shown in place of the resolution controls when a C0 item names no discrepancy id. */
 export const DISCREPANCY_UNAVAILABLE_TEXT = 'Discrepancy details unavailable';
 
 /**
- * The start of the text shown when the live discrepancy list could not be read:
- * "Could not load this discrepancy: {message}".
+ * The start of the status line shown when a discrepancy list a current C0 card needs could not
+ * be read, the unresolved list or the resolved one: "Could not load this discrepancy:
+ * {message}".
  */
 export const DISCREPANCY_LOAD_ERROR_PREFIX = 'Could not load this discrepancy';
 
@@ -114,6 +163,9 @@ export const RESOLVE_ON_DECISIONS_LABEL = 'Resolve on the Decisions page';
 
 /** The error detail when a failed discrepancy read carries no message of its own. */
 const LOAD_ERROR_FALLBACK = 'the request failed';
+
+/** The state the resolved list is read in, to confirm a resolution since the run. */
+const RESOLVED_DISCREPANCY_STATES: readonly DiscrepancyState[] = Object.freeze(['resolved']);
 
 /** The `/decisions` route, where `DiscrepancyResolver` lists every unresolved discrepancy. */
 const DECISIONS_HREF = '/decisions';
@@ -399,54 +451,346 @@ function LaunchGapEvidence({ item }: ItemProps): ReactElement | null {
 // Discrepancies (C0)
 // ---------------------------------------------------------------------------------------------
 
-/** Props of {@link LiveDiscrepancyResolution}. */
-interface LiveDiscrepancyResolutionProps {
-  /** The discrepancy id the C0 item froze (`extra.discrepancy_id`), as a string. */
-  discrepancyId: string;
-  /** Disables every resolution, as on a historical item computed from replaced data. */
-  disabled: boolean;
+/** One discrepancy list as its group read it, indexed by id. */
+interface DiscrepancyIndex {
+  /** The listed discrepancies keyed by `String(id)`; `null` until a read has succeeded. */
+  readonly byId: ReadonlyMap<string, Discrepancy> | null;
+  /** The detail of the failed read while no list has been read, otherwise `null`. */
+  readonly failure: string | null;
+  /** Whether a read of the list is in flight, the refresh of a list already read included. */
+  readonly fetching: boolean;
 }
 
 /**
- * The resolution controls of a C0 card, read from the live discrepancy list
- * (`GET /discrepancies`, open and awaiting-platform), so the buttons are exactly the
- * resolutions the API offers for the discrepancy's kind and subject type now (AAP 0.5.4.4):
+ * What one group's live reads know, in which each current C0 card below them looks up its
+ * discrepancy ({@link liveDiscrepancyState}).
+ */
+interface DiscrepancyLookup {
+  /** The open and awaiting-platform list; `null` until its reader has reported. */
+  readonly open: DiscrepancyIndex | null;
+  /**
+   * The resolved list, read only while the loaded open list lacks a current C0 card's
+   * discrepancy; `null` otherwise, and until its reader has reported.
+   */
+  readonly resolved: DiscrepancyIndex | null;
+}
+
+/** The lookup of the nearest {@link LiveDiscrepancyLookup}; `null` outside one. */
+const DiscrepancyLookupContext = createContext<DiscrepancyLookup | null>(null);
+
+/** Where a current C0 card's discrepancy stands, according to its group's reads. */
+type LiveDiscrepancyState =
+  | { readonly status: 'loading' }
+  | { readonly status: 'error'; readonly message: string }
+  | { readonly status: 'open'; readonly discrepancy: Discrepancy }
+  | { readonly status: 'checking' }
+  | { readonly status: 'resolved' }
+  | { readonly status: 'not_listed' };
+
+/**
+ * Where a current C0 card's discrepancy stands, from one map lookup per list:
  *
- * - while the first read runs: a `Spinner` "Loading discrepancy";
- * - when it fails before any list arrived: "Could not load this discrepancy: {message}" and no
- *   control;
- * - when the list holds the discrepancy: its {@link DiscrepancyResolution}, disabled when
- *   `disabled` is set;
- * - when it does not: "Resolved since this run" and no control.
+ * - no open list yet: `loading`, or `error` with the detail when its first read failed;
+ * - in the open list: `open`, with the discrepancy as the API lists it now, whose resolutions
+ *   are exactly those the API offers for its kind and subject type (AAP 0.5.4.4);
+ * - missing from it: `resolved` once the resolved list holds the id, which is final, because a
+ *   resolved discrepancy never reopens; otherwise `checking` while either list is being read,
+ *   `error` when the resolved list's first read failed, and `not_listed` once both lists are
+ *   read and neither holds the id. Only the resolved list is evidence of a resolution: the API
+ *   also leaves out of the open list a discrepancy whose subject it cannot load. Waiting for
+ *   reads in flight keeps a list cached before the discrepancy was detected or resolved from
+ *   calling it "no longer listed" for a moment.
  *
  * A failed refresh of a list already read keeps that list, because the server refuses a
  * resolution of a discrepancy closed since then with its own message.
+ *
+ * @param discrepancyId - The id the C0 item froze (`extra.discrepancy_id`), as a string.
+ * @param lookup - The group's reads.
+ * @returns The discrepancy's live state.
  */
-function LiveDiscrepancyResolution({
-  discrepancyId,
-  disabled,
-}: LiveDiscrepancyResolutionProps): ReactElement {
-  const discrepancies = useDiscrepancies();
-  const list = discrepancies.data;
-  if (list === undefined) {
-    if (discrepancies.isError) {
-      const message = textOrNull(discrepancies.error.message) ?? LOAD_ERROR_FALLBACK;
-      return <div>{`${DISCREPANCY_LOAD_ERROR_PREFIX}: ${message}`}</div>;
-    }
-    return <Spinner label={LOADING_DISCREPANCY_LABEL} />;
+function liveDiscrepancyState(
+  discrepancyId: string,
+  lookup: DiscrepancyLookup,
+): LiveDiscrepancyState {
+  const openById = lookup.open?.byId ?? null;
+  if (openById === null) {
+    const failure = lookup.open?.failure ?? null;
+    return failure === null ? { status: 'loading' } : { status: 'error', message: failure };
   }
-  const discrepancy = list.find((entry) => String(entry.id) === discrepancyId);
-  if (discrepancy === undefined) {
-    return <div>{RESOLVED_SINCE_RUN_TEXT}</div>;
+  const discrepancy = openById.get(discrepancyId);
+  if (discrepancy !== undefined) {
+    return { status: 'open', discrepancy };
   }
-  return <DiscrepancyResolution discrepancy={discrepancy} disabled={disabled} />;
+  const resolvedById = lookup.resolved?.byId ?? null;
+  if (resolvedById?.has(discrepancyId) === true) {
+    return { status: 'resolved' };
+  }
+  if (lookup.open?.fetching === true) {
+    return { status: 'checking' };
+  }
+  if (resolvedById === null) {
+    const failure = lookup.resolved?.failure ?? null;
+    return failure === null ? { status: 'checking' } : { status: 'error', message: failure };
+  }
+  return lookup.resolved?.fetching === true ? { status: 'checking' } : { status: 'not_listed' };
 }
 
 /**
- * A C0 discrepancy card: the comparison line in the body and the live resolution controls in
- * the footer, where the card puts them instead of feedback actions (AAP 0.5.4.2: C0 cannot be
- * dismissed, snoozed or marked done). A C0 item without a discrepancy id shows "Discrepancy
- * details unavailable" in the footer instead, because no discrepancy can be looked up.
+ * The status line of a current C0 card in `state`: empty while the first read runs, which the
+ * `Spinner` shows, and while the resolution controls are shown.
+ */
+function liveStatusText(state: LiveDiscrepancyState): string | null {
+  switch (state.status) {
+    case 'loading':
+    case 'open':
+      return null;
+    case 'error':
+      return `${DISCREPANCY_LOAD_ERROR_PREFIX}: ${state.message}`;
+    case 'checking':
+      return DISCREPANCY_CHECKING_TEXT;
+    case 'resolved':
+      return RESOLVED_SINCE_RUN_TEXT;
+    case 'not_listed':
+      return DISCREPANCY_NOT_LISTED_TEXT;
+  }
+}
+
+/** Props of {@link DiscrepancyIndexReader}. */
+interface DiscrepancyIndexReaderProps {
+  /** The states to list; the unresolved `open` and `awaiting_platform` when omitted. */
+  states?: readonly DiscrepancyState[];
+  /** Receives the list's index each time it changes, and `null` when the reader unmounts. */
+  onIndex: (index: DiscrepancyIndex | null) => void;
+}
+
+/**
+ * Reads one discrepancy list for a whole group (`GET /discrepancies?state=…`, every page) and
+ * reports it to {@link LiveDiscrepancyLookup} as a map keyed by id, built once per list the API
+ * returns, so each C0 card finds its discrepancy in one lookup, together with the failure of a
+ * first read and whether a read is in flight. It renders nothing.
+ *
+ * The index is reported from a layout effect, so the cards show a list already cached before
+ * the browser paints, instead of a frame of the loading state.
+ */
+function DiscrepancyIndexReader({ states, onIndex }: DiscrepancyIndexReaderProps): null {
+  const discrepancies = useDiscrepancies(states);
+  const list = discrepancies.data;
+  const failure =
+    list === undefined && discrepancies.isError
+      ? (textOrNull(discrepancies.error.message) ?? LOAD_ERROR_FALLBACK)
+      : null;
+  const fetching = discrepancies.isFetching;
+  const byId = useMemo(
+    () =>
+      list === undefined
+        ? null
+        : new Map(list.map((entry) => [String(entry.id), entry] as const)),
+    [list],
+  );
+  const index = useMemo<DiscrepancyIndex>(
+    () => ({ byId, failure, fetching }),
+    [byId, failure, fetching],
+  );
+  useLayoutEffect(() => {
+    onIndex(index);
+    return () => {
+      onIndex(null);
+    };
+  }, [index, onIndex]);
+  return null;
+}
+
+/** Props of {@link LiveDiscrepancyLookup}. */
+interface LiveDiscrepancyLookupProps {
+  /** The discrepancy ids of the current C0 cards inside, as strings; empty when there is none. */
+  discrepancyIds: readonly string[];
+  /** The cards. */
+  children: ReactNode;
+}
+
+/**
+ * Gives the C0 cards inside it one shared read of the live discrepancies, so a group of C
+ * cards keeps one observer per list and one id lookup per card, rather than C observers each
+ * searching the whole list:
+ *
+ * - the open and awaiting-platform list, read only while `discrepancyIds` holds an id, so a
+ *   group whose C0 cards are all historical or name no discrepancy sends no request;
+ * - the resolved list, read only once the open list is loaded and lacks one of
+ *   `discrepancyIds`, to tell a resolution since the run from a discrepancy no longer listed.
+ *
+ * Each reader is keyed by the ids it serves, so a card that a newer run adds, or a
+ * discrepancy that newly leaves the open list, mounts a fresh observer, which refreshes a stale
+ * cached list as a card's own read would. The readers are siblings of the cards, which keep
+ * their place whichever reader is mounted, so a card's status line and focus survive a reader
+ * starting, stopping or being replaced.
+ */
+function LiveDiscrepancyLookup({
+  discrepancyIds,
+  children,
+}: LiveDiscrepancyLookupProps): ReactElement {
+  const [open, setOpen] = useState<DiscrepancyIndex | null>(null);
+  const [resolved, setResolved] = useState<DiscrepancyIndex | null>(null);
+  const openById = open?.byId ?? null;
+  const missingIds =
+    openById === null ? [] : discrepancyIds.filter((id) => !openById.has(id));
+  const needsResolved = missingIds.length > 0;
+  const lookup = useMemo<DiscrepancyLookup>(
+    () => ({ open, resolved: needsResolved ? resolved : null }),
+    [open, resolved, needsResolved],
+  );
+  return (
+    <DiscrepancyLookupContext.Provider value={lookup}>
+      {discrepancyIds.length === 0 ? null : (
+        <DiscrepancyIndexReader key={`open:${discrepancyIds.join(' ')}`} onIndex={setOpen} />
+      )}
+      {needsResolved ? (
+        <DiscrepancyIndexReader
+          key={`resolved:${missingIds.join(' ')}`}
+          states={RESOLVED_DISCREPANCY_STATES}
+          onIndex={setResolved}
+        />
+      ) : null}
+      {children}
+    </DiscrepancyLookupContext.Provider>
+  );
+}
+
+/** Whether a frozen resolution key is one the resolver labels. */
+function isLabelledResolution(key: string): key is Resolution {
+  return Object.hasOwn(RESOLUTION_LABELS, key);
+}
+
+/** Props of {@link FrozenResolutions}. */
+interface FrozenResolutionsProps {
+  /** The resolution keys the C0 item froze (`extra.resolutions`), in their frozen order. */
+  resolutions: readonly string[];
+}
+
+/**
+ * The resolutions a historical C0 item froze with the run, which the backend computed for its
+ * kind and subject type, in their frozen order: one disabled `Button` each, labelled from
+ * `RESOLUTION_LABELS`, the first `primary` and the rest `secondary`, as
+ * {@link DiscrepancyResolution} shows them. None posts, opens a dialog or holds a mutation,
+ * because the API refuses every resolution of a replaced subject (AAP 0.3.2). A key the
+ * resolver does not label, or a repeat, is left out; with none left, nothing is rendered.
+ */
+function FrozenResolutions({ resolutions }: FrozenResolutionsProps): ReactElement | null {
+  const offered = [...new Set(resolutions)].filter(isLabelledResolution);
+  if (offered.length === 0) {
+    return null;
+  }
+  return (
+    <Inline gap={2}>
+      {offered.map((resolution, index) => (
+        <Button key={resolution} variant={index === 0 ? 'primary' : 'secondary'} disabled>
+          {RESOLUTION_LABELS[resolution]}
+        </Button>
+      ))}
+    </Inline>
+  );
+}
+
+/** Props of {@link DiscrepancyResolverSlot}. */
+interface DiscrepancyResolverSlotProps {
+  /** The discrepancy the C0 item froze with the run. */
+  frozen: DiscrepancyRef;
+  /** Whether the item is historical, computed from replaced data, so resolution is disabled. */
+  historical: boolean;
+}
+
+/**
+ * The resolver of a C0 card that names a discrepancy, in the footer where the card puts it
+ * instead of feedback actions. It reads its group's {@link LiveDiscrepancyLookup}. A C0 card
+ * outside a discrepancy group, where the API never puts one, has no group read above it, so the
+ * slot gets a lookup of its own.
+ */
+function DiscrepancyResolverSlot({
+  frozen,
+  historical,
+}: DiscrepancyResolverSlotProps): ReactElement {
+  const lookup = useContext(DiscrepancyLookupContext);
+  if (lookup === null) {
+    return (
+      <LiveDiscrepancyLookup discrepancyIds={historical ? [] : [frozen.discrepancyId]}>
+        <DiscrepancyResolverSlot frozen={frozen} historical={historical} />
+      </LiveDiscrepancyLookup>
+    );
+  }
+  return <DiscrepancyResolverSlotBody frozen={frozen} historical={historical} lookup={lookup} />;
+}
+
+/** Props of {@link DiscrepancyResolverSlotBody}. */
+interface DiscrepancyResolverSlotBodyProps extends DiscrepancyResolverSlotProps {
+  /** The group's live reads. */
+  lookup: DiscrepancyLookup;
+}
+
+/**
+ * The body of {@link DiscrepancyResolverSlot}: always one `Stack` whose first child is a
+ * persistent polite status line, so every outcome is announced when it appears and none
+ * replaces the region that announces it (WCAG 2.2 SC 4.1.3). It never carries `role="alert"`,
+ * which AAP 0.5.5 reserves for the discrepancy banner.
+ *
+ * - **Historical item**: the status line reads {@link HISTORICAL_RESOLUTION_NOTICE} above the
+ *   {@link FrozenResolutions}, all disabled. No discrepancy list is read: the API lists only
+ *   discrepancies of the active datasets, so a replaced one is never in it, and its absence says
+ *   nothing about a resolution.
+ * - **Current item**, by {@link liveDiscrepancyState}: a `Spinner` "Loading discrepancy" while
+ *   the first read runs; the {@link DiscrepancyResolution} of the listed discrepancy; or, in the
+ *   status line, "Checking whether this discrepancy was resolved", "Resolved since this run",
+ *   "This discrepancy is no longer listed, so it cannot be resolved here" or "Could not load
+ *   this discrepancy: {message}".
+ *
+ * When the resolution controls leave, after a resolution that closed the discrepancy for
+ * example, and focus left with them (onto the page, or an element no longer in it), the status
+ * line takes focus, so keyboard and screen-reader users stay on this card (WCAG 2.2 SC 2.4.3).
+ * Focus the user has moved elsewhere is left where it is.
+ */
+function DiscrepancyResolverSlotBody({
+  frozen,
+  historical,
+  lookup,
+}: DiscrepancyResolverSlotBodyProps): ReactElement {
+  const live = historical ? null : liveDiscrepancyState(frozen.discrepancyId, lookup);
+  const statusText = live === null ? HISTORICAL_RESOLUTION_NOTICE : liveStatusText(live);
+  const controlsShown = live?.status === 'open';
+
+  const statusRef = useRef<HTMLDivElement>(null);
+  const controlsWereShown = useRef(false);
+  useEffect(() => {
+    const wereShown = controlsWereShown.current;
+    controlsWereShown.current = controlsShown;
+    if (!wereShown || controlsShown) {
+      return;
+    }
+    const active = document.activeElement;
+    if (active === null || active === document.body || !active.isConnected) {
+      statusRef.current?.focus();
+    }
+  }, [controlsShown]);
+
+  return (
+    // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive and feature code
+    // carries no CSS (AAP 0.4.4), so the status line is an unstyled <div>, spaced by the Stack
+    // gap alone. Stack takes it out of the column while it is empty, so the region exists ahead
+    // of its first message without leaving a gap; it must then hold no child node at all.
+    <Stack gap={2}>
+      <div ref={statusRef} role="status" tabIndex={-1}>
+        {statusText}
+      </div>
+      {live?.status === 'loading' ? <Spinner label={LOADING_DISCREPANCY_LABEL} /> : null}
+      {live?.status === 'open' ? <DiscrepancyResolution discrepancy={live.discrepancy} /> : null}
+      {live === null ? <FrozenResolutions resolutions={frozen.resolutions} /> : null}
+    </Stack>
+  );
+}
+
+/**
+ * A C0 discrepancy card: the comparison line in the body and the {@link DiscrepancyResolverSlot}
+ * in the footer, where the card puts it instead of feedback actions (AAP 0.5.4.2: C0 cannot be
+ * dismissed, snoozed or marked done). The resolver is historical when the item is, or when the
+ * card disables it. A C0 item without a discrepancy id shows "Discrepancy details unavailable"
+ * in the footer instead, because no discrepancy can be looked up, and reads nothing.
  */
 function DiscrepancyCard({ item }: ItemProps): ReactElement {
   const ref = discrepancyRef(item);
@@ -458,7 +802,7 @@ function DiscrepancyCard({ item }: ItemProps): ReactElement {
         ref === null ? (
           <div>{DISCREPANCY_UNAVAILABLE_TEXT}</div>
         ) : (
-          <LiveDiscrepancyResolution discrepancyId={ref.discrepancyId} disabled={disabled} />
+          <DiscrepancyResolverSlot frozen={ref} historical={item.current.historical || disabled} />
         )
       }
     >
@@ -527,6 +871,25 @@ function CampaignCard({ item }: ItemProps): ReactElement {
   }
 }
 
+/**
+ * The discrepancy ids, as strings and in item order, of the current C0 cards among `items`:
+ * those that are not historical and name a discrepancy. A historical C0 reads no list, and one
+ * without an id has nothing to look up.
+ */
+function currentDiscrepancyIds(items: readonly Item[]): string[] {
+  const ids: string[] = [];
+  for (const item of items) {
+    if (item.rule_id !== RULE.discrepancy || item.current.historical) {
+      continue;
+    }
+    const ref = discrepancyRef(item);
+    if (ref !== null) {
+      ids.push(ref.discrepancyId);
+    }
+  }
+  return ids;
+}
+
 /** Props of {@link DiscrepancyGroupBody}. */
 interface DiscrepancyGroupBodyProps {
   /** The discrepancy group, as the API returned it. */
@@ -545,26 +908,32 @@ interface DiscrepancyGroupBodyProps {
  * never has, while AAP 0.5.5 shows it in place with its resolver disabled. So C0 cards stay
  * pinned here, and the card itself shows the historical badge and disables the resolver. Items
  * feedback hides are skipped, as the frame does (the frame counts them).
+ *
+ * The group's C0 cards share one {@link LiveDiscrepancyLookup}: the live discrepancies are read
+ * once for the group, and only while it shows a current C0 card naming a discrepancy
+ * ({@link currentDiscrepancyIds}).
  */
 function DiscrepancyGroupBody({ group, anchorId }: DiscrepancyGroupBodyProps): ReactElement {
   const shown = group.items.filter((item) => !isHidden(item));
   const pinned = shown.filter((item) => item.rule_id === RULE.discrepancy || !isHeld(item));
   const held = shown.filter((item) => item.rule_id !== RULE.discrepancy && isHeld(item));
   return (
-    <Stack>
-      {pinned.map((item) => (
-        <Fragment key={item.id}>
-          <CampaignCard item={item} />
-        </Fragment>
-      ))}
-      <HeldDisclosure id={`${anchorId}-held`} count={held.length}>
-        {held.map((item) => (
+    <LiveDiscrepancyLookup discrepancyIds={currentDiscrepancyIds(shown)}>
+      <Stack>
+        {pinned.map((item) => (
           <Fragment key={item.id}>
             <CampaignCard item={item} />
           </Fragment>
         ))}
-      </HeldDisclosure>
-    </Stack>
+        <HeldDisclosure id={`${anchorId}-held`} count={held.length}>
+          {held.map((item) => (
+            <Fragment key={item.id}>
+              <CampaignCard item={item} />
+            </Fragment>
+          ))}
+        </HeldDisclosure>
+      </Stack>
+    </LiveDiscrepancyLookup>
   );
 }
 

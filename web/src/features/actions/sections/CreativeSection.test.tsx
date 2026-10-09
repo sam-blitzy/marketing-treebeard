@@ -7,9 +7,10 @@
  *   anchored at `groupAnchorId('creative', key)` (`campaign:1` → `group-creative-campaign-1`),
  *   holding its own variants table ("Variants in {campaign}": Creative, Impressions, Click rate,
  *   Open rate, Completion rate, Leads; rates as `formatPercent` renders them at two digits, "n/a"
- *   for a stage the campaign does not use, "unavailable" for an absent count), then the cards in
- *   API order: the CR3 next test with the CR2 weak stage as its reason, then the CR1 pairs, held
- *   ones behind the held disclosure.
+ *   only for a stage the campaign's objective does not use, "not estimable" for a missing rate
+ *   over a zero denominator, "unavailable" for any other missing rate and for an absent count),
+ *   then the cards in API order: the CR3 next test with the CR2 weak stage as its reason, then
+ *   the CR1 pairs, held ones behind the held disclosure.
  * - **Distinguishability (CR1, P7).** Pair labels are the API's own words, "Distinguishable
  *   (adjusted p = …)" or "{A} ahead, not yet distinguishable …", and the "Not yet
  *   distinguishable" badge is the API's flag; the section never declares a winner.
@@ -46,6 +47,7 @@ import { formatCount, formatPercent } from '../../../lib/format';
 import { renderWithProviders } from '../../../test/render';
 import {
   CreativeSection,
+  NOT_ESTIMABLE,
   VARIANT_RATE_DIGITS,
   VariantsTable,
   formatVariantRate,
@@ -108,13 +110,19 @@ function pairItem(id: number, action: string, flagMessage: string | null): Item 
   });
 }
 
-/** A CR3 item whose `extra.variants` is `rows`. */
-function testItemWith(id: number, rows: unknown[]): Item {
+/**
+ * A CR3 item whose `extra.variants` is `rows` and, when given, whose `extra.campaign` is
+ * `campaign` (`creative._Campaign.summary`, which names the objective group). Without it the
+ * evidence names no objective.
+ */
+function testItemWith(id: number, rows: unknown[], campaign?: Record<string, unknown>): Item {
+  const extra: Record<string, unknown> =
+    campaign === undefined ? { variants: rows } : { campaign, variants: rows };
   return makeItem({
     id,
     rule_id: 'CR3',
     action: `Next test ${String(id)}`,
-    evidence: makeEvidence({ extra: { variants: rows } }),
+    evidence: makeEvidence({ extra }),
   });
 }
 
@@ -478,20 +486,24 @@ describe('CreativeSection', () => {
             key: 'campaign:779',
             title: 'Website visits',
             items: [
-              testItemWith(56, [
-                {
-                  creative_id: 9101,
-                  urn: 'urn:li:sponsoredCreative:9101',
-                  name: 'Visit A',
-                  impressions: 20000,
-                  click_rate: '0.0105',
-                  open_rate: null,
-                  completion_rate: null,
-                },
-                { urn: 'urn:li:sponsoredCreative:9102', click_rate: 0.009 },
-                { name: 'no id at all' },
-                'not a row',
-              ]),
+              testItemWith(
+                56,
+                [
+                  {
+                    creative_id: 9101,
+                    urn: 'urn:li:sponsoredCreative:9101',
+                    name: 'Visit A',
+                    impressions: 20000,
+                    click_rate: '0.0105',
+                    open_rate: null,
+                    completion_rate: null,
+                  },
+                  { urn: 'urn:li:sponsoredCreative:9102', click_rate: 0.009 },
+                  { name: 'no id at all' },
+                  'not a row',
+                ],
+                { id: 779, name: 'Website visits', objective_group: 'linkedin_other' },
+              ),
             ],
           }),
         ),
@@ -503,6 +515,110 @@ describe('CreativeSection', () => {
         // A variant without a name is shown by its URN; a number rate is read as its decimal.
         ['urn:li:sponsoredCreative:9102', 'unavailable', '0.9%', 'n/a', 'n/a', 'unavailable'],
       ]);
+    });
+
+    it('renders a missing rate of a lead-gen stage as "unavailable", or "not estimable" over zero form opens, never "n/a"', async () => {
+      // Rows as creative._variant_row writes them for a lead-gen campaign: opens unreported
+      // leave the open and completion rates None; zero form opens leave the completion rate
+      // None over a known-zero denominator; more clicks than impressions leave the click rate
+      // None over a known, non-zero denominator.
+      await renderCreative(
+        creativeWith(
+          makeGroup({
+            key: 'campaign:781',
+            title: 'Lead Gen — Guide',
+            items: [
+              testItemWith(
+                58,
+                [
+                  {
+                    creative_id: 9301,
+                    name: 'Opens unreported',
+                    impressions: 5000,
+                    clicks: 20,
+                    form_opens: null,
+                    leads: 10,
+                    click_rate: '0.004',
+                    open_rate: null,
+                    completion_rate: null,
+                  },
+                  {
+                    creative_id: 9302,
+                    name: 'Form never opened',
+                    impressions: 4200,
+                    clicks: 21,
+                    form_opens: 0,
+                    leads: 0,
+                    click_rate: '0.005',
+                    open_rate: '0.000000',
+                    completion_rate: null,
+                  },
+                  {
+                    creative_id: 9303,
+                    name: 'Inconsistent clicks',
+                    impressions: 1200,
+                    clicks: 1300,
+                    form_opens: 30,
+                    leads: 6,
+                    click_rate: null,
+                    open_rate: '0.025',
+                    completion_rate: '0.2',
+                  },
+                ],
+                { id: 781, name: 'Lead Gen — Guide', objective_group: 'linkedin_lead_gen' },
+              ),
+            ],
+          }),
+        ),
+      );
+
+      const table = screen.getByRole('table', { name: 'Variants in Lead Gen — Guide' });
+      expect(bodyRows(table)).toEqual([
+        ['Opens unreported', '5,000', '0.4%', 'unavailable', 'unavailable', '10'],
+        ['Form never opened', '4,200', '0.5%', '0%', 'not estimable', '0'],
+        ['Inconsistent clicks', '1,200', 'unavailable', '2.5%', '20%', '6'],
+      ]);
+      expect(within(table).queryByText('n/a')).toBeNull();
+    });
+
+    it('never renders "n/a" when the evidence names no objective group', async () => {
+      await renderCreative(
+        creativeWith(
+          makeGroup({
+            key: 'campaign:782',
+            title: 'Objective unknown',
+            items: [
+              testItemWith(59, [
+                {
+                  creative_id: 9401,
+                  name: 'Unknown A',
+                  impressions: 3000,
+                  click_rate: '0.01',
+                  open_rate: null,
+                  completion_rate: null,
+                },
+                {
+                  creative_id: 9402,
+                  name: 'Unknown B',
+                  impressions: 2800,
+                  form_opens: 0,
+                  leads: 0,
+                  click_rate: '0.0125',
+                  open_rate: null,
+                  completion_rate: null,
+                },
+              ]),
+            ],
+          }),
+        ),
+      );
+
+      const table = screen.getByRole('table', { name: 'Variants in Objective unknown' });
+      expect(bodyRows(table)).toEqual([
+        ['Unknown A', '3,000', '1%', 'unavailable', 'unavailable', 'unavailable'],
+        ['Unknown B', '2,800', '1.25%', 'unavailable', 'not estimable', '0'],
+      ]);
+      expect(within(table).queryByText('n/a')).toBeNull();
     });
 
     it('keeps every variant row when creative ids repeat', async () => {
@@ -526,11 +642,24 @@ describe('CreativeSection', () => {
       expect(rows.map((row) => row[0])).toEqual(['First', 'Second', 'Third']);
     });
 
-    it('formats a stage rate at two digits, and a stage that does not apply as "n/a"', () => {
+    it('formats a stage rate at two digits, "n/a" only where the stage does not apply, and a missing rate as "not estimable" or "unavailable"', () => {
       expect(VARIANT_RATE_DIGITS).toBe(2);
-      expect(formatVariantRate('0.395062')).toBe('39.51%');
-      expect(formatVariantRate('0.004377')).toBe('0.44%');
-      expect(formatVariantRate(null)).toBe('n/a');
+      expect(NOT_ESTIMABLE).toBe('not estimable');
+      // A rate, whether its stage is known to apply or its applicability is unknown.
+      expect(formatVariantRate('0.395062', true, 162)).toBe('39.51%');
+      expect(formatVariantRate('0.004377', null, 13250)).toBe('0.44%');
+      expect(formatVariantRate('0.000000', true, 4200)).toBe('0%');
+      // A stage the campaign does not use is "n/a", checked before anything else.
+      expect(formatVariantRate(null, false, null)).toBe('n/a');
+      expect(formatVariantRate(null, false, 0)).toBe('n/a');
+      expect(formatVariantRate('0.01', false, 1000)).toBe('n/a');
+      // A missing rate over a known-zero denominator, applicable or of unknown applicability.
+      expect(formatVariantRate(null, true, 0)).toBe('not estimable');
+      expect(formatVariantRate(null, null, 0)).toBe('not estimable');
+      // Any other missing rate: an unreported denominator, or inconsistent counts.
+      expect(formatVariantRate(null, true, null)).toBe('unavailable');
+      expect(formatVariantRate(null, true, 1200)).toBe('unavailable');
+      expect(formatVariantRate(null, null, null)).toBe('unavailable');
     });
 
     it('renders nothing for a campaign without variants', () => {
