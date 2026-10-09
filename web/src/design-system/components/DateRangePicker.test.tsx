@@ -18,6 +18,11 @@
  * - `disabled` disables every control, and an invalid window configuration fails closed with a
  *   static error naming each problem and no control.
  *
+ * The fixture's window configuration is deliberately unlike the product's `config/thresholds.yaml`
+ * defaults (presets 14, 28, 56 and 90, default 28, at most 180 days), and one test swaps the
+ * preset array for another, so the tests prove the picker renders the configuration it is given
+ * and hard-codes no window length (AAP 0.5.5).
+ *
  * jsdom, like a browser, sanitizes the value of an `<input type="date">`, so a malformed or
  * impossible date cannot be typed into a field. Such dates reach the picker's drafts the way a
  * reopened custom run does: through a custom `value`.
@@ -27,17 +32,20 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { DateRangePicker, type DateRangePickerProps, type DateRangeValue } from './DateRangePicker';
 
-/** `window.presets` as `GET /config` serves it by default. */
-const PRESETS: readonly number[] = [14, 28, 56, 90];
+/** `window.presets` for these tests: deliberately not the product's default presets. */
+const PRESETS: readonly number[] = [7, 21, 35];
+
+/** `window.default_days` for these tests: one of {@link PRESETS}, but not the product's 28. */
+const DEFAULT_PRESET = 21;
 
 /** The default window end: the latest selectable date. */
-const MAX_DATE = '2026-10-10';
+const MAX_DATE = '2026-10-05';
 
-/** `window.max_days` for these tests. */
-const MAX_DAYS = 90;
+/** `window.max_days` for these tests: deliberately not the product's 180. */
+const MAX_DAYS = 120;
 
 /** The default run's window. */
-const DEFAULT_VALUE: DateRangeValue = { kind: 'preset', days: 28 };
+const DEFAULT_VALUE: DateRangeValue = { kind: 'preset', days: DEFAULT_PRESET };
 
 /** The props of a picker under test, with mock callbacks the test can inspect. */
 function pickerProps(overrides: Partial<DateRangePickerProps> = {}) {
@@ -46,7 +54,7 @@ function pickerProps(overrides: Partial<DateRangePickerProps> = {}) {
   const props: DateRangePickerProps = {
     label: 'Analysis window',
     presets: PRESETS,
-    defaultPreset: 28,
+    defaultPreset: DEFAULT_PRESET,
     value: DEFAULT_VALUE,
     onSelectPreset,
     onSelectCustom,
@@ -123,37 +131,73 @@ describe('DateRangePicker', () => {
       const group = screen.getByRole('group', { name: 'Analysis window' });
       expect(group.getAttribute('aria-labelledby')).toBe(label.id);
       expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
-        '14 days',
-        '28 days (default)',
-        '56 days',
-        '90 days',
+        '7 days',
+        '21 days (default)',
+        '35 days',
         'Custom range',
       ]);
+      for (const name of ['7 days', '21 days (default)', '35 days', 'Custom range']) {
+        expect(within(group).getByRole('button', { name })).toBeDefined();
+      }
+    });
+
+    it('presses the default preset when value is the default run', () => {
+      renderPicker();
+
+      const pressed = (name: string) =>
+        screen.getByRole('button', { name }).getAttribute('aria-pressed');
+      expect(pressed('21 days (default)')).toBe('true');
+      expect(pressed('7 days')).toBe('false');
+      expect(pressed('35 days')).toBe('false');
     });
 
     it('presses only the preset matching value', () => {
-      renderPicker({ value: { kind: 'preset', days: 56 } });
+      renderPicker({ value: { kind: 'preset', days: 35 } });
 
-      expect(pressedStates()).toEqual(['false', 'false', 'true', 'false']);
+      expect(pressedStates()).toEqual(['false', 'false', 'true']);
       expect(customToggle().hasAttribute('aria-pressed')).toBe(false);
     });
 
     it('reports an activated preset and leaves the selection to the caller', () => {
-      const { onSelectPreset } = renderPicker();
+      const { onSelectPreset, onSelectCustom } = renderPicker();
 
-      fireEvent.click(screen.getByRole('button', { name: '90 days' }));
+      fireEvent.click(screen.getByRole('button', { name: '35 days' }));
 
       expect(onSelectPreset).toHaveBeenCalledTimes(1);
-      expect(onSelectPreset).toHaveBeenCalledWith(90);
-      expect(pressedStates()).toEqual(['false', 'true', 'false', 'false']);
+      expect(onSelectPreset).toHaveBeenCalledWith(35);
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(pressedStates()).toEqual(['false', 'true', 'false']);
     });
 
     it('reports the default preset by its length too', () => {
-      const { onSelectPreset } = renderPicker({ value: { kind: 'preset', days: 14 } });
+      const { onSelectPreset } = renderPicker({ value: { kind: 'preset', days: 7 } });
 
-      fireEvent.click(screen.getByRole('button', { name: '28 days (default)' }));
+      fireEvent.click(screen.getByRole('button', { name: '21 days (default)' }));
 
-      expect(onSelectPreset).toHaveBeenCalledWith(28);
+      expect(onSelectPreset).toHaveBeenCalledTimes(1);
+      expect(onSelectPreset).toHaveBeenCalledWith(21);
+    });
+
+    it('replaces its options when the configured presets and default change', () => {
+      const { rerenderWith } = renderPicker();
+
+      rerenderWith({ presets: [10, 30], defaultPreset: 30 });
+
+      const group = screen.getByRole('group', { name: 'Analysis window' });
+      expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
+        '10 days',
+        '30 days (default)',
+        'Custom range',
+      ]);
+      for (const gone of ['7 days', '21 days (default)', '21 days', '35 days']) {
+        expect(screen.queryByRole('button', { name: gone })).toBeNull();
+      }
+      // The shown window (21 days) is no longer offered, so no preset is pressed.
+      expect(pressedStates()).toEqual(['false', 'false']);
+
+      rerenderWith({ presets: [10, 30], defaultPreset: 30, value: { kind: 'preset', days: 30 } });
+
+      expect(pressedStates()).toEqual(['false', 'true']);
     });
 
     it('offers exactly the configured lengths, each distinct length once, with a singular day', () => {
@@ -172,7 +216,7 @@ describe('DateRangePicker', () => {
     it('presses no preset for a custom value', () => {
       renderPicker({ value: { kind: 'custom', start: '2026-09-01', end: '2026-09-30' } });
 
-      expect(pressedStates()).toEqual(['false', 'false', 'false', 'false']);
+      expect(pressedStates()).toEqual(['false', 'false', 'false']);
     });
   });
 
@@ -214,12 +258,16 @@ describe('DateRangePicker', () => {
       expect(statusRegion().textContent).toBe('');
     });
 
-    it('opens with the range of a custom value prefilled', () => {
+    it('opens with the range of a custom value prefilled and no preset pressed', () => {
       renderPicker({ value: { kind: 'custom', start: '2026-09-01', end: '2026-09-30' } });
 
-      expect(customToggle().getAttribute('aria-expanded')).toBe('true');
+      const toggle = customToggle();
+      const panel = document.getElementById(toggle.getAttribute('aria-controls') ?? '');
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(panel?.hidden).toBe(false);
       expect(startField().value).toBe('2026-09-01');
       expect(endField().value).toBe('2026-09-30');
+      expect(pressedStates()).toEqual(['false', 'false', 'false']);
     });
   });
 
@@ -240,15 +288,31 @@ describe('DateRangePicker', () => {
     });
 
     it.each([
-      ['a one-day range ending on maxDate', '2026-10-10', '2026-10-10'],
-      ['a range of exactly maxDays days', '2026-07-13', '2026-10-10'],
+      ['a one-day range ending on maxDate', '2026-10-05', '2026-10-05'],
+      // 2026-06-08 to 2026-10-05, both ends inclusive: 23 + 31 + 31 + 30 + 5 = 120 days.
+      ['a range of exactly maxDays days', '2026-06-08', '2026-10-05'],
       ['a year 0001 range', '0001-01-01', '0001-01-31'],
     ])('accepts %s', (_case, start, end) => {
       const { onSelectCustom } = renderPicker({ value: { kind: 'custom', start, end } });
 
       apply();
 
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
       expect(onSelectCustom).toHaveBeenCalledWith(start, end);
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
+    });
+
+    it('accepts a typed range of exactly maxDays days', () => {
+      const { onSelectCustom } = renderPicker();
+      fireEvent.click(customToggle());
+
+      fireEvent.change(startField(), { target: { value: '2026-06-08' } });
+      fireEvent.change(endField(), { target: { value: '2026-10-05' } });
+      apply();
+
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
+      expect(onSelectCustom).toHaveBeenCalledWith('2026-06-08', '2026-10-05');
     });
 
     it('shows no message before the first Apply, however invalid the drafts', () => {
@@ -290,19 +354,28 @@ describe('DateRangePicker', () => {
       ['an empty end date', '2026-09-01', '', 'end', 'Enter an end date'],
       [
         'a start after the end',
+        '2026-09-20',
         '2026-09-10',
-        '2026-09-01',
         'start',
         'Start date must be on or before the end date',
       ],
       [
         'an end after maxDate',
         '2026-09-01',
-        '2026-10-11',
+        '2026-10-06',
         'end',
-        'End date must be on or before 2026-10-10',
+        'End date must be on or before 2026-10-05',
       ],
-      ['a range one day over maxDays', '2026-07-12', '2026-10-10', 'end', 'Range must be at most 90 days'],
+      // 2026-06-07 to 2026-10-05, both ends inclusive: 121 days.
+      [
+        'a range one day over maxDays',
+        '2026-06-07',
+        '2026-10-05',
+        'end',
+        'Range must be at most 120 days',
+      ],
+      // 2026-01-01 to 2026-10-05, both ends inclusive: 273 + 5 = 278 days.
+      ['a 278-day range', '2026-01-01', '2026-10-05', 'end', 'Range must be at most 120 days'],
     ])('rejects %s on that field alone and focuses it', (_case, start, end, field, message) => {
       const { onSelectCustom } = renderPicker({ value: { kind: 'custom', start, end } });
 
@@ -320,8 +393,44 @@ describe('DateRangePicker', () => {
       expect(statusRegion().textContent).toBe(`1 error: ${label}: ${message}.`);
     });
 
+    it.each([
+      [
+        'a start after the end',
+        '2026-09-20',
+        '2026-09-10',
+        'start',
+        'Start date must be on or before the end date',
+      ],
+      [
+        'an end after maxDate',
+        '2026-09-01',
+        '2026-10-06',
+        'end',
+        'End date must be on or before 2026-10-05',
+      ],
+      ['a 278-day range', '2026-01-01', '2026-10-05', 'end', 'Range must be at most 120 days'],
+    ])('rejects typed %s after Apply without reporting it', (_case, start, end, field, message) => {
+      const { onSelectCustom } = renderPicker();
+      fireEvent.click(customToggle());
+
+      fireEvent.change(startField(), { target: { value: start } });
+      fireEvent.change(endField(), { target: { value: end } });
+      apply();
+
+      const invalid = field === 'start' ? startField() : endField();
+      const valid = field === 'start' ? endField() : startField();
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(invalid.getAttribute('aria-invalid')).toBe('true');
+      expect(messageOf(invalid)).toBe(message);
+      expect(screen.getByText(message)).toBeDefined();
+      expect(valid.hasAttribute('aria-invalid')).toBe(false);
+    });
+
     it('words a one-day maximum in the singular', () => {
-      renderPicker({ maxDays: 1, value: { kind: 'custom', start: '2026-10-09', end: '2026-10-10' } });
+      renderPicker({
+        maxDays: 1,
+        value: { kind: 'custom', start: '2026-10-04', end: '2026-10-05' },
+      });
 
       apply();
 
@@ -425,7 +534,7 @@ describe('DateRangePicker', () => {
       expect(startField().hasAttribute('aria-invalid')).toBe(false);
       expect(endField().hasAttribute('aria-invalid')).toBe(false);
       expect(statusRegion().textContent).toBe('');
-      expect(pressedStates()).toEqual(['false', 'false', 'false', 'false']);
+      expect(pressedStates()).toEqual(['false', 'false', 'false']);
     });
 
     it('reopens a collapsed panel when value changes to another custom range', () => {
@@ -446,11 +555,11 @@ describe('DateRangePicker', () => {
       fireEvent.click(customToggle());
       fireEvent.change(startField(), { target: { value: '2026-09-01' } });
 
-      rerenderWith({ value: { kind: 'preset', days: 56 } });
+      rerenderWith({ value: { kind: 'preset', days: 35 } });
 
       expect(customToggle().getAttribute('aria-expanded')).toBe('true');
       expect(startField().value).toBe('2026-09-01');
-      expect(pressedStates()).toEqual(['false', 'false', 'true', 'false']);
+      expect(pressedStates()).toEqual(['false', 'false', 'true']);
     });
   });
 
@@ -463,10 +572,9 @@ describe('DateRangePicker', () => {
 
       const buttons = screen.getAllByRole<HTMLButtonElement>('button');
       expect(buttons.map((button) => button.textContent)).toEqual([
-        '14 days',
-        '28 days (default)',
-        '56 days',
-        '90 days',
+        '7 days',
+        '21 days (default)',
+        '35 days',
         'Custom range',
         'Apply',
       ]);
@@ -563,12 +671,17 @@ describe('DateRangePicker', () => {
     });
 
     it('recovers its controls as soon as the configuration is fixed', () => {
-      const { rerenderWith } = renderPicker({ defaultPreset: 30 });
+      // 28 is the product's default window, but not one of these presets.
+      const { rerenderWith } = renderPicker({ defaultPreset: 28 });
       expect(screen.queryByRole('group')).toBeNull();
+      expect(listedProblems()).toEqual([
+        'The default window of 28 days is not one of the presets.',
+      ]);
 
-      rerenderWith({ defaultPreset: 28 });
+      rerenderWith({ defaultPreset: DEFAULT_PRESET });
 
       expect(screen.getByRole('group', { name: 'Analysis window' })).toBeDefined();
+      expect(screen.getByRole('button', { name: '21 days (default)' })).toBeDefined();
       expect(screen.queryByText('No window can be chosen: the window settings are invalid')).toBeNull();
     });
   });

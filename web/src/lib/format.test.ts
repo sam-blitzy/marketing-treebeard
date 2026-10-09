@@ -7,10 +7,21 @@
  * display zones and unparsable instants. Expected strings are literal, so a change in rendering
  * fails a test rather than passing silently. The verified ICU outputs quoted in the module's
  * contract are asserted verbatim.
+ *
+ * Fixtures are typed against `../api/types` with `satisfies`, so a schema change fails the
+ * typecheck. The suite mocks nothing and reads no clock, locale or `TZ`: it passes unchanged
+ * under `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
  */
 import { describe, expect, it } from 'vitest';
 
-import type { EvidenceWindow, Metric, SourceName } from '../api/types';
+import type {
+  EvidenceWindow,
+  Metric,
+  Sample,
+  SourceDay,
+  SourceName,
+  StatTest,
+} from '../api/types';
 import * as format from './format';
 import {
   DAY_UNITS,
@@ -66,6 +77,19 @@ function metric(value: Metric['value'], overrides: Partial<Metric> = {}): Metric
 /** The spaces format.ts must never leave in its output. */
 const SPECIAL_SPACES = /[\u202F\u00A0]/;
 
+/**
+ * Minutes since midnight of the 12-hour clock time in a formatted instant, such as
+ * `"Oct 6, 2026, 11:22 AM America/New_York"` → 682. Fails the test when no time is present.
+ */
+function clockMinutes(text: string): number {
+  const match = /(\d{1,2}):(\d{2}) (AM|PM)/.exec(text);
+  if (match === null) {
+    throw new Error(`no clock time in ${JSON.stringify(text)}`);
+  }
+  const [, hours = '', minutes = '', meridiem = ''] = match;
+  return ((Number(hours) % 12) + (meridiem === 'PM' ? 12 : 0)) * 60 + Number(minutes);
+}
+
 describe('constants', () => {
   it('fixes the locale and the placeholder texts', () => {
     expect(LOCALE).toBe('en');
@@ -88,22 +112,87 @@ describe('constants', () => {
   it('has no default export', () => {
     expect('default' in format).toBe(false);
   });
+
+  it('exports nothing that sums, totals, converts or aggregates across currencies', async () => {
+    const exported = Object.keys(await import('./format')).sort();
+    expect(exported).toEqual(
+      [
+        'DAY_UNITS',
+        'EM_DASH',
+        'LOCALE',
+        'MONEY_UNITS',
+        'MULTIPLE_UNITS',
+        'NOT_APPLICABLE',
+        'PERCENT_POINT_UNITS',
+        'P_VALUE_UNITS',
+        'RATE_UNITS',
+        'RATIO_UNITS',
+        'TEST_LABELS',
+        'TEXT_UNITS',
+        'UNAVAILABLE',
+        'boundariesDiffer',
+        'currencyMinorDigits',
+        'currencyStep',
+        'formatCost',
+        'formatCount',
+        'formatDateRange',
+        'formatDays',
+        'formatDecimal',
+        'formatFloor',
+        'formatInstant',
+        'formatMetric',
+        'formatMoney',
+        'formatPValue',
+        'formatPercent',
+        'formatSample',
+        'formatSourceBoundaries',
+        'formatSourceDate',
+        'formatTestLine',
+        'formatWindowChip',
+        'isDecimalString',
+        'sourceLabel',
+      ].sort(),
+    );
+    expect(exported.filter((name) => /sum|total|convert|aggregate/i.test(name))).toEqual([]);
+  });
 });
 
 describe('isDecimalString', () => {
-  it.each(['120.500000', ' -3 ', '.5', '1e-7', '+5', '5.', '0', '-0.00', '2E+3'])(
-    'accepts %j',
-    (value) => {
-      expect(isDecimalString(value)).toBe(true);
-    },
-  );
+  it.each([
+    '12',
+    '-0.5',
+    '.5',
+    '1E+2',
+    ' 3.4 ',
+    '120.500000',
+    ' -3 ',
+    '1e-7',
+    '+5',
+    '5.',
+    '0',
+    '-0.00',
+    '2E+3',
+  ])('accepts %j', (value) => {
+    expect(isDecimalString(value)).toBe(true);
+  });
 
-  it.each(['', '  ', 'n/a', '1,234', '0x10', 'Infinity', 'NaN', '--1', '1.2.3', '≥ 12', 'e5'])(
-    'rejects %j',
-    (value) => {
-      expect(isDecimalString(value)).toBe(false);
-    },
-  );
+  it.each([
+    '',
+    '  ',
+    '1,000',
+    'abc',
+    'NaN',
+    'Infinity',
+    'n/a',
+    '1,234',
+    '0x10',
+    '--1',
+    '1.2.3',
+    '≥ 12',
+    'e5',
+  ])('rejects %j', (value) => {
+    expect(isDecimalString(value)).toBe(false);
+  });
 });
 
 describe('sourceLabel', () => {
@@ -129,7 +218,26 @@ describe('formatMoney', () => {
 
   it('rounds the exact decimal string, never a float', () => {
     expect(formatMoney('999999999999.994999', 'USD')).toBe('$999,999,999,999.99');
+    expect(formatMoney('123456789012.344999', 'USD')).toBe('$123,456,789,012.34');
     expect(formatMoney('120.500000', 'USD')).toBe('$120.50');
+  });
+
+  it('differs from the Number() round trip, which loses the precision', () => {
+    // The nearest double's shortest decimal is 999999999999.995 (and 123456789012.345), which
+    // Intl rounds half up; the string keeps the trailing 4999 and rounds down.
+    expect(formatMoney(Number('999999999999.994999'), 'USD')).toBe('$1,000,000,000,000.00');
+    expect(formatMoney(Number('123456789012.344999'), 'USD')).toBe('$123,456,789,012.35');
+    expect(formatMoney('999999999999.994999', 'USD')).not.toBe(
+      formatMoney(Number('999999999999.994999'), 'USD'),
+    );
+  });
+
+  it('formats each currency independently, one amount per call', () => {
+    expect(formatMoney('40', 'GBP')).toBe('£40.00');
+    expect(formatMoney('1234.5', 'JPY')).toBe('¥1,235');
+    expect(formatMoney('40', 'EUR')).toBe('€40.00');
+    // Formatting one currency leaves the next call's currency untouched.
+    expect(formatMoney('40', 'GBP')).toBe('£40.00');
   });
 
   it('formats numbers and lower-case codes', () => {
@@ -145,10 +253,12 @@ describe('formatMoney', () => {
     'renders %j as unavailable',
     (value) => {
       expect(formatMoney(value, 'USD')).toBe(UNAVAILABLE);
+      expect(formatMoney(value, 'USD')).not.toBe('0');
     },
   );
 
   it('implies no currency when the code is missing', () => {
+    expect(formatMoney('12.5', null)).toBe('12.5');
     expect(formatMoney('40.5', null)).toBe('40.5');
     expect(formatMoney('40.5', undefined)).toBe('40.5');
     expect(formatMoney('40.5', '  ')).toBe('40.5');
@@ -284,6 +394,25 @@ describe('formatCost', () => {
     expect(formatCost('300', zero, 'USD')).toBe(EM_DASH);
   });
 
+  it('renders a zero denominator as a dash, never a finite cost or a ceiling', () => {
+    expect(formatCost('500', 0, 'USD')).toBe('—');
+    expect(formatCost('500', 0, 'USD', 'no QL yet')).toBe('— (no QL yet)');
+    expect(formatCost('500', 0, 'USD')).not.toMatch(/\d/);
+    expect(formatCost('500', 4, 'USD')).toBe('$125.00');
+  });
+
+  // An absent denominator is unknown evidence, not a known zero: AAP 0.5.4.7 reserves "—" for
+  // a cost whose known denominator is 0, and AAP 0.11.1 renders absent values "unavailable".
+  // The module follows the AAP here, so a null or undefined denominator stays "unavailable"
+  // rather than the "—" the test plan's wording suggests.
+  it.each([null, undefined])(
+    'keeps the absent denominator %j apart from a known zero',
+    (absent) => {
+      expect(formatCost('500', absent, 'USD')).toBe(UNAVAILABLE);
+      expect(formatCost('500', absent, 'USD')).not.toBe(formatCost('500', 0, 'USD'));
+    },
+  );
+
   it.each([
     null,
     undefined,
@@ -360,6 +489,7 @@ describe('formatCost', () => {
 describe('formatFloor', () => {
   it('marks counts and costs', () => {
     expect(formatFloor('12', 'min')).toBe('≥ 12');
+    expect(formatFloor(formatMoney('40', 'EUR'), 'max')).toBe('≤ €40.00');
     expect(formatFloor('$75.00', 'max')).toBe('≤ $75.00');
     expect(formatFloor(' 12 ', 'min')).toBe('≥ 12');
     expect(formatFloor('XYZ 5.00', 'max')).toBe('≤ XYZ 5.00');
@@ -393,6 +523,23 @@ describe('formatMetric', () => {
     expect(formatMetric({ value: undefined })).toBe(UNAVAILABLE);
   });
 
+  it('renders an unavailable zero as unavailable, not 0', () => {
+    const unavailableZero = {
+      key: 'ql',
+      label: 'Qualified Leads',
+      value: '0',
+      unit: 'contacts',
+      currency: null,
+      floor: null,
+      unavailable: true,
+    } satisfies Metric;
+    expect(formatMetric(unavailableZero)).toBe('unavailable');
+    expect(formatMetric(unavailableZero)).not.toBe('0');
+    expect(formatMetric({ ...unavailableZero, value: null, unavailable: null })).toBe(
+      'unavailable',
+    );
+  });
+
   it('renders booleans as yes or no', () => {
     expect(formatMetric(metric(true))).toBe('yes');
     expect(formatMetric(metric(false))).toBe('no');
@@ -414,6 +561,17 @@ describe('formatMetric', () => {
       'unknown (3 deals not assessed)',
     );
   });
+
+  it.each(['n/a', '≥ 7', 'unknown (3 deals not assessed)'])(
+    'passes the pre-rendered %j through unchanged, floored or not',
+    (text) => {
+      expect(formatMetric(metric(text))).toBe(text);
+      expect(formatMetric(metric(text, { floor: true }))).toBe(text);
+      expect(formatMetric(metric(text, { unit: 'currency', currency: 'EUR', floor: true }))).toBe(
+        text,
+      );
+    },
+  );
 
   it('formats money by currency code or money unit', () => {
     expect(formatMetric(metric('12.340000', { unit: 'currency', currency: 'USD' }))).toBe(
@@ -439,7 +597,47 @@ describe('formatMetric', () => {
     expect(formatMetric(metric(Number.NaN, { unit: 'multiple' }))).toBe(UNAVAILABLE);
   });
 
+  it.each([...MONEY_UNITS])('formats the money unit %j in its currency', (unit) => {
+    expect(formatMetric(metric('40', { unit, currency: 'EUR' }))).toBe('€40.00');
+    expect(formatMetric(metric('40', { unit }))).toBe('40');
+  });
+
+  it.each([...RATIO_UNITS])('formats the ratio unit %j as a percentage', (unit) => {
+    expect(formatMetric(metric('0.123', { unit }))).toBe('12.3%');
+    expect(formatMetric(metric(1.4, { unit }))).toBe('140%');
+  });
+
+  it.each([...RATE_UNITS])('formats the rate unit %j as a six-place decimal', (unit) => {
+    expect(formatMetric(metric('0.012345', { unit }))).toBe('0.012345');
+  });
+
+  it.each([...PERCENT_POINT_UNITS])('formats the percent-point unit %j with a % sign', (unit) => {
+    expect(formatMetric(metric(12.3, { unit }))).toBe('12.3%');
+  });
+
+  it.each([...DAY_UNITS])('formats the day unit %j as a day count', (unit) => {
+    expect(formatMetric(metric(28, { unit }))).toBe('28 days');
+    expect(formatMetric(metric(1, { unit }))).toBe('1 day');
+  });
+
+  it.each([...P_VALUE_UNITS])('formats the p-value unit %j', (unit) => {
+    expect(formatMetric(metric('0.0321', { unit }))).toBe('0.032');
+    expect(formatMetric(metric(0.0004, { unit }))).toBe('< 0.001');
+  });
+
+  // A multiple renders through formatDecimal at two places without padding, the contract
+  // format.ts documents ("1.5×"), so 1.5 reads "1.5×" rather than the test plan's "1.50×".
+  it.each([...MULTIPLE_UNITS])('formats the multiple unit %j with a × sign', (unit) => {
+    expect(formatMetric(metric(1.5, { unit }))).toBe('1.5×');
+    expect(formatMetric(metric('1.456', { unit }))).toBe('1.46×');
+  });
+
+  it.each([...TEXT_UNITS])('shows the text unit %j verbatim', (unit) => {
+    expect(formatMetric(metric('2024', { unit }))).toBe('2024');
+  });
+
   it('formats counts and unknown units as counts', () => {
+    expect(formatMetric(metric(0.25, { unit: 'widgets' }))).toBe('0.25');
     expect(formatMetric(metric(1234, { unit: 'clicks' }))).toBe('1,234');
     expect(formatMetric(metric('0.3', { unit: 'conversions' }))).toBe('0.3');
     expect(formatMetric(metric('6.5', { unit: 'score' }))).toBe('6.5');
@@ -451,6 +649,9 @@ describe('formatMetric', () => {
     expect(
       formatMetric(metric('75', { unit: 'currency', currency: 'USD', floor: true })),
     ).toBe('≤ $75.00');
+    expect(
+      formatMetric(metric('40', { unit: 'currency', currency: 'EUR', floor: true })),
+    ).toBe('≤ €40.00');
     expect(formatMetric(metric(12, { unit: 'contacts', floor: true }))).toBe('≥ 12');
     expect(formatMetric(metric(12, { unit: 'contacts', floor: false }))).toBe('12');
     expect(formatMetric(metric(Number.NaN, { unit: 'meetings', floor: true }))).toBe(UNAVAILABLE);
@@ -487,6 +688,31 @@ describe('formatSample', () => {
     expect(formatSample({ observed: 3100, required: '4200', unit: 'form opens' })).toBe(
       '3,100 / 4,200 form opens',
     );
+  });
+
+  it('renders a typed evidence sample and its projection', () => {
+    const clicks = {
+      observed: 37,
+      required: 300,
+      unit: 'clicks',
+      projected: null,
+    } satisfies Sample;
+    expect(formatSample(clicks)).toBe('37 / 300 clicks');
+
+    const impressions = {
+      observed: 37,
+      required: 300,
+      unit: 'clicks',
+      projected: {
+        value: 1200,
+        unit: 'impressions',
+        basis: 'projected through the observed open rate',
+      },
+    } satisfies Sample;
+    const line = formatSample(impressions);
+    expect(line).toContain('37 / 300 clicks');
+    expect(line).toContain('≈ 1,200 impressions');
+    expect(line).toContain('projected through the observed open rate');
   });
 
   it('labels a projection as one', () => {
@@ -575,6 +801,28 @@ describe('formatTestLine', () => {
     ).toBe("Fisher's exact test · p = 0.012 · adjusted p = 0.036 · α 0.05");
   });
 
+  it('renders a typed evidence test, with the adjusted segment only when present', () => {
+    const holm = {
+      name: 'fisher_exact',
+      p_value: '0.012',
+      p_adjusted: '0.036',
+      alpha: '0.05',
+    } satisfies StatTest;
+    const line = formatTestLine(holm);
+    expect(line).toContain("Fisher's exact test");
+    expect(line).toContain('p = 0.012');
+    expect(line).toContain('adjusted p = 0.036');
+    expect(line).toContain('α 0.05');
+
+    const unadjusted = formatTestLine({ ...holm, p_adjusted: null } satisfies StatTest);
+    expect(unadjusted).not.toContain('adjusted');
+    expect(unadjusted).toBe("Fisher's exact test · p = 0.012 · α 0.05");
+
+    expect(formatTestLine({ ...holm, name: 'mystery_test' } satisfies StatTest)).toContain(
+      'mystery_test',
+    );
+  });
+
   it('maps every known backend name', () => {
     expect([...TEST_LABELS.keys()]).toEqual([
       'fisher_exact',
@@ -632,6 +880,15 @@ describe('formatSourceDate', () => {
   });
 
   it('never shifts the calendar date, whatever the boundary', () => {
+    // A Date round trip would read 2026-01-01 as UTC midnight and print 2025-12-31 in any zone
+    // west of UTC, such as New York or Pago Pago; the stored string must survive unchanged.
+    expect(formatSourceDate('2026-01-01', 'linkedin')).toBe('2026-01-01 (LinkedIn day)');
+    expect(formatSourceDate('2026-01-01', 'google', 'America/New_York')).toBe(
+      '2026-01-01 (Google day, America/New_York)',
+    );
+    expect(formatSourceDate('2026-01-01', 'google', 'America/New_York')).not.toContain(
+      '2025-12-31',
+    );
     expect(formatSourceDate('2026-01-01', 'google', 'Pacific/Kiritimati')).toContain('2026-01-01');
     expect(formatSourceDate('2026-01-01', 'google', 'Pacific/Pago_Pago')).toContain('2026-01-01');
   });
@@ -658,13 +915,13 @@ describe('formatSourceBoundaries and boundariesDiffer', () => {
     start: '2026-09-04',
     end: '2026-10-01',
     boundary: 'America/New_York',
-  } as const;
+  } as const satisfies SourceDay;
   const linkedin = {
     source: 'linkedin',
     start: '2026-09-04',
     end: '2026-10-01',
     boundary: 'UTC',
-  } as const;
+  } as const satisfies SourceDay;
 
   it('renders the status-bar example exactly', () => {
     expect(formatSourceBoundaries([google, linkedin])).toBe(
@@ -678,6 +935,12 @@ describe('formatSourceBoundaries and boundariesDiffer', () => {
     ).toBe('LinkedIn days: UTC · Google days: America/New_York');
   });
 
+  it('shows a duplicate source once', () => {
+    expect(formatSourceBoundaries([google, linkedin, google])).toBe(
+      'Google days: America/New_York · LinkedIn days: UTC',
+    );
+  });
+
   it('renders an empty list as empty and a blank boundary as unavailable', () => {
     expect(formatSourceBoundaries([])).toBe('');
     expect(formatSourceBoundaries([{ source: 'google', boundary: ' ' }])).toBe(
@@ -687,6 +950,7 @@ describe('formatSourceBoundaries and boundariesDiffer', () => {
 
   it('detects differing boundaries', () => {
     expect(boundariesDiffer([google, linkedin])).toBe(true);
+    expect(boundariesDiffer([linkedin, { ...google, boundary: 'UTC' }])).toBe(false);
     expect(boundariesDiffer([linkedin, { boundary: 'UTC' }])).toBe(false);
     expect(boundariesDiffer([linkedin])).toBe(false);
     expect(boundariesDiffer([])).toBe(false);
@@ -696,7 +960,7 @@ describe('formatSourceBoundaries and boundariesDiffer', () => {
 });
 
 describe('formatWindowChip', () => {
-  const window: EvidenceWindow = {
+  const window = {
     start: '2026-09-04',
     end: '2026-10-01',
     days: 28,
@@ -706,11 +970,20 @@ describe('formatWindowChip', () => {
     ],
     boundaries_differ: true,
     description: 'Google 2026-09-04 to 2026-10-01 (America/New_York); LinkedIn same dates (UTC)',
-  };
+  } satisfies EvidenceWindow;
 
   it('renders the card chip example exactly', () => {
     expect(formatWindowChip(window)).toBe(
       '2026-09-04 – 2026-10-01 · 28 days · Google days: America/New_York · LinkedIn days: UTC',
+    );
+  });
+
+  it('reads one day in the singular and drops the boundary segment without source days', () => {
+    expect(formatWindowChip({ ...window, days: 1 })).toBe(
+      '2026-09-04 – 2026-10-01 · 1 day · Google days: America/New_York · LinkedIn days: UTC',
+    );
+    expect(formatWindowChip({ ...window, source_days: [] })).toBe(
+      '2026-09-04 – 2026-10-01 · 28 days',
     );
   });
 
@@ -749,6 +1022,23 @@ describe('formatInstant', () => {
       'Oct 6, 2026, 11:22 AM America/New_York',
     );
     expect(formatInstant('2026-10-06T15:22:00Z', 'UTC')).toBe('Oct 6, 2026, 3:22 PM UTC');
+  });
+
+  it('differs from UTC by the zone offset in force: 4 h in EDT, 5 h in EST', () => {
+    const october = '2026-10-06T15:22:00Z';
+    const january = '2026-01-15T15:22:00Z';
+    expect(formatInstant(january, 'America/New_York')).toBe(
+      'Jan 15, 2026, 10:22 AM America/New_York',
+    );
+    expect(formatInstant(january, 'UTC')).toBe('Jan 15, 2026, 3:22 PM UTC');
+    expect(
+      clockMinutes(formatInstant(october, 'UTC')) -
+        clockMinutes(formatInstant(october, 'America/New_York')),
+    ).toBe(4 * 60);
+    expect(
+      clockMinutes(formatInstant(january, 'UTC')) -
+        clockMinutes(formatInstant(january, 'America/New_York')),
+    ).toBe(5 * 60);
   });
 
   it('reuses the cached formatter and keeps plain spaces', () => {

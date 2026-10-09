@@ -895,6 +895,44 @@ describe('proposedDailyBudget', () => {
     expect(proposedDailyBudget(withExtra({ proposed_daily_budget: ' 240.50 ' }))).toBe('240.50');
   });
 
+  it('refuses a malformed amount in every layer rather than parsing part of it', () => {
+    const malformed: readonly unknown[] = ['12.3.4', { amount: '12.00' }, ['12.00'], '', '1e999x'];
+    for (const amount of malformed) {
+      const label = JSON.stringify(amount);
+      const own = withExtra({ proposed_daily_budget: amount });
+      const linked = withExtra({ b1_link: { proposed_daily_budget: amount } });
+      const legacy = withExtra({ proposed: amount });
+      expect(proposedDailyBudget(own), label).toBeNull();
+      expect(proposedDailyBudget(linked), label).toBeNull();
+      expect(proposedDailyBudget(legacy), label).toBeNull();
+    }
+    const objectMetric = rawEvidence({
+      metrics: [{ key: 'proposed_daily_budget', value: { amount: '12.00' } }],
+    });
+    expect(proposedDailyBudget(objectMetric)).toBeNull();
+    const dottedMetric = withExtra(null, [metric('proposed_daily_budget', '12.3.4')]);
+    expect(proposedDailyBudget(dottedMetric)).toBeNull();
+  });
+
+  it('always returns a decimal string, never a number, so no amount went through Number()', () => {
+    const sources: readonly Evidence[] = [
+      withExtra({ proposed_daily_budget: 240 }),
+      withExtra({ b1_link: { proposed_daily_budget: 0.1 } }),
+      withExtra(null, [metric('proposed_daily_budget', 250)]),
+      withExtra({ proposed: '240.10' }),
+    ];
+    expect(sources.map((source) => typeof proposedDailyBudget(source))).toEqual([
+      'string',
+      'string',
+      'string',
+      'string',
+    ]);
+    expect(proposedDailyBudget(withExtra({ proposed: '240.10' }))).toBe('240.10');
+    expect(proposedDailyBudget(withExtra({ proposed_daily_budget: '240.000000' }))).toBe(
+      '240.000000',
+    );
+  });
+
   it('returns null when the item proposes no amount', () => {
     expect(proposedDailyBudget(pageItem(FIXTURE_ITEM_IDS.c1))).toBeNull();
     expect(
@@ -1244,6 +1282,44 @@ describe('variants', () => {
     });
   });
 
+  it('leaves the open and completion rates null for a non-lead-gen variant', () => {
+    // The row exactly as creative._variant_row writes it for a website-conversions campaign:
+    // only the click rate applies, so open_rate and completion_rate are None, never 0.
+    const nonLeadGen = withExtra({
+      variants: [
+        {
+          creative_id: 2101,
+          urn: 'urn:li:sponsoredCreative:990002101',
+          name: 'Webinar Variant A',
+          headline: 'Join the live demo',
+          cta_label: 'Register',
+          impressions: 18400,
+          clicks: 92,
+          form_opens: null,
+          leads: null,
+          click_rate: '0.005000',
+          open_rate: null,
+          completion_rate: null,
+          cost: '640.00',
+          currency: 'USD',
+          outcomes: 11,
+        },
+      ],
+    });
+    expect(variants(nonLeadGen)).toEqual([
+      {
+        creativeId: '2101',
+        urn: 'urn:li:sponsoredCreative:990002101',
+        name: 'Webinar Variant A',
+        impressions: 18400,
+        clickRate: '0.005000',
+        openRate: null,
+        completionRate: null,
+        leads: null,
+      },
+    ]);
+  });
+
   it('is safe on the first item of an empty creative group', () => {
     const items: readonly Item[] = [];
     expect(variants(items[0])).toEqual([]);
@@ -1328,6 +1404,20 @@ describe('WHITE_PAPER_METRIC_KEYS and UNKNOWN_CREATIVE_KEY', () => {
       'ql',
     ]);
     expect(UNKNOWN_CREATIVE_KEY).toBe('unknown-creative');
+  });
+
+  it('hold no key that combines MQL and QL, so the two counts are never blended', () => {
+    const tokensOf = (key: string): readonly string[] => key.split('_');
+    const combined = WHITE_PAPER_METRIC_KEYS.filter((key) => {
+      const tokens = tokensOf(key);
+      return tokens.includes('mql') && tokens.includes('ql');
+    });
+    expect(combined).toEqual([]);
+    const mqlKeys = WHITE_PAPER_METRIC_KEYS.filter((key) => tokensOf(key).includes('mql'));
+    expect(mqlKeys).toEqual(['mql']);
+    for (const key of WHITE_PAPER_METRIC_KEYS) {
+      expect(key, key).not.toMatch(/mql.*ql|ql.*mql|leads_total|mql_or_ql|blended/);
+    }
   });
 });
 
@@ -1719,6 +1809,53 @@ describe('decisionContextFor', () => {
       ],
       currency: 'USD',
     });
+  });
+
+  it('writes a B1 on a shared budget on the budget subject, with every member listed', () => {
+    // A shared-budget B1 as budget.budget_evidence and budget._members_extra freeze it: the
+    // proposed amount is a metric and the members sit in extra.members.
+    const b1Shared = makeItem({
+      id: 9101,
+      rule_id: 'B1',
+      decision_subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+      evidence: withExtra(
+        {
+          outcome: 'Scale',
+          increase: '30.00',
+          members: [
+            {
+              campaign_id: FIXTURE_CAMPAIGN_IDS.pipelineSearch,
+              name: 'Pipeline Search — US',
+              member_days: 28,
+            },
+            {
+              campaign_id: FIXTURE_CAMPAIGN_IDS.searchPartners,
+              name: 'Search Partners — US',
+              member_days: 21,
+            },
+          ],
+        },
+        [
+          metric('proposed_daily_budget', '180.00', {
+            label: 'Proposed daily budget',
+            unit: 'currency',
+            currency: 'USD',
+          }),
+        ],
+      ),
+    });
+    const context = decisionContextFor(b1Shared);
+    expect(context).toStrictEqual({
+      prefill: { daily_budget: '180.00' },
+      members: [
+        { id: String(FIXTURE_CAMPAIGN_IDS.pipelineSearch), name: 'Pipeline Search — US' },
+        { id: String(FIXTURE_CAMPAIGN_IDS.searchPartners), name: 'Search Partners — US' },
+      ],
+      currency: 'USD',
+    });
+    expect(context.prefill?.daily_budget).toBe(proposedDailyBudget(b1Shared));
+    expect(typeof context.prefill?.daily_budget).toBe('string');
+    expect(context.prefill).not.toHaveProperty('status');
   });
 
   it('prefills a C2 "Scale" from its linked B1 amount, without a currency it cannot name', () => {
