@@ -16,21 +16,76 @@
  * run; payloads come from `../../test/fixtures`; navigation is read from the test router's
  * `router.state.location`. `mockApi` is imported before `../../test/render` and Testing Library,
  * so its unmatched-request check runs after Testing Library's cleanup.
+ *
+ * Window lengths appear in this file only as fixture inputs. Wherever a test asserts which
+ * presets the picker offers, which one is the default, or which window a preset posts, the
+ * expectation is derived from the fixture configuration ({@link fixtureWindow}) and the fixture
+ * default run ({@link defaultRun}), never written as a UI default of its own.
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { queryKeys } from '../../api/queries';
 import type { ConfigView, Run } from '../../api/types';
-import { CUSTOM_RUN_ID, makeConfig, makeRun } from '../../test/fixtures';
+import { CUSTOM_RUN_ID, DEFAULT_RUN_ID, makeConfig, makeRun } from '../../test/fixtures';
 import { WindowPicker, presetWindow } from './WindowPicker';
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and helpers
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * The fixture configuration's window settings (`GET /config`): the presets, in configured
+ * order, and the default that every expectation about the offered presets derives from.
+ */
+const fixtureWindow: ConfigView['window'] = makeConfig().window;
+
+/**
+ * The fixture's latest succeeded default run (`GET /runs/latest`): its `window_end` is the
+ * default window end that every preset ends on (AAP 0.5.4.1).
+ */
+const defaultRun: Run = makeRun();
+
+/** The fixture presets other than the default, in configured order. */
+const otherPresets: readonly number[] = fixtureWindow.presets.filter(
+  (days) => days !== fixtureWindow.default_days,
+);
+
+/** A window length as the picker words it: "1 day", otherwise "{n} days". */
+function daysLabel(days: number): string {
+  return days === 1 ? '1 day' : `${String(days)} days`;
+}
+
+/**
+ * The accessible name `DateRangePicker` gives the preset of `days`: {@link daysLabel}, with
+ * " (default)" on the preset equal to `defaultDays`.
+ */
+function presetLabel(days: number, defaultDays: number = fixtureWindow.default_days): string {
+  return days === defaultDays ? `${daysLabel(days)} (default)` : daysLabel(days);
+}
+
+/** Every preset's accessible name under `window`, in configured order. */
+function presetLabels(window: ConfigView['window'] = fixtureWindow): string[] {
+  return window.presets.map((days) => presetLabel(days, window.default_days));
+}
+
+/** The reopen-select label of a custom run: "{start} – {end} · {days} days". */
+function reopenLabel(run: Run): string {
+  return `${run.window_start} – ${run.window_end} · ${daysLabel(run.days)}`;
+}
+
+/**
+ * The polite `role="status"` region whose whole text is `label`, such as a `Spinner`'s, or
+ * `undefined`. A status region takes no accessible name from its content, so it is found by its
+ * text rather than by `{ name }`.
+ */
+function statusWithText(label: string): HTMLElement | undefined {
+  return screen
+    .queryAllByRole('status')
+    .find((region) => (region.textContent ?? '').trim() === label);
+}
 
 /** The 90-day custom run that `POST /runs` creates for the 90-day preset of the fixture window. */
 const customRun = makeRun({
@@ -160,6 +215,51 @@ function configWithWindow(settings: Partial<ConfigView['window']>): ConfigView {
 // ---------------------------------------------------------------------------------------------
 
 describe('presetWindow', () => {
+  it('gives the 28 days ending 2026-10-01 as 2026-09-04 to 2026-10-01 (AAP 0.5.4.1)', () => {
+    expect(presetWindow(28, '2026-10-01')).toEqual({
+      window_start: '2026-09-04',
+      window_end: '2026-10-01',
+    });
+  });
+
+  it('crosses a year boundary by calendar dates', () => {
+    expect(presetWindow(14, '2026-01-05')).toEqual({
+      window_start: '2025-12-23',
+      window_end: '2026-01-05',
+    });
+  });
+
+  it('gives the same calendar dates whatever time zone the process runs in', () => {
+    const cases = [
+      [28, '2026-10-01'],
+      [14, '2026-01-05'],
+      [1, '2026-10-01'],
+      // A daylight-saving change inside the window: 2026-03-08 in America/Los_Angeles, and
+      // 2026-03-29 in Europe/London.
+      [60, '2026-04-15'],
+    ] as const;
+    const expected = cases.map(([days, end]) => presetWindow(days, end));
+    // Zones on both sides of UTC, a half-hour offset and one 14 hours ahead, so a helper that
+    // read local time would move a date by a day in at least one of them. Each carries its
+    // `getTimezoneOffset()` at 2026-07-01 12:00 UTC, which proves the zone took effect.
+    const zones = [
+      { zone: 'Pacific/Kiritimati', offset: -840 },
+      { zone: 'America/Los_Angeles', offset: 420 },
+      { zone: 'Asia/Kolkata', offset: -330 },
+      { zone: 'Europe/London', offset: -60 },
+    ] as const;
+    const probe = new Date(Date.UTC(2026, 6, 1, 12));
+    try {
+      for (const { zone, offset } of zones) {
+        vi.stubEnv('TZ', zone);
+        expect(probe.getTimezoneOffset()).toBe(offset);
+        expect(cases.map(([days, end]) => presetWindow(days, end))).toEqual(expected);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('returns the window of `days` calendar dates ending on the given end', () => {
     expect(presetWindow(7, '2026-10-01')).toEqual({
       window_start: '2026-09-25',
@@ -221,24 +321,34 @@ describe('WindowPicker', () => {
       stubApi({ 'GET /config': config.handler });
       await renderPicker();
 
-      expect(screen.getByText('Loading windows')).toBeTruthy();
+      // Before GET /config answers: a polite "Loading windows" status, and no preset at all.
+      expect(statusWithText('Loading windows')).toBeDefined();
       expect(screen.queryByRole('group', { name: 'Analysis window' })).toBeNull();
+      expect(screen.queryByRole('button')).toBeNull();
 
-      config.resolve(json(200, makeConfig()));
+      const shipped = makeConfig();
+      config.resolve(json(200, shipped));
       await presetsShown();
 
-      expect(screen.queryByText('Loading windows')).toBeNull();
-      expect(presetNames()).toEqual([
-        '14 days',
-        '28 days (default)',
-        '56 days',
-        '90 days',
-        'Custom range',
+      expect(statusWithText('Loading windows')).toBeUndefined();
+      // The preset buttons are exactly the configured presets, in configured order.
+      const presets = presetNames().filter((name) => /^\d+ days?/u.test(name));
+      expect(presets.map((name) => Number(/^(\d+)/u.exec(name)?.[1]))).toEqual(
+        shipped.window.presets,
+      );
+      expect(presets).toEqual(presetLabels(shipped.window));
+      // Exactly one is marked "(default)": the configured default.
+      expect(presets.filter((name) => name.endsWith('(default)'))).toEqual([
+        `${daysLabel(shipped.window.default_days)} (default)`,
       ]);
-      // The run on screen is the latest default run, so the default preset is pressed.
-      expect(button('28 days (default)').getAttribute('aria-pressed')).toBe('true');
-      for (const name of ['14 days', '56 days', '90 days']) {
-        expect(button(name).getAttribute('aria-pressed')).toBe('false');
+      // The custom range follows the presets.
+      expect(presetNames().at(-1)).toBe('Custom range');
+      // The run on screen is the latest default run, so the default preset alone is pressed.
+      for (const days of shipped.window.presets) {
+        const preset = button(presetLabel(days, shipped.window.default_days));
+        expect(preset.getAttribute('aria-pressed')).toBe(
+          String(days === shipped.window.default_days),
+        );
       }
     });
 
@@ -247,17 +357,22 @@ describe('WindowPicker', () => {
       const api = stubApi({ 'GET /runs/latest': latest.handler });
       const { queryClient } = await renderPicker();
 
-      // The configuration has answered; only the default run holds the picker back.
+      // GET /config and GET /runs?kind=custom have answered; only the held GET /runs/latest
+      // is still fetching, so only the default run holds the picker back.
       await waitFor(() => {
-        expect(queryClient.getQueryData(queryKeys.config)).toBeDefined();
+        expect(queryClient.isFetching()).toBe(1);
       });
-      expect(api.calls.some((call) => call.path === '/runs/latest')).toBe(true);
-      expect(screen.getByText('Loading windows')).toBeTruthy();
+      expect(api.calls.map((call) => `${call.method} ${call.path}`).sort()).toEqual([
+        'GET /config',
+        'GET /runs',
+        'GET /runs/latest',
+      ]);
+      expect(statusWithText('Loading windows')).toBeDefined();
       expect(screen.queryByRole('group', { name: 'Analysis window' })).toBeNull();
 
       latest.resolve(json(200, makeRun()));
       await presetsShown();
-      expect(screen.queryByText('Loading windows')).toBeNull();
+      expect(statusWithText('Loading windows')).toBeUndefined();
     });
 
     it('takes the presets and the default from the configuration, with no window length of its own', async () => {
@@ -275,6 +390,36 @@ describe('WindowPicker', () => {
       expect(presetNames()).toEqual(['7 days', '21 days (default)', '30 days', 'Custom range']);
       expect(button('21 days (default)').getAttribute('aria-pressed')).toBe('true');
       expect(screen.queryByRole('button', { name: /^28 days/u })).toBeNull();
+    });
+
+    it('moves "(default)" to a newly configured default preset', async () => {
+      // The shipped presets plus a 21-day preset, which the configuration makes the default.
+      const changedDefault = 21;
+      const previousDefault = fixtureWindow.default_days;
+      const presets = [...fixtureWindow.presets, changedDefault].sort((a, b) => a - b);
+      const changed = makeConfig({
+        window: { ...fixtureWindow, presets, default_days: changedDefault },
+      });
+      const run = makeRun({
+        ...presetWindow(changedDefault, defaultRun.window_end),
+        days: changedDefault,
+        default_days: changedDefault,
+      });
+      stubApi({ 'GET /config': json(200, changed), 'GET /runs/latest': json(200, run) });
+      await renderPicker(run);
+      await presetsShown();
+
+      expect(presetNames()).toEqual([...presetLabels(changed.window), 'Custom range']);
+      const marked = presetNames().filter((name) => name.endsWith('(default)'));
+      expect(marked).toEqual([`${daysLabel(changedDefault)} (default)`]);
+      expect(button(`${daysLabel(changedDefault)} (default)`).getAttribute('aria-pressed')).toBe(
+        'true',
+      );
+      // The previous default is still offered, as a plain preset.
+      expect(button(daysLabel(previousDefault)).getAttribute('aria-pressed')).toBe('false');
+      expect(
+        screen.queryByRole('button', { name: `${daysLabel(previousDefault)} (default)` }),
+      ).toBeNull();
     });
 
     it('states a configuration that cannot be read, and renders no picker', async () => {
@@ -315,20 +460,70 @@ describe('WindowPicker', () => {
       const api = stubApi({ 'GET /runs': json(200, [customRun]) });
       const { router } = await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
       await presetsShown();
-      // The custom 90-day run ends on the default window end, so its preset is pressed.
-      expect(button('90 days').getAttribute('aria-pressed')).toBe('true');
-      expect(button('28 days (default)').getAttribute('aria-pressed')).toBe('false');
+      expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+      // The custom run is one of the presets and ends on the default window end, so its preset
+      // is pressed rather than the default.
+      expect(button(presetLabel(customRun.days)).getAttribute('aria-pressed')).toBe('true');
+      const defaultPreset = button(presetLabel(fixtureWindow.default_days));
+      expect(defaultPreset.getAttribute('aria-pressed')).toBe('false');
 
-      fireEvent.click(button('28 days (default)'));
+      fireEvent.click(defaultPreset);
 
       await waitFor(() => {
         expect(router.state.location.search).toEqual({});
       });
       expect(router.state.location.pathname).toBe('/actions');
+      expect(router.state.location.search.run).toBeUndefined();
+      expect(router.state.location.searchStr).toBe('');
+      // The default window is the worker's default run: choosing it never posts POST /runs.
       expect(posts(api)).toHaveLength(0);
+      expect(api.calls.some((call) => call.method === 'POST')).toBe(false);
     });
 
     it('computes any other preset ending on the default window end, then opens the run by id', async () => {
+      // A preset of the fixture configuration that is not its default.
+      const days = otherPresets[0];
+      if (days === undefined) {
+        throw new Error('The fixture configuration offers no preset besides its default.');
+      }
+      const expectedBody = presetWindow(days, defaultRun.window_end);
+      const created = makeRun({
+        id: CUSTOM_RUN_ID,
+        kind: 'custom',
+        trigger: 'manual',
+        ...expectedBody,
+        days,
+      });
+      const api = stubApi({ 'POST /runs': json(201, created) });
+      const { router } = await renderPicker(defaultRun);
+      await presetsShown();
+
+      fireEvent.click(button(presetLabel(days)));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+      });
+      expect(router.state.location.search.run).toBe(CUSTOM_RUN_ID);
+      expect(router.state.location.pathname).toBe('/actions');
+
+      const sent = posts(api);
+      expect(sent).toHaveLength(1);
+      const [post] = sent;
+      // The preset's window, ending on the latest default run's window end.
+      expect(post?.body).toEqual(expectedBody);
+      expect((post?.body as typeof expectedBody | undefined)?.window_end).toBe(
+        defaultRun.window_end,
+      );
+      // The client marks every mutating request for the API's CSRF check (AAP 0.3.2).
+      expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post?.headers.get('Content-Type')).toMatch(/^application\/json/u);
+    });
+
+    it('disables every control and states "Computing custom window" while the run computes', async () => {
+      const days = otherPresets.at(-1);
+      if (days === undefined) {
+        throw new Error('The fixture configuration offers no preset besides its default.');
+      }
       const created = deferred();
       const api = stubApi({
         'GET /runs': json(200, [customRun]),
@@ -339,21 +534,20 @@ describe('WindowPicker', () => {
       await waitFor(() => {
         expect(screen.getByRole('combobox', { name: 'Reopen a custom window' })).toBeTruthy();
       });
+      expect(statusWithText('Computing custom window')).toBeUndefined();
 
-      fireEvent.click(button('90 days'));
+      fireEvent.click(button(presetLabel(days)));
 
       await waitFor(() => {
         expect(posts(api)).toHaveLength(1);
       });
-      const [post] = posts(api);
-      expect(post?.body).toEqual({ window_start: '2026-07-08', window_end: '2026-10-05' });
-      expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(posts(api)[0]?.body).toEqual(presetWindow(days, defaultRun.window_end));
 
-      // While the run computes, every control is disabled and a spinner says so.
+      // While the run computes, a polite status says so and every control is disabled.
       await waitFor(() => {
-        expect(screen.getByText('Computing custom window')).toBeTruthy();
+        expect(statusWithText('Computing custom window')).toBeDefined();
       });
-      for (const name of ['14 days', '28 days (default)', '56 days', '90 days', 'Custom range']) {
+      for (const name of [...presetLabels(), 'Custom range']) {
         expect(button(name).hasAttribute('disabled')).toBe(true);
       }
       expect(
@@ -368,9 +562,11 @@ describe('WindowPicker', () => {
       });
       expect(router.state.location.pathname).toBe('/actions');
       await waitFor(() => {
-        expect(screen.queryByText('Computing custom window')).toBeNull();
+        expect(statusWithText('Computing custom window')).toBeUndefined();
       });
-      expect(button('90 days').hasAttribute('disabled')).toBe(false);
+      for (const name of [...presetLabels(), 'Custom range']) {
+        expect(button(name).hasAttribute('disabled')).toBe(false);
+      }
     });
 
     it('ends every preset on the latest default run, not on an older run on screen', async () => {
@@ -386,7 +582,7 @@ describe('WindowPicker', () => {
       await presetsShown();
 
       // The run on screen does not end on the default window end: it shows as a custom range.
-      for (const name of ['14 days', '28 days (default)', '56 days', '90 days']) {
+      for (const name of presetLabels()) {
         expect(button(name).getAttribute('aria-pressed')).toBe('false');
       }
       expect(button('Custom range').getAttribute('aria-expanded')).toBe('true');
@@ -456,7 +652,7 @@ describe('WindowPicker', () => {
       expect(router.state.location.search).toEqual({ run: 208 });
 
       // The next choice clears the message.
-      fireEvent.click(button('28 days (default)'));
+      fireEvent.click(button(presetLabel(fixtureWindow.default_days)));
       await waitFor(() => {
         expect(router.state.location.search).toEqual({});
       });
@@ -557,33 +753,27 @@ describe('WindowPicker', () => {
     });
 
     it('shows the API’s own message for a 422, until the next choice clears it', async () => {
-      stubApi({
-        'POST /runs': apiError(
-          422,
-          'validation_error',
-          'window_end must be on or before the default window end 2026-10-05',
-        ),
-      });
+      const message = 'Window end is after the default window end';
+      stubApi({ 'POST /runs': apiError(422, 'invalid_window', message) });
       const { router } = await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
       await presetsShown();
 
       fireEvent.click(button('14 days'));
 
       await waitFor(() => {
-        expect(noticeTitles()).toEqual([
-          'window_end must be on or before the default window end 2026-10-05',
-        ]);
+        expect(noticeTitles()).toEqual([message]);
       });
+      expect(screen.getByText(message)).toBeTruthy();
+      expect(screen.queryByText('Another analysis is running. Try again shortly.')).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
       expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
 
-      fireEvent.click(button('28 days (default)'));
+      fireEvent.click(button(presetLabel(fixtureWindow.default_days)));
 
       await waitFor(() => {
         expect(router.state.location.search).toEqual({});
       });
-      expect(
-        screen.queryByText('window_end must be on or before the default window end 2026-10-05'),
-      ).toBeNull();
+      expect(screen.queryByText(message)).toBeNull();
     });
 
     it('shows the client’s wording of any other failure, until the next computation clears it', async () => {
@@ -630,7 +820,9 @@ describe('WindowPicker', () => {
         ),
       ).toBeTruthy();
       // The picker stays usable, on the run on screen's window end.
-      expect(button('28 days (default)').getAttribute('aria-pressed')).toBe('true');
+      expect(button(presetLabel(fixtureWindow.default_days)).getAttribute('aria-pressed')).toBe(
+        'true',
+      );
 
       // A retry that fails again keeps the warning, with the new reason, and focus on Retry.
       const latest = deferred();
@@ -744,9 +936,43 @@ describe('WindowPicker', () => {
       status: 'failed',
     });
 
-    it('lists only succeeded custom runs, newest first, and opens the chosen one by id', async () => {
-      const api = stubApi({ 'GET /runs': json(200, [september, failed, customRun]) });
+    it('lists the custom runs as "{start} – {end} · {days} days" and opens the chosen one by id', async () => {
+      const runs = [september, customRun] as const;
+      const api = stubApi({ 'GET /runs': json(200, runs) });
       const { router } = await renderPicker();
+      await presetsShown();
+
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        ...runs.map(reopenLabel),
+      ]);
+      expect(Array.from(select.options, (option) => option.value)).toEqual([
+        '',
+        ...runs.map((run) => String(run.id)),
+      ]);
+      // The default run is on screen: it is never listed, and no custom run is chosen.
+      expect(Array.from(select.options, (option) => option.value)).not.toContain(
+        String(DEFAULT_RUN_ID),
+      );
+      expect(select.value).toBe('');
+
+      const [, second] = runs;
+      fireEvent.change(select, { target: { value: String(second.id) } });
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: second.id });
+      });
+      expect(router.state.location.pathname).toBe('/actions');
+      // Reopening navigates by id; it never computes a run.
+      expect(posts(api)).toHaveLength(0);
+    });
+
+    it('lists only succeeded custom runs, newest first as the API orders them', async () => {
+      stubApi({ 'GET /runs': json(200, [september, failed, customRun]) });
+      await renderPicker();
       await presetsShown();
 
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
@@ -757,15 +983,9 @@ describe('WindowPicker', () => {
         '2026-09-01 – 2026-09-30 · 30 days',
         '2026-07-08 – 2026-10-05 · 90 days',
       ]);
-      // The default run is on screen, so no custom run is chosen.
-      expect(select.value).toBe('');
-
-      fireEvent.change(select, { target: { value: '203' } });
-
-      await waitFor(() => {
-        expect(router.state.location.search).toEqual({ run: 203 });
-      });
-      expect(posts(api)).toHaveLength(0);
+      expect(Array.from(select.options, (option) => option.value)).not.toContain(
+        String(failed.id),
+      );
     });
 
     it('selects the custom run on screen, and ignores the empty choice', async () => {
@@ -783,9 +1003,25 @@ describe('WindowPicker', () => {
       expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
     });
 
+    it('renders no select when GET /runs lists no custom run', async () => {
+      const api = stubApi({ 'GET /runs': json(200, []) });
+      const { queryClient } = await renderPicker();
+      await presetsShown();
+
+      // Every read has answered, the empty custom-run list included.
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      const listed = api.calls.find((call) => call.method === 'GET' && call.path === '/runs');
+      expect(listed?.search.get('kind')).toBe('custom');
+      expect(screen.queryByRole('combobox', { name: 'Reopen a custom window' })).toBeNull();
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
+    });
+
     it('hides the select while no succeeded custom run exists', async () => {
       const api = stubApi({ 'GET /runs': json(200, [failed]) });
-      await renderPicker();
+      const { queryClient } = await renderPicker();
       await presetsShown();
 
       await waitFor(() => {
@@ -794,8 +1030,9 @@ describe('WindowPicker', () => {
         );
       });
       await waitFor(() => {
-        expect(screen.queryByText('Loading windows')).toBeNull();
+        expect(queryClient.isFetching()).toBe(0);
       });
+      expect(statusWithText('Loading windows')).toBeUndefined();
       expect(screen.queryByRole('combobox', { name: 'Reopen a custom window' })).toBeNull();
       expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
     });

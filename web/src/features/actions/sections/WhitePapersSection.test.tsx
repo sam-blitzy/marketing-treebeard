@@ -9,18 +9,21 @@
  *   loads or fails), Qualified Lead, Meetings booked, Other meetings (ordering unverified), Deals
  *   after touch, Cost per Qualified Lead, Cost per meeting, Action. MQL and Qualified Lead are
  *   never blended into one column.
- * - **Rendering rules.** Floors render "≥ N" for counts and "≤ X" for costs; an unavailable
- *   count renders "unavailable", never 0; a cost with a zero denominator (QL 0, no meetings)
- *   renders "—" with its reason.
+ * - **Rendering rules.** Floors render "≥ N" for counts and "≤ X" for costs, exactly as
+ *   `formatMetric` renders the evidence; an unavailable count (MQL or Qualified Lead) renders
+ *   "unavailable", never 0; a cost with a zero denominator (QL 0, no meetings) renders "—" with
+ *   its reason. Rows keep the API's order, even when a costlier row comes first.
  * - **Rows expand** to their per-creative rows, "unknown creative" included, then the reason, the
  *   baselines and sample, the flags (the floor flag among them), the window chip and the footer
- *   actions; held rows sit behind the held disclosure, linked to the blocking discrepancy;
- *   historical rows carry the replaced-data badge with every action disabled.
+ *   actions, whose "Mark done" posts feedback once; held rows sit behind the held disclosure,
+ *   linked to the blocking discrepancy; historical rows carry the replaced-data badge with every
+ *   action disabled.
  * - **Cohort notes**: the backend's spend total in the cohort's own currency, "counts overlap
- *   across assets", and what the LinkedIn leads and meetings booked columns count.
+ *   across assets", and what the LinkedIn leads and meetings booked columns count. No other
+ *   total exists, and no amount is summed across currencies.
  *
  * The section reads `GET /config` (for the MQL label) and nothing else; any other request fails
- * the test.
+ * the test. Only the "Mark done" case also answers `POST /recommendations/:id/feedback`.
  */
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandler, MockResponse } from '../../../test/mockApi';
@@ -41,6 +44,7 @@ import {
   findPageItem,
   makeConfig,
   makeEvidence,
+  makeFeedback,
   makeGroup,
   makeItem,
   makeItemOverlay,
@@ -50,6 +54,8 @@ import {
   makeSection,
 } from '../../../test/fixtures';
 import { renderWithProviders } from '../../../test/render';
+import { formatMetric } from '../../../lib/format';
+import { WHITE_PAPER_METRIC_KEYS, type WhitePaperMetricKey } from '../evidenceExtra';
 import { WhitePapersSection, mqlHeader } from './WhitePapersSection';
 
 // ---------------------------------------------------------------------------------------------
@@ -149,6 +155,20 @@ function listEntries(container: HTMLElement, name: string): (string | null)[] {
   return within(within(container).getByRole('list', { name }))
     .getAllByRole('listitem')
     .map((entry) => entry.textContent);
+}
+
+/** The position of a metric's cell in a {@link bodyRows} row: after the toggle and the asset. */
+function cellIndex(key: WhitePaperMetricKey): number {
+  return 2 + WHITE_PAPER_METRIC_KEYS.indexOf(key);
+}
+
+/** The evidence metric an item cites under `key`. */
+function citedMetric(item: Item, key: string): Metric {
+  const cited = item.evidence.metrics.find((each) => each.key === key);
+  if (cited === undefined) {
+    throw new Error(`item ${String(item.id)} cites no ${key}`);
+  }
+  return cited;
 }
 
 /** One evidence metric, as the backend serialises it. */
@@ -263,6 +283,192 @@ describe('WhitePapersSection', () => {
       ]);
     });
 
+    it('renders every floored cell as formatMetric renders its evidence metric', async () => {
+      await renderDefault();
+
+      // The W1 row sits under a 12% contact floor: every count is a floor, every cost a ceiling.
+      const wEur = pageItem(FIXTURE_ITEM_IDS.wEur);
+      const [row] = bodyRows(table('White papers (EUR)'));
+      const expected = WHITE_PAPER_METRIC_KEYS.map((key) => formatMetric(citedMetric(wEur, key)));
+      expect(row?.slice(cellIndex('spend'), cellIndex('cost_per_meeting') + 1)).toEqual(expected);
+      expect(row?.[cellIndex('mql')]).toBe('≥ 14');
+      expect(row?.[cellIndex('ql')]).toBe('≥ 6');
+      expect(row?.[cellIndex('cost_per_ql')]).toMatch(/^≤ €/u);
+      expect(row?.[cellIndex('cost_per_meeting')]).toMatch(/^≤ €/u);
+      // Spend and platform leads are not attribution counts, so they carry no floor mark.
+      expect(row?.[cellIndex('spend')]).toBe('€2,840.00');
+      expect(row?.[cellIndex('linkedin_leads')]).toBe('116');
+    });
+
+    it("keeps MQL and Qualified Lead in separate cells, and totals nothing but each cohort's spend", async () => {
+      await renderDefault();
+
+      const section = screen.getByRole('region', { name: 'White papers' });
+      const eur = table('White papers (EUR)');
+      const columns = headers(eur);
+      const mqlColumn = columns.indexOf(MQL_BOUND);
+      const qlColumn = columns.indexOf('Qualified Lead');
+      expect(mqlColumn).toBe(cellIndex('mql'));
+      expect(qlColumn).toBe(cellIndex('ql'));
+      // Only the MQL header names MQL, only the QL columns name Qualified Leads, and no header
+      // names a bare "QL" that could stand for a blend of the two.
+      expect(columns.filter((header) => header?.includes('MQL'))).toEqual([MQL_BOUND]);
+      expect(columns.filter((header) => header?.includes('Qualified'))).toEqual([
+        'Qualified Lead',
+        'Cost per Qualified Lead',
+      ]);
+      expect(columns.filter((header) => header !== null && /\bQL\b/u.test(header))).toEqual([]);
+      // Each row's MQL and QL are two cells, each with its own count.
+      for (const row of within(eur).getAllByRole('row').slice(1)) {
+        const cells = Array.from(row.children);
+        expect(cells[mqlColumn]).toBeDefined();
+        expect(cells[mqlColumn]).not.toBe(cells[qlColumn]);
+      }
+      expect(bodyRows(eur).map((row) => [row[mqlColumn], row[qlColumn]])).toEqual([
+        ['≥ 14', '≥ 6'],
+        ['5', '2'],
+      ]);
+
+      // The captions name a cohort and nothing else; the only totals are each cohort's own
+      // spend total, so no MQL, QL, meeting or deal total exists and no amount crosses currencies.
+      expect(
+        within(section)
+          .getAllByRole('table')
+          .map((each) => each.querySelector('caption')?.textContent),
+      ).toEqual(['White papers (EUR)', 'White papers (USD)']);
+      expect(within(section).queryAllByText(/total/iu).map((node) => node.textContent)).toEqual([
+        'Spend total (EUR): €4,340.00',
+        'Spend total (USD): $1,210.00',
+      ]);
+      // EUR 4,340.00 + USD 1,210.00 would be 5,550.00; MQL + QL of the first row would be 20.
+      expect(section.textContent).not.toContain('5,550');
+      expect(within(section).queryByText(/^(≥ )?20$/u)).toBeNull();
+    });
+
+    it('keeps the API order: a higher-cost row given first stays first', async () => {
+      const section = defaultWhitePapers();
+      const eur = section.groups[0];
+      if (eur === undefined) {
+        throw new Error('the default page has no EUR cohort');
+      }
+      // The API sends the €750.00 row ahead of the ≤ €473.33 one; the section never re-sorts.
+      eur.items = [...eur.items].reverse().map((item, index) => ({ ...item, rank: index + 1 }));
+      await renderWhitePapers(section);
+      await screen.findAllByRole('columnheader', { name: MQL_BOUND });
+
+      expect(
+        bodyRows(table('White papers (EUR)')).map((row) => [row[1], row[cellIndex('cost_per_ql')]]),
+      ).toEqual([
+        ['The Attribution Playbook', '€750.00'],
+        ['The 2026 B2B Pipeline Report', '≤ €473.33'],
+      ]);
+    });
+
+    it('renders an unavailable Qualified Lead count as "unavailable", never 0, per row and per creative', async () => {
+      const unavailableCount = {
+        value: null,
+        floor: false,
+        unavailable: true,
+        reason: 'QL stage "Qualified Lead" not found among the lifecyclestage options',
+        display: 'unavailable',
+      };
+      const unavailableCost = {
+        value: null,
+        ceiling: false,
+        note: 'the Qualified Lead count is unavailable',
+        unavailable: true,
+        display: 'unavailable',
+      };
+      const count = (value: number) => ({
+        value,
+        floor: false,
+        unavailable: false,
+        reason: null,
+        display: String(value),
+      });
+      const meetingCost = {
+        value: '600.00',
+        ceiling: false,
+        note: null,
+        unavailable: false,
+        display: '600.00',
+      };
+      const unboundQl = whitePaperItem(
+        66,
+        { name: 'Unbound QL Report', id: 'unbound-ql-report|USD' },
+        makeEvidence({
+          metrics: [
+            metric('spend', '600.00', 'currency', 'USD'),
+            metric('linkedin_leads', 18, 'leads', null),
+            metric('mql', 4, 'contacts', null),
+            metric('ql', null, 'contacts', null),
+            metric('meetings_booked', 1, 'meetings', null),
+            metric('other_meetings', 0, 'meetings', null),
+            metric('deals_after_touch', 0, 'deals', null),
+            metric('cost_per_ql', null, 'currency', 'USD'),
+            metric('cost_per_meeting', '600.00', 'currency', 'USD'),
+          ],
+          extra: {
+            asset: { slug: 'unbound-ql-report', title: 'Unbound QL Report', currency: 'USD' },
+            rows: [
+              {
+                creative_id: 1701,
+                creative_urn: 'urn:li:sponsoredCreative:990001701',
+                label: 'Variant Q',
+                spend: '600.00',
+                leads: 18,
+                mql: count(4),
+                ql: unavailableCount,
+                meetings_booked: count(1),
+                other_meetings: count(0),
+                deals: count(0),
+                cost_per_ql: unavailableCost,
+                cost_per_meeting: meetingCost,
+              },
+            ],
+            costs: { cost_per_ql: unavailableCost, cost_per_meeting: meetingCost },
+            cohort: {
+              currency: 'USD',
+              spend_total: '600.00',
+              overlap_note: 'counts overlap across assets',
+            },
+          },
+        }),
+      );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [makeGroup({ key: 'cohort:USD', title: 'USD', items: [unboundQl] })],
+        }),
+      );
+      await screen.findAllByRole('columnheader', { name: MQL_BOUND });
+
+      const [row] = bodyRows(table('White papers (USD)'));
+      expect(row?.[cellIndex('ql')]).toBe('unavailable');
+      expect(row?.[cellIndex('ql')]).toBe(formatMetric(citedMetric(unboundQl, 'ql')));
+      // The cost over an unavailable count is unavailable too: never "—", "0" or a finite value.
+      expect(row?.[cellIndex('cost_per_ql')]).toBe('unavailable');
+      // The known counts beside it are unaffected, and MQL stays its own count.
+      expect(row).toEqual([
+        'Details for Unbound QL Report',
+        'Unbound QL Report',
+        '$600.00',
+        '18',
+        '4',
+        'unavailable',
+        '1',
+        '0',
+        '0',
+        'unavailable',
+        '$600.00',
+        'No change warranted',
+      ]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Details for Unbound QL Report' }));
+      expect(bodyRows(table('Per creative: Unbound QL Report'))).toEqual([
+        ['Variant Q', '$600.00', '18', '4', 'unavailable', '1', '0', '0', 'unavailable', '$600.00'],
+      ]);
+    });
+
     it('renders an unavailable MQL as "unavailable" and the costs at QL 0 as "—" with their reasons', async () => {
       await renderDefault();
 
@@ -363,6 +569,42 @@ describe('WhitePapersSection', () => {
       fireEvent.click(toggle);
       expect(toggle.getAttribute('aria-expanded')).toBe('false');
       expect(screen.queryByRole('table', { name: 'Per creative: The 2026 B2B Pipeline Report' })).toBeNull();
+    });
+
+    it('posts "Mark done" feedback for an expanded row once, with the CSRF header', async () => {
+      const { api } = await renderDefault();
+      // Only this case acts on a row, so only this case answers the feedback request.
+      api.use({
+        'POST /recommendations/:id/feedback': json(
+          201,
+          makeFeedback('done', {
+            recommendation_id: FIXTURE_ITEM_IDS.wEur,
+            rule_id: 'W1',
+            entity_type: 'content_asset',
+            entity_id: 'b2b-pipeline-report-2026|EUR',
+          }),
+        ),
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }));
+      const details = table('Per creative: The 2026 B2B Pipeline Report').closest('td');
+      if (details === null) {
+        throw new Error('the per-creative table is not inside the detail cell');
+      }
+      fireEvent.click(within(details).getByRole('button', { name: 'Mark done' }));
+
+      expect(await within(details).findByText('Marked done')).toBeTruthy();
+      const posts = api.calls.filter((call) => call.method === 'POST');
+      expect(posts).toHaveLength(1);
+      const [post] = posts;
+      expect(post?.path).toBe(`/recommendations/${String(FIXTURE_ITEM_IDS.wEur)}/feedback`);
+      expect(post?.body).toEqual({ kind: 'done' });
+      expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
+      // Feedback never writes a decision, and a recorded feedback ends the row's actions.
+      expect(api.calls.some((call) => call.path === '/decisions')).toBe(false);
+      for (const name of ['Mark done', 'Dismiss', 'Snooze for 7 days']) {
+        expect(within(details).getByRole('button', { name }).hasAttribute('disabled')).toBe(true);
+      }
     });
   });
 

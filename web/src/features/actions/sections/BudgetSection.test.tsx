@@ -17,7 +17,9 @@
  * - the B1 funding sentence and each B3 allocation as funding for a named B1, linked to that
  *   card when the evidence names it, with the unallocated part as a plain decrease, including
  *   the AAP's two-donor allocation of 300 and 100 against a 400 increase;
- * - held cards collapsed behind the held disclosure, and the data-state flags.
+ * - held cards collapsed behind the held disclosure, and the data-state flags;
+ * - each card's amounts in its own account currency, with no total summed in the browser
+ *   (AAP 0.1.1 "never converted or summed across currencies").
  *
  * The section fetches nothing: every test stubs the network with an empty `mockApi`, which
  * fails the test on any request.
@@ -28,6 +30,7 @@ import { fireEvent, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import type { Baseline, Flag, Item, Metric, Section } from '../../../api/types';
+import { formatMoney } from '../../../lib/format';
 import {
   FIXTURE_BUDGET_IDS,
   FIXTURE_CAMPAIGN_IDS,
@@ -777,6 +780,12 @@ describe('other budget cards', () => {
     await renderBudget(budgetWith([b2]));
 
     const article = card('Do not increase. Lower daily budget by 20% or fix efficiency first');
+    // Utilization beside efficiency (AAP 0.5.5): sibling cells of the one grid, utilization first.
+    const utilizationCell = namedGroup(article, 'Utilization');
+    const efficiencyCell = namedGroup(article, 'Efficiency');
+    expect(utilizationCell.parentElement).toBe(efficiencyCell.parentElement);
+    expect(utilizationCell.parentElement).toBe(namedGroup(article, 'Utilization and efficiency'));
+    expect(follows(utilizationCell, efficiencyCell)).toBe(true);
     expect(groupFields(article, 'Utilization')).toEqual([
       'Window utilization (spend vs cap): 93%',
       'Days (observed / required): Spending days 10 / 7 · High-utilization days 9 / 7',
@@ -1014,6 +1023,105 @@ describe('utilization and efficiency edge cases', () => {
       'Window leads: 12',
       'Daily budget: unavailable',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Currencies: each card in its own account currency, never summed (AAP 0.1.1)
+// ---------------------------------------------------------------------------------------------
+
+describe('amounts in each account currency', () => {
+  /** A B2 on a USD account. */
+  function usdB2(): Item {
+    return budgetItem({
+      id: 6401,
+      rule_id: 'B2',
+      action: 'Do not increase the US campaign',
+      metrics: [
+        usd('spend', 'Window spend', '2790.00'),
+        metric('outcomes', 'Window leads', 9, 'leads'),
+        usd('cost_per_outcome', 'Cost per lead', '310.00'),
+        usd('daily_budget', 'Latest effective daily budget', '100.00'),
+        usd('proposed_daily_budget', 'Proposed daily budget', '80.00'),
+      ],
+      baselines: [baseline('baseline_cost_per_outcome', 'Account cost per lead', '120.00')],
+      extra: { currency: 'USD', proposed: '80.00' },
+      decision_subject: { type: 'campaign', id: 6401 },
+    });
+  }
+
+  /** A B1 on a EUR account whose funding sentence is built from the API's amounts. */
+  function eurB1(): Item {
+    const eur = (key: string, label: string, value: string): Metric =>
+      metric(key, label, value, 'currency', 'EUR');
+    return budgetItem({
+      id: 6402,
+      rule_id: 'B1',
+      action: 'Raise daily budget from EUR 200.00 to EUR 240.00',
+      metrics: [
+        eur('spend', 'Window spend', '4200.00'),
+        metric('outcomes', 'Window conversions', 50, 'conversions'),
+        eur('cost_per_outcome', 'Cost per conversion', '84.00'),
+        eur('daily_budget', 'Latest effective daily budget', '200.00'),
+        eur('proposed_daily_budget', 'Proposed daily budget', '240.00'),
+      ],
+      baselines: [baseline('baseline_cost_per_outcome', 'Account cost per conversion', '90.00')],
+      extra: {
+        currency: 'EUR',
+        proposed: '240.00',
+        increase: '40.00',
+        funded_by_reallocation: '0.00',
+        from_new_budget: '40.00',
+        allocations: [],
+      },
+      decision_subject: { type: 'campaign', id: 6402 },
+    });
+  }
+
+  it('formats each card in its own currency and shows no cross-card total', async () => {
+    // The expected strings differ by currency, so the assertions below cannot pass vacuously.
+    expect(formatMoney('100.00', 'EUR')).not.toBe(formatMoney('100.00', 'USD'));
+
+    await renderBudget(budgetWith([usdB2(), eurB1()]));
+
+    const usdCard = card('Do not increase the US campaign');
+    expect(groupFields(usdCard, 'Efficiency')).toEqual([
+      `Cost per lead: ${formatMoney('310.00', 'USD')}`,
+      `Account cost per lead: ${formatMoney('120.00', 'USD')}`,
+    ]);
+    expect(listLines(usdCard, 'Budget details')).toEqual([
+      'Window leads: 9',
+      `Latest effective daily budget: ${formatMoney('100.00', 'USD')}`,
+      `Proposed daily budget: ${formatMoney('80.00', 'USD')}`,
+    ]);
+
+    const eurCard = card('Raise daily budget from EUR 200.00 to EUR 240.00');
+    expect(groupFields(eurCard, 'Efficiency')).toEqual([
+      `Cost per conversion: ${formatMoney('84.00', 'EUR')}`,
+      `Account cost per conversion: ${formatMoney('90.00', 'EUR')}`,
+    ]);
+    expect(listLines(eurCard, 'Budget details')).toEqual([
+      'Window conversions: 50',
+      `Latest effective daily budget: ${formatMoney('200.00', 'EUR')}`,
+      `Proposed daily budget: ${formatMoney('240.00', 'EUR')}`,
+    ]);
+    expect(
+      within(eurCard).getByText(
+        `Raise by ${formatMoney('40.00', 'EUR')}: ${formatMoney('0.00', 'EUR')} funded by ` +
+          `reallocation, ${formatMoney('40.00', 'EUR')} from new budget`,
+      ),
+    ).toBeTruthy();
+
+    // Neither card borrows the other's currency.
+    expect(usdCard.textContent).not.toContain('€');
+    expect(eurCard.textContent).not.toContain('$');
+
+    // No total line: nothing labelled a total, and neither the spend sum (2,790 + 4,200) nor
+    // the daily-budget sum (100 + 200) appears in any currency.
+    const section = document.getElementById('section-budget') as HTMLElement;
+    expect(section.textContent).not.toMatch(/total/iu);
+    expect(section.textContent).not.toMatch(/6,?990/u);
+    expect(section.textContent).not.toMatch(/\b300\.00\b/u);
   });
 });
 

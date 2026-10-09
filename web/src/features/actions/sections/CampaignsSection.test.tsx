@@ -19,17 +19,22 @@
  * - no `role="alert"` anywhere in the section.
  *
  * The network is stubbed with `mockApi`, which fails a test on any request it does not expect,
- * so a section without a C0 card is also shown to send no request at all.
+ * so a section without a C0 card is also shown to send no request at all. Loading states are
+ * asserted against a response the test holds pending, never against a race with the stub.
+ * Assertions use Testing Library queries and Vitest's own matchers only (no jest-dom, no
+ * user-event).
  */
 import { apiError, json, mockApi } from '../../../test/mockApi';
+import type { MockResponse } from '../../../test/mockApi';
 import { renderWithProviders } from '../../../test/render';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import type { Item, Metric, Overlay, Section } from '../../../api/types';
+import type { Discrepancy, Item, Metric, Overlay, Section } from '../../../api/types';
 import {
   FIXTURE_DISCREPANCY_ID,
   FIXTURE_ITEM_IDS,
+  FIXTURE_RESOLUTIONS,
   findPageItem,
   makeDiscrepancy,
   makeEvidence,
@@ -136,6 +141,47 @@ function openDiscrepancies() {
   return json(200, [makeDiscrepancy('status')]);
 }
 
+/** The accessible names of every button inside `scope`, in document order. */
+function buttonNames(scope: HTMLElement): string[] {
+  return within(scope)
+    .queryAllByRole('button')
+    .map((button) => button.textContent);
+}
+
+/** The footer actions C0 never offers: feedback (AAP 0.5.4.2) and "Record decision". */
+const NON_C0_ACTIONS = ['Dismiss', 'Snooze for 7 days', 'Mark done', 'Record decision'] as const;
+
+/** A response the test releases by hand, so the request stays pending until it does. */
+interface HeldResponse {
+  /** The handler: every request waits for {@link HeldResponse.release}. */
+  handler: () => Promise<MockResponse>;
+  /** Answers every waiting request, and every later one, with `response`. */
+  release: (response: MockResponse) => void;
+}
+
+/**
+ * A {@link HeldResponse}, so a loading state is asserted while the request is certainly still
+ * pending rather than racing the stub's asynchronous answer.
+ */
+function heldResponse(): HeldResponse {
+  let answer: MockResponse | undefined;
+  const waiting: ((response: MockResponse) => void)[] = [];
+  return {
+    handler: () =>
+      answer === undefined
+        ? new Promise<MockResponse>((resolve) => {
+            waiting.push(resolve);
+          })
+        : Promise.resolve(answer),
+    release: (response) => {
+      answer = response;
+      for (const resolve of waiting.splice(0)) {
+        resolve(response);
+      }
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section layout
 // ---------------------------------------------------------------------------------------------
@@ -212,6 +258,27 @@ describe('CampaignsSection layout', () => {
     expect(api.calls).toHaveLength(0);
   });
 
+  it('sends no GET /discrepancies when the section holds no C0 card', async () => {
+    const api = mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    await renderCampaigns(
+      campaignsWith([
+        makeGroup({ key: 'pause', title: 'Pause', items: [pageItem(FIXTURE_ITEM_IDS.c1)] }),
+        makeGroup({ key: 'scale', title: 'Scale', items: [pageItem(FIXTURE_ITEM_IDS.c2Hold)] }),
+      ]),
+      makeOverlay({ open_discrepancies: 0 }),
+    );
+
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(card('Pause')).toBeTruthy();
+    expect(card('Hold: platform outcomes are not reaching Qualified Lead')).toBeTruthy();
+    // Give any effect-started query a macrotask to reach the stub before counting the calls.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(api.calls.filter((call) => call.path === '/discrepancies')).toHaveLength(0);
+    expect(api.calls).toHaveLength(0);
+  });
+
   it('renders an unknown rule as the plain card, so no item is dropped', async () => {
     const api = mockApi({});
     const future = makeItem({
@@ -237,21 +304,25 @@ describe('CampaignsSection layout', () => {
 
 describe('C0 discrepancy cards', () => {
   it('compares platform and decision, and offers live resolutions, not feedback', async () => {
-    const api = mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    // The read is held pending, so the loading state is asserted before any list arrives.
+    const read = heldResponse();
+    const api = mockApi({ 'GET /discrepancies': read.handler });
     await renderCampaigns(defaultCampaigns());
 
     const c0 = card(C0_ACTION);
     expect(c0.textContent).toContain('Platform shows paused, last decided active');
     // While the first read runs, the footer holds a polite spinner, not the controls.
-    const loading = within(c0).getByText(LOADING_DISCREPANCY_LABEL);
-    expect(loading.closest('[role="status"]')).not.toBeNull();
-    expect(within(c0).queryByRole('button', { name: 'Platform is correct' })).toBeNull();
+    const loading = within(c0).getByRole('status');
+    expect(loading.textContent).toBe(LOADING_DISCREPANCY_LABEL);
+    expect(within(c0).getByText(LOADING_DISCREPANCY_LABEL)).toBeTruthy();
+    expect(within(c0).queryByRole('button')).toBeNull();
 
+    read.release(openDiscrepancies());
     await within(c0).findByRole('button', { name: 'Platform is correct' });
     expect(within(c0).getByRole('button', { name: 'Decision is correct' })).toBeTruthy();
     expect(within(c0).queryByText(LOADING_DISCREPANCY_LABEL)).toBeNull();
     // C0 is exempt from dismiss, snooze and done, and records no decision from its footer.
-    for (const label of ['Dismiss', 'Snooze for 7 days', 'Mark done', 'Record decision']) {
+    for (const label of NON_C0_ACTIONS) {
       expect(within(c0).queryByRole('button', { name: label })).toBeNull();
     }
 
@@ -263,10 +334,14 @@ describe('C0 discrepancy cards', () => {
   });
 
   it('offers exactly the resolutions the API lists, never derived ones', async () => {
-    // The run froze a status discrepancy; the live list now reports it as untracked.
+    // The run froze a status discrepancy (its extra lists platform_correct and
+    // decision_correct); the live list now reports it as untracked, and the card follows the API.
     mockApi({
       'GET /discrepancies': json(200, [
-        makeDiscrepancy('untracked', { id: FIXTURE_DISCREPANCY_ID }),
+        makeDiscrepancy('untracked', {
+          id: FIXTURE_DISCREPANCY_ID,
+          resolutions: [...FIXTURE_RESOLUTIONS.untracked],
+        }),
       ]),
     });
     await renderCampaigns(
@@ -275,9 +350,33 @@ describe('C0 discrepancy cards', () => {
 
     const c0 = card(C0_ACTION);
     await within(c0).findByRole('button', { name: 'Adopt platform state' });
-    expect(within(c0).getByRole('button', { name: 'Record intended state' })).toBeTruthy();
+    // Exactly the two untracked resolutions, in the API's order, and no other control.
+    expect(buttonNames(c0)).toEqual(['Adopt platform state', 'Record intended state']);
     expect(within(c0).queryByRole('button', { name: 'Platform is correct' })).toBeNull();
     expect(within(c0).queryByRole('button', { name: 'Decision is correct' })).toBeNull();
+    for (const label of NON_C0_ACTIONS) {
+      expect(within(c0).queryByRole('button', { name: label })).toBeNull();
+    }
+    // The frozen comparison line stays on the card beside the live controls.
+    expect(c0.textContent).toContain('Platform shows paused, last decided active');
+  });
+
+  it('renders a single resolution when that is all the API lists', async () => {
+    mockApi({
+      'GET /discrepancies': json(200, [
+        makeDiscrepancy('missing', {
+          id: FIXTURE_DISCREPANCY_ID,
+          resolutions: ['acknowledge_removal'],
+        }),
+      ]),
+    });
+    await renderCampaigns(
+      oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
+    );
+
+    const c0 = card(C0_ACTION);
+    await within(c0).findByRole('button', { name: 'Acknowledge removal' });
+    expect(buttonNames(c0)).toEqual(['Acknowledge removal']);
   });
 
   it('resolves the live discrepancy, then shows that it was resolved since the run', async () => {
@@ -310,12 +409,17 @@ describe('C0 discrepancy cards', () => {
     expect(within(c0).queryByRole('button', { name: 'Decision is correct' })).toBeNull();
   });
 
-  it('says it was resolved since the run when the live list lacks it', async () => {
-    mockApi({
-      'GET /discrepancies': json(200, [
-        makeDiscrepancy('budget', { id: FIXTURE_DISCREPANCY_ID + 1 }),
-      ]),
-    });
+  /** Live lists that no longer hold the C0 card's discrepancy. */
+  const listsWithoutIt: readonly [string, () => Discrepancy[]][] = [
+    ['is empty', () => []],
+    [
+      'holds only another discrepancy',
+      () => [makeDiscrepancy('budget', { id: FIXTURE_DISCREPANCY_ID + 1 })],
+    ],
+  ];
+
+  it.each(listsWithoutIt)('reads as resolved since the run when the list %s', async (_, list) => {
+    mockApi({ 'GET /discrepancies': json(200, list()) });
     await renderCampaigns(
       oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
     );
@@ -399,6 +503,11 @@ describe('C0 discrepancy cards', () => {
     expect((platformCorrect as HTMLButtonElement).disabled).toBe(true);
     const decisionCorrect = within(article).getByRole('button', { name: 'Decision is correct' });
     expect((decisionCorrect as HTMLButtonElement).disabled).toBe(true);
+    // Every control on the historical card is disabled, and none is a feedback action.
+    expect(buttonNames(article)).toEqual(['Platform is correct', 'Decision is correct']);
+    for (const button of within(article).getAllByRole('button')) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
   });
 
   it('pins C0 cards and puts other held items behind the disclosure', async () => {
@@ -578,10 +687,21 @@ describe('pause and scale cards', () => {
       'Meetings',
     ]);
     expect(pipeline.rows).toEqual([['30', '28', '2', '26', '4', '0', '0']]);
-    // No header or cell combines MQL and QL.
-    expect(pipeline.headers.some((header) => /MQL.*Qualified|Qualified.*MQL/u.test(header))).toBe(
-      false,
-    );
+    // MQL and QL are two separate header cells, each with its own count (AAP 0.5.4.7).
+    const mqlColumns = pipeline.headers.filter((header) => /\bMQL\b/u.test(header));
+    const qlColumns = pipeline.headers.filter((header) => /\bQL\b|Qualified Lead/u.test(header));
+    expect(mqlColumns).toEqual(['MQL (First meeting booked)']);
+    expect(qlColumns).toEqual(['Qualified Leads']);
+    const mqlCell = pipeline.rows[0]?.[pipeline.headers.indexOf('MQL (First meeting booked)')];
+    const qlCell = pipeline.rows[0]?.[pipeline.headers.indexOf('Qualified Leads')];
+    expect([mqlCell, qlCell]).toEqual(['4', '0']);
+    // No header combines them: no "MQL + QL", "MQL/QL", "MQL and Qualified Leads" or the like.
+    const combines = (header: string): boolean =>
+      /\bMQL\b/u.test(header) && /\bQL\b|Qualified/u.test(header);
+    expect(pipeline.headers.filter(combines)).toEqual([]);
+    for (const combined of ['MQL + QL', 'MQL/QL', 'MQL & QL', 'MQL + Qualified Leads']) {
+      expect(pipeline.headers).not.toContain(combined);
+    }
   });
 
   it('shows a C2 "Scale" no pipeline table', async () => {
