@@ -41,7 +41,7 @@ The body is exactly:
 
 - **Three keys, in this order, and no others.** No client ID, client secret, refresh token, developer token or `login-customer-id` is ever sent. The body is serialised once per call, so every retry sends the same bytes.
 - **`page_token`** is `null` on a first page. On a follow-up page it carries the previous response's `nextPageToken`.
-- **One GAQL query per call.** The workflow's Google Ads node runs it as `googleAds:search` v25, the REST call `POST https://googleads.googleapis.com/v25/customers/<customer id>/googleAds:search`. `searchStream` is never used. `pageSize`, `validateOnly` and `searchSettings` are never sent.
+- **One GAQL query per call.** The workflow's Google Ads node runs it as `googleAds:search` v25, the REST call `POST https://googleads.googleapis.com/v25/customers/<customer id>/googleAds:search`. `GOOGLE_ADS_API_VERSION` in `settings.py` records v25 as metadata of this contract; the product never sends it. `searchStream` is never used. `pageSize`, `validateOnly` and `searchSettings` are never sent.
 - **Every query is a template** from `QUERIES` in `queries.py` (see [Queries](#queries)). Scope values are validated integer ids and dates only, so no caller-supplied text is interpolated into GAQL.
 - **Timeout**: 120 s per call (`SOURCE_TIMEOUTS["google"]` in `connectors/http.py`), with a 10 s connect timeout.
 

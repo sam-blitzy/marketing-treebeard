@@ -105,6 +105,7 @@ from ads_engine.connectors.linkedin.parser import (
     urn_id,
 )
 from ads_engine.logging import get_logger
+from ads_engine.settings import LINKEDIN_API_VERSION
 
 __all__ = [
     "CREATIVE_CAMPAIGN_CHUNK",
@@ -138,8 +139,11 @@ log = get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-LINKEDIN_VERSION: Final = "202609"
-"""Marketing API version sent as ``Linkedin-Version`` on every request (AAP 0.1.3)."""
+LINKEDIN_VERSION: Final = LINKEDIN_API_VERSION
+"""Marketing API version sent as ``Linkedin-Version`` on every request (AAP 0.1.3).
+
+It is the settings pin :data:`ads_engine.settings.LINKEDIN_API_VERSION`, never a local literal.
+"""
 
 RESTLI_PROTOCOL_VERSION: Final = "2.0.0"
 """Rest.li protocol sent as ``X-Restli-Protocol-Version``; it fixes the query syntax used here."""

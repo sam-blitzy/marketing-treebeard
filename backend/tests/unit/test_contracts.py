@@ -13,7 +13,8 @@ guards the files themselves:
 * shape: each file is UTF-8 JSON with a trailing newline and no tab, holds exactly the
   documented keys, names its own surface and source, carries its source's pinned API version,
   an ``https`` reference URL (HubSpot: its ``latest`` CRM reference page) and a last-modified
-  date that is ``null`` or ``YYYY-MM-DD``, and loads through the simulator's own loader;
+  date that is ``null`` or ``YYYY-MM-DD``, and loads through the simulator's own loader, which
+  refuses any version other than the three ``ads_engine.settings`` pins;
 * samples and strictness: every documented sample satisfies its response schema (a contract
   without one must accept the minimal body built from its required members), and adding an
   undeclared top-level key, dropping a required one or answering with an unlisted status
@@ -515,6 +516,15 @@ def test_the_simulator_loader_reads_the_file_as_written(
     assert list(loaded.request.required_headers) == raw["request"]["required_headers"]
     assert loaded.response.status == tuple(raw["response"]["status"])
     assert loaded.response.documented_sample == raw["response"]["documented_sample"]
+
+
+@pytest.mark.parametrize("version", ["v24", "202608", "2026-03", "v3"])
+def test_the_simulator_loader_accepts_only_the_settings_pins(version: str) -> None:
+    raw = _read_raw("hubspot", "crm_search")
+    raw["api_version"] = version
+    with pytest.raises(ContractViolation) as caught:
+        Contract.from_json(raw, _contract_path("hubspot", "crm_search"))
+    assert "$.api_version: must be one of 2026-09, 202609, v25" in caught.value.errors
 
 
 # ---------------------------------------------------------------------------------------------

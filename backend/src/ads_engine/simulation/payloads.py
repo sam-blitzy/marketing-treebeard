@@ -88,7 +88,14 @@ from ads_engine.connectors.google_n8n.queries import (
 )
 from ads_engine.db.models.ops import SOURCES
 from ads_engine.logging import get_logger
-from ads_engine.settings import Settings, Source, get_settings
+from ads_engine.settings import (
+    GOOGLE_ADS_API_VERSION,
+    HUBSPOT_API_VERSION,
+    LINKEDIN_API_VERSION,
+    Settings,
+    Source,
+    get_settings,
+)
 from ads_engine.simulation import SIM_EMAIL_DOMAIN
 from ads_engine.simulation.generator import (
     FAULT_SURFACES,
@@ -251,7 +258,11 @@ if {key: tuple(value) for key, value in SURFACES.items()} != {
 }:  # pragma: no cover - a static invariant between two modules
     raise RuntimeError("payloads.SURFACES and generator.FAULT_SURFACES disagree")
 
-_API_VERSIONS: Final = frozenset({"v25", "202609", "2026-09"})
+# The settings pins, the only API versions a contract file may record.
+_API_VERSIONS: Final = frozenset(
+    {GOOGLE_ADS_API_VERSION, LINKEDIN_API_VERSION, HUBSPOT_API_VERSION}
+)
+_API_VERSION_ERROR: Final = f"$.api_version: must be one of {', '.join(sorted(_API_VERSIONS))}"
 _TOP_LEVEL_KEYS: Final = frozenset(
     {"surface", "source", "reference_url", "api_version", "last_modified", "request", "response"}
 )
@@ -405,7 +416,7 @@ class Contract:
         if not isinstance(reference_url, str) or not reference_url.strip():
             errors.append("$.reference_url: must be a non-empty string")
         if not isinstance(api_version, str) or api_version not in _API_VERSIONS:
-            errors.append("$.api_version: must be one of 2026-09, 202609, v25")
+            errors.append(_API_VERSION_ERROR)
         if last_modified is not None and (
             not isinstance(last_modified, str) or not _DATE_RE.fullmatch(last_modified)
         ):
@@ -2129,7 +2140,6 @@ _SURFACE_RULES: Final[Mapping[str, _Rule]] = MappingProxyType(
 # Surface identification
 # ---------------------------------------------------------------------------------------------
 
-_HUBSPOT_VERSION: Final = "2026-09"
 _LINKEDIN_OAUTH_HOST: Final = "www.linkedin.com"
 _LINKEDIN_OAUTH_PATH: Final = "/oauth/v2/accessToken"
 _REST_PREFIX: Final = "/rest/"
@@ -2255,9 +2265,9 @@ _ACCOUNT_SUBRESOURCES: Final[Mapping[str, str]] = MappingProxyType(
 
 
 def _hubspot_surface(shape: RequestShape, url: httpx.URL) -> str:
-    """Match a HubSpot ``2026-09`` path."""
+    """Match a HubSpot ``2026-09`` path (the settings pin ``HUBSPOT_API_VERSION``)."""
     segments = url.path.strip("/").split("/")
-    if len(segments) >= 3 and segments[0] == "crm" and segments[2] == _HUBSPOT_VERSION:
+    if len(segments) >= 3 and segments[0] == "crm" and segments[2] == HUBSPOT_API_VERSION:
         kind, rest = segments[1], segments[3:]
         if shape.method == "POST" and kind == "objects":
             if len(rest) == 3 and rest[0] and rest[1:] == ["batch", "read"]:

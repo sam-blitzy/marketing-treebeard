@@ -15,7 +15,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import AliasChoices, SecretStr, ValidationError
 
+from ads_engine.connectors.hubspot.client import HUBSPOT_API_VERSION as HUBSPOT_CLIENT_VERSION
+from ads_engine.connectors.linkedin.client import LINKEDIN_VERSION
 from ads_engine.settings import (
+    GOOGLE_ADS_API_VERSION,
+    HUBSPOT_API_VERSION,
+    LINKEDIN_API_VERSION,
     SOURCES,
     ConfigurationError,
     DataMode,
@@ -107,6 +112,43 @@ def test_sources_lists_every_source_in_display_order() -> None:
 
 def test_data_mode_allows_exactly_auto_and_simulated() -> None:
     assert get_args(DataMode) == ("auto", "simulated")
+
+
+def test_api_versions_are_pinned_to_the_supported_releases() -> None:
+    assert GOOGLE_ADS_API_VERSION == "v25"
+    assert LINKEDIN_API_VERSION == "202609"
+    assert HUBSPOT_API_VERSION == "2026-09"
+
+
+def test_no_settings_field_holds_an_api_version() -> None:
+    assert [name for name in Settings.model_fields if "version" in name] == []
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["GOOGLE_ADS_API_VERSION", "LINKEDIN_API_VERSION", "HUBSPOT_API_VERSION", "LINKEDIN_VERSION"],
+)
+def test_api_versions_are_never_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    baseline = Settings().model_dump()
+    monkeypatch.setenv(variable, "2099-01")
+
+    settings = Settings()
+
+    assert variable.lower() not in SETTINGS_ENV_NAMES
+    assert settings.model_dump() == baseline
+    assert not hasattr(settings, variable.lower())
+    assert (GOOGLE_ADS_API_VERSION, LINKEDIN_API_VERSION, HUBSPOT_API_VERSION) == (
+        "v25",
+        "202609",
+        "2026-09",
+    )
+
+
+def test_connectors_send_the_settings_pins() -> None:
+    assert LINKEDIN_VERSION is LINKEDIN_API_VERSION
+    assert HUBSPOT_CLIENT_VERSION is HUBSPOT_API_VERSION
 
 
 def test_configuration_error_is_a_runtime_error() -> None:

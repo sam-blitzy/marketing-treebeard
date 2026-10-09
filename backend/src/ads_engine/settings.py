@@ -23,6 +23,13 @@ Conventions:
 * Loading performs no network or database I/O, and importing this module reads no
   environment variable.
 
+API versions:
+    :data:`GOOGLE_ADS_API_VERSION`, :data:`LINKEDIN_API_VERSION` and
+    :data:`HUBSPOT_API_VERSION` pin each source's external API version. They are code
+    constants, not environment variables and not :class:`Settings` fields: the documented
+    variables include no version, and only those variables are read. A version move is a
+    code change that ships with the contract files in ``backend/tests/contracts/``.
+
 Example:
     A process entry point loads the cached settings once and checks what it needs::
 
@@ -42,6 +49,9 @@ from pydantic_core import PydanticUseDefault
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 __all__ = [
+    "GOOGLE_ADS_API_VERSION",
+    "HUBSPOT_API_VERSION",
+    "LINKEDIN_API_VERSION",
     "SOURCES",
     "ConfigurationError",
     "DataMode",
@@ -59,6 +69,23 @@ the equality is therefore kept by convention and asserted by the tests.
 
 SOURCES: Final[tuple[Source, ...]] = ("google", "linkedin", "hubspot")
 """Every source, in display order. Must equal ``ads_engine.db.models.ops.SOURCES``."""
+
+GOOGLE_ADS_API_VERSION: Final = "v25"
+"""The Google Ads API version of the n8n relay contract, as declarative metadata only.
+
+n8n's Google Ads node runs each query as ``googleAds:search`` on this version. The product
+never sends it: the webhook body is exactly ``{customer_id, query, page_token}``, and the
+product holds no Google credential and runs no Google OAuth.
+"""
+
+LINKEDIN_API_VERSION: Final = "202609"
+"""The LinkedIn Marketing API version, sent as ``Linkedin-Version`` on every request."""
+
+HUBSPOT_API_VERSION: Final = "2026-09"
+"""The HubSpot CRM API version, the dated path segment of every surface the product calls.
+
+For example ``/crm/objects/2026-09/contacts/search``.
+"""
 
 DataMode = Literal["auto", "simulated"]
 """``DATA_MODE``: ``auto`` falls back per source; ``simulated`` forces every source."""

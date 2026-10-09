@@ -21,14 +21,14 @@ Read-only:
     created, updated or deleted in HubSpot, because the product only recommends.
 
 Paths:
-    Every call uses its surface's dated ``2026-09`` path (:data:`HUBSPOT_API_VERSION`),
-    relative to the ``https://api.hubapi.com`` base of
-    :func:`ads_engine.connectors.http.build_client`. No numbered path is used, because
-    HubSpot ends support for the numbered association and object APIs during the
-    product's first year. Requests and responses follow the contract files in
-    ``backend/tests/contracts/hubspot/``; the simulator validates requests against the same
-    files, so live and simulated calls take one code path and this module never branches
-    on the data mode, except for the cross-source isolation rule below.
+    Every call uses its surface's dated ``2026-09`` path (:data:`HUBSPOT_API_VERSION`, the
+    version pinned in :mod:`ads_engine.settings`), relative to the
+    ``https://api.hubapi.com`` base of :func:`ads_engine.connectors.http.build_client`. No
+    numbered path is used, because HubSpot ends support for the numbered association and
+    object APIs during the product's first year. Requests and responses follow the contract
+    files in ``backend/tests/contracts/hubspot/``; the simulator validates requests against
+    the same files, so live and simulated calls take one code path and this module never
+    branches on the data mode, except for the cross-source isolation rule below.
 
 Throttle:
     Every attempt, retries included, first awaits :meth:`RateLimiter.acquire` of the
@@ -140,7 +140,7 @@ from ads_engine.db.models.crm import (
     TARGET_READ_STATUSES,
 )
 from ads_engine.logging import get_logger
-from ads_engine.settings import Settings, Source
+from ads_engine.settings import HUBSPOT_API_VERSION, Settings, Source
 
 if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
@@ -175,8 +175,8 @@ log = get_logger(__name__)
 # Constants (AAP 0.2.4 surfaces table; backend/tests/contracts/hubspot/*.json "limits")
 # ---------------------------------------------------------------------------
 
-HUBSPOT_API_VERSION: Final = "2026-09"
-"""The dated API version of every surface this client calls."""
+# HUBSPOT_API_VERSION, the dated API version of every surface this client calls, is the
+# settings pin imported from ads_engine.settings and re-exported through __all__.
 
 MAX_BATCH_READ_INPUTS: Final = 100
 """Inputs per objects batch read; HubSpot rejects a larger batch with HTTP 400."""

@@ -39,7 +39,8 @@ Paths are relative to `backend/src/ads_engine/`.
 
 ## API version and support
 
-- Every call uses its surface's dated `2026-09` path (`HUBSPOT_API_VERSION` in `client.py`).
+- Every call uses its surface's dated `2026-09` path (`HUBSPOT_API_VERSION`, pinned in
+  `settings.py` and consumed by `client.py` and the simulator's surface router).
   No numbered path (`/crm/v3/…`, `/crm/v4/…`) is used anywhere, and the connector's
   integration tests assert that none is sent.
 - HubSpot's changelog "Introducing date-based API versioning" (2026-03-30) states the support
@@ -50,10 +51,9 @@ Paths are relative to `backend/src/ads_engine/`.
 - HubSpot has announced that v4, including `/crm/v4/associations/…`, becomes unsupported on
   2027-03-30, and v1 to v3 in September 2027. The `2026-09` associations surface performs the
   same batch read, so the product never depends on a numbered contract.
-- A version move changes three places together: `HUBSPOT_API_VERSION` in `client.py`, the
-  simulator's surface router (`_HUBSPOT_VERSION` in `simulation/payloads.py`), and each contract
-  file's `request.url` and `api_version`. The contract tests then rerun against the new
-  reference pages.
+- A version move changes two places together: the `HUBSPOT_API_VERSION` pin in `settings.py`,
+  which `client.py` and `simulation/payloads.py` read, and each contract file's `request.url`
+  and `api_version`. The contract tests then rerun against the new reference pages.
 
 ## Credentials and settings
 

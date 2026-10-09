@@ -90,7 +90,7 @@ Backend modules, relative to `backend/src/ads_engine/`:
 
 | Module | Responsibility |
 |--------|----------------|
-| `settings.py` | Typed environment settings (`Settings`, `get_settings()`). Secrets are `SecretStr`; startup checks refuse an unsafe base URL |
+| `settings.py` | Typed environment settings (`Settings`, `get_settings()`). Secrets are `SecretStr`; startup checks refuse an unsafe base URL. Also holds the API version pins as code constants: `GOOGLE_ADS_API_VERSION` (v25), `LINKEDIN_API_VERSION` (`202609`) and `HUBSPOT_API_VERSION` (`2026-09`) |
 | `logging.py` | structlog JSON logs on stdout, with secret, token and email redaction |
 | `cli.py` | The `ads-engine` CLI: `hash-password`, `migrate`, `ensure-admin`, `sync --source`, `analyze --start --end`, `seed-simulated`, `capture-fixtures --source` |
 | `decisions.py` | Decision patches per decision shape, discrepancy resolutions, rejection of writes on retired subjects |

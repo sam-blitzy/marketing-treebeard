@@ -24,10 +24,11 @@ matching) and the [project README](../../README.md).
 
 ## Version, base URL and headers
 
-The connector is pinned to Marketing API version `202609` (`LINKEDIN_VERSION`) and Rest.li
-protocol `2.0.0` (`RESTLI_PROTOCOL_VERSION`). LinkedIn supports each monthly version for at least
-a year. Every request path is relative to `https://api.linkedin.com/rest/`, and every request is a
-`GET` carrying these headers:
+The connector is pinned to Marketing API version `202609` and Rest.li protocol `2.0.0`
+(`RESTLI_PROTOCOL_VERSION`). The version pin lives in `settings.py` as `LINKEDIN_API_VERSION`,
+and the client exposes it as `LINKEDIN_VERSION`. LinkedIn supports each monthly version for at
+least a year. Every request path is relative to `https://api.linkedin.com/rest/`, and every request
+is a `GET` carrying these headers:
 
 ```http
 GET /rest/adAccounts/<account id> HTTP/1.1
