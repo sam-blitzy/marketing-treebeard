@@ -51,7 +51,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from decimal import ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decimal
 from typing import Any, Final
 
 # The CRM Qualified Lead count every budget card shows "where linked" (AAP 0.5.4.5) is the
@@ -225,7 +225,7 @@ _FOUR_PLACES: Final = Decimal("0.0001")
 """Shares and utilization keep four places: a hundredth of a percent."""
 
 _ONE_PLACE: Final = Decimal("0.1")
-"""Percentages render with at most one decimal place in reason sentences."""
+"""Percentages and expected outcomes render with at most one decimal place in reason sentences."""
 
 _ZERO: Final = Decimal(0)
 
@@ -388,6 +388,20 @@ def _number(value: Decimal | int | str | None) -> str:
     if isinstance(value, Decimal):
         return format(value.normalize(_EXACT), "f")
     return str(value)
+
+
+def _one_place(value: Decimal | int | str | None) -> str:
+    """Render expected outcomes at one decimal place, rounded down: 80.219409 → ``80.2``.
+
+    Rounding down never shows a figure the value did not reach, so 2.95 reads ``2.9``, never a
+    ``3.0`` that would meet ``b2.min_expected_outcomes``; this is how C1 states expected
+    outcomes. ``unavailable`` for ``None``; a pre-rendered string is returned as it is.
+    """
+    if value is None:
+        return "unavailable"
+    if isinstance(value, str):
+        return value
+    return format(Decimal(value).quantize(_ONE_PLACE, rounding=ROUND_FLOOR, context=_EXACT), "f")
 
 
 def _p_value(value: Decimal, alpha: Decimal) -> str:
@@ -1393,8 +1407,8 @@ def _b2(
     singular = _singular(label)
     if evidence.extra["branch"] == "zero_outcomes":
         efficiency = (
-            f"with 0 {label} where {_number(_value(evidence, 'expected_outcomes'))} were "
-            f"expected at the account's {_baseline_text(evidence)} per {singular}"
+            f"with 0 {label} where {_one_place(_value(evidence, 'expected_outcomes'))} {label} "
+            f"were expected at the account's {_baseline_text(evidence)} per {singular}"
         )
     else:
         efficiency = (

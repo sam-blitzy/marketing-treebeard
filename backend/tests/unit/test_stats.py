@@ -171,8 +171,17 @@ def library_solver_fails(rate_1: float, rate_2: float, *, alpha: float) -> bool:
     return math.isnan(float(solved)) and warned
 
 
-def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> Decimal:
-    """statsmodels' two-sided score test of a rate ratio of 1."""
+def rate_probability(value: SupportsFloat) -> Decimal:
+    """Reference conversion of a rate-test p-value: a positive value below the 6-place quantum
+    keeps 6 significant digits (half even), any other value is :func:`probability`."""
+    exact = Decimal(repr(float(value)))
+    if Decimal(0) < exact < QUANTUM:
+        return Context(prec=6, rounding=ROUND_HALF_EVEN).create_decimal(exact)
+    return probability(value)
+
+
+def poisson_p(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> float:
+    """statsmodels' two-sided score-test p-value of a rate ratio of 1, as the library float."""
     result = poisson_2indep_reference(
         count_a,
         float(spend_a),
@@ -183,7 +192,12 @@ def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Dec
         compare="ratio",
         alternative=TWO_SIDED,
     )
-    return probability(result.pvalue)
+    return float(result.pvalue)
+
+
+def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> Decimal:
+    """statsmodels' two-sided score test of a rate ratio of 1, as :func:`rate_probability`."""
+    return rate_probability(poisson_p(count_a, spend_a, count_b, spend_b))
 
 
 def type7_reference(values: Sequence[Decimal | int], q: Decimal) -> Decimal:
@@ -1251,6 +1265,87 @@ def test_poisson_rate_test_accepts_int_exposure() -> None:
 @pytest.mark.parametrize(
     ("count_a", "spend_a", "count_b", "spend_b"),
     [
+        (16, Decimal(800), 200, Decimal(2000)),  # the catalogue's B4 card, p about 5.8e-12
+        (60, Decimal(1000), 5, Decimal(1000)),
+        # Between half the quantum and the quantum, which 6 places would show as 0.000001.
+        (37, Decimal(100), 5, Decimal(100)),
+    ],
+)
+def test_poisson_rate_test_keeps_six_significant_digits_below_the_quantum(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: a positive p-value below 0.000001 is recorded at 6 significant digits, never as 0."""
+    library = poisson_p(count_a, spend_a, count_b, spend_b)
+
+    result = poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+    assert 0.0 < library < 1e-6
+    assert result is not None
+    assert result.p_value > 0
+    assert result.p_value == Decimal(f"{library:.5e}")
+    assert len(result.p_value.as_tuple().digits) == 6
+    assert result.p_value == poisson_reference(count_a, spend_a, count_b, spend_b)
+    assert format(result.p_value, "f") not in ("0.000000", "0.000001")
+    swapped = poisson_rate_test(count_b, spend_b, count_a, spend_a)
+    assert swapped is not None
+    assert swapped.p_value == result.p_value
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
+        (36, Decimal(100), 5, Decimal(100)),  # p about 1.29e-6, just above the quantum
+        (35, Decimal(100), 5, Decimal(100)),
+        (40, Decimal(100), 10, Decimal(100)),
+        (30, Decimal(1000), 10, Decimal(1000)),
+        (4, Decimal("812.40"), 15, Decimal("2950.15")),
+        (10, Decimal(1000), 20, Decimal(2000)),
+    ],
+)
+def test_poisson_rate_test_keeps_six_places_from_the_quantum_up(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: from 0.000001 up the p-value is exactly the 6-place half-even figure."""
+    library = poisson_p(count_a, spend_a, count_b, spend_b)
+
+    result = poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+    assert library >= 1e-6
+    assert result is not None
+    assert result.p_value == probability(library)
+    assert result.p_value.as_tuple().exponent == -6
+
+
+@pytest.mark.parametrize(
+    ("library", "expected"),
+    [
+        (5.7664369391539194e-12, "5.76644E-12"),
+        (4.9999995e-07, "5.00000E-7"),  # 6 places alone would round it to 0.000000
+        (9.9999996e-07, "0.00000100000"),  # rounds up to the quantum, still at 6 digits
+        (5e-324, "5E-324"),  # the smallest positive double
+        (1e-06, "0.000001"),  # the quantum itself keeps 6 places
+        (0.001565402258002548, "0.001565"),
+        (0.0, "0.000000"),  # an underflow to exactly 0.0 has no digit to keep
+        (-0.0, "0.000000"),
+        (-1e-300, "0.000000"),  # clamped to [0, 1]
+        (1.0000000000000002, "1.000000"),
+        (math.nan, None),
+        (math.inf, None),
+    ],
+)
+def test_rate_p_value_conversion(library: float, expected: str | None) -> None:
+    """The rate test's p-value conversion: 6 significant digits only for (0, 0.000001)."""
+    result = stats._rate_p_value_from_float(np.float64(library))
+
+    assert (None if result is None else str(result)) == expected
+    if result is not None:
+        assert result == rate_probability(library)
+        assert Decimal(0) <= result <= Decimal(1)
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
         (0, Decimal(1000), 0, Decimal(1000)),  # no outcome on either side
         (5, Decimal(0), 5, Decimal(1000)),  # no exposure
         (5, Decimal(1000), 5, Decimal("0.00")),
@@ -1448,6 +1543,7 @@ def test_results_do_not_depend_on_the_callers_decimal_context() -> None:
             required_n(Decimal("0.02"), Decimal("0.024"), alpha=ALPHA, power=POWER),
             additional_n_for_difference(12, 800, 30, 1500, alpha=ALPHA, power=POWER),
             poisson_rate_test(3, Decimal("0.75"), 17, Decimal("123456.789012")),
+            poisson_rate_test(16, Decimal(800), 200, Decimal(2000)),
             percentile([Decimal("1000000000.000001"), Decimal("1000000000.000003")], HALF),
         ]
 

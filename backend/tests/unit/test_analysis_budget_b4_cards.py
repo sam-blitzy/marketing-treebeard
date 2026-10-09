@@ -9,7 +9,7 @@ budget history of its budget subject (the shared budget for a member campaign, "
 utilization for a lifetime or custom-period budget) with the keys and labels B1-B3 use, and
 records every ``budget.*`` key; known zero spend on either or both sides is withheld "no
 exposure" while absent facts say nothing; and a p-value is never rendered on the wrong side
-of alpha.
+of alpha, nor recorded in evidence as 0 when it lies below 0.000001.
 
 Contexts come from the scenario catalogue (``SCENARIOS[name].build_context()``); a few cases
 copy a built context with :func:`dataclasses.replace` (always with a fresh ``cache``, so no
@@ -23,6 +23,9 @@ from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final
 
 import pytest
+
+# Aliased so the module namespace holds no ``test_*`` name for pytest to collect.
+from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep_reference
 
 from ads_engine.analysis import budget
 from ads_engine.analysis.budget import (
@@ -659,6 +662,52 @@ def test_a_significant_test_reads_below_alpha() -> None:
     assert item.evidence.test is not None
     assert item.evidence.test.p_value == p_value
     assert item.evidence.test.alpha == alpha
+
+
+@pytest.mark.parametrize("name", [LINKEDIN_FIRES, GOOGLE_FIRES])
+def test_a_tiny_p_value_is_recorded_in_evidence_never_as_zero(name: str) -> None:
+    """A p-value below 0.000001 keeps 6 significant digits in evidence; the reason states a bound.
+
+    Both catalogue cards compare 16 weekend outcomes on USD 800 with 200 weekday outcomes on
+    USD 2000, where statsmodels' score test gives about 5.8e-12. Six decimal places alone
+    would record "0.000000", stating p = 0.
+    """
+    _scenario, ctx = _built(name)
+    item = _only_item(ctx)
+    metrics = _metrics(item)
+
+    def number(key: str) -> Decimal:
+        value = metrics[key].value
+        assert isinstance(value, int | Decimal), (key, value)
+        return Decimal(value)
+
+    library = float(
+        poisson_2indep_reference(
+            int(number("weekend_outcomes")),
+            float(number("weekend_spend")),
+            int(number("weekday_outcomes")),
+            float(number("weekday_spend")),
+            value=1.0,
+            method="score",
+            compare="ratio",
+            alternative="two-sided",
+        ).pvalue
+    )
+    significant = Decimal(f"{library:.5e}")
+
+    test = item.evidence.test
+    assert 0.0 < library < 1e-6
+    assert test is not None
+    assert test.name == B4_TEST_NAME
+    assert test.p_value is not None
+    assert test.p_value > 0
+    assert test.p_value == significant
+    rendered = item.evidence.to_json()["test"]["p_value"]
+    assert rendered != "0.000000"
+    assert rendered == format(significant, "f")
+    assert Decimal(rendered) == significant
+    assert _shown_p(item.reason) == ("<", Decimal("0.0001"))
+    assert "p < 0.0001, below alpha 0.05" in item.reason
 
 
 # ---------------------------------------------------------------------------

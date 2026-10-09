@@ -19,7 +19,7 @@ network.
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, Final, cast
 from zoneinfo import ZoneInfo
 
@@ -817,7 +817,11 @@ def test_b2_fires_on_five_of_seven_high_utilization_days_with_poor_efficiency() 
 
 
 def test_b2_zero_outcome_branch_fires_when_expected_outcomes_reach_the_minimum() -> None:
-    """AAP 0.5.4.5 B2: 0 outcomes with expected outcomes >= b2.min_expected_outcomes fire."""
+    """AAP 0.5.4.5 B2: 0 outcomes with expected outcomes >= b2.min_expected_outcomes fire.
+
+    The reason states the evidence's six-place expected outcomes at one decimal place, rounded
+    down, with the outcome label, as C1 does: 80.219409 reads "80.2 leads were expected".
+    """
     scenario, ctx = _built("g1.b2_target.fires")
     hot = _campaign_id(scenario, "linkedin", "hot")
     silent = _with_days(ctx, hot, (replace(day, leads=0) for day in ctx.campaign_days[hot]))
@@ -829,7 +833,13 @@ def test_b2_zero_outcome_branch_fires_when_expected_outcomes_reach_the_minimum()
     expected = metrics["expected_outcomes"]
     assert isinstance(expected, Decimal)
     assert expected >= silent.thresholds.ratio("b2.min_expected_outcomes")
-    assert "with 0 leads where" in item.reason
+    shown = expected.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+    assert shown != expected
+    assert f"with 0 leads where {shown} leads were expected at the account's " in item.reason
+    assert format(expected, "f") not in item.reason
+    assert budget._one_place(Decimal("2.95")) == "2.9"
+    assert budget._one_place(Decimal("3.000000")) == "3.0"
+    assert (budget._one_place(None), budget._one_place("n/a")) == ("unavailable", "n/a")
 
 
 def test_b2_and_b3_are_withheld_on_four_spending_days_of_five_required() -> None:

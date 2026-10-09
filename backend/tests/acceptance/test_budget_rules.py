@@ -1061,7 +1061,7 @@ def test_b2_zero_outcome_branch_fires_at_three_expected_outcomes_and_not_at_two_
     assert item.evidence.extra["branch"] == "zero_outcomes"
     assert (shown["outcomes"], shown["cost_per_outcome"]) == (0, None)
     assert shown["expected_outcomes"] == expected
-    assert "with 0 leads where 3 were expected" in item.reason
+    assert "with 0 leads where 3.0 leads were expected" in item.reason
     assert subject in spend_increase_blocked(ctx)
     assert subject not in _increase_targets(_survivors(out))
     assert out.suppressed_total(SUPPRESS_G1_BLOCKED) == 3

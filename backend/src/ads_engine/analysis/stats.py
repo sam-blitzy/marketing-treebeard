@@ -34,7 +34,9 @@ Conventions:
   thresholds are ``Decimal`` (``int`` is accepted wherever a ``Decimal`` is, being exact).
   ``float`` exists only inside the library calls. Library results come back through
   ``Decimal(repr(float(value)))`` rounded to 6 decimal places with banker's rounding
-  (``ROUND_HALF_EVEN``), independent of the caller's decimal context. Threshold decisions
+  (``ROUND_HALF_EVEN``), independent of the caller's decimal context. The one exception is
+  a positive rate-test p-value below 0.000001, which keeps 6 significant digits instead, so
+  a vanishing p-value never reads as 0 (:func:`poisson_rate_test`). Threshold decisions
   inside this module use exact counts, never the rounded values.
 * "Not estimable" is ``None``: degenerate input (zero trials, zero exposure, no observed
   difference, a baseline of 0 or a target above 100%) returns ``None``, which the rules
@@ -117,8 +119,12 @@ POISSON_RATE_METHOD: Final = "two_sample_poisson_score"
 """Method label of :func:`poisson_rate_test`: the score test of a rate ratio of 1."""
 
 # Every Decimal leaving this module carries 6 decimal places, the scale of the stored
-# numeric(18,6) money and conversion columns.
+# numeric(18,6) money and conversion columns, except a positive rate-test p-value below this
+# quantum, which keeps _P_VALUE_DIGITS significant digits (see _rate_p_value_from_float).
 _QUANTUM: Final = Decimal("0.000001")
+# Significant digits a positive rate-test p-value below _QUANTUM keeps, where 6 decimal places
+# would round it to 0: 5.7664369391539194e-12 becomes Decimal("5.76644E-12").
+_P_VALUE_DIGITS: Final = 6
 # Working precision of the exact bookkeeping. 50 digits hold any count ratio or spend sum the
 # product stores (numeric(18,6) has at most 18 digits) with room for the 6-place quantum.
 _PRECISION: Final = 50
@@ -176,7 +182,9 @@ class RateTest:
 
     Attributes:
         method: Always :data:`POISSON_RATE_METHOD`.
-        p_value: Two-sided p-value in [0, 1] for a rate ratio of 1.
+        p_value: Two-sided p-value in [0, 1] for a rate ratio of 1: 6 decimal places from
+            0.000001 up, 6 significant digits below it (``Decimal("5.76644E-12")``), so a
+            positive p-value never reads as 0.
         rate_a: Outcomes per unit of exposure on side A (``count_a / exposure_a``).
         rate_b: Outcomes per unit of exposure on side B (``count_b / exposure_b``).
     """
@@ -313,6 +321,26 @@ def _probability_from_float(value: SupportsFloat) -> Decimal | None:
     if result is None:
         return None
     return min(max(result, _ZERO_6), _ONE_6)
+
+
+def _rate_p_value_from_float(value: SupportsFloat) -> Decimal | None:
+    """Convert the rate test's library p-value, clamped to [0, 1]; ``None`` when not finite.
+
+    From 0.000001 (the 6-place quantum) up, and at or below 0, the result is exactly that of
+    :func:`_probability_from_float`: rounded half even to 6 decimal places, then clamped. A
+    positive p-value below the quantum, which 6 places would round to 0, keeps
+    :data:`_P_VALUE_DIGITS` significant digits instead, rounded half even:
+    ``5.7664369391539194e-12`` becomes ``Decimal("5.76644E-12")``. A strong B4 pattern thus
+    records its p-value rather than 0. A library result of exactly 0.0, a p-value that
+    underflowed below the smallest positive double, has no digit to keep and stays 0.
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    exact = Decimal(repr(number))
+    if _ZERO < exact < _QUANTUM:
+        return Context(prec=_P_VALUE_DIGITS, rounding=ROUND_HALF_EVEN).create_decimal(exact)
+    return _probability_from_float(number)
 
 
 def _require_finite(value: Decimal | None, what: str) -> Decimal:
@@ -767,6 +795,12 @@ def poisson_rate_test(
     counting contract, and must never round weighted conversions into this test (B4
     withholds the pattern instead). A ``float`` or ``Decimal`` count raises ``TypeError``.
 
+    The p-value is rounded half even to 6 decimal places from 0.000001 up, like every other
+    output of this module. A positive p-value below 0.000001 keeps 6 significant digits
+    instead (``Decimal("5.76644E-12")``, which evidence renders as ``"0.00000000000576644"``),
+    so a strong pattern never records p = 0. Only a library p-value of exactly 0.0, a
+    p-value that underflowed below the smallest positive double, stays 0.
+
     Args:
         count_a: Outcomes on side A (for example weekend days), an unweighted event count.
         exposure_a: Spend on side A.
@@ -785,6 +819,8 @@ def poisson_rate_test(
     Example:
         >>> poisson_rate_test(30, Decimal(1000), 10, Decimal(1000)).p_value
         Decimal('0.001565')
+        >>> poisson_rate_test(16, Decimal(800), 200, Decimal(2000)).p_value
+        Decimal('5.76644E-12')
     """
     events_a = _require_count("count_a", count_a)
     events_b = _require_count("count_b", count_b)
@@ -804,7 +840,7 @@ def poisson_rate_test(
         compare="ratio",
         alternative=_TWO_SIDED,
     )
-    p_value = _probability_from_float(result.pvalue)
+    p_value = _rate_p_value_from_float(result.pvalue)
     if p_value is None:
         return None
     return RateTest(
