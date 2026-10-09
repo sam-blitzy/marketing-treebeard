@@ -113,6 +113,29 @@ describe('Card', () => {
     expect(screen.queryByText(/Rank/)).toBeNull();
   });
 
+  it('holds a string rank, the entity line, the body and the footer inside the named article', () => {
+    const { container } = render(
+      <Card id="item-1">
+        <Card.Header title="Pause" rank="1" meta="Brand campaign · LinkedIn" />
+        <Card.Body>Reason text</Card.Body>
+        <Card.Footer>Footer actions</Card.Footer>
+      </Card>,
+    );
+
+    const article = screen.getByRole('article', { name: 'Pause' });
+    expect(article.id).toBe('item-1');
+    const heading = within(article).getByRole('heading', { level: 3, name: 'Pause' });
+    expect(article.getAttribute('aria-labelledby')).toBe(heading.id);
+
+    const rank = container.querySelector('.ds-card__rank');
+    expect(rank?.textContent).toBe('Rank 1');
+    expect(rank?.firstElementChild?.className).toBe('ds-visually-hidden');
+
+    expect(within(article).getByText('Brand campaign · LinkedIn').className).toBe('ds-card__meta');
+    expect(within(article).getByText('Reason text').className).toBe('ds-card__body');
+    expect(within(article).getByText('Footer actions').className).toBe('ds-card__footer');
+  });
+
   it('renders a rank and an entity line of 0, because 0 is content', () => {
     const { container } = render(
       <Card>

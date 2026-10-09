@@ -8,7 +8,7 @@
  * skipped for slots React renders as nothing (`undefined`, `null`, booleans, `''`) but kept for
  * `0`; the tone sets exactly one modifier (default `info`); and `id` is forwarded.
  */
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -63,18 +63,26 @@ describe('Banner', () => {
     expect(modifiers).toEqual([`ds-banner--${tone}`]);
   });
 
-  it('is an alert only when alert is set, and announces its whole content', () => {
+  it('is an alert only when alert is set, and announces its title, content and actions', () => {
     render(
-      <Banner tone="critical" alert title="3 open discrepancies to resolve first">
-        Platform state no longer matches the last recorded decisions.
+      <Banner
+        tone="critical"
+        title="3 open discrepancies"
+        alert
+        actions={<a href="#group-campaigns-discrepancies">Review</a>}
+      >
+        Resolve these first.
       </Banner>,
     );
 
     const alert = screen.getByRole('alert');
-    expect(alert.textContent).toBe(
-      '3 open discrepancies to resolve first' +
-        'Platform state no longer matches the last recorded decisions.',
-    );
+    expect(alert.classList.contains('ds-banner--critical')).toBe(true);
+    expect(within(alert).getByText('3 open discrepancies').className).toBe('ds-banner__title');
+    expect(within(alert).getByText('Resolve these first.').className).toBe('ds-banner__content');
+    const review = within(alert).getByRole('link', { name: 'Review' });
+    expect(review.getAttribute('href')).toBe('#group-campaigns-discrepancies');
+    expect(review.parentElement?.className).toBe('ds-banner__actions');
+    expect(alert.textContent).toBe('3 open discrepanciesResolve these first.Review');
   });
 
   it('is silent content without alert: no alert, status, live region or landmark', () => {

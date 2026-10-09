@@ -48,6 +48,22 @@ describe('Select', () => {
       expect(label.getAttribute('for')).toBe(select.id);
     });
 
+    it('is found by its label text, typed by an explicit value union, holding value', () => {
+      render(
+        <Select<Status> label="Status" options={STATUS_OPTIONS} value="active" onChange={ignoreChange} />,
+      );
+
+      // getByLabelText follows the label's `for` to the control, as a sighted user reads it.
+      const select = screen.getByLabelText<HTMLSelectElement>('Status');
+      expect(select.tagName).toBe('SELECT');
+      expect(select.value).toBe('active');
+      expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual([
+        'Active',
+        'Paused',
+        'Removed',
+      ]);
+    });
+
     it('selects the option matching value', () => {
       render(<Select label="Status" options={STATUS_OPTIONS} value="paused" onChange={ignoreChange} />);
 

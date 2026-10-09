@@ -256,6 +256,16 @@ describe('DataTable', () => {
         false,
         false,
       ]);
+      // The asset row header and the other text cells carry the explicit start class.
+      expect(cells.map((cell) => cell.classList.contains('ds-datatable__cell--start'))).toEqual([
+        true,
+        false,
+        false,
+        false,
+        true,
+        true,
+        true,
+      ]);
     });
 
     it('renders a cell for a row that is not an object as empty', () => {

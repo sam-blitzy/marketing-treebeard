@@ -81,6 +81,24 @@ describe('EmptyState', () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
+  it('renders a section reason and a link to the Sources page without adding a heading', () => {
+    render(
+      <EmptyState title="No keywords to adjust" action={<a href="/sources">View sources</a>}>
+        No search term met the minimum clicks.
+      </EmptyState>,
+    );
+
+    expect(screen.getByText('No keywords to adjust').className).toBe('ds-emptystate__title');
+    expect(screen.getByText('No search term met the minimum clicks.').className).toBe(
+      'ds-emptystate__reason',
+    );
+    expect(screen.queryByRole('heading')).toBeNull();
+
+    const link = screen.getByRole('link', { name: 'View sources' });
+    expect(link.getAttribute('href')).toBe('/sources');
+    expect(link.parentElement?.className).toBe('ds-emptystate__action');
+  });
+
   it.each(EMPTY_SLOTS)('renders no reason or action container for %s', (_name, slot) => {
     render(
       <EmptyState title="Nothing here" action={slot}>

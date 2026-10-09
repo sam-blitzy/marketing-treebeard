@@ -38,8 +38,15 @@ import type { HttpMethod } from './client';
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/** The stubbed global `fetch`. */
-type FetchMock = Mock<typeof fetch>;
+/**
+ * The signature of the global the client calls, written out rather than derived from the
+ * global itself: only `client.ts` may name that global (`eslint.config.js`, block
+ * `web/api-client`), so the tests never reference it, even in a type position.
+ */
+type FetchImpl = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+/** The stub installed with `vi.stubGlobal('fetch', …)`. */
+type FetchMock = Mock<FetchImpl>;
 
 /** One request as the stub received it. */
 interface SentRequest {
@@ -47,9 +54,16 @@ interface SentRequest {
   url: string;
   /** The `RequestInit` the client passed to `fetch`. */
   init: RequestInit;
-  /** `init.headers`, which the client always builds as a plain record. */
-  headers: Record<string, string>;
+  /**
+   * `init.headers` normalised through `new Headers(…)`, so the assertions hold whether the
+   * client builds a record, an entry list or a `Headers` object, and names compare
+   * case-insensitively as HTTP defines them.
+   */
+  headers: Headers;
 }
+
+/** The `Content-Type` of the API's JSON responses. */
+const JSON_CONTENT_TYPE = { 'Content-Type': 'application/json' } as const;
 
 /** Messages the client documents for failures without the API's envelope. */
 const MESSAGES = {
@@ -69,7 +83,7 @@ const MESSAGES = {
 function stubFetch(
   handler: (url: string, init: RequestInit) => Response | Promise<Response>,
 ): FetchMock {
-  const mock = vi.fn<typeof fetch>(async (input, init) => handler(String(input), init ?? {}));
+  const mock = vi.fn<FetchImpl>(async (input, init) => handler(String(input), init ?? {}));
   vi.stubGlobal('fetch', mock);
   return mock;
 }
@@ -81,7 +95,7 @@ function stubFetch(
  * @returns The mock.
  */
 function stubFetchRejecting(failure: unknown): FetchMock {
-  const mock = vi.fn<typeof fetch>(() => Promise.reject(failure));
+  const mock = vi.fn<FetchImpl>(() => Promise.reject(failure));
   vi.stubGlobal('fetch', mock);
   return mock;
 }
@@ -103,7 +117,18 @@ function sentRequest(mock: FetchMock, index = 0): SentRequest {
   if (typeof input !== 'string' || init === undefined) {
     throw new Error('the client must call fetch(url: string, init: RequestInit)');
   }
-  return { url: input, init, headers: init.headers as Record<string, string> };
+  return { url: input, init, headers: new Headers(init.headers) };
+}
+
+/**
+ * Every header of a request as a plain object, for an exact `toEqual`. `Headers` lowercases
+ * names, so the keys are lowercase.
+ *
+ * @param headers - The normalised request headers.
+ * @returns Header names mapped to their values.
+ */
+function headerRecord(headers: Headers): Record<string, string> {
+  return Object.fromEntries(headers.entries());
 }
 
 /**
@@ -117,7 +142,7 @@ function sentRequest(mock: FetchMock, index = 0): SentRequest {
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { ...JSON_CONTENT_TYPE, ...headers },
   });
 }
 
@@ -213,6 +238,7 @@ function fields(error: ApiError): {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -263,6 +289,7 @@ describe('isApiError', () => {
     expect(isApiError({ name: 'ApiError', status: 404, code: 'not_found', message: 'x' })).toBe(
       false,
     );
+    expect(isApiError({ status: 401, code: 'unauthenticated' })).toBe(false);
     expect(isApiError(null)).toBe(false);
     expect(isApiError(undefined)).toBe(false);
     expect(isApiError('not_found')).toBe(false);
@@ -283,10 +310,69 @@ describe('apiFetch request construction', () => {
     expect(url).toBe('/api/v1/auth/me');
     expect(init.method).toBe('GET');
     expect(init.credentials).toBe('same-origin');
-    expect(headers).toEqual({ Accept: 'application/json' });
-    expect(CSRF_HEADER in headers).toBe(false);
+    expect(headerRecord(headers)).toEqual({ accept: 'application/json' });
+    expect(headers.has(CSRF_HEADER)).toBe(false);
     expect('body' in init).toBe(false);
     expect('signal' in init).toBe(false);
+  });
+
+  it('sends GET /runs/latest without the CSRF header, a body or a Content-Type', async () => {
+    const mock = stubFetch(() => json({ id: 101, kind: 'default' }));
+    await apiFetch('/runs/latest');
+
+    const call = mock.mock.calls[0];
+    expect(call).toBeDefined();
+    const [input, init] = call ?? [];
+    const headers = new Headers(init?.headers);
+    expect(input).toBe('/api/v1/runs/latest');
+    expect(init?.method).toBe('GET');
+    expect(init?.credentials).toBe('same-origin');
+    expect(headers.get('Accept')).toBe('application/json');
+    expect(headers.has(CSRF_HEADER)).toBe(false);
+    expect(headers.has('Content-Type')).toBe(false);
+    expect(init?.body).toBeUndefined();
+  });
+
+  it('sends POST /auth/login as JSON with the CSRF header', async () => {
+    const mock = stubFetch(() => json({ email: 'admin@example.com' }));
+    const credentials = { email: 'admin@example.com', password: 'not-a-real-password' };
+    await expect(
+      apiFetch('/auth/login', { method: 'POST', body: credentials }),
+    ).resolves.toEqual({ email: 'admin@example.com' });
+
+    const { url, init, headers } = sentRequest(mock);
+    expect(url).toBe('/api/v1/auth/login');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('same-origin');
+    expect(headers.get(CSRF_HEADER)).toBe(CSRF_VALUE);
+    expect(headers.get('X-Requested-With')).toBe('ads-engine');
+    expect(headers.get('Content-Type')).toBe('application/json');
+    expect(headers.get('Accept')).toBe('application/json');
+    expect(init.body).toBe(JSON.stringify(credentials));
+  });
+
+  it('builds a repeated, skipped and typed query as URLSearchParams reads it', async () => {
+    const mock = stubFetch(() => json([]));
+    await apiFetch('/discrepancies', {
+      query: {
+        state: ['open', 'awaiting_platform'],
+        run_id: 7,
+        flag: true,
+        skipped: undefined,
+        empty: null,
+      },
+    });
+
+    const { url } = sentRequest(mock);
+    const [path, search] = url.split('?');
+    expect(path).toBe('/api/v1/discrepancies');
+    expect(search).toBe('state=open&state=awaiting_platform&run_id=7&flag=true');
+    const params = new URLSearchParams(search);
+    expect(params.getAll('state')).toEqual(['open', 'awaiting_platform']);
+    expect(params.get('run_id')).toBe('7');
+    expect(params.get('flag')).toBe('true');
+    expect(params.has('skipped')).toBe(false);
+    expect(params.has('empty')).toBe(false);
   });
 
   it('adds the missing leading slash to a path', async () => {
@@ -342,19 +428,27 @@ describe('apiFetch request construction', () => {
     expect(init.method).toBe('POST');
     expect(init.credentials).toBe('same-origin');
     expect(init.body).toBe(JSON.stringify(body));
-    expect(headers).toEqual({
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-Requested-With': 'ads-engine',
+    expect(headerRecord(headers)).toEqual({
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'x-requested-with': 'ads-engine',
     });
+    expect(headers.get(CSRF_HEADER)).toBe(CSRF_VALUE);
   });
 
   it('sends the CSRF header on a POST without a body, and no Content-Type', async () => {
     const mock = stubFetch(() => new Response(null, { status: 204 }));
-    await apiFetch('/auth/logout', { method: 'POST' });
+    await expect(apiFetch('/auth/logout', { method: 'POST' })).resolves.toBeUndefined();
 
-    const { init, headers } = sentRequest(mock);
-    expect(headers).toEqual({ Accept: 'application/json', 'X-Requested-With': 'ads-engine' });
+    const { url, init, headers } = sentRequest(mock);
+    expect(url).toBe('/api/v1/auth/logout');
+    expect(init.method).toBe('POST');
+    expect(headerRecord(headers)).toEqual({
+      accept: 'application/json',
+      'x-requested-with': 'ads-engine',
+    });
+    expect(headers.get(CSRF_HEADER)).toBe(CSRF_VALUE);
+    expect(headers.has('Content-Type')).toBe(false);
     expect('body' in init).toBe(false);
   });
 
@@ -365,7 +459,7 @@ describe('apiFetch request construction', () => {
       await apiFetch('/x', { method, body: { a: 1 } });
       const { init, headers } = sentRequest(mock);
       expect(init.method).toBe(method);
-      expect(headers[CSRF_HEADER]).toBe(CSRF_VALUE);
+      expect(headers.get(CSRF_HEADER)).toBe(CSRF_VALUE);
     },
   );
 
@@ -374,7 +468,7 @@ describe('apiFetch request construction', () => {
     await apiFetch('/x', { method: 'POST', body: null });
     const { init, headers } = sentRequest(mock);
     expect(init.body).toBe('null');
-    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers.get('Content-Type')).toBe('application/json');
   });
 
   it('passes the caller signal through', async () => {
@@ -472,6 +566,13 @@ describe('apiFetch success responses', () => {
     expect(error.cause).toBeInstanceOf(SyntaxError);
   });
 
+  it('rejects a 200 whose body is "not json" as invalid_response', async () => {
+    stubFetch(() => new Response('not json', { status: 200, headers: JSON_CONTENT_TYPE }));
+    const error = await rejection(apiFetch('/runs/latest'));
+    expect(isApiError(error)).toBe(true);
+    expect(error).toMatchObject({ status: 200, code: 'invalid_response' });
+  });
+
   it('rejects a 2xx body that cannot be read as invalid_response with the read error', async () => {
     const failure = new TypeError('terminated');
     stubFetch(() => unreadable(200, failure));
@@ -506,6 +607,85 @@ describe('apiFetch error responses', () => {
       message: 'Computed from data that has since been replaced.',
       retryAfter: undefined,
     });
+  });
+
+  it('rejects a 409 run_in_progress with an ApiError that is an Error', async () => {
+    stubFetch(() =>
+      json({ error: { code: 'run_in_progress', message: 'Another analysis is running' } }, 409),
+    );
+    const error = await rejection(
+      apiFetch('/runs', {
+        method: 'POST',
+        body: { window_start: '2026-09-01', window_end: '2026-09-28' },
+      }),
+    );
+
+    expect(isApiError(error)).toBe(true);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      name: 'ApiError',
+      status: 409,
+      code: 'run_in_progress',
+      message: 'Another analysis is running',
+    });
+  });
+
+  it("maps FastAPI's default 422 {detail: [...]} body to http_422", async () => {
+    stubFetch(() =>
+      json(
+        {
+          detail: [
+            {
+              type: 'missing',
+              loc: ['body', 'window_end'],
+              msg: 'Field required',
+              input: { window_start: '2026-09-01' },
+            },
+          ],
+        },
+        422,
+      ),
+    );
+    const error = await apiErrorOf(
+      apiFetch('/runs', { method: 'POST', body: { window_start: '2026-09-01' } }),
+    );
+    expect(error.status).toBe(422);
+    expect(error.code).toBe('http_422');
+    expect(error.message).toBe('Request failed with status 422.');
+  });
+
+  it('keeps the server code of a 422 in the error shape', async () => {
+    stubFetch(() => json(envelope('validation_error', 'window_end: Field required'), 422));
+    const error = await apiErrorOf(apiFetch('/runs', { method: 'POST', body: {} }));
+    expect(fields(error)).toEqual({
+      name: 'ApiError',
+      status: 422,
+      code: 'validation_error',
+      message: 'window_end: Field required',
+      retryAfter: undefined,
+    });
+  });
+
+  it('keeps the server code of a 503 in the error shape, not the fallback', async () => {
+    stubFetch(() => json(envelope('database_unavailable', 'Database unavailable'), 503));
+    const error = await apiErrorOf(apiFetch('/healthz'));
+    expect(fields(error)).toEqual({
+      name: 'ApiError',
+      status: 503,
+      code: 'database_unavailable',
+      message: 'Database unavailable',
+      retryAfter: undefined,
+    });
+  });
+
+  it('maps an nginx 502 HTML page to http_502 and the "temporarily unavailable" text', async () => {
+    stubFetch(() => text('<html>Bad Gateway</html>', 502));
+    const error = await apiErrorOf(apiFetch('/runs/latest'));
+    expect(error.status).toBe(502);
+    expect(error.code).toBe('http_502');
+    expect(error.message).toMatch(/temporarily unavailable/);
+    expect(error.message).toBe(MESSAGES.unavailable);
   });
 
   it('passes an envelope code the client does not know through unchanged', async () => {
@@ -593,6 +773,46 @@ describe('Retry-After', () => {
     });
   });
 
+  it('reads Retry-After: 42 on a 429 rate_limited', async () => {
+    stubFetch(() =>
+      json(envelope('rate_limited', 'Too many login attempts.'), 429, { 'Retry-After': '42' }),
+    );
+    const error = await apiErrorOf(
+      apiFetch('/auth/login', { method: 'POST', body: { email: 'a', password: 'b' } }),
+    );
+    expect(error.status).toBe(429);
+    expect(error.code).toBe('rate_limited');
+    expect(error.retryAfter).toBe(42);
+  });
+
+  it('reads an HTTP-date 30 s in the future as 30 under fake timers', async () => {
+    vi.useFakeTimers();
+    const now = new Date('2026-10-06T09:00:00Z');
+    vi.setSystemTime(now);
+    const at = new Date(now.getTime() + 30_000).toUTCString();
+    stubFetch(() => json(envelope('rate_limited', 'x'), 429, { 'Retry-After': at }));
+
+    const error = await apiErrorOf(apiFetch('/auth/login', { method: 'POST', body: {} }));
+    expect(at).toBe('Tue, 06 Oct 2026 09:00:30 GMT');
+    expect(error.retryAfter).toBe(30);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['unparsable', 'in a while'],
+  ])('leaves retryAfter undefined when Retry-After is %s', async (_label, header) => {
+    stubFetch(() =>
+      json(
+        envelope('rate_limited', 'x'),
+        429,
+        header === undefined ? {} : { 'Retry-After': header },
+      ),
+    );
+    const error = await apiErrorOf(apiFetch('/x'));
+    expect(error.code).toBe('rate_limited');
+    expect(error.retryAfter).toBeUndefined();
+  });
+
   it('reads it on a response without an envelope too', async () => {
     stubFetch(() => text('<h1>Service Unavailable</h1>', 503, { 'Retry-After': '120' }));
     const error = await apiErrorOf(apiFetch('/x'));
@@ -666,6 +886,34 @@ describe('apiFetch network failures', () => {
     await expect(apiFetch('/runs/latest')).rejects.toBe(abort);
   });
 
+  it.each([
+    ['before', true],
+    ['during', false],
+  ])(
+    'rejects with the original AbortError, not an ApiError, when aborted %s the call',
+    async (_label, abortFirst) => {
+      const controller = new AbortController();
+      const abort = new DOMException('Aborted', 'AbortError');
+      if (abortFirst) {
+        controller.abort();
+      }
+      const mock = vi.fn<FetchImpl>(() => {
+        if (!abortFirst) {
+          controller.abort();
+        }
+        return Promise.reject(abort);
+      });
+      vi.stubGlobal('fetch', mock);
+
+      const error = await rejection(apiFetch('/runs/latest', { signal: controller.signal }));
+      expect(error).toBe(abort);
+      expect(error).toBeInstanceOf(DOMException);
+      expect((error as DOMException).name).toBe('AbortError');
+      expect(isApiError(error)).toBe(false);
+      expect(mock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+    },
+  );
+
   it('rethrows an error named AbortError from another realm unchanged', async () => {
     const abort = { name: 'AbortError', message: 'aborted' };
     stubFetchRejecting(abort);
@@ -720,7 +968,7 @@ describe('apiFetchPage', () => {
     expect(init.method).toBe('GET');
     expect(init.credentials).toBe('same-origin');
     expect(init.signal).toBe(controller.signal);
-    expect(headers).toEqual({ Accept: 'application/json' });
+    expect(headerRecord(headers)).toEqual({ accept: 'application/json' });
   });
 
   it('resolves the rel="next" target relative to /api/v1, query included', async () => {

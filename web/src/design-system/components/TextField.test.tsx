@@ -6,6 +6,8 @@
  * changes the wrapper's internals must still pass them:
  * - the visible label is the control's accessible name, also when the field is required, whose
  *   asterisk stays out of the name;
+ * - a field is found by its label text (`getByLabelText`), the lookup the login form and the
+ *   end-to-end specs depend on, for inputs and text areas alike;
  * - the hint and error are described by `aria-describedby` in the order hint, error, extra ids,
  *   each id once, and only content-bearing slots render;
  * - `aria-invalid="true"` appears only while an error message is shown;
@@ -71,6 +73,44 @@ describe('TextField', () => {
     });
   });
 
+  describe('label-based lookup', () => {
+    it('finds an email input by its label text and reports edits', () => {
+      const onChange = vi.fn<(value: string) => void>();
+      render(<TextField label="Email" type="email" value="" onChange={onChange} />);
+
+      const input = screen.getByLabelText<HTMLInputElement>('Email');
+      expect(input.tagName).toBe('INPUT');
+      expect(input.getAttribute('type')).toBe('email');
+
+      fireEvent.change(input, { target: { value: 'a@b.c' } });
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith('a@b.c');
+    });
+
+    it('still finds a required field by its label text', () => {
+      render(<TextField label="Email" required value="" onChange={ignoreChange} />);
+
+      // getByLabelText matches the label's raw text, which includes the aria-hidden asterisk
+      // ("Email *"), so an exact 'Email' would miss it; the anchored pattern is what the login
+      // form's tests use. The accessible name, which skips aria-hidden content, stays "Email".
+      const input = screen.getByLabelText<HTMLInputElement>(/^Email/u);
+      expect(input.tagName).toBe('INPUT');
+      expect(input.required).toBe(true);
+      expect(screen.getByRole('textbox', { name: 'Email' })).toBe(input);
+      const asterisk = document.querySelector(`label[for="${input.id}"] .ds-field__required`);
+      expect(asterisk?.getAttribute('aria-hidden')).toBe('true');
+    });
+
+    it('finds a multiline field by its label text as a textarea', () => {
+      render(<TextField multiline rows={4} label="Note" value="" onChange={ignoreChange} />);
+
+      const area = screen.getByLabelText('Note');
+      expect(area.tagName).toBe('TEXTAREA');
+      expect(area.getAttribute('rows')).toBe('4');
+    });
+  });
+
   describe('hint, error and aria-describedby', () => {
     it('renders no description and no invalid state without a hint or error', () => {
       render(<TextField label="Email" value="" onChange={ignoreChange} />);
@@ -120,6 +160,28 @@ describe('TextField', () => {
       expect(screen.getByRole('textbox', { description: 'Up to two decimals. Enter an amount' })).toBe(
         input,
       );
+    });
+
+    it('links generated hint and error ids that resolve to their messages', () => {
+      render(
+        <TextField
+          label="Email"
+          type="email"
+          hint="Use your work email"
+          error="Email is required"
+          value=""
+          onChange={ignoreChange}
+        />,
+      );
+
+      const input = screen.getByLabelText('Email');
+      expect(input.getAttribute('aria-invalid')).toBe('true');
+      const ids = (input.getAttribute('aria-describedby') ?? '').split(' ');
+      expect(ids).toHaveLength(2);
+      const [hintId = '', errorId = ''] = ids;
+      expect(hintId).not.toBe(errorId);
+      expect(document.getElementById(hintId)?.textContent).toBe('Use your work email');
+      expect(document.getElementById(errorId)?.textContent).toBe('Email is required');
     });
 
     it('clears the invalid state and the message once the error is removed', () => {
