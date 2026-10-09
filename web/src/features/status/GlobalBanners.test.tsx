@@ -8,6 +8,11 @@
  * links to the Campaigns discrepancy group and is the only banner with `role="alert"`; every
  * other banner shows the API's own message. Payloads come from `../../test/fixtures`.
  *
+ * Banner codes are never written out here: they come from the component's own `BANNER_ORDER`,
+ * the mirror of the backend's `analysis.context.BANNER_ORDER`, or from the fixture banners, so
+ * the tests follow that mirror when the backend adds or moves a code. Only codes the client
+ * must not know, the "later" codes of the unknown-code cases, are literals.
+ *
  * The component is presentational and calls no data hook, so it renders without providers and
  * no request is stubbed.
  */
@@ -23,21 +28,46 @@ function fixtureBanners(): Banner[] {
   return FIXTURE_BANNERS.map((banner) => ({ ...banner }));
 }
 
-/** The stale-datasets banner, which the default fixture page does not carry. */
-const staleBanner = makeBanner({
-  code: 'stale_datasets',
-  tone: 'warning',
-  message: 'Data as of 2026-10-04: google.metrics_daily last succeeded more than 24 hours ago',
-  count: 1,
-});
+/** The five fixture banners, each a fresh copy, named by its place in the API's order. */
+interface NamedFixtureBanners {
+  discrepancies: Banner;
+  tracking: Banner;
+  simulated: Banner;
+  incomplete: Banner;
+  shortWindow: Banner;
+}
 
-/** A fixture banner by code. */
-function fixtureBanner(code: string): Banner {
-  const found = FIXTURE_BANNERS.find((banner) => banner.code === code);
-  if (found === undefined) {
-    throw new Error(`No fixture banner has the code ${code}.`);
+/**
+ * Fresh copies of the fixture banners by name: open discrepancies, tracking absent, simulated
+ * sources, incomplete datasets and short window, the order `FIXTURE_BANNERS` documents.
+ *
+ * @throws Error when `FIXTURE_BANNERS` no longer holds five banners.
+ */
+function namedFixtureBanners(): NamedFixtureBanners {
+  const [discrepancies, tracking, simulated, incomplete, shortWindow] = fixtureBanners();
+  if (
+    discrepancies === undefined ||
+    tracking === undefined ||
+    simulated === undefined ||
+    incomplete === undefined ||
+    shortWindow === undefined
+  ) {
+    throw new Error('FIXTURE_BANNERS no longer holds five banners.');
   }
-  return { ...found };
+  return { discrepancies, tracking, simulated, incomplete, shortWindow };
+}
+
+/** The message {@link orderedBanners} gives the banner of `code`: distinct for every code. */
+function messageFor(code: string): string {
+  return `Banner message for ${code}`;
+}
+
+/**
+ * One banner per {@link BANNER_ORDER} code, in that order, each built by `makeBanner` with the
+ * distinct message {@link messageFor} its code.
+ */
+function orderedBanners(): Banner[] {
+  return BANNER_ORDER.map((code) => makeBanner({ code, message: messageFor(code), count: null }));
 }
 
 /** The title paragraph of every rendered banner, in document order. */
@@ -47,51 +77,54 @@ function bannerTitles(container: HTMLElement): string[] {
   );
 }
 
-/** The rendered banner whose title is `title`. */
-function bannerTitled(title: string): HTMLElement {
-  const banner = screen.getByText(title).closest<HTMLElement>('.ds-banner');
+/**
+ * The rendered banner that shows `text`, as its title or, for the discrepancy banner, as its
+ * supporting content.
+ */
+function bannerShowing(text: string): HTMLElement {
+  const banner = screen.getByText(text).closest<HTMLElement>('.ds-banner');
   if (banner === null) {
-    throw new Error(`No banner is titled "${title}".`);
+    throw new Error(`No banner shows "${text}".`);
   }
   return banner;
 }
 
 describe('BANNER_ORDER', () => {
-  it('lists the API banner codes in the fixed order of AAP 0.5.5, frozen', () => {
-    expect(BANNER_ORDER).toEqual([
-      'open_discrepancies',
-      'tracking_absent',
-      'simulated_sources',
-      'stale_datasets',
-      'incomplete_datasets',
-      'short_window',
-    ]);
+  it('starts with the discrepancy banner, lists each code once and is frozen', () => {
+    // The fixtures' default banner is the open-discrepancies banner, which sits above everything.
+    expect(BANNER_ORDER[0]).toBe(makeBanner().code);
+    expect(new Set(BANNER_ORDER).size).toBe(BANNER_ORDER.length);
     expect(Object.isFrozen(BANNER_ORDER)).toBe(true);
+  });
+
+  it("agrees with the order of the fixture banners, which mirror the backend's", () => {
+    const positions = FIXTURE_BANNERS.map((banner) =>
+      (BANNER_ORDER as readonly string[]).indexOf(banner.code),
+    );
+
+    expect(positions).not.toContain(-1);
+    expect([...positions].sort((left, right) => left - right)).toEqual(positions);
   });
 });
 
 describe('orderBanners', () => {
   it('re-applies the fixed order to banners that arrive out of order', () => {
-    const [discrepancies, tracking, simulated, incomplete, shortWindow] = fixtureBanners();
-    const shuffled = [shortWindow, incomplete, simulated, staleBanner, tracking, discrepancies];
+    const inOrder = orderedBanners();
 
-    expect(orderBanners(shuffled.filter((banner) => banner !== undefined))).toEqual([
-      discrepancies,
-      tracking,
-      simulated,
-      staleBanner,
-      incomplete,
-      shortWindow,
-    ]);
+    const ordered = orderBanners([...inOrder].reverse());
+
+    expect(ordered.map((banner) => banner.code)).toEqual([...BANNER_ORDER]);
+    // The same banner objects, not copies.
+    expect(ordered.every((banner, index) => banner === inOrder[index])).toBe(true);
   });
 
   it('keeps unknown codes after the known ones in their API order, and never mutates its input', () => {
     const futureA = makeBanner({ code: 'future_a', tone: 'info', message: 'A', count: null });
     const futureB = makeBanner({ code: 'future_b', tone: 'info', message: 'B', count: null });
-    const shortWindow = fixtureBanner('short_window');
-    const discrepancies = fixtureBanner('open_discrepancies');
+    const { discrepancies, shortWindow } = namedFixtureBanners();
     const input = [futureA, shortWindow, futureB, discrepancies];
-    const snapshot = [...input];
+    // Copies of every banner too, so a change to a banner object is caught as well as a reorder.
+    const snapshot = input.map((banner) => ({ ...banner }));
 
     const ordered = orderBanners(input);
 
@@ -103,8 +136,9 @@ describe('orderBanners', () => {
   });
 
   it('is stable for banners that share a position', () => {
-    const first = makeBanner({ code: 'tracking_absent', tone: 'warning', message: 'first' });
-    const second = makeBanner({ code: 'tracking_absent', tone: 'warning', message: 'second' });
+    const { tracking } = namedFixtureBanners();
+    const first = { ...tracking, message: 'first' };
+    const second = { ...tracking, message: 'second' };
 
     expect(orderBanners([first, second]).map((banner) => banner.message)).toEqual([
       'first',
@@ -114,12 +148,64 @@ describe('orderBanners', () => {
 });
 
 describe('GlobalBanners', () => {
-  it('renders every banner in the fixed order, the discrepancy banner above everything', () => {
-    const [discrepancies, tracking, simulated, incomplete, shortWindow] = fixtureBanners();
-    const shuffled = [shortWindow, simulated, incomplete, staleBanner, tracking, discrepancies];
+  it('renders one banner per BANNER_ORDER code in that order, whatever the input order', () => {
     const { container } = render(
       <GlobalBanners
-        banners={shuffled.filter((banner) => banner !== undefined)}
+        banners={orderedBanners().reverse()}
+        overlay={makeOverlay({ open_discrepancies: 2 })}
+      />,
+    );
+
+    // Each code's banner, found by its distinct message, listed in BANNER_ORDER.
+    const expected = BANNER_ORDER.map((code) => bannerShowing(messageFor(code)));
+    const rendered = Array.from(container.querySelectorAll<HTMLElement>('.ds-banner'));
+
+    expect(rendered).toHaveLength(BANNER_ORDER.length);
+    expect(rendered.map((banner) => expected.indexOf(banner))).toEqual(
+      BANNER_ORDER.map((_code, index) => index),
+    );
+    // The first code's banner is the discrepancy alert, and every other banner follows it.
+    const alert = screen.getByRole('alert');
+    expect(expected[0]).toBe(alert);
+    for (const banner of expected.slice(1)) {
+      expect(alert.compareDocumentPosition(banner) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    }
+  });
+
+  it('renders banners with unknown codes after every known banner, in their input order', () => {
+    // Named so that their alphabetical order is the reverse of their input order.
+    const sentFirst = makeBanner({
+      code: 'zeta_later_banner',
+      tone: 'info',
+      message: 'A banner code added later, sent first',
+      count: null,
+    });
+    const sentLast = makeBanner({
+      code: 'alpha_later_banner',
+      tone: 'info',
+      message: 'Another banner code added later, sent last',
+      count: null,
+    });
+    const { container } = render(
+      <GlobalBanners
+        banners={[sentFirst, ...orderedBanners().reverse(), sentLast]}
+        overlay={makeOverlay({ open_discrepancies: 2 })}
+      />,
+    );
+
+    const titles = bannerTitles(container);
+    expect(titles).toHaveLength(BANNER_ORDER.length + 2);
+    expect(titles.slice(-2)).toEqual([sentFirst.message, sentLast.message]);
+    expect(titles.slice(1, BANNER_ORDER.length)).toEqual(BANNER_ORDER.slice(1).map(messageFor));
+  });
+
+  it("renders the API's banners in the fixed order, each titled with the API's own message", () => {
+    const { discrepancies, tracking, simulated, incomplete, shortWindow } = namedFixtureBanners();
+    const { container } = render(
+      <GlobalBanners
+        banners={[shortWindow, simulated, incomplete, tracking, discrepancies]}
         overlay={makeOverlay({ open_discrepancies: 3 })}
       />,
     );
@@ -128,10 +214,15 @@ describe('GlobalBanners', () => {
       '3 open discrepancies to resolve first',
       'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
       'Simulated data: Google (credentials not configured); LinkedIn (credentials not configured); HubSpot (credentials not configured)',
-      'Data as of 2026-10-04: google.metrics_daily last succeeded more than 24 hours ago',
       'Incomplete data: google.search_terms (result limit reached at finest partition)',
       'Window of 10 days is below the 14-day trusted minimum',
     ]);
+    // The simulated-sources title is the API's message itself, reasons included.
+    const simulatedBanner = bannerShowing(simulated.message);
+    expect(simulatedBanner.querySelector('.ds-banner__title')?.textContent).toBe(
+      simulated.message,
+    );
+    expect(simulatedBanner.getAttribute('role')).toBeNull();
   });
 
   it('titles the discrepancy banner with the live overlay count, links to the discrepancy group and is the only alert', () => {
@@ -157,7 +248,7 @@ describe('GlobalBanners', () => {
     expect(link.getAttribute('href')).toBe('#group-campaigns-discrepancies');
 
     // Every other banner is silent content.
-    const shortWindow = bannerTitled('Window of 10 days is below the 14-day trusted minimum');
+    const shortWindow = bannerShowing('Window of 10 days is below the 14-day trusted minimum');
     expect(shortWindow.getAttribute('role')).toBeNull();
     expect(shortWindow.className).toContain('ds-banner--warning');
     expect(within(shortWindow).queryByRole('link')).toBeNull();
@@ -224,17 +315,12 @@ describe('GlobalBanners', () => {
   });
 
   it('skips a banner with a blank or missing message, and renders nothing when none is left', () => {
-    const missing = {
-      ...makeBanner({ code: 'tracking_absent', tone: 'warning' }),
-      message: null,
-    } as unknown as Banner;
+    const { tracking, shortWindow } = namedFixtureBanners();
+    // A payload that breaks the contract: the API never sends a null message.
+    const missing = { ...tracking, message: null } as unknown as Banner;
     const { container } = render(
       <GlobalBanners
-        banners={[
-          makeBanner({ code: 'short_window', tone: 'warning', message: '  ' }),
-          missing,
-          makeBanner(),
-        ]}
+        banners={[{ ...shortWindow, message: '  ' }, missing, makeBanner()]}
         overlay={makeOverlay({ open_discrepancies: 0 })}
       />,
     );
@@ -247,6 +333,8 @@ describe('GlobalBanners', () => {
     const { container } = render(<GlobalBanners banners={[]} overlay={makeOverlay()} />);
 
     expect(container.innerHTML).toBe('');
+    expect(container.querySelector('.ds-banner')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('trims messages, renders an unknown tone as neutral and keeps an unknown code last', () => {
@@ -257,25 +345,28 @@ describe('GlobalBanners', () => {
       message: '  A banner code the client does not know yet  ',
       count: null,
     });
-    const tracking = fixtureBanner('tracking_absent');
+    const { tracking } = namedFixtureBanners();
     const trackingAgain = { ...tracking, message: 'A second tracking finding' };
-    const { container } = render(
-      <GlobalBanners
-        banners={[future, tracking, trackingAgain]}
-        overlay={makeOverlay({ open_discrepancies: 0 })}
-      />,
-    );
+    try {
+      const { container } = render(
+        <GlobalBanners
+          banners={[future, tracking, trackingAgain]}
+          overlay={makeOverlay({ open_discrepancies: 0 })}
+        />,
+      );
 
-    expect(bannerTitles(container)).toEqual([
-      'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
-      'A second tracking finding',
-      'A banner code the client does not know yet',
-    ]);
-    const unknown = bannerTitled('A banner code the client does not know yet');
-    expect(unknown.className).toContain('ds-banner--neutral');
-    expect(unknown.className).not.toContain('emphatic');
-    // A repeated code gets a key of its own, so React reports no duplicate key.
-    expect(consoleError).not.toHaveBeenCalled();
-    consoleError.mockRestore();
+      expect(bannerTitles(container)).toEqual([
+        'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
+        'A second tracking finding',
+        'A banner code the client does not know yet',
+      ]);
+      const unknown = bannerShowing('A banner code the client does not know yet');
+      expect(unknown.className).toContain('ds-banner--neutral');
+      expect(unknown.className).not.toContain('emphatic');
+      // A repeated code gets a key of its own, so React reports no duplicate key.
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

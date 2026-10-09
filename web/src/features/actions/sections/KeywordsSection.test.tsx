@@ -7,7 +7,8 @@
  *   Expand and Review: K1, K2, K3) in API order, each labelled with the group title and its count
  *   of visible cards. The section opens on the first sub-list with a visible card, else one with
  *   a held card; an empty sub-list says "No items"; a chosen tab survives a refetch and falls
- *   back to the default when its group disappears.
+ *   back to the default when its group disappears. A section with no card to show renders the
+ *   frame's empty state with its reasons (feedback, findings, a withheld K1 term) and no tabs.
  * - **The coverage finding.** The `search_term_coverage` finding (search-term spend ÷ keyword
  *   spend, below 80%) sits above the tabs as a banner, never an alert, and every keyword card
  *   carries the low-coverage flag.
@@ -41,6 +42,7 @@ import {
   makeRecommendationsPage,
   makeRun,
   makeSection,
+  makeWithheld,
 } from '../../../test/fixtures';
 import { renderWithProviders } from '../../../test/render';
 import {
@@ -330,6 +332,44 @@ describe('KeywordsSection', () => {
       expect(panel.querySelector('#group-keywords-block')).not.toBeNull();
     });
 
+    it('counts each sub-list\'s visible cards (2, 1, 0) in API order and says "No items" on an empty Review tab', async () => {
+      await renderKeywords(
+        keywordsWith(
+          makeGroup({
+            key: 'block',
+            title: 'Block / negative-keyword candidates',
+            items: [k1With(51, [], null), k1With(52, [], null)],
+          }),
+          makeGroup({
+            key: 'expand',
+            title: 'Expansion candidates',
+            items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+          }),
+          makeGroup({ key: 'review', title: 'Review', items: [] }),
+        ),
+      );
+
+      // One tab per API group, in API order, each its API title followed by its card count.
+      const tablist = screen.getByRole('tablist', { name: KEYWORD_TABS_LABEL });
+      expect(
+        within(tablist)
+          .getAllByRole('tab')
+          .map((tab) => tab.textContent),
+      ).toEqual(['Block / negative-keyword candidates 2', 'Expansion candidates 1', 'Review 0']);
+      expect(selectedTabName()).toBe('Block / negative-keyword candidates 2');
+      expect(within(visiblePanel()).getAllByRole('article')).toHaveLength(2);
+
+      // An empty group still gets its tab, whose panel says so instead of showing no card.
+      fireEvent.click(within(tablist).getByRole('tab', { name: 'Review 0' }));
+
+      expect(selectedTabName()).toBe('Review 0');
+      const panel = visiblePanel();
+      expect(within(panel).getByText(EMPTY_GROUP_TITLE)).toBeTruthy();
+      expect(within(panel).getByText('No Review actions in this window')).toBeTruthy();
+      expect(within(panel).queryByRole('article')).toBeNull();
+      expect(panel.querySelector('#group-keywords-review')).not.toBeNull();
+    });
+
     it('opens on a sub-list with only a held card, which the tab does not count', async () => {
       const heldK2 = { ...pageItem(FIXTURE_ITEM_IDS.k2), held: true };
       const hiddenK3 = {
@@ -425,6 +465,37 @@ describe('KeywordsSection', () => {
       ).toBeTruthy();
       // The coverage finding is both the banner above and a reason line of the empty state.
       expect(screen.getAllByText(/^Search terms cover 74% of keyword spend/u)).toHaveLength(2);
+    });
+
+    it('gives a withheld K1 term as the empty state\'s reason, with no tabs, when no group has an item', async () => {
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+            makeGroup({ key: 'expand', title: 'Expansion candidates', items: [] }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+          ],
+          withheld: [makeWithheld()],
+        }),
+      );
+
+      // Empty groups never open a tab set of empty panels: the frame's empty state stands alone.
+      expect(screen.queryByRole('tablist')).toBeNull();
+      expect(screen.queryByRole('tab')).toBeNull();
+
+      // The withheld line, "{rule} · {term}: {reason} — {observed} / {required} {unit}", with the
+      // recorded sample of the fixture (30 clicks of the 37 required).
+      const line = 'K1 · crm pricing comparison: clicks 30 of 37 required — 30 / 37 clicks';
+      const emptyState = screen.getByText('No actions in this section').parentElement;
+      if (emptyState === null) {
+        throw new Error('the empty-state title has no container');
+      }
+      expect(within(emptyState).getByText(line)).toBeTruthy();
+      // A section with a withheld pattern has a reason, so the no-reason fallback is not shown.
+      expect(within(emptyState).queryByText('No rule fired for this window')).toBeNull();
+      // The full withheld list follows the empty state, with the same line.
+      expect(listEntries(document.body, 'Withheld for sample size')).toEqual([line]);
+      expect(screen.getAllByText(line)).toHaveLength(2);
     });
   });
 

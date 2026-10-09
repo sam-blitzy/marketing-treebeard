@@ -3,11 +3,13 @@
  * (AAP 0.5.5 Copy; AAP 0.5.4.6 rules CR1–CR3; AAP 0.5.4.2 P7; FR-7).
  *
  * They hold the section to its TSDoc contract and to the AAP's field set:
- * - **One block per campaign**, in API order, each a region headed by the campaign name, holding
- *   the variants table ("Variants in {campaign}": Creative, Impressions, Click rate, Open rate,
- *   Completion rate, Leads; rates at two digits, "n/a" for a stage the campaign does not use,
- *   "unavailable" for an absent count), then the cards in API order: the CR3 next test with the
- *   CR2 weak stage as its reason, then the CR1 pairs, held ones behind the held disclosure.
+ * - **One block per campaign**, in API order, each a region headed by the campaign name and
+ *   anchored at `groupAnchorId('creative', key)` (`campaign:1` → `group-creative-campaign-1`),
+ *   holding its own variants table ("Variants in {campaign}": Creative, Impressions, Click rate,
+ *   Open rate, Completion rate, Leads; rates as `formatPercent` renders them at two digits, "n/a"
+ *   for a stage the campaign does not use, "unavailable" for an absent count), then the cards in
+ *   API order: the CR3 next test with the CR2 weak stage as its reason, then the CR1 pairs, held
+ *   ones behind the held disclosure.
  * - **Distinguishability (CR1, P7).** Pair labels are the API's own words, "Distinguishable
  *   (adjusted p = …)" or "{A} ahead, not yet distinguishable …", and the "Not yet
  *   distinguishable" badge is the API's flag; the section never declares a winner.
@@ -40,6 +42,7 @@ import {
   makeRun,
   makeSection,
 } from '../../../test/fixtures';
+import { formatCount, formatPercent } from '../../../lib/format';
 import { renderWithProviders } from '../../../test/render';
 import {
   CreativeSection,
@@ -47,6 +50,7 @@ import {
   VariantsTable,
   formatVariantRate,
 } from './CreativeSection';
+import { groupAnchorId } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and helpers
@@ -139,6 +143,20 @@ function precedes(first: Element, second: Element): boolean {
   return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 }
 
+/** The element with `id`, the target of a group anchor link; throws when there is none. */
+function elementById(id: string): HTMLElement {
+  const element = document.getElementById(id);
+  if (element === null) {
+    throw new Error(`no element with id "${id}"`);
+  }
+  return element;
+}
+
+/** The level-4 card headings of `block`, in document order. */
+function cardHeadings(block: HTMLElement): HTMLElement[] {
+  return within(block).getAllByRole('heading', { level: 4 });
+}
+
 beforeEach(() => {
   mockApi({});
 });
@@ -178,6 +196,123 @@ describe('CreativeSection', () => {
       });
       expect(precedes(table, card)).toBe(true);
       expect(precedes(card, toggle)).toBe(true);
+    });
+
+    it('renders one captioned variants table per campaign, each inside its own group anchor', async () => {
+      const rowsA = [
+        {
+          creative_id: 7101,
+          name: 'A1',
+          impressions: 4000,
+          leads: 12,
+          click_rate: '0.004377',
+          open_rate: '0.0125',
+          completion_rate: '0.24',
+        },
+        {
+          creative_id: 7102,
+          name: 'A2',
+          impressions: 3800,
+          leads: 9,
+          click_rate: '0.0041',
+          open_rate: '0.011842',
+          completion_rate: '0.2',
+        },
+      ];
+      const rowsB = [
+        {
+          creative_id: 7201,
+          name: 'B1',
+          impressions: 2500,
+          leads: 4,
+          click_rate: '0.0068',
+          open_rate: '0.0096',
+          completion_rate: '0.166667',
+        },
+        {
+          creative_id: 7202,
+          name: 'B2',
+          impressions: 2100,
+          leads: 6,
+          click_rate: '0.007143',
+          open_rate: '0.012381',
+          completion_rate: '0.230769',
+        },
+      ];
+      const campaignA = makeGroup({
+        key: 'campaign:1',
+        title: 'Campaign A',
+        items: [
+          testItemWith(61, rowsA),
+          pairItem(
+            62,
+            'A1 vs A2: A1 ahead, not yet distinguishable (adjusted p = 0.41)',
+            'Not yet distinguishable (adjusted p = 0.41)',
+          ),
+        ],
+      });
+      const campaignB = makeGroup({
+        key: 'campaign:2',
+        title: 'Campaign B',
+        items: [
+          testItemWith(63, rowsB),
+          pairItem(64, 'B1 vs B2: Distinguishable (adjusted p = 0.008)', null),
+        ],
+      });
+      await renderCreative(creativeWith(campaignA, campaignB));
+
+      // The anchors follow SectionFrame's sanitised `group-{section}-{group key}` scheme.
+      expect(groupAnchorId('creative', campaignA.key)).toBe('group-creative-campaign-1');
+      expect(groupAnchorId('creative', campaignB.key)).toBe('group-creative-campaign-2');
+
+      // Exactly one variants table per campaign, in API order.
+      const allTables = screen.getAllByRole('table', { name: /^Variants in/u });
+      expect(allTables).toHaveLength(2);
+      const [firstTable, secondTable] = allTables;
+      if (firstTable === undefined || secondTable === undefined) {
+        throw new Error('expected two variants tables');
+      }
+      expect(precedes(firstTable, secondTable)).toBe(true);
+
+      const blocks = [
+        { anchor: 'group-creative-campaign-1', name: 'Campaign A', group: campaignA, rows: rowsA },
+        { anchor: 'group-creative-campaign-2', name: 'Campaign B', group: campaignB, rows: rowsB },
+      ];
+      for (const { anchor, name, group, rows } of blocks) {
+        const block = elementById(anchor);
+        // The anchor is the campaign's own group region, headed by the campaign name.
+        expect(screen.getByRole('region', { name })).toBe(block);
+
+        const tables = within(block).getAllByRole('table', { name: /^Variants in/u });
+        expect(tables).toHaveLength(1);
+        const table = within(block).getByRole('table', { name: `Variants in ${name}` });
+        expect(tables[0]).toBe(table);
+        expect(headers(table)).toEqual(VARIANT_HEADERS);
+        // Every rate is formatPercent's output at the table's precision, every count formatCount's.
+        expect(bodyRows(table)).toEqual(
+          rows.map((row) => [
+            row.name,
+            formatCount(row.impressions),
+            formatPercent(row.click_rate, VARIANT_RATE_DIGITS),
+            formatPercent(row.open_rate, VARIANT_RATE_DIGITS),
+            formatPercent(row.completion_rate, VARIANT_RATE_DIGITS),
+            formatCount(row.leads),
+          ]),
+        );
+
+        // The CR3 card's heading precedes the CR1 pair's, in API order, after the table.
+        const [cr3Heading, cr1Heading] = cardHeadings(block);
+        if (cr3Heading === undefined || cr1Heading === undefined) {
+          throw new Error(`expected two card headings in ${name}`);
+        }
+        expect([cr3Heading.textContent, cr1Heading.textContent]).toEqual(
+          group.items.map((item) => item.action),
+        );
+        expect(precedes(table, cr3Heading)).toBe(true);
+        expect(precedes(cr3Heading, cr1Heading)).toBe(true);
+      }
+      // Pinned once in literal form, so a change in the formatter itself shows up here too.
+      expect(bodyRows(firstTable)[0]).toEqual(['A1', '4,000', '0.44%', '1.25%', '24%', '12']);
     });
 
     it('shows the held historical CR1 pair with its API wording, badge and disabled actions', async () => {

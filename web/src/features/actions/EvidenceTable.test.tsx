@@ -18,12 +18,16 @@
  *
  * Evidence comes from `../../test/fixtures`, either as the backend-shaped page items (C1 pause,
  * B1 increase) or built in the test for a single edge case. The component makes no request, so
- * it renders without providers.
+ * most cases render it without providers. The last block renders it through
+ * `renderWithProviders`, inside the Query and Router providers every card renders in, and
+ * compares each rendering with `formatMetric`, `formatSample` and `formatTestLine` from
+ * `lib/format`, so those assertions restate no locale rule of their own.
  */
 import { render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Baseline, Item, Metric } from '../../api/types';
+import type { Baseline, Item, Metric, Sample, StatTest } from '../../api/types';
+import { formatMetric, formatSample, formatTestLine } from '../../lib/format';
 import {
   FIXTURE_ITEM_IDS,
   FIXTURE_WINDOW,
@@ -31,6 +35,7 @@ import {
   makeEvidence,
   makeRecommendationsPage,
 } from '../../test/fixtures';
+import { renderWithProviders } from '../../test/render';
 import {
   BASELINES_LABEL,
   DATASETS_LABEL,
@@ -490,3 +495,177 @@ describe('EvidenceTable', () => {
     expect(text).not.toContain('paused');
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// EvidenceTable inside the app providers, against lib/format
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The row of the evidence table whose row header is `label`.
+ *
+ * @param label - The metric's display label, the row header's accessible name.
+ * @returns The `<tr>` holding that row header.
+ * @throws Error when the row header sits outside a table row.
+ */
+function metricRow(label: string): HTMLElement {
+  const row = screen.getByRole('rowheader', { name: label }).closest('tr');
+  if (row === null) {
+    throw new Error(`The row header "${label}" sits outside a table row.`);
+  }
+  return row;
+}
+
+/**
+ * The value and baseline cells of the row whose row header is `label`, in column order.
+ *
+ * @param label - The metric's display label.
+ * @returns The row's two data cells.
+ * @throws Error when the row does not hold exactly a value and a baseline cell.
+ */
+function metricCells(label: string): { value: HTMLElement; baseline: HTMLElement } {
+  const [value, baseline, ...rest] = within(metricRow(label)).getAllByRole('cell');
+  if (value === undefined || baseline === undefined || rest.length > 0) {
+    throw new Error(`The row "${label}" does not hold exactly a value and a baseline cell.`);
+  }
+  return { value, baseline };
+}
+
+describe('EvidenceTable inside the app providers', () => {
+  /** A cited spend in its account currency. */
+  const spend = metric('spend', 'Spend', '1240.50', 'currency', { currency: 'USD' });
+  /** A cited count compared against nothing. */
+  const clicks = metric('clicks', 'Clicks', 412, 'clicks');
+  /** A baseline that shares the spend metric's key. */
+  const accountSpend = baseline('spend', 'Account spend', '980.00');
+
+  it('names the table "Evidence" by default and by the caption passed', async () => {
+    const evidence = makeEvidence({ metrics: [spend] });
+    const first = await renderWithProviders(<EvidenceTable evidence={evidence} />);
+
+    expect(screen.getByRole('table', { name: 'Evidence' })).toBeDefined();
+    expect(screen.getByText('Evidence').tagName).toBe('CAPTION');
+    first.unmount();
+
+    await renderWithProviders(<EvidenceTable evidence={evidence} caption="Search term evidence" />);
+
+    expect(screen.getByRole('table', { name: 'Search term evidence' })).toBeDefined();
+    expect(screen.queryByRole('table', { name: 'Evidence' })).toBeNull();
+  });
+
+  it('shows a metric and its same-key baseline in one row, and "—" where none applies', async () => {
+    const evidence = makeEvidence({ metrics: [spend, clicks], baselines: [accountSpend] });
+    await renderWithProviders(<EvidenceTable evidence={evidence} />);
+
+    // The baseline is formatted in its metric's unit and currency.
+    const spendBaseline = formatMetric({
+      value: accountSpend.value,
+      unit: spend.unit,
+      currency: spend.currency,
+    });
+    const spendRow = within(metricRow('Spend'));
+    expect(spendRow.getByText(formatMetric(spend))).toBeDefined();
+    expect(spendRow.getByText(spendBaseline)).toBeDefined();
+    expect(metricCells('Spend').baseline.textContent).toBe(`Account spend: ${spendBaseline}`);
+
+    const clickCells = metricCells('Clicks');
+    expect(clickCells.value.textContent).toBe(formatMetric(clicks));
+    expect(clickCells.baseline.textContent).toBe('—');
+  });
+
+  it('shows an unavailable metric as "unavailable", never as 0', async () => {
+    const qualifiedLeads = metric('ql', 'Qualified Leads', null, 'leads', { unavailable: true });
+    await renderWithProviders(
+      <EvidenceTable evidence={makeEvidence({ metrics: [qualifiedLeads] })} />,
+    );
+
+    const { value } = metricCells('Qualified Leads');
+    expect(value.textContent).toBe('unavailable');
+    expect(value.textContent).toBe(formatMetric(qualifiedLeads));
+    expect(value.textContent).not.toMatch(/0/);
+  });
+
+  it('marks a floored count "≥ N" and a floored cost "≤ X"', async () => {
+    const mql = metric('mql', 'MQL', 12, 'leads', { floor: true });
+    const costPerQl = metric('cost_per_ql', 'Cost per Qualified Lead', '412.50', 'currency', {
+      currency: 'EUR',
+      floor: true,
+    });
+    await renderWithProviders(
+      <EvidenceTable evidence={makeEvidence({ metrics: [mql, costPerQl] })} />,
+    );
+
+    expect(metricCells('MQL').value.textContent).toBe('≥ 12');
+    expect(metricCells('MQL').value.textContent).toBe(formatMetric(mql));
+    const cost = metricCells('Cost per Qualified Lead').value.textContent;
+    expect(cost).toBe(formatMetric(costPerQl));
+    expect(cost).toMatch(/^≤ /);
+  });
+
+  it('shows the sample as "observed / required unit", with its projection when recorded', async () => {
+    const clickSample: Sample = { observed: 37, required: 64, unit: 'clicks', projected: null };
+    const first = await renderWithProviders(
+      <EvidenceTable evidence={makeEvidence({ sample: clickSample })} />,
+    );
+
+    expect(screen.getByText('Sample: 37 / 64 clicks')).toBeDefined();
+    expect(`Sample: ${formatSample(clickSample)}`).toBe('Sample: 37 / 64 clicks');
+    first.unmount();
+
+    const openSample: Sample = {
+      observed: 1850,
+      required: 2600,
+      unit: 'form opens',
+      projected: {
+        value: 41000,
+        unit: 'impressions',
+        basis: 'projected through the observed open rate',
+      },
+    };
+    await renderWithProviders(<EvidenceTable evidence={makeEvidence({ sample: openSample })} />);
+
+    const line = screen.getByText(`Sample: ${formatSample(openSample)}`);
+    expect(line.textContent).toMatch(/^Sample: \S+ \/ \S+ form opens · ≈ /);
+    expect(line.textContent).toContain('impressions (projected through the observed open rate)');
+  });
+
+  it('shows the test line with the adjusted p-value', async () => {
+    const fisher: StatTest = {
+      name: 'fisher_exact',
+      p_value: 0.0081,
+      p_adjusted: 0.0243,
+      alpha: 0.05,
+    };
+    await renderWithProviders(<EvidenceTable evidence={makeEvidence({ test: fisher })} />);
+
+    const line = screen.getByText(`Test: ${formatTestLine(fisher)}`);
+    expect(line.textContent).toContain('adjusted p');
+  });
+
+  it('lists the thresholds applied and the datasets used exactly as stored', async () => {
+    const evidence = makeEvidence({
+      thresholds: { 'k1.min_clicks_floor': 10 },
+      datasets: [
+        {
+          dataset: 'google.search_terms',
+          completeness: 'complete',
+          covered_through: '2026-10-01',
+        },
+      ],
+    });
+    await renderWithProviders(<EvidenceTable evidence={evidence} />);
+
+    expect(listTexts(THRESHOLDS_LABEL)).toEqual(['k1.min_clicks_floor = 10']);
+    expect(listTexts(DATASETS_LABEL)).toEqual([
+      'google.search_terms: complete, covered through 2026-10-01',
+    ]);
+  });
+
+  it('states "No metrics recorded" when the evidence cites no metric', async () => {
+    await renderWithProviders(<EvidenceTable evidence={makeEvidence()} />);
+
+    const table = screen.getByRole('table', { name: 'Evidence' });
+    expect(within(table).getByText('No metrics recorded')).toBeDefined();
+    expect(within(table).queryAllByRole('rowheader')).toEqual([]);
+  });
+});
+

@@ -32,6 +32,7 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { withheldLine } from '../WithheldList';
 import {
   DISCREPANCY_GROUP_ANCHOR,
   FieldList,
@@ -434,6 +435,42 @@ describe('SectionFrame', () => {
     }
   });
 
+  it('shows a tracking and a coverage finding, in API order, above the first group heading', () => {
+    const tracking = makeFinding({
+      code: 'conversion_tracking_absent',
+      message:
+        'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
+    });
+    const coverage = makeFinding({ code: 'search_term_coverage' });
+    renderFrame({
+      section: makeSection('keywords', {
+        findings: [tracking, coverage],
+        groups: [
+          makeGroup({ items: [visibleItem(1, 'Add as exact-match negative')] }),
+          makeGroup({
+            key: 'expand',
+            title: 'Expansion candidates',
+            items: [visibleItem(2, 'Add as phrase-match keyword')],
+          }),
+        ],
+      }),
+    });
+
+    const trackingMessage = screen.getByText(tracking.message);
+    const coverageMessage = screen.getByText(coverage.message);
+    const firstHeading = screen.getAllByRole('heading', { level: 3 })[0];
+    expect(firstHeading?.textContent).toBe('Block / negative-keyword candidates');
+    if (firstHeading !== undefined) {
+      expect(follows(trackingMessage, firstHeading)).toBe(true);
+      expect(follows(coverageMessage, firstHeading)).toBe(true);
+    }
+    expect(follows(trackingMessage, coverageMessage)).toBe(true);
+    // Section findings are banners, never alerts: `alert` belongs to the discrepancy banner.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(findingTone(tracking.code)).toBe('warning');
+    expect(findingTone(coverage.code)).toBe('info');
+  });
+
   it('places beforeGroups after the findings and before the groups', () => {
     renderFrame({
       section: makeSection('keywords', {
@@ -528,6 +565,7 @@ describe('SectionFrame', () => {
       name: 'Held until discrepancies are resolved (2)',
     });
     const heldRegion = document.getElementById('group-campaigns-pause-held');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.getAttribute('aria-controls')).toBe('group-campaigns-pause-held');
     expect(heldRegion?.hidden).toBe(true);
     expect(heldRegion?.contains(screen.getByTestId('item-11'))).toBe(true);
@@ -535,6 +573,7 @@ describe('SectionFrame', () => {
     expect(heldRegion?.contains(screen.getByTestId('item-12'))).toBe(false);
 
     fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(heldRegion?.hidden).toBe(false);
 
     expect(listLines('Not shown')).toEqual(['1 hidden since this run']);
@@ -550,6 +589,54 @@ describe('SectionFrame', () => {
     expect(
       screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
     ).toBeTruthy();
+    expect(screen.queryByText('No actions in this section')).toBeNull();
+  });
+
+  it('leaves out a group whose items are all hidden by feedback, and counts them', () => {
+    const snoozed = makeItem({
+      id: 7,
+      rank: 7,
+      action: 'Snoozed since the run',
+      current: makeItemOverlay({ hidden_by: 'snooze' }),
+    });
+    renderFrame({
+      section: makeSection('campaigns', {
+        groups: [
+          makeGroup({ key: 'pause', title: 'Pause', items: [visibleItem(1, 'C1')] }),
+          makeGroup({ key: 'launch', title: 'Launch ideas', items: [snoozed] }),
+        ],
+      }),
+    });
+
+    expect(
+      screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent),
+    ).toEqual(['Pause']);
+    expect(screen.queryByRole('region', { name: 'Launch ideas' })).toBeNull();
+    expect(document.getElementById('group-campaigns-launch')).toBeNull();
+    // The snoozed card is counted, never rendered.
+    expect(screen.queryByTestId('item-7')).toBeNull();
+    expect(screen.queryByText('launch: Snoozed since the run')).toBeNull();
+    expect(listLines('Not shown')).toEqual(['1 hidden since this run']);
+    expect(screen.queryByText('No actions in this section')).toBeNull();
+  });
+
+  it('lists the run suppression counts under "Not shown" beside the shown cards', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [makeGroup({ key: 'changes', title: 'Changes', items: [visibleItem(1, 'B1')] })],
+        suppressed: { feedback_dismiss: 2, g1_blocked: 1, unknown_reason: 4 },
+      }),
+    });
+
+    // The keys are the runner's run_suppression reasons. A g1_blocked count of exactly 1 reads
+    // in the singular ("1 spend increase blocked …"), as SectionFrame's singular label map
+    // defines it, and an unknown reason keeps its raw key so its count is never dropped.
+    expect(listLines('Not shown')).toEqual([
+      '2 dismissed',
+      '1 spend increase blocked by the high-utilization guard',
+      '4 unknown_reason',
+    ]);
+    expect(screen.getByTestId('item-1').textContent).toBe('changes: B1');
     expect(screen.queryByText('No actions in this section')).toBeNull();
   });
 
@@ -711,6 +798,34 @@ describe('SectionFrame', () => {
       );
       expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
       expect(screen.queryByText('Withheld for sample size')).toBeNull();
+    });
+
+    it('quotes the withheld line as its reason, and the full withheld list follows', () => {
+      const withheld = makeWithheld();
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [makeGroup({ items: [] })],
+          withheld: [withheld],
+        }),
+      });
+
+      const empty = document.querySelector('.ds-emptystate');
+      expect(empty).not.toBeNull();
+      expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+        'No actions in this section',
+      );
+      expect(empty?.querySelector('.ds-emptystate__reason')?.textContent).toBe(
+        withheldLine(withheld),
+      );
+      expect(screen.queryByText('No rule fired for this window')).toBeNull();
+
+      // The WithheldList still renders in full, below the empty state.
+      const list = screen.getByRole('list', { name: 'Withheld for sample size' });
+      expect(listLines('Withheld for sample size')).toEqual([withheldLine(withheld)]);
+      if (empty !== null) {
+        expect(follows(empty, list)).toBe(true);
+      }
+      expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
     });
 
     it('states why: hidden cards, suppressions, three withheld lines, findings', () => {
