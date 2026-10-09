@@ -233,8 +233,11 @@ Worked examples:
 or a shared budget an active campaign currently draws from. Any other subject gets neither an
 item nor a withheld line. The history is short when known-budget active days fall below
 `budget.min_known_days` (default 7) or spending days below `budget.min_spending_days` (default
-5). A failed gate becomes a withheld line, with every shortfall observed against required (for
-example "spending days 3 of 5 required; known-budget days 9 of 7"), only for a near pattern:
+5). A count checked against both a day minimum and a share, such as capped days against
+`budget.min_capped_days` and `budget.sustained_share`, appears once among the shortfalls,
+against the stricter requirement. A failed gate becomes a withheld line, with every
+shortfall observed against required (for example "spending days 3 of 5 required;
+known-budget days 9 of 7"), only for a near pattern:
 
 - `C2`/`B1`: an efficient subject (cost per outcome ≤ `scale.max_cpa_ratio` (default 1.0) ×
   baseline) whose history is short, or that was capped on at least one day;
@@ -1138,10 +1141,15 @@ baseline".
   - "{A} ahead, not yet distinguishable (adjusted p = …); more impressions per variant needed:
     not estimable (target power unreachable at the observed difference)" when no sample reaches
     `cr.power` at the observed difference.
+
+  The adjusted p-value is shown at 4 places ("adjusted p = 0.0865"). Below 0.0001 the bound
+  replaces it, with no equals sign: "adjusted p < 0.0001".
 - **Reason and extra output**: each variant's rate with its counts, the test, its raw p-value,
   the Holm-adjusted p-value across the campaign's pairs and `cr.alpha`, also recorded in
-  `evidence.test`. A pair that is not distinguishable carries `not_distinguishable`; no other
-  wording calls it a winner (P7).
+  `evidence.test`. The reason renders both p-values the same way, for example "two-proportion
+  z-test p < 0.0001, Holm-adjusted across 1 pair in {campaign} < 0.0001". A pair that is not
+  distinguishable carries `not_distinguishable`, whose message repeats the label's figure
+  ("Not yet distinguishable (adjusted p < 0.0001)"); no other wording calls it a winner (P7).
 - **Ranking**: after the `CR2`/`CR3` card, by adjusted p-value, ascending.
 
 ### CR2 Weak stage
@@ -1379,7 +1387,7 @@ resolve. Each share is measured over the scope actually assessed:
 | Contact share | The asset's leads whose `lead_match` is not `matched` (`pending`, `no_email`, `no_match` or `error`) ÷ the asset's leads | At ≥ `attribution.floor_share`: MQL, QL, meetings and deals display as "≥ N", and cost per QL and per meeting as "≤ X" (only when the known denominator is above 0), with `attribution_floor`: "Floor: {share}% of leads unmatched in HubSpot" |
 | Unknown CRM evidence share | Matched contacts whose evidence is unknown ÷ matched contacts. Evidence is unknown when the contact refresh failed or was not recorded (`contact_read_status = error`), the contact record was not read, its contact-to-meeting or contact-to-deal fetch is missing, `error` or `partial`, or that fetch succeeded but its target reads are `partial` or `error` | At ≥ `attribution.floor_share`: counts display as "≥ N" with `unknown_crm_evidence`: "Floor: CRM evidence unknown for {share}% of matched contacts ({n} of {m})". Any share above 0 withholds `W2` and `C1b` and makes the `C2` veto unavailable. An associated but unread meeting or deal is never counted as absent |
 | Creative share | Leads without a creative ÷ leads | At ≥ `attribution.floor_share`: the per-creative breakdown is a floor, with `creative_floor`: "Per-creative breakdown is a floor: {share}% of leads have no creative". Asset totals are unaffected |
-| Orphan-deal share | Over the portal's deals created from window start to run time: deals whose deal-to-contact fetch is `ok_empty` ÷ deals whose fetch is known (`ok_empty`, or `ok` with target reads `ok`) | At ≥ `attribution.floor_share`, deal counts carry `deal_floor`: "Deal counts are a floor: orphan-deal share {label}". When a deal-search partition is incomplete or some deals were not assessed, the share reads "unknown (N deals not assessed)" and deal counts carry `deal_floor` |
+| Orphan-deal share | Over the portal's deals created from window start to run time: deals whose deal-to-contact fetch is `ok_empty` ÷ deals whose fetch is known (`ok_empty`, or `ok` with target reads `ok`) | At ≥ `attribution.floor_share`, deal counts carry `deal_floor`: "Deal counts are a floor: orphan-deal share {label}". When a deal-search partition is incomplete or some deals were not assessed, the share is unknown and deal counts carry `deal_floor`. After a complete search it reads "unknown (N deals not assessed)". Deals an incomplete search never returned are not counted in N, so after an incomplete search it reads "unknown (deal search incomplete)", or "unknown (deal search incomplete; at least N deals not assessed)" when N > 0; "deal search completeness unknown" replaces "deal search incomplete" when the `hubspot.deal_search` completeness is `unknown`. With no CRM dataset it reads "unknown (no CRM dataset for LinkedIn-attributed evidence)" |
 
 A stage binding that does not resolve is portal-wide: its count shows "unavailable" rather than
 a "≥ N" floor.

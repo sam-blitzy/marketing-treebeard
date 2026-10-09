@@ -305,11 +305,18 @@ def _lift(value: Decimal) -> str:
     return f"{_exact().multiply(value, _HUNDRED).normalize():f}%"
 
 
-def _p(value: Decimal) -> str:
-    """Render a p-value at 4 places, or "< 0.0001" below that."""
+def _p_relation(value: Decimal) -> str:
+    """Render a p-value with its relation: ``= 0.0123`` at 4 places, or ``< 0.0001`` below that.
+
+    Templates write ``p {relation}``, so a bound never reads ``p = < 0.0001``.
+
+    Example:
+        >>> _p_relation(Decimal("0.086505")), _p_relation(Decimal("0.000046"))
+        ('= 0.0865', '< 0.0001')
+    """
     if value < Decimal("0.0001"):
         return "< 0.0001"
-    return f"{value.quantize(Decimal('0.0001')):f}"
+    return f"= {value.quantize(Decimal('0.0001')):f}"
 
 
 def _count(value: int) -> str:
@@ -1142,7 +1149,7 @@ def _pair_candidate(
         if not_estimable_reason is not None:
             sample_needed = NOT_ESTIMABLE
 
-    adjusted_text = "" if p_adjusted is None else f" (adjusted p = {_p(p_adjusted)})"
+    adjusted_text = "" if p_adjusted is None else f" (adjusted p {_p_relation(p_adjusted)})"
     if distinguishable:
         label = f"Distinguishable{adjusted_text}"
     elif test is None:
@@ -1295,8 +1302,8 @@ def _pair_reason(
         return f"{text}; the pair could not be tested ({pair.unavailable})."
     plural = "pair" if comparisons == 1 else "pairs"
     text += (
-        f"; {_TEST_LABELS[test.method]} p = {_p(test.p_value)}, Holm-adjusted across "
-        f"{comparisons} {plural} in {campaign.info.name} = {_p(p_adjusted)}, "
+        f"; {_TEST_LABELS[test.method]} p {_p_relation(test.p_value)}, Holm-adjusted across "
+        f"{comparisons} {plural} in {campaign.info.name} {_p_relation(p_adjusted)}, "
         f"against {_ALPHA} {_level(config.alpha)}"
     )
     if distinguishable:

@@ -87,7 +87,7 @@ from ads_engine.analysis.context import (
     SubjectKey,
     Withheld,
 )
-from ads_engine.analysis.metrics import native_day_zone
+from ads_engine.analysis.metrics import cap_constrained, native_day_zone
 from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
 from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, ResolvedBinding
 from ads_engine.analysis.window import AnalysisWindow
@@ -1492,6 +1492,25 @@ def test_short_cap_evidence_is_withheld_with_observed_and_required(
         observed,
         required,
     )
+
+
+def test_short_cap_evidence_samples_the_requirement_its_reason_states() -> None:
+    """P6: capped days failing both their minimum and a stricter share are stated once.
+
+    Over 10 known-budget days with every day spending, 4 capped days fall short of the
+    capped-day minimum (5) and of the 70% share (7): the reason and the sample name 7.
+    """
+    _, ctx = _built("c2.cap_evidence.does_not_fire")
+    (entry,) = scale_outcomes(ctx)
+    assert isinstance(entry, ScaleWithheld)
+    assert entry.history is not None
+    longer = replace(entry.history, known_active=10, spending=10, idle=0, capped=4)
+    gate = cap_constrained(longer)
+    assert (gate.counts["capped_days"], gate.counts["capped_share"]) == ((4, 5), (4, 7))
+    line = campaigns._gate_withheld(entry.subject, entry.entity, longer, gate, entry.members)
+    assert line is not None
+    assert line.reason == "capped days 4 of 7 required (70% of 10 known-budget days)"
+    assert (line.observed, line.required, line.unit) == (4, 7, "capped days")
 
 
 def test_c2_is_withheld_below_the_sustained_window() -> None:

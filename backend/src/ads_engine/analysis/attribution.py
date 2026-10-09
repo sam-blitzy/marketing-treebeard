@@ -580,7 +580,11 @@ class OrphanDealShare:
         share: ``orphans / assessed``; ``None`` when unknown or nothing was assessed.
         unknown: Whether the share is unknown: the deal search is incomplete or some deals were
             not assessed.
-        label: "unknown (N deals not assessed)" when unknown, else the share as a percentage.
+        label: The share as a percentage, or when unknown "unknown (N deals not assessed)"
+            after a complete search, "unknown (deal search incomplete)" or "unknown (deal
+            search incomplete; at least N deals not assessed)" after an incomplete one ("deal
+            search completeness unknown" when its completeness is unknown), and "unknown (no
+            CRM dataset for LinkedIn-attributed evidence)" without a CRM dataset.
         reason: Why the share is unknown, when it is.
     """
 
@@ -1049,13 +1053,18 @@ def _orphan_deals(ctx: AnalysisContext, crm: CrmData | None) -> OrphanDealShare:
     A deal is an orphan when its deal-to-contact fetch is ``ok_empty`` and linked when it is
     ``ok`` with its target reads ``ok``; any other deal is not assessed. The share is measured
     over the assessed deals. It is unknown when the deal search did not cover the range
-    completely (``CrmData.deal_search_complete``, or an ``incomplete`` ``hubspot.deal_search``
-    freshness row of the dataset) or when any deal was not assessed.
+    completely (``CrmData.deal_search_complete``, or a ``hubspot.deal_search`` freshness row of
+    the dataset that is not ``complete``) or when any deal was not assessed.
+
+    The unknown label is "unknown (N deals not assessed)" after a complete search. Deals an
+    incomplete search never returned are not counted in N, so the label then states the search
+    instead: "unknown (deal search incomplete)", or "unknown (deal search incomplete; at least
+    N deals not assessed)" when N > 0, with "deal search completeness unknown" in place of
+    "deal search incomplete" when the freshness row's completeness is ``unknown``. Without a
+    CRM dataset it is "unknown (no CRM dataset for LinkedIn-attributed evidence)".
     """
     if crm is None:
-        return OrphanDealShare(
-            0, 0, 0, None, True, "unknown (0 deals not assessed)", _NO_CRM_REASON
-        )
+        return OrphanDealShare(0, 0, 0, None, True, f"unknown ({_NO_CRM_REASON})", _NO_CRM_REASON)
     assessed = orphans = not_assessed = 0
     for deal_id in dict.fromkeys(crm.window_deal_ids):
         fetch = crm.fetch("deal", deal_id, "contact")
@@ -1066,17 +1075,32 @@ def _orphan_deals(ctx: AnalysisContext, crm: CrmData | None) -> OrphanDealShare:
         if fetch.is_empty:
             orphans += 1
     reasons: list[str] = []
+    search_gap: str | None = None
     freshness = ctx.freshness_for("hubspot.deal_search", crm.dataset.dataset_id)
     if not crm.deal_search_complete:
         reasons.append("deal search did not cover the range completely")
+        search_gap = "deal search incomplete"
     elif freshness is not None and not freshness.is_complete:
         detail = f": {freshness.reason}" if freshness.reason else ""
         reasons.append(f"deal search {freshness.completeness}{detail}")
+        search_gap = (
+            "deal search completeness unknown"
+            if freshness.completeness == "unknown"
+            else "deal search incomplete"
+        )
     if not_assessed:
         reasons.append(f"{not_assessed} deal-to-contact fetches unknown")
     unknown = bool(reasons)
     share = _share(orphans, assessed)
-    if unknown:
+    if search_gap is not None:
+        # Deals the search never returned are absent from ``window_deal_ids``, so the count of
+        # deals not assessed is only a lower bound and is stated as one, never as a bare 0.
+        label = (
+            f"unknown ({search_gap}; at least {not_assessed} deals not assessed)"
+            if not_assessed
+            else f"unknown ({search_gap})"
+        )
+    elif unknown:
         label = f"unknown ({not_assessed} deals not assessed)"
     elif share is None:
         label = "no deals created in range"

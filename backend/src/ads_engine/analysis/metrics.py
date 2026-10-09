@@ -3698,15 +3698,20 @@ class GateResult:
 
     Attributes:
         passed: Whether every check holds.
-        shortfalls: One sentence per failed check, for example
-            "spending days 3 of 5 required", for ``Withheld`` lines and evidence.
+        shortfalls: One sentence per count that falls short, for example
+            "spending days 3 of 5 required", for ``Withheld`` lines and evidence. A count
+            failing both its day minimum and its share is stated once, against the
+            stricter requirement (:func:`_gate`).
         counts: ``{check: (observed, required)}`` for every check, failed or not, so
             evidence can show "known-budget days 9 of 7" beside a shortfall.
+        shortfall_checks: The check each shortfall states, aligned with ``shortfalls``:
+            the one whose requirement binds, so a sample read from ``counts`` matches it.
     """
 
     passed: bool
     shortfalls: tuple[str, ...]
     counts: Mapping[str, tuple[int, int]]
+    shortfall_checks: tuple[str, ...] = ()
 
     def describe(self) -> str:
         """The shortfalls joined for one ``Withheld`` reason; empty when the gate passed."""
@@ -3724,15 +3729,35 @@ def _percent(share: Decimal) -> str:
 
 
 def _gate(checks: Sequence[tuple[str, str, int, int, str]]) -> GateResult:
-    """Evaluate ``(key, label, observed, required, note)`` checks into a :class:`GateResult`."""
-    shortfalls: list[str] = []
+    """Evaluate ``(key, label, observed, required, note)`` checks into a :class:`GateResult`.
+
+    Every check enters ``counts``. Failed checks that test the same count (the same label
+    and observed value, such as capped days against ``budget.min_capped_days`` and against
+    ``budget.sustained_share``) are stated as one shortfall, where the first of them is
+    listed, against the binding requirement: the largest ``required``, or the first-listed
+    check on a tie. A share's derivation note therefore appears only when the share asks
+    for strictly more days than the minimum: with 7 known-budget days both ask for 5 and
+    the clause reads "capped days 1 of 5 required"; with 10 the share's 7 binds and the
+    clause reads "capped days 4 of 7 required (70% of 10 known-budget days)".
+    """
     counts: dict[str, tuple[int, int]] = {}
+    binding: dict[tuple[str, int], tuple[str, int, str]] = {}
     for key, label, observed, required, note in checks:
         counts[key] = (observed, required)
         if observed < required:
-            suffix = f" ({note})" if note else ""
-            shortfalls.append(f"{label} {observed} of {required} required{suffix}")
-    return GateResult(not shortfalls, tuple(shortfalls), MappingProxyType(counts))
+            held = binding.get((label, observed))
+            if held is None or required > held[1]:
+                binding[(label, observed)] = (key, required, note)
+    shortfalls = tuple(
+        f"{label} {observed} of {required} required" + (f" ({note})" if note else "")
+        for (label, observed), (_, required, note) in binding.items()
+    )
+    return GateResult(
+        not shortfalls,
+        shortfalls,
+        MappingProxyType(counts),
+        tuple(key for key, _, _ in binding.values()),
+    )
 
 
 def _base_checks(

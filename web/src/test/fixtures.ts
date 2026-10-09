@@ -696,7 +696,8 @@ type CatalogueFlag<K extends FlagCode> = Readonly<Flag & { code: K }>;
  *   {@link FIXTURE_BANNERS} (`precedence._apply_short_window`).
  * - `creative_floor`: 12 of 96 leads without a creative (12.5%).
  * - `deal_floor`: 1 of 4 assessed deals without a contact (25%); an incomplete deal search
- *   renders the share "unknown (N deals not assessed)" instead (`attribution._orphan_deals`).
+ *   renders the share "unknown (deal search incomplete)" instead, or "unknown (deal search
+ *   incomplete; at least N deals not assessed)" when N > 0 (`attribution._orphan_deals`).
  * - `unknown_crm_evidence`: the white-paper form, 2 of 20 matched contacts (10%). Campaign and
  *   budget cards, judged on the pipeline-veto population, word it "Unknown CRM evidence for {n}
  *   of {m} eligible contacts" (`campaigns._veto_flags`).

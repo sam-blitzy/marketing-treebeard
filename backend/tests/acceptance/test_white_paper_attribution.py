@@ -1824,10 +1824,11 @@ def test_the_orphan_deal_share_is_measured_over_the_assessed_deals(
 def test_an_incomplete_deal_search_makes_the_orphan_share_unknown(
     make_context: MakeContext,
 ) -> None:
-    """An ``incomplete`` deal-search partition: "unknown (N deals not assessed)" with a floor.
+    """An ``incomplete`` deal-search partition: the share is unknown and deals carry a floor.
 
-    The twin marks the same search complete (one input): the share is known and deals are
-    exact.
+    Deals past the search ceiling were never returned, so the label states the incomplete
+    search rather than a count of 0 deals not assessed. The twin marks the same search
+    complete (one input): the share is known and deals are exact.
     """
     run = run_scenario(make_context, "wp.deal_search_incomplete.case")
     dataset_id = run.crm.dataset.dataset_id
@@ -1837,9 +1838,16 @@ def test_an_incomplete_deal_search_makes_the_orphan_share_unknown(
     share = run.table.orphan_deals
     assert share.unknown
     assert share.share is not None
-    assert re.fullmatch(r"unknown \(\d+ deals not assessed\)", share.label)
+    assert re.fullmatch(
+        r"unknown \(deal search incomplete(; at least [1-9]\d* deals not assessed)?\)",
+        share.label,
+    )
+    assert "0 deals not assessed" not in share.label
     row = run.row()
     assert row.has_flag(FLAG_DEAL_FLOOR)
+    assert row.flag_messages[FLAG_DEAL_FLOOR] == (
+        f"Deal counts are a floor: orphan-deal share {share.label}"
+    )
     assert row.deals_after_touch.render() == "≥ 10"
 
     complete = dataclasses.replace(freshness, completeness="complete", reason=None)
@@ -1863,7 +1871,7 @@ def test_an_incomplete_deal_search_makes_the_orphan_share_unknown(
     share = rerun(run, flagged_only).table.orphan_deals
     assert share.unknown
     assert share.reason == f"deal search incomplete: {freshness.reason}"
-    assert share.label == "unknown (0 deals not assessed)"
+    assert share.label == "unknown (deal search incomplete)"
 
 
 # ---------------------------------------------------------------------------------------------

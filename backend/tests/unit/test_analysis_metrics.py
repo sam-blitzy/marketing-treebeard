@@ -1992,7 +1992,6 @@ def test_cap_constrained_needs_known_spending_and_capped_days(thresholds: Thresh
     assert cap_constrained(one_then_idle).shortfalls == (
         "spending days 1 of 5 required",
         "capped days 1 of 5 required",
-        "capped days 1 of 5 required (70% of 7 known-budget days)",
     )
     assert high_utilization(one_then_idle).passed is False
     share = cap_constrained(_history(thresholds, known=10, spending=10, capped=6))
@@ -2015,6 +2014,53 @@ def test_high_utilization_needs_seventy_percent_spending_and_high_days(
         "high-utilization days 6 of 7 required (70% of 10 known-budget days)",
     )
     assert dict(sparse.counts)["spending_share"] == (6, 7)
+
+
+def test_a_count_failing_its_minimum_and_its_share_is_stated_once(thresholds: Thresholds) -> None:
+    """AAP 0.5.4.1 short history: each shortfall is stated once, observed against required.
+
+    Spending days (B2) and capped days (C2/B1) are each checked against a day minimum and a
+    share. When both fail, one clause carries the stricter requirement, and the share's
+    derivation appears only when the share asks for more; ``counts`` keeps both checks.
+    """
+    # A tie: ⌈70% x 7⌉ = 5 equals the minimum, so the minimum's clause stands, with no note.
+    tie = high_utilization(_history(thresholds, known=7, spending=4, high=4))
+    assert tie.describe() == (
+        "spending days 4 of 5 required; "
+        "high-utilization days 4 of 5 required (70% of 7 known-budget days)"
+    )
+    assert tie.shortfall_checks == ("spending_days", "high_utilization_days")
+    assert (tie.counts["spending_days"], tie.counts["spending_share"]) == ((4, 5), (4, 5))
+    capped_tie = cap_constrained(_history(thresholds, known=7, spending=7, capped=4))
+    assert capped_tie.shortfalls == ("capped days 4 of 5 required",)
+    assert capped_tie.shortfall_checks == ("capped_days",)
+    assert dict(capped_tie.counts) == {
+        "known_budget_days": (7, 7),
+        "spending_days": (7, 5),
+        "capped_days": (4, 5),
+        "capped_share": (4, 5),
+    }
+    # The share stricter: ⌈70% x 10⌉ = 7 binds over the minimum 5, and names its derivation.
+    stricter = high_utilization(_history(thresholds, known=10, spending=4, high=4))
+    assert stricter.shortfalls == (
+        "spending days 4 of 7 required (70% of 10 known-budget days)",
+        "high-utilization days 4 of 7 required (70% of 10 known-budget days)",
+    )
+    assert stricter.shortfall_checks == ("spending_share", "high_utilization_days")
+    assert (stricter.counts["spending_days"], stricter.counts["spending_share"]) == (
+        (4, 5),
+        (4, 7),
+    )
+    capped = cap_constrained(_history(thresholds, known=10, spending=10, capped=4))
+    assert (capped.passed, capped.describe()) == (
+        False,
+        "capped days 4 of 7 required (70% of 10 known-budget days)",
+    )
+    assert capped.shortfall_checks == ("capped_share",)
+    assert (capped.counts["capped_days"], capped.counts["capped_share"]) == ((4, 5), (4, 7))
+    # A passed gate states nothing and names no check.
+    met = cap_constrained(_history(thresholds, known=10, spending=10, capped=7))
+    assert (met.passed, met.shortfalls, met.shortfall_checks) == (True, (), ())
 
 
 def test_under_utilized_needs_spending_days_so_an_idle_budget_is_no_donor(

@@ -700,7 +700,7 @@ export function formatCost(
  * - it is {@link UNAVAILABLE}, {@link NOT_APPLICABLE} or starts with {@link EM_DASH}: a
  *   zero-denominator cost stays `"—"` under a floor, because "≤ X" applies only when the known
  *   denominator is above 0;
- * - it holds no digit at all, such as `"unknown (3 deals not assessed)"`.
+ * - it holds no digit at all, such as `"unknown (deal search incomplete)"`.
  *
  * @param text - The formatted value.
  * @param kind - `'min'` for a count's lower bound, `'max'` for a cost's upper bound.

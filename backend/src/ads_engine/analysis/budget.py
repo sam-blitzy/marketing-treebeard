@@ -1125,26 +1125,26 @@ def _gate_withheld(
 ) -> Withheld:
     """The withheld line of a failed gate: every shortfall, the first one as the sample.
 
+    The sample is the check the first shortfall states, so it carries the requirement that
+    clause names (the stricter one when a count fails both its minimum and its share).
+
     Raises:
         ValueError: When the gate has no shortfall.
     """
-    for check, (observed, required) in gate.counts.items():
-        if observed < required:
-            unit = (
-                history.known_label
-                if check == "known_budget_days"
-                else _CHECK_UNITS.get(check, "days")
-            )
-            return Withheld(
-                rule_id=rule_id,
-                section=BUDGET,
-                entity=entity,
-                reason=gate.describe(),
-                observed=observed,
-                required=required,
-                unit=unit,
-            )
-    raise ValueError(f"{rule_id}: a passed gate has no shortfall to withhold")
+    if not gate.shortfall_checks:
+        raise ValueError(f"{rule_id}: a passed gate has no shortfall to withhold")
+    check = gate.shortfall_checks[0]
+    observed, required = gate.counts[check]
+    unit = history.known_label if check == "known_budget_days" else _CHECK_UNITS.get(check, "days")
+    return Withheld(
+        rule_id=rule_id,
+        section=BUDGET,
+        entity=entity,
+        reason=gate.describe(),
+        observed=observed,
+        required=required,
+        unit=unit,
+    )
 
 
 def _mixed_withheld(rule_id: str, entity: EntityRef, groups: frozenset[str]) -> Withheld:

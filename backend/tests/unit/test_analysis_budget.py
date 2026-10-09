@@ -79,6 +79,7 @@ from ads_engine.analysis.metrics import (
     GateResult,
     budget_history,
     budget_subjects,
+    high_utilization,
     member_poor_efficiency,
     subject_campaigns,
     under_utilized,
@@ -1584,6 +1585,29 @@ def test_gate_withheld_refuses_a_gate_that_passed() -> None:
     with pytest.raises(ValueError, match="no shortfall"):
         budget._gate_withheld(B3, budget._subject_ref(ctx, subject), history, gate)
     assert not budget._history_short(gate)
+
+
+def test_gate_withheld_samples_the_requirement_its_first_shortfall_states() -> None:
+    """P6: the sample carries the requirement the reason states, the stricter share included.
+
+    With 10 known-budget days, 4 spending days fail both the minimum (5) and the 70% share
+    (7); the one clause and the sample both name 7. With 7 days both ask for 5.
+    """
+    scenario, ctx = _built("b2.spending_days.case")
+    subject: SubjectKey = ("campaign", _campaign_id(scenario, "linkedin", "hot"))
+    entity = budget._subject_ref(ctx, subject)
+    week = budget_history(ctx, subject)
+    assert (week.known_active, week.spending) == (7, 4)
+    line = budget._gate_withheld(B2, entity, week, high_utilization(week))
+    assert line.reason.startswith("spending days 4 of 5 required; high-utilization days")
+    assert (line.observed, line.required, line.unit) == (4, 5, "spending days")
+    longer = replace(week, known_active=10, idle=10 - week.spending)
+    gate = high_utilization(longer)
+    assert gate.counts["spending_days"] == (4, 5)
+    line = budget._gate_withheld(B2, entity, longer, gate)
+    assert line.reason.startswith("spending days 4 of 7 required (70% of 10 known-budget days)")
+    assert line.reason.count("spending days") == 1
+    assert (line.observed, line.required, line.unit) == (4, 7, "spending days")
 
 
 def test_subject_helpers_resolve_campaigns_and_shared_budgets() -> None:

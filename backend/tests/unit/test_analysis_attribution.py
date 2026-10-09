@@ -1795,7 +1795,7 @@ ORPHAN_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
             0,
             Decimal(0),
             True,
-            "unknown (0 deals not assessed)",
+            "unknown (deal search incomplete)",
             "deal search did not cover the range completely",
             True,
         ),
@@ -1809,7 +1809,7 @@ ORPHAN_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
             1,
             None,
             True,
-            "unknown (1 deals not assessed)",
+            "unknown (deal search incomplete; at least 1 deals not assessed)",
             "deal search did not cover the range completely; 1 deal-to-contact fetches unknown",
             True,
         ),
@@ -1856,14 +1856,19 @@ def test_the_orphan_deal_share_is_measured_over_the_assessed_deals(
 
 
 @pytest.mark.parametrize(
-    ("completeness", "reason", "expected"),
+    ("completeness", "reason", "expected", "label"),
     [
-        ("incomplete", "an hour above 10,000 results", "deal search incomplete: an hour above"),
-        ("unknown", None, "deal search unknown"),
+        (
+            "incomplete",
+            "an hour above 10,000 results",
+            "deal search incomplete: an hour above",
+            "unknown (deal search incomplete)",
+        ),
+        ("unknown", None, "deal search unknown", "unknown (deal search completeness unknown)"),
     ],
 )
 def test_an_incomplete_deal_search_freshness_row_makes_the_share_unknown(
-    make: MakeContext, completeness: Completeness, reason: str | None, expected: str
+    make: MakeContext, completeness: Completeness, reason: str | None, expected: str, label: str
 ) -> None:
     crm = _crm(
         [ContactInfo("c1", "lead")],
@@ -1880,9 +1885,38 @@ def test_an_incomplete_deal_search_freshness_row_makes_the_share_unknown(
 
     orphan = table.orphan_deals
     assert (orphan.unknown, orphan.assessed, orphan.not_assessed) == (True, 1, 0)
-    assert orphan.label == "unknown (0 deals not assessed)"
+    assert orphan.label == label
     assert orphan.reason is not None
     assert orphan.reason.startswith(expected)
+    row = _row(table)
+    assert row.has_flag(FLAG_DEAL_FLOOR)
+    assert row.flag_messages[FLAG_DEAL_FLOOR] == (
+        f"Deal counts are a floor: orphan-deal share {label}"
+    )
+
+
+def test_an_unknown_deal_search_with_unassessed_deals_states_a_lower_bound(
+    make: MakeContext,
+) -> None:
+    crm = _crm(
+        [ContactInfo("c1", "lead")],
+        window_deal_ids=["d0", "d1"],
+        fetches=_deal_fetches([], ["d1"]),
+    )
+    table = build_attribution(
+        make(
+            crm=crm,
+            leads=[_lead(1, _t(10), contact="c1")],
+            freshness=[_deal_search("unknown", None)],
+        )
+    )
+
+    orphan = table.orphan_deals
+    assert (orphan.unknown, orphan.assessed, orphan.not_assessed) == (True, 1, 1)
+    assert orphan.label == (
+        "unknown (deal search completeness unknown; at least 1 deals not assessed)"
+    )
+    assert orphan.reason == "deal search unknown; 1 deal-to-contact fetches unknown"
     assert _row(table).has_flag(FLAG_DEAL_FLOOR)
 
 
@@ -2034,7 +2068,7 @@ def test_without_a_crm_dataset_every_crm_count_is_unavailable(make: MakeContext)
     assert (row.contact_share, row.creative_share) == (Decimal(1), Decimal(0))
     assert row.flags == (FLAG_ATTRIBUTION_FLOOR, FLAG_DEAL_FLOOR, FLAG_PIPELINE_UNAVAILABLE)
     assert table.orphan_deals == OrphanDealShare(
-        0, 0, 0, None, True, "unknown (0 deals not assessed)", NO_CRM_REASON
+        0, 0, 0, None, True, f"unknown ({NO_CRM_REASON})", NO_CRM_REASON
     )
     assert [finding.message for finding in table.findings] == [
         f"MQL (First meeting booked) count unavailable: {NO_CRM_REASON}",

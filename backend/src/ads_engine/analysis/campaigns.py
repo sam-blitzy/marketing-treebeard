@@ -1125,7 +1125,8 @@ def _gate_withheld(
 
     A short history (known-budget or spending days below their minimums) or at least one
     capped day is a pattern below its minimum (P6) and is withheld with observed against
-    required. A full history with no capped day is not cap-constrained at all.
+    required. A full history with no capped day is not cap-constrained at all. The sample is
+    the check the first shortfall states, so it carries the requirement that clause names.
     """
     short = [
         key
@@ -1134,7 +1135,7 @@ def _gate_withheld(
     ]
     if not short and history.capped == 0:
         return None
-    first = next(key for key, (observed, required) in gate.counts.items() if observed < required)
+    first = gate.shortfall_checks[0]
     observed, required = gate.counts[first]
     unit = history.known_label if first == "known_budget_days" else _CHECK_UNITS[first]
     return ScaleWithheld(

@@ -721,7 +721,10 @@ the range as a sequence of narrower queries whose union is the range.
 - **De-duplication**: records are de-duplicated by `id`, keeping the first occurrence.
 - **Consequence**: a search cut short by the ceiling or a short read (steps 4 and 5) is a
   completed read and marks `hubspot.deal_search` `incomplete` with its reason. The orphan-deal
-  share then displays as "unknown (N deals not assessed)" and deal counts carry `deal_floor`.
+  share is then unknown and deal counts carry `deal_floor`. Deals the search never returned
+  cannot be counted as not assessed, so the share displays as "unknown (deal search
+  incomplete)", or "unknown (deal search incomplete; at least N deals not assessed)" when N
+  deals the search did return have an unknown deals-to-contacts fetch.
   An interrupted search (step 6) is a failed attempt: the deals read are stored and their
   deals-to-contacts associations still read, but no success is recorded, and the error is
   handed to `sync/mode.py`. The connection becomes `stale` at once and the failed attempt is

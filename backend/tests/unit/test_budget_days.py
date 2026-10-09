@@ -1014,9 +1014,10 @@ def test_one_capped_day_and_six_idle_days_is_neither_capped_nor_high_utilization
     """AAP 0.5.4.1: "One capped day followed by six idle days is therefore 1 capped day of 7
     and 1 spending day of 7. It is neither cap-constrained nor high-utilization."
 
-    Every check is reported observed against required, the share check with how its
-    requirement was derived (⌈70% x 7⌉ = 5). The idle days are under-utilized, yet the
-    under-utilized gate fails too: a budget that rarely serves is idle, not a B3 donor.
+    Every check is counted observed against required. The 70% share asks for ⌈70% x 7⌉ = 5
+    capped days, the same as the capped-day minimum, so the shortfall states capped days
+    once. The idle days are under-utilized, yet the under-utilized gate fails too: a budget
+    that rarely serves is idle, not a B3 donor.
     """
     history = _week_history(thresholds, ["100", "0", "0", "0", "0", "0", "0"])
     assert (history.known_active, history.spending, history.idle, history.capped) == (7, 1, 6, 1)
@@ -1029,10 +1030,10 @@ def test_one_capped_day_and_six_idle_days_is_neither_capped_nor_high_utilization
         "capped_days": (1, 5),
         "capped_share": (1, 5),
     }
+    # The capped-day minimum and the 70% share both ask for 5: one clause states the count.
     assert cap.shortfalls == (
         "spending days 1 of 5 required",
         "capped days 1 of 5 required",
-        "capped days 1 of 5 required (70% of 7 known-budget days)",
     )
 
     high = high_utilization(history)
@@ -1085,10 +1086,7 @@ def test_four_known_budget_days_fall_short_of_the_configured_minimum(
         pytest.param(
             ["100"] * 4 + ["50"] + ["0"] * 2,
             False,
-            (
-                "capped days 4 of 5 required",
-                "capped days 4 of 5 required (70% of 7 known-budget days)",
-            ),
+            ("capped days 4 of 5 required",),
             id="4-capped-of-7",
         ),
     ],

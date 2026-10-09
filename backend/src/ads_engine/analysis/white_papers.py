@@ -361,7 +361,7 @@ def _row_extra(ctx: AnalysisContext, table: AttributionTable, row: AssetRow) -> 
 
     ``rows`` is the per-creative partition (including "unknown creative"), ``shares`` the
     contact, unknown-evidence and creative shares, ``orphan_deals`` the portal orphan-deal
-    share (or "unknown (N deals not assessed)"), ``already_before`` and ``skipped`` the events
+    share (or its "unknown (…)" label), ``already_before`` and ``skipped`` the events
     the causal check and the stage binding excluded, and ``costs`` each cost with its note.
     """
     return {
