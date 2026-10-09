@@ -15,25 +15,70 @@ session-level advisory lock dies with its session. Work is fenced by that lock:
 
 * after every acquisition the scheduler waits :data:`LOCK_TAKEOVER_GRACE` (20 s) and proves
   the lock again before any work (``scheduler.lock_fence_wait``);
-* while it holds the lock, everything it runs is a task watched by lock checks: the startup
-  (``on_start``) and, after a re-acquisition, the ``scheduler_lock_lost`` requeue run under
-  one guard, then the lanes and their trigger checks; the lock session is proved alive
+* it then recovers orphaned ``sync_run`` rows: every row ``running`` at that moment was left
+  by a process that ended (a killed or aborted worker, bookkeeping a cancellation abandoned,
+  a killed CLI), so it is recorded ``failed`` as interrupted. The "Sync now" request whose
+  manual run it belongs to is made pending again, with the requests claimed with it that the
+  dead pass never reached (``scheduler.sync_runs_recovered``). Every job stamps its rows with
+  its own start, so a row is matched to the latest claim of its lane at or before its
+  ``started_at``, when it is a job of that request's manual run and that job's first run
+  since the claim (``_requeue_interrupted``). ``ads-engine sync`` and ``seed-simulated``
+  write ``sync_run`` rows without the scheduler lock, so they hold
+  :data:`SYNC_WRITER_LOCK_KEY` shared (:func:`sync_writer`) and the recovery defers behind a
+  live one, retrying the same rows at later wakes (``scheduler.sync_run_recovery_deferred``).
+  That lock is fenced like the scheduler's: a writer proves its lock session alive every
+  :data:`LOCK_CHECK_INTERVAL` and stops (``sync_writer.lock_lost``), or aborts, once it is
+  not, and the recovery, having found the key free, waits :data:`SYNC_WRITER_FENCE` (20 s,
+  ``scheduler.sync_run_recovery_fence_wait``) and takes the key again before it sweeps, so
+  a writer whose session just died has stopped first. The fence is spent only when there
+  are rows to recover;
+* while it holds the lock, everything it runs is a task watched by lock checks: the recovery,
+  then the startup (``on_start``) or, after a re-acquisition, the ``scheduler_lock_lost``
+  requeue run under one guard each, then the lanes, their trigger checks and any deferred
+  recovery retry; the lock session is proved alive
   (``SELECT 1`` on that connection, within :data:`LOCK_CHECK_TIMEOUT`) on absolute deadlines
   every :data:`LOCK_CHECK_INTERVAL` (5 s), and again immediately before every lane dispatch,
   the first one included;
 * when a check fails or times out, the scheduler logs ``scheduler.lock_lost``, cancels every
-  task and waits for them at most :data:`LOCK_LOST_STOP_TIMEOUT` (5 s), because cancelled
-  work still writes while it unwinds (a cancelled build discards its dataset, a cancelled
-  job closes its ``sync_run`` rows). Once they have ended (``scheduler.lanes_cancelled``) it
-  returns the connection (which runs ``pg_advisory_unlock_all()`` or discards it) and
-  reconnects and re-acquires. An interrupted startup runs again on the next acquisition;
-  otherwise one ``scheduler_lock_lost`` ``analysis_request`` is queued. A task still running
-  after the timeout makes it log ``scheduler.fence_stop_timeout`` and abort the process with
-  exit code 1; the container restarts the worker, exactly as after a defect.
+  task with the message ``jobs.CANCEL_LOCK_LOST`` (so a cancelled sync job logs
+  ``sync.job.cancelled`` at error level, naming its source, job and dataset) and waits for
+  them at most :data:`LOCK_LOST_STOP_TIMEOUT` (5 s), because cancelled work still writes
+  while it unwinds (a cancelled build discards its dataset, a cancelled job closes its
+  ``sync_run`` rows). Once they have ended (``scheduler.lanes_cancelled``) it returns the
+  connection (which runs ``pg_advisory_unlock_all()`` or discards it) and reconnects and
+  re-acquires. An interrupted startup runs again on the next acquisition; otherwise every
+  "Sync now" request a cancelled pass had claimed and not finished serving is made pending
+  again (``scheduler.sync_requests_requeued``), even when the cancelled jobs closed their
+  own ``sync_run`` rows, and one ``scheduler_lock_lost`` ``analysis_request`` is queued.
+  Those claims are recorded in memory only: an orderly stop (SIGTERM) or an aborted process
+  loses the record, and the orphaned-run recovery above still re-queues a request whose
+  rows were left ``running``;
+* a task still running after the timeout could still write, so the scheduler logs
+  ``scheduler.fence_stop_timeout`` and aborts the process with exit code 1, and the
+  container restarts the worker, exactly as after a defect. Only failure and silence are told
+  apart first. A check that failed with an answer (a terminated backend, a connection the
+  server closed, a failed statement) proves the server answers this process and may already
+  have given the lock to another worker: the abort follows the timeout with no probe. A check
+  that went silent (it timed out) may mean the whole database stopped answering, so the task
+  first gets one reachability probe of the database (:data:`FENCE_PROBE_TIMEOUT`, a fresh
+  connection outside the pool). Any answer, an error included (failed authentication, too
+  many clients, a refused or reset connection), aborts the process as above. Only silence
+  (the probe's deadline or libpq's connect timeout expiring:
+  ``scheduler.fence_wait_unreachable``) means nothing the task does can land, so the
+  scheduler keeps waiting for it, probing every :data:`FENCE_PROBE_INTERVAL`, and reconnects
+  as above once it has ended: a database outage never ends the worker. A probe answered
+  while the task still runs (``scheduler.fence_wait_reachable``) leaves it
+  :data:`LOCK_LOST_STOP_TIMEOUT` more, then the process aborts.
 
-A holder whose session died thus has stopped all its work, or its process, within 15 s,
-before any other worker's 20 s grace has passed, so two workers never run work at the same
-time (both bounds are checked at import). The scheduler never takes the ``analysis`` lock:
+While the database answers, a holder whose session died thus has stopped all its work, or its
+process, within 15 s, before any other worker's 20 s grace has passed; no probe can stretch
+that bound, because a check that got an answer is never followed by one. A lock check against
+a server that stopped answering returns only after psycopg's own cancellation of the query in
+flight (about 10 s more), and cancelled database calls take as long, but no other worker can
+take the lock before that server answers again; from then on the holder stops or aborts
+within 13 s (the probe in flight, the probe interval, one more probe and the stop timeout),
+again inside the grace. Two workers therefore never run work at the same time (every bound is
+checked at import). The scheduler never takes the ``analysis`` lock:
 ``analysis.runner.run_analysis`` takes it itself, the one convention the API, the worker and
 the CLI share, and it additionally fences an analysis run's own writes: the run's dedicated
 connection keeps that lock until the run's unwind has ended.
@@ -127,14 +172,21 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from functools import partial
 from time import monotonic as system_monotonic
 from types import MappingProxyType
 from typing import Any, Final, NoReturn
 
 import httpx
+from psycopg.errors import ConnectionTimeout
 from sqlalchemy import func, select, text, update
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    AsyncSessionTransaction,
+    async_sessionmaker,
+)
 
 from ads_engine.analysis import runner
 from ads_engine.analysis.lock import ANALYSIS_LOCK_KEY, RunInProgress
@@ -145,6 +197,8 @@ from ads_engine.db.models.ops import (
     DATASET_ROLE_PRIMARY,
     DATASET_STATE_RETIRED,
     SOURCE_GOOGLE,
+    SOURCE_HUBSPOT,
+    SOURCE_LINKEDIN,
     SYNC_RUN_FAILED,
     SYNC_RUN_RUNNING,
     SYNC_RUN_SUCCEEDED,
@@ -152,7 +206,7 @@ from ads_engine.db.models.ops import (
     SyncRequest,
     SyncRun,
 )
-from ads_engine.db.session import dedicated_connection
+from ads_engine.db.session import dedicated_connection, ping_database
 from ads_engine.logging import get_logger, logged_as
 from ads_engine.settings import SOURCES, Settings, Source, get_settings
 from ads_engine.sync import jobs
@@ -168,6 +222,8 @@ from ads_engine.sync.mode import (
 
 __all__ = [
     "COALESCE_WINDOW",
+    "FENCE_PROBE_INTERVAL",
+    "FENCE_PROBE_TIMEOUT",
     "JOB_FAILURES",
     "JOB_PROBE",
     "JOB_PURGE",
@@ -179,12 +235,16 @@ __all__ = [
     "SCHEDULE",
     "SCHEDULER_LOCK_KEY",
     "STANDBY_RETRY",
+    "SYNC_WRITER_FENCE",
+    "SYNC_WRITER_LOCK_KEY",
     "WAKE_INTERVAL",
     "ScheduleEntry",
     "Scheduler",
+    "SyncWriterLockLostError",
     "TickReport",
     "is_due",
     "latest_slot",
+    "sync_writer",
 ]
 
 _log = get_logger(__name__)
@@ -207,6 +267,47 @@ if SCHEDULER_LOCK_KEY == ANALYSIS_LOCK_KEY:  # pragma: no cover - distinct SHA-2
     # One key for both locks would let a running analysis block every worker as a standby,
     # and a standby worker block every analysis run.
     raise RuntimeError("SCHEDULER_LOCK_KEY must differ from analysis.lock.ANALYSIS_LOCK_KEY")
+
+SYNC_WRITER_LOCK_KEY: Final[int] = int.from_bytes(
+    hashlib.sha256(b"ads_engine:sync_writer").digest()[:8], "big", signed=True
+)
+"""The advisory-lock key every ``sync_run`` writer outside the worker holds shared.
+
+``ads-engine sync`` and ``ads-engine seed-simulated`` run sync jobs, which write ``sync_run``
+rows, without the scheduler lock and while a worker runs. Each holds this key shared
+(:func:`sync_writer`) for as long as its jobs run, and proves its lock session alive while
+they do. The scheduler's recovery of orphaned ``sync_run`` rows takes it exclusively, without
+waiting (``pg_try_advisory_xact_lock``), twice: once to find no writer running, then again,
+:data:`SYNC_WRITER_FENCE` later, in the transaction that sweeps. It defers while any writer
+holds it, so it never records a live command's rows as interrupted. Derived like
+:data:`SCHEDULER_LOCK_KEY`, from the name ``"ads_engine:sync_writer"``.
+"""
+
+if SYNC_WRITER_LOCK_KEY in (SCHEDULER_LOCK_KEY, ANALYSIS_LOCK_KEY):  # pragma: no cover
+    # A shared key would make a CLI sync block the scheduler's standby or an analysis run, and
+    # the recovery's exclusive lock contend with the scheduler lock itself.
+    raise RuntimeError(
+        "SYNC_WRITER_LOCK_KEY must differ from SCHEDULER_LOCK_KEY and "
+        "analysis.lock.ANALYSIS_LOCK_KEY"
+    )
+
+SYNC_WRITER_FENCE: Final = timedelta(seconds=20)
+"""How long the orphaned-run recovery waits, after finding no sync writer, before it sweeps.
+
+The recovery of orphaned ``sync_run`` rows takes :data:`SYNC_WRITER_LOCK_KEY` exclusively in
+a short transaction first. When it is free, that transaction rolls back (releasing it), the
+recovery waits this long, and only the transaction that sweeps, which takes the key again,
+records rows as interrupted. A writer whose lock session died just before the first
+transaction has by then noticed the loss and stopped (:func:`sync_writer`): it proves its
+session alive every :data:`LOCK_CHECK_INTERVAL` within :data:`LOCK_CHECK_TIMEOUT`, then
+gives its cancelled block :data:`LOCK_LOST_STOP_TIMEOUT` before it aborts its process, all
+three together shorter than this fence (checked at import). So the sweep never records a
+row that is still being written. A writer whose lock connection went silent (a hung or
+partitioned network) is outside that bound, and needs none: its session is still alive on
+the server, so it keeps the key and the sweep defers, until the server ends that session,
+long after the writer's own check timed out and stopped it. The wait is spent only when
+there are candidates to sweep.
+"""
 
 WAKE_INTERVAL: Final = timedelta(seconds=30)
 """The spacing of the scheduler's wakes (AAP 0.3.2: the worker wakes every 30 s).
@@ -231,35 +332,78 @@ every wake falls on a check deadline and one check serves both.
 LOCK_CHECK_TIMEOUT: Final = timedelta(seconds=5)
 """How long one lock check may take before the lock counts as lost.
 
-A check that does not answer in time (a hung or partitioned connection) is treated exactly as
-a failed one: every lane is cancelled and awaited, and the scheduler reconnects.
+A check that does not answer in time (a hung or partitioned connection) went silent. It is
+treated as a failed one, every lane cancelled and awaited before the scheduler reconnects,
+with one difference: only after a silent check may a probe that finds the database silent
+too extend the wait for cancelled work past :data:`LOCK_LOST_STOP_TIMEOUT`. Against a
+server that stopped answering, the check returns only after psycopg's own cancellation of the
+query in flight, about 10 s more: it asks the server to cancel (waiting up to 5 s), waits up
+to 5 s for the query to end, then closes the connection. No other worker can take the lock
+meanwhile, because only that server can end the lock session.
 """
 
 LOCK_LOST_STOP_TIMEOUT: Final = timedelta(seconds=5)
-"""The most time the scheduler waits for its cancelled tasks to end after losing its lock.
+"""The most time the scheduler waits for its cancelled tasks to end while the database answers.
 
 Cancelled work can still write while it unwinds: a cancelled dataset build discards its
 building dataset (a cascade ``DELETE``), a cancelled sync job or recovery probe records its
 own ``sync_run`` rows as failed (bounded by ``jobs.CANCEL_CLOSE_TIMEOUT``, checked at import
 to be shorter), a cancelled analysis run records its failure. A task still running after
-this long is not waited for: the scheduler logs ``scheduler.fence_stop_timeout`` and aborts
-the process (exit code 1), so the unwind of the lost holder always ends inside the next
-holder's :data:`LOCK_TAKEOVER_GRACE`. Only a lost lock is bounded this way: on SIGTERM or a
-defect the lock is still held, so every task is awaited however long it takes.
+this long could still write, so it is not waited for: the scheduler logs
+``scheduler.fence_stop_timeout`` and aborts the process (exit code 1), so the unwind of the
+lost holder always ends inside the next holder's :data:`LOCK_TAKEOVER_GRACE`. That happens
+at once when the lock check that lost the lock failed with an answer. When the check went
+silent, the task first gets one reachability probe of the database
+(:data:`FENCE_PROBE_TIMEOUT`):
+
+* anything answers, an error included: the process aborts as above;
+* only silence (``scheduler.fence_wait_unreachable``): nothing the task does can land, and
+  no other worker can take the lock before the server answers again, so the scheduler keeps
+  waiting, probing every :data:`FENCE_PROBE_INTERVAL`, and reconnects once the task has
+  ended. A probe that gets an answer while the task still runs
+  (``scheduler.fence_wait_reachable``) leaves it this long again before the process aborts.
+
+A database call cancelled while the server does not answer itself ends only after psycopg's
+cancellation (about 10 s, :data:`LOCK_CHECK_TIMEOUT`), so an outage longer than this timeout
+would otherwise abort the worker. Only a lost lock is bounded this way: on SIGTERM or a defect
+the lock is still held, so every task is awaited however long it takes.
 """
 
 LOCK_TAKEOVER_GRACE: Final = timedelta(seconds=20)
 """How long a worker waits after every lock acquisition before it runs any work.
 
-A previous holder whose lock session died notices the loss within
+While the database answers, a previous holder whose lock session died notices the loss within
 :data:`LOCK_CHECK_INTERVAL` plus :data:`LOCK_CHECK_TIMEOUT`, cancels its work and waits at
-most :data:`LOCK_LOST_STOP_TIMEOUT` for it to end, or aborts its process. Waiting longer than
-all three before the startup or the first wake (checked at import) means two workers never
-run work at the same time. The lock is proved alive again once the grace has passed. The
-bound assumes a responsive event loop: CPU-bound work that does not yield (an analysis run's
-rule evaluation) delays the checks for its duration. An analysis run's own writes are
-additionally fenced by the ``analysis`` advisory lock, which its dedicated connection keeps
-until the run's unwind has ended.
+most :data:`LOCK_LOST_STOP_TIMEOUT` for it to end, or aborts its process. When the database
+stopped answering, no worker can take the lock until it answers again; from that moment the
+previous holder has stopped its work, or aborted, within one probe in flight
+(:data:`FENCE_PROBE_TIMEOUT`), one :data:`FENCE_PROBE_INTERVAL`, one more probe and
+:data:`LOCK_LOST_STOP_TIMEOUT`. Waiting longer than either bound before the startup or the
+first wake (both checked at import) means two workers never run work at the same time. The
+lock is proved alive again once the grace has passed. The bound assumes a responsive event
+loop: CPU-bound work that does not yield (an analysis run's rule evaluation) delays the checks
+for its duration. An analysis run's own writes are additionally fenced by the ``analysis``
+advisory lock, which its dedicated connection keeps until the run's unwind has ended.
+"""
+
+FENCE_PROBE_TIMEOUT: Final = timedelta(seconds=3)
+"""How long one reachability probe of the database may take before it counts as unreachable.
+
+The probe (``db.session.ping_database``) makes one ``SELECT 1`` round trip on a fresh
+connection outside the pool, so neither a pooled connection stuck on a frozen server nor an
+exhausted pool decides it. It runs only after a lock check that went silent, once cancelled
+work has outlasted :data:`LOCK_LOST_STOP_TIMEOUT`. Only silence reads as unreachable: this
+deadline expiring, or libpq's connect timeout (psycopg's ``ConnectionTimeout``) expiring
+first. Every answer reads as reachable, which aborts the process: success, and every error a
+server or the network returns (failed authentication, too many clients, a refused or reset
+connection, any other database or socket error), because whatever answers this process may
+answer another worker too, which can then take the lock.
+"""
+
+FENCE_PROBE_INTERVAL: Final = timedelta(seconds=2)
+"""The pause between two reachability probes while cancelled work waits on a silent database.
+
+The wait ends as soon as the work has ended, whatever the interval.
 """
 
 COALESCE_WINDOW: Final = timedelta(seconds=60)
@@ -290,6 +434,18 @@ if (  # pragma: no cover - the constants above satisfy it
         "LOCK_TAKEOVER_GRACE"
     )
 
+if (  # pragma: no cover - the constants above satisfy it
+    FENCE_PROBE_TIMEOUT + FENCE_PROBE_INTERVAL + FENCE_PROBE_TIMEOUT + LOCK_LOST_STOP_TIMEOUT
+    >= LOCK_TAKEOVER_GRACE
+):
+    # Once a silent database answers again, a holder waiting on cancelled work learns it from
+    # the probe in flight or the next one, then waits the stop timeout at most; a longer
+    # bound would let a new holder start while that work may still write.
+    raise RuntimeError(
+        "2 * FENCE_PROBE_TIMEOUT + FENCE_PROBE_INTERVAL + LOCK_LOST_STOP_TIMEOUT must be less "
+        "than LOCK_TAKEOVER_GRACE"
+    )
+
 if jobs.CANCEL_CLOSE_TIMEOUT >= LOCK_LOST_STOP_TIMEOUT:  # pragma: no cover
     # A job cancelled by a lost lock records its own sync_run rows as failed before it ends;
     # bookkeeping outlasting the stop timeout would abort the worker on every lost lock.
@@ -298,8 +454,23 @@ if jobs.CANCEL_CLOSE_TIMEOUT >= LOCK_LOST_STOP_TIMEOUT:  # pragma: no cover
 if WAKE_INTERVAL < LOCK_CHECK_INTERVAL or WAKE_INTERVAL % LOCK_CHECK_INTERVAL:  # pragma: no cover
     raise RuntimeError("WAKE_INTERVAL must be a whole multiple of LOCK_CHECK_INTERVAL")
 
+if (  # pragma: no cover - the constants above satisfy it
+    LOCK_CHECK_INTERVAL + LOCK_CHECK_TIMEOUT + LOCK_LOST_STOP_TIMEOUT >= SYNC_WRITER_FENCE
+):
+    # A shorter fence would let the recovery sweep while a sync writer whose lock session
+    # died has not yet noticed the loss, or is still waiting for its cancelled jobs to end.
+    raise RuntimeError(
+        "LOCK_CHECK_INTERVAL + LOCK_CHECK_TIMEOUT + LOCK_LOST_STOP_TIMEOUT must be less than "
+        "SYNC_WRITER_FENCE"
+    )
+
 _TRY_LOCK: Final = text("SELECT pg_try_advisory_lock(:key)")
 _ALIVE: Final = text("SELECT 1")
+# The sync-writer lock: held shared by a writer outside the worker for its whole run, taken
+# exclusively by the orphaned-run recovery for one short transaction at a time (the check
+# before its fence and the sweep after it), without ever waiting.
+_WRITER_SHARED_LOCK: Final = text("SELECT pg_advisory_lock_shared(:key)")
+_TRY_WRITER_XACT_LOCK: Final = text("SELECT pg_try_advisory_xact_lock(:key)")
 
 # Every slot of SCHEDULE recurs at most 24 h apart, 25 h across a DST change, so a run that
 # started more than two days ago can never be at or after the latest slot: its job is due
@@ -311,6 +482,8 @@ _ANALYSIS_REASON_LIMIT: Final = 500
 _ERROR_LIMIT: Final = 500
 _RERUN_REASON: Final = "analysis_lock_lost"
 _LOCK_LOST_REASON: Final = "scheduler_lock_lost"
+# The `sync_run.error` of a row the orphaned-run recovery closes: its writer died mid-run.
+_INTERRUPTED: Final = "interrupted: the process running this job ended before it finished"
 
 # ---------------------------------------------------------------------------------------------
 # Schedule model
@@ -428,6 +601,11 @@ if sorted(source for group in _SOURCE_LANES.values() for source in group) != sor
     SOURCES
 ):  # pragma: no cover - the source lanes are literals above
     raise RuntimeError("the source lanes must cover every source exactly once")
+
+_LANE_SOURCES_OF: Final[Mapping[str, tuple[Source, ...]]] = MappingProxyType(
+    {source: group for group in _SOURCE_LANES.values() for source in group}
+)
+"""Each source's lane sources: a ``sync_request`` of any of them may have run its jobs."""
 
 
 def _aware(value: datetime, what: str) -> datetime:
@@ -751,6 +929,8 @@ def _next_deadline(deadline: float, interval: float, now: float) -> float:
 _LANES_CANCELLED: Final = "scheduler.lanes_cancelled"
 _START_CANCELLED: Final = "scheduler.start_cancelled"
 _REQUEUE_CANCELLED: Final = "scheduler.lock_lost_requeue_cancelled"
+_RECOVERY_CANCELLED: Final = "scheduler.sync_run_recovery_cancelled"
+_RECOVERY: Final = "sync_run_recovery"
 
 
 async def _invoke(factory: Callable[[], Awaitable[None]]) -> None:
@@ -768,40 +948,52 @@ class _Lanes:
         watched: The pass each tracked check was dispatched against, by source lane.
         rerun: The lanes to dispatch again as soon as they are idle, without waiting for the
             next wake.
+        recovery: The ``sync_run`` ids found ``running`` at this acquisition whose recovery
+            is still pending (:meth:`Scheduler._retry_recovery`); empty once done.
+        recovering: The recovery retry in progress, at most one. A retry that finds no
+            sync writer running waits ``SYNC_WRITER_FENCE`` (20 s) before it sweeps, so it
+            may span wakes; no second one is dispatched meanwhile.
     """
 
-    __slots__ = ("checks", "passes", "rerun", "watched")
+    __slots__ = ("checks", "passes", "recovering", "recovery", "rerun", "watched")
 
-    def __init__(self) -> None:
-        """Start with no task tracked and no lane marked."""
+    def __init__(self, recovery: tuple[int, ...] = ()) -> None:
+        """Start with no task tracked and no lane marked; ``recovery`` is still to sweep."""
         self.passes: dict[str, asyncio.Task[TickReport]] = {}
         self.checks: dict[str, asyncio.Task[tuple[str, ...]]] = {}
         self.watched: dict[str, asyncio.Task[TickReport]] = {}
         self.rerun: set[str] = set()
+        self.recovery: tuple[int, ...] = recovery
+        self.recovering: asyncio.Task[tuple[int, ...]] | None = None
 
     def tasks(self) -> list[asyncio.Task[Any]]:
-        """Every pass and check still tracked."""
-        return [*self.passes.values(), *self.checks.values()]
+        """Every pass, check and recovery retry still tracked."""
+        tracked: list[asyncio.Task[Any]] = [*self.passes.values(), *self.checks.values()]
+        if self.recovering is not None:
+            tracked.append(self.recovering)
+        return tracked
 
     def ready(self) -> list[str]:
         """The lanes marked for a rerun that no pass occupies, in dispatch order."""
         return [lane for lane in _LANES if lane in self.rerun and lane not in self.passes]
 
     def reap(self) -> None:
-        """Forget every pass and check that has ended; mark reruns; re-raise a defect.
+        """Forget every task that has ended; mark reruns; re-raise a defect.
 
         A pass ending normally, or cancelled by something other than the scheduler (logged
         as ``scheduler.lane_cancelled``), is simply forgotten, so the next wake dispatches it
         again, or at once when it is marked for a rerun. A check that found work pending
         marks its lane for a rerun while the pass it watched still runs or has ended; a
-        newer pass already started after it, so its result is then dropped.
+        newer pass already started after it, so its result is then dropped. A recovery retry
+        that ended leaves :attr:`recovery` as it returned it (empty once done); one cancelled
+        by something other than the scheduler keeps it for the next wake.
 
         Raises:
-            BaseException: The exception a pass or check ended with (a defect:
-                :data:`JOB_FAILURES` are isolated inside the steps and the trigger reads),
-                logged as ``scheduler.lane_failed`` or ``scheduler.lane_check_failed``. That
-                task is forgotten; the tasks still running stay tracked for the caller to
-                stop.
+            BaseException: The exception a pass, check or recovery retry ended with (a
+                defect: :data:`JOB_FAILURES` are isolated inside the steps, the trigger reads
+                and the recovery), logged as ``scheduler.lane_failed`` or
+                ``scheduler.lane_check_failed``. That task is forgotten; the tasks still
+                running stay tracked for the caller to stop.
         """
         for lane, task in tuple(self.passes.items()):
             if not task.done():
@@ -829,16 +1021,75 @@ class _Lanes:
             current = self.passes.get(lane)
             if check.result() and (current is None or current is watched):
                 self.rerun.add(lane)
+        recovering = self.recovering
+        if recovering is None or not recovering.done():
+            return
+        self.recovering = None
+        if recovering.cancelled():
+            _log.warning("scheduler.lane_cancelled", lane=_RECOVERY)
+            return
+        error = recovering.exception()
+        if error is not None:
+            _log.error("scheduler.lane_failed", lane=_RECOVERY, error=type(error).__name__)
+            raise error
+        self.recovery = recovering.result()
 
     def take(self) -> dict[str, asyncio.Task[Any]]:
-        """Return every tracked task by name (a check as ``<lane>.check``), then forget all."""
+        """Return every tracked task by name, then forget all.
+
+        A check is named ``<lane>.check`` and the recovery retry ``sync_run_recovery``.
+        """
         tasks: dict[str, asyncio.Task[Any]] = dict(self.passes)
         tasks.update({f"{lane}.check": check for lane, check in self.checks.items()})
+        if self.recovering is not None:
+            tasks[_RECOVERY] = self.recovering
         self.passes.clear()
         self.checks.clear()
         self.watched.clear()
         self.rerun.clear()
+        self.recovering = None
         return tasks
+
+
+async def _database_reachable() -> bool:
+    """Probe the database once within :data:`FENCE_PROBE_TIMEOUT`; the scheduler's default probe.
+
+    One ``SELECT 1`` on a fresh connection outside the pool (``db.session.ping_database``).
+    Only silence means the database did not answer this process:
+
+    * the probe's deadline expiring (:class:`TimeoutError`, which also ends a query psycopg
+      had to cancel in flight), or
+    * libpq's own ``connect_timeout`` expiring first: psycopg's
+      :class:`~psycopg.errors.ConnectionTimeout`, as the ``orig`` of SQLAlchemy's
+      :class:`~sqlalchemy.exc.DBAPIError`.
+
+    Every other outcome is an answer, and reads as reachable, the side that aborts: success,
+    and every error a server or the network returned, such as failed authentication, too
+    many clients, a refused or reset connection, or any other
+    :class:`~sqlalchemy.exc.SQLAlchemyError` or :class:`OSError`. Whatever answered this
+    process may answer another worker too, which can then take the lock. Such an error is
+    logged as ``scheduler.fence_probe_failed`` (warning) with its class name only, because its
+    text can carry the URL. Any other exception propagates, and :func:`_stop` reads it as
+    reachable as well.
+
+    Returns:
+        ``False`` when the database stayed silent; ``True`` when anything answered.
+    """
+    try:
+        async with asyncio.timeout(FENCE_PROBE_TIMEOUT.total_seconds()):
+            await ping_database()
+    except TimeoutError:
+        return False
+    except (SQLAlchemyError, OSError) as exc:
+        if isinstance(exc, DBAPIError) and isinstance(exc.orig, ConnectionTimeout):
+            return False
+        _log.warning("scheduler.fence_probe_failed", error=type(exc).__name__)
+    return True
+
+
+async def _probe_once(reachable: Callable[[], Awaitable[bool]]) -> bool:
+    """Await one reachability probe; a task needs a coroutine, and ``reachable`` returns any."""
+    return bool(await reachable())
 
 
 def _flush_streams() -> None:
@@ -858,33 +1109,55 @@ async def _stop(
     reason: str,
     event: str = _LANES_CANCELLED,
     abort: Callable[[int], NoReturn] | None = None,
+    reachable: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Cancel every task of ``tasks`` and wait until each has ended; ``tasks`` is emptied.
 
     Without ``abort`` (SIGTERM or a defect: the lock is still held until every task has
-    ended) the wait is unbounded, so nothing outlives this call and no cancelled work can
-    write after the lock connection is released. With ``abort`` (a lost lock: another worker
-    may take over) cancelled work could still write while it unwinds, so the wait is bounded
-    by :data:`LOCK_LOST_STOP_TIMEOUT`: a task still running then is logged as
-    ``scheduler.fence_stop_timeout`` (critical, with the task names), stdout and stderr are
-    flushed and ``abort(1)`` ends the process before the next holder's
-    :data:`LOCK_TAKEOVER_GRACE` has passed. The container restarts the worker, exactly as
-    after a defect, and a dataset left ``building`` is discarded by ``sync/mode.py``'s
-    abandoned-build sweep.
+    ended) the tasks are cancelled plainly and the wait is unbounded, so nothing outlives
+    this call and no cancelled work can write after the lock connection is released. With
+    ``abort`` (a lost lock: another worker may take over) the tasks are cancelled with the
+    message ``jobs.CANCEL_LOCK_LOST``, and cancelled work could still write while it
+    unwinds, so the wait is fenced:
 
-    A cancellation of the caller while it waits is held back until the wait ends and is then
-    re-raised, as :class:`asyncio.TaskGroup` does. Every ended task's outcome is retrieved:
-    an exception other than the cancellation (a task that was already done with a defect, or
-    one raised while unwinding) is logged as ``scheduler.lane_failed``. The tasks actually
-    cancelled are logged as ``event`` with their names and ``reason``.
+    1. Wait at most :data:`LOCK_LOST_STOP_TIMEOUT` for every task to end.
+    2. A task still running then gets one probe through ``reachable`` (run as a task of its
+       own; an error it raises reads as reachable). When the database answers, or no
+       ``reachable`` is given, go to step 4. The scheduler gives ``reachable`` only when the
+       lock check that lost the lock went silent (:meth:`Scheduler._fence_probe`): a check
+       that got an answer, an error included, proves the server answers this process and
+       may already have given the lock to another worker, so its stuck task goes straight
+       to step 4.
+    3. The database does not answer: nothing the tasks do can land, and no other worker can
+       take the lock before it answers again. ``scheduler.fence_wait_unreachable`` is logged
+       (error level, the task names, ``reason`` and the probe's timeout and interval) and the
+       wait goes on, probing again every :data:`FENCE_PROBE_INTERVAL`; the moment every task
+       has ended, this call returns normally. A probe answered while a task still runs is
+       logged as ``scheduler.fence_wait_reachable`` (warning) and leaves the tasks
+       :data:`LOCK_LOST_STOP_TIMEOUT` more.
+    4. A task still running is logged as ``scheduler.fence_stop_timeout`` (critical, with the
+       task names), stdout and stderr are flushed and ``abort(1)`` ends the process before
+       the next holder's :data:`LOCK_TAKEOVER_GRACE` has passed. The container restarts the
+       worker, exactly as after a defect, and a dataset left ``building`` is discarded by
+       ``sync/mode.py``'s abandoned-build sweep.
+
+    A cancellation of the caller while it waits, a probe included, is held back until the
+    wait ends and is then re-raised, as :class:`asyncio.TaskGroup` does. Every ended task's
+    outcome is retrieved: an exception other than the cancellation (a task that was already
+    done with a defect, or one raised while unwinding) is logged as ``scheduler.lane_failed``.
+    The tasks actually cancelled are logged as ``event`` with their names and ``reason``.
 
     Args:
-        tasks: The running tasks by name (a lane, ``<lane>.check``, ``on_start`` or
-            ``lock_lost_requeue``).
+        tasks: The running tasks by name (a lane, ``<lane>.check``, ``sync_run_recovery``,
+            ``on_start`` or ``lock_lost_requeue``).
         reason: Why they stop: ``lock_lost``, ``cancelled`` or ``defect``.
         event: The log event naming the cancelled tasks.
         abort: Ends the process with the given exit code; given only when the lock was
-            lost, which bounds the wait.
+            lost, which fences the wait.
+        reachable: Probes whether the database answers, ``False`` only when it stays
+            silent; used only with ``abort``, and given only after a lock check that went
+            silent. ``None`` bounds the wait at :data:`LOCK_LOST_STOP_TIMEOUT` without a
+            probe.
 
     Raises:
         asyncio.CancelledError: When the caller was cancelled while waiting, once the wait
@@ -894,18 +1167,77 @@ async def _stop(
     tasks.clear()
     cancelled = [name for name, task in stopping.items() if not task.done()]
     for name in cancelled:
-        stopping[name].cancel()
+        if abort is None:
+            stopping[name].cancel()
+        else:
+            stopping[name].cancel(msg=jobs.CANCEL_LOCK_LOST)
     loop = asyncio.get_running_loop()
-    deadline = None if abort is None else loop.time() + LOCK_LOST_STOP_TIMEOUT.total_seconds()
+    everything = tuple(stopping.values())
     interrupted: asyncio.CancelledError | None = None
-    while pending := [task for task in stopping.values() if not task.done()]:
-        timeout = None if deadline is None else deadline - loop.time()
-        if timeout is not None and timeout <= 0:
-            break
-        try:
-            await asyncio.wait(pending, timeout=timeout)
-        except asyncio.CancelledError as exc:
-            interrupted = exc
+
+    async def settle(waited: tuple[asyncio.Task[Any], ...], deadline: float | None) -> None:
+        """Wait until all of ``waited`` have ended or ``deadline`` passes; hold back a cancel."""
+        nonlocal interrupted
+        while pending := [task for task in waited if not task.done()]:
+            timeout = None if deadline is None else deadline - loop.time()
+            if timeout is not None and timeout <= 0:
+                return
+            try:
+                await asyncio.wait(pending, timeout=timeout)
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+
+    async def answered(probe_with: Callable[[], Awaitable[bool]]) -> bool:
+        """Probe once in a task of its own; a probe that fails or is cancelled reads as reachable.
+
+        Failing toward "reachable" keeps the fence: the tasks are then waited for only
+        :data:`LOCK_LOST_STOP_TIMEOUT` more before the process aborts. A probe's error is
+        logged as ``scheduler.fence_probe_failed`` with its class name.
+        """
+        probe = asyncio.create_task(_probe_once(probe_with), name="scheduler.fence_probe")
+        await settle((probe,), None)
+        if probe.cancelled():
+            return True
+        error = probe.exception()
+        if error is not None:
+            _log.warning("scheduler.fence_probe_failed", error=type(error).__name__)
+            return True
+        return probe.result()
+
+    def running() -> list[str]:
+        """The names of the tasks still running."""
+        return [name for name, task in stopping.items() if not task.done()]
+
+    stop_s = LOCK_LOST_STOP_TIMEOUT.total_seconds()
+    if abort is None:
+        await settle(everything, None)
+    else:
+        await settle(everything, loop.time() + stop_s)
+        # A probe takes up to FENCE_PROBE_TIMEOUT (more when psycopg cancels it mid-query), so
+        # the tasks may end while it runs; only tasks still running after it are reported.
+        if reachable is not None and running() and not await answered(reachable) and running():
+            silent_since = loop.time()
+            _log.error(
+                "scheduler.fence_wait_unreachable",
+                lanes=running(),
+                reason=reason,
+                probe_timeout_s=FENCE_PROBE_TIMEOUT.total_seconds(),
+                probe_interval_s=FENCE_PROBE_INTERVAL.total_seconds(),
+            )
+            while running():
+                await settle(everything, loop.time() + FENCE_PROBE_INTERVAL.total_seconds())
+                if not running() or not await answered(reachable):
+                    continue
+                if stuck_now := running():
+                    _log.warning(
+                        "scheduler.fence_wait_reachable",
+                        lanes=stuck_now,
+                        reason=reason,
+                        unreachable_s=round(loop.time() - silent_since, 3),
+                        timeout_s=stop_s,
+                    )
+                    await settle(everything, loop.time() + stop_s)
+                break
     for name, task in stopping.items():
         if not task.done() or task.cancelled():
             continue
@@ -928,6 +1260,540 @@ async def _stop(
         abort(1)
     if interrupted is not None:
         raise interrupted
+
+
+# ---------------------------------------------------------------------------------------------
+# Orphaned sync_run recovery
+# ---------------------------------------------------------------------------------------------
+
+
+class SyncWriterLockLostError(Exception):
+    """A :func:`sync_writer` block was stopped because its lock session was no longer alive.
+
+    Raised by :func:`sync_writer` once the block has ended with the cancellation its
+    supervisor caused (``jobs.CANCEL_WRITER_LOCK_LOST``). Each cancelled job closed its own
+    still-open ``sync_run`` rows as failed (``job cancelled``) within its bound, and the
+    worker's recovery of orphaned ``sync_run`` rows records any row still ``running`` as
+    interrupted. The message is fixed: it names no connection detail, credential or URL.
+    """
+
+    def __init__(self) -> None:
+        """Carry the fixed message."""
+        super().__init__(
+            "the sync-writer lock session was lost, so the jobs were stopped before they finished"
+        )
+
+
+class _WriterFence:
+    """The supervisor of one :func:`sync_writer` block: proves its lock alive, stops it if not.
+
+    Attributes:
+        lost: Whether a lock check failed or timed out, so the block's task was cancelled with
+            ``jobs.CANCEL_WRITER_LOCK_LOST``.
+    """
+
+    __slots__ = ("_abort", "_conn", "_ended", "_supervisor", "_task", "lost")
+
+    def __init__(
+        self, conn: AsyncConnection, task: asyncio.Task[Any], abort: Callable[[int], NoReturn]
+    ) -> None:
+        """Watch the lock held on ``conn`` for the block running in ``task``; nothing starts yet."""
+        self._conn = conn
+        self._task = task
+        self._abort = abort
+        self._supervisor: asyncio.Task[None] | None = None
+        # Set once the block has ended: from then on the supervisor never cancels the task.
+        self._ended = False
+        self.lost = False
+
+    def start(self) -> None:
+        """Start the supervisor task (:meth:`_watch`)."""
+        self._supervisor = asyncio.create_task(self._watch(), name="sync_writer.supervisor")
+
+    def release(self, cancelling: int) -> bool:
+        """Stop supervising as the block ends; withdraw the cancellation the supervisor requested.
+
+        Called synchronously the moment the block has ended, before anything else can run,
+        so the supervisor never cancels the task once the block is over. When it had
+        cancelled the block, that one request is withdrawn (``Task.uncancel()``, as
+        :func:`asyncio.timeout` does), so the task's cancellation count is as it was.
+
+        Args:
+            cancelling: The task's ``cancelling()`` count when the block was entered.
+
+        Returns:
+            Whether the supervisor cancelled the block and no other cancellation is pending,
+            so a ``CancelledError`` the block ended with is the supervisor's own.
+        """
+        self._ended = True
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+        return self.lost and self._task.uncancel() <= cancelling
+
+    async def close(self) -> None:
+        """Cancel the supervisor and wait until it has ended; hold back a cancellation meanwhile.
+
+        A cancellation of the caller while it waits is re-raised once the supervisor has ended,
+        as :class:`asyncio.TaskGroup` does, so the lock connection is never used by both.
+
+        Raises:
+            BaseException: What the supervisor ended with other than its cancellation: the
+                exception of an injected ``abort``, or a defect of a lock check.
+            asyncio.CancelledError: When the caller was cancelled while waiting, once the
+                supervisor has ended.
+        """
+        self._ended = True
+        supervisor = self._supervisor
+        if supervisor is None:
+            return
+        supervisor.cancel()
+        interrupted: asyncio.CancelledError | None = None
+        while not supervisor.done():
+            try:
+                await asyncio.wait((supervisor,))
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+        if not supervisor.cancelled():
+            error = supervisor.exception()
+            if error is not None:
+                raise error
+        if interrupted is not None:
+            raise interrupted
+
+    async def _watch(self) -> None:
+        """Prove the lock alive on absolute deadlines; once a check fails, stop the block.
+
+        A check runs every :data:`LOCK_CHECK_INTERVAL` of the event loop's clock
+        (:meth:`_failure`). When one fails or times out, ``sync_writer.lock_lost`` is logged
+        (error level, the error's class name only) and the block's task is cancelled with
+        ``jobs.CANCEL_WRITER_LOCK_LOST``. The block's end cancels this task
+        (:meth:`release`); when it is still running :data:`LOCK_LOST_STOP_TIMEOUT` after the
+        cancellation, cancelled work could still write after the recovery's fence, so
+        ``sync_writer.fence_stop_timeout`` is logged (critical), stdout and stderr are flushed
+        and ``abort(1)`` ends the process. A check that the block's end interrupted (psycopg
+        may turn that cancellation into a database error) ends this task quietly instead.
+        """
+        loop = asyncio.get_running_loop()
+        check_every = LOCK_CHECK_INTERVAL.total_seconds()
+        check_at = loop.time() + check_every
+        while True:
+            await asyncio.sleep(max(check_at - loop.time(), 0.0))
+            error = await self._failure()
+            if self._ended:
+                return
+            if error is not None:
+                break
+            check_at = _next_deadline(check_at, check_every, loop.time())
+        _log.error(
+            "sync_writer.lock_lost", error=error, timeout_s=LOCK_CHECK_TIMEOUT.total_seconds()
+        )
+        self.lost = True
+        self._task.cancel(msg=jobs.CANCEL_WRITER_LOCK_LOST)
+        stop_s = LOCK_LOST_STOP_TIMEOUT.total_seconds()
+        await asyncio.sleep(stop_s)
+        _log.critical("sync_writer.fence_stop_timeout", reason="lock_lost", timeout_s=stop_s)
+        _flush_streams()
+        self._abort(1)
+
+    async def _failure(self) -> str | None:
+        """Prove the lock session alive: ``SELECT 1`` on its connection within the check timeout.
+
+        A session-level lock lives exactly as long as its session.
+
+        Returns:
+            ``None`` when the session answered in time; otherwise the class name of what
+            ended the check: ``TimeoutError`` after :data:`LOCK_CHECK_TIMEOUT`, or the
+            database or socket error.
+        """
+        try:
+            async with asyncio.timeout(LOCK_CHECK_TIMEOUT.total_seconds()):
+                await self._conn.execute(_ALIVE)
+        except (TimeoutError, SQLAlchemyError, OSError) as exc:
+            return type(exc).__name__
+        return None
+
+
+@asynccontextmanager
+async def sync_writer(*, abort: Callable[[int], NoReturn] | None = None) -> AsyncIterator[None]:
+    """Hold the sync-writer lock shared for the block, fenced: run sync jobs outside the worker.
+
+    ``ads-engine sync`` and ``ads-engine seed-simulated`` wrap their jobs in it. It checks
+    out a dedicated connection (``db.session.dedicated_connection``) and takes
+    ``pg_advisory_lock_shared(SYNC_WRITER_LOCK_KEY)`` on it, so any number of writers run at
+    once while the scheduler's recovery of orphaned ``sync_run`` rows, which takes the key
+    exclusively, defers until every one has finished and never records a live writer's rows
+    as interrupted. The wait for the lock is at most the recovery's own short transaction.
+
+    The lock is only as alive as its session, so while the block runs a supervisor task
+    proves it, as the scheduler proves its own lock: ``SELECT 1`` on the lock connection
+    every :data:`LOCK_CHECK_INTERVAL`, within :data:`LOCK_CHECK_TIMEOUT`. When a check fails
+    or times out (``sync_writer.lock_lost``), the block's task is cancelled with
+    ``jobs.CANCEL_WRITER_LOCK_LOST`` (each cancelled job logs ``sync.job.cancelled`` at error
+    level and closes its rows), and a block still running :data:`LOCK_LOST_STOP_TIMEOUT`
+    later aborts the process (``sync_writer.fence_stop_timeout``, exit code 1). The writer
+    has thus stopped within the three of them after its session died, which is shorter
+    than the recovery's :data:`SYNC_WRITER_FENCE`, so the recovery never records rows that
+    are still being written. The cancellation is withdrawn from the task's count
+    (``Task.uncancel()``) once the block has ended, as :func:`asyncio.timeout` does.
+
+    The supervisor is stopped and awaited on every way out, before the connection's exit
+    runs ``pg_advisory_unlock_all()`` (or discards a broken connection). A process that is
+    killed releases the lock with its database session; the rows it left ``running`` are
+    then recorded as interrupted by the worker at its next scheduler-lock acquisition.
+
+    Example::
+
+        async with sync_writer():
+            report = await run_source_jobs(source, trigger="manual")
+
+    Args:
+        abort: Ends the process with the given exit code; :func:`os._exit` when omitted.
+            Called with ``1`` only when the block is still running
+            :data:`LOCK_LOST_STOP_TIMEOUT` after the lost lock cancelled it. Tests inject one
+            that records the code and raises.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When the database cannot be reached or the lock
+            statement fails; the block does not run.
+        SyncWriterLockLostError: When the block ended with the cancellation the lost lock
+            caused.
+        asyncio.CancelledError: When the task was cancelled from outside, unchanged, even
+            when the lock was lost meanwhile.
+        BaseException: What an injected ``abort`` raised, once the block has ended.
+    """
+    task = asyncio.current_task()
+    if task is None:  # pragma: no cover - an async context manager always runs in a task
+        raise RuntimeError("sync_writer() must be entered inside an asyncio task")
+    async with dedicated_connection() as conn:
+        await conn.execute(_WRITER_SHARED_LOCK, {"key": SYNC_WRITER_LOCK_KEY})
+        fence = _WriterFence(conn, task, abort if abort is not None else os._exit)
+        cancelling = task.cancelling()
+        fence.start()
+        try:
+            yield
+        except asyncio.CancelledError as exc:
+            if fence.release(cancelling):
+                raise SyncWriterLockLostError from exc
+            raise
+        except BaseException:
+            fence.release(cancelling)
+            raise
+        else:
+            fence.release(cancelling)
+        finally:
+            await fence.close()
+
+
+async def _take_writer_lock(
+    session: AsyncSession, transaction: AsyncSessionTransaction, candidates: tuple[int, ...]
+) -> bool:
+    """Take :data:`SYNC_WRITER_LOCK_KEY` exclusively for ``transaction``, without waiting.
+
+    When a writer outside the worker (:func:`sync_writer`) holds the key shared, the
+    transaction is rolled back and ``scheduler.sync_run_recovery_deferred`` is logged (info,
+    with the candidate count).
+
+    Args:
+        session: The recovery's session.
+        transaction: Its open transaction, which holds the key until it ends.
+        candidates: The ``sync_run`` ids the recovery is to sweep; only counted.
+
+    Returns:
+        Whether the key is held, so no sync writer runs until the transaction ends.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When the statement fails.
+    """
+    free = bool(await session.scalar(_TRY_WRITER_XACT_LOCK, {"key": SYNC_WRITER_LOCK_KEY}))
+    if not free:
+        await transaction.rollback()
+        _log.info(
+            "scheduler.sync_run_recovery_deferred",
+            candidates=len(candidates),
+            reason="a sync writer outside the worker is running",
+        )
+    return free
+
+
+@dataclass(frozen=True, slots=True)
+class _Claimed:
+    """A claimed ``sync_request`` row, as the orphaned-run sweep correlates it.
+
+    Attributes:
+        id: The request's id.
+        source: Its source.
+        requested_at: When it was requested.
+        picked_at: The instant of the lane pass that claimed it.
+    """
+
+    id: int
+    source: Source
+    requested_at: datetime
+    picked_at: datetime
+
+    @property
+    def serve_order(self) -> tuple[datetime, int]:
+        """Where its pass serves it among the requests claimed with it (``requested_at``, id)."""
+        return self.requested_at, self.id
+
+
+@dataclass(frozen=True, slots=True)
+class _Belonging:
+    """A swept ``sync_run`` row that is a job of a claimed request's manual run.
+
+    Attributes:
+        source: The row's source.
+        job: The row's job.
+        started_at: The row's ``started_at``.
+        owner: The request whose manual run the job is.
+        claim: Every request its lane pass claimed with the owner, in serve order.
+    """
+
+    source: str
+    job: str
+    started_at: datetime
+    owner: _Claimed
+    claim: tuple[_Claimed, ...]
+
+
+def _in_manual_run(request_source: Source, source: str, job: str) -> bool:
+    """Whether (``source``, ``job``) is a job of a "Sync now" run of ``request_source``.
+
+    That run runs the source's :data:`jobs.SOURCE_JOBS`; a LinkedIn run also syncs its
+    companion CRM dataset after its leads while LinkedIn is simulated, recorded as HubSpot
+    rows of job :data:`jobs.JOB_CRM_COMPANION`.
+    """
+    if source == request_source:
+        return job in jobs.SOURCE_JOBS.get(request_source, ())
+    return (
+        request_source == SOURCE_LINKEDIN
+        and source == SOURCE_HUBSPOT
+        and job == jobs.JOB_CRM_COMPANION
+    )
+
+
+async def _lane_claims(
+    session: AsyncSession, lane_sources: tuple[Source, ...], started: Sequence[datetime]
+) -> list[_Claimed]:
+    """Read the claimed requests of one lane that swept rows started at ``started`` may own.
+
+    One read: the requests of ``lane_sources`` picked from the latest claim at or before
+    the earliest of ``started`` up to the latest of ``started``. An older claim is never the
+    latest one at or before any of them, and a later one claimed none of their runs.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When the read fails.
+    """
+    earliest, latest = min(started), max(started)
+    in_lane = SyncRequest.source.in_(sorted(lane_sources))
+    floor = (
+        select(func.max(SyncRequest.picked_at))
+        .where(in_lane, SyncRequest.picked_at <= earliest)
+        .scalar_subquery()
+    )
+    rows = (
+        await session.execute(
+            select(
+                SyncRequest.id, SyncRequest.source, SyncRequest.requested_at, SyncRequest.picked_at
+            ).where(
+                in_lane,
+                SyncRequest.picked_at.is_not(None),
+                SyncRequest.picked_at <= latest,
+                SyncRequest.picked_at >= func.coalesce(floor, earliest),
+            )
+        )
+    ).all()
+    claims: list[_Claimed] = []
+    for request_id, value, requested_at, picked_at in rows:
+        source = _as_source(str(value))
+        if source is None or picked_at is None:  # pragma: no cover - CHECK and WHERE above
+            continue
+        claims.append(_Claimed(int(request_id), source, requested_at, picked_at))
+    return claims
+
+
+async def _runs_since_claims(
+    session: AsyncSession, belonging: Sequence[_Belonging]
+) -> dict[tuple[str, str], list[datetime]]:
+    """Read the ``started_at`` of every run of the rows' (source, job) since their claims.
+
+    One read, from the earliest owner's ``picked_at`` up to (not including) the latest row's
+    ``started_at``, of the rows' sources and jobs; the swept rows themselves are included.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When the read fails.
+    """
+    rows = (
+        await session.execute(
+            select(SyncRun.source, SyncRun.job, SyncRun.started_at).where(
+                SyncRun.source.in_(sorted({row.source for row in belonging})),
+                SyncRun.job.in_(sorted({row.job for row in belonging})),
+                SyncRun.started_at >= min(row.owner.picked_at for row in belonging),
+                SyncRun.started_at < max(row.started_at for row in belonging),
+            )
+        )
+    ).all()
+    history: dict[tuple[str, str], list[datetime]] = {}
+    for source, job, started in rows:
+        history.setdefault((str(source), str(job)), []).append(started)
+    return history
+
+
+async def _requeue_interrupted(
+    session: AsyncSession, swept: Sequence[tuple[int, str, str, datetime]]
+) -> tuple[list[tuple[int, Source]], list[int]]:
+    """Put the "Sync now" requests whose manual run the swept rows belong to back in the queue.
+
+    A source lane claims its pending requests with ``picked_at`` set to its pass's instant,
+    then runs each claimed source's manual jobs in serve order (``requested_at``, then id).
+    Each job stamps its rows' ``started_at`` with its own start on the controller clock, so
+    a row starts after its claim, not at it, and ``picked_at == started_at`` matches nothing.
+    A swept row (source ``s``, job ``j``, ``started_at`` ``t``) belongs instead to a request
+    ``Q`` of its claim, the latest ``picked_at`` at or before ``t`` among the requests of
+    ``s``'s lane (:data:`_LANE_SOURCES_OF`), only when both hold:
+
+    a. (``s``, ``j``) is a job of ``Q.source``'s manual run (:func:`_in_manual_run`): one of
+       its :data:`jobs.SOURCE_JOBS`, or for LinkedIn HubSpot's ``crm_companion``. ``probe``
+       and ``purge`` rows, HubSpot's ``crm`` after a LinkedIn claim and LinkedIn's rows
+       after a HubSpot claim belong to no request.
+    b. The row is the first run of (``s``, ``j``) since the claim: no other row of that
+       source and job started at or after ``Q.picked_at`` and before ``t``. A job's rows
+       (one per dataset) share one ``started_at``, so they are one run, and a later
+       scheduled run of a job the request already ran is not taken for the request.
+
+    The ``linkedin_hubspot`` lane claims HubSpot and LinkedIn together, at one
+    ``picked_at``; of a claim's requests the one (a) holds for is ``Q``, the greatest id
+    should several. Each ``Q`` is made pending again once (``picked_at`` cleared), together
+    with the requests of its claim served after it, which the dead pass never reached. Each
+    update runs in a savepoint of the caller's transaction and only while the request still
+    carries that ``picked_at``: a source that already has a pending request (at most one may
+    exist, ``uq_sync_request_pending``) keeps that one, and this one stays picked.
+
+    Delivery is at least once. A manual run that ended early (an ``AccessDenied`` stops the
+    source's remaining jobs) leaves the jobs it never reached with no run since the claim,
+    so when a later run of one of them is interrupted, the request is queued once more. A
+    pass that died before any job of a claimed source opened a row leaves nothing to match;
+    only a lock loss inside a surviving process re-queues that (:func:`_requeue_claims`).
+    The reads are one per lane, of the requests :func:`_lane_claims` selects, and one of the
+    job history since the earliest claim matched (:func:`_runs_since_claims`).
+
+    Args:
+        session: The recovery's transaction.
+        swept: The rows just recorded as interrupted: (id, source, job, started_at).
+
+    Returns:
+        The requests made pending again as (id, source), and the ids of those left picked
+        because their source already had a pending request.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When a read or an update fails other than on the
+            pending-request constraint.
+    """
+    by_lane: dict[tuple[Source, ...], list[tuple[str, str, datetime]]] = {}
+    for _, value, job, started in swept:
+        lane_sources = _LANE_SOURCES_OF.get(str(value))
+        if lane_sources is not None:
+            by_lane.setdefault(lane_sources, []).append((str(value), str(job), started))
+    belonging: list[_Belonging] = []
+    for lane_sources, rows in by_lane.items():
+        claims = await _lane_claims(session, lane_sources, [started for _, _, started in rows])
+        for source, job, started in rows:
+            eligible = [claimed for claimed in claims if claimed.picked_at <= started]
+            if not eligible:
+                continue
+            claim_at = max(claimed.picked_at for claimed in eligible)
+            claim = tuple(
+                sorted(
+                    (claimed for claimed in eligible if claimed.picked_at == claim_at),
+                    key=lambda claimed: claimed.serve_order,
+                )
+            )
+            owners = [claimed for claimed in claim if _in_manual_run(claimed.source, source, job)]
+            if owners:
+                owner = max(owners, key=lambda claimed: claimed.id)
+                belonging.append(_Belonging(source, job, started, owner, claim))
+    due: dict[int, _Claimed] = {}
+    if belonging:
+        history = await _runs_since_claims(session, belonging)
+        for row in belonging:
+            runs = history.get((row.source, row.job), ())
+            if any(row.owner.picked_at <= other < row.started_at for other in runs):
+                continue  # Not the job's first run since the claim: (b) fails.
+            due.setdefault(row.owner.id, row.owner)
+            for mate in row.claim:
+                if mate.serve_order > row.owner.serve_order:
+                    due.setdefault(mate.id, mate)
+    requeued: list[tuple[int, Source]] = []
+    kept: list[int] = []
+    for claimed in sorted(due.values(), key=lambda item: (item.picked_at, *item.serve_order)):
+        try:
+            async with session.begin_nested():
+                matched = (
+                    await session.execute(
+                        update(SyncRequest)
+                        .where(
+                            SyncRequest.id == claimed.id,
+                            SyncRequest.picked_at == claimed.picked_at,
+                        )
+                        .values(picked_at=None)
+                        .returning(SyncRequest.id)
+                        .execution_options(synchronize_session=False)
+                    )
+                ).scalar_one_or_none()
+        except IntegrityError:
+            kept.append(claimed.id)
+            continue
+        if matched is not None:
+            requeued.append((claimed.id, claimed.source))
+    return requeued, kept
+
+
+async def _requeue_claims(
+    session: AsyncSession, claims: Mapping[int, tuple[Source, datetime]]
+) -> tuple[list[tuple[int, Source]], list[int]]:
+    """Put the "Sync now" requests a lost lock cancelled mid-serve back in the queue.
+
+    ``claims`` are the requests this process claimed and had not finished serving when its
+    passes were cancelled (``Scheduler._claims_in_flight``). Each is made pending again
+    (``picked_at`` cleared) in a savepoint of the caller's transaction, in id order, only
+    while its row still carries the ``picked_at`` it was claimed with: a request the
+    orphaned-run sweep (:func:`_requeue_interrupted`) already re-queued, and a claim whose
+    commit never landed, no longer match and are left alone. A source that already has a
+    pending request (at most one may exist, ``uq_sync_request_pending``) keeps that one,
+    which serves it, and this one stays picked.
+
+    Args:
+        session: The lock-loss requeue's transaction.
+        claims: The in-flight claims by request id: (source, ``picked_at``).
+
+    Returns:
+        The requests made pending again as (id, source), and the ids of those left picked
+        because their source already had a pending request.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When an update fails other than on the
+            pending-request constraint.
+    """
+    requeued: list[tuple[int, Source]] = []
+    kept: list[int] = []
+    for request_id, (source, picked_at) in sorted(claims.items()):
+        try:
+            async with session.begin_nested():
+                matched = (
+                    await session.execute(
+                        update(SyncRequest)
+                        .where(SyncRequest.id == request_id, SyncRequest.picked_at == picked_at)
+                        .values(picked_at=None)
+                        .returning(SyncRequest.id)
+                        .execution_options(synchronize_session=False)
+                    )
+                ).scalar_one_or_none()
+        except IntegrityError:
+            kept.append(request_id)
+            continue
+        if matched is not None:
+            requeued.append((request_id, source))
+    return requeued, kept
 
 
 # ---------------------------------------------------------------------------------------------
@@ -954,10 +1820,13 @@ class Scheduler:
     __slots__ = (
         "_abort",
         "_budget",
+        "_claims_in_flight",
         "_clock",
         "_controller",
         "_datasets",
+        "_lock_check_silent",
         "_monotonic",
+        "_reachable",
         "_settings",
         "_sleep",
         "_tz",
@@ -974,6 +1843,7 @@ class Scheduler:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         monotonic: Callable[[], float] | None = None,
         abort: Callable[[int], NoReturn] | None = None,
+        reachable: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         """Configure the scheduler; nothing is read, locked or sent until it runs.
 
@@ -990,7 +1860,8 @@ class Scheduler:
                 omitted.
             sleep: Awaits the given number of seconds; :func:`asyncio.sleep` when omitted.
                 It times the standby retries, the takeover grace, the waits until the next
-                lock-check or wake deadline, and the analysis lane's coalescing wait.
+                lock-check or wake deadline, the analysis lane's coalescing wait, and the
+                orphaned-run recovery's :data:`SYNC_WRITER_FENCE`.
             monotonic: Returns seconds on a monotonic clock; :func:`time.monotonic` when
                 omitted. The wakes and the lock checks fall on absolute deadlines of this
                 clock (the injected ``sleep`` only waits until the next one), so wakes stay
@@ -999,11 +1870,25 @@ class Scheduler:
                 without waiting.
             abort: Ends the process with the given exit code; :func:`os._exit` when
                 omitted. Called with ``1`` only when, after a lost lock, a cancelled task is
-                still running after :data:`LOCK_LOST_STOP_TIMEOUT`: the container restarts
-                the worker, exactly as after a defect, and a dataset build left ``building``
-                is discarded by ``sync/mode.py``'s abandoned-build sweep. Never called on
-                SIGTERM or a defect, where the lock is still held until every task has
-                ended. Tests inject one that records the code and raises.
+                still running after :data:`LOCK_LOST_STOP_TIMEOUT` and either the lock check
+                that lost the lock got an answer (an error) or the database answers
+                (``reachable``): the container restarts the worker, exactly as after a
+                defect, and a dataset build left ``building`` is discarded by
+                ``sync/mode.py``'s abandoned-build sweep. Never called while a lock check
+                that went silent is followed by a database that stays silent (the scheduler
+                waits for the task instead), nor on SIGTERM or a defect, where the lock is
+                still held until every task has ended. Tests inject one that records the
+                code and raises.
+            reachable: Returns whether the database answers this process now; consulted
+                only after a lock check that went silent (no answer within
+                :data:`LOCK_CHECK_TIMEOUT`), once a cancelled task has outlasted
+                :data:`LOCK_LOST_STOP_TIMEOUT`, and then every :data:`FENCE_PROBE_INTERVAL`
+                while it answers ``False``; never after a check that failed with an answer.
+                When omitted, :func:`_database_reachable`: one ``SELECT 1`` on a fresh
+                connection outside the pool, ``False`` only on silence (its
+                :data:`FENCE_PROBE_TIMEOUT` or libpq's connect timeout expiring) and ``True``
+                on every answer, an error included. An error it raises reads as ``True``,
+                the side that aborts. Tests inject one that answers as the test needs.
         """
         resolved = settings
         if resolved is None:
@@ -1031,6 +1916,21 @@ class Scheduler:
             monotonic if monotonic is not None else system_monotonic
         )
         self._abort: Callable[[int], NoReturn] = abort if abort is not None else os._exit
+        self._reachable: Callable[[], Awaitable[bool]] = (
+            reachable if reachable is not None else _database_reachable
+        )
+        # Whether the last lock check went silent rather than failing with an answer; set by
+        # every check (_check_lock), read where a lost lock is fenced (_fence_probe).
+        self._lock_check_silent: bool = False
+        # The "Sync now" requests this process claimed and has not finished serving, by id:
+        # (source, picked_at). Recorded by _claim_sync_requests before its commit, discarded by
+        # _serve_sync_requests once the source's jobs have run (or failed, isolated), and made
+        # pending again by _requeue_after_loss after a re-acquisition, so a pass the lost lock
+        # cancelled never drops its request, even when the cancelled jobs closed their own
+        # sync_run rows and the orphaned-run sweep finds nothing. It lives in memory only: an
+        # orderly stop (SIGTERM) or an aborted process loses it, and then only the sweep
+        # re-queues a request, the one whose rows were left running.
+        self._claims_in_flight: dict[int, tuple[Source, datetime]] = {}
         # Validated by Settings (an IANA zone the tz database loads); slots follow it only.
         self._tz: tzinfo = resolved.display_tz
 
@@ -1069,7 +1969,22 @@ class Scheduler:
            again before any work. This happens after every acquisition: a previous holder
            whose lock session died has by then noticed the loss and cancelled its own work,
            so two workers never run work at the same time.
-        3. Run ``on_start`` (``worker/main.py``'s startup: content assets, the config-change
+        3. Recover orphaned ``sync_run`` rows (:meth:`_recover_orphaned_runs`), under
+           :meth:`_guard`: every row ``running`` now was left by a process that ended (a
+           killed or aborted worker, bookkeeping a cancellation abandoned, a killed CLI) and
+           is recorded ``failed`` as interrupted, and the "Sync now" request whose manual
+           run it belongs to, the latest claim of its lane at or before its ``started_at``
+           when the row is a job of that run and the job's first run since the claim, is
+           made pending again with the requests claimed with it that the dead pass never
+           reached (:func:`_requeue_interrupted`); behind a live ``ads-engine sync`` or
+           ``seed-simulated`` (:func:`sync_writer`) the same rows are retried at the wakes
+           of step 5 instead.
+           With such rows and no writer running, the sweep first waits
+           :data:`SYNC_WRITER_FENCE` (20 s), so a writer whose lock session just died has
+           stopped before anything is recorded; with none, nothing waits. When the lock is
+           lost meanwhile, the recovery is cancelled and awaited and runs again after the
+           next acquisition, before anything else.
+        4. Run ``on_start`` (``worker/main.py``'s startup: content assets, the config-change
            check, source bootstrap and the first default analysis) under :meth:`_guard`,
            which proves the lock alive every :data:`LOCK_CHECK_INTERVAL`. This refines
            "``on_start`` runs once, on the first acquisition": it still completes exactly
@@ -1077,19 +1992,30 @@ class Scheduler:
            but when the lock is lost while it runs it is cancelled and awaited, stays
            pending, and runs again from the start after the next acquisition. It counts as
            done only once it returns normally.
-        4. Supervise the lanes (:meth:`_supervise`): the first wake follows at once, then one
+        5. Supervise the lanes (:meth:`_supervise`): the first wake follows at once, then one
            every :data:`WAKE_INTERVAL` on absolute deadlines, each dispatching every idle
            lane, while the lock is proved alive every :data:`LOCK_CHECK_INTERVAL` and
            immediately before every dispatch, the first one included. When the lock is lost
-           (a failed check, or one taking longer than :data:`LOCK_CHECK_TIMEOUT`), every task
-           is cancelled and awaited (at most :data:`LOCK_LOST_STOP_TIMEOUT`, else the process
-           aborts), the connection is returned (its exit runs ``pg_advisory_unlock_all()``,
-           or discards a broken connection) and the loop goes back to step 1 at once, so no
-           work ever runs without the lock.
-        5. After a re-acquisition once ``on_start`` has completed, one ``analysis_request``
-           with reason ``scheduler_lock_lost`` is queued, under :meth:`_guard` like the
-           startup, before the lanes start again, so the work the loss cancelled (an
-           analysis run, a sync's completion request) is followed by a default run.
+           (a check that failed with an answer, or one that went silent for longer than
+           :data:`LOCK_CHECK_TIMEOUT`; against a server that stopped answering, the check
+           returns only after psycopg's own cancellation, about 10 s more), every task is
+           cancelled and awaited at most :data:`LOCK_LOST_STOP_TIMEOUT`, else the process
+           aborts. Only after a check that went silent, and only while a probe finds the
+           database silent too, is a task awaited until it has ended (:func:`_stop`).
+           The connection is then returned (its exit runs ``pg_advisory_unlock_all()``, or
+           discards a broken connection) and the loop goes back to step 1 at once, so no
+           work ever runs without the lock and a database outage never ends the worker.
+        6. After a re-acquisition once ``on_start`` has completed, the lock-loss requeue
+           (:meth:`_requeue_after_loss`) runs instead of step 4, after step 3 and under
+           :meth:`_guard` like the startup, before the lanes start again: every "Sync now"
+           request a cancelled pass had claimed and not finished serving is made pending
+           again, so its lane serves it at the next wake even when the cancelled jobs closed
+           their own ``sync_run`` rows, and one ``analysis_request`` with reason
+           ``scheduler_lock_lost`` is queued, so the work the loss cancelled (an analysis
+           run, a sync's completion request) is followed by a default run. The claims are
+           recorded in memory only: an orderly stop (SIGTERM) or an aborted process loses
+           the record, and step 3 still re-queues a request whose rows were left
+           ``running``.
 
         A database error while connecting or taking the lock is logged as
         ``scheduler.lock_unavailable`` and retried after :data:`STANDBY_RETRY`, so a
@@ -1122,21 +2048,28 @@ class Scheduler:
                     )
                 else:
                     if await self._fence(conn):
-                        if started:
+                        orphans: list[int] = []
+                        ready = await self._guard(
+                            conn,
+                            partial(self._recover_orphaned_runs, orphans),
+                            name=_RECOVERY,
+                            event=_RECOVERY_CANCELLED,
+                        )
+                        if ready and started:
                             ready = await self._guard(
                                 conn,
                                 self._requeue_after_loss,
                                 name="lock_lost_requeue",
                                 event=_REQUEUE_CANCELLED,
                             )
-                        else:
+                        elif ready:
                             ready = start is None or await self._guard(
                                 conn, start, name="on_start", event=_START_CANCELLED
                             )
                             if ready:
                                 start, started = None, True
                         if ready:
-                            await self._supervise(conn)
+                            await self._supervise(conn, tuple(orphans))
                     # The lock was lost: reconnect at once rather than after a pause.
                     continue
             await self._sleep(STANDBY_RETRY.total_seconds())
@@ -1182,17 +2115,22 @@ class Scheduler:
     ) -> bool:
         """Run ``work`` as a task while proving the lock on ``conn`` alive throughout.
 
-        The guard of the work :meth:`run_forever` runs outside the lanes: ``on_start`` and
-        the lock-loss requeue (:meth:`_requeue_after_loss`), so neither can keep writing
+        The guard of the work :meth:`run_forever` runs outside the lanes: the orphaned
+        ``sync_run`` recovery (:meth:`_recover_orphaned_runs`), ``on_start`` and the
+        lock-loss requeue (:meth:`_requeue_after_loss`), so none of them can keep writing
         unmonitored after the lock session died. The lock is proved (:meth:`_check_lock`)
         on absolute deadlines every :data:`LOCK_CHECK_INTERVAL` of the monotonic clock, and
         the wait ends as soon as ``work`` does, so what follows it (the first wake) starts
-        at once.
+        at once. When a check finds the lock lost, ``work`` is cancelled and awaited the way
+        :func:`_stop` fences a lost lock: at most :data:`LOCK_LOST_STOP_TIMEOUT` before the
+        process aborts, with the database probed (:meth:`_fence_probe`) only when that check
+        went silent.
 
         Args:
             conn: The lock connection.
             work: Returns the awaitable to run.
-            name: The task's name in logs, ``on_start`` or ``lock_lost_requeue``.
+            name: The task's name in logs, ``sync_run_recovery``, ``on_start`` or
+                ``lock_lost_requeue``.
             event: The log event naming the task when it is cancelled.
 
         Returns:
@@ -1224,7 +2162,13 @@ class Scheduler:
                         sleeper.result()  # An error of the injected sleep propagates.
                     continue
                 if not await self._check_lock(conn):
-                    await _stop(tracked, reason="lock_lost", event=event, abort=self._abort)
+                    await _stop(
+                        tracked,
+                        reason="lock_lost",
+                        event=event,
+                        abort=self._abort,
+                        reachable=self._fence_probe(),
+                    )
                     return False
                 check_at = _next_deadline(check_at, check_every, self._monotonic())
         finally:
@@ -1233,8 +2177,13 @@ class Scheduler:
         task.result()
         return True
 
-    async def _supervise(self, conn: AsyncConnection) -> None:
+    async def _supervise(self, conn: AsyncConnection, orphans: tuple[int, ...] = ()) -> None:
         """Run the lanes while the lock on ``conn`` holds; return once it is lost.
+
+        ``orphans`` are the ``sync_run`` ids this acquisition's recovery found ``running`` but
+        could not sweep yet (:meth:`_recover_orphaned_runs`): every wake while they are
+        pending dispatches one recovery retry (:meth:`_retry_recovery`) as a task, like a
+        lane, at most one at a time, until it has swept them.
 
         Wakes and lock checks fall on absolute deadlines of the monotonic clock: the first
         wake at once, then one every :data:`WAKE_INTERVAL` from it, and a lock check
@@ -1249,13 +2198,16 @@ class Scheduler:
         (``scheduler.lane_rerun``) the moment its pass ends, without waiting for the next
         wake.
 
-        Every task (lane passes and trigger checks) ends before this method does, whatever
-        ends it, so no cancelled work can write once the lock connection is released
-        (``scheduler.lanes_cancelled`` names the tasks cancelled and why):
+        Every task (lane passes, trigger checks and a recovery retry) ends before this method
+        does, whatever ends it, so no cancelled work can write once the lock connection is
+        released (``scheduler.lanes_cancelled`` names the tasks cancelled and why):
 
-        * the lock is lost: every task is cancelled and awaited for at most
-          :data:`LOCK_LOST_STOP_TIMEOUT`, then this method returns; a task still unwinding
-          after that aborts the process (``scheduler.fence_stop_timeout``, :func:`_stop`);
+        * the lock is lost: every task is cancelled (with ``jobs.CANCEL_LOCK_LOST``) and
+          awaited for at most :data:`LOCK_LOST_STOP_TIMEOUT`, then this method returns; a task
+          still unwinding after that aborts the process (``scheduler.fence_stop_timeout``,
+          :func:`_stop`), unless the check that lost the lock went silent and a probe finds
+          the database silent too (:meth:`_fence_probe`), when it is awaited until it ends
+          (``scheduler.fence_wait_unreachable``);
         * the scheduler is cancelled (SIGTERM): every task is cancelled and awaited however
           long it takes (the lock is still held), then the cancellation propagates;
         * a pass or check ends with a defect (an exception its steps do not isolate): the
@@ -1266,7 +2218,7 @@ class Scheduler:
             asyncio.CancelledError: When the scheduler is cancelled.
             Exception: The first lane defect.
         """
-        lanes = _Lanes()
+        lanes = _Lanes(orphans)
         reason = "lock_lost"
         lost = False
         check_every = LOCK_CHECK_INTERVAL.total_seconds()
@@ -1305,12 +2257,15 @@ class Scheduler:
                 lanes.take(),
                 reason="lock_lost" if lost else reason,
                 abort=self._abort if lost else None,
+                reachable=self._fence_probe() if lost else None,
             )
 
     def _wake(self, lanes: _Lanes) -> None:
         """Dispatch every idle lane; look into each busy one so its pending work is not missed.
 
-        An idle lane (a lane marked for a rerun included) is dispatched as a task. A busy
+        First, while this acquisition's orphaned ``sync_run`` rows are still to sweep and no
+        retry runs, one recovery retry (:meth:`_retry_recovery`) is dispatched as a task. An
+        idle lane (a lane marked for a rerun included) is dispatched as a task. A busy
         lane is left running (``scheduler.lane_busy``), and unless it is already marked for
         a rerun:
 
@@ -1321,9 +2276,14 @@ class Scheduler:
           is coalesced right after it.
 
         Raises:
-            Exception: The defect of a pass or check that ended since the last look.
+            Exception: The defect of a pass, check or recovery retry that ended since the
+                last look.
         """
         lanes.reap()
+        if lanes.recovery and lanes.recovering is None:
+            lanes.recovering = asyncio.create_task(
+                self._retry_recovery(lanes.recovery), name=f"scheduler.{_RECOVERY}"
+            )
         for lane in _LANES:
             if lane not in lanes.passes:
                 self._dispatch(lanes, lane)
@@ -1385,18 +2345,24 @@ class Scheduler:
             sleeper.result()  # An error of the injected sleep propagates.
 
     async def _check_lock(self, conn: AsyncConnection) -> bool:
-        """Prove the lock session alive within :data:`LOCK_CHECK_TIMEOUT`.
+        """Prove the lock session alive within :data:`LOCK_CHECK_TIMEOUT`; note how it failed.
 
-        A check that does not answer in time counts as a lost lock and is logged as
-        ``scheduler.lock_lost`` too, with ``error`` ``TimeoutError``.
+        A check that does not answer in time went silent: it counts as a lost lock and is
+        logged as ``scheduler.lock_lost`` too, with ``error`` ``TimeoutError`` and ``cause``
+        ``silent``. Every check records whether it went silent, so the fence of a lost lock
+        (:meth:`_fence_probe`) tells a silent check, which an outage of the whole database
+        may explain, from one that failed with an answer (:meth:`_lock_alive`).
         """
+        self._lock_check_silent = False
         try:
             async with asyncio.timeout(LOCK_CHECK_TIMEOUT.total_seconds()):
                 return await self._lock_alive(conn)
         except TimeoutError as exc:
+            self._lock_check_silent = True
             _log.error(
                 "scheduler.lock_lost",
                 error=type(exc).__name__,
+                cause="silent",
                 timeout_s=LOCK_CHECK_TIMEOUT.total_seconds(),
             )
             return False
@@ -1406,35 +2372,224 @@ class Scheduler:
         """Return whether the lock session still exists; a session-level lock lives with it.
 
         A failed check (any :class:`~sqlalchemy.exc.SQLAlchemyError`, the driver's
-        ``DBAPIError`` included) is logged as ``scheduler.lock_lost``.
+        ``DBAPIError`` included: a terminated backend, a connection the server closed, a
+        failed statement) got an answer, and is logged as ``scheduler.lock_lost`` with its
+        class name and ``cause`` ``answered``.
         """
         try:
             await conn.execute(_ALIVE)
         except SQLAlchemyError as exc:
-            _log.error("scheduler.lock_lost", error=type(exc).__name__)
+            _log.error("scheduler.lock_lost", error=type(exc).__name__, cause="answered")
             return False
         return True
 
-    async def _requeue_after_loss(self) -> None:
-        """Queue one default run after a re-acquisition, for the work the lost lock cancelled.
+    def _fence_probe(self) -> Callable[[], Awaitable[bool]] | None:
+        """The probe :func:`_stop` may wait on after the lock check that just failed, or ``None``.
 
-        A lane cancelled by the loss may have been an analysis run, or a sync whose
-        completion request was never written, so a ``scheduler_lock_lost`` request makes a
-        default run follow. It commits in a transaction of its own and runs under
-        :meth:`_guard`, so the lock is proved alive while it waits (a blocked ``INSERT``):
-        when the lock is lost meanwhile, it is cancelled and awaited
-        (``scheduler.lock_lost_requeue_cancelled``) and runs again after the next
-        acquisition, before any lane. A :data:`JOB_FAILURES` error is logged as
-        ``scheduler.lock_lost_requeue_failed``, never raised: the lock check reconnects, and
-        the next sync or activation queues a request of its own.
+        Only a check that went silent (:meth:`_check_lock` timed out) leaves room for a
+        database outage, during which nothing a stuck task does can land and no other worker
+        can take the lock: then the injected or default ``reachable`` probe is returned. A
+        check that failed with an answer proves the server answers this process, and its
+        session may have been ended so another worker can take the lock at once, so no
+        probe is returned and a stuck task is bounded by :data:`LOCK_LOST_STOP_TIMEOUT`
+        alone, before the process aborts.
         """
+        return self._reachable if self._lock_check_silent else None
+
+    async def _requeue_after_loss(self) -> None:
+        """Requeue the work the lost lock cancelled: its "Sync now" requests and a default run.
+
+        Runs after a re-acquisition, after the orphaned-run recovery and before any lane.
+        A lane cancelled by the loss may have been serving a "Sync now" request: every
+        request this process claimed and had not finished serving (``_claims_in_flight``,
+        see :meth:`_serve_sync_requests`) is made pending again (:func:`_requeue_claims`),
+        so its lane serves it at the next wake, whether the cancelled jobs closed their
+        ``sync_run`` rows ``failed`` themselves or left them ``running`` for the sweep. A
+        request the sweep already re-queued, or whose claim never committed, does not match
+        and is left alone; one whose source already has a pending request stays picked, the
+        pending one serving it. ``scheduler.sync_requests_requeued`` (warning) names the
+        re-queued requests and sources and the ones kept picked, only when any matched.
+        The record lives in memory, so an orderly stop (SIGTERM) or an aborted process
+        loses it; the orphaned-run sweep still re-queues a request whose rows were left
+        ``running``.
+
+        A cancelled lane may also have been an analysis run, or a sync whose completion
+        request was never written, so a ``scheduler_lock_lost`` request makes a default run
+        follow. Both commit in one transaction of their own, and the in-flight record is
+        cleared only once it committed. It runs under :meth:`_guard`, so the lock is proved
+        alive while it waits (a blocked ``INSERT``): when the lock is lost meanwhile, it is
+        cancelled and awaited (``scheduler.lock_lost_requeue_cancelled``) and runs again,
+        record intact, after the next acquisition, before any lane. A :data:`JOB_FAILURES`
+        error is logged as ``scheduler.lock_lost_requeue_failed`` (with the in-flight
+        request ids it keeps for the next acquisition), never raised: the lock check
+        reconnects, and the next sync or activation queues an analysis request of its own.
+        """
+        claims = dict(self._claims_in_flight)
         try:
             async with self._sessions()() as session, session.begin():
+                requeued, kept = await _requeue_claims(session, claims)
                 await repositories.enqueue_analysis_request(session, _LOCK_LOST_REASON)
         except JOB_FAILURES as exc:
-            _log.error("scheduler.lock_lost_requeue_failed", error=type(exc).__name__)
+            _log.error(
+                "scheduler.lock_lost_requeue_failed",
+                error=type(exc).__name__,
+                sync_request_ids=sorted(claims),
+            )
             return
+        for request_id, claim in claims.items():
+            if self._claims_in_flight.get(request_id) == claim:
+                del self._claims_in_flight[request_id]
+        if requeued or kept:
+            _log.warning(
+                "scheduler.sync_requests_requeued",
+                requeued_request_ids=[request_id for request_id, _ in requeued],
+                requeued_sources=[source for _, source in requeued],
+                already_pending_request_ids=kept,
+                reason=_LOCK_LOST_REASON,
+            )
         _log.info("scheduler.lock_lost_requeued", reason=_LOCK_LOST_REASON)
+
+    async def _recover_orphaned_runs(self, pending: list[int]) -> None:
+        """Record the ``sync_run`` rows a dead process left ``running`` as interrupted.
+
+        Runs after every acquisition, once the takeover grace has passed and before the
+        startup or the lock-loss requeue, under :meth:`_guard`. The candidates are the ids of
+        every row ``running`` now: this holder has run nothing yet, and the previous holder
+        has stopped all its work or its process (:data:`LOCK_TAKEOVER_GRACE`), so none of
+        them can belong to this worker's work; a row created later is never a candidate. A
+        candidate may still belong to a live writer outside the worker (``ads-engine sync``
+        or ``seed-simulated``, which hold :data:`SYNC_WRITER_LOCK_KEY` shared): the sweep
+        (:meth:`_retry_recovery`) then defers, and ``pending`` keeps the candidates for the
+        wakes to retry (:meth:`_wake`). When there are candidates and no writer runs, the
+        sweep first waits :data:`SYNC_WRITER_FENCE` (:meth:`_sweep_orphaned_runs`), so the
+        startup or the requeue then starts that much later; with no candidate nothing waits.
+
+        A :data:`JOB_FAILURES` error reading the candidates is logged as
+        ``scheduler.sync_run_recovery_failed`` (stage ``read``) and leaves the recovery to
+        the next acquisition: this holder's own rows would be indistinguishable later.
+
+        Args:
+            pending: Filled with the candidates still to sweep; left empty once done.
+        """
+        try:
+            async with self._sessions()() as session:
+                found = await session.scalars(
+                    select(SyncRun.id)
+                    .where(SyncRun.status == SYNC_RUN_RUNNING)
+                    .order_by(SyncRun.id)
+                )
+                candidates = tuple(int(run_id) for run_id in found)
+        except JOB_FAILURES as exc:
+            _log.error(
+                "scheduler.sync_run_recovery_failed",
+                stage="read",
+                error=type(exc).__name__,
+                retry="next_acquisition",
+            )
+            return
+        if candidates:
+            pending[:] = await self._retry_recovery(candidates)
+
+    async def _retry_recovery(self, candidates: tuple[int, ...]) -> tuple[int, ...]:
+        """Sweep ``candidates`` once (:meth:`_sweep_orphaned_runs`); return what stays pending.
+
+        A sweep that finds no writer running waits :data:`SYNC_WRITER_FENCE` before it
+        writes, so one retry takes at least that long; it runs as a task of its own (at
+        acquisition under :meth:`_guard`, later dispatched by :meth:`_wake`), so the lock
+        checks, wakes and lanes go on meanwhile, and a lost lock cancels it during the fence.
+
+        Returns:
+            Empty once the sweep committed; ``candidates`` unchanged when it deferred behind
+            a live sync writer, or failed with a :data:`JOB_FAILURES` error (logged as
+            ``scheduler.sync_run_recovery_failed``, stage ``sweep``), so a later wake retries
+            exactly the same rows.
+        """
+        try:
+            done = await self._sweep_orphaned_runs(candidates)
+        except JOB_FAILURES as exc:
+            _log.error(
+                "scheduler.sync_run_recovery_failed",
+                stage="sweep",
+                candidates=len(candidates),
+                error=type(exc).__name__,
+                retry="next_wake",
+            )
+            return candidates
+        return () if done else candidates
+
+    async def _sweep_orphaned_runs(self, candidates: tuple[int, ...]) -> bool:
+        """Fail the candidates still ``running`` and re-queue their "Sync now", behind a fence.
+
+        1. A short transaction takes ``pg_try_advisory_xact_lock(SYNC_WRITER_LOCK_KEY)``. When
+           a writer outside the worker holds the key shared, it rolls back,
+           ``scheduler.sync_run_recovery_deferred`` is logged (info, with the candidate count)
+           and ``False`` is returned. When the key is free, no such writer runs now, and the
+           transaction rolls back at once, releasing it.
+        2. The writer fence: ``scheduler.sync_run_recovery_fence_wait`` is logged and the
+           injected sleep waits :data:`SYNC_WRITER_FENCE`. A writer whose lock session died
+           just before step 1 has by then noticed the loss and stopped, or aborted its
+           process (:func:`sync_writer`), so none of its rows is still being written.
+        3. The sweep's own transaction takes the key again; held by a writer that started
+           meanwhile, it is deferred exactly as in step 1. Holding it, no writer runs, and
+           none can start writing until the commit, so every candidate still ``running`` is
+           orphaned. Those rows become ``failed`` with ``finished_at`` from the scheduler
+           clock and the error ``interrupted: the process running this job ended before it
+           finished``; a row its writer closed meanwhile keeps its outcome. Each swept row
+           is matched to the "Sync now" request whose manual run it belongs to: the latest
+           claim of its lane at or before its ``started_at`` (every job stamps its own
+           start, so never at it), when the row is a job of that request's manual run and
+           that job's first run since the claim. Those requests, and the ones claimed with
+           them that the dead pass never reached, are made pending again
+           (:func:`_requeue_interrupted`), and the transaction commits sweep and re-queue
+           together.
+           ``scheduler.sync_runs_recovered`` (warning) then names the rows and the re-queued
+           requests.
+
+        A cancellation (a lost scheduler lock, SIGTERM) during the fence writes nothing.
+
+        Returns:
+            ``True`` once committed, ``False`` when deferred.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: When a transaction fails; nothing is written.
+        """
+        async with self._sessions()() as session, session.begin() as transaction:
+            if not await _take_writer_lock(session, transaction, candidates):
+                return False
+            # No writer runs now; release the key at once and take it again after the fence.
+            await transaction.rollback()
+        fence_s = SYNC_WRITER_FENCE.total_seconds()
+        _log.info(
+            "scheduler.sync_run_recovery_fence_wait", candidates=len(candidates), fence_s=fence_s
+        )
+        await self._sleep(fence_s)
+        now = self._now()
+        async with self._sessions()() as session, session.begin() as transaction:
+            if not await _take_writer_lock(session, transaction, candidates):
+                return False
+            swept = [
+                (int(run_id), str(source), str(job), started)
+                for run_id, source, job, started in (
+                    await session.execute(
+                        update(SyncRun)
+                        .where(SyncRun.id.in_(candidates), SyncRun.status == SYNC_RUN_RUNNING)
+                        .values(status=SYNC_RUN_FAILED, finished_at=now, error=_INTERRUPTED)
+                        .returning(SyncRun.id, SyncRun.source, SyncRun.job, SyncRun.started_at)
+                        .execution_options(synchronize_session=False)
+                    )
+                ).all()
+            ]
+            requeued, kept = await _requeue_interrupted(session, swept)
+        if swept:
+            _log.warning(
+                "scheduler.sync_runs_recovered",
+                count=len(swept),
+                run_ids=sorted(run_id for run_id, _, _, _ in swept),
+                requeued_request_ids=[request_id for request_id, _ in requeued],
+                requeued_sources=[source for _, source in requeued],
+                already_pending_request_ids=kept,
+            )
+        return True
 
     async def _lane(self, lane: str) -> TickReport:
         """Run one pass of ``lane`` under a tick record of its own; log it as ``scheduler.lane``.
@@ -1706,7 +2861,15 @@ class Scheduler:
     async def _serve_sync_requests(
         self, tick: _Tick, sources: tuple[Source, ...] = SOURCES
     ) -> None:
-        """Claim the pending "Sync now" requests of ``sources`` and run each source's jobs."""
+        """Claim the pending "Sync now" requests of ``sources`` and run each source's jobs.
+
+        The claim records each request as in flight (:meth:`_claim_sync_requests`). Once a
+        source's jobs have run, or failed with an isolated :data:`JOB_FAILURES` error, its
+        requests of this pass are served and forgotten, before the next source's jobs start,
+        so a cancellation later in the pass keeps only the requests not yet served. A
+        cancellation (a lost lock, SIGTERM) inside a source's jobs leaves its requests in
+        flight, for :meth:`_requeue_after_loss` to make pending again after a re-acquisition.
+        """
         claimed: tuple[Source, ...] = ()
         async with self._step(tick, "sync_requests"):
             claimed = await self._claim_sync_requests(tick.now, sources)
@@ -1718,6 +2881,13 @@ class Scheduler:
                     source, trigger="manual", controller=self._controller, now=tick.now
                 )
                 tick.ran("sync_requests", report)
+            # Reached only once the block above was left normally or through an isolated
+            # failure; a cancellation or a defect propagates instead, keeping the claim.
+            served = (source, tick.now)
+            for request_id in [
+                key for key, claim in self._claims_in_flight.items() if claim == served
+            ]:
+                del self._claims_in_flight[request_id]
 
     async def _claim_sync_requests(
         self, now: datetime, sources: tuple[Source, ...] = SOURCES
@@ -1727,6 +2897,15 @@ class Scheduler:
         ``FOR UPDATE SKIP LOCKED`` keeps a row being claimed elsewhere out of this claim, and
         a lane claims only its own sources' rows, so another lane's requests stay pending for
         that lane. The sources come back in request order.
+
+        Every claimed request is recorded in flight, as (source, ``now``), inside the
+        transaction and before its commit, and the record stays whatever ends the claim
+        after that, an error or a cancellation: only the commit and the session's close can
+        still fail there, and their outcome is unknown (a connection lost after the server
+        committed leaves the requests picked). :meth:`_requeue_after_loss` matches
+        ``picked_at`` exactly, so it makes a claim that did commit pending again, changes
+        nothing for one that never committed, and clears the record once it has committed
+        itself. A failure before ``RETURNING`` answered records nothing.
         """
         pending = (
             select(SyncRequest.id)
@@ -1744,6 +2923,10 @@ class Scheduler:
                     .execution_options(synchronize_session=False)
                 )
             ).all()
+            for request_id, value, _ in rows:
+                claimed_source = _as_source(str(value))
+                if claimed_source is not None:
+                    self._claims_in_flight[int(request_id)] = (claimed_source, now)
         ordered: list[Source] = []
         for request_id, value, _ in sorted(rows, key=lambda row: (row[2], row[0])):
             source = _as_source(str(value))

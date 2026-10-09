@@ -19,6 +19,10 @@ uvicorn serves the factory, never a module-level application::
 * **Session cookie**: Starlette's ``SessionMiddleware`` signs ``ads_engine_session`` with
   ``SESSION_SECRET``. The cookie is always HttpOnly, ``SameSite=Lax`` and lives 12 h; it is
   ``Secure`` exactly when ``APP_BASE_URL`` is ``https://``.
+* **Request deadline**: every HTTP request runs under a 45 s deadline. A request still
+  running then, typically one waiting on a database that stopped answering, is cancelled
+  and answered 503 ``request_timeout`` in the error envelope, and logged as one
+  ``api.request_timeout`` WARNING naming its method and path.
 * **Routers**: one per route module, in the order of the endpoint table, each under
   ``/api/v1`` and behind :func:`~ads_engine.api.deps.require_csrf`, which requires
   ``X-Requested-With: ads-engine`` on mutating methods and passes safe methods untouched.
@@ -28,12 +32,13 @@ uvicorn serves the factory, never a module-level application::
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
   failing the first request, and disposes the database pool on shutdown.
 
-No other middleware is installed. The SPA is served same-origin by nginx, which also proxies
-``/api``, so CORS and compression have no role here. Swagger UI and ReDoc are disabled: they
-load CDN assets that nginx's ``default-src 'self'`` Content-Security-Policy blocks. The
-OpenAPI document, the contract ``web/src/api/types.ts`` is written against, is served at
-``/api/v1/openapi.json`` to a signed-in session only. FastAPI's own schema route is
-disabled, because it sits outside the guarded routers and would answer without a session.
+No middleware beyond the session cookie and the request deadline is installed. The SPA is
+served same-origin by nginx, which also proxies ``/api``, so CORS and compression have no
+role here. Swagger UI and ReDoc are disabled: they load CDN assets that nginx's
+``default-src 'self'`` Content-Security-Policy blocks. The OpenAPI document, the contract
+``web/src/api/types.ts`` is written against, is served at ``/api/v1/openapi.json`` to a
+signed-in session only. FastAPI's own schema route is disabled, because it sits outside the
+guarded routers and would answer without a session.
 
 The API reads stored results only. Neither this module nor any module it imports loads
 ``ads_engine.connectors``, ``ads_engine.sync`` or ``ads_engine.simulation``: all external I/O
@@ -41,6 +46,7 @@ belongs to the worker. Importing this module builds no application, reads no set
 creates no database engine.
 """
 
+import asyncio
 import http
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -54,6 +60,7 @@ from pydantic import ValidationError
 from pydantic_core.core_schema import ErrorType
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ads_engine import __version__
 from ads_engine.analysis.lock import RunInProgress
@@ -95,6 +102,21 @@ APP_TITLE: Final = "Ads Action Engine API"
 
 _OPENAPI_PATH: Final = f"{API_PREFIX}/openapi.json"
 """Where :func:`_serve_openapi` serves the OpenAPI document to a signed-in session."""
+
+_REQUEST_TIMEOUT_S: Final = 45.0
+"""Seconds an HTTP request may run before it is cancelled and answered 503 ``request_timeout``.
+
+The deadline must clear the slowest legitimate request: ``POST /runs`` computes a
+custom-window run synchronously, which the product's performance budget allows up to 30 s.
+It must also leave room for the answer to reach the client: cancelling a query that is in
+flight costs psycopg up to about 10 s more (a cancel request to the server, then a wait for
+it) before the 503 can be sent, and nginx gives up on an upstream after its default 60 s
+``proxy_read_timeout`` with a bare 504 that has neither the error envelope nor an API log
+line. 45 s plus that unwind lands at about 55 s, inside nginx's limit.
+"""
+
+_REQUEST_TIMEOUT_CODE: Final = "request_timeout"
+_REQUEST_TIMEOUT_MESSAGE: Final = "The request did not complete in time"
 
 # Routers in the order of the endpoint table. The order fixes the order of the OpenAPI
 # paths, and no two modules share a path, so it never decides which route matches.
@@ -506,6 +528,79 @@ def _register_error_handlers(app: FastAPI) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Request deadline
+# ---------------------------------------------------------------------------
+
+
+class _RequestDeadlineMiddleware:
+    """Bound every HTTP request by a deadline, so none hangs without an answer or a log line.
+
+    A pure ASGI middleware: a request still running when the deadline passes, for example
+    one waiting on a pooled connection to a database that stopped answering, is cancelled
+    through :func:`asyncio.timeout`. When no response has started, it is answered 503
+    ``request_timeout`` in the error envelope. It is logged either way as one
+    ``api.request_timeout`` WARNING with the method, the path without its query string, the
+    deadline and whether the response had already started. A response already under way is
+    never started a second time; the server then closes the connection.
+
+    Only the deadline's own expiry is handled. A ``TimeoutError`` the application raised for
+    another reason, and any cancellation from outside (a client disconnect, a server
+    shutdown), propagate unchanged. Lifespan and websocket scopes pass through untouched.
+
+    Args:
+        app: The ASGI application it wraps.
+        timeout: The deadline in seconds.
+    """
+
+    def __init__(self, app: ASGIApp, *, timeout: float) -> None:
+        self.app = app
+        self.timeout = timeout
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Serve one ASGI connection, answering 503 ``request_timeout`` past the deadline.
+
+        Args:
+            scope: The connection scope.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+        """
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        response_started = False
+
+        async def send_tracked(message: Message) -> None:
+            """Forward ``message``, noting when the response has started."""
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        deadline = asyncio.timeout(self.timeout)
+        try:
+            async with deadline:
+                await self.app(scope, receive, send_tracked)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            _log.warning(
+                "api.request_timeout",
+                method=scope.get("method"),
+                path=scope.get("path"),
+                timeout_s=self.timeout,
+                response_started=response_started,
+            )
+            if response_started:
+                return
+            response = _error_response(
+                http.HTTPStatus.SERVICE_UNAVAILABLE,
+                _REQUEST_TIMEOUT_CODE,
+                _REQUEST_TIMEOUT_MESSAGE,
+            )
+            await response(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -664,10 +759,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     4. Install ``SessionMiddleware``: cookie ``ads_engine_session``, HttpOnly,
        ``SameSite=Lax``, ``Max-Age`` 12 h, path ``/``, and ``Secure`` exactly when
        ``APP_BASE_URL`` is ``https://``.
-    5. Store the login rate limiter and the settings on ``app.state``. They are created
+    5. Install the request deadline around it, inside only Starlette's own server-error
+       middleware: an HTTP request still running after :data:`_REQUEST_TIMEOUT_S` is
+       cancelled, answered 503 ``request_timeout`` and logged as ``api.request_timeout``.
+    6. Store the login rate limiter and the settings on ``app.state``. They are created
        here rather than in the lifespan, because test transports run no lifespan.
-    6. Include every router under ``/api/v1`` behind the CSRF guard.
-    7. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope.
+    7. Include every router under ``/api/v1`` behind the CSRF guard.
+    8. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope.
 
     Example::
 
@@ -750,6 +848,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         same_site="lax",
         https_only=settings.secure_cookies,
     )
+    # Added last, so it is the outermost user middleware: its deadline covers the session
+    # cookie, the routers and their error handlers. Only Starlette's server-error middleware,
+    # which renders the catch-all 500, sits outside it.
+    app.add_middleware(_RequestDeadlineMiddleware, timeout=_REQUEST_TIMEOUT_S)
     app.state.login_limiter = security.LoginRateLimiter()
     app.state.settings = settings
 

@@ -4,9 +4,14 @@ The pure helpers (the ``jsonb`` serialiser, URL normalisation and the libpq ``op
 builder) are tested without a database. Everything else runs against the shared
 PostgreSQL 18 at ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``): engine caching,
 reset and disposal, the UTC session time zone, the ``jsonb`` round trip, the pre-pinged
-pool, ``session_scope`` commit, rollback and cancellation, and the advisory-lock release
-guaranteed by ``dedicated_connection``. An unreachable database fails the test; it is never
-skipped.
+pool, the connect and pool timeouts, the ``ping_database`` probe, ``session_scope``
+commit, rollback and cancellation, and the advisory-lock release guaranteed by
+``dedicated_connection``. An unreachable database fails the test; it is never skipped.
+
+A database that stopped answering is played by a local TCP server that accepts every
+connection and never replies: to libpq that looks exactly like a paused or partitioned
+PostgreSQL, whose kernel still completes the TCP handshake. A refused connection comes from
+a loopback port that is bound but not listening.
 
 No table or other database object is created. Commit and rollback are observed through
 ``pg_xact_status`` of the scope's own transaction id, and advisory locks are observed from a
@@ -21,7 +26,9 @@ connection ever crosses event loops, and the settings environment is isolated wi
 import asyncio
 import hashlib
 import os
+import socket
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
@@ -31,9 +38,9 @@ import pytest
 from sqlalchemy import bindparam, event, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import InterfaceError, SQLAlchemyError
+from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.pool import NullPool, QueuePool
 
 from ads_engine.db import session as db_session
 from ads_engine.db.session import (
@@ -43,6 +50,7 @@ from ads_engine.db.session import (
     get_sessionmaker,
     json_dumps,
     normalise_database_url,
+    ping_database,
     reset_engine,
     session_scope,
 )
@@ -176,6 +184,62 @@ async def _advisory_locks_held(probe: ProbeConnection, pid: int) -> int:
     row = await cur.fetchone()
     assert row is not None
     return int(row[0])
+
+
+@asynccontextmanager
+async def _silent_server() -> AsyncIterator[tuple[int, list[asyncio.StreamWriter]]]:
+    """Serve TCP on a free loopback port that accepts every connection and never answers.
+
+    Yields:
+        The port, and the server side of every connection accepted so far; each is closed,
+        with the server, on exit.
+    """
+    accepted: list[asyncio.StreamWriter] = []
+
+    async def hold(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Keep the connection open and silent until the server shuts down."""
+        del reader
+        accepted.append(writer)
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield server.sockets[0].getsockname()[1], accepted
+    finally:
+        for writer in accepted:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+@contextmanager
+def _refusing_port() -> Iterator[int]:
+    """Hold a loopback port that is bound but not listening, so every connection is refused."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield sock.getsockname()[1]
+
+
+def _unreachable_url(port: int, *, password: str | None = None, **query: str) -> str:
+    """Return a psycopg URL for loopback ``port``, with ``query`` parameters set.
+
+    No password is set unless one is given: nothing ever authenticates against ``port``.
+    """
+    url = make_url(f"postgresql+psycopg://ads@127.0.0.1:{port}/ads_engine").set(
+        password=password, query=query
+    )
+    return url.render_as_string(hide_password=False)
+
+
+def _record_connect_params(engine: AsyncEngine) -> list[dict[str, Any]]:
+    """Record the keyword arguments of every new DBAPI connection ``engine`` makes."""
+    recorded: list[dict[str, Any]] = []
+
+    def record(dialect: object, conn_rec: object, cargs: object, cparams: dict[str, Any]) -> None:
+        """Copy the connect parameters; returning ``None`` lets the connection proceed."""
+        recorded.append(dict(cparams))
+
+    event.listen(engine.sync_engine, "do_connect", record)
+    return recorded
 
 
 class _LogRecorder:
@@ -506,6 +570,8 @@ async def test_get_engine_builds_without_connecting_and_logs_only_an_allowlisted
                 "database": "nowhere",
                 "pool_size": 5,
                 "max_overflow": 10,
+                "pool_timeout_s": 10,
+                "connect_timeout_s": 10,
             },
         )
     ]
@@ -541,7 +607,16 @@ async def test_get_engine_never_logs_query_credentials_or_the_user(
     assert built.pool.checkedout() == 0
     assert [(level, name) for level, name, _ in log_events] == [("info", "db_engine_created")]
     fields = log_events[0][2]
-    assert set(fields) == {"driver", "host", "port", "database", "pool_size", "max_overflow"}
+    assert set(fields) == {
+        "driver",
+        "host",
+        "port",
+        "database",
+        "pool_size",
+        "max_overflow",
+        "pool_timeout_s",
+        "connect_timeout_s",
+    }
     assert fields == {
         "driver": "postgresql+psycopg",
         "host": "127.0.0.1",
@@ -549,6 +624,8 @@ async def test_get_engine_never_logs_query_credentials_or_the_user(
         "database": "nowhere",
         "pool_size": 5,
         "max_overflow": 10,
+        "pool_timeout_s": 10,
+        "connect_timeout_s": 10,
     }
     logged = repr(log_events)
     for leaked in (password, ssl_password, query_password, username, "sslpassword"):
@@ -670,6 +747,217 @@ async def test_pool_pre_ping_replaces_a_pooled_connection_that_died(
         replacement = await session.scalar(_PID)
 
     assert replacement != pid
+
+
+# ---------------------------------------------------------------------------
+# Connect and pool timeouts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("", 10),
+        ("?connect_timeout=3", 3),
+        ("?connect_timeout=%20%203%20", 3),
+        ("?connect_timeout=%20%20", 10),
+        ("?connect_timeout=4&connect_timeout=6", 6),
+        ("?connect_timeout=4&connect_timeout=", 4),
+        ("?connect_timeout=0", 0),
+    ],
+)
+def test_connect_args_set_the_connect_timeout_and_keep_a_url_value(
+    query: str, expected: int
+) -> None:
+    """``connect_timeout`` is 10 s unless the URL sets one; its last non-blank value is kept."""
+    url = make_url(f"postgresql+psycopg://h/db{query}")
+
+    assert db_session._connect_args(url) == {
+        "options": "-c TimeZone=UTC",
+        "connect_timeout": expected,
+    }
+
+
+@pytest.mark.parametrize("value", ["2.5", "soon", "1e3"])
+def test_connect_timeout_rejects_a_url_value_that_is_not_whole_seconds(value: str) -> None:
+    """A ``connect_timeout`` libpq cannot read raises a fixed ValueError naming no URL."""
+    password = "-".join(("pw", "timeout", "r2c"))
+    url = make_url(_unreachable_url(1, password=password, connect_timeout=value))
+
+    with pytest.raises(ValueError, match="connect_timeout must be a whole number") as excinfo:
+        db_session._connect_args(url)
+
+    message = str(excinfo.value)
+    assert password not in message
+    assert value not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(("query", "expected"), [({}, 10), ({"connect_timeout": "7"}, 7)])
+async def test_engines_connect_with_the_connect_timeout_and_a_bounded_pool_checkout(
+    database_url: str,
+    engine_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+    log_events: list[LogEvent],
+    query: dict[str, str],
+    expected: int,
+) -> None:
+    """Both engines hand psycopg the connect timeout, and a checkout waits at most 10 s.
+
+    A ``connect_timeout`` in ``DATABASE_URL`` replaces the 10 s default, and the
+    ``db_engine_created`` descriptor logs the values in effect.
+    """
+    _use_database_url(monkeypatch, _with_query(database_url, **query))
+    built = get_engine()
+    probe_engine = db_session._get_probe_engine()
+    pooled = _record_connect_params(built)
+    unpooled = _record_connect_params(probe_engine)
+
+    await _ping_or_fail(built, database_url)
+    await ping_database()
+
+    assert isinstance(built.pool, QueuePool)
+    assert built.pool.timeout() == 10
+    assert [params["connect_timeout"] for params in pooled] == [expected]
+    assert [params["connect_timeout"] for params in unpooled] == [expected]
+    assert pooled[0]["options"] == unpooled[0]["options"]
+    assert pooled[0]["options"].endswith("-c TimeZone=UTC")
+    created = [fields for _, name, fields in log_events if name == "db_engine_created"]
+    assert [(fields["connect_timeout_s"], fields["pool_timeout_s"]) for fields in created] == [
+        (expected, 10)
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_server_that_never_answers_fails_a_new_connection_at_its_connect_timeout(
+    engine_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection attempt to a server that never answers ends at ``connect_timeout``.
+
+    Without it psycopg would wait its own 130 s. The URL's 2 s, libpq's minimum, keeps the
+    test short; the 10 s default takes the same path.
+    """
+    async with _silent_server() as (port, accepted):
+        _use_database_url(monkeypatch, _unreachable_url(port, connect_timeout="2"))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(OperationalError):
+            async with session_scope() as session:
+                await session.execute(text("SELECT 1"))
+        elapsed = loop.time() - started
+        assert len(accepted) == 1
+
+    assert 1.5 <= elapsed < 8.0
+
+
+# ---------------------------------------------------------------------------
+# ping_database: the probe outside the pool, bounded by its caller
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_ping_database_round_trips_on_its_own_unpooled_autocommit_engine(
+    engine: AsyncEngine, log_events: list[LogEvent]
+) -> None:
+    """The ping succeeds on a cached ``NullPool`` engine and never touches the process pool."""
+    log_events.clear()
+    checked_in = engine.pool.checkedin()
+
+    await ping_database()
+    probe_engine = db_session._get_probe_engine()
+    await ping_database()
+
+    assert probe_engine is not engine
+    assert db_session._get_probe_engine() is probe_engine
+    assert isinstance(probe_engine.pool, NullPool)
+    assert probe_engine.url == engine.url
+    async with probe_engine.connect() as conn:
+        # psycopg in autocommit sends no BEGIN, so the ping is the SELECT 1 alone.
+        raw = await conn.get_raw_connection()
+        assert raw.driver_connection is not None
+        assert raw.driver_connection.autocommit is True
+    assert engine.pool.checkedout() == 0
+    assert engine.pool.checkedin() == checked_in
+    assert log_events == []
+
+
+@pytest.mark.anyio
+async def test_ping_database_ends_at_the_callers_deadline_when_the_server_never_answers(
+    engine_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that accepts TCP and never answers costs the caller's deadline, nothing more.
+
+    The caller bounds the ping with ``asyncio.timeout``. The attempt is caught while
+    connecting, so the cancel ends it at once: neither libpq's 10 s ``connect_timeout`` nor
+    psycopg's 130 s default is waited out.
+    """
+    async with _silent_server() as (port, accepted):
+        _use_database_url(monkeypatch, _unreachable_url(port))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.5):
+                await ping_database()
+        elapsed = loop.time() - started
+        assert len(accepted) == 1
+
+    assert 0.45 <= elapsed < 2.0
+    assert db_session._engine is None
+
+
+@pytest.mark.anyio
+async def test_ping_database_reports_a_refused_connection_as_a_database_error(
+    engine_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused connection raises ``OperationalError`` at once, without the password."""
+    password = "-".join(("pw", "refused", "t5n"))
+    with _refusing_port() as port:
+        _use_database_url(monkeypatch, _unreachable_url(port, password=password))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(OperationalError) as excinfo:
+            await ping_database()
+        elapsed = loop.time() - started
+
+    assert elapsed < 5.0
+    assert password not in str(excinfo.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_dispose_and_reset_forget_the_probe_engine(
+    database_url: str,
+    engine_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+    log_events: list[LogEvent],
+) -> None:
+    """``reset_engine`` and ``dispose_engine`` forget the probe; the next ping reads settings anew.
+
+    Disposing only the probe logs nothing: ``db_engine_disposed`` belongs to the pool.
+    """
+    await ping_database()
+    first = db_session._probe_engine
+    assert first is not None
+
+    reset_engine()
+    assert db_session._probe_engine is None
+    await ping_database()
+    second = db_session._probe_engine
+    assert second is not None
+    assert second is not first
+
+    await dispose_engine()
+    assert db_session._probe_engine is None
+    assert log_events == []
+
+    with _refusing_port() as port:
+        _use_database_url(monkeypatch, _unreachable_url(port))
+        with pytest.raises(OperationalError):
+            await ping_database()
 
 
 # ---------------------------------------------------------------------------

@@ -38,8 +38,15 @@ Lifecycle:
    ``linkedin_hubspot``, ``purge``, ``budget`` and ``analysis``, which coalesces pending
    ``analysis_request`` rows within 60 s), at most one task per lane, so a long job delays
    only its own lane. On a lost lock every lane task is cancelled and awaited before the
-   connection is returned; after the next acquisition one ``scheduler_lock_lost``
-   ``analysis_request`` is queued and the wakes resume.
+   connection is returned: one still running after 5 s aborts the process (exit code 1),
+   except while the database does not answer at all, when the cancelled lanes are waited
+   for until they end. After every acquisition and its 20 s grace, before startup or any
+   lane, ``sync_run`` rows a dead process left ``running`` are recorded ``failed`` as
+   interrupted, behind the sync-writer fence (the rows of a live ``ads-engine sync`` or
+   ``seed-simulated`` are retried at later wakes instead), and the "Sync now" request they
+   served is made pending again. After a re-acquisition the "Sync now" requests the
+   cancelled lanes had claimed and not finished serving are made pending again, one
+   ``scheduler_lock_lost`` ``analysis_request`` is queued, and the wakes resume.
 
 Boundaries: the worker never serves HTTP and exposes no health endpoint (the API's
 ``/healthz`` and the structured logs are the monitoring surface), and it never writes to

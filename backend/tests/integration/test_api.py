@@ -12,6 +12,13 @@ test database; nothing reaches the network. The guarantees proven here:
   needs ``X-Requested-With: ads-engine`` (403); every endpoint except ``POST /auth/login`` and
   ``GET /healthz`` needs the session (401); every error status renders ``{"error": {"code",
   "message"}}`` and nothing else.
+* **Bounded waits** (AAP 0.5.3 ``GET /healthz`` and error envelope): a database that accepts
+  TCP and never answers, as a paused or partitioned PostgreSQL does, makes ``/healthz`` answer
+  503 ``database_unavailable`` within its 3 s bound, logged as ``health.database_unavailable``;
+  a request still running at the request deadline, a database-backed one included, is
+  cancelled and answered 503 ``request_timeout``, logged as ``api.request_timeout``. A request
+  that finishes in time, a ``TimeoutError`` of the application's own, a response already
+  started, other ASGI scopes and an outside cancellation are left alone.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
   ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET`` or on a ``DATABASE_URL``
   the engine would refuse (malformed, or a driver other than psycopg 3), while an unreachable
@@ -41,16 +48,18 @@ pausing an active Google campaign, the ``status`` discrepancy the next entity sy
 would open for it, and one default-window run.
 """
 
+import asyncio
 import functools
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import textwrap
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -63,6 +72,7 @@ import yaml
 from fastapi import FastAPI
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import Engine, inspect, text
+from starlette.types import Message, Receive, Scope, Send
 
 from ads_engine import logging as ads_logging
 from ads_engine.analysis import runner
@@ -70,6 +80,7 @@ from ads_engine.analysis.thresholds import CONFIG_FILES, ConfigError, Thresholds
 from ads_engine.api import app as api_app
 from ads_engine.api import deps, schemas, security
 from ads_engine.api.app import API_PREFIX, create_app
+from ads_engine.api.routes import health
 from ads_engine.db import session as db_session
 from ads_engine.db.models.ops import DATASETS, SOURCES, AppUser
 from ads_engine.settings import ConfigurationError, Settings, get_settings
@@ -1035,6 +1046,315 @@ async def test_healthz_without_auth(api_client: httpx.AsyncClient) -> None:
     assert response.status_code == 200, response.text
     assert response.json() == {"status": "ok"}
     assert response.headers.get_list("set-cookie") == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Bounded waits: /healthz and the request deadline (AAP 0.5.3 "GET /healthz", error envelope)
+# ---------------------------------------------------------------------------------------------
+
+LOG_FIELDS: Final = frozenset({"event", "level", "logger", "timestamp"})
+"""The fields every product log line carries besides its own."""
+
+SHORT_DEADLINE_S: Final = 0.5
+"""The request deadline the deadline tests patch in, instead of the production 45 s."""
+
+
+@asynccontextmanager
+async def silent_server() -> AsyncIterator[tuple[int, list[asyncio.StreamWriter]]]:
+    """Serve TCP on a free loopback port that accepts every connection and never answers.
+
+    To libpq this is a paused or partitioned PostgreSQL: the kernel completes the TCP
+    handshake, but no reply to the startup message ever comes.
+
+    Yields:
+        The port, and the server side of every connection accepted so far; each is closed,
+        with the server, on exit.
+    """
+    accepted: list[asyncio.StreamWriter] = []
+
+    async def hold(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Keep the connection open and silent until the server shuts down."""
+        del reader
+        accepted.append(writer)
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield server.sockets[0].getsockname()[1], accepted
+    finally:
+        for writer in accepted:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+@contextmanager
+def refusing_port() -> Iterator[int]:
+    """Hold a loopback port that is bound but not listening, so every connection is refused."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield sock.getsockname()[1]
+
+
+async def point_database_at(set_env: Callable[..., None], port: int, password: str) -> None:
+    """Dispose this test's engines, then point ``DATABASE_URL`` at loopback ``port``."""
+    await db_session.dispose_engine()
+    set_env(DATABASE_URL=f"postgresql+psycopg://ads:{password}@127.0.0.1:{port}/ads_engine")
+
+
+def events_named(captured_logs: CapturedLogs, event: str) -> list[dict[str, Any]]:
+    """Return the captured log records of ``event``."""
+    return [record for record in captured_logs() if record.get("event") == event]
+
+
+async def test_healthz_503_within_its_bound_when_the_database_never_answers(
+    api_client: httpx.AsyncClient, set_env: Callable[..., None], captured_logs: CapturedLogs
+) -> None:
+    """AAP 0.5.3: a database that stopped answering makes ``/healthz`` a prompt 503.
+
+    The ping runs on a fresh connection bounded by 3 s, so the answer is 503
+    ``database_unavailable`` after about 3 s, never psycopg's 130 s connect wait. It is logged
+    once as the WARNING ``health.database_unavailable`` with the error class and the bound only,
+    never the exception text, the URL or its password.
+    """
+    password = "-".join(("pw", "healthz", "w7k"))
+    async with silent_server() as (port, accepted):
+        await point_database_at(set_env, port, password)
+        captured_logs.configure(settings=get_settings())
+        captured_logs.clear()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        response = await api_client.get(api("/healthz"))
+        elapsed = loop.time() - started
+        assert len(accepted) == 1
+
+    error = assert_error(response, 503, "database_unavailable")
+    assert error.error.message == "Database unavailable"
+    assert health._PING_TIMEOUT_S == 3.0
+    assert health._PING_TIMEOUT_S - 0.1 <= elapsed < health._PING_TIMEOUT_S + 2.0
+    [record] = events_named(captured_logs, "health.database_unavailable")
+    assert set(record) == LOG_FIELDS | {"error_type", "timeout_s"}
+    assert record["level"] == "warning"
+    assert record["logger"] == "ads_engine.api.routes.health"
+    assert record["error_type"] == "TimeoutError"
+    assert record["timeout_s"] == health._PING_TIMEOUT_S
+    assert events_named(captured_logs, "api.request_timeout") == []
+    assert password not in captured_logs.text
+
+
+async def test_healthz_503_at_once_when_the_database_refuses(
+    api_client: httpx.AsyncClient, set_env: Callable[..., None], captured_logs: CapturedLogs
+) -> None:
+    """A refused connection is 503 ``database_unavailable`` without waiting for the bound."""
+    password = "-".join(("pw", "refused", "h3q"))
+    with refusing_port() as port:
+        await point_database_at(set_env, port, password)
+        captured_logs.configure(settings=get_settings())
+        captured_logs.clear()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        response = await api_client.get(api("/healthz"))
+        elapsed = loop.time() - started
+
+    assert_error(response, 503, "database_unavailable")
+    assert elapsed < health._PING_TIMEOUT_S
+    [record] = events_named(captured_logs, "health.database_unavailable")
+    assert set(record) == LOG_FIELDS | {"error_type", "timeout_s"}
+    assert record["error_type"] == "OperationalError"
+    assert password not in captured_logs.text
+
+
+async def test_database_backed_request_past_the_deadline_is_503_request_timeout(
+    db: object,
+    monkeypatch: pytest.MonkeyPatch,
+    set_env: Callable[..., None],
+    captured_logs: CapturedLogs,
+    test_identity: AdminIdentity,
+) -> None:
+    """A request waiting on a database that never answers ends at the request deadline.
+
+    ``POST /auth/login`` reads ``app_user``; with the database silent the read never completes,
+    so the deadline cancels it. The answer is the 503 ``request_timeout`` envelope with no
+    session cookie, and one ``api.request_timeout`` WARNING names the method, the path and the
+    deadline, never the body.
+    """
+    del db  # Requested for the per-test engine lifecycle: the engine is disposed on teardown.
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    password = "-".join(("pw", "deadline", "j4m"))
+    async with silent_server() as (port, accepted):
+        await point_database_at(set_env, port, password)
+        app = create_app()
+        captured_logs.configure(settings=get_settings())
+        captured_logs.clear()
+        loop = asyncio.get_running_loop()
+        async with serve(app) as client:
+            started = loop.time()
+            response = await post_login(
+                client, test_identity, email=test_identity.email, password=test_identity.password
+            )
+            elapsed = loop.time() - started
+            assert test_identity.session_cookie not in client.cookies
+        assert len(accepted) == 1
+
+    error = assert_error(response, 503, "request_timeout")
+    assert error.error.message == "The request did not complete in time"
+    assert SHORT_DEADLINE_S - 0.05 <= elapsed < SHORT_DEADLINE_S + 3.0
+    [record] = events_named(captured_logs, "api.request_timeout")
+    assert set(record) == LOG_FIELDS | {"method", "path", "timeout_s", "response_started"}
+    assert record["level"] == "warning"
+    assert record["logger"] == "ads_engine.api.app"
+    assert (record["method"], record["path"]) == ("POST", api("/auth/login"))
+    assert record["timeout_s"] == SHORT_DEADLINE_S
+    assert record["response_started"] is False
+    for value in (password, test_identity.email, test_identity.password):
+        assert value not in captured_logs.text
+
+
+async def test_request_deadline_answers_only_a_request_still_running(
+    monkeypatch: pytest.MonkeyPatch, captured_logs: CapturedLogs
+) -> None:
+    """Only a request still running at the deadline is cancelled and answered 503.
+
+    Under a 0.5 s deadline a route that never finishes is cancelled, answered 503
+    ``request_timeout`` and logged without its query string. A fast route answers 200 as usual,
+    and a ``TimeoutError`` the route raised itself stays an ordinary 500 ``internal_error``.
+    """
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    app = create_app()
+    cancelled = asyncio.Event()
+
+    async def stalled() -> dict[str, bool]:
+        """Wait for an event nobody sets, noting the cancellation."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"finished": True}
+
+    async def fast() -> dict[str, bool]:
+        """Answer at once."""
+        return {"finished": True}
+
+    async def own_timeout() -> dict[str, bool]:
+        """Fail with a TimeoutError of the route's own, well inside the deadline."""
+        raise TimeoutError("the route's own timeout")
+
+    for path, endpoint in (
+        ("/test-stalled", stalled),
+        ("/test-fast", fast),
+        ("/test-own-timeout", own_timeout),
+    ):
+        app.add_api_route(api(path), endpoint, methods=["GET"])
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    marker = "-".join(("query", "marker", "0451"))
+    # Starlette re-raises an unhandled error after answering 500; the client must not.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        stalled_response = await client.get(api(f"/test-stalled?marker={marker}"))
+        fast_response = await client.get(api("/test-fast"))
+        own_response = await client.get(api("/test-own-timeout"))
+
+    assert_error(stalled_response, 503, "request_timeout")
+    assert cancelled.is_set()
+    assert fast_response.status_code == 200, fast_response.text
+    assert fast_response.json() == {"finished": True}
+    assert_error(own_response, 500, "internal_error")
+    [record] = events_named(captured_logs, "api.request_timeout")
+    assert (record["method"], record["path"]) == ("GET", api("/test-stalled"))
+    assert record["response_started"] is False
+    assert marker not in captured_logs.text
+    unhandled = events_named(captured_logs, "api.unhandled_error")
+    assert [record["error_type"] for record in unhandled] == ["TimeoutError"]
+
+
+def http_scope(path: str) -> Scope:
+    """Return a minimal ASGI ``http`` scope for ``GET path?secret=1``."""
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "query_string": b"secret=1",
+        "headers": [],
+    }
+
+
+async def receive_nothing() -> Message:
+    """An ASGI receive channel with an empty request body."""
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+async def stall_forever(scope: Scope, receive: Receive, send: Send) -> None:
+    """An ASGI application that never answers."""
+    await asyncio.Event().wait()
+
+
+async def test_request_deadline_never_starts_a_second_response(
+    captured_logs: CapturedLogs,
+) -> None:
+    """A deadline passing after the response started is logged, and nothing more is sent.
+
+    Driven at the ASGI level: a test client cannot read a response the application abandons,
+    which a real server answers by closing the connection.
+    """
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    start: Message = {"type": "http.response.start", "status": 200, "headers": []}
+
+    async def started_then_stalled(scope: Scope, receive: Receive, send: Send) -> None:
+        """Start a response, then never finish it."""
+        await send(start)
+        await asyncio.Event().wait()
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends."""
+        sent.append(message)
+
+    middleware = api_app._RequestDeadlineMiddleware(started_then_stalled, timeout=0.2)
+    await middleware(http_scope("/api/v1/stream"), receive_nothing, collect)
+
+    assert sent == [start]
+    [record] = events_named(captured_logs, "api.request_timeout")
+    assert (record["method"], record["path"]) == ("GET", "/api/v1/stream")
+    assert record["timeout_s"] == 0.2
+    assert record["response_started"] is True
+
+
+async def test_request_deadline_leaves_other_scopes_and_outside_cancellation_alone() -> None:
+    """The deadline applies to ``http`` scopes only, and never swallows a foreign cancellation.
+
+    A lifespan scope outlives a 0.05 s deadline untouched. An ``http`` request cancelled from
+    outside (a client disconnect, a server shutdown) well before its deadline ends cancelled,
+    with nothing sent.
+    """
+    finished: list[str] = []
+
+    async def slow_lifespan(scope: Scope, receive: Receive, send: Send) -> None:
+        """Take longer than the deadline, then finish."""
+        await asyncio.sleep(0.2)
+        finished.append(scope["type"])
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends."""
+        sent.append(message)
+
+    await api_app._RequestDeadlineMiddleware(slow_lifespan, timeout=0.05)(
+        {"type": "lifespan"}, receive_nothing, collect
+    )
+    assert finished == ["lifespan"]
+
+    middleware = api_app._RequestDeadlineMiddleware(stall_forever, timeout=30.0)
+    task = asyncio.create_task(middleware(http_scope("/api/v1/x"), receive_nothing, collect))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert sent == []
 
 
 async def test_openapi_document_401_without_session(

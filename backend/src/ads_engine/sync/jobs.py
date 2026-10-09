@@ -338,6 +338,8 @@ from ads_engine.sync.snapshots import EnumerationResult, SnapshotRow
 
 __all__ = [
     "CANCEL_CLOSE_TIMEOUT",
+    "CANCEL_LOCK_LOST",
+    "CANCEL_WRITER_LOCK_LOST",
     "INCREMENTAL_DAYS",
     "JOB_CRM",
     "JOB_CRM_COMPANION",
@@ -460,8 +462,32 @@ waits for its cancelled work, ``LOCK_LOST_STOP_TIMEOUT``, before it aborts the p
 ``sync.scheduler`` checks at import that this bound is shorter than that timeout, and that
 its lock check interval, check timeout and that timeout together end inside the next holder's
 ``LOCK_TAKEOVER_GRACE``. Bookkeeping that does not finish in time is abandoned and its rows
-stay ``running``.
+stay ``running`` until the next scheduler-lock acquisition records them as interrupted.
 """
+
+CANCEL_LOCK_LOST: Final = "scheduler lock lost"
+"""The message ``sync.scheduler`` cancels its tasks with when its scheduler lock is lost.
+
+A job whose ``asyncio.CancelledError`` carries it (``task.cancel(msg=CANCEL_LOCK_LOST)``; the
+message survives psycopg's own cancellation handling and every shield on the way, because each
+re-raises the same exception) logs ``sync.job.cancelled`` at error level with this text as its
+``reason``: the job was stopped by a failure, typically a database that stopped answering.
+Any other cancellation (the worker's SIGTERM) is an orderly stop, logged as a warning.
+"""
+
+CANCEL_WRITER_LOCK_LOST: Final = "sync writer lock lost"
+"""The message ``sync.scheduler.sync_writer`` cancels its block with when its lock is lost.
+
+``ads-engine sync`` and ``ads-engine seed-simulated`` run their jobs holding the sync-writer
+lock shared; when that lock's session can no longer be proved alive, the jobs are cancelled
+with this message. Like :data:`CANCEL_LOCK_LOST`, a job whose cancellation carries it logs
+``sync.job.cancelled`` at error level with this text as its ``reason``: the job was stopped
+by a failure, before the worker's recovery of orphaned ``sync_run`` rows could take over.
+"""
+
+# The cancellation messages that mean a job was stopped by a failure, not an orderly stop. A
+# tuple, compared by equality: a cancellation message may be any object, hashable or not.
+_FAILURE_CANCELLATIONS: Final[tuple[str, ...]] = (CANCEL_LOCK_LOST, CANCEL_WRITER_LOCK_LOST)
 
 # Google partition scope keys, as connectors/google_n8n/queries.py names them ("start", "end"
 # of a dated template). queries.py is not imported here; the values are the wire contract of
@@ -1263,8 +1289,11 @@ class _JobBase(ABC):
                 error and the error's class name as its error type, never the error's text;
                 the scheduler logs its traceback and the next slot retries.
             asyncio.CancelledError: Unchanged, when the task running the job is cancelled (a
-                lost scheduler lock, the worker's graceful shutdown), wherever the job then
-                was (:meth:`_close_cancelled`). It is logged as ``sync.job.cancelled``, and
+                lost scheduler or sync-writer lock, the worker's graceful shutdown), wherever
+                the job then was (:meth:`_close_cancelled`). It is logged as
+                ``sync.job.cancelled``, at error level with ``reason`` :data:`CANCEL_LOCK_LOST`
+                or :data:`CANCEL_WRITER_LOCK_LOST` when the cancellation carries that message
+                and as a warning otherwise, and
                 within :data:`CANCEL_CLOSE_TIMEOUT` the job's still-open ``sync_run`` rows,
                 including rows whose close the cancellation rolled back, are closed as failed
                 with ``job cancelled``; nothing else is written. Bookkeeping that times out or
@@ -1298,7 +1327,7 @@ class _JobBase(ABC):
         except asyncio.CancelledError as exc:
             # Also a cancellation that lands in a handler of :meth:`_attempt`.
             try:
-                await self._close_cancelled(started)
+                await self._close_cancelled(started, exc)
             finally:
                 # Logged even when the cleanup is itself cancelled.
                 self._result(started, raised=exc)
@@ -1312,8 +1341,15 @@ class _JobBase(ABC):
             raise
         return self._result(started)
 
-    async def _close_cancelled(self, started: float) -> None:
+    async def _close_cancelled(self, started: float, cancellation: asyncio.CancelledError) -> None:
         """Log ``sync.job.cancelled`` and close the still-open rows ``job cancelled``, bounded.
+
+        The event names the source, job and dataset with the rows, calls and duration so far.
+        A cancellation carrying :data:`CANCEL_LOCK_LOST` (the scheduler lost its lock) or
+        :data:`CANCEL_WRITER_LOCK_LOST` (a CLI sync lost its sync-writer lock), so the job
+        ends unfinished because of a failure, is logged at error level with the text it
+        carries as ``reason``; any other (the worker's SIGTERM) is an orderly stop, logged as a
+        warning.
 
         The scheduler cancels and awaits its lane tasks when its lock is lost and must stop
         them inside its own bound, so this bookkeeping is abandoned after
@@ -1324,17 +1360,22 @@ class _JobBase(ABC):
 
         Args:
             started: ``time.perf_counter()`` when the run started.
+            cancellation: The cancellation :meth:`run` caught; only its message is read.
         """
         ctx = self.ctx
-        _log.warning(
-            "sync.job.cancelled",
-            source=ctx.source,
-            job=self.job,
-            dataset_id=ctx.dataset_id,
-            rows=self._total_rows,
-            calls=self._meter.calls,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-        )
+        fields: dict[str, Any] = {
+            "source": ctx.source,
+            "job": self.job,
+            "dataset_id": ctx.dataset_id,
+            "rows": self._total_rows,
+            "calls": self._meter.calls,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+        reason = cancellation.args[0] if cancellation.args else None
+        if reason in _FAILURE_CANCELLATIONS:
+            _log.error("sync.job.cancelled", reason=reason, **fields)
+        else:
+            _log.warning("sync.job.cancelled", **fields)
         try:
             async with asyncio.timeout(CANCEL_CLOSE_TIMEOUT.total_seconds()):
                 await self._close_remaining(_REASON_CANCELLED, quiet=True)

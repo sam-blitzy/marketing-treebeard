@@ -10,7 +10,8 @@ analysis lock is held) and 0.11.2 ("First start"). Covered here:
 * ``migrate``, ``ensure-admin``, ``sync``, ``analyze`` and ``seed-simulated`` with their
   collaborators replaced, so exit codes and JSON reports are checked without PostgreSQL
   (``tests/integration/test_first_start.py`` and ``test_runs_and_decisions.py`` run them
-  against the database);
+  against the database); ``sync`` and ``seed-simulated`` whose sync-writer lock is lost
+  (``SyncWriterLockLostError``) write one error line and exit 1;
 * error mapping: expected domain errors write one redacted ``cli_error`` JSON line and exit 1,
   anything else is logged as ``cli_failed`` and exits 1; after a failure every stderr line is
   one JSON object, whatever ``--log-level`` is;
@@ -96,6 +97,7 @@ from ads_engine.simulation.payloads import canonical_json, validate_capture
 from ads_engine.simulation.scenarios import FIXED_CLOCK
 from ads_engine.simulation.transport import mock_transport
 from ads_engine.sync import budget_guard, jobs, mode
+from ads_engine.sync import scheduler as scheduler_module
 
 BACKEND = Path(__file__).resolve().parents[2]
 CONTRACTS = BACKEND / "tests" / "contracts"
@@ -1423,6 +1425,40 @@ def test_ensure_admin_accepts_every_hash_argon2_verifies(
 # ---------------------------------------------------------------------------
 
 
+class WriterLock:
+    """Stands in for ``sync.scheduler.sync_writer``: records when the block is held.
+
+    With :attr:`lose` set, the block ends as ``sync_writer`` ends one whose lock session
+    died: with ``SyncWriterLockLostError``, once the lock is released.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.held = False
+        self.lose = False
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[None]:
+        """Hold the fake shared sync-writer lock for the block."""
+        self.events.append("acquired")
+        self.held = True
+        try:
+            yield
+            if self.lose:
+                raise scheduler_module.SyncWriterLockLostError
+        finally:
+            self.held = False
+            self.events.append("released")
+
+
+@pytest.fixture
+def writer_lock(monkeypatch: pytest.MonkeyPatch) -> WriterLock:
+    """``sync_writer`` replaced by a recorder, so no database connection is opened."""
+    fake = WriterLock()
+    monkeypatch.setattr(scheduler_module, "sync_writer", fake)
+    return fake
+
+
 def _job(disposition: str | None, *, job: str = "entities") -> jobs.JobResult:
     return jobs.JobResult(
         job=job,
@@ -1456,6 +1492,7 @@ def _job(disposition: str | None, *, job: str = "entities") -> jobs.JobResult:
 def test_sync_prints_the_report(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    writer_lock: WriterLock,
     disposition: str | None,
     code: int,
     message: str | None,
@@ -1464,6 +1501,8 @@ def test_sync_prints_the_report(
     seen: list[tuple[str, str]] = []
 
     async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
+        # The jobs write sync_run rows, so they run while the shared writer lock is held.
+        assert writer_lock.held
         seen.append((source, trigger))
         return jobs.SourceSyncReport(
             source="google",
@@ -1476,6 +1515,7 @@ def test_sync_prints_the_report(
     monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
     assert cli.main(["sync", "--source", "google"]) == code
     assert seen == [("google", "manual")]
+    assert writer_lock.events == ["acquired", "released"]
     captured = capsys.readouterr()
     report = json.loads(captured.out)
     assert report["source"] == "google"
@@ -1575,7 +1615,7 @@ def test_sync_names_each_failed_job_and_its_disposition(
 
 
 def test_sync_exits_failure_on_a_data_integrity_defect(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], writer_lock: WriterLock
 ) -> None:
     violation = jobs.IntegrityFailure(
         kind="foreign_key_violation",
@@ -1604,11 +1644,36 @@ def test_sync_exits_failure_on_a_data_integrity_defect(
 
     monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
     assert cli.main(["sync", "--source", "google"]) == cli.EXIT_FAILURE
+    assert writer_lock.events == ["acquired", "released"]
     captured = capsys.readouterr()
     (job,) = json.loads(captured.out)["jobs"]
     assert job["integrity"] == violation.to_json()
     assert job["error"] == violation.reason
     assert "a job failed on a defect (query or data integrity)" in captured.err
+
+
+def test_sync_exits_failure_when_the_writer_lock_is_lost(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], writer_lock: WriterLock
+) -> None:
+    """A lost sync-writer lock stops the jobs: one line on stderr, no report, exit 1."""
+    writer_lock.lose = True
+
+    async def run_source_jobs(source: str, *, trigger: str) -> jobs.SourceSyncReport:
+        assert writer_lock.held
+        return jobs.SourceSyncReport(source="google", trigger="manual")
+
+    monkeypatch.setattr(jobs, "run_source_jobs", run_source_jobs)
+    assert cli.main(["sync", "--source", "google"]) == cli.EXIT_FAILURE
+    assert writer_lock.events == ["acquired", "released"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "ads-engine: sync google: the sync-writer lock session was lost, so the jobs were "
+        "stopped before they finished; see the log, then run the sync again"
+    ) in captured.err
+    # Handled as an expected outcome: no traceback, no generic failure line.
+    assert "cli_failed" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def _fake_run(kind: str) -> SimpleNamespace:
@@ -1706,6 +1771,7 @@ def _bootstrap_report(failures: dict[str, str]) -> mode.BootstrapReport:
 def test_seed_simulated(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    writer_lock: WriterLock,
     failures: dict[str, str],
     lock_held: bool,
     code: int,
@@ -1713,6 +1779,8 @@ def test_seed_simulated(
     forced: list[bool] = []
 
     async def bootstrap_sources(settings: Settings, *, force_simulated: bool) -> Any:
+        # The backfills write sync_run rows, so they run while the writer lock is held.
+        assert writer_lock.held
         forced.append(force_simulated)
         return _bootstrap_report(failures)
 
@@ -1720,6 +1788,8 @@ def test_seed_simulated(
         return "default-window"
 
     async def run_analysis(window: str, kind: str, trigger: str, **kwargs: Any) -> Any:
+        # The analysis writes no sync_run row: the writer lock is already released.
+        assert not writer_lock.held
         assert (window, kind, trigger) == ("default-window", "default", "manual")
         if lock_held:
             raise RunInProgress
@@ -1730,6 +1800,7 @@ def test_seed_simulated(
     monkeypatch.setattr(runner, "run_analysis", run_analysis)
     assert cli.main(["seed-simulated"]) == code
     assert forced == [True]
+    assert writer_lock.events == ["acquired", "released"]
     output = json.loads(capsys.readouterr().out)
     assert output["sources"]["linkedin"] == {
         "mode": "simulated",
@@ -1741,6 +1812,36 @@ def test_seed_simulated(
     }
     assert output["sources"]["hubspot"]["failure"] == failures.get("hubspot")
     assert (output["run"] is None) == lock_held
+
+
+def test_seed_simulated_exits_failure_when_the_writer_lock_is_lost(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], writer_lock: WriterLock
+) -> None:
+    """A lost sync-writer lock stops the bootstrap: no analysis, no report, one line, exit 1."""
+    writer_lock.lose = True
+    analysed: list[str] = []
+
+    async def bootstrap_sources(settings: Settings, *, force_simulated: bool) -> Any:
+        assert writer_lock.held
+        return _bootstrap_report({})
+
+    async def run_analysis(window: str, kind: str, trigger: str, **kwargs: Any) -> Any:
+        analysed.append(kind)
+        return _fake_run(kind)
+
+    monkeypatch.setattr(mode, "bootstrap_sources", bootstrap_sources)
+    monkeypatch.setattr(runner, "run_analysis", run_analysis)
+    assert cli.main(["seed-simulated"]) == cli.EXIT_FAILURE
+    assert writer_lock.events == ["acquired", "released"]
+    assert analysed == [], "the default run followed a stopped bootstrap"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "ads-engine: seed-simulated: the sync-writer lock session was lost, so the bootstrap "
+        "was stopped before it finished; see the log, then run seed-simulated again"
+    ) in captured.err
+    assert "cli_failed" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 # ---------------------------------------------------------------------------

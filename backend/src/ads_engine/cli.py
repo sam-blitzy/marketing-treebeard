@@ -656,10 +656,19 @@ async def _sync(source: Source) -> int:
     job that succeeded on an active dataset. The report carries jobs, rows, completeness,
     mode and reason, never a credential.
 
+    The jobs write ``sync_run`` rows without the scheduler lock, so they run inside
+    ``sync.scheduler.sync_writer()``: a worker's recovery of orphaned ``sync_run`` rows waits
+    until this command has finished and never records its live rows as interrupted. When
+    the writer lock's session dies while the jobs run, they are stopped
+    (``SyncWriterLockLostError``): no report is printed, and one line on stderr says the sync
+    stopped before it finished. When this process is killed, the rows it left ``running``
+    are recorded as interrupted by the worker at its next scheduler-lock acquisition.
+
     Returns:
         :data:`EXIT_OK` only when every job ran and succeeded (``report.ok``). Otherwise
-        :data:`EXIT_FAILURE`, with the report printed and one line on stderr saying why:
+        :data:`EXIT_FAILURE`, with one line on stderr saying why:
 
+        * the writer lock was lost and the jobs were stopped (no report is printed);
         * a job failed on a defect: a ``QueryDefect``, or a database integrity violation (the
           job's ``integrity`` in the report names its kind, SQLSTATE, table and constraint);
         * no job ran: the source has no active dataset yet, or its live dataset may not be
@@ -668,10 +677,21 @@ async def _sync(source: Source) -> int:
           denied, or the dataset could not be written): the line names each failed job and
           its disposition, never the error text, and the failed datasets keep their last
           good data.
+
+        The report is printed in every case but the first.
     """
     from ads_engine.sync.jobs import run_source_jobs
+    from ads_engine.sync.scheduler import SyncWriterLockLostError, sync_writer
 
-    report = await run_source_jobs(source, trigger="manual")
+    try:
+        async with sync_writer():
+            report = await run_source_jobs(source, trigger="manual")
+    except SyncWriterLockLostError:
+        _error(
+            f"sync {source}: the sync-writer lock session was lost, so the jobs were stopped "
+            "before they finished; see the log, then run the sync again"
+        )
+        return EXIT_FAILURE
     _emit_json(report.to_json())
     if report.ok:
         return EXIT_OK
@@ -800,18 +820,38 @@ async def _seed_simulated() -> int:
     is kept. It is safe while the worker runs, because ``DatasetManager.activate`` serialises
     activations per source. The default-window run then reads the seeded data.
 
+    The backfills write ``sync_run`` rows without the scheduler lock, so the bootstrap runs
+    inside ``sync.scheduler.sync_writer()``: a worker's recovery of orphaned ``sync_run`` rows
+    waits until it has finished and never records its live rows as interrupted. When the
+    writer lock's session dies while the bootstrap runs, it is stopped
+    (``SyncWriterLockLostError``): nothing is printed on stdout, no analysis runs, and one line on
+    stderr says the seeding stopped before it finished. When this process is killed, the
+    rows it left ``running`` are recorded as interrupted by the worker at its next
+    scheduler-lock acquisition. The analysis run writes no ``sync_run`` row and runs after
+    the lock is released.
+
     Returns:
         :data:`EXIT_LOCK_HELD` when the analysis lock is held (the seeding stands);
         :data:`EXIT_FAILURE` when a source failed to bootstrap (the others are seeded and
-        analysed); :data:`EXIT_OK` otherwise.
+        analysed), or when the writer lock was lost and the bootstrap was stopped;
+        :data:`EXIT_OK` otherwise.
     """
     from ads_engine.analysis.lock import RunInProgress
     from ads_engine.analysis.runner import default_window, run_analysis
     from ads_engine.analysis.thresholds import Thresholds
     from ads_engine.sync.mode import bootstrap_sources
+    from ads_engine.sync.scheduler import SyncWriterLockLostError, sync_writer
 
     settings = get_settings()
-    report = await bootstrap_sources(settings, force_simulated=True)
+    try:
+        async with sync_writer():
+            report = await bootstrap_sources(settings, force_simulated=True)
+    except SyncWriterLockLostError:
+        _error(
+            "seed-simulated: the sync-writer lock session was lost, so the bootstrap was "
+            "stopped before it finished; see the log, then run seed-simulated again"
+        )
+        return EXIT_FAILURE
     sources: dict[str, dict[str, object]] = {}
     for source in SETTINGS_SOURCES:
         resolved = report.modes.get(source)

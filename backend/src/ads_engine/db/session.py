@@ -26,11 +26,22 @@ These entry points cover every caller:
   The lock keys and the lock statements belong to their owners, ``analysis/lock.py`` and
   ``sync/scheduler.py``; this module only supplies the connection and guarantees that no
   advisory lock survives the block.
+* :func:`ping_database` makes one ``SELECT 1`` round trip on a fresh connection outside
+  the pool. Its caller bounds it with :func:`asyncio.timeout`, so ``GET /healthz`` (and any
+  caller that must tell a reachable database from a hung one) answers within its own
+  deadline even when every pooled connection is stuck on a server that stopped answering.
 * :func:`dispose_engine` and :func:`reset_engine` end or forget the engine at process
   shutdown and between tests.
 * :func:`normalise_database_url` is the rule ``DATABASE_URL`` must meet (psycopg 3, plain
   ``postgresql://`` and ``postgres://`` rewritten to it); the engine applies it, and the API
   applies it at startup so that a URL the engine would refuse stops the API before it serves.
+
+Every new connection carries libpq's ``connect_timeout`` (10 s, unless ``DATABASE_URL``'s
+query string sets its own), and a checkout waits at most 10 s for a free pooled connection,
+so a database that accepts TCP but never answers fails a connection attempt with an error
+instead of holding the caller for psycopg's 130 s default. No ``statement_timeout`` is set:
+the engine also runs the worker's long upserts and purges, and a frozen server could not
+enforce one anyway.
 
 The URL is a secret (it carries the database password). It is read from
 ``Settings.database_url`` only where the engine is built and where the API checks it at
@@ -57,6 +68,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from ads_engine.logging import get_logger
 from ads_engine.settings import get_settings
@@ -68,6 +80,7 @@ __all__ = [
     "get_sessionmaker",
     "json_dumps",
     "normalise_database_url",
+    "ping_database",
     "reset_engine",
     "run_to_completion",
     "session_scope",
@@ -88,6 +101,17 @@ _PLAIN_SCHEMES: Final = frozenset({"postgresql", "postgres"})
 # the same pool.
 _POOL_SIZE: Final = 5
 _MAX_OVERFLOW: Final = 10
+# Seconds a checkout waits for a free pooled connection before SQLAlchemy raises its
+# TimeoutError, instead of its 30 s default, so an exhausted pool fails a request or a job
+# with an error well inside the API's request deadline.
+_POOL_TIMEOUT_S: Final = 10
+
+# libpq `connect_timeout` of every new connection, in seconds. psycopg's own default is
+# 130 s, so without it a server that accepts TCP but never answers the startup handshake (a
+# frozen or partitioned PostgreSQL) holds the caller for over two minutes. A
+# `connect_timeout` given in DATABASE_URL's query string is kept instead.
+_CONNECT_TIMEOUT_S: Final = 10
+_CONNECT_TIMEOUT_PARAM: Final = "connect_timeout"
 
 # Every session runs in UTC, so `timestamptz` values come back tz-aware in UTC and no SQL
 # depends on the server's zone. Native-day semantics are owned by the application.
@@ -97,12 +121,17 @@ _UTC_SESSION_OPTION: Final = "-c TimeZone=UTC"
 # dedicated connection before it returns to the pool.
 _UNLOCK_ALL: Final = text("SELECT pg_advisory_unlock_all()")
 
+# The round trip ping_database makes.
+_PING: Final = text("SELECT 1")
+
 # Process-wide lazy singletons. Guarded by a re-entrant lock so that two threads (for
 # example FastAPI's threadpool and the event loop thread) never build two engines, and so
-# that get_sessionmaker() may call get_engine() while holding it.
+# that get_sessionmaker() may call get_engine() while holding it. The probe engine behind
+# ping_database has no pool, so it holds no connection that could cross event loops.
 _state_lock: Final = threading.RLock()
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_probe_engine: AsyncEngine | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -243,26 +272,79 @@ def _connect_options(url: URL) -> str:
     return " ".join([*(option for option in given if option.strip()), _UTC_SESSION_OPTION])
 
 
+def _connect_timeout(url: URL) -> int:
+    """Return the libpq ``connect_timeout`` every new connection uses, in seconds.
+
+    ``connect_args`` replace a same-named URL query parameter, so a ``connect_timeout``
+    given in the URL is read here and passed on: the last non-blank one, as libpq keeps the
+    last of repeated keywords. Without one, :data:`_CONNECT_TIMEOUT_S` applies.
+
+    Args:
+        url: The normalised database URL.
+
+    Returns:
+        The URL's value, or :data:`_CONNECT_TIMEOUT_S`. libpq reads zero or less as no
+        limit, which psycopg then caps at its own 130 s default.
+
+    Raises:
+        ValueError: When the URL's value is not a whole number of seconds, the only form
+            libpq documents. The message never contains the URL.
+    """
+    existing = url.query.get(_CONNECT_TIMEOUT_PARAM)
+    given = [existing] if isinstance(existing, str) else list(existing or ())
+    present = [value for value in given if value.strip()]
+    if not present:
+        return _CONNECT_TIMEOUT_S
+    try:
+        return int(present[-1])
+    except ValueError:
+        raise ValueError(
+            "DATABASE_URL's connect_timeout must be a whole number of seconds"
+        ) from None
+
+
+def _connect_args(url: URL) -> dict[str, Any]:
+    """Build the psycopg connect arguments shared by the pooled engine and the probe engine.
+
+    Args:
+        url: The normalised database URL.
+
+    Returns:
+        ``options`` from :func:`_connect_options` and ``connect_timeout`` from
+        :func:`_connect_timeout`.
+
+    Raises:
+        ValueError: When the URL's ``connect_timeout`` is not a whole number of seconds.
+    """
+    return {
+        "options": _connect_options(url),
+        _CONNECT_TIMEOUT_PARAM: _connect_timeout(url),
+    }
+
+
 def _create_engine() -> AsyncEngine:
     """Build the process engine from the current settings.
 
     Returns:
-        A new :class:`AsyncEngine` with a pre-pinged pool and the ``jsonb`` serialiser.
-        Building it opens no connection.
+        A new :class:`AsyncEngine` with a pre-pinged pool, the pool and connect timeouts and
+        the ``jsonb`` serialiser. Building it opens no connection.
 
     Raises:
-        ValueError: When ``DATABASE_URL`` is malformed or names another driver.
+        ValueError: When ``DATABASE_URL`` is malformed, names another driver or carries a
+            ``connect_timeout`` that is not a whole number of seconds.
         pydantic.ValidationError: When the environment cannot be parsed into settings.
     """
     url = normalise_database_url(get_settings().database_url.get_secret_value())
+    connect_args = _connect_args(url)
     engine = create_async_engine(
         url,
         pool_pre_ping=True,
         pool_size=_POOL_SIZE,
         max_overflow=_MAX_OVERFLOW,
+        pool_timeout=_POOL_TIMEOUT_S,
         json_serializer=json_dumps,
         json_deserializer=json.loads,
-        connect_args={"options": _connect_options(url)},
+        connect_args=connect_args,
     )
     # The URL is never logged, not even rendered with its password hidden: its query string
     # can carry credentials of its own (libpq `password`, `sslpassword`, key paths), which
@@ -275,6 +357,8 @@ def _create_engine() -> AsyncEngine:
         database=url.database,
         pool_size=_POOL_SIZE,
         max_overflow=_MAX_OVERFLOW,
+        pool_timeout_s=_POOL_TIMEOUT_S,
+        connect_timeout_s=connect_args[_CONNECT_TIMEOUT_PARAM],
     )
     return engine
 
@@ -283,15 +367,18 @@ def get_engine() -> AsyncEngine:
     """Return the process-wide async engine, building it on first call.
 
     The engine uses psycopg 3's async dialect, a pre-pinged pool of 5 connections plus 10
-    overflow, :func:`json_dumps` and :func:`json.loads` for ``jsonb``, and a UTC session
-    time zone. Building it opens no connection; the first connection is made on first use.
+    overflow whose checkout waits at most 10 s, a 10 s libpq ``connect_timeout`` (unless
+    ``DATABASE_URL`` sets its own), :func:`json_dumps` and :func:`json.loads` for ``jsonb``,
+    and a UTC session time zone. Building it opens no connection; the first connection is
+    made on first use.
 
     Returns:
         The cached :class:`AsyncEngine`.
 
     Raises:
-        ValueError: When ``DATABASE_URL`` is malformed or names a driver other than
-            ``postgresql+psycopg``.
+        ValueError: When ``DATABASE_URL`` is malformed, names a driver other than
+            ``postgresql+psycopg`` or carries a ``connect_timeout`` that is not a whole
+            number of seconds.
     """
     global _engine
     engine = _engine
@@ -323,35 +410,110 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
         return _sessionmaker
 
 
+def _get_probe_engine() -> AsyncEngine:
+    """Return the engine behind :func:`ping_database`, building it on first call.
+
+    It is built from the same normalised URL and connect arguments as :func:`get_engine`,
+    with no pool (:class:`~sqlalchemy.pool.NullPool`): every checkout opens a new
+    connection and closing it ends that connection. It runs in ``AUTOCOMMIT``, so the ping
+    sends no ``BEGIN`` and no ``ROLLBACK`` around its ``SELECT 1``. Building it opens no
+    connection and logs nothing.
+
+    Returns:
+        The cached probe :class:`AsyncEngine`.
+
+    Raises:
+        ValueError: When ``DATABASE_URL`` is malformed, names another driver or carries a
+            ``connect_timeout`` that is not a whole number of seconds.
+    """
+    global _probe_engine
+    engine = _probe_engine
+    if engine is not None:
+        return engine
+    with _state_lock:
+        if _probe_engine is None:
+            url = normalise_database_url(get_settings().database_url.get_secret_value())
+            _probe_engine = create_async_engine(
+                url,
+                poolclass=NullPool,
+                isolation_level="AUTOCOMMIT",
+                connect_args=_connect_args(url),
+            )
+        return _probe_engine
+
+
+async def ping_database() -> None:
+    """Make one ``SELECT 1`` round trip on a fresh connection outside the pool.
+
+    The connection is opened outside the process pool and closed afterwards, so neither a
+    pooled connection stuck on a server that stopped answering nor an exhausted pool can
+    stall the check. ``GET /healthz`` uses it, and so can any caller that must tell a
+    reachable database from an unreachable one. The caller bounds it with
+    :func:`asyncio.timeout`, whose expiry it reports as :class:`TimeoutError`::
+
+        try:
+            async with asyncio.timeout(3.0):
+                await ping_database()
+        except TimeoutError, SQLAlchemyError, OSError:
+            ...  # the database is unreachable
+
+    A server that accepts TCP but never answers (paused or partitioned) is caught while
+    connecting, and the cancel ends that attempt at once on the caller's deadline. Even with
+    no caller deadline, libpq's ``connect_timeout`` (10 s, unless ``DATABASE_URL`` sets its
+    own) bounds the connect. A cancel that lands mid-query, when the server stops answering
+    between the handshake and the ``SELECT 1``, costs psycopg up to about 10 s more: it
+    first asks the server to cancel the query and waits for it, so the caller's
+    ``TimeoutError`` then arrives up to about 10 s after its deadline. Nothing is logged:
+    the caller owns the consequence, and no message names the URL.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When the database refused or failed the attempt,
+            for example a refused connection, failed authentication or libpq's
+            ``connect_timeout`` expiring; psycopg's error is wrapped as an
+            :class:`~sqlalchemy.exc.OperationalError`.
+        OSError: When the attempt failed in the socket layer outside psycopg.
+        ValueError: When ``DATABASE_URL`` is malformed, for example naming another driver
+            or carrying a ``connect_timeout`` that is not a whole number of seconds.
+    """
+    engine = _get_probe_engine()
+    async with engine.connect() as conn:
+        await conn.execute(_PING)
+
+
 async def dispose_engine() -> None:
-    """Close every pooled connection and forget the engine and session factory.
+    """Close every pooled connection and forget the engines and session factory.
 
     ``api/app.py`` calls this from its lifespan on shutdown, and the worker on graceful
     exit. The caches are cleared before the pool is disposed, so a caller arriving during
-    disposal builds a fresh engine instead of using the one being closed. Calling it when
-    no engine exists does nothing.
+    disposal builds a fresh engine instead of using the one being closed. The probe engine
+    of :func:`ping_database` is disposed and forgotten as well. Calling it when no engine
+    exists does nothing.
     """
-    global _engine, _sessionmaker
+    global _engine, _sessionmaker, _probe_engine
     with _state_lock:
         engine, _engine, _sessionmaker = _engine, None, None
+        probe, _probe_engine = _probe_engine, None
+    if probe is not None:
+        await probe.dispose()
     if engine is not None:
         await engine.dispose()
         _log.info("db_engine_disposed")
 
 
 def reset_engine() -> None:
-    """Forget the engine and session factory without closing any connection.
+    """Forget the engines and session factory without closing any connection.
 
     Tests call this after ``get_settings.cache_clear()`` when they switch ``DATABASE_URL``
-    or event loops, so the next :func:`get_engine` call reads the new settings. Async
-    connections belong to the event loop that opened them, so callers first
-    ``await dispose_engine()`` while that loop is still running; this function only
+    or event loops, so the next :func:`get_engine` or :func:`ping_database` call reads the
+    new settings. Async connections belong to the event loop that opened them, so callers
+    first ``await dispose_engine()`` while that loop is still running; this function only
     clears the caches, for a process or loop where disposal is no longer possible.
     """
-    global _engine, _sessionmaker
+    global _engine, _sessionmaker, _probe_engine
     with _state_lock:
         _engine = None
         _sessionmaker = None
+        _probe_engine = None
 
 
 # ---------------------------------------------------------------------------
