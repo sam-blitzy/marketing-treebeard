@@ -101,6 +101,8 @@ import {
   HeldDisclosure,
   SectionFrame,
   isHeld,
+  itemIdentity,
+  itemKeys,
   type FieldItem,
   type GroupParts,
   type SectionComponentProps,
@@ -648,10 +650,16 @@ interface AssetTableProps {
  * and a revealed row keeps the columns, caption and expansion of the rows before it. The MQL
  * header is taken from every row of the table, shown or not yet, so revealing rows never
  * renames the column.
+ *
+ * Rows are keyed by their recommendation's identity across runs ({@link itemKeys}), never by the
+ * per-run item id, and the table keeps a row's expansion by that key. A newer run's row of the
+ * same asset therefore stays expanded, and its expand toggle and details keep their elements, so
+ * keyboard focus on them, and the footer actions' state, survive the swap (WCAG 2.2 SC 2.4.3).
  */
 function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
   const header = useMemo(() => tableMqlHeader(items, mql), [items, mql]);
   const columns = useMemo(() => assetColumns(header), [header]);
+  const rowKeys = useMemo(() => itemKeys(items), [items]);
   const batches = useBatches(items, { batchSize: ROW_BATCH_SIZE });
   const rows = batches.shown.map((item, index) =>
     assetRowOf(item, batches.batched ? batches.entryId(index) : null),
@@ -662,7 +670,7 @@ function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
         caption={caption}
         columns={columns}
         rows={rows}
-        getRowKey={(row) => String(row.item.id)}
+        getRowKey={(row) => rowKeys.get(row.item) ?? itemIdentity(row.item)}
         renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
         expandLabel={(row) => `Details for ${row.name}`}
       />

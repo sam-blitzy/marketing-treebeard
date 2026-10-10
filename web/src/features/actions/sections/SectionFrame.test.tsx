@@ -31,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FindingCode, Group, Item, Section } from '../../../api/types';
 import { Button } from '../../../design-system';
 import {
+  makeEvidence,
   makeFinding,
   makeGroup,
   makeItem,
@@ -42,6 +43,7 @@ import { HISTORICAL_LABEL } from '../RecommendationCard';
 import { withheldLine } from '../WithheldList';
 import { CARD_BATCH_SIZE, GROUP_BATCH_SIZE } from '../batches';
 import {
+  CardList,
   DISCREPANCY_GROUP_ANCHOR,
   FieldList,
   HeldDisclosure,
@@ -55,6 +57,8 @@ import {
   isHidden,
   isHistorical,
   itemAnchorId,
+  itemIdentity,
+  itemKeys,
   partitionGroup,
   sectionAnchorId,
   suppressionLabel,
@@ -1386,5 +1390,235 @@ describe('bounded batches', () => {
 
     expect(renderGroups.mock.calls[0]?.[0]).toHaveLength(25);
     expect(screen.queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Card keys across runs
+// ---------------------------------------------------------------------------------------------
+
+describe('card keys across runs', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A card with one action, anchored as `RecommendationCard` anchors it, at `item-{id}`. */
+  function actionCard(item: Item): ReactNode {
+    return (
+      <article id={itemAnchorId(item.id)} aria-label={item.action}>
+        <Button>{`Mark done: ${item.action}`}</Button>
+      </article>
+    );
+  }
+
+  /** A K1 item on the search term `term`, so items with different terms are different actions. */
+  function termItem(id: number, term: string): Item {
+    return makeItem({
+      id,
+      rank: id,
+      action: `Add "${term}" as exact-match negative`,
+      entity: { source: 'google', type: 'search_term', id: `61000201|7700119|${term}`, name: term },
+    });
+  }
+
+  /** The same recommendation as a newer run recomputes it: every field kept but a new id. */
+  function nextRun(item: Item): Item {
+    return { ...item, id: item.id + 1000 };
+  }
+
+  /** A C0 item on campaign "Generic CRM — US" for the discrepancy `discrepancyId`. */
+  function discrepancyItem(id: number, discrepancyId: number): Item {
+    return makeItem({
+      id,
+      rank: id,
+      rule_id: 'C0',
+      action: `Resolve discrepancy ${String(discrepancyId)}`,
+      entity: { source: 'google', type: 'campaign', id: '1234567890', name: 'Generic CRM — US' },
+      evidence: makeEvidence({ extra: { discrepancy_id: discrepancyId, kind: 'status' } }),
+    });
+  }
+
+  /** An item whose entity carries no id, with `entityId` as the payload sends it. */
+  function unidentifiedItem(id: number, entityId: string | null): Item {
+    return makeItem({
+      id,
+      rank: id,
+      action: `Unidentified action ${String(id)}`,
+      entity: { source: 'google', type: 'search_term', id: entityId, name: null },
+    });
+  }
+
+  /**
+   * Renders `view(items)` from state, starting with `initial`, and returns `show`, which hands it
+   * new items as the refetched page of a newer run does.
+   */
+  function renderReplaceable(
+    initial: readonly Item[],
+    view: (items: readonly Item[]) => ReactNode,
+  ): (next: readonly Item[]) => void {
+    const control: { show?: (next: readonly Item[]) => void } = {};
+    function Host(): ReactNode {
+      const [items, setItems] = useState(initial);
+      control.show = setItems;
+      return view(items);
+    }
+    render(<Host />);
+    return (next) => {
+      act(() => {
+        control.show?.(next);
+      });
+    };
+  }
+
+  /** A card list of `items`, as a section's group body renders it. */
+  function cardList(items: readonly Item[]): ReactNode {
+    return <CardList items={items} renderCard={actionCard} />;
+  }
+
+  it('gives the same recommendation in a newer run the same identity, and another one its own', () => {
+    const item = termItem(61, 'crm demo');
+
+    expect(itemIdentity(nextRun(item))).toBe(itemIdentity(item));
+    expect(itemIdentity({ ...item, rule_id: 'K2' })).not.toBe(itemIdentity(item));
+    expect(itemIdentity(termItem(61, 'crm trial'))).not.toBe(itemIdentity(item));
+    expect(itemIdentity({ ...item, entity: { ...item.entity, source: 'linkedin' } })).not.toBe(
+      itemIdentity(item),
+    );
+    expect(itemIdentity({ ...item, entity: { ...item.entity, type: 'keyword' } })).not.toBe(
+      itemIdentity(item),
+    );
+  });
+
+  it('never lets a separator inside an entity id make two identities equal', () => {
+    const split = makeItem({
+      entity: { source: 'google', type: 'keyword', id: '1|2', name: null },
+    });
+    const shifted = makeItem({
+      entity: { source: 'google', type: 'keyword|1', id: '2', name: null },
+    });
+    const quoted = makeItem({
+      entity: { source: 'google', type: 'keyword', id: '1","2', name: null },
+    });
+
+    expect(new Set([split, shifted, quoted].map(itemIdentity)).size).toBe(3);
+  });
+
+  it('tells the C0 discrepancies of one subject apart by their discrepancy id', () => {
+    const first = discrepancyItem(1, 51);
+
+    expect(itemIdentity(discrepancyItem(2, 52))).not.toBe(itemIdentity(first));
+    expect(itemIdentity(nextRun(first))).toBe(itemIdentity(first));
+  });
+
+  it('falls back to a key for its run alone when the entity has no id', () => {
+    expect(itemIdentity(unidentifiedItem(7, null))).toBe('run-item:7');
+    expect(itemIdentity(unidentifiedItem(8, '  '))).toBe('run-item:8');
+    // Only a cast can express the non-string id an untyped payload could still carry.
+    expect(itemIdentity(unidentifiedItem(9, 42 as unknown as string))).toBe('run-item:9');
+    expect(itemIdentity(nextRun(unidentifiedItem(7, null)))).not.toBe('run-item:7');
+  });
+
+  it('keys every item of a list uniquely, suffixing a repeated identity in list order', () => {
+    const first = termItem(1, 'crm demo');
+    const other = termItem(2, 'crm trial');
+    const second = { ...first, id: 3 };
+    const third = { ...first, id: 4 };
+
+    const keys = itemKeys([first, other, second, third]);
+
+    expect(keys.get(first)).toBe(itemIdentity(first));
+    expect(keys.get(other)).toBe(itemIdentity(other));
+    expect(keys.get(second)).toBe(`${itemIdentity(first)}#1`);
+    expect(keys.get(third)).toBe(`${itemIdentity(first)}#2`);
+    expect(new Set(keys.values()).size).toBe(4);
+  });
+
+  it('keeps a card, and focus on its action, when a newer run replaces every item id', () => {
+    const items = [termItem(1, 'crm demo'), termItem(2, 'crm trial')];
+    const show = renderReplaceable(items, cardList);
+    const card = screen.getByRole('article', { name: 'Add "crm trial" as exact-match negative' });
+    const action = within(card).getByRole('button');
+    action.focus();
+    expect(document.activeElement).toBe(action);
+
+    show(items.map(nextRun));
+
+    const replaced = screen.getByRole('article', {
+      name: 'Add "crm trial" as exact-match negative',
+    });
+    expect(replaced).toBe(card);
+    expect(replaced.id).toBe('item-1002');
+    expect(within(replaced).getByRole('button')).toBe(action);
+    expect(document.activeElement).toBe(action);
+  });
+
+  it('mounts a new card for a different recommendation, even when it reuses the id', () => {
+    const show = renderReplaceable([termItem(1, 'crm demo')], cardList);
+    const card = screen.getByRole('article');
+
+    show([termItem(1, 'crm trial')]);
+
+    const replaced = screen.getByRole('article', {
+      name: 'Add "crm trial" as exact-match negative',
+    });
+    expect(replaced).not.toBe(card);
+  });
+
+  it("keeps a card of the frame's default body, and focus on its action, across a newer run", () => {
+    const items = [termItem(1, 'crm demo'), termItem(2, 'crm trial')];
+    const show = renderReplaceable(items, (shown) => (
+      <SectionFrame
+        section={makeSection('keywords', { groups: [makeGroup({ items: [...shown] })] })}
+        renderItem={actionCard}
+      />
+    ));
+    const action = within(
+      screen.getByRole('article', { name: 'Add "crm demo" as exact-match negative' }),
+    ).getByRole('button');
+    action.focus();
+
+    show(items.map(nextRun));
+
+    expect(screen.getByRole('article', { name: 'Add "crm demo" as exact-match negative' }).id).toBe(
+      'item-1001',
+    );
+    expect(action.isConnected).toBe(true);
+    expect(document.activeElement).toBe(action);
+  });
+
+  it('keys two C0 cards of one subject apart, without a duplicate-key warning', () => {
+    const consoleError = vi.spyOn(console, 'error');
+    const show = renderReplaceable([discrepancyItem(1, 51), discrepancyItem(2, 52)], cardList);
+    const second = screen.getByRole('article', { name: 'Resolve discrepancy 52' });
+
+    show([discrepancyItem(11, 51), discrepancyItem(12, 52)]);
+
+    expect(screen.getAllByRole('article').map((article) => article.id)).toEqual([
+      'item-11',
+      'item-12',
+    ]);
+    expect(screen.getByRole('article', { name: 'Resolve discrepancy 52' })).toBe(second);
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('renders items that share an identity, or carry no entity id, each as its own card', () => {
+    const consoleError = vi.spyOn(console, 'error');
+    const shared = termItem(1, 'crm demo');
+    render(
+      cardList([
+        shared,
+        { ...shared, id: 2, action: 'A second action on the same term' },
+        unidentifiedItem(7, null),
+        unidentifiedItem(8, null),
+      ]),
+    );
+
+    expect(screen.getAllByRole('article').map((article) => article.id)).toEqual([
+      'item-1',
+      'item-2',
+      'item-7',
+      'item-8',
+    ]);
+    expect(consoleError).not.toHaveBeenCalled();
   });
 });

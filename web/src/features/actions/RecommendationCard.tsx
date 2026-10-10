@@ -39,10 +39,15 @@
  *
  * A historical item keeps its card readable, but every footer action is disabled, the C0
  * resolver too (`resolver({ disabled: true })`). A 409 `subject_retired` from a screen that
- * went stale before its refetch, whether a feedback or the decision form received it, locks the
- * actions the same way for as long as the item is rendered and shows the same message. A
- * decision save keeps every footer action disabled until it settles, even once its dialog is
- * closed, and its failure is shown on the card.
+ * went stale before its refetch, whether a feedback or the decision form received it, always
+ * shows the same message, "Computed from replaced data", as the card's failure text, which stays
+ * until the next action starts. It locks the actions the same way only while the recommendation
+ * the refused request submitted is the item shown, and the lock belongs to that run's item: a
+ * newer run's item is judged by its own `current.historical`. A decision save keeps every
+ * footer action disabled until it settles, even once its dialog is closed, and its failure is
+ * shown on the card. The rest of the footer's state belongs to the recommendation, not to one
+ * run's item, so a newer run's item of the same recommendation keeps the footer's buttons,
+ * keyboard focus on them, the failure text and an open decision dialog (WCAG 2.2 SC 2.4.3).
  *
  * A recorded feedback can remove its own card: the refetched item carries `current.hidden_by`
  * and its section drops it. The outcome is therefore announced in the polite region of an
@@ -58,11 +63,26 @@
  *
  * @packageDocumentation
  */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { isApiError, useFeedback } from '../../api/queries';
-import type { DataStatus, EntityView, FeedbackKind, Item, ProvenanceEntry } from '../../api/types';
+import type {
+  DataStatus,
+  DecisionSubjectRef,
+  EntityView,
+  FeedbackKind,
+  Item,
+  ProvenanceEntry,
+} from '../../api/types';
 import { Badge, Banner, Button, Card, Dialog, Inline, Stack } from '../../design-system';
 import type { CardHeaderProps } from '../../design-system';
 import { formatMetric, formatWindowChip, sourceLabel } from '../../lib/format';
@@ -71,7 +91,7 @@ import { BlockingDiscrepancyLinks } from './BlockingDiscrepancies';
 import { EvidenceTable } from './EvidenceTable';
 import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
 import { FlagList } from './FlagList';
-import { isHeld } from './sections/SectionFrame';
+import { isHeld, itemIdentity } from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Labels
@@ -243,10 +263,10 @@ function headlineFigure(item: Item): CardHeaderProps['figure'] {
 }
 
 /**
- * The message a failed feedback request shows (AAP 0.5.3 status codes):
+ * The message a failed feedback request shows (AAP 0.5.3 status codes), for every failure but a
+ * 409 `subject_retired`, which always shows {@link HISTORICAL_LABEL} instead, never the generic
+ * retry text, whether or not it locks the item shown:
  *
- * - 409 `subject_retired`: {@link HISTORICAL_LABEL}, the same message as the historical badge,
- *   because the item was computed from data that has since been replaced (AAP 0.3.2);
  * - 422 (for example `feedback_not_allowed`) and every other `ApiError`: its message, which is
  *   the API's envelope message or the client's own fallback text, both safe to show, or a
  *   generic retry text when it is blank;
@@ -257,9 +277,6 @@ function headlineFigure(item: Item): CardHeaderProps['figure'] {
  * @returns the text for the footer's warning banner
  */
 function feedbackErrorMessage(error: unknown): string {
-  if (isRetiredError(error)) {
-    return HISTORICAL_LABEL;
-  }
   return (isApiError(error) ? textOrNull(error.message) : null) ?? FEEDBACK_ERROR_FALLBACK;
 }
 
@@ -571,24 +588,58 @@ export interface RecommendationActionsProps {
 /** The feedback kinds in footer order, after the item's primary action. */
 const SECONDARY_FEEDBACK: readonly FeedbackKind[] = ['dismiss', 'snooze'];
 
+/** The item a "Record decision" dialog was opened from. */
+interface DialogOpener {
+  /** The item's id, which the dialog's form posts as `recommendation_id`. */
+  readonly recommendationId: Item['id'];
+  /** The item's decision subject, which the form records about. */
+  readonly subject: DecisionSubjectRef | null;
+}
+
 /**
- * The "Record decision" dialog of one card: whether it is open, and which opening it is.
- * `session` grows with every opening, so a save that ends after its dialog was closed can tell
- * whether the dialog shown now is still its own.
+ * The "Record decision" dialog of one card: whether it is open, which opening it is, and the
+ * item it was opened from. `session` grows with every opening, so a save that ends after its
+ * dialog was closed can tell whether the dialog shown now is still its own.
  */
 interface DialogSession {
   /** Whether the dialog is shown. */
   readonly open: boolean;
   /** The number of the latest opening; `0` before the first. */
   readonly session: number;
+  /**
+   * The item the latest opening was made from; `null` before the first. While the dialog stays
+   * open and the decision subject is unchanged, the form keeps posting this item's id, so a
+   * newer run's item of the same recommendation keeps the open form, its edits and focus
+   * included (the form starts afresh whenever the recommendation id it is given changes). The
+   * API accepts any recommendation whose subject matches the decision's.
+   */
+  readonly opener: DialogOpener | null;
 }
 
 /** The dialog before its first opening. */
-const CLOSED_DIALOG: DialogSession = { open: false, session: 0 };
+const CLOSED_DIALOG: DialogSession = { open: false, session: 0, opener: null };
 
-/** The dialog opened anew: a session no earlier save belongs to. */
-function openDialogSession(current: DialogSession): DialogSession {
-  return { open: true, session: current.session + 1 };
+/** The dialog opened anew from `item`: a session no earlier save belongs to. */
+function openDialogSession(current: DialogSession, item: Item): DialogSession {
+  return {
+    open: true,
+    session: current.session + 1,
+    opener: { recommendationId: item.id, subject: item.decision_subject ?? null },
+  };
+}
+
+/** Whether two decision subjects are the same campaign or budget. */
+function sameSubject(
+  left: DecisionSubjectRef | null,
+  right: DecisionSubjectRef | null | undefined,
+): boolean {
+  return (
+    left !== null &&
+    right !== null &&
+    right !== undefined &&
+    left.type === right.type &&
+    left.id === right.id
+  );
 }
 
 /** The dialog closed, keeping its session; unchanged when it is closed already. */
@@ -619,22 +670,36 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * C0 discrepancies render nothing here (`null`): they are exempt from feedback, and the card
  * renders their resolver instead (AAP 0.5.4.2, 0.5.4.4).
  *
- * Every action is disabled on a historical item (`current.historical`) and, from then on, after
- * a 409 `subject_retired` to a feedback or to the decision form (its `onRetired`), which shows
- * {@link HISTORICAL_LABEL} in a warning `Banner` for as long as the item is rendered, including
- * after the dialog closes. While a feedback request is pending, its button shows the loading
- * state and every action is disabled; once it succeeds, the actions stay disabled and a status
- * line ("Marked done", "Dismissed", "Snoozed") stands until the refetched recommendations hide
- * the item. Inside an {@link ActionOutcomeProvider} that outcome, and a recorded decision, is
- * announced in the provider's region, which outlives the card, instead of in the card's own
- * line. Keyboard focus, lost with the disabled or removed button, then moves to the next card's
- * first enabled action, else the previous card's, else the enclosing section's heading, else
- * `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Any other failure, of a
- * feedback or of a decision save (the form's `onFailed`), shows the API's message, or a
- * generic text for a failure that carries none, in the warning `Banner`, until the next action
- * starts. The banner takes focus when it appears, or once the decision dialog closes, so
- * keyboard and screen-reader users land on it;
- * `role="alert"` stays reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
+ * Every action is disabled on a historical item (`current.historical`). A 409
+ * `subject_retired` to a feedback or to the decision form (its `onRetired`) disables them the
+ * same way, including after the dialog closes, while the recommendation the refused request
+ * submitted (the feedback's item at the click, the id the form posted) is the item shown. While
+ * a feedback request is pending, its button shows the loading state and every action is
+ * disabled; once it succeeds, the actions stay disabled and a status line ("Marked done",
+ * "Dismissed", "Snoozed") stands until the refetched recommendations hide the item. Inside an
+ * {@link ActionOutcomeProvider} that outcome, and a recorded decision, is announced in the
+ * provider's region, which outlives the card, instead of in the card's own line. Keyboard
+ * focus, lost with the disabled or removed button, then moves to the next card's first enabled
+ * action, else the previous card's, else the enclosing section's heading, else `<main>`, unless
+ * the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Every refused action, of a feedback or
+ * of a decision save, shows its explanation in a warning `Banner` until the next action starts:
+ * {@link HISTORICAL_LABEL} for every 409 `subject_retired`, whether or not it locked the item
+ * shown; for any other failure (the form's `onFailed`), the API's message, or a generic text
+ * for a failure that carries none. The banner takes focus when it appears, or once the
+ * decision dialog closes, so keyboard and screen-reader users land on it; `role="alert"` stays
+ * reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
+ *
+ * The actions' state belongs to the recommendation ({@link itemIdentity}), not to one run's
+ * item: when a newer run's item of the same recommendation takes the item's place, the buttons
+ * keep their elements, so keyboard focus stays on the one that had it (WCAG 2.2 SC 2.4.3), and
+ * a recorded feedback, a failure's text with its banner and the focus on it ("Computed from
+ * replaced data" included), "Decision recorded", an open dialog with its form and a running
+ * decision save carry over. An open dialog closes when the newer item has no decision subject,
+ * and focus moves to its first enabled action, else to the card. Only the `subject_retired`
+ * lock belongs to the run's item it was learned on, the recommendation id the refused request
+ * submitted: the newer item is judged by its own `current.historical`, and a refusal for an
+ * item already replaced never locks the item shown. A different recommendation rendered in the
+ * same place starts with fresh state.
  *
  * @param props - see {@link RecommendationActionsProps}
  * @returns the actions, or `null` for a C0 item
@@ -650,14 +715,21 @@ export function RecommendationActions(props: RecommendationActionsProps): ReactE
   if (props.item.rule_id === 'C0') {
     return null;
   }
-  // Keyed by the item, so a retired lock, a recorded feedback and an open dialog belong to the
-  // item they were given on and never carry over to another item rendered in the same place.
-  return <RecommendationActionsBody key={props.item.id} {...props} />;
+  // Keyed by the recommendation, never by one run's item id: a newer run's item of the same
+  // recommendation keeps the buttons, and focus on them, while another recommendation rendered
+  // in the same place never inherits this one's state.
+  return <RecommendationActionsBody key={itemIdentity(props.item)} {...props} />;
 }
 
 /**
  * The footer actions of one non-C0 item; see {@link RecommendationActions}. Its state lives as
- * long as the item's id, because {@link RecommendationActions} keys it by that id.
+ * long as the item's recommendation identity ({@link itemIdentity}), because
+ * {@link RecommendationActions} keys it by that identity, so it outlives a newer run's item of
+ * the same recommendation. The one exception is the `subject_retired` lock: it belongs to the
+ * run's item it was learned on, the recommendation id the refused request submitted, so it is
+ * lifted when the item's id changes and is never set by a refusal for an item already replaced.
+ * The "Computed from replaced data" explanation of every refusal is failure text like any
+ * other, and stays until the next action starts.
  *
  * @param props - see {@link RecommendationActionsProps}
  * @returns the action row with its status and error lines, and the decision dialog
@@ -680,18 +752,78 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   const rowRef = useRef<HTMLDivElement>(null);
   const messageRef = useRef<HTMLDivElement>(null);
   const openerRef = useRef<HTMLButtonElement>(null);
+  // The id of the item the row showed at its latest commit. A retirement locks the row only
+  // while the recommendation its request submitted is still the item shown
+  // ({@link learnRetirement}).
+  const shownIdRef = useRef(item.id);
+  // Set when an open dialog's item lost its decision subject; consumed by the first commit
+  // after it.
+  const [refocusRow, setRefocusRow] = useState(false);
 
-  // A retirement learned from any write, a feedback's or the decision form's, shows the
-  // historical message (AAP 0.5.5: "shown as the same message"); otherwise a failed feedback or
-  // decision save shows its own text.
-  const message = retired ? HISTORICAL_LABEL : errorText;
+  // A newer run's item of the same recommendation has taken the item's place, before the
+  // browser paints. The lock belongs to the previous run's item: the new one is judged by its
+  // own `current.historical`. Everything else carries over, the failure text with its banner and
+  // the focus it holds included, but an open dialog needs a decision subject, so an item without
+  // one closes it.
+  useLayoutEffect(() => {
+    if (shownIdRef.current === item.id) {
+      return;
+    }
+    shownIdRef.current = item.id;
+    setRetired(false);
+    if (dialogOpen && (item.decision_subject === null || item.decision_subject === undefined)) {
+      setDialog(closeDialogSession);
+      setRefocusRow(true);
+    }
+  }, [item.id, item.decision_subject, dialogOpen]);
+
+  // After the commit that closed the dialog, the element that held focus is gone. Focus moves
+  // to the row's first enabled action, else to the card, so it stays on the item (WCAG 2.2
+  // SC 2.4.3): only when focus was lost or is still on the row, never where the user has moved
+  // it, and never over a message still shown, which takes focus itself (the effect below).
+  useLayoutEffect(() => {
+    if (!refocusRow) {
+      return;
+    }
+    setRefocusRow(false);
+    const row = rowRef.current;
+    if (row === null || messageRef.current !== null || !focusIsLostOrWithin(row)) {
+      return;
+    }
+    const action = firstEnabledAction(row);
+    if (action !== null && moveFocusTo(action)) {
+      return;
+    }
+    // Outside a card, such as a white-paper row's details, the row itself takes focus.
+    moveFocusTo(row.closest('article') ?? row, true);
+  }, [refocusRow]);
+
+  /**
+   * Records a 409 `subject_retired` to a request that submitted the recommendation `sentFor`:
+   * a feedback's item id at the click, or the id the decision form posted. Every such refusal
+   * shows {@link HISTORICAL_LABEL} as the card's failure text (AAP 0.5.5: "shown as the same
+   * message"), which, like any failure text, stays until the next action starts, also across a
+   * newer run's item. The lock is set only while `sentFor` is the item shown: a refusal for an
+   * item a newer run has replaced since leaves the item shown now unlocked, judged by its own
+   * `current.historical`, so the refused action may be tried again on it.
+   */
+  const learnRetirement = (sentFor: Item['id']) => {
+    setErrorText(HISTORICAL_LABEL);
+    if (shownIdRef.current === sentFor) {
+      setRetired(true);
+    }
+  };
+
+  // The failure text alone is the card's message, independent of the lock: a retirement's is
+  // HISTORICAL_LABEL ({@link learnRetirement}); a failed feedback or decision save shows its own.
+  const message = errorText;
 
   // A pressed button is disabled while its request runs, which drops keyboard focus to the
   // page. When the request fails, focus moves to the message instead (WCAG 2.2 SC 2.4.3, 3.3.1).
   // The banner is no live region, so taking focus is how its message is read. While the
   // decision dialog is open its focus trap owns focus, so the message waits and takes focus
   // once the dialog closes: React runs the dialog's cleanup, which returns focus to the
-  // "Record decision" button a retirement has disabled, before this effect.
+  // "Record decision" button (disabled when a retirement locked the row), before this effect.
   useEffect(() => {
     if (message !== null && !dialogOpen) {
       messageRef.current?.focus();
@@ -751,10 +883,12 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         }
       },
       (error: unknown) => {
+        // `item` is the item shown on the click, the one the request was sent for.
         if (isRetiredError(error)) {
-          setRetired(true);
+          learnRetirement(item.id);
+        } else {
+          setErrorText(feedbackErrorMessage(error));
         }
-        setErrorText(feedbackErrorMessage(error));
       },
     );
   };
@@ -790,11 +924,20 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     // (`decisionPending`), and the decision is recorded either way, so the outcome is still
     // shown and announced.
     const formSession = dialog.session;
+    // The recommendation the open form posts: the item the dialog was opened from, while the
+    // subject is unchanged, so a newer run's item of the same recommendation keeps the form
+    // with its edits and focus (DecisionForm starts afresh when this id changes); otherwise the
+    // item shown now.
+    const opener = dialog.opener;
+    const formRecommendationId =
+      dialogOpen && opener !== null && sameSubject(opener.subject, subject)
+        ? opener.recommendationId
+        : item.id;
     decisionDialog = (
       <Dialog open={dialogOpen} title={RECORD_DECISION_LABEL} onClose={closeDialog}>
         <DecisionForm
           subject={subject}
-          recommendationId={item.id}
+          recommendationId={formRecommendationId}
           prefill={context.prefill}
           members={context.members}
           currency={context.currency}
@@ -806,9 +949,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
             announce?.(outcomeMessage(DECISION_RECORDED_MESSAGE, item));
           }}
           onRetired={() => {
-            // The subject's dataset was replaced: lock every footer action of this item, not
-            // only the form, so closing and reopening the dialog cannot lift the lock.
-            setRetired(true);
+            // The subject's dataset was replaced. The form calls the onRetired it had when the
+            // user saved, so `formRecommendationId` is the recommendation that save posted: the
+            // refusal is that recommendation's. While it is the item shown, every footer action
+            // locks, not only the form, so closing and reopening the dialog cannot lift the lock.
+            learnRetirement(formRecommendationId);
           }}
           onPendingChange={(saving) => {
             setDecisionPending(saving);
@@ -849,7 +994,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
           }
           setErrorText(null);
           setDecisionSaved(false);
-          setDialog(openDialogSession);
+          setDialog((current) => openDialogSession(current, item));
         }}
       >
         {RECORD_DECISION_LABEL}

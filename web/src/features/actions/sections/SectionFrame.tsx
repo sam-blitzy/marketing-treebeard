@@ -43,12 +43,15 @@
  *   each followed by a "Show {n} more" control. Every card that renders is the card
  *   `renderItem` returns, with its rank, flags and evidence, and a link to one not yet shown
  *   (`#item-{id}`, `#group-…`) reveals it.
+ * - A card is keyed by its recommendation's identity across runs ({@link itemIdentity}), never by
+ *   the per-run item id, so a newer run's items update the cards in place: keyboard focus stays
+ *   on the control that had it (WCAG 2.2 SC 2.4.3). Anchors stay `item-{id}`.
  * - Built only on the design-system index (AAP 0.4.4): no raw buttons, headings or tables, no
  *   inline styles and no stylesheet. Layout comes from `Stack` and `Inline` alone.
  *
  * @packageDocumentation
  */
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import type {
@@ -64,6 +67,7 @@ import { Banner, Button, EmptyState, Inline, PageShell, Stack } from '../../../d
 import type { Tone } from '../../../design-system';
 import { UNAVAILABLE, formatCount } from '../../../lib/format';
 import { WithheldList, withheldLine } from '../WithheldList';
+import { discrepancyRef } from '../evidenceExtra';
 import {
   ACTION_NOUN,
   BatchedList,
@@ -281,9 +285,82 @@ export interface GroupParts {
 // Card lists
 // ---------------------------------------------------------------------------------------------
 
-/** The React key of an item's card: its id, unique within a run. */
-function itemKey(item: Item): Item['id'] {
-  return item.id;
+/** The rule whose items are discrepancies (C0): one item per discrepancy, not per subject. */
+const DISCREPANCY_RULE = 'C0';
+
+/**
+ * The identity of an item's recommendation across runs: what stays the same when a newer run
+ * recomputes the same action on the same entity, while its `id` (one `recommendation` row per
+ * run) changes with every run.
+ *
+ * It is the key feedback matches an item by in later runs (the rule id with the entity's type
+ * and id, `analysis/overlay.py` `FeedbackKey`), plus the entity's source. The entity id is built
+ * from platform ids, never internal row ids, so it survives a re-sync and a dataset transition
+ * of the same platform entity. A C0 discrepancy adds its discrepancy id (`extra.discrepancy_id`,
+ * {@link discrepancyRef}): there is one C0 item per discrepancy, and one subject can have
+ * several. The parts are serialised as one JSON array, so separators inside an entity id (such
+ * as `|` and `:`) never make two different identities equal.
+ *
+ * An item whose entity has no id (`null` or blank) has no identity across runs and gets
+ * `run-item:{id}`, which lasts for its run only and never equals an identity built from parts,
+ * since that always starts with `[`.
+ *
+ * @param item - the item
+ * @returns the identity, as a string
+ *
+ * @example
+ * ```ts
+ * itemIdentity(k1Item); // '["K1","google","search_term","61000201|7700119|crm demo"]'
+ * itemIdentity({ ...k1Item, entity: { ...k1Item.entity, id: null } }); // "run-item:1"
+ * ```
+ */
+export function itemIdentity(item: Item): string {
+  const { entity } = item;
+  // A runtime payload may still send a non-string id, which has no identity across runs.
+  if (typeof entity.id !== 'string' || entity.id.trim() === '') {
+    return `run-item:${String(item.id)}`;
+  }
+  const parts: (string | null)[] = [item.rule_id, entity.source, entity.type, entity.id];
+  if (item.rule_id === DISCREPANCY_RULE) {
+    parts.push(discrepancyRef(item)?.discrepancyId ?? null);
+  }
+  return JSON.stringify(parts);
+}
+
+/**
+ * The React key of each item's card in one list: its {@link itemIdentity}, so a newer run's item
+ * of the same recommendation keeps the card, with its DOM, keyboard focus and local state, in
+ * place of remounting it (WCAG 2.2 SC 2.4.3). A later item of the list with an identity already
+ * taken gets `#{n}` after it, its occurrence count, so every key in the list is unique even when
+ * two items share an identity. An identity ends with `]` and a `run-item:{id}` fallback holds no
+ * `#`, so a suffixed key never equals another item's key.
+ *
+ * Keys are given in list order, over the whole list rather than the batch shown, so revealing
+ * more of the list never changes the key of a card already shown. An item object listed twice
+ * keeps the key of its first occurrence.
+ *
+ * @param items - the list's items, in API order
+ * @returns each item's key
+ *
+ * @example
+ * ```tsx
+ * const keys = itemKeys(items);
+ * items.map((item) => <Fragment key={keys.get(item)}>{renderCard(item)}</Fragment>);
+ * ```
+ */
+export function itemKeys(items: readonly Item[]): ReadonlyMap<Item, string> {
+  const keys = new Map<Item, string>();
+  const occurrences = new Map<string, number>();
+  for (const item of items) {
+    if (keys.has(item)) {
+      continue;
+    }
+    const identity = itemIdentity(item);
+    const seen = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, seen + 1);
+    keys.set(item, seen === 0 ? identity : `${identity}#${String(seen)}`);
+  }
+  return keys;
 }
 
 /** The anchors a card holds: its `item-{id}` ({@link itemAnchorId}). */
@@ -306,12 +383,17 @@ export interface CardListProps {
 
 /**
  * A list of cards in API order, mounted `CARD_BATCH_SIZE` at a time (`../batches`). Each card
- * is exactly what `renderCard` returns, in a `Fragment` keyed by the item id, so it stays a
- * direct child of the enclosing `Stack` and keeps its rank, flags and evidence. A list longer
- * than one batch is followed by a polite "Showing {n} of {total} actions" status and a "Show
- * {k} more actions" button; each press reveals the next batch and moves focus to its first card
- * (the card's `item-{id}` element). A list at or under one batch renders every card and no
- * control, exactly as an unbatched map.
+ * is exactly what `renderCard` returns, in a `Fragment` keyed by the item's recommendation
+ * identity across runs ({@link itemKeys}), so it stays a direct child of the enclosing `Stack`
+ * and keeps its rank, flags and evidence. When a newer run replaces the items, every id changes
+ * but a card of the same recommendation keeps its element: keyboard focus on one of its
+ * controls, and the card's local state, survive the swap instead of falling to the page
+ * (WCAG 2.2 SC 2.4.3).
+ *
+ * A list longer than one batch is followed by a polite "Showing {n} of {total} actions" status
+ * and a "Show {k} more actions" button; each press reveals the next batch and moves focus to its
+ * first card (the card's `item-{id}` element). A list at or under one batch renders every card
+ * and no control, exactly as an unbatched map.
  *
  * When `location.hash` names a card not shown yet (`#item-{id}`, such as a held card's link to
  * its blocking C0 card), the list reveals the batches through it and scrolls it into view, on
@@ -331,12 +413,13 @@ export interface CardListProps {
  * ```
  */
 export function CardList({ items, renderCard }: CardListProps): ReactElement {
+  const keys = useMemo(() => itemKeys(items), [items]);
   return (
     <BatchedList
       entries={items}
       batchSize={CARD_BATCH_SIZE}
       noun={ACTION_NOUN}
-      getKey={itemKey}
+      getKey={(item) => keys.get(item) ?? itemIdentity(item)}
       renderEntry={renderCard}
       anchorsOf={itemAnchors}
       focusIdOf={itemFocusId}
@@ -386,7 +469,7 @@ export interface HistoricalItemsProps {
  * @example
  * ```tsx
  * <HistoricalItems id={`${parts.anchorId}-historical`} count={parts.historical.length}>
- *   {parts.historical.map((item) => <RecommendationCard key={item.id} item={item} />)}
+ *   <CardList items={parts.historical} renderCard={(item) => <RecommendationCard item={item} />} />
  * </HistoricalItems>
  * ```
  */
@@ -463,7 +546,7 @@ export interface HeldDisclosureProps {
  * @example
  * ```tsx
  * <HeldDisclosure id={`${parts.anchorId}-held`} count={parts.held.length}>
- *   {parts.held.map((item) => <RecommendationCard key={item.id} item={item} />)}
+ *   <CardList items={parts.held} renderCard={(item) => <RecommendationCard item={item} />} />
  * </HeldDisclosure>
  * ```
  */
@@ -756,8 +839,10 @@ interface ItemCardsProps {
 
 /**
  * `renderItem` for each item, in order, through a {@link CardList}: each card in a `Fragment`
- * keyed by the item id (unique within a run), so `renderItem` may return any node without a key
- * of its own, and a long list mounts one batch of cards at a time.
+ * keyed by the item's recommendation identity across runs ({@link itemKeys}), so `renderItem`
+ * may return any node without a key of its own, a long list mounts one batch of cards at a time,
+ * and a newer run's item of the same recommendation keeps its card, so keyboard focus and the
+ * card's local state survive the swap.
  *
  * A component rather than an inline map, so `renderItem` runs only when the list renders: the
  * held cards of a {@link HeldDisclosure} nobody has opened are never even built, and a card

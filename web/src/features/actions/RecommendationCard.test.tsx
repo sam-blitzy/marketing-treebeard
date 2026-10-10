@@ -33,6 +33,13 @@
  *   posts again. A late success is reported and announced, a late failure of any kind is shown
  *   on the card and takes focus, and focus otherwise returns to "Record decision" when it was
  *   lost.
+ * - **A newer run**: the same recommendation under a new id keeps the footer's buttons, focus on
+ *   them, a recorded feedback, a failure's text and an open decision dialog with its edits; a
+ *   retirement lock stays with the item it was learned on, the recommendation id the refused
+ *   request submitted, so the newer item is unlocked while the "Computed from replaced data"
+ *   banner, and the focus on it, stay until the next action starts; a refusal that arrives for a
+ *   replaced item, or for the item a still-open dialog was opened from, shows the same message
+ *   without locking the item shown. Another recommendation in the same place starts fresh.
  * - **Holds**: a held item states why and links its recorded blocking discrepancy on
  *   `/decisions` (rendered alone, the card has no run C0 card to link), or, with no blocker to
  *   name, "View open discrepancies" to the Campaigns discrepancy group.
@@ -963,7 +970,17 @@ describe('RecommendationCard: footer actions', () => {
         makeFeedback('dismiss', { recommendation_id: first.id }),
       ),
     });
-    const second = makeItem({ id: 62, action: 'Add "crm trial" as exact-match negative' });
+    // Another recommendation: the same rule on another search term.
+    const second = makeItem({
+      id: 62,
+      action: 'Add "crm trial" as exact-match negative',
+      entity: {
+        source: 'google',
+        type: 'search_term',
+        id: '61000201|7700119|crm trial',
+        name: 'crm trial',
+      },
+    });
 
     /** Shows `first`, then `second` in the same place once "Show next item" is pressed. */
     function ItemSwitcher() {
@@ -1443,6 +1460,380 @@ describe('RecommendationCard: record decision', () => {
     expect(document.activeElement).toBe(elsewhere);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// A newer run's item of the same recommendation
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Renders the card of `initial` from state and returns `show`, which puts another item in its
+ * place, as the refetched page of a newer run does.
+ */
+async function renderReplaceableCard(initial: Item): Promise<(next: Item) => void> {
+  const control: { show?: (next: Item) => void } = {};
+  function Host() {
+    const [item, setItem] = useState(initial);
+    control.show = setItem;
+    return <RecommendationCard item={item} />;
+  }
+  await renderCard(<Host />);
+  return (next) => {
+    act(() => {
+      control.show?.(next);
+    });
+  };
+}
+
+/** `item` as a newer run recomputes it: the same recommendation under a new id. */
+function newerRun(item: Item): Item {
+  return { ...item, id: item.id + 1000 };
+}
+
+/** A response a test releases itself, for a request it keeps pending until then. */
+function heldResponse(): {
+  pending: Promise<MockResponse>;
+  release: (response: MockResponse) => void;
+} {
+  let release: (response: MockResponse) => void = () => {
+    throw new Error('the pending response was never created');
+  };
+  const pending = new Promise<MockResponse>((resolve) => {
+    release = resolve;
+  });
+  return { pending, release };
+}
+
+describe('RecommendationActions: a newer run of the same recommendation', () => {
+  it('keeps its buttons, and focus on them, when the same recommendation arrives under a new id', async () => {
+    const item = makeItem({ id: 61 });
+    const show = await renderReplaceableCard(item);
+    const dismiss = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss });
+    dismiss.focus();
+
+    const next = newerRun(item);
+    show(next);
+
+    expect(cardOf(next).id).toBe('item-1061');
+    expect(within(cardOf(next)).getByRole('button', { name: FEEDBACK_LABELS.dismiss })).toBe(
+      dismiss,
+    );
+    expect(document.activeElement).toBe(dismiss);
+    cardButtons(next).forEach((button) => {
+      expect(button).toHaveProperty('disabled', false);
+    });
+  });
+
+  it('carries a recorded feedback and a failure, with the focus on it, over to the newer item', async () => {
+    api.use({
+      'POST /recommendations/:id/feedback': apiError(
+        422,
+        'feedback_not_allowed',
+        'Feedback is not accepted for this item.',
+      ),
+    });
+    const item = makeItem({ id: 61 });
+    const show = await renderReplaceableCard(item);
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.done }));
+    const message = await within(cardOf(item)).findByText(
+      'Feedback is not accepted for this item.',
+    );
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    const focused = document.activeElement;
+
+    const next = newerRun(item);
+    show(next);
+
+    expect(within(cardOf(next)).getByText('Feedback is not accepted for this item.')).toBe(message);
+    expect(document.activeElement).toBe(focused);
+
+    api.use({
+      'POST /recommendations/:id/feedback': json(
+        201,
+        makeFeedback('snooze', { recommendation_id: next.id }),
+      ),
+    });
+    fireEvent.click(within(cardOf(next)).getByRole('button', { name: FEEDBACK_LABELS.snooze }));
+    expect(await within(cardOf(next)).findByText('Snoozed')).toBeDefined();
+    // The newer item posts under its own id.
+    expect(posts(api).map((call) => call.path)).toEqual([
+      '/recommendations/61/feedback',
+      '/recommendations/1061/feedback',
+    ]);
+
+    // Recorded on this run's item, the snooze holds the recommendation's actions in the next.
+    const latest = newerRun(next);
+    show(latest);
+    expect(within(cardOf(latest)).getByText('Snoozed')).toBeDefined();
+    cardButtons(latest).forEach((button) => {
+      expect(button).toHaveProperty('disabled', true);
+    });
+  });
+
+  it('lifts a retirement learned on the old id, keeping its banner and the focus on it until the next action', async () => {
+    api.use({
+      'POST /recommendations/:id/feedback': apiError(
+        409,
+        'subject_retired',
+        'Computed from data that has since been replaced.',
+      ),
+    });
+    const item = makeItem({ id: 61 });
+    const show = await renderReplaceableCard(item);
+    const markDone = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.done });
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+    const message = await within(cardOf(item)).findByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    const focused = document.activeElement;
+    cardButtons(item).forEach((button) => {
+      expect(button).toHaveProperty('disabled', true);
+    });
+
+    // The newer item, computed from current data, is judged by its own overlay: the lock lifts,
+    // while the refusal's explanation, like any failure text, stays with the focus on it.
+    const next = newerRun(item);
+    show(next);
+
+    cardButtons(next).forEach((button) => {
+      expect(button).toHaveProperty('disabled', false);
+    });
+    expect(within(cardOf(next)).getByRole('button', { name: FEEDBACK_LABELS.done })).toBe(
+      markDone,
+    );
+    expect(within(cardOf(next)).getByText(HISTORICAL_LABEL)).toBe(message);
+    expect(document.activeElement).toBe(focused);
+    expect(document.activeElement?.contains(message)).toBe(true);
+
+    // The next action starts afresh, and clears the explanation.
+    api.use({
+      'POST /recommendations/:id/feedback': json(
+        201,
+        makeFeedback('done', { recommendation_id: next.id }),
+      ),
+    });
+    fireEvent.click(markDone);
+    expect(await within(cardOf(next)).findByText('Marked done')).toBeDefined();
+    expect(within(cardOf(next)).queryByText(HISTORICAL_LABEL)).toBeNull();
+    expect(posts(api).map((call) => call.path)).toEqual([
+      '/recommendations/61/feedback',
+      '/recommendations/1061/feedback',
+    ]);
+  });
+
+  it('keeps a newer historical item locked, with the banner and the focus on it in place', async () => {
+    api.use({
+      'POST /recommendations/:id/feedback': apiError(409, 'subject_retired', 'Replaced.'),
+    });
+    const item = makeItem({ id: 61 });
+    const show = await renderReplaceableCard(item);
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+    const message = await within(cardOf(item)).findByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    const focused = document.activeElement;
+
+    const next = { ...newerRun(item), current: historicalOverlay() };
+    show(next);
+
+    // Locked by its own overlay, whose badge in the body states it beside the footer's banner.
+    cardButtons(next).forEach((button) => {
+      expect(button).toHaveProperty('disabled', true);
+    });
+    expect(within(cardOf(next)).getAllByText(HISTORICAL_LABEL)).toHaveLength(2);
+    expect(message.isConnected).toBe(true);
+    expect(document.activeElement).toBe(focused);
+    expect(document.activeElement?.contains(message)).toBe(true);
+  });
+
+  it('shows the retirement message, never locking the newer item, on a refusal for the item it replaced', async () => {
+    const held = heldResponse();
+    api.use({ 'POST /recommendations/:id/feedback': () => held.pending });
+    const item = makeItem({ id: 61 });
+    const show = await renderReplaceableCard(item);
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+
+    const next = newerRun(item);
+    show(next);
+    held.release(apiError(409, 'subject_retired', 'Replaced.'));
+
+    const message = await within(cardOf(next)).findByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    expect(
+      within(cardOf(next)).queryByText('The action could not be recorded. Try again.'),
+    ).toBeNull();
+    expect(within(cardOf(next)).queryByText('Replaced.')).toBeNull();
+    cardButtons(next).forEach((button) => {
+      expect(button).toHaveProperty('disabled', false);
+    });
+  });
+
+  it('shows the retirement message, never locking the newer item, on a decision refusal after it replaced the item', async () => {
+    const held = heldResponse();
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': () => held.pending,
+    });
+    const item = c1Item();
+    const show = await renderReplaceableCard(item);
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+
+    const next = newerRun(item);
+    show(next);
+    held.release(apiError(409, 'subject_retired', 'The dataset is no longer active.'));
+
+    const message = await within(cardOf(next)).findByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    expect(
+      within(cardOf(next)).queryByText('The action could not be recorded. Try again.'),
+    ).toBeNull();
+    await waitFor(() => {
+      cardButtons(next).forEach((button) => {
+        expect(button).toHaveProperty('disabled', false);
+      });
+    });
+  });
+
+  it('attributes a decision refusal to the recommendation the open form posted, not the newer item', async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+    });
+    const item = c1Item();
+    const show = await renderReplaceableCard(item);
+    const dialog = await openDecisionDialog(item);
+
+    // A newer run's item of the same recommendation and decision subject arrives while the
+    // dialog opened on the older one is still open, and the user saves from it.
+    const next = newerRun(item);
+    show(next);
+    expect(screen.getByRole('dialog', { name: RECORD_DECISION_LABEL })).toBe(dialog);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    expect(await within(dialog).findByText(HISTORICAL_LABEL)).toBeDefined();
+    const decisionBody = {
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm },
+      patch: { status: 'paused' },
+    };
+    expect(posts(api).map((call) => call.body)).toEqual([
+      { ...decisionBody, recommendation_id: item.id },
+    ]);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // The refusal was the older item's: the item shown is not locked, and the card explains it.
+    const message = within(cardOf(next)).getByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    await waitFor(() => {
+      cardButtons(next).forEach((button) => {
+        expect(button).toHaveProperty('disabled', false);
+      });
+    });
+
+    // Reopened, the dialog belongs to the item shown, and its save posts that item's id.
+    api.use({
+      'POST /decisions': json(
+        201,
+        genericCrmDecision({
+          id: 811,
+          origin: 'user',
+          status: 'paused',
+          patch: { status: 'paused' },
+        }),
+      ),
+    });
+    const reopened = await openDecisionDialog(next);
+    expect(within(cardOf(next)).queryByText(HISTORICAL_LABEL)).toBeNull();
+    fireEvent.click(within(reopened).getByRole('button', { name: 'Save decision' }));
+
+    expect(await within(cardOf(next)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts(api).map((call) => call.body)).toEqual([
+      { ...decisionBody, recommendation_id: item.id },
+      { ...decisionBody, recommendation_id: next.id },
+    ]);
+  });
+
+  it('keeps an open "Record decision" dialog, its edits and focus across a new id', async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': json(
+        201,
+        genericCrmDecision({
+          id: 811,
+          origin: 'user',
+          status: 'paused',
+          patch: { status: 'paused' },
+        }),
+      ),
+    });
+    const item = c1Item();
+    const show = await renderReplaceableCard(item);
+    const dialog = await openDecisionDialog(item);
+    const noteText = 'Pause until the CRM sync is fixed';
+    const note = within(dialog).getByRole('textbox', { name: 'Note' });
+    fireEvent.change(note, { target: { value: noteText } });
+    note.focus();
+
+    const next = newerRun(item);
+    show(next);
+
+    expect(screen.getByRole('dialog', { name: RECORD_DECISION_LABEL })).toBe(dialog);
+    expect(within(dialog).getByRole('textbox', { name: 'Note' })).toBe(note);
+    expect(note).toHaveProperty('value', noteText);
+    expect(document.activeElement).toBe(note);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    expect(await within(cardOf(next)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // The form posts the recommendation it was opened for, whose subject is the same.
+    expect(posts(api).map((call) => call.body)).toEqual([
+      {
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm },
+        patch: { status: 'paused' },
+        recommendation_id: item.id,
+        note: noteText,
+      },
+    ]);
+  });
+
+  it('closes the dialog when the newer item has no decision subject, focusing its first action', async () => {
+    api.use({ 'GET /decisions': json(200, [genericCrmDecision()]) });
+    const item = c1Item();
+    const show = await renderReplaceableCard(item);
+    within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }).focus();
+    await openDecisionDialog(item);
+
+    const next = { ...newerRun(item), decision_subject: null };
+    show(next);
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const markDone = within(cardOf(next)).getByRole('button', { name: FEEDBACK_LABELS.done });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(markDone);
+    });
+    expect(buttonNames(next)).toEqual(['Mark done', 'Dismiss', 'Snooze for 7 days']);
+  });
+});
+
 
 // ---------------------------------------------------------------------------------------------
 // Outcome announcements and focus recovery

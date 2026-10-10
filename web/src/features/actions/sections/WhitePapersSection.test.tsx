@@ -1485,6 +1485,41 @@ describe('WhitePapersSection rendered again', () => {
     expect(second?.[cellIndex('spend')]).toBe('€1,500.00');
   });
 
+  /** `section` as a newer run recomputes it: every asset the same, every item under a new id. */
+  function newerRun(section: Section): Section {
+    return {
+      ...section,
+      groups: section.groups.map((group) => ({
+        ...group,
+        items: group.items.map((item) => ({ ...item, id: item.id + 1000 })),
+      })),
+    };
+  }
+
+  it('keeps an expanded row open, with focus on its toggle, when a newer run gives its assets new ids', async () => {
+    const section = defaultWhitePapers();
+    const show = await renderReplaceable(section);
+    const name = 'Details for The 2026 B2B Pipeline Report';
+    const toggle = screen.getByRole('button', { name });
+    fireEvent.click(toggle);
+    toggle.focus();
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const markDone = screen.getByRole('button', { name: 'Mark done' });
+
+    show(newerRun(section));
+
+    expect(screen.getByRole('button', { name })).toBe(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(toggle);
+    const details = table('Per creative: The 2026 B2B Pipeline Report').closest('td');
+    if (details === null) {
+      throw new Error('the per-creative table is not inside the detail cell');
+    }
+    expect(within(details).getByText('Variant A')).toBeTruthy();
+    // The footer actions in the details keep their elements too.
+    expect(within(details).getByRole('button', { name: 'Mark done' })).toBe(markDone);
+  });
+
   it("keeps an expanded row open and shows its item's new per-creative rows", async () => {
     const section = defaultWhitePapers();
     const creatives = vi.spyOn(evidenceExtraModule, 'creativeRows');

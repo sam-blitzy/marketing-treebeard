@@ -557,6 +557,43 @@ describe('C0 discrepancy cards', () => {
     ).toHaveLength(2);
   });
 
+  it('keeps a C0 card, and focus on its resolution, when a newer run gives it a new id', async () => {
+    // Two discrepancies on one subject: their cards are told apart by their discrepancy ids.
+    mockApi({
+      'GET /discrepancies': json(200, [makeDiscrepancy('status'), budgetDiscrepancy()]),
+    });
+    const handle: SectionSwap = {};
+    const c0 = pageItem(FIXTURE_ITEM_IDS.c0);
+    await renderWithProviders(
+      <SwappableCampaigns
+        initial={oneGroup('discrepancies', 'Discrepancies', [c0, budgetC0()])}
+        handle={handle}
+      />,
+    );
+    const shown = card(C0_ACTION);
+    const other = card(BUDGET_C0_ACTION);
+    const resolution = await within(shown).findByRole('button', { name: 'Platform is correct' });
+    resolution.focus();
+
+    // Both discrepancies recomputed by the next run: new recommendation ids, nothing else.
+    const budget = budgetC0();
+    act(() => {
+      handle.swap?.(
+        oneGroup('discrepancies', 'Discrepancies', [
+          { ...c0, id: c0.id + 1000 },
+          { ...budget, id: budget.id + 1000 },
+        ]),
+      );
+    });
+    await settle();
+
+    expect(card(BUDGET_C0_ACTION)).toBe(other);
+    expect(card(C0_ACTION)).toBe(shown);
+    expect(shown.id).toBe(`item-${String(c0.id + 1000)}`);
+    expect(within(shown).getByRole('button', { name: 'Platform is correct' })).toBe(resolution);
+    expect(document.activeElement).toBe(resolution);
+  });
+
   it('offers exactly the resolutions the API lists, never derived ones', async () => {
     // The run froze a status discrepancy (its extra lists platform_correct and
     // decision_correct); the live list now reports it as untracked, and the card follows the API.
