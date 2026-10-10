@@ -8,10 +8,15 @@
  * links to the Campaigns discrepancy group and is the only banner with `role="alert"`; every
  * other banner shows the API's own message. Payloads come from `../../test/fixtures`.
  *
- * Banner codes are never written out here: they come from the component's own `BANNER_ORDER`,
- * the mirror of the backend's `analysis.context.BANNER_ORDER`, or from the fixture banners, so
- * the tests follow that mirror when the backend adds or moves a code. Only codes the client
- * must not know, the "later" codes of the unknown-code cases, are literals.
+ * The fixed order is checked against {@link AAP_BANNER_ORDER}, the six known banner codes
+ * written out here in that order, rather than against the component's own `BANNER_ORDER`: an
+ * expectation read from the constant under test passes whatever order the constant holds, so
+ * it cannot catch a reorder. The written-out codes stay checked against the API's `BannerCode`
+ * union, so a code the backend renames or drops still fails the typecheck, and `BANNER_ORDER`,
+ * the mirror of the backend's `analysis.context.BANNER_ORDER`, must equal the oracle. The
+ * fixture banners carry no stale-datasets banner, so the stale slot uses a local one worded as
+ * the backend words it. The codes the client must not know, the "later" codes of the
+ * unknown-code cases, are literals too.
  *
  * The component is presentational and calls no data hook, so it renders without providers and
  * no request is stubbed.
@@ -19,9 +24,42 @@
 import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Banner, BannerTone } from '../../api/types';
+import type { Banner, BannerCode, BannerTone } from '../../api/types';
 import { FIXTURE_BANNERS, makeBanner, makeOverlay } from '../../test/fixtures';
 import { BANNER_ORDER, GlobalBanners, orderBanners } from './GlobalBanners';
+
+/**
+ * The fixed order of the global banners as AAP 0.5.5 sets it: open discrepancies, tracking
+ * findings, simulated sources, stale then incomplete datasets (its single "stale or incomplete"
+ * slot, stale first, as the backend builds them), and the short window.
+ *
+ * Written out here deliberately, independently of the component's {@link BANNER_ORDER}: an
+ * expectation derived from the constant under test cannot catch a reorder of it. `satisfies`
+ * checks each literal against the API's `BannerCode` union, so a code the backend renames or
+ * drops still fails the typecheck.
+ */
+const AAP_BANNER_ORDER = Object.freeze([
+  'open_discrepancies',
+  'tracking_absent',
+  'simulated_sources',
+  'stale_datasets',
+  'incomplete_datasets',
+  'short_window',
+] as const satisfies readonly BannerCode[]);
+
+/**
+ * A fresh stale-datasets banner, worded as `analysis/overlay.py` builds it: "Stale data:
+ * {dataset} (last success YYYY-MM-DD HH:MM UTC)", with the warning tone and the count of stale
+ * datasets. The fixture banners carry none, so this banner fills the stale slot of the order.
+ */
+function staleBanner(): Banner {
+  return {
+    code: 'stale_datasets' satisfies BannerCode,
+    tone: 'warning',
+    message: 'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
+    count: 1,
+  } satisfies Banner;
+}
 
 /** Fresh copies of the five fixture banners, in the API's order. */
 function fixtureBanners(): Banner[] {
@@ -58,16 +96,18 @@ function namedFixtureBanners(): NamedFixtureBanners {
 }
 
 /** The message {@link orderedBanners} gives the banner of `code`: distinct for every code. */
-function messageFor(code: string): string {
+function messageFor(code: BannerCode): string {
   return `Banner message for ${code}`;
 }
 
 /**
- * One banner per {@link BANNER_ORDER} code, in that order, each built by `makeBanner` with the
- * distinct message {@link messageFor} its code.
+ * One banner per {@link AAP_BANNER_ORDER} code, in that order, each built by `makeBanner` with
+ * the distinct message {@link messageFor} its code.
  */
 function orderedBanners(): Banner[] {
-  return BANNER_ORDER.map((code) => makeBanner({ code, message: messageFor(code), count: null }));
+  return AAP_BANNER_ORDER.map((code) =>
+    makeBanner({ code, message: messageFor(code), count: null }),
+  );
 }
 
 /** The title paragraph of every rendered banner, in document order. */
@@ -97,9 +137,13 @@ describe('BANNER_ORDER', () => {
     expect(Object.isFrozen(BANNER_ORDER)).toBe(true);
   });
 
+  it('equals the fixed order written out independently of the component', () => {
+    expect(BANNER_ORDER).toEqual(AAP_BANNER_ORDER);
+  });
+
   it("agrees with the order of the fixture banners, which mirror the backend's", () => {
     const positions = FIXTURE_BANNERS.map((banner) =>
-      (BANNER_ORDER as readonly string[]).indexOf(banner.code),
+      (AAP_BANNER_ORDER as readonly string[]).indexOf(banner.code),
     );
 
     expect(positions).not.toContain(-1);
@@ -113,9 +157,21 @@ describe('orderBanners', () => {
 
     const ordered = orderBanners([...inOrder].reverse());
 
-    expect(ordered.map((banner) => banner.code)).toEqual([...BANNER_ORDER]);
+    expect(ordered.map((banner) => banner.code)).toEqual([...AAP_BANNER_ORDER]);
     // The same banner objects, not copies.
     expect(ordered.every((banner, index) => banner === inOrder[index])).toBe(true);
+  });
+
+  it('puts the stale-datasets banner before the incomplete-datasets banner', () => {
+    const { incomplete } = namedFixtureBanners();
+    const stale = staleBanner();
+
+    const ordered = orderBanners([incomplete, stale]);
+
+    expect(ordered).toHaveLength(2);
+    // The same banner objects, not copies.
+    expect(ordered[0]).toBe(stale);
+    expect(ordered[1]).toBe(incomplete);
   });
 
   it('keeps unknown codes after the known ones in their API order, and never mutates its input', () => {
@@ -148,7 +204,7 @@ describe('orderBanners', () => {
 });
 
 describe('GlobalBanners', () => {
-  it('renders one banner per BANNER_ORDER code in that order, whatever the input order', () => {
+  it('renders the six known banners in the fixed order, whatever the input order', () => {
     const { container } = render(
       <GlobalBanners
         banners={orderedBanners().reverse()}
@@ -156,18 +212,28 @@ describe('GlobalBanners', () => {
       />,
     );
 
-    // Each code's banner, found by its distinct message, listed in BANNER_ORDER.
-    const expected = BANNER_ORDER.map((code) => bannerShowing(messageFor(code)));
+    // Written out in the fixed order: the discrepancy title reports the live count, and every
+    // other title is its banner's own message.
+    expect(bannerTitles(container)).toEqual([
+      '2 open discrepancies to resolve first',
+      messageFor('tracking_absent'),
+      messageFor('simulated_sources'),
+      messageFor('stale_datasets'),
+      messageFor('incomplete_datasets'),
+      messageFor('short_window'),
+    ]);
+    // The discrepancy banner is the only alert, rendered first, and every other banner follows it.
+    const alerts = screen.getAllByRole('alert');
+    expect(alerts).toHaveLength(1);
+    const [alert] = alerts;
+    if (alert === undefined) {
+      throw new Error('No alert is rendered.');
+    }
     const rendered = Array.from(container.querySelectorAll<HTMLElement>('.ds-banner'));
-
-    expect(rendered).toHaveLength(BANNER_ORDER.length);
-    expect(rendered.map((banner) => expected.indexOf(banner))).toEqual(
-      BANNER_ORDER.map((_code, index) => index),
-    );
-    // The first code's banner is the discrepancy alert, and every other banner follows it.
-    const alert = screen.getByRole('alert');
-    expect(expected[0]).toBe(alert);
-    for (const banner of expected.slice(1)) {
+    expect(rendered).toHaveLength(AAP_BANNER_ORDER.length);
+    expect(rendered[0]).toBe(alert);
+    expect(within(alert).getByText(messageFor('open_discrepancies'))).toBeTruthy();
+    for (const banner of rendered.slice(1)) {
       expect(alert.compareDocumentPosition(banner) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
         Node.DOCUMENT_POSITION_FOLLOWING,
       );
@@ -196,16 +262,19 @@ describe('GlobalBanners', () => {
     );
 
     const titles = bannerTitles(container);
-    expect(titles).toHaveLength(BANNER_ORDER.length + 2);
+    expect(titles).toHaveLength(AAP_BANNER_ORDER.length + 2);
     expect(titles.slice(-2)).toEqual([sentFirst.message, sentLast.message]);
-    expect(titles.slice(1, BANNER_ORDER.length)).toEqual(BANNER_ORDER.slice(1).map(messageFor));
+    expect(titles.slice(1, AAP_BANNER_ORDER.length)).toEqual(
+      AAP_BANNER_ORDER.slice(1).map(messageFor),
+    );
   });
 
   it("renders the API's banners in the fixed order, each titled with the API's own message", () => {
     const { discrepancies, tracking, simulated, incomplete, shortWindow } = namedFixtureBanners();
+    // Stale arrives after incomplete, and simulated before tracking.
     const { container } = render(
       <GlobalBanners
-        banners={[shortWindow, simulated, incomplete, tracking, discrepancies]}
+        banners={[shortWindow, simulated, incomplete, tracking, staleBanner(), discrepancies]}
         overlay={makeOverlay({ open_discrepancies: 3 })}
       />,
     );
@@ -214,6 +283,7 @@ describe('GlobalBanners', () => {
       '3 open discrepancies to resolve first',
       'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
       'Simulated data: Google (credentials not configured); LinkedIn (credentials not configured); HubSpot (credentials not configured)',
+      'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
       'Incomplete data: google.search_terms (result limit reached at finest partition)',
       'Window of 10 days is below the 14-day trusted minimum',
     ]);
@@ -223,6 +293,21 @@ describe('GlobalBanners', () => {
       simulated.message,
     );
     expect(simulatedBanner.getAttribute('role')).toBeNull();
+  });
+
+  it('renders the stale-datasets banner before the incomplete-datasets banner', () => {
+    const { incomplete } = namedFixtureBanners();
+    const { container } = render(
+      <GlobalBanners
+        banners={[incomplete, staleBanner()]}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+      />,
+    );
+
+    expect(bannerTitles(container)).toEqual([
+      'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
+      'Incomplete data: google.search_terms (result limit reached at finest partition)',
+    ]);
   });
 
   it('titles the discrepancy banner with the live overlay count, links to the discrepancy group and is the only alert', () => {
