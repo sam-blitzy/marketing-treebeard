@@ -68,7 +68,12 @@ export interface RetryControl {
   retrying: boolean;
   /** The Retry button, so focus can return to it. */
   buttonRef: RefObject<HTMLButtonElement | null>;
-  /** Runs the retry; call it from the button's click handler. It never rejects. */
+  /**
+   * Runs the retry; call it from the button's click handler. It rejects only when the `refetch`
+   * given to {@link useRetry} rejects, with that rejection, and clears the loading state either
+   * way. TanStack Query's `refetch`, which both lists pass, never rejects, so with it the retry
+   * never rejects either.
+   */
   retry: () => Promise<void>;
 }
 

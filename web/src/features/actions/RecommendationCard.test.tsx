@@ -20,8 +20,9 @@
  * - **Failures and locks**: a 409 `subject_retired` shows "Computed from replaced data" and locks
  *   every action, whether a feedback or the decision form received it, also once the dialog has
  *   closed and when it was closed while the save ran; any other failure shows the API's
- *   message; a historical item shows the badge and its frozen provenance with every action
- *   disabled, the C0 resolver too.
+ *   message, and a failure that is not an `ApiError` the generic text, never its own message;
+ *   a historical item shows the badge and its frozen provenance with every action disabled,
+ *   the C0 resolver too.
  * - **Outcomes and focus**: inside an `ActionOutcomeProvider`, a recorded feedback or decision is
  *   announced in the provider's polite region, which outlives the card a refetch removes, and
  *   focus moves to the next card's first enabled action, else the previous card's, else the
@@ -869,6 +870,35 @@ describe('RecommendationCard: footer actions', () => {
     expect(await within(cardOf(item)).findByText('Dismissed')).toBeDefined();
     expect(within(cardOf(item)).queryByText('Feedback is not accepted for this item.')).toBeNull();
     expect(posts(api).map((call) => call.body)).toEqual([{ kind: 'done' }, { kind: 'dismiss' }]);
+  });
+
+  it('shows the generic text, never the message, of a failure that is not an ApiError', async () => {
+    // Assembled at run time, so the secret scan never meets a literal secret assignment.
+    const secret = `${['SESSION', 'SECRET'].join('_')}=${'9f3c'.repeat(8)}`;
+    const internalPath = '/srv/ads_engine/.env';
+    api.use({
+      'POST /recommendations/:id/feedback': json(201, makeFeedback('done')),
+    });
+    const item = makeItem();
+    const { queryClient } = await renderCard(<RecommendationCard item={item} />);
+    // The POST succeeds, then the refetch `useFeedback` awaits rejects with a plain Error,
+    // which TanStack Query makes the mutation's error.
+    vi.spyOn(queryClient, 'invalidateQueries').mockRejectedValue(
+      new Error(`ENOENT: no such file or directory, open '${internalPath}' (${secret})`),
+    );
+
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.done }));
+
+    const message = await within(cardOf(item)).findByText(
+      'The action could not be recorded. Try again.',
+    );
+    await waitFor(() => {
+      expect(document.activeElement?.contains(message)).toBe(true);
+    });
+    expect(posts(api)).toHaveLength(1);
+    expect(document.body.innerHTML).not.toContain(internalPath);
+    expect(document.body.innerHTML).not.toContain(secret);
+    expect(document.body.innerHTML).not.toContain('ENOENT');
   });
 
   it('keeps its action state with its item, never carrying it to another', async () => {

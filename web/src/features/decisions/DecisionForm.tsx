@@ -33,9 +33,10 @@
  *   step follows the same rule. Amounts are shown padded to the currency's minor unit, and
  *   finer digits are never rounded away, so an unchanged micro amount is posted exactly as the
  *   API sent it.
- * - **Errors are the API's.** 422 messages are shown as returned. A 409 `subject_retired`
- *   locks the form for as long as it records about that subject (AAP 0.3.2) and is reported
- *   through `onRetired`, so the consumer locks its own actions too; a 409
+ * - **Errors are the API's.** 422 messages are shown as returned; a failure that is not an
+ *   `ApiError`, whose text may carry internal detail, reads "The save failed." instead. A 409
+ *   `subject_retired` locks the form for as long as it records about that subject (AAP 0.3.2)
+ *   and is reported through `onRetired`, so the consumer locks its own actions too; a 409
  *   `discrepancy_resolved` reads "Already resolved". Every failure but `subject_retired` is
  *   reported through `onFailed` with the text the form shows. Error banners never take
  *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
@@ -213,6 +214,9 @@ const RETIRED_MESSAGE = 'Computed from replaced data';
 
 /** Shown when the discrepancy was resolved before this resolution reached the server. */
 const RESOLVED_MESSAGE = 'Already resolved';
+
+/** Shown for a failure that carries no API message: a blank one, or a non-`ApiError` rejection. */
+const SAVE_FAILED_MESSAGE = 'The save failed.';
 
 /** Shown when the subject has neither a decision nor a discrepancy to start from. */
 const NO_STATE_MESSAGE = 'No decided state is recorded for this subject yet.';
@@ -565,9 +569,13 @@ function describeState(state: SubjectState, currency: string | null): string {
 }
 
 /**
- * The text of a failed save: "Computed from replaced data" for a 409 `subject_retired`
- * (AAP 0.3.2), "Already resolved" for a 409 `discrepancy_resolved`, otherwise the API's own
- * message, which for a 422 names the patch rule it broke.
+ * The text of a failed save, or of a failed decision-log read: "Computed from replaced data"
+ * for a 409 `subject_retired` (AAP 0.3.2), "Already resolved" for a 409
+ * `discrepancy_resolved`, otherwise an `ApiError`'s message, which is the API's envelope message
+ * (for a 422 it names the patch rule it broke) or the client's own fallback text, both safe to
+ * show. A blank `ApiError` message, and any rejection that is not an `ApiError`, such as a plain
+ * `Error`, a `TypeError` or an abort, read {@link SAVE_FAILED_MESSAGE}: such a message is
+ * outside that contract and may carry internal detail.
  *
  * The backend names a closed discrepancy `discrepancy_resolved`; it sends no
  * `discrepancy_closed`, so that is the code read here.
@@ -580,9 +588,9 @@ function saveErrorMessage(error: unknown): string {
     if (error.status === 409 && error.code === 'discrepancy_resolved') {
       return RESOLVED_MESSAGE;
     }
-    return error.message;
+    return textOrNull(error.message) ?? SAVE_FAILED_MESSAGE;
   }
-  return error instanceof Error && error.message !== '' ? error.message : 'The save failed.';
+  return SAVE_FAILED_MESSAGE;
 }
 
 /** Whether a failed save means the subject's dataset was replaced (409 `subject_retired`). */

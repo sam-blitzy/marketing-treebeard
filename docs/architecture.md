@@ -60,11 +60,11 @@ The local stack is `docker-compose.yml` (Compose project `ads-engine`).
 
 | Service | Image | Command | Starts when | Notes |
 |---------|-------|---------|-------------|-------|
-| `db` | `postgres:18.6` | Image default | First | Healthcheck `pg_isready -h 127.0.0.1` over TCP every 5 s, 20 retries. Named volume `pgdata` at `/var/lib/postgresql`. Receives only `POSTGRES_DB`, `POSTGRES_USER` and `POSTGRES_PASSWORD`. No published port |
+| `db` | Built from `postgres:18.6` with Debian security updates (inline Dockerfile in `docker-compose.yml`) | Image default | First | Runs as postgres, uid/gid 999, from its first process. Healthcheck `pg_isready -h 127.0.0.1` over TCP every 5 s, 20 retries. Named volume `pgdata` at `/var/lib/postgresql`. Receives only `POSTGRES_DB`, `POSTGRES_USER` and `POSTGRES_PASSWORD`. No published port |
 | `migrate` | `ads-engine-backend:local`, built from `backend/Dockerfile` (`python:3.14.8-slim`) | `ads-engine migrate && ads-engine ensure-admin` | `db` is healthy | One-shot, `restart: "no"`. Both commands are idempotent, so it runs again on every `up` |
 | `api` | `ads-engine-backend:local` | `uvicorn ads_engine.api.app:create_app --factory --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "*"` | `migrate` exited 0 | Serves `/api/v1`. Healthy when `GET /api/v1/healthz` answers 200, which needs a database round trip. Port 8000 is never published |
 | `worker` | `ads-engine-backend:local` | `python -m ads_engine.worker.main` | `migrate` exited 0 | Owns all external I/O. `stop_grace_period: 30s` lets it cancel its work and release its advisory locks |
-| `web` | Built from `web/Dockerfile` (`node:24.21.0-slim` build stage, `nginx:1.30.5` runtime) | nginx | `api` is healthy | The only published port, `8080:8080`. Serves the SPA and proxies `/api/` to `api:8000` (`web/nginx.conf`). Receives no environment |
+| `web` | Built from `web/Dockerfile` (`node:24.21.0-slim` build stage, `nginx:1.30.5` runtime) | nginx | `api` is healthy | The only published port, `127.0.0.1:8080:8080`: loopback only, so no other machine reaches its plain HTTP ([runbook](runbook.md#hosting-beyond-localhost)). Serves the SPA and proxies `/api/` to `api:8000` (`web/nginx.conf`). Receives no environment |
 
 Each service has its own CPU and memory ceiling (`deploy.resources.limits`), which bounds how much
 of the host a backfill, an analysis run, PostgreSQL or nginx can use. The defaults are `db` 1 CPU
@@ -837,12 +837,26 @@ Verified against `api/app.py`, `api/security.py`, `settings.py` and `web/nginx.c
   `base-uri` and `form-action` also `'self'`, and `object-src 'none'` and
   `frame-ancestors 'none'`. It also adds `X-Content-Type-Options: nosniff` and
   `Referrer-Policy: same-origin`. Because of that policy, Swagger UI and ReDoc are disabled; the
-  OpenAPI document is served at `/api/v1/openapi.json` to a signed-in session only.
+  OpenAPI document is served at `/api/v1/openapi.json` to a signed-in session only. Every `/api/`
+  response carries exactly one `Cache-Control: no-store`, set by the API on every answer and
+  enforced by nginx on `/api/`, its own 502, 504 and 413 included, so no browser or shared cache
+  keeps an API body after sign-out.
 - **Log redaction.** structlog JSON logs redact the `Authorization` header, the n8n secret header,
   every configured secret value, database URL passwords and email addresses
   (`[REDACTED_EMAIL]`) before rendering (`logging.py`).
-- **Secret scanning.** CI and `make secret-scan` run gitleaks `v8.30.1`
-  (`zricethezav/gitleaks:v8.30.1`) with `.gitleaks.toml`, and a finding fails the job.
+- **Secret scanning.** CI runs `make secret-scan`, the same target as a local scan. It builds the
+  local image `ads-engine-gitleaks:v8.30.1-patched` (never pushed) on the pinned
+  `zricethezav/gitleaks:v8.30.1` with its Alpine security fixes applied, upgrading only the
+  libraries in `GITLEAKS_APK_FLOORS` to at least their fixed versions, and checks that its gitleaks
+  reports `v8.30.1`. It then scans every commit with `.gitleaks.toml`, with no network and a
+  read-only checkout (`gitleaks git --redact --exit-code 1`), and a finding fails the job
+  ([Make targets](runbook.md#make-targets)).
+- **Container hardening** (`docker-compose.yml`, `backend/Dockerfile`, `web/Dockerfile`). Every
+  container runs as a fixed non-root user from its first process: 10001 for `migrate`, `api` and
+  `worker`, 101 for `web` and 999 for `db`. Every service sets `no-new-privileges` and drops all
+  Linux capabilities (`cap_drop: ALL`). Each image applies Debian security updates on top of its
+  exact base tag at build time and fails the build if Python, Node, nginx or PostgreSQL moves
+  off its pinned version ([runbook](runbook.md#base-images-and-os-security-updates)).
 
 ## Web UI layer
 

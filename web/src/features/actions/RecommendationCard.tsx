@@ -134,7 +134,10 @@ const HELD_REASON_FALLBACK = 'Resolve discrepancy first';
 /** The provenance text when the frozen evidence names no dataset. */
 const REPLACED_WITHOUT_PROVENANCE = 'Source data has since been replaced';
 
-/** The error text when a failed feedback request carries no message of its own. */
+/**
+ * The error text when a failed feedback request carries no API message of its own: a blank
+ * `ApiError` message, or a rejection that is not an `ApiError`.
+ */
 const FEEDBACK_ERROR_FALLBACK = 'The action could not be recorded. Try again.';
 
 /** The separator between the entity name and its source on the header's entity line. */
@@ -244,8 +247,11 @@ function headlineFigure(item: Item): CardHeaderProps['figure'] {
  *
  * - 409 `subject_retired`: {@link HISTORICAL_LABEL}, the same message as the historical badge,
  *   because the item was computed from data that has since been replaced (AAP 0.3.2);
- * - 422 (for example `feedback_not_allowed`) and every other failure: the API's own message,
- *   which the client guarantees is safe to show, or a generic retry text when it is blank.
+ * - 422 (for example `feedback_not_allowed`) and every other `ApiError`: its message, which is
+ *   the API's envelope message or the client's own fallback text, both safe to show, or a
+ *   generic retry text when it is blank;
+ * - any other rejection, such as a plain `Error`, a `TypeError` or an abort: the generic retry
+ *   text, because its message is outside that contract and may carry internal detail.
  *
  * @param error - what the mutation rejected with
  * @returns the text for the footer's warning banner
@@ -254,10 +260,7 @@ function feedbackErrorMessage(error: unknown): string {
   if (isRetiredError(error)) {
     return HISTORICAL_LABEL;
   }
-  if (error instanceof Error) {
-    return textOrNull(error.message) ?? FEEDBACK_ERROR_FALLBACK;
-  }
-  return FEEDBACK_ERROR_FALLBACK;
+  return (isApiError(error) ? textOrNull(error.message) : null) ?? FEEDBACK_ERROR_FALLBACK;
 }
 
 /**
@@ -627,9 +630,10 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * line. Keyboard focus, lost with the disabled or removed button, then moves to the next card's
  * first enabled action, else the previous card's, else the enclosing section's heading, else
  * `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Any other failure, of a
- * feedback or of a decision save (the form's `onFailed`), shows the API's message in the
- * warning `Banner`, until the next action starts. The banner takes focus when it appears, or
- * once the decision dialog closes, so keyboard and screen-reader users land on it;
+ * feedback or of a decision save (the form's `onFailed`), shows the API's message, or a
+ * generic text for a failure that carries none, in the warning `Banner`, until the next action
+ * starts. The banner takes focus when it appears, or once the decision dialog closes, so
+ * keyboard and screen-reader users land on it;
  * `role="alert"` stays reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
  *
  * @param props - see {@link RecommendationActionsProps}

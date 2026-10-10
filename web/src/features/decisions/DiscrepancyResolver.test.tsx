@@ -20,7 +20,8 @@
  * - 409 `subject_retired` and 409 `discrepancy_resolved` lock every control, whether a resolution
  *   or the intended-state form received them; 409 `platform_state_unknown`, 422
  *   `resolution_not_allowed` and 422 `intended_state_invalid` show the API's own message and
- *   leave the controls usable; `disabled` locks every control;
+ *   leave the controls usable; a failure that is not an `ApiError` shows the generic text,
+ *   never its own message; `disabled` locks every control;
  * - the list's loading, empty, failed and failed-refresh states, announced in one polite status
  *   region kept from the first render (never an alert), with Retry and the last-loaded instant;
  *   the first page of `DISCREPANCY_PAGE_SIZE` with its `X-Total-Count` summary, the line on
@@ -148,7 +149,10 @@ function outcomeRegion(scope: HTMLElement = document.body): HTMLElement {
 
 /**
  * The resolver's own polite status region: the one `div` status element outside every card.
- * `hidden` is set so the region is found while it is still empty.
+ * `hidden: true` also includes status elements excluded from the accessibility tree: those with
+ * `visibility: hidden`, or with the `hidden` attribute, `aria-hidden="true"` or `display: none`
+ * on themselves or an ancestor. The one-region check therefore counts every matching `div`,
+ * whether or not it is exposed to assistive technology.
  */
 function listRegion(): HTMLElement {
   const regions = screen
@@ -803,9 +807,11 @@ describe('DiscrepancyResolver list', () => {
 
 /**
  * The most rounds {@link settle} runs. A round past the first follows one in which the query
- * cache emitted an event or after which a read was in flight; the bound makes a resolver that
- * keeps reading, or keeps changing its queries, fail inside {@link settle}, never at the test
- * timeout.
+ * cache emitted an event or after which a read was in flight. The bound caps the number of
+ * rounds, not the time they take: a resolver that keeps changing its queries, or starts another
+ * read in every round, fails inside {@link settle} after the last round instead of looping. Each
+ * round's Testing Library `waitFor` can still fail on its own timeout, and rounds that are slow
+ * to settle can together outlast the test's timeout.
  */
 const SETTLE_ROUNDS = 10;
 
@@ -1612,6 +1618,34 @@ describe('DiscrepancyResolution errors', () => {
       { resolution: 'decision_correct' },
       { resolution: 'platform_correct' },
     ]);
+  });
+
+  it('shows the generic text, never the message, of a failure that is not an ApiError', async () => {
+    // Assembled at run time, so the secret scan never meets a literal secret assignment.
+    const secret = `${['SESSION', 'SECRET'].join('_')}=${'9f3c'.repeat(8)}`;
+    const internalPath = '/srv/ads_engine/.env';
+    const api = mockApi({
+      [RESOLVE_KEY]: json(200, makeDiscrepancy('status', { state: 'resolved' })),
+    });
+    const { queryClient, onResolved } = await renderResolution(makeDiscrepancy('status'));
+    // The POST succeeds, then the refetch `useResolveDiscrepancy` awaits rejects with a plain
+    // Error, which TanStack Query makes the mutation's error.
+    vi.spyOn(queryClient, 'invalidateQueries').mockRejectedValue(
+      new Error(`ENOENT: no such file or directory, open '${internalPath}' (${secret})`),
+    );
+
+    fireEvent.click(buttonNamed('Platform is correct'));
+
+    const title = await screen.findByText('The resolution failed.');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+    });
+    expect(resolveCalls(api)).toHaveLength(1);
+    expect(onResolved).not.toHaveBeenCalled();
+    expect(outcomeRegion().textContent).toBe('');
+    expect(document.body.innerHTML).not.toContain(internalPath);
+    expect(document.body.innerHTML).not.toContain(secret);
+    expect(document.body.innerHTML).not.toContain('ENOENT');
   });
 
   it('starts fresh for another discrepancy, so a lock never spreads to another', async () => {

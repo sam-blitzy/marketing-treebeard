@@ -27,6 +27,12 @@ uvicorn serves the factory, never a module-level application::
   running then, typically one waiting on a database that stopped answering, is cancelled
   and answered 503 ``request_timeout`` in the error envelope, and logged as one
   ``api.request_timeout`` WARNING naming its method and path.
+* **No caching**: every HTTP response carries exactly one ``Cache-Control: no-store``, so no
+  browser or shared cache keeps an API answer, signed-in evidence, decisions and identity
+  included, after sign-out (CWE-525). :class:`_NoStoreMiddleware`, the outermost user
+  middleware, sets it on every answer, the request deadline's 503 included; the error
+  envelope carries it as well, so Starlette's server-error 500, sent outside every user
+  middleware, has it too.
 * **Routers**: one per route module, in the order of the endpoint table, each under
   ``/api/v1`` and behind :func:`~ads_engine.api.deps.require_csrf`, which requires
   ``X-Requested-With: ads-engine`` on mutating methods and passes safe methods untouched.
@@ -36,13 +42,13 @@ uvicorn serves the factory, never a module-level application::
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
   failing the first request, and disposes the database pool on shutdown.
 
-No middleware beyond the session cookie, the HEAD handling and the request deadline is
-installed. The SPA is served same-origin by nginx, which also proxies ``/api``, so CORS and
-compression have no role here. Swagger UI and ReDoc are disabled: they load CDN assets that
-nginx's ``default-src 'self'`` Content-Security-Policy blocks. The OpenAPI document, the
-contract ``web/src/api/types.ts`` is written against, is served at ``/api/v1/openapi.json``
-to a signed-in session only. FastAPI's own schema route is disabled, because it sits outside
-the guarded routers and would answer without a session.
+No middleware beyond the session cookie, the HEAD handling, the request deadline and the
+no-store cache policy is installed. The SPA is served same-origin by nginx, which also
+proxies ``/api``, so CORS and compression have no role here. Swagger UI and ReDoc are
+disabled: they load CDN assets that nginx's ``default-src 'self'`` Content-Security-Policy
+blocks. The OpenAPI document, the contract ``web/src/api/types.ts`` is written against, is
+served at ``/api/v1/openapi.json`` to a signed-in session only. FastAPI's own schema route is
+disabled, because it sits outside the guarded routers and would answer without a session.
 
 The API reads stored results only. Neither this module nor any module it imports loads
 ``ads_engine.connectors``, ``ads_engine.sync`` or ``ads_engine.simulation``: all external I/O
@@ -62,6 +68,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from pydantic_core.core_schema import ErrorType
+from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -122,6 +129,12 @@ line. 45 s plus that unwind lands at about 55 s, inside the 120 s ``web/nginx.co
 
 _REQUEST_TIMEOUT_CODE: Final = "request_timeout"
 _REQUEST_TIMEOUT_MESSAGE: Final = "The request did not complete in time"
+
+# The cache policy of every response, set by _NoStoreMiddleware and by _error_response. API
+# bodies are the signed-in operator's evidence, decisions and identity, which no browser or
+# shared cache may keep after sign-out (CWE-525); `no-cache` would still let a cache store them.
+_CACHE_CONTROL_HEADER: Final = "Cache-Control"
+_CACHE_CONTROL_NO_STORE: Final = "no-store"
 
 # Routers in the order of the endpoint table. The order fixes the order of the OpenAPI
 # paths, and no two modules share a path, so it never decides which route matches.
@@ -190,23 +203,32 @@ def _error_response(
 ) -> JSONResponse:
     """Render ``{"error": {"code": code, "message": message}}`` with ``status_code``.
 
+    Every error envelope carries ``Cache-Control: no-store``. :class:`_NoStoreMiddleware`
+    sets it on every answer that passes through it, but Starlette's server-error middleware
+    sends the catch-all 500 straight to the server, outside every user middleware, so the
+    envelope carries the header itself.
+
     Args:
         status_code: The HTTP status of the response.
         code: The machine-readable error code.
         message: The human-readable message; callers never pass an email, a password, a
             secret or a token.
-        headers: Extra response headers, for example ``Retry-After`` on a 429.
+        headers: Extra response headers, for example ``Retry-After`` on a 429 or ``Allow``
+            on a 405; a ``Cache-Control`` among them is replaced by ``no-store``.
 
     Returns:
         The JSON response, built through :class:`~ads_engine.api.schemas.ErrorResponse` so
-        every error body has exactly the published shape.
+        every error body has exactly the published shape, with ``headers`` and exactly one
+        ``Cache-Control: no-store``.
     """
     body = ErrorResponse(error=ErrorDetail(code=code, message=message))
-    return JSONResponse(
-        status_code=status_code,
-        content=body.model_dump(),
-        headers=None if headers is None else dict(headers),
-    )
+    merged = {
+        name: value
+        for name, value in (headers or {}).items()
+        if name.lower() != _CACHE_CONTROL_HEADER.lower()
+    }
+    merged[_CACHE_CONTROL_HEADER] = _CACHE_CONTROL_NO_STORE
+    return JSONResponse(status_code=status_code, content=body.model_dump(), headers=merged)
 
 
 def _expect[E: Exception](exc: Exception, kind: type[E]) -> E:
@@ -565,6 +587,61 @@ def _register_error_handlers(app: FastAPI) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cache policy
+# ---------------------------------------------------------------------------
+
+
+class _NoStoreMiddleware:
+    """Mark every HTTP response ``Cache-Control: no-store``, so no cache keeps an API answer.
+
+    Every body the API sends belongs to the signed-in operator: recommendation and CRM
+    evidence, decisions, the admin's identity. Logout revokes the session, so a saved cookie
+    cannot be replayed, but it cannot reach a copy a browser or a shared cache already stored;
+    nothing may be stored at all (CWE-525). ``no-cache`` would not do, because it still lets a
+    cache store the body and only makes it revalidate before reuse.
+
+    A pure ASGI middleware, installed as the outermost user middleware. On an ``http`` scope's
+    ``http.response.start`` it sets exactly one ``Cache-Control: no-store``, replacing any
+    value the application sent, then forwards the message; the status, the body and every
+    other header pass unchanged. It covers every routed answer and every error the handlers
+    render, ``HEAD`` answers, login and logout with their ``Set-Cookie``, and the request
+    deadline's 503 ``request_timeout``. Starlette's server-error middleware, which renders the
+    catch-all 500 ``internal_error``, sits outside it and sends straight to the server; that
+    answer carries the header because :func:`_error_response` adds it to every error envelope.
+    Lifespan and websocket scopes pass through untouched.
+
+    Args:
+        app: The ASGI application it wraps.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Serve one ASGI connection, marking its response ``Cache-Control: no-store``.
+
+        Args:
+            scope: The connection scope.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+        """
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message: Message) -> None:
+            """Forward ``message``, setting a response start's ``Cache-Control`` to ``no-store``."""
+            if message["type"] == "http.response.start":
+                # ASGI makes `headers` optional; MutableHeaders edits the message's own list,
+                # and its assignment replaces every existing Cache-Control with one value.
+                message.setdefault("headers", [])
+                MutableHeaders(scope=message)[_CACHE_CONTROL_HEADER] = _CACHE_CONTROL_NO_STORE
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
+# ---------------------------------------------------------------------------
 # Request deadline
 # ---------------------------------------------------------------------------
 
@@ -861,15 +938,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     5. Install the HEAD handling around it (:class:`_HeadAsGetMiddleware`): a ``HEAD`` is
        served from the session cookie inwards as ``GET``, and answered with ``GET``'s status
        and headers and no body.
-    6. Install the request deadline around that, inside only Starlette's own server-error
-       middleware: an HTTP request still running after :data:`_REQUEST_TIMEOUT_S` is
-       cancelled, answered 503 ``request_timeout`` and logged as ``api.request_timeout``.
-    7. Store the login rate limiter and the settings on ``app.state``. They are created
+    6. Install the request deadline around that: an HTTP request still running after
+       :data:`_REQUEST_TIMEOUT_S` is cancelled, answered 503 ``request_timeout`` and logged
+       as ``api.request_timeout``.
+    7. Install the cache policy around that (:class:`_NoStoreMiddleware`), inside only
+       Starlette's own server-error middleware: every HTTP response carries exactly one
+       ``Cache-Control: no-store``, the deadline's 503 included. The error envelope carries
+       it too, so the catch-all 500 that the server-error middleware renders has it as well.
+    8. Store the login rate limiter and the settings on ``app.state``. They are created
        here rather than in the lifespan, because test transports run no lifespan.
-    8. Include every router under ``/api/v1`` behind the CSRF guard, then the OpenAPI
+    9. Include every router under ``/api/v1`` behind the CSRF guard, then the OpenAPI
        document's ``GET`` route.
-    9. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope; a
-       405's ``Allow`` that names ``GET`` names ``HEAD`` too.
+    10. Register the error handlers of the ``{"error": {"code", "message"}}`` envelope; a
+        405's ``Allow`` that names ``GET`` names ``HEAD`` too.
 
     Example::
 
@@ -955,10 +1036,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Around the session cookie and inside the deadline: everything from the session cookie
     # inwards sees a HEAD as GET, while the deadline's log names the client's real method.
     app.add_middleware(_HeadAsGetMiddleware)
-    # Added last, so it is the outermost user middleware: its deadline covers the HEAD
-    # handling, the session cookie, the routers and their error handlers. Only Starlette's
-    # server-error middleware, which renders the catch-all 500, sits outside it.
+    # Around the HEAD handling and inside only the cache policy: its deadline covers the HEAD
+    # handling, the session cookie, the routers and their error handlers.
     app.add_middleware(_RequestDeadlineMiddleware, timeout=_REQUEST_TIMEOUT_S)
+    # Added last, so it is the outermost user middleware: its Cache-Control: no-store covers
+    # every answer inside it, the deadline's 503 included. Only Starlette's server-error
+    # middleware, which renders the catch-all 500, sits outside it; _error_response puts the
+    # header on that answer.
+    app.add_middleware(_NoStoreMiddleware)
     app.state.login_limiter = security.LoginRateLimiter()
     app.state.settings = settings
 

@@ -369,8 +369,9 @@ function originLabel(decision: Decision): string {
 
 /**
  * One field of a stored patch, read defensively: the patch is stored `jsonb`, so the field is
- * read only when the patch is a plain object holding it as its own key with a non-blank string
- * value. Anything else counts as absent and is never cast.
+ * read only when the patch is a non-null, non-array object (any such object, not only a plain
+ * one) holding it as its own property with a non-blank string value. Anything else counts as
+ * absent and is never cast.
  *
  * @param patch - The row's patch, as the API returned it.
  * @param field - A field `DecisionPatchView` defines.

@@ -8,8 +8,12 @@
 #                               falls back to index.html for SPA routes, sets the security
 #                               headers
 #
-# Both base tags are exact, so a rebuild cannot change the build toolchain or the runtime
-# silently.
+# Both base tags are exact, so a build always selects Node 24.21.0 and nginx 1.30.5; they do not
+# fix the images' bytes. Tags are mutable: their publishers can rebuild them with refreshed
+# Debian layers, and each stage's security-update layer also changes OS packages from one build
+# to the next by design, while failing the build if Node or nginx is no longer that version.
+# Pinning each tag's digest is optional, for byte-identical bases (docs/runbook.md, Base images
+# and OS security updates).
 #
 # Runtime user: uid/gid 101, the base image's own `nginx` user. The entrypoint and every nginx
 # process, the master included, run as it; nothing runs as root. Port 8080 is above 1024, so
@@ -29,6 +33,25 @@
 # Build stage
 # -------------------------------------------------------------------------------------------
 FROM node:24.21.0-slim AS build
+
+# Debian security updates only. For this step a temporary source list naming just the image's
+# <codename>-security suite replaces its APT sources, so `apt-get upgrade` takes nothing from the
+# main archive or any other repository, installs no new package and removes none; its output
+# names every package it upgrades. The step fails unless node is still v24.21.0. Nothing from
+# this stage except /app/dist reaches the runtime image.
+RUN codename="$(. /etc/os-release && echo "$VERSION_CODENAME")" \
+  && [ -n "$codename" ] \
+  && apt_dir="$(mktemp -d)" \
+  && mkdir "$apt_dir/parts" \
+  && printf 'deb [signed-by=%s] %s %s-security main\n' \
+    /usr/share/keyrings/debian-archive-keyring.gpg http://deb.debian.org/debian-security \
+    "$codename" > "$apt_dir/security.list" \
+  && apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" update \
+  && DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" -y upgrade \
+  && rm -rf /var/lib/apt/lists/* "$apt_dir" \
+  && [ "$(node --version)" = "v24.21.0" ]
 
 WORKDIR /app
 
@@ -64,6 +87,23 @@ FROM nginx:1.30.5
 
 LABEL org.opencontainers.image.title="ads-engine-web" \
   org.opencontainers.image.description="Ads Action Engine SPA served by nginx, with /api proxied to the API"
+
+# Debian security updates only, exactly as in the build stage. The nginx package comes from
+# nginx.org, not from the security suite, so it cannot change here; the step fails unless nginx
+# is still 1.30.5.
+RUN codename="$(. /etc/os-release && echo "$VERSION_CODENAME")" \
+  && [ -n "$codename" ] \
+  && apt_dir="$(mktemp -d)" \
+  && mkdir "$apt_dir/parts" \
+  && printf 'deb [signed-by=%s] %s %s-security main\n' \
+    /usr/share/keyrings/debian-archive-keyring.gpg http://deb.debian.org/debian-security \
+    "$codename" > "$apt_dir/security.list" \
+  && apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" update \
+  && DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" -y upgrade \
+  && rm -rf /var/lib/apt/lists/* "$apt_dir" \
+  && [ "$(nginx -v 2>&1)" = "nginx version: nginx/1.30.5" ]
 
 # Non-root runtime. The base image's /etc/nginx/nginx.conf is written for a root master that
 # drops its workers to `user nginx` and writes its pid file to root-owned /run. This edit

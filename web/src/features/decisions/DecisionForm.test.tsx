@@ -20,7 +20,8 @@
  *   fields in a patch and the complete state in an intended state.
  * - **Errors.** A 422 shows the API's message and takes focus; a 409 `subject_retired` locks
  *   the form as "Computed from replaced data"; a 409 `discrepancy_resolved` reads "Already
- *   resolved". No error takes `role="alert"`.
+ *   resolved"; a failure that is not an `ApiError` reads "The save failed.", never its own
+ *   message. No error takes `role="alert"`.
  * - **Outcomes.** `onPendingChange` reports `true` when a save is sent and `false` when it
  *   settles, before `onDone`, `onRetired` or `onFailed`; `onFailed` receives every failure but
  *   `subject_retired`, with the form's message; each reaches the consumer after an unmount too.
@@ -191,7 +192,9 @@ function deferredResponse(): {
 }
 
 /**
- * Renders the form at `/decisions` and waits until the decision log has loaded.
+ * Renders the form at `/decisions` and waits for the initial decision-log read to settle, that
+ * is, until the "Loading decision" spinner is gone. The read need not succeed: a failed read,
+ * which shows the critical banner in the spinner's place, ends the wait too.
  *
  * @param props - The form's props.
  * @param options - The query client to render with; a fresh one when omitted.
@@ -1727,6 +1730,45 @@ describe('DecisionForm', () => {
         expect(onRetired).toHaveBeenCalledTimes(1);
       });
       expect(onFailed).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows and reports the generic text, never the message, of a non-ApiError failure', async () => {
+      // Assembled at run time, so the secret scan never meets a literal secret assignment.
+      const secret = `${['SESSION', 'SECRET'].join('_')}=${'9f3c'.repeat(8)}`;
+      const internalPath = '/srv/ads_engine/.env';
+      const failure = new Error(
+        `ENOENT: no such file or directory, open '${internalPath}' (${secret})`,
+      );
+      const onFailed = vi.fn<(message: string, error: unknown) => void>();
+      const onDone = vi.fn<() => void>();
+      const queryClient = createTestQueryClient();
+      const api = mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': json(201, makeDecision('own_budget', { status: 'paused' })),
+      });
+      await renderForm(
+        { subject: OWN_BUDGET, prefill: { status: 'paused' }, onFailed, onDone },
+        { queryClient },
+      );
+      // The POST succeeds, then the refetch `useRecordDecision` awaits rejects with a plain
+      // Error, which TanStack Query makes the mutation's error.
+      vi.spyOn(queryClient, 'invalidateQueries').mockRejectedValue(failure);
+
+      fireEvent.click(saveButton());
+
+      const banner = await screen.findByText('The save failed.');
+      await waitFor(() => {
+        expect(document.activeElement?.contains(banner)).toBe(true);
+      });
+      await waitFor(() => {
+        expect(onFailed).toHaveBeenCalledTimes(1);
+      });
+      expect(onFailed).toHaveBeenCalledWith('The save failed.', failure);
+      expect(onDone).not.toHaveBeenCalled();
+      expect(callsTo(api, 'POST', '/decisions')).toHaveLength(1);
+      expect(document.body.innerHTML).not.toContain(internalPath);
+      expect(document.body.innerHTML).not.toContain(secret);
+      expect(document.body.innerHTML).not.toContain('ENOENT');
     });
 
     it.each([

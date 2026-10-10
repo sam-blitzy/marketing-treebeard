@@ -9,22 +9,35 @@
 #   backend-tests  pytest on a disposable postgres:18.6 service, with the coverage gates that
 #                  backend/pyproject.toml and backend/tests/conftest.py define
 #   web-tests      Vitest, with the coverage thresholds web/vite.config.ts defines
-#   build          the SPA build and both Compose images, after Compose 5.5.1 is installed
-#                  (SHA-256 checked) and `make check-tools` passes
+#   build          the SPA build and the three Compose images (backend, web and db's inline
+#                  postgres:18.6 build), after Compose 5.5.1 is installed (SHA-256 checked) and
+#                  `make check-tools` passes
 #   e2e            needs lint, typecheck, backend-tests, web-tests and build. On its own runner
 #                  it repeats the Compose 5.5.1 install and `make check-tools`, then runs the
 #                  documented first start (`make init`, then `docker compose up`) with no
 #                  source credentials, so every source runs on simulated data, then Playwright
-#   secret-scan    gitleaks v8.30.1 (pinned image) over every commit, with .gitleaks.toml;
-#                  independent of every other job
+#   secret-scan    `make secret-scan`: gitleaks v8.30.1 over every commit, with .gitleaks.toml,
+#                  from a local image built on the pinned one with its Alpine security fixes
+#                  applied; independent of every other job
 #
 # Nothing is published or deployed: no image push, no registry login, no release, and no
 # repository secret is read. The only credential is the e2e admin password, generated in the job.
 #
-# Pins: actions by full commit SHA; tools by exact version, every download checked against a
-# pinned SHA-256. Dependencies install from the committed lockfiles: `uv sync --frozen`
-# (backend/uv.lock) and `npm ci` (web/package-lock.json). Every command a job runs is defined
-# by the root Makefile, backend/pyproject.toml or web/package.json; this file owns none.
+# Pins: actions by full commit SHA; tools by exact version or tag. The two downloads this file
+# makes itself, CPython (python-build-standalone) and the Compose plugin, are checked against
+# a SHA-256 pinned below; uv and Node.js come through their setup actions at the exact versions
+# below, and the scanner image through `make secret-scan` by its pinned tag. Dependencies
+# install from the committed lockfiles: `uv sync --frozen` (backend/uv.lock) and `npm ci`
+# (web/package-lock.json).
+#
+# Commands: the product checks run commands defined outside this file: the root Makefile's
+# check-tools, init and secret-scan; ruff, mypy and pytest through `uv run`, as declared and
+# configured by backend/pyproject.toml; and the npm scripts of web/package.json. This file owns
+# the runner provisioning and orchestration around them: the CPython download, SHA-256 check,
+# extraction and version check; the Compose download, checksum checks, install and version
+# check; the e2e admin password; the build job's .env copy; `docker compose build` and `up`;
+# the health wait; the Playwright browser install; the failure state dump and report upload;
+# and the teardown.
 #
 # Runner: ubuntu-26.04 ships Docker Engine 29, which `make check-tools` requires (>=29);
 # ubuntu-24.04 ships Engine 28, and the floating "latest" label moves between images.
@@ -65,8 +78,6 @@ env:
   # release's docker-compose-linux-x86_64.sha256.
   COMPOSE_VERSION: "5.5.1"
   COMPOSE_SHA256: "db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576"
-  # The image of the root Makefile's secret-scan recipe.
-  GITLEAKS_IMAGE: "zricethezav/gitleaks:v8.30.1"
 
 jobs:
   lint:
@@ -356,7 +367,8 @@ jobs:
       - name: Provide the Compose .env (copy of .env.example)
         run: cp .env.example .env
 
-      # Builds backend/Dockerfile and web/Dockerfile as local images only; nothing is pushed.
+      # Builds backend/Dockerfile, web/Dockerfile and the db service's inline Dockerfile
+      # (postgres:18.6 with Debian security updates) as local images only; nothing is pushed.
       - name: Build the Compose images (docker compose build)
         run: docker compose build
 
@@ -499,12 +511,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The image, mount, entrypoint and flags of the root Makefile's secret-scan recipe, which
-      # is the single source; keep the two identical. The image's git refuses a mounted
-      # repository owned by another uid, so /repo is declared safe first. A finding exits 1.
-      - name: Scan every commit (gitleaks git)
-        run: |
-          set -euo pipefail
-          docker run --rm --volume "${GITHUB_WORKSPACE}:/repo:ro" --workdir /repo --entrypoint sh \
-            "${GITLEAKS_IMAGE}" \
-            -c 'git config --global --add safe.directory /repo && exec gitleaks git /repo --config /repo/.gitleaks.toml --redact --exit-code 1 --verbose'
+      # The root Makefile's secret-scan recipe is the single source of the scanner image, its
+      # Alpine library floors, mounts and flags; CI runs it unchanged. It builds the local
+      # scanner image from the pinned zricethezav/gitleaks:v8.30.1 (never pushed), checks that
+      # the binary reports v8.30.1, and scans the read-only checkout with --network none. A
+      # finding fails the step.
+      - name: Scan every commit (make secret-scan)
+        run: make secret-scan

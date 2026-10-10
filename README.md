@@ -85,7 +85,7 @@ labelled "Simulated" everywhere ([Quick start](#quick-start-simulated-data-no-cr
 ├── config/                   thresholds.yaml, content_assets.yaml, hubspot_mapping.yaml
 ├── docs/                     Architecture, recommendation rules, integrations, runbook
 ├── .github/workflows/ci.yml  CI: lint, type check, tests, build, end-to-end, secret scan
-├── docker-compose.yml        Local stack: db, migrate, api, worker, web (port 8080)
+├── docker-compose.yml        Local stack: db, migrate, api, worker, web (127.0.0.1:8080)
 ├── Makefile                  Tool checks, first start, stack control, tests, lint, secret scan
 ├── .env.example              Every environment variable: safe defaults, empty secrets
 └── .gitleaks.toml            Secret-scan rules and allowlists
@@ -145,6 +145,7 @@ make check-tools
      or updates the admin from `.env`.
    - `api` and `worker` start only after `migrate` succeeds.
    - `web` (nginx) starts once `api` is healthy, serves the SPA on port 8080 and proxies `/api/`.
+     Port 8080 is published on `127.0.0.1` only, so no other machine reaches it.
 
 3. Open <http://localhost:8080> and sign in as `admin@example.com` with the password from step 1.
    You land on `/actions`. It shows "No analysis run yet" until the worker's first default run
@@ -268,7 +269,7 @@ Who reads each variable, and how to rotate secrets:
 | `lint` | `ruff format --check`, `ruff check` and `mypy --strict src`; ESLint, stylelint and `tsc --noEmit` |
 | `e2e` | Playwright against the Compose stack started with `DATA_MODE=simulated` (`make e2e ADMIN_PASSWORD=<value>`); leaves the stack running |
 | `seed-simulated` | Seeds simulated datasets for every source and computes the default-window run |
-| `secret-scan` | Runs the pinned `zricethezav/gitleaks:v8.30.1` image with `.gitleaks.toml` over every commit; a finding fails it |
+| `secret-scan` | Builds the local scanner image `ads-engine-gitleaks:v8.30.1-patched` (never pushed) from the pinned `zricethezav/gitleaks:v8.30.1`, upgrading only the Alpine libraries that have published security fixes to at least the fixed versions, then runs gitleaks `v8.30.1` from it, with no network, and `.gitleaks.toml` over every commit; a finding fails it |
 
 Overridable variables (`COMPOSE`, `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`, `PYTEST_ARGS`,
 `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) are
@@ -302,8 +303,10 @@ the worker queues a fresh default-window run. Every rule and threshold key is ex
 - **Login**: a single admin login. The session cookie is signed, HttpOnly, `SameSite=Lax` and
   lasts 12 h; it is marked Secure whenever `APP_BASE_URL` is `https://`.
 - **HTTPS beyond localhost**: plain HTTP is accepted only for a `localhost` or `127.0.0.1`
-  `APP_BASE_URL`. Any other host needs an `https://` `APP_BASE_URL` and TLS terminated in front of
-  nginx ([Hosting beyond localhost](docs/runbook.md#hosting-beyond-localhost)).
+  `APP_BASE_URL`, and Compose publishes nginx on `127.0.0.1:8080` only, so the plain-HTTP login
+  never reaches the network. Any other host needs an `https://` `APP_BASE_URL` and a TLS
+  terminator in front of nginx that redirects HTTP to HTTPS and sends HSTS
+  ([Hosting beyond localhost](docs/runbook.md#hosting-beyond-localhost)).
 - **CSRF**: every mutating request must carry `X-Requested-With: ads-engine`.
 - **Brute force**: sign-in is limited to 5 attempts per minute per client IP.
 - **Personal data**: lead emails are persisted only as SHA-256 hashes, and free-text form answers
@@ -359,8 +362,9 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 - type checks (`mypy --strict`; `tsc --noEmit`);
 - backend tests against a `postgres:18.6` service container, with the coverage gates;
 - web unit tests (Vitest), with the coverage thresholds;
-- the SPA build (`npm run build`), then both Compose images (`docker compose build`) once Compose
-  5.5.1 is installed (SHA-256 checked) and `make check-tools` passes;
+- the SPA build (`npm run build`), then the three Compose images (`docker compose build`): the
+  backend and web images and `db`'s inline `postgres:18.6` build, once Compose 5.5.1 is installed
+  (SHA-256 checked) and `make check-tools` passes;
 - Playwright end-to-end tests on the documented first start (`make init`, then
   `docker compose up -d --build`) with no source credentials, so every source runs on simulated
   data;

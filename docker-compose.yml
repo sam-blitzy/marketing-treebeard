@@ -11,8 +11,9 @@
 #                                      sections (simulated data until credentials are set)
 #
 # Startup order:
-#   db       postgres:18.6. Healthy once pg_isready answers over TCP, which the image's
-#            socket-only initialisation server never does, so first-run init is complete.
+#   db       Built from postgres:18.6 with Debian security updates; runs as postgres (999).
+#            Healthy once pg_isready answers over TCP, which the image's socket-only
+#            initialisation server never does, so first-run init is complete.
 #   migrate  One-shot, once db is healthy: `ads-engine migrate && ads-engine ensure-admin`.
 #            Both are idempotent, so it runs again on every `up`.
 #   api      Once migrate exited 0. Healthy once GET /api/v1/healthz answers 200, which needs
@@ -35,7 +36,9 @@
 #     DATA_MODE=auto every source is simulated with the reason "credentials not configured".
 #   - This file holds no secret value. Source credentials go in .env only.
 #
-# Ports: only web is published, on 8080, matching APP_BASE_URL=http://localhost:8080. db and
+# Ports: only web is published, on 127.0.0.1:8080, matching APP_BASE_URL=http://localhost:8080.
+# The loopback address keeps the plain-HTTP login off the network: any other host reaches the
+# stack only through a TLS terminator (docs/runbook.md, Hosting beyond localhost). db and
 # api are reachable only on the project's default network: backend tests use their own
 # disposable database, and a published 5432 could collide with a local PostgreSQL.
 #
@@ -48,6 +51,16 @@
 #
 # Logging: Docker's default json-file driver. The api and worker write structured JSON lines
 # (structlog, with secrets redacted) to stdout: `docker compose logs -f worker`.
+#
+# Containers: every process runs as a fixed non-root user from the container's first process:
+# migrate, api and worker as 10001 (backend/Dockerfile), web as nginx's 101 (web/Dockerfile)
+# and db as postgres's 999 (its inline Dockerfile below). Every service also sets
+# no-new-privileges, so no setuid or setgid binary in an image can raise a process's
+# privileges, and drops every Linux capability (cap_drop: ALL), none of which they need. Each
+# image applies Debian security updates on top of its exact base tag at build time, and the
+# build fails if Python, Node, nginx or PostgreSQL is no longer the pinned version. A cached
+# build keeps the packages it already has; `docker compose build --pull --no-cache` takes
+# newer updates (docs/runbook.md, Base images and OS security updates).
 #
 # Resources: each service runs under a CPU and memory ceiling (deploy.resources.limits), set
 # from the shell, else from .env (Compose interpolation, as for POSTGRES_*), else the default
@@ -84,10 +97,50 @@ x-backend: &backend
     DATA_MODE: "${DATA_MODE:-auto}"
   volumes:
     - ./config:/app/config:ro
+  # No privilege gain through a setuid or setgid binary, and no Linux capability: the backend
+  # runs as 10001 and needs none (Containers, above).
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
 
 services:
   db:
-    image: postgres:18.6
+    # postgres:18.6 itself plus a Debian security-update layer, run as the image's postgres
+    # user from its first process. The Dockerfile is inline, so it needs no file of its own;
+    # with no `image:` key the build is tagged for this Compose project only (<project>-db) and
+    # never pushed. `$$` passes a literal `$` through Compose interpolation to the build shell.
+    build:
+      dockerfile_inline: |
+        FROM postgres:18.6
+        # Debian security updates only. For this step a temporary source list naming just the
+        # image's <codename>-security suite replaces its APT sources, the PostgreSQL (PGDG)
+        # repository included, so `apt-get upgrade` cannot move the server, installs no new
+        # package and removes none; its output names every package it upgrades. The step fails
+        # unless the server is still 18.6 and the postgres user still 999:999. It then gives
+        # /var/lib/postgresql to that user, private (0700): a new pgdata volume copies this
+        # owner and mode on first mount, so initdb, running as postgres, can create PGDATA.
+        RUN codename="$$(. /etc/os-release && echo "$$VERSION_CODENAME")" \
+          && [ -n "$$codename" ] \
+          && apt_dir="$$(mktemp -d)" \
+          && mkdir "$$apt_dir/parts" \
+          && printf 'deb [signed-by=%s] %s %s-security main\n' \
+            /usr/share/keyrings/debian-archive-keyring.gpg http://deb.debian.org/debian-security \
+            "$$codename" > "$$apt_dir/security.list" \
+          && apt-get -o Dir::Etc::SourceList="$$apt_dir/security.list" \
+            -o Dir::Etc::SourceParts="$$apt_dir/parts" update \
+          && DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Dir::Etc::SourceList="$$apt_dir/security.list" \
+            -o Dir::Etc::SourceParts="$$apt_dir/parts" -y upgrade \
+          && rm -rf /var/lib/apt/lists/* "$$apt_dir" \
+          && [ "$$(postgres --version | cut -d ' ' -f 3)" = "18.6" ] \
+          && [ "$$(id -u postgres):$$(id -g postgres)" = "999:999" ] \
+          && chown 999:999 /var/lib/postgresql \
+          && chmod 0700 /var/lib/postgresql
+        # The postgres user, given numerically so a runAsNonRoot policy can verify it. The
+        # entrypoint and every server process run as it: started as non-root, the entrypoint
+        # skips its chown and gosu steps and initialises or starts the cluster directly.
+        USER 999:999
     environment:
       POSTGRES_DB: "${POSTGRES_DB:-ads_engine}"
       POSTGRES_USER: "${POSTGRES_USER:-ads}"
@@ -109,6 +162,12 @@ services:
       retries: 20
       start_period: 20s
     restart: unless-stopped
+    # No privilege gain through a setuid or setgid binary, and no Linux capability: PostgreSQL
+    # runs as postgres from the start and needs none (Containers, above).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -190,12 +249,21 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+    # IPv4 loopback only: http://localhost:8080 (APP_BASE_URL) works on this machine, and
+    # nothing else on the network can reach this plain-HTTP port. Remote access goes through a
+    # TLS terminator (docs/runbook.md, Hosting beyond localhost).
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
+    # No privilege gain through a setuid or setgid binary, and no Linux capability: nginx runs
+    # as 101 and listens on 8080, above 1024, so it needs none (Containers, above).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:

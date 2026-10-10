@@ -144,7 +144,10 @@ function buttonNamed(name: string, scope: HTMLElement = document.body): HTMLButt
 
 /**
  * The log's own polite status region: the one `div` status element outside the dialog.
- * `hidden` is set so the region is found while it is still empty.
+ * `hidden: true` also includes status elements excluded from the accessibility tree: those with
+ * `visibility: hidden`, or with the `hidden` attribute, `aria-hidden="true"` or `display: none`
+ * on themselves or an ancestor. The one-region check therefore counts every matching `div`,
+ * whether or not it is exposed to assistive technology.
  */
 function logRegion(): HTMLElement {
   const regions = screen

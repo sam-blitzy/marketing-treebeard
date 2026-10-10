@@ -30,6 +30,7 @@ notes for [Google Ads via n8n](integrations/google-ads-n8n.md),
 - [Changing thresholds, mappings and the registry](#changing-thresholds-mappings-and-the-registry)
 - [Hosting beyond localhost](#hosting-beyond-localhost)
 - [Database reset and backup](#database-reset-and-backup)
+- [Base images and OS security updates](#base-images-and-os-security-updates)
 - [Tests and quality checks](#tests-and-quality-checks)
 - [Make targets](#make-targets)
 
@@ -117,7 +118,9 @@ make check-tools
    - `api` and `worker` start only after `migrate` exits 0. `api` is healthy once
      `GET /api/v1/healthz` answers 200, which includes a database round trip.
    - `web` (nginx) starts once `api` is healthy. It serves the SPA on port 8080 and proxies
-     `/api/` to the API. Port 8080 is the only published port.
+     `/api/` to the API. Port 8080 is the only published port, and only on the loopback address
+     `127.0.0.1`, so no other machine reaches the plain-HTTP login
+     ([Hosting beyond localhost](#hosting-beyond-localhost)).
 
 4. Open <http://localhost:8080> and sign in as `admin@example.com` with the chosen password.
 
@@ -250,15 +253,62 @@ what each command needs.
 
   `docker compose restart` is not enough: a restarted container keeps the environment it was
   created with.
-- **Rotating `SESSION_SECRET`**: generate 32 random bytes, put them in `.env` as
-  `SESSION_SECRET=<64 hex characters>`, and recreate `api`. Every open session is signed out.
+- **Rotating `SESSION_SECRET`**: run this block from the repository root. It writes a new key, 32
+  random bytes as 64 hex characters, into `.env` the way `make init` does and never prints it:
+  owner-only (mode 600), through a temporary file renamed over `.env`, refusing a missing or
+  symlinked `.env`, and leaving `.env` as it was on any failure. It then recreates `api`, the only
+  process that reads the key, and prints only a confirmation. Every open session is signed out.
 
   ```bash
-  od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; echo
+  (
+    set -eu +x
+    umask 077
+    tmp_env=''
+    written=0
+    trap '
+      if [ -n "$tmp_env" ]; then rm -f -- "$tmp_env"; fi
+      if [ "$written" -eq 0 ]; then echo "SESSION_SECRET not rotated; .env left as it was" >&2; fi
+    ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ -L .env ] || [ ! -f .env ]; then
+      echo "refusing: .env must be a regular file, not a symlink, in the repository root" >&2
+      exit 1
+    fi
+    session_secret="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+    case "$session_secret" in
+      *[!0-9a-f]*) session_secret='' ;;
+    esac
+    if [ "${#session_secret}" -ne 64 ]; then
+      echo "could not read 32 random bytes from /dev/urandom" >&2
+      exit 1
+    fi
+    tmp_env="$(mktemp .env.XXXXXX)"
+    SESSION_SECRET_VALUE="$session_secret" awk '
+      /^SESSION_SECRET=/ { if (!s) print "SESSION_SECRET=" ENVIRON["SESSION_SECRET_VALUE"]; s = 1; next }
+      { print }
+      END { if (!s) print "SESSION_SECRET=" ENVIRON["SESSION_SECRET_VALUE"] }
+    ' .env > "$tmp_env"
+    unset session_secret
+    chmod 600 "$tmp_env"
+    mv -f "$tmp_env" .env
+    tmp_env=''
+    written=1
+    if ! docker compose up -d --force-recreate api; then
+      echo "SESSION_SECRET written, but api not recreated; run: docker compose up -d --force-recreate api" >&2
+      exit 1
+    fi
+    echo "SESSION_SECRET rotated; api recreated; every session must sign in again"
+  )
   ```
 
-- **Before every push**: run the secret scan. It runs the pinned `zricethezav/gitleaks:v8.30.1`
-  image with `.gitleaks.toml` over every commit, and any finding fails it. CI runs the same scan.
+  Run it as it stands. `+x` stops a shell traced with `set -x` from echoing the key; chained with
+  `&&` or `||`, the subshell would run with `set -e` silently off; and the key reaches `awk` only
+  through its environment, never its arguments, which other local users can read in `ps`.
+
+- **Before every push**: run the secret scan. It runs gitleaks v8.30.1 from a local image built on
+  the pinned `zricethezav/gitleaks:v8.30.1` with its Alpine security fixes applied, with
+  `.gitleaks.toml` over every commit, and any finding fails it. CI runs the same `make secret-scan`.
 
   ```bash
   make secret-scan
@@ -715,13 +765,15 @@ docker compose run --rm --no-deps --user "$(id -u):$(id -g)" \
   account and customer ids with zeros of the same length, and the webhook URL with a reserved
   placeholder URL.
 
-Review the captures before committing them. Scan the working tree with the pinned gitleaks image
-first, then commit, then run `make secret-scan` over the history before pushing:
+Review the captures before committing them. Scan the working tree with the scanner image that
+`make secret-scan` builds from the pinned gitleaks image (run `make secret-scan` once first, so
+`ads-engine-gitleaks:v8.30.1-patched` exists), then commit, then run `make secret-scan` over the
+history before pushing:
 
 ```bash
 git status --short backend/tests/contracts
 git diff --stat -- backend/tests/contracts
-docker run --rm -v "$PWD:/repo:ro" -w /repo zricethezav/gitleaks:v8.30.1 \
+docker run --rm --network none -v "$PWD:/repo:ro" -w /repo ads-engine-gitleaks:v8.30.1-patched \
   dir backend/tests/contracts --config /repo/.gitleaks.toml --redact --exit-code 1
 ```
 
@@ -759,12 +811,53 @@ Each threshold, its rationale and the load-time checks are in
 
 ## Hosting beyond localhost
 
-The local stack serves plain HTTP on port 8080 and accepts an `http://` base URL only for
-`localhost` or `127.0.0.1`. Any other host needs TLS in front of nginx:
+The local stack serves plain HTTP on port 8080, published on the loopback address `127.0.0.1`
+only, and accepts an `http://` base URL only for `localhost` or `127.0.0.1`. Any other host needs
+TLS in front of nginx:
 
 1. **Terminate TLS** in a reverse proxy or load balancer in front of nginx's port 8080. Forward
    `X-Forwarded-For` and `X-Forwarded-Proto` to it.
-2. **Set the public origin** in `.env`:
+2. **Enforce HTTPS at the terminator** before relying on the `https://` origin of the next step:
+   - Redirect every plain-HTTP request for the public name to HTTPS with 301 or 308, or do not
+     listen on HTTP at all.
+   - Send `Strict-Transport-Security: max-age=<seconds>` on HTTPS responses only. Start with
+     `max-age=300` while you verify the site, then raise it to at least `31536000` (one year).
+     Until the header expires, browsers that saw it refuse plain HTTP for that name.
+   - Never send HSTS from the local nginx or on `http://localhost`. Browsers ignore it over plain
+     HTTP, and a pin for `localhost` would force HTTPS on every local port and app.
+   - Add `includeSubDomains` only when every subdomain of that host serves valid HTTPS. Add
+     `preload` only after `includeSubDomains` with a `max-age` of at least `31536000`, and only
+     when the whole registrable domain is committed to HTTPS: removal from the browsers' preload
+     lists takes months.
+
+   For example, an nginx terminator on this host. It is the operator's own server, not a file in
+   this repository:
+
+   ```nginx
+   server {
+     listen 80;
+     server_name <host>;
+     return 308 https://<host>$request_uri;
+   }
+
+   server {
+     listen 443 ssl;
+     server_name <host>;
+     ssl_certificate <certificate chain file>;
+     ssl_certificate_key <private key file>;
+     # HTTPS responses only. max-age=300 while verifying, then a year.
+     add_header Strict-Transport-Security "max-age=31536000" always;
+
+     location / {
+       proxy_pass http://127.0.0.1:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $remote_addr;
+       proxy_set_header X-Forwarded-Proto https;
+     }
+   }
+   ```
+
+3. **Set the public origin** in `.env`:
 
    ```dotenv
    APP_BASE_URL=https://<host>
@@ -773,23 +866,33 @@ The local stack serves plain HTTP on port 8080 and accepts an `http://` base URL
    With `https://`, the session cookie is marked Secure. The API refuses to start on any `http://`
    base URL other than `localhost` or `127.0.0.1`. Apply it with
    `docker compose up -d --force-recreate api worker`.
-3. **Expose only nginx, and only to the proxy**. Compose publishes `8080:8080` on every interface;
-   a host-local `docker-compose.override.yml` beside `docker-compose.yml`, which Compose reads
-   automatically, restricts it. Keep that file out of commits:
+4. **Expose only nginx, and only to the proxy**. Compose publishes nginx on `127.0.0.1:8080`
+   only, so a terminator on this host proxies to `http://127.0.0.1:8080` and needs no change. A
+   terminator on another host needs nginx on the private address it connects to: write a
+   host-local `docker-compose.override.yml` beside `docker-compose.yml`, which Compose reads
+   automatically, and keep that file out of commits. `!override` replaces the default mapping
+   instead of adding to it:
 
    ```yaml
    services:
      web:
        ports: !override
-         - "127.0.0.1:8080:8080"
+         - "<private address>:8080:8080"
    ```
+
+   Let only the proxy reach that address and port. Docker's published ports bypass host firewall
+   front ends such as `ufw`, so filter in a network firewall or security group, or in Docker's
+   `DOCKER-USER` chain. Never publish 8080 on `0.0.0.0` or a public address: clients could then
+   reach the plain-HTTP login directly, bypassing the TLS terminator.
 
    Never publish `db` (5432) or `api` (8000). The API trusts the client address in
    `X-Forwarded-For` from every peer, which is safe only while nginx is its sole client-facing peer.
-4. **Keep the sign-in limit per client**. nginx overwrites `X-Forwarded-For` with the address of the
+5. **Keep the sign-in limit per client**. nginx overwrites `X-Forwarded-For` with the address of the
    peer connected to it, which behind a TLS proxy is the proxy itself, so every client would share
    one limit. Trust the proxy with nginx's realip module in the `server` block of `web/nginx.conf`,
-   then rebuild `web`:
+   then rebuild `web`. The proxy address is the one `docker compose logs web` shows for the
+   proxy's requests; for a terminator on this host it is the Compose network's gateway, not
+   `127.0.0.1`:
 
    ```nginx
    set_real_ip_from <proxy address or CIDR>;
@@ -801,7 +904,7 @@ The local stack serves plain HTTP on port 8080 and accepts an `http://` base URL
    docker compose up -d --build web
    ```
 
-5. **Change the database password** from the local default `ads`. `POSTGRES_PASSWORD` takes effect
+6. **Change the database password** from the local default `ads`. `POSTGRES_PASSWORD` takes effect
    only when the `pgdata` volume is first initialised, so set it, together with the password inside
    `DATABASE_URL` (percent-encoded where it holds special characters), before the first
    `docker compose up`. On an existing volume, change the role's password first; `\password`
@@ -859,6 +962,76 @@ docker compose up -d --build
 On the next start, `migrate` recreates the schema and the admin login from `.env`, and the worker
 builds and backfills a new dataset per source, live or simulated, writes fresh baseline decisions
 and computes the first default run.
+
+## Base images and OS security updates
+
+Every image builds on an exact tag: `python:3.14.8-slim` for `migrate`, `api` and `worker`,
+`node:24.21.0-slim` for the web build stage only, `nginx:1.30.5` for `web`, and `postgres:18.6`
+for `db`, which `docker-compose.yml` builds from an inline Dockerfile. An exact tag fixes the
+version a build selects, not the image's bytes: tags are mutable, and their publishers rebuild
+them with refreshed Debian packages. Pinning a digest is optional, for builds from
+byte-identical bases: replace a tag with `<tag>@sha256:<digest>`, using the digest that
+`docker buildx imagetools inspect <tag>` prints. A pinned digest receives no publisher refresh
+until you change it.
+
+Each build also applies Debian security updates, in one step per image, both web stages
+included:
+
+- APT reads only a temporary source list naming the image's own `<codename>-security` suite
+  (`trixie-security`, or `bookworm-security` for the node build stage). The step takes nothing
+  from Debian's main archive, the PostgreSQL (PGDG) repository or nginx.org, installs no new
+  package and removes none.
+- `apt-get upgrade` names every package it upgrades in the build log
+  (`docker compose --progress plain build`).
+- The step fails the build unless the image still has Python 3.14.8, Node v24.21.0,
+  nginx 1.30.5 or PostgreSQL 18.6 respectively, so a build never ships a different principal
+  version.
+
+The `db` image runs as postgres (999:999) and gives that user `/var/lib/postgresql` with mode
+0700, so a new `pgdata` volume starts private to postgres. A `pgdata` volume created by an
+earlier version of this stack, whose entrypoint ran as root, keeps working: that entrypoint
+already gave the data directory to postgres.
+
+A cached step keeps the packages it had when it ran, and `docker compose up -d --build` reuses
+it. To take newer base images and security updates, rebuild without the cache and recreate the
+services; the `pgdata` volume is kept:
+
+```bash
+docker compose build --pull --no-cache
+docker compose up -d
+```
+
+`--pull` fetches the image each tag currently names, and `--no-cache` reruns every step. Check
+a package afterwards, for example `docker compose exec db dpkg-query -W liblzma5`.
+
+### Advisories without a Debian fix
+
+At the time of writing (October 2026), Debian's security tracker lists these as vulnerable in
+both bookworm and trixie, with no fixed package; the fixes exist only in Debian testing or
+unstable, so no security update can apply them yet. Re-check each entry when you rebuild: once
+a fix reaches `<codename>-security`, the rebuild above installs it.
+
+| Advisory | Affected | Precondition | In this stack |
+|----------|----------|--------------|---------------|
+| [CVE-2026-27171](https://security-tracker.debian.org/tracker/CVE-2026-27171) | zlib before 1.3.2: `zlib1g` 1.3.1 in the trixie images, 1.2.13 in the node build stage | A caller passes a crafted length to `crc32_combine64` or `crc32_combine_gen64` (CPU exhaustion) | The backend source never calls zlib, and Python 3.14's `zlib` module has no `crc32_combine`. No executable or shared library in the backend or web image imports a `crc32_combine` function. In the db image only Perl's `Compress::Raw::Zlib` module does, and no Perl process runs there. Node uses its own bundled zlib (version 1.3.2.1), not `zlib1g` |
+| [CVE-2026-95818](https://security-tracker.debian.org/tracker/CVE-2026-95818) | glibc dynamic loader: `libc6` 2.41 (trixie), 2.36 (bookworm) | A setuid or setgid program whose `DT_RPATH` or `DT_RUNPATH` begins with `$ORIGIN` (loader memory corruption) | None of the 11 setuid or setgid programs in each image (`su`, `passwd`, `mount` and others from the base) has a `DT_RPATH` or `DT_RUNPATH`, and `no-new-privileges` keeps every one of them from raising privileges |
+| [CVE-2026-86805](https://security-tracker.debian.org/tracker/CVE-2026-86805) | glibc dynamic loader, as above | As above, plus a `..` traversal, a hard link the attacker controls and `fs.protected_hardlinks` disabled on the host | As above. `fs.protected_hardlinks` is a host kernel setting, on by default in the major distributions; keep it on |
+
+`docker-compose.yml` enforces these mitigations (its header, Containers):
+
+- Every process runs as a fixed non-root user from the container's first process: 10001 for
+  `migrate`, `api` and `worker`, nginx's 101 for `web`, and postgres's 999 for `db`.
+- Every service sets `no-new-privileges:true`: the kernel ignores setuid and setgid bits, so a
+  loader flaw in a setuid program cannot raise a process's privileges.
+- Every service drops all Linux capabilities (`cap_drop: ALL`); none needs one.
+- Only nginx is published, on `127.0.0.1:8080`; `db` and `api` are reachable only on the
+  project's network.
+- The node build stage contributes only the built `dist/` files to the `web` image, so its
+  bookworm packages never run in the stack.
+
+What these checks do not prove: they cover dynamically linked imports and the code this product
+ships, not a call made through `dlopen`, `ctypes` or a statically linked, unexported copy of
+zlib. Exploitability through this product is not established either way.
 
 ## Tests and quality checks
 
@@ -927,7 +1100,7 @@ at the first failing command.
 | `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; a container it did not create is never reused or removed), then the web unit tests. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
 | `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e` with `E2E_COMPOSE` set to `COMPOSE`; leaves the stack running |
-| `secret-scan` | `zricethezav/gitleaks:v8.30.1` with `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
+| `secret-scan` | Builds `ads-engine-gitleaks:v8.30.1-patched` from `zricethezav/gitleaks:v8.30.1`, upgrading only the Alpine libraries in `GITLEAKS_APK_FLOORS` to at least their fixed versions (a local image, never pushed); checks that its gitleaks reports `v8.30.1`; then runs it with `--network none` and `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
 
 Overridable variables, on the command line or in the environment: `COMPOSE` (default
 `docker compose`; add `-p` or `-f` flags here), `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`,

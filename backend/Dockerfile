@@ -32,8 +32,32 @@
 # HTTP. Compose probes the api service with the image's own Python (urllib) on
 # /api/v1/healthz; the slim base has no curl, and none is added.
 
-# Exact tag, so a rebuild cannot change the runtime silently.
+# The exact tag fixes the Python version a build selects, 3.14.8, not the image's bytes. Tags
+# are mutable: the publisher can rebuild python:3.14.8-slim with refreshed Debian layers, and the
+# security-update layer below also changes OS packages from one build to the next by design.
+# Pinning the tag's digest (python:3.14.8-slim@sha256:<digest>) is optional, for byte-identical
+# bases (docs/runbook.md, Base images and OS security updates).
 FROM python:3.14.8-slim
+
+# Debian security updates only. For this step a temporary source list naming just the image's
+# <codename>-security suite replaces its APT sources, so `apt-get upgrade` takes nothing from the
+# main archive or any other repository, installs no new package and removes none; its output
+# names every package it upgrades. The step fails unless the interpreter is still Python 3.14.8,
+# so a build never ships a different runtime. It precedes the uv and project layers, so source
+# changes keep it cached; `docker compose build --pull --no-cache` refreshes it.
+RUN codename="$(. /etc/os-release && echo "$VERSION_CODENAME")" \
+  && [ -n "$codename" ] \
+  && apt_dir="$(mktemp -d)" \
+  && mkdir "$apt_dir/parts" \
+  && printf 'deb [signed-by=%s] %s %s-security main\n' \
+    /usr/share/keyrings/debian-archive-keyring.gpg http://deb.debian.org/debian-security \
+    "$codename" > "$apt_dir/security.list" \
+  && apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" update \
+  && DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Etc::SourceList="$apt_dir/security.list" \
+    -o Dir::Etc::SourceParts="$apt_dir/parts" -y upgrade \
+  && rm -rf /var/lib/apt/lists/* "$apt_dir" \
+  && [ "$(python3 --version)" = "Python 3.14.8" ]
 
 # uv pinned exactly; backend/pyproject.toml declares `required-version = "==0.12.21"`, so any
 # other uv refuses to sync.

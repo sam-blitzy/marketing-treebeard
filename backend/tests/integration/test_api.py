@@ -24,6 +24,12 @@ test database; nothing reaches the network. The guarantees proven here:
   no ``head`` operation; a 405's ``Allow`` that names ``GET`` names ``HEAD`` too, and ``HEAD`` on
   a ``POST``-only route is 405 ``Allow: POST``. The deadline's 503 and the catch-all 500 log the
   client's real method.
+* **No caching** (CWE-525): every answer carries exactly one ``Cache-Control: no-store``, so no
+  browser or shared cache keeps it after sign-out: a login, a failed login and the 6th attempt's
+  429 (its ``Retry-After`` kept), ``/auth/me`` and logout; the signed-in evidence and decision
+  reads and the OpenAPI document on ``GET`` and ``HEAD``; 401, 403, 404, 405 (its ``Allow``
+  kept) and 422; ``/healthz``; the deadline's 503 and the catch-all 500. The middleware replaces
+  any ``Cache-Control`` the application sent and leaves other ASGI scopes alone.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
   ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET`` or on a ``DATABASE_URL``
   the engine would refuse (malformed, or a driver other than psycopg 3), while an unreachable
@@ -1687,6 +1693,247 @@ async def test_head_errors_rendered_outside_the_middleware_log_the_real_method(
     assert (timeout_record["method"], timeout_record["path"]) == ("HEAD", api("/test-stalled"))
     [unhandled] = events_named(captured_logs, "api.unhandled_error")
     assert (unhandled["method"], unhandled["error_type"]) == ("HEAD", "RuntimeError")
+
+
+# ---------------------------------------------------------------------------------------------
+# No caching (CWE-525: every answer carries exactly one Cache-Control: no-store)
+# ---------------------------------------------------------------------------------------------
+
+
+def assert_no_store(response: httpx.Response) -> None:
+    """Assert ``response`` carries exactly one ``Cache-Control`` header, ``no-store``.
+
+    ``no-cache`` or a second ``Cache-Control`` fails: ``no-cache`` still lets a cache store the
+    body, and a repeated header leaves caches to combine the values.
+    """
+    request = response.request
+    assert response.headers.get_list("cache-control") == ["no-store"], (
+        request.method,
+        str(request.url),
+        response.headers.multi_items(),
+    )
+
+
+async def test_auth_answers_are_no_store(admin_user: AppUser, test_identity: AdminIdentity) -> None:
+    """CWE-525: sign-in, identity and sign-out answers are never kept by a cache.
+
+    A failed login (401), a successful one (200 with the session ``Set-Cookie``),
+    ``GET /auth/me``, logout (200 expiring the cookie) and the 6th attempt's 429 with its
+    ``Retry-After`` each carry exactly one ``Cache-Control: no-store``, beside their unchanged
+    status, body and cookies. The login limiter runs on a fixed injected clock, so the 429 never
+    depends on how long the requests and password checks take.
+    """
+    del admin_user
+    app = create_app()
+    app.state.login_limiter = security.LoginRateLimiter(clock=lambda: 0.0)
+    email, password = test_identity.email, test_identity.password
+    async with serve(app) as client:
+        failed = await post_login(client, test_identity, email=email, password="wrong-password")
+        assert_error(failed, 401, "invalid_credentials")
+        assert failed.headers.get_list("set-cookie") == []
+        signed_in = await post_login(client, test_identity, email=email, password=password)
+        assert signed_in.status_code == 200, signed_in.text
+        assert schemas.Me.model_validate(signed_in.json()) == schemas.Me(email=email)
+        assert security.SESSION_COOKIE in cookie_names(signed_in)
+        me = await client.get(api("/auth/me"))
+        assert me.status_code == 200, me.text
+        assert me.json() == {"email": email}
+        logged_out = await client.post(
+            api("/auth/logout"), headers=dict(test_identity.csrf_headers)
+        )
+        assert logged_out.status_code == 200, logged_out.text
+        expired = cookie_attributes(logged_out, security.SESSION_COOKIE)
+        assert "1970" in expired.get("expires", ""), expired
+        for _ in range(security.LOGIN_MAX_ATTEMPTS - 2):  # attempts 3 to 5
+            wrong = await post_login(client, test_identity, email=email, password="wrong-password")
+            assert_error(wrong, 401, "invalid_credentials")
+        limited = await post_login(client, test_identity, email=email, password=password)
+        assert_error(limited, 429, "rate_limited")
+        assert limited.headers["Retry-After"] == str(security.LOGIN_WINDOW_SECONDS)
+
+    for response in (failed, signed_in, me, logged_out, limited):
+        assert_no_store(response)
+
+
+async def test_signed_in_reads_are_no_store(seeded: Seeded) -> None:
+    """CWE-525: evidence, decisions and the OpenAPI document are never kept by a cache.
+
+    On the seeded database the signed-in ``GET /recommendations`` (recommendation and CRM
+    evidence), ``GET /decisions`` and ``GET`` and ``HEAD /openapi.json`` each answer 200 with
+    exactly one ``Cache-Control: no-store``; the ``HEAD`` answer still has no body.
+    """
+    client = seeded.client
+    page = await client.get(api("/recommendations"))
+    decisions = await client.get(api("/decisions"))
+    document = await client.get(api("/openapi.json"))
+    document_head = await client.head(api("/openapi.json"))
+    for response in (page, decisions, document, document_head):
+        assert response.status_code == 200, (str(response.request.url), response.text)
+        assert_no_store(response)
+    assert page_items(page.json())
+    assert decisions.json()
+    assert document_head.content == b""
+    assert document_head.headers["content-length"] == str(len(document.content))
+
+
+async def test_error_answers_and_healthz_are_no_store(
+    api_client: httpx.AsyncClient,
+    admin_user: AppUser,
+    login: LoginFunction,
+    test_identity: AdminIdentity,
+) -> None:
+    """CWE-525: every error status the handlers render, and ``/healthz``, is ``no-store``.
+
+    401 without a session, 403 without the CSRF header, 404 for an unknown path, 405 with its
+    ``Allow`` kept, 422 for an invalid body and the anonymous ``GET /healthz`` each carry exactly
+    one ``Cache-Control: no-store``, and each error is still exactly the envelope.
+    """
+    del admin_user
+    csrf = dict(test_identity.csrf_headers)
+    anonymous = await api_client.get(api("/recommendations"))
+    assert_error(anonymous, 401, "unauthenticated")
+    healthz = await api_client.get(api("/healthz"))
+    assert healthz.status_code == 200, healthz.text
+    assert healthz.json() == {"status": "ok"}
+    not_allowed = await api_client.post(api("/healthz"), headers=csrf)
+    assert_error(not_allowed, 405, "method_not_allowed")
+    assert not_allowed.headers["allow"] == "GET, HEAD"
+    unknown = await api_client.get(api("/no-such-route"))
+    assert_error(unknown, 404, "not_found")
+
+    await login(api_client)
+    no_csrf = await api_client.post(api("/runs"), json={})
+    assert_error(no_csrf, 403, "csrf_header_missing")
+    invalid = await api_client.post(api("/runs"), json={"window_start": "soon"}, headers=csrf)
+    assert_error(invalid, 422, "validation_error")
+
+    for response in (anonymous, healthz, not_allowed, unknown, no_csrf, invalid):
+        assert_no_store(response)
+
+
+async def test_deadline_503_and_catch_all_500_are_no_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CWE-525: the answers rendered outside the routes' error handlers are ``no-store`` too.
+
+    The request deadline renders its 503 ``request_timeout`` inside the cache policy, while
+    Starlette's server-error middleware renders the catch-all 500 ``internal_error`` outside
+    every user middleware. Under a 0.5 s deadline, ``GET`` and ``HEAD`` of a route that never
+    finishes and of one that raises each carry exactly one ``Cache-Control: no-store``.
+    """
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    app = create_app()
+
+    async def stalled() -> dict[str, bool]:
+        """Wait for an event nobody sets."""
+        await asyncio.Event().wait()
+        return {"finished": True}
+
+    async def crashed() -> dict[str, bool]:
+        """Fail with an unexpected error."""
+        raise RuntimeError("unexpected failure")
+
+    app.add_api_route(api("/test-stalled"), stalled, methods=["GET"])
+    app.add_api_route(api("/test-crashed"), crashed, methods=["GET"])
+    # Starlette re-raises an unhandled error after answering 500; the client must not.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        timed_out = await client.get(api("/test-stalled"))
+        failed = await client.get(api("/test-crashed"))
+        timed_out_head = await client.head(api("/test-stalled"))
+        failed_head = await client.head(api("/test-crashed"))
+
+    assert_error(timed_out, 503, "request_timeout")
+    assert_error(failed, 500, "internal_error")
+    for response, status in ((timed_out_head, 503), (failed_head, 500)):
+        assert response.status_code == status, response.headers
+        assert response.content == b""
+    for response in (timed_out, failed, timed_out_head, failed_head):
+        assert_no_store(response)
+
+
+async def test_no_store_middleware_replaces_cache_control_and_leaves_other_scopes_alone() -> None:
+    """Driven at the ASGI level: a response start gets exactly one ``Cache-Control: no-store``.
+
+    Every ``Cache-Control`` the application sent, a repeated one included, is replaced by one
+    ``no-store`` in the first one's place; every other header keeps its value and order, and the
+    status and body are forwarded as sent. A start message without ``headers`` gains the one
+    header. Lifespan and websocket scopes reach the application with the very scope, receive
+    and send they were called with, and what a websocket sends is forwarded untouched.
+    """
+    body: Message = {"type": "http.response.body", "body": b"{}", "more_body": False}
+    starts: dict[str, Message] = {
+        "/api/v1/cached": {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"cache-control", b"public, max-age=600"),
+                (b"set-cookie", b"ads_engine_session=signed; path=/"),
+                (b"cache-control", b"max-age=60"),
+            ],
+        },
+        "/api/v1/bare": {"type": "http.response.start", "status": 204},
+    }
+
+    async def answering_app(scope: Scope, receive: Receive, send: Send) -> None:
+        """Send the start message registered for the path, then the body."""
+        await send(starts[scope["path"]])
+        await send(body)
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what reaches the server."""
+        sent.append(message)
+
+    middleware = api_app._NoStoreMiddleware(answering_app)
+    for path in starts:
+        await middleware(http_scope(path), receive_nothing, collect)
+
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+        "http.response.start",
+        "http.response.body",
+    ]
+    assert (sent[0]["status"], sent[2]["status"]) == (200, 204)
+    assert sent[0]["headers"] == [
+        (b"content-type", b"application/json"),
+        (b"cache-control", b"no-store"),
+        (b"set-cookie", b"ads_engine_session=signed; path=/"),
+    ]
+    assert sent[2]["headers"] == [(b"cache-control", b"no-store")]
+    assert sent[1] is body
+    assert sent[3] is body
+
+    passed: list[tuple[Scope, Receive, Send]] = []
+    accept: Message = {"type": "websocket.accept", "headers": [(b"cache-control", b"public")]}
+
+    async def recording_app(scope: Scope, receive: Receive, send: Send) -> None:
+        """Record the arguments it was called with; accept a websocket with its own header."""
+        passed.append((scope, receive, send))
+        if scope["type"] == "websocket":
+            await send(accept)
+
+    forwarded: list[Message] = []
+
+    async def collect_other(message: Message) -> None:
+        """Record what reaches the server from a non-http scope."""
+        forwarded.append(message)
+
+    other_scopes: list[Scope] = [
+        {"type": "lifespan"},
+        {"type": "websocket", "path": "/api/v1/ws", "headers": []},
+    ]
+    for scope in other_scopes:
+        await api_app._NoStoreMiddleware(recording_app)(scope, receive_nothing, collect_other)
+
+    assert len(passed) == len(other_scopes)
+    for scope, (seen_scope, seen_receive, seen_send) in zip(other_scopes, passed, strict=True):
+        assert seen_scope is scope
+        assert seen_receive is receive_nothing
+        assert seen_send is collect_other
+    assert forwarded == [accept]
+    assert forwarded[0]["headers"] == [(b"cache-control", b"public")]
 
 
 # ---------------------------------------------------------------------------------------------

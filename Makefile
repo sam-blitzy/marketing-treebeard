@@ -10,7 +10,8 @@
 #   test            backend pytest on a disposable postgres:18.6, then the web unit tests
 #   lint            ruff format/check and mypy --strict; eslint, stylelint and tsc
 #   e2e             Playwright against the stack in DATA_MODE=simulated
-#   secret-scan     gitleaks (pinned image) over every commit with .gitleaks.toml
+#   secret-scan     gitleaks v8.30.1 over every commit with .gitleaks.toml, from a local image
+#                   built on the pinned one with its Alpine security fixes applied
 #
 # First start:
 #   make init ADMIN_PASSWORD=<value>
@@ -21,24 +22,38 @@
 #   COMPOSE             the Compose command (default: docker compose); add -p/-f flags here;
 #                       empty means the default. e2e passes it to Playwright as E2E_COMPOSE
 #   APP_URL             origin of the web service that up/e2e poll and Playwright targets
-#   HEALTH_TIMEOUT      seconds up/e2e wait for /api/v1/healthz to answer 200
+#   HEALTH_TIMEOUT      seconds up/e2e wait for /api/v1/healthz to answer 200: a whole number
+#                       from 1 to 999999999 (default 180); any other value fails before the
+#                       stack starts
 #   TEST_DB_PORT        127.0.0.1 port of the disposable test database (default 55432); 0 lets
 #                       Docker choose a free port. make test points TEST_DATABASE_URL at it
 #   PYTEST_ARGS         extra pytest arguments for `make test`, such as tests/unit
 #   PLAYWRIGHT_INSTALL  browser install step of `make e2e`; empty skips it
 #   ADMIN_EMAIL         e2e login, the APP_ADMIN_EMAIL of .env
 #   ADMIN_PASSWORD      init: the admin password to hash; e2e: the password given to init
+# Each is one of two kinds:
+#   data                APP_URL, HEALTH_TIMEOUT, TEST_DB_PORT, ADMIN_EMAIL and ADMIN_PASSWORD
+#                       reach the recipes through their environment and are expanded there in
+#                       double quotes, never pasted into shell source, so a quote, `$` or
+#                       backtick in a value stays text; HEALTH_TIMEOUT and TEST_DB_PORT are
+#                       also checked as numbers
+#   trusted shell text  COMPOSE, PYTEST_ARGS and PLAYWRIGHT_INSTALL are commands and argument
+#                       lists the operator writes, and the recipes run them as written, with
+#                       shell quoting, expansion and word splitting; never fill them from
+#                       untrusted input
 #
 # Secrets: ADMIN_PASSWORD, SESSION_SECRET and the hash are never printed, never placed in a
 # command line (the password reaches `ads-engine hash-password` on stdin, the generated values
 # reach awk through its environment) and only ever written to .env, mode 600, which is
 # gitignored. Recipes print "written" instead of a value.
 #
-# Requirements: GNU make 4.0 or newer and bash; POSIX awk, od and mktemp; curl or
-# wget for the health poll. Every recipe runs as one bash script (.ONESHELL) with -eu and
-# pipefail, so any failing command stops it. Inside recipes no line may begin with `-`, `+` or
-# `@` once indented: GNU make strips those prefix characters from every .ONESHELL line, so long
-# docker invocations are assembled in bash arrays instead.
+# Requirements: GNU make 4.0 or newer and bash; POSIX awk, od and mktemp; curl or wget for the
+# health poll; for secret-scan, network access to pull the pinned gitleaks image and, until its
+# build is cached, the Alpine v3.22 package repositories (dl-cdn.alpinelinux.org). Every recipe
+# runs as one bash script (.ONESHELL) with -eu and pipefail, so any failing command stops it.
+# Inside recipes no line may begin with `-`, `+` or `@` once indented: GNU make strips those
+# prefix characters from every .ONESHELL line, so long docker invocations are assembled in bash
+# arrays instead.
 
 ifneq ($(filter 0.% 1.% 2.% 3.%,$(MAKE_VERSION)),)
 $(error GNU make 4.0 or newer is required (found $(MAKE_VERSION)); on macOS run `brew install make` and use gmake)
@@ -72,6 +87,44 @@ ENGINE_MIN := 29
 # Pinned by tag, never `latest`.
 GITLEAKS_IMAGE := zricethezav/gitleaks:v8.30.1
 
+# secret-scan scans from GITLEAKS_SCAN_IMAGE, a local image it derives from GITLEAKS_IMAGE on
+# every run (the layer cache makes a repeat build cheap) and never pushes. The pinned image's
+# Alpine 3.22 libraries predate published security fixes, so the derivation upgrades only the
+# packages in GITLEAKS_APK_FLOORS, from the image's own v3.22 repositories with apk checking
+# every package against the image's Alpine signing keys. Every other package (unless an
+# upgraded one requires a newer dependency) and the gitleaks binary stay as pinned. Each entry
+# is a minimum, the fixed version that the advisories below name, not an exact pin: the
+# branch's index keeps only a package's newest revision, so an exact pin would fail the build
+# as soon as the next fix landed, while a floor still refuses anything older than the vetted
+# fix. A floor the index cannot meet fails the build, and with it the scan.
+#   c-ares             1.34.8-r0  CVE-2026-33630
+#   libcurl            8.14.1-r3  CVE-2026-5545
+#   libexpat           2.8.5-r0   CVE-2026-41080, -45186, -50219, -56131, -56132, -56403 to
+#                                 -56412, -66046, -76641, -76956, -76957, -93990
+#   nghttp2-libs       1.68.1-r0  CVE-2026-27135
+#   libcrypto3,        3.5.8-r0   OpenSSL: CVE-2026-2673, -7383, -9076, -14456, -14457, -18798,
+#   libssl3                       -28387 to -28390, -31789, -31790, -34180 to -34183, -42764,
+#                                 -42766 to -42770, -45445 to -45447, -54874, -63072 to -63076,
+#                                 -75803
+#   musl, musl-utils   1.2.5-r11  CVE-2026-6042
+#   zlib               1.3.2-r0   CVE-2026-27171
+GITLEAKS_SCAN_IMAGE := ads-engine-gitleaks:v8.30.1-patched
+GITLEAKS_APK_FLOORS := c-ares>=1.34.8-r0 libcurl>=8.14.1-r3 libexpat>=2.8.5-r0
+GITLEAKS_APK_FLOORS += nghttp2-libs>=1.68.1-r0 libcrypto3>=3.5.8-r0 libssl3>=3.5.8-r0
+GITLEAKS_APK_FLOORS += musl>=1.2.5-r11 musl-utils>=1.2.5-r11 zlib>=1.3.2-r0
+
+# The derivation, fed to `docker build` on stdin with no build context, so nothing from the
+# checkout enters the image. The base image and the floors arrive as build arguments, and a
+# build without the base image fails (`:?`). The floor list is split into words on purpose, one
+# apk constraint per word; apk installs the newest revision that meets each one, and without
+# --upgrade it moves no dependency that the new revisions do not require.
+define GITLEAKS_DOCKERFILE
+ARG GITLEAKS_IMAGE
+FROM $${GITLEAKS_IMAGE:?}
+ARG GITLEAKS_APK_FLOORS
+RUN apk add --no-cache $${GITLEAKS_APK_FLOORS}
+endef
+
 # The disposable database of `make test`. Every run creates its own container, named
 # TEST_DB_NAME-<random token> and labelled TEST_DB_LABEL=<token>, and removes, with its anonymous
 # volume, only what carries that token: it never adopts or deletes a container it did not create,
@@ -94,14 +147,27 @@ HEALTH_TIMEOUT ?= 180
 PYTEST_ARGS ?=
 PLAYWRIGHT_INSTALL ?= npx playwright install --with-deps chromium
 
+# ADMIN_PASSWORD, ADMIN_EMAIL, APP_URL and HEALTH_TIMEOUT are data: they are exported, and the
+# recipes read them from their environment in double quotes ("$$APP_URL"), never as make text
+# pasted into their shell source, where a quote in a value would end the quoting and the rest
+# of the value would run as commands. STACK_UP checks HEALTH_TIMEOUT before anything starts.
 # A command-line value would be expanded by make before it reaches the recipe environment, so
-# `make init ADMIN_PASSWORD='pa$word'` would hash "paord". Re-binding it as a simple variable
-# from its unexpanded text passes the password through byte for byte; an environment value is
+# `make init ADMIN_PASSWORD='pa$word'` would hash "paord". Re-binding each as a simple variable
+# from its unexpanded text passes the value through byte for byte; an environment value is
 # passed through unchanged already.
 ifeq ($(origin ADMIN_PASSWORD),command line)
 override ADMIN_PASSWORD := $(value ADMIN_PASSWORD)
 endif
-export ADMIN_PASSWORD
+ifeq ($(origin ADMIN_EMAIL),command line)
+override ADMIN_EMAIL := $(value ADMIN_EMAIL)
+endif
+ifeq ($(origin APP_URL),command line)
+override APP_URL := $(value APP_URL)
+endif
+ifeq ($(origin HEALTH_TIMEOUT),command line)
+override HEALTH_TIMEOUT := $(value HEALTH_TIMEOUT)
+endif
+export ADMIN_PASSWORD ADMIN_EMAIL APP_URL HEALTH_TIMEOUT
 
 # -----------------------------------------------------------------------------------------------
 # Shared recipe fragments (expanded inside .ONESHELL recipes; `$$` reaches bash as `$`)
@@ -126,9 +192,26 @@ endef
 
 # Builds and starts the stack, then polls the API through nginx until it answers 200. The poll
 # replaces `up --wait`, which fails on the one-shot migrate service that exits by design.
+# HEALTH_TIMEOUT is checked first, so a bad value fails before the stack starts: digits only,
+# leading zeros dropped so bash never reads octal, at most nine digits left so the deadline
+# arithmetic cannot overflow, and 0 refused, since the poll would give up before it began.
 define STACK_UP
 $(DEFINE_STACK_DIAGNOSTICS)
-health_url='$(APP_URL)/api/v1/healthz'
+health_timeout=''
+case "$${HEALTH_TIMEOUT:-}" in
+	'' | *[!0-9]*) ;;
+	*)
+		timeout_digits="$${HEALTH_TIMEOUT#"$${HEALTH_TIMEOUT%%[!0]*}"}"
+		if [ -n "$$timeout_digits" ] && [ "$${#timeout_digits}" -le 9 ]; then
+			health_timeout="$$timeout_digits"
+		fi
+		;;
+esac
+if [ -z "$$health_timeout" ]; then
+	echo "HEALTH_TIMEOUT must be a whole number of seconds from 1 to 999999999, not '$${HEALTH_TIMEOUT:-}'" >&2
+	exit 1
+fi
+health_url="$$APP_URL/api/v1/healthz"
 if command -v curl >/dev/null 2>&1; then
 	probe_health() {
 		[ "$$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 "$$health_url" || true)" = 200 ]
@@ -147,11 +230,11 @@ if ! $(COMPOSE) up -d --build; then
 	stack_diagnostics
 	exit 1
 fi
-echo "Waiting up to $(HEALTH_TIMEOUT) s for $$health_url to answer 200"
-deadline=$$(( $$(date +%s) + $(HEALTH_TIMEOUT) ))
+echo "Waiting up to $$health_timeout s for $$health_url to answer 200"
+deadline=$$(( $$(date +%s) + health_timeout ))
 until probe_health; do
 	if [ "$$(date +%s)" -ge "$$deadline" ]; then
-		echo "$$health_url did not answer 200 within $(HEALTH_TIMEOUT) s" >&2
+		echo "$$health_url did not answer 200 within $$health_timeout s" >&2
 		stack_diagnostics
 		exit 1
 	fi
@@ -318,12 +401,12 @@ init: check-tools ## First start: write .env with SESSION_SECRET and the admin h
 	admin_email="$$(awk 'index($$0, "APP_ADMIN_EMAIL=") == 1 { v = substr($$0, 17) } END { print v }' .env)"
 	echo ".env is ready (mode 600). Next:"
 	echo "  docker compose up -d --build    (or: make up)"
-	echo "  open $(APP_URL) and sign in as $${admin_email:-admin@example.com} with ADMIN_PASSWORD"
+	echo "  open $$APP_URL and sign in as $${admin_email:-admin@example.com} with ADMIN_PASSWORD"
 
 up: check-tools ## Build and start the stack, then wait for /api/v1/healthz to answer 200
 	@$(REQUIRE_ENV_FILE)
 	$(STACK_UP)
-	echo "Open $(APP_URL) and sign in with the admin of .env; stop the stack with make down"
+	echo "Open $$APP_URL and sign in with the admin of .env; stop the stack with make down"
 
 # The pgdata volume is kept; `docker compose down -v` also deletes the database for a full reset.
 down: ## Stop and remove the stack's containers (the database volume is kept)
@@ -377,7 +460,9 @@ test: ## Backend tests on a disposable postgres:18.6 (removed on exit; an unconf
 	db_name='$(TEST_DB_NAME)'"-$$token"
 	db_label='$(TEST_DB_LABEL)'"=$$token"
 	# The cleanup state is set and the traps are installed before anything is created: from
-	# here on every exit, Ctrl-C included, removes what this run created and nothing else.
+	# here on every exit, Ctrl-C included, runs remove_test_db, which tries for a bounded time
+	# to remove what this run created and nothing else. A removal it cannot confirm fails the
+	# run, tests passed or not, and is reported with the docker command that finds or removes it.
 	db_id=''
 	db_volumes=''
 	create_attempted=0
@@ -594,7 +679,7 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 	cd web
 	npm ci
 	$(if $(strip $(PLAYWRIGHT_INSTALL)),$(PLAYWRIGHT_INSTALL),echo "PLAYWRIGHT_INSTALL is empty; using the installed Playwright browsers")
-	E2E_BASE_URL='$(APP_URL)' E2E_ADMIN_EMAIL='$(ADMIN_EMAIL)' E2E_ADMIN_PASSWORD="$$ADMIN_PASSWORD" npm run e2e
+	E2E_BASE_URL="$$APP_URL" E2E_ADMIN_EMAIL="$$ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$$ADMIN_PASSWORD" npm run e2e
 
 # `gitleaks git` scans every commit: the committed history is the gate. The image's git refuses
 # a mounted repository owned by another uid ("dubious ownership"), so /repo is declared safe
@@ -602,15 +687,37 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 # at its own path so the worktree's .git file still resolves inside the container. The checkout
 # directory reaches bash as the environment variable CHECKOUT_DIR and is expanded in double
 # quotes, never spliced into the script as make text, so a path with spaces, quotes or dollar
-# signs is passed through as data.
+# signs is passed through as data. The image names, the floors and the Dockerfile reach it the
+# same way. The scan runs the image ID this run's build wrote, so a concurrent build that moves
+# the GITLEAKS_SCAN_IMAGE tag cannot swap the image between the version check and the scan; the
+# check refuses a binary whose version differs from the pinned image's tag. Both containers run
+# with --network none: the scan reads only the mounted repository, so the image's network
+# libraries have no network to reach.
 secret-scan: export CHECKOUT_DIR := $(CURDIR)
-secret-scan: ## gitleaks v8.30.1 (pinned image) over every commit with .gitleaks.toml; a finding fails
-	@scan_args=(run --rm --volume "$$CHECKOUT_DIR:/repo:ro" --workdir /repo --entrypoint sh)
+secret-scan: export GITLEAKS_IMAGE := $(GITLEAKS_IMAGE)
+secret-scan: export GITLEAKS_SCAN_IMAGE := $(GITLEAKS_SCAN_IMAGE)
+secret-scan: export GITLEAKS_APK_FLOORS := $(GITLEAKS_APK_FLOORS)
+secret-scan: export GITLEAKS_DOCKERFILE := $(GITLEAKS_DOCKERFILE)
+secret-scan: ## gitleaks v8.30.1 (pinned image, Alpine fixes applied) over every commit with .gitleaks.toml; a finding fails
+	@iid_file="$$(mktemp)"
+	trap 'rm -f "$$iid_file"' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	echo "Building $$GITLEAKS_SCAN_IMAGE from $$GITLEAKS_IMAGE with $$GITLEAKS_APK_FLOORS"
+	printf '%s\n' "$$GITLEAKS_DOCKERFILE" | docker build --iidfile "$$iid_file" --tag "$$GITLEAKS_SCAN_IMAGE" --build-arg "GITLEAKS_IMAGE=$$GITLEAKS_IMAGE" --build-arg "GITLEAKS_APK_FLOORS=$$GITLEAKS_APK_FLOORS" -
+	scan_image="$$(cat "$$iid_file")"
+	expected_version="$${GITLEAKS_IMAGE##*:}"
+	scan_version="$$(docker run --rm --network none --entrypoint gitleaks "$$scan_image" version)"
+	if [ "$$scan_version" != "$$expected_version" ]; then
+		echo "$$GITLEAKS_SCAN_IMAGE reports gitleaks $$scan_version, expected $$expected_version" >&2
+		exit 1
+	fi
+	scan_args=(run --rm --network none --volume "$$CHECKOUT_DIR:/repo:ro" --workdir /repo --entrypoint sh)
 	git_common_dir="$$(git -C "$$CHECKOUT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 	if [ -n "$$git_common_dir" ] && [ "$$git_common_dir" != "$$CHECKOUT_DIR/.git" ]; then
 		scan_args+=(--volume "$$git_common_dir:$$git_common_dir:ro")
 	fi
-	scan_args+=('$(GITLEAKS_IMAGE)' -c 'git config --global --add safe.directory /repo && exec gitleaks git /repo --config /repo/.gitleaks.toml --redact --exit-code 1 --verbose')
-	echo "Scanning every commit with $(GITLEAKS_IMAGE) and .gitleaks.toml"
+	scan_args+=("$$scan_image" -c 'git config --global --add safe.directory /repo && exec gitleaks git /repo --config /repo/.gitleaks.toml --redact --exit-code 1 --verbose')
+	echo "Scanning every commit with $$GITLEAKS_SCAN_IMAGE (gitleaks $$scan_version) and .gitleaks.toml"
 	docker "$${scan_args[@]}"
 	echo "No secrets found"

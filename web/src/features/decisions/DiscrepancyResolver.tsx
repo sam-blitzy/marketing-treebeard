@@ -151,7 +151,10 @@ const RETIRED_MESSAGE = 'Computed from replaced data';
 /** Shown when the discrepancy was closed before this resolution reached the server. */
 const RESOLVED_MESSAGE = 'Already resolved';
 
-/** Shown for a failure that carries no message of its own. */
+/**
+ * Shown for a failure that carries no API message of its own: a blank `ApiError` message, or a
+ * rejection that is not an `ApiError`.
+ */
 const FALLBACK_ERROR_MESSAGE = 'The resolution failed.';
 
 /** The platform side of a `missing` discrepancy, worded as the backend's C0 item words it. */
@@ -314,9 +317,17 @@ function assignmentText(value: DiscrepancyValue): string {
 }
 
 /**
- * The amounts of an `own_budget` or `budget` side, each named by its field. A side with no money
- * key, or whose reported amount is `null`, is "budget unavailable", never zero; a side that
- * reports neither budget field has "no budget set".
+ * The amounts of an `own_budget` or `budget` side, each named by its field, never zero for an
+ * amount the side does not report:
+ *
+ * - "budget unavailable" when the side has none of the `daily_budget`, `total_budget` and
+ *   `amount_micros` keys;
+ * - "daily budget {amount}" and "total budget {amount}" for each of `daily_budget` and
+ *   `total_budget` that holds an amount, daily first; `amount_micros` is then not read;
+ * - otherwise "budget {amount}" from an `amount_micros` that is a safe integer;
+ * - otherwise "no budget set" when the side has no `amount_micros` key, as a side whose
+ *   `daily_budget` or `total_budget` is an explicit `null` reads;
+ * - otherwise "budget unavailable", for an `amount_micros` that is `null` or not a safe integer.
  *
  * @returns The parts to join, in display order.
  */
@@ -437,8 +448,12 @@ function isResolvedError(error: unknown): boolean {
 
 /**
  * The text of a failed resolution: "Computed from replaced data" for `subject_retired`,
- * "Already resolved" for `discrepancy_resolved`, otherwise the API's own message, which for a
- * 422 such as `resolution_not_allowed` names the rule it broke.
+ * "Already resolved" for `discrepancy_resolved`, otherwise an `ApiError`'s message, which is the
+ * API's envelope message (for a 422 such as `resolution_not_allowed` it names the rule it broke)
+ * or the client's own fallback text, both safe to show. A blank `ApiError` message, and any
+ * rejection that is not an `ApiError`, such as a plain `Error`, a `TypeError` or an abort, read
+ * {@link FALLBACK_ERROR_MESSAGE}: such a message is outside that contract and may carry internal
+ * detail.
  */
 function resolveErrorMessage(error: unknown): string {
   if (isRetiredError(error)) {
@@ -447,10 +462,7 @@ function resolveErrorMessage(error: unknown): string {
   if (isResolvedError(error)) {
     return RESOLVED_MESSAGE;
   }
-  if (isApiError(error) || error instanceof Error) {
-    return textOrNull(error.message) ?? FALLBACK_ERROR_MESSAGE;
-  }
-  return FALLBACK_ERROR_MESSAGE;
+  return (isApiError(error) ? textOrNull(error.message) : null) ?? FALLBACK_ERROR_MESSAGE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -501,9 +513,10 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
  *   platform to match the decision" for `awaiting_platform`. Then `onResolved` is called.
  * - A failure shows a critical banner, which takes focus, with "Computed from replaced data"
- *   (409 `subject_retired`), "Already resolved" (409 `discrepancy_resolved`) or the API's
- *   message. Either 409 disables every control while this discrepancy is shown, because the
- *   server would refuse any resolution of it again. A failure of the intended-state save, which
+ *   (409 `subject_retired`), "Already resolved" (409 `discrepancy_resolved`), the API's
+ *   message, or "The resolution failed." for a failure that carries none. Either 409 disables
+ *   every control while this discrepancy is shown, because the server would refuse any
+ *   resolution of it again. A failure of the intended-state save, which
  *   the form reports through `onRetired` and `onFailed`, is shown and locks the same way, in this
  *   banner outside the dialog, so it stays once the dialog is closed, even when the save settled
  *   after that; the banner takes focus once the dialog is closed. Any other failure stands until
