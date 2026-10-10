@@ -275,6 +275,7 @@ def walk_strings(value: object) -> Iterator[str]:
 
 
 def test_every_hubspot_contract_surface_has_a_decoder() -> None:
+    """The decoders cover exactly the HubSpot contract surfaces: none missing, none extra."""
     assert set(DECODERS) == set(SURFACES[HUBSPOT])
 
 
@@ -282,6 +283,7 @@ def test_every_hubspot_contract_surface_has_a_decoder() -> None:
 def test_contract_is_traceable_to_its_2026_09_reference_page(
     contract: ContractLoader, surface: str
 ) -> None:
+    """Each contract cites its dated HubSpot reference page and the ``2026-09`` version and path."""
     loaded = contract(HUBSPOT, surface)
 
     assert loaded.surface == f"{HUBSPOT}.{surface}"
@@ -297,6 +299,7 @@ def test_contract_is_traceable_to_its_2026_09_reference_page(
 def test_documented_sample_conforms_and_decodes_verbatim(
     contract: ContractLoader, surface: str
 ) -> None:
+    """Each documented sample conforms and decodes verbatim, unmutated, to its surface's type."""
     loaded = contract(HUBSPOT, surface)
     validate_documented_sample(loaded)
     sample = loaded.response.documented_sample
@@ -314,6 +317,7 @@ def test_documented_sample_conforms_and_decodes_verbatim(
 def test_associations_reference_sample_reports_its_canceled_status_as_parsed(
     contract: ContractLoader,
 ) -> None:
+    """The associations sample's ``CANCELED`` status is kept as parsed, so it settles no input."""
     loaded = contract(HUBSPOT, ASSOCIATIONS)
     assert loaded.reference_url.endswith(
         "/crm/associations/associate-records/batch/get-associations"
@@ -338,6 +342,7 @@ def test_associations_reference_sample_reports_its_canceled_status_as_parsed(
 def test_objects_reference_sample_is_a_failed_call_with_no_usable_data(
     contract: ContractLoader,
 ) -> None:
+    """The objects batch read sample is ``CANCELED``: incomplete, with no records or errors."""
     sample = copy.deepcopy(contract(HUBSPOT, OBJECTS).response.documented_sample)
     assert isinstance(sample, dict)
 
@@ -352,6 +357,7 @@ def test_objects_reference_sample_is_a_failed_call_with_no_usable_data(
 def test_crm_search_reference_sample_decodes_into_a_page_of_contacts(
     contract: ContractLoader,
 ) -> None:
+    """The CRM Search sample is a last page of two contacts whose unbound fields are ``None``."""
     sample = copy.deepcopy(contract(HUBSPOT, SEARCH).response.documented_sample)
 
     page = parse_search_page(sample)
@@ -372,6 +378,7 @@ def test_crm_search_reference_sample_decodes_into_a_page_of_contacts(
 def test_properties_reference_sample_decodes_every_required_field(
     contract: ContractLoader,
 ) -> None:
+    """The properties sample decodes its placeholder fields and option; it is not a datetime."""
     sample = copy.deepcopy(contract(HUBSPOT, PROPERTIES).response.documented_sample)
 
     definition = parse_property(sample)
@@ -387,6 +394,7 @@ def test_properties_reference_sample_decodes_every_required_field(
 def test_captured_live_payloads_decode_with_their_surface_decoder(
     captured_payloads: Callable[[str], list[dict[str, Any]]],
 ) -> None:
+    """Every redacted 2xx live capture decodes to its surface's type; error captures are skipped."""
     # Zero captures is the normal state until `ads-engine capture-fixtures` has run with
     # working credentials; every capture present is decoded.
     for capture in captured_payloads(HUBSPOT):
@@ -408,10 +416,12 @@ def test_captured_live_payloads_decode_with_their_surface_decoder(
 
 
 def test_normalize_email_trims_and_lowercases() -> None:
+    """An email is trimmed of surrounding whitespace and lowercased."""
     assert normalize_email(RAW_EMAIL) == NORMALISED_EMAIL
 
 
 def test_email_sha256_is_the_digest_of_the_normalised_utf8_address() -> None:
+    """The digest is the hex SHA-256 of the normalised address, for raw or normalised input."""
     expected = hashlib.sha256(b"alice@example.com").hexdigest()
 
     assert email_sha256(NORMALISED_EMAIL) == expected
@@ -429,6 +439,7 @@ def test_email_sha256_is_the_digest_of_the_normalised_utf8_address() -> None:
     ],
 )
 def test_parse_instant_returns_timezone_aware_utc(value: str, expected: datetime) -> None:
+    """Zulu, offset, epoch-millisecond and date-only values all parse to an aware UTC instant."""
     parsed = parse_instant(value)
 
     assert parsed == expected
@@ -438,11 +449,13 @@ def test_parse_instant_returns_timezone_aware_utc(value: str, expected: datetime
 
 
 def test_parse_instant_offset_and_zulu_forms_are_the_same_instant() -> None:
+    """A ``+02:00`` offset and its Zulu equivalent parse to the same instant."""
     assert parse_instant("2026-09-04T12:00:00Z") == parse_instant("2026-09-04T14:00:00+02:00")
 
 
 @pytest.mark.parametrize("value", ["", None], ids=["empty", "null"])
 def test_parse_instant_empty_is_none(value: str | None) -> None:
+    """An empty or ``null`` instant parses to ``None``."""
     assert parse_instant(value) is None
 
 
@@ -452,6 +465,7 @@ def test_parse_instant_empty_is_none(value: str | None) -> None:
     ids=["text", "bad-date", "bad-time", "bool", "float"],
 )
 def test_parse_instant_rejects_anything_else_as_a_defect(value: object) -> None:
+    """Any other value is a HubSpot validation defect naming the field, never the string value."""
     with pytest.raises(QueryDefect) as caught:
         parse_instant(value, what="contact property 'hs_v2_date_entered_x'")
 
@@ -463,6 +477,7 @@ def test_parse_instant_rejects_anything_else_as_a_defect(value: object) -> None:
 
 
 def test_parse_decimal_is_exact() -> None:
+    """A decimal string parses to an exact ``Decimal`` that keeps its scale, never a float."""
     parsed = parse_decimal("1250.50")
 
     assert parsed == Decimal("1250.50")
@@ -473,6 +488,7 @@ def test_parse_decimal_is_exact() -> None:
 
 @pytest.mark.parametrize("value", ["", None], ids=["empty", "null"])
 def test_parse_decimal_empty_is_none(value: str | None) -> None:
+    """An empty or ``null`` decimal parses to ``None``."""
     assert parse_decimal(value) is None
 
 
@@ -504,6 +520,7 @@ def contact_properties(**overrides: str | None) -> dict[str, str | None]:
 
 
 def test_parse_contact_reads_each_bound_property(contract: ContractLoader) -> None:
+    """With every binding resolved, each bound property is read into its ``ContactRow`` field."""
     record = read_one(contract, crm_record(CONTACT_ID, contact_properties()))
 
     row = parse_contact(record, FULL_BINDINGS)
@@ -524,6 +541,7 @@ def test_parse_contact_reads_each_bound_property(contract: ContractLoader) -> No
 def test_parse_contact_empty_bound_date_is_a_skipped_stage(
     contract: ContractLoader, empty: str | None
 ) -> None:
+    """An empty or ``null`` MQL date leaves ``mql_at`` ``None``; the QL date and stage are kept."""
     # The contact is in a later stage now, but never entered the MQL stage: it is not counted,
     # and neither the current stage nor the QL date stands in for the missing MQL date.
     properties = contact_properties(**{MQL_PROPERTY: empty})
@@ -539,6 +557,7 @@ def test_parse_contact_empty_bound_date_is_a_skipped_stage(
 def test_parse_contact_unavailable_binding_leaves_its_field_none(
     contract: ContractLoader,
 ) -> None:
+    """An unresolved binding leaves its field ``None`` even when the record holds the property."""
     # The record carries every property, but the MQL stage and the Google link did not resolve
     # against the portal, so their fields are unavailable whatever the record holds.
     bindings = ContactPropertyMap(mql_property=None, ql_property=QL_PROPERTY)
@@ -553,6 +572,7 @@ def test_parse_contact_unavailable_binding_leaves_its_field_none(
 
 
 def test_parse_contact_keeps_no_plaintext_email(contract: ContractLoader) -> None:
+    """No field, ``repr`` or ``str`` of a contact row shows the address, only its digest."""
     record = read_one(contract, crm_record(CONTACT_ID, contact_properties()))
 
     row = parse_contact(record, FULL_BINDINGS)
@@ -565,6 +585,7 @@ def test_parse_contact_keeps_no_plaintext_email(contract: ContractLoader) -> Non
 
 
 def test_request_properties_cover_every_bound_property(contract: ContractLoader) -> None:
+    """Each bound property is requested once, and the requested ones alone yield the same row."""
     requested = FULL_BINDINGS.request_properties()
 
     for name in (
@@ -588,6 +609,7 @@ def test_request_properties_cover_every_bound_property(contract: ContractLoader)
 
 
 def test_request_properties_omit_unavailable_bindings() -> None:
+    """Only resolved bindings are requested, beside ``email`` and ``lifecyclestage``."""
     bindings = ContactPropertyMap(mql_property=MQL_PROPERTY)
 
     requested = bindings.request_properties()
@@ -602,6 +624,7 @@ def test_request_properties_omit_unavailable_bindings() -> None:
 
 
 def test_request_properties_de_duplicate_a_property_bound_twice() -> None:
+    """A property bound to both MQL and QL is requested once."""
     # A property-mode binding may name the same datetime property for MQL and QL.
     bindings = ContactPropertyMap(mql_property=QL_PROPERTY, ql_property=QL_PROPERTY)
 
@@ -624,6 +647,7 @@ def meeting_properties(**overrides: str | None) -> dict[str, str | None]:
 
 
 def test_parse_meeting_creation_comes_from_hs_createdate(contract: ContractLoader) -> None:
+    """A meeting's creation is ``hs_createdate``, not ``createdAt`` or ``hs_timestamp``."""
     properties = meeting_properties(hs_timestamp="2026-09-13T11:00:00.000Z")
     record = read_one(
         contract, crm_record(MEETING_ID, properties, created_at="2026-09-05T09:00:07.000Z")
@@ -644,6 +668,7 @@ def test_parse_meeting_creation_comes_from_hs_createdate(contract: ContractLoade
 
 
 def test_meeting_properties_list_exactly_the_properties_read(contract: ContractLoader) -> None:
+    """``MEETING_PROPERTIES`` lists, once each, exactly the properties ``parse_meeting`` reads."""
     assert len(MEETING_PROPERTIES) == len(set(MEETING_PROPERTIES))
     assert set(MEETING_PROPERTIES) == set(meeting_properties())
     # A record holding nothing but MEETING_PROPERTIES fills every field of the row.
@@ -675,6 +700,7 @@ def deal_properties(**overrides: str | None) -> dict[str, str | None]:
 def test_parse_deal_reads_creation_stage_pipeline_and_exact_amount(
     contract: ContractLoader,
 ) -> None:
+    """A deal yields its ``createdate``, stage, pipeline and an exact ``Decimal`` amount."""
     record = read_one(
         contract, crm_record(DEAL_ID, deal_properties(), created_at="2026-09-14T13:20:01.000Z")
     )
@@ -692,12 +718,14 @@ def test_parse_deal_reads_creation_stage_pipeline_and_exact_amount(
 
 
 def test_parse_deal_empty_amount_is_unavailable(contract: ContractLoader) -> None:
+    """An empty deal amount is ``None`` (unavailable), never zero."""
     record = read_one(contract, crm_record(DEAL_ID, deal_properties(amount="")))
 
     assert parse_deal(record).amount is None
 
 
 def test_parse_deal_creation_is_never_the_current_time(contract: ContractLoader) -> None:
+    """A deal's creation is ``createdate``, else the record's ``createdAt``; never the clock."""
     with_createdate = parse_deal(read_one(contract, crm_record(DEAL_ID, deal_properties())))
     without_createdate = parse_deal(
         read_one(contract, crm_record(DEAL_ID, deal_properties(createdate=None)))
@@ -714,6 +742,7 @@ def test_parse_deal_creation_is_never_the_current_time(contract: ContractLoader)
 
 
 def test_deal_properties_list_exactly_the_properties_read(contract: ContractLoader) -> None:
+    """``DEAL_PROPERTIES`` lists, once each, exactly the properties ``parse_deal`` reads."""
     assert len(DEAL_PROPERTIES) == len(set(DEAL_PROPERTIES))
     assert set(DEAL_PROPERTIES) == set(deal_properties())
     row = parse_deal(read_one(contract, crm_record(DEAL_ID, deal_properties())))
@@ -738,6 +767,7 @@ NOT_FOUND_MESSAGE: Final = (
 
 
 def test_batch_read_200_returns_records_by_id(contract: ContractLoader) -> None:
+    """A 200 batch read is complete with no errors; records keep their order and ``null`` values."""
     body = checked(
         contract,
         OBJECTS,
@@ -760,6 +790,7 @@ def test_batch_read_200_returns_records_by_id(contract: ContractLoader) -> None:
 
 
 def test_batch_read_207_reports_failed_inputs_and_invents_none(contract: ContractLoader) -> None:
+    """A 207 batch read reports failed inputs by category and invents nothing for unlisted ones."""
     # Three ids were requested: one returned, one named by an error, one neither.
     requested = (CONTACT_ID, OTHER_CONTACT_ID, THIRD_CONTACT_ID)
     body = checked(
@@ -798,6 +829,7 @@ def test_batch_read_207_reports_failed_inputs_and_invents_none(contract: Contrac
 def test_batch_read_207_by_email_holds_failed_inputs_only_as_digests(
     contract: ContractLoader,
 ) -> None:
+    """A 207 read by email holds each failed input only as its digest, never as plaintext."""
     missing = "Missing.Person@Example.com"
     body = checked(
         contract,
@@ -825,6 +857,7 @@ def test_batch_read_207_by_email_holds_failed_inputs_only_as_digests(
 
 
 def test_association_batch_exposes_each_inputs_own_cursor(contract: ContractLoader) -> None:
+    """Each association input keeps its own cursor; a paged input is neither empty nor failed."""
     body = checked(
         contract,
         ASSOCIATIONS,
@@ -851,6 +884,7 @@ def test_association_batch_exposes_each_inputs_own_cursor(contract: ContractLoad
 
 
 def test_association_target_ids_normalise_to_strings(contract: ContractLoader) -> None:
+    """Numeric ``toObjectId`` values normalise to strings beside string ones, in order."""
     numeric_target = 99100000003  # The associations guide and live responses send numbers.
     body = checked(
         contract,
@@ -867,6 +901,11 @@ def test_association_target_ids_normalise_to_strings(contract: ContractLoader) -
 def test_association_207_no_associations_found_is_a_genuine_zero_not_an_error(
     contract: ContractLoader,
 ) -> None:
+    """A 207 ``NO_ASSOCIATIONS_FOUND`` entry is a genuine zero (``ok_empty``), never an error.
+
+    An empty successful result is ``ok_empty`` too; every other ``errors[]`` entry fails its
+    input, labelled with its category.
+    """
     body = checked(
         contract,
         ASSOCIATIONS,
@@ -909,6 +948,7 @@ def test_association_207_no_associations_found_is_a_genuine_zero_not_an_error(
 def test_association_input_both_returned_and_reported_empty_is_a_defect(
     contract: ContractLoader,
 ) -> None:
+    """An input both returned and reported ``NO_ASSOCIATIONS_FOUND`` is an associations defect."""
     body = checked(
         contract,
         ASSOCIATIONS,
@@ -931,6 +971,7 @@ def test_association_input_both_returned_and_reported_empty_is_a_defect(
 
 
 def test_search_page_reads_total_records_and_next_cursor(contract: ContractLoader) -> None:
+    """A search page yields its ``total``, its records in order and its next-page cursor."""
     body = checked(
         contract,
         SEARCH,
@@ -953,6 +994,7 @@ def test_search_page_reads_total_records_and_next_cursor(contract: ContractLoade
 
 
 def test_search_page_without_paging_is_the_last_page(contract: ContractLoader) -> None:
+    """A search page without ``paging`` is the last page: its cursor is ``None``."""
     body = checked(contract, SEARCH, {"total": 1, "results": [crm_record(DEAL_ID, {})]})
 
     page = parse_search_page(body)
@@ -1000,6 +1042,7 @@ def lifecycle_stage_definition() -> dict[str, Any]:
 def test_parse_property_keeps_lifecycle_stage_labels_and_values(
     contract: ContractLoader,
 ) -> None:
+    """``lifecyclestage`` keeps each option's label and value in order, custom stage included."""
     body = checked(contract, PROPERTIES, lifecycle_stage_definition())
 
     definition = parse_property(body)
@@ -1021,6 +1064,7 @@ def test_parse_property_keeps_lifecycle_stage_labels_and_values(
 def test_custom_stage_value_stays_a_string_usable_as_a_stage_date_suffix(
     contract: ContractLoader,
 ) -> None:
+    """A custom stage id stays a string that names its ``hs_v2_date_entered_`` property."""
     definition = parse_property(checked(contract, PROPERTIES, lifecycle_stage_definition()))
     by_label = {option.label: option for option in definition.options}
 
@@ -1035,6 +1079,7 @@ def test_custom_stage_value_stays_a_string_usable_as_a_stage_date_suffix(
 def test_parse_property_of_a_stage_date_is_a_datetime_without_options(
     contract: ContractLoader,
 ) -> None:
+    """A stage-date property decodes as a datetime instant with no options."""
     body = checked(
         contract,
         PROPERTIES,
@@ -1078,6 +1123,7 @@ def assert_validation_defect(error: QueryDefect, surface: str) -> None:
     "body", [[], "COMPLETE", None, 7, True], ids=["array", "string", "null", "number", "bool"]
 )
 def test_non_object_body_is_a_defect(surface: str, body: object) -> None:
+    """A body that is not a JSON object is a validation defect on every surface."""
     with pytest.raises(QueryDefect) as caught:
         DECODERS[surface](body)
 
@@ -1113,6 +1159,7 @@ def test_non_object_body_is_a_defect(surface: str, body: object) -> None:
     ],
 )
 def test_results_that_are_not_a_list_are_a_defect(surface: str, body: dict[str, Any]) -> None:
+    """A ``results`` that is not a list is a validation defect naming ``results``."""
     with pytest.raises(QueryDefect) as caught:
         DECODERS[surface](body)
 
@@ -1135,6 +1182,7 @@ def record_without_id() -> dict[str, Any]:
     ],
 )
 def test_record_without_id_is_a_defect(surface: str, body: dict[str, Any]) -> None:
+    """A record without its ``id`` is a validation defect in a batch read or a search page."""
     with pytest.raises(QueryDefect) as caught:
         DECODERS[surface](body)
 
@@ -1153,6 +1201,7 @@ def test_record_without_id_is_a_defect(surface: str, body: dict[str, Any]) -> No
 def test_row_decoders_reject_a_record_without_id(
     kind: str, decode: Callable[[HubSpotRecord], object]
 ) -> None:
+    """Each row decoder rejects a record without its ``id`` as a defect naming the missing field."""
     with pytest.raises(QueryDefect) as caught:
         decode(record_without_id())
 
@@ -1327,6 +1376,7 @@ MALFORMED: Final = [
 def test_contract_breach_is_a_defect_naming_the_field_not_the_value(
     surface: str, body: dict[str, Any], field: str
 ) -> None:
+    """Each single contract breach is a validation defect naming the field, never an id or value."""
     with pytest.raises(QueryDefect) as caught:
         DECODERS[surface](body)
 
@@ -1337,6 +1387,7 @@ def test_contract_breach_is_a_defect_naming_the_field_not_the_value(
 
 
 def test_malformed_cases_start_from_contract_valid_bodies(contract: ContractLoader) -> None:
+    """The bodies the malformed cases edit conform to their contracts and decode cleanly."""
     # Each broken body above is a single edit of one of these, so every defect test isolates
     # exactly one contract breach.
     checked(contract, OBJECTS, copy.deepcopy(OBJECTS_OK))
