@@ -2011,13 +2011,16 @@ def _segment_window_gap(ctx: AnalysisContext) -> tuple[str, str] | None:
     Returns:
         ``(case, label)``: ``not_yet_available`` for a preset ending on the default end that
         has not been fetched for that end, or ``preset_windows_only`` for any other window.
-        Another window's segments are never reused.
+        The ``not_yet_available`` label's "latest available ends {date}" is the latest end
+        among the fetched windows of the same preset length, or ``none`` when that preset has
+        never been fetched; other presets' windows never stand in for it. Another window's
+        segments are never reused.
     """
     window = ctx.window
     if window.is_segment_window():
         if (window.start, window.end) in ctx.segment_windows:
             return None
-        ends = [end for _, end in ctx.segment_windows]
+        ends = [end for start, end in ctx.segment_windows if (end - start).days + 1 == window.days]
         latest = max(ends).isoformat() if ends else "none"
         return (
             "not_yet_available",

@@ -2293,7 +2293,12 @@ def test_c3a_is_withheld_while_the_segment_window_is_not_yet_available(
     and never reuses the earlier window's segments."""
     ctx = make_context("c3a.not_yet_available.case")
     end = ctx.window.end
-    latest = max(window_end for _, window_end in ctx.segment_windows)
+    # "Latest available" is the latest fetched end of the run window's own preset length.
+    latest = max(
+        window_end
+        for window_start, window_end in ctx.segment_windows
+        if (window_end - window_start).days + 1 == ctx.window.days
+    )
     assert latest == end - timedelta(days=1)
     # The fetched segments of the same length ending a day earlier would qualify on their own.
     assert (latest - timedelta(days=ctx.window.days - 1), latest) in ctx.segment_windows

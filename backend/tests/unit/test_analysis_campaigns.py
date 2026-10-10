@@ -2073,6 +2073,42 @@ def test_c3a_never_reuses_another_window_and_reports_when_none_was_fetched() -> 
     )
 
 
+@pytest.mark.parametrize("own_preset_fetched", [True, False], ids=["lagging", "never_fetched"])
+def test_c3a_reports_the_latest_end_of_the_run_windows_own_preset(
+    own_preset_fetched: bool,
+) -> None:
+    """The "latest available" date is the run preset's own latest fetched end, never another
+    preset's current end, and ``none`` when only the other presets were fetched (AAP 0.3.2)."""
+    _, ctx = _built("c3a.preset.case")
+    window = ctx.window
+    current = tuple(
+        (window.end - timedelta(days=days - 1), window.end)
+        for days in window.presets
+        if days != window.days
+    )
+    assert current
+    lagging_end = window.end - timedelta(days=1)
+    lagging = (lagging_end - timedelta(days=window.days - 1), lagging_end)
+    fetched = (*current, lagging) if own_preset_fetched else current
+    latest = lagging_end.isoformat() if own_preset_fetched else "none"
+    result = campaigns.evaluate(_fresh(ctx, segment_windows=fetched))
+    assert _items(result, C3A) == []
+    label = (
+        f"Segment data for the {window.days}-day window ending {window.end.isoformat()} not "
+        f"yet available; latest available ends {latest}"
+    )
+    (finding,) = [
+        item for item in result.findings if item.code == FINDING_SEGMENT_WINDOW_UNAVAILABLE
+    ]
+    assert finding.message == label
+    assert finding.evidence["case"] == "not_yet_available"
+    assert finding.evidence["fetched_windows"] == tuple(
+        {"start": start, "end": end} for start, end in sorted(fetched)
+    )
+    (line,) = _withheld(result, C3A)
+    assert line.reason == label
+
+
 @pytest.mark.parametrize(
     ("name", "check"),
     [("c3a.share.does_not_fire", "share"), ("c3a.no_lead_pivot.does_not_fire", "leads")],

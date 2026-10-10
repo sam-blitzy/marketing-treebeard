@@ -904,8 +904,9 @@ subject, and never one on its members.
   `segment_window_unavailable` finding and one of two labels, and never reuses another window's
   segments:
   - a preset not yet fetched for the current end date: "Segment data for the {n}-day window
-    ending {end} not yet available; latest available ends {date}", where {date} is `none` when
-    no segment window has been fetched;
+    ending {end} not yet available; latest available ends {date}", where {date} is the latest
+    end of a fetched window of that same n-day preset, and `none` when that preset has never
+    been fetched;
   - a custom window whose length is not a preset or whose end is not the default end: "Segment
     data exists only for the preset windows {list} ending {end}".
 - **Action**: "Launch a campaign targeting {facet}: {value} with {campaign}'s offer".
