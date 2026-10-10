@@ -663,8 +663,9 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   the dialog cannot be reopened and no second decision can be posted, and with the dialog
  *   closed the card's status line reads "Saving decision". A save that ends after its dialog
  *   was closed is still reported: a success as "Decision recorded", a failure in the warning
- *   `Banner`. Focus, which the closed dialog could not return to the disabled button, then
- *   goes back to "Record decision" when nothing else has taken it.
+ *   `Banner`. The closed dialog returns focus to "Record decision", which stays focusable while
+ *   it loads; once the save settles, focus that has been lost goes back to it when nothing else
+ *   has taken it.
  * - **Mark done** on every other action: feedback `done`, which never writes a decision.
  * - **Dismiss** and **Snooze for 7 days** (quiet) on every item: feedback `dismiss` and
  *   `snooze`, posted as `POST /recommendations/{id}/feedback`.
@@ -681,7 +682,8 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * "Dismissed", "Snoozed") stands until the refetched recommendations hide the item. Inside an
  * {@link ActionOutcomeProvider} that outcome, and a recorded decision, is announced in the
  * provider's region, which outlives the card, instead of in the card's own line. Keyboard
- * focus, lost with the disabled or removed button, then moves to the next card's first enabled
+ * focus, which the pressed button keeps while its request runs and after it is disabled, or
+ * which is lost with a removed card, then moves to the next card's first enabled
  * action, else the previous card's, else the enclosing section's heading, else `<main>`, unless
  * the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Every refused action, of a feedback or
  * of a decision save, shows its explanation in a warning `Banner` until the next action starts:
@@ -820,9 +822,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   // HISTORICAL_LABEL ({@link learnRetirement}); a failed feedback or decision save shows its own.
   const message = errorText;
 
-  // A pressed button is disabled while its request runs, which drops keyboard focus to the
-  // page. When the request fails, focus moves to the message instead (WCAG 2.2 SC 2.4.3, 3.3.1).
-  // The banner is no live region, so taking focus is how its message is read. While the
+  // A pressed button is loading while its request runs, and keeps keyboard focus. When the
+  // request fails, focus moves on to the message (WCAG 2.2 SC 2.4.3, 3.3.1). The banner is no
+  // live region, so taking focus is how its message is read. While the
   // decision dialog is open its focus trap owns focus, so the message waits and takes focus
   // once the dialog closes: React runs the dialog's cleanup, which returns focus to the
   // "Record decision" button (disabled when a retirement locked the row), before this effect.
@@ -832,11 +834,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     }
   }, [message, dialogOpen]);
 
-  // A dialog closed while its save runs cannot return focus to "Record decision", which stays
-  // disabled until the save settles, so focus drops to the page. Once the save has settled and
-  // the button is enabled again, focus goes back to it (WCAG 2.2 SC 2.4.3): only when focus is
-  // still lost, never while the dialog is open and owns focus, and never over a message, which
-  // takes focus itself (the effect above).
+  // A dialog closed while its save runs returns focus to "Record decision", which stays
+  // focusable while it loads. Should focus be lost by the time the save settles, it goes back to
+  // the button once the button is enabled again (WCAG 2.2 SC 2.4.3): only when focus is lost or
+  // still on the row, never while the dialog is open and owns focus, and never over a message,
+  // which takes focus itself (the effect above).
   useEffect(() => {
     if (!refocusOpener) {
       return;

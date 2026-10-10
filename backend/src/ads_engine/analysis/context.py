@@ -11,9 +11,10 @@ The module holds four kinds of definitions:
 
 * **Constants** (AAP 0.5.3, 0.5.5, 0.11.1): rule ids (``K1`` … ``W2``), the five sections and
   their groups, flag codes, finding codes, data statuses, suppression reasons, banner codes and
-  tones, objective groups and the fixed hold, unverified and historical texts. Rule ids are the
-  same strings as the ``config/thresholds.yaml`` namespaces, the evidence, the tests and
-  ``docs/recommendation-rules.md``.
+  tones, objective groups and the fixed hold, unverified and historical texts, with
+  :func:`format_instant`, the one rendering of an instant inside those texts (in
+  ``DISPLAY_TIMEZONE``). Rule ids are the same strings as the ``config/thresholds.yaml``
+  namespaces, the evidence, the tests and ``docs/recommendation-rules.md``.
 * **Output types**: :class:`EntityRef`, :class:`DecisionSubject`, :class:`Flag`,
   :class:`Metric`, :class:`Baseline`, :class:`Sample`, :class:`TestResult`,
   :class:`ProvenanceEntry`, :class:`DatasetStatus`, :class:`Evidence`, :class:`Candidate`,
@@ -57,6 +58,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, Literal, Protocol, get_args, runtime_checkable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ads_engine.analysis.thresholds import ContentAsset, CrmBindings, Thresholds
 from ads_engine.analysis.window import AnalysisWindow
@@ -246,6 +248,8 @@ __all__ = [
     "creative_group",
     "creative_group_campaign",
     "creative_pair_external_id",
+    "display_zone",
+    "format_instant",
     "google_link_gap",
     "json_value",
     "keyword_external_id",
@@ -253,6 +257,7 @@ __all__ = [
     "objective_group",
     "search_term_external_id",
     "segment_external_id",
+    "short_window_message",
     "term_cluster_external_id",
     "unverified_message",
 ]
@@ -776,15 +781,141 @@ HELD_DISCREPANCY_REASON: Final = "Resolve discrepancy first"
 """``held_reason`` of an item that depends on a discrepant campaign or budget (P1)."""
 
 UNVERIFIED_TEMPLATE: Final = "Unverified while {n} discrepancies are open"
-"""Message of the ``unverified_discrepancies`` flag; ``{n}`` is every unresolved one."""
+"""Message of the ``unverified_discrepancies`` flag; ``{n}`` is every unresolved one.
+
+The plural template; :func:`unverified_message` renders the singular "Unverified while 1
+discrepancy is open" at a count of one.
+"""
 
 HISTORICAL_REASON: Final = "Computed from data that has since been replaced"
 """``held_reason_now`` of an item whose provenance datasets are no longer active."""
 
 
 def unverified_message(n: int) -> str:
-    """Render :data:`UNVERIFIED_TEMPLATE` for ``n`` unresolved discrepancies."""
+    """Render the ``unverified_discrepancies`` message for ``n`` unresolved discrepancies.
+
+    Every count but one renders :data:`UNVERIFIED_TEMPLATE` verbatim; a count of one reads
+    "Unverified while 1 discrepancy is open". The compute-time flag (``precedence.py``) and
+    the read-time flag (``overlay.py``) both render here, so their wording never differs.
+
+    Example:
+        >>> unverified_message(1)
+        'Unverified while 1 discrepancy is open'
+        >>> unverified_message(3)
+        'Unverified while 3 discrepancies are open'
+    """
+    if n == 1:
+        return f"Unverified while {n} discrepancy is open"
     return UNVERIFIED_TEMPLATE.format(n=n)
+
+
+def short_window_message(days: int, trusted_min_days: int) -> str:
+    """Render the short-window text of the P5 banner and the ``short_window`` flag.
+
+    "Window of N days is below the {trusted_min_days}-day trusted minimum", with "1 day" for
+    a one-day window; the "{trusted_min_days}-day" adjective never takes a plural. The banner
+    (``overlay.py``, from the run's stored minimum) and the flag (``precedence.py``, from the
+    window's configured minimum) both render here, so they never drift apart.
+
+    Args:
+        days: The window's length in days.
+        trusted_min_days: The ``window.trusted_min_days`` the window was judged against.
+
+    Example:
+        >>> short_window_message(1, 14)
+        'Window of 1 day is below the 14-day trusted minimum'
+        >>> short_window_message(20, 21)
+        'Window of 20 days is below the 21-day trusted minimum'
+    """
+    noun = "day" if days == 1 else "days"
+    return f"Window of {days} {noun} is below the {trusted_min_days}-day trusted minimum"
+
+
+# ---------------------------------------------------------------------------
+# Instants in message text (AAP 0.5.5 Behaviour, 0.5.4.1)
+# ---------------------------------------------------------------------------
+
+_MONTH_ABBREVIATIONS: Final[tuple[str, ...]] = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+"""English month abbreviations, fixed so a message never depends on the process locale."""
+
+
+def display_zone(zone: object, what: str = "display timezone") -> ZoneInfo:
+    """Return the IANA zone that ``zone`` names, the ``DISPLAY_TIMEZONE`` instants are shown in.
+
+    The id must load exactly as given, surrounding whitespace included, as ``settings.py``
+    stores ``DISPLAY_TIMEZONE`` once validated. The zone only formats instants; it never moves
+    a source's day boundary (AAP 0.5.4.1).
+
+    Args:
+        zone: The IANA zone id, for example ``"America/New_York"``.
+        what: The name of the checked value, for the error message.
+
+    Returns:
+        The loaded zone.
+
+    Raises:
+        TypeError: When ``zone`` is not a string.
+        ValueError: When the tz database cannot load it (blank, malformed or unknown).
+    """
+    if not isinstance(zone, str):
+        raise TypeError(f"{what} must be an IANA time zone name, found {zone!r}")
+    try:
+        return ZoneInfo(zone)
+    except ZoneInfoNotFoundError, ValueError, OSError:
+        raise ValueError(f"{what} must be a loadable IANA time zone name, found {zone!r}") from None
+
+
+def format_instant(value: datetime, zone: str) -> str:
+    """Render an instant in ``zone`` for a banner or flag message.
+
+    The text is exactly what ``formatInstant`` in ``web/src/lib/format.ts`` renders for the
+    same instant and zone (``Intl.DateTimeFormat`` ``en`` with ``dateStyle: "medium"`` and
+    ``timeStyle: "short"``, then the zone id), so an instant inside a message reads like
+    every other instant on the screen (AAP 0.5.5 "Instants are formatted in
+    DISPLAY_TIMEZONE"): the English month abbreviation, the day and the 12-hour clock
+    without a leading zero, two-digit minutes (seconds are dropped), ``AM`` or ``PM``
+    (``12:05 AM`` just after midnight, ``12:00 PM`` at noon) and the zone id as given.
+    Native days are never passed here: coverage dates stay ISO dates of their source's own
+    day boundary (AAP 0.5.4.1).
+
+    Args:
+        value: The instant (tz-aware, any offset).
+        zone: The IANA zone id to show it in: ``settings.display_timezone``.
+
+    Returns:
+        The rendered instant.
+
+    Raises:
+        TypeError: When ``value`` is not a ``datetime`` or ``zone`` is not a string.
+        ValueError: When ``value`` is naive or ``zone`` is not a loadable IANA zone.
+
+    Example:
+        >>> format_instant(datetime(2026, 10, 6, 15, 22, tzinfo=UTC), "America/New_York")
+        'Oct 6, 2026, 11:22 AM America/New_York'
+        >>> format_instant(datetime(2026, 1, 5, 0, 7, tzinfo=UTC), "UTC")
+        'Jan 5, 2026, 12:07 AM UTC'
+    """
+    _require_instant(value, "instant")
+    local = value.astimezone(display_zone(zone))
+    hour = local.hour % 12 or 12
+    meridiem = "AM" if local.hour < 12 else "PM"
+    return (
+        f"{_MONTH_ABBREVIATIONS[local.month - 1]} {local.day}, {local.year}, "
+        f"{hour}:{local.minute:02d} {meridiem} {zone}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1151,7 +1282,8 @@ class Flag:
 
     Attributes:
         code: One of :data:`FLAG_CODES`.
-        message: The badge's explanatory text, for example "Data as of 2026-10-01 03:10 UTC".
+        message: The badge's explanatory text, for example "Data as of Oct 1, 2026, 3:10 AM
+            UTC".
 
     Raises:
         ValueError: On construction, for an unknown code or a blank message.
@@ -3408,6 +3540,10 @@ class AnalysisContext:
         thresholds: The loaded configuration.
         now: The run time; downstream CRM events count as of this instant.
         run_kind: ``default`` or ``custom``.
+        display_timezone: ``DISPLAY_TIMEZONE``, the IANA zone the instants inside frozen
+            flag messages are rendered in (:func:`format_instant`), such as the ``stale``
+            flag's "Data as of …". It only formats instants and never moves a day boundary
+            (AAP 0.5.4.1). Defaults to ``UTC``, the setting's own default.
         datasets: The active primary dataset per source; a source may be absent.
         linkedin_crm: The effective CRM dataset for LinkedIn-attributed evidence: the
             companion while LinkedIn is simulated, else HubSpot's active primary.
@@ -3450,17 +3586,19 @@ class AnalysisContext:
 
     Raises:
         TypeError: On construction, when ``window``, ``thresholds`` or a CRM dataset has the
-            wrong type, ``now`` is not a ``datetime``, a mapping field is not a mapping, or a
-            sequence field (or a ``campaign_days``, ``keyword_days`` or ``observations``
-            value) is not a list or tuple.
-        ValueError: On construction, when ``now`` is naive, a dataset is filed under the wrong
-            source or is not primary, or a CRM dataset breaks the isolation rule.
+            wrong type, ``now`` is not a ``datetime``, ``display_timezone`` is not a string,
+            a mapping field is not a mapping, or a sequence field (or a ``campaign_days``,
+            ``keyword_days`` or ``observations`` value) is not a list or tuple.
+        ValueError: On construction, when ``now`` is naive, ``display_timezone`` is not a
+            loadable IANA zone, a dataset is filed under the wrong source or is not primary,
+            or a CRM dataset breaks the isolation rule.
     """
 
     window: AnalysisWindow
     thresholds: Thresholds
     now: datetime
     run_kind: RunKind = "default"
+    display_timezone: str = "UTC"
     datasets: Mapping[Source, DatasetRef] = field(default_factory=dict)
     linkedin_crm: CrmData | None = None
     google_crm: CrmData | None = None
@@ -3512,6 +3650,7 @@ class AnalysisContext:
             raise TypeError("AnalysisContext.thresholds must be a Thresholds")
         _require_instant(self.now, "AnalysisContext.now")
         _require_in(self.run_kind, get_args(RunKind), "AnalysisContext.run_kind")
+        display_zone(self.display_timezone, "AnalysisContext.display_timezone")
         for source, ref in self.datasets.items():
             _require_in(source, SOURCES, "AnalysisContext.datasets key")
             if not isinstance(ref, DatasetRef) or ref.source != source or ref.role != "primary":

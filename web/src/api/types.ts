@@ -460,7 +460,7 @@ export interface CreateRunRequest {
 export interface Flag {
   /** The flag code. */
   code: FlagCode;
-  /** The badge's explanatory text, for example "Data as of 2026-10-01 03:10". */
+  /** The badge's explanatory text, for example "Data as of Oct 1, 2026, 3:10 AM UTC". */
   message: string;
 }
 

@@ -194,7 +194,7 @@ async def startup(settings: Settings | None = None) -> None:
     thresholds = await _sync_config_and_assets()
     await _check_config_change(thresholds)
     await _bootstrap(resolved)
-    await _startup_analysis(thresholds)
+    await _startup_analysis(thresholds, display_timezone=resolved.display_timezone)
 
 
 async def _sync_config_and_assets() -> Thresholds:
@@ -331,7 +331,7 @@ async def _requeue_startup_analysis() -> None:
     _log.info("startup_analysis_requeued", reason=REASON_STARTUP)
 
 
-async def _startup_analysis(thresholds: Thresholds) -> None:
+async def _startup_analysis(thresholds: Thresholds, *, display_timezone: str | None = None) -> None:
     """Compute the default-window run before the first wake, serving every pending request.
 
     The window comes from :func:`~ads_engine.analysis.runner.default_window`, the helper the
@@ -346,6 +346,9 @@ async def _startup_analysis(thresholds: Thresholds) -> None:
 
     Args:
         thresholds: The configuration loaded at this startup; the run records its hash.
+        display_timezone: The worker's ``DISPLAY_TIMEZONE``, the zone of the instants in the
+            run's frozen flag messages; ``run_analysis`` reads the process settings' when
+            ``None``.
     """
     at = datetime.now(UTC)
     backlog: PendingRequests | None = None
@@ -361,6 +364,7 @@ async def _startup_analysis(thresholds: Thresholds) -> None:
             serve_through=None if backlog is None else backlog.through_id,
             thresholds=thresholds,
             now=at,
+            display_timezone=display_timezone,
         )
     except RunInProgress:
         # The API (POST /runs) or the CLI (analyze) holds the analysis lock. The pending

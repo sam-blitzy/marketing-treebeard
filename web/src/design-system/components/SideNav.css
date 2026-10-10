@@ -81,14 +81,16 @@
 }
 
 /*
- * Hover: a background tint plus an underline, so the state does not rely on the tint alone.
- * Scoped to devices that can hover, so a tap on a touch screen leaves no sticky hover state.
- * No transition is declared: the token set has no motion token, and every value here comes from
- * a token.
+ * Hover: the --color-surface tint plus an underline, so the state does not rely on the tint
+ * alone. Both navigations sit on the page background (--color-bg, PageShell.css), so the tint
+ * is the surface colour, which stands apart from it; the underline marks hover on any
+ * background. Scoped to devices that can hover, so a tap on a touch screen leaves no sticky
+ * hover state. No transition is declared: the token set has no motion token, and every value
+ * here comes from a token.
  */
 @media (hover: hover) {
   .ds-sidenav__link:hover {
-    background: var(--color-bg);
+    background: var(--color-surface);
     text-decoration: underline;
   }
 }
@@ -103,12 +105,31 @@
   outline-offset: calc(var(--space-1) / 2);
 }
 
-/* Current page or section: heavier weight and the accent bar, with the hover tint at rest. */
+/*
+ * Current page or section: heavier weight and the accent bar, with the hover tint at rest. The
+ * weight and the bar, which hover never shows, keep it distinguishable from a hovered link.
+ */
 .ds-sidenav__link--current,
 .ds-sidenav__link[aria-current="page"] {
   font-weight: var(--font-weight-semibold);
   border-inline-start-color: var(--color-accent);
-  background: var(--color-bg);
+  background: var(--color-surface);
+}
+
+/*
+ * Pressed (:active), for pointer and touch alike: a --color-text bar in the inline-start border
+ * every link reserves, and the underline thickened to the focus-ring width (half of --space-1),
+ * on the hover tint. Hover shows neither, so a press reads apart from it, and the bar takes no
+ * space of its own, so nothing shifts. --color-text is at least 4.5:1 on both backgrounds. The
+ * rule follows the current rule at no lower specificity, so the current link pressed shows the
+ * press bar too while held. In forced colours only the current link draws a bar (below), and the
+ * thicker underline marks the press on every link.
+ */
+.ds-sidenav__link:active {
+  background: var(--color-surface);
+  border-inline-start-color: var(--color-text);
+  text-decoration: underline;
+  text-decoration-thickness: calc(var(--space-1) / 2);
 }
 
 /*

@@ -774,10 +774,10 @@ function DecisionFormBody(props: DecisionFormProps) {
   const submitHintId = useId();
   const statusId = useId();
 
-  // The submit button is disabled while its request runs, which drops keyboard focus to the
-  // page. When a save fails, focus moves to the error instead, so keyboard and screen-reader
-  // users land on the message (WCAG 2.2 SC 2.4.3, 3.3.1) without a role="alert" live region,
-  // which AAP 0.5.5 reserves for the discrepancy banner on /actions.
+  // The submit button is loading while its request runs, and keeps keyboard focus. When a save
+  // fails, focus moves on to the error, so keyboard and screen-reader users land on the message
+  // (WCAG 2.2 SC 2.4.3, 3.3.1) without a role="alert" live region, which AAP 0.5.5 reserves for
+  // the discrepancy banner on /actions.
   const activeMutation = mode === 'decision' ? recordDecision : resolveDiscrepancy;
   const saveError = activeMutation.error;
   const errorRef = useRef<HTMLDivElement>(null);

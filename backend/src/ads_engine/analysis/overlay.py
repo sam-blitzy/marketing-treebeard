@@ -35,7 +35,9 @@ Decisions taken in this module, each stated where its code lives:
   :func:`overlay` gains a leading ``session`` because it reads live tables, plus keyword-only
   ``findings`` (the run's stored findings, when the caller already loaded them) and a
   required ``thresholds``: the caller injects the configuration it already holds (the API's
-  cached ``app.state.thresholds``), so the async read path never reads config files.
+  cached ``app.state.thresholds``), so the async read path never reads config files. A
+  required ``display_timezone`` (``settings.display_timezone``) renders the instants inside
+  the stale banner and ``stale`` flags (AAP 0.5.5: instants in ``DISPLAY_TIMEZONE``).
   :func:`is_current` takes the current id set so it stays pure.
 * **Hold subjects**: an item's live P1 hold reads the subjects ``precedence.py`` froze in
   ``evidence.extra.depends_on`` (``[{type, id}]``) plus the item's own ``decision_subject``,
@@ -77,7 +79,15 @@ Example::
 
     run = await session.get(AnalysisRun, run_id)
     rows = (await session.scalars(select(Recommendation).filter_by(run_id=run.id))).all()
-    result = await overlay(session, run, rows, now, findings=findings, thresholds=thresholds)
+    result = await overlay(
+        session,
+        run,
+        rows,
+        now,
+        findings=findings,
+        thresholds=thresholds,
+        display_timezone=settings.display_timezone,
+    )
     result.items[rows[0].id].held_now  # live P1 hold or historical-only marking
     [banner.code for banner in result.banners]  # AAP 0.5.5 fixed banner order
 """
@@ -86,7 +96,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -123,7 +133,10 @@ from ads_engine.analysis.context import (
     Freshness,
     ProvenanceEntry,
     Tone,
+    display_zone,
+    format_instant,
     json_value,
+    short_window_message,
     unverified_message,
 )
 from ads_engine.analysis.thresholds import Thresholds
@@ -242,11 +255,6 @@ def _require_thresholds(value: object) -> Thresholds:
             f"(ThresholdsDep / app.state.thresholds), found {type(value).__name__}"
         )
     return value
-
-
-def _format_instant(value: datetime) -> str:
-    """Render an instant as ``YYYY-MM-DD HH:MM UTC``; the UI re-formats in DISPLAY_TIMEZONE."""
-    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _ordered_names(names: Iterable[str]) -> tuple[str, ...]:
@@ -1142,8 +1150,15 @@ def _judge(
     )
 
 
-def _stale_flag(checks: Sequence[_DatasetCheck], window_end: date) -> Flag:
-    """Build the ``stale`` flag: "Data as of …", naming any coverage shortfall."""
+def _stale_flag(
+    checks: Sequence[_DatasetCheck], window_end: date, *, display_timezone: str
+) -> Flag:
+    """Build the ``stale`` flag: "Data as of …", naming any coverage shortfall.
+
+    The oldest last success is an instant, rendered in ``display_timezone``
+    (:func:`~ads_engine.analysis.context.format_instant`); coverage ends are native dates and
+    stay ISO dates (AAP 0.5.4.1).
+    """
     never: list[str] = []
     successes: list[datetime] = []
     shortfalls: list[str] = []
@@ -1163,7 +1178,7 @@ def _stale_flag(checks: Sequence[_DatasetCheck], window_end: date) -> Flag:
     if never:
         message = f"Data as of: no successful sync of {', '.join(_ordered_names(never))}"
     else:
-        message = f"Data as of {_format_instant(min(successes))}"
+        message = f"Data as of {format_instant(min(successes), display_timezone)}"
     if shortfalls:
         message = f"{message}; {'; '.join(shortfalls)}"
     return Flag(FLAG_STALE, message)
@@ -1271,6 +1286,7 @@ def _item_view(
     window_start: date,
     window_end: date,
     lookback_days: Mapping[str, int],
+    display_timezone: str,
 ) -> tuple[ItemOverlayView, tuple[_DatasetCheck, ...]]:
     """Compute one stored item's read-time state; pure over the preloaded live state.
 
@@ -1298,8 +1314,9 @@ def _item_view(
       → ``simulated``, mixed → ``mixed``, else ``live``, which becomes ``stale`` when a
       required dataset is stale now (P3, P4). With no decodable entry the frozen
       ``simulated``/``mixed`` status stands.
-    * ``flags_now``: current ``simulated``, ``stale``, ``incomplete`` and, for non-C0 items
-      while discrepancies are open, ``unverified_discrepancies`` with the live count.
+    * ``flags_now``: current ``simulated``, ``stale`` (its last success in
+      ``display_timezone``), ``incomplete`` and, for non-C0 items while discrepancies are
+      open, ``unverified_discrepancies`` with the live count.
     * ``hidden_by``: the active feedback on the item's rule and entity; C0 is exempt.
     """
     is_c0 = item.rule_id == C0
@@ -1358,7 +1375,7 @@ def _item_view(
     if base in (DATA_SIMULATED, DATA_MIXED):
         flags.append(_simulated_flag(base, simulated_sources))
     if stale_checks:
-        flags.append(_stale_flag(stale_checks, window_end))
+        flags.append(_stale_flag(stale_checks, window_end, display_timezone=display_timezone))
     if incomplete_checks:
         flags.append(_incomplete_flag(incomplete_checks))
     if not is_c0 and live.open_discrepancies > 0:
@@ -1443,7 +1460,17 @@ def _tracking_banner(run: AnalysisRun, findings: Sequence[RunFinding]) -> Banner
 
 
 def _simulated_banner(live: _LiveState) -> BannerView | None:
-    """Every source whose active dataset is simulated, each with its reason (P3)."""
+    """Every source whose active dataset is simulated, each with its current reason (P3).
+
+    A simulated ``source_connection`` gives the reason: ``sync/mode.py`` keeps it current, as
+    the platform's denial after an automatic fallback, ``DATA_MODE=simulated`` while the mode
+    is forced, or ``credentials not configured``. The dataset's own reason only records why it
+    was built, and the dataset is kept, not rebuilt, when the source stays simulated for a new
+    reason (a denial once credentials are added, or a forced mode). A connection already back
+    in live mode (a live dataset building beside the simulated one) does not explain the
+    simulated data still active, so the dataset's reason stands in, then
+    :data:`_DEFAULT_SIMULATED_REASON`. A blank reason counts as none.
+    """
     parts: list[str] = []
     for source in SOURCES:
         dataset = live.datasets.primaries.get(source)
@@ -1453,15 +1480,22 @@ def _simulated_banner(live: _LiveState) -> BannerView | None:
         connection_reason = (
             connection[1] if connection is not None and connection[0] == DATA_SIMULATED else None
         )
-        reason = dataset.reason or connection_reason or _DEFAULT_SIMULATED_REASON
+        reason = next(
+            (
+                text.strip()
+                for text in (connection_reason, dataset.reason)
+                if text is not None and text.strip()
+            ),
+            _DEFAULT_SIMULATED_REASON,
+        )
         parts.append(f"{_SOURCE_LABELS[source]} ({reason})")
     if not parts:
         return None
     return _banner(BANNER_SIMULATED_SOURCES, f"Simulated data: {'; '.join(parts)}", len(parts))
 
 
-def _stale_banner(checks: Sequence[_DatasetCheck]) -> BannerView | None:
-    """The datasets that are stale now, each with its last success."""
+def _stale_banner(checks: Sequence[_DatasetCheck], *, display_timezone: str) -> BannerView | None:
+    """The datasets that are stale now, each with its last success in ``display_timezone``."""
     names = _ordered_names(check.name for check in checks)
     if not names:
         return None
@@ -1476,7 +1510,8 @@ def _stale_banner(checks: Sequence[_DatasetCheck]) -> BannerView | None:
         if len(successes) < len(group):
             parts.append(f"{name} (no successful sync)")
         else:
-            parts.append(f"{name} (last success {_format_instant(min(successes))})")
+            last_success = format_instant(min(successes), display_timezone)
+            parts.append(f"{name} (last success {last_success})")
     return _banner(BANNER_STALE_DATASETS, f"Stale data: {', '.join(parts)}", len(names))
 
 
@@ -1509,10 +1544,7 @@ def _short_window_banner(run: AnalysisRun) -> BannerView | None:
     trusted_min_days = run.trusted_min_days
     if days >= trusted_min_days:
         return None
-    return _banner(
-        BANNER_SHORT_WINDOW,
-        f"Window of {days} days is below the {trusted_min_days}-day trusted minimum",
-    )
+    return _banner(BANNER_SHORT_WINDOW, short_window_message(days, trusted_min_days))
 
 
 def _banners(
@@ -1522,13 +1554,14 @@ def _banners(
     *,
     stale_checks: Sequence[_DatasetCheck],
     incomplete_checks: Sequence[_DatasetCheck],
+    display_timezone: str,
 ) -> tuple[BannerView, ...]:
     """Build every banner that applies, in ``BANNER_ORDER`` (AAP 0.5.5)."""
     candidates = (
         _discrepancy_banner(live.open_discrepancies),
         _tracking_banner(run, findings),
         _simulated_banner(live),
-        _stale_banner(stale_checks),
+        _stale_banner(stale_checks, display_timezone=display_timezone),
         _incomplete_banner(incomplete_checks),
         _short_window_banner(run),
     )
@@ -1549,6 +1582,7 @@ async def overlay(
     *,
     findings: Sequence[RunFinding] | None = None,
     thresholds: Thresholds,
+    display_timezone: str,
 ) -> OverlayResult:
     """Compute the current-state overlay of one page of a stored run (AAP 0.3.2, 0.5.3).
 
@@ -1569,18 +1603,26 @@ async def overlay(
             ``app.state.thresholds`` through :data:`~ads_engine.api.deps.ThresholdsDep`. It
             is never read from disk here, so the async read path does no blocking file I/O.
             The short-window banner reads the run's stored ``trusted_min_days`` instead.
+        display_timezone: Required: ``DISPLAY_TIMEZONE`` (``settings.display_timezone``),
+            the IANA zone the instants inside messages are rendered in: the stale banner's
+            "last success …" and the ``stale`` flag's "Data as of …"
+            (:func:`~ads_engine.analysis.context.format_instant`, the text the web's
+            ``formatInstant`` renders). Coverage dates stay ISO native dates.
 
     Returns:
         The page-level overlay, one :class:`ItemOverlayView` per item keyed by its id, and the
         banners in the fixed AAP 0.5.5 order.
 
     Raises:
-        TypeError: When ``now`` is not a ``datetime``, or ``thresholds`` is not a loaded
-            :class:`~ads_engine.analysis.thresholds.Thresholds` (``None`` included).
-        ValueError: When ``now`` is naive or an item belongs to another run.
+        TypeError: When ``now`` is not a ``datetime``, ``thresholds`` is not a loaded
+            :class:`~ads_engine.analysis.thresholds.Thresholds` (``None`` included), or
+            ``display_timezone`` is not a string.
+        ValueError: When ``now`` is naive, ``display_timezone`` is not a loadable IANA zone,
+            or an item belongs to another run.
     """
     now = _require_aware(now, "now")
     config = _require_thresholds(thresholds)
+    display_zone(display_timezone, "display_timezone")
     foreign = sorted({item.run_id for item in items if item.run_id != run.id})
     if foreign:
         raise ValueError(f"overlay of run {run.id} was given items of runs {foreign}")
@@ -1629,6 +1671,7 @@ async def overlay(
             window_start=window_start,
             window_end=window_end,
             lookback_days=lookback_days,
+            display_timezone=display_timezone,
         )
         views[item.id] = item_view
         assessments.update(dict.fromkeys(item_checks))
@@ -1656,5 +1699,6 @@ async def overlay(
         stored_findings,
         stale_checks=stale_checks,
         incomplete_checks=incomplete_checks,
+        display_timezone=display_timezone,
     )
     return OverlayResult(overlay=view, items=MappingProxyType(views), banners=banners)

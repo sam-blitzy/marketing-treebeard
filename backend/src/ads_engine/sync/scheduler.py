@@ -3213,6 +3213,7 @@ class Scheduler:
                     serve_through=backlog.through_id,
                     thresholds=thresholds,
                     now=at,
+                    display_timezone=self._settings.display_timezone,
                 )
             except RunInProgress:
                 tick.analysis_deferred = True

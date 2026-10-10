@@ -34,14 +34,22 @@
  * Revealed on focus. Both pseudo-classes are listed so the link also appears when focus arrives
  * programmatically or in a browser that treats it as non-visible focus. No outline is set, so
  * the base :focus-visible ring from ../tokens.css still marks the focused link.
+ *
+ * Once shown, the link can also be tapped, so it gets the same target as Button: at least 44 by
+ * 44 CSS px (WCAG 2.2 SC 2.5.5), through minimum block and inline sizes of --space-8 + --space-3
+ * (2.75rem at the 16px root), with its text centred on the cross axis.
  */
 .ds-visually-hidden--focusable:focus,
 .ds-visually-hidden--focusable:focus-visible {
   position: absolute;
   inset-block-start: var(--space-2);
   inset-inline-start: var(--space-2);
+  display: flex;
+  align-items: center;
   inline-size: auto;
   block-size: auto;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
   padding: var(--space-2) var(--space-3);
   overflow: visible;
   clip-path: none;

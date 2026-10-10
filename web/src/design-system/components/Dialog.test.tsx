@@ -5,9 +5,12 @@
  * binding: `role="dialog"` with `aria-modal`, named by its level-2 title; the props `open`,
  * `title`, `onClose`, `children`, `footer` and `closeLabel`; initial focus, the Tab and
  * Shift+Tab trap with its sentinels and document focus guard, Escape, the Close button and the
- * backdrop; and focus returning to the opener. jsdom performs no sequential navigation of its
- * own, so a Tab the dialog leaves to the browser shows as a keydown that is not prevented, and
- * the browser's step is simulated by focusing where the browser would go.
+ * backdrop; the page behind it made inert and its scroll locked while open, and freed before
+ * focus returns; and focus returning to the opener. jsdom performs no sequential navigation of
+ * its own, so a Tab the dialog leaves to the browser shows as a keydown that is not prevented,
+ * and the browser's step is simulated by focusing where the browser would go. jsdom also lets an
+ * inert element take focus, so the order of freeing the page and returning focus is checked by
+ * reading the page's state from the opener's focus event.
  *
  * The last block repeats the core contract on a generic fixture, a `TextField` body plus a footer
  * action, so the wrapper is also proven with a real design-system field rather than a raw input
@@ -935,6 +938,283 @@ describe('Dialog keyboard focus trap', () => {
         opener.remove();
       }
     });
+  });
+});
+
+describe('Dialog modal background: inert page and scroll lock', () => {
+  /** The class on `<html>` that locks the page scroll while a dialog is open. */
+  const SCROLL_LOCK = 'ds-dialog-scroll-lock';
+  /** The modifier on `<html>` that keeps the page's vertical scrollbar gutter. */
+  const SCROLL_LOCK_GUTTER = 'ds-dialog-scroll-lock--gutter';
+  /** The inline size, in CSS px, a classic vertical scrollbar takes from the viewport. */
+  const SCROLLBAR_SIZE = 15;
+
+  /** The root element, which carries the scroll-lock classes. */
+  function html(): HTMLElement {
+    return document.documentElement;
+  }
+
+  /**
+   * The open dialog's portal root.
+   *
+   * @returns the `.ds-dialog` element around the panel
+   */
+  function dialogRoot(): HTMLElement {
+    const root = panel().parentElement;
+    if (root === null) {
+      throw new Error('Dialog root not found');
+    }
+    return root;
+  }
+
+  /**
+   * Whether the page is free: no element of `page` is inert and `<html>` has no scroll lock.
+   *
+   * @param page - the elements of the page behind the dialog
+   * @returns `true` when nothing of the dialog's background hold is left
+   */
+  function pageIsFree(...page: Element[]): boolean {
+    return (
+      page.every((element) => !element.hasAttribute('inert')) &&
+      !html().classList.contains(SCROLL_LOCK) &&
+      !html().classList.contains(SCROLL_LOCK_GUTTER)
+    );
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('makes every element of the page behind it inert while open, never its own root', () => {
+    const banner = document.createElement('div');
+    document.body.append(banner);
+    try {
+      const { container } = render(<Harness />);
+      expect(pageIsFree(container, banner)).toBe(true);
+
+      openThroughOpener();
+
+      const root = dialogRoot();
+      expect(root.parentElement).toBe(document.body);
+      for (const child of Array.from(document.body.children)) {
+        expect(child.hasAttribute('inert')).toBe(child !== root);
+      }
+      expect(container.getAttribute('inert')).toBe('');
+      expect(banner.getAttribute('inert')).toBe('');
+      expect(panel().closest('[inert]')).toBeNull();
+    } finally {
+      banner.remove();
+    }
+  });
+
+  it('locks the page scroll with a class on <html> while open', () => {
+    render(<Harness />);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(false);
+
+    openThroughOpener();
+
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+  });
+
+  it('keeps the scrollbar gutter only when the page showed a vertical scrollbar', () => {
+    const clientWidth = vi.spyOn(document.documentElement, 'clientWidth', 'get');
+    clientWidth.mockReturnValue(window.innerWidth - SCROLLBAR_SIZE);
+    const { unmount } = render(<Harness initiallyOpen />);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+    expect(html().classList.contains(SCROLL_LOCK_GUTTER)).toBe(true);
+    unmount();
+    expect(html().classList.contains(SCROLL_LOCK_GUTTER)).toBe(false);
+
+    clientWidth.mockReturnValue(window.innerWidth);
+    render(<Harness initiallyOpen />);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+    expect(html().classList.contains(SCROLL_LOCK_GUTTER)).toBe(false);
+  });
+
+  it.each([
+    [
+      'the Close button',
+      () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+      },
+    ],
+    [
+      'Escape',
+      () => {
+        fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+      },
+    ],
+    [
+      'a backdrop click',
+      () => {
+        const backdrop = document.querySelector('.ds-dialog__backdrop');
+        if (backdrop === null) {
+          throw new Error('Dialog backdrop not found');
+        }
+        fireEvent.click(backdrop);
+      },
+    ],
+  ])('frees the page before focus returns to the opener when closed by %s', (_how, close) => {
+    const { container } = render(<Harness />);
+    const opener = openThroughOpener();
+    expect(container.hasAttribute('inert')).toBe(true);
+    const freeWhenFocused: boolean[] = [];
+    opener.addEventListener('focus', () => {
+      freeWhenFocused.push(pageIsFree(container));
+    });
+
+    close();
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    expect(freeWhenFocused).toEqual([true]);
+    expect(pageIsFree(container)).toBe(true);
+  });
+
+  it('frees the page when it unmounts while open', () => {
+    const { container, unmount } = render(<Harness initiallyOpen />);
+    expect(container.hasAttribute('inert')).toBe(true);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+
+    unmount();
+
+    expect(pageIsFree(container)).toBe(true);
+  });
+
+  it('frees the page after StrictMode runs its effects twice', () => {
+    const { container } = render(
+      <StrictMode>
+        <Harness initiallyOpen />
+      </StrictMode>,
+    );
+    expect(container.hasAttribute('inert')).toBe(true);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    expect(pageIsFree(container)).toBe(true);
+  });
+
+  it('leaves an inert attribute it did not set in place after it closes', () => {
+    const frozen = document.createElement('div');
+    frozen.setAttribute('inert', '');
+    document.body.append(frozen);
+    try {
+      const { container } = render(<Harness />);
+      openThroughOpener();
+      expect(frozen.hasAttribute('inert')).toBe(true);
+      expect(container.hasAttribute('inert')).toBe(true);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+      expect(frozen.getAttribute('inert')).toBe('');
+      expect(pageIsFree(container)).toBe(true);
+    } finally {
+      frozen.remove();
+    }
+  });
+
+  it('keeps the page inert and locked while one dialog closes in the commit that opens the next', () => {
+    /** Two dialogs, where the first one's only action closes it and opens the second. */
+    function Switcher() {
+      const [which, setWhich] = useState<'first' | 'second' | null>('first');
+      return (
+        <>
+          <Dialog open={which === 'first'} title="First" onClose={() => setWhich(null)}>
+            <button type="button" onClick={() => setWhich('second')}>
+              Next
+            </button>
+          </Dialog>
+          <Dialog open={which === 'second'} title="Second" onClose={() => setWhich(null)}>
+            <input aria-label="Note" />
+          </Dialog>
+        </>
+      );
+    }
+    const { container } = render(<Switcher />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    const second = screen.getByRole('dialog', { name: 'Second' });
+    expect(screen.queryByRole('dialog', { name: 'First' })).toBeNull();
+    expect(container.hasAttribute('inert')).toBe(true);
+    expect(second.closest('[inert]')).toBeNull();
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+
+    fireEvent.click(within(second).getByRole('button', { name: 'Close' }));
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(pageIsFree(container)).toBe(true);
+  });
+
+  it('counts its holds per element, so a dialog opened from an open one frees only its own', () => {
+    /** An outer dialog whose body opens an inner dialog, while the outer one stays open. */
+    function Nested() {
+      const [inner, setInner] = useState(false);
+      return (
+        <Dialog open title="Outer" onClose={() => undefined}>
+          <button type="button" onClick={() => setInner(true)}>
+            Details
+          </button>
+          <Dialog open={inner} title="Inner" onClose={() => setInner(false)}>
+            <input aria-label="Note" />
+          </Dialog>
+        </Dialog>
+      );
+    }
+    const { container, unmount } = render(<Nested />);
+    const outer = screen.getByRole('dialog', { name: 'Outer' });
+    const details = screen.getByRole('button', { name: 'Details' });
+    act(() => {
+      details.focus();
+    });
+    fireEvent.click(details);
+
+    const inner = screen.getByRole('dialog', { name: 'Inner' });
+    expect(container.hasAttribute('inert')).toBe(true);
+    expect(outer.closest('[inert]')).not.toBeNull();
+    expect(inner.closest('[inert]')).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Note' }));
+
+    fireEvent.click(within(inner).getByRole('button', { name: 'Close' }));
+
+    expect(screen.queryByRole('dialog', { name: 'Inner' })).toBeNull();
+    expect(outer.closest('[inert]')).toBeNull();
+    expect(container.hasAttribute('inert')).toBe(true);
+    expect(html().classList.contains(SCROLL_LOCK)).toBe(true);
+    expect(document.activeElement).toBe(details);
+
+    unmount();
+
+    expect(pageIsFree(container)).toBe(true);
+  });
+
+  it('keeps the dialog and content its descendants portal interactive while the page is inert', () => {
+    const onChange = vi.fn();
+    const onSave = vi.fn();
+    const { container } = render(
+      <Dialog open title="Record decision" onClose={() => undefined}>
+        <input aria-label="Note" onChange={onChange} />
+        <button type="button" onClick={onSave}>
+          Save
+        </button>
+        <PortalledButton />
+      </Dialog>,
+    );
+    expect(container.hasAttribute('inert')).toBe(true);
+    const note = screen.getByRole('textbox', { name: 'Note' });
+    const save = screen.getByRole('button', { name: 'Save' });
+    const portalled = screen.getByRole('button', { name: 'Portalled' });
+    for (const element of [note, save, portalled, screen.getByRole('button', { name: 'Close' })]) {
+      expect(element.closest('[inert]')).toBeNull();
+    }
+    expect(document.activeElement).toBe(note);
+
+    fireEvent.change(note, { target: { value: 'Paused in Google Ads' } });
+    fireEvent.click(save);
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledTimes(1);
   });
 });
 

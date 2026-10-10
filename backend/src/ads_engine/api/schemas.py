@@ -964,7 +964,8 @@ class Flag(ApiModel):
 
     Attributes:
         code: The flag code.
-        message: The badge's explanatory text, for example "Data as of 2026-10-01 03:10".
+        message: The badge's explanatory text, for example "Data as of Oct 1, 2026, 3:10 AM
+            UTC".
     """
 
     code: FlagCode

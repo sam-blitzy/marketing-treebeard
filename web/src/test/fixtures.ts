@@ -705,7 +705,9 @@ type CatalogueFlag<K extends FlagCode> = Readonly<Flag & { code: K }>;
  *   pair), `search_term_coverage` (74%) and `shared_budget` (the B3 donor).
  * - `stale`: `google.metrics_daily` last succeeded at 2026-10-04 05:31 UTC, more than
  *   `sources.stale_after_hours` (24) before the run, and covers only through 2026-10-03
- *   (`precedence._stale_flag`).
+ *   (`precedence._stale_flag`). The instant reads in the fixture run's `display_timezone`
+ *   (`UTC`), formatted as `formatInstant` formats it (`context.format_instant`); the coverage
+ *   end stays an ISO native date.
  * - `short_window`: a 10-day window, the same text as the short-window banner of
  *   {@link FIXTURE_BANNERS} (`precedence._apply_short_window`).
  * - `creative_floor`: 12 of 96 leads without a creative (12.5%).
@@ -721,7 +723,7 @@ export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.
   simulated: Object.freeze({ code: 'simulated', message: 'Simulated data' } satisfies Flag),
   stale: Object.freeze({
     code: 'stale',
-    message: 'Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+    message: 'Data as of Oct 4, 2026, 5:31 AM UTC; google.metrics_daily covers through 2026-10-03',
   } satisfies Flag),
   incomplete: Object.freeze({
     code: 'incomplete',
@@ -733,7 +735,7 @@ export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.
   } satisfies Flag),
   unverified_discrepancies: Object.freeze({
     code: 'unverified_discrepancies',
-    message: 'Unverified while 1 discrepancies are open',
+    message: 'Unverified while 1 discrepancy is open',
   } satisfies Flag),
   attribution_floor: Object.freeze({
     code: 'attribution_floor',
@@ -3158,9 +3160,24 @@ function eurCohortExtra(): Record<string, unknown> {
   };
 }
 
-/** The portal's orphan-deal share over the assessed deals (`attribution.OrphanDeals`). */
+/**
+ * The portal's orphan-deal share over the assessed deals, as the backend serialises it
+ * (`attribution.OrphanDealShare.to_json`: `assessed`, `orphans`, `not_assessed`, `share` bounded
+ * to six decimals, `unknown`, `label`, `reason`): 0 of 4 assessed deals without a contact, every
+ * deal assessed, so the share is known and its label reads as `attribution._orphan_deals` words
+ * it, "{percent}% ({orphans} of {N} deals without a contact)", the percentage rendered as
+ * `attribution._percent` does (at most one decimal, trailing zeros dropped).
+ */
 function orphanDealsExtra(): Record<string, unknown> {
-  return { share: '0', orphans: 0, assessed: 4, unassessed: 0, display: '0%' };
+  return {
+    assessed: 4,
+    orphans: 0,
+    not_assessed: 0,
+    share: '0',
+    unknown: false,
+    label: '0% (0 of 4 deals without a contact)',
+    reason: null,
+  };
 }
 
 /**

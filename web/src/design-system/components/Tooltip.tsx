@@ -90,12 +90,13 @@ export interface TooltipProps {
    *
    * - An element child receives the tooltip's id in its `aria-describedby`, after the ids it
    *   already carries (each id once). When, after rendering, an element inside it that the
-   *   browser visits with Tab carries that id, as with a raw `<button>`, a `Button`, or a
-   *   `TextField` or `Select` (which forward `aria-describedby` to their control), that element
-   *   is the trigger and no focus stop is added.
+   *   browser visits with Tab carries that id, as with a raw `<button>`, a `Button` (a loading
+   *   one included, which stays focusable as `aria-disabled`), or a `TextField` or `Select`
+   *   (which forward `aria-describedby` to their control), that element is the trigger and no
+   *   focus stop is added.
    * - Otherwise the child is shown inside a focusable `<span class="ds-tooltip__trigger">`
    *   with `tabindex="0"` and the tooltip's id, so the help stays reachable by keyboard. This
-   *   covers a plain element such as a `<span>`, a disabled or loading `Button`, a disabled
+   *   covers a plain element such as a `<span>`, a natively disabled `Button`, a disabled
    *   field, a composite component that drops `aria-describedby` instead of passing it to its
    *   focusable element, and one that passes it to an element Tab never reaches: one that is
    *   not rendered (`display: none` from an inline style or a stylesheet), `hidden`, `inert`,

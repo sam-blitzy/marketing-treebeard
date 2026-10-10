@@ -704,14 +704,18 @@ describe('LoginPage', () => {
     signIn(ADMIN_EMAIL, TYPED_PASSWORD);
 
     await waitFor(() => {
-      expect(controls().submit.disabled).toBe(true);
+      expect(controls().submit.getAttribute('aria-busy')).toBe('true');
     });
     const { email, password, submit } = controls();
-    expect(submit.getAttribute('aria-busy')).toBe('true');
+    // Inert but never natively disabled, so a focused Sign in keeps focus: a second press is
+    // cancelled.
+    expect(submit.getAttribute('aria-disabled')).toBe('true');
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
     // The fields stay editable while the request runs.
     expect(email.disabled).toBe(false);
     expect(password.disabled).toBe(false);
-    // Enter in a field still submits the form; the pending request makes it a no-op.
+    // A submit event reaching the form directly is a no-op too while the request is pending.
     fireEvent.submit(loginForm());
     expect(api.calls).toHaveLength(1);
 

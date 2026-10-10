@@ -139,9 +139,21 @@ async function renderKeywords(section: Section) {
   return renderWithProviders(<KeywordsSection section={section} run={RUN} overlay={OVERLAY} />);
 }
 
+/**
+ * The text a tab presents: its text content without its `aria-hidden` content, which leaves out
+ * the hidden copy of the label that `Tabs` renders to reserve the label's semibold width.
+ */
+function tabText(tab: HTMLElement): string | null {
+  const copy = tab.cloneNode(true) as HTMLElement;
+  for (const hidden of copy.querySelectorAll('[aria-hidden="true"]')) {
+    hidden.remove();
+  }
+  return copy.textContent;
+}
+
 /** The tab names, in display order. */
 function tabNames(): (string | null)[] {
-  return screen.getAllByRole('tab').map((tab) => tab.textContent);
+  return screen.getAllByRole('tab').map(tabText);
 }
 
 /** The name of the selected tab. */
@@ -150,7 +162,8 @@ function selectedTabName(): string | null {
     .getAllByRole('tab')
     .filter((tab) => tab.getAttribute('aria-selected') === 'true');
   expect(selected).toHaveLength(1);
-  return selected[0]?.textContent ?? null;
+  const [tab] = selected;
+  return tab === undefined ? null : tabText(tab);
 }
 
 /** The one visible tab panel. */
@@ -509,11 +522,11 @@ describe('KeywordsSection', () => {
 
       // One tab per API group, in API order, each its API title followed by its card count.
       const tablist = screen.getByRole('tablist', { name: KEYWORD_TABS_LABEL });
-      expect(
-        within(tablist)
-          .getAllByRole('tab')
-          .map((tab) => tab.textContent),
-      ).toEqual(['Block / negative-keyword candidates 2', 'Expansion candidates 1', 'Review 0']);
+      expect(within(tablist).getAllByRole('tab').map(tabText)).toEqual([
+        'Block / negative-keyword candidates 2',
+        'Expansion candidates 1',
+        'Review 0',
+      ]);
       expect(selectedTabName()).toBe('Block / negative-keyword candidates 2');
       expect(within(visiblePanel()).getAllByRole('article')).toHaveLength(2);
 

@@ -310,20 +310,23 @@ function sourceEntry(sources: readonly Source[], source: SourceName): Source {
 /**
  * The reason the simulated-sources banner quotes for a source, read from `GET /sources`.
  *
- * The banner (`analysis/overlay.py`) names the reason of the source's active dataset, and the
- * connection's reason only when the dataset records none. Both are the mode reason when the
- * dataset is built, so on a fresh stack this equals {@link Source.reason}. They part only when
- * a stack that already holds simulated datasets restarts under the other `DATA_MODE`: the
- * connection then reports the new mode reason while the active dataset, which is kept rather
- * than rebuilt, keeps the reason it was built with. Expecting the dataset's reason keeps this
- * check true to what the banner states in both cases.
+ * The banner (`analysis/overlay.py`) names the current mode reason, {@link Source.reason}, while
+ * the connection is simulated, and the reason of the source's active dataset only when the
+ * connection records none or is already back in live mode. Both are the mode reason when the
+ * dataset is built, so on a fresh stack they agree. They part when a stack that already holds
+ * simulated datasets restarts under the other `DATA_MODE`, or when added credentials are
+ * denied: the connection then reports the new mode reason while the active dataset, which is
+ * kept rather than rebuilt, keeps the reason it was built with. Mirroring that precedence keeps
+ * this check true to what the banner states in every case.
  *
  * @param source - The source's entry from `GET /sources`.
  * @returns The reason text.
- * @throws Error when neither the dataset nor the connection records a reason.
+ * @throws Error when neither the connection nor the dataset records a reason.
  */
 function bannerReason(source: Source): string {
-  const reason = visibleText(source.active_dataset?.reason) ?? visibleText(source.reason);
+  const datasetReason = visibleText(source.active_dataset?.reason);
+  const reason =
+    source.mode === 'simulated' ? (visibleText(source.reason) ?? datasetReason) : datasetReason;
   if (reason === null) {
     throw new Error(`${source.source} reports no reason for its simulated mode`);
   }
@@ -598,10 +601,30 @@ function flagWords(text: string): string[] {
 }
 
 /**
+ * `word` with a simple English plural ending reduced (`singular` in `FlagList.tsx`, restated
+ * because this spec imports only types): a final "ies" becomes "y" and any other final "s" is
+ * dropped, except in a word of three characters or fewer or one ending in "ss".
+ *
+ * @param word - One lowercased word, from {@link flagWords}.
+ * @returns The word with its plural ending reduced, for example "discrepancy" for
+ *   "discrepancies".
+ */
+function flagSingular(word: string): string {
+  if (word.length <= 3 || word.endsWith('ss')) {
+    return word;
+  }
+  if (word.endsWith('ies')) {
+    return `${word.slice(0, -3)}y`;
+  }
+  return word.endsWith('s') ? word.slice(0, -1) : word;
+}
+
+/**
  * A flag badge's visible text (`flagText` in `FlagList.tsx`, restated because this spec imports
  * only types): the trimmed message as written when its words contain the code's label
- * ({@link FLAG_LABELS}) in order, else "{label}: {message}"; the label alone for a blank
- * message or the code itself; and, for a code with no label, the message, else the code.
+ * ({@link FLAG_LABELS}) in order, compared with plural endings reduced on both sides
+ * ({@link flagSingular}), else "{label}: {message}"; the label alone for a blank message or the
+ * code itself; and, for a code with no label, the message, else the code.
  *
  * @param flag - One flag, as {@link shownFlags} merges it.
  * @returns The badge text, for example "Simulated data (Google, LinkedIn)".
@@ -616,10 +639,10 @@ function flagText(flag: Flag): string {
   if (blank) {
     return label;
   }
-  const wanted = flagWords(label);
+  const wanted = flagWords(label).map(flagSingular);
   let matched = 0;
   for (const word of flagWords(message)) {
-    if (matched < wanted.length && word === wanted[matched]) {
+    if (matched < wanted.length && flagSingular(word) === wanted[matched]) {
       matched += 1;
     }
   }

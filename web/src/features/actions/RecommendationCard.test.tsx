@@ -221,6 +221,14 @@ function cardButtons(item: Item): HTMLElement[] {
   return within(cardOf(item)).queryAllByRole('button');
 }
 
+/**
+ * Whether a button is inactive as `Button` renders it: natively disabled, or `aria-disabled`
+ * while it loads or keeps the keyboard focus it held when it was disabled.
+ */
+function isInactive(button: HTMLElement): boolean {
+  return button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true';
+}
+
 /** The names of the card's buttons, in document order. */
 function buttonNames(item: Item): string[] {
   return cardButtons(item).map((button) => button.textContent);
@@ -391,7 +399,7 @@ describe('RecommendationCard: header and body', () => {
     ).toEqual([
       'Simulated data',
       FIXTURE_FLAGS.search_term_coverage.message,
-      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+      `Stale: ${FIXTURE_FLAGS.stale.message}`,
     ]);
   });
 
@@ -401,7 +409,7 @@ describe('RecommendationCard: header and body', () => {
       flags: [
         makeFlag('simulated'),
         makeFlag('unverified_discrepancies', {
-          message: 'Unverified while 1 discrepancies are open',
+          message: 'Unverified while 1 discrepancy is open',
         }),
       ],
       current: makeItemOverlay({ flags_now: [makeFlag('stale')] }),
@@ -413,10 +421,7 @@ describe('RecommendationCard: header and body', () => {
       within(flags)
         .getAllByRole('listitem')
         .map((entry) => entry.textContent),
-    ).toEqual([
-      'Simulated data',
-      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
-    ]);
+    ).toEqual(['Simulated data', `Stale: ${FIXTURE_FLAGS.stale.message}`]);
     expect(within(flags).queryByText(/Unverified while/u)).toBeNull();
     expect(within(cardOf(item)).queryByText(/Unverified while/u)).toBeNull();
   });
@@ -426,7 +431,7 @@ describe('RecommendationCard: header and body', () => {
       flags: [
         makeFlag('simulated'),
         makeFlag('unverified_discrepancies', {
-          message: 'Unverified while 1 discrepancies are open',
+          message: 'Unverified while 1 discrepancy is open',
         }),
       ],
       current: makeItemOverlay({
@@ -854,8 +859,11 @@ describe('RecommendationCard: footer actions', () => {
     await waitFor(() => {
       expect(snooze.getAttribute('aria-busy')).toBe('true');
     });
+    // The loading button stays focusable (aria-disabled); the others are natively disabled.
+    expect(snooze.getAttribute('aria-disabled')).toBe('true');
     cardButtons(item).forEach((button) => {
-      expect(button).toHaveProperty('disabled', true);
+      expect(isInactive(button)).toBe(true);
+      expect(button).toHaveProperty('disabled', button !== snooze);
     });
     expect(
       within(cardOf(item))
@@ -1210,8 +1218,10 @@ describe('RecommendationCard: record decision', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
     const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
     expect(opener.getAttribute('aria-busy')).toBe('true');
+    // The loading opener stays focusable (aria-disabled); the others are natively disabled.
     for (const button of cardButtons(item)) {
-      expect(button).toHaveProperty('disabled', true);
+      expect(isInactive(button)).toBe(true);
+      expect(button).toHaveProperty('disabled', button !== opener);
     }
 
     release(apiError(409, 'subject_retired', 'The dataset is no longer active.'));
@@ -1305,11 +1315,14 @@ describe('RecommendationCard: record decision', () => {
     fireEvent.click(within(first).getByRole('button', { name: 'Close' }));
     expect(screen.queryByRole('dialog')).toBeNull();
 
-    // Until the save settles, nothing on the card reopens the dialog or posts again.
+    // Until the save settles, nothing on the card reopens the dialog or posts again. The closed
+    // dialog returned focus to the loading "Record decision", which keeps it (aria-disabled).
     expect(opener.getAttribute('aria-busy')).toBe('true');
+    expect(document.activeElement).toBe(opener);
     expect(within(cardOf(item)).getByText(DECISION_SAVING_MESSAGE)).toBeDefined();
     for (const button of cardButtons(item)) {
-      expect(button).toHaveProperty('disabled', true);
+      expect(isInactive(button)).toBe(true);
+      expect(button).toHaveProperty('disabled', button !== opener);
       fireEvent.click(button);
     }
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -1323,8 +1336,7 @@ describe('RecommendationCard: record decision', () => {
     expect(outcomeRegion().textContent).toBe(
       `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
     );
-    // ...the actions are usable again, and focus, which the closed dialog could not return to
-    // the disabled button, is back on "Record decision".
+    // ...the actions are usable again, and focus is still on "Record decision".
     await waitFor(() => {
       expect(document.activeElement).toBe(opener);
     });
@@ -1397,7 +1409,10 @@ describe('RecommendationCard: record decision', () => {
       });
       fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
       expect(screen.queryByRole('dialog')).toBeNull();
-      expect(opener).toHaveProperty('disabled', true);
+      // The closed dialog returned focus to the loading opener, which keeps it.
+      expect(opener.getAttribute('aria-disabled')).toBe('true');
+      expect(opener).toHaveProperty('disabled', false);
+      expect(document.activeElement).toBe(opener);
       // Outside a provider the card's own polite line says the save is still running.
       expect(within(cardOf(item)).getByRole('status').textContent).toBe(DECISION_SAVING_MESSAGE);
 
@@ -2159,8 +2174,14 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
     const line = await within(cardOf(item)).findByText(FEEDBACK_STATUS_MESSAGES.dismiss);
     expect(line.getAttribute('role')).toBeNull();
     expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', item));
+    // With no other card, heading or main to move to, focus stays on the pressed Dismiss, which
+    // is aria-disabled until focus leaves it; the other actions are natively disabled.
+    const dismiss = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss });
+    expect(document.activeElement).toBe(dismiss);
+    expect(dismiss.getAttribute('aria-disabled')).toBe('true');
     for (const button of cardButtons(item)) {
-      expect(button).toHaveProperty('disabled', true);
+      expect(isInactive(button)).toBe(true);
+      expect(button).toHaveProperty('disabled', button !== dismiss);
     }
   });
 });

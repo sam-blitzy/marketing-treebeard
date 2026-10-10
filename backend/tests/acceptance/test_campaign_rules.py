@@ -781,13 +781,18 @@ class PersistedGoogle:
     make_world: WorldFactory
     source: DecisionSource = "google"
 
-    async def sync(self, offset_hours: int, *, world_of: str | None = None) -> JobResult:
+    async def sync(
+        self, offset_hours: int, *, world_of: str | None = None, cut_short: bool = False
+    ) -> JobResult:
         """Run one entity sync of the source at ``offset_hours``.
 
         Args:
             offset_hours: The sync instant, after the anchor's UTC midnight.
             world_of: Serve this scenario's world instead (a twin with a ``Fault``); its
                 spec differs from the bootstrap world's in that input only.
+            cut_short: Whether the served world's transient ``Fault`` cuts the sync short.
+                The job then ends ``failed`` with the error's reason, its read recorded as
+                a cut-short ``incomplete`` success all the same; otherwise it succeeds.
         """
         self.clock.move(offset_hours)
         controller = self.controller
@@ -802,7 +807,18 @@ class PersistedGoogle:
             now=self.clock.at,
         )
         (result,) = report.results
-        assert result.status == "succeeded", result.to_json()
+        if not cut_short:
+            assert result.status == "succeeded", result.to_json()
+            return result
+        assert (result.status, result.disposition, result.completeness) == (
+            "failed",
+            "stale",
+            "incomplete",
+        ), result.to_json()
+        assert result.error is not None
+        assert all(
+            outcome.succeeded and outcome.cut_short for outcome in result.freshness.values()
+        ), result.to_json()
         return result
 
     async def resolve(
@@ -1018,7 +1034,8 @@ async def test_persisted_detection_matches_the_catalogue(
     google = await persist(name, bootstrap_at, world_of=bootstrap_world)
     assert await google.discrepancies(include_resolved=True) == []
     for offset in sync_at:
-        await google.sync(offset, world_of=name if bootstrap_world is not None else None)
+        faulted = bootstrap_world is not None
+        await google.sync(offset, world_of=name if faulted else None, cut_short=faulted)
     stored = await google.discrepancies()
     scenario = SCENARIOS[name]
     values = scenario.expect.values
@@ -1417,7 +1434,7 @@ async def test_missing_is_raised_only_after_a_complete_enumeration(
     """C0 missing: a deferred Q-G2 keyset page or a failed Q-G2b chunk raises no missing and
     leaves google.entities incomplete; the next complete enumeration raises it."""
     google = await persist("c0.missing.fires", -36)
-    result = await google.sync(NOW_OFFSET, world_of=faulted)
+    result = await google.sync(NOW_OFFSET, world_of=faulted, cut_short=True)
     assert result.completeness == "incomplete"
     row = await google.freshness("google.entities")
     assert row.completeness == SCENARIOS[faulted].expect.values["google.entities"] == "incomplete"
@@ -1469,19 +1486,22 @@ async def test_linkedin_search_cut_short_raises_no_missing_until_a_complete_sear
 ) -> None:
     """C0 missing (LinkedIn safe absence): an all-status campaign search cut short by a
     transient error raises no missing, leaves linkedin.entities incomplete with the
-    interruption as its reason and keeps the previous snapshot; the next complete search
-    raises missing on the absent tracked campaign."""
+    interruption as its reason, keeps the previous snapshot and fails the job with that
+    reason; the next complete search raises missing on the absent tracked campaign."""
     linkedin, brand = await _linkedin_baseline(persist, LINKEDIN_CUT_SHORT)
     baseline = brand.latest_snapshot
     assert baseline is not None
     assert [row.id for row in await linkedin.campaign_snapshots_at(-36)] == [baseline.id]
-    result = await linkedin.sync(NOW_OFFSET, world_of=LINKEDIN_CUT_SHORT)
-    # The interrupted listing is recorded as an incomplete success of the job, not a failure.
+    result = await linkedin.sync(NOW_OFFSET, world_of=LINKEDIN_CUT_SHORT, cut_short=True)
+    # The interrupted listing is recorded as an incomplete success of the dataset, while the
+    # job fails with the listing's error.
     assert (result.source, result.status, result.completeness) == (
         "linkedin",
-        "succeeded",
+        "failed",
         "incomplete",
     )
+    assert result.error is not None
+    assert result.error.startswith("linkedin ad_campaigns: SERVICE_UNAVAILABLE")
     row = await linkedin.freshness("linkedin.entities")
     expected = linkedin.scenario.expect.values["linkedin.entities"]
     assert row.completeness == expected == "incomplete"

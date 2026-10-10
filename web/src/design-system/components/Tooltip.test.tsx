@@ -159,10 +159,23 @@ describe('Tooltip structure and naming', () => {
     expect(trigger.hasAttribute('tabindex')).toBe(false);
   });
 
+  it('describes a loading Button directly, because it stays focusable while loading', () => {
+    render(
+      <Tooltip content="Requests a sync of every dataset.">
+        <Button loading>Sync now</Button>
+      </Tooltip>,
+    );
+    const { trigger, bubble } = parts();
+
+    const button = screen.getByRole('button', { name: 'Sync now' });
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(button.getAttribute('aria-describedby')).toBe(bubble.id);
+    expect(isFocusStop(trigger, bubble)).toBe(false);
+  });
+
   it.each<[string, ReactElement]>([
     ['a plain element', <span key="plain">Window</span>],
     ['a disabled Button', <Button key="disabled" disabled>Sync now</Button>],
-    ['a loading Button', <Button key="loading" loading>Sync now</Button>],
     [
       'a button hidden with display none',
       <button key="none" type="button" style={{ display: 'none' }}>

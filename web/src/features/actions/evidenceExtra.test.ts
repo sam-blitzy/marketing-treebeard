@@ -64,10 +64,12 @@ import {
   sharedMembers,
   unallocatedAmount,
   variants,
+  whitePaperAlreadyBefore,
   whitePaperCells,
   whitePaperCostNotes,
   whitePaperMqlLabel,
   whitePaperMqlMetricLabel,
+  whitePaperOrphanDealLabel,
 } from './evidenceExtra';
 
 // ---------------------------------------------------------------------------------------------
@@ -1965,6 +1967,108 @@ describe('whitePaperMqlMetricLabel', () => {
     expect(whitePaperMqlMetricLabel(withExtra(null, [metric('ql', 2)]))).toBeNull();
     expect(whitePaperMqlMetricLabel(pageItem(FIXTURE_ITEM_IDS.k1))).toBeNull();
     expect(whitePaperMqlMetricLabel(null)).toBeNull();
+  });
+});
+
+describe('whitePaperAlreadyBefore', () => {
+  const none = { mql: null, ql: null, meetings: null, deals: null };
+
+  it('reads what the causal check excluded, known zeros kept as 0', () => {
+    expect(whitePaperAlreadyBefore(pageItem(FIXTURE_ITEM_IDS.wEur))).toEqual({
+      mql: 1,
+      ql: 0,
+      meetings: 0,
+      deals: 0,
+    });
+    const evidence = withExtra({ already_before: { mql: 2, ql: 1, meetings: 1, deals: 3 } });
+    expect(whitePaperAlreadyBefore(evidence)).toEqual({ mql: 2, ql: 1, meetings: 1, deals: 3 });
+    expect(whitePaperAlreadyBefore({ evidence })).toEqual(whitePaperAlreadyBefore(evidence));
+    // A whole number sent as a numeric string still reads.
+    expect(whitePaperAlreadyBefore(withExtra({ already_before: { mql: '4' } })).mql).toBe(4);
+  });
+
+  it('reads a missing, fractional or non-numeric count as null, never 0', () => {
+    expect(
+      whitePaperAlreadyBefore(
+        withExtra({ already_before: { mql: null, ql: 1.5, meetings: 'two', deals: true } }),
+      ),
+    ).toEqual(none);
+    expect(whitePaperAlreadyBefore(withExtra({ already_before: { ql: 0 } }))).toEqual({
+      ...none,
+      ql: 0,
+    });
+    expect(whitePaperAlreadyBefore(withExtra({ already_before: [1, 0, 0, 0] }))).toEqual(none);
+    expect(whitePaperAlreadyBefore(withExtra({ already_before: 3 }))).toEqual(none);
+    expect(whitePaperAlreadyBefore(withExtra({}))).toEqual(none);
+    expect(whitePaperAlreadyBefore(withExtra(null))).toEqual(none);
+    expect(whitePaperAlreadyBefore(pageItem(FIXTURE_ITEM_IDS.b1))).toEqual(none);
+    expect(whitePaperAlreadyBefore(null)).toEqual(none);
+    expect(whitePaperAlreadyBefore(undefined)).toEqual(none);
+  });
+
+  it("reads a count as null while the asset's own metric is unavailable", () => {
+    // The fixture's USD row has an unavailable MQL count; the backend still records 0 before.
+    expect(whitePaperAlreadyBefore(pageItem(FIXTURE_ITEM_IDS.wUsd))).toEqual({
+      mql: null,
+      ql: 0,
+      meetings: 0,
+      deals: 0,
+    });
+    const before = { already_before: { mql: 0, ql: 0, meetings: 0, deals: 0 } };
+    const unavailable = { unavailable: true };
+    expect(
+      whitePaperAlreadyBefore(
+        withExtra(before, [
+          metric('mql', 3),
+          metric('ql', null, unavailable),
+          metric('meetings_booked', null),
+          metric('deals_after_touch', 2),
+        ]),
+      ),
+    ).toEqual({ mql: 0, ql: null, meetings: null, deals: 0 });
+    expect(
+      whitePaperAlreadyBefore(withExtra(before, [metric('deals_after_touch', 1, unavailable)])),
+    ).toEqual({ mql: 0, ql: 0, meetings: 0, deals: null });
+  });
+});
+
+describe('whitePaperOrphanDealLabel', () => {
+  it("reads the orphan-deal share's label verbatim, the unknown label included", () => {
+    const label = '5.7% (2 of 35 deals without a contact)';
+    const share = { assessed: 35, orphans: 2, not_assessed: 0, share: '0.057143', unknown: false };
+    const known = withExtra({ orphan_deals: { ...share, label, reason: null } });
+    expect(whitePaperOrphanDealLabel(known)).toBe(label);
+    expect(whitePaperOrphanDealLabel({ evidence: known })).toBe(label);
+    expect(
+      whitePaperOrphanDealLabel(
+        withExtra({
+          orphan_deals: {
+            assessed: 30,
+            orphans: 1,
+            not_assessed: 3,
+            share: null,
+            unknown: true,
+            label: 'unknown (3 deals not assessed)',
+            reason: '3 deals not assessed',
+          },
+        }),
+      ),
+    ).toBe('unknown (3 deals not assessed)');
+    // The fixture page's white papers carry the share as `OrphanDealShare.to_json` writes it.
+    expect(whitePaperOrphanDealLabel(pageItem(FIXTURE_ITEM_IDS.wEur))).toBe(
+      '0% (0 of 4 deals without a contact)',
+    );
+  });
+
+  it('returns null for an absent, blank or non-string label', () => {
+    expect(whitePaperOrphanDealLabel(withExtra({ orphan_deals: { label: '  ' } }))).toBeNull();
+    expect(whitePaperOrphanDealLabel(withExtra({ orphan_deals: { label: 0.057 } }))).toBeNull();
+    expect(whitePaperOrphanDealLabel(withExtra({ orphan_deals: { share: '0.05' } }))).toBeNull();
+    expect(whitePaperOrphanDealLabel(withExtra({ orphan_deals: '5.7%' }))).toBeNull();
+    expect(whitePaperOrphanDealLabel(withExtra({}))).toBeNull();
+    // A fixture-page item that is no white paper carries no orphan-deal share.
+    expect(whitePaperOrphanDealLabel(pageItem(FIXTURE_ITEM_IDS.b1))).toBeNull();
+    expect(whitePaperOrphanDealLabel(null)).toBeNull();
   });
 });
 

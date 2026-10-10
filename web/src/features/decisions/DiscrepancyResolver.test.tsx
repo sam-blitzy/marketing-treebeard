@@ -276,8 +276,8 @@ describe('DiscrepancyResolver list', () => {
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
     const region = listRegion();
     const retry = await within(region).findByRole('button', { name: 'Retry' });
-    // A browser drops focus to the body when the focused button turns disabled while loading;
-    // jsdom keeps it, so the click is made with focus already on the body.
+    // The click is made with focus on the body, as when focus is lost while the read runs (a
+    // loading Button itself keeps focus).
     expect(document.activeElement).toBe(document.body);
     fireEvent.click(retry);
 
@@ -354,7 +354,7 @@ describe('DiscrepancyResolver list', () => {
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
     const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
-    // As in a browser, where the loading (disabled) button drops focus to the body.
+    // The click is made with focus on the body, as when focus is lost while the page loads.
     expect(document.activeElement).toBe(document.body);
     fireEvent.click(buttonNamed(SHOW_MORE));
 
@@ -1444,7 +1444,9 @@ describe('DiscrepancyResolution posting', () => {
     await waitFor(() => {
       expect(buttonNamed('Platform is correct').getAttribute('aria-busy')).toBe('true');
     });
-    expect(buttonNamed('Platform is correct').disabled).toBe(true);
+    // The loading button is inert but stays focusable (aria-disabled); the other is disabled.
+    expect(buttonNamed('Platform is correct').getAttribute('aria-disabled')).toBe('true');
+    expect(buttonNamed('Platform is correct').disabled).toBe(false);
     expect(buttonNamed('Decision is correct').disabled).toBe(true);
     expect(outcomeRegion().textContent).toBe('');
 
@@ -1919,9 +1921,12 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     fireEvent.click(buttonNamed('Close', first));
     expect(screen.queryByRole('dialog')).toBeNull();
 
-    // Until the save settles, no control reopens the dialog or posts another resolution.
+    // Until the save settles, no control reopens the dialog or posts another resolution. The
+    // closed dialog returned focus to the loading opener, which keeps it (aria-disabled).
     expect(opener.getAttribute('aria-busy')).toBe('true');
-    expect(opener.disabled).toBe(true);
+    expect(opener.getAttribute('aria-disabled')).toBe('true');
+    expect(opener.disabled).toBe(false);
+    expect(document.activeElement).toBe(opener);
     expect(buttonNamed('Adopt platform state').disabled).toBe(true);
     fireEvent.click(buttonNamed('Adopt platform state'));
     fireEvent.click(opener);
@@ -1936,8 +1941,7 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     });
     expect(onResolved).toHaveBeenCalledWith(updated);
     expect(outcomeRegion().textContent).toBe('Waiting for the platform to match the decision');
-    // ...the controls are usable again, and focus, which the closed dialog could not return to
-    // the disabled button, is back on "Record intended state".
+    // ...the controls are usable again, and focus is still on "Record intended state".
     await waitFor(() => {
       expect(document.activeElement).toBe(opener);
     });

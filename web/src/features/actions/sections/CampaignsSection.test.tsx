@@ -2002,7 +2002,7 @@ describe('data-state flags on campaign cards', () => {
 
     const c1Flags = listLines(card('Pause'), 'Flags');
     expect(c1Flags).toContain('Simulated data (Google)');
-    expect(c1Flags).toContain('Unverified while 1 discrepancies are open');
+    expect(c1Flags).toContain('Unverified while 1 discrepancy is open');
     const c3bFlags = listLines(card("Create ad group or campaign for 'data warehouse'"), 'Flags');
     expect(c3bFlags).toContain(
       'Incomplete: google.search_terms (result limit reached at finest partition)',

@@ -82,6 +82,7 @@ import type {
   Discrepancy,
   DiscrepancyKind,
   DiscrepancyValue,
+  EntityView,
   Evidence,
   EvidenceWindow,
   FeedbackKind,
@@ -269,9 +270,22 @@ const WINDOW_CHIP_PATTERN = '^\\S+ \u2013 \\S+ \u00b7 ';
 
 // The white-paper tables, as `src/features/actions/sections/WhitePapersSection.tsx` labels them.
 const PER_CREATIVE_PREFIX = 'Per creative: ';
+/** The name of an asset row's notes list in its details, before the asset name. */
+const ROW_NOTES_PREFIX = 'Notes on ';
 const NO_CREATIVE_ROWS = 'No per-creative rows recorded for this white paper';
 const UNKNOWN_CREATIVE_LABEL = 'unknown creative';
 const REPLACED_DATA_LABEL = 'Computed from replaced data';
+/** A held row's hold reason when it records none (`HELD_REASON_FALLBACK`). */
+const HELD_REASON_FALLBACK = 'Resolve discrepancy first';
+/**
+ * The text of a held row's links to the discrepancies that hold it, as
+ * `src/features/actions/BlockingDiscrepancies.tsx` (a React module this spec cannot import)
+ * labels them: "View open discrepancies" when no blocker can be named, otherwise one or more
+ * "View blocking discrepancy: {subject} ({kind})" or "View blocking discrepancy {id} ({kind})".
+ * Which blockers are named depends on the run's C0 cards and the live discrepancy list the
+ * browser read, so the spec checks the labels' form, not each subject.
+ */
+const BLOCKER_LINKS_PATTERN = '(?:View open discrepancies|View blocking discrepancy[: ].+)';
 const MQL_PLAIN = 'MQL';
 const TOGGLE_HEADER = 'Details';
 
@@ -545,10 +559,28 @@ function flagWords(text: string): string[] {
 }
 
 /**
+ * `word` with a simple English plural ending reduced (`singular` in `FlagList.tsx`, restated for
+ * the same reason as {@link LIVE_ONLY_FLAG_CODES}): a final "ies" becomes "y" and any other
+ * final "s" is dropped, except in a word of three characters or fewer or one ending in "ss".
+ */
+function flagSingular(word: string): string {
+  if (word.length <= 3 || word.endsWith('ss')) {
+    return word;
+  }
+  if (word.endsWith('ies')) {
+    return `${word.slice(0, -3)}y`;
+  }
+  return word.endsWith('s') ? word.slice(0, -1) : word;
+}
+
+/**
  * A flag badge's visible text (`flagText` in `FlagList.tsx`, restated for the same reason as
  * {@link LIVE_ONLY_FLAG_CODES}): the trimmed message as written when its words contain the
- * code's label ({@link FLAG_LABELS}) in order, else "{label}: {message}"; the label alone for a
- * blank message or the code itself; and, for a code with no label, the message, else the code.
+ * code's label ({@link FLAG_LABELS}) in order, compared with plural endings reduced on both
+ * sides ({@link flagSingular}), else "{label}: {message}"; the label alone for a blank message
+ * or the code itself; and, for a code with no label, the message, else the code. So "Unverified
+ * while 1 discrepancy is open" is shown as written, as "Unverified while 3 discrepancies are
+ * open" is.
  *
  * @param flag - One flag, as {@link shownFlags} merges it.
  * @returns The badge text, for example "Short window: Window of 10 days is below the 14-day
@@ -564,10 +596,10 @@ function flagText(flag: Flag): string {
   if (blank) {
     return label;
   }
-  const wanted = flagWords(label);
+  const wanted = flagWords(label).map(flagSingular);
   let matched = 0;
   for (const word of flagWords(message)) {
-    if (matched < wanted.length && word === wanted[matched]) {
+    if (matched < wanted.length && flagSingular(word) === wanted[matched]) {
       matched += 1;
     }
   }
@@ -749,9 +781,17 @@ interface RenderedCard extends RenderedEvidence {
   elementId: string;
 }
 
-/** A white-paper row's expanded detail: its per-creative table, then its evidence. */
+/** A labelled list inside a white-paper row's detail: its name and its entries. */
+interface RenderedList {
+  label: string;
+  entries: string[];
+}
+
+/** A white-paper row's expanded detail: its per-creative table, its evidence and its notes. */
 interface RenderedDetail extends RenderedEvidence {
   creatives: RenderedTable[];
+  /** Every list inside it whose name starts "Notes on " (one at most is expected). */
+  notes: RenderedList[];
 }
 
 /** One body row of a rendered `DataTable`. */
@@ -782,6 +822,7 @@ interface SnapshotLabels {
   evidenceCaption: string;
   evidenceCaptionPrefix: string;
   perCreativePrefix: string;
+  rowNotesPrefix: string;
   flagsLabel: string;
   chipPattern: string;
 }
@@ -790,6 +831,7 @@ const SNAPSHOT_LABELS: SnapshotLabels = {
   evidenceCaption: EVIDENCE_CAPTION,
   evidenceCaptionPrefix: EVIDENCE_FOR_PREFIX,
   perCreativePrefix: PER_CREATIVE_PREFIX,
+  rowNotesPrefix: ROW_NOTES_PREFIX,
   flagsLabel: FLAGS_LABEL,
   chipPattern: WINDOW_CHIP_PATTERN,
 };
@@ -798,8 +840,8 @@ const SNAPSHOT_LABELS: SnapshotLabels = {
  * Reads, inside the page, what each element shows, so a section of any size is compared in
  * one round trip: a card's evidence blocks, window chips and flag lists, or a table's caption,
  * headers and body rows, each with its expanded white-paper detail (per-creative table,
- * evidence, chip and flags). Texts are `textContent`, trimmed. It runs through `evaluateAll`,
- * so it reads only its arguments and the DOM.
+ * evidence, chip, flags and "Notes on {asset}" list). Texts are `textContent`, trimmed. It runs
+ * through `evaluateAll`, so it reads only its arguments and the DOM.
  *
  * @param roots - the `article` cards or `table` elements to read
  * @param labels - the UI labels the parts are found by
@@ -897,6 +939,14 @@ function snapshotRendered(roots: Element[], labels: SnapshotLabels): RenderedRoo
                   creatives: Array.from(detailCell.querySelectorAll('table'))
                     .filter((inner) => text(inner.caption).startsWith(labels.perCreativePrefix))
                     .map((inner) => readTable(inner, false)),
+                  notes: Array.from(detailCell.querySelectorAll('ul[aria-label]'))
+                    .filter((list) =>
+                      (list.getAttribute('aria-label') ?? '').startsWith(labels.rowNotesPrefix),
+                    )
+                    .map((list) => ({
+                      label: list.getAttribute('aria-label') ?? '',
+                      entries: Array.from(list.children).map(text),
+                    })),
                 },
         };
       }),
@@ -1483,6 +1533,60 @@ function assetBadge(item: Item): string | null {
   return fallback === null ? null : flagText({ code: 'simulated', message: fallback });
 }
 
+/**
+ * The flag codes whose badges an asset row's name carries after its simulated-data badge
+ * (`FLOOR_FLAG_CODES` in `WhitePapersSection.tsx`).
+ */
+const FLOOR_FLAG_CODES: ReadonlySet<FlagCode> = new Set<FlagCode>([
+  'attribution_floor',
+  'creative_floor',
+  'deal_floor',
+  'unknown_crm_evidence',
+]);
+
+/**
+ * The floor badges an asset row's name carries after its simulated-data badge (`floorFlags`):
+ * the badge text ({@link flagText}) of each of its shown floor flags ({@link shownFlags}), in
+ * their shown order, as its flags row shows them, for example "Unknown CRM evidence: Floor: CRM
+ * evidence unknown for 10% of matched contacts (2 of 20)".
+ */
+function assetFloorBadges(item: Item): string[] {
+  return shownFlags(item)
+    .filter((flag) => FLOOR_FLAG_CODES.has(flag.code))
+    .map((flag) => flagText(flag));
+}
+
+/**
+ * An entity's identity (`entityKey` in `WhitePapersSection.tsx`): source, type and id as one
+ * JSON array, or `null` without an id.
+ */
+function entityKey(entity: EntityView): string | null {
+  if (typeof entity.id !== 'string' || entity.id.trim() === '') {
+    return null;
+  }
+  return JSON.stringify([entity.source, entity.type, entity.id]);
+}
+
+/**
+ * The skipped-stage notes a rendered white-paper row lists first in its details' "Notes on
+ * {asset}" (`placeSkippedFindings`, `assetNotes`): the message of each `skipped_stage` finding of
+ * the section about the row's entity, in API order, or its code when the message is blank.
+ */
+function skippedStageNotes(section: Section, item: Item): string[] {
+  const key = entityKey(item.entity);
+  if (key === null) {
+    return [];
+  }
+  return section.findings.flatMap((finding) =>
+    finding.code === 'skipped_stage' &&
+    finding.entity !== null &&
+    entityKey(finding.entity) === key
+      ? [finding.message.trim() === '' ? finding.code : finding.message.trim()]
+      : [],
+  );
+}
+
+
 /** The column headers of an asset table (`withToggle`) or a per-creative table. */
 function whitePaperHeaders(first: string, mql: string, withToggle: boolean): string[] {
   const metrics = WHITE_PAPER_METRIC_KEYS.map((key) =>
@@ -1505,18 +1609,48 @@ function expectHeaders(rendered: readonly string[], expected: string[], mql: str
   expect(rendered, 'the white-paper columns, in the order AAP 0.5.5 fixes').toEqual(expected);
 }
 
-/** An asset row's cells: name and badge, the nine metric cells, then the action (`AssetTable`). */
-function assetRowCells(item: Item): string[] {
+/**
+ * The hold reason a row a discrepancy holds shows in its Action cell (`discrepancyHoldReason`):
+ * the live reason, else the recorded one, else {@link HELD_REASON_FALLBACK}; `null` for a row no
+ * discrepancy holds, a historical row included, whose badge states its hold instead.
+ */
+function discrepancyHoldReason(item: Item): string | null {
+  if (item.current.historical || !isHeld(item)) {
+    return null;
+  }
+  const reason = [item.current.held_reason_now, item.held_reason]
+    .map((text) => text?.trim() ?? '')
+    .find((text) => text !== '');
+  return reason ?? HELD_REASON_FALLBACK;
+}
+
+/**
+ * An asset row's cells (`AssetTable`): the Asset cell (name, simulated-data badge, then floor
+ * badges, {@link assetFloorBadges}; the row's skipped-stage notes are in its details, not here),
+ * the nine metric cells, then the action.
+ * A historical row's action is followed by its replaced-data badge; a held row's by its hold
+ * reason and its blocker links, whose labels are checked by form ({@link BLOCKER_LINKS_PATTERN}).
+ */
+function assetRowCells(item: Item): (string | ReturnType<typeof expect.stringMatching>)[] {
   const cells = whitePaperCells(item);
   const notes = whitePaperCostNotes(item);
   const badge = assetBadge(item) ?? '';
+  const floors = assetFloorBadges(item).join('');
   const action = item.current.historical ? `${item.action}${REPLACED_DATA_LABEL}` : item.action;
+  const heldReason = discrepancyHoldReason(item);
   return [
-    `${assetName(item)}${badge}`.trim(),
+    `${assetName(item)}${badge}${floors}`.trim(),
     ...WHITE_PAPER_METRIC_KEYS.map((key) =>
       whitePaperCellText(cells[key], WHITE_PAPER_COSTS.has(key) ? notes[key] : null).trim(),
     ),
-    action.trim(),
+    heldReason === null
+      ? action.trim()
+      : expect.stringMatching(
+          new RegExp(
+            `^${escapeRegExp(`${item.action.trimStart()}${heldReason}`)}${BLOCKER_LINKS_PATTERN}$`,
+            'su',
+          ),
+        ),
   ];
 }
 
@@ -1625,8 +1759,9 @@ function expectWhitePaperRendering(
  * Checks every white-paper row against the API page `expected` (AAP 0.5.5 White papers): with
  * every held disclosure, batch and row opened, the section shows one table per cohort and row
  * kind, in order; each table its column headers and exactly its rows, in API order; each row its
- * cells; and each row's detail its per-creative rows and its evidence, chip and flags
- * ({@link expectItemEvidence}).
+ * cells; and each row's detail its per-creative rows, its evidence, chip and flags
+ * ({@link expectItemEvidence}), and its skipped-stage notes first in its "Notes on {asset}"
+ * ({@link skippedStageNotes}).
  *
  * @returns the rendered asset tables
  */
@@ -1673,6 +1808,16 @@ async function expectWhitePaperRows(
       }
       expectWhitePaperRendering(row.cells, creatives.rows, item, where);
       expect(row.cells, `${where}: its cells`).toEqual(assetRowCells(item));
+      const skipped = skippedStageNotes(section, item);
+      const notes = row.detail.notes;
+      expect(
+        notes.map((list) => list.label),
+        `${where} shows at most one notes list, its own`,
+      ).toEqual(notes.length === 0 ? [] : [`${ROW_NOTES_PREFIX}${name}`]);
+      expect(
+        notes[0]?.entries.slice(0, skipped.length) ?? [],
+        `${where}: its skipped-stage notes, verbatim and first among its notes`,
+      ).toEqual(skipped);
       expect(creatives.caption, `${where}: its per-creative caption`).toBe(
         `${PER_CREATIVE_PREFIX}${name}`,
       );

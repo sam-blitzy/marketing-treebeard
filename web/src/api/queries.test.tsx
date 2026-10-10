@@ -2382,16 +2382,44 @@ const DECISION_STATE_ROOTS: readonly QueryKey[] = [
   queryKeys.decisionsAll,
 ];
 
-/** Cached variants under those roots, every one of which the prefix match must reach. */
-const DECISION_STATE_KEYS: readonly QueryKey[] = [
+/**
+ * Cached recommendations pages, both under `recommendationsAll`. Seeded without an observer,
+ * they are inactive, so a decision write or a resolution removes them rather than
+ * invalidating them.
+ */
+const RECOMMENDATIONS_KEYS: readonly QueryKey[] = [
   queryKeys.recommendations('default'),
   queryKeys.recommendations(CUSTOM_RUN_ID),
+];
+
+/** Cached list variants under the other two roots, each of which the prefix match must reach. */
+const DECISION_LIST_KEYS: readonly QueryKey[] = [
   queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
   queryKeys.discrepancies(['resolved']),
   queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES),
   queryKeys.decisions({}),
   queryKeys.decisions({ subject_type: 'campaign', subject_id: CAMPAIGN_ID }),
 ];
+
+/** Every cached variant under the three roots a decision write or a resolution refreshes. */
+const DECISION_STATE_KEYS: readonly QueryKey[] = [...RECOMMENDATIONS_KEYS, ...DECISION_LIST_KEYS];
+
+/** The one removal a decision write or a resolution makes: the pages no screen shows. */
+const INACTIVE_RECOMMENDATIONS = {
+  queryKey: queryKeys.recommendationsAll,
+  type: 'inactive',
+} as const;
+
+/**
+ * Spies on `queryClient.removeQueries`, still calling through, so a test can assert the exact
+ * filters a mutation removes by.
+ *
+ * @param client - The query client.
+ * @returns The spy.
+ */
+function spyOnRemove(client: QueryClient) {
+  return vi.spyOn(client, 'removeQueries');
+}
 
 /** Keys no decision, resolution or feedback write touches. */
 const UNRELATED_KEYS: readonly QueryKey[] = [
@@ -2516,9 +2544,15 @@ describe('useLogout', () => {
 describe('useCreateRun', () => {
   const body = { window_start: '2026-07-08', window_end: '2026-10-05' };
 
-  it('posts the window, seeds runs.byId and invalidates only the custom-run lists', async () => {
+  it('posts the window, seeds the run, caches its page, invalidates custom lists', async () => {
     const run = runPayload(CUSTOM_RUN_ID, 'custom');
-    const mock = stubFetch(routes({ 'POST /api/v1/runs': () => json(201, run) }));
+    const page = pagePayload(CUSTOM_RUN_ID, 'custom');
+    const mock = stubFetch(
+      routes({
+        'POST /api/v1/runs': () => json(201, run),
+        'GET /api/v1/recommendations': () => json(200, page),
+      }),
+    );
     const { result, queryClient } = renderWithWrapper(() => useCreateRun());
     const untouched = [
       queryKeys.runs.latest,
@@ -2528,11 +2562,14 @@ describe('useCreateRun', () => {
     seed(queryClient, [queryKeys.runs.custom(20), queryKeys.runs.custom(5), ...untouched]);
     const invalidate = spyOnInvalidate(queryClient);
     let resolved: unknown;
+    let pageOnResolve: unknown;
     await act(async () => {
       resolved = await result.current.mutateAsync(body);
+      pageOnResolve = queryClient.getQueryData(queryKeys.recommendations(run.id));
     });
 
     expect(resolved).toEqual(run);
+    expect(pageOnResolve).toEqual(page);
     expect(queryClient.getQueryData(queryKeys.runs.byId(run.id))).toEqual(run);
     expect(invalidatedKeys(invalidate)).toEqual([queryKeys.runs.customAll]);
     expect(invalidated(queryClient, queryKeys.runs.custom(20))).toBe(true);
@@ -2540,15 +2577,97 @@ describe('useCreateRun', () => {
     for (const key of untouched) {
       expect(invalidated(queryClient, key)).toBe(false);
     }
-    const request = onlyRequest(mock);
-    expect(request.method).toBe('POST');
-    expect(request.parsed.pathname).toBe('/api/v1/runs');
-    expect(request.headers).toEqual(JSON_MUTATION_HEADERS);
-    expect(request.body).toBe(JSON.stringify(body));
+    const [post, read, ...rest] = sent(mock);
+    expect(rest).toEqual([]);
+    expect(post?.method).toBe('POST');
+    expect(post?.parsed.pathname).toBe('/api/v1/runs');
+    expect(post?.headers).toEqual(JSON_MUTATION_HEADERS);
+    expect(post?.body).toBe(JSON.stringify(body));
+    expect(read?.method).toBe('GET');
+    expect(read?.parsed.pathname).toBe('/api/v1/recommendations');
+    expect(read === undefined ? [] : params(read)).toEqual([['run_id', String(run.id)]]);
+    expect(read?.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it('surfaces 409 run_in_progress as an ApiError and seeds or invalidates nothing', async () => {
-    stubFetch(() => json(409, envelope('run_in_progress', 'An analysis run is in progress')));
+  it('stays pending until the new run’s page is cached, and that page never polls', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const run = runPayload(CUSTOM_RUN_ID, 'custom');
+    const page = pagePayload(CUSTOM_RUN_ID, 'custom');
+    const pageRead = deferred<Response>();
+    const mock = stubFetch(
+      sequence(
+        () => json(201, run),
+        () => pageRead.promise,
+      ),
+    );
+    const { result, queryClient } = renderWithWrapper(() => useCreateRun());
+    let settled = false;
+    let pageOnResolve: unknown;
+    const creating = result.current
+      .mutateAsync(body)
+      .then((created) => {
+        pageOnResolve = queryClient.getQueryData(queryKeys.recommendations(created.id));
+        return created;
+      })
+      .finally(() => {
+        settled = true;
+      });
+    await waitFor(() =>
+      expect(sentPaths(mock)).toEqual(['POST /api/v1/runs', 'GET /api/v1/recommendations']),
+    );
+    await nextMacrotask();
+
+    // The POST has answered and the page read is held: the mutation must still be pending.
+    expect(settled).toBe(false);
+    expect(result.current.isPending).toBe(true);
+
+    pageRead.resolve(json(200, page));
+    let resolved: unknown;
+    await act(async () => {
+      resolved = await creating;
+    });
+    expect(resolved).toEqual(run);
+    expect(pageOnResolve).toEqual(page);
+
+    // No component shows the page yet, so the prefetch reads it once and never polls.
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS * 2));
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['a 500', () => json(500, envelope('internal_error', 'Database unavailable'))],
+    ['an unreachable server', () => Promise.reject(new TypeError('Failed to fetch'))],
+  ] as const)(
+    'still succeeds when the new run’s page read fails with %s, leaving the error cached',
+    async (_label, respondToRead) => {
+      const run = runPayload(CUSTOM_RUN_ID, 'custom');
+      const mock = stubFetch(
+        routes({
+          'POST /api/v1/runs': () => json(201, run),
+          'GET /api/v1/recommendations': respondToRead,
+        }),
+      );
+      const { result, queryClient } = renderWithWrapper(() => useCreateRun());
+      let resolved: unknown;
+      await act(async () => {
+        resolved = await result.current.mutateAsync(body);
+      });
+
+      expect(resolved).toEqual(run);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(queryClient.getQueryData(queryKeys.runs.byId(run.id))).toEqual(run);
+      const pageState = queryClient.getQueryState(queryKeys.recommendations(run.id));
+      expect(pageState?.status).toBe('error');
+      expect(pageState?.data).toBeUndefined();
+      expect(isApiError(pageState?.error)).toBe(true);
+      expect(sentPaths(mock)).toEqual(['POST /api/v1/runs', 'GET /api/v1/recommendations']);
+    },
+  );
+
+  it('surfaces 409 run_in_progress as an ApiError and touches or reads nothing', async () => {
+    const mock = stubFetch(
+      () => json(409, envelope('run_in_progress', 'An analysis run is in progress')),
+    );
     const { result, queryClient } = renderWithWrapper(() => useCreateRun());
     seed(queryClient, [queryKeys.runs.custom(20)]);
     const invalidate = spyOnInvalidate(queryClient);
@@ -2563,6 +2682,8 @@ describe('useCreateRun', () => {
     expect(queryClient.getQueryData(queryKeys.runs.byId(CUSTOM_RUN_ID))).toBeUndefined();
     expect(invalidate).not.toHaveBeenCalled();
     expect(invalidated(queryClient, queryKeys.runs.custom(20))).toBe(false);
+    expect(queryClient.getQueryState(queryKeys.recommendations(CUSTOM_RUN_ID))).toBeUndefined();
+    expect(sentPaths(mock)).toEqual(['POST /api/v1/runs']);
   });
 });
 
@@ -2575,21 +2696,26 @@ describe('useRecordDecision', () => {
     note: 'Paused after review',
   };
 
-  it('posts the patch and invalidates recommendations, discrepancies and decisions', async () => {
+  it('posts the patch, removes unshown pages and invalidates the decision state', async () => {
     const decision = decisionPayload(11, 'recommendation');
     const mock = stubFetch(routes({ 'POST /api/v1/decisions': () => json(201, decision) }));
     const { result, queryClient } = renderWithWrapper(() => useRecordDecision());
     seed(queryClient, [...DECISION_STATE_KEYS, ...UNRELATED_KEYS]);
     const invalidate = spyOnInvalidate(queryClient);
+    const remove = spyOnRemove(queryClient);
     let resolved: unknown;
     await act(async () => {
       resolved = await result.current.mutateAsync(body);
     });
 
     expect(resolved).toEqual(decision);
+    expect(remove.mock.calls).toEqual([[INACTIVE_RECOMMENDATIONS]]);
     expect(invalidatedKeys(invalidate)).toEqual(DECISION_STATE_ROOTS);
     expect(invalidatedKeys(invalidate)).not.toContainEqual(queryKeys.sources);
-    for (const key of DECISION_STATE_KEYS) {
+    for (const key of RECOMMENDATIONS_KEYS) {
+      expect(queryClient.getQueryState(key)).toBeUndefined();
+    }
+    for (const key of DECISION_LIST_KEYS) {
       expect(invalidated(queryClient, key)).toBe(true);
     }
     for (const key of UNRELATED_KEYS) {
@@ -2717,17 +2843,19 @@ describe('useRecordDecision', () => {
     }
   });
 
-  it('invalidates nothing when the patch is rejected', async () => {
+  it('removes and invalidates nothing when the patch is rejected', async () => {
     stubFetch(() => json(422, envelope('no_change', 'The patch changes nothing')));
     const { result, queryClient } = renderWithWrapper(() => useRecordDecision());
     seed(queryClient, DECISION_STATE_KEYS);
     const invalidate = spyOnInvalidate(queryClient);
+    const remove = spyOnRemove(queryClient);
     await act(async () => {
       await rejection(result.current.mutateAsync(body));
     });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.code).toBe('no_change');
     expect(invalidate).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
     for (const key of DECISION_STATE_KEYS) {
       expect(invalidated(queryClient, key)).toBe(false);
     }
@@ -2741,7 +2869,7 @@ describe('useResolveDiscrepancy', () => {
     note: 'Paused in the platform',
   };
 
-  it('posts to /discrepancies/{id}/resolve and invalidates the decision state', async () => {
+  it('posts to /discrepancies/{id}/resolve, removes unshown pages and invalidates', async () => {
     const updated = discrepancyPayload(
       DISCREPANCY_ID,
       'awaiting_platform',
@@ -2753,15 +2881,20 @@ describe('useResolveDiscrepancy', () => {
     const { result, queryClient } = renderWithWrapper(() => useResolveDiscrepancy());
     seed(queryClient, [...DECISION_STATE_KEYS, ...UNRELATED_KEYS]);
     const invalidate = spyOnInvalidate(queryClient);
+    const remove = spyOnRemove(queryClient);
     let resolved: unknown;
     await act(async () => {
       resolved = await result.current.mutateAsync({ id: DISCREPANCY_ID, body });
     });
 
     expect(resolved).toEqual(updated);
+    expect(remove.mock.calls).toEqual([[INACTIVE_RECOMMENDATIONS]]);
     expect(invalidatedKeys(invalidate)).toEqual(DECISION_STATE_ROOTS);
     expect(invalidatedKeys(invalidate)).not.toContainEqual(queryKeys.sources);
-    for (const key of DECISION_STATE_KEYS) {
+    for (const key of RECOMMENDATIONS_KEYS) {
+      expect(queryClient.getQueryState(key)).toBeUndefined();
+    }
+    for (const key of DECISION_LIST_KEYS) {
       expect(invalidated(queryClient, key)).toBe(true);
     }
     for (const key of UNRELATED_KEYS) {
@@ -2823,21 +2956,166 @@ describe('useResolveDiscrepancy', () => {
     await waitFor(() => expect(result.current.list.data).toEqual({ discrepancies: [], total: 0 }));
   });
 
-  it('invalidates nothing on 409 discrepancy_resolved', async () => {
+  it('removes and invalidates nothing on 409 discrepancy_resolved', async () => {
     stubFetch(() => json(409, envelope('discrepancy_resolved', 'Already resolved')));
     const { result, queryClient } = renderWithWrapper(() => useResolveDiscrepancy());
     seed(queryClient, DECISION_STATE_KEYS);
     const invalidate = spyOnInvalidate(queryClient);
+    const remove = spyOnRemove(queryClient);
     await act(async () => {
       await rejection(result.current.mutateAsync({ id: DISCREPANCY_ID, body }));
     });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.code).toBe('discrepancy_resolved');
     expect(invalidate).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
     for (const key of DECISION_STATE_KEYS) {
       expect(invalidated(queryClient, key)).toBe(false);
     }
   });
+});
+
+describe('decision-state writes and the cached recommendations pages', () => {
+  /** One of the two writes that refresh the decision state. */
+  interface DecisionStateWrite {
+    /** The hook as the test titles show it. */
+    label: string;
+    /** `METHOD pathname` of its request. */
+    request: string;
+    /** Its success response. */
+    respond: () => Response;
+    /** Mounts the hook and returns a call that runs one write through `mutateAsync`. */
+    hook: () => () => Promise<unknown>;
+  }
+
+  const RESOLVE_PATH = `/api/v1/discrepancies/${String(DISCREPANCY_ID)}/resolve`;
+
+  const WRITES: readonly DecisionStateWrite[] = [
+    {
+      label: 'useRecordDecision',
+      request: 'POST /api/v1/decisions',
+      respond: () => json(201, decisionPayload(13, 'recommendation')),
+      hook: () => {
+        const record = useRecordDecision();
+        return () =>
+          record.mutateAsync({
+            subject: { type: 'campaign', id: CAMPAIGN_ID },
+            patch: { status: 'paused' },
+          });
+      },
+    },
+    {
+      label: 'useResolveDiscrepancy',
+      request: `POST ${RESOLVE_PATH}`,
+      respond: () => json(200, discrepancyPayload(DISCREPANCY_ID, 'resolved')),
+      hook: () => {
+        const resolve = useResolveDiscrepancy();
+        return () =>
+          resolve.mutateAsync({ id: DISCREPANCY_ID, body: { resolution: 'platform_correct' } });
+      },
+    },
+  ];
+
+  /**
+   * A page whose overlay counts `open` unresolved discrepancies, the count the discrepancy
+   * banner (`role="alert"`) is built from.
+   *
+   * @param open - `overlay.open_discrepancies`.
+   * @param runId - A custom run's id; the latest default run's page when omitted.
+   * @returns A fresh page payload.
+   */
+  function pageWithDiscrepancies(open: number, runId?: RunId) {
+    const page = runId === undefined ? pagePayload() : pagePayload(runId, 'custom');
+    return { ...page, overlay: { open_discrepancies: open } } satisfies {
+      overlay: Pick<RecommendationsPage['overlay'], 'open_discrepancies'>;
+    };
+  }
+
+  it.each(WRITES)(
+    '$label drops an unshown page, so the next visit renders only the current overlay',
+    async ({ request, respond, hook }) => {
+      const current = pageWithDiscrepancies(0);
+      const mock = stubFetch(
+        routes({ [request]: respond, 'GET /api/v1/recommendations': () => json(200, current) }),
+      );
+      // The app's freshness: a page kept in the cache would render at once, without a read.
+      const setup = createWrapper(APP_STALE_MS);
+      setup.queryClient.setQueryData(
+        queryKeys.recommendations('default'),
+        pageWithDiscrepancies(1),
+      );
+      const { result: write } = renderWithWrapper(hook, setup);
+      await act(async () => {
+        await write.current();
+      });
+      expect(setup.queryClient.getQueryState(queryKeys.recommendations('default'))).toBeUndefined();
+      // Nothing showed the page, so the write read none.
+      expect(sentPaths(mock)).toEqual([request]);
+
+      const { result: visit } = renderWithWrapper(() => useRecommendations(), setup);
+      // The first render has no page: the outdated count of 1 is never shown.
+      expect(visit.current.data).toBeUndefined();
+      expect(visit.current.isPending).toBe(true);
+      await waitFor(() => expect(visit.current.data).toEqual(current));
+      expect(sentPaths(mock)).toEqual([request, 'GET /api/v1/recommendations']);
+    },
+  );
+
+  it.each(WRITES)(
+    '$label refetches a shown page in place and resolves only once it has landed',
+    async ({ request, respond, hook }) => {
+      const before = pageWithDiscrepancies(1, CUSTOM_RUN_ID);
+      const after = pageWithDiscrepancies(0, CUSTOM_RUN_ID);
+      const refetch = deferred<Response>();
+      const mock = stubFetch(
+        sequence(
+          () => json(200, before),
+          () => respond(),
+          () => refetch.promise,
+        ),
+      );
+      const { result, queryClient } = renderWithWrapper(() => ({
+        page: useRecommendations(CUSTOM_RUN_ID),
+        write: hook(),
+      }));
+      await waitFor(() => expect(result.current.page.data).toEqual(before));
+      seed(queryClient, DECISION_LIST_KEYS);
+
+      const key = queryKeys.recommendations(CUSTOM_RUN_ID);
+      let settled = false;
+      let cachedOnResolve: unknown;
+      const writing = result.current
+        .write()
+        .then((value) => {
+          cachedOnResolve = queryClient.getQueryData(key);
+          return value;
+        })
+        .finally(() => {
+          settled = true;
+        });
+      const page = 'GET /api/v1/recommendations';
+      await waitFor(() => expect(sentPaths(mock)).toEqual([page, request, page]));
+      await nextMacrotask();
+
+      // The shown page is kept and refetched, not removed, and the write waits on its refetch.
+      expect(settled).toBe(false);
+      expect(queryClient.getQueryState(key)?.fetchStatus).toBe('fetching');
+      expect(result.current.page.data).toEqual(before);
+      for (const listKey of DECISION_LIST_KEYS) {
+        expect(invalidated(queryClient, listKey)).toBe(true);
+      }
+
+      refetch.resolve(json(200, after));
+      await act(async () => {
+        await writing;
+      });
+      expect(cachedOnResolve).toEqual(after);
+      const runIdParams = [['run_id', String(CUSTOM_RUN_ID)]];
+      const pageReads = sent(mock).filter((sentRequest) => sentRequest.method === 'GET');
+      expect(pageReads.map(params)).toEqual([runIdParams, runIdParams]);
+      await waitFor(() => expect(result.current.page.data).toEqual(after));
+    },
+  );
 });
 
 describe('useFeedback', () => {

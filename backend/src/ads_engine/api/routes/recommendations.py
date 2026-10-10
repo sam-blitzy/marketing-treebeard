@@ -179,7 +179,7 @@ FLAG_LABELS: Final[Mapping[str, str]] = MappingProxyType(
 """The badge label of every flag code, in the AAP 0.5.5 wording.
 
 Used only when a flag carries no recorded message: the runner stores each flag's own message
-(for example "Data as of 2026-10-01 03:10 UTC") in ``evidence.extra.flag_messages``, and the
+(for example "Data as of Oct 1, 2026, 3:10 AM UTC") in ``evidence.extra.flag_messages``, and the
 overlay gives every current flag its message, so this table is the fallback for rows written
 without one."""
 
@@ -708,7 +708,8 @@ async def get_recommendations(
         session: The request's database session; only read.
         thresholds: The loaded configuration the overlay reads (freshness limits and the
             K1 baseline length).
-        settings: The application's settings (``DISPLAY_TIMEZONE`` for the run header).
+        settings: The application's settings (``DISPLAY_TIMEZONE`` for the run header and
+            for the instants in the overlay's stale banner and ``stale`` flags).
         now: The read time the overlay is computed for.
         run_id: The run to show, or ``None`` for the latest succeeded default run.
 
@@ -725,7 +726,13 @@ async def get_recommendations(
     withheld = await _withheld(session, run.id)
     suppressions = await _suppressions(session, run.id)
     result = await overlay(
-        session, run, recommendations, now, findings=findings, thresholds=thresholds
+        session,
+        run,
+        recommendations,
+        now,
+        findings=findings,
+        thresholds=thresholds,
+        display_timezone=settings.display_timezone,
     )
     page = schemas.RecommendationsPage(
         run=schemas.Run.from_row(run, display_timezone=settings.display_timezone),

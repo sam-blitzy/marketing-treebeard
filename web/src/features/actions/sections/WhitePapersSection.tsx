@@ -12,22 +12,32 @@
  *    Cost per Qualified Lead, Cost per meeting, Action. The MQL label is the one the rows'
  *    frozen evidence records ({@link tableMqlHeader}), so the current configuration
  *    ({@link mqlHeader}) heads a table only when no row of it records one. The Asset cell
- *    carries the row's simulated-data badge ({@link AssetCell}), so a collapsed row of
- *    simulated or mixed data says so;
+ *    ({@link AssetCell}) states on the collapsed row what qualifies its numbers: the row's
+ *    simulated-data badge and its floor badges ({@link floorFlags}: attribution, creative and
+ *    deal floors and unknown CRM evidence) beside the "≥ N" and "≤ X" cells they explain;
  * 2. each row expands ("Details for {asset}") to its per-creative rows, "unknown creative"
  *    included, then the reason, the evidence it was judged on in the shared
  *    {@link EvidenceTable} (metrics against baselines, sample, test, thresholds applied, data
- *    used), the flags (floor flags among them), the window chip, any hold or replaced-data
- *    notice and the footer actions ("Mark done", "Dismiss", "Snooze for 7 days": white-paper
- *    rows carry no decision subject);
+ *    used), the flags (floor flags among them), the row's notes ("Notes on {asset}": first its
+ *    `skipped_stage` notes, "{stage}: N contacts skipped this stage (not counted)" (AAP 0.5.4.7
+ *    "The row reports …"), each on the row of the asset and currency it counts
+ *    ({@link placeSkippedFindings}) rather than as an anonymous section banner; then the
+ *    contacts already MQL or Qualified Lead before their touch, the meetings and deals before
+ *    it, none of them counted, and the portal's orphan-deal share, each as the backend recorded
+ *    it), the window chip, any replaced-data notice and
+ *    the footer actions ("Mark done", "Dismiss", "Snooze for 7 days": white-paper rows carry no
+ *    decision subject). A held row's hold notice is not in its details but in its Action cell;
  * 3. rows computed from replaced data (AAP 0.3.2: readable, every action disabled), never
  *    collapsed, in a table of their own captioned "White papers ({currency}) computed from
  *    replaced data", each with its replaced-data badge in the Action cell;
- * 4. rows a discrepancy holds, collapsed behind the frame's {@link HeldDisclosure}, in a table
- *    captioned "White papers ({currency}) held until discrepancies are resolved";
- * 5. the cohort's notes: its spend total in its own currency, as the backend computed it, the
+ * 4. the cohort's notes: its spend total in its own currency, as the backend computed it, the
  *    note that counts overlap across assets, and what the LinkedIn leads and meetings booked
- *    columns count.
+ *    columns count;
+ * 5. last in the group (AAP 0.5.5 "Held cards appear collapsed at the end of their group"),
+ *    rows a discrepancy holds, collapsed behind the frame's {@link HeldDisclosure}, in a table
+ *    captioned "White papers ({currency}) held until discrepancies are resolved", each with its
+ *    hold reason and the link to its blocking discrepancy in the Action cell
+ *    ({@link ActionCell}), so neither waits on the row being expanded.
  *
  * Each asset table and each per-creative table shows `ROW_BATCH_SIZE` rows at a time, in the
  * API's order, followed by a "Show {n} more" control when it holds more (`../batches`;
@@ -52,7 +62,7 @@
  *
  * @packageDocumentation
  */
-import { useMemo } from 'react';
+import { createContext, useContext, useMemo } from 'react';
 import type { ReactElement } from 'react';
 
 import { useConfig } from '../../../api/queries';
@@ -60,15 +70,21 @@ import type {
   ConfigView,
   CrmBindingsView,
   DataStatus,
+  EntityView,
+  Finding,
+  FindingCode,
   Flag,
+  FlagCode,
   Item,
   Metric,
+  Section,
 } from '../../../api/types';
 import { Badge, DataTable, Inline, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import {
   EM_DASH,
   UNAVAILABLE,
+  formatCount,
   formatMetric,
   formatMoney,
   formatWindowChip,
@@ -79,10 +95,13 @@ import {
   cohortSummary,
   creativeRows,
   evidenceCurrency,
+  isRecord,
+  whitePaperAlreadyBefore,
   whitePaperCells,
   whitePaperCostNotes,
   whitePaperMqlLabel,
   whitePaperMqlMetricLabel,
+  whitePaperOrphanDealLabel,
   type CohortSummary,
   type WhitePaperMetricKey,
   type WhitePaperRow,
@@ -101,6 +120,7 @@ import {
   HeldDisclosure,
   SectionFrame,
   isHeld,
+  isHidden,
   itemIdentity,
   itemKeys,
   type FieldItem,
@@ -420,6 +440,138 @@ const ASSET_ROW_NOUN: BatchNoun = Object.freeze({
 const CREATIVE_ROW_NOUN: BatchNoun = Object.freeze({ singular: 'creative', plural: 'creatives' });
 
 // ---------------------------------------------------------------------------------------------
+// Skipped-stage notes
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The code of the findings a white-paper row reports as its own notes (AAP 0.5.4.7 "Skipped
+ * stages": "The row reports 'N contacts skipped this stage (not counted)' as a `skipped_stage`
+ * finding").
+ */
+const SKIPPED_STAGE: FindingCode = 'skipped_stage';
+
+/**
+ * The identity of the entity an item or a finding is about: its source, type and id, serialised
+ * as one JSON array, so a separator inside the id (the `|` of "attribution-playbook|USD") never
+ * makes two entities equal. A row and the `skipped_stage` findings of that row share it, because
+ * the backend gives each finding the row's own entity (`attribution._skipped_findings`).
+ *
+ * @returns the identity, or `null` for an entity without an id (a runtime payload may still
+ *   send a non-string one), which names no row
+ */
+function entityKey(entity: EntityView): string | null {
+  if (typeof entity.id !== 'string' || entity.id.trim() === '') {
+    return null;
+  }
+  return JSON.stringify([entity.source, entity.type, entity.id]);
+}
+
+/** Each row's skipped-stage notes, keyed by its {@link entityKey}, in API order. */
+type RowNotes = ReadonlyMap<string, readonly string[]>;
+
+/**
+ * No row notes: what an {@link AssetDetails} rendered outside {@link WhitePapersSection} reads.
+ */
+const NO_ROW_NOTES: RowNotes = new Map();
+
+/** No skipped-stage notes: a row no `skipped_stage` finding is about, or one without an id. */
+const NO_SKIPPED_NOTES: readonly string[] = Object.freeze([]);
+
+/**
+ * The row notes of the section being rendered ({@link placeSkippedFindings}), provided by
+ * {@link WhitePapersSection} around its frame and read by each {@link AssetDetails}, in a table's
+ * expanded row and in {@link WhitePaperItemFallback} alike, so the rows the {@link ASSET_ROWS}
+ * cache keeps per item never hold a section's findings.
+ */
+const RowNotesContext = createContext<RowNotes>(NO_ROW_NOTES);
+
+/** A finding's text: its message, else its code, as the frame's banners read it; never blank. */
+function findingMessage(finding: Finding): string {
+  return textOrNull(finding.message) ?? finding.code;
+}
+
+/**
+ * The banner text of a skipped-stage finding no rendered row reports, naming what it counts:
+ * "{asset} ({currency}): {message}". The asset is the entity's name, else its id; the currency
+ * is the finding's `evidence.currency` when it is a non-blank string, and without one the
+ * parenthesis is left out. An entity with neither name nor id leaves the message as it is.
+ */
+function namedSkippedMessage(finding: Finding, entity: EntityView): string {
+  const message = findingMessage(finding);
+  const asset = textOrNull(entity.name) ?? textOrNull(entity.id);
+  if (asset === null) {
+    return message;
+  }
+  const currency = isRecord(finding.evidence) ? textOrNull(finding.evidence.currency) : null;
+  return currency === null ? `${asset}: ${message}` : `${asset} (${currency}): ${message}`;
+}
+
+/** The result of {@link placeSkippedFindings}. */
+interface PlacedFindings {
+  /** The skipped-stage notes each rendered row reports first in its details' notes. */
+  readonly rowNotes: RowNotes;
+  /** The section the frame renders, whose findings it shows as banners at the top. */
+  readonly section: Section;
+}
+
+/**
+ * Places each `skipped_stage` finding on the row it counts (AAP 0.5.4.7 "Skipped stages"). The
+ * backend emits one per stage per asset row, about that row's entity, and its message names the
+ * stage but neither the asset nor the currency, so as section banners two assets with equal
+ * counts would read identically and none would say which row it qualifies.
+ *
+ * - A skipped-stage finding about a row the section renders becomes one of that row's notes,
+ *   its message verbatim, in API order, listed first in the row's "Notes on {asset}" when the
+ *   row is expanded ({@link AssetDetails}), and leaves the section's findings. A rendered row is
+ *   an item of any group, visible, computed from replaced data or held, that feedback does not
+ *   hide ({@link isHidden}): the frame never renders a hidden one.
+ * - A skipped-stage finding about an entity no rendered row has stays a section banner, its
+ *   message prefixed with the asset and currency it counts ({@link namedSkippedMessage}).
+ * - Every other finding, `pipeline_unavailable` and any finding without an entity among them,
+ *   stays as it is: a banner at the top of the section (AAP 0.5.5 "Tracking findings sit at the
+ *   top of each affected section").
+ *
+ * Nothing is mutated. When no finding is placed or renamed, the section itself is returned.
+ *
+ * @param section - the White papers section, as the API returned it
+ * @returns the row notes and the section the frame renders
+ */
+function placeSkippedFindings(section: Section): PlacedFindings {
+  const rendered = new Set<string>();
+  for (const group of section.groups) {
+    for (const item of group.items) {
+      const key = isHidden(item) ? null : entityKey(item.entity);
+      if (key !== null) {
+        rendered.add(key);
+      }
+    }
+  }
+  const rowNotes = new Map<string, string[]>();
+  const findings: Finding[] = [];
+  let changed = false;
+  for (const finding of section.findings) {
+    const entity = finding.entity ?? null;
+    if (finding.code !== SKIPPED_STAGE || entity === null) {
+      findings.push(finding);
+      continue;
+    }
+    changed = true;
+    const key = entityKey(entity);
+    if (key === null || !rendered.has(key)) {
+      findings.push({ ...finding, message: namedSkippedMessage(finding, entity) });
+      continue;
+    }
+    const notes = rowNotes.get(key);
+    if (notes === undefined) {
+      rowNotes.set(key, [findingMessage(finding)]);
+    } else {
+      notes.push(findingMessage(finding));
+    }
+  }
+  return { rowNotes, section: changed ? { ...section, findings } : section };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Columns
 // ---------------------------------------------------------------------------------------------
 
@@ -458,29 +610,103 @@ function simulatedFlag(item: Item): Flag | null {
 }
 
 /**
- * The Asset cell, the row header: the asset's name, then its simulated-data badge
- * ({@link simulatedFlag}) in the flag's tone, with the text the flags row gives the same flag
- * ({@link flagText}), so a collapsed row states that its numbers are
- * simulated without being expanded, in the cell that names the row. Captions and the expand
- * label keep the plain name. In a batched table the name is the row's focus target
- * ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it first.
+ * The flag codes that state a row's counts or costs are floors (AAP 0.5.4.7 "Completeness and
+ * floors"): `attribution_floor` (leads unmatched in HubSpot: counts "≥ N", costs "≤ X"),
+ * `creative_floor` (the per-creative breakdown), `deal_floor` (the orphan-deal share) and
+ * `unknown_crm_evidence` (counts "≥ N" while CRM evidence is unknown).
+ */
+const FLOOR_FLAG_CODES: ReadonlySet<FlagCode> = new Set<FlagCode>([
+  'attribution_floor',
+  'creative_floor',
+  'deal_floor',
+  'unknown_crm_evidence',
+]);
+
+/**
+ * The floor flags an asset row shows on its collapsed row, beside the "≥ N" and "≤ X" cells they
+ * explain (AAP 0.5.5 "Floors render as '≥ N' and '≤ X' with the floor flag"): each flag of
+ * {@link FLOOR_FLAG_CODES} among the row's recorded and current flags, merged exactly as the
+ * flags row in its details merges them ({@link mergeFlags}), in that order. Each is shown with the
+ * badge text the flags row gives it ({@link flagText}), for example "Floor: 12% of leads unmatched
+ * in HubSpot" or "Unknown CRM evidence: Floor: CRM evidence unknown for 10% of matched contacts
+ * (2 of 20)".
+ *
+ * @returns the floor flags, possibly none
+ */
+function floorFlags(item: Item): Flag[] {
+  return mergeFlags(item.flags, item.current.flags_now).filter((flag) =>
+    FLOOR_FLAG_CODES.has(flag.code),
+  );
+}
+
+/**
+ * The Asset cell, the row header, which states on the collapsed row what qualifies the row's
+ * numbers, without the row being expanded: the asset's name, then its simulated-data badge
+ * ({@link simulatedFlag}), then one badge per floor flag ({@link floorFlags}), each in its flag's
+ * tone ({@link flagTone}) with the text the flags row gives the same flag ({@link flagText}). The
+ * row's skipped-stage notes are not here but first among its details' notes
+ * ({@link AssetDetails}), so the cell stays as narrow as its name and badges.
+ *
+ * Captions and the expand label keep the plain name. In a batched table the name is the row's
+ * focus target ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it
+ * first.
  */
 function AssetCell({ row }: { row: AssetRowView }): ReactElement {
-  const flag = simulatedFlag(row.item);
+  const simulated = simulatedFlag(row.item);
+  const badges = [...(simulated === null ? [] : [simulated]), ...floorFlags(row.item)];
   const name = <BatchEntryAnchor id={row.focusId}>{row.name}</BatchEntryAnchor>;
-  if (flag === null) {
+  if (badges.length === 0) {
     return name;
   }
   return (
     <Inline gap={2}>
       <span>{name}</span>
-      <Badge tone={flagTone(flag.code)}>{flagText(flag)}</Badge>
+      {badges.map((flag) => (
+        <Badge key={flag.code} tone={flagTone(flag.code)}>
+          {flagText(flag)}
+        </Badge>
+      ))}
     </Inline>
   );
 }
 
-/** The Action cell: the action, with the replaced-data badge on a historical row. */
+/**
+ * The hold reason of a row a discrepancy holds (AAP 0.5.4.2 P1): the live reason first, then the
+ * one frozen with the run, else "Resolve discrepancy first". `null` for a row no discrepancy
+ * holds, a historical row included: it is held by its replaced data, which its badge states, as
+ * on a card, so it carries no discrepancy notice and no link.
+ */
+function discrepancyHoldReason(item: Item): string | null {
+  if (item.current.historical || !isHeld(item)) {
+    return null;
+  }
+  return (
+    textOrNull(item.current.held_reason_now) ??
+    textOrNull(item.held_reason) ??
+    HELD_REASON_FALLBACK
+  );
+}
+
+/**
+ * The Action cell: the action, then
+ * - on a row a discrepancy holds, its hold reason and the link to each discrepancy that holds it
+ *   ({@link BlockingDiscrepancyLinks}), so the collapsed row in the held table names and links
+ *   its blocker without being expanded (AAP 0.5.5 "with the blocking discrepancy linked");
+ * - on a historical row, its replaced-data badge.
+ */
 function ActionCell({ item }: { item: Item }): ReactElement {
+  const heldReason = discrepancyHoldReason(item);
+  if (heldReason !== null) {
+    return (
+      <Stack gap={1}>
+        <span>{item.action}</span>
+        <Inline gap={2}>
+          <span>{heldReason}</span>
+          <BlockingDiscrepancyLinks item={item} />
+        </Inline>
+      </Stack>
+    );
+  }
   if (!item.current.historical) {
     return <>{item.action}</>;
   }
@@ -543,6 +769,78 @@ function creativeColumns(mql: string): DataTableColumn<CreativeRowView>[] {
 // Row details
 // ---------------------------------------------------------------------------------------------
 
+/** One line of an asset row's notes ({@link assetNotes}). */
+interface AssetNote {
+  /** A stable key, naming what the line reports. */
+  readonly key: string;
+  /** The line as shown. */
+  readonly text: string;
+}
+
+/** A count with its noun, singular for exactly 1: "1 meeting", "0 meetings", "2 meetings". */
+function countWithNoun(count: number, singular: string, plural: string): string {
+  return `${formatCount(count)} ${count === 1 ? singular : plural}`;
+}
+
+/**
+ * The notes of an asset row's details, in this order:
+ *
+ * 1. the row's skipped-stage notes, each `skipped_stage` finding's message verbatim, in API
+ *    order, "{stage}: N contacts skipped this stage (not counted)" (AAP 0.5.4.7 "The row reports
+ *    'N contacts skipped this stage (not counted)'"), as {@link placeSkippedFindings} placed
+ *    them on this row's asset and currency;
+ *
+ * then each of these only when the evidence carries it (a known 0 included; an absent or
+ * unavailable count is left out, never shown as 0):
+ *
+ * 2. the contacts the causal check excluded because they were already in the stage before their
+ *    touch (AAP 0.5.4.7 "N already MQL/QL before this touch", `extra.already_before.mql` and
+ *    `.ql`): "{n} already MQL before this touch", "{n} already QL before this touch";
+ * 3. the meetings and deals before the touch, excluded likewise (AAP 0.11.2 "MQL, QL, meetings
+ *    and deals before the touch are excluded and reported", `.meetings` and `.deals`): "{n}
+ *    meetings before this touch (not counted)", "{n} deals created before this touch (not
+ *    counted)", singular for 1;
+ * 4. the portal's orphan-deal share, the backend's label verbatim (AAP 0.5.4.7 "Completeness and
+ *    floors", `extra.orphan_deals.label`): "Orphan-deal share: 5.7% (2 of 35 deals without a
+ *    contact)", or "Orphan-deal share: unknown (3 deals not assessed)".
+ *
+ * @param item - the asset row's item, whose evidence gives lines 2 to 4
+ * @param skipped - the row's skipped-stage messages ({@link RowNotesContext}), possibly none
+ * @returns the lines, each keyed uniquely; `[]` when there are none
+ */
+function assetNotes(item: Item, skipped: readonly string[]): AssetNote[] {
+  const before = whitePaperAlreadyBefore(item);
+  const orphanDeals = whitePaperOrphanDealLabel(item);
+  const notes: AssetNote[] = skipped.map((text, index) => ({
+    key: `skipped-${String(index)}`,
+    text,
+  }));
+  if (before.mql !== null) {
+    notes.push({
+      key: 'already-mql',
+      text: `${formatCount(before.mql)} already MQL before this touch`,
+    });
+  }
+  if (before.ql !== null) {
+    notes.push({
+      key: 'already-ql',
+      text: `${formatCount(before.ql)} already QL before this touch`,
+    });
+  }
+  if (before.meetings !== null) {
+    const meetings = countWithNoun(before.meetings, 'meeting', 'meetings');
+    notes.push({ key: 'meetings-before', text: `${meetings} before this touch (not counted)` });
+  }
+  if (before.deals !== null) {
+    const deals = countWithNoun(before.deals, 'deal', 'deals');
+    notes.push({ key: 'deals-before', text: `${deals} created before this touch (not counted)` });
+  }
+  if (orphanDeals !== null) {
+    notes.push({ key: 'orphan-deals', text: `Orphan-deal share: ${orphanDeals}` });
+  }
+  return notes;
+}
+
 /** Props of {@link AssetDetails}. */
 interface AssetDetailsProps {
   /** The asset row to detail. */
@@ -562,9 +860,13 @@ interface AssetDetailsProps {
  * {asset}", AAP 0.5.4.8): the cited metrics against their baselines (the cohort median cost per
  * Qualified Lead beside the cost per Qualified Lead), the sample and test lines, the thresholds
  * applied and the datasets used with their completeness and coverage; the flags, recorded and
- * current (floor flags among them); the window chip; a historical row's "Computed from replaced
- * data" badge with its original provenance, or a held row's hold reason with its link to the
- * blocking discrepancy; the footer actions, all disabled on a historical row.
+ * current (floor flags among them); the row's notes, a list named "Notes on {asset}"
+ * ({@link assetNotes}): first its skipped-stage notes, read from the section being rendered
+ * ({@link RowNotesContext}), then what the causal check excluded and the orphan-deal share, the
+ * list left out when it has no line; the window chip; a historical row's "Computed from replaced
+ * data" badge with its original provenance; the footer actions, all disabled on a historical
+ * row. A held row's hold reason and its link to the blocking discrepancy are not repeated here:
+ * its Action cell shows them on the collapsed row ({@link ActionCell}).
  *
  * The per-creative table shows `ROW_BATCH_SIZE` rows at a time, in stored order, followed by a
  * "Show {n} more creatives" control when the asset has more (`../batches`), so an asset with
@@ -572,6 +874,9 @@ interface AssetDetailsProps {
  */
 function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   const { item, name } = row;
+  const rowNotes = useContext(RowNotesContext);
+  const entity = entityKey(item.entity);
+  const skipped = entity === null ? NO_SKIPPED_NOTES : (rowNotes.get(entity) ?? NO_SKIPPED_NOTES);
   const stored = useMemo(() => creativeRows(item), [item]);
   const batches = useBatches(stored, { batchSize: ROW_BATCH_SIZE });
   const creatives: CreativeRowView[] = batches.shown.map((creative, index) => ({
@@ -582,14 +887,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   const columns = useMemo(() => creativeColumns(mql), [mql]);
   const reason = textOrNull(item.reason);
   const historical = item.current.historical;
-  // As on a card: a historical row is held by its replaced data, which its badge states, so the
-  // discrepancy notice and link show only for a discrepancy hold.
-  const heldReason =
-    !historical && isHeld(item)
-      ? (textOrNull(item.current.held_reason_now) ??
-        textOrNull(item.held_reason) ??
-        HELD_REASON_FALLBACK)
-      : null;
+  const notes = useMemo(() => assetNotes(item, skipped), [item, skipped]);
 
   return (
     <Stack gap={3}>
@@ -604,6 +902,13 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
       {reason === null ? null : <div>{reason}</div>}
       <EvidenceTable evidence={item.evidence} caption={`Evidence for ${name}`} />
       <FlagList flags={item.flags} current={item.current.flags_now} />
+      {notes.length === 0 ? null : (
+        <Stack as="ul" gap={1} aria-label={`Notes on ${name}`}>
+          {notes.map((note) => (
+            <li key={note.key}>{note.text}</li>
+          ))}
+        </Stack>
+      )}
       <Inline>
         <Badge tone="neutral">{formatWindowChip(item.evidence.window)}</Badge>
       </Inline>
@@ -615,12 +920,6 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
           </span>
         </Inline>
       ) : null}
-      {heldReason === null ? null : (
-        <Inline gap={2}>
-          <span>{heldReason}</span>
-          <BlockingDiscrepancyLinks item={item} />
-        </Inline>
-      )}
       <RecommendationActions item={item} />
     </Stack>
   );
@@ -683,11 +982,13 @@ function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
 
 /**
  * The fallback rendering of one white-paper row outside a table: the asset name with its
- * simulated-data badge ({@link AssetCell}), its cells as a labelled list in column order, then
- * its {@link AssetDetails}. `SectionFrame` builds it for its
- * default group body, which {@link WhitePapersSection} replaces with the cohort tables, so the
- * row stays readable wherever the frame falls back to it, held rows included. Its MQL label is
- * the one the row's frozen evidence records, else `mql`, the current configuration's.
+ * badges, as the table's Asset cell shows them ({@link AssetCell}), its cells as a labelled list
+ * in column order, the Action field as the table's {@link ActionCell} shows it (a held row's
+ * hold reason and blocking link included), then its {@link AssetDetails}, whose notes list the
+ * row's skipped-stage notes first, as an expanded table row does. `SectionFrame` builds it for
+ * its default group body, which {@link WhitePapersSection} replaces with the cohort tables, so
+ * the row stays readable wherever the frame falls back to it, held rows included. Its MQL label
+ * is the one the row's frozen evidence records, else `mql`, the current configuration's.
  */
 function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): ReactElement {
   const row = assetRowOf(item);
@@ -698,7 +999,7 @@ function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): Rea
       label: metricHeader(key, header),
       value: row.cells.get(key) ?? UNAVAILABLE,
     })),
-    { key: 'action', label: ACTION_HEADER, value: item.action },
+    { key: 'action', label: ACTION_HEADER, value: <ActionCell item={item} /> },
   ];
   return (
     <Stack gap={3}>
@@ -756,10 +1057,10 @@ interface CohortTablesProps {
 
 /**
  * One currency cohort (AAP 0.5.5, 0.5.4.7 "Currency cohorts"): the table of visible rows, the
- * open table of rows computed from replaced data, the held rows' table behind the held
- * disclosure, then the cohort's notes. Every amount is in the cohort's one currency. The spend
- * total is the backend's (`extra.cohort.spend_total`), shown as "unavailable" when absent and
- * never summed here; no other total is shown, because counts overlap across assets.
+ * open table of rows computed from replaced data, the cohort's notes, then, last in the group,
+ * the held rows' table behind the held disclosure. Every amount is in the cohort's one currency.
+ * The spend total is the backend's (`extra.cohort.spend_total`), shown as "unavailable" when
+ * absent and never summed here; no other total is shown, because counts overlap across assets.
  */
 function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const summary = findCohortSummary(parts.group.items);
@@ -778,7 +1079,16 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
           mql={mql}
         />
       ) : null}
-      {/* The held table formats its rows only once the disclosure is first opened. */}
+      <Stack as="ul" gap={1} aria-label={`Notes on the ${currency} white papers`}>
+        <li>{`Spend total (${currency}): ${formatMoney(summary?.spendTotal, currency)}`}</li>
+        <li>{overlapNote}</li>
+        <li>{LINKEDIN_LEADS_NOTE}</li>
+        <li>{MEETINGS_BOOKED_NOTE}</li>
+      </Stack>
+      {/*
+        Last in the group (AAP 0.5.5: held cards sit collapsed at the end of their group). The
+        held table formats its rows only once the disclosure is first opened.
+      */}
       <HeldDisclosure id={`${parts.anchorId}-held`} count={parts.held.length}>
         <AssetTable
           caption={`White papers (${currency}) held until discrepancies are resolved`}
@@ -786,12 +1096,6 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
           mql={mql}
         />
       </HeldDisclosure>
-      <Stack as="ul" gap={1} aria-label={`Notes on the ${currency} white papers`}>
-        <li>{`Spend total (${currency}): ${formatMoney(summary?.spendTotal, currency)}`}</li>
-        <li>{overlapNote}</li>
-        <li>{LINKEDIN_LEADS_NOTE}</li>
-        <li>{MEETINGS_BOOKED_NOTE}</li>
-      </Stack>
     </Stack>
   );
 }
@@ -814,6 +1118,12 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
  * section as the API returned it. Rows keep the API's rank order (within each cohort, rows with
  * QL ≥ 1 by cost per QL, then zero-QL rows by spend); the section never re-sorts them.
  *
+ * Each `skipped_stage` finding about a rendered row is reported on that row, first in the
+ * "Notes on {asset}" list of its details, rather than as a section banner
+ * ({@link placeSkippedFindings}, {@link RowNotesContext}); one about an asset no rendered row
+ * shows stays a banner naming its asset and currency, and every other finding stays a banner at
+ * the top of the section.
+ *
  * @param props - see `SectionComponentProps`; only `section` is read
  * @returns the section region
  *
@@ -825,12 +1135,15 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
 export function WhitePapersSection({ section }: SectionComponentProps): ReactElement {
   const config = useConfig();
   const configuredMql = mqlHeader(config.data);
+  const placed = useMemo(() => placeSkippedFindings(section), [section]);
 
   return (
-    <SectionFrame
-      section={section}
-      renderItem={(item) => <WhitePaperItemFallback item={item} mql={configuredMql} />}
-      renderGroup={(_group, parts) => <CohortTables parts={parts} mql={configuredMql} />}
-    />
+    <RowNotesContext.Provider value={placed.rowNotes}>
+      <SectionFrame
+        section={placed.section}
+        renderItem={(item) => <WhitePaperItemFallback item={item} mql={configuredMql} />}
+        renderGroup={(_group, parts) => <CohortTables parts={parts} mql={configuredMql} />}
+      />
+    </RowNotesContext.Provider>
   );
 }

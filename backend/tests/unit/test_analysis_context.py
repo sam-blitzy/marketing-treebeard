@@ -14,7 +14,7 @@ import doctest
 import itertools
 import json
 from collections.abc import Mapping
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -85,6 +85,8 @@ from ads_engine.analysis.context import (
     creative_group,
     creative_group_campaign,
     creative_pair_external_id,
+    display_zone,
+    format_instant,
     google_link_gap,
     json_value,
     keyword_external_id,
@@ -92,6 +94,7 @@ from ads_engine.analysis.context import (
     objective_group,
     search_term_external_id,
     segment_external_id,
+    short_window_message,
     term_cluster_external_id,
     unverified_message,
 )
@@ -211,6 +214,148 @@ def test_flag_finding_and_banner_codes() -> None:
     assert set(ALERT_BANNERS) == {"open_discrepancies"}
     assert BANNER_TONES["open_discrepancies"] == "critical"
     assert unverified_message(3) == "Unverified while 3 discrepancies are open"
+
+
+@pytest.mark.parametrize(
+    ("count", "message"),
+    [
+        (1, "Unverified while 1 discrepancy is open"),
+        (0, "Unverified while 0 discrepancies are open"),
+        (2, "Unverified while 2 discrepancies are open"),
+        (3, "Unverified while 3 discrepancies are open"),
+    ],
+)
+def test_unverified_message_is_singular_only_at_one(count: int, message: str) -> None:
+    """AAP 0.5.4.2 P1: "Unverified while N discrepancies are open", singular at a count of 1."""
+    assert unverified_message(count) == message
+    assert ctx_module.UNVERIFIED_TEMPLATE == "Unverified while {n} discrepancies are open"
+    assert "unverified_message" in ctx_module.__all__
+
+
+@pytest.mark.parametrize(
+    ("days", "trusted_min_days", "message"),
+    [
+        (1, 14, "Window of 1 day is below the 14-day trusted minimum"),
+        (2, 14, "Window of 2 days is below the 14-day trusted minimum"),
+        (13, 14, "Window of 13 days is below the 14-day trusted minimum"),
+        (20, 21, "Window of 20 days is below the 21-day trusted minimum"),
+    ],
+)
+def test_short_window_message_is_singular_only_for_a_one_day_window(
+    days: int, trusted_min_days: int, message: str
+) -> None:
+    """AAP 0.5.5: "Window of N days is below the {trusted_min_days}-day trusted minimum".
+
+    A one-day window reads "1 day"; the "{trusted_min_days}-day" adjective never pluralises.
+    """
+    assert short_window_message(days, trusted_min_days) == message
+    assert "short_window_message" in ctx_module.__all__
+
+
+@pytest.mark.parametrize(
+    ("instant", "zone", "text"),
+    [
+        # The examples of web/src/lib/format.ts formatInstant, rendered there by Intl.
+        (datetime(2026, 10, 6, 15, 22, tzinfo=UTC), "UTC", "Oct 6, 2026, 3:22 PM UTC"),
+        (
+            datetime(2026, 10, 6, 15, 22, tzinfo=UTC),
+            "America/New_York",
+            "Oct 6, 2026, 11:22 AM America/New_York",
+        ),
+        # The finding's banner instant, 16:58 UTC, during daylight saving time (UTC-4).
+        (
+            datetime(2026, 10, 8, 16, 58, tzinfo=UTC),
+            "America/New_York",
+            "Oct 8, 2026, 12:58 PM America/New_York",
+        ),
+        # Standard time (UTC-5) moves the local date back across midnight.
+        (
+            datetime(2026, 1, 15, 4, 7, tzinfo=UTC),
+            "America/New_York",
+            "Jan 14, 2026, 11:07 PM America/New_York",
+        ),
+        (
+            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+            "America/New_York",
+            "Mar 8, 2026, 3:30 AM America/New_York",
+        ),
+        # Midnight and noon on the 12-hour clock; a single-digit day and hour, no zero pad.
+        (datetime(2026, 1, 15, 0, 0, tzinfo=UTC), "UTC", "Jan 15, 2026, 12:00 AM UTC"),
+        (datetime(2026, 1, 15, 12, 0, tzinfo=UTC), "UTC", "Jan 15, 2026, 12:00 PM UTC"),
+        (datetime(2026, 9, 5, 9, 3, 59, tzinfo=UTC), "UTC", "Sep 5, 2026, 9:03 AM UTC"),
+        # An input carrying another offset is the same instant, shown in the display zone.
+        (
+            datetime(2026, 5, 1, 22, 9, tzinfo=timezone(timedelta(hours=2))),
+            "UTC",
+            "May 1, 2026, 8:09 PM UTC",
+        ),
+        (
+            datetime(2026, 5, 1, 22, 9, tzinfo=timezone(timedelta(hours=2))),
+            "Europe/Berlin",
+            "May 1, 2026, 10:09 PM Europe/Berlin",
+        ),
+        (
+            datetime(2026, 9, 30, 23, 59, 59, tzinfo=UTC),
+            "Asia/Kolkata",
+            "Oct 1, 2026, 5:29 AM Asia/Kolkata",
+        ),
+    ],
+)
+def test_format_instant_renders_the_web_format_in_the_display_zone(
+    instant: datetime, zone: str, text: str
+) -> None:
+    """AAP 0.5.5: instants are formatted in ``DISPLAY_TIMEZONE``, as ``formatInstant`` does."""
+    assert format_instant(instant, zone) == text
+    assert format_instant(instant, zone) == format_instant(instant.astimezone(ZoneInfo(zone)), zone)
+    assert "format_instant" in ctx_module.__all__
+
+
+def test_format_instant_uses_its_own_month_names_for_every_month() -> None:
+    months = [format_instant(datetime(2026, m, 5, 9, 3, tzinfo=UTC), "UTC") for m in range(1, 13)]
+    assert [text.split(" ", 1)[0] for text in months] == [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "zone", "error", "match"),
+    [
+        (datetime(2026, 10, 6, 15, 22), "UTC", ValueError, "instant must be tz-aware"),  # noqa: DTZ001
+        (date(2026, 10, 6), "UTC", TypeError, "instant must be a tz-aware datetime"),
+        ("2026-10-06T15:22:00Z", "UTC", TypeError, "instant must be a tz-aware datetime"),
+        (NOW, "Mars/Base", ValueError, "loadable IANA time zone name, found 'Mars/Base'"),
+        (NOW, "", ValueError, "loadable IANA time zone name"),
+        (NOW, " UTC", ValueError, "loadable IANA time zone name"),
+        (NOW, "../etc/passwd", ValueError, "loadable IANA time zone name"),
+        (NOW, None, TypeError, "must be an IANA time zone name, found None"),
+        (NOW, ZoneInfo("UTC"), TypeError, "must be an IANA time zone name"),
+    ],
+)
+def test_format_instant_rejects_a_naive_instant_or_an_unloadable_zone(
+    value: object, zone: object, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        format_instant(value, zone)  # type: ignore[arg-type]
+
+
+def test_display_zone_loads_an_iana_zone_and_names_the_checked_value() -> None:
+    assert display_zone("America/New_York") == ZoneInfo("America/New_York")
+    with pytest.raises(ValueError, match=r"^AnalysisContext\.display_timezone must be a loadable"):
+        display_zone("utc ", "AnalysisContext.display_timezone")
+    with pytest.raises(TypeError, match=r"^display_timezone must be an IANA time zone name"):
+        display_zone(3, "display_timezone")
+    assert "display_zone" in ctx_module.__all__
 
 
 def test_group_keys_round_trip() -> None:
@@ -1512,9 +1657,23 @@ def test_feedback_stores_until_in_utc() -> None:
 # -- the analysis context --------------------------------------------------------------------
 
 
+def test_context_display_timezone_must_be_a_loadable_zone(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """The zone of the instants in frozen flag messages; it never moves a day boundary."""
+    context = _context(thresholds, window, display_timezone="America/New_York")
+    assert context.display_timezone == "America/New_York"
+    assert context.window == window
+    with pytest.raises(ValueError, match=r"^AnalysisContext\.display_timezone must be a loadable"):
+        _context(thresholds, window, display_timezone="Mars/Base")
+    with pytest.raises(TypeError, match=r"^AnalysisContext\.display_timezone must be an IANA"):
+        _context(thresholds, window, display_timezone=None)
+
+
 def test_context_defaults_lookups_and_cache(thresholds: Thresholds, window: AnalysisWindow) -> None:
     bare = AnalysisContext(window, thresholds, NOW)
     assert bare.run_kind == "default"
+    assert bare.display_timezone == "UTC"
     assert bare.campaigns == {}
     assert bare.dataset_id_for("google.entities", crm_scope=None) is None
     context = _context(

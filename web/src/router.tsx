@@ -58,7 +58,8 @@
  *   because the browser keeps a failed module fetch for the life of the document.
  *
  * Focus after navigation (WCAG 2.2 SC 2.4.3) is handled once, by the always-mounted root route:
- * see {@link useFocusRecoveryAfterNavigation}.
+ * see {@link useFocusRecoveryAfterNavigation} for route navigations and
+ * {@link useFocusOnHashTarget} for in-page links.
  *
  * Rules this file keeps:
  * - **Server state only through `./api/queries`** (AAP 0.11.1). The CSRF header on
@@ -127,6 +128,7 @@ import {
 import type { SideNavItem, SideNavLinkProps } from './design-system';
 import { ActionsPage } from './features/actions/ActionsPage';
 import { LoginPage } from './features/auth/LoginPage';
+import { focusElement, idFromHash } from './lib/focus';
 
 // ---------------------------------------------------------------------------------------------
 // Texts and constants
@@ -431,6 +433,12 @@ function RouteFrame({ children }: RouteFrameProps): ReactElement {
  * and it never takes focus from a control that is still mounted, such as a navigation link the
  * user activated.
  *
+ * It never acts on a hash-only navigation either (same path and search, another hash), such as
+ * an in-page link to a section: that stays on the same screen, and
+ * {@link useFocusOnHashTarget} moves focus to the element the hash names. The browser leaves
+ * focus on `<body>` after following a link to an element that is not focusable, so without this
+ * exception `<main>` would take focus and the next Tab would start over at the top of the page.
+ *
  * Called from the root route's component, which stays mounted across every navigation, so it
  * also covers a change of layout (sign-in, sign-out).
  */
@@ -445,6 +453,14 @@ function useFocusRecoveryAfterNavigation(): void {
         if (fromLocation === undefined || fromLocation === toLocation) {
           return;
         }
+        // A hash-only navigation keeps the screen: its focus belongs to the hash target.
+        if (
+          toLocation.pathname === fromLocation.pathname &&
+          toLocation.searchStr === fromLocation.searchStr &&
+          toLocation.hash !== fromLocation.hash
+        ) {
+          return;
+        }
         const focused = document.activeElement;
         if (focused === null || focused === document.body) {
           document.querySelector('main')?.focus({ preventScroll: true });
@@ -455,11 +471,119 @@ function useFocusRecoveryAfterNavigation(): void {
 }
 
 /**
+ * The fragment of the same-document link a click follows, such as `#section-keywords` of a
+ * section navigation link or `#group-campaigns-discrepancies` of the discrepancy banner's link,
+ * or `null` when the click follows no such link.
+ *
+ * A click qualifies only when the browser will follow the link in this document: no handler
+ * prevented its default (a router `Link` does, and so does the skip link, which focuses
+ * `<main>` itself), the primary button with no modifier key (modifiers open a new tab or window,
+ * or download), no `download` attribute and no browsing context other than this one (`target`,
+ * or the page's `<base target>`). Its URL must be this document's own origin, path and search
+ * with a non-empty fragment; a bare `#` scrolls to the top and names no element.
+ *
+ * @param event - a `click` that has reached `document`, after every handler of the app
+ * @returns the link's fragment with its `#`, as `URL.hash` spells it, or `null`
+ */
+function sameDocumentLinkHash(event: MouseEvent): string | null {
+  if (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey
+  ) {
+    return null;
+  }
+  const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
+  if (!(link instanceof HTMLAnchorElement) || link.hasAttribute('download')) {
+    return null;
+  }
+  const context =
+    link.getAttribute('target') ??
+    link.ownerDocument.querySelector('base[target]')?.getAttribute('target') ??
+    '';
+  if (context !== '' && context.toLowerCase() !== '_self') {
+    return null;
+  }
+  let url: URL;
+  try {
+    url = new URL(link.href);
+  } catch {
+    // An href the URL parser rejects is one the browser does not follow either.
+    return null;
+  }
+  const here = window.location;
+  const sameDocument =
+    url.origin === here.origin && url.pathname === here.pathname && url.search === here.search;
+  return sameDocument && url.hash !== '' ? url.hash : null;
+}
+
+/**
+ * Moves focus to the element an in-page link names, so keyboard and screen-reader users
+ * continue inside the section, group or card they asked for (WCAG 2.2 SC 2.4.3 Focus Order):
+ * after a link such as a section navigation link (`#section-{key}`), the discrepancy banner's
+ * "Review discrepancies" (`#group-campaigns-discrepancies`) or a link to a card (`#item-{id}`),
+ * focus is on that element, and the next Tab reaches the first control inside it.
+ *
+ * The browser follows the link itself (it changes the hash and scrolls the target into view),
+ * but it moves focus only to a target that is focusable. The regions and cards these links name
+ * are not, so it would leave focus on `<body>`. The element therefore gets `tabindex="-1"` for as
+ * long as it holds focus ({@link focusElement}), and focus moves without scrolling, because the
+ * browser has scrolled already.
+ *
+ * - **Click** (with the mouse, or Enter on a focused link): on a click on a same-document link
+ *   ({@link sameDocumentLinkHash}), the target is focused at once, before the browser follows
+ *   the link, so the browser's own focus step finds it focusable and keeps focus there. A link
+ *   to the hash already in the URL fires no `hashchange`, so this alone covers activating the
+ *   same link again.
+ * - **`hashchange`**: back and forward through in-page entries, or an edited address, focus the
+ *   element the new hash names.
+ *
+ * A hash that names no element leaves focus where it is. A target the page has not rendered
+ * yet, such as a card beyond the shown batch, is revealed, scrolled to and focused by its list
+ * on `hashchange` (`features/actions/batches.tsx`). A page load with a hash moves no focus.
+ *
+ * Called from the root route's component, which stays mounted on every screen.
+ */
+function useFocusOnHashTarget(): void {
+  useEffect(() => {
+    const focusTarget = (hash: string): void => {
+      const id = idFromHash(hash);
+      const element = id === null ? null : document.getElementById(id);
+      if (element !== null) {
+        focusElement(element, { preventScroll: true });
+      }
+    };
+    const onClick = (event: MouseEvent): void => {
+      const hash = sameDocumentLinkHash(event);
+      if (hash !== null) {
+        focusTarget(hash);
+      }
+    };
+    const onHashChange = (): void => {
+      focusTarget(window.location.hash);
+    };
+    // Bubble phase on document, so the app's own handlers, which React runs on its root
+    // container, have run and any of them may have prevented the default.
+    document.addEventListener('click', onClick);
+    window.addEventListener('hashchange', onHashChange);
+    return () => {
+      document.removeEventListener('click', onClick);
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, []);
+}
+
+/**
  * The root route's component: the matched child route and nothing else (the signed-in frame is
- * {@link AppLayout}'s, and `/login` renders its own), plus focus recovery after navigation.
+ * {@link AppLayout}'s, and `/login` renders its own), plus focus recovery after navigation and
+ * focus on the target of an in-page link.
  */
 function RootComponent(): ReactElement {
   useFocusRecoveryAfterNavigation();
+  useFocusOnHashTarget();
   return <Outlet />;
 }
 
@@ -646,11 +770,11 @@ function isSessionGone(error: ApiError): boolean {
  *     `role="alert"`, which open discrepancies alone use. Inside it an `Inline`, spaced like the
  *     top bar's actions row, lays out the message and the button, so without a failure the
  *     region holds the button alone and the bar looks as it would without the region.
- *   - **Focus** (WCAG 2.2 SC 2.4.3): the loading button is natively disabled, so a browser may
- *     drop focus to `<body>` while the request is pending. After each failure, once the render
- *     that re-enables the button has committed, focus returns to "Sign out" when it is on
- *     `<body>` or nowhere. Focus the user moved to another control during the request stays
- *     where it is.
+ *   - **Focus** (WCAG 2.2 SC 2.4.3): the loading button keeps focus (it is `aria-disabled`,
+ *     never natively disabled), but focus can still be lost to `<body>` while the request is
+ *     pending. After each failure, once the render that re-enables the button has committed,
+ *     focus returns to "Sign out" when it is on `<body>` or nowhere. Focus the user moved to
+ *     another control during the request stays where it is.
  * - **Primary navigation**: Actions, Decisions, Sources and Settings, in that order. The current
  *   screen's link carries `aria-current="page"`, set by `SideNav` from the router's pathname.
  * - **Main**: the routed page, or "Page not found" for a path no screen matches.

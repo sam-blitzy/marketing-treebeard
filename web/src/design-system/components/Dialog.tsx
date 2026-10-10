@@ -29,8 +29,9 @@
  * Accessibility (WCAG 2.2 AA, AAP 0.1.1), implemented without a headless library (AAP 0.4.5):
  * - 4.1.2 Name, Role, Value: `role="dialog"` with `aria-modal="true"`, named by its visible
  *   title through `aria-labelledby`, so `getByRole('dialog', { name: 'Record decision' })`
- *   matches and assistive technology treats the page behind it as inert. The title is required
- *   plain text and an open dialog with a blank one throws, so the dialog is never unnamed.
+ *   matches and assistive technology treats the page behind it as inert; the page is also made
+ *   inert in the DOM (below). The title is required plain text and an open dialog with a blank
+ *   one throws, so the dialog is never unnamed.
  * - 2.4.3 Focus Order: on open, focus moves to the first tab stop of the body, so a form's
  *   first field is ready for input; when the body holds none, the panel itself takes focus (it
  *   has `tabindex="-1"` and a `:focus-visible` ring in `Dialog.css`). A hidden, disabled or
@@ -59,6 +60,21 @@
  *   returns focus that reaches the page behind the modal by any other path (a script focusing
  *   an element there, or a positive `tabindex` there) to the first stop. The modal is never a
  *   trap: Escape, the Close button and a backdrop click all close it.
+ * - Modal background: while the dialog is open, the page behind it is `inert` and the document
+ *   does not scroll. Every element child of `document.body` at the moment the dialog opens (the
+ *   app's root among them) gets the `inert` attribute, so nothing there can be clicked, focused
+ *   or found by assistive technology; the dialog's own portal root, and content its descendants
+ *   portal to `document.body`, are added to the body later in the commit that opens it, so they
+ *   stay interactive. An element that already has `inert` is left alone and keeps it after the
+ *   dialog closes. `<html>` takes the `ds-dialog-scroll-lock` class, which `Dialog.css` styles
+ *   with `overflow: hidden`, so wheel, touch, keyboard and scrollbar scrolling of the page stop
+ *   while the scroll position is kept, and the panel still scrolls its own content. When the
+ *   page shows a classic vertical scrollbar as the dialog opens, `<html>` also takes the
+ *   `ds-dialog-scroll-lock--gutter` modifier (`scrollbar-gutter: stable`), so the content behind
+ *   the backdrop does not shift as the scrollbar hides. On close or unmount both are removed
+ *   before focus returns to the opener, because an element inside an inert subtree cannot take
+ *   focus. The attributes and classes are counted per element across open dialogs, so when one
+ *   dialog closes in the commit that opens another, the page stays inert and locked throughout.
  *
  * Tab stops follow `./focusable.ts`: natively focusable elements (links, form controls,
  * iframes, media with controls, editing hosts, a `details` toggle) and valid `tabindex`
@@ -153,10 +169,101 @@ function focusedElement(): FocusableElement | null {
 }
 
 /**
+ * The page behind a dialog that is opening: the element children of `document.body` now. It is
+ * read while rendering the opening, as the return focus target is, before the commit that adds
+ * the dialog's portal root and any content its descendants portal to `document.body`, so those
+ * are never part of it.
+ *
+ * @returns the body's element children, in document order
+ */
+function bodyChildren(): readonly Element[] {
+  return Array.from(document.body.children);
+}
+
+/**
+ * The background elements open dialogs have made inert, each with the number of open dialogs
+ * holding it. An element enters only when a dialog finds it without `inert`, so an `inert` that
+ * anything else set is never removed, and it leaves when its last holder closes, so a dialog
+ * closing in the commit that opens another never frees the page the other one covers.
+ */
+const inertHolds = new Map<Element, number>();
+
+/** The number of open dialogs holding the document scroll lock. */
+let scrollLockHolds = 0;
+
+/** The class on `<html>` that stops the document scrolling while a dialog is open (`Dialog.css`). */
+const SCROLL_LOCK_CLASS = 'ds-dialog-scroll-lock';
+
+/**
+ * The modifier on `<html>` that keeps the space of the page's vertical scrollbar while the scroll
+ * lock hides it (`Dialog.css`), so nothing behind the backdrop shifts.
+ */
+const SCROLL_LOCK_GUTTER_CLASS = 'ds-dialog-scroll-lock--gutter';
+
+/**
+ * Makes the page behind an open dialog inert and stops the document scrolling, until the
+ * returned release runs.
+ *
+ * Each element of `background` that is still a child of `document.body`, other than the
+ * dialog's `root` and any element containing it, gets the `inert` attribute. It is set and
+ * removed as an attribute, which every engine reflects (jsdom included), rather than through the
+ * `inert` property. An element that already has `inert` from anything but an open dialog is
+ * skipped and never touched. The first hold adds the scroll-lock class to `<html>`, together
+ * with the gutter modifier when the page shows a classic vertical scrollbar at that moment (the
+ * viewport is wider than the root's client area); measuring before the lock is applied keeps a
+ * page without one, or with overlay scrollbars, from gaining a gutter it never had.
+ *
+ * @param background - the body children recorded when the dialog opened ({@link bodyChildren})
+ * @param root - the dialog's portal root, which stays interactive
+ * @returns the release, to be called once, which removes this hold's share of the `inert`
+ *   attributes and of the scroll lock
+ */
+function holdModalBackground(background: readonly Element[], root: Element): () => void {
+  const held: Element[] = [];
+  for (const element of background) {
+    if (element.parentElement !== document.body || element === root || element.contains(root)) {
+      continue;
+    }
+    const holds = inertHolds.get(element);
+    if (holds !== undefined) {
+      inertHolds.set(element, holds + 1);
+    } else if (element.hasAttribute('inert')) {
+      continue;
+    } else {
+      element.setAttribute('inert', '');
+      inertHolds.set(element, 1);
+    }
+    held.push(element);
+  }
+  const html = document.documentElement;
+  if (scrollLockHolds === 0) {
+    html.classList.toggle(SCROLL_LOCK_GUTTER_CLASS, window.innerWidth > html.clientWidth);
+    html.classList.add(SCROLL_LOCK_CLASS);
+  }
+  scrollLockHolds += 1;
+  return () => {
+    for (const element of held) {
+      const holds = inertHolds.get(element) ?? 0;
+      if (holds > 1) {
+        inertHolds.set(element, holds - 1);
+      } else {
+        inertHolds.delete(element);
+        element.removeAttribute('inert');
+      }
+    }
+    scrollLockHolds -= 1;
+    if (scrollLockHolds === 0) {
+      html.classList.remove(SCROLL_LOCK_CLASS, SCROLL_LOCK_GUTTER_CLASS);
+    }
+  };
+}
+
+/**
  * Modal dialog: renders the panel into `document.body` while `open` is `true`, moves focus
- * into it, keeps Tab and Shift+Tab inside it, closes on Escape, the Close button or a backdrop
- * click (by calling `onClose`), and returns focus to the element that had focus when it opened
- * once it closes or unmounts.
+ * into it, makes the page behind it inert and stops the page scrolling, keeps Tab and
+ * Shift+Tab inside it, closes on Escape, the Close button or a backdrop click (by calling
+ * `onClose`), and once it closes or unmounts frees the page, at the scroll position it had, and
+ * returns focus to the element that had focus when it opened.
  *
  * Usage contract:
  * - The parent owns `open`, and `onClose` must set it to `false`.
@@ -164,6 +271,10 @@ function focusedElement(): FocusableElement | null {
  *   without an accessible name.
  * - Only one dialog is open at a time. Dialogs are not stacked: each one traps focus within
  *   its own panel and covers the whole viewport.
+ * - The page behind is what `document.body` holds when the dialog opens. Content a descendant
+ *   portals to `document.body` stays interactive; anything else added to the body while the
+ *   dialog is open is not made inert, and the focus guard still sends focus there back to the
+ *   panel.
  * - Escape on the panel closes the dialog and stops propagating there. An open `Tooltip`
  *   inside the dialog consumes the first Escape in the capture phase, before it reaches the
  *   panel, so that press only dismisses the tooltip and the dialog stays open.
@@ -197,6 +308,7 @@ export function Dialog({
 }: DialogProps) {
   // Hooks run unconditionally, before the early return for a closed dialog.
   const titleId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const leadingSentinelRef = useRef<HTMLSpanElement>(null);
@@ -212,14 +324,19 @@ export function Dialog({
   // runs (a layout effect included), so an effect would read that descendant instead. This is
   // React's pattern for adjusting state when a prop changes: the update made during render is
   // applied before React renders the children, and it is dropped with any render React
-  // discards.
+  // discards. The page behind the dialog, which it makes inert while open, is read in the same
+  // render, before the commit adds the dialog's own portal root to the body.
   const [returnFocus, setReturnFocus] = useState<FocusableElement | null>(() =>
     open ? focusedElement() : null,
+  );
+  const [background, setBackground] = useState<readonly Element[]>(() =>
+    open ? bodyChildren() : [],
   );
   const [openedWith, setOpenedWith] = useState(open);
   if (open !== openedWith) {
     setOpenedWith(open);
     setReturnFocus(open ? focusedElement() : null);
+    setBackground(open ? bodyChildren() : []);
   }
   // The element that had focus inside the panel when a cleanup ran while the panel stayed in
   // the document, as React StrictMode's simulated unmount does; the setup that follows gives it
@@ -230,18 +347,26 @@ export function Dialog({
   // of an open dialog (new children or a new onClose) never steals focus back to the first
   // field. The effect runs after the portal is committed, so every ref is attached when it
   // starts. Focus already inside the panel (a descendant's `autoFocus`) stays where it is;
-  // otherwise the body's first tab stop, or the panel, takes it. The cleanup runs when the
-  // dialog closes or unmounts, after the panel has left the DOM, and returns focus to
-  // `returnFocus` if it is still in the document.
+  // otherwise the body's first tab stop, or the panel, takes it. Then the page behind the
+  // dialog turns inert and stops scrolling, once focus has left it. The cleanup runs when the
+  // dialog closes or unmounts, after the panel has left the DOM, frees the page, and returns
+  // focus to `returnFocus` if it is still in the document.
   useEffect(() => {
     if (!open) {
       return undefined;
     }
+    const root = rootRef.current;
     const panel = panelRef.current;
     const body = bodyRef.current;
     const leadingSentinel = leadingSentinelRef.current;
     const trailingSentinel = trailingSentinelRef.current;
-    if (panel === null || body === null || leadingSentinel === null || trailingSentinel === null) {
+    if (
+      root === null ||
+      panel === null ||
+      body === null ||
+      leadingSentinel === null ||
+      trailingSentinel === null
+    ) {
       return undefined;
     }
     const resume = resumeFocusRef.current;
@@ -254,6 +379,8 @@ export function Dialog({
         panel.focus();
       }
     }
+    // Focus is inside the panel now, so no element of the page holds focus as it turns inert.
+    const releaseBackground = holdModalBackground(background, root);
     // Focus guard and sentinels: focus that reaches an element outside the panel by a path
     // the keyboard handler leaves to the browser or never sees is sent back into the panel.
     // Focus on the leading sentinel comes from Shift+Tab out of the panel's first stop, or into
@@ -299,11 +426,14 @@ export function Dialog({
       }
       const focused = focusedElement();
       resumeFocusRef.current = focused !== null && panel.contains(focused) ? focused : null;
+      // The page is freed before focus returns: an element inside an inert subtree cannot take
+      // focus, and the opener is normally part of the page behind the dialog.
+      releaseBackground();
       if (returnFocus?.isConnected === true) {
         returnFocus.focus();
       }
     };
-  }, [open, returnFocus]);
+  }, [open, returnFocus, background]);
 
   if (!open) {
     return null;
@@ -384,7 +514,7 @@ export function Dialog({
   }
 
   return createPortal(
-    <div className="ds-dialog">
+    <div ref={rootRef} className="ds-dialog">
       {/* Focus sentinels: the document focus guard in the effect above sends focus that lands
           on one back into the panel, at its last stop from this one and at its first stop from
           the trailing one. This one precedes the backdrop, so after a click on the backdrop

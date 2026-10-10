@@ -285,8 +285,8 @@ describe('DecisionLog states', () => {
     await renderLog();
     const region = logRegion();
     const retry = await within(region).findByRole('button', { name: 'Retry' });
-    // A browser drops focus to the body when the focused button turns disabled while loading;
-    // jsdom keeps it, so the click is made with focus already on the body.
+    // The click is made with focus on the body, as when focus is lost while the read runs (a
+    // loading Button itself keeps focus).
     expect(document.activeElement).toBe(document.body);
     fireEvent.click(retry);
 
@@ -911,6 +911,9 @@ describe('DecisionLog "Record decision"', () => {
     const dialog = await saveEmeaPause(api);
     fireEvent.click(buttonNamed('Close', dialog));
     expect(screen.queryByRole('dialog')).toBeNull();
+    // The closed dialog returns focus to its opener, which keeps it while it loads.
+    expect(document.activeElement).toBe(emeaRecord());
+    expect(emeaRecord().getAttribute('aria-disabled')).toBe('true');
   }
 
   /** A failure banner the log's region shows, found by its message, and its focus target. */
@@ -1105,7 +1108,7 @@ describe('DecisionLog "Record decision"', () => {
     // budget's action stays usable and opens its dialog.
     fireEvent.click(buttonNamed('Close', first));
     expect(linkedin.getAttribute('aria-busy')).toBe('true');
-    expect(linkedin).toHaveProperty('disabled', true);
+    expect(linkedin.getAttribute('aria-disabled')).toBe('true');
     expect(budget.getAttribute('aria-busy')).toBeNull();
     expect(budget).toHaveProperty('disabled', false);
     fireEvent.click(budget);
@@ -1188,15 +1191,17 @@ describe('DecisionLog "Record decision"', () => {
     fireEvent.click(buttonNamed('Close', first));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(record.getAttribute('aria-busy')).toBe('true');
-    expect(record.disabled).toBe(true);
+    // Inert but focusable: the closed dialog returned focus to it.
+    expect(record.getAttribute('aria-disabled')).toBe('true');
+    expect(record.disabled).toBe(false);
+    expect(document.activeElement).toBe(record);
     fireEvent.click(record);
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(posts(api)).toHaveLength(1);
 
     firstSave.resolve(json(201, saved));
 
-    // The late save is announced, frees the action and, as the closed dialog could not return
-    // focus to the disabled button, puts focus back on it.
+    // The late save is announced and frees the action, which keeps focus.
     await waitFor(() => {
       expect(logRegion().textContent).toBe('Decision recorded');
     });

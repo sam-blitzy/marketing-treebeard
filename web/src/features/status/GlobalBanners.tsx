@@ -30,6 +30,12 @@
  *   simulated-sources message names each simulated source with its reason, such as
  *   "credentials not configured".
  *
+ * - **Run notice**: the page may pass a notice about the run on screen (`runNotice`), such as
+ *   the custom-window banner. It is rendered in the same `Stack` as the global banners,
+ *   directly after the open-discrepancies banner (first when that banner is not shown) and
+ *   before every other banner, so the discrepancy banner still sits above everything and the
+ *   notice is spaced like its neighbours. It is never an alert.
+ *
  * Presentational only: the page passes `banners` and `overlay` from one `GET /recommendations`
  * response, and this module calls no data hook. UI comes only from the design-system index:
  * `Stack` spaces the banners and `Banner` renders each one, with no styles of their own
@@ -138,6 +144,13 @@ export interface GlobalBannersProps {
    * the live count the open-discrepancies banner's title reports.
    */
   overlay: Overlay;
+  /**
+   * A notice about the run on screen, such as the custom-window banner, rendered in the same
+   * `Stack` directly after the open-discrepancies banner, or first when that banner is not
+   * shown, and before every other banner. It must not carry `role="alert"`, which AAP 0.5.5
+   * reserves for the open-discrepancies banner. Omitted or `null`, no notice is shown.
+   */
+  runNotice?: ReactElement | null;
 }
 
 /**
@@ -189,24 +202,38 @@ function isTone(tone: unknown): tone is BannerTone {
  *   the API's message, and the action is a "Review discrepancies" link to
  *   `#group-campaigns-discrepancies`. It is skipped while the live count is `0`, and shown at
  *   most once.
+ * - **The run notice** (`runNotice`), when given: rendered as passed, right after the
+ *   open-discrepancies banner, or first when that banner is not shown.
  * - **Every other banner**: the API's tone, with its message as the title, no content, no
  *   action and no live region. A banner with a blank message has nothing to say and is
  *   skipped; an unknown tone renders as `neutral`.
  *
- * Returns `null` when no banner is left to show, so the page keeps no empty container.
+ * The open-discrepancies banner and the run notice each keep a slot of their own in the
+ * `Stack`, so the notice is not remounted when the discrepancy banner appears or goes.
+ *
+ * Returns `null` when neither a banner nor a run notice is left to show, so the page keeps no
+ * empty container.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *
  * @example
  * ```tsx
- * <GlobalBanners banners={page.banners} overlay={page.overlay} />
+ * <GlobalBanners
+ *   banners={page.banners}
+ *   overlay={page.overlay}
+ *   runNotice={run.kind === 'custom' ? <CustomRunBanner run={run} /> : null}
+ * />
  * ```
  */
-export function GlobalBanners({ banners, overlay }: GlobalBannersProps): ReactElement | null {
+export function GlobalBanners({
+  banners,
+  overlay,
+  runNotice = null,
+}: GlobalBannersProps): ReactElement | null {
   const openDiscrepancies = liveDiscrepancyCount(overlay);
   const occurrences = new Map<string, number>();
   const rendered: ReactElement[] = [];
-  let discrepancyShown = false;
+  let discrepancyBanner: ReactElement | null = null;
 
   for (const banner of orderBanners(banners)) {
     // The API sends each code at most once; a repeat still gets a key of its own.
@@ -217,13 +244,11 @@ export function GlobalBanners({ banners, overlay }: GlobalBannersProps): ReactEl
 
     if (banner.code === DISCREPANCY_CODE) {
       // One alert at most, and only while the live count says something is open.
-      if (discrepancyShown || openDiscrepancies === 0) {
+      if (discrepancyBanner !== null || openDiscrepancies === 0) {
         continue;
       }
-      discrepancyShown = true;
-      rendered.push(
+      discrepancyBanner = (
         <Banner
-          key={key}
           tone="critical"
           alert
           id={DISCREPANCY_BANNER_ID}
@@ -231,7 +256,7 @@ export function GlobalBanners({ banners, overlay }: GlobalBannersProps): ReactEl
           actions={<a href={DISCREPANCY_GROUP_HREF}>{REVIEW_DISCREPANCIES_LABEL}</a>}
         >
           {message}
-        </Banner>,
+        </Banner>
       );
       continue;
     }
@@ -244,8 +269,15 @@ export function GlobalBanners({ banners, overlay }: GlobalBannersProps): ReactEl
     );
   }
 
-  if (rendered.length === 0) {
+  if (discrepancyBanner === null && runNotice === null && rendered.length === 0) {
     return null;
   }
-  return <Stack>{rendered}</Stack>;
+  // The discrepancy banner sits above everything; the run notice follows it, then the rest.
+  return (
+    <Stack>
+      {discrepancyBanner}
+      {runNotice}
+      {rendered}
+    </Stack>
+  );
 }

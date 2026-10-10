@@ -274,10 +274,11 @@ function useSettledError(error: ApiError | null, hasData: boolean): ApiError | n
 /**
  * Returns keyboard focus to a button once the work it started has settled.
  *
- * A design-system `Button` is natively disabled while `loading`, and a disabled button drops
- * focus to the page body. Call the returned `arm` function when the user presses the button;
- * once `busy` turns `false` again, focus goes back to it, provided it is still on the page and
- * enabled and focus has not been moved elsewhere in the meantime (WCAG 2.2 SC 2.4.3). Background
+ * A design-system `Button` keeps focus while `loading` (it is `aria-disabled`, never natively
+ * disabled), but focus can still be lost to the page body while the work runs. Call the
+ * returned `arm` function when the user presses the button; once `busy` turns `false` again,
+ * focus on the body goes back to it, provided it is still on the page and enabled; focus moved
+ * elsewhere in the meantime stays there (WCAG 2.2 SC 2.4.3). Background
  * work the user did not start never moves focus.
  *
  * @param busy - whether the work the button started is still running
@@ -794,7 +795,7 @@ export function SourcesPage(): ReactElement {
   const defaultRun = useDefaultRun();
   const failure = useSettledError(sources.error, sources.data !== undefined);
 
-  // A Retry the user started: the button shows as loading, hence disabled, until it settles.
+  // A Retry the user started: the button shows as loading, hence inert, until it settles.
   const [retrying, setRetrying] = useState(false);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const armRetryFocus = useFocusReturn(retrying, retryButtonRef);

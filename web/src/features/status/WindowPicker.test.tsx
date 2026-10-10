@@ -35,7 +35,13 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { ConfigView, Run } from '../../api/types';
-import { CUSTOM_RUN_ID, DEFAULT_RUN_ID, makeConfig, makeRun } from '../../test/fixtures';
+import {
+  CUSTOM_RUN_ID,
+  DEFAULT_RUN_ID,
+  makeConfig,
+  makeRecommendationsPage,
+  makeRun,
+} from '../../test/fixtures';
 import { WindowPicker, presetWindow } from './WindowPicker';
 
 // ---------------------------------------------------------------------------------------------
@@ -133,8 +139,9 @@ function deferred(): Deferred {
 
 /**
  * Stubs the picker's reads with the fixture world: the shipped configuration, the latest
- * default run, no custom run and a `POST /runs` that creates {@link customRun}. `overrides`
- * replaces any of them.
+ * default run, no custom run and a `POST /runs` that creates {@link customRun}, plus the
+ * created run's page, `GET /recommendations?run_id=<id>`, which the mutation reads before the
+ * picker opens the run. `overrides` replaces any of them.
  */
 function stubApi(overrides: MockHandlers = {}): ApiMock {
   return mockApi({
@@ -142,8 +149,20 @@ function stubApi(overrides: MockHandlers = {}): ApiMock {
     'GET /runs/latest': json(200, makeRun()),
     'GET /runs': json(200, []),
     'POST /runs': json(201, customRun),
+    'GET /recommendations': (call) =>
+      json(
+        200,
+        makeRecommendationsPage({ run: { ...customRun, id: Number(call.search.get('run_id')) } }),
+      ),
     ...overrides,
   });
+}
+
+/** The `run_id` of every `GET /recommendations` request made so far, in order. */
+function pageReads(api: ApiMock): (string | null)[] {
+  return api.calls
+    .filter((call) => call.method === 'GET' && call.path === '/recommendations')
+    .map((call) => call.search.get('run_id'));
 }
 
 /** Renders the picker for `run` at `path`. */
@@ -223,8 +242,9 @@ function noticeTitles(): string[] {
 }
 
 /**
- * Leaves focus on the page body, as a browser does once the focused control is disabled (the
- * focus fixup rule). jsdom implements no fixup, and its `blur()` ignores a disabled element, so
+ * Leaves focus on the page body, as a browser does once a focused control is natively disabled
+ * (the focus fixup rule; a date field, say, since a `Button` keeps focus), or after a click on
+ * the page background. jsdom implements no fixup, and its `blur()` ignores a disabled element, so
  * focus is moved to a temporary focusable element that is then removed, which jsdom does
  * follow by returning focus to the body.
  */
@@ -550,6 +570,8 @@ describe('WindowPicker', () => {
       // The client marks every mutating request for the API's CSRF check (AAP 0.3.2).
       expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
       expect(post?.headers.get('Content-Type')).toMatch(/^application\/json/u);
+      // The created run's page was read before the picker opened it, so it renders at once.
+      expect(pageReads(api)).toEqual([String(CUSTOM_RUN_ID)]);
     });
 
     it('disables every control and states "Computing custom window" while the run computes', async () => {
@@ -725,6 +747,8 @@ describe('WindowPicker', () => {
       expect(posts(api)).toHaveLength(1);
       expect(post?.body).toEqual({ window_start: '2026-08-01', window_end: '2026-08-30' });
       expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
+      // The created run's page was read before the picker opened it, so it renders at once.
+      expect(pageReads(api)).toEqual([String(CUSTOM_RUN_ID)]);
     });
 
     it('holds a range to the default window end and the configured longest span, posting nothing', async () => {
@@ -753,7 +777,7 @@ describe('WindowPicker', () => {
   });
 
   describe('a failed computation', () => {
-    it('reads "Another analysis is running" for 409 run_in_progress, stays put and returns focus', async () => {
+    it('reads "Another analysis is running" for 409 run_in_progress, stays put and keeps focus', async () => {
       const created = deferred();
       const api = stubApi({ 'POST /runs': created.handler });
       const { router } = await renderPicker();
@@ -762,11 +786,14 @@ describe('WindowPicker', () => {
       const preset = button('56 days');
       preset.focus();
       fireEvent.click(preset);
+      // The focused preset is disabled while the run computes, but keeps focus: it is inert and
+      // aria-disabled until focus leaves it, while the other presets are natively disabled.
       await waitFor(() => {
-        expect(preset.hasAttribute('disabled')).toBe(true);
+        expect(preset.getAttribute('aria-disabled')).toBe('true');
       });
-      // A browser moves focus off a control once it is disabled; jsdom does not.
-      dropFocusToBody();
+      expect(preset.hasAttribute('disabled')).toBe(false);
+      expect(document.activeElement).toBe(preset);
+      expect(button('14 days').hasAttribute('disabled')).toBe(true);
 
       created.resolve(apiError(409, 'run_in_progress', 'An analysis is already running.'));
 
@@ -781,10 +808,11 @@ describe('WindowPicker', () => {
         { window_start: '2026-08-11', window_end: '2026-10-05' },
       ]);
       expect(router.state.location.search).toEqual({});
-      // The picker is usable again, and focus is back on the control that started the run.
+      // The picker is usable again, and focus is still on the control that started the run.
       await waitFor(() => {
-        expect(preset.hasAttribute('disabled')).toBe(false);
+        expect(preset.hasAttribute('aria-disabled')).toBe(false);
       });
+      expect(preset.hasAttribute('disabled')).toBe(false);
       expect(document.activeElement).toBe(preset);
     });
 
@@ -871,11 +899,14 @@ describe('WindowPicker', () => {
       await waitFor(() => {
         expect(retry.getAttribute('aria-busy')).toBe('true');
       });
-      expect(retry.hasAttribute('disabled')).toBe(true);
+      // Inert while loading but never natively disabled, so it keeps focus.
+      expect(retry.getAttribute('aria-disabled')).toBe('true');
+      expect(retry.hasAttribute('disabled')).toBe(false);
+      expect(document.activeElement).toBe(retry);
       // The warning is kept in place while the read runs again.
       expect(noticeTitles()).toEqual(['Could not read the latest default run']);
       expect(retry.isConnected).toBe(true);
-      // A browser moves focus off the button once it is disabled; jsdom does not.
+      // Focus lost to the page body meanwhile still goes back to Retry once the read settles.
       dropFocusToBody();
 
       latest.resolve(apiError(500, 'internal_error', 'The database is still unavailable.'));

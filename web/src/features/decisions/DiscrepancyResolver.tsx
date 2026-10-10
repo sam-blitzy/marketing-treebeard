@@ -505,9 +505,9 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   close it without posting, and may close it while its save runs. Until that save settles,
  *   "Record intended state" shows its loading state and every other resolution is disabled, so
  *   neither a second intended state nor another resolution can be posted. A save that ends
- *   after its dialog was closed is still reported, and focus, which the closed dialog could not
- *   return to the disabled button, goes back to "Record intended state" when nothing else has
- *   taken it.
+ *   after its dialog was closed is still reported. The closed dialog returns focus to "Record
+ *   intended state", which stays focusable while it loads; focus lost by the time the save
+ *   settles goes back to it when nothing else has taken it.
  * - Every other resolution posts `POST /discrepancies/{id}/resolve` with `{ resolution }` at
  *   once. While it runs, the clicked button shows its loading state and the others are disabled.
  * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
@@ -568,10 +568,10 @@ function DiscrepancyResolutionBody({
   // once its dialog closes.
   const formMessage = formRetired ? RETIRED_MESSAGE : formFailure;
 
-  // A clicked button is disabled while its request runs, which drops keyboard focus to the page.
-  // When the request fails, focus moves to the error instead, so keyboard and screen-reader users
-  // land on the message (WCAG 2.2 SC 2.4.3, 3.3.1) without a role="alert" live region, which
-  // AAP 0.5.5 reserves for the discrepancy banner on /actions.
+  // A clicked button is loading while its request runs, and keeps keyboard focus. When the
+  // request fails, focus moves on to the error, so keyboard and screen-reader users land on the
+  // message (WCAG 2.2 SC 2.4.3, 3.3.1) without a role="alert" live region, which AAP 0.5.5
+  // reserves for the discrepancy banner on /actions.
   const errorRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (error !== null) {
@@ -588,12 +588,12 @@ function DiscrepancyResolutionBody({
   }, [formMessage, dialog.open]);
 
   // A success that leaves this discrepancy on screen (awaiting_platform) re-enables the clicked
-  // button; focus goes back to it when the loading state dropped focus to the page, so keyboard
-  // and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). So does an
-  // intended-state save that settles after its dialog was closed, which could not return focus
-  // to the disabled "Record intended state". A failure's banner takes focus first (the effects
-  // above), and a closed discrepancy leaves the lists, where the browser's focus navigation
-  // starting point keeps the user's place, so nothing is focused for either.
+  // button, which keeps focus while it loads; focus lost to the page meanwhile goes back to it,
+  // so keyboard and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). So
+  // does an intended-state save that settles after its dialog was closed, for focus lost after
+  // the dialog returned it to "Record intended state". A failure's banner takes focus first (the
+  // effects above), and a closed discrepancy leaves the lists, where the browser's focus
+  // navigation starting point keeps the user's place, so nothing is focused for either.
   const buttonRefs = useRef(new Map<Resolution, HTMLButtonElement>());
   const [refocus, setRefocus] = useState<Resolution | null>(null);
   useEffect(() => {
@@ -1146,7 +1146,7 @@ export function DiscrepancyResolver() {
     }
   };
 
-  // "Show more": the button is loading, hence disabled, until the page settles; then focus is
+  // "Show more": the button is loading, hence inert, until the page settles; then focus is
   // placed once the render that shows the page has committed.
   const [loadingMore, setLoadingMore] = useState(false);
   const [settledMore, setSettledMore] = useState<SettledMore | null>(null);

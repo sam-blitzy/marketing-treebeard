@@ -22,8 +22,11 @@
  * - **Invalidation.** After a successful write, a mutation invalidates the `*All` roots of
  *   everything the write can change. Its `onSuccess` returns that promise, so `mutateAsync`
  *   resolves only once the refetch of every shown (active) entry it invalidated has settled.
- *   Mutations set no `retry`. The app's `QueryClient` (`src/main.tsx`) does not retry them,
- *   because a POST is not idempotent from the UI's point of view.
+ *   A decision write or a discrepancy resolution first removes the recommendations pages no
+ *   screen shows: invalidation would only mark them stale, and a later visit would render
+ *   their outdated overlay, a resolved discrepancy's `role="alert"` banner included, until
+ *   the refetch landed. Mutations set no `retry`. The app's `QueryClient` (`src/main.tsx`)
+ *   does not retry them, because a POST is not idempotent from the UI's point of view.
  * - **Polling.** {@link useDefaultRun} and {@link useRecommendations}, with or without a run
  *   id, refetch every {@link CURRENT_STATE_POLL_MS} while they are shown, so a new default
  *   run and the live overlay (holds, discrepancy count, source modes, freshness, feedback and
@@ -36,8 +39,8 @@
  *   discrepancies on its own schedule; the paged list refetches only the pages already
  *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. Polling runs only while
  *   the page is visible and stops when the last component using the query unmounts. A
- *   prefetch ({@link usePrefetchActionsReads}) registers no component, so it reads once and
- *   never polls.
+ *   prefetch ({@link usePrefetchActionsReads}, and {@link useCreateRun}'s read of the page of
+ *   the run it creates) registers no component, so it reads once and never polls.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -591,7 +594,8 @@ export function useForgetCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT): 
  * API exactly as the run stored it. Each item's `current` and the page's `overlay` and
  * `banners` are read-time state, computed when the API serves the request: live
  * discrepancies, source modes, freshness, feedback and historical-only marking (AAP 0.3.2).
- * Every write that changes them invalidates this key's root.
+ * Every write that changes them invalidates this key's root; a decision write or a
+ * discrepancy resolution first removes the pages no screen shows, so none renders outdated.
  *
  * The worker and other sessions change that state too, so a shown page, default or custom,
  * refetches every {@link CURRENT_STATE_POLL_MS}. A new discrepancy then holds its dependent
@@ -604,11 +608,35 @@ export function useForgetCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT): 
  * Status codes: 200; 404 `not_found` for an unknown run or before the first default run; 409
  * `run_not_ready` for a run that is still `running` or has `failed`.
  *
+ * The options come from {@link recommendationsQueryOptions}, which {@link useCreateRun} also
+ * prefetches, so a custom run it creates is already cached when `/actions?run=<id>` mounts
+ * this hook, and the page renders at once instead of a loading state.
+ *
  * @param runId - The run to show; omitted for the latest default run.
  * @returns The query result, keyed by `queryKeys.recommendations(runId ?? 'default')`.
  */
 export function useRecommendations(runId?: RunId) {
-  return useQuery({
+  return useQuery(recommendationsQueryOptions(runId));
+}
+
+/**
+ * Query options for the five sections of one run with the current-state overlay,
+ * `GET /recommendations[?run_id=]` → {@link RecommendationsPage}: the options
+ * {@link useRecommendations} observes and {@link useCreateRun} prefetches for the run it
+ * creates. Without `runId` the request carries no `run_id` and reads the latest default run.
+ *
+ * Polling is inline, `(query) => currentStatePollInterval(query.state.error, runId ===
+ * undefined)`, for the reason {@link currentStatePollInterval} gives: every
+ * {@link CURRENT_STATE_POLL_MS} while shown, every {@link FIRST_RUN_POLL_MS} while the default
+ * page awaits its first run, and never after a final error. A prefetch registers no
+ * component, so it reads once and never polls.
+ *
+ * @param runId - The run to read; omitted for the latest default run.
+ * @returns Options for `useQuery` or `prefetchQuery`, keyed by
+ *   `queryKeys.recommendations(runId ?? 'default')`.
+ */
+export function recommendationsQueryOptions(runId?: RunId) {
+  return queryOptions({
     queryKey: queryKeys.recommendations(runId ?? 'default'),
     queryFn: ({ signal }) =>
       apiFetch<RecommendationsPage>('/recommendations', {
@@ -1142,12 +1170,20 @@ export interface FeedbackVariables {
 }
 
 /**
- * Invalidates everything a decision write can change: the recommendations pages, whose
+ * Refreshes everything a decision write can change: the recommendations pages, whose
  * overlay holds, discrepancy banner and historical marking are read live; the discrepancy
  * lists, because a decision can open, close or await a discrepancy; and the decision log.
- * Resolves once the refetch of every shown (active) entry under those roots has settled.
+ *
+ * It first removes every recommendations page no screen shows (`type: 'inactive'`), for
+ * example the `/actions` pages cached before the user moved to `/decisions`. Invalidating
+ * such a page would only mark it stale, and a later visit would render its outdated overlay
+ * until the refetch lands: a resolved discrepancy would flash its `role="alert"` banner
+ * again. A removed page is read afresh before it renders, so it can show only the current
+ * state. It then invalidates the three roots, so every shown (active) entry, a page on screen
+ * included, refetches in place, and resolves once those refetches have settled.
  */
 function invalidateDecisionState(queryClient: QueryClient): Promise<unknown> {
+  queryClient.removeQueries({ queryKey: queryKeys.recommendationsAll, type: 'inactive' });
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: queryKeys.recommendationsAll }),
     queryClient.invalidateQueries({ queryKey: queryKeys.discrepanciesAll }),
@@ -1217,8 +1253,14 @@ export function useLogout() {
  * calendar dates applied to each source's native days.
  *
  * On success the run is written into `queryKeys.runs.byId(run.id)`, so a {@link useRun} read
- * of it starts from that copy, and `queryKeys.runs.customAll` is invalidated. The run never
- * becomes `/runs/latest`, so the default run and its page stay as they are.
+ * of it starts from that copy, `queryKeys.runs.customAll` is invalidated, and the run's page
+ * is prefetched (`GET /recommendations?run_id=<id>`, {@link recommendationsQueryOptions}). The
+ * mutation stays pending until both have settled, so the caller's own `onSuccess`, which
+ * opens `/actions?run=<id>`, runs once the page is cached: the page renders at once, and the
+ * caller's pending state covers the read. The prefetch never rejects. A failed page read
+ * leaves its error in the cache, the mutation still succeeds, and `/actions?run=<id>` states
+ * that failure as it would for any read. The run never becomes `/runs/latest`, so the default
+ * run and its page stay as they are. A failed `POST /runs` reads no page.
  *
  * Status codes: 201; 409 `run_in_progress` while any process holds the analysis lock; 422
  * `end_before_start`, `end_after_default_end`, `too_long` (over `window.max_days`),
@@ -1232,7 +1274,10 @@ export function useCreateRun() {
     mutationFn: (body: CreateRunRequest) => apiFetch<Run>('/runs', { method: 'POST', body }),
     onSuccess: (run) => {
       queryClient.setQueryData<Run>(queryKeys.runs.byId(run.id), run);
-      return queryClient.invalidateQueries({ queryKey: queryKeys.runs.customAll });
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs.customAll }),
+        queryClient.prefetchQuery(recommendationsQueryOptions(run.id)),
+      ]);
     },
   });
 }
@@ -1242,8 +1287,10 @@ export function useCreateRun() {
  * {@link DecisionRequest} → {@link Decision} (201, AAP 0.5.2). The response carries the
  * subject's decision shape and its complete materialised expected state.
  *
- * On success it invalidates `queryKeys.recommendationsAll`, `queryKeys.discrepanciesAll` and
- * `queryKeys.decisionsAll`.
+ * On success it removes the recommendations pages no screen shows, because their overlay and
+ * discrepancy banner are outdated and a later visit must read them afresh rather than flash
+ * them, and invalidates `queryKeys.recommendationsAll`, `queryKeys.discrepanciesAll` and
+ * `queryKeys.decisionsAll`, so every shown entry refetches before `mutateAsync` resolves.
  *
  * Status codes: 201; 404 `not_found` for an unknown subject or `recommendation_id`; 409
  * `subject_retired` when the subject's dataset, or a dataset the item read, is no longer
@@ -1270,9 +1317,13 @@ export function useRecordDecision() {
  * and `acknowledge_removal` close it at once (`resolved`). `decision_correct` and
  * `record_intended` move it to `awaiting_platform`.
  *
- * On success it invalidates `queryKeys.recommendationsAll`, `queryKeys.discrepanciesAll` and
- * `queryKeys.decisionsAll`, like {@link useRecordDecision}, because a resolution can write a
- * decision and changes the open-discrepancy holds and banner.
+ * On success, like {@link useRecordDecision}, it removes the recommendations pages no screen
+ * shows and invalidates `queryKeys.recommendationsAll`, `queryKeys.discrepanciesAll` and
+ * `queryKeys.decisionsAll`, because a resolution can write a decision and changes the
+ * open-discrepancy holds and banner. After a resolution on `/decisions`, where no `/actions`
+ * page is shown, returning to `/actions` reads the page afresh and never shows the
+ * `role="alert"` banner of the discrepancy just resolved; after one on an `/actions` card, the
+ * page on screen refetches in place.
  *
  * Status codes: 200; 404 `not_found` for an unknown discrepancy or subject; 409
  * `subject_retired` when its dataset is no longer active, `discrepancy_resolved` when it is

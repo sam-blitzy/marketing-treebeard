@@ -12,12 +12,14 @@ test's docstring names the guarantee it proves:
 * **Attempts recorded on every attempt** (AAP 0.5.2): a completion whose transaction rolls back
   (a failed enqueue, a failing statement after the completion, a failed commit) leaves no
   ``running`` ``sync_run`` row, publishes none of its freshness, queues no request, and leaves
-  an earlier committed completion of the same job as it committed.
+  an earlier committed completion of the same job as it committed; a cut-short failure text
+  naming a dataset with no outcome is refused before any write.
 * **Logging points** (AAP 0.11.1): ``sync.job.start`` and exactly one ``sync.job.finish`` per
   run, both with source, job, rows, calls and duration, on success, on an unexpected error
   (re-raised unchanged) and on cancellation (re-raised, the open rows closed failed); a failed
   job's finish is at error level with the failure text its ``sync_run`` rows record (a
-  defect's names its query id) and the error's class, a persistent outage's included.
+  defect's names its query id) and the error's class, a persistent outage's included, and so
+  is the finish of an entity sync an outage cut short.
 * **Job starts** (AAP 0.5.2): each job's ``sync_run`` rows start when that job started, on the
   controller's clock, while the run's ``now`` anchors the freshness attempts.
 * **Stand-alone matching** (AAP 0.5.1): a ``LeadMatchJob`` pass that attempts rows in an active
@@ -61,7 +63,7 @@ from ads_engine.simulation.generator import Fault, SimulatedWorld
 from ads_engine.simulation.scenarios import FIXED_NOW, SCENARIOS, fixed_clock
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
-from ads_engine.sync.freshness import FreshnessOutcome
+from ads_engine.sync.freshness import REASON_INTERRUPTED, FreshnessOutcome
 from ads_engine.sync.mode import SourceModeController
 
 pytestmark = pytest.mark.anyio
@@ -355,6 +357,12 @@ OUTAGE_Q_G5: Final = Fault(
 )
 """Q-G5 (keyword days) answers HTTP 503 on every attempt: a persistent outage."""
 
+OUTAGE_Q_G4: Final = Fault(
+    "google", "search", "http_status", status=503, match={"query_id": "Q-G4"}
+)
+"""Q-G4 (the ad-group enumeration) answers HTTP 503 on every attempt, after Q-G1 and Q-G2
+answered: an outage that cuts the entity sync short."""
+
 
 # ---------------------------------------------------------------------------------------------
 # Stand-in jobs and failure injection
@@ -420,6 +428,25 @@ class _CompleteThenFail(jobs._JobBase):
                 await session.execute(text("SELECT 1 / 0"))
             else:
                 event.listen(session.sync_session, "before_commit", _commit_refused)
+
+
+class _MisnamedFailure(jobs._JobBase):
+    """Completes :data:`ENTITIES` with a failure text for a dataset it records no outcome for."""
+
+    job = jobs.JOB_ENTITIES
+
+    def freshness_datasets(self) -> tuple[str, ...]:
+        """One dataset."""
+        return (ENTITIES,)
+
+    async def _execute(self) -> None:
+        """Complete :data:`ENTITIES`, naming ``google.metrics_daily`` as cut short."""
+        async with self.ctx.sessionmaker() as session, session.begin():
+            await self._complete(
+                session,
+                {ENTITIES: jobs._success(self.ctx.now, covered=None, reasons=())},
+                failures={"google.metrics_daily": "google search Q-G3: HTTP 503: unavailable"},
+            )
 
 
 async def _call_google(ctx: jobs.JobContext, times: int) -> None:
@@ -637,6 +664,32 @@ async def test_failure_after_completion_rolls_it_back(
     )
 
 
+async def test_a_failure_text_for_a_dataset_without_an_outcome_writes_nothing(lab: Lab) -> None:
+    """Every attempt recorded: a cut-short failure text naming no recorded dataset is refused.
+
+    ``_complete`` refuses it before any write, so the run re-raises the ``ValueError`` as it
+    does a bug: the freshness row stands, no request is queued, and the open row closes
+    ``failed`` with the reason a raised run's rows close with.
+    """
+    dataset_id, _ = await lab.build("google")
+    before = await lab.freshness(dataset_id, ENTITIES)
+    assert before is not None
+
+    with pytest.raises(ValueError, match=r"google\.metrics_daily"):
+        async with lab.context("google", dataset_id) as ctx:
+            await _MisnamedFailure(ctx).run()
+
+    runs = await lab.runs(jobs.JOB_ENTITIES)
+    assert [(row.status, row.error) for row in runs.values()] == [("failed", UNEXPECTED)]
+    after = await lab.freshness(dataset_id, ENTITIES)
+    assert after is not None
+    assert (after.last_attempt_at, after.last_success_at) == (
+        before.last_attempt_at,
+        before.last_success_at,
+    )
+    assert await lab.sync_requests() == []
+
+
 # ---------------------------------------------------------------------------------------------
 # Logging points (AAP 0.11.1: sync job start and finish with source, job, rows, calls, duration)
 # ---------------------------------------------------------------------------------------------
@@ -827,6 +880,76 @@ async def test_persistent_outage_logs_one_error_finish_with_its_failure_text(lab
         "status": "failed",
         "disposition": "stale",
         "error": failed.error,
+        "error_type": None,
+    }
+
+
+async def test_entity_sync_cut_short_by_an_outage_logs_one_error_finish(lab: Lab) -> None:
+    """Logging: an entity sync a transient outage cuts short is failed, at error level.
+
+    Q-G4 answers HTTP 503 on all three attempts after Q-G1 and Q-G2 answered. What was read is
+    written and counted, and ``google.entities`` records its cut-short ``incomplete`` success
+    as before: ``last_success_at`` stays the build's, the unread work is kept as the
+    checkpoint, and the analysis request is committed with the freshness write. The job is no
+    success: its ``sync_run`` row closes ``failed``, ``incomplete``, with Q-G4's error in the
+    same transaction, and its finish is an error-level ``failed`` line with that error,
+    ``incomplete`` and ``stale``, and no ``error_type`` (the error was returned, not raised),
+    as a metrics job the same outage fails reports it.
+    """
+    dataset_id, _ = await lab.build("google")
+    before = await lab.freshness(dataset_id, ENTITIES)
+    assert before is not None
+    assert (before.last_success_at, before.completeness) == (T0, "complete")
+
+    with capture_logs() as entries:
+        async with lab.context("google", dataset_id, world=_faulted_world(OUTAGE_Q_G4)) as ctx:
+            result = await jobs.EntitySyncJob(ctx).run()
+
+    assert (result.status, result.completeness, result.disposition) == (
+        "failed",
+        "incomplete",
+        "stale",
+    )
+    assert result.error is not None
+    assert result.error.startswith("google search Q-G4: ")
+    assert "503" in result.error
+    assert result.rows > 0, "the account and campaigns read before the outage are counted"
+    runs = await lab.runs(jobs.JOB_ENTITIES)
+    assert set(runs) == {ENTITIES}
+    run = runs[ENTITIES]
+    assert (run.status, run.completeness, run.error, run.rows) == (
+        "failed",
+        "incomplete",
+        result.error,
+        result.rows,
+    )
+    row = await lab.freshness(dataset_id, ENTITIES)
+    assert row is not None
+    assert (row.last_attempt_at, row.last_success_at, row.completeness) == (T1, T0, "incomplete")
+    assert row.reason is not None
+    assert row.reason.startswith(REASON_INTERRUPTED)
+    assert row.checkpoint is not None, "the unread work is kept for the next sync"
+    (request,) = await lab.requests(f"sync:google.{jobs.JOB_ENTITIES}")
+    assert await lab.committed_with(request.id, dataset_id, ENTITIES)
+    finish = _one(entries, "sync.job.finish")
+    assert {
+        key: finish[key]
+        for key in (
+            "log_level",
+            "status",
+            "rows",
+            "completeness",
+            "disposition",
+            "error",
+            "error_type",
+        )
+    } == {
+        "log_level": "error",
+        "status": "failed",
+        "rows": result.rows,
+        "completeness": "incomplete",
+        "disposition": "stale",
+        "error": run.error,
         "error_type": None,
     }
 

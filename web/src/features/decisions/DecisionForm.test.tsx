@@ -977,11 +977,14 @@ describe('DecisionForm', () => {
       api.use({ [logKey(OWN_BUDGET)]: json(200, [saved, makeDecision('own_budget')]) });
       fireEvent.click(saveButton());
 
-      // In flight: the button is busy and cannot be pressed again.
+      // In flight: the button is busy and cannot be pressed again. It is aria-disabled, never
+      // natively disabled, so it would keep keyboard focus.
       await waitFor(() => {
         expect(saveButton().getAttribute('aria-busy')).toBe('true');
       });
-      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(saveButton().getAttribute('aria-disabled')).toBe('true');
+      expect(saveButton()).toHaveProperty('disabled', false);
+      fireEvent.click(saveButton());
       const post = onlyCall(api, 'POST', '/decisions');
       expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
       expect(post.body).toEqual({

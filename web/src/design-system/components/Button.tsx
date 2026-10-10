@@ -14,17 +14,25 @@
  * - `ds-button--{sm|md}`: always exactly one, from `size` (default `md`);
  * - `ds-button__label`: the span around the children, always rendered;
  * - `ds-button__spinner`: the span around the {@link Spinner}, rendered after the label only
- *   while `loading`, and hidden from the accessibility tree.
+ *   while `loading`, and hidden from the accessibility tree. `Button.css` lays it over the
+ *   label, which it hides visually but keeps as the accessible name, so loading never changes
+ *   the button's size or moves its neighbours.
  *
- * States are carried by native attributes, which `Button.css` styles: `disabled` (the
- * `disabled` prop, and always while loading), `aria-busy="true"` (while loading) and
- * `aria-pressed` (passed through by toggle callers such as the DateRangePicker presets).
+ * States are carried by attributes, which `Button.css` styles: native `disabled` (the
+ * `disabled` prop on a button that is neither loading nor focused), `aria-disabled="true"` (a
+ * loading button, and a disabled one that still holds focus), `aria-busy="true"` (while
+ * loading) and `aria-pressed` (passed through by toggle callers such as the DateRangePicker
+ * presets).
  *
  * Accessibility (WCAG 2.2 AA, AAP 0.1.1):
  * - It is a native `<button>`, so it is focusable and operable with Enter and Space with no
  *   script, and `Button.css` draws a `:focus-visible` ring that is never removed.
  * - `type` defaults to `"button"`, so a Button placed inside a form never submits it by accident;
  *   a form's submit control passes `type="submit"` explicitly.
+ * - Keyboard focus is never dropped by a state change (SC 2.4.3): a browser moves focus off a
+ *   button that becomes natively disabled, to the page body, so a button that holds focus when
+ *   it starts loading or becomes disabled keeps it, inert and marked `aria-disabled="true"`.
+ *   A loading button is never natively disabled; a disabled one is, once focus leaves it.
  * - While loading, the button's accessible name stays its own label: the Spinner slot is
  *   `aria-hidden`, so the Spinner's "Loading" label is never appended to the name, and the busy
  *   state is conveyed by `aria-busy="true"` instead. Queries such as
@@ -41,7 +49,8 @@
  */
 import './Button.css';
 
-import type { ComponentPropsWithRef } from 'react';
+import { useState } from 'react';
+import type { ComponentPropsWithRef, FocusEvent, MouseEvent } from 'react';
 
 import { Spinner } from './Spinner';
 
@@ -59,8 +68,9 @@ export type ButtonVariant = 'primary' | 'secondary' | 'quiet';
 
 /**
  * The size of a {@link Button}: `md` (the default) for page and form actions, `sm` for compact
- * rows such as card footers and window presets. Both meet the WCAG 2.2 SC 2.5.8 minimum target
- * size of 24 by 24 CSS pixels (see `Button.css`).
+ * rows such as card footers and window presets. `sm` has a smaller label and padding, but both
+ * sizes keep a target of at least 44 by 44 CSS pixels (WCAG 2.2 SC 2.5.5, beyond the SC 2.5.8
+ * minimum of 24 by 24; see `Button.css`).
  *
  * GAP: bind to Blitzy OS on source arrival. These are product-level sizes, not Blitzy OS ones;
  * on binding, each maps onto the matching Blitzy OS button size.
@@ -93,9 +103,19 @@ export interface ButtonProps extends Omit<
   /** The size. Defaults to `'md'`. */
   size?: ButtonSize;
   /**
+   * Whether the action is unavailable. A disabled button fires no click, submits no form and
+   * is natively `disabled`, out of the tab order; while it holds keyboard focus it is instead
+   * marked `aria-disabled="true"` and stays focusable, so the browser does not drop focus to
+   * the page, until focus leaves it. Defaults to `false`.
+   */
+  disabled?: boolean;
+  /**
    * Whether the action is in progress, for example while its request is pending. A loading
-   * button is disabled, so it fires no click, carries `aria-busy="true"` and shows a Spinner
-   * after its label; its accessible name stays the label. Defaults to `false`.
+   * button is inert, so it fires no click and submits no form, carries `aria-busy="true"` and
+   * `aria-disabled="true"` and shows a Spinner in place of its label, at the same size; its
+   * accessible name stays the label. It is never natively disabled, so it keeps keyboard focus
+   * for the whole request and stays in the tab order. It wins over `disabled`. Defaults to
+   * `false`.
    */
   loading?: boolean;
   /**
@@ -107,18 +127,32 @@ export interface ButtonProps extends Omit<
 
 /**
  * Action button: renders one native `<button>` carrying `ds-button` and its variant and size
- * modifiers, with the children in the label slot and, while loading, a Spinner after them.
+ * modifiers, with the children in the label slot and, while loading, a Spinner laid over them.
  *
- * The button is disabled when `disabled` is `true` or while `loading`. Native `disabled` keeps
- * the click from firing and takes the button out of the tab order until it is enabled again.
- * The attributes this component owns (`type`, `className`, `disabled`, `aria-busy` and
- * `dangerouslySetInnerHTML`) are applied after the forwarded props, so they always reflect
- * `type`, `variant`, `size`, `disabled` and `loading`. `dangerouslySetInnerHTML` is always
- * unset: the content goes only through the escaped children in the label slot, so a
- * `dangerouslySetInnerHTML` that reaches the props untyped (from JavaScript, or a spread of an
- * untyped object) is discarded instead of colliding with the label.
+ * The button is inactive when `disabled` is `true` or while `loading`, in one of two forms:
  *
- * The component holds no state and has no effects; its output depends only on its props.
+ * - natively `disabled`, which keeps the click from firing and takes the button out of the tab
+ *   order until it is enabled again: a disabled button that is neither loading nor focused,
+ *   such as every footer action of a historical card, disabled from its first render;
+ * - `aria-disabled="true"`, which keeps the button focusable: a loading button, and a disabled
+ *   one that held keyboard focus when it became disabled, until focus leaves it. A browser
+ *   moves focus off a button that becomes natively disabled, to the page body, which would
+ *   strand keyboard and screen-reader users for the whole request (WCAG 2.2 SC 2.4.3). The
+ *   click is still delivered, so the component cancels it (`preventDefault`, which also stops
+ *   a `type="submit"` button, and a form's implicit submission through it, from submitting)
+ *   and never calls the caller's `onClick`.
+ *
+ * The attributes this component owns (`type`, `className`, `disabled`, `aria-disabled`,
+ * `aria-busy`, `onClick`, `onFocus`, `onBlur` and `dangerouslySetInnerHTML`) are applied after
+ * the forwarded props, so they always reflect `type`, `variant`, `size`, `disabled`, `loading`
+ * and focus; the caller's `onClick` runs only while the button is active, and its `onFocus` and
+ * `onBlur` always run. `dangerouslySetInnerHTML` is always unset: the content goes only through
+ * the escaped children in the label slot, so a `dangerouslySetInnerHTML` that reaches the props
+ * untyped (from JavaScript, or a spread of an untyped object) is discarded instead of colliding
+ * with the label.
+ *
+ * The component's one piece of state is whether the button holds focus, which its own
+ * `focus` and `blur` events keep; it has no effects, and `ref` is forwarded unchanged.
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -145,16 +179,49 @@ export function Button({
   loading = false,
   type = 'button',
   disabled,
+  onClick,
+  onFocus,
+  onBlur,
   children,
   ...rest
 }: ButtonProps) {
+  // Whether the button holds keyboard focus, so a button disabled while focused keeps focus.
+  const [focused, setFocused] = useState(false);
+  const inactive = loading || disabled === true;
+  // Native disabled only where it cannot take focus away: never while loading or focused.
+  const nativelyDisabled = disabled === true && !loading && !focused;
+
+  const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
+    if (inactive) {
+      // A focusable inactive button still receives the click (pointer, Enter, Space, or a
+      // form's implicit submission): cancelling it stops a submit, and the action never runs.
+      event.preventDefault();
+      return;
+    }
+    onClick?.(event);
+  };
+
+  const handleFocus = (event: FocusEvent<HTMLButtonElement>) => {
+    setFocused(true);
+    onFocus?.(event);
+  };
+
+  const handleBlur = (event: FocusEvent<HTMLButtonElement>) => {
+    setFocused(false);
+    onBlur?.(event);
+  };
+
   return (
     <button
       {...rest}
       type={type}
       className={`ds-button ds-button--${variant} ds-button--${size}`}
-      disabled={disabled === true || loading}
+      disabled={nativelyDisabled}
+      aria-disabled={inactive && !nativelyDisabled ? true : undefined}
       aria-busy={loading ? true : undefined}
+      onClick={handleClick}
+      onFocus={handleFocus}
+      onBlur={handleBlur}
       dangerouslySetInnerHTML={undefined}
     >
       <span className="ds-button__label">{children}</span>

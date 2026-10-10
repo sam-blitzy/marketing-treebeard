@@ -52,15 +52,18 @@
  * surface and the page background (WCAG 2.2 SC 1.4.11 non-text contrast). margin: 0 clears the
  * user-agent margin some engines give form controls, so the field's gap alone spaces them.
  *
- * BLITZY [A11Y]: the rendered block size is about 42px (block padding, the normal line height and
- * two hairline borders at the 16px root), above the WCAG 2.2 AA 24px target minimum (SC 2.5.8)
- * and below the 44px enhanced recommendation. Implemented per the specified spacing tokens and
- * min-block-size; flagged for designer review.
+ * Target size (WCAG 2.2 SC 2.5.5 and 2.5.8): the minimum block size is --space-8 + --space-3
+ * (2.75rem, 44px at the 16px root), the same token-derived target as Button, Tabs and the
+ * SideNav links, so every input, select and DateRangePicker date field is at least 44px tall and
+ * a Select beside a TextField keeps the same height. The full inline size makes each at least as
+ * wide. 44px is the touch target minimum that applies when no design source specifies a smaller
+ * target; the Blitzy OS source is unavailable, so none does. It holds for every pointer type and
+ * grows with the user's text size. A multiline textarea is taller than this through its rows.
  */
 .ds-field__control {
   box-sizing: border-box;
   inline-size: var(--size-full);
-  min-block-size: var(--space-8);
+  min-block-size: calc(var(--space-8) + var(--space-3));
   margin: 0;
   padding-block: var(--space-2);
   padding-inline: var(--space-3);

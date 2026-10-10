@@ -81,10 +81,11 @@ export interface RetryControl {
  * The "Retry" button of a failed list read: its loading state while the read runs again, and
  * focus returned to it once the read settles.
  *
- * A design-system `Button` is natively disabled while `loading`, and a disabled button drops
- * focus to the page body. Once the retry settles, focus goes back to the button if it is still
- * on the page and enabled and focus has not been moved elsewhere in the meantime (WCAG 2.2
- * SC 2.4.3). A read that succeeds removes the button, and focus is then left where it is. A
+ * A design-system `Button` keeps focus while `loading` (it is `aria-disabled`, never natively
+ * disabled), but focus can still be lost to the page body while the read runs. Once the retry
+ * settles, focus on the body goes back to the button if it is still on the page and enabled;
+ * focus moved elsewhere in the meantime stays there (WCAG 2.2 SC 2.4.3). A read that succeeds
+ * removes the button, and focus is then left where it is. A
  * background poll never moves focus, because only a Retry the user started arms the return.
  *
  * @param refetch - the query's `refetch`; TanStack's never rejects, a failed read settles into

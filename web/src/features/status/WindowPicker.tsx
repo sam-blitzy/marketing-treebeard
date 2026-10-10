@@ -417,7 +417,7 @@ export function WindowPicker({ run }: WindowPickerProps) {
   // Stated only while the list is open: a closed list is not read, so its last failure is moot.
   const customRunsFailed = customRunsOpen && customRunsError !== null;
   // Busy while a run computes, or while a failed read runs again: that read's Retry button is
-  // then loading, hence disabled.
+  // then loading, hence inert.
   const busy =
     pending ||
     (defaultRunFailed && defaultRun.isFetching) ||
@@ -425,10 +425,11 @@ export function WindowPicker({ run }: WindowPickerProps) {
 
   // The control that started the work: a preset button, Apply or a date field for a
   // computation, or a Retry button. Every control is disabled while the run computes, and a
-  // Retry button while its read runs, and a disabled control loses focus to the page body, so
-  // focus is returned to it once the picker is no longer busy (WCAG 2.2 SC 2.4.3). Focus the
-  // user has moved elsewhere in the meantime is left alone, and a control that has left the
-  // page, after navigation to the created run or a successful retry for example, is skipped.
+  // Retry button while its read runs. A Button keeps focus meanwhile, but a disabled date field
+  // loses it to the page body, so focus is returned to the control that started the work once
+  // the picker is no longer busy (WCAG 2.2 SC 2.4.3). Focus the user has moved elsewhere in the
+  // meantime is left alone, and a control that has left the page, after navigation to the
+  // created run or a successful retry for example, is skipped.
   const focusReturnRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     if (busy) {

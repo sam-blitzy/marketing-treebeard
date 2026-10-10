@@ -1522,6 +1522,80 @@ export function whitePaperMqlMetricLabel(source: MaybeSource): string | null {
   return null;
 }
 
+/**
+ * What the causal ordering check excluded from one white-paper asset row (AAP 0.5.4.7 "Causal
+ * ordering check"), each a whole number, or `null` when absent or not known.
+ */
+export interface WhitePaperAlreadyBefore {
+  /** Contacts already MQL before their touch (`already_before.mql`), not counted as MQL. */
+  readonly mql: number | null;
+  /** Contacts already Qualified Lead before their touch (`already_before.ql`), not counted. */
+  readonly ql: number | null;
+  /** Meetings created or starting before the touch (`already_before.meetings`), not counted. */
+  readonly meetings: number | null;
+  /** Deals created before the touch (`already_before.deals`), not counted. */
+  readonly deals: number | null;
+}
+
+/**
+ * The asset metric each {@link WhitePaperAlreadyBefore} count belongs to: a count is known only
+ * while that metric is.
+ */
+const ALREADY_BEFORE_METRICS: Readonly<
+  Record<keyof WhitePaperAlreadyBefore, WhitePaperMetricKey>
+> = Object.freeze({
+  mql: 'mql',
+  ql: 'ql',
+  meetings: 'meetings_booked',
+  deals: 'deals_after_touch',
+});
+
+/**
+ * Reads the events the causal ordering check excluded from a white-paper asset row
+ * (`white_papers._row_extra`, `extra.already_before`: `{mql, ql, meetings, deals}` from
+ * `attribution.AssetRow`'s `already_mql_before`, `already_ql_before`, `meetings_before_touch` and
+ * `deals_before_touch`). Contacts already in a stage before their touch, and meetings and deals
+ * before it, are excluded from the row's counts and reported (AAP 0.5.4.7, AAP 0.11.2).
+ *
+ * A count reads `null`, never `0`, when it is absent, not a whole number, or its asset metric
+ * (`mql`, `ql`, `meetings_booked`, `deals_after_touch`) is unavailable: the backend records `0`
+ * for a stage it could not bind or a CRM it could not read, and an unavailable count is never
+ * shown as 0 (AAP 0.11.1). A known `0` stays `0`.
+ *
+ * @param source - The white-paper item or its evidence.
+ * @returns The four counts; each `null` when absent, malformed or unavailable.
+ */
+export function whitePaperAlreadyBefore(source: MaybeSource): WhitePaperAlreadyBefore {
+  const before = extraRecord(readExtra(source), 'already_before');
+  const cells = whitePaperCells(source);
+  const count = (key: keyof WhitePaperAlreadyBefore): number | null => {
+    const cell = cells[ALREADY_BEFORE_METRICS[key]];
+    if (cell?.unavailable === true || cell?.value === null) {
+      return null;
+    }
+    return readInteger(before?.[key]);
+  };
+  return {
+    mql: count('mql'),
+    ql: count('ql'),
+    meetings: count('meetings'),
+    deals: count('deals'),
+  };
+}
+
+/**
+ * The portal's orphan-deal share as the backend words it (`white_papers._row_extra`,
+ * `extra.orphan_deals.label`: `attribution.OrphanDealShare.label`), for example "5.7% (2 of 35
+ * deals without a contact)", or "unknown (3 deals not assessed)" when the share is unknown
+ * (AAP 0.5.4.7 "Completeness and floors"). The label is passed through verbatim.
+ *
+ * @param source - The white-paper item or its evidence.
+ * @returns The label; `null` when `orphan_deals` or its label is absent, blank or not a string.
+ */
+export function whitePaperOrphanDealLabel(source: MaybeSource): string | null {
+  return readString(extraRecord(readExtra(source), 'orphan_deals')?.label);
+}
+
 /** The cross-asset view of one currency cohort (AAP 0.5.4.7 "Across assets"). */
 export interface CohortSummary {
   /** The cohort's currency; every amount below is in it. */

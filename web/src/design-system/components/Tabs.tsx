@@ -20,11 +20,23 @@
  *   away and back.
  *
  * No headless library is used (AAP 0.4.5). The styling lives in `Tabs.css`, whose class names are
- * the contract this component renders: `ds-tabs`, `ds-tabs__list`, `ds-tabs__tab`,
- * `ds-tabs__label`, `ds-tabs__count` and `ds-tabs__panel`. The label sits in its own span so a
- * long unbroken label wraps inside its tab instead of widening the row. The selected tab is
- * styled from `aria-selected`, so the visual state can never disagree with the state announced
- * to assistive technology.
+ * the contract this component renders: `ds-tabs`, `ds-tabs__scroller`, `ds-tabs__list`,
+ * `ds-tabs__tab`, `ds-tabs__label`, `ds-tabs__label-text`, `ds-tabs__label-sizer`,
+ * `ds-tabs__count` and `ds-tabs__panel`. The selected tab is styled from `aria-selected`, so the
+ * visual state can never disagree with the state announced to assistive technology.
+ *
+ * Selecting a tab moves no tab. The selected label is semibold, so each label slot holds two
+ * copies of the label in one grid cell: the visible one, and a sizer that is always semibold,
+ * invisible and `aria-hidden`. The cell is as wide as the semibold label in every state, so
+ * neither the tab nor its neighbours change width or position when the selection moves, and the
+ * label's start never shifts. The sizer stays out of the accessible name, which remains the
+ * label and count ("Block 3"), and every tab renders the same markup selected or not.
+ *
+ * The tabs form one row at every width, so the selected tab's accent bar always sits on the
+ * row's baseline. A row wider than its container scrolls sideways inside `ds-tabs__scroller`,
+ * a plain wrapper around the tab list, and the page itself never scrolls (WCAG 2.2 SC 1.4.10).
+ * The arrow keys, Home and End move focus to a tab and scroll the row just far enough to show
+ * that tab whole with its focus ring, or, for a tab wider than the row, its start.
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled solely by semantic tokens, and
@@ -52,8 +64,13 @@ export interface TabItem {
    */
   key: string;
   /**
-   * The visible tab label, for example `"Block"`. It forms the tab's accessible name. A long
-   * unbroken label, such as an identifier, wraps inside its tab and is never truncated.
+   * The visible tab label, for example `"Block"`. It forms the tab's accessible name, stays on
+   * one line and is never truncated.
+   *
+   * The label is rendered twice: visibly, and as an invisible `aria-hidden` copy in the selected
+   * tab's semibold weight that reserves the tab's width (see the module overview). It must
+   * therefore be phrasing content, normally plain text, holding no element `id` and nothing
+   * interactive, because the copy would duplicate both.
    */
   label: ReactNode;
   /**
@@ -130,6 +147,50 @@ function targetIndex(key: string, current: number, count: number): number | unde
 }
 
 /**
+ * The length a computed scroll padding resolves to, in CSS px; `0` for `auto` or an unset value.
+ *
+ * @param value - a computed `scroll-padding-*` value, such as `"8px"`
+ */
+function scrollPaddingPx(value: string): number {
+  const px = Number.parseFloat(value);
+  return Number.isFinite(px) ? px : 0;
+}
+
+/**
+ * Scrolls a tab that keyboard navigation focused into view inside the scrolling tab row, and the
+ * page only when the tab lies outside it.
+ *
+ * The caller focuses the tab with `preventScroll` and leaves the scrolling to this function,
+ * because a browser's own focus scrolling leaves an element where it is on the inline axis while
+ * part of it is visible (Chrome while 32 CSS px or more is), so a tab cut off at the row's end
+ * could stay cut off, its focus ring with it. A tab that fits in the row's viewing region, the
+ * scroller less its `scroll-padding-inline`, moves the row just far enough to show it whole with
+ * its ring (`inline: 'nearest'`). A tab wider than that region shows its start, where its label
+ * begins (`inline: 'start'`).
+ *
+ * @param tab - the tab that now holds focus
+ * @param scroller - the element that scrolls the tab row, or `null` before it mounts
+ */
+function revealTab(tab: HTMLElement, scroller: HTMLElement | null): void {
+  // Environments without layout, such as jsdom, do not implement scrollIntoView.
+  if (typeof tab.scrollIntoView !== 'function') {
+    return;
+  }
+  let inline: ScrollLogicalPosition = 'nearest';
+  if (scroller !== null) {
+    const style = getComputedStyle(scroller);
+    const region =
+      scroller.clientWidth -
+      scrollPaddingPx(style.scrollPaddingInlineStart) -
+      scrollPaddingPx(style.scrollPaddingInlineEnd);
+    if (tab.offsetWidth > region) {
+      inline = 'start';
+    }
+  }
+  tab.scrollIntoView({ block: 'nearest', inline });
+}
+
+/**
  * Accessible tabs: a labelled tab list over one visible panel, operated by pointer and keyboard
  * per the WAI-ARIA tabs pattern with automatic activation.
  *
@@ -162,6 +223,8 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
   // Each rendered tab registers its button here, so keyboard navigation can move focus to the
   // tab it selects. Keyed by tab key, so the map stays correct when tabs are reordered.
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  // The element that scrolls the tab row, which keyboard navigation scrolls the focused tab into.
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
   // The requested key wins only when it names a rendered tab; otherwise the first tab is
   // selected, so exactly one tab is always selected and exactly one panel visible.
@@ -211,46 +274,59 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
     }
     event.preventDefault();
     select(next.key);
-    tabRefs.current.get(next.key)?.focus();
+    const nextTab = tabRefs.current.get(next.key);
+    if (nextTab !== undefined) {
+      nextTab.focus({ preventScroll: true });
+      revealTab(nextTab, scrollerRef.current);
+    }
   };
 
   return (
     <div className="ds-tabs">
-      <div className="ds-tabs__list" role="tablist" aria-label={label} onKeyDown={onKeyDown}>
-        {tabs.map((tab, index) => {
-          const selected = tab.key === activeKey;
-          return (
-            <button
-              key={tab.key}
-              ref={(node) => {
-                if (node === null) {
-                  tabRefs.current.delete(tab.key);
-                } else {
-                  tabRefs.current.set(tab.key, node);
-                }
-              }}
-              type="button"
-              role="tab"
-              id={tabId(index)}
-              className="ds-tabs__tab"
-              aria-selected={selected}
-              aria-controls={panelId(tab, index)}
-              tabIndex={selected ? 0 : -1}
-              onClick={() => {
-                select(tab.key);
-              }}
-            >
-              <span className="ds-tabs__label">{tab.label}</span>
-              {/* The space between label and count keeps the accessible name "Block 3". */}
-              {tab.count !== undefined && (
-                <>
-                  {' '}
-                  <span className="ds-tabs__count">{tab.count}</span>
-                </>
-              )}
-            </button>
-          );
-        })}
+      {/* The scroller scrolls a row wider than its container (see the module overview). */}
+      <div ref={scrollerRef} className="ds-tabs__scroller">
+        <div className="ds-tabs__list" role="tablist" aria-label={label} onKeyDown={onKeyDown}>
+          {tabs.map((tab, index) => {
+            const selected = tab.key === activeKey;
+            return (
+              <button
+                key={tab.key}
+                ref={(node) => {
+                  if (node === null) {
+                    tabRefs.current.delete(tab.key);
+                  } else {
+                    tabRefs.current.set(tab.key, node);
+                  }
+                }}
+                type="button"
+                role="tab"
+                id={tabId(index)}
+                className="ds-tabs__tab"
+                aria-selected={selected}
+                aria-controls={panelId(tab, index)}
+                tabIndex={selected ? 0 : -1}
+                onClick={() => {
+                  select(tab.key);
+                }}
+              >
+                <span className="ds-tabs__label">
+                  <span className="ds-tabs__label-text">{tab.label}</span>
+                  {/* The hidden semibold copy reserves the selected width (module overview). */}
+                  <span className="ds-tabs__label-sizer" aria-hidden="true">
+                    {tab.label}
+                  </span>
+                </span>
+                {/* The space between label and count keeps the accessible name "Block 3". */}
+                {tab.count !== undefined && (
+                  <>
+                    {' '}
+                    <span className="ds-tabs__count">{tab.count}</span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+        </div>
       </div>
       {tabs.map((tab, index) => {
         const selected = tab.key === activeKey;

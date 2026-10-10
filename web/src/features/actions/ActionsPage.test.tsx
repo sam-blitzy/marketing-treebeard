@@ -7,15 +7,18 @@
  * hooks with only `fetch` stubbed. They hold the page to its TSDoc contract:
  * - **Run selection.** Without `?run=` the page reads `GET /recommendations` without `run_id`,
  *   the latest default run; with `?run=<id>` it reads that run, shows "Custom window {start} –
- *   {end}" with "Back to default", and the link returns to the default run.
+ *   {end}" with "Back to default", and the link returns to the default run. An older default run
+ *   opened by id shows "Older default run {start} – {end}" with "Back to default"; the latest
+ *   default run, by id or not, shows no run notice.
  * - **Status bar reads.** `GET /config` and `GET /sources` start before `GET /recommendations`
  *   answers; a loaded default page then reads neither `GET /runs/latest` (its own run is the
  *   latest default run) nor `GET /runs?kind=custom`, and `/actions?run=<id>` also starts
  *   `GET /runs/latest` before its page answers.
- * - **The loaded page**, top to bottom: the single `<h1>` "Actions", the status bar, the custom
- *   banner (custom runs only), the global banners in their fixed order (only the discrepancy
- *   banner is an alert, and the short-window banner reads "Window of N days is below the
- *   {trusted_min_days}-day trusted minimum"), the section navigation, the empty polite region
+ * - **The loaded page**, top to bottom: the single `<h1>` "Actions", the status bar, the global
+ *   banners in their fixed order in one stack, with the custom banner (custom runs only) right
+ *   after the discrepancy banner (only the discrepancy banner is an alert, and the short-window
+ *   banner reads "Window of N days is below the {trusted_min_days}-day trusted minimum"), the
+ *   section navigation, the empty polite region
  *   card outcomes are announced in, then all five sections in the user's order, from one
  *   `GET /recommendations` response. A section the API omits is skipped and a repeated key
  *   renders once. A recorded feedback whose refetch hides its card is still announced there,
@@ -48,6 +51,7 @@ import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, SectionKey } from '../../api/types';
 import {
   CUSTOM_RUN_ID,
+  DEFAULT_RUN_ID,
   FIXTURE_BANNERS,
   FIXTURE_ITEM_IDS,
   FIXTURE_SECTION_TITLES,
@@ -91,6 +95,26 @@ function customRun(overrides: Partial<Run> = {}): Run {
 function customPage(): RecommendationsPage {
   return makeRecommendationsPage({
     run: customRun(),
+    banners: FIXTURE_BANNERS.map((banner) => ({ ...banner })),
+  });
+}
+
+/** The id of an older default run, opened at `/actions?run=6` after later default runs. */
+const OLDER_DEFAULT_RUN_ID = 6;
+
+/**
+ * The page of a default run that finished a week before the latest one (`makeRun()`, which
+ * `GET /runs/latest` returns): the run and every fixture banner.
+ */
+function olderDefaultPage(): RecommendationsPage {
+  return makeRecommendationsPage({
+    run: makeRun({
+      id: OLDER_DEFAULT_RUN_ID,
+      window_start: '2026-09-01',
+      window_end: '2026-09-28',
+      days: 28,
+      finished_at: '2026-09-29T06:00:00Z',
+    }),
     banners: FIXTURE_BANNERS.map((banner) => ({ ...banner })),
   });
 }
@@ -319,6 +343,20 @@ describe('ActionsPage', () => {
       expect(within(banner).getByText('Custom window 2026-09-26 – 2026-10-05')).toBeTruthy();
       expect(within(banner).getByText('10 days')).toBeTruthy();
       expect(banner.getAttribute('role')).toBeNull();
+      // The discrepancy banner sits above everything; the custom-window banner follows it in the
+      // same stack as every other global banner, so it is spaced like them.
+      const alerts = screen.getAllByRole('alert');
+      expect(alerts).toHaveLength(1);
+      const [discrepancies] = alerts;
+      if (discrepancies === undefined) {
+        throw new Error('no discrepancy banner');
+      }
+      expect(precedes(discrepancies, banner)).toBe(true);
+      expect(discrepancies.nextElementSibling).toBe(banner);
+      expect(banner.parentElement).toBe(discrepancies.parentElement);
+      expect(
+        screen.getByText(FIXTURE_BANNERS[1]?.message ?? '').closest('.ds-banner')?.parentElement,
+      ).toBe(banner.parentElement);
       // The short-window banner uses the run's trusted minimum.
       const shortWindow = screen.getByText('Window of 10 days is below the 14-day trusted minimum');
       // It comes last in the fixed banner order, after the incomplete-data banner.
@@ -344,6 +382,89 @@ describe('ActionsPage', () => {
         String(CUSTOM_RUN_ID),
         null,
       ]);
+    });
+
+    it('marks an older default run opened by id as not the latest, with a way back', async () => {
+      const { api, router } = await renderPage(
+        defaultHandlers({
+          [`GET /recommendations?run_id=${String(OLDER_DEFAULT_RUN_ID)}`]: json(200, olderDefaultPage()),
+        }),
+        `/actions?run=${String(OLDER_DEFAULT_RUN_ID)}`,
+      );
+
+      await loadedPage();
+      const banner = await waitFor(() => {
+        const element = document.getElementById('banner-older-default-run');
+        if (element === null) {
+          throw new Error('no older-default-run banner');
+        }
+        return element;
+      });
+      expect(within(banner).getByText('Older default run 2026-09-01 – 2026-09-28')).toBeTruthy();
+      expect(within(banner).getByText('28 days · not the latest default run')).toBeTruthy();
+      expect(banner.getAttribute('role')).toBeNull();
+      expect(document.getElementById('banner-custom-window')).toBeNull();
+      // Like the custom-window banner: right after the discrepancy banner, in the same stack.
+      const [discrepancies] = screen.getAllByRole('alert');
+      expect(discrepancies?.nextElementSibling).toBe(banner);
+
+      const back = within(banner).getByRole('link', { name: 'Back to default' });
+      expect(back.getAttribute('aria-current')).toBeNull();
+      fireEvent.click(back);
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({});
+      });
+      await waitFor(() => {
+        expect(document.getElementById('banner-older-default-run')).toBeNull();
+      });
+      await loadedPage();
+      expect(recommendationReads(api).map((call) => call.search.get('run_id'))).toEqual([
+        String(OLDER_DEFAULT_RUN_ID),
+        null,
+      ]);
+    });
+
+    it('shows no run notice for the latest default run opened by id', async () => {
+      const { queryClient } = await renderPage(
+        defaultHandlers({
+          [`GET /recommendations?run_id=${String(DEFAULT_RUN_ID)}`]: json(
+            200,
+            makeRecommendationsPage(),
+          ),
+        }),
+        `/actions?run=${String(DEFAULT_RUN_ID)}`,
+      );
+
+      await loadedPage();
+      // The latest default run has been read: it is the run on screen.
+      await waitFor(() => {
+        expect(queryClient.getQueryData<Run>(queryKeys.runs.latest)?.id).toBe(DEFAULT_RUN_ID);
+      });
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(document.getElementById('banner-older-default-run')).toBeNull();
+      expect(document.getElementById('banner-custom-window')).toBeNull();
+    });
+
+    it('never marks the default page as older, even when GET /runs/latest has a newer run', async () => {
+      const newer = makeRun({ id: DEFAULT_RUN_ID + 1, finished_at: '2026-10-07T06:00:00Z' });
+      const { queryClient } = await renderPage(
+        defaultHandlers({ 'GET /runs/latest': json(200, newer) }),
+      );
+
+      await loadedPage();
+      // The default test client reads the seeded entry again at once, and gets the newer run,
+      // while the page still shows the default run it read first.
+      await waitFor(() => {
+        expect(queryClient.getQueryData<Run>(queryKeys.runs.latest)?.id).toBe(newer.id);
+      });
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(screen.getAllByRole('heading', { level: 2 })).toHaveLength(SECTION_TITLES.length);
+      expect(document.getElementById('banner-older-default-run')).toBeNull();
+      expect(screen.queryByText(/not the latest default run/u)).toBeNull();
     });
 
     it('skips a section the API leaves out and renders a repeated key once', async () => {
@@ -658,11 +779,15 @@ describe('ActionsPage', () => {
       await waitFor(() => {
         expect(first.gate.release).toBeDefined();
       });
-      expect(screen.getByRole('button', { name: /Retry/u }).hasAttribute('disabled')).toBe(true);
+      // The loading Retry is aria-disabled, never natively disabled, so it keeps focus.
+      const busy = screen.getByRole('button', { name: /Retry/u });
+      expect(busy.getAttribute('aria-disabled')).toBe('true');
+      expect(busy.hasAttribute('disabled')).toBe(false);
+      expect(document.activeElement).toBe(busy);
       expect(screen.getByText('Actions could not be loaded')).toBeTruthy();
       expect(screen.queryByText('Loading actions')).toBeNull();
-      // A browser moves focus off a button that becomes disabled, to the page body. jsdom keeps
-      // it on the disabled button and ignores blur() there, so the test moves it to the body.
+      // Focus lost to the page body meanwhile, as when the user clicks the page background,
+      // still goes back to Retry once the read settles.
       const title = screen.getByRole('heading', { level: 1, name: 'Actions' });
       title.tabIndex = -1;
       title.focus();
@@ -1033,7 +1158,7 @@ describe('ActionsPage polls', () => {
 
   it('renders every section again for a poll whose overlay.stale_datasets gains a dataset, and shows it as stale', async () => {
     const staleDataset = 'google.metrics_daily';
-    const staleMessage = `Stale data: ${staleDataset} (last success 2026-10-04 05:30 UTC)`;
+    const staleMessage = `Stale data: ${staleDataset} (last success Oct 4, 2026, 5:30 AM UTC)`;
     const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
     const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
     await loadedPage();

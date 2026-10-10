@@ -20,9 +20,10 @@
  *   frozen.
  * - {@link flagText} puts the code's label before a message that does not name it ("Stale: Data
  *   as of …", "Short window: Window of 10 days …", "Meeting time proxy: 1 other meeting …"),
- *   shows a message that names it as written ("Simulated data (Google)", "Not yet
- *   distinguishable …"), shows the label alone for a blank message or the code itself, and the
- *   message alone, else the code, for a code it has no label for.
+ *   shows a message that names it, in the singular or the plural, as written ("Simulated data
+ *   (Google)", "Not yet distinguishable …", "Unverified while 1 discrepancy is open"), shows the
+ *   label alone for a blank message or the code itself, and the message alone, else the code,
+ *   for a code it has no label for.
  * - `FlagList` renders a list named "Flags" with one badge per merged code, showing
  *   {@link flagText}, and renders nothing when no flag applies.
  *
@@ -99,8 +100,7 @@ const AAP_LABELS: Readonly<Record<FlagCode, string>> = {
 };
 
 /** The stale fixture flag's badge text: its message does not say "stale", so the label leads. */
-const STALE_BADGE =
-  'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03';
+const STALE_BADGE = `Stale: ${FIXTURE_FLAGS.stale.message}`;
 
 /** The short-window fixture flag's badge text. */
 const SHORT_WINDOW_BADGE = 'Short window: Window of 10 days is below the 14-day trusted minimum';
@@ -123,7 +123,7 @@ const FIXTURE_BADGE_TEXTS: Readonly<Record<FlagCode, string>> = {
   stale: STALE_BADGE,
   incomplete: FIXTURE_FLAGS.incomplete.message,
   short_window: SHORT_WINDOW_BADGE,
-  unverified_discrepancies: 'Unverified while 1 discrepancies are open',
+  unverified_discrepancies: FIXTURE_FLAGS.unverified_discrepancies.message,
   attribution_floor: 'Floor: 12% of leads unmatched in HubSpot',
   creative_floor: 'Per-creative breakdown is a floor: 12.5% of leads have no creative',
   deal_floor: 'Deal counts are a floor: orphan-deal share 25% (1 of 4 deals without a contact)',
@@ -222,6 +222,7 @@ describe('flagText', () => {
     ['incomplete', 'Incomplete: x'],
     ['incomplete', 'Baseline incomplete: x'],
     ['unverified_discrepancies', 'Unverified while 3 discrepancies are open'],
+    ['unverified_discrepancies', 'Unverified while 1 discrepancy is open'],
     ['attribution_floor', 'Floor: 12% of leads unmatched in HubSpot'],
     ['creative_floor', FIXTURE_FLAGS.creative_floor.message],
     ['deal_floor', FIXTURE_FLAGS.deal_floor.message],
@@ -312,7 +313,7 @@ describe('mergeFlags', () => {
       [
         makeFlag('simulated'),
         makeFlag('unverified_discrepancies', {
-          message: 'Unverified while 1 discrepancies are open',
+          message: 'Unverified while 1 discrepancy is open',
         }),
       ],
       [
@@ -395,7 +396,7 @@ describe('mergeFlags', () => {
       Object.freeze(makeFlag('simulated')),
       Object.freeze(
         makeFlag('unverified_discrepancies', {
-          message: 'Unverified while 1 discrepancies are open',
+          message: 'Unverified while 1 discrepancy is open',
         }),
       ),
       Object.freeze(makeFlag('no_crm_link')),
@@ -418,7 +419,7 @@ describe('mergeFlags', () => {
   it('gives a live-only code the code itself as its message, never the frozen recorded text', () => {
     const recorded = [
       makeFlag('unverified_discrepancies', {
-        message: 'Unverified while 1 discrepancies are open',
+        message: 'Unverified while 1 discrepancy is open',
       }),
       makeFlag('simulated'),
     ];
@@ -436,7 +437,7 @@ describe('mergeFlags', () => {
       'Unverified while discrepancies open',
       'Simulated data',
     ]);
-    expect(screen.queryByText('Unverified while 1 discrepancies are open')).toBeNull();
+    expect(screen.queryByText('Unverified while 1 discrepancy is open')).toBeNull();
   });
 });
 
@@ -466,7 +467,7 @@ describe('FlagList', () => {
     expect(flagItems().map((entry) => entry.textContent)).toEqual([
       'Simulated data (Google)',
       FIXTURE_FLAGS.no_crm_link.message,
-      'Unverified while 1 discrepancies are open',
+      'Unverified while 1 discrepancy is open',
     ]);
   });
 
@@ -489,7 +490,7 @@ describe('FlagList', () => {
       'Short window: Window of 10 days is below the 14-day trusted minimum',
       'Meeting time proxy: 1 other meeting (ordering unverified): booking time is proxied by ' +
         'record creation, so it is excluded from cost per meeting',
-      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+      STALE_BADGE,
     ]);
     expect(screen.getByText(SHORT_WINDOW_BADGE).className).toBe('ds-badge ds-badge--warning');
     expect(screen.getByText(MEETING_PROXY_BADGE).className).toBe('ds-badge ds-badge--info');
@@ -507,7 +508,7 @@ describe('FlagList', () => {
     const recorded = [
       makeFlag('simulated'),
       makeFlag('unverified_discrepancies', {
-        message: 'Unverified while 1 discrepancies are open',
+        message: 'Unverified while 1 discrepancy is open',
       }),
       makeFlag('no_crm_link'),
     ];
@@ -516,7 +517,7 @@ describe('FlagList', () => {
         flags={recorded}
         current={[
           makeFlag('unverified_discrepancies', {
-            message: 'Unverified while 1 discrepancies are open',
+            message: 'Unverified while 1 discrepancy is open',
           }),
         ]}
       />,
@@ -524,7 +525,7 @@ describe('FlagList', () => {
 
     expect(flagItems().map((entry) => entry.textContent)).toEqual([
       'Simulated data',
-      'Unverified while 1 discrepancies are open',
+      'Unverified while 1 discrepancy is open',
       FIXTURE_FLAGS.no_crm_link.message,
     ]);
 
@@ -556,7 +557,7 @@ describe('FlagList inside the app providers', () => {
     { code: 'simulated', message: 'Simulated data' } satisfies Flag,
     {
       code: 'unverified_discrepancies',
-      message: 'Unverified while 1 discrepancies are open',
+      message: 'Unverified while 1 discrepancy is open',
     } satisfies Flag,
   ];
 
@@ -589,7 +590,7 @@ describe('FlagList inside the app providers', () => {
     ]);
     // The code both sets carry appears once, with the overlay's message; the frozen count is gone.
     expect(screen.getAllByText(/^Unverified while /u)).toHaveLength(1);
-    expect(screen.queryByText('Unverified while 1 discrepancies are open')).toBeNull();
+    expect(screen.queryByText('Unverified while 1 discrepancy is open')).toBeNull();
   });
 
   it('shows the "Simulated data" label inside the list named "Flags"', async () => {

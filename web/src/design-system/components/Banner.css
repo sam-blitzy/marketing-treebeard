@@ -131,11 +131,27 @@
 
 /*
  * Actions: buttons and links in a wrapping row with a token gap. Centring on the cross axis
- * lines up a text link, such as "Back to default", with the taller buttons beside it.
+ * lines up a text link, such as "Back to default", with the buttons beside it.
  */
 .ds-banner__actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+}
+
+/*
+ * A link placed directly in the actions slot, such as "Review discrepancies" or "Back to
+ * default", stands alone rather than inside a sentence, so it gets the same target as Button:
+ * at least 44 by 44 CSS px (WCAG 2.2 SC 2.5.5), through minimum block and inline sizes of
+ * --space-8 + --space-3 (2.75rem at the 16px root), with its text centred on the cross axis.
+ * 44px is the touch target minimum that applies when no design source specifies a smaller
+ * target; the Blitzy OS source is unavailable, so none does. Only the box grows: the link stays
+ * a native link with the global link colour, underline and focus ring from ../tokens.css.
+ */
+.ds-banner__actions > a {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
 }

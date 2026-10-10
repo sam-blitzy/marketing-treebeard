@@ -807,7 +807,9 @@ describe('SourcesPage', () => {
       await waitFor(() => {
         expect(syncButton('LinkedIn').getAttribute('aria-busy')).toBe('true');
       });
-      expect(syncButton('LinkedIn').disabled).toBe(true);
+      // Inert while busy, but never natively disabled, so a focused button keeps focus.
+      expect(syncButton('LinkedIn').getAttribute('aria-disabled')).toBe('true');
+      expect(syncButton('LinkedIn').disabled).toBe(false);
       expect(syncButton('Google').disabled).toBe(false);
       expect(outcomeRegion('LinkedIn').textContent).toBe('');
 
@@ -827,10 +829,10 @@ describe('SourcesPage', () => {
 
       fireEvent.click(button);
       await waitFor(() => {
-        expect(button.disabled).toBe(true);
+        expect(button.getAttribute('aria-busy')).toBe('true');
       });
-      // While the button is disabled, focus rests on the page body, where a browser drops it
-      // from a button that becomes disabled.
+      // fireEvent does not focus the button, so focus rests on the page body while the request
+      // runs, as if it had been lost there.
       expect(document.activeElement).toBe(document.body);
       response.release(json(202, syncRequest('google')));
 
@@ -850,7 +852,7 @@ describe('SourcesPage', () => {
 
       fireEvent.click(google);
       await waitFor(() => {
-        expect(google.disabled).toBe(true);
+        expect(google.getAttribute('aria-busy')).toBe('true');
       });
       const hubspot = syncButton('HubSpot');
       hubspot.focus();

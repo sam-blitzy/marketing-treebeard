@@ -11,16 +11,17 @@
  * set only adds codes or refreshes a message. The one exception is a live-only code
  * ({@link LIVE_ONLY_FLAG_CODES}), whose recorded copy states a present-tense value frozen with
  * the run: the row shows it only while the current set carries it, in the current words, so a
- * card stops saying "Unverified while 1 discrepancies are open" once every discrepancy is
+ * card stops saying "Unverified while 1 discrepancy is open" once every discrepancy is
  * resolved (AAP 0.5.4.2 P1: the count is read from the overlay).
  *
  * Every badge names its code's label from {@link FLAG_LABELS}, the wording AAP 0.5.5 gives each
  * code ("Stale", "Short window", "Meeting time proxy" and so on), and keeps the flag's own
  * `message`, written by the backend (`analysis/context.py`, `analysis/overlay.py`), as the
- * detail ({@link flagText}): "Stale: Data as of 2026-10-04 05:31 UTC". A message that already
- * names its label, such as "Simulated data (LinkedIn)" or "Unverified while 2 discrepancies are
- * open", is shown as written. Chips are text labels only, with no icons (AAP 0.4.5), and the
- * tone colour only repeats what the label says (WCAG 2.2 SC 1.4.1).
+ * detail ({@link flagText}): "Stale: Data as of Oct 4, 2026, 5:31 AM UTC". A message that
+ * already names its label, in the singular or the plural, such as "Simulated data (LinkedIn)",
+ * "Unverified while 1 discrepancy is open" or "Unverified while 2 discrepancies are open", is
+ * shown as written. Chips are text labels only, with no icons (AAP 0.4.5), and the tone colour
+ * only repeats what the label says (WCAG 2.2 SC 1.4.1).
  *
  * Built only on the design-system index (AAP 0.4.4): `Inline` for layout and `Badge` for the
  * chips, with no styles of its own.
@@ -147,24 +148,24 @@ function collect(
  * mergeFlags(
  *   [
  *     { code: 'simulated', message: 'Simulated data' },
- *     { code: 'unverified_discrepancies', message: 'Unverified while 1 discrepancies are open' },
+ *     { code: 'unverified_discrepancies', message: 'Unverified while 1 discrepancy is open' },
  *   ],
  *   [
  *     { code: 'unverified_discrepancies', message: 'Unverified while 3 discrepancies are open' },
- *     { code: 'stale', message: 'Data as of 2026-10-01 03:10' },
+ *     { code: 'stale', message: 'Data as of Oct 1, 2026, 3:10 AM UTC' },
  *   ],
  * );
  * // [
  * //   { code: 'simulated', message: 'Simulated data' },
  * //   { code: 'unverified_discrepancies', message: 'Unverified while 3 discrepancies are open' },
- * //   { code: 'stale', message: 'Data as of 2026-10-01 03:10' },
+ * //   { code: 'stale', message: 'Data as of Oct 1, 2026, 3:10 AM UTC' },
  * // ]
  *
  * // Recorded with 1 discrepancy open; 0 are open now, so the overlay no longer carries the flag.
  * mergeFlags(
  *   [
  *     { code: 'simulated', message: 'Simulated data' },
- *     { code: 'unverified_discrepancies', message: 'Unverified while 1 discrepancies are open' },
+ *     { code: 'unverified_discrepancies', message: 'Unverified while 1 discrepancy is open' },
  *   ],
  *   [{ code: 'simulated', message: 'Simulated data (LinkedIn)' }],
  * );
@@ -238,15 +239,36 @@ function words(text: string): string[] {
 }
 
 /**
+ * `word` with a simple English plural ending reduced: a final "ies" becomes "y"
+ * ("discrepancies" → "discrepancy") and any other final "s" is dropped ("meetings" →
+ * "meeting"). A word of three characters or fewer ("is", "has") or one ending in "ss" ("loss")
+ * is kept as it is, since those endings are rarely plurals. {@link namesLabel} reduces both
+ * sides alike, so a singular and a plural form of one word compare equal.
+ */
+function singular(word: string): string {
+  if (word.length <= 3 || word.endsWith('ss')) {
+    return word;
+  }
+  if (word.endsWith('ies')) {
+    return `${word.slice(0, -3)}y`;
+  }
+  return word.endsWith('s') ? word.slice(0, -1) : word;
+}
+
+/**
  * Whether `message` already names `label`: the label's words occur among the message's words in
- * the same order, not necessarily adjacent, so "Not yet distinguishable" names "Not
- * distinguishable" and "Deal counts are a floor" names "Floor".
+ * the same order, not necessarily adjacent. Words are compared whole, in lowercase, with simple
+ * plural endings reduced on both sides ({@link singular}), so the singular and plural forms of a
+ * word match. "Not yet distinguishable" names "Not distinguishable", "Deal counts are a floor"
+ * names "Floor", and "Unverified while 1 discrepancy is open" names "Unverified while
+ * discrepancies open" just as "Unverified while 3 discrepancies are open" does, while
+ * "Stalemate" does not name "Stale".
  */
 function namesLabel(message: string, label: string): boolean {
-  const wanted = words(label);
+  const wanted = words(label).map(singular);
   let matched = 0;
   for (const word of words(message)) {
-    if (matched < wanted.length && word === wanted[matched]) {
+    if (matched < wanted.length && singular(word) === wanted[matched]) {
       matched += 1;
     }
   }
@@ -257,10 +279,11 @@ function namesLabel(message: string, label: string): boolean {
  * The visible text of a flag's badge: its code's label ({@link FLAG_LABELS}), with the backend's
  * message as the detail.
  *
- * - A message that already names the label (its words, lowercased, contain the label's words in
- *   order) is shown as written, trimmed, so "Simulated data (Google)" or "Floor: 12% of leads
- *   unmatched in HubSpot" never repeats its label.
- * - Any other message follows the label: "Stale: Data as of 2026-10-04 05:31 UTC".
+ * - A message that already names the label ({@link namesLabel}: its words contain the label's
+ *   words in order, ignoring case and singular or plural form) is shown as written, trimmed, so
+ *   "Simulated data (Google)", "Floor: 12% of leads unmatched in HubSpot" or "Unverified while
+ *   1 discrepancy is open" never repeats its label.
+ * - Any other message follows the label: "Stale: Data as of Oct 4, 2026, 5:31 AM UTC".
  * - A blank message (empty, whitespace, or the code itself, which {@link mergeFlags} puts in
  *   place of a message blank in both sets) gives the label alone.
  * - A code with no label, which a later API version may add, shows its trimmed message, or its
@@ -277,6 +300,11 @@ function namesLabel(message: string, label: string): boolean {
  * });
  * // 'Short window: Window of 10 days is below the 14-day trusted minimum'
  * flagText({ code: 'simulated', message: 'Simulated data (Google)' }); // 'Simulated data (Google)'
+ * flagText({
+ *   code: 'unverified_discrepancies',
+ *   message: 'Unverified while 1 discrepancy is open',
+ * });
+ * // 'Unverified while 1 discrepancy is open'
  * flagText({ code: 'stale', message: 'stale' }); // 'Stale'
  * ```
  */

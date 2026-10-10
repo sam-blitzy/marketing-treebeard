@@ -153,6 +153,8 @@ from ads_engine.analysis.context import (
     Withheld,
     cohort_group_currency,
     creative_group_campaign,
+    format_instant,
+    short_window_message,
     unverified_message,
 )
 from ads_engine.analysis.thresholds import Thresholds
@@ -1530,13 +1532,13 @@ def _checks(
     return tuple(checks)
 
 
-def _format_instant(value: datetime) -> str:
-    """Render an instant as ``YYYY-MM-DD HH:MM UTC``; the UI re-formats it for display."""
-    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+def _stale_flag(checks: Sequence[_Check], window_end: date, *, display_timezone: str) -> Flag:
+    """The ``stale`` flag: "Data as of {oldest last success}", naming any coverage shortfall.
 
-
-def _stale_flag(checks: Sequence[_Check], window_end: date) -> Flag:
-    """The ``stale`` flag: "Data as of {oldest last success}", naming any coverage shortfall."""
+    The last success is an instant, rendered in the run's ``display_timezone``
+    (:func:`~ads_engine.analysis.context.format_instant`, as the overlay renders its current
+    flag); coverage ends are native dates and stay ISO dates (AAP 0.5.4.1).
+    """
     never: list[str] = []
     successes: list[datetime] = []
     shortfalls: list[str] = []
@@ -1555,7 +1557,7 @@ def _stale_flag(checks: Sequence[_Check], window_end: date) -> Flag:
     if never:
         message = f"Data as of: no successful sync of {', '.join(dict.fromkeys(never))}"
     else:
-        message = f"Data as of {_format_instant(min(successes))}"
+        message = f"Data as of {format_instant(min(successes), display_timezone)}"
     if shortfalls:
         message = f"{message}; {'; '.join(shortfalls)}"
     return Flag(FLAG_STALE, message)
@@ -1679,8 +1681,9 @@ def _apply_data_state(
     statuses carry the ``simulated`` flag naming the simulated sources.
 
     P4, per item from its own ``required_datasets`` only, so a fresh entity sync never clears
-    a stale metrics dataset (AAP 0.3.2): ``stale`` ("Data as of …") when a required dataset
-    last succeeded more than ``sources.stale_after_hours`` before ``ctx.now`` or covers less
+    a stale metrics dataset (AAP 0.3.2): ``stale`` ("Data as of …", the instant in
+    ``ctx.display_timezone``) when a required dataset last succeeded more than
+    ``sources.stale_after_hours`` before ``ctx.now`` or covers less
     than the window end, and ``incomplete`` when one is not ``complete`` over its required
     range (:func:`_required_start`). A ``live`` item with a stale dataset becomes ``stale``.
     Every item with at least one required dataset, stale or not, has the configured
@@ -1721,7 +1724,9 @@ def _apply_data_state(
         if base in (DATA_SIMULATED, DATA_MIXED):
             updated = _merge_flag(updated, _simulated_flag(base, simulated_sources))
         if stale:
-            updated = _merge_flag(updated, _stale_flag(stale, window_end))
+            updated = _merge_flag(
+                updated, _stale_flag(stale, window_end, display_timezone=ctx.display_timezone)
+            )
         if incomplete:
             parts = [
                 f"{check.name} ({'; '.join(_incomplete_reasons(check, window_end))})"
@@ -1771,10 +1776,7 @@ def _apply_short_window(ctx: AnalysisContext, candidates: Sequence[Candidate]) -
     frozen = [_with_applied_thresholds(candidate, applied) for candidate in candidates]
     if not window.short_window:
         return frozen
-    flag = Flag(
-        FLAG_SHORT_WINDOW,
-        f"Window of {window.days} days is below the {window.trusted_min_days}-day trusted minimum",
-    )
+    flag = Flag(FLAG_SHORT_WINDOW, short_window_message(window.days, window.trusted_min_days))
     return [_merge_flag(candidate, flag) for candidate in frozen]
 
 

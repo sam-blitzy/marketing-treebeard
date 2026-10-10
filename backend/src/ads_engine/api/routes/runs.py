@@ -258,7 +258,8 @@ async def create_run(
             committed.
         thresholds: The loaded configuration the window and the run use; the view reads
             the window settings the run stored from it.
-        settings: The application's settings, for ``DISPLAY_TIMEZONE``.
+        settings: The application's settings, for ``DISPLAY_TIMEZONE``: the run's frozen
+            flag messages and the returned view render instants in it.
         now: The request's instant: the default window end is derived from it and it is the
             run's instant.
 
@@ -288,6 +289,7 @@ async def create_run(
         reason="api",
         thresholds=thresholds,
         now=now,
+        display_timezone=settings.display_timezone,
     )
     _log.info(
         "runs.custom_created",

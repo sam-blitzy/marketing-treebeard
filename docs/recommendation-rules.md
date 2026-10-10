@@ -414,7 +414,7 @@ Donor A, Donor B, USD 0.00 from new budget".
   ([Read-time overlay](#read-time-overlay)).
 - While any discrepancy is unresolved, every other item carries `unverified_discrepancies`
   ("Unverified while N discrepancies are open"), with N the live count of every unresolved
-  discrepancy.
+  discrepancy. A count of one reads "Unverified while 1 discrepancy is open".
 
 ### P2 tracking absent
 
@@ -1647,7 +1647,7 @@ Global banners are built from the run plus the read-time overlay, in this fixed 
 | `simulated_sources` | info | Each simulated source with its reason (P3) |
 | `stale_datasets` | warning | Datasets that are stale now |
 | `incomplete_datasets` | warning | Datasets that are not complete |
-| `short_window` | warning | "Window of {days} days is below the {trusted_min_days}-day trusted minimum" (P5) |
+| `short_window` | warning | "Window of {days} days is below the {trusted_min_days}-day trusted minimum" (P5); a one-day window reads "Window of 1 day …" |
 
 ### Withheld lines and suppression counts
 

@@ -576,9 +576,8 @@ function saveFailureTitle(title: string): string {
 
 /**
  * Whether keyboard focus is lost: on no element, on the body, where a browser leaves it once
- * the focused element is disabled or removed (as a dialog closed mid-save leaves it, unable to
- * return focus to its disabled opener), or on an element no longer in the document. Anywhere
- * else the user has put it, and it stays there.
+ * the focused element is natively disabled or removed, or on an element no longer in the
+ * document. Anywhere else the user or a closing dialog has put it.
  */
 function focusIsLost(): boolean {
   const { activeElement, body } = document;
@@ -615,9 +614,9 @@ interface SubjectDecisionsProps {
  * a screen reader announces which subject it records for.
  *
  * While a save on the subject runs (`saving`), the action shows its loading state
- * (`aria-busy="true"`) and is disabled, so the dialog cannot be reopened and no second,
- * overlapping save can start. After a 409 `subject_retired` (`retired`) it stays disabled: the
- * server refuses every decision on the subject from then on.
+ * (`aria-busy="true"`) and is inert (`aria-disabled`, still focusable), so the dialog cannot be
+ * reopened and no second, overlapping save can start. After a 409 `subject_retired`
+ * (`retired`) it stays disabled: the server refuses every decision on the subject from then on.
  */
 function SubjectDecisions({
   group,
@@ -729,11 +728,11 @@ function SubjectDecisions({
  *   which lists active datasets only, drops the subject; the banner stays, so the refusal is
  *   not lost with it.
  *
- * Focus (WCAG 2.2 SC 2.4.3): a dialog closed mid-save cannot return focus to its disabled
- * opener, so focus drops to the page. Once that save settles with no dialog open, and while
- * focus is still lost, it moves to the subject's failure banner, which is focusable by script
- * only, or after a success back to "Record decision". Focus the user has moved elsewhere stays
- * there, and an open dialog keeps the focus it owns.
+ * Focus (WCAG 2.2 SC 2.4.3): a dialog closed mid-save returns focus to its opener, which keeps
+ * it while it loads. Once that save settles with no dialog open, and while focus is still on
+ * that opener or lost to the page, it moves to the subject's failure banner, which is focusable
+ * by script only, or after a success stays on (or goes back to) "Record decision". Focus the
+ * user has moved elsewhere stays there, and an open dialog keeps the focus it owns.
  */
 export function DecisionLog() {
   const decisions = useDecisions();
@@ -749,6 +748,9 @@ export function DecisionLog() {
   const [failures, setFailures] = useState<ReadonlyMap<string, SaveFailure>>(() => new Map());
   // The subject whose save settled last, until focus has been placed for it.
   const [settledKey, setSettledKey] = useState<string | null>(null);
+  // Whether focus was on that subject's opener when its save settled: where a dialog closed
+  // mid-save returns it, as the loading opener keeps focus. A dialog still open then owns focus.
+  const settledOnOpenerRef = useRef(false);
   const openerRefs = useRef(new Map<string, HTMLButtonElement>());
   const failureRefs = useRef(new Map<string, HTMLDivElement>());
   const dialogOpen = dialogTarget !== null;
@@ -760,18 +762,25 @@ export function DecisionLog() {
   );
   const { retrying, buttonRef: retryButtonRef, retry } = useRetry(decisions.refetch);
 
-  // Once a save has settled and no dialog owns focus, focus that the closed dialog could not
-  // return to the disabled opener goes to the subject's failure, or back to "Record decision"
-  // after a success (WCAG 2.2 SC 2.4.3, 3.3.1). The region announces the failure politely; the
-  // banner itself carries no role, as role="alert" stays reserved for the discrepancy banner
-  // (AAP 0.5.5). React runs a closing dialog's cleanup, which returns focus to its opener when
-  // it can, before this effect.
+  // Once a save has settled and no dialog owns focus, focus that the closed dialog returned to
+  // the loading opener, or that was lost to the page, goes to the subject's failure, or back to
+  // "Record decision" after a success (WCAG 2.2 SC 2.4.3, 3.3.1). The region announces the
+  // failure politely; the banner itself carries no role, as role="alert" stays reserved for the
+  // discrepancy banner (AAP 0.5.5). React runs a closing dialog's cleanup, which returns focus
+  // to its opener when it can, before this effect.
   useEffect(() => {
     if (settledKey === null || dialogOpen) {
       return;
     }
     setSettledKey(null);
-    if (!focusIsLost()) {
+    const opener = openerRefs.current.get(settledKey);
+    // Focus still on the subject's opener, where the dialog closed mid-save returned it, has not
+    // been placed by the user either, so it moves on like focus lost to the page. Focus the
+    // dialog returns there after a save settled inside it stays, as the form showed the outcome.
+    const onOpener =
+      settledOnOpenerRef.current && opener !== undefined && document.activeElement === opener;
+    settledOnOpenerRef.current = false;
+    if (!focusIsLost() && !onOpener) {
       return;
     }
     const failureBanner = failureRefs.current.get(settledKey);
@@ -779,7 +788,6 @@ export function DecisionLog() {
       failureBanner.focus();
       return;
     }
-    const opener = openerRefs.current.get(settledKey);
     if (opener !== undefined && opener.isConnected && !opener.disabled) {
       opener.focus();
     }
@@ -818,6 +826,7 @@ export function DecisionLog() {
       return;
     }
     setSavingKeys((current) => withoutKey(current, target.key));
+    settledOnOpenerRef.current = document.activeElement === openerRefs.current.get(target.key);
     setSettledKey(target.key);
   };
   const handleFailed = (target: DialogTarget, message: string) => {

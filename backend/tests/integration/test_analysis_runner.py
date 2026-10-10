@@ -654,7 +654,39 @@ async def test_invalid_arguments_write_no_run(app_db: str) -> None:
         await runner.run_analysis(short, "custom", "manual", request_ids=[True], now=NOW)
     with pytest.raises(ValueError, match="naive"):
         await runner.run_analysis(short, "custom", "manual", now=datetime(2026, 10, 7))  # noqa: DTZ001
+    with pytest.raises(ValueError, match="display_timezone must be a loadable IANA time zone"):
+        await runner.run_analysis(short, "custom", "manual", now=NOW, display_timezone="Mars/Base")
     assert await _count(AnalysisRun) == 0
+
+
+@pytest.mark.anyio
+async def test_the_run_context_carries_the_display_timezone(
+    app_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The zone of the instants in frozen flag messages: the caller's, else the settings'.
+
+    AAP 0.5.5: instants are formatted in ``DISPLAY_TIMEZONE``; ``run_analysis`` reads
+    ``get_settings().display_timezone`` when its caller passes no zone.
+    """
+    await _seed()
+    seen: list[str] = []
+    original = metrics.load_context
+
+    async def spying(*args: Any, **kwargs: Any) -> AnalysisContext:
+        ctx = await original(*args, **kwargs)
+        seen.append(ctx.display_timezone)
+        return ctx
+
+    monkeypatch.setattr(metrics, "load_context", spying)
+    window = await runner.custom_window(END - timedelta(days=20), END, now=NOW)
+    await runner.run_analysis(
+        window, "custom", "manual", now=NOW, display_timezone="America/New_York"
+    )
+    monkeypatch.setenv("DISPLAY_TIMEZONE", "Europe/Berlin")
+    get_settings.cache_clear()
+    await runner.run_analysis(window, "custom", "manual", now=NOW)
+    assert seen == ["America/New_York", "Europe/Berlin"]
+    assert await _count(AnalysisRun) == 2
 
 
 # ---------------------------------------------------------------------------

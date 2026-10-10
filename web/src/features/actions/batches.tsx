@@ -22,7 +22,11 @@
  * A list whose `location.hash` names one of its entries beyond the shown batches, such as a held
  * card's link to its blocking C0 card (`#item-{id}`) or a group anchor (`#group-…`), reveals the
  * batches through that entry and scrolls it into view: when the list mounts, and on every
- * `hashchange`. In-page links therefore never point at an entry that is not rendered.
+ * `hashchange`. In-page links therefore never point at an entry that is not rendered. A
+ * `hashchange`, which follows such a link, also moves focus to the revealed element (or to the
+ * entry's own focus target when the entry does not render the element the hash names), as the
+ * root route does for a link target already rendered (`src/router.tsx`), so the next Tab
+ * continues from there; a hash present when the list mounts, as on a page load, moves no focus.
  *
  * The bound is a presentation bound, not an analysis threshold: it changes how many entries are
  * mounted at once, never which entries exist, their order, rank, flags or evidence. Every
@@ -38,6 +42,7 @@ import { Fragment, useEffect, useId, useLayoutEffect, useRef, useState } from 'r
 import type { ReactElement, ReactNode } from 'react';
 
 import { Button, Inline } from '../../design-system';
+import { focusElement, idFromHash } from '../../lib/focus';
 import { formatCount } from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
@@ -142,20 +147,10 @@ function normalBatchSize(size: number): number {
 
 /**
  * The element id `location.hash` names, decoded, or `null` when the hash is empty or `#`. A
- * fragment that is not valid percent-encoding is used as written.
+ * fragment that is not valid percent-encoding is used as written ({@link idFromHash}).
  */
 function hashTarget(): string | null {
-  const fragment = window.location.hash.slice(1);
-  if (fragment === '') {
-    return null;
-  }
-  try {
-    return decodeURIComponent(fragment);
-  } catch {
-    // decodeURIComponent throws URIError on a malformed escape such as "%E0%A4%A"; the raw
-    // fragment is then the id the browser itself would look up.
-    return fragment;
-  }
+  return idFromHash(window.location.hash);
 }
 
 /** The position of the first entry whose anchors include `target`, or -1 when none does. */
@@ -197,26 +192,18 @@ function scrollToId(id: string): boolean {
  * Moves focus to the element with this id. An element that is not focusable by itself, such as
  * a card's `<article>` or a group's `<section>`, gets `tabindex="-1"` for as long as it holds
  * focus, which makes it focusable by script but never a Tab stop; the attribute is removed again
- * when it loses focus, so the element is left exactly as it was rendered.
+ * when it loses focus, so the element is left exactly as it was rendered ({@link focusElement}).
  *
+ * @param options - passed to `focus()`, such as `{ preventScroll: true }` for an element already
+ *   scrolled into view
  * @returns whether the element exists
  */
-function focusId(id: string): boolean {
+function focusId(id: string, options?: FocusOptions): boolean {
   const element = document.getElementById(id);
   if (element === null) {
     return false;
   }
-  if (!element.hasAttribute('tabindex') && element.tabIndex < 0) {
-    element.setAttribute('tabindex', '-1');
-    element.addEventListener(
-      'blur',
-      () => {
-        element.removeAttribute('tabindex');
-      },
-      { once: true },
-    );
-  }
-  element.focus();
+  focusElement(element, options);
   return true;
 }
 
@@ -235,8 +222,8 @@ export interface BatchOptions<T> {
    * The element ids an entry holds, such as a card's `item-{id}` or a group's anchor together
    * with the anchors of its cards. When `location.hash` names one of them, on mount or on a
    * `hashchange`, the list reveals its batches through that entry and scrolls the named element
-   * into view (or the entry's own focus target, when the named element is not rendered). Omitted,
-   * the list ignores the hash.
+   * into view (or the entry's own focus target, when the named element is not rendered); after a
+   * `hashchange` it also focuses that element. Omitted, the list ignores the hash.
    */
   readonly anchorsOf?: (entry: T) => readonly string[];
   /**
@@ -310,7 +297,10 @@ export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): 
   });
   /** The first entry of the batch a reveal showed, which takes focus once it has rendered. */
   const pendingFocus = useRef<number | null>(null);
-  /** The hash target a `hashchange` revealed, scrolled into view once it has rendered. */
+  /**
+   * The hash target a `hashchange` revealed, scrolled into view and focused once it has
+   * rendered.
+   */
   const pendingScroll = useRef<{ target: string; index: number } | null>(null);
   /** The latest render's inputs, read by the `hashchange` listener and the mount effect. */
   const latest = useRef({ entries, anchorsOf, focusIdOf, limit, batchSize, baseId });
@@ -371,15 +361,24 @@ export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): 
     };
   }, [hashAware]);
 
-  // After a reveal has rendered: scroll to what a hash change revealed, focus what a press of
-  // the button revealed.
+  // After a reveal has rendered: scroll to and focus what a hash change revealed, focus what a
+  // press of the button revealed.
   useEffect(() => {
     const scroll = pendingScroll.current;
     pendingScroll.current = null;
-    if (scroll !== null && !scrollToId(scroll.target)) {
-      const own = targetOf(scroll.index);
-      if (own !== null) {
-        scrollToId(own);
+    if (scroll !== null) {
+      let revealed: string | null = scroll.target;
+      if (!scrollToId(revealed)) {
+        // The entry does not render the element the hash names (such as a collapsed held
+        // card's anchor): its own focus target stands in for it.
+        revealed = targetOf(scroll.index);
+        if (revealed !== null && !scrollToId(revealed)) {
+          revealed = null;
+        }
+      }
+      if (revealed !== null) {
+        // Already scrolled into view, aligned to the top: focusing must not scroll it again.
+        focusId(revealed, { preventScroll: true });
       }
     }
     const focusIndex = pendingFocus.current;

@@ -6,28 +6,31 @@
  *
  * 1. the page title, the page's single `<h1>` ("Actions");
  * 2. the {@link StatusBar}: window picker, each source's day boundary and the source chips;
- * 3. the {@link CustomRunBanner}, only for a custom-window run ("Custom window {start} – {end}"
- *    with "Back to default");
- * 4. the {@link GlobalBanners}, in their fixed order, open discrepancies first;
- * 5. the {@link SectionNav}: anchor links with item counts for the five sections;
- * 6. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
+ * 3. the {@link GlobalBanners}, in their fixed order and one `Stack`: open discrepancies first,
+ *    because the discrepancy banner sits above everything, then the run notice, then the rest.
+ *    The run notice is the {@link CustomRunBanner} for a custom-window run ("Custom window
+ *    {start} – {end}" with "Back to default"), or the {@link OlderDefaultRunBanner} for a
+ *    default run opened by id that is no longer the latest default run;
+ * 4. the {@link SectionNav}: anchor links with item counts for the five sections;
+ * 5. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
  *    card confirms an outcome there, such as "Dismissed: Pause (Generic CRM — US)": it outlives
  *    the card a recorded feedback removes;
- * 7. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
+ * 6. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
  *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
  *
  * Run selection (AAP 0.5.3): without `runId` the page shows the latest succeeded **default** run,
  * because `GET /recommendations` is sent without `run_id`. With `runId`, which `src/router.tsx`
  * reads from `/actions?run=<id>`, it shows that run, typically a custom window created by the
- * window picker. A custom run never stands in for the default one.
+ * window picker. A custom run never stands in for the default one, and a default run opened by
+ * id that a later default run has replaced is marked as older, with a way back.
  *
  * Performance (AAP 0.1.1): the whole page comes from one precomputed `GET /recommendations`
  * response. This module sends no per-item request; the children read only page-level state
  * (configuration, sources, the discrepancy list), each once. The status bar's reads start
  * alongside the page's own read rather than after it, the default page's run doubles as the
- * latest default run the window picker needs, and recent custom runs are read only when the
- * user opens that list.
+ * latest default run the window picker and the run notice need, and recent custom runs are read
+ * only when the user opens that list.
  *
  * States, in precedence order:
  *
@@ -66,6 +69,7 @@ import type { ComponentType, ReactElement, ReactNode } from 'react';
 import {
   isApiError,
   isAwaitingFirstRun,
+  useDefaultRun,
   usePrefetchActionsReads,
   useRecommendations,
 } from '../../api/queries';
@@ -73,7 +77,11 @@ import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, RunId, Section, SectionKey } from '../../api/types';
 import { Button, EmptyState, PageShell, Spinner, Stack } from '../../design-system';
-import { CustomRunBanner } from '../status/CustomRunBanner';
+import {
+  CustomRunBanner,
+  OlderDefaultRunBanner,
+  isOlderDefaultRun,
+} from '../status/CustomRunBanner';
 import { GlobalBanners } from '../status/GlobalBanners';
 import { StatusBar } from '../status/StatusBar';
 import { BlockingDiscrepanciesProvider } from './BlockingDiscrepancies';
@@ -405,30 +413,74 @@ function ActionsFrame({ notice, children }: ActionsFrameProps): ReactElement {
 interface ActionsContentProps {
   /** One `GET /recommendations` response: the run, its overlay, banners and sections. */
   page: RecommendationsPage;
+  /**
+   * Whether `/actions?run=<id>` addressed the run. Without an id the page is the latest default
+   * run by definition, so it is never marked as an older one.
+   */
+  runAddressed: boolean;
 }
 
 /**
- * The loaded page: status bar, custom-window banner (custom runs only), global banners, section
- * navigation and the five sections in {@link SECTION_ORDER}, each with the run and overlay of the
- * same response, so every part describes one moment. The sections sit inside one
+ * The notice about the run on screen that {@link GlobalBanners} shows right after the
+ * open-discrepancies banner:
+ *
+ * - a custom run: the {@link CustomRunBanner};
+ * - a default run addressed by id that {@link isOlderDefaultRun} places before `latest`: the
+ *   {@link OlderDefaultRunBanner};
+ * - anything else, including every run while `latest` has not been read: no notice.
+ *
+ * @param run - the run on screen
+ * @param runAddressed - whether `/actions?run=<id>` addressed it
+ * @param latest - the latest succeeded default run, or `undefined` while it is not known
+ * @returns the notice, or `null`
+ */
+function runNoticeFor(
+  run: Run,
+  runAddressed: boolean,
+  latest: Run | undefined,
+): ReactElement | null {
+  if (run.kind === 'custom') {
+    return <CustomRunBanner run={run} />;
+  }
+  if (runAddressed && latest !== undefined && isOlderDefaultRun(run, latest)) {
+    return <OlderDefaultRunBanner run={run} />;
+  }
+  return null;
+}
+
+/**
+ * The loaded page: status bar, global banners with the run notice ({@link runNoticeFor}) right
+ * after the open-discrepancies banner, section navigation and the five sections in
+ * {@link SECTION_ORDER}, each with the run and overlay of the same response, so every part
+ * describes one moment. The sections sit inside one
  * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
  * section, announces each card's outcome even after the card has left the page, and inside one
  * {@link BlockingDiscrepanciesProvider}, through which each held card links the discrepancies
  * that hold it.
  *
- * Memoized on `page`: the page re-renders whenever its read's fetch status changes, at the start
- * and the end of every poll, and this content renders again only for a newly delivered page.
+ * Memoized on `page` and `runAddressed`: the page re-renders whenever its read's fetch status
+ * changes, at the start and the end of every poll, and this content renders again only for a
+ * newly delivered page, or for a new latest default run, which it reads for the run notice.
  * Each section then renders again only when its own inputs changed ({@link SECTION_RENDERERS}).
  */
-const ActionsContent = memo(function ActionsContent({ page }: ActionsContentProps): ReactElement {
+const ActionsContent = memo(function ActionsContent({
+  page,
+  runAddressed,
+}: ActionsContentProps): ReactElement {
   const { run, overlay, banners, sections } = page;
+  // The entry the window picker observes too, so this sends no request of its own. Only `data`
+  // is read, so a poll that leaves the latest default run unchanged renders nothing here.
+  const latestDefaultRun = useDefaultRun().data;
   const sectionsByKey = firstSectionByKey(sections);
 
   return (
     <ActionsFrame>
       <StatusBar run={run} overlay={overlay} />
-      {run.kind === 'custom' && <CustomRunBanner run={run} />}
-      <GlobalBanners banners={banners} overlay={overlay} />
+      <GlobalBanners
+        banners={banners}
+        overlay={overlay}
+        runNotice={runNoticeFor(run, runAddressed, latestDefaultRun)}
+      />
       <SectionNav sections={sections} />
       <ActionOutcomeProvider>
         {/* Held cards link the discrepancies that hold them: the run's C0 cards or /decisions. */}
@@ -500,14 +552,15 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
     query.data !== undefined,
   );
 
-  // A Retry the user started: the button shows as loading, hence disabled, until it settles.
+  // A Retry the user started: the button shows as loading, hence inert, until it settles.
   const [retrying, setRetrying] = useState(false);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef(false);
 
-  // A disabled button loses focus to the page body, so once a Retry settles and the failure is
-  // still shown, focus goes back to its button. Focus the user moved elsewhere in the meantime is
-  // left alone, and a button that left the page (the retry succeeded) is skipped.
+  // The loading button keeps focus, but focus can still be lost to the page body meanwhile, so
+  // once a Retry settles and the failure is still shown, focus on the body goes back to its
+  // button. Focus the user moved elsewhere in the meantime is left alone, and a button that left
+  // the page (the retry succeeded) is skipped.
   useEffect(() => {
     if (retrying || !returnFocusRef.current) {
       return;
@@ -537,7 +590,7 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   };
 
   if (query.data !== undefined) {
-    return <ActionsContent page={query.data} />;
+    return <ActionsContent page={query.data} runAddressed={runId !== undefined} />;
   }
 
   if (failure === null) {

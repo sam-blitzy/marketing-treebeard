@@ -684,7 +684,9 @@ async def _overlay_at(
                 .order_by(Recommendation.id)
             )
         )
-        result = await overlay.overlay(session, stored, rows, now, thresholds=config)
+        result = await overlay.overlay(
+            session, stored, rows, now, thresholds=config, display_timezone="UTC"
+        )
     return rows, result
 
 
@@ -1001,7 +1003,7 @@ async def test_p1_a_discrepancy_detected_after_the_run_holds_items_at_read_time(
     The run is stored first; then the scenario's post-run ``status`` discrepancy is raised on
     the campaign the K1 item rests on, exactly as the entity sync's detection would. At once,
     without a rerun, ``GET /recommendations`` shows the item ``held_now`` with "Resolve
-    discrepancy first" and the live "Unverified while 1 discrepancies are open" flag, the
+    discrepancy first" and the live "Unverified while 1 discrepancy is open" flag, the
     overlay counts one open discrepancy and the discrepancy banner leads with that count. The
     stored item is unchanged: ``held`` stays false, and evidence and flags are byte-identical.
     """
@@ -1058,6 +1060,7 @@ async def test_p1_a_discrepancy_detected_after_the_run_holds_items_at_read_time(
     assert held["current"]["historical"] is False
     flags_now = {flag["code"]: flag["message"] for flag in held["current"]["flags_now"]}
     assert flags_now[FLAG_UNVERIFIED_DISCREPANCIES] == unverified_message(1)
+    assert flags_now[FLAG_UNVERIFIED_DISCREPANCIES] == "Unverified while 1 discrepancy is open"
     assert after["overlay"]["open_discrepancies"] == expected["open_discrepancies"]
     banner = after["banners"][0]
     assert banner["code"] == BANNER_OPEN_DISCREPANCIES

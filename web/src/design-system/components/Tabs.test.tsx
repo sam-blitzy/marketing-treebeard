@@ -6,18 +6,21 @@
  * They pin what feature code and assistive technology rely on, so a later Blitzy OS binding that
  * changes the wrapper's internals must still pass them:
  * - one `tablist` named by `label`, one `tab` per item named by its label and count;
+ * - each label rendered visibly and once more as an `aria-hidden` sizer that reserves its
+ *   semibold width, out of the tab's name, with a tab's content the same selected or not;
  * - exactly one tab selected (`aria-selected`), alone in the Tab sequence, controlling the one
  *   visible `tabpanel`, which is labelled by its tab; every panel element exists from the start
  *   (named by the tab's `id` when given), its content mounts on its tab's first selection and
  *   then stays mounted;
  * - ArrowRight and ArrowLeft wrap, Home and End jump, focus and selection move together, and
- *   modified or unrelated keys are left to the browser;
+ *   modified or unrelated keys are left to the browser; the row scrolls the tab the keys reach
+ *   into view, showing the start of a tab wider than the visible row;
  * - uncontrolled by default, controlled through `selectedKey` and `onChange`, with an unknown
  *   key falling back to the first tab, and nothing rendered for an empty `tabs` array.
  */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { useEffect, useState } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Tabs, type TabItem } from './Tabs';
 
@@ -47,6 +50,18 @@ function tabAt(index: number): HTMLElement {
   return tab;
 }
 
+/**
+ * The text `element` presents: its text content without the `aria-hidden` subtrees, which
+ * leaves out the hidden copy of each tab label that reserves its semibold width.
+ */
+function presentedText(element: HTMLElement): string | null {
+  const copy = element.cloneNode(true) as HTMLElement;
+  for (const hidden of copy.querySelectorAll('[aria-hidden="true"]')) {
+    hidden.remove();
+  }
+  return copy.textContent;
+}
+
 /** The `aria-selected` value of every tab, in display order. */
 function selectedStates(): (string | null)[] {
   return allTabs().map((tab) => tab.getAttribute('aria-selected'));
@@ -64,7 +79,7 @@ describe('Tabs', () => {
 
       const list = screen.getByRole('tablist', { name: 'Keyword actions' });
       expect(list.getAttribute('aria-label')).toBe('Keyword actions');
-      expect(allTabs().map((tab) => tab.textContent)).toEqual(['Block 3', 'Expand 0', 'Review']);
+      expect(allTabs().map(presentedText)).toEqual(['Block 3', 'Expand 0', 'Review']);
       expect(screen.getByRole('tab', { name: 'Block 3' })).toBe(tabAt(0));
       expect(screen.getByRole('tab', { name: 'Expand 0' })).toBe(tabAt(1));
       expect(screen.getByRole('tab', { name: 'Review' })).toBe(tabAt(2));
@@ -74,6 +89,57 @@ describe('Tabs', () => {
         expect(tab.tagName).toBe('BUTTON');
         expect(tab.getAttribute('type')).toBe('button');
       }
+    });
+
+    it('reserves each label width with one hidden copy that stays out of the tab name', () => {
+      render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+
+      allTabs().forEach((tab, index) => {
+        const expected = KEYWORD_TABS[index]?.label;
+        const slot = tab.querySelector('.ds-tabs__label');
+        // The visible label, then the sizer that reserves its semibold width, both the label.
+        expect(Array.from(slot?.children ?? [], (child) => child.className)).toEqual([
+          'ds-tabs__label-text',
+          'ds-tabs__label-sizer',
+        ]);
+        const [text, sizer] = Array.from(slot?.children ?? []);
+        expect(text?.textContent).toBe(expected);
+        expect(text?.hasAttribute('aria-hidden')).toBe(false);
+        expect(sizer?.textContent).toBe(expected);
+        expect(sizer?.getAttribute('aria-hidden')).toBe('true');
+        // The sizer is the only content of the tab hidden from assistive technology.
+        const hidden = tab.querySelectorAll('[aria-hidden="true"]');
+        expect(hidden).toHaveLength(1);
+        expect(hidden[0]).toBe(sizer);
+      });
+      // Every name is still the label and count, with no trace of the hidden copy.
+      expect(screen.getByRole('tab', { name: 'Block 3' })).toBe(tabAt(0));
+      expect(screen.getByRole('tab', { name: 'Expand 0' })).toBe(tabAt(1));
+      expect(screen.getByRole('tab', { name: 'Review' })).toBe(tabAt(2));
+      expect(screen.queryByRole('tab', { name: /Block\s*Block|Review\s*Review/u })).toBeNull();
+    });
+
+    it('owns its tabs directly, inside a scroller that adds no semantics', () => {
+      render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+
+      const list = screen.getByRole('tablist', { name: 'Keyword actions' });
+      expect(Array.from(list.children)).toEqual(allTabs());
+      // The row scrolls inside a plain wrapper, so no role or name sits between list and tabs.
+      const scroller = list.parentElement;
+      expect(scroller?.className).toBe('ds-tabs__scroller');
+      expect(scroller?.getAttributeNames()).toEqual(['class']);
+      expect(scroller?.children).toHaveLength(1);
+    });
+
+    it('renders the same tab content whether the tab is selected or not', () => {
+      render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+      const contentBefore = allTabs().map((tab) => tab.innerHTML);
+
+      fireEvent.click(tabAt(1));
+
+      expect(selectedStates()).toEqual(['false', 'true', 'false']);
+      // Only the tabs' own state attributes changed; their content, sizers included, did not.
+      expect(allTabs().map((tab) => tab.innerHTML)).toEqual(contentBefore);
     });
 
     it('selects the first tab by default and keeps only it in the Tab sequence', () => {
@@ -314,6 +380,69 @@ describe('Tabs', () => {
       expect(selectedStates()).toEqual(['true', 'false', 'false']);
     });
 
+    describe('scrolling the focused tab into view', () => {
+      /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+      let scrollIntoView: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        scrollIntoView = vi.fn();
+        Object.defineProperty(Element.prototype, 'scrollIntoView', {
+          configurable: true,
+          writable: true,
+          value: scrollIntoView,
+        });
+      });
+
+      afterEach(() => {
+        Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+      });
+
+      it('scrolls the row just far enough to show each tab the keys move to', () => {
+        render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+        tabAt(0).focus();
+
+        fireEvent.keyDown(tabAt(0), { key: 'End' });
+        fireEvent.keyDown(tabAt(2), { key: 'ArrowLeft' });
+
+        expect(scrollIntoView.mock.contexts).toEqual([tabAt(2), tabAt(1)]);
+        expect(scrollIntoView.mock.calls).toEqual([
+          [{ block: 'nearest', inline: 'nearest' }],
+          [{ block: 'nearest', inline: 'nearest' }],
+        ]);
+        expect(document.activeElement).toBe(tabAt(1));
+      });
+
+      it('shows the start of a tab wider than the visible row', () => {
+        render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+        const scroller = screen.getByRole('tablist').parentElement;
+        if (scroller === null) {
+          throw new Error('The tab list has no scroller');
+        }
+        Object.defineProperty(scroller, 'clientWidth', { configurable: true, value: 296 });
+        Object.defineProperty(tabAt(1), 'offsetWidth', { configurable: true, value: 297 });
+        Object.defineProperty(tabAt(2), 'offsetWidth', { configurable: true, value: 296 });
+        tabAt(0).focus();
+
+        fireEvent.keyDown(tabAt(0), { key: 'ArrowRight' });
+        fireEvent.keyDown(tabAt(1), { key: 'ArrowRight' });
+
+        expect(scrollIntoView.mock.contexts).toEqual([tabAt(1), tabAt(2)]);
+        expect(scrollIntoView.mock.calls).toEqual([
+          [{ block: 'nearest', inline: 'start' }],
+          [{ block: 'nearest', inline: 'nearest' }],
+        ]);
+      });
+
+      it('leaves pointer selection to the browser', () => {
+        render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} />);
+
+        fireEvent.click(tabAt(2));
+
+        expect(selectedStates()).toEqual(['false', 'false', 'true']);
+        expect(scrollIntoView).not.toHaveBeenCalled();
+      });
+    });
+
     it('navigates from the selected tab when the key event comes from the tablist itself', () => {
       render(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="expand" />);
 
@@ -411,7 +540,7 @@ describe('Tabs', () => {
 
       rerender(<Tabs label="Keyword actions" tabs={[...KEYWORD_TABS].reverse()} />);
 
-      expect(allTabs().map((tab) => tab.textContent)).toEqual(['Review', 'Expand 0', 'Block 3']);
+      expect(allTabs().map(presentedText)).toEqual(['Review', 'Expand 0', 'Block 3']);
       expect(selectedStates()).toEqual(['false', 'true', 'false']);
 
       tabAt(1).focus();

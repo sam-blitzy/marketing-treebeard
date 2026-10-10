@@ -12,7 +12,8 @@
  * - after a reveal, focus moves to the first newly revealed entry (made focusable with
  *   `tabindex="-1"` only while it holds focus), or to the status when that entry has no target;
  * - a hash naming an entry beyond the shown batches reveals through it and scrolls it into view,
- *   on mount and on `hashchange`; a hash naming a shown or unknown entry changes nothing;
+ *   on mount and on `hashchange`, and on `hashchange` alone also focuses it (or the entry's own
+ *   target), without scrolling again; a hash naming a shown or unknown entry changes nothing;
  * - table rows are sliced, the control follows the table and focus lands on the row header of
  *   the first new row;
  * - the status is never an `alert`.
@@ -257,11 +258,15 @@ describe('BatchedList', () => {
     expect(screen.getByRole('status').textContent).toBe('Showing 80 of 250 actions');
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView.mock.contexts[0]).toBe(screen.getByRole('article', { name: 'Card 75' }));
+    // A hash present on mount, as on a page load, moves no focus.
+    expect(document.activeElement).toBe(document.body);
+    expect(screen.getByRole('article', { name: 'Card 75' }).hasAttribute('tabindex')).toBe(false);
   });
 
-  it('reveals through the entry a hash change names, and scrolls it into view', () => {
+  it('reveals through the entry a hash change names, scrolls it into view and focuses it', () => {
     render(<CardList items={entries(250)} />);
     expect(renderedRanks()).toHaveLength(20);
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
 
     act(() => {
       setHash('item-130');
@@ -269,11 +274,22 @@ describe('BatchedList', () => {
     });
 
     expect(renderedRanks()).toEqual(ranksThrough(140));
+    const target = screen.getByRole('article', { name: 'Card 130' });
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
-    expect(scrollIntoView.mock.contexts[0]).toBe(screen.getByRole('article', { name: 'Card 130' }));
-    // The hash reveal moves no focus: the button keeps working from the new count.
+    expect(scrollIntoView.mock.contexts[0]).toBe(target);
+    // Focus lands on the revealed card, focusable only while it holds focus, without scrolling
+    // it again.
+    expect(document.activeElement).toBe(target);
+    expect(target.getAttribute('tabindex')).toBe('-1');
+    expect(focus.mock.contexts).toEqual([target]);
+    expect(focus.mock.calls).toEqual([[{ preventScroll: true }]]);
+    focus.mockRestore();
+    target.blur();
+    expect(target.hasAttribute('tabindex')).toBe(false);
+    // The button keeps working from the new count.
     fireEvent.click(showMore() as HTMLElement);
     expect(renderedRanks()).toHaveLength(160);
+    expect(document.activeElement).toBe(screen.getByRole('article', { name: 'Card 141' }));
   });
 
   it('ignores a hash naming a shown or an unknown entry, and a list that is not hash-aware', () => {
@@ -295,6 +311,8 @@ describe('BatchedList', () => {
     });
     expect(renderedRanks()).toHaveLength(20);
     expect(scrollIntoView).not.toHaveBeenCalled();
+    // Nothing was revealed, so focus stays where it was.
+    expect(document.activeElement).toBe(document.body);
   });
 
   it('decodes a percent-encoded hash, keeps a malformed one as written, and needs no scrolling', () => {
@@ -335,13 +353,49 @@ describe('BatchedList', () => {
       screen.getByRole('article', { name: 'Card 75' }),
     ]);
 
+    expect(document.activeElement).toBe(document.body);
+
     act(() => {
       setHash('held-130');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
     });
-    expect(scrollIntoView.mock.contexts.at(-1)).toBe(
-      screen.getByRole('article', { name: 'Card 130' }),
+    const own = screen.getByRole('article', { name: 'Card 130' });
+    expect(scrollIntoView.mock.contexts.at(-1)).toBe(own);
+    // The entry's own focus target takes the focus the unrendered element cannot.
+    expect(document.activeElement).toBe(own);
+    expect(own.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('reveals but moves no focus when neither the named element nor its entry target renders', () => {
+    render(
+      <>
+        <Button>Elsewhere</Button>
+        <BatchedList
+          entries={entries(100)}
+          batchSize={CARD_BATCH_SIZE}
+          noun={ACTION_NOUN}
+          getKey={(entry) => entry.id}
+          renderEntry={(entry) => (
+            <article id={anchorOf(entry)} aria-label={`Card ${String(entry.id)}`}>
+              {String(entry.id)}
+            </article>
+          )}
+          anchorsOf={(entry) => [anchorOf(entry), `held-${String(entry.id)}`]}
+          focusIdOf={() => 'no-such-element'}
+        />
+      </>,
     );
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+
+    act(() => {
+      setHash('held-90');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+
+    expect(screen.getAllByRole('article')).toHaveLength(100);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(elsewhere);
   });
 
   it('ignores a reveal once every entry is shown', () => {

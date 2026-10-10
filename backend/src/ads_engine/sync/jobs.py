@@ -89,8 +89,13 @@ retried ``error``, also when a later batch of the pass raises (before the raised
 whose consequence stands). An interrupted or deferred full-state entity read is
 ``incomplete`` with its reason: no removal or disappearance is inferred from it (AAP 0.3.3
 "Safe absence"), and it is cut short too, so the entity dataset's ``last_success_at``
-stands and the dataset turns stale the same way. The next Google entity sync reads only
-what is still outstanding.
+stands and the dataset turns stale the same way. Its ``sync_run`` row and the job end
+``succeeded`` only when every interruption was a call-budget deferral: any other transient
+error that cut the read short closes the row ``failed`` in the entity transaction,
+``incomplete`` with that error's reason, and fails the job with the same reason, as the
+same outage fails a metrics job; the error is handed to ``on_error`` with no dataset, the
+freshness row having recorded the read. The next Google entity sync reads only what is
+still outstanding.
 
 Google checkpoints (``dataset_freshness.checkpoint``, version 1; scopes are
 :func:`~ads_engine.connectors.google_n8n.partition.scope_to_json` objects)::
@@ -738,8 +743,11 @@ class JobResult:
         source: The source of the dataset written.
         dataset_id: The dataset written.
         status: ``succeeded`` when every freshness dataset of the job recorded a success
-            (complete or incomplete); ``failed`` when the job raised, a dataset's refresh
-            failed and kept its last good data, or a database integrity violation ended it.
+            (complete or incomplete) and no read was cut short by a transient error other
+            than a call-budget deferral; ``failed`` when the job raised, a dataset's refresh
+            failed and kept its last good data, a transient error that outlived its retries
+            cut an entity read short (recorded as an ``incomplete`` success all the same),
+            or a database integrity violation ended it.
         rows: Rows written (entities, facts, leads, contacts, associations, …).
         calls: Connector calls the job made, read from its clients' own counters however the
             job ended, so the calls of an operation that raised (a defect, a denial) or of a
@@ -1508,21 +1516,22 @@ class _JobBase(ABC):
         Every path of :meth:`run` ends here exactly once, so the event has one shape: source,
         job, dataset, status, rows, calls, completeness, the outcome per freshness dataset,
         disposition, duration, error and error type. Outcomes are those committed (or, for a
-        failure, recorded). The level follows the status: ``info`` for ``succeeded``,
-        ``error`` for ``failed`` (a defect, a denial, a transient error whose retries ran out,
-        an integrity violation, a retired dataset or an unexpected error), so every job
-        failure, a persistent outage included, has an error-level line; ``warning`` for
-        ``cancelled``.
+        failure, recorded). The level follows the status: ``info`` for ``succeeded`` (a
+        call-budget deferral included), ``error`` for ``failed`` (a defect, a denial, a
+        transient error whose retries ran out, whether it failed a dataset's refresh or cut an
+        entity read short, an integrity violation, a retired dataset or an unexpected error),
+        so every job failure, a persistent outage included, has an error-level line;
+        ``warning`` for ``cancelled``.
 
         ``error`` is the failure text the job recorded, the same sanitized reasons it writes
         to ``sync_run.error`` and truncated as those are (a connector's reason with its query
         id, :attr:`IntegrityFailure.reason`, a retired dataset's reason, the reasons of the
-        datasets whose refresh failed); for a raised run, ``job failed unexpectedly`` or
-        ``job cancelled`` (the reason its open rows close with) joins them. ``error_type`` is
-        the class name of the exception that ended the job: the one :meth:`run` re-raises,
-        else the connector error, integrity violation or retirement :meth:`_attempt`
-        settled; ``None`` when no exception ended it. The event never carries an email, a
-        secret, a token or an exception's own text.
+        datasets whose refresh failed or whose read a transient error cut short); for a
+        raised run, ``job failed unexpectedly`` or ``job cancelled`` (the reason its open rows
+        close with) joins them. ``error_type`` is the class name of the exception that ended
+        the job: the one :meth:`run` re-raises, else the connector error, integrity violation
+        or retirement :meth:`_attempt` settled; ``None`` when no exception ended it. The event
+        never carries an email, a secret, a token or an exception's own text.
 
         Args:
             started: ``time.perf_counter()`` when the run started.
@@ -1610,7 +1619,9 @@ class _JobBase(ABC):
                 (a call-budget deferral, an interrupted full-state read), which keeps the
                 dataset's ``last_success_at`` so it turns stale the same way, or lives outside
                 ``dataset_freshness`` (lead matching's retried ``lead_match`` rows), and only
-                the connection's health is reported.
+                the connection's health is reported. Noting it fails nothing: the commit that
+                recorded an interrupted full-state read failed its job already
+                (:meth:`_complete`), unless every interruption was a deferral.
             datasets: Further freshness datasets the same interruption failed; all of them
                 are handed to ``on_error`` together, in one call.
         """
@@ -1627,6 +1638,7 @@ class _JobBase(ABC):
         *,
         changed: bool = False,
         rows: Mapping[str, int] | None = None,
+        failures: Mapping[str, str] | None = None,
     ) -> None:
         """Record freshness outcomes in the transaction that wrote their data.
 
@@ -1639,6 +1651,13 @@ class _JobBase(ABC):
         request, so data a later transaction of the job writes is never left behind by a run
         that served an earlier request; the worker coalesces the requests that arrive within
         60 s into one run.
+
+        A dataset named in ``failures`` is one whose read a transient error cut short after
+        its retries, recorded as its cut-short ``incomplete`` success all the same (an
+        interrupted full-state entity read): its freshness outcome is written as given and
+        counts as a success for the analysis request, while its ``sync_run`` rows close
+        ``failed`` with the outcome's completeness and the failure text, and the job reports
+        it failed with that text (:meth:`_result`).
 
         The job's own bookkeeping learns of the completion only when the transaction commits
         (:meth:`_publish_on_commit`): a completion rolled back by a later failure of its
@@ -1654,29 +1673,45 @@ class _JobBase(ABC):
             rows: Rows the transaction wrote per freshness dataset that the job has not
                 counted yet. They are included in the closed ``sync_run`` rows and added to
                 the job's counts once the transaction commits.
+            failures: The failure text (:func:`_failure_text`) per dataset of ``outcomes``
+                whose read a transient error cut short; ``None`` when no read was.
 
         Raises:
+            ValueError: If ``failures`` names a dataset that has no outcome in ``outcomes``;
+                nothing is written then.
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
         """
         ctx = self.ctx
         uncounted = dict(rows) if rows is not None else {}
+        cut_short = dict(failures) if failures is not None else {}
+        unknown = sorted(name for name in cut_short if name not in outcomes)
+        if unknown:
+            raise ValueError(f"failure texts for datasets with no outcome: {', '.join(unknown)}")
         dataset = await repositories.ensure_writable(session, ctx.dataset_id)
         for name, outcome in outcomes.items():
             await freshness.record_freshness(session, ctx.dataset_id, name, outcome)
         closed: list[str | None] = []
         for name, outcome in outcomes.items():
+            failure = cut_short.get(name)
+            status: Literal["succeeded", "failed"]
+            error: str | None
+            if failure is None:
+                status = SYNC_RUN_SUCCEEDED if outcome.succeeded else SYNC_RUN_FAILED
+                error = None if outcome.succeeded else outcome.reason
+            else:
+                status, error = SYNC_RUN_FAILED, failure
             if await self._close(
                 session,
                 name,
-                status=SYNC_RUN_SUCCEEDED if outcome.succeeded else SYNC_RUN_FAILED,
+                status=status,
                 completeness=outcome.completeness,
-                error=None if outcome.succeeded else outcome.reason,
+                error=error,
                 uncounted=uncounted.get(name, 0),
             ):
                 closed.append(name)
         if changed or any(outcome.succeeded for outcome in outcomes.values()):
             await self._queue_analysis(session, dataset)
-        self._publish_on_commit(session, outcomes, closed, uncounted)
+        self._publish_on_commit(session, outcomes, closed, uncounted, cut_short)
 
     def _publish_on_commit(
         self,
@@ -1684,25 +1719,29 @@ class _JobBase(ABC):
         outcomes: Mapping[str, FreshnessOutcome],
         closed: Sequence[str | None],
         rows: Mapping[str, int] | None = None,
+        failed: Mapping[str, str] | None = None,
     ) -> None:
         """Publish a completion to the job's bookkeeping once ``session``'s transaction commits.
 
         The outcomes join the ones :meth:`run` reports and logs, the closed datasets the ones
-        :meth:`_close_remaining` skips, and the rows the job's counts (:meth:`_count`), only
-        after the commit. A rollback of the transaction (a failed statement after the
-        completion, a failed enqueue or commit) discards them, and a later transaction of the
-        same session never publishes them. A savepoint released inside the transaction is not
-        its commit.
+        :meth:`_close_remaining` skips, the failure texts the ones that fail the job
+        (:meth:`_result`), and the rows the job's counts (:meth:`_count`), only after the
+        commit. A rollback of the transaction (a failed statement after the completion, a
+        failed enqueue or commit) discards them, and a later transaction of the same session
+        never publishes them. A savepoint released inside the transaction is not its commit.
 
         Args:
             session: The transaction the completion was written in.
             outcomes: The freshness outcomes it recorded.
             closed: The datasets whose ``sync_run`` rows it closed.
             rows: Rows it wrote per freshness dataset that are not counted yet.
+            failed: The failure text per dataset whose ``sync_run`` rows it closed ``failed``
+                for a read a transient error cut short (:meth:`_complete`).
         """
         published = dict(outcomes)
         names = tuple(closed)
         counts = dict(rows) if rows is not None else {}
+        failures = dict(failed) if failed is not None else {}
         settled = False
 
         def on_commit(committed: Session) -> None:
@@ -1712,6 +1751,7 @@ class _JobBase(ABC):
             settled = True
             self._freshness.update(published)
             self._closed.update(names)
+            self._failed.update(failures)
             for name, count in counts.items():
                 self._count(name, count)
 
@@ -2624,7 +2664,10 @@ class EntitySyncJob(_JobBase):
     (:attr:`~ads_engine.sync.freshness.FreshnessOutcome.cut_short`). The entity dataset's
     ``last_success_at`` then stands, so a persistent outage or an exhausted budget turns it
     stale (AAP 0.3.3); a sync that reads everything outstanding moves it again. A shortfall a
-    finished read reports (a page limit, a result limit) is not cut short.
+    finished read reports (a page limit, a result limit) is not cut short. The ``sync_run``
+    row and the job end ``succeeded`` when only call-budget deferrals cut the sync short, and
+    ``failed`` with the error's reason when any other transient error did, the cut-short
+    ``incomplete`` freshness outcome and what was read being recorded either way.
 
     Google cycles: an interrupted sync stores its outstanding work as the
     ``google.entities`` checkpoint (module docstring) in the entity transaction, and the
@@ -2735,6 +2778,9 @@ class EntitySyncJob(_JobBase):
             )
             if error is not None
         ]
+        failure = next(
+            (error for error in interruptions if not isinstance(error, CallBudgetExhausted)), None
+        )
         enumerations: dict[str, EnumerationProgress] = {}
         if campaigns is not None and campaigns.progress is not None:
             enumerations["Q-G2"] = campaigns.progress
@@ -2839,13 +2885,14 @@ class EntitySyncJob(_JobBase):
                 sealed=sealed,
                 reasons=reasons,
                 cut_short=outstanding > 0,
+                failure=failure,
             )
             # After the freshness write, so the row is locked in record_freshness's order.
             await freshness.write_checkpoint(
                 session, ctx.dataset_id, name, cycle.to_json() if outstanding else None
             )
         if interruptions:
-            self._interrupted(interruptions[0], dataset=None)
+            self._interrupted(failure if failure is not None else interruptions[0], dataset=None)
 
     async def _write_google(
         self,
@@ -3136,6 +3183,7 @@ class EntitySyncJob(_JobBase):
         sealed: bool,
         reasons: Iterable[str | None],
         cut_short: bool,
+        failure: TransientError | None,
     ) -> None:
         """Snapshots, baseline, discrepancy check and freshness, in the entity transaction.
 
@@ -3144,6 +3192,11 @@ class EntitySyncJob(_JobBase):
         transient error or a call-budget deferral left part of the entity state unread: the
         read is recorded ``incomplete`` with its reasons and is no successful refresh, so the
         entity dataset's ``last_success_at`` stands and it turns stale (AAP 0.3.3).
+        ``failure`` is the first transient error other than a call-budget deferral that cut
+        the read short, or ``None``: with one, the same transaction closes the entity
+        ``sync_run`` row ``failed``, ``incomplete``, with its failure text, and the job reports
+        failed with that text once it commits (:meth:`_complete`); a deferral alone leaves the
+        row ``succeeded``.
         """
         ctx = self.ctx
         distinct = list({row.key: row for row in rows}.values())
@@ -3167,13 +3220,11 @@ class EntitySyncJob(_JobBase):
             discrepancies_raised=report.total_raised,
             discrepancies_resolved=report.auto_resolved,
         )
+        name = f"{ctx.source}.entities"
         await self._complete(
             session,
-            {
-                f"{ctx.source}.entities": _success(
-                    ctx.now, covered=None, reasons=reasons, cut_short=cut_short
-                )
-            },
+            {name: _success(ctx.now, covered=None, reasons=reasons, cut_short=cut_short)},
+            failures=None if failure is None else {name: _failure_text(failure)},
         )
 
     # -- LinkedIn --------------------------------------------------------------------------
@@ -3230,6 +3281,9 @@ class EntitySyncJob(_JobBase):
         )
         interruptions = [listing.interrupted_by for listing in listings if listing.interrupted_by]
         interruptions.extend(read.posts_interrupted for read in reads if read.posts_interrupted)
+        failure = next(
+            (error for error in interruptions if not isinstance(error, CallBudgetExhausted)), None
+        )
 
         async with ctx.sessionmaker() as session, session.begin():
             await _lock_subjects(session, ctx.dataset_id)
@@ -3268,9 +3322,10 @@ class EntitySyncJob(_JobBase):
                 sealed=sealed,
                 reasons=reasons,
                 cut_short=bool(interruptions),
+                failure=failure,
             )
         if interruptions:
-            self._interrupted(interruptions[0], dataset=None)
+            self._interrupted(failure if failure is not None else interruptions[0], dataset=None)
 
     async def _write_linkedin_account(
         self, session: AsyncSession, read: _LinkedInAccountRead

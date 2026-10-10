@@ -231,7 +231,7 @@ def test_item_overlay_view_renders_item_overlay_with_optional_keys_only_when_set
         "data_status_now": "live",
         "flags_now": [],
     }
-    stale = Flag(FLAG_STALE, "Data as of 2026-10-06 11:00 UTC")
+    stale = Flag(FLAG_STALE, "Data as of Oct 6, 2026, 11:00 AM UTC")
     historical = ItemOverlayView(
         held_now=True,
         held_reason_now=HISTORICAL_REASON,
@@ -247,7 +247,7 @@ def test_item_overlay_view_renders_item_overlay_with_optional_keys_only_when_set
         "held_reason_now": HISTORICAL_REASON,
         "historical": True,
         "data_status_now": "stale",
-        "flags_now": [{"code": FLAG_STALE, "message": "Data as of 2026-10-06 11:00 UTC"}],
+        "flags_now": [{"code": FLAG_STALE, "message": "Data as of Oct 6, 2026, 11:00 AM UTC"}],
         "hidden_by": "snooze",
     }
     assert list(historical.to_json()) == [
@@ -472,7 +472,14 @@ async def test_overlay_rejects_a_now_that_is_not_an_instant(
     session = AsyncSession()
     try:
         with pytest.raises(error, match=match):
-            await overlay(session, _transient_run(), [], now, thresholds=shipped)  # type: ignore[arg-type]
+            await overlay(
+                session,
+                _transient_run(),
+                [],
+                now,  # type: ignore[arg-type]
+                thresholds=shipped,
+                display_timezone="UTC",
+            )
     finally:
         await session.close()
 
@@ -488,7 +495,9 @@ async def test_overlay_rejects_items_of_another_run(shipped: Thresholds) -> None
     session = AsyncSession()
     try:
         with pytest.raises(ValueError, match=r"overlay of run 1 was given items of runs \[2, 3\]"):
-            await overlay(session, _transient_run(1), items, NOW, thresholds=shipped)
+            await overlay(
+                session, _transient_run(1), items, NOW, thresholds=shipped, display_timezone="UTC"
+            )
     finally:
         await session.close()
 
@@ -505,10 +514,48 @@ async def test_overlay_requires_injected_thresholds_and_never_loads_the_config(
     session = AsyncSession()
     try:
         with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
-            await overlay(session, _transient_run(), [], NOW)  # type: ignore[call-arg]
+            await overlay(session, _transient_run(), [], NOW, display_timezone="UTC")  # type: ignore[call-arg]
         for value, found in ((None, "NoneType"), ({"window": {}}, "dict")):
             with pytest.raises(TypeError, match=rf"injected by the caller .*found {found}$"):
-                await overlay(session, _transient_run(), [], NOW, thresholds=value)  # type: ignore[arg-type]
+                await overlay(
+                    session,
+                    _transient_run(),
+                    [],
+                    NOW,
+                    thresholds=value,  # type: ignore[arg-type]
+                    display_timezone="UTC",
+                )
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("zone", "error", "match"),
+    [
+        ("Mars/Base", ValueError, "display_timezone must be a loadable IANA time zone name"),
+        ("", ValueError, "display_timezone must be a loadable IANA time zone name"),
+        (None, TypeError, "display_timezone must be an IANA time zone name, found None"),
+    ],
+)
+async def test_overlay_requires_a_loadable_display_timezone_before_any_read(
+    zone: object, error: type[Exception], match: str, shipped: Thresholds
+) -> None:
+    """The zone the stale banner and flags render instants in (AAP 0.5.5) is checked first."""
+    # An unbound session: any database read would raise UnboundExecutionError instead.
+    session = AsyncSession()
+    try:
+        with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
+            await overlay(session, _transient_run(), [], NOW, thresholds=shipped)  # type: ignore[call-arg]
+        with pytest.raises(error, match=match):
+            await overlay(
+                session,
+                _transient_run(),
+                [],
+                NOW,
+                thresholds=shipped,
+                display_timezone=zone,  # type: ignore[arg-type]
+            )
     finally:
         await session.close()
 
@@ -886,8 +933,13 @@ async def _page(
     *,
     thresholds: Thresholds,
     findings: Sequence[RunFinding] | None = None,
+    display_timezone: str = "UTC",
 ) -> OverlayResult:
-    """Load a run and its items in a fresh session and overlay them, as the API does."""
+    """Load a run and its items in a fresh session and overlay them, as the API does.
+
+    ``display_timezone`` is the API's ``settings.display_timezone``: ``UTC``, the shipped
+    default, unless a test shows instants in another zone.
+    """
     async with sessions() as session:
         run = await session.get(AnalysisRun, run_id)
         assert run is not None
@@ -898,7 +950,15 @@ async def _page(
                 .order_by(Recommendation.id)
             )
         )
-        return await overlay(session, run, items, NOW, findings=findings, thresholds=thresholds)
+        return await overlay(
+            session,
+            run,
+            items,
+            NOW,
+            findings=findings,
+            thresholds=thresholds,
+            display_timezone=display_timezone,
+        )
 
 
 async def _stored(sessions: Sessions, item_id: int) -> Recommendation:
@@ -1029,7 +1089,7 @@ async def test_a_discrepancy_detected_after_the_run_holds_dependent_items_at_rea
             flags_now=(_unverified(1),),
         )
     assert after.items[keyword.id].flags_now[0].message == (
-        "Unverified while 1 discrepancies are open"
+        "Unverified while 1 discrepancy is open"
     )
     assert after.banners == (
         BannerView(
@@ -1048,6 +1108,9 @@ async def test_a_discrepancy_detected_after_the_run_holds_dependent_items_at_rea
     assert later.overlay.open_discrepancies == 2
     assert later.items[budget.id].held_reason_now == HELD_DISCREPANCY_REASON
     assert later.items[budget.id].flags_now == (_unverified(2),)
+    assert later.items[budget.id].flags_now[0].message == (
+        "Unverified while 2 discrepancies are open"
+    )
     assert not later.items[pause.id].held_now
     assert later.items[c0.id].flags_now == ()
     assert later.banners[0].message == (
@@ -1260,7 +1323,7 @@ async def test_linkedin_evidence_reads_the_companion_while_google_reads_the_crm_
         data_status_now="simulated",
         flags_now=(
             Flag(FLAG_SIMULATED, "Simulated data (LinkedIn, HubSpot)"),
-            Flag(FLAG_STALE, "Data as of 2026-10-06 06:00 UTC"),
+            Flag(FLAG_STALE, "Data as of Oct 6, 2026, 6:00 AM UTC"),
         ),
     )
     assert result.items[google_crm.id] == ItemOverlayView(
@@ -1289,7 +1352,7 @@ async def test_linkedin_evidence_reads_the_companion_while_google_reads_the_crm_
         {
             "code": BANNER_STALE_DATASETS,
             "tone": "warning",
-            "message": "Stale data: hubspot.contacts (last success 2026-10-06 06:00 UTC)",
+            "message": "Stale data: hubspot.contacts (last success Oct 6, 2026, 6:00 AM UTC)",
             "count": 1,
         },
     ]
@@ -1314,6 +1377,8 @@ async def test_the_simulated_banner_names_each_simulated_source_with_its_reason(
         await _connection(session, "google", "simulated", "access denied: 403 on search", google)
         # A connection already back in live mode lends no reason to the simulated dataset.
         await _connection(session, "linkedin", "live", "recovered", linkedin)
+        # A simulated connection's current reason wins over the reason its dataset was built
+        # with.
         await _connection(session, "hubspot", "simulated", "probe failed", hubspot)
         run = await _run(session)
 
@@ -1330,12 +1395,101 @@ async def test_the_simulated_banner_names_each_simulated_source_with_its_reason(
             tone="info",
             message=(
                 "Simulated data: Google (access denied: 403 on search); "
-                "LinkedIn (simulated data mode); HubSpot (credentials not configured)"
+                "LinkedIn (simulated data mode); HubSpot (probe failed)"
             ),
             count=3,
         ),
     )
     assert not result.banners[0].alert
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_the_simulated_banner_names_the_denial_that_keeps_a_source_simulated(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # First start without credentials builds the dataset; credentials are then added and the
+    # probe's 401 puts Google into automatic fallback, keeping that dataset active.
+    denial = "Q-G1: HTTP 401: Authorization data is wrong!"
+    async with sessions() as session, session.begin():
+        google = await _dataset(
+            session, "google", mode="simulated", reason="credentials not configured"
+        )
+        await _connection(session, "google", "simulated", denial, google)
+        run = await _run(session)
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_SIMULATED_SOURCES,
+            tone="info",
+            message=f"Simulated data: Google ({denial})",
+            count=1,
+        ),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_the_simulated_banner_names_a_forced_mode_over_the_dataset_reason(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # A stack first started without credentials restarts under DATA_MODE=simulated: every
+    # connection reports the forced mode while each kept dataset keeps the reason it was
+    # built with.
+    async with sessions() as session, session.begin():
+        for source in ("google", "linkedin", "hubspot"):
+            dataset = await _dataset(
+                session, source, mode="simulated", reason="credentials not configured"
+            )
+            await _connection(session, source, "simulated", "DATA_MODE=simulated", dataset)
+        run = await _run(session)
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_SIMULATED_SOURCES,
+            tone="info",
+            message=(
+                "Simulated data: Google (DATA_MODE=simulated); "
+                "LinkedIn (DATA_MODE=simulated); HubSpot (DATA_MODE=simulated)"
+            ),
+            count=3,
+        ),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_the_simulated_banner_falls_back_to_the_dataset_reason_for_a_blank_connection(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    async with sessions() as session, session.begin():
+        google = await _dataset(
+            session, "google", mode="simulated", reason="credentials not configured"
+        )
+        linkedin = await _dataset(
+            session, "linkedin", mode="simulated", reason="simulated data seeded on request"
+        )
+        hubspot = await _dataset(session, "hubspot", mode="simulated")
+        await _connection(session, "google", "simulated", None, google)
+        await _connection(session, "linkedin", "simulated", "   ", linkedin)
+        # Neither the connection nor the dataset records a reason: the default names the mode.
+        await _connection(session, "hubspot", "simulated", "", hubspot)
+        run = await _run(session)
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_SIMULATED_SOURCES,
+            tone="info",
+            message=(
+                "Simulated data: Google (credentials not configured); "
+                "LinkedIn (simulated data seeded on request); HubSpot (simulated data mode)"
+            ),
+            count=3,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1425,7 +1579,8 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
         flags_now=(
             Flag(
                 FLAG_STALE,
-                "Data as of 2026-10-06 11:00 UTC; google.search_terms covers through 2026-10-05",
+                "Data as of Oct 6, 2026, 11:00 AM UTC; "
+                "google.search_terms covers through 2026-10-05",
             ),
             # Both shortfalls are named: the recorded reason and the missing last day.
             Flag(
@@ -1441,7 +1596,7 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
         held_now=False,
         historical=False,
         data_status_now="stale",
-        flags_now=(Flag(FLAG_STALE, "Data as of 2026-10-06 11:59 UTC"),),
+        flags_now=(Flag(FLAG_STALE, "Data as of Oct 6, 2026, 11:59 AM UTC"),),
     )
     assert result.items[never.id].flags_now == (
         Flag(
@@ -1487,11 +1642,11 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
             code=BANNER_STALE_DATASETS,
             tone="warning",
             message=(
-                "Stale data: google.metrics_daily (last success 2026-10-06 11:00 UTC), "
-                "google.search_terms (last success 2026-10-07 11:00 UTC), "
-                "linkedin.analytics_daily (last success 2026-10-06 11:59 UTC), "
+                "Stale data: google.metrics_daily (last success Oct 6, 2026, 11:00 AM UTC), "
+                "google.search_terms (last success Oct 7, 2026, 11:00 AM UTC), "
+                "linkedin.analytics_daily (last success Oct 6, 2026, 11:59 AM UTC), "
                 "linkedin.segments (no successful sync), "
-                "linkedin.leads (last success 2026-10-07 11:00 UTC), "
+                "linkedin.leads (last success Oct 7, 2026, 11:00 AM UTC), "
                 "hubspot.deal_search (no successful sync)"
             ),
             count=6,
@@ -1589,7 +1744,7 @@ async def test_coverage_starting_after_the_window_start_is_incomplete_over_the_w
         held_now=False,
         historical=False,
         data_status_now="stale",
-        flags_now=(Flag(FLAG_STALE, "Data as of 2026-10-06 11:00 UTC"),),
+        flags_now=(Flag(FLAG_STALE, "Data as of Oct 6, 2026, 11:00 AM UTC"),),
     )
     assert result.overlay.stale_datasets == ("linkedin.entities",)
     assert result.overlay.incomplete_datasets == ("google.metrics_daily",)
@@ -1597,7 +1752,7 @@ async def test_coverage_starting_after_the_window_start_is_incomplete_over_the_w
         BannerView(
             code=BANNER_STALE_DATASETS,
             tone="warning",
-            message="Stale data: linkedin.entities (last success 2026-10-06 11:00 UTC)",
+            message="Stale data: linkedin.entities (last success Oct 6, 2026, 11:00 AM UTC)",
             count=1,
         ),
         BannerView(
@@ -1765,7 +1920,9 @@ async def test_a_k1_items_metrics_must_cover_its_frozen_baseline_window(
                 .order_by(Recommendation.id.desc())
             )
         )
-        reversed_page = await overlay(session, stored_run, items, NOW, thresholds=shipped)
+        reversed_page = await overlay(
+            session, stored_run, items, NOW, thresholds=shipped, display_timezone="UTC"
+        )
     assert reversed_page.overlay == result.overlay
     assert reversed_page.banners == result.banners
 
@@ -1804,6 +1961,64 @@ async def test_a_k1_items_metrics_must_cover_its_frozen_baseline_window(
 
 @pytest.mark.anyio
 @pytest.mark.db
+async def test_stale_banner_and_flags_render_instants_in_the_display_timezone(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    """AAP 0.5.5: instants are formatted in ``DISPLAY_TIMEZONE``, as the web formats them.
+
+    The stale banner's "last success …" and the ``stale`` flag's "Data as of …" read
+    America/New_York time (EDT, UTC-4) beside the web's "Times shown in America/New_York".
+    The zone only formats instants (AAP 0.5.4.1): coverage ends stay ISO native dates, and
+    which datasets are stale does not change with it.
+    """
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        linkedin = await _dataset(session, "linkedin")
+        await _freshness(
+            session,
+            google,
+            "google.metrics_daily",
+            success=OLD,
+            through=WINDOW_END - timedelta(days=1),
+        )
+        await _freshness(session, linkedin, "linkedin.analytics_daily", success=OLD)
+        run = await _run(session)
+        expand = await _item(
+            session, run, rule_id=K2, provenance=_prov(google), required=("google.metrics_daily",)
+        )
+
+    zoned = await _page(sessions, run.id, thresholds=shipped, display_timezone="America/New_York")
+    utc = await _page(sessions, run.id, thresholds=shipped)
+    zoned_flags = {flag.code: flag.message for flag in zoned.items[expand.id].flags_now}
+    assert zoned_flags[FLAG_STALE] == (
+        "Data as of Oct 6, 2026, 7:00 AM America/New_York; "
+        "google.metrics_daily covers through 2026-10-05"
+    )
+    utc_flags = {flag.code: flag.message for flag in utc.items[expand.id].flags_now}
+    assert utc_flags[FLAG_STALE] == (
+        "Data as of Oct 6, 2026, 11:00 AM UTC; google.metrics_daily covers through 2026-10-05"
+    )
+    zoned_banners = {banner.code: banner for banner in zoned.banners}
+    assert zoned_banners[BANNER_STALE_DATASETS] == BannerView(
+        code=BANNER_STALE_DATASETS,
+        tone="warning",
+        message=(
+            "Stale data: google.metrics_daily (last success Oct 6, 2026, 7:00 AM "
+            "America/New_York), linkedin.analytics_daily (last success Oct 6, 2026, 7:00 AM "
+            "America/New_York)"
+        ),
+        count=2,
+    )
+    # Only the instants differ: the stale lists, the incomplete flag and its banner do not.
+    assert zoned.overlay == utc.overlay
+    assert zoned_flags[FLAG_INCOMPLETE] == utc_flags[FLAG_INCOMPLETE]
+    assert {banner.code: banner for banner in utc.banners}[BANNER_INCOMPLETE_DATASETS] == (
+        zoned_banners[BANNER_INCOMPLETE_DATASETS]
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
 async def test_coverage_ending_before_the_window_end_is_stale_and_incomplete(
     sessions: Sessions, shipped: Thresholds
 ) -> None:
@@ -1833,7 +2048,8 @@ async def test_coverage_ending_before_the_window_end_is_stale_and_incomplete(
         flags_now=(
             Flag(
                 FLAG_STALE,
-                "Data as of 2026-10-07 11:00 UTC; google.metrics_daily covers through 2026-10-05",
+                "Data as of Oct 7, 2026, 11:00 AM UTC; "
+                "google.metrics_daily covers through 2026-10-05",
             ),
             Flag(FLAG_INCOMPLETE, f"Incomplete: google.metrics_daily ({end_shortfall})"),
         ),
@@ -1846,8 +2062,8 @@ async def test_coverage_ending_before_the_window_end_is_stale_and_incomplete(
             code=BANNER_STALE_DATASETS,
             tone="warning",
             message=(
-                "Stale data: google.metrics_daily (last success 2026-10-07 11:00 UTC), "
-                "linkedin.analytics_daily (last success 2026-10-07 11:00 UTC)"
+                "Stale data: google.metrics_daily (last success Oct 7, 2026, 11:00 AM UTC), "
+                "linkedin.analytics_daily (last success Oct 7, 2026, 11:00 AM UTC)"
             ),
             count=2,
         ),
@@ -1957,7 +2173,7 @@ async def test_the_page_lists_and_banners_name_required_datasets_without_freshne
             tone="warning",
             message=(
                 "Stale data: google.search_terms (no successful sync), "
-                "linkedin.leads (last success 2026-10-06 11:00 UTC), "
+                "linkedin.leads (last success Oct 6, 2026, 11:00 AM UTC), "
                 "hubspot.contacts (no successful sync)"
             ),
             count=3,
@@ -2399,6 +2615,28 @@ async def test_the_short_window_banner_uses_the_trusted_minimum_the_run_stored(
 
 @pytest.mark.anyio
 @pytest.mark.db
+async def test_a_one_day_short_window_banner_reads_1_day(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    """P5: a one-day run's banner reads "Window of 1 day", never "1 days" (AAP 0.5.5).
+
+    The "{trusted_min_days}-day" adjective stays singular whatever the minimum.
+    """
+    async with sessions() as session, session.begin():
+        run = await _run(session, start=WINDOW_END, trusted_min_days=shipped.trusted_min_days)
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_SHORT_WINDOW,
+            tone="warning",
+            message=f"Window of 1 day is below the {shipped.trusted_min_days}-day trusted minimum",
+        ),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
 async def test_every_banner_renders_in_the_fixed_order(
     sessions: Sessions, shipped: Thresholds
 ) -> None:
@@ -2427,7 +2665,7 @@ async def test_every_banner_renders_in_the_fixed_order(
         "No conversions or leads recorded for Google — verify tracking before acting on "
         "zero-outcome rules",
         "Simulated data: LinkedIn (credentials not configured)",
-        "Stale data: google.metrics_daily (last success 2026-10-06 11:00 UTC)",
+        "Stale data: google.metrics_daily (last success Oct 6, 2026, 11:00 AM UTC)",
         "Incomplete data: google.search_terms (call budget exhausted)",
         f"Window of 10 days is below the {shipped.trusted_min_days}-day trusted minimum",
     ]
@@ -2532,7 +2770,9 @@ async def _page_of(
         items = list(
             await session.scalars(select(Recommendation).where(Recommendation.id.in_(item_ids)))
         )
-        return await overlay(session, run, items, NOW, thresholds=thresholds)
+        return await overlay(
+            session, run, items, NOW, thresholds=thresholds, display_timezone="UTC"
+        )
 
 
 @pytest.mark.anyio
@@ -2758,7 +2998,9 @@ async def test_overlay_is_read_only_and_issues_at_most_eight_statements_per_page
         ]
         event.listen(engine.sync_engine, "before_cursor_execute", record)
         try:
-            result = await overlay(session, stored, items, NOW, thresholds=shipped)
+            result = await overlay(
+                session, stored, items, NOW, thresholds=shipped, display_timezone="UTC"
+            )
         finally:
             event.remove(engine.sync_engine, "before_cursor_execute", record)
         assert not session.new

@@ -6,7 +6,9 @@
  * sources, stale then incomplete datasets, and the short window, whatever order the API sends
  * them in. The open-discrepancies banner reports the live `Overlay.open_discrepancies` count,
  * links to the Campaigns discrepancy group and is the only banner with `role="alert"`; every
- * other banner shows the API's own message. Payloads come from `../../test/fixtures`.
+ * other banner shows the API's own message. Payloads come from `../../test/fixtures`. A run
+ * notice the page passes (`runNotice`) renders in the same stack, right after the discrepancy
+ * banner or first without it, and keeps the component rendering when no banner is left.
  *
  * The fixed order is checked against {@link AAP_BANNER_ORDER}, the six known banner codes
  * written out here in that order, rather than against the component's own `BANNER_ORDER`: an
@@ -23,9 +25,11 @@
  * no request is stubbed.
  */
 import { render, screen, within } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Banner, BannerCode, BannerTone } from '../../api/types';
+import { Banner as DesignBanner } from '../../design-system';
 import { FIXTURE_BANNERS, makeBanner, makeOverlay } from '../../test/fixtures';
 import { BANNER_ORDER, GlobalBanners, orderBanners } from './GlobalBanners';
 
@@ -51,14 +55,15 @@ const AAP_BANNER_ORDER = Object.freeze([
 
 /**
  * A fresh stale-datasets banner, worded as `analysis/overlay.py` builds it: "Stale data:
- * {dataset} (last success YYYY-MM-DD HH:MM UTC)", with the warning tone and the count of stale
- * datasets. The fixture banners carry none, so this banner fills the stale slot of the order.
+ * {dataset} (last success {instant})", the instant in the run's `display_timezone` as
+ * `formatInstant` renders it, with the warning tone and the count of stale datasets. The
+ * fixture banners carry none, so this banner fills the stale slot of the order.
  */
 function staleBanner(): Banner {
   return {
     code: 'stale_datasets' satisfies BannerCode,
     tone: 'warning',
-    message: 'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
+    message: 'Stale data: google.metrics_daily (last success Oct 4, 2026, 5:31 AM UTC)',
     count: 1,
   } satisfies Banner;
 }
@@ -110,6 +115,29 @@ function orderedBanners(): Banner[] {
   return AAP_BANNER_ORDER.map((code) =>
     makeBanner({ code, message: messageFor(code), count: null }),
   );
+}
+
+/** The title of the run notice {@link runNotice} builds. */
+const RUN_NOTICE_TITLE = 'Custom window 2026-07-08 – 2026-10-05';
+
+/** The element id of the run notice {@link runNotice} builds. */
+const RUN_NOTICE_ID = 'banner-run-notice';
+
+/**
+ * A run notice as the page passes one: a plain design-system `Banner` with tone `info` and no
+ * alert, standing in for the custom-window banner, which needs a router to render its link.
+ */
+function runNotice(): ReactElement {
+  return <DesignBanner tone="info" id={RUN_NOTICE_ID} title={RUN_NOTICE_TITLE} />;
+}
+
+/** The rendered run notice, found by its element id. */
+function noticeElement(container: HTMLElement): HTMLElement {
+  const notice = container.querySelector<HTMLElement>(`#${RUN_NOTICE_ID}`);
+  if (notice === null) {
+    throw new Error('The run notice is not rendered.');
+  }
+  return notice;
 }
 
 /** The title paragraph of every rendered banner, in document order. */
@@ -285,7 +313,7 @@ describe('GlobalBanners', () => {
       '3 open discrepancies to resolve first',
       'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
       'Simulated data: Google (credentials not configured); LinkedIn (credentials not configured); HubSpot (credentials not configured)',
-      'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
+      'Stale data: google.metrics_daily (last success Oct 4, 2026, 5:31 AM UTC)',
       'Incomplete data: google.search_terms (result limit reached at finest partition)',
       'Window of 10 days is below the 14-day trusted minimum',
     ]);
@@ -307,7 +335,7 @@ describe('GlobalBanners', () => {
     );
 
     expect(bannerTitles(container)).toEqual([
-      'Stale data: google.metrics_daily (last success 2026-10-04 05:31 UTC)',
+      'Stale data: google.metrics_daily (last success Oct 4, 2026, 5:31 AM UTC)',
       'Incomplete data: google.search_terms (result limit reached at finest partition)',
     ]);
   });
@@ -422,6 +450,109 @@ describe('GlobalBanners', () => {
     expect(container.innerHTML).toBe('');
     expect(container.querySelector('.ds-banner')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('renders the run notice right after the discrepancy banner, in the same stack as the others', () => {
+    const { container } = render(
+      <GlobalBanners
+        banners={fixtureBanners().reverse()}
+        overlay={makeOverlay({ open_discrepancies: 2 })}
+        runNotice={runNotice()}
+      />,
+    );
+
+    // The discrepancy banner sits above everything; the notice comes next, then the rest.
+    expect(bannerTitles(container)).toEqual([
+      '2 open discrepancies to resolve first',
+      RUN_NOTICE_TITLE,
+      'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
+      'Simulated data: Google (credentials not configured); LinkedIn (credentials not configured); HubSpot (credentials not configured)',
+      'Incomplete data: google.search_terms (result limit reached at finest partition)',
+      'Window of 10 days is below the 14-day trusted minimum',
+    ]);
+    // One stack spaces every banner, the notice included, so their gaps are equal.
+    const rendered = Array.from(container.querySelectorAll<HTMLElement>('.ds-banner'));
+    expect(rendered).toHaveLength(6);
+    const [stack] = Array.from(container.children);
+    expect(stack?.classList.contains('ds-stack')).toBe(true);
+    expect(rendered.every((banner) => banner.parentElement === stack)).toBe(true);
+    // The notice is not an alert: the discrepancy banner stays the only one.
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(noticeElement(container).getAttribute('role')).toBeNull();
+  });
+
+  it('renders the run notice first when no discrepancy banner is shown', () => {
+    const { container } = render(
+      <GlobalBanners
+        banners={fixtureBanners()}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+        runNotice={runNotice()}
+      />,
+    );
+
+    const titles = bannerTitles(container);
+    expect(titles).toHaveLength(5);
+    expect(titles[0]).toBe(RUN_NOTICE_TITLE);
+    expect(titles[1]).toBe(
+      'No conversions or leads recorded — verify tracking before acting on zero-outcome rules',
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('renders the run notice alone when no banner is left, and nothing without one', () => {
+    const { container, rerender } = render(
+      <GlobalBanners
+        banners={[makeBanner()]}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+        runNotice={runNotice()}
+      />,
+    );
+
+    expect(bannerTitles(container)).toEqual([RUN_NOTICE_TITLE]);
+    expect(container.querySelector('.ds-stack')).not.toBeNull();
+
+    rerender(
+      <GlobalBanners
+        banners={[makeBanner()]}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+        runNotice={null}
+      />,
+    );
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('keeps the same run notice element when the discrepancy banner appears and goes', () => {
+    const { container, rerender } = render(
+      <GlobalBanners
+        banners={fixtureBanners()}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+        runNotice={runNotice()}
+      />,
+    );
+    const notice = noticeElement(container);
+
+    rerender(
+      <GlobalBanners
+        banners={fixtureBanners()}
+        overlay={makeOverlay({ open_discrepancies: 1 })}
+        runNotice={runNotice()}
+      />,
+    );
+    expect(noticeElement(container)).toBe(notice);
+    expect(bannerTitles(container).slice(0, 2)).toEqual([
+      '1 open discrepancy to resolve first',
+      RUN_NOTICE_TITLE,
+    ]);
+
+    rerender(
+      <GlobalBanners
+        banners={fixtureBanners()}
+        overlay={makeOverlay({ open_discrepancies: 0 })}
+        runNotice={runNotice()}
+      />,
+    );
+    expect(noticeElement(container)).toBe(notice);
+    expect(bannerTitles(container)[0]).toBe(RUN_NOTICE_TITLE);
   });
 
   it('trims messages, renders an unknown tone as neutral and keeps an unknown code last', () => {

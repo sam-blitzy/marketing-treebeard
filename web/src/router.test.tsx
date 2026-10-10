@@ -28,6 +28,11 @@
  *   polite status region mounted with the layout, and returns focus to the button only when focus
  *   had fallen to `<body>`.
  * - **Focus after navigation**: focus moves to `<main>` only when the focused control was removed.
+ * - **Focus after an in-page link**: a same-document link (a section navigation link, the
+ *   discrepancy banner's link), activated again or not, and a `hashchange` focus the element the
+ *   hash names, made focusable only while it holds focus; a hash naming no element, and a click
+ *   the browser does not follow here, leave focus alone; a hash-only navigation never moves focus
+ *   to `<main>`, while a route change still does.
  * - **Expired session** (`src/main.tsx`): once signed in, a 401 from a protected read or from a
  *   mutation ("Sync now") clears the cache and opens `/login` once, carrying the current href
  *   (path, search and hash) as `redirect`, and sign-in returns there and reads the data again; a
@@ -54,7 +59,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryKeys } from './api/queries';
 import { createAppRouter } from './router';
 import type { AppRouter } from './router';
-import { makeConfig, makeMe, makeRun, makeSources } from './test/fixtures';
+import {
+  makeConfig,
+  makeDiscrepancy,
+  makeMe,
+  makeRecommendationsPage,
+  makeRun,
+  makeSources,
+} from './test/fixtures';
 
 /** One root created through the `react-dom/client` wrapper below, with what it was given. */
 interface CapturedRoot {
@@ -942,7 +954,7 @@ describe('sign out', () => {
     fireEvent.click(button);
 
     await waitFor(() => {
-      expect(button.hasAttribute('disabled')).toBe(true);
+      expect(button.getAttribute('aria-busy')).toBe('true');
     });
     expect(screen.queryByText(SIGN_OUT_FAILED)).toBeNull();
     expect(button.hasAttribute('aria-describedby')).toBe(false);
@@ -966,10 +978,14 @@ describe('sign out', () => {
     button.focus();
     fireEvent.click(button);
     await waitFor(() => {
-      expect(button.hasAttribute('disabled')).toBe(true);
+      expect(button.getAttribute('aria-busy')).toBe('true');
     });
-    // A browser moves focus off a control that becomes disabled; jsdom keeps it there and
-    // ignores blur() on it, so focus passes through <main> (tabindex="-1") to reach <body>.
+    // The loading button is inert but never natively disabled, so it keeps focus.
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(button.hasAttribute('disabled')).toBe(false);
+    expect(document.activeElement).toBe(button);
+    // Focus lost to <body> meanwhile, as after a click on the page background, still returns
+    // to the button once the request fails.
     const main = screen.getByRole('main');
     main.focus();
     main.blur();
@@ -994,7 +1010,7 @@ describe('sign out', () => {
     button.focus();
     fireEvent.click(button);
     await waitFor(() => {
-      expect(button.hasAttribute('disabled')).toBe(true);
+      expect(button.getAttribute('aria-busy')).toBe('true');
     });
     const link = within(primaryNav()).getByRole('link', { name: 'Decisions' });
     link.focus();
@@ -1013,6 +1029,77 @@ describe('sign out', () => {
 // ---------------------------------------------------------------------------------------------
 // Focus after navigation
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * Every read of a loaded `/actions` page for the signed-in admin: the default recommendations
+ * page, whose five sections each render their region and whose open-discrepancies banner links
+ * to the Campaigns discrepancy group, plus that one open discrepancy.
+ *
+ * @returns Fresh handlers for one test.
+ */
+function loadedActionsReads(): MockHandlers {
+  return {
+    ...pageReads(),
+    ...SIGNED_IN,
+    'GET /recommendations': json(200, makeRecommendationsPage()),
+    'GET /discrepancies': json(200, [makeDiscrepancy('status')]),
+  };
+}
+
+/**
+ * Resolves once the router has rendered its next load (`onRendered`), the event focus recovery
+ * acts on.
+ *
+ * @param router - The router under test.
+ * @returns A promise of the next `onRendered`.
+ */
+function nextRendered(router: AppRouter): Promise<void> {
+  return new Promise((resolve) => {
+    const unsubscribe = router.subscribe('onRendered', () => {
+      unsubscribe();
+      resolve();
+    });
+  });
+}
+
+/**
+ * Pushes `href` onto the router's history, as the browser's history does when it follows a
+ * link, and waits until the router has rendered it.
+ *
+ * @param router - The router under test.
+ * @param href - Path, search and hash.
+ */
+async function pushAndRender(router: AppRouter, href: string): Promise<void> {
+  const rendered = nextRendered(router);
+  act(() => {
+    router.history.push(href);
+  });
+  await act(async () => {
+    await rendered;
+  });
+}
+
+/**
+ * The element with `id`, which the test requires to exist.
+ *
+ * @param id - The element id.
+ * @returns The element.
+ */
+function byId(id: string): HTMLElement {
+  const element = document.getElementById(id);
+  expect(element).not.toBeNull();
+  return element as HTMLElement;
+}
+
+/**
+ * Waits for the element with `id`, such as a section a screen renders once its data arrives.
+ *
+ * @param id - The element id.
+ * @returns The element.
+ */
+function findById(id: string): Promise<HTMLElement> {
+  return waitFor(() => byId(id));
+}
 
 describe('focus after navigation', () => {
   it('leaves focus on <body> after the initial load', async () => {
@@ -1054,6 +1141,188 @@ describe('focus after navigation', () => {
     await waitForPath(router, '/settings');
     expect(document.activeElement).toBe(link);
     expect(link.getAttribute('aria-current')).toBe('page');
+  });
+
+  describe('in-page links', () => {
+    // Following a link changes jsdom's own address, which the memory history never reads; each
+    // test starts from, and leaves, the address it found.
+    let initialHref = '';
+    beforeEach(() => {
+      initialHref = window.location.href;
+      // The router scrolls a navigation's hash target into view once it has rendered, with
+      // Element.prototype.scrollIntoView, which jsdom does not implement. Without this stand-in
+      // the call throws and stops the router's later onRendered listeners, focus recovery among
+      // them.
+      Object.defineProperty(Element.prototype, 'scrollIntoView', {
+        configurable: true,
+        writable: true,
+        value: vi.fn(),
+      });
+    });
+    afterEach(() => {
+      window.history.replaceState(null, '', initialHref);
+      Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+    });
+
+    it('focuses the section a section navigation link names, never <main>', async () => {
+      mockApi(loadedActionsReads());
+      const { router } = renderApp('/actions');
+      await findTitle('Actions');
+      const nav = await screen.findByRole('navigation', { name: 'Sections' });
+      const link = within(nav).getByRole('link', { name: /^Keywords to adjust/u });
+      link.focus();
+
+      fireEvent.click(link);
+
+      // Focus moves on the click itself, before the browser follows the link.
+      const section = byId('section-keywords');
+      expect(document.activeElement).toBe(section);
+      expect(section.getAttribute('tabindex')).toBe('-1');
+      await waitFor(() => {
+        expect(window.location.hash).toBe('#section-keywords');
+      });
+      expect(document.activeElement).toBe(section);
+      // The router then sees the hash-only navigation, and leaves focus on the section.
+      await pushAndRender(router, '/actions#section-keywords');
+      expect(document.activeElement).toBe(section);
+
+      // The section is focusable only while it holds focus.
+      link.focus();
+      expect(section.hasAttribute('tabindex')).toBe(false);
+      // Activating the link again, while its hash is already in the URL, fires no hashchange;
+      // the click alone moves focus.
+      fireEvent.click(link);
+      expect(document.activeElement).toBe(section);
+    });
+
+    it("focuses the discrepancy group the banner's Review discrepancies link names", async () => {
+      mockApi(loadedActionsReads());
+      renderApp('/actions');
+      await findTitle('Actions');
+      const link = await screen.findByRole('link', { name: 'Review discrepancies' });
+      link.focus();
+
+      fireEvent.click(link);
+
+      const group = byId('group-campaigns-discrepancies');
+      expect(document.activeElement).toBe(group);
+      expect(group.getAttribute('tabindex')).toBe('-1');
+    });
+
+    it('moves no focus to <main> on a hash-only navigation, only on a route change', async () => {
+      mockApi({ ...pageReads(), ...SIGNED_IN });
+      const { router } = renderApp('/settings');
+      await findTitle('Settings');
+      await waitForPath(router, '/settings');
+      expect(document.activeElement).toBe(document.body);
+
+      // The browser leaves focus on <body> after following a link to a region that is not
+      // focusable; the router's focus recovery must not mistake that for a removed control.
+      await pushAndRender(router, '/settings#settings-thresholds');
+      expect(router.state.location.hash).toBe('settings-thresholds');
+      expect(document.activeElement).toBe(document.body);
+
+      // A new screen, even one addressed with a hash, still recovers focus to <main>.
+      await pushAndRender(router, '/actions#section-keywords');
+      await findTitle('Actions');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(screen.getByRole('main'));
+      });
+    });
+
+    it('focuses the element a changed hash names; a hash naming none moves no focus', async () => {
+      mockApi({ ...pageReads(), ...SIGNED_IN });
+      renderApp('/settings');
+      await findTitle('Settings');
+      const section = await findById('settings-window');
+      const button = screen.getByRole('button', { name: 'Sign out' });
+      button.focus();
+
+      act(() => {
+        window.history.replaceState(null, '', '#nowhere');
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+      expect(document.activeElement).toBe(button);
+
+      // Back or forward to an in-page entry.
+      act(() => {
+        window.history.replaceState(null, '', '#settings-window');
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+      expect(document.activeElement).toBe(section);
+      expect(section.getAttribute('tabindex')).toBe('-1');
+    });
+
+    it('acts only on links the browser follows in this document', async () => {
+      mockApi({ ...pageReads(), ...SIGNED_IN });
+      renderApp('/settings');
+      await findTitle('Settings');
+      const section = await findById('settings-window');
+      const button = screen.getByRole('button', { name: 'Sign out' });
+      const here = `${window.location.pathname}${window.location.search}`;
+      // Runs after the root route's document listener and stops jsdom from following the link,
+      // so each case checks only what the listener decided.
+      const keepAddress = (event: Event): void => {
+        event.preventDefault();
+      };
+      window.addEventListener('click', keepAddress);
+      const base = document.createElement('base');
+
+      /** Clicks a link to `href` with `attributes`, and returns what has focus afterwards. */
+      const clickLink = (
+        href: string,
+        attributes: Record<string, string> = {},
+        init: MouseEventInit = {},
+      ): Element | null => {
+        const link = document.createElement('a');
+        link.setAttribute('href', href);
+        for (const [name, value] of Object.entries(attributes)) {
+          link.setAttribute(name, value);
+        }
+        document.body.append(link);
+        button.focus();
+        fireEvent.click(link, init);
+        link.remove();
+        return document.activeElement;
+      };
+
+      try {
+        expect(clickLink('#nowhere')).toBe(button);
+        expect(clickLink('#')).toBe(button);
+        expect(clickLink('#settings-window', { target: '_blank' })).toBe(button);
+        expect(clickLink('#settings-window', { download: '' })).toBe(button);
+        expect(clickLink('#settings-window', {}, { ctrlKey: true })).toBe(button);
+        expect(clickLink('#settings-window', {}, { metaKey: true })).toBe(button);
+        expect(clickLink('#settings-window', {}, { shiftKey: true })).toBe(button);
+        expect(clickLink('#settings-window', {}, { altKey: true })).toBe(button);
+        expect(clickLink('#settings-window', {}, { button: 1 })).toBe(button);
+        expect(clickLink(`/elsewhere#settings-window`)).toBe(button);
+        expect(clickLink(`${here}?other=1#settings-window`)).toBe(button);
+        expect(clickLink('https://example.com/#settings-window')).toBe(button);
+        expect(clickLink('http://[::1#settings-window')).toBe(button);
+        base.setAttribute('target', 'reports');
+        document.head.append(base);
+        expect(clickLink('#settings-window')).toBe(button);
+        base.remove();
+
+        // A link whose default another handler prevented, such as a router Link.
+        const prevent = (event: Event): void => {
+          event.preventDefault();
+        };
+        document.body.addEventListener('click', prevent);
+        expect(clickLink('#settings-window')).toBe(button);
+        document.body.removeEventListener('click', prevent);
+
+        // This document's own links: relative, absolute, with an explicit _self target, and a
+        // percent-encoded fragment.
+        expect(clickLink('#settings-window', { target: '_SELF' })).toBe(section);
+        expect(clickLink(`${window.location.origin}${here}#settings-window`)).toBe(section);
+        expect(clickLink('#settings-%77indow')).toBe(section);
+      } finally {
+        base.remove();
+        window.removeEventListener('click', keepAddress);
+      }
+    });
   });
 });
 

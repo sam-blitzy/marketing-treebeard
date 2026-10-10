@@ -14,6 +14,9 @@
  *       .ds-dialog__footer      optional row of the caller's actions
  *     .ds-visually-hidden       trailing focus sentinel, a span with tabindex="0"
  *
+ *   html.ds-dialog-scroll-lock            on the root element while a dialog is open
+ *   html.ds-dialog-scroll-lock--gutter    with it, when the page showed a vertical scrollbar
+ *
  * The two sentinels are styled by the .ds-visually-hidden utility in shared.css, which
  * Dialog.tsx imports, so this file holds no rule for them.
  *
@@ -31,6 +34,10 @@
  * - 2.4.11 Focus Not Obscured: the overlay's padding is wider than the focus ring's width plus
  *   offset, and the panel's padding is too, so neither the panel's ring nor the ring of a
  *   control at the panel's edge is clipped by the viewport or by the panel's own overflow.
+ * - Modal background: while a dialog is open, Dialog.tsx makes the page behind it inert and puts
+ *   .ds-dialog-scroll-lock on <html>, so the page neither takes input nor scrolls behind the
+ *   backdrop; the scroll-lock rules at the end of this file hold the page still without moving
+ *   it, and Dialog.tsx removes both before focus returns to the opener.
  * - Modal semantics, the focus trap and Escape handling live in Dialog.tsx; this file only
  *   keeps them visible.
  */
@@ -103,12 +110,14 @@
 }
 
 /*
- * Header: title at the start, Close button at the end, top-aligned so a title that wraps onto
- * several lines keeps the button on its first line.
+ * Header: title at the start, Close button at the end, aligned on their first baselines. The
+ * Close label therefore sits level with the title's first line even though the button's 44px
+ * target (Button.css) is taller than that line, and a title that wraps onto several lines keeps
+ * the button on its first line.
  */
 .ds-dialog__header {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   justify-content: space-between;
   gap: var(--space-3);
 }
@@ -144,4 +153,26 @@
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: var(--space-2);
+}
+
+/*
+ * Scroll lock, on <html> while any dialog is open. The root's overflow applies to the viewport,
+ * which is the page's scroll container: hidden stops wheel, touch, keyboard and scrollbar
+ * scrolling of the page behind the modal, yet keeps its scroll position, so the page is where
+ * the user left it when the dialog closes. The panel keeps its own overflow: auto and still
+ * scrolls its content.
+ */
+.ds-dialog-scroll-lock {
+  overflow: hidden;
+}
+
+/*
+ * Gutter modifier. Dialog.tsx adds it only when the page showed a classic vertical scrollbar as
+ * the dialog opened; scrollbar-gutter: stable keeps that scrollbar's space while overflow: hidden
+ * hides it, so the content behind the backdrop does not shift sideways on open or close. A page
+ * without a scrollbar, or with overlay scrollbars, never gets it, since a gutter it never had
+ * would shift its content instead.
+ */
+.ds-dialog-scroll-lock--gutter {
+  scrollbar-gutter: stable;
 }

@@ -2451,9 +2451,12 @@ async def test_a_google_entity_sync_whose_every_read_fails_turns_stale(rig: Rig)
     and records ``google.entities`` ``incomplete`` with the interruption's repairable reason.
     It read nothing, so it is no successful refresh: ``last_success_at`` stays the build's and
     only ``last_attempt_at`` moves, which makes the dataset stale 24 h after the build
-    although the failed sync ran an hour later (AAP 0.3.2). The source stays live with a
-    ``stale`` connection and no simulated dataset; the next healthy sync reads the
-    outstanding work and moves ``last_success_at`` again.
+    although the failed sync ran an hour later (AAP 0.3.2). The job is no success either: it
+    and its ``sync_run`` row end ``failed``, ``incomplete``, with Q-G1's sanitized error as
+    their error and no secret in it, as a metrics job the same outage fails does. The source
+    stays live with a ``stale`` connection and no simulated dataset; the next healthy sync
+    reads the outstanding work, moves ``last_success_at`` again and ends ``succeeded``,
+    ``complete``.
     """
     assert Thresholds.load().int("sources.stale_after_hours") == 24, "DAY_AFTER assumes 24 h"
     dataset_id = await _live_google(rig)
@@ -2484,9 +2487,24 @@ async def test_a_google_entity_sync_whose_every_read_fails_turns_stale(rig: Rig)
 
     (result,) = report.results
     assert (result.status, result.completeness, result.disposition) == (
-        "succeeded",
+        "failed",
         "incomplete",
         "stale",
+    )
+    assert not report.ok
+    assert result.error is not None
+    assert result.error.startswith("google search Q-G1: "), "the first read's error"
+    assert "503" in result.error
+    secret = get_settings().n8n_webhook_secret
+    assert secret is not None
+    assert secret.get_secret_value() not in result.error
+    (run,) = await rig.all(SyncRun, SyncRun.job == jobs.JOB_ENTITIES, SyncRun.started_at == T1)
+    assert (run.dataset, run.status, run.completeness, run.error, run.rows) == (
+        "google.entities",
+        "failed",
+        "incomplete",
+        result.error,
+        result.rows,
     )
     assert len(journal) == 3 * len(_GOOGLE_ENTITY_QUERIES), "three attempts per query"
     assert {entry.status for entry in journal} == {503}
@@ -2517,7 +2535,13 @@ async def test_a_google_entity_sync_whose_every_read_fails_turns_stale(rig: Rig)
     )
 
     (recovered,) = report.results
-    assert (recovered.status, recovered.completeness) == ("succeeded", "complete")
+    assert (recovered.status, recovered.completeness, recovered.error) == (
+        "succeeded",
+        "complete",
+        None,
+    )
+    (run,) = await rig.all(SyncRun, SyncRun.job == jobs.JOB_ENTITIES, SyncRun.started_at == T2)
+    assert (run.status, run.completeness, run.error) == ("succeeded", "complete", None)
     row = await rig.freshness_row(dataset_id, "google.entities")
     assert row is not None
     assert (row.last_attempt_at, row.last_success_at, row.completeness, row.checkpoint) == (
@@ -2536,9 +2560,11 @@ async def test_a_linkedin_entity_sync_cut_short_by_lead_sync_turns_stale(rig: Ri
     the lead-form listing. What was read is stored, and ``linkedin.entities`` is
     ``incomplete`` with the platform error's own reason, which, unlike Google's, carries no
     repairable prefix. The read is still no successful refresh: ``last_success_at`` stays
-    the build's, so the dataset is stale 24 h after it (AAP 0.3.2). The source stays live
-    with a ``stale`` connection and no simulated dataset; the next healthy entity sync moves
-    ``last_success_at`` again.
+    the build's, so the dataset is stale 24 h after it (AAP 0.3.2). The job and its
+    ``sync_run`` row end ``failed``, ``incomplete``, with the lead-form error as their error
+    and no token in it. The source stays live with a ``stale`` connection and no simulated
+    dataset; the next healthy entity sync moves ``last_success_at`` again and ends
+    ``succeeded``, ``complete``.
     """
     dataset_id = await _live_linkedin(rig)
     before = await rig.freshness_row(dataset_id, "linkedin.entities")
@@ -2558,9 +2584,25 @@ async def test_a_linkedin_entity_sync_cut_short_by_lead_sync_turns_stale(rig: Ri
 
     (result,) = report.results
     assert (result.status, result.completeness, result.disposition) == (
-        "succeeded",
+        "failed",
         "incomplete",
         "stale",
+    )
+    assert not report.ok
+    assert result.error is not None
+    assert result.error.startswith("linkedin lead_forms: "), "the lead-form listing's error"
+    assert "SERVICE_UNAVAILABLE" in result.error, "the platform's code for its 503"
+    token = get_settings().linkedin_access_token
+    assert token is not None
+    assert token.get_secret_value() not in result.error
+    assert result.rows > 0, "what was read is written and counted"
+    (run,) = await rig.all(SyncRun, SyncRun.job == jobs.JOB_ENTITIES, SyncRun.started_at == T1)
+    assert (run.dataset, run.status, run.completeness, run.error, run.rows) == (
+        "linkedin.entities",
+        "failed",
+        "incomplete",
+        result.error,
+        result.rows,
     )
     form_calls = [entry for entry in journal if entry.surface == "lead_forms"]
     assert form_calls, "the lead-form listing was requested"
@@ -2591,7 +2633,13 @@ async def test_a_linkedin_entity_sync_cut_short_by_lead_sync_turns_stale(rig: Ri
     )
 
     (recovered,) = report.results
-    assert (recovered.status, recovered.completeness) == ("succeeded", "complete")
+    assert (recovered.status, recovered.completeness, recovered.error) == (
+        "succeeded",
+        "complete",
+        None,
+    )
+    (run,) = await rig.all(SyncRun, SyncRun.job == jobs.JOB_ENTITIES, SyncRun.started_at == T2)
+    assert (run.status, run.completeness, run.error) == ("succeeded", "complete", None)
     row = await rig.freshness_row(dataset_id, "linkedin.entities")
     assert row is not None
     assert (row.last_attempt_at, row.last_success_at, row.completeness) == (T2, T2, "complete")
@@ -3544,7 +3592,9 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
     still outstanding, and turns ``complete`` with the checkpoint cleared once the cycle drains.
     Until then no sync is a successful refresh ("The affected datasets keep their last good
     data and turn stale"): ``last_success_at`` stays the build's through both deferred syncs
-    and moves only with the sync that drains the cycle.
+    and moves only with the sync that drains the cycle. A deferral alone fails no job: the
+    deferred sync and its ``sync_run`` row end ``succeeded``, ``incomplete``, with no error,
+    and its ``sync.job.finish`` is logged at info level.
     """
     dataset_id = await _live_google(rig)
     discrepancies_before = await rig.count(Discrepancy)
@@ -3554,15 +3604,30 @@ async def test_call_budget_deferral_resumes_the_entity_cycle_with_only_outstandi
     await _cap_google_calls(rig, T1, allowed=1)
     first_sync = rig.recording(rig.live("google"))
 
-    report = await jobs.run_source_jobs(
-        "google",
-        trigger="manual",
-        jobs=[jobs.JOB_ENTITIES],
-        controller=rig.controller({"google": first_sync}, at=T1),
-    )
+    with capture_logs() as entries:
+        report = await jobs.run_source_jobs(
+            "google",
+            trigger="manual",
+            jobs=[jobs.JOB_ENTITIES],
+            controller=rig.controller({"google": first_sync}, at=T1),
+        )
 
     (first,) = report.results
-    assert (first.status, first.completeness) == ("succeeded", "incomplete")
+    assert (first.status, first.completeness, first.disposition, first.error) == (
+        "succeeded",
+        "incomplete",
+        "stale",
+        None,
+    )
+    (run,) = await rig.all(SyncRun, SyncRun.job == jobs.JOB_ENTITIES, SyncRun.started_at == T1)
+    assert (run.status, run.completeness, run.error) == ("succeeded", "incomplete", None)
+    (finish,) = [entry for entry in entries if entry.get("event") == "sync.job.finish"]
+    assert (finish["log_level"], finish["status"], finish["error"], finish["completeness"]) == (
+        "info",
+        "succeeded",
+        None,
+        "incomplete",
+    )
     assert [query_id for query_id, _scope in _google_reads(first_sync)] == ["Q-G1"]
     row = await rig.freshness_row(dataset_id, "google.entities")
     assert row is not None

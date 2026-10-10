@@ -82,9 +82,9 @@ row keys (``campaign_id`` … ``creative_id``); and the frozen evidence, whose `
 two runner-owned keys: ``entity`` (``{source, type, id, name}``, the name the page shows)
 and ``flag_messages`` (``{code: message}`` for the codes stored in ``flags``).
 
-Boundaries: imports the analysis modules, ``db.session``, ``db.repositories``, the analysis
-and accounts models and ``logging`` only; never ``sync``, ``connectors``, ``simulation`` or
-``api``.
+Boundaries: imports only the analysis modules, ``db.session``, ``db.repositories``, the
+analysis and accounts models, ``logging`` and ``settings`` (for ``DISPLAY_TIMEZONE`` when the
+caller passes no zone); never ``sync``, ``connectors``, ``simulation`` or ``api``.
 
 Example::
 
@@ -145,6 +145,7 @@ from ads_engine.analysis.context import (
     Finding,
     RuleResult,
     Withheld,
+    display_zone,
 )
 from ads_engine.analysis.lock import RunInProgress, analysis_lock
 from ads_engine.analysis.precedence import PrecedenceOutput, RankedItem
@@ -164,6 +165,7 @@ from ads_engine.db.models.analysis import (
 from ads_engine.db.repositories import active_datasets
 from ads_engine.db.session import run_to_completion, session_scope, use_session
 from ads_engine.logging import get_logger, mark_logged
+from ads_engine.settings import get_settings
 
 __all__ = [
     "DATASET_ID_KEYS",
@@ -1289,7 +1291,12 @@ async def _insert_running(
 
 
 async def _load(
-    window: AnalysisWindow, config: Thresholds, kind: RunKind, instant: datetime
+    window: AnalysisWindow,
+    config: Thresholds,
+    kind: RunKind,
+    instant: datetime,
+    *,
+    display_timezone: str,
 ) -> AnalysisContext:
     """Read the run's context in one read-only ``REPEATABLE READ`` transaction.
 
@@ -1297,13 +1304,16 @@ async def _load(
     decisions, discrepancies, feedback). Under one snapshot they all see the same committed
     state, so a sync committing midway can never pair, say, new leads with old matches. The
     transaction is read-only, so it cannot fail on a serialization conflict, and the
-    connection's isolation level is restored when it returns to the pool.
+    connection's isolation level is restored when it returns to the pool. The context
+    carries ``display_timezone``, the zone of the instants in the run's frozen flag messages.
     """
     async with session_scope() as session:
         await session.connection(
             execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
         )
-        return await metrics.load_context(session, window, config, kind=kind, now=instant)
+        return await metrics.load_context(
+            session, window, config, kind=kind, now=instant, display_timezone=display_timezone
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1575,7 @@ async def run_analysis(
     serve_through: int | None = None,
     thresholds: Thresholds | None = None,
     now: datetime | None = None,
+    display_timezone: str | None = None,
 ) -> AnalysisRun:
     """Compute one analysis run over ``window`` from stored data and persist it, frozen.
 
@@ -1602,6 +1613,9 @@ async def run_analysis(
         thresholds: The loaded configuration; :meth:`Thresholds.load` when ``None``.
         now: The run instant (tz-aware): ``started_at``, the CRM "as of" time and the
             feedback cut-off. ``datetime.now(UTC)`` when omitted.
+        display_timezone: ``DISPLAY_TIMEZONE``, the IANA zone the instants inside the
+            run's frozen flag messages are rendered in (the ``stale`` flag's "Data as of …");
+            ``get_settings().display_timezone`` when ``None``. It never moves a day boundary.
 
     Returns:
         The persisted ``succeeded`` run, readable after its session closed.
@@ -1615,11 +1629,14 @@ async def run_analysis(
         PrecedenceInvariantError: When a precedence guarantee breaks (the run is marked
             failed).
         TypeError: When ``window`` is not an :class:`AnalysisWindow`, ``now`` is not a
-            ``datetime``, or a request id or ``serve_through`` is not an ``int``.
+            ``datetime``, ``display_timezone`` is not a string, or a request id or
+            ``serve_through`` is not an ``int``.
         ValueError: For an unknown ``kind`` or ``trigger``, a naive ``now``, a
-            ``serve_through`` that is not a positive id, both ``serve_through`` and
-            ``request_ids``, or a default run over a window other than the configured
-            default.
+            ``display_timezone`` that is not a loadable IANA zone, a ``serve_through`` that
+            is not a positive id, both ``serve_through`` and ``request_ids``, or a default
+            run over a window other than the configured default.
+        pydantic.ValidationError: When ``display_timezone`` is ``None`` and the settings
+            cannot be loaded from the environment.
         sqlalchemy.exc.SQLAlchemyError: When the database fails.
         asyncio.CancelledError: When the call is cancelled, once the computation has
             stopped and the run, if its row exists, is recorded ``failed``.
@@ -1636,6 +1653,8 @@ async def run_analysis(
     through = _serve_through(serve_through)
     if through is not None and served:
         raise ValueError("pass either serve_through or request_ids to run_analysis, not both")
+    zone = get_settings().display_timezone if display_timezone is None else display_timezone
+    display_zone(zone, "display_timezone")
     log_reason = None if reason is None else reason[:_REASON_LOG_LIMIT]
 
     async with analysis_lock():
@@ -1661,7 +1680,7 @@ async def run_analysis(
                 config_hash=config.config_hash,
             )
             progress.stage = "load_context"
-            ctx = await _load(window, config, kind, instant)
+            ctx = await _load(window, config, kind, instant, display_timezone=zone)
             loaded = time.perf_counter()
             progress.stage = "check_overrides"
             prepared, computed = await _in_analysis_thread(

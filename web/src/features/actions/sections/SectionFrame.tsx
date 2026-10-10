@@ -397,7 +397,7 @@ export interface CardListProps {
  *
  * When `location.hash` names a card not shown yet (`#item-{id}`, such as a held card's link to
  * its blocking C0 card), the list reveals the batches through it and scrolls it into view, on
- * mount and on `hashchange`.
+ * mount and on `hashchange`; a `hashchange` also moves focus to it.
  *
  * Exported so a section that builds a group body of its own (Campaigns' discrepancy group)
  * bounds its lists the same way.

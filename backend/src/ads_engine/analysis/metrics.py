@@ -126,6 +126,7 @@ from ads_engine.analysis.context import (
     SubjectKey,
     SubjectType,
     TargetReadStatus,
+    display_zone,
     objective_group,
 )
 from ads_engine.analysis.thresholds import ConfigError, CrmBindings, Thresholds
@@ -2077,6 +2078,7 @@ async def load_context(
     *,
     kind: RunKind,
     now: datetime,
+    display_timezone: str = "UTC",
 ) -> AnalysisContext:
     """Assemble one run's :class:`AnalysisContext` from the active datasets.
 
@@ -2116,14 +2118,17 @@ async def load_context(
         thresholds: The loaded configuration.
         kind: ``default`` or ``custom``.
         now: The run time (tz-aware); window deals and active feedback are judged at it.
+        display_timezone: ``DISPLAY_TIMEZONE``, the IANA zone the instants inside the run's
+            frozen flag messages are rendered in (:attr:`AnalysisContext.display_timezone`);
+            the runner passes ``settings.display_timezone``. It never moves a day boundary.
 
     Returns:
         The immutable context of the run.
 
     Raises:
-        ValueError: When ``now`` is naive, ``kind`` is unknown or a stored value breaks an
-            enumeration.
-        TypeError: When ``now`` is not a ``datetime``.
+        ValueError: When ``now`` is naive, ``kind`` is unknown, ``display_timezone`` is not a
+            loadable IANA zone or a stored value breaks an enumeration.
+        TypeError: When ``now`` is not a ``datetime`` or ``display_timezone`` is not a string.
     """
     started = time.perf_counter()
     if not isinstance(now, datetime):
@@ -2131,6 +2136,7 @@ async def load_context(
     if now.utcoffset() is None:
         raise ValueError("now must be a tz-aware datetime (an instant), found a naive datetime")
     run_kind = _choice(kind, _RUN_KINDS, "kind")
+    display_zone(display_timezone, "display_timezone")
 
     # 1. Datasets.
     datasets = {
@@ -2244,6 +2250,7 @@ async def load_context(
         thresholds=thresholds,
         now=now,
         run_kind=run_kind,
+        display_timezone=display_timezone,
         datasets=scope.datasets,
         linkedin_crm=linkedin_crm,
         google_crm=google_crm,

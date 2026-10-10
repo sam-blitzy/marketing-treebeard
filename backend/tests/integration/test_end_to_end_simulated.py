@@ -422,7 +422,7 @@ def _check_banner_and_modes(page: Json, *, google_zone: str, reason: str) -> Non
     """The simulated-sources banner names every source with its reason; modes are simulated.
 
     AAP 0.3.3 "Labelling" and 0.5.5: one ``simulated_sources`` banner names Google, LinkedIn and
-    HubSpot each with the reason recorded for its dataset; ``overlay.source_modes`` and the
+    HubSpot each with its simulated connection's current reason; ``overlay.source_modes`` and the
     frozen ``run.data_modes`` are all simulated; ``run.source_days`` names both boundaries and
     ``DISPLAY_TIMEZONE`` stays a display setting. A first start raises no discrepancy and leaves
     no dataset stale or incomplete, so no hold and no other warning banner appears.

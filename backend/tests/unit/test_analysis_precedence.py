@@ -16,7 +16,7 @@ no network.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -465,7 +465,7 @@ def test_allocation_currency_falls_back_to_the_decision_subject() -> None:
 def test_p1_holds_dependent_items_and_pins_c0() -> None:
     ctx, out = run("p1.holds.case")
     open_count = len(ctx.discrepancies)
-    assert open_count
+    assert open_count == 1
     held = of_rule(out, KEYWORDS, K1)
     assert held
     for candidate in held:
@@ -474,6 +474,10 @@ def test_p1_holds_dependent_items_and_pins_c0() -> None:
         assert candidate.evidence.extra["blocking_discrepancies"] == (ctx.discrepancies[0].id,)
         assert flag_message(candidate, FLAG_UNVERIFIED_DISCREPANCIES) == unverified_message(
             open_count
+        )
+        # One open discrepancy reads in the singular, never "1 discrepancies are open".
+        assert flag_message(candidate, FLAG_UNVERIFIED_DISCREPANCIES) == (
+            "Unverified while 1 discrepancy is open"
         )
     first = out.items[CAMPAIGNS][0]
     assert first.rank == 1
@@ -778,6 +782,35 @@ def test_p3_all_live_is_live_and_stale_live_is_stale() -> None:
     assert stale.has_flag(FLAG_STALE)
 
 
+@pytest.mark.parametrize(
+    ("zone", "instant"),
+    [
+        ("UTC", "Sep 30, 2026, 4:58 PM UTC"),
+        ("America/New_York", "Sep 30, 2026, 12:58 PM America/New_York"),
+    ],
+)
+def test_p4_frozen_stale_flag_renders_its_instant_in_the_display_timezone(
+    zone: str, instant: str
+) -> None:
+    """AAP 0.5.5: the frozen "Data as of …" instant is in ``DISPLAY_TIMEZONE``.
+
+    Coverage ends stay ISO native dates (AAP 0.5.4.1): the zone formats instants only.
+    """
+    ctx, candidate = sample_candidate()
+    last_success = datetime(2026, 9, 30, 16, 58, tzinfo=UTC)
+    short_end = ctx.window.end - timedelta(days=1)
+    old = {
+        key: replace(row, last_success_at=last_success, covered_through=short_end)
+        for key, row in ctx.freshness.items()
+    }
+    zoned = replace(ctx, freshness=old, display_timezone=zone, cache={})
+    (item,) = apply_precedence(RuleResult(candidates=(candidate,)), zoned).all_items()
+    shortfalls = "; ".join(
+        f"{name} covers through {short_end.isoformat()}" for name in candidate.required_datasets
+    )
+    assert flag_message(item.candidate, FLAG_STALE) == f"Data as of {instant}; {shortfalls}"
+
+
 @pytest.mark.parametrize("name", ["p4.stale.case", "p4.entity_sync_does_not_clear_metrics.case"])
 def test_p4_stale_metrics_dataset(name: str) -> None:
     _, out = run(name)
@@ -997,6 +1030,26 @@ def test_p5_configured_minimum_flags_a_20_day_window() -> None:
         item.candidate.evidence.thresholds[TRUSTED_MIN_DAYS_KEY] == 14
         for item in default.all_items()
     )
+
+
+def test_p5_a_one_day_window_flag_reads_1_day() -> None:
+    """P5: a one-day window's flag reads "Window of 1 day", never "1 days" (AAP 0.5.5).
+
+    The "{trusted_min_days}-day" adjective stays singular, and a two-day window keeps the
+    plural.
+    """
+    ctx, candidate = sample_candidate()
+    end = ctx.window.end
+    for days, message in (
+        (1, "Window of 1 day is below the 14-day trusted minimum"),
+        (2, "Window of 2 days is below the 14-day trusted minimum"),
+    ):
+        window = ctx.window.custom(end - timedelta(days=days - 1), end)
+        short = replace(ctx, window=window, cache={})
+        assert (short.window.days, short.window.trusted_min_days) == (days, 14)
+        assert short.window.short_window
+        (item,) = apply_precedence(RuleResult(candidates=(candidate,)), short).all_items()
+        assert flag_message(item.candidate, FLAG_SHORT_WINDOW) == message
 
 
 def test_p4_p5_freeze_the_applied_thresholds_into_the_evidence() -> None:

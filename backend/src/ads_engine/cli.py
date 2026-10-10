@@ -973,7 +973,13 @@ async def _seed_simulated() -> int:
     thresholds = Thresholds.load()
     window = await default_window(thresholds=thresholds)
     try:
-        run = await run_analysis(window, "default", "manual", thresholds=thresholds)
+        run = await run_analysis(
+            window,
+            "default",
+            "manual",
+            thresholds=thresholds,
+            display_timezone=settings.display_timezone,
+        )
     except RunInProgress:
         _emit_json(output)
         _error("an analysis run is in progress; the simulated datasets are seeded")
