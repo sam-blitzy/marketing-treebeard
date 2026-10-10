@@ -7,9 +7,12 @@
  *
  * 1. waits for the latest default analysis run and picks an actionable campaign item from
  *    "Campaigns to pause or launch", preferring a C1 / C1b pause, whose "Record decision" form
- *    is prefilled with status `paused`;
- * 2. records that decision through the card's dialog and finds it at the top of the subject's
- *    table in the `/decisions` log;
+ *    is prefilled with status `paused`, on a campaign with its own budget, so the form offers a
+ *    budget amount;
+ * 2. enters a budget amount only the server refuses, and checks that the 422's message is shown
+ *    in the dialog, which stays open with the entered values and nothing written; then corrects
+ *    the amount, records the pause through the same dialog and finds it at the top of the
+ *    subject's table in the `/decisions` log;
  * 3. presses "Sync now" for the item's source on `/sources`. The product is recommend-only
  *    (AAP 0.7.2), so the platform still reports the campaign active, and the entity sync raises
  *    a `status` discrepancy against the `paused` decision. The `/actions` discrepancy banner
@@ -23,15 +26,25 @@
  * Shared, mutating stack: other specs and the worker change runs, feedback and discrepancies
  * while this test runs, so every name, id and count is read from the API at the moment it is
  * compared, and every page check retries with a reload. Recommendation ids are per run, so an
- * item is re-picked whenever a rerun replaced the run a page showed. Resolving with "Platform is
- * correct" restores the campaign's decided status, so the next run of the suite can pause and
- * resolve the same campaign again, and the run leaves no discrepancy of its own behind.
+ * item is re-picked whenever a rerun replaced the run a page showed.
+ *
+ * Restoration is guaranteed on every outcome. On the happy path, resolving with "Platform is
+ * correct" restores the campaign's decided status. Whatever the outcome (a failed assertion, a
+ * timeout, or a discrepancy left awaiting the platform), the `afterEach` teardown then restores
+ * what this test changed and nothing else: it resolves the campaign's `status` and `budget`
+ * discrepancies that were not unresolved before its first save, and records the campaign's
+ * earlier decided state again when its newest decision differs from it. The next run of the
+ * suite, a retry included, can therefore pause and resolve the same campaign again, and the run
+ * leaves no decision or discrepancy of its own behind. On the happy path the teardown finds
+ * nothing to do.
  *
  * Harness rules (`playwright.config.ts`): the session comes from the storage state that
  * `auth.setup.ts` saved, so this file never signs in; reads go through `page.request`, which
- * shares the browser context's cookies; every write goes through the UI, which adds the CSRF
- * header. UI labels are mirrored as local constants rather than imported, because the feature
- * modules that own them load React and stylesheets, which the Node-side test runner cannot.
+ * shares the browser context's cookies; every write the test itself makes goes through the UI,
+ * which adds the CSRF header. The teardown is the only API write: it goes through
+ * `page.request` with that header, because it must restore the state whatever the UI did. UI
+ * labels are mirrored as local constants rather than imported, because the feature modules that
+ * own them load React and stylesheets, which the Node-side test runner cannot.
  *
  * @example
  * ```sh
@@ -42,16 +55,21 @@
  * @packageDocumentation
  */
 import { test, expect } from '@playwright/test';
-import type { APIResponse, Locator, Page } from '@playwright/test';
+import type { APIResponse, Locator, Page, Response } from '@playwright/test';
 
 import type {
   CampaignStatus,
   Decision,
+  DecisionPatchIn,
+  DecisionRequest,
   Discrepancy,
+  DiscrepancyKind,
+  ErrorResponse,
   FeedbackKind,
   Item,
   RecommendationsPage,
   Resolution,
+  ResolveRequest,
   Run,
   SourceName,
   SubjectView,
@@ -78,6 +96,13 @@ const DISCREPANCY_PAGE_LIMIT = 500;
 
 /** A bound on `Link: rel="next"` pages followed, so a looping header can never hang a read. */
 const MAX_DISCREPANCY_PAGES = 50;
+
+/**
+ * The CSRF header every mutating request carries, with its exact value (`CSRF_HEADER` and
+ * `CSRF_VALUE` of `src/api/client.ts`, mirroring `api/security.py`); without it the API answers
+ * 403. Only the teardown sends it itself; the UI's client adds it to every other write.
+ */
+const CSRF_HEADERS: Readonly<Record<string, string>> = { 'X-Requested-With': 'ads-engine' };
 
 // ---------------------------------------------------------------------------------------------
 // UI labels and anchors (mirrored from the feature modules named beside each)
@@ -147,6 +172,15 @@ const DISCREPANCY_GROUP_KEY = 'discrepancies';
 /** The rules whose "Record decision" form is prefilled with `paused` (`evidenceExtra.ts`). */
 const PAUSE_RULES: ReadonlySet<string> = new Set(['C1', 'C1b']);
 
+/**
+ * A budget amount only the server refuses: 10^12, the smallest amount `decisions.py` rejects with
+ * 422 `invalid_amount` ("must be a positive amount below 10^12"). The decision form checks an
+ * amount's sign and precision but not its size, and the request schema admits up to 18 digits,
+ * so the form posts it and the API refuses it and writes nothing. It is a whole number, so no
+ * currency's minor unit and no Google micro rule refuses it first.
+ */
+const SERVER_REFUSED_AMOUNT = '1000000000000';
+
 // ---------------------------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------------------------
@@ -182,6 +216,24 @@ const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const RESOLUTION_TIMEOUT_MS = 60_000;
 
 // ---------------------------------------------------------------------------------------------
+// Teardown
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The most teardown rounds. A round that restores nothing ends the teardown; when every round
+ * still had something to restore, the state keeps changing under it, and the teardown fails
+ * naming what remains.
+ */
+const MAX_TEARDOWN_ROUNDS = 4;
+
+/** The note on every write the teardown makes, so the decision log names who wrote it. */
+const TEARDOWN_NOTE =
+  'e2e teardown (decisions.spec.ts): restores the state its test changed on this campaign';
+
+/** The discrepancy kinds a decision can raise against the platform (`status`, `budget`). */
+const DECISION_DISCREPANCY_KINDS: ReadonlySet<DiscrepancyKind> = new Set(['status', 'budget']);
+
+// ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
 
@@ -207,6 +259,19 @@ interface GroupedItem {
   group: string;
   /** The item. */
   item: Item;
+}
+
+/**
+ * What the test owns from its first save on: the campaign, and its state just before that save.
+ * The teardown restores exactly this, and nothing else.
+ */
+interface OwnedDecisionState {
+  /** The campaign's internal id, the decision subject. */
+  subjectId: number;
+  /** The ids of the campaign's unresolved discrepancies before the first save; left alone. */
+  before: ReadonlySet<number>;
+  /** The campaign's newest decision before the first save: the decided state to restore. */
+  decidedBefore: Decision;
 }
 
 /** The expected-state budget fields the decision form can offer. */
@@ -346,40 +411,71 @@ function isActionableCampaignItem(item: Item): boolean {
 }
 
 /**
- * Picks the campaign to decide on: the first actionable C1 / C1b item of the Campaigns "Pause"
- * group, whose decision form is prefilled with status `paused`; failing that, the first
- * actionable campaign-subject item anywhere in the Campaigns section.
+ * Whether a campaign's last decision makes its decision form offer a budget input: shape
+ * `own_budget` (a shared member's form offers status only), not an acknowledged removal (whose
+ * form offers nothing), and a daily or total budget decided (an own-budget form offers exactly
+ * the budget fields the decision holds).
  *
- * @param page - The latest default run's recommendations.
- * @returns The chosen item and its subject.
- * @throws When the run offers no actionable campaign decision; the message names the run.
+ * @param latest - The campaign's newest decision, if any.
  */
-function pickSubject(page: RecommendationsPage): ChosenSubject {
-  const candidates = sectionItems(page, CAMPAIGNS_SECTION_KEY).filter(({ item }) =>
+function offersAmountInput(latest: Decision | undefined): boolean {
+  return (
+    latest !== undefined &&
+    latest.shape === 'own_budget' &&
+    !latest.tombstone &&
+    (latest.daily_budget !== null || latest.total_budget !== null)
+  );
+}
+
+/**
+ * Picks the campaign to decide on, in order of preference: the actionable C1 / C1b items of the
+ * Campaigns "Pause" group, whose decision form is prefilled with status `paused`, then every
+ * other actionable campaign-subject item of the section. The first whose campaign's last
+ * decision {@link offersAmountInput} is chosen, so its form has a budget input for the refused
+ * amount; the candidates' decision logs are read in that order, stopping at the first match.
+ *
+ * @param page - The test's page.
+ * @param recommendations - The latest default run's recommendations.
+ * @returns The chosen item and its subject.
+ * @throws When no actionable campaign item has a campaign with its own budget; the message
+ *   names the run.
+ */
+async function pickSubject(
+  page: Page,
+  recommendations: RecommendationsPage,
+): Promise<ChosenSubject> {
+  const candidates = sectionItems(recommendations, CAMPAIGNS_SECTION_KEY).filter(({ item }) =>
     isActionableCampaignItem(item),
   );
-  const preferred =
-    candidates.find(
-      ({ group, item }) => group === PAUSE_GROUP_KEY && PAUSE_RULES.has(item.rule_id),
-    ) ?? candidates[0];
-  const item = preferred?.item;
-  const subject = item?.decision_subject;
-  const source = item?.entity.source;
-  if (item === undefined || subject === undefined || subject === null || !source) {
-    throw new Error(
-      `Run ${String(page.run.id)} has no actionable campaign item with ` +
-        `"${RECORD_DECISION_LABEL}" ` +
-        'in "Campaigns to pause or launch"; the seeded scenario catalog guarantees a C1 pause item',
-    );
+  const isPreferred = ({ group, item }: GroupedItem): boolean =>
+    group === PAUSE_GROUP_KEY && PAUSE_RULES.has(item.rule_id);
+  const ordered = [
+    ...candidates.filter(isPreferred),
+    ...candidates.filter((candidate) => !isPreferred(candidate)),
+  ];
+  for (const { item } of ordered) {
+    const subject = item.decision_subject;
+    const source = item.entity.source;
+    if (subject === undefined || subject === null || !source) {
+      continue;
+    }
+    if (offersAmountInput((await campaignDecisions(page, subject.id))[0])) {
+      return {
+        runId: recommendations.run.id,
+        itemId: item.id,
+        ruleId: item.rule_id,
+        subjectId: subject.id,
+        entityName: item.entity.name,
+        source,
+      };
+    }
   }
-  return {
-    runId: page.run.id,
-    itemId: item.id,
-    ruleId: item.rule_id,
-    subjectId: subject.id,
-    entityName: item.entity.name,
-    source,
-  };
+  throw new Error(
+    `Run ${String(recommendations.run.id)} has no actionable campaign item with ` +
+      `"${RECORD_DECISION_LABEL}" in "Campaigns to pause or launch" whose campaign has its own ` +
+      'budget (an own_budget decision with a daily or total budget, not a removal); the default ' +
+      'simulated world pauses "Competitor - Conquest" (C1), which has its own daily budget',
+  );
 }
 
 /**
@@ -615,9 +711,241 @@ async function resetAmountsToDecided(dialog: Locator, latest: Decision): Promise
   }
 }
 
+/**
+ * The first budget input the decision dialog shows, in the form's order (daily, then total).
+ *
+ * @param dialog - The open "Record decision" dialog, with its form rendered.
+ * @returns The input's locator.
+ * @throws When the dialog shows no budget input; {@link pickSubject} picks only campaigns whose
+ *   form offers one.
+ */
+async function firstAmountInput(dialog: Locator): Promise<Locator> {
+  for (const field of AMOUNT_FIELDS) {
+    const input = dialog.getByRole('spinbutton', { name: AMOUNT_FIELD_LABELS[field], exact: true });
+    if ((await input.count()) > 0) {
+      return input;
+    }
+  }
+  throw new Error(
+    `The "${RECORD_DECISION_LABEL}" dialog shows no ` +
+      `${Object.values(AMOUNT_FIELD_LABELS).join(' or ')} input`,
+  );
+}
+
+/** Whether a response answers the decision form's `POST /api/v1/decisions`. */
+function isDecisionPost(response: Response): boolean {
+  return (
+    response.request().method() === 'POST' && new URL(response.url()).pathname === DECISIONS_PATH
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Teardown helpers (the only API writes of this file)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The machine code of an API error body (`{"error": {"code", "message"}}`).
+ *
+ * @param body - The response body as text.
+ * @returns `error.code`, or `null` when the body has no such envelope, for example a proxy's
+ *   error page.
+ */
+function errorCode(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as Partial<ErrorResponse> | null;
+    const code = parsed?.error?.code;
+    return typeof code === 'string' ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The patch that records the earlier decided state again over the campaign's newest decision:
+ * each of status, daily budget and total budget that the earlier decision holds and the newest
+ * one differs on. A field the earlier decision leaves unset is not sent, because a decided field
+ * cannot be cleared, and the test never sets one.
+ *
+ * @param newest - The campaign's newest decision, if any.
+ * @param decided - The decision the test found before its first save.
+ * @returns The fields to send; empty when the newest decision is that one or matches it.
+ */
+function restorationPatch(newest: Decision | undefined, decided: Decision): DecisionPatchIn {
+  const patch: DecisionPatchIn = {};
+  if (newest === undefined || newest.id === decided.id) {
+    return patch;
+  }
+  if (decided.status !== null && newest.status !== decided.status) {
+    patch.status = decided.status;
+  }
+  for (const field of AMOUNT_FIELDS) {
+    const amount = decided[field];
+    if (amount !== null && newest[field] !== amount) {
+      patch[field] = amount;
+    }
+  }
+  return patch;
+}
+
+/**
+ * The discrepancies the test raised on its campaign: unresolved ones of a kind a decision can
+ * raise (`status`, `budget`) that were not unresolved before its first save. `untracked` and
+ * `missing` discrepancies, and every other subject's, are never the test's.
+ *
+ * @param page - The test's page.
+ * @param state - What the test owns.
+ * @returns The live list, oldest first.
+ */
+async function raisedSinceFirstSave(page: Page, state: OwnedDecisionState): Promise<Discrepancy[]> {
+  return (await listUnresolvedDiscrepancies(page)).filter(
+    (discrepancy) =>
+      discrepancy.subject.type === 'campaign' &&
+      discrepancy.subject.id === state.subjectId &&
+      !state.before.has(discrepancy.id) &&
+      DECISION_DISCREPANCY_KINDS.has(discrepancy.kind),
+  );
+}
+
+/**
+ * Resolves one discrepancy the test raised with "Platform is correct", which writes the
+ * platform's value as the decision and closes the discrepancy at once.
+ *
+ * @param page - The test's page.
+ * @param discrepancy - The discrepancy.
+ * @returns `true` when this call closed it; `false` when it was already closed (409
+ *   `discrepancy_resolved`), for example by an entity sync meanwhile.
+ * @throws On any other answer, naming its status and body.
+ */
+async function resolvePlatformCorrect(page: Page, discrepancy: Discrepancy): Promise<boolean> {
+  const path = `${DISCREPANCIES_PATH}/${String(discrepancy.id)}/resolve`;
+  const body: ResolveRequest = { resolution: 'platform_correct', note: TEARDOWN_NOTE };
+  const response = await page.request.post(path, { headers: CSRF_HEADERS, data: body });
+  if (response.status() === 200) {
+    return true;
+  }
+  const text = await response.text();
+  if (response.status() === 409 && errorCode(text) === 'discrepancy_resolved') {
+    return false;
+  }
+  throw new Error(`Teardown: POST ${path} answered ${String(response.status())}: ${text}`);
+}
+
+/**
+ * Records the earlier decided state again when the campaign's newest decision differs from it,
+ * as a patch of exactly the differing fields.
+ *
+ * @param page - The test's page.
+ * @param state - What the test owns.
+ * @returns What it recorded, or `null` when nothing differed (including 422 `no_change`).
+ * @throws On any other answer, naming its status and body.
+ */
+async function recordDecidedStateAgain(
+  page: Page,
+  state: OwnedDecisionState,
+): Promise<string | null> {
+  const newest = (await campaignDecisions(page, state.subjectId))[0];
+  const patch = restorationPatch(newest, state.decidedBefore);
+  if (newest === undefined || Object.keys(patch).length === 0) {
+    return null;
+  }
+  const body: DecisionRequest = {
+    subject: { type: 'campaign', id: state.subjectId },
+    patch,
+    note: TEARDOWN_NOTE,
+  };
+  const response = await page.request.post(DECISIONS_PATH, { headers: CSRF_HEADERS, data: body });
+  if (response.status() === 201) {
+    return `recorded ${JSON.stringify(patch)} over decision ${String(newest.id)}`;
+  }
+  const text = await response.text();
+  if (response.status() === 422 && errorCode(text) === 'no_change') {
+    return null;
+  }
+  throw new Error(
+    `Teardown: POST ${DECISIONS_PATH} answered ${String(response.status())}: ${text}`,
+  );
+}
+
+/**
+ * Restores what the test changed on its campaign, and nothing else, whatever the test's
+ * outcome. Each round first resolves every discrepancy the test raised
+ * ({@link raisedSinceFirstSave}) with "Platform is correct", then records the earlier decided
+ * state again where the newest decision differs from it. It runs in rounds because the state
+ * can change under it: a pending "Sync now" can raise a discrepancy between the two halves of a
+ * round, and after a timeout the test body may still be running beside it. A round that
+ * restores nothing ends it.
+ *
+ * @param page - The test's page; its request context carries the session cookie.
+ * @param state - What the test owns.
+ * @returns What each round restored; empty when the test left nothing to restore.
+ * @throws When a write is refused, or when every one of {@link MAX_TEARDOWN_ROUNDS} rounds still
+ *   had something to restore; the message names what remains.
+ */
+async function restoreOwnedState(page: Page, state: OwnedDecisionState): Promise<string[]> {
+  const restored: string[] = [];
+  for (let round = 1; round <= MAX_TEARDOWN_ROUNDS; round += 1) {
+    const changes: string[] = [];
+    for (const discrepancy of await raisedSinceFirstSave(page, state)) {
+      if (await resolvePlatformCorrect(page, discrepancy)) {
+        changes.push(`resolved ${discrepancy.kind} discrepancy ${String(discrepancy.id)}`);
+      }
+    }
+    const recorded = await recordDecidedStateAgain(page, state);
+    if (recorded !== null) {
+      changes.push(recorded);
+    }
+    if (changes.length === 0) {
+      return restored;
+    }
+    restored.push(...changes.map((change) => `round ${String(round)}: ${change}`));
+  }
+  const remaining = (await raisedSinceFirstSave(page, state)).map(
+    (discrepancy) =>
+      `${discrepancy.kind} discrepancy ${String(discrepancy.id)} (${discrepancy.state})`,
+  );
+  const newest = (await campaignDecisions(page, state.subjectId))[0];
+  const patch = restorationPatch(newest, state.decidedBefore);
+  if (newest !== undefined && Object.keys(patch).length > 0) {
+    remaining.push(
+      `decision ${String(newest.id)} differs from decision ` +
+        `${String(state.decidedBefore.id)} by ${JSON.stringify(patch)}`,
+    );
+  }
+  throw new Error(
+    `Teardown of campaign ${String(state.subjectId)} did not settle in ` +
+      `${String(MAX_TEARDOWN_ROUNDS)} rounds (${restored.join('; ')}); still to restore: ` +
+      (remaining.length === 0 ? 'nothing at the last read' : remaining.join('; ')),
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The test
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * What the running test owns, set immediately before its first save so that every write it may
+ * make, even one whose response was lost, is restored; taken and cleared by the teardown.
+ */
+let owned: OwnedDecisionState | undefined;
+
+// The teardown departs from this file's rule that every mutation goes through the UI: it must
+// restore the campaign whatever the UI did, after a failed assertion, a timeout with the page
+// mid-flow, or a closed dialog, so it writes through `page.request` with the CSRF header the
+// UI's client would have added.
+test.afterEach(async ({ page }, testInfo) => {
+  const state = owned;
+  owned = undefined;
+  if (state === undefined) {
+    return;
+  }
+  const restored = await restoreOwnedState(page, state);
+  testInfo.annotations.push({
+    type: 'teardown',
+    description:
+      `Campaign ${String(state.subjectId)}: ` +
+      (restored.length === 0 ? 'nothing to restore' : restored.join('; ')),
+  });
+});
 
 test('records a decision and resolves the discrepancy it creates', async ({ page }) => {
   test.setTimeout(TEST_TIMEOUT_MS);
@@ -630,7 +958,7 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
       // page load, the card is missing, so the item is picked again from the newer run.
       await expect(async () => {
         const recommendations = await getJson<RecommendationsPage>(page, RECOMMENDATIONS_PATH);
-        const candidate = pickSubject(recommendations);
+        const candidate = await pickSubject(page, recommendations);
         await page.goto('/actions');
         await expect(page.locator(`#item-${String(candidate.itemId)}`)).toBeVisible({
           timeout: PAGE_LOAD_TIMEOUT_MS,
@@ -666,35 +994,97 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
   }
   const subjectName = decisionLogName(decidedBefore.subject);
 
-  await test.step('record the decision through the card on /actions', async () => {
-    const card = page.locator(`#item-${String(itemId)}`);
-    await expect(card).toBeVisible({ timeout: PAGE_LOAD_TIMEOUT_MS });
-    await card.getByRole('button', { name: RECORD_DECISION_LABEL, exact: true }).click();
+  const card = page.locator(`#item-${String(itemId)}`);
+  const dialog = page.getByRole('dialog', { name: RECORD_DECISION_LABEL, exact: true });
+  const status = dialog.getByRole('combobox', { name: STATUS_FIELD_LABEL, exact: true });
+  const save = dialog.getByRole('button', { name: SAVE_DECISION_LABEL, exact: true });
 
-    const dialog = page.getByRole('dialog', { name: RECORD_DECISION_LABEL, exact: true });
-    await expect(dialog).toBeVisible();
-    const status = dialog.getByRole('combobox', { name: STATUS_FIELD_LABEL, exact: true });
-    if (prefilledPause) {
-      // C1 and C1b prefill the decision with status `paused` (AAP 0.5.5).
-      await expect(status).toHaveValue('paused');
-    } else {
-      await expect(status).toBeVisible();
-      await status.selectOption('paused');
-      await resetAmountsToDecided(dialog, decidedBefore);
-    }
-    await expect(status.locator('option:checked')).toHaveText(CAMPAIGN_STATUS_LABELS.paused);
+  const refusedMessage =
+    await test.step('an amount the server refuses (422) is shown and writes nothing', async () => {
+      await expect(card).toBeVisible({ timeout: PAGE_LOAD_TIMEOUT_MS });
+      await card.getByRole('button', { name: RECORD_DECISION_LABEL, exact: true }).click();
 
-    const save = dialog.getByRole('button', { name: SAVE_DECISION_LABEL, exact: true });
+      await expect(dialog).toBeVisible();
+      if (prefilledPause) {
+        // C1 and C1b prefill the decision with status `paused` (AAP 0.5.5).
+        await expect(status).toHaveValue('paused');
+      } else {
+        await expect(status).toBeVisible();
+        await status.selectOption('paused');
+        await resetAmountsToDecided(dialog, decidedBefore);
+      }
+      await expect(status.locator('option:checked')).toHaveText(CAMPAIGN_STATUS_LABELS.paused);
+
+      const amount = await firstAmountInput(dialog);
+      await amount.fill(SERVER_REFUSED_AMOUNT);
+      await expect(save, 'the form accepts the amount; only the server refuses it').toBeEnabled();
+
+      const answered = page.waitForResponse(isDecisionPost);
+      // From this click on the test may have written, so the teardown restores the campaign.
+      owned = { subjectId, before, decidedBefore };
+      await save.click();
+      const response = await answered;
+      expect(response.status(), 'the API refuses the amount with 422').toBe(422);
+      const { error } = (await response.json()) as ErrorResponse;
+      expect(error.code, 'the 422 names the amount rule').toBe('invalid_amount');
+      expect(error.message.trim(), 'the 422 carries a message').not.toBe('');
+      test.info().annotations.push({
+        type: 'refused-decision',
+        description: `POST ${DECISIONS_PATH} answered 422 ${error.code}: ${error.message}`,
+      });
+
+      // The dialog stays open and usable: it shows the API's message as a plain banner (the
+      // alert role is reserved for the discrepancy banner) and keeps every entered value.
+      await expect(dialog, 'the dialog stays open after the refusal').toBeVisible();
+      await expect(
+        dialog.getByText(error.message, { exact: true }),
+        'the dialog shows the API message',
+      ).toBeVisible();
+      await expect(dialog.getByRole('alert'), 'the error is not an alert').toHaveCount(0);
+      await expect(status, 'the status stays paused').toHaveValue('paused');
+      await expect(amount, 'the refused amount stays entered').toHaveValue(SERVER_REFUSED_AMOUNT);
+      await expect(amount, 'the amount stays editable').toBeEnabled();
+      await expect(save, 'the decision can be saved again').toBeEnabled();
+      await expect(
+        card.getByText(error.message, { exact: true }),
+        'the card shows the refused save message too',
+      ).toHaveCount(1);
+
+      const newest = (await campaignDecisions(page, subjectId))[0];
+      expect(newest?.id, 'the refused decision wrote no decision').toBe(decidedBefore.id);
+      const unresolved = (await listUnresolvedDiscrepancies(page))
+        .filter((entry) => entry.subject.type === 'campaign' && entry.subject.id === subjectId)
+        .map((entry) => entry.id);
+      expect(new Set(unresolved), 'the refused decision wrote no discrepancy').toEqual(before);
+      return error.message;
+    });
+
+  await test.step('the corrected decision saves and appears in the /decisions log', async () => {
+    await resetAmountsToDecided(dialog, decidedBefore);
+    await expect(status).toHaveValue('paused');
     await expect(save, 'pausing changes the last decided status').toBeEnabled();
+    const answered = page.waitForResponse(isDecisionPost);
     await save.click();
+    const response = await answered;
+    expect(response.status(), 'the corrected decision is saved').toBe(201);
     await expect(dialog, 'the dialog closes once the decision is saved').toBeHidden({
       timeout: PAGE_LOAD_TIMEOUT_MS,
     });
+    await expect(
+      card.getByText(refusedMessage, { exact: true }),
+      'the card no longer shows the refused save message',
+    ).toHaveCount(0);
 
     const latest = (await campaignDecisions(page, subjectId))[0];
     expect(latest?.status, 'the newest decision pauses the campaign').toBe('paused');
     expect(latest?.recommendation_id, 'the decision names the item it was recorded from').toBe(
       itemId,
+    );
+    expect(latest?.daily_budget, 'the refused amount was not kept').toBe(
+      decidedBefore.daily_budget,
+    );
+    expect(latest?.total_budget, 'the refused amount was not kept').toBe(
+      decidedBefore.total_budget,
     );
 
     await expect(async () => {

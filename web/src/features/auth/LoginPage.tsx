@@ -59,7 +59,8 @@
  *   straight from `@tanstack/react-router`.
  * - **Fixed strings**: the e2e specs (`web/tests/e2e/auth.setup.ts`, `first-start.spec.ts`)
  *   fill the fields labelled "Email" and "Password" and click "Sign in", and wait for
- *   `/actions`.
+ *   `/actions`. `first-start.spec.ts` also expects the 401 message "Email or password is
+ *   incorrect", in the form's banner and under the Password field.
  *
  * Out of scope (AAP 0.7.2): password reset, "remember me", sign-up, OAuth and any multi-user or
  * role UI.

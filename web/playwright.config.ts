@@ -23,8 +23,11 @@
  * project (`tests/e2e/auth.setup.ts`) signs in once through the UI and saves the session to
  * {@link STORAGE_STATE}, and every spec in the `chromium` project starts from that state.
  * `first-start.spec.ts` alone overrides it with an empty state, because it asserts the
- * first-start login path itself. A run therefore makes at most two UI logins, and at most four
- * with one retry of each, which stays under the limit.
+ * first-start login path and a refused sign-in itself. The limit counts every attempt, refused
+ * ones included: a run without retries makes at most 4 (1 in `setup`, 1 in the first-start
+ * test, 2 in its wrong-password test). A CI retry repeats a failed test's attempts, up to 8 in
+ * one run, and a second run started within a minute adds its own, so either can exceed 5 within
+ * 60 s and get 429; wait a minute before running the suite again.
  *
  * Specs rely on roles and accessible names rather than test ids, so the default
  * `testIdAttribute` is kept.

@@ -13,14 +13,20 @@
  *    every source and no "Live" chip.
  * 3. **Global banner**: the simulated-sources banner names every source with its reason. It is
  *    plain content, never the `role="alert"` banner, which AAP 0.5.5 reserves for discrepancies.
- * 4. **Cards**: no recommendation is `live`, every one carries the `simulated` flag, and every
- *    visible card on `/actions` shows its "Simulated data" badge.
+ * 4. **Every item**: no recommendation is `live` and every one carries the `simulated` flag. On
+ *    `/actions`, every item that feedback does not hide shows its own "Simulated data" label,
+ *    matched to the item by the API: each card's flags row in every group of every section, and
+ *    each white-paper row's asset cell and expanded details in every currency cohort's tables.
+ *    Each item is revealed first: every Keywords tab is selected, every "Held until
+ *    discrepancies are resolved" disclosure opened and every "Show N more" batch shown, and the
+ *    number of cards and rows on the page must equal the number of items.
  * 5. **Sources page**: each `#source-{source}` section shows the "Simulated" mode badge and the
  *    API's reason.
  *
  * Harness (`playwright.config.ts`): the `chromium` project starts from the session that
  * `auth.setup.ts` saved, so this file never signs in. The spec is read-only: it records no
- * feedback, decision or sync request, so it cannot disturb the specs that share the stack.
+ * feedback, decision or sync request, so it cannot disturb the specs that share the stack. Its
+ * only clicks reveal content: tabs, held disclosures, "Show N more" batches and row details.
  *
  * Nothing the seeded world contains is written here: entity names, counts and window lengths
  * all come from the API. `process.env.DATA_MODE` is read only to choose which of the two
@@ -43,7 +49,18 @@
 import { test, expect } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
 
-import type { Item, RecommendationsPage, Run, Source, SourceName } from '../../src/api/types';
+import type {
+  Flag,
+  FlagCode,
+  Group,
+  Item,
+  RecommendationsPage,
+  Run,
+  Section,
+  SectionKey,
+  Source,
+  SourceName,
+} from '../../src/api/types';
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -119,6 +136,70 @@ const LIVE_LABEL = 'Live';
 
 /** Every recommendation card is an `<article id="item-{id}">` (`RecommendationCard.tsx`). */
 const CARD_SELECTOR = 'article[id^="item-"]';
+
+/**
+ * The five sections of `/actions`, in the fixed order `GET /recommendations` returns them
+ * (`SECTION_ORDER` in `src/api/types.ts`, restated because this spec imports only types).
+ */
+const SECTION_KEYS: readonly SectionKey[] = [
+  'keywords',
+  'campaigns',
+  'budget',
+  'creative',
+  'white_papers',
+];
+
+/** The accessible name of an item's flags row, one badge per flag code (`FlagList.tsx`). */
+const FLAGS_LABEL = 'Flags';
+
+/** The accessible name of the Keywords section's tab list (`KeywordsSection.tsx`). */
+const KEYWORD_TABS_LABEL = 'Keyword actions';
+
+/**
+ * The control that mounts the next batch of a bounded list of items (`showMoreLabel` in
+ * `batches.tsx`): cards ("Show 20 more actions"), group regions ("Show 1 more group") and
+ * white-paper asset rows ("Show 50 more white papers"). The per-creative and variants tables hold
+ * no item, so their controls are left alone.
+ */
+const SHOW_MORE_CONTROL = /^Show \d[\d,]* more (?:actions?|groups?|white papers?)$/u;
+
+/** The toggle of a group's held items (`HeldDisclosure` in `SectionFrame.tsx`). */
+const HELD_DISCLOSURE = /^Held until discrepancies are resolved \(\d[\d,]*\)$/u;
+
+/** Every character a group anchor id replaces with `-` (`groupAnchorId` in `SectionFrame.tsx`). */
+const ANCHOR_UNSAFE = /[^A-Za-z0-9_-]/gu;
+
+/** The key prefix of a white-paper currency cohort, `cohort:{CURRENCY}` (`api/schemas.py`). */
+const COHORT_KEY_PREFIX = 'cohort:';
+
+/**
+ * The caption suffix of a cohort's table of rows computed from replaced data
+ * (`WhitePapersSection.tsx`), after "White papers ({currency})".
+ */
+const HISTORICAL_TABLE_SUFFIX = ' computed from replaced data';
+
+/**
+ * The caption suffix of a cohort's table of held rows, behind its held disclosure
+ * (`WhitePapersSection.tsx`), after "White papers ({currency})".
+ */
+const HELD_TABLE_SUFFIX = ' held until discrepancies are resolved';
+
+/**
+ * The data rows of a white-paper asset table, relative to the table: the body's own rows that
+ * carry a row header. A row's detail row carries none, and the rows of the per-creative table
+ * nested in it are not the body's own. XPath, because Playwright's CSS engine does not resolve
+ * a relative `:has(> …)` against the scope.
+ */
+const ASSET_ROW_SELECTOR = 'xpath=./tbody/tr[th[@scope="row"]]';
+
+/** The row header of an asset row, relative to the row: the asset's name and its badge. */
+const ROW_HEADER_SELECTOR = 'xpath=./th[@scope="row"]';
+
+/**
+ * Bound on one reveal click or attribute read, so a control that is missing fails the attempt
+ * and its retry reloads the page, instead of waiting for the test's timeout.
+ */
+const ACTION_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -276,6 +357,485 @@ function pageTitle(page: Page, name: string): Locator {
   return page.getByRole('heading', { level: 1, name, exact: true });
 }
 
+/**
+ * An item as assertion messages name it.
+ *
+ * @param item - One item.
+ * @returns For example "item 12 (K1)".
+ */
+function describeItem(item: Item): string {
+  return `item ${String(item.id)} (${item.rule_id})`;
+}
+
+/**
+ * The section with `key` in a recommendations page.
+ *
+ * @param recommendations - The `GET /recommendations` body.
+ * @param key - The section to find.
+ * @returns The section.
+ * @throws Error when the page has no such section.
+ */
+function sectionOf(recommendations: RecommendationsPage, key: SectionKey): Section {
+  const section = recommendations.sections.find((candidate) => candidate.key === key);
+  if (section === undefined) {
+    throw new Error(`${RECOMMENDATIONS_PATH} has no ${key} section`);
+  }
+  return section;
+}
+
+/**
+ * A group's items as `/actions` places them (`partitionGroup` in `SectionFrame.tsx`), each list
+ * in API order. Items that feedback hides now are counted by the page and never rendered, so
+ * they are in none of the lists.
+ */
+interface ShownItems {
+  /** Items neither hidden, historical nor held: shown openly. */
+  visible: Item[];
+  /** Items computed from replaced data: shown openly, in a block or table of their own. */
+  historical: Item[];
+  /** Items held until discrepancies are resolved: behind the group's held disclosure. */
+  held: Item[];
+}
+
+/**
+ * Splits a group's items as the page does: hidden when `current.hidden_by` is set, else
+ * historical when `current.historical` is set, else held when the run or the overlay holds it,
+ * else visible.
+ *
+ * @param group - One group of a section.
+ * @returns Its items that the page renders, by where it renders them.
+ */
+function shownItems(group: Group): ShownItems {
+  const shown: ShownItems = { visible: [], historical: [], held: [] };
+  for (const item of group.items) {
+    const hiddenBy = item.current.hidden_by;
+    if (hiddenBy !== null && hiddenBy !== undefined) {
+      continue;
+    }
+    if (item.current.historical) {
+      shown.historical.push(item);
+    } else if (item.held || item.current.held_now) {
+      shown.held.push(item);
+    } else {
+      shown.visible.push(item);
+    }
+  }
+  return shown;
+}
+
+/**
+ * Every item of a group that the page renders, in any of its places.
+ *
+ * @param group - One group of a section.
+ * @returns The visible, historical and held items.
+ */
+function allShown(group: Group): Item[] {
+  const { visible, historical, held } = shownItems(group);
+  return [...visible, ...historical, ...held];
+}
+
+/**
+ * How many reveal clicks a set of groups can need at most: each click mounts at least one more
+ * card, row or group region, or opens one group's held disclosure.
+ *
+ * @param groups - The groups the clicks reveal.
+ * @returns One click per item, plus two per group.
+ */
+function revealBound(groups: readonly Group[]): number {
+  return groups.reduce((sum, group) => sum + group.items.length + 2, 0);
+}
+
+/**
+ * The anchor id of a group's region or Keywords tab panel (`groupAnchorId` in
+ * `SectionFrame.tsx`): `group-{sectionKey}-{groupKey}`, with every character outside
+ * `[A-Za-z0-9_-]` replaced by `-`.
+ *
+ * @param sectionKey - The section the group belongs to.
+ * @param groupKey - The group key, as the API returned it.
+ * @returns For example `group-white_papers-cohort-EUR` for `cohort:EUR`.
+ */
+function groupAnchorId(sectionKey: SectionKey, groupKey: string): string {
+  return `group-${sectionKey}-${groupKey}`.replace(ANCHOR_UNSAFE, '-');
+}
+
+/**
+ * The title a group's tab or heading shows: its API title trimmed, else its key.
+ *
+ * @param group - One group of a section.
+ * @returns The title.
+ */
+function groupTitle(group: Group): string {
+  return visibleText(group.title) ?? group.key;
+}
+
+/**
+ * The currency of a white-paper cohort: the `{CURRENCY}` of its `cohort:{CURRENCY}` key, else
+ * its title, which the API sets to the currency.
+ *
+ * @param group - One group of the White papers section.
+ * @returns The currency code, for example "EUR".
+ */
+function cohortCurrency(group: Group): string {
+  const fromKey = group.key.startsWith(COHORT_KEY_PREFIX)
+    ? visibleText(group.key.slice(COHORT_KEY_PREFIX.length))
+    : null;
+  return fromKey ?? groupTitle(group);
+}
+
+/**
+ * The name a white-paper row shows (`assetName` in `WhitePapersSection.tsx`): the entity name
+ * trimmed, else the entity id, else "White paper {id}".
+ *
+ * @param item - One white-paper item.
+ * @returns The asset name.
+ */
+function assetName(item: Item): string {
+  return (
+    visibleText(item.entity.name) ?? visibleText(item.entity.id) ?? `White paper ${String(item.id)}`
+  );
+}
+
+/**
+ * `text` escaped for use inside a regular expression.
+ *
+ * @param text - Literal text.
+ * @returns The pattern that matches exactly that text.
+ */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+/**
+ * An attribute selector matching `value` exactly, whatever characters it holds, such as the
+ * colons of a React-generated id.
+ *
+ * @param attribute - The attribute name.
+ * @param value - Its exact value.
+ * @returns For example `[id="item-12"]`.
+ */
+function attributeSelector(attribute: string, value: string): string {
+  return `[${attribute}=${JSON.stringify(value)}]`;
+}
+
+/**
+ * The flag badges an item's flags row shows (`mergeFlags` in `FlagList.tsx`), in their order:
+ * every code once, the recorded codes first, then those only the overlay carries, each labelled
+ * with its current message, else its recorded one, else its code.
+ *
+ * @param item - One item.
+ * @returns The flags as the row shows them.
+ */
+function shownFlags(item: Item): Flag[] {
+  const order: FlagCode[] = [];
+  const recorded = new Map<FlagCode, string>();
+  const current = new Map<FlagCode, string>();
+  const collect = (flags: readonly Flag[], messages: Map<FlagCode, string>): void => {
+    for (const flag of flags) {
+      if (!order.includes(flag.code)) {
+        order.push(flag.code);
+      }
+      if (!messages.has(flag.code) && flag.message.trim() !== '') {
+        messages.set(flag.code, flag.message);
+      }
+    }
+  };
+  collect(item.flags, recorded);
+  collect(item.current.flags_now, current);
+  return order.map((code) => ({
+    code,
+    message: current.get(code) ?? recorded.get(code) ?? code,
+  }));
+}
+
+/** An item's simulated-data label: the badge text and where its flags row shows it. */
+interface SimulatedLabel {
+  /** The badge text, for example "Simulated data (Google)". */
+  message: string;
+  /** The badge's position in the item's flags row, from 0. */
+  position: number;
+}
+
+/**
+ * The label an item's simulated flag shows, on its card's flags row, a white-paper row's asset
+ * cell and that row's details alike (`simulatedFlag` in `WhitePapersSection.tsx` reads the same
+ * merged flag).
+ *
+ * @param item - One item.
+ * @returns The label and its position in the flags row.
+ * @throws Error when the item carries no simulated flag.
+ */
+function simulatedLabel(item: Item): SimulatedLabel {
+  const flags = shownFlags(item);
+  const position = flags.findIndex((flag) => flag.code === SIMULATED_FLAG_CODE);
+  const flag = flags[position];
+  if (flag === undefined) {
+    throw new Error(`${describeItem(item)} carries no ${SIMULATED_FLAG_CODE} flag`);
+  }
+  return { message: flag.message, position };
+}
+
+/**
+ * Clicks every reveal control in `scope` until none is left: each collapsed "Held until
+ * discrepancies are resolved" disclosure and each "Show N more" button of a list of cards,
+ * groups or white papers. A reveal can bring more controls into view (a revealed group holds its
+ * own lists and disclosure), so the controls are looked up again after every click. Controls in
+ * a hidden Keywords panel are not visible and stay untouched.
+ *
+ * @param scope - The section region or tab panel to reveal.
+ * @param bound - The most clicks the scope can need ({@link revealBound}).
+ * @param where - The scope, as assertion messages name it.
+ * @throws Error when controls remain after `bound` clicks.
+ */
+async function revealAll(scope: Locator, bound: number, where: string): Promise<void> {
+  const held = scope
+    .getByRole('button', { name: HELD_DISCLOSURE, expanded: false })
+    .filter({ visible: true });
+  const more = scope.getByRole('button', { name: SHOW_MORE_CONTROL }).filter({ visible: true });
+  for (let clicks = 0; ; clicks += 1) {
+    const heldCount = await held.count();
+    const moreCount = heldCount > 0 ? 0 : await more.count();
+    if (heldCount === 0 && moreCount === 0) {
+      return;
+    }
+    if (clicks >= bound) {
+      throw new Error(`${where} still shows reveal controls after ${String(bound)} clicks`);
+    }
+    if (heldCount > 0) {
+      const region = await held.first().getAttribute('aria-controls', {
+        timeout: ACTION_TIMEOUT_MS,
+      });
+      if (region === null) {
+        throw new Error(`A held disclosure in ${where} controls no region`);
+      }
+      // Pinned by the region it controls: "expanded: false" would let go of it once clicked.
+      const toggle = scope.locator(attributeSelector('aria-controls', region));
+      await toggle.click({ timeout: ACTION_TIMEOUT_MS });
+      await expect(toggle, `the held disclosure in ${where} opens`).toHaveAttribute(
+        'aria-expanded',
+        'true',
+      );
+    } else {
+      await more.first().click({ timeout: ACTION_TIMEOUT_MS });
+    }
+  }
+}
+
+/**
+ * Asserts that `container`, an item's card or a white-paper row's details, shows the item's own
+ * simulated-data badge: in its own flags row, at the position the item's merged flags give it,
+ * with the API's message, which names simulated data.
+ *
+ * @param container - The element that holds the item's flags row and no other item's.
+ * @param item - The item.
+ */
+async function expectFlagsRowLabel(container: Locator, item: Item): Promise<void> {
+  const label = simulatedLabel(item);
+  expect(
+    label.message.trim().startsWith(SIMULATED_FLAG_TEXT),
+    `${describeItem(item)} labels its flag "${SIMULATED_FLAG_TEXT}…" ("${label.message}")`,
+  ).toBe(true);
+  const badge = container
+    .getByRole('list', { name: FLAGS_LABEL, exact: true })
+    .getByRole('listitem')
+    .nth(label.position);
+  await expect(badge, `${describeItem(item)} shows "${label.message}" in its flags row`).toHaveText(
+    label.message,
+  );
+  await expect(badge).toBeVisible();
+}
+
+/**
+ * Asserts that each item is shown as its own card inside `scope` and that the card's flags row
+ * shows the item's simulated-data badge.
+ *
+ * @param scope - The item's group region or Keywords tab panel.
+ * @param items - The group's items that the page renders.
+ */
+async function expectCards(scope: Locator, items: readonly Item[]): Promise<void> {
+  for (const item of items) {
+    const card = scope.locator(attributeSelector('id', `item-${String(item.id)}`));
+    await expect(card, `${describeItem(item)} is shown as a card in its group`).toBeVisible();
+    await expectFlagsRowLabel(card, item);
+  }
+}
+
+/**
+ * Checks a section whose items are cards (Campaigns, Budget, Copy/creative): reveals every
+ * batch and held disclosure, then every item's card in its own group region, and requires the
+ * section to render no card beyond them.
+ *
+ * @param region - The section region.
+ * @param section - The section, as the API returned it.
+ * @returns How many items were found and checked on the page.
+ */
+async function checkCardSection(region: Locator, section: Section): Promise<number> {
+  await revealAll(region, revealBound(section.groups), `the ${section.key} section`);
+  let checked = 0;
+  for (const group of section.groups) {
+    const items = allShown(group);
+    if (items.length === 0) {
+      continue;
+    }
+    const groupRegion = region.locator(
+      attributeSelector('id', groupAnchorId(section.key, group.key)),
+    );
+    await expect(groupRegion, `the ${section.key} group "${group.key}" is shown`).toBeVisible();
+    await expectCards(groupRegion, items);
+    checked += items.length;
+  }
+  await expect(
+    region.locator(CARD_SELECTOR),
+    `the ${section.key} section renders one card per item not hidden by feedback`,
+  ).toHaveCount(checked);
+  return checked;
+}
+
+/**
+ * Checks the Keywords section: selects each group's tab in turn, reveals every batch and held
+ * disclosure in its panel, then every item's card in that panel. Once every tab has been
+ * selected, every panel's cards are mounted, and the section must hold no card beyond them.
+ *
+ * @param region - The section region.
+ * @param section - The Keywords section, as the API returned it.
+ * @returns How many items were found and checked on the page.
+ */
+async function checkKeywordsSection(region: Locator, section: Section): Promise<number> {
+  // With nothing to show the section renders its empty state, and no tab list.
+  if (section.groups.every((group) => allShown(group).length === 0)) {
+    return 0;
+  }
+  const tabList = region.getByRole('tablist', { name: KEYWORD_TABS_LABEL, exact: true });
+  await expect(tabList.getByRole('tab'), 'one Keywords tab per API group').toHaveCount(
+    section.groups.length,
+  );
+  let checked = 0;
+  for (const group of section.groups) {
+    const title = groupTitle(group);
+    // The tab's name is its title, followed by the count of the cards it shows openly.
+    const tab = tabList.getByRole('tab', {
+      name: new RegExp(`^${escapeRegExp(title)}(?: \\d[\\d,]*)?$`, 'u'),
+    });
+    await tab.click({ timeout: ACTION_TIMEOUT_MS });
+    await expect(tab, `the "${title}" tab is selected`).toHaveAttribute('aria-selected', 'true');
+    const panel = region.locator(attributeSelector('id', groupAnchorId(section.key, group.key)));
+    await expect(panel, `the "${title}" panel is shown`).toBeVisible();
+    const items = allShown(group);
+    if (items.length === 0) {
+      continue;
+    }
+    await revealAll(panel, revealBound([group]), `the "${title}" tab`);
+    await expectCards(panel, items);
+    checked += items.length;
+  }
+  await expect(
+    region.locator(CARD_SELECTOR),
+    'the keywords section renders one card per item not hidden by feedback',
+  ).toHaveCount(checked);
+  return checked;
+}
+
+/**
+ * Checks one white-paper table: it shows exactly one row per item, in API order, and each row
+ * names its item's asset and shows the item's simulated-data badge in its asset cell; expanded,
+ * the row's details show the same badge in their flags row.
+ *
+ * @param groupRegion - The cohort's group region.
+ * @param caption - The table's caption, which names it.
+ * @param items - The items the table holds, in API order.
+ */
+async function expectAssetRows(
+  groupRegion: Locator,
+  caption: string,
+  items: readonly Item[],
+): Promise<void> {
+  const table = groupRegion.getByRole('table', { name: caption, exact: true });
+  await expect(table, `the table "${caption}" is shown`).toBeVisible();
+  const rows = table.locator(ASSET_ROW_SELECTOR);
+  await expect(rows, `"${caption}" shows one row per item`).toHaveCount(items.length);
+  for (const [index, item] of items.entries()) {
+    const name = assetName(item);
+    const label = simulatedLabel(item);
+    const row = rows.nth(index);
+    const what = `${describeItem(item)}, row ${String(index + 1)} of "${caption}"`;
+    const header = row.locator(ROW_HEADER_SELECTOR);
+    await expect(header.getByText(name, { exact: true }), `${what} names "${name}"`).toBeVisible();
+    await expect(
+      header.getByText(label.message, { exact: true }),
+      `${what} shows "${label.message}" in its asset cell`,
+    ).toBeVisible();
+
+    const detailId = await row
+      .getByRole('button', { name: `Details for ${name}`, exact: true })
+      .getAttribute('aria-controls', { timeout: ACTION_TIMEOUT_MS });
+    if (detailId === null) {
+      throw new Error(`The details toggle of ${what} controls no detail row`);
+    }
+    // Pinned by its detail row, which is unique, unlike the asset name across cohorts.
+    const toggle = table.locator(attributeSelector('aria-controls', detailId));
+    await toggle.click({ timeout: ACTION_TIMEOUT_MS });
+    await expect(toggle, `the details of ${what} open`).toHaveAttribute('aria-expanded', 'true');
+    const details = table.locator(attributeSelector('id', detailId));
+    await expect(details, `the details of ${what} are shown`).toBeVisible();
+    await expectFlagsRowLabel(details, item);
+  }
+}
+
+/**
+ * Checks the White papers section: reveals every batch and held disclosure, then, for each
+ * currency cohort, its table of visible rows, its table of rows computed from replaced data and
+ * its table of held rows, each with exactly its items.
+ *
+ * @param region - The section region.
+ * @param section - The White papers section, as the API returned it.
+ * @returns How many items were found and checked on the page.
+ */
+async function checkWhitePapersSection(region: Locator, section: Section): Promise<number> {
+  await revealAll(region, revealBound(section.groups), 'the white_papers section');
+  let checked = 0;
+  for (const group of section.groups) {
+    const { visible, historical, held } = shownItems(group);
+    if (visible.length + historical.length + held.length === 0) {
+      continue;
+    }
+    const groupRegion = region.locator(
+      attributeSelector('id', groupAnchorId(section.key, group.key)),
+    );
+    await expect(groupRegion, `the white-paper cohort "${group.key}" is shown`).toBeVisible();
+    const caption = `White papers (${cohortCurrency(group)})`;
+    const tables: [string, Item[]][] = [
+      [caption, visible],
+      [`${caption}${HISTORICAL_TABLE_SUFFIX}`, historical],
+      [`${caption}${HELD_TABLE_SUFFIX}`, held],
+    ];
+    for (const [tableCaption, items] of tables) {
+      if (items.length > 0) {
+        await expectAssetRows(groupRegion, tableCaption, items);
+        checked += items.length;
+      }
+    }
+  }
+  return checked;
+}
+
+/**
+ * Finds every item of a section that the page renders and checks its own simulated-data label,
+ * in the way the section renders its items.
+ *
+ * @param region - The section region.
+ * @param section - The section, as the API returned it.
+ * @returns How many items were found and checked on the page.
+ */
+function checkSection(region: Locator, section: Section): Promise<number> {
+  switch (section.key) {
+    case 'keywords':
+      return checkKeywordsSection(region, section);
+    case 'white_papers':
+      return checkWhitePapersSection(region, section);
+    default:
+      return checkCardSection(region, section);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -391,46 +951,56 @@ test.describe('simulated mode', () => {
     }).toPass(SETTLE);
   });
 
-  test('every recommendation is simulated and every visible card shows "Simulated data"', async ({
+  test('every recommendation is simulated and every item shows its "Simulated data" label', async ({
     page,
   }) => {
-    await expect(async () => {
-      const recommendations = await getJson<RecommendationsPage>(page, RECOMMENDATIONS_PATH);
-      const items = allItems(recommendations);
-      expect(items.length, 'the latest default run has recommendations').toBeGreaterThan(0);
-      for (const item of items) {
-        const what = `item ${String(item.id)} (${item.rule_id})`;
-        expect(item.data_status, `${what} data status at compute time`).not.toBe('live');
-        expect(item.current.data_status_now, `${what} data status now`).not.toBe('live');
-        expect(hasSimulatedFlag(item), `${what} carries the ${SIMULATED_FLAG_CODE} flag`).toBe(
-          true,
-        );
-      }
+    await test.step('the API reports every recommendation as simulated', async () => {
+      await expect(async () => {
+        const recommendations = await getJson<RecommendationsPage>(page, RECOMMENDATIONS_PATH);
+        expect(
+          recommendations.sections.map((section) => section.key),
+          `${RECOMMENDATIONS_PATH} returns the five sections in order`,
+        ).toEqual(SECTION_KEYS);
+        // Every item, including those feedback hides now, which the page only counts.
+        const items = allItems(recommendations);
+        expect(items.length, 'the latest default run has recommendations').toBeGreaterThan(0);
+        for (const item of items) {
+          const what = describeItem(item);
+          expect(item.data_status, `${what} data status at compute time`).not.toBe('live');
+          expect(item.current.data_status_now, `${what} data status now`).not.toBe('live');
+          expect(hasSimulatedFlag(item), `${what} carries the ${SIMULATED_FLAG_CODE} flag`).toBe(
+            true,
+          );
+        }
+      }).toPass(SETTLE);
+    });
 
-      await page.goto(ACTIONS_PATH);
-      await expect(pageTitle(page, 'Actions')).toBeVisible();
+    // One step per section, each with its own retry: a rerun that replaces the run while a
+    // section is read only repeats that section, with a fresh read and a fresh page.
+    let checked = 0;
+    for (const key of SECTION_KEYS) {
+      await test.step(`every ${key} item on /actions shows its own "${SIMULATED_FLAG_TEXT}" label`, async () => {
+        let sectionChecked = 0;
+        await expect(async () => {
+          const recommendations = await getJson<RecommendationsPage>(page, RECOMMENDATIONS_PATH);
+          const section = sectionOf(recommendations, key);
+          const expected = section.groups.reduce((sum, group) => sum + allShown(group).length, 0);
 
-      // The "Simulated data" badge in a card's own flags row, so no other text on the card can
-      // stand in for it.
-      const simulatedBadge = page
-        .getByRole('list', { name: 'Flags', exact: true })
-        .getByText(SIMULATED_FLAG_TEXT);
-      let checked = 0;
-      for (const section of recommendations.sections) {
-        const region = page.locator(`#section-${section.key}`);
-        await expect(region, `the ${section.key} section is shown`).toBeVisible();
-        // Held cards sit in a collapsed disclosure and keyword cards outside the selected tab
-        // in a hidden panel; only the cards on screen are checked.
-        const cards = region.locator(CARD_SELECTOR).filter({ visible: true });
-        const count = await cards.count();
-        await expect(
-          cards.filter({ hasNot: simulatedBadge }),
-          `every visible ${section.key} card shows "${SIMULATED_FLAG_TEXT}"`,
-        ).toHaveCount(0);
-        checked += count;
-      }
-      expect(checked, 'at least one recommendation card is visible').toBeGreaterThan(0);
-    }).toPass(SETTLE);
+          await page.goto(ACTIONS_PATH);
+          await expect(pageTitle(page, 'Actions')).toBeVisible();
+          const region = page.locator(`#section-${key}`);
+          await expect(region, `the ${key} section is shown`).toBeVisible();
+
+          sectionChecked = await checkSection(region, section);
+          expect(
+            sectionChecked,
+            `every ${key} item not hidden by feedback is found and checked on the page`,
+          ).toBe(expected);
+        }).toPass(SETTLE);
+        checked += sectionChecked;
+      });
+    }
+    expect(checked, 'at least one item is shown on /actions').toBeGreaterThan(0);
   });
 
   test('the Sources page shows each source as Simulated with its reason', async ({ page }) => {

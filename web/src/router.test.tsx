@@ -2,11 +2,13 @@
  * Tests for `src/router.tsx`, the SPA's route tree, auth guard and authenticated app layout
  * (AAP 0.5.5 routes; AAP 0.1.1 "The UI requires a login"; AAP 0.5.3 session endpoints).
  *
- * Each test builds the real app router with `createAppRouter` on a memory history and renders it
- * inside a `QueryClientProvider` of the same {@link createQueryClient}, exactly as `src/main.tsx`
- * does. The network is stubbed with `./test/mockApi`, so the real API client and
- * TanStack Query hooks run, and every request a screen makes must be answered. The cases cover
- * the module's TSDoc contract:
+ * Most tests build the real app router with `createAppRouter` on a memory history and render it
+ * inside a `QueryClientProvider` of the same {@link createQueryClient}, as `src/main.tsx` renders
+ * them, but on a client without main's error callbacks. The expired-session block instead boots
+ * `src/main.tsx` itself, on the browser history, because those callbacks are what it tests. The
+ * network is stubbed with `./test/mockApi`, so the real API client and TanStack Query hooks run,
+ * and every request a screen makes must be answered. The cases cover the module's TSDoc contract
+ * and the session expiry `src/main.tsx` wires into the query client:
  *
  * - **Auth guard**: a 401 from `GET /auth/me` redirects to `/login` carrying the requested href
  *   (path, search and hash) as `redirect`, and sign-in returns there without asking
@@ -26,6 +28,11 @@
  *   polite status region mounted with the layout, and returns focus to the button only when focus
  *   had fallen to `<body>`.
  * - **Focus after navigation**: focus moves to `<main>` only when the focused control was removed.
+ * - **Expired session** (`src/main.tsx`): once signed in, a 401 from a protected read or from a
+ *   mutation ("Sync now") clears the cache and opens `/login` once, carrying the current href
+ *   (path, search and hash) as `redirect`, and sign-in returns there and reads the data again; a
+ *   wrong password on that form keeps it, with the same `redirect`; the guard's own
+ *   `GET /auth/me` 401 is left to the guard, so a signed-out visit redirects once.
  */
 // mockApi registers an afterEach hook that fails a test with an unmatched request. Vitest skips
 // the remaining afterEach hooks once one throws and runs them in reverse order of registration,
@@ -35,14 +42,60 @@ import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from './test/m
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createMemoryHistory } from '@tanstack/react-router';
+import type { RouterProps } from '@tanstack/react-router';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { RenderResult } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { StrictMode, isValidElement } from 'react';
+import type { ComponentType, ExoticComponent, ReactNode } from 'react';
+import type * as ReactDomClient from 'react-dom/client';
+import type { Container, Root, RootOptions } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from './api/queries';
 import { createAppRouter } from './router';
 import type { AppRouter } from './router';
 import { makeConfig, makeMe, makeRun, makeSources } from './test/fixtures';
+
+/** One root created through the `react-dom/client` wrapper below, with what it was given. */
+interface CapturedRoot {
+  /** The real root `react-dom/client` created. */
+  readonly root: Root;
+  /** The node the root renders into. */
+  readonly container: Container;
+  /** The node last passed to `render`; `undefined` until the first call. */
+  element: ReactNode;
+}
+
+/**
+ * Every root created through the wrapper since the last teardown, in creation order. Only
+ * `src/main.tsx`, which the expired-session block evaluates, creates roots through it: Testing
+ * Library loads `react-dom/client` from `node_modules` itself, outside Vitest's module mocks.
+ */
+const createdRoots = vi.hoisted((): CapturedRoot[] => []);
+
+// A transparent wrapper: each root is the real one, and the wrapper only records the root, its
+// container and what it renders, so the expired-session block can read back the query client
+// and router that src/main.tsx built. Nothing else in this file renders through it.
+vi.mock('react-dom/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof ReactDomClient>();
+  return {
+    ...actual,
+    createRoot: (container: Container, options?: RootOptions): Root => {
+      const root = actual.createRoot(container, options);
+      const captured: CapturedRoot = { root, container, element: undefined };
+      createdRoots.push(captured);
+      return {
+        render: (children: ReactNode): void => {
+          captured.element = children;
+          root.render(children);
+        },
+        unmount: (): void => {
+          root.unmount();
+        },
+      };
+    },
+  };
+});
 
 // ---------------------------------------------------------------------------------------------
 // Harness
@@ -57,6 +110,9 @@ import { makeConfig, makeMe, makeRun, makeSources } from './test/fixtures';
  *   once instead of after the hooks' backoff.
  * - `gcTime: Infinity` starts no garbage-collection timer that could outlive the test.
  * - `staleTime: 0` and no refetch on window focus keep every request one the test caused.
+ * - It has none of main's `QueryCache` and `MutationCache` error callbacks, so a 401 from a
+ *   screen's read or write redirects nowhere here; the expired-session block boots `src/main.tsx`
+ *   for those.
  *
  * @returns A fresh client.
  */
@@ -998,5 +1054,308 @@ describe('focus after navigation', () => {
     await waitForPath(router, '/settings');
     expect(document.activeElement).toBe(link);
     expect(link.getAttribute('aria-current')).toBe('page');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Expired session, through the production bootstrap
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What one {@link bootMain} call started besides its root, filled in as the boot proceeds, so
+ * the teardown stops whatever a failed boot got as far as starting.
+ */
+interface MainBoot {
+  /** The `<div id="root">` the boot appended to `<body>`. */
+  readonly container: HTMLElement;
+  /** main's router, once read back. Its browser history patches `window.history`. */
+  router?: AppRouter;
+  /** main's query client, once read back. */
+  queryClient?: QueryClient;
+}
+
+/** The boots of the running test, stopped by the expired-session block's afterEach. */
+const mainBoots: MainBoot[] = [];
+
+/** What {@link bootMain} returns: the objects `src/main.tsx` built, not copies of them. */
+interface BootedApp {
+  /** main's one query client, with its QueryCache and MutationCache error callbacks. */
+  queryClient: QueryClient;
+  /** main's router, on the browser history, so `window.location` is the app's address. */
+  router: AppRouter;
+}
+
+/**
+ * The props of `node`, which must be an element of `type`; how the boot reads back the tree
+ * `src/main.tsx` rendered.
+ *
+ * @param node - A node main rendered.
+ * @param type - The component `node` must be an element of.
+ * @param name - The component's name, for the failure message.
+ * @returns The element's props.
+ * @throws Error when `node` is not an element of `type`.
+ */
+function propsOf<P>(node: ReactNode, type: ComponentType<P> | ExoticComponent<P>, name: string): P {
+  if (!isValidElement<P>(node) || node.type !== type) {
+    throw new Error(`src/main.tsx did not render a ${name} element where one was expected`);
+  }
+  return node.props;
+}
+
+/**
+ * Starts the SPA as `web/index.html` does: opens `href` in the browser history, appends
+ * `<div id="root">` and evaluates `src/main.tsx`, then reads back main's query client and router
+ * from the element it rendered (`StrictMode`, `QueryClientProvider`, `RouterProvider`).
+ *
+ * @param href - The address the browser opens, search and hash included.
+ * @returns main's query client and router.
+ */
+async function bootMain(href: string): Promise<BootedApp> {
+  window.history.replaceState(null, '', href);
+  const container = document.createElement('div');
+  container.id = 'root';
+  document.body.append(container);
+  const boot: MainBoot = { container };
+  mainBoots.push(boot);
+  const before = createdRoots.length;
+
+  // main.tsx has no suite of its own and exports nothing: its session-expiry callbacks live in
+  // the query client it builds, so this suite evaluates the module itself. A fresh registry
+  // gives each boot its own client and router; React and TanStack load from node_modules,
+  // outside the registry, so the app shares Testing Library's React.
+  vi.resetModules();
+  await act(async () => {
+    await import('./main');
+  });
+
+  const created = createdRoots.slice(before);
+  expect(created).toHaveLength(1);
+  const [captured] = created;
+  if (captured === undefined) {
+    throw new Error('src/main.tsx created no root');
+  }
+  expect(captured.container).toBe(container);
+  const strict = propsOf(captured.element, StrictMode, 'StrictMode');
+  const provider = propsOf(strict.children, QueryClientProvider, 'QueryClientProvider');
+  const { router } = propsOf<RouterProps<AppRouter>>(
+    provider.children,
+    RouterProvider,
+    'RouterProvider',
+  );
+  boot.router = router;
+  boot.queryClient = provider.client;
+  expect(router.options.context.queryClient).toBe(provider.client);
+  return { queryClient: provider.client, router };
+}
+
+/** The API's answer once the session has ended: 401 `unauthenticated`. */
+const EXPIRED = apiError(401, 'unauthenticated', 'Not signed in');
+
+/**
+ * The API after the session has ended: `GET /auth/me` and every read of the four screens answer
+ * 401 `unauthenticated`, as every endpoint but `POST /auth/login` and `GET /healthz` does
+ * without a valid session cookie (AAP 0.5.3).
+ *
+ * @returns Fresh handlers for one test.
+ */
+function expiredSession(): MockHandlers {
+  const keys = Object.keys({ ...pageReads(), ...SIGNED_OUT });
+  return Object.fromEntries(keys.map((key) => [key, EXPIRED]));
+}
+
+/**
+ * How long, in milliseconds, {@link settle} lets the app run: many round trips through the
+ * stub, which answers within a few event-loop turns, so a redirect or request loop shows.
+ */
+const SETTLE_MS = 200;
+
+/** Lets the app run for {@link SETTLE_MS}, so a test can then check that nothing else happened. */
+async function settle(): Promise<void> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, SETTLE_MS);
+      }),
+  );
+}
+
+/**
+ * Waits for the sign-in form at `/login?redirect=<href>`, idle, and checks the address in the
+ * router's state and in the browser alike. The whole href, its hash included, travels inside
+ * the `redirect` value, so the browser's address carries no hash of its own.
+ *
+ * @param router - main's router.
+ * @param href - The href the redirect must carry: path, search and hash.
+ */
+async function expectSignInFor(router: AppRouter, href: string): Promise<void> {
+  await waitForPath(router, '/login');
+  await findTitle('Sign in');
+  expect(router.state.location.search).toEqual({ redirect: href });
+  expect(window.location.pathname).toBe('/login');
+  expect(new URLSearchParams(window.location.search).get('redirect')).toBe(href);
+  expect(window.location.hash).toBe('');
+}
+
+/**
+ * The browser's address, as the app's router wrote it: path, search and hash.
+ *
+ * @returns `location.pathname`, `location.search` and `location.hash`, joined.
+ */
+function browserHref(): string {
+  return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+}
+
+/**
+ * Checks that no data of the ended session is left in main's cache: no query holds data, and
+ * no mutation is kept. A screen still mounted during the redirect may re-create a query, but
+ * only to receive the 401 of the ended session.
+ *
+ * @param queryClient - main's query client.
+ */
+function expectNoSessionData(queryClient: QueryClient): void {
+  expect(queryClient.getQueryData(queryKeys.me)).toBeUndefined();
+  const withData = queryClient
+    .getQueryCache()
+    .getAll()
+    .filter((query) => query.state.data !== undefined);
+  expect(withData.map((query) => query.queryKey)).toEqual([]);
+  expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
+}
+
+describe('expired session, through the production bootstrap (src/main.tsx)', () => {
+  // Registered inside this block, so it runs before the file-level hooks: mockApi's, which can
+  // throw and skip the hooks after it and which removes the network stub, and Testing
+  // Library's cleanup, which knows nothing of main's root.
+  afterEach(() => {
+    act(() => {
+      for (const { root } of createdRoots.splice(0).reverse()) {
+        root.unmount();
+      }
+    });
+    for (const boot of mainBoots.splice(0).reverse()) {
+      boot.container.remove();
+      boot.router?.history.destroy();
+      boot.queryClient?.clear();
+    }
+    window.history.replaceState(null, '', '/');
+  });
+
+  /** A custom run's section: the href an expired read or a sign-in must keep, search and hash. */
+  const RUN_HREF = '/actions?run=202#section-budget';
+
+  it('sends a signed-in user whose read gets a 401 to sign in, then back to the same href', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { queryClient, router } = await bootMain('/settings');
+    await findTitle('Settings');
+    await waitForPath(router, '/settings');
+    expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
+    expect(queryClient.getQueryData(queryKeys.config)).toEqual(makeConfig());
+
+    const historyLength = window.history.length;
+
+    // The session ends while the tab is open; the next screen's reads get the API's 401.
+    api.use(expiredSession());
+    await act(() =>
+      router.navigate({ to: '/actions', search: { run: 202 }, hash: 'section-budget' }),
+    );
+
+    await expectSignInFor(router, RUN_HREF);
+    // The custom run's own read was among those refused.
+    const runReads = callsTo(api, 'GET', '/recommendations');
+    expect(runReads.length).toBeGreaterThan(0);
+    expect(runReads.every((call) => call.search.get('run_id') === '202')).toBe(true);
+    expectNoSessionData(queryClient);
+    // The custom run's entry, then one redirect: the 401s after the first find the app on
+    // /login already.
+    expect(window.history.length).toBe(historyLength + 2);
+    // No loop: once the form shows, the app stops asking the API.
+    await settle();
+    const settled = api.calls.length;
+    await settle();
+    expect(api.calls).toHaveLength(settled);
+    expect(router.state.location.search).toEqual({ redirect: RUN_HREF });
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+    const configReads = callsTo(api, 'GET', '/config').length;
+    api.use({ ...pageReads(), ...SIGNED_IN, ...LOGIN_OK });
+    signIn();
+
+    await findTitle('Actions');
+    await screen.findByText('Run not found');
+    await waitForPath(router, '/actions');
+    expect(router.state.location.href).toBe(RUN_HREF);
+    expect(browserHref()).toBe(RUN_HREF);
+    // Sign-in replaced /login, so Back does not return to the form.
+    expect(window.history.length).toBe(historyLength + 2);
+    expect(callsTo(api, 'POST', '/auth/login')).toHaveLength(1);
+    // Sign-in seeded the user, so the guard asked nothing; the configuration, fresh in the
+    // cache before the session ended, is read again because the cache was cleared.
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    expect(callsTo(api, 'GET', '/config').length).toBeGreaterThan(configReads);
+    expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
+  });
+
+  it('sends a user whose "Sync now" gets a 401 to sign in with the current href', async () => {
+    // `/sources` declares no search, so the router keeps whatever search it is given; the
+    // redirect must carry it, with the hash.
+    const href = '/sources?source=google#recent-runs';
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { queryClient, router } = await bootMain(href);
+    const google = await screen.findByRole('region', { name: 'Google' });
+    await waitForPath(router, '/sources');
+    expect(router.state.location.href).toBe(href);
+    expect(queryClient.getQueryData(queryKeys.sources)).toEqual(makeSources());
+    const historyLength = window.history.length;
+
+    api.use({ ...expiredSession(), 'POST /sources/:source/sync': EXPIRED });
+    fireEvent.click(within(google).getByRole('button', { name: 'Sync now' }));
+
+    await expectSignInFor(router, href);
+    expect(callsTo(api, 'POST', '/sources/google/sync')).toHaveLength(1);
+    expectNoSessionData(queryClient);
+    expect(window.history.length).toBe(historyLength + 1);
+    expect(screen.queryByRole('region', { name: 'Google' })).toBeNull();
+  });
+
+  it('keeps a failed sign-in after an expired session on /login, with the same redirect', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { router } = await bootMain('/settings');
+    await findTitle('Settings');
+    api.use(expiredSession());
+    fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Decisions' }));
+    await expectSignInFor(router, '/decisions');
+    const loginHref = browserHref();
+    const historyLength = window.history.length;
+
+    api.use({
+      'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
+    });
+    signIn();
+
+    // The form shows the failure itself: at the top and under the password field.
+    expect(await screen.findAllByText('Email or password is incorrect')).toHaveLength(2);
+    await settle();
+    await waitForPath(router, '/login');
+    expect(router.state.location.search).toEqual({ redirect: '/decisions' });
+    // No navigation at all: a 401 on /login is a wrong password, not an expired session.
+    expect(browserHref()).toBe(loginHref);
+    expect(window.history.length).toBe(historyLength);
+    expect(callsTo(api, 'POST', '/auth/login')).toHaveLength(1);
+    expect(screen.getByRole('heading', { level: 1, name: 'Sign in' })).toBeTruthy();
+  });
+
+  it('leaves a GET /auth/me 401 to the guard: one replacing redirect carrying the href', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const historyLength = window.history.length;
+    const { router } = await bootMain(RUN_HREF);
+
+    await expectSignInFor(router, RUN_HREF);
+    await settle();
+    // The guard's redirect replaces the entry it refused; a second redirect from the cache's
+    // error handler would push another.
+    expect(window.history.length).toBe(historyLength);
+    expect(router.state.location.search).toEqual({ redirect: RUN_HREF });
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    expect(callsTo(api, 'GET', '/recommendations')).toHaveLength(0);
   });
 });

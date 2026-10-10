@@ -6,7 +6,7 @@
  * With no source credentials the worker resolves every source to simulated ("credentials not
  * configured"), builds and backfills the simulated datasets and runs the default analysis, and
  * the admin signs in and sees `/actions` with all five sections populated on simulated data.
- * This spec is the CI proof of that path, in one test:
+ * This spec is the CI proof of that path. Its first test walks the path itself:
  *
  * 1. **Unauthenticated redirect**: the browser starts with no session, and `/actions` sends it
  *    to the sign-in page (`src/router.tsx`, `/login?redirect=…`).
@@ -20,14 +20,38 @@
  * 4. **Five populated sections**: the sections render in the user's order (`section-keywords`,
  *    `section-campaigns`, `section-budget`, `section-creative`, `section-white_papers`), titled as
  *    the API titles them, and every one shows at least one action: its "Sections" navigation
- *    link counts one or more items and it shows no "No actions in this section" notice.
+ *    link counts one or more items, it shows no "No actions in this section" notice, and it
+ *    renders an action that matches the same `GET /recommendations` read. Where only held
+ *    actions exist, the "Held until discrepancies are resolved" list is opened first.
+ *    - Keywords, Campaigns, Budget and Copy/creative: the first visible card
+ *      (`<article id="item-{id}">`) is an item of that section that feedback does not hide,
+ *      headed with the item's action and showing its entity line, "{name} · {Source}".
+ *    - White papers: the first visible asset row names an asset of the section that feedback
+ *      does not hide, its Action cell reads that asset's action and every cell holds a value;
+ *      its "Details for {asset}" toggle opens the "Per creative: {asset}" table with at least
+ *      one creative row.
  * 5. **Simulated labelling**: at least one source chip in the status bar reads "Simulated".
+ *
+ * Its second test, declared after the first so the first-start sign-in is never preceded by a
+ * refused one, proves that a wrong password signs nobody in (CWE-20 browser coverage). From a
+ * signed-out browser on `/login`, it enters the admin email and a password generated at run time
+ * (`wrong-{UUID}`, checked to differ from `E2E_ADMIN_PASSWORD`). `POST /api/v1/auth/login`
+ * answers 401 `invalid_credentials`, and the page stays on `/login`. The page shows "Email or
+ * password is incorrect" as the form's banner and as the Password field's error, with the field
+ * marked invalid, cleared and focused, and the email kept. There is no "Sign out"; `/auth/me`
+ * still answers 401, and a new page of the same browser opening `/actions` is sent to `/login`.
+ * The correct password, entered on the same form, then opens `/actions` with a session
+ * `/auth/me` names. The test never signs out, because sign-out revokes every session, the one
+ * `auth.setup.ts` saved for the other specs included.
  *
  * Harness (`playwright.config.ts`): the spec runs in the `chromium` project, whose specs normally
  * start from the session `auth.setup.ts` saved. This file alone overrides that with an empty
- * storage state, because the first-start sign-in is what it asserts. The API accepts 5 sign-in
- * attempts per minute per IP, so the test signs in exactly once per attempt; with the setup
- * project and one CI retry a run stays at four sign-ins at most.
+ * storage state, because the first-start sign-in is what it asserts. The API counts every
+ * sign-in attempt per IP, refused ones included, and answers the 6th within 60 s with 429. The
+ * first-start test makes 1 attempt and the wrong-password test 2, so with the setup project's 1
+ * a run without retries makes 4. A CI retry repeats a failed test's attempts (up to 8 in one
+ * run), and a second run started within a minute adds its own, so either can get 429: wait a
+ * minute before running the suite again. A sign-in answered 429 fails with that cause.
  *
  * Nothing the seeded world contains is written here: titles, counts, window lengths and entity
  * names all come from the API or the page. The only literals are the fixed UI texts and the
@@ -42,10 +66,20 @@
  *
  * @packageDocumentation
  */
+import { randomUUID } from 'node:crypto';
 import { errors, expect, test } from '@playwright/test';
-import type { Locator, Page } from '@playwright/test';
+import type { Locator, Page, Response } from '@playwright/test';
 
-import type { Me, RecommendationsPage, Run, Section, SectionKey } from '../../src/api/types';
+import type {
+  ErrorResponse,
+  Item,
+  Me,
+  RecommendationsPage,
+  Run,
+  Section,
+  SectionKey,
+  SourceName,
+} from '../../src/api/types';
 
 // ---------------------------------------------------------------------------------------------
 // Timing
@@ -94,6 +128,12 @@ const SETTLE = { timeout: 120_000, intervals: [5_000, 10_000] };
 /** The signed-in user; 401 without a valid session cookie. */
 const ME_PATH = '/api/v1/auth/me';
 
+/** The sign-in the form posts; each call is one attempt against the 5-per-minute limit. */
+const LOGIN_API_PATH = '/api/v1/auth/login';
+
+/** The error code of a refused sign-in, for an unknown email and a wrong password alike. */
+const INVALID_CREDENTIALS_CODE = 'invalid_credentials';
+
 /** The latest succeeded default run; 404 `not_found` until the first one has succeeded. */
 const RUNS_LATEST_PATH = '/api/v1/runs/latest';
 
@@ -117,6 +157,15 @@ const SIGN_IN_LABEL = 'Sign in';
 /** The top bar's sign-out button (`src/router.tsx`). */
 const SIGN_OUT_LABEL = 'Sign out';
 
+/**
+ * The sign-in page's message for 401 `invalid_credentials` (`LoginPage.tsx`): it heads the form
+ * and describes the Password field.
+ */
+const INVALID_CREDENTIALS_MESSAGE = 'Email or password is incorrect';
+
+/** The start of the wrong password generated at run time; the rest is a random UUID. */
+const WRONG_PASSWORD_PREFIX = 'wrong-';
+
 /** The Actions page's level-1 heading, rendered in every state of the page. */
 const ACTIONS_TITLE = 'Actions';
 
@@ -134,6 +183,43 @@ const SOURCE_CHIPS_LABEL = 'Data sources';
 
 /** The mode chip of a simulated source. */
 const SIMULATED_CHIP = 'Simulated';
+
+/**
+ * A recommendation card: the `<article id="item-{id}">` `RecommendationCard.tsx` renders, named
+ * by its heading, whose text is the item's action (`Card.tsx`).
+ */
+const CARD_SELECTOR = 'article[id^="item-"]';
+
+/** The toggle of a collapsed held list, "Held until discrepancies are resolved ({count})". */
+const HELD_DISCLOSURE = /^Held until discrepancies are resolved/u;
+
+/** The start of a white-paper row's toggle, "Details for {asset}" (`WhitePapersSection.tsx`). */
+const ASSET_TOGGLE_PREFIX = 'Details for ';
+
+/** A white-paper row's toggle, matched by its accessible name. */
+const ASSET_TOGGLE = /^Details for /u;
+
+/** The start of an expanded white-paper row's table caption, "Per creative: {asset}". */
+const PER_CREATIVE_CAPTION_PREFIX = 'Per creative: ';
+
+/** The badge a white-paper row computed from replaced data shows beside its action. */
+const HISTORICAL_LABEL = 'Computed from replaced data';
+
+/**
+ * The cells of a white-paper row besides its Asset row header: the "Details for" toggle, the
+ * nine figure columns between Asset and Action (spend through cost per meeting), and Action.
+ */
+const ASSET_ROW_CELL_COUNT = 1 + 9 + 1;
+
+/** The separator of a card header's entity line, "{entity name} · {Source}". */
+const ENTITY_LINE_SEPARATOR = ' · ';
+
+/** The display name of each source (`sourceLabel` in `src/lib/format.ts`). */
+const SOURCE_LABELS: Readonly<Record<SourceName, string>> = {
+  google: 'Google',
+  linkedin: 'LinkedIn',
+  hubspot: 'HubSpot',
+};
 
 /** The five sections in the order the user specified (AAP 0.5.5). */
 const SECTION_KEYS: readonly SectionKey[] = [
@@ -250,6 +336,35 @@ async function fieldDescription(field: Locator): Promise<string> {
 }
 
 /**
+ * Clicks "Sign in" and returns the answer to the `POST /api/v1/auth/login` the click sends. The
+ * wait is armed before the click, so a quick answer is never missed. A 429 fails at once with
+ * its cause, so a used-up login limit is never mistaken for a wrong outcome of the sign-in.
+ *
+ * @param page - The page showing the sign-in form, both fields filled.
+ * @param attempt - What the attempt is, for example "The wrong-password sign-in", for messages.
+ * @returns The login response.
+ * @throws Error when the API answers 429 `rate_limited`.
+ */
+async function submitSignIn(page: Page, attempt: string): Promise<Response> {
+  const answered = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' &&
+      new URL(response.url()).pathname === LOGIN_API_PATH,
+    { timeout: SIGN_IN_TIMEOUT_MS },
+  );
+  await page.getByRole('button', { name: SIGN_IN_LABEL, exact: true }).click();
+  const response = await answered;
+  if (response.status() === 429) {
+    throw new Error(
+      `${attempt} was answered 429: the API's login limit of 5 attempts per minute per IP is ` +
+        'used up, by this run, a retry or another run within the last minute. Wait a minute ' +
+        'before running the suite again.',
+    );
+  }
+  return response;
+}
+
+/**
  * Waits for `locator` to leave the page, and reports whether it did in time. Only a timeout is
  * reported as `false`; any other failure, such as a closed page, is rethrown.
  *
@@ -319,6 +434,256 @@ async function sectionNavCount(page: Page, key: SectionKey): Promise<number> {
     throw new Error(`The "${key}" section link "${text}" shows no item count`);
   }
   return Number.parseInt(digits.replaceAll(',', ''), 10);
+}
+
+/** Every item of a section, in group order, hidden ones included. */
+function allItems(section: Section): Item[] {
+  return section.groups.flatMap((group) => group.items);
+}
+
+/** Whether feedback given since the run hides the item now (`current.hidden_by`). */
+function isHidden(item: Item): boolean {
+  return item.current.hidden_by !== null && item.current.hidden_by !== undefined;
+}
+
+/**
+ * `text` with each run of whitespace collapsed to one space and its ends trimmed, the way
+ * Playwright compares text, so texts read from the page compare with texts from the API.
+ */
+function normalizeText(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim();
+}
+
+/** An attribute selector matching `value` exactly, whatever characters it holds. */
+function attributeSelector(attribute: string, value: string): string {
+  return `[${attribute}=${JSON.stringify(value)}]`;
+}
+
+/** The display name of a source, or the raw value for a source this spec does not know. */
+function sourceLabel(source: SourceName): string {
+  return Object.hasOwn(SOURCE_LABELS, source) ? SOURCE_LABELS[source] : String(source);
+}
+
+/**
+ * The entity line a card's header shows (`entityLine` in `RecommendationCard.tsx`): the trimmed
+ * entity name and the source's display name, joined by " · ", leaving out a part the entity does
+ * not carry.
+ *
+ * @param item - The card's item.
+ * @returns The line, or an empty string when the entity has neither part and the card shows none.
+ */
+function entityLine(item: Item): string {
+  const name = item.entity.name?.trim() ?? '';
+  const source = item.entity.source ? sourceLabel(item.entity.source) : '';
+  return [name, source].filter((part) => part !== '').join(ENTITY_LINE_SEPARATOR);
+}
+
+/**
+ * The name a white-paper row shows (`assetName` in `WhitePapersSection.tsx`): the entity name,
+ * else its id, else "White paper {item id}", so a row is never unnamed.
+ *
+ * @param item - The white-paper item.
+ * @returns The asset's display name.
+ */
+function assetName(item: Item): string {
+  const name = item.entity.name?.trim() ?? '';
+  if (name !== '') {
+    return name;
+  }
+  const id = item.entity.id?.trim() ?? '';
+  return id !== '' ? id : `White paper ${String(item.id)}`;
+}
+
+/**
+ * Whether a white-paper row's Action cell shows `item`'s action: exactly the action, or, on a row
+ * computed from replaced data, the action followed by its "Computed from replaced data" badge.
+ *
+ * @param item - A white-paper item of the API's section.
+ * @param cellText - The Action cell's text, whitespace-normalized.
+ * @returns `true` when the cell renders this item's action.
+ */
+function showsAction(item: Item, cellText: string): boolean {
+  const action = normalizeText(item.action);
+  if (!item.current.historical) {
+    return cellText === action;
+  }
+  return cellText.startsWith(action) && cellText.endsWith(HISTORICAL_LABEL);
+}
+
+/**
+ * The item id of a card's element id, `item-{id}`.
+ *
+ * @param elementId - The card's `id` attribute.
+ * @returns The item id.
+ * @throws Error when the id is not a recommendation card id.
+ */
+function cardItemId(elementId: string | null): number {
+  const digits = /^item-(\d+)$/u.exec(elementId ?? '')?.[1];
+  if (digits === undefined) {
+    throw new Error(`"${String(elementId)}" is not a recommendation card id`);
+  }
+  return Number.parseInt(digits, 10);
+}
+
+/**
+ * Expands every collapsed "Held until discrepancies are resolved" list shown in `region`, so the
+ * held cards or rows it holds mount and become visible: `HeldDisclosure` mounts its content the
+ * first time it opens. Each toggle is pinned by its `aria-controls` id before it is clicked,
+ * because a locator filtered on `expanded: false` moves to the next toggle once one opens.
+ *
+ * @param region - A section's region.
+ */
+async function expandHeld(region: Locator): Promise<void> {
+  const ids = await region
+    .getByRole('button', { name: HELD_DISCLOSURE, expanded: false })
+    .evaluateAll((toggles) => toggles.map((toggle) => toggle.getAttribute('aria-controls') ?? ''));
+  for (const id of ids.filter((value) => value !== '')) {
+    const toggle = region.locator(attributeSelector('aria-controls', id));
+    await toggle.click({ timeout: READ_TIMEOUT_MS });
+    await expect(toggle, `the held list "${id}" opens`).toHaveAttribute('aria-expanded', 'true', {
+      timeout: READ_TIMEOUT_MS,
+    });
+  }
+}
+
+/**
+ * Asserts that a card section renders an action as a card that matches the API. The first
+ * visible card, or the first held one when only held cards exist, must be an item of this
+ * section that feedback does not hide, headed with the item's action and showing its entity
+ * line. Keywords selects the first tab with a card (`defaultTabKey` in `KeywordsSection.tsx`),
+ * so its first visible card sits in the open tab.
+ *
+ * @param region - The section's region, `#section-{key}`.
+ * @param section - The same section of the `GET /recommendations` read the page is compared to.
+ * @param runLabel - "run {id}" of that read, for the failure messages.
+ */
+async function expectRenderedCard(
+  region: Locator,
+  section: Section,
+  runLabel: string,
+): Promise<void> {
+  const title = section.title.trim();
+  const cards = region.locator(CARD_SELECTOR).filter({ visible: true });
+  if ((await cards.count()) === 0) {
+    await expandHeld(region);
+  }
+  const card = cards.first();
+  await expect(card, `the "${title}" section of ${runLabel} renders an action card`).toBeVisible({
+    timeout: READ_TIMEOUT_MS,
+  });
+
+  const id = cardItemId(await card.getAttribute('id', { timeout: READ_TIMEOUT_MS }));
+  const label = `card item-${String(id)} of the "${title}" section in ${runLabel}`;
+  const item = allItems(section).find((candidate) => candidate.id === id);
+  if (item === undefined) {
+    throw new Error(`The ${label} is not an item of that section; a rerun may have replaced it`);
+  }
+  expect(isHidden(item), `the ${label} is not hidden by feedback`).toBe(false);
+  await expect(card, `the ${label} is headed with its action`).toHaveAccessibleName(
+    item.action.trim(),
+    { timeout: READ_TIMEOUT_MS },
+  );
+  // An entity with neither a name nor a source gives the header no entity line to compare.
+  const line = entityLine(item);
+  if (line !== '') {
+    await expect(
+      card.getByText(line, { exact: true }).first(),
+      `the ${label} names its entity "${line}"`,
+    ).toBeVisible({ timeout: READ_TIMEOUT_MS });
+  }
+}
+
+/**
+ * Asserts that the White papers section renders an asset row that matches the API and reveals
+ * its per-creative breakdown. The first visible row with a "Details for {asset}" toggle, or the
+ * first held one when only held rows exist, must name an asset of this section that feedback
+ * does not hide, with that asset's action in its Action cell and text in every cell; expanding
+ * it must show the "Per creative: {asset}" table with at least one creative row.
+ *
+ * @param page - The test's page.
+ * @param region - The section's region, `#section-white_papers`.
+ * @param section - The same section of the `GET /recommendations` read the page is compared to.
+ * @param runLabel - "run {id}" of that read, for the failure messages.
+ */
+async function expectRenderedAssetRow(
+  page: Page,
+  region: Locator,
+  section: Section,
+  runLabel: string,
+): Promise<void> {
+  const title = section.title.trim();
+  const rows = region
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: ASSET_TOGGLE }) })
+    .filter({ visible: true });
+  if ((await rows.count()) === 0) {
+    await expandHeld(region);
+  }
+  const row = rows.first();
+  await expect(row, `the "${title}" section of ${runLabel} renders an asset row`).toBeVisible({
+    timeout: READ_TIMEOUT_MS,
+  });
+
+  const toggle = row.getByRole('button', { name: ASSET_TOGGLE });
+  const toggleText = normalizeText((await toggle.textContent({ timeout: READ_TIMEOUT_MS })) ?? '');
+  const name = toggleText.slice(ASSET_TOGGLE_PREFIX.length);
+  const cells = row.getByRole('cell');
+  const actionText = normalizeText(
+    (await cells.last().textContent({ timeout: READ_TIMEOUT_MS })) ?? '',
+  );
+  const item = allItems(section).find(
+    (candidate) =>
+      !isHidden(candidate) &&
+      normalizeText(assetName(candidate)) === name &&
+      showsAction(candidate, actionText),
+  );
+  if (item === undefined) {
+    throw new Error(
+      `The "${title}" section of ${runLabel} shows the asset row "${name}" with the action ` +
+        `"${actionText}", which is no white paper of that section that feedback does not hide`,
+    );
+  }
+  const label =
+    `asset row item ${String(item.id)} ("${name}") of the "${title}" section in ` + runLabel;
+
+  await expect(cells, `the ${label} has its toggle, figure and Action cells`).toHaveCount(
+    ASSET_ROW_CELL_COUNT,
+    { timeout: READ_TIMEOUT_MS },
+  );
+  const cellTexts = (await cells.allTextContents()).map(normalizeText);
+  expect(
+    cellTexts.flatMap((text, index) => (text === '' ? [index + 1] : [])),
+    `every cell of the ${label} shows a value (blank cells listed by position)`,
+  ).toEqual([]);
+  const header = row.getByRole('rowheader');
+  await expect(header, `the ${label} has one Asset row header`).toHaveCount(1);
+  await expect(header, `the ${label} is headed with its asset name`).toContainText(name, {
+    timeout: READ_TIMEOUT_MS,
+  });
+
+  // Pinned by its detail id: "expanded: false" would no longer match once the row opens.
+  const detailId = await toggle.getAttribute('aria-controls', { timeout: READ_TIMEOUT_MS });
+  if (detailId === null || detailId === '') {
+    throw new Error(`The toggle of the ${label} controls no detail row`);
+  }
+  const pinned = region.locator(attributeSelector('aria-controls', detailId));
+  await pinned.click({ timeout: READ_TIMEOUT_MS });
+  await expect(pinned, `the ${label} expands`).toHaveAttribute('aria-expanded', 'true', {
+    timeout: READ_TIMEOUT_MS,
+  });
+  const detail = page.locator(attributeSelector('id', detailId));
+  await expect(detail, `the ${label} shows its details`).toBeVisible({ timeout: READ_TIMEOUT_MS });
+  const perCreative = detail.getByRole('table', {
+    name: `${PER_CREATIVE_CAPTION_PREFIX}${name}`,
+    exact: true,
+  });
+  await expect(perCreative, `the ${label} details its creatives`).toBeVisible({
+    timeout: READ_TIMEOUT_MS,
+  });
+  await expect(
+    perCreative.getByRole('rowheader').first(),
+    `the per-creative table of the ${label} lists at least one creative`,
+  ).toBeVisible({ timeout: READ_TIMEOUT_MS });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -484,6 +849,12 @@ test('first start: sign in and see five populated sections on simulated data', a
           region.getByText(EMPTY_SECTION_TITLE, { exact: true }),
           `the "${title}" section is not empty`,
         ).toHaveCount(0, { timeout: READ_TIMEOUT_MS });
+        // The counts above come from the API; the section must also render one of its actions.
+        if (section.key === 'white_papers') {
+          await expectRenderedAssetRow(page, region, section, runLabel);
+        } else {
+          await expectRenderedCard(region, section, runLabel);
+        }
       }
     }).toPass(SETTLE);
   });
@@ -497,5 +868,105 @@ test('first start: sign in and see five populated sections on simulated data', a
       await simulated.count(),
       `at least one source chip reads "${SIMULATED_CHIP}"`,
     ).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// Declared after the first-start test, so that test's sign-in is never preceded by a refused one
+// in this file. Exactly two login attempts: the wrong password, then the right one.
+test('a wrong password is refused, leaves no session, and the correct one then signs in', async ({
+  page,
+}) => {
+  const { email, password } = adminCredentials();
+  // Generated per run, so no password is written in the repository. The check compares the two
+  // without printing either.
+  const wrongPassword = `${WRONG_PASSWORD_PREFIX}${randomUUID()}`;
+  expect(
+    wrongPassword === password,
+    'the generated wrong password differs from E2E_ADMIN_PASSWORD',
+  ).toBe(false);
+
+  const emailField = page.getByRole('textbox', { name: EMAIL_LABEL, exact: true });
+  const passwordField = page.getByRole('textbox', { name: PASSWORD_LABEL, exact: true });
+  const signOut = page.getByRole('button', { name: SIGN_OUT_LABEL, exact: true });
+
+  await test.step('the browser starts signed out, on the sign-in page', async () => {
+    const me = await page.request.get(ME_PATH);
+    expect(me.status(), `the browser starts without a session (${ME_PATH} answers 401)`).toBe(401);
+    await page.goto(LOGIN_PATH);
+    await expect(page, `${LOGIN_PATH} opens`).toHaveURL((url) => url.pathname === LOGIN_PATH);
+    await expect(page.getByRole('button', { name: SIGN_IN_LABEL, exact: true })).toBeVisible();
+  });
+
+  await test.step('the API refuses the wrong password with 401 invalid_credentials', async () => {
+    await emailField.fill(email);
+    await enterPassword(passwordField, wrongPassword);
+    const response = await submitSignIn(page, 'The wrong-password sign-in');
+    expect(response.status(), `${LOGIN_API_PATH} refuses the wrong password with 401`).toBe(401);
+    const body = (await response.json()) as Partial<ErrorResponse>;
+    expect(body.error?.code, `the refusal is "${INVALID_CREDENTIALS_CODE}"`).toBe(
+      INVALID_CREDENTIALS_CODE,
+    );
+  });
+
+  await test.step('the form shows the refusal and stays usable on /login', async () => {
+    await expect(page, `a refused sign-in stays on ${LOGIN_PATH}`).toHaveURL(
+      (url) => url.pathname === LOGIN_PATH,
+    );
+    await expect(passwordField, 'the Password field is marked invalid').toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
+    await expect
+      .poll(() => fieldDescription(passwordField), {
+        message: 'the Password field is described by the refusal message',
+        timeout: READ_TIMEOUT_MS,
+      })
+      .toBe(INVALID_CREDENTIALS_MESSAGE);
+    // Once in the critical banner that heads the form, once as the Password field's error.
+    await expect(
+      page.locator('form').getByText(INVALID_CREDENTIALS_MESSAGE, { exact: true }),
+      `the form shows "${INVALID_CREDENTIALS_MESSAGE}" as its banner and as the field error`,
+    ).toHaveCount(2);
+    // Compared as a boolean, so a failure never prints the field's value.
+    await expect
+      .poll(async () => (await passwordField.inputValue()) === '', {
+        message: 'the refused password is cleared from the Password field',
+        timeout: READ_TIMEOUT_MS,
+      })
+      .toBe(true);
+    await expect(passwordField, 'focus returns to the Password field').toBeFocused();
+    await expect(emailField, 'the Email field keeps the entered email').toHaveValue(email);
+    await expect(signOut, `no "${SIGN_OUT_LABEL}" button: nobody is signed in`).toHaveCount(0);
+  });
+
+  await test.step('the refused sign-in created no session', async () => {
+    const me = await page.request.get(ME_PATH);
+    expect(me.status(), `${ME_PATH} still answers 401 after the refusal`).toBe(401);
+    // A second page of the same browser context shares its cookies; it is a GET, not a login.
+    const other = await page.context().newPage();
+    try {
+      await other.goto(ACTIONS_PATH);
+      await expect(other, `a new page opening ${ACTIONS_PATH} is sent to ${LOGIN_PATH}`).toHaveURL(
+        (url) => url.pathname === LOGIN_PATH,
+      );
+      await expect(other.getByRole('button', { name: SIGN_IN_LABEL, exact: true })).toBeVisible();
+    } finally {
+      await other.close();
+    }
+  });
+
+  // No sign-out afterwards: logging out revokes every session, the one auth.setup.ts saved for
+  // the later specs included.
+  await test.step('the correct password then signs in on the same form', async () => {
+    await enterPassword(passwordField, password);
+    const response = await submitSignIn(page, 'The sign-in with the correct password');
+    expect(response.status(), `${LOGIN_API_PATH} accepts the correct password`).toBe(200);
+    await expect(page, `the accepted sign-in opens ${ACTIONS_PATH}`).toHaveURL(
+      (url) => url.pathname === ACTIONS_PATH,
+      { timeout: SIGN_IN_TIMEOUT_MS },
+    );
+    await expect(actionsTitle(page)).toBeVisible();
+    const me = await getJson<Me>(page, ME_PATH);
+    expect(me.email, `${ME_PATH} names the admin who signed in`).toBe(email.trim().toLowerCase());
   });
 });

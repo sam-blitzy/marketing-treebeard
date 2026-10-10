@@ -7,11 +7,14 @@
  * (`web/test-results/.auth/admin.json`). Every spec in the `chromium` project depends on this
  * project and starts from that state, already signed in.
  *
- * Why one sign-in: the API accepts 5 login attempts per minute per client IP and answers the
- * 6th with 429 `rate_limited`. Signing in per test would trip that limit, so only this file and
- * `first-start.spec.ts` (which asserts the first-start sign-in itself) ever use the login form.
- * A run therefore stays well under the limit, including a retry and a second run within the same
- * minute.
+ * Why one sign-in: the API counts every login attempt per client IP, refused ones included, and
+ * answers the 6th within 60 s with 429 `rate_limited`. Signing in per test would trip that limit,
+ * so only this file and `first-start.spec.ts` (which asserts the first-start sign-in and a
+ * refused one) ever use the login form. A full run without retries makes at most 4 attempts:
+ * 1 here, 1 in the first-start test and 2 in its wrong-password test. A CI retry repeats the
+ * attempts of the test it retries, up to 8 in one run, and a second run started within a minute
+ * adds its own, so either can exceed 5 within 60 s and get 429. Wait a minute before running the
+ * suite again.
  *
  * The test reads and writes no application data: it never waits for an analysis run, which the
  * specs that need one wait for themselves. Sign-in works as soon as the `migrate` service has run
