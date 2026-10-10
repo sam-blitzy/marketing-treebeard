@@ -128,6 +128,7 @@ from ads_engine.simulation.generator import (
 )
 
 __all__ = [
+    "GOOGLE_ADS_FAILURE_TYPE",
     "SURFACES",
     "Contract",
     "ContractNotFound",
@@ -2384,7 +2385,11 @@ def _untoken(token: str) -> list[str] | None:
     return text.split("|")
 
 
-_GOOGLE_FAILURE_TYPE: Final = "type.googleapis.com/google.ads.googleads.v25.errors.GoogleAdsFailure"
+GOOGLE_ADS_FAILURE_TYPE: Final = (
+    f"type.googleapis.com/google.ads.googleads.{GOOGLE_ADS_API_VERSION}.errors.GoogleAdsFailure"
+)
+"""``@type`` of the ``GoogleAdsFailure`` detail in a simulated Google error, at the settings pin."""
+
 _RPC_STATUS: Final[Mapping[int, str]] = MappingProxyType(
     {
         400: "INVALID_ARGUMENT",
@@ -2512,7 +2517,7 @@ def _google_error(status: int, code: str | None, message: str, digest: str) -> J
             "status": rpc,
             "details": [
                 {
-                    "@type": _GOOGLE_FAILURE_TYPE,
+                    "@type": GOOGLE_ADS_FAILURE_TYPE,
                     "errors": [failure],
                     "requestId": digest[:22],
                 }

@@ -76,6 +76,7 @@ from ads_engine.logging import get_logger
 from ads_engine.settings import SOURCES, Settings, Source
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.payloads import (
+    GOOGLE_ADS_FAILURE_TYPE,
     ContractViolation,
     JSONValue,
     RenderedResponse,
@@ -100,8 +101,8 @@ UNKNOWN_SURFACE: Final = "unknown"
 """Journal surface of a request that matched none of the transport source's surfaces."""
 
 # Platform error shapes of the 400 that answers a request matching no surface. They mirror the
-# bodies ``payloads`` renders for a contract violation, so a client classifies both alike.
-_GOOGLE_FAILURE_TYPE: Final = "type.googleapis.com/google.ads.googleads.v25.errors.GoogleAdsFailure"
+# bodies ``payloads`` renders for a contract violation, so a client classifies both alike; the
+# Google ``@type`` is the one ``payloads`` renders (``GOOGLE_ADS_FAILURE_TYPE``).
 _LINKEDIN_OAUTH_HOST: Final = "www.linkedin.com"
 _LINKEDIN_OAUTH_PREFIX: Final = "/oauth/"
 _JSON_CONTENT_TYPE: Final = "application/json"
@@ -190,7 +191,7 @@ def _unknown_surface_body(source: Source, url: httpx.URL, message: str, digest: 
                 "status": "INVALID_ARGUMENT",
                 "details": [
                     {
-                        "@type": _GOOGLE_FAILURE_TYPE,
+                        "@type": GOOGLE_ADS_FAILURE_TYPE,
                         "errors": [{"errorCode": {"requestError": "UNKNOWN"}, "message": message}],
                         "requestId": digest[:22],
                     }

@@ -3764,7 +3764,10 @@ def test_capture_google_sends_nothing_once_the_window_is_full(
     assert len(seen) == cap
     assert google_calls_24h() == cap
     assert _written(out) == []
-    assert f"Google call budget exhausted: {cap} of {cap} calls in the last 24 h" in err
+    assert (
+        f"Google call budget exhausted: {cap} of {cap} calls counted in the sliding 24 h window"
+        in err
+    )
     assert "no surface could be captured" in err
 
 

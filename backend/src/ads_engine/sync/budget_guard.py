@@ -674,7 +674,8 @@ class GoogleCallBudget:
         )
         self._log_usage(window.used)
         return CallBudgetExhausted(
-            f"Google call budget exhausted: {window.used} of {self._cap} calls in the last 24 h",
+            f"Google call budget exhausted: {window.used} of {self._cap} calls counted in the "
+            "sliding 24 h window",
             source=_SOURCE,
             endpoint=BUDGET_ENDPOINT,
             code=_EXHAUSTED_CODE,

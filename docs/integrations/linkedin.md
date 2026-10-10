@@ -631,11 +631,11 @@ LinkedIn in its simulated-sources banner with the reason.
   `Authorization` token, the form fields of the exchange and the provider's exchanged, rotated
   and retired tokens while each error is built. Every REST call also holds the last 8
   distinct access tokens the client used and, read as the call is sent, every secret the
-  token provider holds: the client secret, the current and rotated refresh tokens, and the
-  cached and retired access tokens, or the static access token. No REST request carries a
-  refresh token or the client secret, but an error echoing one is stripped of it all the same.
-  A platform echoing any of these in plain prose, even a token replaced by an earlier refresh
-  or rotation, therefore never reaches `connector.error` or any later reason.
+  token provider holds: the client id, the client secret, the current and rotated refresh
+  tokens, and the cached and retired access tokens, or the static access token. No REST request
+  carries a refresh token or the client secret, but an error echoing one is stripped of it all
+  the same. A platform echoing any of these in plain prose, even a token replaced by an earlier
+  refresh or rotation, therefore never reaches `connector.error` or any later reason.
 - **Opaque reprs**: `LeadBatch` and `DecodedEmail` hide their contents from `repr`.
 
 ## Contract files and references

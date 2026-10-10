@@ -952,9 +952,9 @@ class LinkedInClient:
     still echo one, so the client fails closed: when ``tokens`` also
     :class:`~ads_engine.connectors.linkedin.auth.HoldsSecrets`, as ``LinkedInTokenProvider``
     and ``StaticTokenProvider`` do, every call holds what ``tokens.held_secrets()`` returns
-    when it is sent (the client secret, the current and rotated refresh tokens, and the
-    access tokens the provider cached or retired). The client copies none of them; a
-    rotation between two calls is covered by the later one.
+    when it is sent (the client id, the client secret, the current and rotated refresh
+    tokens, and the access tokens the provider cached or retired). The client copies none
+    of them; a rotation between two calls is covered by the later one.
 
     Days: LinkedIn reports daily buckets on UTC days, and rows keep the dates as returned.
 
@@ -1065,11 +1065,11 @@ class LinkedInClient:
         source (``_used_tokens``), nor one of ``held``, tokens beyond ``token`` such as the
         one a 401 refresh replaced, nor, when the token source
         :class:`~ads_engine.connectors.linkedin.auth.HoldsSecrets`, any secret its
-        ``held_secrets()`` returns: its client secret, current and rotated refresh tokens
-        and cached or retired access tokens. Those are read for each call, so a refresh
-        token rotated since an earlier call is held too. ``send_json`` holds them all as its
-        ``secrets``, with the bearer token the request itself carries, so a token from
-        before a refresh stays out of the errors of every later call too.
+        ``held_secrets()`` returns: its client id, client secret, current and rotated
+        refresh tokens and cached or retired access tokens. Those are read for each call, so
+        a refresh token rotated since an earlier call is held too. ``send_json`` holds them
+        all as its ``secrets``, with the bearer token the request itself carries, so a token
+        from before a refresh stays out of the errors of every later call too.
 
         Raises:
             TypeError: When ``held`` is a single string, which would otherwise be read as
@@ -1271,9 +1271,10 @@ class LinkedInClient:
         Stop rule (lead_form_responses contract): ``paging.total`` counts only the elements
         of the current page, so ``start + count >= total`` would stop after page 1. Paging
         stops on a page with fewer than ``page_size`` elements and no ``next`` link, and on
-        an empty page. The lead_forms contract's ``start + count >= total`` rule is not used
-        for forms either: Lead Sync pages forms the same way, and under an overall total the
-        rule used here costs at most one extra, empty page instead of a missed one.
+        an empty page. AAP 0.3.3's ``start + count >= paging.total`` rule is not used for
+        forms either: Lead Sync pages forms the same way, and under an overall total the rule
+        used here costs at most one extra, empty page instead of a missed one. ``lead_forms.json``
+        records the stop rule used here.
 
         Envelope (both contracts' ``#/response/body/required``): each page's ``paging`` block
         is validated by :func:`_checked_offset_paging` before its elements are consumed or

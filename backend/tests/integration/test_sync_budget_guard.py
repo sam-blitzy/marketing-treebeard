@@ -1061,7 +1061,9 @@ async def test_acquire_refuses_at_the_cap_and_counts_nothing(
     )
     assert error.http_status is None
     assert error.retry_after == FULL_DAY
-    assert error.message == "Google call budget exhausted: 3 of 3 calls in the last 24 h"
+    assert error.message == (
+        "Google call budget exhausted: 3 of 3 calls counted in the sliding 24 h window"
+    )
     assert await _stored(sessions) == ({_key(BOOKED): 3}, 3)
     assert log_events == [
         (
@@ -1245,7 +1247,9 @@ async def test_a_lowered_cap_holds_at_once_and_frees_after_enough_buckets_leave(
 
     retry_after = (_freed_at(_start(-600)) - NOW).total_seconds()
     assert raised.value.retry_after == retry_after
-    assert raised.value.message == "Google call budget exhausted: 5 of 3 calls in the last 24 h"
+    assert raised.value.message == (
+        "Google call budget exhausted: 5 of 3 calls counted in the sliding 24 h window"
+    )
     assert await budget.remaining() == 0
 
     clock.advance(timedelta(seconds=retry_after))

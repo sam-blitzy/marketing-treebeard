@@ -1064,11 +1064,18 @@ These targets run tools on the host, so they need uv, Python and Node in additio
   `APP_URL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD`. It leaves the stack running in simulated mode; run
   `docker compose up -d` to return to the `.env` mode. Against an already running stack, run
   Playwright directly; `E2E_ADMIN_PASSWORD` is required, while `E2E_BASE_URL`
-  (`http://localhost:8080`) and `E2E_ADMIN_EMAIL` (`admin@example.com`) have defaults:
+  (`http://localhost:8080`) and `E2E_ADMIN_EMAIL` (`admin@example.com`) have defaults. Give
+  Playwright the stack's `DATA_MODE` too, as `make e2e` does: `simulated-mode.spec.ts` reads it to
+  choose the reason every source must report, "DATA_MODE=simulated" when it is `simulated` and
+  "credentials not configured" otherwise (unset, blank or `auto`). Playwright does not read
+  `.env`, so pass `DATA_MODE` on the command line:
 
   ```bash
   read -rs -p 'Admin password: ' E2E_ADMIN_PASSWORD; echo
+  # Stack in auto mode, started from .env with no source credentials (docker compose up -d)
   (cd web && E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" npm run e2e)
+  # Stack in forced simulation (left running by make e2e, or DATA_MODE=simulated in .env)
+  (cd web && DATA_MODE=simulated E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" npm run e2e)
   unset E2E_ADMIN_PASSWORD
   ```
 
