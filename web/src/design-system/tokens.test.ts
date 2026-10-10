@@ -41,6 +41,7 @@ const TOKEN_NAMES = [
   '--space-7',
   '--space-8',
   '--font-family',
+  '--font-family-mono',
   '--font-size-xs',
   '--font-size-sm',
   '--font-size-md',

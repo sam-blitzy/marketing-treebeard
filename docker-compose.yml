@@ -30,7 +30,9 @@
 #   - db receives only POSTGRES_DB, POSTGRES_USER and POSTGRES_PASSWORD, interpolated from
 #     the shell, else from .env, else the local defaults below.
 #   - web receives no environment: the SPA bundle holds no configuration and no secret.
-#   - DATA_MODE set in the shell overrides .env. `make e2e` forces simulated data this way:
+#   - DATA_MODE set in the shell overrides .env; a blank shell value counts as unset, so .env
+#     applies, and with neither set, the default auto applies (x-backend, below). `make e2e`
+#     forces simulated data this way:
 #       DATA_MODE=simulated docker compose up -d
 #     CI's first start sets neither DATA_MODE nor a source credential, so under the default
 #     DATA_MODE=auto every source is simulated with the reason "credentials not configured".
@@ -90,11 +92,18 @@ x-backend: &backend
     context: ./backend
     dockerfile: Dockerfile
   image: ads-engine-backend:local
-  env_file: .env
-  environment:
-    # Precedence: shell, then .env (Compose interpolation), then auto. `environment:`
-    # outranks `env_file:`, so the shell value wins inside the container too.
-    DATA_MODE: "${DATA_MODE:-auto}"
+  # DATA_MODE precedence: a non-blank shell value, then .env, then settings' default auto.
+  # Later env files override earlier ones. Compose reads docker-compose.data-mode.env, whose
+  # one line is DATA_MODE=${DATA_MODE}, only when DATA_MODE interpolates non-empty (shell,
+  # else .env), so a blank shell value leaves .env in force, and with neither set, the
+  # container gets no DATA_MODE. `environment:` cannot do this: Compose counts an exported
+  # empty variable as set, and `environment:` outranks every env file. A value of only spaces
+  # is non-empty to Compose, so it passes through, and settings reads it as blank (auto).
+  env_file:
+    - path: .env
+    - path: "${DATA_MODE:+docker-compose.data-mode.env}"
+      # Skipped when the path interpolates empty; the file itself is committed.
+      required: false
   volumes:
     - ./config:/app/config:ro
   # No privilege gain through a setuid or setgid binary, and no Linux capability: the backend

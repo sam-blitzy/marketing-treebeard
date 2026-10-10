@@ -11,9 +11,12 @@
  * - every threshold as a dotted, sorted key with its configured value verbatim;
  * - the HubSpot mapping: MQL and Qualified Lead bound separately, the meeting rules, and the
  *   bindings resolved against the primary and the companion CRM dataset, an unresolved one
- *   reading "unavailable" with its reason and never `0`;
+ *   reading "unavailable" with its reason and never `0`, each verified at an instant shown in
+ *   the default run's display time zone (UTC until a run names one) with its ISO 8601 value in
+ *   `<time dateTime>`;
  * - the white paper registry and `config_hash`;
- * - the read-only contract (no control, no request but `GET /config`), loading, failure, and a
+ * - the read-only contract (no control, no request but `GET /config` and, while an instant is on
+ *   screen, `GET /runs/latest`), text lines that are never paragraphs, loading, failure, and a
  *   failed background refresh that keeps the last configuration under a non-alert "Settings
  *   could not be refreshed" notice with the reason and the last-loaded instant in the default
  *   run's display time zone (UTC before the first run), which leaves once a refresh succeeds.
@@ -41,9 +44,59 @@ import { SettingsPage } from './SettingsPage';
 const GOOGLE_LINK_UNCONFIGURED =
   'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured';
 
-/** Stubs `GET /config`, the page's only request. */
-function stubConfig(config: MockHandler = json(200, makeConfig())) {
-  return mockApi({ 'GET /config': config });
+/**
+ * The display time zone of the default run the stubs answer with: not UTC, so a test sees each
+ * instant converted from the API's UTC value.
+ */
+const DISPLAY_TIMEZONE = 'America/New_York';
+
+/** When the fixture's primary and companion CRM datasets verified their bindings. */
+const PRIMARY_VERIFIED_AT = '2026-10-01T08:10:00Z';
+const COMPANION_VERIFIED_AT = '2026-10-01T08:11:00Z';
+
+/**
+ * Stubs the page's two reads: `GET /config`, and `GET /runs/latest`, which the page reads for the
+ * display time zone of its instants while one is on screen.
+ *
+ * @param config - the answer to `GET /config`; the fixture configuration by default
+ * @param defaultRun - the answer to `GET /runs/latest`; by default a run in
+ *   {@link DISPLAY_TIMEZONE}
+ * @returns the request log
+ */
+function stubConfig(
+  config: MockHandler = json(200, makeConfig()),
+  defaultRun: MockHandler = json(200, makeRun({ display_timezone: DISPLAY_TIMEZONE })),
+) {
+  return mockApi({ 'GET /config': config, 'GET /runs/latest': defaultRun });
+}
+
+/** Each request of the log as "METHOD /path", in request order. */
+function requests(api: ApiMock): string[] {
+  return api.calls.map((call) => `${call.method} ${call.path}`);
+}
+
+/**
+ * A bindings table's verification line in `section`: the `<time>` showing `verifiedAt` as
+ * `formatInstant` formats it in `zone`, once it does.
+ *
+ * @param section - the bindings table's section
+ * @param verifiedAt - the API's ISO 8601 `verified_at`
+ * @param zone - the IANA zone the instant is expected in
+ * @returns the `<time>` element
+ */
+async function findVerifiedAt(
+  section: HTMLElement,
+  verifiedAt: string,
+  zone: string,
+): Promise<HTMLElement> {
+  const shown = formatInstant(verifiedAt, zone);
+  expect(shown.endsWith(` ${zone}`)).toBe(true);
+  const time = await within(section).findByText(shown);
+  expect(time.tagName).toBe('TIME');
+  // The instant stays machine-readable exactly as the API returned it.
+  expect(time.getAttribute('datetime')).toBe(verifiedAt);
+  expect(time.parentElement?.textContent).toBe(`Verified against the portal at ${shown}.`);
+  return time;
 }
 
 /** Renders the page at `/settings` and waits for the loaded configuration. */
@@ -158,20 +211,22 @@ const SECTION_TITLES = [
 const REFRESH_FAILURE_MESSAGE = 'Database unavailable';
 
 /**
- * Renders the loaded page, then refetches `GET /config` against a 503 while `GET /runs/latest`
- * answers `defaultRun`, as a background refresh on window focus or remount would.
+ * Renders the loaded page while `GET /runs/latest` answers `defaultRun`, then refetches
+ * `GET /config` against a 503, as a background refresh on window focus or remount would.
  *
- * @param defaultRun - the answer to the notice's `GET /runs/latest`
+ * @param defaultRun - the answer to every `GET /runs/latest`, the bindings tables' and the
+ *   notice's
  * @returns the request log and the page's query client
  */
 async function renderFailedRefresh(
   defaultRun: MockResponse,
 ): Promise<{ api: ApiMock; queryClient: QueryClient }> {
-  const api = stubConfig();
+  // The loaded page's bindings tables read the default run first, so it answers `defaultRun`
+  // from the start rather than only for the notice.
+  const api = stubConfig(undefined, defaultRun);
   const { queryClient } = await renderLoaded();
   api.use({
     'GET /config': apiError(503, 'service_unavailable', REFRESH_FAILURE_MESSAGE),
-    'GET /runs/latest': defaultRun,
   });
   await act(async () => {
     await queryClient.refetchQueries({ queryKey: queryKeys.config });
@@ -221,14 +276,72 @@ describe('SettingsPage', () => {
       ]);
     });
 
-    it('renders no control and sends no request but GET /config', async () => {
+    it('renders no control and sends no request but GET /config and GET /runs/latest', async () => {
       const api = stubConfig();
       await renderLoaded();
+      await findVerifiedAt(
+        subsection('Resolved stage properties'),
+        PRIMARY_VERIFIED_AT,
+        DISPLAY_TIMEZONE,
+      );
 
       for (const role of ['button', 'textbox', 'combobox', 'checkbox', 'spinbutton'] as const) {
         expect(screen.queryAllByRole(role)).toHaveLength(0);
       }
-      expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual(['GET /config']);
+      // Both bindings tables observe the one default-run query, so the zone is read once.
+      expect(requests(api)).toEqual(['GET /config', 'GET /runs/latest']);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('reads no run while no instant is on screen', async () => {
+      const api = stubConfig(
+        json(200, makeConfig({ crm_bindings: null, companion_crm_bindings: null })),
+      );
+      const { container } = await renderLoaded();
+
+      expect(container.querySelectorAll('time')).toHaveLength(0);
+      expect(requests(api)).toEqual(['GET /config']);
+    });
+
+    it.each([
+      ['with resolved primary and companion bindings', makeConfig()],
+      [
+        'before HubSpot has verified its bindings',
+        makeConfig({ crm_bindings: null, companion_crm_bindings: null }),
+      ],
+    ])(
+      'renders its notes as Stack lines, never paragraphs, %s',
+      async (_case, config: ConfigView) => {
+        stubConfig(json(200, config));
+        const { container } = await renderLoaded();
+
+        // A <p>'s user-agent margins would add space that no spacing token sets (AAP 0.4.4).
+        expect(container.querySelectorAll('p')).toHaveLength(0);
+        // The read-only note follows the title bar in the page's Stack, so the Stack gap alone
+        // separates them.
+        const note = screen.getByText(
+          'Read-only. Change the files in config/ and restart the services.',
+        );
+        expect(note.tagName).toBe('DIV');
+        expect(
+          note.previousElementSibling?.contains(
+            screen.getByRole('heading', { level: 1, name: 'Settings' }),
+          ),
+        ).toBe(true);
+      },
+    );
+
+    it('keeps the polite status region after the note, empty until there is news', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      // An empty status child of a Stack is taken out of flow, so it adds no gap, while the region
+      // stays in the accessibility tree for a later failure to be announced (WCAG 2.2 SC 4.1.3).
+      const status = screen.getByRole('status');
+      expect(status.childNodes).toHaveLength(0);
+      expect(status.previousElementSibling?.textContent).toBe(
+        'Read-only. Change the files in config/ and restart the services.',
+      );
       expect(screen.queryByRole('alert')).toBeNull();
     });
   });
@@ -470,9 +583,10 @@ describe('SettingsPage', () => {
           GOOGLE_LINK_UNCONFIGURED,
         ],
       ]);
+      // Each instant is shown in the default run's display time zone, never as the raw ISO text.
       const primarySection = subsection('Resolved stage properties');
-      const verified = within(primarySection).getByText('2026-10-01T08:10:00Z');
-      expect(verified.getAttribute('datetime')).toBe('2026-10-01T08:10:00Z');
+      await findVerifiedAt(primarySection, PRIMARY_VERIFIED_AT, DISPLAY_TIMEZONE);
+      expect(within(primarySection).queryByText(PRIMARY_VERIFIED_AT)).toBeNull();
 
       const companionSection = subsection('Resolved stage properties (simulated companion)');
       expect(
@@ -483,7 +597,56 @@ describe('SettingsPage', () => {
       expect(
         bodyRows(table('Resolved stage properties (simulated companion)', companionSection)),
       ).toHaveLength(4);
-      expect(within(companionSection).getByText('2026-10-01T08:11:00Z')).toBeTruthy();
+      await findVerifiedAt(companionSection, COMPANION_VERIFIED_AT, DISPLAY_TIMEZONE);
+      expect(within(companionSection).queryByText(COMPANION_VERIFIED_AT)).toBeNull();
+    });
+
+    it('shows the verification instant in the configured zone', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      const time = await findVerifiedAt(
+        subsection('Resolved stage properties'),
+        PRIMARY_VERIFIED_AT,
+        DISPLAY_TIMEZONE,
+      );
+      // 08:10 UTC is 04:10 in New York on daylight time.
+      expect(time.textContent).toBe('Oct 1, 2026, 4:10 AM America/New_York');
+    });
+
+    it.each([
+      ['before the first run (404)', apiError(404, 'not_found', 'No analysis run yet')],
+      ['while the run names no zone', json(200, makeRun({ display_timezone: '  ' }))],
+    ])('shows the verification instants in UTC %s', async (_case, defaultRun) => {
+      stubConfig(undefined, defaultRun);
+      const { queryClient } = await renderLoaded();
+
+      // The read of the default run has settled, so the fallback is not just pending.
+      await waitFor(() => {
+        const run = queryClient.getQueryState(queryKeys.runs.latest);
+        expect(['success', 'error']).toContain(run?.status);
+        expect(run?.fetchStatus).toBe('idle');
+      });
+      await findVerifiedAt(subsection('Resolved stage properties'), PRIMARY_VERIFIED_AT, 'UTC');
+      await findVerifiedAt(
+        subsection('Resolved stage properties (simulated companion)'),
+        COMPANION_VERIFIED_AT,
+        'UTC',
+      );
+    });
+
+    it('shows the instant in UTC while the run is pending, then in its zone', async () => {
+      const run = heldResponse();
+      stubConfig(undefined, () => run.promise);
+      await renderLoaded();
+
+      const primarySection = subsection('Resolved stage properties');
+      await findVerifiedAt(primarySection, PRIMARY_VERIFIED_AT, 'UTC');
+
+      run.release(json(200, makeRun({ display_timezone: ` ${DISPLAY_TIMEZONE} ` })));
+
+      // The configured zone is trimmed before use.
+      await findVerifiedAt(primarySection, PRIMARY_VERIFIED_AT, DISPLAY_TIMEZONE);
     });
 
     it('reads "unavailable" with its reason for an unresolved binding, never 0', async () => {
@@ -695,11 +858,9 @@ describe('SettingsPage', () => {
       expect(screen.queryByRole('alert')).toBeNull();
       // The page has no controls, so the notice offers no Retry.
       expect(screen.queryAllByRole('button')).toHaveLength(0);
-      expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
-        'GET /config',
-        'GET /config',
-        'GET /runs/latest',
-      ]);
+      // The notice shares the bindings tables' default-run query: the page reads nothing else.
+      expect(new Set(requests(api))).toEqual(new Set(['GET /config', 'GET /runs/latest']));
+      expect(requests(api).filter((call) => call === 'GET /config')).toHaveLength(2);
     });
 
     it.each([

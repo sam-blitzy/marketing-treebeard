@@ -85,8 +85,11 @@ Shared backend settings (the `x-backend` anchor):
 
 - `.env` reaches `migrate`, `api` and `worker` through `env_file`, and nothing else. A missing
   `.env` stops Compose before any container starts.
-- `DATA_MODE` is set as `${DATA_MODE:-auto}`, so a value in the shell overrides `.env`
-  (`DATA_MODE=simulated docker compose up -d`).
+- A non-blank `DATA_MODE` in the shell overrides `.env`
+  (`DATA_MODE=simulated docker compose up -d`) through a second env file,
+  `docker-compose.data-mode.env` (`DATA_MODE=${DATA_MODE}`), which Compose reads only when
+  `DATA_MODE` interpolates non-empty. A blank shell value therefore leaves `.env` in force, and
+  with neither set the containers get no `DATA_MODE`, so the settings default `auto` applies.
 - `./config` is bind-mounted read-only at `/app/config`, the backend's working directory.
   `docker compose restart api worker` picks up edited YAML, and the worker re-runs the default
   analysis when the configuration hash changed ([Rerun triggers](#rerun-triggers)).

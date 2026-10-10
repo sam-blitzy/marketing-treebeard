@@ -8,7 +8,7 @@ tests call the route function directly on real PostgreSQL and show that the page
 log's contract: newest first with the ``id`` tie-break across and within datasets, a limit
 that cuts the merged order (also when one dataset holds every newest row), only the active
 datasets' rows, the ``subject_type`` and ``subject_id`` filters, the 422 for a
-``subject_id`` without its type, and the joined subject views.
+``subject_id`` without its type, and the joined subject views and shared-member budget ids.
 
 The tests run against the PostgreSQL 18 test database named by ``TEST_DATABASE_URL``
 (falling back to ``DATABASE_URL``). The module creates a private schema, builds every table
@@ -514,7 +514,8 @@ async def test_no_active_dataset_lists_nothing(session: AsyncSession) -> None:
 @pytest.mark.db
 async def test_each_row_carries_its_subjects_view(session: AsyncSession) -> None:
     """Every listed row joins its own subject: a campaign by name with its account's
-    currency, a shared budget as ``Shared budget {external_id}`` in its members' currency."""
+    currency, a shared budget as ``Shared budget {external_id}`` in its members' currency,
+    and a shared member its assigned budget's Google id, which every other shape lacks."""
     world = await _seed(session)
 
     views = {view.id: view for view in await list_decisions(USER, session)}
@@ -556,6 +557,10 @@ async def test_each_row_carries_its_subjects_view(session: AsyncSession) -> None
         assert view.decided_at == T0 + timedelta(hours=hours[label])
     member = views[world.decisions["google_member_2"]]
     assert (member.shape, member.budget_id) == ("shared_member", world.subjects["google:budget"])
+    # The member names its assigned budget by the Google id the rest of the product uses.
+    assert member.budget_external_id == SHARED_BUDGET_EXTERNAL_ID
+    for label in ("google_campaign_4", "google_budget_2", "linkedin_campaign_2"):
+        assert views[world.decisions[label]].budget_external_id is None, label
     budget = views[world.decisions["google_budget_2"]]
     assert (budget.shape, budget.status, budget.daily_budget) == (
         "budget",

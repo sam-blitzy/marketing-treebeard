@@ -57,7 +57,9 @@
  *
  * Every text on the card (action, headline metric label, reason, flag messages, held reason,
  * entity name) comes from the API, so no threshold, window length or rule wording is written
- * into the client (AAP 0.5.4.1). Server state goes only through `../../api/queries`
+ * into the client (AAP 0.5.4.1). The flags row adds only each code's fixed AAP 0.5.5 label
+ * (`FLAG_LABELS` in `FlagList.tsx`) before a message that does not name it, and that label
+ * carries no threshold or window length. Server state goes only through `../../api/queries`
  * (AAP 0.11.1), and UI comes only from the design-system index (AAP 0.4.4): no raw buttons,
  * headings or tables, no inline styles and no stylesheet; layout comes from `Stack` and `Inline`.
  *

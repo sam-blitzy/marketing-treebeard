@@ -391,7 +391,7 @@ describe('RecommendationCard: header and body', () => {
     ).toEqual([
       'Simulated data',
       FIXTURE_FLAGS.search_term_coverage.message,
-      FIXTURE_FLAGS.stale.message,
+      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
     ]);
   });
 
@@ -413,7 +413,10 @@ describe('RecommendationCard: header and body', () => {
       within(flags)
         .getAllByRole('listitem')
         .map((entry) => entry.textContent),
-    ).toEqual(['Simulated data', FIXTURE_FLAGS.stale.message]);
+    ).toEqual([
+      'Simulated data',
+      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+    ]);
     expect(within(flags).queryByText(/Unverified while/u)).toBeNull();
     expect(within(cardOf(item)).queryByText(/Unverified while/u)).toBeNull();
   });

@@ -1408,6 +1408,66 @@ def test_every_copy_item_of_a_campaign_carries_the_campaign_variants_table(
             assert set(pair.evidence.extra["pair"]) <= {row["urn"] for row in rows}
 
 
+@pytest.mark.parametrize("name", [DEFAULT, "cr1.holm_flip.case", "cr2.click_only.case"])
+def test_variants_table_records_no_decimal_finer_than_six_places(
+    make_context: ContextFactory, name: str
+) -> None:
+    """Variants table: every Decimal has at most 6 places, as the stored rates and costs do.
+
+    The cost per outcome is spend ÷ outcomes (AAP 0.5.4.1 efficiency) at exactly 6 places,
+    never a 28-digit quotient, and ``None`` when the variant has no outcomes.
+    """
+    run = _evaluate(make_context, name)
+    assert run.result.candidates
+    for item in run.result.candidates:
+        rows = item.evidence.extra["variants"]
+        assert rows
+        for row in rows:
+            for key, value in row.items():
+                if isinstance(value, Decimal):
+                    exponent = value.as_tuple().exponent
+                    assert isinstance(exponent, int), (key, value)
+                    assert exponent >= -6, (key, value)
+            outcomes = row["outcomes"]
+            if outcomes:
+                expected = (row["cost"] / Decimal(outcomes)).quantize(RATE_PLACES)
+                assert format(row["cost_per_outcome"], "f") == format(expected, "f")
+            else:
+                assert row["cost_per_outcome"] is None
+
+
+@pytest.mark.parametrize(
+    ("cost", "leads", "expected"),
+    [
+        ("1348.93", 41, "32.900732"),
+        # A tie at the seventh place rounds half even: 0.0000025 records 0.000002.
+        ("0.000005", 2, "0.000002"),
+        ("1348.93", 0, None),
+        ("1348.93", None, None),
+    ],
+)
+def test_variant_cost_per_outcome_is_spend_over_outcomes_at_six_places(
+    make_context: ContextFactory, cost: str, leads: int | None, expected: str | None
+) -> None:
+    """Variants table: a variant's cost per outcome is spend ÷ outcomes at 6 places, half even.
+
+    USD 1,348.93 over 41 leads records 32.900732, never the quotient
+    32.90073170731707317073170732; zero or unreported leads record ``None`` ("unavailable",
+    AAP 0.11.1), never 0.
+    """
+    run = _with_totals(
+        _evaluate(make_context, "cr1.distinguishable.fires"),
+        {"cr-a": {"cost": Decimal(cost), "leads": leads}},
+    )
+    rows = run.single_pair().evidence.extra["variants"]
+    row = next(row for row in rows if row["urn"] == run.urn("cr-a"))
+    assert (row["cost"], row["outcomes"]) == (Decimal(cost), leads)
+    if expected is None:
+        assert row["cost_per_outcome"] is None
+    else:
+        assert format(row["cost_per_outcome"], "f") == expected
+
+
 # ---------------------------------------------------------------------------------------------
 # Unavailable and inconsistent platform counts (AAP 0.11.1: absent values are "unavailable")
 # ---------------------------------------------------------------------------------------------

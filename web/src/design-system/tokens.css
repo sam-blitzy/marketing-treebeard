@@ -44,8 +44,9 @@
   --space-7: 1.75rem; /* GAP: placeholder, not Blitzy OS */
   --space-8: 2rem; /* GAP: placeholder, not Blitzy OS */
 
-  /* Typography: system font stack only, because the CSP allows no external font source */
+  /* Typography: system font stacks only, because the CSP allows no external font source; the monospace family sets code identifiers */
   --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; /* GAP: placeholder, not Blitzy OS */
+  --font-family-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; /* GAP: placeholder, not Blitzy OS */
   --font-size-xs: 0.75rem; /* GAP: placeholder, not Blitzy OS */
   --font-size-sm: 0.875rem; /* GAP: placeholder, not Blitzy OS */
   --font-size-md: 1rem; /* GAP: placeholder, not Blitzy OS */
@@ -97,6 +98,27 @@ body {
   line-height: var(--line-height-normal);
   color: var(--color-text);
   background: var(--color-bg);
+}
+
+/*
+ * Bold text takes the semibold weight token. The user-agent rule for <b> and <strong> is
+ * font-weight: bolder, which computes 700 on regular text, a weight no token holds. The design
+ * system has no text primitive, so feature code marks bold inline text with these elements and
+ * this rule alone sets their weight. :where() adds no specificity, so any component rule that
+ * sets its own weight wins.
+ */
+:where(b, strong) {
+  font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * Code, keyboard input, preformatted text and sample output take the monospace family token in
+ * place of the user-agent monospace, which no token holds. Feature code sets identifiers such as
+ * threshold keys, property names and URNs in <code>. :where() adds no specificity, so any
+ * component rule that sets its own family wins.
+ */
+:where(code, kbd, pre, samp) {
+  font-family: var(--font-family-mono);
 }
 
 /* Router links render as plain anchors; the accent keeps them at AA contrast on both backgrounds */

@@ -29,7 +29,7 @@ notes for [Google Ads via n8n](integrations/google-ads-n8n.md),
 - [Capturing live contract fixtures](#capturing-live-contract-fixtures)
 - [Changing thresholds, mappings and the registry](#changing-thresholds-mappings-and-the-registry)
 - [Hosting beyond localhost](#hosting-beyond-localhost)
-- [Database reset and backup](#database-reset-and-backup)
+- [Database backup, restore and reset](#database-backup-restore-and-reset)
 - [Base images and OS security updates](#base-images-and-os-security-updates)
 - [Tests and quality checks](#tests-and-quality-checks)
 - [Make targets](#make-targets)
@@ -87,6 +87,11 @@ make check-tools
    - runs `make check-tools`;
    - refuses to run when `.env` already exists ("refusing to overwrite existing .env; move it
      aside first to initialise again");
+   - makes `config/` readable to the backend containers with `chmod -R a+rX config/`
+     (directories traversable and files readable by every user). Compose bind-mounts `config/`
+     with the checkout's own modes, the containers run as uid 10001, and a checkout made under
+     umask 077 would otherwise leave the YAML unreadable to them. The files hold no secret, and
+     the step touches nothing else;
    - copies `.env.example` to `.env`, readable by the owner only (mode 600);
    - writes `SESSION_SECRET`, 32 random bytes as 64 hex characters from `/dev/urandom`;
    - builds the backend image and writes `APP_ADMIN_PASSWORD_HASH`, the argon2id hash printed
@@ -193,6 +198,9 @@ from `.env.example`.
   contains `$`, as `make init` does for the hash, because Compose interpolates `$` in unquoted and
   double-quoted values.
 - **`DATA_MODE` from the shell wins**: `DATA_MODE=simulated docker compose up -d` overrides `.env`.
+  A blank shell value (`DATA_MODE= docker compose up -d`) counts as unset, so the `.env` value
+  applies; with neither set, the default `auto` applies. A shell value of only spaces is not
+  blank to Compose: it still overrides `.env`, and the processes read it as blank, so `auto`.
 
 | Variable | Group | Default | Secret | Read by | Purpose |
 |----------|-------|---------|--------|---------|---------|
@@ -668,6 +676,7 @@ How the freshness rows turn into item flags:
 | A discrepancy banner sits above everything | A platform status or budget differs from the last recorded decision | Resolve it on `/decisions`. The valid resolutions per kind are in [C0 resolutions](recommendation-rules.md#c0-resolutions) |
 | MQL or QL shows "unavailable" | The stage label in `config/hubspot_mapping.yaml` is not among the portal's `lifecyclestage` options, or its date property is missing | Read the reason on `/settings`. Fix the label, or bind a date property with `mode: property`, then restart `api` and `worker` |
 | The worker exits at startup with `worker_config_invalid` | A configuration rule failed, for example `window.presets` lacks `window.default_days`, or a lead form or creative is listed under two assets | Fix the YAML named in the log, then `docker compose restart worker api` |
+| `api` or `worker` stops with "cannot read /app/config/…: Permission denied" (the worker logs it as `worker_config_invalid`) | The files in `config/` are not readable by other users, so the containers' uid 10001 cannot read them through the bind mount, for example after a checkout or `git pull` under umask 077 | `chmod -R a+rX config/`, then `docker compose restart api worker`. The YAML holds no secret |
 | A card shows "Computed from replaced data", or an action answers 409 `subject_retired` | The item was computed from a dataset that has since been replaced | Wait for the rerun the activation queued, then reload |
 | `ads-engine analyze` exits 3, or a custom window answers 409 `run_in_progress` | Another run holds the shared analysis lock | Wait and retry |
 | A service keeps restarting under load, or `migrate` shows "Exited (137)" in `docker compose ps --all` | The service exceeded its memory ceiling and was killed. `docker events --since 1h --until 0s --filter event=oom` names each killed container. `docker inspect --format '{{.State.OOMKilled}}' <container>` prints `true` for `migrate`, but for a restarted service only until Docker starts it again | Raise that service's `<SERVICE>_MEMORY_LIMIT` in `.env`, for example `WORKER_MEMORY_LIMIT=3g` ([Resource limits](#resource-limits)), then run `docker compose up -d` |
@@ -806,6 +815,9 @@ docker compose restart worker api
   unchanged.
 - An invalid file stops the worker with `worker_config_invalid`, naming the file and the key
   ([Troubleshooting](#troubleshooting)).
+- The containers read the files as uid 10001 through the bind mount, so every file must stay
+  readable by other users: a file written under umask 077 fails with "Permission denied" until
+  `chmod -R a+rX config/` ([Troubleshooting](#troubleshooting)).
 - `/settings` shows the values in force, the resolved HubSpot bindings and `config_hash`.
 
 Each threshold, its rationale and the load-time checks are in
@@ -920,7 +932,7 @@ TLS in front of nginx:
    Then update `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env` and apply them with
    `docker compose up -d`.
 
-## Database reset and backup
+## Database backup, restore and reset
 
 All state lives in the named volume `pgdata`: datasets, snapshots, decisions, discrepancy
 resolutions, feedback, analysis runs and the admin login. `make down` (`docker compose down`) keeps
@@ -964,6 +976,65 @@ docker compose up -d --build
 On the next start, `migrate` recreates the schema and the admin login from `.env`, and the worker
 builds and backfills a new dataset per source, live or simulated, writes fresh baseline decisions
 and computes the first default run.
+
+### Restore from a backup
+
+A restore replaces the database with the dump: every table returns to its state when the dump was
+taken, and whatever was written since is lost. To keep the current data as well, run the backup
+block first. It sets `$dump_file` to its new file, so set `dump_file` back to the dump to restore
+afterwards. The dump stays as sensitive as when it was written: restore from the owner-only copy
+and delete it once it is no longer needed, as above.
+
+`$dump_file` is the path the backup block listed. In a new shell, set it to that path first:
+
+```bash
+dump_file="$HOME/ads_engine.dump.<suffix>"
+```
+
+The block checks that the file is a `pg_dump` archive before it stops anything. It then stops
+`web`, `api` and `worker`, so nothing writes during the restore (`migrate` is one-shot and has
+already exited), restores the dump, and starts the stack again only when the restore succeeded:
+
+```bash
+if docker compose exec -T db pg_restore --list < "$dump_file" > /dev/null; then
+  if docker compose stop web api worker &&
+    docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --single-transaction' < "$dump_file"; then
+    docker compose up -d
+  else
+    echo "restore failed; the database is unchanged and the stack was not restarted" >&2
+  fi
+else
+  echo "not a readable pg_dump archive, or db is not running; nothing stopped" >&2
+fi
+```
+
+- `--clean --if-exists` drops each object the dump holds before recreating it, so the same block
+  restores into an empty database or over the current one.
+- `--no-owner` makes `POSTGRES_USER`, the restoring role, the owner of every object it creates.
+- `--single-transaction` applies the whole dump or none of it. When `pg_restore` fails, for
+  example on a truncated file, the database stays exactly as it was and `web`, `api` and `worker`
+  stay stopped. Read the error, then fix its cause and run the block again, or resume on the
+  unchanged data with `docker compose up -d`.
+
+On that `docker compose up -d`, `migrate` runs again before `api` and `worker` start.
+`ads-engine migrate` upgrades a dump taken by an older version to the current schema, and
+`ads-engine ensure-admin` sets the admin login from `.env`. After a restore the admin therefore
+signs in as `APP_ADMIN_EMAIL` with the password whose hash `APP_ADMIN_PASSWORD_HASH` holds, not
+with the dump's login, and any other login the dump held is removed.
+
+To restore into a new volume, after a reset (`docker compose down -v`) or when the volume is lost,
+start only `db` first, so that `migrate` cannot create an empty schema and the worker cannot start
+a new backfill before the dump is in place. `--wait` returns once the healthcheck passes
+(`docker compose ps db` then shows `(healthy)`), and fails when it never does:
+
+```bash
+docker compose up -d --wait db
+```
+
+When it succeeds, run the restore block above. Its `stop` finds no `web`, `api` or `worker`
+container, and its final `docker compose up -d` creates them on the restored data. If the restore
+fails here, the unchanged database is the new, empty one: run the block again rather than
+`docker compose up -d`, which would start a fresh backfill.
 
 ## Base images and OS security updates
 
@@ -1101,7 +1172,7 @@ at the first failing command.
 |--------|--------------|
 | `help` | Lists the targets (the default goal) |
 | `check-tools` | Verifies Docker Compose `>=5.5.1,<6` and Docker Engine `>=29`, and prints the found versions and the required range |
-| `init` | `check-tools`; requires `ADMIN_PASSWORD`; refuses an existing `.env`; copies `.env.example` to `.env` (mode 600); writes a random `SESSION_SECRET`; builds the backend image (`docker compose build migrate`) and writes the single-quoted argon2id `APP_ADMIN_PASSWORD_HASH` from `ads-engine hash-password`; removes the partial `.env` on failure |
+| `init` | `check-tools`; requires `ADMIN_PASSWORD`; refuses an existing `.env`; makes `config/` readable to the backend containers (`chmod -R a+rX config/`); copies `.env.example` to `.env` (mode 600); writes a random `SESSION_SECRET`; builds the backend image (`docker compose build migrate`) and writes the single-quoted argon2id `APP_ADMIN_PASSWORD_HASH` from `ads-engine hash-password`; removes the partial `.env` on failure |
 | `up` | `check-tools`; requires `.env`; `docker compose up -d --build`; waits up to `HEALTH_TIMEOUT` (default 180) seconds for `APP_URL/api/v1/healthz` (default `http://localhost:8080`) to answer 200, and prints the containers' state and recent logs when it does not |
 | `down` | `docker compose down`: stops and removes the containers and keeps the `pgdata` volume |
 | `migrate` | Requires `.env`; `docker compose run --rm migrate`, which runs `ads-engine migrate && ads-engine ensure-admin` |

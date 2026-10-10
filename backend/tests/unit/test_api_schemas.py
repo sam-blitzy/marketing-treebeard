@@ -2401,6 +2401,7 @@ DECISION_KEYS = {
     "daily_budget",
     "total_budget",
     "budget_id",
+    "budget_external_id",
     "tombstone",
     "decided_at",
     "decided_by",
@@ -2425,6 +2426,7 @@ def test_decision_from_row_carries_the_shape_and_the_complete_expected_state() -
     assert (dumped["shape"], dumped["status"]) == ("own_budget", "active")
     assert (dumped["daily_budget"], dumped["total_budget"]) == ("120.500000", None)
     assert (dumped["budget_id"], dumped["tombstone"]) == (None, False)
+    assert dumped["budget_external_id"] is None
     assert dumped["decided_at"] == "2026-10-06T12:00:00Z"
     assert (dumped["decided_by"], dumped["origin"]) == ("admin@example.com", "user")
     assert (dumped["recommendation_id"], dumped["patch"]) == (501, {"daily_budget": "120.50"})
@@ -2442,9 +2444,22 @@ def test_decision_from_row_for_a_shared_member_holds_its_budget_assignment_only(
             patch={"status": "paused"},
         ),
         subject=_subject(),
+        budget_external_id="990100000005",
     )
     assert (decision.shape, decision.status, decision.budget_id) == ("shared_member", "paused", 9)
+    assert decision.budget_external_id == "990100000005"
+    assert decision.model_dump(mode="json")["budget_external_id"] == "990100000005"
     assert (decision.daily_budget, decision.total_budget) == (None, None)
+
+
+def test_decision_from_row_for_a_shared_member_without_its_budgets_id_names_none() -> None:
+    """A member whose assigned budget the route could not read keeps ``budget_id`` alone."""
+    decision = Decision.from_row(
+        _decision_row(shape="shared_member", status="active", daily_budget=None, budget_id=9),
+        subject=_subject(),
+    )
+    assert (decision.budget_id, decision.budget_external_id) == (9, None)
+    assert decision.model_dump(mode="json")["budget_external_id"] is None
 
 
 def test_decision_from_row_for_a_budget_subject_has_no_status() -> None:

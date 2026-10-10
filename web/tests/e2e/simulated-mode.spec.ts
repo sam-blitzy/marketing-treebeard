@@ -564,6 +564,68 @@ function shownFlags(item: Item): Flag[] {
   });
 }
 
+/**
+ * The label each flag code's badge names (`FLAG_LABELS` in `FlagList.tsx`, restated because
+ * this spec imports only types): the wording AAP 0.5.5 gives the flags row, with one "Floor"
+ * label for the attribution, creative and deal floors.
+ */
+const FLAG_LABELS: Readonly<Record<FlagCode, string>> = Object.freeze({
+  simulated: 'Simulated data',
+  stale: 'Stale',
+  incomplete: 'Incomplete',
+  short_window: 'Short window',
+  unverified_discrepancies: 'Unverified while discrepancies open',
+  attribution_floor: 'Floor',
+  creative_floor: 'Floor',
+  deal_floor: 'Floor',
+  unknown_crm_evidence: 'Unknown CRM evidence',
+  meeting_time_proxy: 'Meeting time proxy',
+  pipeline_unavailable: 'Pipeline unavailable',
+  no_crm_link: 'No CRM link',
+  not_distinguishable: 'Not distinguishable',
+  search_term_coverage: 'Low search-term coverage',
+  shared_budget: 'Shared budget',
+});
+
+/**
+ * The lowercased words of `text`: each maximal run of letters and digits, in order.
+ *
+ * @param text - Any text.
+ * @returns The words.
+ */
+function flagWords(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/**
+ * A flag badge's visible text (`flagText` in `FlagList.tsx`, restated because this spec imports
+ * only types): the trimmed message as written when its words contain the code's label
+ * ({@link FLAG_LABELS}) in order, else "{label}: {message}"; the label alone for a blank
+ * message or the code itself; and, for a code with no label, the message, else the code.
+ *
+ * @param flag - One flag, as {@link shownFlags} merges it.
+ * @returns The badge text, for example "Simulated data (Google, LinkedIn)".
+ */
+function flagText(flag: Flag): string {
+  const message = flag.message.trim();
+  const blank = message === '' || message === flag.code;
+  if (!Object.hasOwn(FLAG_LABELS, flag.code)) {
+    return blank ? flag.code : message;
+  }
+  const label = FLAG_LABELS[flag.code];
+  if (blank) {
+    return label;
+  }
+  const wanted = flagWords(label);
+  let matched = 0;
+  for (const word of flagWords(message)) {
+    if (matched < wanted.length && word === wanted[matched]) {
+      matched += 1;
+    }
+  }
+  return matched === wanted.length ? message : `${label}: ${message}`;
+}
+
 /** An item's simulated-data label: the badge text and where its flags row shows it. */
 interface SimulatedLabel {
   /** The badge text, for example "Simulated data (Google)". */
@@ -575,7 +637,7 @@ interface SimulatedLabel {
 /**
  * The label an item's simulated flag shows, on its card's flags row, a white-paper row's asset
  * cell and that row's details alike (`simulatedFlag` in `WhitePapersSection.tsx` reads the same
- * merged flag).
+ * merged flag, and both show it as {@link flagText} words it).
  *
  * @param item - One item.
  * @returns The label and its position in the flags row.
@@ -588,7 +650,7 @@ function simulatedLabel(item: Item): SimulatedLabel {
   if (flag === undefined) {
     throw new Error(`${describeItem(item)} carries no ${SIMULATED_FLAG_CODE} flag`);
   }
-  return { message: flag.message, position };
+  return { message: flagText(flag), position };
 }
 
 /**
@@ -640,7 +702,7 @@ async function revealAll(scope: Locator, bound: number, where: string): Promise<
 /**
  * Asserts that `container`, an item's card or a white-paper row's details, shows the item's own
  * simulated-data badge: in its own flags row, at the position the item's merged flags give it,
- * with the API's message, which names simulated data.
+ * with its badge text ({@link flagText}), which starts with "Simulated data".
  *
  * @param container - The element that holds the item's flags row and no other item's.
  * @param item - The item.

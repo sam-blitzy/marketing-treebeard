@@ -7791,8 +7791,72 @@ def _google_client_scenarios(module: str) -> Iterator[Scenario]:
     )
 
 
+# LinkedIn's ten seniority values with impression shares summing to exactly 1, so each
+# delivering campaign of ``linkedin.repeat_pages`` reports exactly these values and no default
+# one: one full page at LinkedIn's default ``count`` of 10, the live case of 2026-10-10.
+_REPEAT_SENIORITY_SHARES: Final = (
+    ("urn:li:seniority:1", "0.05"),  # Unpaid
+    ("urn:li:seniority:2", "0.05"),  # Training
+    ("urn:li:seniority:3", "0.15"),  # Entry
+    ("urn:li:seniority:4", "0.20"),  # Senior
+    ("urn:li:seniority:5", "0.15"),  # Manager
+    ("urn:li:seniority:6", "0.12"),  # Director
+    ("urn:li:seniority:7", "0.08"),  # VP
+    ("urn:li:seniority:8", "0.08"),  # CXO
+    ("urn:li:seniority:9", "0.07"),  # Partner
+    ("urn:li:seniority:10", "0.05"),  # Owner
+)
+_REPEAT_PAGE_COUNT: Final = 10
+_REPEAT_CAMPAIGNS: Final = (
+    ("li-repeat-a", "Repeat pages A - Website visits"),
+    ("li-repeat-b", "Repeat pages B - Website visits"),
+)
+
+
+def _repeat_pages_world(name: str) -> WorldSpec:
+    """Live 202609's ``ALL`` paging on the segment fallback's path.
+
+    One account with two delivering campaigns, each reporting exactly the ten seniority values
+    of :data:`_REPEAT_SENIORITY_SHARES`; the world pages the ``timeGranularity=ALL`` surfaces
+    as live does (``analytics_repeat_pages``: ``start`` ignored, a perpetual ``next`` link,
+    no ``total``), and LinkedIn's live 400 rejects the Statistics Finder, so the client takes
+    the per-campaign Analytics Finder fallback.
+    """
+    campaigns = tuple(
+        _li_campaign(key, name, objective="WEBSITE_VISIT") for key, name in _REPEAT_CAMPAIGNS
+    )
+    delivery = DayMetrics(cost=Decimal("50.00"), impressions=1_000, clicks=10)
+    creatives = tuple(
+        _li_creative(f"cr-{key}", key, _daily(_offsets(-180, -1), delivery), form=None)
+        for key, _name in _REPEAT_CAMPAIGNS
+    )
+    segments = tuple(
+        LinkedInSegmentSpec(
+            key,
+            "MEMBER_SENIORITY",
+            values=tuple(
+                SegmentValueSpec(value, Decimal(share), Decimal(1))
+                for value, share in _REPEAT_SENIORITY_SHARES
+            ),
+        )
+        for key, _name in _REPEAT_CAMPAIGNS
+    )
+    rejected = Fault(
+        "linkedin",
+        "ad_analytics_statistics",
+        "http_status",
+        status=400,
+        code="FIELD_INVALID",
+        message='"MEMBER_SENIORITY" is not an enum symbol',
+    )
+    linkedin = replace(
+        _linkedin(campaigns, creatives, forms=(), segments=segments), analytics_repeat_pages=True
+    )
+    return _world(name, linkedin=linkedin, faults=(rejected,))
+
+
 def _linkedin_client_scenarios(module: str) -> Iterator[Scenario]:
-    """Analytics element cap, next links and all-status entity listing."""
+    """Analytics element cap, next links, repeat pages and all-status entity listing."""
     many = tuple(
         _li_creative(
             f"cr-bulk-{index:03d}",
@@ -7825,6 +7889,19 @@ def _linkedin_client_scenarios(module: str) -> Iterator[Scenario]:
         elements_cap=15_000,
         creatives=100,
         days=180,
+    )
+    yield _transport(
+        "linkedin.repeat_pages",
+        module,
+        "Analytics: a next-link chain ends complete at the first page that adds no new "
+        "pivotValues, as live timeGranularity=ALL paging ignores start and repeats its page",
+        _repeat_pages_world("linkedin.repeat_pages"),
+        pivot="MEMBER_SENIORITY",
+        window_days=14,
+        page_count=_REPEAT_PAGE_COUNT,
+        campaigns=len(_REPEAT_CAMPAIGNS),
+        values_per_campaign=len(_REPEAT_SENIORITY_SHARES),
+        member_segment_calls_per_campaign=2,
     )
     statuses: tuple[LinkedInCampaignStatus, ...] = (
         "ACTIVE",

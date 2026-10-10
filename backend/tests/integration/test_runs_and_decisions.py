@@ -1193,13 +1193,17 @@ async def test_shared_member_rejects_any_amount_naming_budget(
 async def test_shared_member_status_patch_keeps_budget_id(
     seeded: Seed, client: httpx.AsyncClient
 ) -> None:
-    """Shared-member patches: a status patch keeps the member's shared ``budget_id``."""
-    decided = _decision(
-        await _decide(client, "campaign", seeded.member_campaign_id, {"status": "paused"})
-    )
+    """Shared-member patches: a status patch keeps the member's shared ``budget_id``.
+
+    The answer also names that budget by its Google id, so the form can say which shared
+    budget owns the amount without showing a database id.
+    """
+    response = await _decide(client, "campaign", seeded.member_campaign_id, {"status": "paused"})
+    decided = _decision(response)
     assert decided.shape == "shared_member"
     assert decided.status == "paused"
     assert decided.budget_id == seeded.shared_budget_id
+    assert response.json()["budget_external_id"] == seeded.shared_budget_external_id
     assert decided.daily_budget is None
     assert decided.total_budget is None
 

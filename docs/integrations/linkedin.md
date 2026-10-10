@@ -200,9 +200,9 @@ GET leadFormResponses?ids=List({id1},{id2},...)&owner=(sponsoredAccount:{acct})&
 | `creatives` | `list_creatives` | Campaign, `intendedStatus`, `content.reference` (the post) and the lead-gen call-to-action `destination` and `label` | At most 100 campaign URNs per request (`CREATIVE_CAMPAIGN_CHUNK`), each chunk paged by `pageToken`. An empty campaign list sends no request, because LinkedIn reads `campaigns=List()` as "no filter" |
 | `posts` | `get_posts` | Headline (`content.media.title` or `content.article.title`) and intro text (`commentary`). Only `urn:li:share:` and `urn:li:ugcPost:` URNs with a numeric id are requested | At most 50 URNs per call (`POST_BATCH_SIZE`); batch envelope `{results, statuses, errors}` |
 | `ad_analytics` | `analytics_daily` | Daily per-creative spend, impressions, clicks, landing-page clicks, lead form opens, leads and website conversions, into `fact_creative_daily` | Date chunks sized to the response cap; `next` links followed (see [Limits and retention](#limits-and-retention)) |
-| `ad_analytics_statistics` | `analytics_segments` | Demographic segments per campaign for one exact preset window, into `fact_segment_window` (see [Demographic segments](#demographic-segments)) | `next` links followed |
-| `ad_analytics_campaign_delivery` | `analytics_segments` (live fallback) | The account's campaigns with delivery in the window, after LinkedIn rejects the Statistics Finder with HTTP 400 | `next` links followed; cached per account and window |
-| `ad_analytics_member_segments` | `analytics_segments` (live fallback) | One pivot's demographic values for one delivering campaign; the campaign is taken from the request | One request per delivering campaign; `next` links followed |
+| `ad_analytics_statistics` | `analytics_segments` | Demographic segments per campaign for one exact preset window, into `fact_segment_window` (see [Demographic segments](#demographic-segments)) | `next` links followed until a repeat page (see [Limits and retention](#limits-and-retention)) |
+| `ad_analytics_campaign_delivery` | `analytics_segments` (live fallback) | The account's campaigns with delivery in the window, after LinkedIn rejects the Statistics Finder with HTTP 400 | `next` links followed until a repeat page; cached per account and window |
+| `ad_analytics_member_segments` | `analytics_segments` (live fallback) | One pivot's demographic values for one delivering campaign; the campaign is taken from the request | One request per delivering campaign; `next` links followed until a repeat page |
 | `lead_forms` | `list_lead_forms` | Each form's canonical URN, current `versionId` and that version's `content.questions` | `count`/`start` (see [Lead Sync](#lead-sync)) |
 | `lead_form_responses` | `list_lead_responses` | Sponsored lead responses submitted in a time range | `count`/`start` |
 | `lead_form_responses_batch` | `get_lead_responses` | The transient email re-fetch by response id, for HubSpot matching | At most 100 ids per call (`LEAD_BATCH_SIZE`) |
@@ -277,13 +277,25 @@ Professional-demographic pivots are documented only for the Analytics Finder `pi
   ```
 
   Campaigns reported with zero impressions are skipped. The discovery result is cached per
-  account and window, so the three pivots of one preset share one discovery call. A defect in
-  the fallback itself fails the job, chained to the original 400.
+  account and window, so the three pivots of one preset share one discovery call. Both forms
+  follow `next` links until a repeat page (see [Limits and retention](#limits-and-retention)).
+  Live 202609 ignores `start` here and repeats the page behind every `next` link (observed
+  2026-10-10), so a campaign whose values fill one page costs 2 calls, the page and one repeat,
+  instead of running into the 1,000-link bound. A defect in the fallback itself fails the job,
+  chained to the original 400.
 - **In simulated mode**: the simulator answers the contracted form, so simulated runs never take
   the fallback unless a world fault rejects `ad_analytics_statistics` with HTTP 400. The
   simulator validates and renders both fallback forms from the same world as the Statistics
   Finder: campaign delivery is each campaign's impressions over the window, and member segments
-  are the demographic values of the one requested campaign.
+  are the demographic values of the one requested campaign. A world with
+  `LinkedInSpec.analytics_repeat_pages` pages the three `timeGranularity=ALL` surfaces
+  (statistics, campaign delivery and member segments) as live 202609 does: `start` is ignored,
+  every response serves the first page, and `paging` echoes the request's `count` (10 when
+  absent) and `start`, carries no `total`, and links `next` to `start + count` whenever the
+  page holds at least `count` elements. Scenario `linkedin.repeat_pages.case` exercises it: one
+  account with two delivering campaigns, each reporting exactly the ten `MEMBER_SENIORITY`
+  values, and a 400 fault on `ad_analytics_statistics`, so the fallback runs and each campaign's
+  chain ends complete after 2 calls.
 
 **Segment semantics.**
 
@@ -296,9 +308,10 @@ Professional-demographic pivots are documented only for the Analytics Finder `pi
   keyed by its exact start and end.
 - **Missing metrics**: a metric the pivot does not return is stored as NULL (unavailable), never
   0.
-- **Response cap**: a response at the 15,000-element cap without a `next` link makes the listing
-  incomplete with the reason "result limit reached". The window must stay exact, so it is never
-  split by date.
+- **Response cap**: a response at the 15,000-element cap that ends its chain, with no `next`
+  link or as a repeat page (see [Limits and retention](#limits-and-retention)), makes the
+  listing incomplete with the reason "result limit reached". The window must stay exact, so it
+  is never split by date.
 - **Use by C3a**: C3a runs only on a run whose window exactly equals a fetched segment window.
   Otherwise, while at least one LinkedIn campaign is active, it is withheld with
   `segment_window_unavailable` and never reuses another window's segments (see
@@ -335,11 +348,23 @@ retention. Every daily range starts no earlier than 179 days before today in UTC
   - **Chunk size**: `max(1, 14,999 // n)` days, where `n` is the number of creatives the
     dataset holds for the account, or else the count from the client's latest creative listing
     of that account. With no known count, the whole range is one chunk.
-  - **`next` links**: a `next` paging link is followed at once, even from an empty page, for at
-    most 1,000 links per chain. A link that repeats an earlier request is a defect.
-  - **Split at the cap**: a response with 15,000 or more elements and no `next` link may be
-    truncated. Its rows are discarded and its range is halved into `[start, mid]` and
-    `[mid + 1, end]`.
+  - **`next` links**: a `next` paging link is followed at once, even from an empty page. On
+    every `adAnalytics` surface the chain ends complete at its first non-empty page that adds
+    no new (`pivotValues`, `dateRange`) element; that repeat page's elements are not added
+    again, and `linkedin.analytics.repeat_page` is logged. Live 202609 ignores `start` with
+    `timeGranularity=ALL` and repeats its page behind a perpetual `next` link to
+    `start + count`, with no `total` (observed 2026-10-10), so such a chain would otherwise
+    never end. The same creatives on a new day are new elements, so a daily chain reads on. A
+    repeat page at the cap still reads as possibly truncated. The rule is checked before the
+    `max_pages` bound and the repeated-request check, so a repeat page ends its chain complete
+    even at that bound or when its link points back to a request already read. The first
+    response is never a repeat, so the capture's one-response bound still ends with
+    "page limit" while a `next` link remains. Otherwise a link that repeats an earlier request
+    is a defect, from an empty page too, and so is a chain of more than 1,000 links
+    (`_MAX_NEXT_LINKS`) whose pages keep adding new elements.
+  - **Split at the cap**: a response with 15,000 or more elements that ends its chain, with no
+    `next` link or as a repeat page, may be truncated. The chunk's rows are discarded and its
+    range is halved into `[start, mid]` and `[mid + 1, end]`.
   - **One day at the cap**: the rows are kept, and the listing and `linkedin.analytics_daily` are
     marked incomplete with the reason "result limit reached at finest partition (one day)".
   - Completeness never depends on the creative count, because any chunk at the cap is split.

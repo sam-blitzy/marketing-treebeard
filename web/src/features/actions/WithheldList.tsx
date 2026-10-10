@@ -162,9 +162,9 @@ export function WithheldList({ withheld, title }: WithheldListProps): ReactEleme
         wrapper renders text at --font-weight-semibold and feature code carries no CSS of its own
         (AAP 0.4.4). It is a <strong> placed directly in the Stack, so it is a block flex item
         whose spacing is the gap token alone; a raw <p> would add its user-agent block margins,
-        which are not spacing tokens. Its weight is the user-agent bold until Blitzy OS supplies
-        a text component. It is not a heading element, because headings come only from the
-        PageShell heading slots.
+        which are not spacing tokens. The design-system base layer sets <strong> to
+        --font-weight-semibold until Blitzy OS supplies a text component. It is not a heading
+        element, because headings come only from the PageShell heading slots.
       */}
       <strong>{label}</strong>
       <Stack as="ul" gap={1} aria-label={label}>

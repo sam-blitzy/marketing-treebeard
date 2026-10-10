@@ -8,8 +8,9 @@ applied, and ``DecisionForm`` records a new decision as a patch (AAP 0.5.5).
 What this module does, and what it leaves to the domain:
 
 * **Reading** is a single joined statement per request: each ``decision`` row with its
-  subject's name, source and currency (:func:`_decision_query`), restricted to the active
-  primary datasets, so decisions about replaced data never reappear in the log. The
+  subject's name, source and currency, and a shared member's assigned budget's Google id
+  (:func:`_decision_query`), restricted to the active primary datasets, so decisions
+  about replaced data never reappear in the log. The
   newest-first page is drawn from one bounded index probe per active dataset
   (:func:`_newest_decision_ids`), so its cost does not grow with the log's history.
   ``POST`` answers with the same statement over the committed row, re-read from the
@@ -98,6 +99,12 @@ _MemberAccount = aliased(AdAccount, name="member_account")
 _MemberCampaign = aliased(Campaign, name="member_campaign")
 _GoogleAccount = aliased(AdAccount, name="google_account")
 
+# The shared budget a ``shared_member`` row assigns its campaign to, joined for its Google id.
+# It must differ from the subject's own ``budget`` join: the correlated subqueries of
+# _budget_currency correlate on the unaliased ``budget``, which must remain the budget
+# *subject*, and joining ``budget`` a second time unaliased would name one table twice.
+_AssignedBudget = aliased(Budget, name="assigned_budget")
+
 
 # ---------------------------------------------------------------------------
 # The joined read
@@ -150,19 +157,23 @@ def _budget_currency() -> Any:
     return case((member_count > 0, member_currency), else_=dataset_currency)
 
 
-def _decision_query() -> Select[DecisionRow, str | None, str | None, str | None]:
+def _decision_query() -> Select[DecisionRow, str | None, str | None, str | None, str | None]:
     """Return the statement that reads decisions with their subjects' display fields.
 
     One statement, no per-row queries: each ``decision`` is outer-joined to the
     ``campaign`` or ``budget`` row its ``subject_type`` names (``subject_id`` cannot carry a
     foreign key, because the referenced table varies) within the decision's own dataset,
-    and a campaign to its ``ad_account`` for the currency. The outer joins keep a decision
-    readable even if its subject row were missing; its name and currency are then ``NULL``.
+    and a campaign to its ``ad_account`` for the currency. A ``shared_member`` row is also
+    outer-joined to the shared budget its ``budget_id`` assigns, within the same dataset
+    (the (``budget_id``, ``dataset_id``) foreign key guarantees the row), for the Google id
+    the product names that budget by. The outer joins keep a decision readable even if a
+    joined row were missing; its name, currency or assigned budget's id are then ``NULL``.
 
     Callers add their own filters, ordering and limit.
 
     Returns:
-        ``SELECT decision, campaign.name, budget.external_id, <subject currency>``.
+        ``SELECT decision, campaign.name, budget.external_id, <subject currency>,
+        assigned_budget.external_id``.
     """
     currency = case(
         (DecisionRow.subject_type == "campaign", AdAccount.currency),
@@ -174,6 +185,7 @@ def _decision_query() -> Select[DecisionRow, str | None, str | None, str | None]
             Campaign.name.label("campaign_name"),
             Budget.external_id.label("budget_external_id"),
             currency,
+            _AssignedBudget.external_id.label("assigned_budget_external_id"),
         )
         .select_from(DecisionRow)
         .outerjoin(
@@ -191,6 +203,13 @@ def _decision_query() -> Select[DecisionRow, str | None, str | None, str | None]
                 DecisionRow.subject_type == "budget",
                 Budget.id == DecisionRow.subject_id,
                 Budget.dataset_id == DecisionRow.dataset_id,
+            ),
+        )
+        .outerjoin(
+            _AssignedBudget,
+            and_(
+                _AssignedBudget.id == DecisionRow.budget_id,
+                _AssignedBudget.dataset_id == DecisionRow.dataset_id,
             ),
         )
     )
@@ -278,7 +297,7 @@ def _subject_view(
 
 async def _read_views(
     session: AsyncSession,
-    statement: Select[DecisionRow, str | None, str | None, str | None],
+    statement: Select[DecisionRow, str | None, str | None, str | None, str | None],
 ) -> list[schemas.Decision]:
     """Execute a decision read and build one :class:`schemas.Decision` per row.
 
@@ -287,7 +306,8 @@ async def _read_views(
         statement: :func:`_decision_query` with the caller's filters applied.
 
     Returns:
-        The decision views, in the statement's order.
+        The decision views, in the statement's order, a shared member's carrying its
+        assigned budget's Google id.
     """
     result = await session.execute(statement)
     return [
@@ -299,8 +319,9 @@ async def _read_views(
                 budget_external_id=budget_external_id,
                 currency=currency,
             ),
+            budget_external_id=assigned_budget_external_id,
         )
-        for row, campaign_name, budget_external_id, currency in result
+        for row, campaign_name, budget_external_id, currency, assigned_budget_external_id in result
     ]
 
 
@@ -479,7 +500,8 @@ async def list_decisions(
     """List the decision log of the active datasets, newest first.
 
     Each row carries its decision shape, the complete materialised expected state for that
-    shape (status, the amounts the shape owns, a shared member's ``budget_id``), its origin
+    shape (status, the amounts the shape owns, a shared member's ``budget_id`` with that
+    budget's Google id, ``budget_external_id``), its origin
     (``baseline``, ``user``, ``recommendation`` or ``resolution``), when and by whom it was
     decided, the patch the submission carried and its note (AAP 0.5.2, 0.5.5). Only
     decisions of each source's active primary dataset are listed, so decisions about

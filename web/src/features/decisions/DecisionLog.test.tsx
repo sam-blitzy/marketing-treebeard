@@ -732,11 +732,16 @@ const CELLS: readonly CellCase[] = [
   [
     'a shared member whose budget no row of the log names',
     makeDecision('shared_member'),
+    { 4: 'Active · shared budget 31000402' },
+  ],
+  [
+    'a shared member whose budget neither the log nor the API names',
+    makeDecision('shared_member', { budget_external_id: null }),
     { 4: 'Active · shared budget id 402' },
   ],
   [
     'a shared member with no budget assignment',
-    makeDecision('shared_member', { budget_id: null }),
+    makeDecision('shared_member', { budget_id: null, budget_external_id: null }),
     { 4: 'Active' },
   ],
   [

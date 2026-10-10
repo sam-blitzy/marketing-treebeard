@@ -1756,6 +1756,10 @@ class Decision(ApiModel):
         daily_budget: The decided daily budget; ``None`` where the shape has none.
         total_budget: The decided lifetime or custom-period budget.
         budget_id: For ``shared_member`` rows, the shared budget the campaign is assigned to.
+        budget_external_id: For ``shared_member`` rows, the Google id of the shared budget the
+            campaign is assigned to, the id the product names it by ("Shared budget
+            {external_id}"); ``None`` for the other shapes, or when that budget row cannot be
+            read.
         tombstone: Whether the row records an acknowledged removal.
         decided_at: When the decision was recorded.
         decided_by: Who recorded it; ``None`` for baseline and system rows.
@@ -1773,6 +1777,7 @@ class Decision(ApiModel):
     daily_budget: Money | None
     total_budget: Money | None
     budget_id: int | None
+    budget_external_id: str | None
     tombstone: bool
     decided_at: AwareDatetime
     decided_by: str | None
@@ -1782,12 +1787,22 @@ class Decision(ApiModel):
     note: str | None
 
     @classmethod
-    def from_row(cls, row: DecisionRow, *, subject: SubjectView) -> Self:
+    def from_row(
+        cls,
+        row: DecisionRow,
+        *,
+        subject: SubjectView,
+        budget_external_id: str | None = None,
+    ) -> Self:
         """Build the view of a stored ``decision`` row.
 
         Args:
             row: The decision row.
             subject: The subject view the route resolved for ``row.subject_id``.
+            budget_external_id: The Google id of the shared budget ``row.budget_id`` assigns
+                a ``shared_member`` row to, as the route read it within the decision's
+                dataset; ``None`` (the default) when the row names no budget or that budget
+                could not be read.
 
         Returns:
             The decision view.
@@ -1804,6 +1819,7 @@ class Decision(ApiModel):
                 "daily_budget": row.daily_budget,
                 "total_budget": row.total_budget,
                 "budget_id": row.budget_id,
+                "budget_external_id": budget_external_id,
                 "tombstone": row.tombstone,
                 "decided_at": row.decided_at,
                 "decided_by": row.decided_by,

@@ -9,15 +9,22 @@
  *   code, including one a later API version adds.
  * - {@link mergeFlags} keeps one flag per code: the recorded flags first in their order, then the
  *   codes only the overlay carries; a code in both keeps its recorded place and takes the current
- *   message, a blank current message never replaces a recorded label, and a code blank in both is
- *   labelled with the code itself. Inputs are never mutated.
+ *   message, a blank current message never replaces a recorded one, and a code blank in both
+ *   takes the code itself as its message. Inputs are never mutated.
  * - A live-only code ({@link LIVE_ONLY_FLAG_CODES}: exactly `unverified_discrepancies`, whose
  *   count AAP 0.5.4.2 P1 reads from the overlay) is read from the current set alone: a recorded
- *   one stays, at its recorded place, only while the overlay carries it, and its label is the
- *   current message, else the code, never the frozen recorded text. A card recorded with one
- *   open discrepancy therefore drops the flag once none is open.
- * - `FlagList` renders a list named "Flags" with one badge per merged code, labelled with the
- *   backend's own message, and renders nothing when no flag applies.
+ *   one stays, at its recorded place, only while the overlay carries it, and its message is the
+ *   current one, else the code, never the frozen recorded text. A card recorded with one open
+ *   discrepancy therefore drops the flag once none is open.
+ * - {@link FLAG_LABELS} gives every flag code the label AAP 0.5.5 names on the flags row, and is
+ *   frozen.
+ * - {@link flagText} puts the code's label before a message that does not name it ("Stale: Data
+ *   as of …", "Short window: Window of 10 days …", "Meeting time proxy: 1 other meeting …"),
+ *   shows a message that names it as written ("Simulated data (Google)", "Not yet
+ *   distinguishable …"), shows the label alone for a blank message or the code itself, and the
+ *   message alone, else the code, for a code it has no label for.
+ * - `FlagList` renders a list named "Flags" with one badge per merged code, showing
+ *   {@link flagText}, and renders nothing when no flag applies.
  *
  * Flags come from `FIXTURE_FLAGS`, whose messages are the ones the backend renders for each of
  * the fifteen codes, and from the default page's C1 card. The component makes no request, so
@@ -40,9 +47,11 @@ import {
 } from '../../test/fixtures';
 import { renderWithProviders } from '../../test/render';
 import {
+  FLAG_LABELS,
   FlagList,
   LIVE_ONLY_FLAG_CODES,
   WARNING_FLAG_CODES,
+  flagText,
   flagTone,
   mergeFlags,
 } from './FlagList';
@@ -70,6 +79,63 @@ const INFO_CODES: readonly FlagCode[] = [
   'shared_budget',
 ];
 
+/** The label AAP 0.5.5 names on the flags row for each code. */
+const AAP_LABELS: Readonly<Record<FlagCode, string>> = {
+  simulated: 'Simulated data',
+  stale: 'Stale',
+  incomplete: 'Incomplete',
+  short_window: 'Short window',
+  unverified_discrepancies: 'Unverified while discrepancies open',
+  attribution_floor: 'Floor',
+  creative_floor: 'Floor',
+  deal_floor: 'Floor',
+  unknown_crm_evidence: 'Unknown CRM evidence',
+  meeting_time_proxy: 'Meeting time proxy',
+  pipeline_unavailable: 'Pipeline unavailable',
+  no_crm_link: 'No CRM link',
+  not_distinguishable: 'Not distinguishable',
+  search_term_coverage: 'Low search-term coverage',
+  shared_budget: 'Shared budget',
+};
+
+/** The stale fixture flag's badge text: its message does not say "stale", so the label leads. */
+const STALE_BADGE =
+  'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03';
+
+/** The short-window fixture flag's badge text. */
+const SHORT_WINDOW_BADGE = 'Short window: Window of 10 days is below the 14-day trusted minimum';
+
+/** The meeting-time-proxy fixture flag's badge text ("proxied" is not the word "proxy"). */
+const MEETING_PROXY_BADGE =
+  'Meeting time proxy: 1 other meeting (ordering unverified): booking time is proxied by ' +
+  'record creation, so it is excluded from cost per meeting';
+
+/** The unknown-CRM-evidence fixture flag's badge text: its message names "unknown" after "CRM". */
+const UNKNOWN_EVIDENCE_BADGE =
+  'Unknown CRM evidence: Floor: CRM evidence unknown for 10% of matched contacts (2 of 20)';
+
+/**
+ * The badge text of each {@link FIXTURE_FLAGS} flag: the message as written where it names its
+ * label, else the label, a colon and the message.
+ */
+const FIXTURE_BADGE_TEXTS: Readonly<Record<FlagCode, string>> = {
+  simulated: 'Simulated data',
+  stale: STALE_BADGE,
+  incomplete: FIXTURE_FLAGS.incomplete.message,
+  short_window: SHORT_WINDOW_BADGE,
+  unverified_discrepancies: 'Unverified while 1 discrepancies are open',
+  attribution_floor: 'Floor: 12% of leads unmatched in HubSpot',
+  creative_floor: 'Per-creative breakdown is a floor: 12.5% of leads have no creative',
+  deal_floor: 'Deal counts are a floor: orphan-deal share 25% (1 of 4 deals without a contact)',
+  unknown_crm_evidence: UNKNOWN_EVIDENCE_BADGE,
+  meeting_time_proxy: MEETING_PROXY_BADGE,
+  pipeline_unavailable: FIXTURE_FLAGS.pipeline_unavailable.message,
+  no_crm_link: FIXTURE_FLAGS.no_crm_link.message,
+  not_distinguishable: 'Not yet distinguishable (adjusted p = 0.21)',
+  search_term_coverage: 'Low search-term coverage: 74% of keyword spend',
+  shared_budget: 'Shared budget across 2 campaigns: decided at budget level',
+};
+
 /** The list items of the "Flags" list, in order. */
 function flagItems(): HTMLElement[] {
   return within(screen.getByRole('list', { name: 'Flags' })).getAllByRole('listitem');
@@ -91,6 +157,138 @@ describe('flagTone', () => {
   it('warns on exactly the documented codes, and the two tone sets cover every flag code', () => {
     expect([...WARNING_FLAG_CODES].sort()).toEqual([...WARNING_CODES].sort());
     expect([...WARNING_CODES, ...INFO_CODES].sort()).toEqual([...FIXTURE_FLAG_CODES].sort());
+  });
+});
+
+describe('FLAG_LABELS', () => {
+  it('labels every flag code, and nothing else', () => {
+    // FIXTURE_FLAG_CODES are the keys of FIXTURE_FLAGS, a Record over the FlagCode union.
+    expect(Object.keys(FLAG_LABELS).sort()).toEqual([...FIXTURE_FLAG_CODES].sort());
+    expect(Object.keys(FLAG_LABELS).sort()).toEqual(Object.keys(FIXTURE_FLAGS).sort());
+  });
+
+  it.each(FIXTURE_FLAG_CODES)('labels %s as AAP 0.5.5 names it on the flags row', (code) => {
+    expect(FLAG_LABELS[code]).toBe(AAP_LABELS[code]);
+    expect(FLAG_LABELS[code].trim()).not.toBe('');
+  });
+
+  it('gives the attribution, creative and deal floors the one "Floor" label', () => {
+    expect([
+      FLAG_LABELS.attribution_floor,
+      FLAG_LABELS.creative_floor,
+      FLAG_LABELS.deal_floor,
+    ]).toEqual(['Floor', 'Floor', 'Floor']);
+  });
+
+  it('is frozen, so no caller can relabel a code', () => {
+    expect(Object.isFrozen(FLAG_LABELS)).toBe(true);
+    expect(() => {
+      (FLAG_LABELS as Record<FlagCode, string>).stale = 'Old';
+    }).toThrow(TypeError);
+    expect(FLAG_LABELS.stale).toBe('Stale');
+  });
+});
+
+describe('flagText', () => {
+  it.each<[FlagCode, string, string]>([
+    ['stale', FIXTURE_FLAGS.stale.message, STALE_BADGE],
+    ['short_window', FIXTURE_FLAGS.short_window.message, SHORT_WINDOW_BADGE],
+    [
+      'short_window',
+      'Window of 6 days is below the 14-day trusted minimum',
+      'Short window: Window of 6 days is below the 14-day trusted minimum',
+    ],
+    ['meeting_time_proxy', FIXTURE_FLAGS.meeting_time_proxy.message, MEETING_PROXY_BADGE],
+    [
+      'meeting_time_proxy',
+      '6 other meetings (ordering unverified): booking time is proxied by record creation, so ' +
+        'they are excluded from cost per meeting',
+      'Meeting time proxy: 6 other meetings (ordering unverified): booking time is proxied by ' +
+        'record creation, so they are excluded from cost per meeting',
+    ],
+    ['unknown_crm_evidence', FIXTURE_FLAGS.unknown_crm_evidence.message, UNKNOWN_EVIDENCE_BADGE],
+    [
+      'pipeline_unavailable',
+      'Qualified Lead count unavailable: r',
+      'Pipeline unavailable: Qualified Lead count unavailable: r',
+    ],
+  ])('puts the %s label before a message that does not name it', (code, message, text) => {
+    expect(flagText({ code, message })).toBe(text);
+  });
+
+  it.each<[FlagCode, string]>([
+    ['simulated', 'Simulated data (Google)'],
+    ['simulated', 'Joins live and simulated data (HubSpot simulated)'],
+    ['incomplete', 'Incomplete: x'],
+    ['incomplete', 'Baseline incomplete: x'],
+    ['unverified_discrepancies', 'Unverified while 3 discrepancies are open'],
+    ['attribution_floor', 'Floor: 12% of leads unmatched in HubSpot'],
+    ['creative_floor', FIXTURE_FLAGS.creative_floor.message],
+    ['deal_floor', FIXTURE_FLAGS.deal_floor.message],
+    ['not_distinguishable', 'Not yet distinguishable (adjusted p = 0.21)'],
+    ['unknown_crm_evidence', 'Unknown CRM evidence for 3 of 25 eligible contacts'],
+    ['pipeline_unavailable', 'Pipeline unavailable: r'],
+    ['no_crm_link', 'No CRM link for Google campaigns: r'],
+    ['search_term_coverage', 'Low search-term coverage: 62% of keyword spend'],
+    ['shared_budget', 'Shared budget across 2 campaigns: decided at budget level'],
+  ])('shows a %s message that already names its label as written: "%s"', (code, message) => {
+    expect(flagText({ code, message })).toBe(message);
+  });
+
+  it('gives each fixture flag its badge text', () => {
+    expect(FIXTURE_FLAG_CODES.map((code) => flagText(FIXTURE_FLAGS[code]))).toEqual(
+      FIXTURE_FLAG_CODES.map((code) => FIXTURE_BADGE_TEXTS[code]),
+    );
+  });
+
+  it('matches the label words in order, ignoring case and punctuation, never inside a word', () => {
+    expect(flagText({ code: 'stale', message: 'STALE since 05:31' })).toBe('STALE since 05:31');
+    expect(flagText({ code: 'short_window', message: 'Short-window run' })).toBe(
+      'Short-window run',
+    );
+    expect(flagText({ code: 'short_window', message: 'Window is short' })).toBe(
+      'Short window: Window is short',
+    );
+    expect(flagText({ code: 'stale', message: 'Stalemate' })).toBe('Stale: Stalemate');
+  });
+
+  it('trims the message it shows', () => {
+    expect(flagText({ code: 'simulated', message: '  Simulated data (Google)\n' })).toBe(
+      'Simulated data (Google)',
+    );
+    expect(flagText({ code: 'stale', message: '  Data as of 05:31  ' })).toBe(
+      'Stale: Data as of 05:31',
+    );
+  });
+
+  it.each(FIXTURE_FLAG_CODES)(
+    'shows the %s label alone for a blank message or the code itself',
+    (code) => {
+      for (const message of ['', '   ', code, ` ${code} `]) {
+        expect(flagText({ code, message })).toBe(AAP_LABELS[code]);
+      }
+    },
+  );
+
+  it('shows the label alone when the message is not a string at run time', () => {
+    expect(flagText({ code: 'stale', message: null as unknown as string })).toBe('Stale');
+  });
+
+  it('shows the message alone, else the code, for a code a later API version adds', () => {
+    const code = 'budget_paced' as FlagCode;
+
+    expect(flagText({ code, message: ' Paced at 80% of the daily budget ' })).toBe(
+      'Paced at 80% of the daily budget',
+    );
+    expect(flagText({ code, message: '  ' })).toBe('budget_paced');
+    expect(flagText({ code, message: 'budget_paced' })).toBe('budget_paced');
+  });
+
+  it('never takes a label from the object prototype', () => {
+    const code = 'constructor' as FlagCode;
+
+    expect(flagText({ code, message: 'Built at run time' })).toBe('Built at run time');
+    expect(flagText({ code, message: '' })).toBe('constructor');
   });
 });
 
@@ -166,13 +364,15 @@ describe('mergeFlags', () => {
     expect(merged).toEqual([{ code: 'short_window', message: FIXTURE_FLAGS.short_window.message }]);
   });
 
-  it('labels a code with the code itself when its message is blank in both sets', () => {
-    const merged = mergeFlags(
-      [makeFlag('deal_floor', { message: '' })],
-      [makeFlag('deal_floor', { message: '   ' })],
-    );
+  it('gives a code blank in both sets the code itself as its message, and its badge the label', () => {
+    const recorded = [makeFlag('deal_floor', { message: '' })];
+    const current = [makeFlag('deal_floor', { message: '   ' })];
 
-    expect(merged).toEqual([{ code: 'deal_floor', message: 'deal_floor' }]);
+    expect(mergeFlags(recorded, current)).toEqual([{ code: 'deal_floor', message: 'deal_floor' }]);
+
+    render(<FlagList flags={recorded} current={current} />);
+
+    expect(flagItems().map((entry) => entry.textContent)).toEqual(['Floor']);
   });
 
   it('defaults the current set to none and returns new objects without mutating its inputs', () => {
@@ -215,26 +415,33 @@ describe('mergeFlags', () => {
     expect(current).toHaveLength(1);
   });
 
-  it('labels a live-only code with the code itself, never the frozen recorded text', () => {
-    const merged = mergeFlags(
-      [
-        makeFlag('unverified_discrepancies', {
-          message: 'Unverified while 1 discrepancies are open',
-        }),
-        makeFlag('simulated'),
-      ],
-      [makeFlag('unverified_discrepancies', { message: '  ' })],
-    );
+  it('gives a live-only code the code itself as its message, never the frozen recorded text', () => {
+    const recorded = [
+      makeFlag('unverified_discrepancies', {
+        message: 'Unverified while 1 discrepancies are open',
+      }),
+      makeFlag('simulated'),
+    ];
+    const current = [makeFlag('unverified_discrepancies', { message: '  ' })];
 
-    expect(merged).toEqual([
+    expect(mergeFlags(recorded, current)).toEqual([
       { code: 'unverified_discrepancies', message: 'unverified_discrepancies' },
       { code: 'simulated', message: 'Simulated data' },
     ]);
+
+    render(<FlagList flags={recorded} current={current} />);
+
+    // The badge shows the code's label alone, and the frozen count nowhere.
+    expect(flagItems().map((entry) => entry.textContent)).toEqual([
+      'Unverified while discrepancies open',
+      'Simulated data',
+    ]);
+    expect(screen.queryByText('Unverified while 1 discrepancies are open')).toBeNull();
   });
 });
 
 describe('FlagList', () => {
-  it('renders one badge per code, labelled with the backend message, toned by the code', () => {
+  it('renders one badge per code, showing its label and message, toned by the code', () => {
     const flags = FIXTURE_FLAG_CODES.map((code) => makeFlag(code));
     // A live-only code shows only while the overlay carries it, so the current set carries those.
     const current = FIXTURE_FLAG_CODES.filter((code) => LIVE_ONLY_FLAG_CODES.has(code)).map(
@@ -244,7 +451,7 @@ describe('FlagList', () => {
 
     const items = flagItems();
     expect(items.map((item) => item.textContent)).toEqual(
-      FIXTURE_FLAG_CODES.map((code) => FIXTURE_FLAGS[code].message),
+      FIXTURE_FLAG_CODES.map((code) => FIXTURE_BADGE_TEXTS[code]),
     );
     FIXTURE_FLAG_CODES.forEach((code, index) => {
       const badge = items[index]?.firstElementChild;
@@ -266,10 +473,27 @@ describe('FlagList', () => {
   it('renders the current flags alone when the run recorded none', () => {
     render(<FlagList flags={[]} current={[makeFlag('stale')]} />);
 
-    expect(flagItems().map((entry) => entry.textContent)).toEqual([FIXTURE_FLAGS.stale.message]);
-    expect(screen.getByText(FIXTURE_FLAGS.stale.message).className).toBe(
-      'ds-badge ds-badge--warning',
+    expect(flagItems().map((entry) => entry.textContent)).toEqual([STALE_BADGE]);
+    expect(screen.getByText(STALE_BADGE).className).toBe('ds-badge ds-badge--warning');
+  });
+
+  it('names the Stale, Short window and Meeting time proxy labels before their messages', () => {
+    render(
+      <FlagList
+        flags={[makeFlag('short_window'), makeFlag('meeting_time_proxy')]}
+        current={[makeFlag('stale')]}
+      />,
     );
+
+    expect(flagItems().map((entry) => entry.textContent)).toEqual([
+      'Short window: Window of 10 days is below the 14-day trusted minimum',
+      'Meeting time proxy: 1 other meeting (ordering unverified): booking time is proxied by ' +
+        'record creation, so it is excluded from cost per meeting',
+      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+    ]);
+    expect(screen.getByText(SHORT_WINDOW_BADGE).className).toBe('ds-badge ds-badge--warning');
+    expect(screen.getByText(MEETING_PROXY_BADGE).className).toBe('ds-badge ds-badge--info');
+    expect(screen.getByText(STALE_BADGE).className).toBe('ds-badge ds-badge--warning');
   });
 
   it('renders nothing, not even an empty list, when no flag applies', () => {

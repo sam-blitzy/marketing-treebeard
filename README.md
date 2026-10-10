@@ -119,12 +119,14 @@ make check-tools
    make init ADMIN_PASSWORD='<choose-a-password>'
    ```
 
-   `make init` runs `make check-tools`, refuses to overwrite an existing `.env`, copies
-   `.env.example` to `.env` (mode 600), writes a random `SESSION_SECRET`, and writes
-   `APP_ADMIN_PASSWORD_HASH`, the argon2id hash computed by `ads-engine hash-password` in the
-   backend image. Every other variable keeps its safe default, so `APP_ADMIN_EMAIL` stays
-   `admin@example.com` and no source has credentials. To keep the password out of your shell
-   history, see [First start](docs/runbook.md#first-start) in the runbook.
+   `make init` runs `make check-tools`, refuses to overwrite an existing `.env`, makes
+   `config/` readable to the backend containers (`chmod -R a+rX config/`, so a checkout made
+   under umask 077 still starts), copies `.env.example` to `.env` (mode 600), writes a random
+   `SESSION_SECRET`, and writes `APP_ADMIN_PASSWORD_HASH`, the argon2id hash computed by
+   `ads-engine hash-password` in the backend image. Every other variable keeps its safe default,
+   so `APP_ADMIN_EMAIL` stays `admin@example.com` and no source has credentials. To keep the
+   password out of your shell history, see [First start](docs/runbook.md#first-start) in the
+   runbook.
 
 2. Build and start the stack:
 
@@ -261,7 +263,7 @@ Who reads each variable, and how to rotate secrets:
 | --- | --- |
 | `help` | Lists the targets (the default goal) |
 | `check-tools` | Verifies Docker Compose `>=5.5.1,<6` and Docker Engine `>=29`, printing the required range on failure |
-| `init` | First start (`make init ADMIN_PASSWORD=<value>`): copies `.env.example` to `.env` without overwriting one, and writes `SESSION_SECRET` and `APP_ADMIN_PASSWORD_HASH` |
+| `init` | First start (`make init ADMIN_PASSWORD=<value>`): makes `config/` readable to the backend containers, copies `.env.example` to `.env` without overwriting one, and writes `SESSION_SECRET` and `APP_ADMIN_PASSWORD_HASH` |
 | `up` | Builds and starts the stack detached (`docker compose up -d --build`), then waits for `/api/v1/healthz` |
 | `down` | Stops and removes the containers; the database volume `pgdata` is kept (`docker compose down -v` deletes it) |
 | `migrate` | Runs the one-shot `migrate` service: `ads-engine migrate && ads-engine ensure-admin` |

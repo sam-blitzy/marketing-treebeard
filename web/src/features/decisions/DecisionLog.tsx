@@ -321,16 +321,26 @@ function sharedBudgetNames(decisions: readonly Decision[]): ReadonlyMap<number, 
 }
 
 /**
- * How a member's shared budget is named after "shared budget": the budget's name without the
- * API's own "Shared budget " prefix ("4455"), its full name when it has no such prefix, or
- * "id {budget_id}" when the log holds no decision naming it, the wording `DecisionForm` uses.
+ * How a member's shared budget is named after "shared budget", the wording `DecisionForm` uses:
+ * the budget's name from a decision of the log, without the API's own "Shared budget " prefix
+ * ("4455"), or its full name when it has no such prefix; else the Google id the member's row
+ * carries (`budget_external_id`); else "id {budget_id}" when the API could not name it either.
+ *
+ * @param budgetId - The member's `budget_id`.
+ * @param externalId - The member row's `budget_external_id`.
+ * @param names - Shared budget names by internal id, from {@link sharedBudgetNames}.
+ * @returns The label.
  */
-function sharedBudgetLabel(budgetId: number, names: ReadonlyMap<number, string>): string {
+function sharedBudgetLabel(
+  budgetId: number,
+  externalId: string | null,
+  names: ReadonlyMap<number, string>,
+): string {
   const name = names.get(budgetId);
-  if (name === undefined) {
-    return `id ${budgetId}`;
+  if (name !== undefined) {
+    return textOrNull(name.replace(SHARED_BUDGET_NAME_PREFIX, '')) ?? name;
   }
-  return textOrNull(name.replace(SHARED_BUDGET_NAME_PREFIX, '')) ?? name;
+  return textOrNull(externalId) ?? `id ${budgetId}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -433,8 +443,8 @@ function amountParts(decision: Decision): string[] {
  *
  * - `own_budget`: "{Status} · daily budget {amount} · total budget {amount}", with only the
  *   amounts the row holds;
- * - `shared_member`: "{Status} · shared budget {name or id}", never an amount, because the
- *   amount belongs to the shared budget;
+ * - `shared_member`: "{Status} · shared budget {name, Google id or id}" (see
+ *   {@link sharedBudgetLabel}), never an amount, because the amount belongs to the shared budget;
  * - `budget`: "daily budget {amount}" or "total budget {amount}", with no status;
  * - an acknowledged removal (`tombstone`): "Removal acknowledged", followed by the campaign's
  *   decided status (" · Ended") on campaign subjects.
@@ -458,7 +468,8 @@ function describeExpectedState(
     case 'shared_member': {
       const parts = [statusLabel(decision.status)];
       if (decision.budget_id !== null) {
-        parts.push(`shared budget ${sharedBudgetLabel(decision.budget_id, budgetNames)}`);
+        const label = sharedBudgetLabel(decision.budget_id, decision.budget_external_id, budgetNames);
+        parts.push(`shared budget ${label}`);
       }
       return parts.join(PART_SEPARATOR);
     }

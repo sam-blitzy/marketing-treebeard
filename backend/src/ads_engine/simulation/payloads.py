@@ -1349,10 +1349,13 @@ _VERSIONED_FORM_RE: Final = re.compile(
 _DIGITS_RE: Final = re.compile(r"\d+")
 
 # Continuation parameters a LinkedIn ``paging.links`` ``next`` href carries. The analytics
-# contracts list none, because live adAnalytics truncates at 15,000 elements instead of paging;
-# the simulator emits a next link only when a world sets ``analytics_next_links``, and the
-# follow-up request carries these two offset parameters (LinkedIn's own paging names). They are
-# accepted on these surfaces only, so every other unknown parameter still fails validation.
+# contracts list none, because the reporting page documents no adAnalytics pagination; the
+# simulator emits a next link only when a world sets ``analytics_next_links`` (the remainder
+# beyond the 15,000 cap) or ``analytics_repeat_pages`` (live 202609's timeGranularity=ALL
+# paging, observed 2026-10-10: ``start`` is ignored and every page repeats the first, linking on
+# to start+count), and the follow-up request carries these two offset parameters (LinkedIn's
+# own paging names). They are accepted on these surfaces only, so every other unknown parameter
+# still fails validation.
 _CONTINUATION_QUERY: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {
         "linkedin.ad_analytics": ("start", "count"),
@@ -1361,6 +1364,13 @@ _CONTINUATION_QUERY: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
         "linkedin.ad_analytics_member_segments": ("start", "count"),
     }
 )
+
+# The timeGranularity=ALL analytics surfaces a world with ``analytics_repeat_pages`` pages as
+# live 202609 does, and the page size Rest.li applies when a request sends no ``count``.
+_REPEAT_PAGE_SURFACES: Final = frozenset(
+    {"ad_analytics_statistics", "ad_analytics_campaign_delivery", "ad_analytics_member_segments"}
+)
+_RESTLI_DEFAULT_COUNT: Final = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -3654,6 +3664,14 @@ def _render_analytics(ctx: _Ctx) -> RenderedResponse:
     Responses are capped at the contract's ``max_elements`` (15,000). Beyond the cap, live
     LinkedIn truncates without a link; a world with ``analytics_next_links`` adds a
     ``paging.links`` ``next`` href that serves the remainder through ``start``/``count``.
+
+    A world with ``analytics_repeat_pages`` serves the three ``timeGranularity=ALL`` surfaces
+    as live 202609 does (observed 2026-10-10): ``start`` is ignored, so every response holds
+    the first page, every element up to the cap; ``paging`` echoes the request's ``count``
+    (Rest.li's default 10 when absent) and ``start``, carries no ``total``, and links ``next``
+    to ``start + count`` whenever the response holds at least ``count`` elements, so the
+    chain never ends on its own. A ``count`` below 1 is rejected with HTTP 400. Faults see the
+    page as ``start // count + 1``. ``ad_analytics`` (``DAILY``) is unaffected.
     """
     accounts = [
         urn.removeprefix(_ACCOUNT_URN)
@@ -3665,8 +3683,17 @@ def _render_analytics(ctx: _Ctx) -> RenderedResponse:
     fields = frozenset(_top_level_fields(cast(str, ctx.leaf("fields"))))
     cap = ctx.prepared.contract.request.limit("max_elements") or 15_000
     offset = ctx.integer("start", 0)
+    linkedin = ctx.world.spec.linkedin
+    repeat = (
+        linkedin is not None
+        and linkedin.analytics_repeat_pages
+        and ctx.surface in _REPEAT_PAGE_SURFACES
+    )
+    count = ctx.integer("count", _RESTLI_DEFAULT_COUNT) if repeat else cap
+    if count < 1:
+        raise _RejectionError("query parameter count: must be at least 1")
     elements: list[JSONValue] = []
-    attributes = {"account_id": accounts[0] if accounts else "", "page": str(offset // cap + 1)}
+    attributes = {"account_id": accounts[0] if accounts else "", "page": str(offset // count + 1)}
     if ctx.surface == "ad_analytics":
         days: list[LinkedInCreativeDay] = []
         for account_id in sorted(set(accounts), key=int):
@@ -3710,14 +3737,21 @@ def _render_analytics(ctx: _Ctx) -> RenderedResponse:
             elements.extend(
                 cast(JSONValue, _segment_element(record, fields)) for record in segments
             )
-    page = elements[offset : offset + cap]
-    paging: JSONObject = {"count": cap, "start": offset, "links": []}
-    linkedin = ctx.world.spec.linkedin
-    if linkedin is not None and linkedin.analytics_next_links and offset + cap < len(elements):
+    following: int | None = None
+    if repeat:
+        page = elements[:cap]
+        if len(page) >= count:
+            following = offset + count
+    else:
+        page = elements[offset : offset + cap]
+        if linkedin is not None and linkedin.analytics_next_links and offset + cap < len(elements):
+            following = offset + cap
+    paging: JSONObject = {"count": count, "start": offset, "links": []}
+    if following is not None:
         kept = "&".join(
             f"{name}={value}" for name, value in ctx.query.pairs if name not in ("start", "count")
         )
-        href = f"{_REST_PREFIX}adAnalytics?{kept}&start={offset + cap}&count={cap}"
+        href = f"{_REST_PREFIX}adAnalytics?{kept}&start={following}&count={count}"
         paging["links"] = [{"rel": "next", "href": href, "type": "application/json"}]
     body: JSONObject = {"elements": page, "paging": paging}
     return RenderedResponse(200, body, surface=ctx.surface)

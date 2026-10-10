@@ -1418,7 +1418,10 @@ function subjectView(shape: DecisionShape): SubjectView {
 }
 
 /** The fields of a decision row its shape fixes: the id and the expected state. */
-type ShapeState = Pick<Decision, 'id' | 'status' | 'daily_budget' | 'total_budget' | 'budget_id'>;
+type ShapeState = Pick<
+  Decision,
+  'id' | 'status' | 'daily_budget' | 'total_budget' | 'budget_id' | 'budget_external_id'
+>;
 
 /** The decision ids and expected states of {@link makeDecision}, per shape (AAP 0.5.2). */
 const SHAPE_STATES: Readonly<Record<DecisionShape, Readonly<ShapeState>>> = Object.freeze({
@@ -1428,6 +1431,7 @@ const SHAPE_STATES: Readonly<Record<DecisionShape, Readonly<ShapeState>>> = Obje
     daily_budget: '200.00',
     total_budget: null,
     budget_id: null,
+    budget_external_id: null,
   }),
   shared_member: Object.freeze({
     id: 802,
@@ -1435,6 +1439,7 @@ const SHAPE_STATES: Readonly<Record<DecisionShape, Readonly<ShapeState>>> = Obje
     daily_budget: null,
     total_budget: null,
     budget_id: FIXTURE_BUDGET_IDS.search,
+    budget_external_id: '31000402',
   }),
   budget: Object.freeze({
     id: 803,
@@ -1442,6 +1447,7 @@ const SHAPE_STATES: Readonly<Record<DecisionShape, Readonly<ShapeState>>> = Obje
     daily_budget: '500.00',
     total_budget: null,
     budget_id: null,
+    budget_external_id: null,
   }),
 });
 
@@ -1451,7 +1457,8 @@ const SHAPE_STATES: Readonly<Record<DecisionShape, Readonly<ShapeState>>> = Obje
  *
  * - `own_budget`: "Brand Search — US", status `active`, daily budget `200.00`;
  * - `shared_member`: "Search Partners — US", status `active`, assigned to the shared budget
- *   {@link FIXTURE_BUDGET_IDS}.search, no amount;
+ *   {@link FIXTURE_BUDGET_IDS}.search, whose Google id (`budget_external_id`) is `31000402`, no
+ *   amount;
  * - `budget`: "Search Shared Budget", no status, daily budget `500.00`.
  *
  * A baseline row records no submitted patch (`patch: {}`) and no author (`decided_by: null`).

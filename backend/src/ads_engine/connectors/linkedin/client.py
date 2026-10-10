@@ -56,6 +56,7 @@ Example:
                 ...  # only a complete listing may drive `missing` discrepancies
 """
 
+import json
 import re
 from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
@@ -241,6 +242,11 @@ _ONE_MS: Final = timedelta(milliseconds=1)
 
 # Defensive bounds on one listing's page count. They stop a misbehaving endpoint that keeps
 # returning cursors or full pages; real accounts stay orders of magnitude below them.
+# _MAX_NEXT_LINKS bounds an adAnalytics next-link chain whose pages keep adding elements not
+# read before. A chain of repeat pages never reaches it: live 202609 ignores `start` with
+# timeGranularity=ALL and answers every next link with the same page and a fresh next link to
+# start+count, with no total (observed 2026-10-10), so LinkedInClient._follow ends a chain,
+# complete, at its first non-empty page that adds no new pivotValues.
 _MAX_CURSOR_PAGES: Final = 10_000
 _MAX_OFFSET_PAGES: Final = 10_000
 _MAX_NEXT_LINKS: Final = 1_000
@@ -538,9 +544,11 @@ class _Pages:
     """The elements of one request and the next links it led to.
 
     Attributes:
-        elements: Every element read, in response order.
-        capped: Whether the last response held at least :data:`MAX_ANALYTICS_ELEMENTS`
-            elements with no ``next`` link, so it may be truncated.
+        elements: Every element read, in response order; a repeat page that ends the chain
+            adds none.
+        capped: Whether the response that ended the chain, one with no ``next`` link or a
+            repeat page, held at least :data:`MAX_ANALYTICS_ELEMENTS` elements, so it may be
+            truncated.
         limited: Whether a ``max_pages`` bound stopped the chain with a ``next`` link unread.
         interrupted_by: The transient error that stopped the next-link chain, or ``None``.
     """
@@ -648,6 +656,27 @@ def _next_href(body: _Element, surface: str) -> str | None:
             raise _defect("a 'next' link has no href", surface)
         return _relative_href(href.strip(), surface)
     return None
+
+
+def _element_key(element: _Element) -> str | None:
+    """Identify an ``adAnalytics`` element within one ``next``-link chain, or return ``None``.
+
+    The identity is the canonical JSON of the element's ``pivotValues`` and ``dateRange``. A
+    daily element is one pivot value on one day, so a daily chain whose next page holds the
+    same creatives on new days adds new elements; an ``ALL`` projection carries no
+    ``dateRange``, so its identity is its ``pivotValues`` alone. An element without a
+    ``pivotValues`` list has no identity and always counts as new, so the parser still
+    rejects it.
+    """
+    pivot_values = element.get("pivotValues")
+    if not isinstance(pivot_values, list):
+        return None
+    return json.dumps(
+        [pivot_values, element.get("dateRange")],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _cursor_token(body: _Element, surface: str) -> str | None:
@@ -1168,17 +1197,35 @@ class LinkedInClient:
         """Read a request and every ``rel=next`` link it leads to.
 
         ``adAnalytics`` documents no pagination, but live responses can carry a ``next``
-        link, which is followed at once, from an empty page too: only a response without a
-        ``next`` link ends the chain, so no row behind an empty page is lost. A link back to
-        any request already read is a defect, and so is a chain of more than
-        :data:`_MAX_NEXT_LINKS` links, so the chain always terminates. A transient failure
-        stops the chain, keeps the elements already read and sets ``interrupted_by``, so the
-        caller reports the listing incomplete. With ``max_pages``, at most that many
-        responses are read (the request and its ``next`` links); a ``next`` link left unread
-        sets ``limited``, so the caller reports the listing incomplete too.
+        link, which is followed at once, from an empty page too: an empty page never ends
+        the chain, so no row behind it is lost. The chain ends at a response without a
+        ``next`` link, or, complete, at the first non-empty response that adds no element
+        not already read in the chain; that repeat page's elements are not added again.
+        Live 202609 ignores ``start`` with ``timeGranularity=ALL``: every ``next`` link is
+        answered with the same page, a fresh ``next`` link to ``start + count`` and no
+        ``total`` (observed on 2026-10-10), so a pivot whose values fill one page would
+        otherwise never end. Elements are identified by their ``pivotValues`` and
+        ``dateRange`` (:func:`_element_key`), so a daily page holding the same creatives on
+        new days adds elements and the chain reads on; a page with any new element is kept
+        whole. The response that ends the chain sets ``capped`` when it holds at least
+        :data:`MAX_ANALYTICS_ELEMENTS` elements, a repeat page included, so a repeated page
+        at the cap still reads as possibly truncated.
+
+        A response with a ``next`` link is judged in this order. First the repeat rule: a
+        repeat page adds nothing and leaves nothing unread, so it ends the chain complete
+        even at the ``max_pages`` bound and even when its link points back to a request
+        already read. The first response is never a repeat. Then, with ``max_pages``, at
+        most that many responses are read (the request and its ``next`` links); a ``next``
+        link left unread sets ``limited``, so the caller reports the listing incomplete.
+        Last, a link back to any request already read is a defect, from an empty page or a
+        page with a new element alike, and so is a chain of more than
+        :data:`_MAX_NEXT_LINKS` links whose pages keep adding elements, so the chain always
+        terminates. A transient failure stops the chain, keeps the elements already read and
+        sets ``interrupted_by``, so the caller reports the listing incomplete too.
         """
         pages = _Pages()
         seen: set[str] = {url}
+        read_keys: set[str] = set()
         current = url
         for read in range(1, _MAX_NEXT_LINKS + 2):
             try:
@@ -1188,16 +1235,24 @@ class LinkedInClient:
                 return pages
             body = _body_object(response, surface)
             elements = _elements(body, surface)
-            pages.elements.extend(elements)
             href = _next_href(body, surface)
             if href is None:
+                pages.elements.extend(elements)
+                pages.capped = len(elements) >= MAX_ANALYTICS_ELEMENTS
+                return pages
+            keys = [_element_key(element) for element in elements]
+            if keys and all(key is not None and key in read_keys for key in keys):
+                log.info("linkedin.analytics.repeat_page", surface=surface, responses=read)
                 pages.capped = len(elements) >= MAX_ANALYTICS_ELEMENTS
                 return pages
             if max_pages is not None and read >= max_pages:
+                pages.elements.extend(elements)
                 pages.limited = True
                 return pages
             if href in seen:
                 raise _defect("a 'next' link repeats an earlier request", surface)
+            pages.elements.extend(elements)
+            read_keys.update(key for key in keys if key is not None)
             seen.add(href)
             current = href
         raise _defect(f"more than {_MAX_NEXT_LINKS} 'next' links in one chain", surface)
@@ -1678,10 +1733,11 @@ class LinkedInClient:
           recent :meth:`list_creatives` of the account, so creatives times days stays below
           the 15,000-element response cap; with neither, the creative count is unknown and
           the whole range is one chunk. Chunks are read in ascending date order;
-        * a ``next`` link is followed at once until none remains;
-        * a response with at least 15,000 elements and no ``next`` link may be truncated: its
-          rows are discarded and its range is split at the midpoint into ``[start, mid]``
-          and ``[mid + 1, end]``, read in that order;
+        * a ``next`` link is followed at once until none remains, or until a page repeats only
+          creative days already read (:meth:`_follow`), which ends the chunk complete;
+        * a response with at least 15,000 elements and no ``next`` link, or such a repeat page,
+          may be truncated: the chunk's rows are discarded and its range is split at the
+          midpoint into ``[start, mid]`` and ``[mid + 1, end]``, read in that order;
         * a single day at the cap keeps its rows and makes the listing incomplete with the
           reason "result limit reached at finest partition (one day)";
         * with ``max_pages``, each chunk's request reads at most that many responses (the
@@ -1793,7 +1849,11 @@ class LinkedInClient:
         q=statistics&pivots=List(CAMPAIGN,{pivot})&timeGranularity=ALL&dateRange=({window})
         &accounts=List({encoded account URN})&fields={SEGMENT_FIELDS}``, one request per
         pivot and preset window; ``SegmentSyncJob`` iterates ``window.presets`` ending on the
-        default window end (AAP 0.3.2). ``next`` links are followed.
+        default window end (AAP 0.3.2). ``next`` links are followed until a page adds no
+        ``pivotValues`` not already read for the request (:meth:`_follow`), which ends the
+        chain complete: live 202609 ignores ``start`` with ``timeGranularity=ALL`` and answers
+        every ``next`` link with the same page and a fresh ``next`` link to ``start + count``,
+        with no ``total`` (observed on 2026-10-10).
 
         Live fallback: LinkedIn 202609 rejects ``MEMBER_*`` values in the Statistics Finder
         ``pivots`` with HTTP 400 ("is not an enum symbol"; recorded as a plan risk in the
@@ -1814,9 +1874,9 @@ class LinkedInClient:
         Segment values are approximate and privacy-thresholded: LinkedIn returns at most the
         top 100 values per pivot and omits values reached by too few members, so a window's
         values are never summed from daily rows. A metric the pivot does not return is
-        ``None`` (parser). A response at the 15,000 cap without a ``next`` link makes the
-        listing incomplete with reason "result limit reached": the window must stay exact,
-        so it cannot be split by date.
+        ``None`` (parser). A response at the 15,000 cap that ends its chain, with no ``next``
+        link or as a repeat page, makes the listing incomplete with reason "result limit
+        reached": the window must stay exact, so it cannot be split by date.
 
         Capture bounds (``capture-fixtures`` sends 1 for both; every sync sends neither):
         ``max_pages`` caps the responses each request reads (the request and its ``next``
@@ -1969,6 +2029,14 @@ class LinkedInClient:
         parsed and logged under that surface. ``max_campaigns`` reads only the first
         delivering campaigns in ascending id order; the rest make the listing incomplete
         with the reason "page limit".
+
+        Each campaign's ``next``-link chain ends, complete, at its first page that adds no
+        ``pivotValues`` not already read for that campaign (:meth:`_follow`). Live 202609
+        ignores ``start`` here: a ``MEMBER_SENIORITY`` request whose 10 values fill one page
+        of ``count=10`` was answered with the same 10 values, a ``next`` link to
+        ``start + 10`` and no ``total`` on every page (observed on 2026-10-10), so such a
+        campaign costs the page and one repeat, 2 calls, where following every link ran into
+        :data:`_MAX_NEXT_LINKS` and failed the segment fetch.
         """
         surface = _SURFACE_MEMBER_SEGMENTS
         campaigns, reason, interrupted = await self._delivering(

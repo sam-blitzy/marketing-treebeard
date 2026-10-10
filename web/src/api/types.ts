@@ -1087,6 +1087,12 @@ export interface Decision {
   total_budget: Money | null;
   /** For `shared_member` rows, the shared budget the campaign is assigned to. */
   budget_id: number | null;
+  /**
+   * For `shared_member` rows, the Google id of the shared budget the campaign is assigned to,
+   * the id the product names it by ("Shared budget {external_id}"); `null` for the other
+   * shapes, or when that budget row cannot be read.
+   */
+  budget_external_id: string | null;
   /** Whether the row records an acknowledged removal. */
   tombstone: boolean;
   /** When the decision was recorded. */

@@ -516,6 +516,64 @@ function shownFlags(item: Item): Flag[] {
   });
 }
 
+/**
+ * The label each flag code's badge names (`FLAG_LABELS` in `FlagList.tsx`, restated for the same
+ * reason as {@link LIVE_ONLY_FLAG_CODES}): the wording AAP 0.5.5 gives the flags row, with one
+ * "Floor" label for the attribution, creative and deal floors.
+ */
+const FLAG_LABELS: Readonly<Record<FlagCode, string>> = Object.freeze({
+  simulated: 'Simulated data',
+  stale: 'Stale',
+  incomplete: 'Incomplete',
+  short_window: 'Short window',
+  unverified_discrepancies: 'Unverified while discrepancies open',
+  attribution_floor: 'Floor',
+  creative_floor: 'Floor',
+  deal_floor: 'Floor',
+  unknown_crm_evidence: 'Unknown CRM evidence',
+  meeting_time_proxy: 'Meeting time proxy',
+  pipeline_unavailable: 'Pipeline unavailable',
+  no_crm_link: 'No CRM link',
+  not_distinguishable: 'Not distinguishable',
+  search_term_coverage: 'Low search-term coverage',
+  shared_budget: 'Shared budget',
+});
+
+/** The lowercased words of `text`: each maximal run of letters and digits, in order. */
+function flagWords(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/**
+ * A flag badge's visible text (`flagText` in `FlagList.tsx`, restated for the same reason as
+ * {@link LIVE_ONLY_FLAG_CODES}): the trimmed message as written when its words contain the
+ * code's label ({@link FLAG_LABELS}) in order, else "{label}: {message}"; the label alone for a
+ * blank message or the code itself; and, for a code with no label, the message, else the code.
+ *
+ * @param flag - One flag, as {@link shownFlags} merges it.
+ * @returns The badge text, for example "Short window: Window of 10 days is below the 14-day
+ *   trusted minimum".
+ */
+function flagText(flag: Flag): string {
+  const message = flag.message.trim();
+  const blank = message === '' || message === flag.code;
+  if (!Object.hasOwn(FLAG_LABELS, flag.code)) {
+    return blank ? flag.code : message;
+  }
+  const label = FLAG_LABELS[flag.code];
+  if (blank) {
+    return label;
+  }
+  const wanted = flagWords(label);
+  let matched = 0;
+  for (const word of flagWords(message)) {
+    if (matched < wanted.length && word === wanted[matched]) {
+      matched += 1;
+    }
+  }
+  return matched === wanted.length ? message : `${label}: ${message}`;
+}
+
 /** The name a white-paper row shows (`assetName` in `WhitePapersSection.tsx`). */
 function assetName(item: Item): string {
   const name = item.entity.name?.trim() ?? '';
@@ -1224,7 +1282,7 @@ function expectItemEvidence(
     ).toContain('simulated');
   }
   expect(rendered.flags, `${where}: one badge per recorded and current flag`).toEqual([
-    flags.map((flag) => flag.message.trim()),
+    flags.map((flag) => flagText(flag)),
   ]);
 }
 
@@ -1406,11 +1464,14 @@ function whitePaperCellText(
   return text.trim() === EM_DASH && reason !== '' ? `${EM_DASH} (${reason})` : text;
 }
 
-/** The simulated-data badge text an asset row's name carries (`simulatedFlag`), or `null`. */
+/**
+ * The simulated-data badge text an asset row's name carries (`simulatedFlag`, shown with
+ * {@link flagText} as the flags row shows it), or `null`.
+ */
 function assetBadge(item: Item): string | null {
   const flag = shownFlags(item).find((each) => each.code === 'simulated');
   if (flag !== undefined) {
-    return flag.message;
+    return flagText(flag);
   }
   const label = (status: DataStatus): string | null =>
     status === 'simulated'
@@ -1418,7 +1479,8 @@ function assetBadge(item: Item): string | null {
       : status === 'mixed'
         ? 'Joins live and simulated data'
         : null;
-  return label(item.data_status) ?? label(item.current.data_status_now);
+  const fallback = label(item.data_status) ?? label(item.current.data_status_now);
+  return fallback === null ? null : flagText({ code: 'simulated', message: fallback });
 }
 
 /** The column headers of an asset table (`withToggle`) or a per-creative table. */

@@ -62,6 +62,7 @@ from ads_engine.connectors.linkedin.auth import (
     StaticTokenProvider,
 )
 from ads_engine.connectors.linkedin.client import (
+    DAILY_FIELDS,
     SEGMENT_DISCOVERY_FIELDS,
     SEGMENT_FIELDS,
     LinkedInClient,
@@ -1433,6 +1434,133 @@ def test_the_member_segments_form_for_an_unknown_campaign_has_no_elements() -> N
     response = render("linkedin", request, _world())
     assert response.status == 200
     assert cast(dict[str, Any], response.body)["elements"] == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Live 202609 repeat pages on the timeGranularity=ALL surfaces (analytics_repeat_pages)
+# ---------------------------------------------------------------------------------------------
+
+DAILY_RANGE = "(start:(year:2026,month:9,day:28),end:(year:2026,month:10,day:1))"
+ACCOUNT_FACET = f"accounts=List(urn%3Ali%3AsponsoredAccount%3A{NA_ACCOUNT})"
+STATISTICS_QUERY = (
+    f"q=statistics&pivots=List(CAMPAIGN,MEMBER_SENIORITY)&timeGranularity=ALL"
+    f"&dateRange={SEGMENT_RANGE}&{ACCOUNT_FACET}&fields={SEGMENT_FIELDS}"
+)
+DELIVERY_QUERY = (
+    f"q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange={SEGMENT_RANGE}"
+    f"&{ACCOUNT_FACET}&fields={SEGMENT_DISCOVERY_FIELDS}"
+)
+MEMBER_QUERY = (
+    f"q=analytics&pivot=MEMBER_SENIORITY&timeGranularity=ALL&dateRange={SEGMENT_RANGE}"
+    f"&campaigns=List({_campaign_urn(990010000)})&fields={SEGMENT_FIELDS}"
+)
+
+
+def _repeat_world() -> SimulatedWorld:
+    """The default world at :data:`NOW`, paging its ``ALL`` analytics as live 202609 does."""
+    config = _config()
+    return SimulatedWorld(
+        42,
+        SPEC.with_linkedin(analytics_repeat_pages=True),
+        clock=lambda: NOW,
+        content_assets=config.content_assets,
+        mapping=config.mapping,
+    )
+
+
+def _analytics_request(query: str) -> httpx.Request:
+    """A LinkedIn ``adAnalytics`` GET with ``query`` and the versioned headers."""
+    return httpx.Request("GET", f"{LINKEDIN_REST}/adAnalytics?{query}", headers=LINKEDIN_HEADERS)
+
+
+def _next_link(query: str, start: int, count: int) -> list[dict[str, str]]:
+    """The ``paging.links`` of a page whose ``next`` link continues ``query`` at ``start``."""
+    href = f"/rest/adAnalytics?{query}&start={start}&count={count}"
+    return [{"rel": "next", "href": href, "type": "application/json"}]
+
+
+@pytest.mark.parametrize(
+    ("query", "surface"),
+    [
+        pytest.param(STATISTICS_QUERY, "ad_analytics_statistics", id="statistics"),
+        pytest.param(DELIVERY_QUERY, "ad_analytics_campaign_delivery", id="campaign-delivery"),
+        pytest.param(MEMBER_QUERY, "ad_analytics_member_segments", id="member-segments"),
+    ],
+)
+def test_repeat_pages_ignore_start_and_link_on_without_a_total(query: str, surface: str) -> None:
+    """Every page of an ``ALL`` surface repeats the first, as live 202609 answered on 2026-10-10.
+
+    The first request carries no ``start`` or ``count``: its page echoes start 0 and
+    LinkedIn's default count 10, and links ``next`` only when it holds at least 10 elements.
+    Each continuation, whatever its ``start``, returns the same elements, echoes its own
+    ``start`` and ``count``, links on to ``start + count`` and never carries a ``total``;
+    every page satisfies its contract.
+    """
+    world = _repeat_world()
+    contract = load_contract("linkedin", surface)
+    first = render("linkedin", _analytics_request(query), world)
+    assert (first.status, first.surface) == (200, surface)
+    validate_response(contract, first.body)
+    body = cast(dict[str, Any], first.body)
+    elements = body["elements"]
+    assert elements
+    assert body["paging"] == {
+        "count": 10,
+        "start": 0,
+        "links": _next_link(query, 10, 10) if len(elements) >= 10 else [],
+    }
+    count = len(elements)
+    for start in (count, 7 * count, 15_000):
+        again = render(
+            "linkedin", _analytics_request(f"{query}&start={start}&count={count}"), world
+        )
+        assert (again.status, again.surface) == (200, surface)
+        validate_response(contract, again.body)
+        repeated = cast(dict[str, Any], again.body)
+        assert repeated["elements"] == elements
+        assert repeated["paging"] == {
+            "count": count,
+            "start": start,
+            "links": _next_link(query, start + count, count),
+        }
+        assert "total" not in repeated["paging"]
+
+
+def test_repeat_pages_link_on_from_a_full_default_page_only() -> None:
+    """A page shorter than its ``count`` has no ``next`` link, as Rest.li pages without a total."""
+    world = _repeat_world()
+    first = render("linkedin", _analytics_request(MEMBER_QUERY), world)
+    elements = cast(dict[str, Any], first.body)["elements"]
+    assert 0 < len(elements) < 10
+    assert cast(dict[str, Any], first.body)["paging"]["links"] == []
+    count = len(elements) + 1
+    longer = render("linkedin", _analytics_request(f"{MEMBER_QUERY}&count={count}"), world)
+    assert cast(dict[str, Any], longer.body) == {
+        "elements": elements,
+        "paging": {"count": count, "start": 0, "links": []},
+    }
+
+
+def test_repeat_pages_reject_a_count_below_one() -> None:
+    """``count=0`` would link a page to itself: the request is rejected with HTTP 400."""
+    request = _analytics_request(f"{MEMBER_QUERY}&start=0&count=0")
+    response = render("linkedin", request, _repeat_world())
+    assert response.status == 400
+    assert "count" in cast(dict[str, Any], response.body)["message"]
+
+
+def test_repeat_pages_leave_the_daily_surface_unchanged() -> None:
+    """``ad_analytics`` (``DAILY``) pages by ``start`` as before: the flag does not reach it."""
+    query = (
+        f"q=analytics&pivot=CREATIVE&timeGranularity=DAILY&dateRange={DAILY_RANGE}"
+        f"&{ACCOUNT_FACET}&fields={DAILY_FIELDS}"
+    )
+    for suffix in ("", "&start=10&count=10"):
+        request = _analytics_request(f"{query}{suffix}")
+        assert render("linkedin", request, _repeat_world()) == render("linkedin", request, _world())
+    first = cast(dict[str, Any], render("linkedin", _analytics_request(query), _world()).body)
+    assert first["elements"]
+    assert first["paging"] == {"count": 15_000, "start": 0, "links": []}
 
 
 def test_analytics_forms_outside_the_four_contracts_are_routed_to_the_daily_contract() -> None:

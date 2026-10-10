@@ -640,7 +640,12 @@ describe('WhitePapersSection', () => {
       );
       expect(listEntries(details, 'Data used')).toHaveLength(6);
       expect(within(details).getByText('Floor: 12% of leads unmatched in HubSpot')).toBeTruthy();
-      expect(within(details).getByText(/^1 other meeting \(ordering unverified\)/u)).toBeTruthy();
+      expect(
+        within(details).getByText(
+          'Meeting time proxy: 1 other meeting (ordering unverified): booking time is proxied ' +
+            'by record creation, so it is excluded from cost per meeting',
+        ),
+      ).toBeTruthy();
       expect(within(details).getByText(/^2026-09-08 – 2026-10-05 · 28 days/u)).toBeTruthy();
       // White-paper rows carry no decision subject: Mark done, Dismiss and Snooze only.
       for (const name of ['Mark done', 'Dismiss', 'Snooze for 7 days']) {

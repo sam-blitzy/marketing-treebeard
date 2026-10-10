@@ -16,7 +16,8 @@ Covered, in the order of the AAP row:
 * **B1 and G1**: +``b1.step`` of the latest effective daily budget at the currency's minor unit;
   no B1 under a C2 "Hold"; no increase of any kind survives on a B2 target; bypassing the G1
   filtering step trips the runner assertion.
-* **Spending-day gates** (AAP 0.5.4.1 table) and the utilization-beside-efficiency card.
+* **Spending-day gates** (AAP 0.5.4.1 table) and the utilization-beside-efficiency card, which
+  records every amount and outcome count at six places whatever the source.
 * **Shared budgets** (AAP 0.5.4.5): dated membership, the member safety predicate, the
   budget subject, mixed objective groups and, against the database, a shared-budget decision
   that raises no discrepancy on any member at the next entity sync.
@@ -694,14 +695,20 @@ def test_b1_example_amount_rounds_to_the_cent() -> None:
 def test_b1_rounds_the_proposal_to_each_currencys_minor_unit(
     make_context: ContextFactory, currency: str, proposed: Decimal
 ) -> None:
-    """B1: a zero-decimal currency proposes whole units; a three-decimal one keeps mils."""
+    """B1: a zero-decimal currency proposes whole units; a three-decimal one keeps mils.
+
+    The value sits at the minor unit, with no finer digit; the evidence records it at six
+    places, like every budget amount, and the action states it at the minor unit.
+    """
     scenario = SCENARIOS["b1.step.case"]
     campaign_id = _campaign_id(scenario, "li-cap")
     ctx = _in_currency(make_context(scenario.name), campaign_id, currency)
     item = _only(_run(ctx), BUDGET, B1)
     shown = evidence_metrics(item)
     assert shown["proposed_daily_budget"] == proposed
-    assert shown["proposed_daily_budget"].as_tuple().exponent == -minor_unit_exponent(currency)
+    minor_unit = Decimal(1).scaleb(-minor_unit_exponent(currency))
+    assert shown["proposed_daily_budget"] == shown["proposed_daily_budget"].quantize(minor_unit)
+    assert shown["proposed_daily_budget"].as_tuple().exponent == -6
     assert item.action.endswith(f"to {_money(proposed, currency)}")
 
 
@@ -1245,6 +1252,106 @@ def test_every_budget_card_shows_utilization_beside_efficiency(
                 "b4.min_outcomes"
             )
     assert seen == {B1, B2, B3, B4}
+
+
+_SIX_PLACE_EXTRAS: Final[tuple[str, ...]] = (
+    "current",
+    "proposed",
+    "increase",
+    "freed",
+    "allocated",
+    "unallocated",
+    "funded_by_reallocation",
+    "from_new_budget",
+)
+"""The ``evidence.extra`` amounts a budget card records at six places, beside each
+``allocations[].amount``."""
+
+_FUNDING_KEYS: Final[Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]]] = {
+    B1: (
+        ("daily_budget", "proposed_daily_budget", "increase", "outcomes"),
+        ("current", "proposed", "increase", "funded_by_reallocation", "from_new_budget"),
+    ),
+    B3: (
+        ("daily_budget", "proposed_daily_budget", "freed", "outcomes"),
+        ("current", "proposed", "freed", "allocated", "unallocated"),
+    ),
+}
+"""``(metric keys, extra keys)`` a funded B1 receiver and a giving B3 donor must record."""
+
+
+def _six_places(value: object, rendered: object) -> bool:
+    """Whether a recorded ``Decimal`` and its stored JSON text both carry six places."""
+    return (
+        isinstance(value, Decimal)
+        and value.as_tuple().exponent == -6
+        and isinstance(rendered, str)
+        and len(rendered.partition(".")[2]) == 6
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [("default", "google"), ("b3.allocation.case", "linkedin"), ("b1.step.case", None)],
+)
+def test_budget_evidence_records_every_amount_and_outcome_count_at_six_places(
+    make_context: ContextFactory, name: str, source: str | None
+) -> None:
+    """Budget evidence keeps one scale per metric, whatever the source: ``numeric(18,6)``.
+
+    A Google budget read from whole micros, a LinkedIn budget, a proposal at the currency's
+    minor unit, the B1 increase, the B3 freed amount and its allocation split, and the window
+    outcomes (Google conversions are decimals, LinkedIn leads a whole count) are all recorded
+    at six places, in the metrics, in ``extra`` and in the stored JSON, on funded and unfunded
+    items alike. ``default`` and ``b3.allocation.case`` each hold a funded B1 receiver and a
+    giving B3 donor of ``source``, and ``default`` adds unfunded Google and LinkedIn donors, a
+    B2 and B4 cards; ``b1.step.case`` holds a B1 nothing funds (``source`` ``None``), whose
+    zero reallocation keeps the same scale. Day counts and the B4 side outcome counts the rate
+    test ran on stay integers.
+    """
+    out = _run(make_context(name))
+    items = _items_of(out, BUDGET)
+    funded = {
+        item.rule_id: item
+        for item in items
+        if item.entity_ref.source == source and item.evidence.extra.get("allocations")
+    }
+    if source is None:
+        assert out.allocations == ()
+        unfunded = _only(out, BUDGET, B1).evidence.extra
+        assert unfunded["funded_by_reallocation"] == 0
+        assert unfunded["from_new_budget"] == unfunded["increase"]
+    else:
+        assert set(funded) == {B1, B3}, (name, sorted(funded))
+        for rule_id, (metric_keys, extra_keys) in _FUNDING_KEYS.items():
+            shown = evidence_metrics(funded[rule_id])
+            assert set(metric_keys) <= set(shown), (name, rule_id)
+            assert set(extra_keys) <= set(funded[rule_id].evidence.extra), (name, rule_id)
+        assert out.allocations
+    assert all(allocation.amount.as_tuple().exponent == -6 for allocation in out.allocations)
+    for item in items:
+        where = (name, item.rule_id, item.entity_ref.source, item.entity_ref.name)
+        rendered = item.evidence.to_json()
+        shown_json = {metric["key"]: metric["value"] for metric in rendered["metrics"]}
+        for metric in item.evidence.metrics:
+            if metric.key in ("weekend_outcomes", "weekday_outcomes", "known_days"):
+                assert type(metric.value) is int, (*where, metric.key)
+            elif (metric.unit == "currency" or metric.key == "outcomes") and not isinstance(
+                metric.value, str | None
+            ):
+                assert _six_places(metric.value, shown_json[metric.key]), (
+                    *where,
+                    metric.key,
+                    metric.value,
+                )
+        extra = item.evidence.extra
+        for key in _SIX_PLACE_EXTRAS:
+            if key in extra:
+                assert _six_places(extra[key], rendered["extra"][key]), (*where, key, extra[key])
+        for entry, entry_json in zip(
+            extra.get("allocations", ()), rendered["extra"].get("allocations", []), strict=True
+        ):
+            assert _six_places(entry["amount"], entry_json["amount"]), (*where, entry)
 
 
 # ---------------------------------------------------------------------------

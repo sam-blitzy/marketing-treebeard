@@ -9,8 +9,9 @@ database, exercise every validation branch of the declarative specs, the configu
 overrides and the CRM binding resolution, and cross-check the expectations the rule code that
 already exists can evaluate (C0 discrepancies, the pipeline veto and K3 keyword entity keys),
 the keyset page sizes the Google keyset cases state, by scanning their worlds through the live
-webhook client on the simulated transport, and the 15,000-element split and ``next`` link the
-LinkedIn analytics cases state, by reading their worlds through the live LinkedIn client.
+webhook client on the simulated transport, and the 15,000-element split, the ``next`` link and
+the repeat pages the LinkedIn analytics cases state, by reading their worlds through the live
+LinkedIn client.
 
 No database or network, and the shipped ``config/`` files are only read: the tests of edited
 configurations work on copies under ``tmp_path``.
@@ -2159,6 +2160,88 @@ async def test_a_capped_analytics_response_without_a_next_link_is_split_by_date(
     assert not any("start" in request.url.params for request, _ in exchanges)
     assert listing.calls == len(exchanges) == 3
     _check_every_creative_day(scenario, listing)
+
+
+REPEAT_PAGES_CASE = "linkedin.repeat_pages.case"
+
+
+def test_the_repeat_pages_case_takes_the_live_fallback_path() -> None:
+    """The world reproduces the failing live read of 2026-10-10 on the segment fallback.
+
+    One account, the stated delivering campaigns, exactly the stated ten seniority values per
+    campaign (one full page at LinkedIn's default count), ``analytics_repeat_pages`` set, and
+    LinkedIn's live 400 on the Statistics Finder, so the client reads per campaign.
+    """
+    scenario = _scenario(REPEAT_PAGES_CASE)
+    values = scenario.expect.values
+    linkedin = scenario.spec.linkedin
+    assert linkedin is not None
+    assert linkedin.analytics_repeat_pages
+    assert not linkedin.analytics_next_links
+    assert [fault.surface for fault in scenario.spec.faults] == ["ad_analytics_statistics"]
+    assert (scenario.spec.faults[0].kind, scenario.spec.faults[0].status) == ("http_status", 400)
+    assert len(linkedin.accounts) == 1
+    assert len(linkedin.campaigns) == values["campaigns"]
+    assert [(segment.pivot, len(segment.values)) for segment in linkedin.segments] == [
+        (values["pivot"], values["values_per_campaign"])
+    ] * cast(int, values["campaigns"])
+    assert values["values_per_campaign"] == values["page_count"] == 10
+    for segment in linkedin.segments:
+        assert all(value.value.startswith("urn:li:seniority:") for value in segment.values)
+        assert sum(value.impression_share for value in segment.values) <= 1
+
+
+@pytest.mark.anyio
+async def test_the_segment_fallback_ends_each_repeat_page_chain_complete() -> None:
+    """AAP 0.3.3 recovery readiness: the live segment read finishes on repeat pages.
+
+    On ``linkedin.repeat_pages.case`` the live client reads through the strict simulated
+    transport, so every request and 2xx body is checked against its contract. The Statistics
+    Finder is rejected with 400; one discovery call finds the campaigns; each campaign's
+    member-segment request returns its ten values with a ``next`` link to ``start=10&count=10``
+    and no ``total``, and so does the continuation, which repeats the page and ends the chain.
+    The listing is complete with the stated values per campaign in the stated calls, and no
+    defect is raised.
+    """
+    scenario = _scenario(REPEAT_PAGES_CASE)
+    values = scenario.expect.values
+    pivot = cast(str, values["pivot"])
+    days = cast(int, values["window_days"])
+    count = cast(int, values["page_count"])
+    world = scenario.world()
+    (account_id,) = world.linkedin_account_ids
+    end = fixed_clock().date() - timedelta(days=1)
+    window = (end - timedelta(days=days - 1), end)
+    recorder = _RecordingTransport(mock_transport("linkedin", world, strict=True))
+    async with build_client("linkedin", recorder) as http:
+        client = LinkedInClient(http, StaticTokenProvider(SIMULATED_TOKEN))
+        listing = await client.analytics_segments(account_id, pivot, window)
+
+    assert (listing.complete, listing.reason, listing.interrupted_by) == (True, None, None)
+    per_campaign = Counter(row.campaign_urn for row in listing.rows)
+    assert len(per_campaign) == values["campaigns"]
+    assert set(per_campaign.values()) == {values["values_per_campaign"]}
+    statistics, discovery, *member = recorder.exchanges
+    assert (statistics[0].url.params["q"], statistics[1].status_code) == ("statistics", 400)
+    assert (discovery[0].url.params["pivot"], discovery[1].status_code) == ("CAMPAIGN", 200)
+    calls = Counter(request.url.params["campaigns"] for request, _ in member)
+    assert len(calls) == values["campaigns"]
+    assert set(calls.values()) == {values["member_segment_calls_per_campaign"]}
+    for (request, response), (repeat, again) in pairwise(member):
+        if request.url.params["campaigns"] != repeat.url.params["campaigns"]:
+            continue
+        assert request.url.params["pivot"] == pivot
+        assert "start" not in request.url.params
+        page, repeated = response.json(), again.json()
+        (link,) = page["paging"]["links"]
+        assert repeat.url.raw_path.decode("ascii") == link["href"]
+        assert (repeat.url.params["start"], repeat.url.params["count"]) == (str(count), str(count))
+        assert repeated["elements"] == page["elements"]
+        assert len(page["elements"]) == count
+        assert repeated["paging"]["links"]
+        assert "total" not in page["paging"]
+        assert "total" not in repeated["paging"]
+    assert listing.calls == len(recorder.exchanges) == 2 + len(member)
 
 
 def test_the_override_routes_the_overridden_creatives_spend_and_leads() -> None:

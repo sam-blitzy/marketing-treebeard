@@ -221,7 +221,15 @@ _EXACT: Final = Context(prec=60)
 """Arithmetic context for quantizing evidence values without overflow or rounding surprises."""
 
 _SIX_PLACES: Final = Decimal("0.000001")
-"""Costs and rates in evidence keep six decimal places, like ``analysis/stats.py`` outputs."""
+"""Costs, rates, money amounts and outcome counts in evidence keep six decimal places.
+
+Six places is the ``numeric(18,6)`` storage scale of money and conversions, the scale of
+``analysis/stats.py`` outputs and of
+:func:`~ads_engine.analysis.campaigns.cost_per_outcome_value`, and the bound
+``white_papers._bounded`` puts on derived amounts. It is lossless for every stored amount and
+for a Google whole-micro budget such as 175.000001, which rounding to the minor unit would
+misstate.
+"""
 
 _FOUR_PLACES: Final = Decimal("0.0001")
 """Shares and utilization keep four places: a hundredth of a percent."""
@@ -347,8 +355,21 @@ class _Settings:
 
 
 def _q(value: Decimal) -> Decimal:
-    """Record a cost or rate in evidence with six places, half even."""
+    """Record a cost, rate, money amount or outcome count in evidence with six places, half even.
+
+    Every money amount and ``Decimal`` outcome count a budget card records goes through here,
+    whatever its source, so one item never mixes ``200``, ``240.00`` and ``5585.610000``: a
+    Google budget (``micros / 1,000,000``), a LinkedIn one (``numeric(18,6)``) and a proposal
+    rounded to the currency's minor unit all read at six places (``240.00`` is recorded as
+    ``240.000000``, the same value). Amounts of at most six places keep their exact value, so
+    the gates and the B3 allocation compare what they would without it.
+    """
     return value.quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN, context=_EXACT)
+
+
+def _q_optional(value: Decimal | None) -> Decimal | None:
+    """:func:`_q` of an amount or outcome count that may be unavailable; ``None`` stays ``None``."""
+    return None if value is None else _q(value)
 
 
 def _share(value: Decimal) -> Decimal:
@@ -926,6 +947,8 @@ def budget_evidence(
     * **Outcomes** and, where linked, the CRM eligible contacts and Qualified Leads of the
       veto population (:func:`budget_crm`), never blended with platform outcomes.
     * **Amounts**: the latest effective daily budget and, when given, the proposed one.
+      Spend, outcomes and both budgets (metrics, ``extra.current`` and ``extra.proposed``)
+      are recorded at six places (:func:`_q`), whatever the source.
     * **Window**: the exact window with each source's native day boundary (from
       :meth:`AnalysisContext.make_evidence`) and ``extra.day_boundary`` for the subject's own
       source.
@@ -973,16 +996,20 @@ def budget_evidence(
     members = subject_campaigns(ctx, subject)
     label = _outcome_label(ctx, members)
     view = budget_crm(ctx, subject) if crm is None else crm
+    # Every amount and outcome count is recorded at six places (:func:`_q`); the exact values
+    # stay the inputs of every gate, and the reason renders them at the minor unit.
+    current = _q_optional(history.latest_daily_budget)
+    recorded_proposed = _q_optional(proposed)
     card: list[Metric] = [
         Metric(
             "spend",
             "Window spend",
-            history.window_spend if spend is None else spend,
+            _q(history.window_spend if spend is None else spend),
             "currency",
             currency,
         ),
         Metric("window_days", "Window days", ctx.window.days, "days"),
-        Metric("outcomes", f"Window {label}", outcomes, label),
+        Metric("outcomes", f"Window {label}", _q_optional(outcomes), label),
         Metric(
             "cost_per_outcome",
             f"Cost per {_singular(label)}",
@@ -990,17 +1017,17 @@ def budget_evidence(
             "currency",
             currency,
         ),
-        Metric(
-            "daily_budget",
-            "Latest effective daily budget",
-            history.latest_daily_budget,
-            "currency",
-            currency,
-        ),
+        Metric("daily_budget", "Latest effective daily budget", current, "currency", currency),
     ]
-    if proposed is not None:
+    if recorded_proposed is not None:
         card.append(
-            Metric("proposed_daily_budget", "Proposed daily budget", proposed, "currency", currency)
+            Metric(
+                "proposed_daily_budget",
+                "Proposed daily budget",
+                recorded_proposed,
+                "currency",
+                currency,
+            )
         )
     card.extend(_history_metrics(history, gate))
     if view.linked:
@@ -1028,10 +1055,10 @@ def budget_evidence(
         "gate_shortfalls": gate.shortfalls,
         **_history_extra(history),
         "day_boundary": {"source": source, "boundary": _day_boundary(ctx, source)},
-        "current": history.latest_daily_budget,
+        "current": current,
     }
-    if proposed is not None:
-        shared_extra["proposed"] = proposed
+    if recorded_proposed is not None:
+        shared_extra["proposed"] = recorded_proposed
     if history.shared:
         shared_extra["members"] = _members_extra(ctx, subject)
     return ctx.make_evidence(
@@ -1247,7 +1274,10 @@ def _b1_candidate(ctx: AnalysisContext, settings: _Settings, outcome: ScaleOutco
     """
     current = outcome.current_daily_budget
     proposed = outcome.proposed_daily_budget
-    increase = proposed - current
+    # Recorded at six places like every budget amount (:func:`_q`). Lossless: the current
+    # budget is a whole number of micros or a ``numeric(18,6)`` amount and the proposal sits at
+    # the minor unit, so the B3 allocation funds exactly this increase.
+    increase = _q(proposed - current)
     currency = outcome.currency
     ceiling = None if outcome.baseline is None else _q(settings.scale_max_ratio * outcome.baseline)
     extra: dict[str, Any] = {
@@ -1526,7 +1556,10 @@ def _b3(
     proposed = round_to_minor_unit(observed * settings.b3_headroom, currency)
     if proposed <= 0 or proposed >= current:
         return None
-    freed = current - proposed
+    # Recorded at six places like every budget amount (:func:`_q`). Lossless: the current
+    # budget is a whole number of micros or a ``numeric(18,6)`` amount and the proposal sits at
+    # the minor unit, so the B3 allocation distributes exactly this freed amount.
+    freed = _q(current - proposed)
     totals = subject_totals(ctx, subject)
     if totals is None:
         return None
@@ -1548,7 +1581,7 @@ def _b3(
             Metric(
                 "spend_percentile",
                 f"{rank} percentile of daily spend on {history.known_label}",
-                observed,
+                _q(observed),
                 "currency",
                 currency,
             ),
@@ -1940,10 +1973,12 @@ def _b4_candidate(
     view = budget_crm(ctx, ("campaign", campaign.id))
     boundary = _day_boundary(ctx, campaign.source)
     source_label = "Google" if campaign.source == "google" else "LinkedIn"
+    # Amounts and the window's outcome count are recorded at six places, as on every budget
+    # card (:func:`_q`); the side outcome counts stay the whole numbers the rate test ran on.
     metrics: list[Metric] = [
-        Metric("spend", "Window spend", totals.spend, "currency", currency),
+        Metric("spend", "Window spend", _q(totals.spend), "currency", currency),
         Metric("window_days", "Window days", ctx.window.days, "days"),
-        Metric("outcomes", f"Window {label}", totals.outcomes, label),
+        Metric("outcomes", f"Window {label}", _q_optional(totals.outcomes), label),
         Metric(
             "cost_per_outcome",
             f"Cost per {singular}",
@@ -1953,8 +1988,8 @@ def _b4_candidate(
         ),
         Metric("weekend_days", "Weekend days with spend", weekend.spend_days, "days"),
         Metric("weekdays", "Weekdays with spend", weekday.spend_days, "days"),
-        Metric("weekend_spend", "Weekend spend", weekend.spend, "currency", currency),
-        Metric("weekday_spend", "Weekday spend", weekday.spend, "currency", currency),
+        Metric("weekend_spend", "Weekend spend", _q(weekend.spend), "currency", currency),
+        Metric("weekday_spend", "Weekday spend", _q(weekday.spend), "currency", currency),
         Metric("weekend_outcomes", f"Weekend {label}", weekend.outcomes, label),
         Metric("weekday_outcomes", f"Weekday {label}", weekday.outcomes, label),
         Metric(
@@ -1976,7 +2011,7 @@ def _b4_candidate(
         Metric(
             "daily_budget",
             "Latest effective daily budget",
-            history.latest_daily_budget,
+            _q_optional(history.latest_daily_budget),
             "currency",
             _subject_currency(ctx, subject),
         ),

@@ -914,7 +914,10 @@ def _with_b1_funding(
     ``depends_on``, so a discrepancy on a donor holds the B1 it funds.
     """
     increase = candidate.evidence.extra["increase"]
-    funded = sum((allocation.amount for allocation, _ in funding), Decimal(0))
+    # Starting from ``increase - increase`` (zero at the increase's six-place scale, as B3
+    # starts from ``freed - freed``) keeps an unfunded receiver's amounts at the same scale as
+    # a funded one's: ``0.000000``, never ``0``.
+    funded = sum((allocation.amount for allocation, _ in funding), increase - increase)
     sentence = budget.render_b1_funding(
         increase, [(name, allocation.amount) for allocation, name in funding], currency
     )

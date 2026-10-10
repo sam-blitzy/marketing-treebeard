@@ -2,8 +2,9 @@
 #
 # Targets (`make help` lists them):
 #   check-tools     Docker Compose >=5.5.1,<6 and Docker Engine >=29 (bounds below, nowhere else)
-#   init            first start: copy .env.example to .env (never over an existing one) and write
-#                   a random SESSION_SECRET and the argon2id APP_ADMIN_PASSWORD_HASH
+#   init            first start: make config/ readable to the backend containers, copy
+#                   .env.example to .env (never over an existing one) and write a random
+#                   SESSION_SECRET and the argon2id APP_ADMIN_PASSWORD_HASH
 #   up, down        build and start the Compose stack and wait for /api/v1/healthz; stop it
 #   migrate         the one-shot migrate service: ads-engine migrate && ads-engine ensure-admin
 #   seed-simulated  seed simulated datasets for every source and compute the default-window run
@@ -299,6 +300,22 @@ init: check-tools ## First start: write .env with SESSION_SECRET and the admin h
 		echo ".env.example not found in $$CHECKOUT_DIR" >&2
 		exit 1
 	fi
+	# Compose bind-mounts config/ read-only at /app/config for migrate, api and worker, which run
+	# as uid 10001, and a bind mount keeps the checkout's modes: a checkout or pull under umask
+	# 077 (0700 directories, 0600 files) leaves the YAML unreadable there, and api and worker
+	# stop with "cannot read /app/config/...: Permission denied". The YAML holds thresholds, the
+	# stage mapping and the registry, no secret, so every user may read it. The chmod is
+	# explicit, so the umask does not matter, and it touches config/ only: .env stays mode 600.
+	# The trailing slash makes chmod follow a config symlink to its directory.
+	if [ ! -d config ]; then
+		echo "config/ not found in $$CHECKOUT_DIR, or not a directory; the backend containers bind-mount it at /app/config" >&2
+		exit 1
+	fi
+	if ! chmod -R a+rX config/; then
+		echo "could not make config/ readable to the backend containers (chmod -R a+rX config/ failed above); fix its ownership or permissions, then run make init again" >&2
+		exit 1
+	fi
+	echo "Made config/ readable to the backend containers (chmod -R a+rX config/)"
 	# Once the reservation below has created .env, a failure, or Ctrl-C, removes it, so a re-run
 	# starts clean; an .env created by anything else is never touched.
 	created=0
@@ -629,7 +646,8 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 		echo "usage: make e2e ADMIN_PASSWORD=<value>   (the password given to make init)" >&2
 		exit 1
 	fi
-	# Compose interpolates DATA_MODE into migrate, api and worker, overriding .env.
+	# A non-blank shell DATA_MODE reaches migrate, api and worker over .env
+	# (docker-compose.data-mode.env).
 	export DATA_MODE=simulated
 	$(STACK_UP)
 	leave_stack_running() {

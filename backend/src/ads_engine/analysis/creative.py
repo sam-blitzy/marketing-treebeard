@@ -972,7 +972,9 @@ def _variant_row(creative: _Creative, objective: str, currency: str) -> dict[str
     campaign, the CR3 item and each CR1 pair, freezes the same rows.
 
     Rates a non-lead-gen campaign does not use, or whose counts are unreported or
-    inconsistent, are ``None`` ("unavailable", never 0).
+    inconsistent, are ``None`` ("unavailable", never 0). The cost per outcome is spend ÷
+    outcomes at 6 places, half even, like every rate of the row, so the table never carries a
+    28-digit quotient; zero or unreported outcomes give ``None``.
     """
     totals = creative.totals
     info = creative.info
@@ -988,6 +990,7 @@ def _variant_row(creative: _Creative, objective: str, currency: str) -> dict[str
     lead_gen = objective == OBJ_LINKEDIN_LEAD_GEN
     outcome = totals.leads if lead_gen else totals.website_conversions
     opens = totals.form_opens
+    cpo = cost_per_outcome(totals.cost, None if outcome is None else Decimal(outcome))
     row.update(
         {
             "impressions": totals.impressions,
@@ -1006,9 +1009,7 @@ def _variant_row(creative: _Creative, objective: str, currency: str) -> dict[str
             "cost": totals.cost,
             "currency": currency,
             "outcomes": outcome,
-            "cost_per_outcome": cost_per_outcome(
-                totals.cost, None if outcome is None else Decimal(outcome)
-            ),
+            "cost_per_outcome": None if cpo is None else cpo.quantize(_QUANTUM, context=_exact()),
             "delivery_days": totals.delivery_days,
         }
     )

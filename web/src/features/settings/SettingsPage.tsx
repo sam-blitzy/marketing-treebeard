@@ -20,9 +20,10 @@
  * 5. **Configuration hash**: `config_hash`, stored on every analysis run (AAP 0.1.1
  *    reproducibility).
  *
- * Data sources: `GET /config` through `useConfig`, and, only while the refresh-failure notice
- * shows, the latest default run's `display_timezone` through `useDefaultRun`, the zone of that
- * notice's last-loaded instant.
+ * Data sources: `GET /config` through `useConfig`, and the latest default run's
+ * `display_timezone` through `useDefaultRun`, the zone every instant on the page is shown in
+ * (`GET /config` carries none). Only the resolved bindings tables and the refresh-failure notice
+ * show instants, so the run is read only while one of them is on screen.
  *
  * States: a spinner until the first response settles; the five sections once it has loaded; the
  * sections with a "Settings could not be refreshed" notice while a later refetch has failed; and
@@ -34,11 +35,14 @@
  * - **No literals the API owns** (AAP 0.5.4.1): every threshold, window length, preset, stage
  *   label and asset shown comes from the response. Only the labels are fixed English text.
  * - **Values verbatim**: configured values are shown as configured (`0.95` stays "0.95"), never
- *   reformatted as percentages or money. The only formatted value is the refresh notice's
- *   last-loaded instant, through `formatInstant` in `DISPLAY_TIMEZONE` (AAP 0.5.5).
+ *   reformatted as percentages or money. The only formatted values are instants, each through
+ *   `formatInstant` in `DISPLAY_TIMEZONE` (AAP 0.5.5): each bindings table's `verified_at`, whose
+ *   ISO 8601 value stays in its `<time dateTime>`, and the refresh notice's last-loaded instant.
  * - **Server state only through `../../api/queries`** (AAP 0.11.1); nothing here fetches.
  * - **Design system only** (AAP 0.4.4): UI comes from the design-system index and layout only
- *   from `Stack` and `Inline`, with no raw tables or headings, no styles and no stylesheet.
+ *   from `Stack` and `Inline`, with no raw tables or headings, no styles and no stylesheet. Text
+ *   lines are `<div>`s, never `<p>`s, so a Stack gap token alone spaces them: a `<p>`'s
+ *   user-agent margins would add space that no spacing token sets.
  * - **No router import**: `src/router.tsx` renders the page frame (`PageShell` with `TopBar` and
  *   `SideNav`) and imports this page, so the page renders only `PageShell.Title` and
  *   `PageShell.Section`s.
@@ -94,10 +98,10 @@ const GENERIC_ERROR_MESSAGE = 'The configuration could not be loaded.';
 const REFRESH_ERROR_TITLE = 'Settings could not be refreshed';
 
 /**
- * The zone the refresh notice's last-loaded instant is shown in until the latest default run
- * reports `display_timezone` (`GET /runs/latest` answers 404 `not_found` before the first
- * analysis). `formatInstant` labels every instant with its zone, so the fallback is never
- * mistaken for the configured one.
+ * The zone the page's instants (each bindings table's `verified_at` and the refresh notice's
+ * last-loaded instant) are shown in until the latest default run reports `display_timezone`
+ * (`GET /runs/latest` answers 404 `not_found` before the first analysis). `formatInstant` labels
+ * every instant with its zone, so the fallback is never mistaken for the configured one.
  */
 const FALLBACK_TIMEZONE = 'UTC';
 
@@ -209,6 +213,24 @@ function failureReason(error: unknown): string {
     }
   }
   return GENERIC_ERROR_MESSAGE;
+}
+
+/**
+ * The zone the page formats instants in (AAP 0.5.5 Behaviour: "Instants are formatted in
+ * `DISPLAY_TIMEZONE`"): the latest default run's `display_timezone`, trimmed, because
+ * `GET /config` carries no zone. While that run's read is pending, on its 404 `not_found` before
+ * the first analysis, or when it names a blank zone, it is {@link FALLBACK_TIMEZONE}.
+ *
+ * Every caller observes the one `useDefaultRun` query (`queryKeys.runs.latest`), so TanStack
+ * Query dedupes their reads and they all show the same zone.
+ *
+ * @returns the IANA zone id to pass to `formatInstant`
+ */
+function useDisplayTimezone(): string {
+  const configuredZone = useDefaultRun().data?.display_timezone;
+  return configuredZone !== undefined && hasText(configuredZone)
+    ? configuredZone.trim()
+    : FALLBACK_TIMEZONE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -588,10 +610,13 @@ interface BindingsTableProps {
 }
 
 /**
- * One dataset's resolved bindings: the table and the instant the portal was checked, shown as
- * the API returned it.
+ * One dataset's resolved bindings: the table, then the instant the portal was checked, formatted
+ * in the display time zone ({@link useDisplayTimezone}; AAP 0.5.5 Behaviour), for example
+ * "Verified against the portal at Oct 10, 2026, 12:50 PM America/New_York." The API's ISO 8601
+ * value stays machine-readable in the `<time>` element's `dateTime`.
  */
 function BindingsTable({ bindings, caption }: BindingsTableProps): ReactElement {
+  const displayTimezone = useDisplayTimezone();
   return (
     <Stack gap={2}>
       <DataTable
@@ -600,10 +625,13 @@ function BindingsTable({ bindings, caption }: BindingsTableProps): ReactElement 
         rows={bindingRows(bindings)}
         getRowKey={(row) => row.id}
       />
-      <p>
+      <div>
         Verified against the portal at{' '}
-        <time dateTime={bindings.verified_at}>{bindings.verified_at}</time>.
-      </p>
+        <time dateTime={bindings.verified_at}>
+          {formatInstant(bindings.verified_at, displayTimezone)}
+        </time>
+        .
+      </div>
     </Stack>
   );
 }
@@ -742,7 +770,7 @@ function HubSpotSection({ mapping, bindings, companion }: HubSpotSectionProps): 
           rows={mappingRows}
           getRowKey={(row) => row.count}
         />
-        <p>{NEVER_BLENDED_NOTE}</p>
+        <div>{NEVER_BLENDED_NOTE}</div>
         {/* Named as a group, because the same lists also appear as `crm.*` rows of the
             thresholds table, where the API merges them for the rules that read them. */}
         <Stack gap={2} aria-label={MEETING_RULES_LABEL}>
@@ -758,7 +786,7 @@ function HubSpotSection({ mapping, bindings, companion }: HubSpotSectionProps): 
           headingLevel={3}
         >
           {bindings === null ? (
-            <p>{NOT_RESOLVED_NOTE}</p>
+            <div>{NOT_RESOLVED_NOTE}</div>
           ) : (
             <BindingsTable bindings={bindings} caption={PRIMARY_BINDINGS_CAPTION} />
           )}
@@ -770,7 +798,7 @@ function HubSpotSection({ mapping, bindings, companion }: HubSpotSectionProps): 
             headingLevel={3}
           >
             <Stack gap={2}>
-              <p>{COMPANION_NOTE}</p>
+              <div>{COMPANION_NOTE}</div>
               <BindingsTable bindings={companion} caption={COMPANION_BINDINGS_TITLE} />
             </Stack>
           </PageShell.Section>
@@ -800,10 +828,10 @@ function ConfigHashSection({ hash }: { hash: string }): ReactElement {
   return (
     <PageShell.Section id="settings-config-hash" title="Configuration hash">
       <Stack gap={2} breakLongWords>
-        <p>
+        <div>
           <code>{hash}</code>
-        </p>
-        <p>{CONFIG_HASH_NOTE}</p>
+        </div>
+        <div>{CONFIG_HASH_NOTE}</div>
       </Stack>
     </PageShell.Section>
   );
@@ -840,21 +868,17 @@ interface RefreshFailureNoticeProps {
  * "Settings could not be refreshed" with the failure's reason and when the configuration on
  * screen was loaded, as an instant in `DISPLAY_TIMEZONE` (AAP 0.5.5 Behaviour).
  *
- * - The zone is the latest default run's `display_timezone`, read here rather than by the page,
- *   so the loaded page sends no request but `GET /config`. Until that run reports a non-blank
- *   zone (while its read is pending, or on its 404 before the first analysis), the instant is
- *   shown in {@link FALLBACK_TIMEZONE}, labelled as such.
+ * - The zone comes from {@link useDisplayTimezone}, like the bindings tables' instants: the
+ *   latest default run's `display_timezone`. Until that run reports a non-blank zone (while its
+ *   read is pending, or on its 404 before the first analysis), the instant is shown in
+ *   {@link FALLBACK_TIMEZONE}, labelled as such.
  * - The banner is not an alert (AAP 0.5.5 reserves `role="alert"` for discrepancies). The page
  *   renders it inside its polite status region, which announces it.
  * - It offers no Retry, because the page has no controls. The query reads again by itself on
  *   window focus or when the page mounts again, and the notice leaves once a read succeeds.
  */
 function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProps): ReactElement {
-  const configuredZone = useDefaultRun().data?.display_timezone;
-  const displayTimezone =
-    configuredZone !== undefined && hasText(configuredZone)
-      ? configuredZone.trim()
-      : FALLBACK_TIMEZONE;
+  const displayTimezone = useDisplayTimezone();
   const loadedAt = formatInstant(new Date(dataUpdatedAt).toISOString(), displayTimezone);
   return (
     <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
@@ -893,6 +917,10 @@ function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProp
  * Neither failure offers an action, because the page has no controls: the query reads again by
  * itself on window focus or when the page mounts again, once its 5-minute freshness has passed.
  *
+ * Instants (the bindings' verification and the notice's last-loaded time) are shown in the
+ * latest default run's display time zone ({@link useDisplayTimezone}), so while either is on
+ * screen the page also reads `GET /runs/latest`; nothing else is requested.
+ *
  * The component must render inside the app's `QueryClientProvider`, as every authenticated page
  * does; `src/router.tsx` renders it inside the page frame at `/settings`.
  *
@@ -914,7 +942,7 @@ export function SettingsPage(): ReactElement {
   return (
     <Stack gap={6}>
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
-      <p>{READ_ONLY_NOTE}</p>
+      <div>{READ_ONLY_NOTE}</div>
       {/* One polite region rendered in every state, so a failure that replaces the spinner, or a
           failed refetch behind the cached sections, is announced (WCAG 2.2 SC 4.1.3); while
           empty, Stack takes it out of the column. */}

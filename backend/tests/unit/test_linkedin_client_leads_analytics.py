@@ -1003,15 +1003,21 @@ async def test_analytics_daily_next_link_repeating_a_request_is_a_defect() -> No
 
 @pytest.mark.anyio
 async def test_analytics_daily_next_link_chain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A chain longer than the next-link bound is a defect rather than an endless read."""
+    """A chain longer than the next-link bound is a defect rather than an endless read.
+
+    Every page adds a creative day not read before, so no page is a repeat that ends the
+    chain: the bound is what stops it.
+    """
     monkeypatch.setattr(client_module, "_MAX_NEXT_LINKS", 2)
     day = date(2026, 9, 1)
     pages = iter(range(1, 10))
 
     def handle(request: httpx.Request) -> httpx.Response:
-        """Answer every page with one row and a fresh next link."""
-        href = f"/rest/adAnalytics?q=analytics&start={next(pages)}"
-        return _json(_daily_body([_daily(CREATIVE_A, day)], next_href=href))
+        """Answer every page with one new creative's row and a fresh next link."""
+        page = next(pages)
+        href = f"/rest/adAnalytics?q=analytics&start={page}"
+        creative = f"urn:li:sponsoredCreative:{990001200 + page}"
+        return _json(_daily_body([_daily(creative, day)], next_href=href))
 
     server = Server(handle)
     async with _linkedin(server) as client:
@@ -1780,6 +1786,83 @@ async def test_analytics_segments_fallback_follows_next_links_past_empty_pages()
     assert listing.reason is None
     assert listing.interrupted_by is None
     assert listing.calls == 7
+
+
+# The ten LinkedIn seniority values: a MEMBER_SENIORITY pivot that fills one page of count=10.
+SENIORITY_URNS = tuple(f"urn:li:seniority:{level}" for level in range(1, 11))
+
+
+def _repeat_page(surface: str, request: httpx.Request, elements: Sequence[Any]) -> httpx.Response:
+    """Answer an ``ALL`` request as live 202609 did on 2026-10-10: ``start`` is ignored.
+
+    Every page holds the same elements, echoes the request's ``start`` and ``count``
+    (LinkedIn's default 10 when absent), carries no ``total`` and, whenever it holds at least
+    ``count`` elements, a ``next`` link to ``start + count``: a perpetual chain.
+    """
+    params = _params(request)
+    start, count = int(params.get("start", "0")), int(params.get("count", "10"))
+    kept = "&".join(
+        f"{key}={value}" for key, value in _pairs(request) if key not in ("start", "count")
+    )
+    href = f"/rest/adAnalytics?{kept}&start={start + count}&count={count}"
+    links = _links(href if len(elements) >= count else None)
+    paging = {"count": count, "start": start, "links": links}
+    return _json(_conforming(surface, {"elements": list(elements), "paging": paging}))
+
+
+@pytest.mark.anyio
+async def test_analytics_segments_fallback_ends_each_repeat_page_chain_complete(
+    captured: list[EventDict],
+) -> None:
+    """Live repeat pages with a perpetual ``next`` link end after the page and one repeat.
+
+    Each campaign's MEMBER_SENIORITY request returns its 10 values on every page, whatever
+    ``start`` says, with a fresh ``next`` link and no ``total``. The second page adds no new
+    ``pivotValues``, so each campaign costs 2 calls and the listing is complete with every
+    value once; no chain runs into the next-link bound.
+    """
+    delivering = (CAMPAIGN_LOW, CAMPAIGN_HIGH)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Reject q=statistics; serve discovery and every per-campaign page as live does."""
+        params = _params(request)
+        if params["q"] == "statistics":
+            return _error(400, '"MEMBER_SENIORITY" is not an enum symbol')
+        if params["pivot"] == "CAMPAIGN":
+            found = [_discovery(campaign, 500) for campaign in delivering]
+            return _repeat_page("ad_analytics_campaign_delivery", request, found)
+        campaign = unquote(params["campaigns"].removeprefix("List(").removesuffix(")"))
+        impressions = 100 if campaign == CAMPAIGN_LOW else 200
+        values = [
+            _segment([urn], impressions=impressions + level, clicks=level)
+            for level, urn in enumerate(SENIORITY_URNS)
+        ]
+        return _repeat_page("ad_analytics_member_segments", request, values)
+
+    server = Server(handle)
+    async with _linkedin(server) as client:
+        listing = await client.analytics_segments(ACCOUNT_ID, "MEMBER_SENIORITY", WINDOW_28)
+
+    per_campaign = [
+        unquote(_params(request)["campaigns"].removeprefix("List(").removesuffix(")"))
+        for request in server.requests
+        if _params(request).get("pivot") == "MEMBER_SENIORITY"
+    ]
+    assert per_campaign == [CAMPAIGN_LOW, CAMPAIGN_LOW, CAMPAIGN_HIGH, CAMPAIGN_HIGH]
+    repeats = [request for request in server.requests if "start" in _params(request)]
+    assert [(_params(r)["start"], _params(r)["count"]) for r in repeats] == [("10", "10")] * 2
+    assert (listing.complete, listing.reason, listing.interrupted_by) == (True, None, None)
+    assert listing.calls == len(server.requests) == 1 + 1 + 2 * len(delivering)
+    assert [(row.campaign_urn, row.value) for row in listing.rows] == [
+        (campaign, urn) for campaign in delivering for urn in SENIORITY_URNS
+    ]
+    assert [row.impressions for row in listing.rows[:2]] == [100, 101]
+    stops = _events(captured, "linkedin.analytics.repeat_page")
+    assert [(event["surface"], event["responses"]) for event in stops] == [
+        ("ad_analytics_member_segments", 2)
+    ] * len(delivering)
+    [outcome] = _events(captured, "linkedin.listing")
+    assert outcome["repeats_dropped"] == 0
 
 
 # ---------------------------------------------------------------------------------------------

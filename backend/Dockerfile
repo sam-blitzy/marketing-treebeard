@@ -24,6 +24,9 @@
 #                      captured/ directory over one to keep them)
 #   config/            NOT in the image: it lies outside the build context, and Compose
 #                      bind-mounts the repository's config/ read-only here
+#   File modes in alembic.ini, migrations/, src/ and tests/contracts/ are set at COPY, not
+#   taken from the checkout: files 0644 (0755 if executable), directories 0755, whatever the
+#   checkout's umask, so the runtime user can read them all.
 #
 # Secrets: none. No ARG or ENV carries a secret and no .env* file is copied; Compose injects
 # .env into the migrate, api and worker containers at run time only.
@@ -102,10 +105,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # or a .env in backend/ can never reach the image, with no .dockerignore to maintain.
 # `--exclude` drops the __pycache__ directories that local test runs leave in the source
 # tree, so an image built from a working checkout matches one built from a clean clone.
-COPY --exclude=**/__pycache__ src ./src
-COPY alembic.ini ./
-COPY --exclude=**/__pycache__ migrations ./migrations
-COPY tests/contracts ./tests/contracts
+# `--chmod=u=rwX,go=rX` sets every copied file to 0644 (0755 if already executable) and every
+# directory to 0755, whatever mode the checkout gives them: writable by root only and readable
+# by the runtime user. Without it COPY keeps the checkout's modes, and a checkout made under
+# umask 077 (0600 files, 0700 directories) leaves alembic.ini, migrations/ and the contracts
+# unreadable to that user, so `ads-engine migrate` fails and the simulator cannot load.
+COPY --chmod=u=rwX,go=rX --exclude=**/__pycache__ src ./src
+COPY --chmod=u=rwX,go=rX alembic.ini ./
+COPY --chmod=u=rwX,go=rX --exclude=**/__pycache__ migrations ./migrations
+COPY --chmod=u=rwX,go=rX tests/contracts ./tests/contracts
 # The capture directories alone, not their contents and not the contracts, go to the runtime
 # user, so `ads-engine capture-fixtures` can write into them; a glob that matches nothing fails
 # the build.
@@ -118,10 +126,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
-# Every file stays root-owned and read-only to the runtime user, with one exception: the
-# tests/contracts/*/captured/ directories it owns, where `ads-engine capture-fixtures` writes
-# its redacted live captures. The api, worker and migrate processes write nothing to the image
-# filesystem.
+# Every file stays root-owned and read-only to the runtime user, and readable by it whatever the
+# checkout's umask (the --chmod above), with one exception: the tests/contracts/*/captured/
+# directories it owns, where `ads-engine capture-fixtures` writes its redacted live captures.
+# The api, worker and migrate processes write nothing to the image filesystem.
 USER 10001:10001
 
 EXPOSE 8000

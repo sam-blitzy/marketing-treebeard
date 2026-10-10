@@ -1830,6 +1830,13 @@ class LinkedInSpec(_Replaceable):
             to exercise the "unknown creative" row and creative floor.
         analytics_next_links: Return ``next`` paging links on capped analytics responses;
             ``False`` truncates at 15,000 elements with no link.
+        analytics_repeat_pages: Page the three ``timeGranularity=ALL`` analytics surfaces
+            (statistics, campaign delivery and member segments) as live 202609 does (observed
+            2026-10-10): ``start`` is ignored, so every response serves the first page, every
+            element up to the 15,000 cap, with ``paging`` echoing the request's ``count``
+            (LinkedIn's default 10) and ``start``, no ``total``, and a ``next`` link to
+            ``start + count`` whenever it holds at least ``count`` elements, a chain that
+            never ends on its own. The daily surface keeps ``analytics_next_links``.
         segment_min_impressions: Privacy threshold: demographic values below it are omitted.
         segment_top_values: At most this many values per (campaign, pivot) are returned.
     """
@@ -1843,6 +1850,7 @@ class LinkedInSpec(_Replaceable):
     test_lead_share: Decimal = Decimal(0)
     unknown_creative_share: Decimal = Decimal(0)
     analytics_next_links: bool = False
+    analytics_repeat_pages: bool = False
     segment_min_impressions: int = 100
     segment_top_values: int = 100
 

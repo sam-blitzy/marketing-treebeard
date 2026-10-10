@@ -426,11 +426,11 @@ const COLUMNS: readonly DataTableColumn<MetricRow>[] = [
  * `DataTable`, whose cells keep their own sizing.
  *
  * BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive with a semibold weight,
- * and feature code carries no CSS (AAP 0.4.4), so the label is a `<b>` (user-agent bold) rather
- * than a semibold paragraph; bind it to the Blitzy OS label style when the source arrives. Text
- * lines are `<div>` elements rather than `<p>`: the base layer keeps the user-agent paragraph
- * margins, which would add space that no spacing token sets, so the `Stack` gaps alone space
- * them.
+ * and feature code carries no CSS (AAP 0.4.4), so the label is a `<b>`, which the design-system
+ * base layer sets to `--font-weight-semibold`, rather than a semibold paragraph; bind it to the
+ * Blitzy OS label style when the source arrives. Text lines are `<div>` elements rather than
+ * `<p>`: the base layer keeps the user-agent paragraph margins, which would add space that no
+ * spacing token sets, so the `Stack` gaps alone space them.
  */
 function LabelledList({
   label,

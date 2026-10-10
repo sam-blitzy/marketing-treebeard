@@ -40,6 +40,11 @@
  *   `discrepancy_resolved` reads "Already resolved". Every failure but `subject_retired` is
  *   reported through `onFailed` with the text the form shows. Error banners never take
  *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
+ * - **Validation errors are announced.** Fields validate as the user types and show their
+ *   messages as static text, so the form keeps one polite `role="status"` region, present from
+ *   its first render, that summarises every current error in display order ("1 error: Daily
+ *   budget: Enter an amount.") and describes the disabled submit button (WCAG 2.2 SC 4.1.3,
+ *   3.3.1). The same region announces a successful save; it is empty otherwise.
  * - **Outcomes outlive the form.** `onPendingChange`, `onDone`, `onRetired` and `onFailed`
  *   reach the consumer even when the form unmounted while its request ran, as it does when its
  *   dialog is closed mid-save. The consumer learns that a save started and when it settled, so
@@ -271,8 +276,10 @@ interface BaseState {
   total_budget: Money | null;
   /**
    * How a shared member's budget assignment is named on the form, as a noun phrase: "shared
-   * budget {Google id}" or "shared budget id {id}" when shared ownership is established, else
-   * "budget (internal id {id})"; `null` when unknown.
+   * budget {Google id}" when the decision or discrepancy carries the budget's Google id; for a
+   * decision row the API could not name, "shared budget id {id}", since its shape establishes
+   * that the budget is shared; for a discrepancy side naming it by internal id alone, which does
+   * not, "budget (internal id {id})"; `null` when unknown.
    */
   budgetLabel: string | null;
 }
@@ -291,6 +298,14 @@ interface ShapeFields {
   status: boolean;
   /** The amount fields the subject has, in display order. */
   amounts: readonly AmountField[];
+}
+
+/** An invalid field, as the validation summary names it (see `summarizeErrors`). */
+interface FieldError {
+  /** The field's visible label, such as "Daily budget". */
+  label: string;
+  /** The message the field shows, such as "Enter an amount". */
+  message: string;
 }
 
 /** How finely the subject's amounts are accepted, shown and stepped (see `amountPolicy`). */
@@ -431,14 +446,49 @@ function noteError(note: string): string | null {
     : null;
 }
 
+/**
+ * The concise summary of the form's validation errors that its status region announces, worded
+ * as the window picker's submit-error summary is: the count, then each invalid field's label
+ * and message in display order, for example "2 errors: Daily budget: Enter an amount. Note: Use
+ * at most 2,000 characters."
+ *
+ * @param errors - Each invalid field, in display order.
+ * @returns The summary, or `null` when no field is invalid.
+ */
+function summarizeErrors(errors: readonly FieldError[]): string | null {
+  if (errors.length === 0) {
+    return null;
+  }
+  const parts = errors.map(({ label, message }) => `${label}: ${message}.`);
+  return `${parts.length} ${parts.length === 1 ? 'error' : 'errors'}: ${parts.join(' ')}`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Subject state
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * How a decision row names the shared budget a `shared_member` decision assigns, as the rest of
+ * the product words it: "shared budget {Google id}" from `budget_external_id`, else, for a
+ * `budget_id` the API could not name, "shared budget id {id}". The shape itself establishes
+ * that the budget is shared, so both read "shared budget".
+ *
+ * @param decision - The decision row.
+ * @returns The noun phrase, or `null` when the row names no budget.
+ */
+function decisionBudgetLabel(decision: Decision): string | null {
+  const externalId = textOrNull(decision.budget_external_id);
+  if (externalId !== null) {
+    return `shared budget ${externalId}`;
+  }
+  return decision.budget_id === null ? null : `shared budget id ${decision.budget_id}`;
+}
+
+/**
  * The subject state a decision row records: its shape and complete expected state. A decision
- * carries `budget_id` only in the `shared_member` shape, where it names the shared budget the
- * member is assigned to, so that budget is "shared budget id {id}".
+ * carries `budget_id` and `budget_external_id` only in the `shared_member` shape, where they
+ * identify the shared budget the member is assigned to, named by {@link decisionBudgetLabel}
+ * ("shared budget 31000402").
  */
 function stateFromDecision(decision: Decision): SubjectState {
   return {
@@ -447,7 +497,7 @@ function stateFromDecision(decision: Decision): SubjectState {
       status: decision.status,
       daily_budget: decision.daily_budget,
       total_budget: decision.total_budget,
-      budgetLabel: decision.budget_id === null ? null : `shared budget id ${decision.budget_id}`,
+      budgetLabel: decisionBudgetLabel(decision),
     },
   };
 }
@@ -545,7 +595,8 @@ function shapeFields(state: SubjectState): ShapeFields {
 /**
  * A state as one line, for the read-only "Last decided" summary: the status label, then each
  * amount in the subject's currency, or the budget a member draws from, named by its
- * `budgetLabel` ("shared budget 31000402", "budget (internal id 401)").
+ * `budgetLabel` ("shared budget 31000402", "shared budget id 402" for a decision the API could
+ * not name, "budget (internal id 401)" for a discrepancy side).
  */
 function describeState(state: SubjectState, currency: string | null): string {
   const { shape, base } = state;
@@ -617,9 +668,10 @@ function isResolvedError(error: unknown): boolean {
  * `prefill` fields:
  *
  * - `own_budget`: "Status", plus "Daily budget" and/or "Total budget" where the subject has one;
- * - `shared_member`: "Status" only, noting the budget that owns the amount: its shared budget,
- *   or "budget (internal id {id})" when a discrepancy names it by internal id alone, which does
- *   not establish that it is shared;
+ * - `shared_member`: "Status" only, noting the budget that owns the amount: its shared budget by
+ *   Google id ("shared budget 31000402"), "shared budget id {id}" for a decision whose budget the
+ *   API could not name, or "budget (internal id {id})" when a discrepancy names it by internal
+ *   id alone, which does not establish that it is shared;
  * - `budget`: its one amount ("Daily budget" or "Total budget") and no status, listing the
  *   `members` that draw from it.
  *
@@ -627,7 +679,8 @@ function isResolvedError(error: unknown): boolean {
  * fields and is disabled while nothing changed. Intended-state mode posts
  * `{ resolution: 'record_intended', intended_state, note? }` with the complete state for the
  * shape. Sending the request calls `onPendingChange(true)`, and its settling calls
- * `onPendingChange(false)` before the outcome's callback. Success calls `onDone`. A 409
+ * `onPendingChange(false)` before the outcome's callback. Success calls `onDone` and puts
+ * "Decision saved" or "Intended state saved" in the form's polite status region. A 409
  * `subject_retired` disables every control while the form records about that subject and calls
  * `onRetired`; the enclosing `Dialog` keeps its own Close button. Every other failure calls
  * `onFailed` with the message the form shows. Each callback is the one the form had when the
@@ -642,7 +695,12 @@ function isResolvedError(error: unknown): boolean {
  * States: a `Spinner` while the decision log loads; a critical `Banner` with the API message
  * when it fails, kept while the polled log is read again; a warning `Banner` with no submit
  * when the subject has no decided state and no discrepancy to start from, or when its removal
- * was acknowledged.
+ * was acknowledged. Once the fields show, the form carries one polite `role="status"` region
+ * from its first render. While a field is invalid and the form is not locked, it holds a
+ * summary of the errors such as "1 error: Daily budget: Enter an amount.", and the disabled
+ * submit button references it through `aria-describedby`; otherwise it holds the success text
+ * after a save, or nothing. An unchanged patch disables the button with the visible "No change
+ * from the last decided state" hint as its description instead.
  */
 export function DecisionForm(props: DecisionFormProps) {
   return <DecisionFormBody key={formIdentity(props)} {...props} />;
@@ -714,6 +772,7 @@ function DecisionFormBody(props: DecisionFormProps) {
   const [retired, setRetired] = useState(false);
   const [closed, setClosed] = useState(false);
   const submitHintId = useId();
+  const statusId = useId();
 
   // The submit button is disabled while its request runs, which drops keyboard focus to the
   // page. When a save fails, focus moves to the error instead, so keyboard and screen-reader
@@ -807,6 +866,21 @@ function DecisionFormBody(props: DecisionFormProps) {
   const noteIssue = noteError(note);
   const hasErrors =
     Object.keys(amountErrors).length > 0 || statusError !== null || noteIssue !== null;
+  // The same errors in display order, for the status region's summary: the fields show theirs
+  // as static text, which is not announced as it changes.
+  const fieldErrors: FieldError[] = [];
+  if (statusError !== null) {
+    fieldErrors.push({ label: 'Status', message: statusError });
+  }
+  for (const field of fields.amounts) {
+    const issue = amountErrors[field];
+    if (issue !== undefined) {
+      fieldErrors.push({ label: AMOUNT_LABELS[field], message: issue });
+    }
+  }
+  if (noteIssue !== null) {
+    fieldErrors.push({ label: 'Note', message: noteIssue });
+  }
 
   const patch: DecisionPatchIn = {};
   if (statusChanged && statusValue !== '') {
@@ -837,6 +911,10 @@ function DecisionFormBody(props: DecisionFormProps) {
     (mode === 'decision' ? !patchIsEmpty : !closed) &&
     !pending;
   const showNoChange = mode === 'decision' && patchIsEmpty && !hasErrors && !locked;
+  // A locked form takes no edits, so its errors are not announced as something to fix.
+  const errorSummary = hasErrors && !locked ? summarizeErrors(fieldErrors) : null;
+  const savedText = mode === 'decision' ? 'Decision saved' : 'Intended state saved';
+  const statusText = errorSummary ?? (activeMutation.isSuccess ? savedText : null);
 
   const noteText = note.trim();
 
@@ -988,7 +1066,9 @@ function DecisionFormBody(props: DecisionFormProps) {
               variant="primary"
               loading={pending}
               disabled={!canSubmit}
-              aria-describedby={showNoChange ? submitHintId : undefined}
+              aria-describedby={
+                showNoChange ? submitHintId : errorSummary !== null ? statusId : undefined
+              }
             >
               {saveLabel}
             </Button>
@@ -999,13 +1079,17 @@ function DecisionFormBody(props: DecisionFormProps) {
             )}
           </Inline>
           {showNoChange ? <div id={submitHintId}>{NO_CHANGE_MESSAGE}</div> : null}
-          {activeMutation.isSuccess ? (
-            // A polite status message (WCAG 2.2 SC 4.1.3); role="alert" stays reserved for the
-            // discrepancy banner on /actions (AAP 0.5.5).
-            <div role="status">
-              {mode === 'decision' ? 'Decision saved' : 'Intended state saved'}
-            </div>
-          ) : null}
+          {/*
+            The form's one polite status region (WCAG 2.2 SC 4.1.3, 3.3.1): rendered from the
+            first render, so it exists before its first message, and holding the error summary
+            while a field is invalid, else the success text after a save, else no child node at
+            all, which the Stack takes out of flow so it adds no gap. Its text is visible, like
+            the hint above. role="alert" stays reserved for the discrepancy banner on /actions
+            (AAP 0.5.5).
+          */}
+          <div role="status" id={statusId}>
+            {statusText}
+          </div>
         </Stack>
       </Stack>
     </form>

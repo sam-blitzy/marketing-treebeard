@@ -1171,7 +1171,9 @@ describe('data-state flags on budget cards', () => {
 
     const flags = listLines(card(B1_ACTION), 'Flags');
     expect(flags).toContain('Simulated data');
-    expect(flags).toContain(makeFlag('stale').message);
+    expect(flags).toContain(
+      'Stale: Data as of 2026-10-04 05:31 UTC; google.metrics_daily covers through 2026-10-03',
+    );
     expect(flags).toContain(makeFlag('incomplete').message);
   });
 });

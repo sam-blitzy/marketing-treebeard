@@ -1867,6 +1867,201 @@ async def test_follow_bounds_the_next_link_chain(monkeypatch: pytest.MonkeyPatch
     assert len(server.requests) == 3
 
 
+def _on_day(element: dict[str, Any], day: int) -> dict[str, Any]:
+    """Return ``element`` moved to 2026-09-``day``, as a daily page for a later day holds it."""
+    moved = {"year": 2026, "month": 9, "day": day}
+    return {**element, "dateRange": {"start": moved, "end": moved}}
+
+
+@pytest.mark.anyio
+async def test_follow_ends_complete_at_a_non_empty_page_that_repeats_the_chain(
+    captured: list[EventDict],
+) -> None:
+    """Live 202609 ignores ``start`` with ``timeGranularity=ALL``: each page repeats the first.
+
+    The second response holds only elements already read and carries a fresh ``next`` link to
+    ``start+10``. The chain ends there, complete, after 2 requests; the repeated elements are
+    not added again, and the stop is logged with counts only.
+    """
+    page = [_daily_element(1), _daily_element(2)]
+    server = Server(
+        _ok(_analytics_page(page, f"/rest/{ANALYTICS_URL}&start=10&count=10")),
+        _ok(_analytics_page(copy.deepcopy(page), f"/rest/{ANALYTICS_URL}&start=20&count=10")),
+    )
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally)
+    assert len(server.requests) == tally.calls == 2
+    assert [e["impressions"] for e in pages.elements] == [1, 2]
+    assert (pages.capped, pages.limited, pages.interrupted_by) == (False, False, None)
+    (event,) = [e for e in captured if e["event"] == "linkedin.analytics.repeat_page"]
+    assert event == {
+        "event": "linkedin.analytics.repeat_page",
+        "log_level": "info",
+        "surface": "ad_analytics",
+        "responses": 2,
+    }
+
+
+@pytest.mark.anyio
+async def test_follow_ends_complete_at_a_repeat_page_at_the_max_pages_bound(
+    captured: list[EventDict],
+) -> None:
+    """A repeat page at the ``max_pages`` bound ends the chain complete, never "page limit".
+
+    With ``max_pages=2`` the second response repeats the first behind a fresh ``next`` link.
+    The repeat rule runs before the bound, and a repeat page leaves nothing unread, so
+    ``limited`` stays ``False`` and the repeated elements are not added again.
+    """
+    page = [_daily_element(1), _daily_element(2)]
+    server = Server(
+        _ok(_analytics_page(page, f"/rest/{ANALYTICS_URL}&start=10&count=10")),
+        _ok(_analytics_page(copy.deepcopy(page), f"/rest/{ANALYTICS_URL}&start=20&count=10")),
+    )
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally, max_pages=2)
+    assert len(server.requests) == tally.calls == 2
+    assert [e["impressions"] for e in pages.elements] == [1, 2]
+    assert (pages.limited, pages.capped, pages.interrupted_by) == (False, False, None)
+    stops = [e for e in captured if e["event"] == "linkedin.analytics.repeat_page"]
+    assert [(e["surface"], e["responses"]) for e in stops] == [("ad_analytics", 2)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "repeated", [f"/rest/{ANALYTICS_URL}", f"/rest/{ANALYTICS_URL}&start=10&count=10"]
+)
+async def test_follow_ends_complete_at_a_repeat_page_whose_next_link_repeats_a_request(
+    repeated: str, captured: list[EventDict]
+) -> None:
+    """A repeat page linking back to a request already read ends complete, with no defect.
+
+    The second response repeats the first and links back to the first request or to itself.
+    The repeat rule runs before the repeated-request check: the page adds nothing, so the
+    chain ends complete after 2 requests and the link is never followed.
+    """
+    page = [_daily_element(1), _daily_element(2)]
+    server = Server(
+        _ok(_analytics_page(page, f"/rest/{ANALYTICS_URL}&start=10&count=10")),
+        _ok(_analytics_page(copy.deepcopy(page), repeated)),
+    )
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally)
+    assert len(server.requests) == tally.calls == 2
+    assert [e["impressions"] for e in pages.elements] == [1, 2]
+    assert (pages.limited, pages.capped, pages.interrupted_by) == (False, False, None)
+    stops = [e for e in captured if e["event"] == "linkedin.analytics.repeat_page"]
+    assert [(e["surface"], e["responses"]) for e in stops] == [("ad_analytics", 2)]
+
+
+@pytest.mark.anyio
+async def test_follow_reads_on_when_a_daily_page_repeats_creatives_on_new_days() -> None:
+    """The same creatives on a new day are new elements: a daily chain never ends early."""
+    first = [_daily_element(1), _daily_element(2)]
+    server = Server(
+        _ok(_analytics_page(first, f"/rest/{ANALYTICS_URL}&start=2")),
+        _ok(
+            _analytics_page(
+                [_on_day(element, 2) for element in first], f"/rest/{ANALYTICS_URL}&start=4"
+            )
+        ),
+        _ok(_analytics_page([_on_day(_daily_element(1), 3)])),
+    )
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    assert len(server.requests) == 3
+    assert [(e["impressions"], e["dateRange"]["start"]["day"]) for e in pages.elements] == [
+        (1, 1),
+        (2, 1),
+        (1, 2),
+        (2, 2),
+        (1, 3),
+    ]
+    assert not pages.capped
+
+
+@pytest.mark.anyio
+async def test_follow_keeps_a_partly_new_page_whole_and_reads_on() -> None:
+    """A page with one new element continues the chain and keeps its repeats for de-duplication.
+
+    The third page repeats elements of both earlier pages, so the repeat is judged against the
+    whole chain, not only the previous page.
+    """
+    server = Server(
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=1")),
+        _ok(
+            _analytics_page(
+                [_daily_element(1), _daily_element(2)], f"/rest/{ANALYTICS_URL}&start=3"
+            )
+        ),
+        _ok(
+            _analytics_page(
+                [_daily_element(2), _daily_element(1)], f"/rest/{ANALYTICS_URL}&start=5"
+            )
+        ),
+    )
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    assert len(server.requests) == 3
+    assert [e["impressions"] for e in pages.elements] == [1, 1, 2]
+    assert not pages.capped
+
+
+@pytest.mark.anyio
+async def test_follow_judges_a_repeat_after_an_empty_page_against_the_whole_chain() -> None:
+    """An empty page still never ends the chain; the non-empty repeat behind it does."""
+    server = Server(
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=10")),
+        _ok(_analytics_page([], f"/rest/{ANALYTICS_URL}&start=20")),
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=30")),
+    )
+    tally = _Tally()
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, tally)
+    assert tally.calls == len(server.requests) == 3
+    assert [e["impressions"] for e in pages.elements] == [1]
+    assert (pages.capped, pages.limited, pages.interrupted_by) == (False, False, None)
+
+
+@pytest.mark.anyio
+async def test_follow_reads_a_repeat_page_at_the_cap_as_capped() -> None:
+    """A repeat page of 15,000 elements ends the chain but may be truncated: it is capped."""
+    elements = [_daily_element(index) for index in range(MAX_ANALYTICS_ELEMENTS)]
+    server = Server(
+        _ok(_analytics_page(elements, f"/rest/{ANALYTICS_URL}&start=15000")),
+        _ok(_analytics_page(copy.deepcopy(elements), f"/rest/{ANALYTICS_URL}&start=30000")),
+    )
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    assert len(server.requests) == 2
+    assert pages.capped
+    assert len(pages.elements) == MAX_ANALYTICS_ELEMENTS
+
+
+@pytest.mark.anyio
+async def test_follow_counts_an_element_without_a_pivot_values_list_as_new() -> None:
+    """An element with no identity never makes a page a repeat; the parser still sees it.
+
+    The second page breaks the contract on purpose: its only element repeats the first page's
+    creative and day but carries ``pivotValues`` as a string, so it is passed on, never dropped
+    as a repeat.
+    """
+    malformed = {**_daily_element(1), "pivotValues": "urn:li:sponsoredCreative:1"}
+    link = {"rel": "next", "href": f"/rest/{ANALYTICS_URL}&start=2", "type": "GET"}
+    unconforming = {"elements": [malformed], "paging": {"count": 10, "start": 1, "links": [link]}}
+    server = Server(
+        _ok(_analytics_page([_daily_element(1)], f"/rest/{ANALYTICS_URL}&start=1")),
+        _ok(unconforming),
+        _ok(_analytics_page([])),
+    )
+    async with _linkedin(server) as linkedin:
+        pages = await linkedin._follow("ad_analytics", ANALYTICS_URL, _Tally())
+    assert len(server.requests) == 3
+    assert pages.elements[1] == malformed
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("body", "fragment"),

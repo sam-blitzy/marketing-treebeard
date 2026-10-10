@@ -12,7 +12,8 @@
  * - **Prefill.** The form starts from the latest decision, overlaid with the recommendation's
  *   proposed change; a subject with no decision yet starts from its discrepancy.
  * - **Validation.** Amounts stop at the currency's minor unit, or at whole micros on Google,
- *   and an empty or no-change patch is refused before any request.
+ *   and an empty or no-change patch is refused before any request. Every current error is
+ *   summarised in the form's one polite status region, which describes the disabled submit.
  * - **Requests.** The exact `POST /decisions` and `record_intended` bodies, the
  *   `X-Requested-With: ads-engine` header, `onDone` and the query invalidation after success.
  *   Total budgets are posted for a `CUSTOM_PERIOD` shared budget with no status or daily
@@ -234,6 +235,21 @@ function saveButton(label: 'Save decision' | 'Save intended state' = 'Save decis
   return screen.getByRole('button', { name: label });
 }
 
+/**
+ * The form's one polite status region. `hidden: true` also counts status elements excluded
+ * from the accessibility tree, so the check fails when the form renders a second one anywhere.
+ *
+ * @throws Error when there is not exactly one.
+ */
+function formStatus(): HTMLElement {
+  const regions = screen.getAllByRole('status', { hidden: true });
+  const [region] = regions;
+  if (region === undefined || regions.length !== 1) {
+    throw new Error(`expected one status region, found ${String(regions.length)}`);
+  }
+  return region;
+}
+
 /** Types `value` into a field. */
 function typeInto(field: HTMLElement, value: string): void {
   fireEvent.change(field, { target: { value } });
@@ -442,11 +458,10 @@ describe('DecisionForm', () => {
         onDone,
       });
 
-      const budgetLabel = `id ${String(FIXTURE_BUDGET_IDS.search)}`;
-      expect(
-        screen.getByText(`Last decided: Active · shared budget ${budgetLabel}`),
-      ).toBeDefined();
-      expect(screen.getByText(`The amount is set on shared budget ${budgetLabel}`)).toBeDefined();
+      // The budget is named by its Google id, as the rest of the product names it.
+      expect(screen.getByText('Last decided: Active · shared budget 31000402')).toBeDefined();
+      expect(screen.getByText('The amount is set on shared budget 31000402')).toBeDefined();
+      expect(screen.queryByText(/budget id/)).toBeNull();
       expect(screen.queryByRole('spinbutton')).toBeNull();
       expect(statusSelect()).toHaveProperty('value', 'paused');
 
@@ -460,9 +475,25 @@ describe('DecisionForm', () => {
       });
     });
 
+    it('names the shared budget by internal id when the API could not name it', async () => {
+      mockApi({
+        [logKey(SHARED_MEMBER)]: json(200, [
+          makeDecision('shared_member', { budget_external_id: null }),
+        ]),
+      });
+      await renderForm({ subject: SHARED_MEMBER });
+
+      // budget_id 402 is FIXTURE_BUDGET_IDS.search, which the shape establishes is shared.
+      expect(screen.getByText('Last decided: Active · shared budget id 402')).toBeDefined();
+      expect(screen.getByText('The amount is set on shared budget id 402')).toBeDefined();
+      expect(screen.queryByRole('spinbutton')).toBeNull();
+    });
+
     it('says the amount is on its shared budget when the assignment is unknown', async () => {
       mockApi({
-        [logKey(SHARED_MEMBER)]: json(200, [makeDecision('shared_member', { budget_id: null })]),
+        [logKey(SHARED_MEMBER)]: json(200, [
+          makeDecision('shared_member', { budget_id: null, budget_external_id: null }),
+        ]),
       });
       await renderForm({ subject: SHARED_MEMBER });
 
@@ -730,6 +761,133 @@ describe('DecisionForm', () => {
       typeInto(noteField(), 'x'.repeat(2000));
       expect(screen.queryByText('Use at most 2,000 characters')).toBeNull();
       expect(saveButton()).toHaveProperty('disabled', false);
+    });
+  });
+
+  describe('announcing validation errors (WCAG 2.2 SC 4.1.3, 3.3.1)', () => {
+    it('renders one empty polite status region from the first render', async () => {
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      await renderForm({ subject: OWN_BUDGET });
+
+      const region = formStatus();
+      expect(formOf(saveButton()).contains(region)).toBe(true);
+      expect(region.id).not.toBe('');
+      // No child node at all, not even an empty text node, so the Stack adds no gap for it.
+      expect(region.childNodes).toHaveLength(0);
+      // Feature code styles nothing itself (AAP 0.4.4): the region is a plain, visible div.
+      expect(region.getAttribute('class')).toBeNull();
+      expect(region.getAttribute('style')).toBeNull();
+      // The unchanged form's button is described by the no-change hint, not by the region.
+      const hint = screen.getByText('No change from the last decided state');
+      expect(saveButton().getAttribute('aria-describedby')).toBe(hint.id);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it.each([
+      ['', 'Enter an amount'],
+      ['-5', 'Enter a non-negative amount'],
+      ['0', 'Enter an amount above zero'],
+    ])('announces %j in the daily budget as "%s"', async (value, message) => {
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      await renderForm({ subject: OWN_BUDGET });
+      expect(amountInput('Daily budget')).toHaveProperty('value', '200.00');
+      const region = formStatus();
+
+      typeInto(amountInput('Daily budget'), value);
+
+      // The same region receives the summary, so it existed before its message.
+      expect(formStatus()).toBe(region);
+      expect(region.textContent).toBe(`1 error: Daily budget: ${message}.`);
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(saveButton().getAttribute('aria-describedby')).toBe(region.id);
+      expect(screen.queryByText('No change from the last decided state')).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('counts every invalid field, in display order', async () => {
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      await renderForm({ subject: OWN_BUDGET });
+
+      typeInto(noteField(), 'x'.repeat(2001));
+      typeInto(amountInput('Daily budget'), '');
+
+      expect(formStatus().textContent).toBe(
+        '2 errors: Daily budget: Enter an amount. Note: Use at most 2,000 characters.',
+      );
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(saveButton().getAttribute('aria-describedby')).toBe(formStatus().id);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('names a missing intended status first, then the amounts', async () => {
+      const discrepancy: Discrepancy = makeDiscrepancy('untracked', {
+        platform_value: {
+          status: null,
+          daily_budget: '200.00',
+          total_budget: null,
+          currency: 'USD',
+        },
+      });
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, []) });
+      await renderForm({ subject: OWN_BUDGET, mode: 'intended_state', discrepancy });
+
+      expect(formStatus().textContent).toBe('1 error: Status: Choose a status.');
+      typeInto(amountInput('Daily budget'), '');
+      expect(formStatus().textContent).toBe(
+        '2 errors: Status: Choose a status. Daily budget: Enter an amount.',
+      );
+      expect(saveButton('Save intended state').getAttribute('aria-describedby')).toBe(
+        formStatus().id,
+      );
+    });
+
+    it('empties the region once the value is fixed', async () => {
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      await renderForm({ subject: OWN_BUDGET });
+      const region = formStatus();
+
+      typeInto(amountInput('Daily budget'), '-5');
+      expect(region.textContent).toBe('1 error: Daily budget: Enter a non-negative amount.');
+
+      typeInto(amountInput('Daily budget'), '150.00');
+      expect(formStatus()).toBe(region);
+      expect(region.childNodes).toHaveLength(0);
+      expect(saveButton()).toHaveProperty('disabled', false);
+      expect(saveButton().getAttribute('aria-describedby')).toBeNull();
+    });
+
+    it('announces no error on a locked form', async () => {
+      mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+      await renderForm({ subject: OWN_BUDGET, prefill: { daily_budget: '0' }, disabled: true });
+
+      expect(screen.getByText('Enter an amount above zero')).toBeDefined();
+      expect(formStatus().childNodes).toHaveLength(0);
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(saveButton().getAttribute('aria-describedby')).toBeNull();
+    });
+
+    it('puts the success text in the same single region', async () => {
+      const onDone = vi.fn<() => void>();
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': json(201, makeDecision('own_budget', { daily_budget: '150.00' })),
+      });
+      await renderForm({ subject: OWN_BUDGET, onDone });
+      const region = formStatus();
+
+      typeInto(amountInput('Daily budget'), '');
+      expect(region.textContent).toBe('1 error: Daily budget: Enter an amount.');
+      typeInto(amountInput('Daily budget'), '150.00');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      await waitFor(() => {
+        expect(region.textContent).toBe('Decision saved');
+      });
+      expect(formStatus()).toBe(region);
+      expect(screen.queryByRole('alert')).toBeNull();
     });
   });
 

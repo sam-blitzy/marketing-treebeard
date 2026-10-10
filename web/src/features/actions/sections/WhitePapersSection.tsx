@@ -88,7 +88,7 @@ import {
   type WhitePaperRow,
 } from '../evidenceExtra';
 import { BlockingDiscrepancyLinks } from '../BlockingDiscrepancies';
-import { FlagList, flagTone, mergeFlags } from '../FlagList';
+import { FlagList, flagText, flagTone, mergeFlags } from '../FlagList';
 import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
 import type { BatchNoun } from '../batches';
 import {
@@ -436,12 +436,13 @@ function statusLabel(status: DataStatus): string | null {
  * labelled everywhere; AAP 0.3.3: a "Simulated data" flag on each affected item).
  *
  * It is the `simulated` flag of the row's recorded and current flags, merged exactly as the
- * flags row in its details merges them ({@link mergeFlags}), so both say the same thing in the
- * backend's own words, for example "Simulated data (LinkedIn, HubSpot)" or "Joins live and
- * simulated data (HubSpot simulated)". The recorded flag stays after the source goes live,
- * because a row computed from simulated data still says so (AAP 0.3.2). Only when neither set
- * carries the flag does the row's data status name it, recorded first, then current
- * ({@link SIMULATED_DATA_FALLBACK}, {@link MIXED_DATA_FALLBACK}).
+ * flags row in its details merges them ({@link mergeFlags}), and the Asset cell shows it with
+ * the same badge text ({@link flagText}), so both say the same thing, for example "Simulated
+ * data (LinkedIn, HubSpot)" or "Joins live and simulated data (HubSpot simulated)". The
+ * recorded flag stays after the source goes live, because a row computed from simulated data
+ * still says so (AAP 0.3.2). Only when neither set carries the flag does the row's data status
+ * name it, recorded first, then current ({@link SIMULATED_DATA_FALLBACK},
+ * {@link MIXED_DATA_FALLBACK}).
  *
  * @returns the flag, or `null` for a row computed from live data only
  */
@@ -458,7 +459,8 @@ function simulatedFlag(item: Item): Flag | null {
 
 /**
  * The Asset cell, the row header: the asset's name, then its simulated-data badge
- * ({@link simulatedFlag}) in the flag's tone, so a collapsed row states that its numbers are
+ * ({@link simulatedFlag}) in the flag's tone, with the text the flags row gives the same flag
+ * ({@link flagText}), so a collapsed row states that its numbers are
  * simulated without being expanded, in the cell that names the row. Captions and the expand
  * label keep the plain name. In a batched table the name is the row's focus target
  * ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it first.
@@ -472,7 +474,7 @@ function AssetCell({ row }: { row: AssetRowView }): ReactElement {
   return (
     <Inline gap={2}>
       <span>{name}</span>
-      <Badge tone={flagTone(flag.code)}>{flag.message}</Badge>
+      <Badge tone={flagTone(flag.code)}>{flagText(flag)}</Badge>
     </Inline>
   );
 }

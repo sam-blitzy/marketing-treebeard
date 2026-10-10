@@ -15,7 +15,10 @@
  *   asterisk marked `aria-hidden` so the name stays the label text alone.
  *
  * The error is static text, not a live region: a form announces its errors through focus and
- * reading order on submit, and a `role="alert"` on every field would be noisy.
+ * reading order on submit, and a `role="alert"` on every field would be noisy. A form that
+ * validates as the user types, or reports a failed submit without moving focus, announces its
+ * errors through a polite status summary of its own (`DecisionForm`, `DateRangePicker`), so
+ * the field's error stays static.
  *
  * The rendered markup is the contract of `TextField.css` (shared with `Select`):
  *

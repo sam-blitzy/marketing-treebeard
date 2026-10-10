@@ -28,10 +28,11 @@
 
 /**
  * Every semantic CSS custom property, in `tokens.css` declaration order (AAP 0.4.3): ten
- * colours, eight spacing steps, the font family, five font sizes, two font weights, two line
- * heights, two radii, two shadows, three z-index layers, two opacities and two sizes. The
- * opacities and the sizes extend the AAP 0.4.3 list, so that every component value, including
- * disabled and backdrop opacity and full-extent geometry, resolves to a token (AAP 0.4.4).
+ * colours, eight spacing steps, two font families (text and monospace), five font sizes, two
+ * font weights, two line heights, two radii, two shadows, three z-index layers, two opacities
+ * and two sizes. The monospace family, the opacities and the sizes extend the AAP 0.4.3 list,
+ * so that every rendered value, including the family of code identifiers, disabled and backdrop
+ * opacity and full-extent geometry, resolves to a token (AAP 0.4.4).
  *
  * `tokens.test.ts` holds `tokens.css` to this exact list and order, so a token added, renamed
  * or removed in one place and not the other fails the tests.
@@ -58,6 +59,7 @@ export const TOKEN_NAMES = [
   '--space-7',
   '--space-8',
   '--font-family',
+  '--font-family-mono',
   '--font-size-xs',
   '--font-size-sm',
   '--font-size-md',
@@ -182,6 +184,7 @@ export const tokens = {
   /** Typography tokens. GAP: bind to Blitzy OS on source arrival. */
   font: {
     family: cssVar('--font-family'),
+    familyMono: cssVar('--font-family-mono'),
     size: {
       xs: cssVar('--font-size-xs'),
       sm: cssVar('--font-size-sm'),
