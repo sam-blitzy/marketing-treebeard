@@ -5,9 +5,13 @@
  *
  * The suite holds the card to its TSDoc contract and to AAP 0.5.5:
  *
- * - **Header**: an `<article>` named by the action, with the rank and "{entity name} · {Source}".
+ * - **Header**: an `<article>` named by the action, with the rank, the headline number the
+ *   frozen evidence selects ("{label} {value}", outside the heading; none when it selects none)
+ *   and "{entity name} · {Source}".
  * - **Body**: the reason, the caller's fields, the evidence table, the window chip
  *   "{start} – {end} · {N} days · {source boundaries}" and the flags (recorded plus current).
+ *   With `reasonPlacement="fields"` the card prints no reason line, so the caller's fields
+ *   carry the reason once.
  * - **Footer**: "Record decision" only on items with a `decision_subject`, opening the
  *   `DecisionForm` prefilled with the proposed change (status `paused` for C1; the proposed daily
  *   budget on a shared budget, with every member listed); "Mark done" on every other action;
@@ -23,7 +27,9 @@
  *   focus moves to the next card's first enabled action, else the previous card's, else the
  *   section heading, unless the user has moved it elsewhere. A decision saved after its dialog
  *   was closed and reopened is reported too, and leaves the reopened dialog open with its edits.
- * - **Holds**: a held item states why and links the Campaigns discrepancy group.
+ * - **Holds**: a held item states why and links its recorded blocking discrepancy on
+ *   `/decisions` (rendered alone, the card has no run C0 card to link), or, with no blocker to
+ *   name, "View open discrepancies" to the Campaigns discrepancy group.
  *
  * The network is stubbed below the real API client by `../../test/mockApi`, which fails a test
  * on any request it has no handler for; it is imported before `../../test/render` and Testing
@@ -37,9 +43,17 @@ import { useState, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useRecommendations } from '../../api/queries';
-import type { DataStatus, Decision, FeedbackKind, Item, ProvenanceEntry } from '../../api/types';
+import type {
+  DataStatus,
+  Decision,
+  FeedbackKind,
+  Item,
+  Metric,
+  ProvenanceEntry,
+} from '../../api/types';
 import { Button, PageShell, Stack } from '../../design-system';
 import { formatWindowChip } from '../../lib/format';
+import { OPEN_DISCREPANCIES_LINK_LABEL } from './BlockingDiscrepancies';
 import {
   FIXTURE_BUDGET_IDS,
   FIXTURE_CAMPAIGN_IDS,
@@ -377,20 +391,224 @@ describe('RecommendationCard: header and body', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Headline number
+// ---------------------------------------------------------------------------------------------
+
+describe('RecommendationCard: headline number', () => {
+  /** A K1 cited number as `analysis.context.Metric.to_json` renders it, in USD. */
+  function usdMetric(key: string, label: string, value: Metric['value']): Metric {
+    return {
+      key,
+      label,
+      value,
+      unit: 'currency',
+      currency: 'USD',
+      floor: null,
+      unavailable: value === null ? true : null,
+    };
+  }
+
+  /**
+   * A K1 block candidate on "crm demo" whose frozen evidence cites its spend and wasted spend
+   * and, with `extra`, selects its headline number (`extra.headline_metric`).
+   */
+  function k1Item(extra: Record<string, unknown> | null, wasted: Metric['value'] = '515.34'): Item {
+    return makeItem({
+      evidence: makeEvidence({
+        metrics: [
+          usdMetric('spend', 'Spend', '515.34'),
+          usdMetric('wasted_spend', 'Wasted spend', wasted),
+        ],
+        extra,
+      }),
+    });
+  }
+
+  /** The header of `item`'s card. */
+  function headerOf(item: Item): HTMLElement {
+    const header = cardOf(item).querySelector('.ds-card__header');
+    if (!(header instanceof HTMLElement)) {
+      throw new Error('The card header was not rendered');
+    }
+    return header;
+  }
+
+  it('leads a K1 card with its wasted spend, between the action and the entity line', async () => {
+    const item = k1Item({ headline_metric: 'wasted_spend' });
+    await renderCard(<RecommendationCard item={item} />);
+
+    // The card is still named by the action alone: the figure is not part of its name.
+    const card = screen.getByRole('article', { name: 'Add as exact-match negative' });
+    const header = headerOf(item);
+    const heading = within(header).getByRole('heading', {
+      level: 3,
+      name: 'Add as exact-match negative',
+    });
+    const figure = within(header).getByText('Wasted spend').parentElement;
+    if (figure === null) {
+      throw new Error('The headline figure was not rendered');
+    }
+
+    expect(figure.textContent).toBe('Wasted spend $515.34');
+    expect(heading.contains(figure)).toBe(false);
+    const entity = within(header).getByText('crm demo · Google');
+    expect(heading.compareDocumentPosition(figure)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(figure.compareDocumentPosition(entity)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    // The full evidence still follows in the body.
+    const table = within(card).getByRole('table', { name: 'Evidence' });
+    expect(within(table).getByRole('rowheader', { name: 'Wasted spend' })).toBeDefined();
+  });
+
+  it('shows no headline number when the frozen evidence selects none', async () => {
+    const item = k1Item(null);
+    await renderCard(<RecommendationCard item={item} />);
+
+    const header = headerOf(item);
+    expect(header.querySelector('.ds-card__figure')).toBeNull();
+    expect(within(header).queryByText('Wasted spend')).toBeNull();
+    expect(within(header).queryByText('$515.34')).toBeNull();
+  });
+
+  it('shows no headline number, and never another metric, when the key names none', async () => {
+    const item = k1Item({ headline_metric: 'cost_per_conversion' });
+    await renderCard(<RecommendationCard item={item} />);
+
+    const header = headerOf(item);
+    expect(header.querySelector('.ds-card__figure')).toBeNull();
+    expect(within(header).queryByText('$515.34')).toBeNull();
+  });
+
+  it('renders an unavailable headline value as "unavailable", never 0', async () => {
+    const item = k1Item({ headline_metric: 'wasted_spend' }, null);
+    await renderCard(<RecommendationCard item={item} />);
+
+    const figure = within(headerOf(item)).getByText('Wasted spend').parentElement;
+    expect(figure?.textContent).toBe('Wasted spend unavailable');
+    expect(figure?.textContent).not.toMatch(/\d/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Reason placement
+// ---------------------------------------------------------------------------------------------
+
+describe('RecommendationCard: reason placement', () => {
+  it('prints the reason once, before the caller fields, by default', async () => {
+    const item = c1Item();
+    await renderCard(
+      <RecommendationCard item={item}>
+        <div>Section fields</div>
+      </RecommendationCard>,
+    );
+
+    const card = cardOf(item);
+    const reasons = within(card).getAllByText(item.reason);
+    expect(reasons).toHaveLength(1);
+    const fields = within(card).getByText('Section fields');
+    expect(reasons[0]?.compareDocumentPosition(fields)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('prints the reason once, before the caller fields, with reasonPlacement "card"', async () => {
+    const item = c1Item();
+    await renderCard(
+      <RecommendationCard item={item} reasonPlacement="card">
+        <div>Section fields</div>
+      </RecommendationCard>,
+    );
+
+    const card = cardOf(item);
+    const reasons = within(card).getAllByText(item.reason);
+    expect(reasons).toHaveLength(1);
+    const fields = within(card).getByText('Section fields');
+    expect(reasons[0]?.compareDocumentPosition(fields)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('prints no reason line of its own with reasonPlacement "fields", leaving the reason to the caller fields', async () => {
+    const item = c1Item();
+    const fieldText = `Reason: ${item.reason}`;
+    await renderCard(
+      <RecommendationCard item={item} reasonPlacement="fields">
+        <div>{fieldText}</div>
+      </RecommendationCard>,
+    );
+
+    const card = cardOf(item);
+    // The card's own reason line is gone; the caller's field holds the only copy.
+    expect(within(card).queryByText(item.reason)).toBeNull();
+    expect((card.textContent ?? '').split(item.reason)).toHaveLength(2);
+    // The body opens with the caller's fields, then the evidence, window chip and flags.
+    const body = card.querySelector('.ds-card__body');
+    expect(body?.textContent?.startsWith(fieldText)).toBe(true);
+    const order = [
+      within(card).getByText(fieldText),
+      within(card).getByRole('table', { name: 'Evidence' }),
+      within(card).getByText(formatWindowChip(item.evidence.window)),
+      within(card).getByRole('list', { name: 'Flags' }),
+    ];
+    order.slice(1).forEach((node, index) => {
+      expect(order[index]?.compareDocumentPosition(node)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+  });
+
+  it('still states a hold before the caller fields with reasonPlacement "fields"', async () => {
+    const item = makeItem({
+      current: makeItemOverlay({ held_now: true, held_reason_now: 'Resolve discrepancy first' }),
+    });
+    await renderCard(
+      <RecommendationCard item={item} reasonPlacement="fields">
+        <div>Section fields</div>
+      </RecommendationCard>,
+    );
+
+    const card = cardOf(item);
+    expect(within(card).queryByText(item.reason)).toBeNull();
+    const held = within(card).getByText('Resolve discrepancy first');
+    expect(held.compareDocumentPosition(within(card).getByText('Section fields'))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Holds and historical items
 // ---------------------------------------------------------------------------------------------
 
 describe('RecommendationCard: holds', () => {
-  it('states why a held item is held and links the blocking discrepancy', async () => {
+  it('states why a held item is held and links its recorded blocking discrepancy', async () => {
     const item = makeItem({
+      held: true,
+      held_reason: 'Resolve discrepancy first',
+      evidence: makeEvidence({
+        extra: {
+          depends_on: [{ type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.brandSearch }],
+          blocking_discrepancies: [51],
+        },
+      }),
       current: makeItemOverlay({ held_now: true, held_reason_now: 'Resolve discrepancy first' }),
     });
     await renderCard(<RecommendationCard item={item} />);
 
     const card = cardOf(item);
     expect(within(card).getByText('Resolve discrepancy first')).toBeDefined();
-    const link = within(card).getByRole('link', { name: BLOCKING_DISCREPANCY_LINK_LABEL });
+    // Rendered alone, the card has no run to find the C0 card in, so it links /decisions.
+    const link = within(card).getByRole('link', { name: `${BLOCKING_DISCREPANCY_LINK_LABEL} 51` });
+    expect(link.getAttribute('href')).toBe('/decisions#discrepancy-51');
+    expect(within(card).queryByRole('link', { name: OPEN_DISCREPANCIES_LINK_LABEL })).toBeNull();
+  });
+
+  it('links the discrepancy list, saying so, when no blocker can be named', async () => {
+    const item = makeItem({
+      current: makeItemOverlay({ held_now: true, held_reason_now: 'Resolve discrepancy first' }),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    const card = cardOf(item);
+    const link = within(card).getByRole('link', { name: OPEN_DISCREPANCIES_LINK_LABEL });
     expect(link.getAttribute('href')).toBe(DISCREPANCY_ANCHOR);
+    expect(
+      within(card).queryByRole('link', { name: new RegExp(BLOCKING_DISCREPANCY_LINK_LABEL) }),
+    ).toBeNull();
+    expect(api.calls).toEqual([]);
   });
 
   it('shows the live hold reason before the one frozen with the run', async () => {
@@ -422,6 +640,7 @@ describe('RecommendationCard: holds', () => {
   });
 
   it('shows the held page card from the fixture with its discrepancy link', async () => {
+    // The fixture records no blocker id, so the card links the discrepancy list.
     const item = pageItem(FIXTURE_ITEM_IDS.heldPause);
     await renderCard(<RecommendationCard item={item} />);
 
@@ -429,7 +648,7 @@ describe('RecommendationCard: holds', () => {
     expect(within(card).getByText('Resolve discrepancy first')).toBeDefined();
     expect(
       within(card)
-        .getByRole('link', { name: BLOCKING_DISCREPANCY_LINK_LABEL })
+        .getByRole('link', { name: OPEN_DISCREPANCIES_LINK_LABEL })
         .getAttribute('href'),
     ).toBe(DISCREPANCY_ANCHOR);
   });
@@ -453,7 +672,10 @@ describe('RecommendationCard: historical items', () => {
     expect(within(card).getByText(HISTORICAL_LABEL).className).toBe('ds-badge ds-badge--warning');
     expect(within(card).getByText('Simulated LinkedIn data, since replaced by live')).toBeDefined();
     // The overlay holds it with the replaced-data reason, which the badge already states.
-    expect(within(card).queryByRole('link', { name: BLOCKING_DISCREPANCY_LINK_LABEL })).toBeNull();
+    expect(
+      within(card).queryByRole('link', { name: new RegExp(BLOCKING_DISCREPANCY_LINK_LABEL) }),
+    ).toBeNull();
+    expect(within(card).queryByRole('link', { name: OPEN_DISCREPANCIES_LINK_LABEL })).toBeNull();
 
     expect(buttonNames(item)).toEqual([
       FEEDBACK_LABELS.done,

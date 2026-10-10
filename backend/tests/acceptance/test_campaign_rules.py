@@ -652,6 +652,8 @@ def test_c0_items_offer_exactly_the_resolutions_of_their_kind(
                 continue
             seen.add(cast(str, extra["shape"]))
             assert frozenset(extra["resolutions"]) == resolutions, scenario.name
+            # The rule names no headline: precedence sets it once every hold is final.
+            assert "headline_metric" not in extra, scenario.name
     assert seen == shapes
 
 
@@ -2027,6 +2029,9 @@ def test_c2_scale_is_linked_to_the_b1_item_carrying_the_amount(
     assert (scale.group, scale.action) == (GROUP_SCALE, SCALE_ACTION)
     extra = scale.evidence.extra
     assert (extra["outcome"], extra["b1"]) == (values["outcome"], values["b1"])
+    # Scale leads with the capped budget's utilization, one of the card's own metrics.
+    assert extra["headline_metric"] == "window_utilization"
+    assert "window_utilization" in evidence_metrics(scale)
     subject = cast(DecisionSubject, scale.decision_subject)
     assert scale.increases_spend_on == (subject,)
     link = extra["b1_link"]
@@ -2062,6 +2067,8 @@ def test_c2_holds_with_no_b1_when_the_veto_fires(make_context: ContextFactory) -
     assert (hold.group, hold.action) == (GROUP_SCALE, HOLD_ACTION)
     assert (hold.evidence.extra["outcome"], hold.evidence.extra["b1"]) == (values["outcome"], False)
     assert "b1_link" not in hold.evidence.extra
+    # Hold leads with the Qualified Leads the veto found missing.
+    assert hold.evidence.extra["headline_metric"] == "ql"
     assert (hold.decision_subject, hold.increases_spend_on) == (None, ())
     metrics = evidence_metrics(hold)
     assert (metrics["eligible_contacts"], metrics["ql"]) == (
@@ -2245,6 +2252,9 @@ def test_c3a_launches_an_underused_proven_segment_on_a_preset_window(
     assert cast(Decimal, metrics["cpl_ratio"]) <= _threshold(ctx, "c3a.max_cpl_ratio")
     assert cast(Decimal, metrics["impression_share"]) < _threshold(ctx, "c3a.max_impression_share")
     assert item.rank_key[0] == -cast(int, metrics["segment_leads"])
+    # The launch idea leads with the segment's cost per lead, the proof the segment is good.
+    assert extra["headline_metric"] == "segment_cpl"
+    assert "segment_cpl" in metrics
 
 
 def test_c3a_needs_an_impression_share_below_fifteen_percent(make_context: ContextFactory) -> None:
@@ -2332,6 +2342,8 @@ def test_c3b_launches_a_converting_cluster_no_campaign_covers(make_context: Cont
     conversions = cast(Decimal, evidence_metrics(item)["conversions"])
     assert conversions == sum(member["conversions"] for member in members)
     assert conversions >= _threshold(ctx, "c3b.min_conversions")
+    # The uncovered cluster's card leads with its conversions.
+    assert extra["headline_metric"] == "conversions"
     assert _items(campaigns.evaluate(make_context("c3b.cluster.does_not_fire")), C3B) == []
 
 

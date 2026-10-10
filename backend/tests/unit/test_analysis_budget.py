@@ -70,6 +70,7 @@ from ads_engine.analysis.context import (
     DatasetRef,
     DayFact,
     DecisionSubject,
+    Metric,
     RuleResult,
     SubjectKey,
     Withheld,
@@ -1050,8 +1051,10 @@ def test_lifetime_budgets_show_no_utilization_and_are_excluded_from_cap_rules() 
         outcomes=None,
         cpo=None,
         baseline=None,
+        headline="window_utilization",
     )
     assert evidence.metric("window_utilization").value == "n/a"
+    assert evidence.extra["headline_metric"] == "window_utilization"
     _, twin = _built("b1.step.case")
     assert _only(budget.evaluate(twin), B1).evidence.extra["current"] is not None
 
@@ -1598,7 +1601,14 @@ def test_budget_evidence_defaults_and_rejects_another_subjects_history() -> None
     minimum = ctx.thresholds.int("budget.min_known_days")
     no_predicate = GateResult(True, (), {"known_budget_days": (history.known_active, minimum)})
     evidence = budget_evidence(
-        ctx, subject, history, no_predicate, outcomes=Decimal(12), cpo=None, baseline=None
+        ctx,
+        subject,
+        history,
+        no_predicate,
+        outcomes=Decimal(12),
+        cpo=None,
+        baseline=None,
+        headline=None,
     )
     keys = [metric.key for metric in evidence.metrics]
     assert not {"capped_days", "high_utilization_days", "under_utilized_days"} & set(keys)
@@ -1606,6 +1616,7 @@ def test_budget_evidence_defaults_and_rejects_another_subjects_history() -> None
     assert evidence.metric("eligible_contacts").value == budget_crm(ctx, subject).eligible_contacts
     assert evidence.baselines[0].value is None
     assert "proposed" not in evidence.extra
+    assert "headline_metric" not in evidence.extra
     with pytest.raises(ValueError, match="cannot evidence subject"):
         budget_evidence(
             ctx,
@@ -1615,7 +1626,32 @@ def test_budget_evidence_defaults_and_rejects_another_subjects_history() -> None
             outcomes=None,
             cpo=None,
             baseline=None,
+            headline=None,
         )
+    # The headline is checked against the card's own metrics, the rule metrics included.
+    with pytest.raises(ValueError, match="'capped_days' is not one of the evidence metrics"):
+        budget_evidence(
+            ctx,
+            subject,
+            history,
+            no_predicate,
+            outcomes=Decimal(12),
+            cpo=None,
+            baseline=None,
+            headline="capped_days",
+        )
+    rule_metric = budget_evidence(
+        ctx,
+        subject,
+        history,
+        no_predicate,
+        outcomes=Decimal(12),
+        cpo=None,
+        baseline=None,
+        metrics=(Metric("freed", "Freed daily amount", Decimal("5.00"), "currency", "USD"),),
+        headline="freed",
+    )
+    assert rule_metric.extra["headline_metric"] == "freed"
 
 
 def test_gate_withheld_refuses_a_gate_that_passed() -> None:

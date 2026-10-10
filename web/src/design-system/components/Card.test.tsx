@@ -4,9 +4,11 @@
  *
  * They hold the wrapper to the contract in its TSDoc: the card is an `<article>` named by the
  * heading `Card.Header` renders (`<h3>` by default, `<h4>` on request); the rank reads as
- * "Rank {rank}" through a visually hidden prefix; the rank and entity line are skipped for values
- * React renders as nothing (`undefined`, `null`, booleans, `''`) but kept for `0`; a header outside
- * a card still gets an id of its own; and the body and footer hold their children.
+ * "Rank {rank}" through a visually hidden prefix; the headline figure reads "{label} {value}"
+ * between the heading and the entity line, outside the heading, so the card's name stays the
+ * action; the rank, figure and entity line are skipped for values React renders as nothing
+ * (`undefined`, `null`, booleans, `''`) but kept for `0`; a header outside a card still gets an id
+ * of its own; and the body and footer hold their children.
  */
 import { render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -111,6 +113,86 @@ describe('Card', () => {
     expect(container.querySelector('.ds-card__rank')).toBeNull();
     expect(container.querySelector('.ds-card__meta')).toBeNull();
     expect(screen.queryByText(/Rank/)).toBeNull();
+  });
+
+  it('shows the headline figure between the heading and the entity line, outside the name', () => {
+    const { container } = render(
+      <Card>
+        <Card.Header
+          rank={1}
+          title="Add as exact-match negative"
+          figure={{ label: 'Wasted spend', value: '$186.40' }}
+          meta="free crm template · Google"
+        />
+        <Card.Body>Body</Card.Body>
+      </Card>,
+    );
+
+    const article = screen.getByRole('article', { name: 'Add as exact-match negative' });
+    const heading = within(article).getByRole('heading', {
+      level: 3,
+      name: 'Add as exact-match negative',
+    });
+    const figure = container.querySelector('.ds-card__figure');
+    expect(figure?.tagName).toBe('P');
+    expect(figure?.textContent).toBe('Wasted spend $186.40');
+    expect(figure?.querySelector('.ds-card__figure-label')?.textContent).toBe('Wasted spend');
+    expect(figure?.querySelector('.ds-card__figure-value')?.textContent).toBe('$186.40');
+    expect(heading.contains(figure ?? null)).toBe(false);
+    expect(figure?.previousElementSibling).toBe(heading);
+    expect(figure?.nextElementSibling?.className).toBe('ds-card__meta');
+    expect(
+      Array.from(container.querySelector('.ds-card__header')?.children ?? []).map(
+        (child) => child.className,
+      ),
+    ).toEqual(['ds-card__rank', 'ds-card__title', 'ds-card__figure', 'ds-card__meta']);
+  });
+
+  it('renders no headline figure when it is omitted', () => {
+    const { container } = render(
+      <Card>
+        <Card.Header title="Pause" meta="Spring webinar · LinkedIn" />
+        <Card.Body>Body</Card.Body>
+      </Card>,
+    );
+
+    expect(container.querySelector('.ds-card__figure')).toBeNull();
+    expect(
+      Array.from(container.querySelector('.ds-card__header')?.children ?? []).map(
+        (child) => child.className,
+      ),
+    ).toEqual(['ds-card__title', 'ds-card__meta']);
+  });
+
+  it.each(EMPTY_SLOTS)('renders no headline figure whose label or value is %s', (_name, slot) => {
+    const { container } = render(
+      <>
+        <Card>
+          <Card.Header title="Pause" figure={{ label: slot, value: '$10.00' }} />
+          <Card.Body>Body</Card.Body>
+        </Card>
+        <Card>
+          <Card.Header title="Scale" figure={{ label: 'Spend', value: slot }} />
+          <Card.Body>Body</Card.Body>
+        </Card>
+      </>,
+    );
+
+    expect(container.querySelector('.ds-card__figure')).toBeNull();
+    expect(screen.queryByText('$10.00')).toBeNull();
+    expect(screen.queryByText('Spend')).toBeNull();
+  });
+
+  it('renders a headline figure of 0, because 0 is content', () => {
+    const { container } = render(
+      <Card>
+        <Card.Header title="Review" figure={{ label: 'Leads', value: 0 }} />
+        <Card.Body>Body</Card.Body>
+      </Card>,
+    );
+
+    expect(container.querySelector('.ds-card__figure')?.textContent).toBe('Leads 0');
+    expect(screen.getByRole('article', { name: 'Review' })).toBeDefined();
   });
 
   it('holds a string rank, the entity line, the body and the footer inside the named article', () => {

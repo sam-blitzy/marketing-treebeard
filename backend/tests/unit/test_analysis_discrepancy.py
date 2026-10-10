@@ -1297,6 +1297,8 @@ def test_evidence_records_the_entity_dataset_and_frozen_values(
         "platform": {"budget_id": OTHER_SHARED_BUDGET, "budget_external_id": None},
         "resolutions": ("platform_correct", "decision_correct"),
     }
+    # No headline yet: precedence appends ``held_recommendations`` once every hold is final.
+    assert [metric.key for metric in evidence.metrics] == ["platform", "decided"]
     assert _platform_text(candidate) == "shared budget 789"
     assert platform_value == {"budget_id": OTHER_SHARED_BUDGET, "budget_external_id": None}
 

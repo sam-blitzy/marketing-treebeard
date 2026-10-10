@@ -12,11 +12,14 @@
  *   Note, with instants in the default run's time zone (UTC until one exists), amounts in each
  *   subject's own currency, the patch read defensively from stored JSON, and the expected state
  *   rendered by decision shape, tombstones included;
- * - the loading, failed, empty and row-limit states, and a failed refetch that keeps the log;
+ * - the loading, failed, empty and row-limit states, and a failed refetch that keeps the log,
+ *   each outcome in one polite status region kept from the first render (never an alert), with
+ *   Retry, the last-loaded instant, no flicker while a poll reads again, and polling itself;
  * - "Record decision", which opens one page-level dialog hosting `DecisionForm` for that subject
- *   in its currency, closes on save or cancel, and lets the refetched log show the new row first;
- *   a save that ends after its dialog closed leaves a dialog opened since, for another subject
- *   or the same one, open with its edits.
+ *   in its currency, closes on save or cancel, lets the refetched log show the new row first,
+ *   and announces "Decision recorded" in the log's region after a save; a save that ends after
+ *   its dialog closed leaves a dialog opened since, for another subject or the same one, open
+ *   with its edits.
  *
  * `../../test/mockApi` is imported first so its `afterEach` check runs after Testing Library's
  * cleanup (Vitest skips later hooks once one throws).
@@ -25,7 +28,7 @@ import { apiError, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 
-import { queryKeys } from '../../api/queries';
+import { CURRENT_STATE_POLL_MS, queryKeys } from '../../api/queries';
 import type { Decision, DecisionPatchView, SubjectType, SubjectView } from '../../api/types';
 import {
   FIXTURE_BUDGET_IDS,
@@ -33,6 +36,7 @@ import {
   makeDecision,
   makeRun,
 } from '../../test/fixtures';
+import { formatInstant } from '../../lib/format';
 import { renderWithProviders } from '../../test/render';
 import { DecisionLog } from './DecisionLog';
 
@@ -133,6 +137,21 @@ function buttonNamed(name: string, scope: HTMLElement = document.body): HTMLButt
   return button;
 }
 
+/**
+ * The log's own polite status region: the one `div` status element outside the dialog.
+ * `hidden` is set so the region is found while it is still empty.
+ */
+function logRegion(): HTMLElement {
+  const regions = screen
+    .getAllByRole('status', { hidden: true })
+    .filter((element) => element.tagName === 'DIV' && element.closest('[role="dialog"]') === null);
+  const [region] = regions;
+  if (region === undefined || regions.length !== 1) {
+    throw new Error(`Expected one log status region, found ${String(regions.length)}`);
+  }
+  return region;
+}
+
 /** A user's budget-only patch on the own-budget campaign, newer than its baseline. */
 const USER_BUDGET_DECISION = makeDecision('own_budget', {
   id: 811,
@@ -190,8 +209,11 @@ describe('DecisionLog states', () => {
 
     await renderLog();
 
-    expect(await screen.findByText('No decisions recorded yet')).toBeTruthy();
-    expect(screen.getByText('Baseline decisions appear after the first entity sync.')).toBeTruthy();
+    const region = logRegion();
+    expect(await within(region).findByText('No decisions recorded yet')).toBeTruthy();
+    expect(
+      within(region).getByText('Baseline decisions appear after the first entity sync.'),
+    ).toBeTruthy();
     expect(screen.queryByRole('table')).toBeNull();
   });
 
@@ -203,9 +225,100 @@ describe('DecisionLog states', () => {
 
     await renderLog();
 
-    expect(await screen.findByText('Decisions could not be loaded')).toBeTruthy();
-    expect(screen.getByText('Database unavailable')).toBeTruthy();
+    const region = logRegion();
+    expect(await within(region).findByText('Decisions could not be loaded')).toBeTruthy();
+    expect(within(region).getByText('Database unavailable')).toBeTruthy();
+    expect(buttonNamed('Retry', region)).toBeTruthy();
     expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps one polite status region, never an alert, from loading to data', async () => {
+    const second = deferred<MockResponse>();
+    let reads = 0;
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LOG_KEY]: () => {
+        reads += 1;
+        return reads === 1
+          ? apiError(500, 'internal_error', 'Database unavailable')
+          : second.promise;
+      },
+    });
+
+    await renderLog();
+    const region = logRegion();
+    expect(region.textContent).toBe('');
+    expect(region.contains(screen.getByText('Loading decisions'))).toBe(false);
+
+    const retry = await within(region).findByRole('button', { name: 'Retry' });
+    fireEvent.click(retry);
+    // The failure stays in place while the read runs again: no spinner, the button is loading.
+    await waitFor(() => {
+      expect(retry.getAttribute('aria-busy')).toBe('true');
+    });
+    expect(screen.queryByText('Loading decisions')).toBeNull();
+    expect(within(region).getByText('Decisions could not be loaded')).toBeTruthy();
+
+    second.resolve(json(200, defaultLog()));
+    await findTable('Brand Search — US');
+    expect(logRegion()).toBe(region);
+    expect(region.textContent).toBe('');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(logCalls(api)).toHaveLength(2);
+  });
+
+  it('returns focus to Retry when a retry the user started fails again', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LOG_KEY]: apiError(503, 'unavailable', 'Database unavailable'),
+    });
+
+    await renderLog();
+    const region = logRegion();
+    const retry = await within(region).findByRole('button', { name: 'Retry' });
+    // A browser drops focus to the body when the focused button turns disabled while loading;
+    // jsdom keeps it, so the click is made with focus already on the body.
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(retry);
+
+    await waitFor(() => {
+      expect(logCalls(api)).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(region).getByRole('button', { name: 'Retry' }));
+    });
+    expect(within(region).getByText('Database unavailable')).toBeTruthy();
+  });
+
+  it('keeps a failed first read on screen while a poll reads the log again', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const poll = deferred<MockResponse>();
+      let reads = 0;
+      mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LOG_KEY]: () => {
+          reads += 1;
+          return reads === 1 ? apiError(502, 'http_502', 'Bad gateway') : poll.promise;
+        },
+      });
+
+      await renderLog();
+      const region = logRegion();
+      expect(await within(region).findByText('Decisions could not be loaded')).toBeTruthy();
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      expect(reads).toBe(2);
+      expect(screen.queryByText('Loading decisions')).toBeNull();
+      expect(within(region).getByText('Bad gateway')).toBeTruthy();
+
+      poll.resolve(json(200, defaultLog()));
+      await findTable('Brand Search — US');
+      expect(within(region).queryByText('Decisions could not be loaded')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps showing the loaded log when a refetch fails', async () => {
@@ -221,6 +334,98 @@ describe('DecisionLog states', () => {
     expect(logCalls(api)).toHaveLength(2);
     expect(screen.getByRole('table', { name: 'Decisions for Brand Search — US' })).toBeTruthy();
     expect(screen.queryByText('Decisions could not be loaded')).toBeNull();
+  });
+
+  it('warns, as last loaded, with Retry, in its status region when a refetch fails', async () => {
+    const api = mockApi(logHandlers(defaultLog()));
+    const { queryClient } = await renderLog();
+    await findTable('Brand Search — US');
+    const loadedAt = queryClient.getQueryState(queryKeys.decisions({}))?.dataUpdatedAt;
+
+    api.use({ [LOG_KEY]: apiError(503, 'unavailable', 'The database is restarting') });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.decisionsAll });
+    });
+
+    const region = logRegion();
+    expect(await within(region).findByText('Decisions could not be refreshed')).toBeTruthy();
+    expect(within(region).getByText('The database is restarting')).toBeTruthy();
+    expect(loadedAt).toBeDefined();
+    const loadedText = formatInstant(new Date(loadedAt ?? 0).toISOString(), 'UTC');
+    expect(within(region).getByText(`Showing the log as last loaded ${loadedText}.`)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    api.use(logHandlers(defaultLog()));
+    fireEvent.click(buttonNamed('Retry', region));
+    await waitFor(() => {
+      expect(within(region).queryByText('Decisions could not be refreshed')).toBeNull();
+    });
+    expect(screen.getByRole('table', { name: 'Decisions for Brand Search — US' })).toBeTruthy();
+  });
+
+  it('never presents an earlier empty log as current when a refetch fails', async () => {
+    const api = mockApi(logHandlers([]));
+    const { queryClient } = await renderLog();
+    const region = logRegion();
+    expect(await within(region).findByText('No decisions recorded yet')).toBeTruthy();
+
+    api.use({ [LOG_KEY]: apiError(502, 'http_502', 'Bad gateway') });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.decisionsAll });
+    });
+
+    expect(await within(region).findByText('Decisions could not be refreshed')).toBeTruthy();
+    expect(within(region).getByText('Bad gateway')).toBeTruthy();
+    expect(
+      within(region).getByText(/^No decisions were recorded when the log was last loaded .+\.$/),
+    ).toBeTruthy();
+    expect(within(region).queryByText('No decisions recorded yet')).toBeNull();
+    expect(buttonNamed('Retry', region)).toBeTruthy();
+  });
+
+  it('refreshes itself while shown, picking up a decision recorded elsewhere', async () => {
+    // A later decision on the same own-budget campaign, with an id of its own, as another
+    // session would record it after the default log's newest row.
+    const elsewhere = makeDecision('own_budget', {
+      id: 812,
+      origin: 'user',
+      decided_by: 'admin@example.com',
+      decided_at: '2026-10-04T14:15:00Z',
+      status: 'paused',
+      daily_budget: '240.00',
+      patch: { status: 'paused' },
+      note: 'Paused from another session',
+    });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let recorded = false;
+      mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LOG_KEY]: () => json(200, recorded ? [elsewhere, ...defaultLog()] : defaultLog()),
+      });
+
+      await renderLog();
+      const ownTable = await findTable('Brand Search — US');
+      expect(bodyRows(ownTable)).toHaveLength(2);
+
+      recorded = true;
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      const refreshedTable = (): HTMLElement =>
+        screen.getByRole('table', { name: 'Decisions for Brand Search — US' });
+      await waitFor(() => {
+        expect(bodyRows(refreshedTable())).toHaveLength(3);
+      });
+      expect(bodyRows(refreshedTable())[0]).toEqual([
+        'Oct 4, 2026, 2:15 PM UTC',
+        'User',
+        'admin@example.com',
+        'status: paused',
+        'Paused · daily budget $240.00',
+        'Paused from another session',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('notes that older decisions may be missing at the 200-row limit', async () => {
@@ -648,7 +853,9 @@ describe('DecisionLog "Record decision"', () => {
     if (section === null) {
       throw new Error('The own-budget campaign has no section');
     }
-    fireEvent.click(buttonNamed('Record decision', section));
+    const trigger = buttonNamed('Record decision', section);
+    trigger.focus();
+    fireEvent.click(trigger);
 
     const dialog = await screen.findByRole('dialog', { name: 'Record decision' });
     expect(within(dialog).getByText('Brand Search — US · Campaign · Google')).toBeTruthy();
@@ -678,6 +885,14 @@ describe('DecisionLog "Record decision"', () => {
       'status: paused',
       'Paused · daily budget $240.00',
     ]);
+    // The form's own status left with the dialog; the log's region announces the save, and the
+    // dialog returned focus to the action that opened it.
+    expect(logRegion().textContent).toBe('Decision recorded');
+    expect(document.activeElement).toBe(trigger);
+
+    fireEvent.click(buttonNamed('Record decision', section));
+    await screen.findByRole('dialog', { name: 'Record decision' });
+    expect(logRegion().textContent).toBe('');
   });
 
   it('closes on Cancel without posting', async () => {
@@ -699,6 +914,7 @@ describe('DecisionLog "Record decision"', () => {
 
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(api.calls.some((call) => call.method === 'POST')).toBe(false);
+    expect(logRegion().textContent).toBe('');
   });
 
   it("opens the form in the subject's own currency, with the fields of its shape", async () => {

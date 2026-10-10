@@ -15,7 +15,9 @@ the real router, with ``require_user`` and ``get_session`` overridden onto this 
 test schema. They check the active-dataset and state filters, the oldest-first order, the
 response shape, the omission (logged once per subject) of a discrepancy whose subject the
 domain cannot load, and that the route's statement count is the same for 10 and 200
-subjects.
+subjects. They also check the ``X-Total-Count`` header on every page: the rows of the active
+datasets in the requested states, unloadable subjects included and other datasets excluded,
+independent of the cursor, and ``0`` with no matching row or no active dataset.
 
 The database tests run against the PostgreSQL 18 test database named by
 ``TEST_DATABASE_URL`` (falling back to ``DATABASE_URL``), in a private schema created and
@@ -23,6 +25,7 @@ dropped by this module, so no other schema is touched. An unreachable database f
 """
 
 import os
+import re
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator
@@ -855,4 +858,100 @@ async def test_list_statement_count_does_not_grow_with_the_subjects(
         assert "Link" not in response.headers
         counts[count] = counter.count
     assert counts[10] == counts[200]
-    assert counts[200] <= 12
+    # 12 for the page and its subjects, plus the one constant X-Total-Count statement.
+    assert counts[200] <= 13
+
+
+# ---------------------------------------------------------------------------------------
+# GET /discrepancies: X-Total-Count
+# ---------------------------------------------------------------------------------------
+
+_NEXT_TARGET = re.compile(r'^<(?P<target>/api/v1/discrepancies\?[^>]*)>; rel="next"$')
+"""The one ``Link`` value the route sends, with its relative target captured."""
+
+
+def _total(response: httpx.Response) -> str | None:
+    """Return the response's ``X-Total-Count`` header, or ``None`` when it is absent."""
+    return response.headers.get(routes.TOTAL_COUNT_HEADER)
+
+
+async def _pages(sessions: Sessions, query: str) -> list[httpx.Response]:
+    """Serve ``GET /api/v1/discrepancies{query}`` and every page its ``Link`` names."""
+    pages = [await _get(sessions, query)]
+    while "Link" in pages[-1].headers:
+        match = _NEXT_TARGET.match(pages[-1].headers["Link"])
+        assert match is not None, f"unexpected Link header {pages[-1].headers['Link']!r}"
+        assert len(pages) < 20, "the Link chain does not end"
+        pages.append(await _get(sessions, match["target"].removeprefix("/api/v1/discrepancies")))
+    return pages
+
+
+async def _counted_world(sessions: Sessions) -> tuple[World, list[int]]:
+    """Commit the world with discrepancies in every state, dataset and loadability.
+
+    The active datasets hold five unresolved rows (four open, one awaiting the platform), one
+    of them about a subject the domain cannot load, and one resolved row; a building dataset
+    holds one more open row.
+    """
+    world = await _world(sessions)
+    async with sessions() as session, session.begin():
+        building = await _dataset(session, "google", "building")
+        rows = [
+            _discrepancy(world.google, world.own_budget, "budget", _at(4)),
+            _discrepancy(world.google, world.shared, "budget", _at(5)),
+            _discrepancy(world.google, world.own, "status", _at(6)),
+            _discrepancy(world.google, world.member_b, "budget", _at(6), state="awaiting_platform"),
+            _discrepancy(world.linkedin, world.li_campaign, "status", _at(8), source="linkedin"),
+            _discrepancy(world.google, world.own, "budget", _at(1), state="resolved"),
+            _discrepancy(building, world.unbudgeted, "status", _at(2)),
+        ]
+        session.add_all(rows)
+        await session.flush()
+        return world, [row.id for row in rows]
+
+
+@pytest.mark.anyio
+async def test_every_page_carries_the_total_of_the_requested_states(sessions: Sessions) -> None:
+    _, ids = await _counted_world(sessions)
+    pages = await _pages(sessions, "?limit=2")
+    assert [response.status_code for response in pages] == [200, 200, 200]
+    # The unloadable subject's row is left out of the body and still counted, as the overlay
+    # counts it; the building dataset's row and the resolved row are not counted.
+    listed = [item["id"] for page in pages for item in page.json()]
+    assert listed == ids[1:5]
+    assert [_total(page) for page in pages] == ["5", "5", "5"]
+
+
+@pytest.mark.anyio
+async def test_total_follows_the_state_filter_and_ignores_the_cursor(sessions: Sessions) -> None:
+    _, ids = await _counted_world(sessions)
+    assert _total(await _get(sessions, "?state=open")) == "4"
+    assert _total(await _get(sessions, "?state=awaiting_platform")) == "1"
+    assert _total(await _get(sessions, "?state=resolved")) == "1"
+    assert _total(await _get(sessions, "?state=open&state=resolved&state=open")) == "5"
+    later = await _get(sessions, f"?state=open&limit=1&after={ids[2]}")
+    assert later.status_code == 200
+    assert [item["id"] for item in later.json()] == [ids[4]]
+    assert _total(later) == "4"
+
+
+@pytest.mark.anyio
+async def test_total_is_zero_with_no_matching_row_or_no_active_dataset(sessions: Sessions) -> None:
+    async with sessions() as session, session.begin():
+        for source in ("google", "linkedin", "hubspot"):
+            await _retire_active(session, source)
+        dataset_id = await _dataset(session, "google")
+        session.add(_discrepancy(dataset_id, SubjectRef("campaign", 987_654_321), "status", _at(1)))
+    unloadable = await _get(sessions)
+    assert (unloadable.status_code, unloadable.json(), _total(unloadable)) == (200, [], "1")
+    none_resolved = await _get(sessions, "?state=resolved")
+    assert (none_resolved.status_code, none_resolved.json(), _total(none_resolved)) == (
+        200,
+        [],
+        "0",
+    )
+    async with sessions() as session, session.begin():
+        await _retire_active(session, "google")
+    inactive = await _get(sessions)
+    assert (inactive.status_code, inactive.json(), _total(inactive)) == (200, [], "0")
+    assert "Link" not in inactive.headers

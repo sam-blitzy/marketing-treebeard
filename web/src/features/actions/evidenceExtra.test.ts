@@ -50,6 +50,7 @@ import {
   evidenceCurrency,
   freedAmount,
   funding,
+  headlineMetric,
   isRecord,
   keywordFields,
   launchGap,
@@ -293,6 +294,94 @@ describe('metricsByKeys', () => {
   it('returns all nulls for an absent source, and nothing for no keys', () => {
     expect(metricsByKeys(null, ['spend', 'ql'])).toEqual([null, null]);
     expect(metricsByKeys(pageItem(FIXTURE_ITEM_IDS.c1), [])).toEqual([]);
+  });
+});
+
+describe('headlineMetric', () => {
+  /** The page's K1 item with `extra.headline_metric` added to its frozen evidence. */
+  function k1WithHeadline(headline: unknown): Item {
+    const k1 = pageItem(FIXTURE_ITEM_IDS.k1);
+    return {
+      ...k1,
+      evidence: { ...k1.evidence, extra: { ...k1.evidence.extra, headline_metric: headline } },
+    };
+  }
+
+  it("returns a guarded copy of the metric extra.headline_metric names: K1's wasted spend", () => {
+    const k1 = k1WithHeadline('wasted_spend');
+    const headline = headlineMetric(k1);
+    expect(headline).toEqual({
+      key: 'wasted_spend',
+      label: 'Wasted spend',
+      value: '186.40',
+      unit: 'currency',
+      currency: 'USD',
+      floor: null,
+      unavailable: null,
+    });
+    expect(headline).not.toBe(k1.evidence.metrics.find((entry) => entry.key === 'wasted_spend'));
+    expect(headlineMetric(k1.evidence)).toEqual(headline);
+  });
+
+  it('keeps the unavailable and floor markers the evidence froze', () => {
+    const unavailableQl = metric('ql', null, { unavailable: true });
+    expect(headlineMetric(withExtra({ headline_metric: 'ql' }, [unavailableQl]))).toMatchObject({
+      key: 'ql',
+      value: null,
+      unavailable: true,
+    });
+    expect(
+      headlineMetric(
+        withExtra({ headline_metric: 'cost_per_ql' }, [
+          metric('cost_per_ql', '40.00', { currency: 'USD', floor: true }),
+        ]),
+      ),
+    ).toMatchObject({ value: '40.00', currency: 'USD', floor: true });
+  });
+
+  it('returns the first metric when the named key repeats', () => {
+    const evidence = withExtra({ headline_metric: 'spend' }, [
+      metric('spend', '10.00'),
+      metric('spend', '20.00'),
+    ]);
+    expect(headlineMetric(evidence)?.value).toBe('10.00');
+  });
+
+  it('returns null for evidence frozen without a headline, and for an absent source', () => {
+    const items: readonly Item[] = [];
+    expect(headlineMetric(pageItem(FIXTURE_ITEM_IDS.k1))).toBeNull();
+    expect(headlineMetric(makeEvidence())).toBeNull();
+    expect(headlineMetric(rawEvidence({ extra: ['headline_metric'] }))).toBeNull();
+    expect(headlineMetric(null)).toBeNull();
+    expect(headlineMetric(undefined)).toBeNull();
+    expect(headlineMetric(items[0])).toBeNull();
+  });
+
+  it('returns null when extra.headline_metric is not a non-blank string', () => {
+    const values: readonly unknown[] = ['', '   ', 7, true, null, ['wasted_spend'], {}];
+    for (const value of values) {
+      expect(headlineMetric(k1WithHeadline(value))).toBeNull();
+    }
+  });
+
+  it('returns null, never another metric, when the key names no well-formed metric', () => {
+    expect(headlineMetric(k1WithHeadline('cost_per_ql'))).toBeNull();
+    expect(
+      headlineMetric(withExtra({ headline_metric: 'wasted_spend' }, [metric('spend', '10.00')])),
+    ).toBeNull();
+    expect(
+      headlineMetric(
+        rawEvidence({
+          extra: { headline_metric: 'wasted_spend' },
+          metrics: [{ key: '  ', value: '1.00' }, { label: 'Wasted spend', value: '2.00' }],
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      headlineMetric(
+        rawEvidence({ extra: { headline_metric: 'wasted_spend' }, metrics: { wasted_spend: '1' } }),
+      ),
+    ).toBeNull();
   });
 });
 

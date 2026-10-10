@@ -6,10 +6,14 @@
  * They hold the module to its TSDoc contract:
  * - anchors: `section-{key}`, the sanitised `group-{sectionKey}-{groupKey}` and
  *   {@link DISCREPANCY_GROUP_ANCHOR}, the target of the discrepancy banner and held cards;
- * - item state: held by the run or by the live overlay, hidden by feedback since the run, and
- *   the partition of a group into visible, held and hidden items in API order;
+ * - item state: held by the run or by the live overlay, computed from replaced data (historical,
+ *   never held), hidden by feedback since the run, and the partition of a group into visible,
+ *   historical, held and hidden items in API order;
  * - the held disclosure: collapsed on first render, a real button with `aria-expanded` and
- *   `aria-controls`, nothing at all for a count that is not positive;
+ *   `aria-controls` over a region that always exists but mounts its content only from the first
+ *   expansion on, nothing at all for a count that is not positive;
+ * - the replaced-data block: open, named "Computed from replaced data ({count})" like the
+ *   historical card badge, between the visible cards and the held disclosure;
  * - labelled fields, suppression labels and finding tones;
  * - the frame itself: the section region and its `<h2>`, findings first as banners that are never
  *   alerts, groups in API order as anchored `<h3>` regions, the `renderGroup`, `renderGroups` and
@@ -19,11 +23,13 @@
  * The frame fetches nothing and never renders a card itself, so every test passes a plain
  * `renderItem` and renders without providers or a network stub.
  */
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FindingCode, Group, Item, Section } from '../../../api/types';
+import { Button } from '../../../design-system';
 import {
   makeFinding,
   makeGroup,
@@ -32,17 +38,23 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { HISTORICAL_LABEL } from '../RecommendationCard';
 import { withheldLine } from '../WithheldList';
+import { CARD_BATCH_SIZE, GROUP_BATCH_SIZE } from '../batches';
 import {
   DISCREPANCY_GROUP_ANCHOR,
   FieldList,
   HeldDisclosure,
+  HistoricalItems,
+  REPLACED_DATA_LABEL,
   SUPPRESSION_LABELS,
   SectionFrame,
   findingTone,
   groupAnchorId,
   isHeld,
   isHidden,
+  isHistorical,
+  itemAnchorId,
   partitionGroup,
   sectionAnchorId,
   suppressionLabel,
@@ -70,6 +82,26 @@ function heldNowItem(id: number, action: string): Item {
     rank: id,
     action,
     current: makeItemOverlay({ held_now: true, held_reason_now: 'Resolve discrepancy first' }),
+  });
+}
+
+/**
+ * An item computed from data that has since been replaced: the overlay marks it historical and
+ * sets `held_now` with the replaced-data reason (AAP 0.3.2). With `heldByRun`, the run had also
+ * held it for a discrepancy.
+ */
+function historicalItem(id: number, action: string, heldByRun = false): Item {
+  return makeItem({
+    id,
+    rank: id,
+    action,
+    held: heldByRun,
+    current: makeItemOverlay({
+      historical: true,
+      held_now: true,
+      held_reason_now: 'Computed from data that has since been replaced',
+      data_status_now: 'live',
+    }),
   });
 }
 
@@ -144,6 +176,20 @@ describe('item state', () => {
     expect(isHeld(heldNowItem(3, 'Pause'))).toBe(true);
   });
 
+  it('treats an item computed from replaced data as historical, never as held', () => {
+    expect(isHistorical(visibleItem(1, 'Pause'))).toBe(false);
+    expect(isHistorical(heldNowItem(2, 'Pause'))).toBe(false);
+    // The overlay's held_now on a historical item is the replaced data, not a discrepancy hold
+    // (AAP 0.3.2), so no discrepancy resolution can lift it.
+    expect(isHistorical(historicalItem(3, 'Pause'))).toBe(true);
+    expect(isHeld(historicalItem(3, 'Pause'))).toBe(false);
+    expect(isHeld(historicalItem(4, 'Pause', true))).toBe(false);
+  });
+
+  it('labels the replaced-data block with the words of the historical card badge', () => {
+    expect(REPLACED_DATA_LABEL).toBe(HISTORICAL_LABEL);
+  });
+
   it('treats an item as hidden only while current.hidden_by is set', () => {
     expect(isHidden(visibleItem(1, 'Pause'))).toBe(false);
     expect(isHidden(hiddenItem(2, 'Pause'))).toBe(true);
@@ -152,30 +198,41 @@ describe('item state', () => {
     }
   });
 
-  it('partitions a group into visible, held and hidden items, keeping the API order', () => {
+  it('partitions a group into visible, historical, held and hidden items, keeping the API order', () => {
+    const hiddenHistorical = historicalItem(9, 'hidden and historical');
+    hiddenHistorical.current.hidden_by = 'snooze';
     const group = makeGroup({
       key: 'pause',
       title: 'Pause',
       items: [
         heldItem(1, 'held first'),
+        historicalItem(7, 'historical first'),
         visibleItem(2, 'visible first'),
         hiddenItem(3, 'hidden'),
         heldNowItem(4, 'held now'),
+        historicalItem(8, 'historical and held by the run', true),
         hiddenItem(5, 'hidden and held', true),
+        hiddenHistorical,
         visibleItem(6, 'visible second'),
       ],
     });
 
-    const { visible, held, hiddenCount } = partitionGroup(group);
+    const { visible, historical, held, hiddenCount } = partitionGroup(group);
 
     expect(visible.map((item) => item.id)).toEqual([2, 6]);
+    expect(historical.map((item) => item.id)).toEqual([7, 8]);
     expect(held.map((item) => item.id)).toEqual([1, 4]);
-    // A hidden item is counted whether or not it is also held.
-    expect(hiddenCount).toBe(2);
+    // A hidden item is counted whether or not it is also held or historical.
+    expect(hiddenCount).toBe(3);
   });
 
   it('partitions an empty group into nothing', () => {
-    expect(partitionGroup(makeGroup())).toEqual({ visible: [], held: [], hiddenCount: 0 });
+    expect(partitionGroup(makeGroup())).toEqual({
+      visible: [],
+      historical: [],
+      held: [],
+      hiddenCount: 0,
+    });
   });
 });
 
@@ -198,10 +255,13 @@ describe('HeldDisclosure', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.getAttribute('aria-controls')).toBe('group-campaigns-pause-held');
 
+    // The controlled region always exists, so aria-controls resolves, but its content is not
+    // mounted until the first expansion.
     const region = document.getElementById('group-campaigns-pause-held');
     expect(region).not.toBeNull();
     expect(region?.hidden).toBe(true);
-    expect(region?.textContent).toBe('Held card AHeld card B');
+    expect(region?.childElementCount).toBe(0);
+    expect(region?.textContent).toBe('');
   });
 
   it('expands and collapses again when the button is operated', () => {
@@ -218,10 +278,50 @@ describe('HeldDisclosure', () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(region?.hidden).toBe(false);
+    expect(region?.textContent).toBe('Held card');
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(region?.hidden).toBe(true);
+  });
+
+  it('mounts its content on the first expansion and keeps it mounted while collapsed', () => {
+    const mounts = vi.fn<() => void>();
+    /** Held content that reports each mount and keeps a local count. */
+    function Probe() {
+      const [clicks, setClicks] = useState(0);
+      useEffect(() => {
+        mounts();
+      }, []);
+      return (
+        <Button onClick={() => setClicks((count) => count + 1)}>
+          {`Held card ${String(clicks)}`}
+        </Button>
+      );
+    }
+    render(
+      <HeldDisclosure id="lazy-held" count={1}>
+        <Probe />
+      </HeldDisclosure>,
+    );
+    const toggle = screen.getByRole('button', {
+      name: 'Held until discrepancies are resolved (1)',
+    });
+    const region = document.getElementById('lazy-held');
+    expect(mounts).not.toHaveBeenCalled();
+    expect(region?.textContent).toBe('');
+
+    fireEvent.click(toggle);
+    expect(mounts).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Held card 0' }));
+
+    // Collapsed again: hidden, yet still mounted with its state.
+    fireEvent.click(toggle);
+    expect(region?.hidden).toBe(true);
+    expect(region?.textContent).toBe('Held card 1');
+    fireEvent.click(toggle);
+    expect(mounts).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Held card 1' })).toBeTruthy();
   });
 
   it('formats a large count with grouping', () => {
@@ -247,6 +347,55 @@ describe('HeldDisclosure', () => {
     );
     expect(container.childElementCount).toBe(0);
     expect(screen.queryByRole('button')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HistoricalItems
+// ---------------------------------------------------------------------------------------------
+
+describe('HistoricalItems', () => {
+  it('shows its items openly in a group named by the replaced-data label and count', () => {
+    render(
+      <HistoricalItems id="group-creative-campaign-1-historical" count={2}>
+        <span>Historical card A</span>
+        <span>Historical card B</span>
+      </HistoricalItems>,
+    );
+
+    const block = screen.getByRole('group', { name: 'Computed from replaced data (2)' });
+    expect(block.id).toBe('group-creative-campaign-1-historical');
+    expect(block.hidden).toBe(false);
+    // The visible label repeats the group's name and is hidden from assistive technology, so
+    // the name is announced once; nothing in the block is a toggle.
+    const label = within(block).getByText('Computed from replaced data (2)');
+    expect(label.getAttribute('aria-hidden')).toBe('true');
+    expect(within(block).queryByRole('button')).toBeNull();
+    expect(block.textContent).toBe(
+      'Computed from replaced data (2)Historical card AHistorical card B',
+    );
+  });
+
+  it('formats a large count with grouping', () => {
+    render(
+      <HistoricalItems id="many-historical" count={1234}>
+        <span>Historical card</span>
+      </HistoricalItems>,
+    );
+    expect(screen.getByRole('group', { name: 'Computed from replaced data (1,234)' })).toBeTruthy();
+  });
+
+  it.each([
+    ['zero', 0],
+    ['a negative count', -1],
+    ['NaN', Number.NaN],
+  ])('renders nothing for %s', (_label, count) => {
+    const { container } = render(
+      <HistoricalItems id="nothing-historical" count={count}>
+        <span>Historical card</span>
+      </HistoricalItems>,
+    );
+    expect(container.childElementCount).toBe(0);
   });
 });
 
@@ -546,20 +695,17 @@ describe('SectionFrame', () => {
     });
 
     const group = screen.getByRole('region', { name: 'Pause' });
-    const lines = within(group)
-      .getAllByTestId(/^item-/u)
-      .map((line) => line.textContent);
-    expect(lines).toEqual([
-      'pause: Pause first',
-      'pause: Pause second',
-      'pause: Held by the run',
-      'pause: Held since the run',
-    ]);
+    const lines = () =>
+      within(group)
+        .getAllByTestId(/^item-/u)
+        .map((line) => line.textContent);
+    const renderedIds = () =>
+      renderItem.mock.calls.map(([item]) => item.id).sort((left, right) => left - right);
+    // Collapsed held cards are not even built until the disclosure is first opened.
+    expect(lines()).toEqual(['pause: Pause first', 'pause: Pause second']);
+    expect(renderedIds()).toEqual([12, 15]);
     // The hidden card is counted, never rendered.
     expect(screen.queryByText('pause: Dismissed since the run')).toBeNull();
-    expect(
-      renderItem.mock.calls.map(([item]) => item.id).sort((left, right) => left - right),
-    ).toEqual([11, 12, 14, 15]);
 
     const toggle = within(group).getByRole('button', {
       name: 'Held until discrepancies are resolved (2)',
@@ -568,15 +714,84 @@ describe('SectionFrame', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.getAttribute('aria-controls')).toBe('group-campaigns-pause-held');
     expect(heldRegion?.hidden).toBe(true);
-    expect(heldRegion?.contains(screen.getByTestId('item-11'))).toBe(true);
-    expect(heldRegion?.contains(screen.getByTestId('item-14'))).toBe(true);
-    expect(heldRegion?.contains(screen.getByTestId('item-12'))).toBe(false);
+    expect(heldRegion?.childElementCount).toBe(0);
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(heldRegion?.hidden).toBe(false);
+    expect(lines()).toEqual([
+      'pause: Pause first',
+      'pause: Pause second',
+      'pause: Held by the run',
+      'pause: Held since the run',
+    ]);
+    expect(heldRegion?.contains(screen.getByTestId('item-11'))).toBe(true);
+    expect(heldRegion?.contains(screen.getByTestId('item-14'))).toBe(true);
+    expect(heldRegion?.contains(screen.getByTestId('item-12'))).toBe(false);
+    expect(new Set(renderedIds())).toEqual(new Set([11, 12, 14, 15]));
 
     expect(listLines('Not shown')).toEqual(['1 hidden since this run']);
+  });
+
+  it('shows cards computed from replaced data openly, after the visible ones and before the held disclosure', () => {
+    renderFrame({
+      section: makeSection('creative', {
+        groups: [
+          makeGroup({
+            key: 'campaign:1',
+            title: 'Lead Gen',
+            items: [
+              historicalItem(21, 'Replaced pair'),
+              visibleItem(22, 'Next test'),
+              heldItem(23, 'Held pair'),
+              historicalItem(24, 'Replaced and held by the run', true),
+            ],
+          }),
+        ],
+      }),
+    });
+
+    const group = screen.getByRole('region', { name: 'Lead Gen' });
+    const block = within(group).getByRole('group', { name: 'Computed from replaced data (2)' });
+    expect(block.id).toBe('group-creative-campaign-1-historical');
+    expect(block.hidden).toBe(false);
+    // Both historical cards, in API order, readable without operating any control.
+    expect(
+      within(block)
+        .getAllByTestId(/^item-/u)
+        .map((line) => line.textContent),
+    ).toEqual(['campaign:1: Replaced pair', 'campaign:1: Replaced and held by the run']);
+
+    // Only the discrepancy hold sits behind the disclosure, which comes last.
+    const toggle = within(group).getByRole('button', {
+      name: 'Held until discrepancies are resolved (1)',
+    });
+    expect(follows(screen.getByTestId('item-22'), block)).toBe(true);
+    expect(follows(block, toggle)).toBe(true);
+    const heldRegion = document.getElementById('group-creative-campaign-1-held');
+    expect(heldRegion?.contains(screen.getByTestId('item-21'))).toBe(false);
+    expect(heldRegion?.contains(screen.getByTestId('item-24'))).toBe(false);
+    expect(heldRegion?.contains(screen.getByTestId('item-22'))).toBe(false);
+  });
+
+  it('keeps a group whose only items are computed from replaced data, with no held disclosure and no empty state', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [
+          makeGroup({ key: 'changes', title: 'Changes', items: [historicalItem(1, 'B4')] }),
+        ],
+      }),
+    });
+    const group = screen.getByRole('region', { name: 'Changes' });
+    expect(group.id).toBe('group-budget-changes');
+    expect(
+      within(group).getByRole('group', { name: 'Computed from replaced data (1)' }).textContent,
+    ).toContain('changes: B4');
+    expect(
+      screen.queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
+    ).toBeNull();
+    expect(document.getElementById('group-budget-changes-held')).toBeNull();
+    expect(screen.queryByText('No actions in this section')).toBeNull();
   });
 
   it('keeps a group whose only items are held, and shows no empty state', () => {
@@ -648,7 +863,12 @@ describe('SectionFrame', () => {
           makeGroup({
             key: 'cohort:EUR',
             title: 'EUR',
-            items: [visibleItem(1, 'Double down'), heldItem(2, 'Held row'), hiddenItem(3, 'Gone')],
+            items: [
+              visibleItem(1, 'Double down'),
+              heldItem(2, 'Held row'),
+              hiddenItem(3, 'Gone'),
+              historicalItem(4, 'Replaced row'),
+            ],
           }),
           makeGroup({ key: 'cohort:USD', title: 'USD', items: [] }),
         ],
@@ -670,6 +890,7 @@ describe('SectionFrame', () => {
     expect(parts?.group.key).toBe('cohort:EUR');
     expect(parts?.anchorId).toBe('group-white_papers-cohort-EUR');
     expect(parts?.visible.map((item) => item.id)).toEqual([1]);
+    expect(parts?.historical.map((item) => item.id)).toEqual([4]);
     expect(parts?.held.map((item) => item.id)).toEqual([2]);
     expect(parts?.hiddenCount).toBe(1);
 
@@ -683,6 +904,9 @@ describe('SectionFrame', () => {
     expect(
       within(region).getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
     ).toBeTruthy();
+    expect(
+      within(region).getByRole('group', { name: 'Computed from replaced data (1)' }).textContent,
+    ).toContain('cohort:EUR: Replaced row');
     expect(screen.queryByRole('region', { name: 'USD' })).toBeNull();
   });
 
@@ -701,7 +925,7 @@ describe('SectionFrame', () => {
       section: makeSection('keywords', {
         groups: [
           makeGroup({ key: 'block', title: 'Block', items: [visibleItem(1, 'K1')] }),
-          makeGroup({ key: 'expand', title: 'Expand', items: [] }),
+          makeGroup({ key: 'expand', title: 'Expand', items: [historicalItem(3, 'K2')] }),
           makeGroup({ key: 'review', title: 'Review', items: [heldItem(2, 'K3')] }),
         ],
       }),
@@ -717,12 +941,27 @@ describe('SectionFrame', () => {
       'group-keywords-expand',
       'group-keywords-review',
     ]);
+    expect(parts.map((part) => part.historical.length)).toEqual([0, 1, 0]);
     expect(parts.map((part) => part.held.length)).toEqual([0, 0, 1]);
 
     expect(screen.getByTestId('tabs').textContent).toBe('Block (1)Expand (0)Review (0)');
     // The frame renders no group region of its own and ignores renderGroup.
     expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
     expect(renderGroup).not.toHaveBeenCalled();
+    expect(screen.queryByText('No actions in this section')).toBeNull();
+  });
+
+  it('calls renderGroups, with no empty state, when the only shown item is computed from replaced data', () => {
+    const renderGroups = vi.fn(() => <div data-testid="tabs">tabs</div>);
+    renderFrame({
+      section: makeSection('keywords', {
+        groups: [makeGroup({ key: 'review', title: 'Review', items: [historicalItem(1, 'K3')] })],
+      }),
+      renderGroups,
+    });
+
+    expect(renderGroups).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('tabs')).toBeTruthy();
     expect(screen.queryByText('No actions in this section')).toBeNull();
   });
 
@@ -939,5 +1178,213 @@ describe('SectionFrame', () => {
       ),
     ).toBe(true);
     expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Bounded batches
+// ---------------------------------------------------------------------------------------------
+
+describe('bounded batches', () => {
+  /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', window.location.pathname);
+    Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  });
+
+  /** A card as `RecommendationCard` anchors it: an `<article>` at `item-{id}`, showing its rank. */
+  function renderCard(item: Item): ReactNode {
+    return (
+      <article id={itemAnchorId(item.id)} aria-label={item.action} data-rank={item.rank}>
+        {`#${String(item.rank)} ${item.action}`}
+      </article>
+    );
+  }
+
+  /** `count` items built by `build`, with ids `offset + 1 …` and ranks `1 …` in API order. */
+  function many(count: number, build: (id: number, action: string) => Item, offset = 0): Item[] {
+    return Array.from({ length: count }, (_, index) => {
+      const item = build(offset + index + 1, `Action ${String(offset + index + 1)}`);
+      return { ...item, rank: index + 1 };
+    });
+  }
+
+  /** The ranks of the cards rendered inside `scope`, in document order. */
+  function ranksIn(scope: HTMLElement): number[] {
+    return within(scope)
+      .queryAllByRole('article')
+      .map((article) => Number(article.dataset.rank));
+  }
+
+  /** The ranks `1..count`. */
+  function ranksThrough(count: number): number[] {
+    return Array.from({ length: count }, (_, index) => index + 1);
+  }
+
+  /** `count` groups `g1 …`, each holding `perGroup` visible items with ids `{g}001 …`. */
+  function manyGroups(count: number, perGroup: number): Group[] {
+    return Array.from({ length: count }, (_, index) =>
+      makeGroup({
+        key: `g${String(index + 1)}`,
+        title: `Group ${String(index + 1)}`,
+        items: many(perGroup, visibleItem, (index + 1) * 1000),
+      }),
+    );
+  }
+
+  it('anchors a card at item-{id}', () => {
+    expect(itemAnchorId(1201)).toBe('item-1201');
+  });
+
+  it('mounts 250 visible cards one batch at a time, in API order, to the end', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        title: 'Budget changes',
+        groups: [makeGroup({ key: 'items', title: 'Changes', items: many(250, visibleItem) })],
+      }),
+      renderItem: renderCard,
+    });
+    const group = screen.getByRole('region', { name: 'Changes' });
+
+    expect(ranksIn(group)).toEqual(ranksThrough(CARD_BATCH_SIZE));
+    expect(within(group).getByRole('status').textContent).toBe('Showing 20 of 250 actions');
+    for (let shown = 40; shown <= 240; shown += 20) {
+      fireEvent.click(within(group).getByRole('button', { name: 'Show 20 more actions' }));
+      expect(ranksIn(group)).toEqual(ranksThrough(shown));
+      // Focus continues at the first card the reveal showed.
+      expect(document.activeElement).toBe(
+        within(group).getByRole('article', { name: `Action ${String(shown - 19)}` }),
+      );
+    }
+    fireEvent.click(within(group).getByRole('button', { name: 'Show 10 more actions' }));
+
+    expect(ranksIn(group)).toEqual(ranksThrough(250));
+    expect(within(group).queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
+    expect(within(group).getByRole('status').textContent).toBe('Showing all 250 actions');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('bounds the replaced-data block and the held cards on their own', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [
+          makeGroup({
+            key: 'items',
+            title: 'Changes',
+            items: [
+              ...many(3, visibleItem),
+              ...many(30, historicalItem, 100),
+              ...many(45, heldItem, 200),
+            ],
+          }),
+        ],
+      }),
+      renderItem: renderCard,
+    });
+    const group = screen.getByRole('region', { name: 'Changes' });
+
+    // The visible cards are under one batch: no control of their own.
+    const block = within(group).getByRole('group', { name: 'Computed from replaced data (30)' });
+    expect(ranksIn(block)).toEqual(ranksThrough(20));
+    expect(within(block).getByRole('status').textContent).toBe('Showing 20 of 30 actions');
+    fireEvent.click(within(block).getByRole('button', { name: 'Show 10 more actions' }));
+    expect(ranksIn(block)).toEqual(ranksThrough(30));
+    expect(document.activeElement?.id).toBe('item-121');
+
+    const heldRegion = document.getElementById('group-budget-items-held');
+    if (heldRegion === null) {
+      throw new Error('the held region is missing');
+    }
+    expect(ranksIn(heldRegion)).toEqual([]);
+    fireEvent.click(
+      within(group).getByRole('button', { name: 'Held until discrepancies are resolved (45)' }),
+    );
+    expect(ranksIn(heldRegion)).toEqual(ranksThrough(20));
+    expect(within(heldRegion).getByRole('status').textContent).toBe('Showing 20 of 45 actions');
+    fireEvent.click(within(heldRegion).getByRole('button', { name: 'Show 20 more actions' }));
+    expect(ranksIn(heldRegion)).toEqual(ranksThrough(40));
+    expect(document.activeElement?.id).toBe('item-221');
+    // 3 visible + 30 historical + 40 held cards, never more than the batches revealed.
+    expect(within(group).getAllByRole('article')).toHaveLength(73);
+  });
+
+  it('mounts the groups area one batch of groups at a time, focusing the first new group', () => {
+    renderFrame({
+      section: makeSection('creative', { groups: manyGroups(25, 1) }),
+      renderItem: renderCard,
+    });
+    const section = screen.getByRole('region', { name: 'Copy/creative changes' });
+    const groupRegions = (): string[] =>
+      within(section)
+        .getAllByRole('region')
+        .map((region) => region.id);
+
+    expect(groupRegions()).toHaveLength(GROUP_BATCH_SIZE);
+    expect(groupRegions()[0]).toBe('group-creative-g1');
+    const status = within(section).getAllByRole('status').at(-1);
+    expect(status?.textContent).toBe('Showing 10 of 25 groups');
+
+    fireEvent.click(within(section).getByRole('button', { name: 'Show 10 more groups' }));
+    expect(groupRegions()).toHaveLength(20);
+    expect(document.activeElement?.id).toBe('group-creative-g11');
+    fireEvent.click(within(section).getByRole('button', { name: 'Show 5 more groups' }));
+    expect(groupRegions()).toHaveLength(25);
+    expect(groupRegions().at(-1)).toBe('group-creative-g25');
+    expect(within(section).queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
+  });
+
+  it('reveals the group and the card a hash names on mount, beyond both first batches', () => {
+    window.history.replaceState(null, '', `#${itemAnchorId(15025)}`);
+    renderFrame({
+      section: makeSection('creative', { groups: manyGroups(25, 50) }),
+      renderItem: renderCard,
+    });
+
+    const group = screen.getByRole('region', { name: 'Group 15' });
+    expect(group.id).toBe('group-creative-g15');
+    // The group list shows two batches (through group 15), its card list two (through rank 25).
+    expect(screen.queryByRole('region', { name: 'Group 20' })).not.toBeNull();
+    expect(screen.queryByRole('region', { name: 'Group 21' })).toBeNull();
+    expect(ranksIn(group)).toEqual(ranksThrough(40));
+    const target = within(group).getByRole('article', { name: 'Action 15025' });
+    expect(scrollIntoView.mock.contexts).toContain(target);
+  });
+
+  it('reveals the group a hash change names, and scrolls it into view', () => {
+    renderFrame({
+      section: makeSection('creative', { groups: manyGroups(25, 1) }),
+      renderItem: renderCard,
+    });
+    expect(screen.queryByRole('region', { name: 'Group 23' })).toBeNull();
+
+    act(() => {
+      window.history.replaceState(null, '', '#group-creative-g23');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+
+    const group = screen.getByRole('region', { name: 'Group 23' });
+    expect(scrollIntoView.mock.contexts).toEqual([group]);
+  });
+
+  it('hands renderGroups every group, unbatched, for the override to place', () => {
+    const renderGroups = vi.fn((parts: readonly GroupParts[]) => <div>{parts.length}</div>);
+    renderFrame({
+      section: makeSection('keywords', { groups: manyGroups(25, 1) }),
+      renderGroups,
+    });
+
+    expect(renderGroups.mock.calls[0]?.[0]).toHaveLength(25);
+    expect(screen.queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
   });
 });

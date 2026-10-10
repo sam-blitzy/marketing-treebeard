@@ -6,16 +6,28 @@
  * Layout, top to bottom:
  *
  * 1. **Header** (`Card.Header`): the rank, the action as the headline (the card's accessible
- *    name), and the entity name with its source, for example "Generic CRM — US · Google".
+ *    name), the headline number, and the entity name with its source, for example "Generic
+ *    CRM — US · Google". The headline number is the metric the rule selected in the frozen
+ *    evidence (`extra.headline_metric`; K1's is the wasted spend), shown as "{label} {value}"
+ *    with its unit and currency, so the card leads with the number that justifies the action
+ *    (AAP 0.1.2). The card never computes or picks the number itself: evidence that selects
+ *    none, such as a run frozen before the key existed, shows no headline number.
  * 2. **Body** (`Card.Body`):
  *    - for a historical item (`current.historical`), the "Computed from replaced data" badge and
  *      the original provenance, for example "Simulated LinkedIn data, since replaced by live"
  *      (AAP 0.3.2: the frozen provenance and the current status are shown apart);
  *    - for an item held by a discrepancy, why it is held ("Resolve discrepancy first") and a
- *      link to the Campaigns discrepancy group (AAP 0.5.4.2 P1, 0.5.5 "with the blocking
- *      discrepancy linked"). C0 items are exempt from holds and never show it, and neither do
- *      historical items, whose overlay hold is the replaced data the badge already states;
- *    - the reason sentence, then the section-specific fields the caller passes as `children`;
+ *      link to each discrepancy that holds it ({@link BlockingDiscrepancyLinks}: the run's C0
+ *      card or the discrepancy on `/decisions`, named by subject and kind), or "View open
+ *      discrepancies" to the Campaigns discrepancy group when no blocker can be named
+ *      (AAP 0.5.4.2 P1, 0.5.5 "with the blocking discrepancy linked"). C0 items are exempt from
+ *      holds and never show it, and neither do historical items, whose overlay hold is the
+ *      replaced data the badge already states;
+ *    - the reason sentence, then the section-specific fields the caller passes as `children`.
+ *      A section whose own fields list the reason in a fixed position passes
+ *      `reasonPlacement="fields"`, and the card prints no reason line of its own, so the reason
+ *      appears once: the keyword cards, whose five fields end with it (AAP 0.1.2: term, spend,
+ *      conversions, cost/conversion, reason);
  *    - the {@link EvidenceTable}, the window chip "{start} – {end} · {N} days · {source
  *      boundaries}" and the flags row ({@link FlagList}: recorded plus current flags).
  * 3. **Footer** (`Card.Footer`):
@@ -36,11 +48,11 @@
  * keyboard focus, which the disabled or removed button lost, moves to the next card's first
  * enabled action, else the previous card's, else the section heading (WCAG 2.2 SC 2.4.3).
  *
- * Every text on the card (action, reason, flag messages, held reason, entity name) comes from
- * the API, so no threshold, window length or rule wording is written into the client
- * (AAP 0.5.4.1). Server state goes only through `../../api/queries` (AAP 0.11.1), and UI comes
- * only from the design-system index (AAP 0.4.4): no raw buttons, headings or tables, no inline
- * styles and no stylesheet; layout comes from `Stack` and `Inline`.
+ * Every text on the card (action, headline metric label, reason, flag messages, held reason,
+ * entity name) comes from the API, so no threshold, window length or rule wording is written
+ * into the client (AAP 0.5.4.1). Server state goes only through `../../api/queries`
+ * (AAP 0.11.1), and UI comes only from the design-system index (AAP 0.4.4): no raw buttons,
+ * headings or tables, no inline styles and no stylesheet; layout comes from `Stack` and `Inline`.
  *
  * @packageDocumentation
  */
@@ -50,12 +62,14 @@ import type { ReactElement, ReactNode } from 'react';
 import { isApiError, useFeedback } from '../../api/queries';
 import type { DataStatus, EntityView, FeedbackKind, Item, ProvenanceEntry } from '../../api/types';
 import { Badge, Banner, Button, Card, Dialog, Inline, Stack } from '../../design-system';
-import { formatWindowChip, sourceLabel } from '../../lib/format';
+import type { CardHeaderProps } from '../../design-system';
+import { formatMetric, formatWindowChip, sourceLabel } from '../../lib/format';
 import { DecisionForm } from '../decisions/DecisionForm';
+import { BlockingDiscrepancyLinks } from './BlockingDiscrepancies';
 import { EvidenceTable } from './EvidenceTable';
-import { decisionContextFor, type DecisionContext } from './evidenceExtra';
+import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
 import { FlagList } from './FlagList';
-import { DISCREPANCY_GROUP_ANCHOR, isHeld } from './sections/SectionFrame';
+import { isHeld } from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Labels
@@ -96,8 +110,11 @@ export const RECORD_DECISION_LABEL = 'Record decision';
 /** The status line a card shows after its decision form saved a decision. */
 export const DECISION_RECORDED_MESSAGE = 'Decision recorded';
 
-/** The text of a held card's link to the Campaigns discrepancy group (AAP 0.5.5). */
-export const BLOCKING_DISCREPANCY_LINK_LABEL = 'View blocking discrepancy';
+/**
+ * The text a held card's link to a specific blocking discrepancy starts with (AAP 0.5.5),
+ * defined beside the links in `./BlockingDiscrepancies` and re-exported for the card's callers.
+ */
+export { BLOCKING_DISCREPANCY_LINK_LABEL } from './BlockingDiscrepancies';
 
 /**
  * The hold reason precedence P1 writes ("Resolve discrepancy first", AAP 0.5.4.2), used only
@@ -198,6 +215,20 @@ function entityLine(entity: EntityView): string | undefined {
     .filter((part): part is string => part !== null)
     .join(META_SEPARATOR);
   return line === '' ? undefined : line;
+}
+
+/**
+ * The header's headline number (AAP 0.1.2): the metric the item's rule selected in its frozen
+ * evidence ({@link headlineMetric}), labelled with the API's own metric label and formatted by
+ * `formatMetric` with its unit and currency, so an unavailable value reads "unavailable", never
+ * `0`, and a floor keeps its "≥" or "≤" mark.
+ *
+ * @param item - the recommendation
+ * @returns the figure, or `undefined` when the evidence selects no headline metric
+ */
+function headlineFigure(item: Item): CardHeaderProps['figure'] {
+  const metric = headlineMetric(item);
+  return metric === null ? undefined : { label: metric.label, value: formatMetric(metric) };
 }
 
 /**
@@ -808,10 +839,23 @@ export interface RecommendationCardProps {
   item: Item;
   /**
    * The section-specific fields (AAP 0.5.5 field sets), rendered after the reason sentence and
-   * before the evidence table: for example a keyword card's term, spend, conversions,
-   * cost/conversion and reason fields, or a budget card's utilization beside its efficiency.
+   * before the evidence table: for example a budget card's utilization beside its efficiency.
+   * With `reasonPlacement="fields"` the card prints no reason sentence and the fields carry the
+   * reason themselves, as a keyword card's term, spend, conversions, cost/conversion and reason
+   * fields do.
    */
   children?: ReactNode;
+  /**
+   * Where the item's reason sentence is printed:
+   *
+   * - `'card'` (the default): first in the body, before `children` (AAP 0.5.5 card body), as
+   *   the Campaigns, Budget and Copy/creative cards show it;
+   * - `'fields'`: within the section's own fields (`children`), which list the reason in their
+   *   fixed order, so the card prints no reason line and the reason appears once. Keyword cards
+   *   use it, because their five fields end with the reason (AAP 0.1.2: term, spend,
+   *   conversions, cost/conversion, reason).
+   */
+  reasonPlacement?: 'card' | 'fields';
   /**
    * Renders a C0 discrepancy's resolver in the footer, in place of the feedback actions C0 is
    * exempt from (AAP 0.5.4.4). It receives `disabled: true` on a historical item, so the
@@ -852,7 +896,11 @@ function hasContent(node: ReactNode): boolean {
  * @example
  * ```tsx
  * <RecommendationCard item={item} headingLevel={4}>
- *   <FieldList fields={keywordFieldList(item)} label="Keyword details" />
+ *   <FieldList fields={budgetFieldList(item)} label="Budget details" />
+ * </RecommendationCard>
+ *
+ * <RecommendationCard item={keywordItem} reasonPlacement="fields">
+ *   <FieldList fields={keywordFieldList(keywordItem)} label="Keyword details" />
  * </RecommendationCard>
  *
  * <RecommendationCard
@@ -869,6 +917,7 @@ export function RecommendationCard({
   resolver,
   decisionContext,
   headingLevel,
+  reasonPlacement,
 }: RecommendationCardProps): ReactElement {
   const isC0 = item.rule_id === 'C0';
   const historical = item.current.historical;
@@ -884,7 +933,8 @@ export function RecommendationCard({
       textOrNull(item.held_reason) ??
       HELD_REASON_FALLBACK)
     : null;
-  const reason = textOrNull(item.reason);
+  // The card's own reason line; none when the section's fields list the reason themselves.
+  const reason = reasonPlacement === 'fields' ? null : textOrNull(item.reason);
   const provenanceText = historical
     ? historicalProvenanceText(item.evidence.provenance, item.current.data_status_now)
     : null;
@@ -901,6 +951,7 @@ export function RecommendationCard({
       <Card.Header
         title={item.action}
         rank={String(item.rank)}
+        figure={headlineFigure(item)}
         meta={entityLine(item.entity)}
         headingLevel={headingLevel ?? 3}
       />
@@ -921,8 +972,8 @@ export function RecommendationCard({
           {heldReason === null ? null : (
             <Inline gap={2}>
               <span>{heldReason}</span>
-              {/* An in-page link to the Campaigns discrepancy group (AAP 0.5.5). */}
-              <a href={`#${DISCREPANCY_GROUP_ANCHOR}`}>{BLOCKING_DISCREPANCY_LINK_LABEL}</a>
+              {/* A link to each discrepancy that holds the item (AAP 0.5.5). */}
+              <BlockingDiscrepancyLinks item={item} />
             </Inline>
           )}
           {reason === null ? null : <div>{reason}</div>}

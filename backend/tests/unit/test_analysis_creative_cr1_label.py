@@ -335,3 +335,49 @@ def test_not_distinguishable_p_below_the_bound_reads_without_an_equals_sign() ->
     assert item.reason.endswith("the gap is not yet distinguishable from noise.")
     for text in (item.action, item.reason, *(f.message for f in item.flags)):
         assert "= <" not in text
+
+
+def _leads_context(leads_a: int, leads_b: int) -> AnalysisContext:
+    """The ``cr1.fisher`` world with ``leads_a`` vs ``leads_b`` leads on 1,000 impressions each."""
+    spec = scenarios._creative_world(
+        "cr1.fisher",
+        (
+            ("cr-a", scenarios._funnel_days(VARIANT_IMPRESSIONS, 20, 30, leads_a)),
+            ("cr-b", scenarios._funnel_days(VARIANT_IMPRESSIONS, 20, 30, leads_b)),
+        ),
+    )
+    return replace(SCENARIOS[FISHER], spec=spec).build_context()
+
+
+def test_headline_is_the_end_to_end_rate_of_the_variant_named_first() -> None:
+    """The pair's card leads with the rate of the variant its title names first (the leader).
+
+    The same pair with its leads swapped puts the other creative ahead, so both sides of the
+    pair are exercised: ``rate_a`` when the first creative leads, ``rate_b`` when the second
+    does. The metric is the leader's own rate, labelled with its name.
+    """
+    sides: set[str] = set()
+    for leads_a, leads_b in (POWERED_LEADS, POWERED_LEADS[::-1]):
+        item = _cr1_item(_leads_context(leads_a, leads_b))
+        extra = item.evidence.extra
+        leader = _leader_name(item)
+        side = "rate_a" if extra["ahead"] == extra["pair"][0] else "rate_b"
+        assert extra["headline_metric"] == side
+        assert item.evidence.metric(side).label.startswith(f"{leader} ")
+        assert item.action.startswith(f"{leader} vs ")
+        assert _metric(item, side) == max(
+            _metric(item, "rate_a"), _metric(item, "rate_b"), key=lambda rate: Decimal(str(rate))
+        )
+        sides.add(side)
+    assert sides == {"rate_a", "rate_b"}
+
+
+def test_headline_of_a_level_pair_is_the_first_variants_rate() -> None:
+    """With no variant ahead, the title names the pair's first variant, and so does the headline."""
+    item = _cr1_item(SCENARIOS[IDENTICAL].build_context())
+    extra = item.evidence.extra
+    assert extra["ahead"] is None
+    assert extra["headline_metric"] == "rate_a"
+    first = str(extra["names"][0])
+    assert item.evidence.metric("rate_a").label.startswith(f"{first} ")
+    assert item.action.startswith(f"{first} vs ")

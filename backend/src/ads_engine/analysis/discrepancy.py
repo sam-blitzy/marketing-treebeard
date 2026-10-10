@@ -498,6 +498,9 @@ def _candidate(ctx: AnalysisContext, item: DiscrepancyInfo, crm_link: Flag | Non
             "platform": None if item.platform_value is None else dict(item.platform_value),
             "resolutions": list(resolutions),
         },
+        # Precedence sets the headline once every hold is final: the number of recommendations
+        # this discrepancy holds (``held_recommendations``, appended after these metrics).
+        headline=None,
     )
     name = item.subject_name if item.subject_name.strip() else ctx.subject_name(item.key)
     subject = DecisionSubject(item.subject_type, item.subject_id)

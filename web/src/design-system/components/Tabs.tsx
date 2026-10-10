@@ -10,9 +10,14 @@
  *   from the tab list straight into the visible panel;
  * - ArrowRight and ArrowLeft move to the next and previous tab, wrapping at either end, and Home
  *   and End move to the first and last tab. Focus and selection move together;
- * - every tab controls its own `tabpanel` (`aria-controls` / `aria-labelledby`). Only the selected
- *   panel is rendered visible; the others carry `hidden`, so they leave both the screen and the
- *   accessibility tree while keeping their content mounted.
+ * - every tab controls its own `tabpanel` (`aria-controls` / `aria-labelledby`). Every panel
+ *   element is always rendered, so each `aria-controls` resolves and a panel given an `id` is
+ *   always a valid in-page anchor. Only the selected panel is visible; the others carry
+ *   `hidden`, so they leave both the screen and the accessibility tree;
+ * - a panel's content mounts the first time its tab is selected and then stays mounted, hidden,
+ *   while another tab is selected. A tab that is never selected costs nothing to render, and
+ *   what a panel holds in local state (an open disclosure, a half-typed note) survives a switch
+ *   away and back.
  *
  * No headless library is used (AAP 0.4.5). The styling lives in `Tabs.css`, whose class names are
  * the contract this component renders: `ds-tabs`, `ds-tabs__list`, `ds-tabs__tab`,
@@ -57,8 +62,18 @@ export interface TabItem {
    * show no count.
    */
   count?: number;
-  /** The panel content shown while this tab is selected. */
+  /**
+   * The panel content shown while this tab is selected. It mounts the first time the tab is
+   * selected and stays mounted, hidden, while another tab is selected.
+   */
   content: ReactNode;
+  /**
+   * Optional id of this tab's panel element, which the tab names in `aria-controls`. It must be
+   * unique on the page. Give it when something links to the panel, such as the in-page anchor
+   * `#group-keywords-block`: the panel element is always rendered, so the anchor resolves even
+   * before the content first mounts. Omitted or empty, the id is derived from `useId`.
+   */
+  id?: string;
 }
 
 /**
@@ -119,7 +134,8 @@ function targetIndex(key: string, current: number, count: number): number | unde
  * per the WAI-ARIA tabs pattern with automatic activation.
  *
  * Renders `null` when `tabs` is empty. Element ids derive from `useId`, so several `Tabs` on one
- * page never collide.
+ * page never collide; a tab's `id`, when given, names its panel instead. Every panel element is
+ * rendered from the start, and its content from the first time its tab is selected.
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -141,21 +157,31 @@ function targetIndex(key: string, current: number, count: number): number | unde
 export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
   const baseId = useId();
   const [internalKey, setInternalKey] = useState<string | undefined>(tabs[0]?.key);
+  // The keys of every tab selected so far, whose panel content is mounted.
+  const [mountedKeys, setMountedKeys] = useState<readonly string[]>([]);
   // Each rendered tab registers its button here, so keyboard navigation can move focus to the
   // tab it selects. Keyed by tab key, so the map stays correct when tabs are reordered.
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
-
-  if (tabs.length === 0) {
-    return null;
-  }
 
   // The requested key wins only when it names a rendered tab; otherwise the first tab is
   // selected, so exactly one tab is always selected and exactly one panel visible.
   const requestedKey = selectedKey ?? internalKey;
   const activeKey = tabs.some((tab) => tab.key === requestedKey) ? requestedKey : tabs[0]?.key;
 
+  // Record a newly selected tab while rendering, React's pattern for state derived from the
+  // previous render: the selection can change without `select` (a controlled parent's new
+  // `selectedKey`, a removed tab's fallback), and React re-renders at once with the key added.
+  if (activeKey !== undefined && !mountedKeys.includes(activeKey)) {
+    setMountedKeys([...mountedKeys, activeKey]);
+  }
+
+  if (tabs.length === 0) {
+    return null;
+  }
+
   const tabId = (index: number) => `${baseId}-tab-${index}`;
-  const panelId = (index: number) => `${baseId}-panel-${index}`;
+  const panelId = (tab: TabItem, index: number) =>
+    tab.id === undefined || tab.id === '' ? `${baseId}-panel-${index}` : tab.id;
 
   const select = (key: string) => {
     // Uncontrolled: track the selection here. Controlled: the parent decides through onChange.
@@ -208,7 +234,7 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
               id={tabId(index)}
               className="ds-tabs__tab"
               aria-selected={selected}
-              aria-controls={panelId(index)}
+              aria-controls={panelId(tab, index)}
               tabIndex={selected ? 0 : -1}
               onClick={() => {
                 select(tab.key);
@@ -226,19 +252,23 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
           );
         })}
       </div>
-      {tabs.map((tab, index) => (
-        <div
-          key={tab.key}
-          role="tabpanel"
-          id={panelId(index)}
-          aria-labelledby={tabId(index)}
-          tabIndex={0}
-          hidden={tab.key !== activeKey}
-          className="ds-tabs__panel"
-        >
-          {tab.content}
-        </div>
-      ))}
+      {tabs.map((tab, index) => {
+        const selected = tab.key === activeKey;
+        return (
+          <div
+            key={tab.key}
+            role="tabpanel"
+            id={panelId(tab, index)}
+            aria-labelledby={tabId(index)}
+            tabIndex={0}
+            hidden={!selected}
+            className="ds-tabs__panel"
+          >
+            {/* Mounted from the first selection on; never before (see the module overview). */}
+            {selected || mountedKeys.includes(tab.key) ? tab.content : null}
+          </div>
+        );
+      })}
     </div>
   );
 }

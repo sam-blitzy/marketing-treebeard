@@ -8,6 +8,9 @@
  *     <div class="ds-card__header">
  *       <span class="ds-card__rank">            optional: rank, with a visually hidden "Rank "
  *       <h3|h4 class="ds-card__title">          the action as the headline
+ *       <p class="ds-card__figure">             optional: the headline number, outside the heading
+ *         <span class="ds-card__figure-label">  what the number is, e.g. "Wasted spend"
+ *         <span class="ds-card__figure-value">  the formatted number, e.g. "$186.40"
  *       <div class="ds-card__meta">             optional: entity name and its source
  *     <div class="ds-card__body">               reason, evidence table, window chip, flags row
  *     <div class="ds-card__footer">             actions (Record decision, Mark done, Dismiss...)
@@ -47,9 +50,9 @@
 }
 
 /*
- * Header row: rank, headline and entity line share one baseline while they fit, and wrap onto
- * further lines when they do not. The row gap is tighter than the column gap, so wrapped header
- * lines still read as one block.
+ * Header row: rank, headline, headline figure and entity line share one baseline while they
+ * fit, and wrap onto further lines when they do not. The row gap is tighter than the column gap,
+ * so wrapped header lines still read as one block.
  */
 .ds-card__header {
   display: flex;
@@ -74,6 +77,28 @@
   flex: 1 1 auto;
   min-inline-size: 0;
   margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+}
+
+/*
+ * Headline figure: the number that justifies the action, read as "{label} {value}". The value
+ * is as prominent as the headline; the label is quiet, like the entity line. The paragraph's
+ * user-agent margin is cleared so the header gap alone spaces it, and min-inline-size: 0 lets a
+ * long label wrap inside the card at narrow widths instead of widening it.
+ */
+.ds-card__figure {
+  min-inline-size: 0;
+  margin: 0;
+}
+
+.ds-card__figure-label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.ds-card__figure-value {
   font-size: var(--font-size-lg);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);

@@ -109,6 +109,7 @@ __all__ = [
     "ENTITY_SEGMENT",
     "ENTITY_TERM_CLUSTER",
     "ENTITY_TYPES",
+    "EXTRA_HEADLINE_METRIC",
     "FEEDBACK_SUPPRESSION",
     "FINDING_CODES",
     "FINDING_CONVERSION_TRACKING_ABSENT",
@@ -1653,6 +1654,17 @@ def _read_only_sequences(value: object, what: str) -> Mapping[Any, tuple[Any, ..
     return MappingProxyType(copied)
 
 
+EXTRA_HEADLINE_METRIC: Final = "headline_metric"
+"""The ``evidence.extra`` key naming the item's headline number (AAP 0.1.2).
+
+Its value is the ``key`` of one metric in the same evidence's ``metrics``: the number the
+card leads with, chosen by the rule (K1's is its wasted spend), or set by precedence for a
+headline only known once every hold is final (C0's count of the recommendations it holds).
+Only :meth:`AnalysisContext.make_evidence`, from its ``headline`` argument, and
+:meth:`Evidence.with_headline`, from the metric it appends, write it.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class Evidence:
     """Everything an item's conclusion rests on, frozen with the run (AAP 0.5.4.8).
@@ -1678,8 +1690,9 @@ class Evidence:
         datasets: The datasets read, with completeness and coverage.
         provenance: One entry per distinct dataset read, frozen at compute time.
         extra: Rule-specific detail, for example white-paper ``rows``, expansion
-            ``adjacent_terms``, B1/B3 allocation text or ``depends_on``; read-only, with
-            nested lists as tuples.
+            ``adjacent_terms``, B1/B3 allocation text, ``depends_on`` or
+            ``headline_metric`` (:data:`EXTRA_HEADLINE_METRIC`, the key of the metric a
+            card leads with); read-only, with nested lists as tuples.
 
     Raises:
         TypeError: On construction, when a field has the wrong type, a mapping has a
@@ -1752,6 +1765,41 @@ class Evidence:
             TypeError: When a value in ``values`` cannot be frozen (see :class:`Evidence`).
         """
         return replace(self, extra={**self.extra, **values})
+
+    def with_headline(self, metric: Metric) -> Evidence:
+        """Return a copy that leads with ``metric``; this evidence is unchanged.
+
+        ``precedence.py`` uses it for a headline only known once every hold is final: a C0
+        item's count of the recommendations its discrepancy holds. ``metric`` is appended after
+        every existing metric, whose keys and order are kept, and ``extra.headline_metric``
+        (:data:`EXTRA_HEADLINE_METRIC`) is set to its key, so the selection names a metric of
+        the copy. As with :meth:`with_extra`, the copy is constructed anew, so its ``window``,
+        ``thresholds`` and ``extra`` are fresh read-only trees that share no mutable object with
+        this evidence.
+
+        Args:
+            metric: The headline number; no metric of this evidence may have its key.
+
+        Returns:
+            The copy, with ``metric`` last in ``metrics`` and named as its headline.
+
+        Raises:
+            TypeError: When ``metric`` is not a :class:`Metric`.
+            ValueError: When this evidence already names a headline metric, or one of its
+                metrics already has ``metric.key`` (raised by the copy's construction).
+        """
+        if not isinstance(metric, Metric):
+            raise TypeError(f"Evidence.with_headline needs a Metric, found {metric!r}")
+        if EXTRA_HEADLINE_METRIC in self.extra:
+            raise ValueError(
+                f"evidence already names the headline metric "
+                f"{self.extra[EXTRA_HEADLINE_METRIC]!r}; {metric.key!r} cannot replace it"
+            )
+        return replace(
+            self,
+            metrics=(*self.metrics, metric),
+            extra={**self.extra, EXTRA_HEADLINE_METRIC: metric.key},
+        )
 
     def to_json(self) -> dict[str, Any]:
         """Return exactly AAP 0.5.3 ``Evidence``.
@@ -3595,6 +3643,7 @@ class AnalysisContext:
         test: TestResult | None = None,
         threshold_keys: Sequence[str] = (),
         extra: Mapping[str, Any] | None = None,
+        headline: str | None,
     ) -> Evidence:
         """Build an item's evidence; every rule builds its evidence through this helper.
 
@@ -3608,6 +3657,11 @@ class AnalysisContext:
           missing.
         * ``provenance`` has one :class:`ProvenanceEntry` per distinct dataset read, frozen at
           compute time and never replaced by the current status (AAP 0.3.2).
+        * ``extra.headline_metric`` (:data:`EXTRA_HEADLINE_METRIC`) is ``headline``: the key
+          of the metric the card leads with (AAP 0.1.2, "Every card leads with one headline
+          number, and its full evidence follows"). It is written only here and by
+          :meth:`Evidence.with_headline`, so the selection always names a metric of the
+          evidence; with ``headline=None`` no key is written.
 
         Args:
             required_datasets: The dataset names the rule read (``db.models.ops.DATASETS``).
@@ -3618,15 +3672,30 @@ class AnalysisContext:
             sample: The sample size against its minimum.
             test: The statistical test, when one was used.
             threshold_keys: The dotted threshold keys the rule applied.
-            extra: Rule-specific detail.
+            extra: Rule-specific detail; it must not set ``headline_metric`` itself.
+            headline: The key of the one metric in ``metrics`` the item's card leads with,
+                the number its action rests on; ``None`` for an item that is not rendered as
+                a card (white-paper table rows), or whose headline precedence appends with
+                :meth:`Evidence.with_headline` once every hold is final (C0). Required, so
+                every rule decides.
 
         Returns:
             The frozen evidence.
 
         Raises:
-            ValueError: For an unknown dataset name or duplicate metric keys.
+            ValueError: For an unknown dataset name or duplicate metric keys; when
+                ``headline`` is not the key of a metric in ``metrics``, naming it and the
+                available keys; and when ``extra`` already sets ``headline_metric``.
             ConfigError: When a threshold key is missing from the configuration.
         """
+        details: dict[str, Any] = {} if extra is None else dict(extra)
+        if EXTRA_HEADLINE_METRIC in details:
+            raise ValueError(
+                f"extra must not set {EXTRA_HEADLINE_METRIC!r}; pass the metric key as "
+                "headline= so it is checked against the metrics"
+            )
+        if headline is not None:
+            details[EXTRA_HEADLINE_METRIC] = headline
         statuses: list[DatasetStatus] = []
         provenance: dict[int, ProvenanceEntry] = {}
         for name in dict.fromkeys(required_datasets):
@@ -3635,7 +3704,7 @@ class AnalysisContext:
             statuses.append(row.status() if row is not None else DatasetStatus(name, "unknown"))
             if ref is not None and ref.dataset_id not in provenance:
                 provenance[ref.dataset_id] = ref.provenance()
-        return Evidence(
+        evidence = Evidence(
             window=self.window.to_json(),
             metrics=tuple(metrics),
             baselines=tuple(baselines),
@@ -3644,8 +3713,15 @@ class AnalysisContext:
             thresholds=self.thresholds.subset(*threshold_keys),
             datasets=tuple(statuses),
             provenance=tuple(provenance.values()),
-            extra={} if extra is None else dict(extra),
+            extra=details,
         )
+        # Checked on the constructed evidence, whose metrics are type-checked and unique.
+        keys = [metric.key for metric in evidence.metrics]
+        if headline is not None and headline not in keys:
+            raise ValueError(
+                f"headline metric {headline!r} is not one of the evidence metrics {keys}"
+            )
+        return evidence
 
 
 # ---------------------------------------------------------------------------

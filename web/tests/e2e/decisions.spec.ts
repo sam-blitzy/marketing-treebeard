@@ -122,6 +122,9 @@ const RESOLUTION_LABELS: Readonly<Record<Resolution, string>> = {
   acknowledge_removal: 'Acknowledge removal',
 };
 
+/** The resolver's button that loads its next page of discrepancies (`DiscrepancyResolver.tsx`). */
+const SHOW_MORE_DISCREPANCIES_LABEL = 'Show more discrepancies';
+
 /** `/sources` "Sync now" and its two outcomes, 202 and 409 (`SourcesPage.tsx`). */
 const SYNC_NOW_LABEL = 'Sync now';
 const SYNC_OUTCOME_PATTERN = /Sync requested|A sync is already pending/;
@@ -486,6 +489,41 @@ function resolverTitle(subject: SubjectView): string {
 }
 
 /**
+ * The resolver card of one discrepancy on a loaded `/decisions`. The resolver lists a page at a
+ * time, oldest first, so a newly raised discrepancy is usually on a later page: "Show more
+ * discrepancies" is pressed, each time waiting for its page to load, until the card is rendered
+ * or no further page exists, and at most `MAX_DISCREPANCY_PAGES` times.
+ *
+ * @param page - The test's page, on `/decisions`.
+ * @param id - The discrepancy's id.
+ * @returns The card's locator, `#discrepancies #discrepancy-{id}`; the caller asserts on it.
+ */
+async function revealResolverEntry(page: Page, id: number): Promise<Locator> {
+  const section = page.locator('#discrepancies');
+  const entry = section.locator(`#discrepancy-${String(id)}`);
+  const more = section.getByRole('button', { name: SHOW_MORE_DISCREPANCIES_LABEL, exact: true });
+  // The first page is shown once the card or "Show more" is.
+  await expect(entry.or(more).first()).toBeVisible({ timeout: PAGE_LOAD_TIMEOUT_MS });
+  for (let pressed = 0; pressed < MAX_DISCREPANCY_PAGES; pressed += 1) {
+    if ((await entry.count()) > 0 || (await more.count()) === 0) {
+      break;
+    }
+    await more.click();
+    // The button is loading (aria-busy) until its page is shown; the last page removes it.
+    await expect
+      .poll(
+        () =>
+          more.evaluateAll((buttons) =>
+            buttons.every((button) => button.getAttribute('aria-busy') !== 'true'),
+          ),
+        { message: 'the next resolver page loads', timeout: PAGE_LOAD_TIMEOUT_MS },
+      )
+      .toBe(true);
+  }
+  return entry;
+}
+
+/**
  * The count the open-discrepancies banner reports, parsed from its title.
  *
  * @param text - The banner's text.
@@ -770,7 +808,7 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
     await expect(
       page.getByRole('heading', { level: 1, name: 'Decisions', exact: true }),
     ).toBeVisible();
-    const entry = page.locator(`#discrepancies #discrepancy-${String(current.id)}`);
+    const entry = await revealResolverEntry(page, current.id);
     await expect(entry).toBeVisible({ timeout: PAGE_LOAD_TIMEOUT_MS });
     await expect(entry).toContainText(resolverTitle(current.subject));
     await entry.getByRole('button', { name: RESOLUTION_LABELS[resolution], exact: true }).click();

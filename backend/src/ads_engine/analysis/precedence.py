@@ -52,6 +52,14 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
     ``evidence.items`` over the section's surviving items that read the dataset incomplete,
     held and C0 items included, and cites only the reasons those items have; a finding with no
     such item keeps its reasons with ``items`` 0 (:func:`_recount_incomplete_datasets`).
+    Every surviving C0 item then leads with ``held_recommendations`` (AAP 0.1.2 "Every card
+    leads with one headline number"; P1 "resolve first, before any other recommendation is
+    trusted"): the number of surviving non-C0 items whose ``extra.blocking_discrepancies``
+    names its discrepancy, 0 included, appended as its last metric and named as its headline
+    (:func:`_with_held_counts`); an item held by two discrepancies counts for both. An
+    independent post-check then raises :class:`PrecedenceInvariantError` when an item outside
+    White papers does not name one of its own metrics as its headline
+    (:func:`_check_headlines`).
 11. **Ranking** (AAP 0.5.4.1 "Ranking ties: broken by entity name, then by id, so runs are
     deterministic"): C0 pinned first, then each group in display order, unheld before held,
     by ``rank_key``, entity name, id and key; ``rank`` is 1-based across the section.
@@ -63,8 +71,9 @@ call time, so a test can replace either one; the independent post-checks then tr
 
 Purity: reads only the :class:`~ads_engine.analysis.context.AnalysisContext` and the rule
 results; no database, network, settings or logging access. Candidates are frozen, so every
-change is a copy made with :func:`dataclasses.replace` and
-:meth:`~ads_engine.analysis.context.Evidence.with_extra`. Never imports ``runner`` or
+change is a copy made with :func:`dataclasses.replace`,
+:meth:`~ads_engine.analysis.context.Evidence.with_extra` and
+:meth:`~ads_engine.analysis.context.Evidence.with_headline`. Never imports ``runner`` or
 ``overlay``, which consume this module's output.
 
 Example:
@@ -106,6 +115,7 @@ from ads_engine.analysis.context import (
     ENTITY_KEYWORD,
     ENTITY_SEARCH_TERM,
     ENTITY_SEGMENT,
+    EXTRA_HEADLINE_METRIC,
     FINDING_CODES,
     FINDING_CONVERSION_TRACKING_ABSENT,
     FINDING_INCOMPLETE_DATASET,
@@ -137,6 +147,7 @@ from ads_engine.analysis.context import (
     Finding,
     Flag,
     Freshness,
+    Metric,
     RuleResult,
     SubjectKey,
     Withheld,
@@ -207,6 +218,15 @@ _STALE_AFTER_KEY: Final = "sources.stale_after_hours"
 _TRUSTED_MIN_DAYS_KEY: Final = "window.trusted_min_days"
 """The threshold P5 judges the window's length against, frozen into the evidence."""
 
+_HELD_METRIC_KEY: Final = "held_recommendations"
+"""The key of a C0 item's headline metric: the recommendations its discrepancy holds."""
+
+_HELD_METRIC_LABEL: Final = "Recommendations held until resolved"
+"""The display label of a C0 item's headline metric."""
+
+_HELD_METRIC_UNIT: Final = "recommendations"
+"""The unit of a C0 item's headline metric."""
+
 _SOURCE_LABELS: Final[Mapping[str, str]] = MappingProxyType(
     {"google": "Google", "linkedin": "LinkedIn", "hubspot": "HubSpot"}
 )
@@ -244,8 +264,9 @@ class PrecedenceInvariantError(AssertionError):
     spend increase survives on a G1-blocked target, a B3 allocation funds a receiver beyond
     its B1 increase or a donor beyond its freed amount, an item carries a sample below its
     minimum (P6), a CR1 pair that is not distinguishable lacks ``not_distinguishable`` or
-    uses winner wording (P7), or an item's ``evidence.thresholds`` records a threshold P4 or
-    P5 applied with another value. Tests assert it trips when a guard step is bypassed.
+    uses winner wording (P7), an item's ``evidence.thresholds`` records a threshold P4 or
+    P5 applied with another value, or an item outside White papers leaves without a
+    headline metric of its own evidence. Tests assert it trips when a guard step is bypassed.
     """
 
 
@@ -1957,6 +1978,82 @@ def _recount_incomplete_datasets(
     }
 
 
+def _with_held_counts(candidates: Sequence[Candidate]) -> list[Candidate]:
+    """Lead every C0 item with the number of stored recommendations its discrepancy holds.
+
+    AAP 0.1.2: "Every card leads with one headline number"; P1: a discrepancy is resolved
+    first, "before any other recommendation is trusted". The number that justifies resolving
+    it is how many recommendations wait on it, which is only final once P1 has held them and
+    feedback (step 10) has dropped what the run will not store. Each C0 item's evidence
+    therefore gets :meth:`~ads_engine.analysis.context.Evidence.with_headline` of
+    ``held_recommendations``: the number of ``candidates`` that are not C0 items and whose
+    ``extra.blocking_discrepancies`` (set by P1) contains the item's
+    ``extra.discrepancy_id``. An item held by two discrepancies counts for both, and 0 is a
+    valid count. The metric is appended after the rule's own metrics, whose keys and order
+    are kept. The counts depend only on the set of ``candidates``, never their order.
+
+    Args:
+        candidates: The items that survived every suppression step.
+
+    Returns:
+        ``candidates`` in their order, each C0 item with its headline metric added.
+
+    Raises:
+        ValueError: When a C0 item's ``extra.discrepancy_id`` is not an integer, or its
+            evidence already names a headline metric or has a ``held_recommendations``
+            metric (:meth:`~ads_engine.analysis.context.Evidence.with_headline`).
+    """
+    held: dict[int, int] = {}
+    for candidate in candidates:
+        if candidate.is_discrepancy:
+            continue
+        for discrepancy_id in candidate.evidence.extra.get("blocking_discrepancies", ()):
+            held[discrepancy_id] = held.get(discrepancy_id, 0) + 1
+    result: list[Candidate] = []
+    for candidate in candidates:
+        if not candidate.is_discrepancy:
+            result.append(candidate)
+            continue
+        discrepancy_id = candidate.evidence.extra.get("discrepancy_id")
+        if not isinstance(discrepancy_id, int) or isinstance(discrepancy_id, bool):
+            raise ValueError(
+                f"C0 item {candidate.entity_ref.key} has no integer extra.discrepancy_id "
+                f"({discrepancy_id!r}), so the recommendations it holds cannot be counted"
+            )
+        metric = Metric(
+            _HELD_METRIC_KEY, _HELD_METRIC_LABEL, held.get(discrepancy_id, 0), _HELD_METRIC_UNIT
+        )
+        result.append(replace(candidate, evidence=candidate.evidence.with_headline(metric)))
+    return result
+
+
+def _check_headlines(candidates: Sequence[Candidate]) -> None:
+    """The headline post-check: every card leads with one metric of its own evidence.
+
+    AAP 0.1.2: "Every card leads with one headline number, and its full evidence follows".
+    Every item outside White papers, whose items are table rows with fixed columns rather
+    than cards, must leave precedence with ``extra.headline_metric``
+    (:data:`~ads_engine.analysis.context.EXTRA_HEADLINE_METRIC`) naming the key of one of
+    its own ``evidence.metrics``. The rules select theirs when they build the evidence; C0's
+    is set by :func:`_with_held_counts`, which this check therefore follows.
+
+    Raises:
+        PrecedenceInvariantError: When an item outside White papers names no headline
+            metric, or names a key that none of its own metrics has.
+    """
+    for candidate in candidates:
+        if candidate.section == WHITE_PAPERS:
+            continue
+        headline = candidate.evidence.extra.get(EXTRA_HEADLINE_METRIC)
+        keys = [metric.key for metric in candidate.evidence.metrics]
+        if not isinstance(headline, str) or headline not in keys:
+            raise PrecedenceInvariantError(
+                f"headline: {candidate.rule_id} on {candidate.entity_ref.key} leads with "
+                f"{headline!r}, which is not one of its evidence metrics {keys}; every card "
+                "leads with one of its own metrics"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Step 11: ranking (AAP 0.5.4.1 "Ranking ties", 0.5.4.2 "Ranking", 0.5.5)
 # ---------------------------------------------------------------------------
@@ -2083,7 +2180,8 @@ def apply_precedence(
 
     The steps run in the fixed order of the module docstring: collect, G1, B3 allocation,
     P1, P2, P3, P4, P5, the P6/P7/P8 checks, feedback suppression with the ``no_crm_link``
-    and ``incomplete_dataset`` recounts over the surviving items, ranking. Pure: the inputs
+    and ``incomplete_dataset`` recounts and each C0 item's ``held_recommendations``
+    headline over the surviving items, the headline post-check, ranking. Pure: the inputs
     are unchanged, and the same inputs, in any order, give the same output.
 
     Args:
@@ -2100,13 +2198,15 @@ def apply_precedence(
         TypeError: When ``ctx`` is not an ``AnalysisContext`` or a result is not a
             ``RuleResult``.
         ValueError: When a result's own suppression counts cannot be attributed to one
-            section.
+            section, or a C0 item has no integer ``extra.discrepancy_id``, already names a
+            headline metric or already has a ``held_recommendations`` metric.
         PrecedenceInvariantError: When a guarantee is broken: an increase survives on a
             G1-blocked target, a B3 allocation exceeds a receiver's increase or a donor's
             freed amount, an item's sample is below its minimum (P6), a CR1 pair that is
-            not distinguishable lacks its flag or calls a winner (P7), or an item's evidence
+            not distinguishable lacks its flag or calls a winner (P7), an item's evidence
             records ``sources.stale_after_hours`` or ``window.trusted_min_days`` with a value
-            other than the one P4 or P5 applied.
+            other than the one P4 or P5 applied, or an item outside White papers leaves
+            without a headline metric of its own evidence.
         ConfigError: When a threshold key precedence reads is missing.
     """
     if not isinstance(ctx, AnalysisContext):
@@ -2144,10 +2244,13 @@ def apply_precedence(
     _check_items(candidates)
 
     # 10. Feedback suppression (C0 exempt), then the no_crm_link and incomplete_dataset item
-    # counts over the surviving items.
+    # counts and each C0 item's held-recommendation headline over the surviving items, and the
+    # independent headline post-check.
     candidates = _apply_feedback(ctx, candidates, counts)
     rule_findings = _recount_no_crm_link(collected.findings, candidates)
     incomplete = _recount_incomplete_datasets(ctx, incomplete, candidates)
+    candidates = _with_held_counts(candidates)
+    _check_headlines(candidates)
 
     # 11. Ranking.
     items = _rank(ctx, candidates)

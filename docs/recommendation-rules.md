@@ -60,7 +60,8 @@ required datasets of the creative rules, is stated once at the top of that secti
 - **Fires when**: the exact condition, with every threshold as `` `key` (default X) ``.
 - **Action**: the card headline, quoted as rendered.
 - **Reason and extra output**: what the reason sentence states and what `evidence.extra`
-  carries beyond the cited metrics.
+  carries beyond the cited metrics and the card's `headline_metric`, which
+  [Headline number](#headline-number) lists for every rule.
 - **Ranking**: the sort order inside the group. Ties always fall back to entity name, then id.
 - **Withheld or suppressed**: when a near pattern becomes a withheld line instead of a card,
   and which precedence step can remove the card.
@@ -336,7 +337,9 @@ run (`analysis/precedence.py`):
 6. **P4 stale or incomplete data**: flag items from their own required datasets.
 7. **P5 short window**: flag every item of a short window.
 8. **P6, P7, P8 checks**: sample minimums, no premature winners, attribution floors.
-9. **Feedback suppression**: drop dismissed, snoozed and done items, except `C0`.
+9. **Feedback suppression**: drop dismissed, snoozed and done items, except `C0`. Each `C0` item
+   then leads with the number of stored items its discrepancy holds
+   ([Headline number](#headline-number)).
 10. **Ranking**: order each group.
 
 Everything removed in steps 1, 4 and 9 is counted in the section's `suppressed` map
@@ -665,9 +668,11 @@ listed below as "the CRM datasets".
   example, "daily budget USD 50.00", "shared budget 123", "not returned by the platform", "no
   decision recorded" or "removed (acknowledged)". An `awaiting_platform` item adds "Awaiting a
   matching platform snapshot."
-- **Reason and extra output**: the `platform` and `decided` metrics side by side; `extra` holds
-  the discrepancy id, kind, decision shape, state, `detected_at`, both raw values and
-  `resolutions`, exactly the resolutions valid for its kind and decision shape (below).
+- **Reason and extra output**: the `platform` and `decided` metrics side by side, followed by
+  the headline `held_recommendations`, which precedence appends once every hold is final
+  ([Headline number](#headline-number)); `extra` holds the discrepancy id, kind, decision shape,
+  state, `detected_at`, both raw values and `resolutions`, exactly the resolutions valid for its
+  kind and decision shape (below).
 - **Ranking**: pinned first in Campaigns, oldest `detected_at` first.
 - **Withheld or suppressed**: never held, never hidden by feedback, never suppressed.
 - **Flags**: the item of a Google subject carries `no_crm_link` without the verified
@@ -1511,11 +1516,43 @@ recommendation showed. The shape is the `Evidence` schema of `GET /api/v1/recomm
 | `thresholds` | `{dotted key: configured value}` for every threshold the rule applied |
 | `datasets[]` | Each required dataset with its `completeness` and `covered_through` at compute time |
 | `provenance[]` | `source`, `dataset_id`, `mode` and `role` of every dataset read, frozen at compute time and never replaced by the current source status |
-| `extra` | Rule-specific detail: `rows` for white papers, `adjacent_terms` for `K2`, `resolutions` for `C0`, `funding` and `allocations` for `B1` and `B3`, `next_test` for `CR3`, `members` for shared budgets |
+| `extra` | Rule-specific detail: `headline_metric` on every card (see [Headline number](#headline-number)), `rows` for white papers, `adjacent_terms` for `K2`, `resolutions` for `C0`, `funding` and `allocations` for `B1` and `B3`, `next_test` for `CR3`, `members` for shared budgets |
 
 Each item also stores `data_status` (`live`, `simulated`, `stale` or `mixed`). Reason sentences
 are rendered from a per-rule template filled only from the item's own evidence, so the conclusion
 can never drift from the numbers.
+
+### Headline number
+
+Every card leads with one headline number, and its full evidence follows. It is frozen as
+`extra.headline_metric`: the `key` of one metric in the same item's `metrics[]`, which the card
+renders with that metric's label, unit and currency. Every rule except `C0` chooses it when it
+builds the evidence. A `C0` card leads with a number known only once every hold is final, so
+precedence appends that metric after the rule's own metrics and names it, after feedback
+suppression. The browser never computes or chooses the number. The key always names a metric of
+the item's own evidence: building evidence whose headline names no metric fails the run, and so
+does any card that leaves precedence without one. Each rule leads with the number its action rests
+on:
+
+| Rule | `headline_metric` | Number shown |
+|------|-------------------|--------------|
+| `K1` | `wasted_spend` | Wasted spend |
+| `K2` | `conversions` | The term's conversions |
+| `K3` | `qs_last` when the quality-score branch fired (`extra.triggers` contains `quality_score`), otherwise `cpc_ratio` | The latest quality score, or CPC second ÷ first half |
+| `C0` | `held_recommendations` | Recommendations held until resolved (set once precedence has applied every hold): the stored items whose `blocking_discrepancies` names this discrepancy, 0 included; an item held by two discrepancies counts for both |
+| `C1` | `spend` | Window spend |
+| `C1b` | `ql` | Qualified Leads |
+| `C2` "Scale" | `window_utilization` | Window utilization (spend vs cap) |
+| `C2` "Hold" | `ql` | Qualified Leads |
+| `C3a` | `segment_cpl` | Segment cost per lead |
+| `C3b` | `conversions` | Cluster conversions |
+| `B1` | `window_utilization` | Window utilization (spend vs cap) |
+| `B2` | `cost_per_outcome` on the `poor_efficiency` branch, `outcomes` on the `zero_outcomes` branch (`extra.branch`) | Cost per outcome, or the zero outcomes |
+| `B3` | `window_utilization` | Window utilization (spend vs cap) |
+| `B4` | `weekend_cpo` | Weekend cost per outcome |
+| `CR1` | `rate_a` or `rate_b`: the end-to-end rate of the variant the title names first (the variant ahead, or the pair's first variant when neither is) | That variant's lead (or click) rate |
+| `CR3` (with `CR2`) | The tested stage's rate: `click_rate`, `open_rate` or `completion_rate` | The tested stage's rate |
+| `W`, `W1`, `W2` | none | White-paper items are table rows with fixed columns, not cards |
 
 ### Flag codes
 

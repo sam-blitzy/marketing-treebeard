@@ -62,7 +62,7 @@ describe('SectionNav', () => {
     await renderWithProviders(<SectionNav sections={page.sections} />);
 
     // Default page: K1, K2, K3; C0, C1, the held pause, C2 Hold, C3b (the held card counts);
-    // B1, B3; CR3 and the held historical CR1 pair; three white-paper rows.
+    // B1, B3; CR3 and the historical CR1 pair; three white-paper rows.
     expect(linkSummary()).toEqual([
       ['Keywords to adjust 3', '#section-keywords'],
       ['Campaigns to pause or launch 5', '#section-campaigns'],

@@ -16,6 +16,11 @@
  *    CR2 weak stage as its reason and the next test as its action, then one CR1 card per variant
  *    pair, then held cards behind the "Held until discrepancies are resolved" disclosure.
  *
+ * Every list is bounded (`../batches`; AAP 0.1.1 "the five sections render from precomputed
+ * runs in under 2 s"): the variants table shows `ROW_BATCH_SIZE` rows at a time, the cards,
+ * whose CR1 pairs grow as V(V−1)/2 with the variants, `CARD_BATCH_SIZE` at a time, and the
+ * campaign blocks `GROUP_BATCH_SIZE` at a time, each followed by a "Show {n} more" control.
+ *
  * What this file deliberately does not do (AAP 0.5.4.2 P7: no premature winners):
  * - it never reorders, relabels or ranks items, and never infers a winner. Every pair label
  *   ("Distinguishable (adjusted p = …)", "{A} ahead, not yet distinguishable …") is the API's
@@ -38,6 +43,8 @@ import { DataTable, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import { NOT_APPLICABLE, UNAVAILABLE, formatCount, formatPercent } from '../../../lib/format';
 import { RecommendationCard } from '../RecommendationCard';
+import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
+import type { BatchNoun } from '../batches';
 import { variants } from '../evidenceExtra';
 import type { VariantRow } from '../evidenceExtra';
 import { SectionFrame } from './SectionFrame';
@@ -146,6 +153,19 @@ interface KeyedVariant {
   readonly variant: VariantRow;
 }
 
+/** One shown variants-table row: a {@link KeyedVariant} and its row header's focus target. */
+interface VariantTableRow extends KeyedVariant {
+  /**
+   * The id of the row header's focus target while the table shows rows in batches
+   * (`BatchEntryAnchor`), so focus lands on the row when a reveal shows it first; `null` when
+   * the table is not batched.
+   */
+  readonly focusId: string | null;
+}
+
+/** What a variants table counts in its batch control: "Showing 50 of 64 variants". */
+const VARIANT_ROW_NOUN: BatchNoun = Object.freeze({ singular: 'variant', plural: 'variants' });
+
 /**
  * Pairs each variant with a key unique within the table. The creative id (`creativeId`, which
  * `variants()` takes from the creative's id or else its URN) is the key; a repeat, which only a
@@ -174,12 +194,12 @@ function keyedVariants(rows: readonly VariantRow[]): KeyedVariant[] {
  * "n/a", a missing rate over zero impressions or form opens "not estimable", and any other
  * missing rate "unavailable".
  */
-const VARIANT_COLUMNS: readonly DataTableColumn<KeyedVariant>[] = [
+const VARIANT_COLUMNS: readonly DataTableColumn<VariantTableRow>[] = [
   {
     key: 'creative',
     header: 'Creative',
     isRowHeader: true,
-    render: (row) => row.variant.name,
+    render: (row) => <BatchEntryAnchor id={row.focusId}>{row.variant.name}</BatchEntryAnchor>,
   },
   {
     key: 'impressions',
@@ -236,8 +256,12 @@ export interface VariantsTableProps {
  * absent count renders "unavailable". The table states numbers only: which variant leads, and
  * whether that lead is distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
  *
+ * The table shows `ROW_BATCH_SIZE` rows at a time, in stored order, followed by a "Show {n}
+ * more variants" control when the campaign has more (`../batches`).
+ *
  * Memoized on its props, with the keyed rows derived once per `rows` array: given the same
- * campaign name and the same rows, a block that renders again keeps the table as it is.
+ * campaign name and the same rows, a block that renders again keeps the table, and the rows it
+ * has revealed, as they are.
  *
  * @param props - see {@link VariantsTableProps}
  * @returns the table, or `null` when there are no variants
@@ -251,17 +275,26 @@ export const VariantsTable = memo(function VariantsTable({
   campaignName,
   rows,
 }: VariantsTableProps): ReactElement | null {
+  // Keys are assigned over every variant, so a shown row keeps the key it has in the full table.
   const keyed = useMemo(() => keyedVariants(rows), [rows]);
+  const batches = useBatches(keyed, { batchSize: ROW_BATCH_SIZE });
   if (keyed.length === 0) {
     return null;
   }
+  const shown: VariantTableRow[] = batches.shown.map((row, index) => ({
+    ...row,
+    focusId: batches.batched ? batches.entryId(index) : null,
+  }));
   return (
-    <DataTable
-      caption={`Variants in ${campaignName}`}
-      columns={VARIANT_COLUMNS}
-      rows={keyed}
-      getRowKey={(row) => row.key}
-    />
+    <>
+      <DataTable
+        caption={`Variants in ${campaignName}`}
+        columns={VARIANT_COLUMNS}
+        rows={shown}
+        getRowKey={(row) => row.key}
+      />
+      <BatchControl batches={batches} noun={VARIANT_ROW_NOUN} />
+    </>
   );
 });
 

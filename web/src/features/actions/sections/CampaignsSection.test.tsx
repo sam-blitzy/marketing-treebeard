@@ -12,7 +12,8 @@
  *   `GET /discrepancies?state=resolved` lists it), no-longer-listed and missing-id states, each
  *   in one persistent polite status line that takes focus when the controls leave with it; a
  *   historical C0 stays pinned with its frozen resolutions disabled and reads no list;
- * - held cards collapsed at the end of their group, linked to the discrepancy group;
+ * - held cards collapsed at the end of their group; one without a recorded blocker links the
+ *   discrepancy group as "View open discrepancies";
  * - the C1, C1b and C2 field sets ("Campaign evidence", and the "Pipeline evidence" table with
  *   MQL and QL in separate columns for C1b and C2 "Hold" only);
  * - the C3a segment gap and the C3b keyword-cluster gap;
@@ -32,7 +33,7 @@ import { renderWithProviders } from '../../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import type { ReactElement } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_DISCREPANCY_STATES, queryKeys } from '../../../api/queries';
 import type { Discrepancy, Item, Metric, Overlay, Section } from '../../../api/types';
@@ -308,24 +309,33 @@ describe('CampaignsSection layout', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.getAttribute('aria-controls')).toBe('group-campaigns-pause-held');
     expect(heldRegion?.hidden).toBe(true);
+    // The held card mounts only once the disclosure is first opened.
+    expect(heldRegion?.querySelector('article')).toBeNull();
 
     const visibleCard = card('Pause');
     expect(visibleCard.id).toBe(`item-${String(FIXTURE_ITEM_IDS.c1)}`);
     expect(heldRegion?.contains(visibleCard)).toBe(false);
 
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(heldRegion?.hidden).toBe(false);
+
     const held = heldRegion?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.heldPause)}`);
     expect(held).not.toBeNull();
     expect(held?.textContent).toContain('Display Remarketing — US');
     expect(held?.textContent).toContain('Resolve discrepancy first');
+    // The fixture's held card records no blocker id, so it links the discrepancy list.
     const link = within(held as HTMLElement).getByRole('link', {
-      name: 'View blocking discrepancy',
+      name: 'View open discrepancies',
       hidden: true,
     });
     expect(link.getAttribute('href')).toBe(`#${DISCREPANCY_GROUP_ANCHOR}`);
 
+    // Collapsed again, the held card stays mounted, hidden.
     fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(heldRegion?.hidden).toBe(false);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(heldRegion?.hidden).toBe(true);
+    expect(heldRegion?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.heldPause)}`)).toBe(held);
     await screen.findByRole('button', { name: 'Platform is correct' });
   });
 
@@ -852,14 +862,19 @@ describe('C0 discrepancy cards', () => {
     await renderCampaigns(oneGroup('discrepancies', 'Discrepancies', [historicalC0()]));
 
     const group = screen.getByRole('region', { name: 'Discrepancies' });
-    // Pinned, never behind the held disclosure.
+    // Pinned, never behind the held disclosure nor moved into the replaced-data block.
     expect(
       within(group).queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
+    ).toBeNull();
+    expect(
+      within(group).queryByRole('group', { name: /^Computed from replaced data/u }),
     ).toBeNull();
     const article = card(C0_ACTION);
     expect(group.contains(article)).toBe(true);
     expect(article.textContent).toContain('Computed from replaced data');
-    expect(within(article).queryByRole('link', { name: 'View blocking discrepancy' })).toBeNull();
+    expect(
+      within(article).queryByRole('link', { name: /^View (blocking|open) discrepanc/u }),
+    ).toBeNull();
     // The frozen comparison and the history-only notice, in the status line.
     expect(article.textContent).toContain('Platform shows paused, last decided active');
     expect(statusLine(article).textContent).toBe(HISTORICAL_RESOLUTION_NOTICE);
@@ -934,6 +949,71 @@ describe('C0 discrepancy cards', () => {
     expect(discrepancyReads(api.calls)).toEqual([['open', 'awaiting_platform']]);
   });
 
+  it('pins every C0 first, then the visible cards, the replaced-data block and the held disclosure', async () => {
+    mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    const replaced = (): Item['current'] =>
+      makeItemOverlay({
+        historical: true,
+        held_now: true,
+        held_reason_now: 'Computed from data that has since been replaced',
+        data_status_now: 'live',
+      });
+    const c0 = pageItem(FIXTURE_ITEM_IDS.c0);
+    const historicalC0: Item = { ...c0, id: 3010, current: replaced() };
+    const historicalPause = makeItem({
+      id: 3011,
+      rule_id: 'C1',
+      action: 'Pause replaced campaign',
+      current: replaced(),
+    });
+    const visible = makeItem({ id: 3003, rule_id: 'C1', action: 'Pause visible campaign' });
+    await renderCampaigns(
+      oneGroup('discrepancies', 'Discrepancies', [
+        visible,
+        historicalPause,
+        c0,
+        pageItem(FIXTURE_ITEM_IDS.heldPause),
+        historicalC0,
+      ]),
+    );
+
+    const group = screen.getByRole('region', { name: 'Discrepancies' });
+    const block = within(group).getByRole('group', { name: 'Computed from replaced data (1)' });
+    expect(block.id).toBe(`${DISCREPANCY_GROUP_ANCHOR}-historical`);
+    expect(within(block).getAllByRole('article').map((article) => article.id)).toEqual([
+      'item-3011',
+    ]);
+    const replacedCard = within(block).getByRole('article', { name: 'Pause replaced campaign' });
+    expect(replacedCard.textContent).toContain('Computed from replaced data');
+    const toggle = within(group).getByRole('button', {
+      name: 'Held until discrepancies are resolved (1)',
+    });
+    const heldRegion = document.getElementById(`${DISCREPANCY_GROUP_ANCHOR}-held`);
+
+    // Both C0 cards, current and historical, in API order, then the visible card.
+    const pinned = [...group.querySelectorAll('article')].filter(
+      (article) => !block.contains(article) && heldRegion?.contains(article) !== true,
+    );
+    expect(pinned.map((article) => article.id)).toEqual([
+      `item-${String(FIXTURE_ITEM_IDS.c0)}`,
+      'item-3010',
+      'item-3003',
+    ]);
+    const lastPinned = pinned.at(-1);
+    expect(
+      lastPinned !== undefined &&
+        (lastPinned.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+    ).toBe(true);
+    expect((block.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(
+      true,
+    );
+    // The historical C0 shows its frozen resolutions at once and the current one its live list's;
+    // let that read settle before the test ends.
+    await waitFor(() => {
+      expect(within(group).getAllByRole('button', { name: 'Platform is correct' })).toHaveLength(2);
+    });
+  });
+
   it('pins C0 cards and puts other held items behind the disclosure', async () => {
     mockApi({ 'GET /discrepancies': openDiscrepancies() });
     const held = pageItem(FIXTURE_ITEM_IDS.heldPause);
@@ -964,6 +1044,8 @@ describe('C0 discrepancy cards', () => {
     expect(toggle.getAttribute('aria-controls')).toBe(`${DISCREPANCY_GROUP_ANCHOR}-held`);
     const heldRegion = document.getElementById(`${DISCREPANCY_GROUP_ANCHOR}-held`);
     expect(heldRegion?.hidden).toBe(true);
+    expect(heldRegion?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.heldPause)}`)).toBeNull();
+    fireEvent.click(toggle);
     expect(heldRegion?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.heldPause)}`)).not.toBeNull();
 
     // The C0 and the visible card are pinned in API order, before the disclosure.
@@ -1397,5 +1479,115 @@ describe('data-state flags on campaign cards', () => {
     await waitFor(() => {
       expect(screen.queryByRole('alert')).toBeNull();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Bounded batches in the discrepancy group
+// ---------------------------------------------------------------------------------------------
+
+describe('a long discrepancy group', () => {
+  /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', window.location.pathname);
+    Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  });
+
+  /** 45 C0 cards (ids 7001–7045) followed by 5 visible C1 cards (ids 7101–7105), API order. */
+  function longDiscrepancyGroup(): Section {
+    const c0 = pageItem(FIXTURE_ITEM_IDS.c0);
+    const pinned = Array.from({ length: 45 }, (_, index) => ({
+      ...c0,
+      id: 7001 + index,
+      rank: index + 1,
+    }));
+    const visible = Array.from({ length: 5 }, (_, index) =>
+      makeItem({
+        id: 7101 + index,
+        rank: 46 + index,
+        rule_id: 'C1',
+        action: `Pause campaign ${String(index + 1)}`,
+      }),
+    );
+    return oneGroup('discrepancies', 'Discrepancies', [...visible, ...pinned]);
+  }
+
+  /** The ids of the cards the discrepancy group renders, in document order. */
+  function cardIds(): string[] {
+    return within(screen.getByRole('region', { name: 'Discrepancies' }))
+      .getAllByRole('article')
+      .map((article) => article.id);
+  }
+
+  /** The text of the group's batch status, told apart from the cards' own status regions. */
+  function batchStatus(scope: HTMLElement): string | null {
+    const statuses = within(scope)
+      .getAllByRole('status')
+      .filter((status) => status.textContent.startsWith('Showing '));
+    expect(statuses).toHaveLength(1);
+    return statuses[0]?.textContent ?? null;
+  }
+
+  /** `item-{id}` for each id from `first` to `last`. */
+  function itemIds(first: number, last: number): string[] {
+    return Array.from({ length: last - first + 1 }, (_, index) => `item-${String(first + index)}`);
+  }
+
+  it('reveals every C0 card, in API order, before the first other card', async () => {
+    mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    await renderCampaigns(longDiscrepancyGroup());
+    const group = screen.getByRole('region', { name: 'Discrepancies' });
+    await within(group).findAllByRole('button', { name: 'Platform is correct' });
+
+    expect(cardIds()).toEqual(itemIds(7001, 7020));
+    expect(batchStatus(group)).toBe('Showing 20 of 50 actions');
+    fireEvent.click(within(group).getByRole('button', { name: 'Show 20 more actions' }));
+    expect(cardIds()).toEqual(itemIds(7001, 7040));
+    expect(document.activeElement?.id).toBe('item-7021');
+
+    fireEvent.click(within(group).getByRole('button', { name: 'Show 10 more actions' }));
+    expect(cardIds()).toEqual([...itemIds(7001, 7045), ...itemIds(7101, 7105)]);
+    expect(batchStatus(group)).toBe('Showing all 50 actions');
+    // Every C0 card keeps its live resolver; none is an alert.
+    expect(within(group).getAllByRole('button', { name: 'Platform is correct' })).toHaveLength(45);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('reveals the C0 card a held card links to when it lies beyond the first batch', async () => {
+    mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    window.history.replaceState(null, '', '#item-7038');
+    await renderCampaigns(longDiscrepancyGroup());
+
+    expect(cardIds()).toEqual(itemIds(7001, 7040));
+    const target = document.getElementById('item-7038');
+    expect(target).not.toBeNull();
+    expect(scrollIntoView.mock.contexts).toContain(target);
+    await screen.findAllByRole('button', { name: 'Platform is correct' });
+  });
+
+  it('reveals a C0 card a hash change names, beyond the shown batch', async () => {
+    mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    await renderCampaigns(longDiscrepancyGroup());
+    expect(document.getElementById('item-7044')).toBeNull();
+
+    act(() => {
+      window.history.replaceState(null, '', '#item-7044');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+
+    expect(cardIds()).toEqual(itemIds(7001, 7045).concat(itemIds(7101, 7105)));
+    expect(scrollIntoView.mock.contexts).toEqual([document.getElementById('item-7044')]);
+    await screen.findAllByRole('button', { name: 'Platform is correct' });
   });
 });

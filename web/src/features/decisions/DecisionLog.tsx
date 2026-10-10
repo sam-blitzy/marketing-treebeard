@@ -33,6 +33,9 @@
  *   contract defines are read, and only when they hold a non-blank string.
  * - **Server state only through `../../api/queries`** (AAP 0.11.1) and UI only from the
  *   design-system index, with no styles of this module's own (AAP 0.4.4).
+ * - **Outcomes go to one polite status region** kept from the first render: load failure,
+ *   failed refresh, empty log and "Decision recorded" (WCAG 2.2 SC 4.1.3), never `role="alert"`
+ *   (AAP 0.5.5), with Retry on a failed read (helpers in `./readState`).
  *
  * @example
  * ```tsx
@@ -57,6 +60,7 @@ import type {
   SubjectView,
 } from '../../api/types';
 import {
+  Banner,
   Button,
   DataTable,
   Dialog,
@@ -68,6 +72,7 @@ import {
 } from '../../design-system';
 import { EM_DASH, formatInstant, formatMoney, sourceLabel } from '../../lib/format';
 import { CAMPAIGN_STATUS_LABELS, DecisionForm } from './DecisionForm';
+import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -127,6 +132,24 @@ const NO_AMOUNT_TEXT = 'no amount recorded';
 
 /** Shown when the decision log could not be loaded and the API sent no message. */
 const LOAD_ERROR_FALLBACK = 'The decision log request failed.';
+
+/** The label of the spinner shown while the first read of the log runs. */
+const LOADING_LABEL = 'Loading decisions';
+
+/** Title of the failure shown when the first read of the log fails. */
+const LOAD_ERROR_TITLE = 'Decisions could not be loaded';
+
+/** Title of the warning shown when a refetch of a log already on screen fails. */
+const REFRESH_ERROR_TITLE = 'Decisions could not be refreshed';
+
+/** Title of the empty state, shown only when the latest read succeeded. */
+const EMPTY_TITLE = 'No decisions recorded yet';
+
+/** Reason of the empty state. */
+const EMPTY_REASON = 'Baseline decisions appear after the first entity sync.';
+
+/** Announced in the log's status region once the dialog's form has saved and closed. */
+const RECORDED_TEXT = 'Decision recorded';
 
 /**
  * A budget name as the API builds it for a shared budget subject ("Shared budget {external
@@ -529,77 +552,153 @@ function SubjectDecisions({ group, columns, onRecord }: SubjectDecisionsProps) {
  *
  * `DecisionsPage` renders it inside its "Decision log" section, so each subject's heading is an
  * `<h3>`. It takes no props: the log comes from `GET /decisions` with no filter, and instants are
- * shown in the latest default run's `display_timezone` (`UTC` until a default run exists).
+ * shown in the latest default run's `display_timezone` (`UTC` until a default run exists). The
+ * log refreshes itself every 30 s while shown (`useDecisions`), so decisions the worker or
+ * another tab records appear without a reload.
  *
- * States:
- * - loading: a `Spinner` "Loading decisions";
- * - failed with nothing loaded: an `EmptyState` "Decisions could not be loaded" with the API's
- *   message; a failed refetch keeps showing the log already loaded;
- * - empty: an `EmptyState` "No decisions recorded yet", because baseline decisions appear after
- *   the first entity sync;
- * - otherwise one section per subject, preceded by a note when the log reached the API's row
- *   limit and older decisions may be missing.
+ * **One polite status region** (WCAG 2.2 SC 4.1.3). The log renders a single `role="status"`
+ * element in every state, from the first render, outside the tables, so each outcome lands in a
+ * region assistive technology already watches and is announced politely. It never carries
+ * `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`. The
+ * `Spinner` "Loading decisions" sits outside it, because it is a status element of its own. The
+ * region holds, as they apply:
+ *
+ * - the first read failed: an `EmptyState` "Decisions could not be loaded" with the API's
+ *   message and a "Retry" `Button`. It stays in place while the read runs again, by poll or by
+ *   Retry, so it never flickers back to the spinner, and focus returns to Retry once a retry
+ *   the user started settles (WCAG 2.2 SC 2.4.3);
+ * - a refetch of a loaded log failed: a warning `Banner` "Decisions could not be refreshed" with
+ *   the API's message, saying the log shown is the state as last loaded at {instant} (or that it
+ *   held no decision then), with "Retry"; an empty log from an earlier read is never presented
+ *   as the current state;
+ * - the latest read succeeded with no row: an `EmptyState` "No decisions recorded yet", because
+ *   baseline decisions appear after the first entity sync;
+ * - "Decision recorded", once the dialog's form has saved, until a dialog opens again.
+ *
+ * A loaded log shows one section per subject, preceded by a note when the log reached the API's
+ * row limit and older decisions may be missing.
  *
  * "Record decision" on a subject opens one page-level `Dialog`, "Record decision", hosting
- * `DecisionForm` for that subject in its own currency. Saving or cancelling closes it, and the
- * form's save invalidates the log, so the new row appears at the top of its subject.
+ * `DecisionForm` for that subject in its own currency. Saving or cancelling closes it, and
+ * `Dialog` returns focus to the button that opened it. The form's save invalidates the log, so
+ * the new row appears at the top of its subject, and the form's own success message leaves with
+ * the dialog, so the region announces "Decision recorded".
  */
 export function DecisionLog() {
   const decisions = useDecisions();
   const defaultRun = useDefaultRun();
   const [dialogTarget, setDialogTarget] = useState<DialogTarget | null>(null);
+  const [recorded, setRecorded] = useState(false);
+  const log = decisions.data;
+  const failure = useSettledFailure(
+    decisions.error,
+    decisions.fetchStatus !== 'idle',
+    log !== undefined,
+  );
+  const { retrying, buttonRef: retryButtonRef, retry } = useRetry(decisions.refetch);
 
   const displayTimezone = textOrNull(defaultRun.data?.display_timezone) ?? FALLBACK_TIMEZONE;
+  const openDialog = (target: DialogTarget) => {
+    setRecorded(false);
+    setDialogTarget(target);
+  };
   const closeDialog = () => {
     setDialogTarget(null);
   };
+  const handleDone = (savedTarget: DialogTarget) => {
+    // DecisionForm reports a save even after its dialog was closed mid-request, so only the
+    // dialog of the target that saved closes. Every opening builds a fresh target, so a dialog
+    // opened in the meantime, for another subject or reopened for this one, keeps its edits.
+    // The decision was recorded either way, so the region says so.
+    setDialogTarget((current) => (current === savedTarget ? null : current));
+    setRecorded(true);
+  };
 
-  let content: ReactNode;
-  if (decisions.data === undefined) {
-    content =
-      decisions.error === null ? (
-        <Spinner label="Loading decisions" />
-      ) : (
-        <EmptyState title="Decisions could not be loaded">
-          {textOrNull(decisions.error.message) ?? LOAD_ERROR_FALLBACK}
-        </EmptyState>
+  const retryButton = (
+    <Button
+      ref={retryButtonRef}
+      loading={retrying}
+      onClick={() => {
+        void retry();
+      }}
+    >
+      {RETRY_LABEL}
+    </Button>
+  );
+
+  const notices: ReactNode[] = [];
+  if (log === undefined) {
+    if (failure !== null) {
+      notices.push(
+        <EmptyState key="load-error" title={LOAD_ERROR_TITLE} action={retryButton}>
+          {textOrNull(failure.message) ?? LOAD_ERROR_FALLBACK}
+        </EmptyState>,
       );
-  } else if (decisions.data.length === 0) {
-    content = (
-      <EmptyState title="No decisions recorded yet">
-        Baseline decisions appear after the first entity sync.
-      </EmptyState>
+    }
+  } else if (decisions.error !== null) {
+    const loadedAt = lastLoadedText(decisions.dataUpdatedAt, displayTimezone);
+    const asLoaded =
+      log.length === 0
+        ? `No decisions were recorded when the log was last loaded ${loadedAt}.`
+        : `Showing the log as last loaded ${loadedAt}.`;
+    notices.push(
+      <Banner key="refresh-error" tone="warning" title={REFRESH_ERROR_TITLE} actions={retryButton}>
+        <Stack gap={1}>
+          <div>{textOrNull(decisions.error.message) ?? LOAD_ERROR_FALLBACK}</div>
+          <div>{asLoaded}</div>
+        </Stack>
+      </Banner>,
     );
-  } else {
-    const rows = decisions.data;
-    const columns = decisionColumns(displayTimezone, sharedBudgetNames(rows));
+  } else if (log.length === 0) {
+    notices.push(
+      <EmptyState key="empty" title={EMPTY_TITLE}>
+        {EMPTY_REASON}
+      </EmptyState>,
+    );
+  }
+  if (recorded) {
+    notices.push(<div key="recorded">{RECORDED_TEXT}</div>);
+  }
+
+  let content: ReactNode = null;
+  if (log !== undefined && log.length > 0) {
+    const columns = decisionColumns(displayTimezone, sharedBudgetNames(log));
     content = (
-      <Stack gap={5}>
+      <>
         {/*
           BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive and feature code
           carries no CSS (AAP 0.4.4), so the limit note is a <div> spaced by the Stack gap token
           rather than a <p>, whose user-agent margins no spacing token sets.
         */}
-        {rows.length >= DECISION_LOG_LIMIT ? (
+        {log.length >= DECISION_LOG_LIMIT ? (
           <div>
             {`Showing the newest ${DECISION_LOG_LIMIT} decisions; older decisions are not listed.`}
           </div>
         ) : null}
-        {groupBySubject(rows).map((group) => (
+        {groupBySubject(log).map((group) => (
           <SubjectDecisions
             key={group.key}
             group={group}
             columns={columns}
-            onRecord={setDialogTarget}
+            onRecord={openDialog}
           />
         ))}
-      </Stack>
+      </>
     );
   }
 
   return (
     <>
-      {content}
+      {/*
+        BLITZY [DESIGN_SYSTEM_GAP]: the design system has no live-region primitive and feature
+        code carries no CSS (AAP 0.4.4), so the status region is an unstyled <div> spaced by the
+        Stack gap alone; Stack takes the region out of the column while it is empty.
+      */}
+      <Stack gap={5}>
+        {log === undefined && failure === null ? <Spinner label={LOADING_LABEL} /> : null}
+        <div role="status">{notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}</div>
+        {content}
+      </Stack>
       <Dialog open={dialogTarget !== null} title={DIALOG_TITLE} onClose={closeDialog}>
         {dialogTarget === null ? null : (
           <Stack gap={4}>
@@ -608,12 +707,7 @@ export function DecisionLog() {
               subject={dialogTarget.subject}
               currency={dialogTarget.currency}
               onDone={() => {
-                // DecisionForm reports a save even after its dialog was closed mid-request, so
-                // only the dialog of the target that saved closes. Every opening builds a fresh
-                // target, so a dialog opened in the meantime, for another subject or reopened
-                // for this one, keeps its edits.
-                const savedTarget = dialogTarget;
-                setDialogTarget((current) => (current === savedTarget ? null : current));
+                handleDone(dialogTarget);
               }}
               onCancel={closeDialog}
             />

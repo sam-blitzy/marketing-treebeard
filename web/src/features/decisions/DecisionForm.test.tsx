@@ -23,10 +23,10 @@
 import { apiError, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockResponse, RecordedCall } from '../../test/mockApi';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 
-import { queryKeys } from '../../api/queries';
+import { CURRENT_STATE_POLL_MS, queryKeys } from '../../api/queries';
 import type { Decision, Discrepancy, SubjectIn, SubjectView } from '../../api/types';
 import { Button } from '../../design-system';
 import {
@@ -243,6 +243,35 @@ describe('DecisionForm', () => {
       expect(await screen.findByText('The database is unavailable.')).toBeDefined();
       expect(screen.queryByRole('button', { name: 'Save decision' })).toBeNull();
       expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('keeps a failed read of the log on screen while a poll reads it again', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const poll = deferredResponse();
+        let reads = 0;
+        mockApi({
+          [logKey(OWN_BUDGET)]: () => {
+            reads += 1;
+            return reads === 1
+              ? apiError(503, 'unavailable', 'The database is unavailable.')
+              : poll.promise;
+          },
+        });
+        await renderWithProviders(<DecisionForm subject={OWN_BUDGET} />, { path: '/decisions' });
+        expect(await screen.findByText('The database is unavailable.')).toBeDefined();
+
+        await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+        expect(reads).toBe(2);
+        expect(screen.queryByText('Loading decision')).toBeNull();
+        expect(screen.getByText('The database is unavailable.')).toBeDefined();
+
+        poll.resolve(json(200, [makeDecision('own_budget')]));
+        expect(await screen.findByRole('button', { name: 'Save decision' })).toBeDefined();
+        expect(screen.queryByText('The database is unavailable.')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('reads a 409 subject_retired on the log as "Computed from replaced data"', async () => {

@@ -542,7 +542,8 @@ def test_c1_pauses_a_steady_spender_with_no_output() -> None:
         DecisionSubject("campaign", dud),
         DecisionSubject("budget", scenario.ids.id("google", "budget", "dud-budget")),
     )
-    assert item.evidence.extra == {"proposed_status": "paused"}
+    # The pause card leads with the spend that produced no outcome.
+    assert item.evidence.extra == {"proposed_status": "paused", "headline_metric": "spend"}
     assert item.rank_key == (-Decimal("50.00"),)
     assert _metrics(item) == {
         "spend": Decimal("50.00"),
@@ -732,6 +733,8 @@ def test_c1b_pauses_a_campaign_whose_matured_leads_reach_no_pipeline() -> None:
             "total_budget": None,
             "currency": "USD",
         },
+        # The pipeline pause card leads with the zero Qualified Leads.
+        "headline_metric": "ql",
     }
     assert item.required_datasets == (
         "linkedin.leads",

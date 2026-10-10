@@ -20,11 +20,19 @@
  *    used), the flags (floor flags among them), the window chip, any hold or replaced-data
  *    notice and the footer actions ("Mark done", "Dismiss", "Snooze for 7 days": white-paper
  *    rows carry no decision subject);
- * 3. held rows, collapsed behind the frame's {@link HeldDisclosure}, in a second table captioned
- *    "White papers ({currency}) held until discrepancies are resolved";
- * 4. the cohort's notes: its spend total in its own currency, as the backend computed it, the
+ * 3. rows computed from replaced data (AAP 0.3.2: readable, every action disabled), never
+ *    collapsed, in a table of their own captioned "White papers ({currency}) computed from
+ *    replaced data", each with its replaced-data badge in the Action cell;
+ * 4. rows a discrepancy holds, collapsed behind the frame's {@link HeldDisclosure}, in a table
+ *    captioned "White papers ({currency}) held until discrepancies are resolved";
+ * 5. the cohort's notes: its spend total in its own currency, as the backend computed it, the
  *    note that counts overlap across assets, and what the LinkedIn leads and meetings booked
  *    columns count.
+ *
+ * Each asset table and each per-creative table shows `ROW_BATCH_SIZE` rows at a time, in the
+ * API's order, followed by a "Show {n} more" control when it holds more (`../batches`;
+ * AAP 0.1.1 "the five sections render from precomputed runs in under 2 s"), so a cohort of
+ * hundreds of assets, or an asset of hundreds of creatives, mounts a bounded table.
  *
  * Rendering rules (AAP 0.5.5, 0.5.4.7), all decided by the backend and kept here:
  * - floors render "≥ N" for counts and "≤ X" for costs ({@link formatMetric});
@@ -79,15 +87,16 @@ import {
   type WhitePaperMetricKey,
   type WhitePaperRow,
 } from '../evidenceExtra';
+import { BlockingDiscrepancyLinks } from '../BlockingDiscrepancies';
 import { FlagList, flagTone, mergeFlags } from '../FlagList';
+import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
+import type { BatchNoun } from '../batches';
 import {
-  BLOCKING_DISCREPANCY_LINK_LABEL,
   HISTORICAL_LABEL,
   RecommendationActions,
   historicalProvenanceText,
 } from '../RecommendationCard';
 import {
-  DISCREPANCY_GROUP_ANCHOR,
   FieldList,
   HeldDisclosure,
   SectionFrame,
@@ -271,17 +280,19 @@ function frozenMqlHeader(item: Item): string | null {
 }
 
 /**
- * The MQL header of one table, from the rows it shows: the frozen header its rows recorded
- * ({@link frozenMqlHeader}). Rows of one run share one binding; should the rows of one table
- * record different headers, the table claims none of them and heads the column plainly "MQL",
- * while each row's own label stays in its details. Only when no row records a header does the
- * column take `configured`, the current configuration's ({@link mqlHeader}).
+ * The MQL header of one table, from the rows it holds, shown or not yet revealed: the frozen
+ * header its rows recorded ({@link frozenMqlHeader}). Rows of one run share one binding; should
+ * the rows of one table record different headers, the table claims none of them and heads the
+ * column plainly "MQL", while each row's own label stays in its details. Only when no row
+ * records a header does the column take `configured`, the current configuration's
+ * ({@link mqlHeader}).
  */
-function tableMqlHeader(rows: readonly AssetRowView[], configured: string): string {
+function tableMqlHeader(items: readonly Item[], configured: string): string {
   const frozen = new Set<string>();
-  for (const row of rows) {
-    if (row.frozenMql !== null) {
-      frozen.add(row.frozenMql);
+  for (const item of items) {
+    const header = frozenMqlHeader(item);
+    if (header !== null) {
+      frozen.add(header);
     }
   }
   if (frozen.size === 0) {
@@ -332,6 +343,12 @@ interface AssetRowView {
   readonly name: string;
   /** Each metric's display text, keyed by `WHITE_PAPER_METRIC_KEYS`. */
   readonly cells: ReadonlyMap<WhitePaperMetricKey, string>;
+  /**
+   * The id of the row header's focus target while its table shows rows in batches
+   * (`BatchEntryAnchor`), so focus lands on the row when a reveal shows it first; `null` when
+   * the table is not batched.
+   */
+  readonly focusId: string | null;
   /** The MQL header the row's frozen evidence records ({@link frozenMqlHeader}), or `null`. */
   readonly frozenMql: string | null;
 }
@@ -343,7 +360,8 @@ function assetName(item: Item): string {
 
 /**
  * Formats an asset row's cells from its evidence (`whitePaperCells`), with the cost notes of
- * `extra.costs` (`whitePaperCostNotes`) after a "—", and reads the MQL header it recorded.
+ * `extra.costs` (`whitePaperCostNotes`) after a "—", and reads the MQL header it recorded. The
+ * row has no focus target; {@link assetRowOf} gives one to a row of a batched table.
  */
 function toAssetRow(item: Item): AssetRowView {
   const metrics = whitePaperCells(item);
@@ -352,7 +370,7 @@ function toAssetRow(item: Item): AssetRowView {
   for (const key of WHITE_PAPER_METRIC_KEYS) {
     cells.set(key, cellText(metrics[key], isCostKey(key) ? costNotes[key] : null));
   }
-  return { item, name: assetName(item), cells, frozenMql: frozenMqlHeader(item) };
+  return { item, name: assetName(item), cells, focusId: null, frozenMql: frozenMqlHeader(item) };
 }
 
 /**
@@ -365,16 +383,16 @@ const ASSET_ROWS = new WeakMap<Item, AssetRowView>();
 
 /**
  * An item's asset row ({@link toAssetRow}), formatted once per item object, so a cohort that
- * renders again reformats only the rows whose item changed.
+ * renders again reformats only the rows whose item changed. `focusId` is the row header's focus
+ * target in a batched table, `null` otherwise; a row given one shares the kept row's cells.
  */
-function assetRowOf(item: Item): AssetRowView {
-  const kept = ASSET_ROWS.get(item);
-  if (kept !== undefined) {
-    return kept;
+function assetRowOf(item: Item, focusId: string | null = null): AssetRowView {
+  let row = ASSET_ROWS.get(item);
+  if (row === undefined) {
+    row = toAssetRow(item);
+    ASSET_ROWS.set(item, row);
   }
-  const row = toAssetRow(item);
-  ASSET_ROWS.set(item, row);
-  return row;
+  return focusId === null ? row : { ...row, focusId };
 }
 
 /** One per-creative row with its position, so equal creative keys never collide. */
@@ -383,7 +401,21 @@ interface CreativeRowView {
   readonly index: number;
   /** The per-creative row. */
   readonly row: WhitePaperRow;
+  /**
+   * The id of the row header's focus target while the per-creative table shows rows in batches
+   * (`BatchEntryAnchor`); `null` when it is not batched.
+   */
+  readonly focusId: string | null;
 }
+
+/** What an asset table counts in its batch control: "Showing 50 of 120 white papers". */
+const ASSET_ROW_NOUN: BatchNoun = Object.freeze({
+  singular: 'white paper',
+  plural: 'white papers',
+});
+
+/** What a per-creative table counts in its batch control: "Show 50 more creatives". */
+const CREATIVE_ROW_NOUN: BatchNoun = Object.freeze({ singular: 'creative', plural: 'creatives' });
 
 // ---------------------------------------------------------------------------------------------
 // Columns
@@ -426,16 +458,18 @@ function simulatedFlag(item: Item): Flag | null {
  * The Asset cell, the row header: the asset's name, then its simulated-data badge
  * ({@link simulatedFlag}) in the flag's tone, so a collapsed row states that its numbers are
  * simulated without being expanded, in the cell that names the row. Captions and the expand
- * label keep the plain name.
+ * label keep the plain name. In a batched table the name is the row's focus target
+ * ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it first.
  */
 function AssetCell({ row }: { row: AssetRowView }): ReactElement {
   const flag = simulatedFlag(row.item);
+  const name = <BatchEntryAnchor id={row.focusId}>{row.name}</BatchEntryAnchor>;
   if (flag === null) {
-    return <>{row.name}</>;
+    return name;
   }
   return (
     <Inline gap={2}>
-      <span>{row.name}</span>
+      <span>{name}</span>
       <Badge tone={flagTone(flag.code)}>{flag.message}</Badge>
     </Inline>
   );
@@ -488,7 +522,7 @@ function creativeColumns(mql: string): DataTableColumn<CreativeRowView>[] {
       key: 'creative',
       header: CREATIVE_HEADER,
       isRowHeader: true,
-      render: ({ row }) => row.label,
+      render: ({ row, focusId }) => <BatchEntryAnchor id={focusId}>{row.label}</BatchEntryAnchor>,
     },
     ...WHITE_PAPER_METRIC_KEYS.map(
       (key): DataTableColumn<CreativeRowView> => ({
@@ -527,13 +561,20 @@ interface AssetDetailsProps {
  * current (floor flags among them); the window chip; a historical row's "Computed from replaced
  * data" badge with its original provenance, or a held row's hold reason with its link to the
  * blocking discrepancy; the footer actions, all disabled on a historical row.
+ *
+ * The per-creative table shows `ROW_BATCH_SIZE` rows at a time, in stored order, followed by a
+ * "Show {n} more creatives" control when the asset has more (`../batches`), so an asset with
+ * hundreds of creatives mounts a bounded table when it is expanded.
  */
 function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   const { item, name } = row;
-  const creatives = useMemo(
-    () => creativeRows(item).map((creative, index) => ({ index, row: creative })),
-    [item],
-  );
+  const stored = useMemo(() => creativeRows(item), [item]);
+  const batches = useBatches(stored, { batchSize: ROW_BATCH_SIZE });
+  const creatives: CreativeRowView[] = batches.shown.map((creative, index) => ({
+    index,
+    row: creative,
+    focusId: batches.batched ? batches.entryId(index) : null,
+  }));
   const columns = useMemo(() => creativeColumns(mql), [mql]);
   const reason = textOrNull(item.reason);
   const historical = item.current.historical;
@@ -555,6 +596,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
         getRowKey={(creative) => `${creative.index}-${creative.row.key}`}
         emptyMessage={NO_CREATIVE_ROWS}
       />
+      <BatchControl batches={batches} noun={CREATIVE_ROW_NOUN} />
       {reason === null ? null : <div>{reason}</div>}
       <EvidenceTable evidence={item.evidence} caption={`Evidence for ${name}`} />
       <FlagList flags={item.flags} current={item.current.flags_now} />
@@ -572,7 +614,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
       {heldReason === null ? null : (
         <Inline gap={2}>
           <span>{heldReason}</span>
-          <a href={`#${DISCREPANCY_GROUP_ANCHOR}`}>{BLOCKING_DISCREPANCY_LINK_LABEL}</a>
+          <BlockingDiscrepancyLinks item={item} />
         </Inline>
       )}
       <RecommendationActions item={item} />
@@ -584,8 +626,8 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
 interface AssetTableProps {
   /** The caption, which names the table. */
   caption: string;
-  /** The rows, in API order. */
-  rows: readonly AssetRowView[];
+  /** The white-paper items, one row each, in API order. */
+  items: readonly Item[];
   /**
    * The MQL header the current configuration gives ({@link mqlHeader}), used only when no row
    * of the table records its frozen header ({@link tableMqlHeader}).
@@ -596,20 +638,36 @@ interface AssetTableProps {
 /**
  * One cohort's asset table, each row expandable to its {@link AssetDetails}. The MQL column is
  * headed from the rows' frozen evidence ({@link tableMqlHeader}), and each row's per-creative
- * table with that row's own frozen header, else the table's.
+ * table with that row's own frozen header, else the table's. The table formats its own rows
+ * ({@link assetRowOf}) when it renders, so a table that is not mounted, such as the held rows'
+ * table inside a disclosure nobody has opened, formats nothing, and a table that renders again
+ * reformats only the rows whose item changed.
+ *
+ * It shows `ROW_BATCH_SIZE` rows at a time, in API order, followed by a "Show {n} more white
+ * papers" control when the cohort has more (`../batches`): only the shown rows are formatted,
+ * and a revealed row keeps the columns, caption and expansion of the rows before it. The MQL
+ * header is taken from every row of the table, shown or not yet, so revealing rows never
+ * renames the column.
  */
-function AssetTable({ caption, rows, mql }: AssetTableProps): ReactElement {
-  const header = tableMqlHeader(rows, mql);
+function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
+  const header = useMemo(() => tableMqlHeader(items, mql), [items, mql]);
   const columns = useMemo(() => assetColumns(header), [header]);
+  const batches = useBatches(items, { batchSize: ROW_BATCH_SIZE });
+  const rows = batches.shown.map((item, index) =>
+    assetRowOf(item, batches.batched ? batches.entryId(index) : null),
+  );
   return (
-    <DataTable
-      caption={caption}
-      columns={columns}
-      rows={rows}
-      getRowKey={(row) => String(row.item.id)}
-      renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
-      expandLabel={(row) => `Details for ${row.name}`}
-    />
+    <>
+      <DataTable
+        caption={caption}
+        columns={columns}
+        rows={rows}
+        getRowKey={(row) => String(row.item.id)}
+        renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
+        expandLabel={(row) => `Details for ${row.name}`}
+      />
+      <BatchControl batches={batches} noun={ASSET_ROW_NOUN} />
+    </>
   );
 }
 
@@ -688,27 +746,33 @@ interface CohortTablesProps {
 
 /**
  * One currency cohort (AAP 0.5.5, 0.5.4.7 "Currency cohorts"): the table of visible rows, the
- * held rows' table behind the held disclosure, then the cohort's notes. Every amount is in the
- * cohort's one currency. The spend total is the backend's (`extra.cohort.spend_total`), shown
- * as "unavailable" when absent and never summed here; no other total is shown, because counts
- * overlap across assets.
+ * open table of rows computed from replaced data, the held rows' table behind the held
+ * disclosure, then the cohort's notes. Every amount is in the cohort's one currency. The spend
+ * total is the backend's (`extra.cohort.spend_total`), shown as "unavailable" when absent and
+ * never summed here; no other total is shown, because counts overlap across assets.
  */
 function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const summary = findCohortSummary(parts.group.items);
   const currency = cohortCurrency(parts, summary);
-  const visibleRows = parts.visible.map(assetRowOf);
-  const heldRows = parts.held.map(assetRowOf);
   const overlapNote = textOrNull(summary?.overlapNote) ?? OVERLAP_NOTE_FALLBACK;
 
   return (
     <Stack gap={4}>
-      {visibleRows.length > 0 ? (
-        <AssetTable caption={`White papers (${currency})`} rows={visibleRows} mql={mql} />
+      {parts.visible.length > 0 ? (
+        <AssetTable caption={`White papers (${currency})`} items={parts.visible} mql={mql} />
       ) : null}
-      <HeldDisclosure id={`${parts.anchorId}-held`} count={heldRows.length}>
+      {parts.historical.length > 0 ? (
+        <AssetTable
+          caption={`White papers (${currency}) computed from replaced data`}
+          items={parts.historical}
+          mql={mql}
+        />
+      ) : null}
+      {/* The held table formats its rows only once the disclosure is first opened. */}
+      <HeldDisclosure id={`${parts.anchorId}-held`} count={parts.held.length}>
         <AssetTable
           caption={`White papers (${currency}) held until discrepancies are resolved`}
-          rows={heldRows}
+          items={parts.held}
           mql={mql}
         />
       </HeldDisclosure>

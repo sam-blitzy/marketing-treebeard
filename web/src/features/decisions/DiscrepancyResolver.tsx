@@ -7,8 +7,12 @@
  *   every resolver card, and `features/actions/sections/CampaignsSection.tsx` renders it inline
  *   on C0 cards, disabled for historical items.
  * - {@link DiscrepancyResolver}: the `/decisions` list of open and awaiting-platform
- *   discrepancies, oldest first, one card each (AAP 0.5.5 "`DiscrepancyResolver` lists open and
- *   awaiting-platform discrepancies with the resolutions valid for each kind and subject type").
+ *   discrepancies, oldest first, one card each, a page at a time with "Show more" (AAP 0.5.5
+ *   "`DiscrepancyResolver` lists open and awaiting-platform discrepancies with the resolutions
+ *   valid for each kind and subject type"). Its load, empty, refresh and closure outcomes are
+ *   announced through one persistent polite status region. A link to
+ *   `/decisions#discrepancy-{id}` loads pages until that card is shown, then scrolls it into
+ *   view, or says the discrepancy is no longer unresolved.
  *
  * Rules this file keeps:
  *
@@ -27,7 +31,7 @@
  *   "Already resolved"; any other failure, a 422 included, shows the API's own message.
  * - **No `alert` role.** AAP 0.5.5 reserves `role="alert"` for the discrepancy banner on
  *   `/actions`. Errors are plain critical banners that take focus; the outcome is a polite
- *   status message.
+ *   status message, and the list's own notices go to its polite status region.
  * - **Values come from the API only.** Each side of a discrepancy is rendered from its stored
  *   keys, statuses with `CAMPAIGN_STATUS_LABELS` and amounts with `formatMoney` in the subject's
  *   currency, and an amount finer than the currency's minor unit (a Google micro) also shows its
@@ -50,14 +54,17 @@
  *
  * @packageDocumentation
  */
+import { useLocation } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 
 import {
   isApiError,
   useDefaultRun,
-  useDiscrepancies,
+  useDiscrepancyPages,
   useResolveDiscrepancy,
 } from '../../api/queries';
+import type { ApiError } from '../../api/queries';
 import type {
   DecisionShape,
   Discrepancy,
@@ -81,12 +88,14 @@ import {
 import {
   UNAVAILABLE,
   currencyMinorDigits,
+  formatCount,
   formatDecimal,
   formatInstant,
   formatMoney,
   sourceLabel,
 } from '../../lib/format';
 import { CAMPAIGN_STATUS_LABELS, DecisionForm } from './DecisionForm';
+import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
 // Public API
@@ -178,8 +187,11 @@ const OUTCOME_TEXT: Readonly<Record<DiscrepancyState, string | null>> = Object.f
   resolved: 'Resolved',
 });
 
-/** The label of each discrepancy kind, as the card's entity line names it. */
-const KIND_LABELS: Readonly<Record<DiscrepancyKind, string>> = Object.freeze({
+/**
+ * The label of each discrepancy kind, as the card's entity line names it, and as a held card's
+ * link to its blocking discrepancy names it on `/actions`.
+ */
+export const KIND_LABELS: Readonly<Record<DiscrepancyKind, string>> = Object.freeze({
   status: 'Status mismatch',
   budget: 'Budget mismatch',
   untracked: 'Untracked entity',
@@ -193,8 +205,11 @@ const STATE_LABELS: Readonly<Record<DiscrepancyState, string>> = Object.freeze({
   resolved: 'Resolved',
 });
 
-/** The label of each subject type: a campaign, or a Google explicitly shared budget. */
-const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object.freeze({
+/**
+ * The label of each subject type: a campaign, or a Google explicitly shared budget. It names an
+ * unnamed subject ("Campaign 12") here and in a held card's blocking-discrepancy link.
+ */
+export const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object.freeze({
   campaign: 'Campaign',
   budget: 'Shared budget',
 });
@@ -661,12 +676,150 @@ function DiscrepancyResolutionBody({
 // DiscrepancyResolver
 // ---------------------------------------------------------------------------------------------
 
+/** Accessible label of the spinner shown until the first page of the list arrives. */
+const LOADING_LABEL = 'Loading discrepancies';
+
+/** Title of the failure shown when the first read of the list fails. */
+const LOAD_ERROR_TITLE = 'Discrepancies could not be loaded';
+
+/** Title of the warning shown when a refetch of a list already on screen fails. */
+const REFRESH_ERROR_TITLE = 'Discrepancies could not be refreshed';
+
+/** Title of the warning shown when "Show more" fails; the list loaded so far stays. */
+const MORE_ERROR_TITLE = 'More discrepancies could not be loaded';
+
+/** Reason shown for a failed read that carries no message of its own. */
+const READ_ERROR_FALLBACK = 'The discrepancy list could not be read.';
+
+/** Title of the empty state, shown only when the latest read succeeded. */
+const EMPTY_TITLE = 'No open discrepancies';
+
+/** Reason of the empty state. */
+const EMPTY_REASON = 'Platform state matches every last decision.';
+
+/**
+ * Accessible name of the card list. Links reach a card by its own element id
+ * ({@link cardId}), never through the list.
+ */
+const LIST_LABEL = 'Discrepancies to resolve';
+
+/** Label of the button that loads the next page of the list. */
+const SHOW_MORE_LABEL = 'Show more discrepancies';
+
+/**
+ * The start of each card's element id, `discrepancy-{id}`, which a link to the card names as its
+ * location hash (`/decisions#discrepancy-{id}`, built by `features/actions/BlockingDiscrepancies`).
+ */
+const CARD_ID_PREFIX = 'discrepancy-';
+
+/** A discrepancy id as the API sends it and a card's element id spells it: a positive integer. */
+const DISCREPANCY_ID_PATTERN = /^[1-9][0-9]*$/u;
+
+/** The element id of a discrepancy's card, `discrepancy-{id}`, from its id or the id's digits. */
+function cardId(id: Discrepancy['id'] | string): string {
+  return `${CARD_ID_PREFIX}${String(id)}`;
+}
+
+/**
+ * The id of the discrepancy a location hash links to, `"12"` for `discrepancy-12`, or `null`
+ * for any other hash, such as the page's own `discrepancies` section anchor. `hash` is the
+ * router's decoded hash, without its `#`.
+ */
+function linkedDiscrepancyId(hash: string): string | null {
+  if (!hash.startsWith(CARD_ID_PREFIX)) {
+    return null;
+  }
+  const id = hash.slice(CARD_ID_PREFIX.length);
+  return DISCREPANCY_ID_PATTERN.test(id) ? id : null;
+}
+
+/**
+ * The status line for a linked discrepancy that a fully read list does not hold: "Discrepancy
+ * {id} is no longer unresolved." It was resolved, by the worker or by hand, after the link was
+ * made. When the list also leaves out discrepancies whose subject cannot be loaded
+ * ({@link unavailableCount}), it may be one of those, and the line names both possibilities.
+ */
+function linkedAbsentText(id: string, unavailable: number): string {
+  return unavailable > 0
+    ? `Discrepancy ${id} is not listed: it is no longer unresolved, or its campaign or ` +
+        'shared budget could not be loaded.'
+    : `Discrepancy ${id} is no longer unresolved.`;
+}
+
+/** The text of a failed list read: the API's message, or a generic sentence without one. */
+function readErrorMessage(error: unknown): string {
+  return (isApiError(error) ? textOrNull(error.message) : null) ?? READ_ERROR_FALLBACK;
+}
+
+/**
+ * The summary line of a loaded list: "Showing {n} of {total} unresolved discrepancies", or
+ * "Showing {n} unresolved discrepancies" when the API sent no total. The total counts every
+ * unresolved discrepancy of the active datasets, as the `/actions` banner does, so it can exceed
+ * what every page together lists when a subject cannot be loaded. While pages remain to load the
+ * rest may still appear; once every page is read, {@link unavailableText} explains the
+ * difference beneath this line.
+ */
+function summaryText(shown: number, total: number | undefined): string {
+  const noun = (total ?? shown) === 1 ? 'unresolved discrepancy' : 'unresolved discrepancies';
+  return total === undefined
+    ? `Showing ${formatCount(shown)} ${noun}`
+    : `Showing ${formatCount(shown)} of ${formatCount(total)} ${noun}`;
+}
+
+/**
+ * How many unresolved discrepancies a list can never show: the API's total less the `shown`
+ * discrepancies, once every page is read (`complete`). `GET /discrepancies` counts in
+ * `X-Total-Count` the rows whose subject cannot be loaded but leaves them out of every page, so
+ * only a fully read list can tell how many those are. `0` while pages remain, when the API sent
+ * no total, or when the total does not exceed what is shown.
+ */
+function unavailableCount(shown: number, total: number | undefined, complete: boolean): number {
+  return complete && total !== undefined && total > shown ? total - shown : 0;
+}
+
+/**
+ * The line explaining the `unavailable` discrepancies ({@link unavailableCount}) a fully read
+ * list leaves out. Beneath the summary of a `listed` list it gives the difference: "1 cannot be
+ * shown because its campaign or shared budget could not be loaded." With nothing listed it
+ * stands in place of the summary and so names the total: "2 unresolved discrepancies cannot be
+ * shown because their campaigns or shared budgets could not be loaded."
+ */
+function unavailableText(unavailable: number, listed: boolean): string {
+  const single = unavailable === 1;
+  const noun = single ? 'unresolved discrepancy' : 'unresolved discrepancies';
+  const subjects = single ? 'its campaign or shared budget' : 'their campaigns or shared budgets';
+  const count = listed ? formatCount(unavailable) : `${formatCount(unavailable)} ${noun}`;
+  return `${count} cannot be shown because ${subjects} could not be loaded.`;
+}
+
+/** A "Show more" that has settled, kept until focus has been placed after it. */
+interface SettledMore {
+  /** The index, in the list, of the first discrepancy the load added. */
+  firstNew: number;
+  /** The query's `dataUpdatedAt` the load settled with; the render that shows it moves focus. */
+  dataUpdatedAt: number;
+  /** The query's `errorUpdatedAt` the load settled with. */
+  errorUpdatedAt: number;
+  /** The error the load failed with, or `null` when it succeeded. */
+  error: ApiError | null;
+}
+
+/** A closed discrepancy to announce, kept until the next successful read replaces the list. */
+interface Closure {
+  /** The text announced: "{subject} resolved". */
+  text: string;
+  /** When the resolution was reported, in milliseconds since the epoch. */
+  at: number;
+}
+
 /** Props of {@link DiscrepancyCard}. */
 interface DiscrepancyCardProps {
   /** The discrepancy shown. */
   discrepancy: Discrepancy;
   /** The IANA zone the detection instant is formatted in. */
   displayTimezone: string;
+  /** Passed to the card's {@link DiscrepancyResolution} as its `onResolved`. */
+  onResolved: (updated: Discrepancy) => void;
 }
 
 /**
@@ -674,9 +827,9 @@ interface DiscrepancyCardProps {
  * the state, the platform and decided values and the detection time in the body, and the
  * resolution controls in the footer. Every line is built from API values only.
  */
-function DiscrepancyCard({ discrepancy, displayTimezone }: DiscrepancyCardProps) {
+function DiscrepancyCard({ discrepancy, displayTimezone, onResolved }: DiscrepancyCardProps) {
   return (
-    <Card id={`discrepancy-${discrepancy.id}`}>
+    <Card id={cardId(discrepancy.id)}>
       <Card.Header
         headingLevel={3}
         title={subjectTitle(discrepancy)}
@@ -688,17 +841,150 @@ function DiscrepancyCard({ discrepancy, displayTimezone }: DiscrepancyCardProps)
         <div>{`Detected ${formatInstant(discrepancy.detected_at, displayTimezone)}`}</div>
       </Card.Body>
       <Card.Footer>
-        <DiscrepancyResolution discrepancy={discrepancy} />
+        <DiscrepancyResolution discrepancy={discrepancy} onResolved={onResolved} />
       </Card.Footer>
     </Card>
   );
 }
 
+/** The resolver's paged list query, as `useDiscrepancyPages()` returns it. */
+type DiscrepancyPagesQuery = ReturnType<typeof useDiscrepancyPages>;
+
+/** A page load {@link useLinkedDiscrepancy} made to reach the card a link names. */
+interface LinkedLoad {
+  /** Whether the load is still in flight. */
+  readonly pending: boolean;
+  /** The query's `dataUpdatedAt` the load settled with; `0` while it is in flight. */
+  readonly dataUpdatedAt: number;
+  /** The query's `errorUpdatedAt` the load settled with; `0` while it is in flight. */
+  readonly errorUpdatedAt: number;
+  /** The error the load failed with; `null` while it is in flight and after a success. */
+  readonly error: ApiError | null;
+}
+
+/** A {@link LinkedLoad} that has not settled yet. */
+const PENDING_LINKED_LOAD: LinkedLoad = Object.freeze({
+  pending: true,
+  dataUpdatedAt: 0,
+  errorUpdatedAt: 0,
+  error: null,
+});
+
+/** What {@link useLinkedDiscrepancy} tells the resolver. */
+interface LinkedDiscrepancy {
+  /** The id of the discrepancy the location hash links to, or `null` when it names none. */
+  readonly id: string | null;
+  /** Whether that discrepancy is among the loaded ones, so its card is rendered. */
+  readonly listed: boolean;
+  /** Whether a page load toward it is in flight. */
+  readonly loading: boolean;
+  /** The failure of the latest such load while it is still the query's error; else `null`. */
+  readonly error: ApiError | null;
+}
+
 /**
- * The `/decisions` resolver: every open and awaiting-platform discrepancy of the active
- * datasets (`GET /discrepancies`, all pages), oldest `detected_at` first as the API returns
- * them, one {@link Card} each with `id="discrepancy-{id}"`, so links to a blocking discrepancy
- * can target it.
+ * Brings the card a link names into view: `/decisions#discrepancy-{id}`, the link a held card on
+ * `/actions` gives a blocker that has no C0 card in its run (`BlockingDiscrepancies`). The list
+ * is paged, so on arrival the card may not be loaded yet, and the router's own scroll to the
+ * hash, made once the route has rendered, finds no element.
+ *
+ * The hash is read through the router (`useLocation`), so a client-side `Link` navigation is
+ * seen as well as a full page load, and a hash that changes while the resolver is shown is
+ * followed.
+ *
+ * - **Loading.** While the loaded pages do not hold the discrepancy and the API names a next
+ *   page, the next page is loaded with `fetchNextPage`: the same `DISCREPANCY_PAGE_SIZE`-row load
+ *   "Show more" makes, under the same paging guards, one load at a time, until the card is
+ *   loaded or the list ends. The whole list is never read in one request. No load starts while
+ *   the list is being read already (a poll, a retry, or "Show more", which `busy` reports),
+ *   before the render that shows the previous load, or while the list's latest read failed; a
+ *   failed load is therefore tried again only after a later read of the list succeeds.
+ * - **Scrolling.** Once the card has rendered, it is scrolled into view, once per hash: polls
+ *   and later pages never scroll again, while a new hash does, and so does the same hash
+ *   followed again after it was cleared. Focus is not moved.
+ *
+ * @param query - The resolver's `useDiscrepancyPages()` result.
+ * @param busy - Whether "Show more" is loading a page.
+ * @returns The linked discrepancy's id, whether it is listed, and its loads' state.
+ */
+function useLinkedDiscrepancy(query: DiscrepancyPagesQuery, busy: boolean): LinkedDiscrepancy {
+  const hash = useLocation({ select: (location) => location.hash });
+  const id = linkedDiscrepancyId(hash);
+  const { data: list, error, hasNextPage, isFetching, fetchNextPage } = query;
+  const { dataUpdatedAt, errorUpdatedAt } = query;
+  const listed =
+    id !== null &&
+    list !== undefined &&
+    list.discrepancies.some((discrepancy) => String(discrepancy.id) === id);
+
+  const [load, setLoad] = useState<LinkedLoad | null>(null);
+  // TanStack notifies observers on a later tick, so a settled load waits for the render that
+  // shows it; deciding from the list before it would load a page past the one just read.
+  const awaitingLoad =
+    load !== null &&
+    (load.pending || dataUpdatedAt < load.dataUpdatedAt || errorUpdatedAt < load.errorUpdatedAt);
+  const loadNext =
+    id !== null &&
+    list !== undefined &&
+    !listed &&
+    hasNextPage &&
+    !isFetching &&
+    !busy &&
+    error === null &&
+    !awaitingLoad;
+
+  useEffect(() => {
+    if (!loadNext) {
+      return;
+    }
+    setLoad(PENDING_LINKED_LOAD);
+    // `cancelRefetch: false` joins a poll that started since this render instead of cancelling
+    // it, so the list is never read twice at once.
+    void fetchNextPage({ cancelRefetch: false }).then((result) => {
+      setLoad({
+        pending: false,
+        dataUpdatedAt: result.dataUpdatedAt,
+        errorUpdatedAt: result.errorUpdatedAt,
+        error: result.isFetchNextPageError ? result.error : null,
+      });
+    });
+  }, [loadNext, fetchNextPage]);
+
+  // The hash whose card was scrolled to; cleared with the hash, so a link followed again scrolls.
+  const scrolledFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (id === null) {
+      scrolledFor.current = null;
+      return;
+    }
+    if (!listed || scrolledFor.current === id) {
+      return;
+    }
+    const card = document.getElementById(cardId(id));
+    if (card === null) {
+      return;
+    }
+    scrolledFor.current = id;
+    // Environments without layout, such as jsdom, do not implement scrollIntoView.
+    if (typeof card.scrollIntoView === 'function') {
+      card.scrollIntoView({ block: 'start' });
+    }
+  }, [id, listed]);
+
+  return {
+    id,
+    listed,
+    loading: load?.pending === true,
+    error: load?.error != null && error === load.error ? load.error : null,
+  };
+}
+
+/**
+ * The `/decisions` resolver: the open and awaiting-platform discrepancies of the active datasets,
+ * oldest `detected_at` first as the API returns them, a page at a time (`useDiscrepancyPages`,
+ * `DISCREPANCY_PAGE_SIZE` rows per page), one {@link Card} each with
+ * `id="discrepancy-{id}"`, the target of links to a blocking discrepancy, in a list labelled
+ * "Discrepancies to resolve".
  *
  * Each card's heading is an `<h3>` below the page's "Discrepancies" section heading. Its entity
  * line reads "{source} · {Campaign or Shared budget} · {kind}", and its body the state ("Open" or
@@ -706,50 +992,254 @@ function DiscrepancyCard({ discrepancy, displayTimezone }: DiscrepancyCardProps)
  * {instant}", formatted in the default run's `display_timezone`, or in UTC, so labelled, until
  * that run is known. The footer holds {@link DiscrepancyResolution}.
  *
- * States: a `Spinner` "Loading discrepancies" while the first read runs; an `EmptyState`
- * "Discrepancies could not be loaded" with the API message when it fails; an `EmptyState` "No
- * open discrepancies" when there are none. A failed refresh of a list already shown keeps the
- * list and adds a warning banner, because a discrepancy left on screen still blocks the items
- * that depend on it (AAP 0.5.4.2 P1).
+ * **Paging** (AAP 0.1.1 performance). Only the pages loaded so far are fetched and mounted.
+ * Below the list a "Show more discrepancies" `Button` loads the next page while the API names
+ * one; it shows its loading state meanwhile, and once the page is shown focus returns to it, or,
+ * after the last page removed it, moves to the first discrepancy the page added, unless the user
+ * moved focus elsewhere (WCAG 2.2 SC 2.4.3). Every discrepancy stays reachable.
+ *
+ * **Linked discrepancy** (AAP 0.5.5 "with the blocking discrepancy linked"). When the location
+ * hash names a card, `#discrepancy-{id}` as a held card's link on `/actions` does, on arrival or
+ * by a later change, the resolver loads the next page while the pages loaded so far do not hold
+ * that discrepancy and the API names one, a page at a time as "Show more" would, with "Show more"
+ * in its loading state meanwhile. Once the card has rendered it is scrolled into view, once per
+ * hash, without moving focus. When every page is read and none holds it, the status region says
+ * so (see below). A failed load reads as a failed "Show more".
+ *
+ * **One polite status region** (WCAG 2.2 SC 4.1.3). The resolver renders a single
+ * `role="status"` element in every state, from the first render, outside the card list, so
+ * each outcome lands in a region assistive technology already watches and is announced
+ * politely. It never carries `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner
+ * on `/actions`. The `Spinner` sits outside it, because it is a status element of its own. The
+ * region holds, as they apply:
+ *
+ * - the first read failed: an `EmptyState` "Discrepancies could not be loaded" with the API's
+ *   message and a "Retry" `Button`. It stays in place while the read runs again, by poll or by
+ *   Retry, so it never flickers back to the spinner, and focus returns to Retry once a retry
+ *   the user started settles;
+ * - a refetch of a loaded list failed: a warning `Banner` "Discrepancies could not be
+ *   refreshed" with the API's message, saying the list shown is the state as last loaded at
+ *   {instant}, or that none were open then when that read listed and counted none, with
+ *   "Retry". A discrepancy left on screen still blocks the items that depend on it (AAP 0.5.4.2
+ *   P1), so the list and its summary lines below are kept, and an empty list from an earlier
+ *   read is never presented as the current state;
+ * - the latest read succeeded, every page is read, nothing is listed and the API's
+ *   `X-Total-Count` is 0 or absent: an `EmptyState` "No open discrepancies", "Platform state
+ *   matches every last decision.";
+ * - a loaded list: "Showing {n} of {total} unresolved discrepancies", the total from the API's
+ *   `X-Total-Count`, or "Showing {n} unresolved discrepancies" without one. While "Show more"
+ *   remains, the rest may still load, so nothing more is said;
+ * - every page is read and the total exceeds what is listed: the API counts, but cannot list, a
+ *   discrepancy whose campaign or shared budget cannot be loaded, so a line beneath the summary
+ *   reads "{total − n} cannot be shown because their campaigns or shared budgets could not be
+ *   loaded.", or, with nothing listed, stands in place of the summary as "{total} unresolved
+ *   discrepancies cannot be shown because …". A positive total is never shown as "No open
+ *   discrepancies", which would contradict the `/actions` banner's count (AAP 0.5.4.2 P1);
+ * - every page is read and none holds the discrepancy the hash links to: "Discrepancy {id} is
+ *   no longer unresolved.", or, while some discrepancies cannot be shown, "Discrepancy {id} is
+ *   not listed: it is no longer unresolved, or its campaign or shared budget could not be
+ *   loaded.";
+ * - "Show more", or a page load toward the linked discrepancy, failed: a warning `Banner` "More
+ *   discrepancies could not be loaded" with the API's message; "Show more" stays to try again;
+ * - a resolution closed a discrepancy: "{subject} resolved", until the next successful read.
+ *   The closed card leaves the refetched list before its own status line could be announced.
+ *
+ * The list refreshes itself every 30 s while shown (`useDiscrepancyPages`), so discrepancies the
+ * worker opens or auto-resolves appear without a reload.
  */
 export function DiscrepancyResolver() {
-  const discrepancies = useDiscrepancies();
+  const query = useDiscrepancyPages();
   const defaultRun = useDefaultRun();
   const displayTimezone = textOrNull(defaultRun.data?.display_timezone) ?? FALLBACK_TIMEZONE;
+  const list = query.data;
+  const { dataUpdatedAt, errorUpdatedAt } = query;
+  const failure = useSettledFailure(query.error, query.fetchStatus !== 'idle', list !== undefined);
+  const { retrying, buttonRef: retryButtonRef, retry } = useRetry(query.refetch);
 
-  if (discrepancies.data === undefined) {
-    if (discrepancies.isError) {
-      return (
-        <EmptyState title="Discrepancies could not be loaded">
-          {resolveErrorMessage(discrepancies.error)}
-        </EmptyState>
+  const [closure, setClosure] = useState<Closure | null>(null);
+  const handleResolved = (updated: Discrepancy) => {
+    if (updated.state === 'resolved') {
+      setClosure({ text: `${subjectTitle(updated)} resolved`, at: Date.now() });
+    }
+  };
+
+  // "Show more": the button is loading, hence disabled, until the page settles; then focus is
+  // placed once the render that shows the page has committed.
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [settledMore, setSettledMore] = useState<SettledMore | null>(null);
+  const focusedMoreRef = useRef<SettledMore | null>(null);
+  const showMoreRef = useRef<HTMLButtonElement>(null);
+  const firstNewRef = useRef<HTMLLIElement>(null);
+  const linked = useLinkedDiscrepancy(query, loadingMore);
+
+  useEffect(() => {
+    if (settledMore === null || focusedMoreRef.current === settledMore) {
+      return;
+    }
+    if (dataUpdatedAt < settledMore.dataUpdatedAt || errorUpdatedAt < settledMore.errorUpdatedAt) {
+      // TanStack notifies observers on a later tick; wait for the render that shows the page.
+      return;
+    }
+    focusedMoreRef.current = settledMore;
+    const active = document.activeElement;
+    if (active !== null && active !== document.body) {
+      return;
+    }
+    const button = showMoreRef.current;
+    if (button !== null && button.isConnected && !button.disabled) {
+      button.focus();
+      return;
+    }
+    const firstNew = firstNewRef.current;
+    if (firstNew !== null && firstNew.isConnected) {
+      firstNew.focus();
+    }
+  }, [settledMore, dataUpdatedAt, errorUpdatedAt]);
+
+  const showMore = async (): Promise<void> => {
+    if (list === undefined || loadingMore || linked.loading) {
+      return;
+    }
+    const firstNew = list.discrepancies.length;
+    setLoadingMore(true);
+    try {
+      const result = await query.fetchNextPage();
+      setSettledMore({
+        firstNew,
+        dataUpdatedAt: result.dataUpdatedAt,
+        errorUpdatedAt: result.errorUpdatedAt,
+        error: result.isFetchNextPageError ? result.error : null,
+      });
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const retryButton = (
+    <Button
+      ref={retryButtonRef}
+      loading={retrying}
+      onClick={() => {
+        void retry();
+      }}
+    >
+      {RETRY_LABEL}
+    </Button>
+  );
+
+  // A failed "Show more", or a failed page load toward a linked card, stays its own notice while
+  // that error is the query's current one; any other error on a loaded list is a failed refresh.
+  const moreError =
+    settledMore?.error != null && query.error === settledMore.error
+      ? settledMore.error
+      : linked.error;
+  const refreshError = list !== undefined && query.error !== moreError ? query.error : null;
+  const notices: ReactNode[] = [];
+  if (list === undefined) {
+    if (failure !== null) {
+      notices.push(
+        <EmptyState key="load-error" title={LOAD_ERROR_TITLE} action={retryButton}>
+          {readErrorMessage(failure)}
+        </EmptyState>,
       );
     }
-    return <Spinner label="Loading discrepancies" />;
+  } else {
+    const shown = list.discrepancies.length;
+    const complete = !query.hasNextPage;
+    const unavailable = unavailableCount(shown, list.total, complete);
+    // Nothing is open only when every page is read, none is listed and the API counts none: a
+    // positive total over an empty list means its subjects could not be loaded, never that the
+    // platform matches every decision.
+    const noneOpen = complete && shown === 0 && (list.total ?? 0) === 0;
+    if (refreshError !== null) {
+      const loadedAt = lastLoadedText(dataUpdatedAt, displayTimezone);
+      const asLoaded = noneOpen
+        ? `No discrepancies were open when the list was last loaded ${loadedAt}.`
+        : `Showing the list as last loaded ${loadedAt}.`;
+      notices.push(
+        <Banner
+          key="refresh-error"
+          tone="warning"
+          title={REFRESH_ERROR_TITLE}
+          actions={retryButton}
+        >
+          <Stack gap={1}>
+            <div>{readErrorMessage(refreshError)}</div>
+            <div>{asLoaded}</div>
+          </Stack>
+        </Banner>,
+      );
+    } else if (noneOpen) {
+      notices.push(
+        <EmptyState key="empty" title={EMPTY_TITLE}>
+          {EMPTY_REASON}
+        </EmptyState>,
+      );
+    }
+    // With nothing listed, the unavailable line names the total in place of the summary.
+    if (shown > 0 || (!noneOpen && unavailable === 0)) {
+      notices.push(<div key="summary">{summaryText(shown, list.total)}</div>);
+    }
+    if (unavailable > 0) {
+      notices.push(<div key="unavailable">{unavailableText(unavailable, shown > 0)}</div>);
+    }
+    if (linked.id !== null && complete && !linked.listed) {
+      notices.push(<div key="linked-absent">{linkedAbsentText(linked.id, unavailable)}</div>);
+    }
+    if (moreError !== null) {
+      notices.push(
+        <Banner key="more-error" tone="warning" title={MORE_ERROR_TITLE}>
+          {readErrorMessage(moreError)}
+        </Banner>,
+      );
+    }
   }
-
-  if (discrepancies.data.length === 0) {
-    return (
-      <EmptyState title="No open discrepancies">
-        Platform state matches every last decision.
-      </EmptyState>
-    );
+  if (closure !== null && dataUpdatedAt <= closure.at) {
+    notices.push(<div key="closure">{closure.text}</div>);
   }
 
   return (
+    // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text or live-region primitive and
+    // feature code carries no CSS (AAP 0.4.4), so the status region and its text lines are
+    // unstyled <div> elements spaced by the Stack gap alone; Stack takes the region out of the
+    // column while it is empty.
     <Stack gap={4}>
-      {discrepancies.isError ? (
-        <Banner tone="warning" title="Discrepancies could not be refreshed">
-          {resolveErrorMessage(discrepancies.error)}
-        </Banner>
+      {list === undefined && failure === null ? <Spinner label={LOADING_LABEL} /> : null}
+      <div role="status">{notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}</div>
+      {list !== undefined && list.discrepancies.length > 0 ? (
+        <Stack as="ul" gap={4} aria-label={LIST_LABEL}>
+          {list.discrepancies.map((discrepancy, index) => {
+            const isFirstNew = settledMore !== null && index === settledMore.firstNew;
+            return (
+              <li
+                key={discrepancy.id}
+                ref={isFirstNew ? firstNewRef : undefined}
+                tabIndex={isFirstNew ? -1 : undefined}
+              >
+                <DiscrepancyCard
+                  discrepancy={discrepancy}
+                  displayTimezone={displayTimezone}
+                  onResolved={handleResolved}
+                />
+              </li>
+            );
+          })}
+        </Stack>
       ) : null}
-      <Stack as="ul" gap={4} aria-label="Discrepancies to resolve">
-        {discrepancies.data.map((discrepancy) => (
-          <li key={discrepancy.id}>
-            <DiscrepancyCard discrepancy={discrepancy} displayTimezone={displayTimezone} />
-          </li>
-        ))}
-      </Stack>
+      {list !== undefined && query.hasNextPage ? (
+        <Inline gap={2}>
+          <Button
+            ref={showMoreRef}
+            variant="secondary"
+            loading={loadingMore || linked.loading}
+            onClick={() => {
+              void showMore();
+            }}
+          >
+            {SHOW_MORE_LABEL}
+          </Button>
+        </Inline>
+      ) : null}
     </Stack>
   );
 }

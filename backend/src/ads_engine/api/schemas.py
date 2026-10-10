@@ -1147,7 +1147,9 @@ class Evidence(ApiModel):
     ``provenance`` is frozen at compute time and never replaced by the current source
     status; the current status travels separately in :attr:`ItemOverlay.data_status_now`.
     White-paper items carry their per-creative rows in ``extra.rows``; expansion items carry
-    their adjacent terms in ``extra.adjacent_terms``.
+    their adjacent terms in ``extra.adjacent_terms``. Every card names its headline number in
+    ``extra.headline_metric``, the ``key`` of one of its own ``metrics``; white-paper rows
+    name none.
 
     Attributes:
         window: The exact window and each source's day boundary.

@@ -7,13 +7,16 @@
  * changes the wrapper's internals must still pass them:
  * - one `tablist` named by `label`, one `tab` per item named by its label and count;
  * - exactly one tab selected (`aria-selected`), alone in the Tab sequence, controlling the one
- *   visible `tabpanel`, which is labelled by its tab; hidden panels stay mounted;
+ *   visible `tabpanel`, which is labelled by its tab; every panel element exists from the start
+ *   (named by the tab's `id` when given), its content mounts on its tab's first selection and
+ *   then stays mounted;
  * - ArrowRight and ArrowLeft wrap, Home and End jump, focus and selection move together, and
  *   modified or unrelated keys are left to the browser;
  * - uncontrolled by default, controlled through `selectedKey` and `onChange`, with an unknown
  *   key falling back to the first tab, and nothing rendered for an empty `tabs` array.
  */
 import { fireEvent, render, screen } from '@testing-library/react';
+import { useEffect, useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { Tabs, type TabItem } from './Tabs';
@@ -24,6 +27,11 @@ const KEYWORD_TABS: readonly TabItem[] = [
   { key: 'expand', label: 'Expand', count: 0, content: <p>Expand list</p> },
   { key: 'review', label: 'Review', content: <p>Review list</p> },
 ];
+
+/** A tab keyed and labelled `key`, whose panel reads "{key} list". */
+function tabFixture(key: string): TabItem {
+  return { key, label: key, content: <p>{`${key} list`}</p> };
+}
 
 /** The tab elements in display order. */
 function allTabs(): HTMLElement[] {
@@ -93,13 +101,99 @@ describe('Tabs', () => {
       expect(visiblePanels).toHaveLength(1);
       expect(visiblePanels[0]).toBe(panels[0]);
       expect(visiblePanels[0]?.textContent).toBe('Block list');
-      // Hidden panels keep their content mounted.
-      expect(panels.map((panel) => panel.textContent)).toEqual([
-        'Block list',
-        'Expand list',
-        'Review list',
-      ]);
+      // Every panel element exists, so each aria-controls resolves, but a tab never selected has
+      // not mounted its content.
+      expect(panels.map((panel) => panel.textContent)).toEqual(['Block list', '', '']);
+      for (const tab of allTabs()) {
+        expect(document.getElementById(tab.getAttribute('aria-controls') ?? '')).not.toBeNull();
+      }
       expect(screen.getByRole('tabpanel', { name: 'Block 3' })).toBe(panels[0]);
+    });
+
+    it('mounts a panel on its first selection and keeps it mounted, hidden, afterwards', () => {
+      const mounts = vi.fn<(name: string) => void>();
+      /** Panel content that reports each mount and keeps a local count. */
+      function Probe({ name }: { name: string }) {
+        const [clicks, setClicks] = useState(0);
+        useEffect(() => {
+          mounts(name);
+        }, [name]);
+        return (
+          <button type="button" onClick={() => setClicks((count) => count + 1)}>
+            {`${name} ${String(clicks)}`}
+          </button>
+        );
+      }
+      render(
+        <Tabs
+          label="Keyword actions"
+          tabs={[
+            { key: 'block', label: 'Block', content: <Probe name="block" /> },
+            { key: 'expand', label: 'Expand', content: <Probe name="expand" /> },
+            { key: 'review', label: 'Review', content: <Probe name="review" /> },
+          ]}
+        />,
+      );
+      expect(mounts.mock.calls).toEqual([['block']]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'block 0' }));
+      fireEvent.click(tabAt(1));
+      expect(mounts.mock.calls).toEqual([['block'], ['expand']]);
+      expect(visiblePanelText()).toBe('expand 0');
+      // Block stays mounted while hidden, so its local state survives the switch.
+      const panels = screen.getAllByRole('tabpanel', { hidden: true });
+      expect(panels.map((panel) => panel.textContent)).toEqual(['block 1', 'expand 0', '']);
+
+      fireEvent.click(tabAt(0));
+      expect(visiblePanelText()).toBe('block 1');
+      expect(mounts.mock.calls).toEqual([['block'], ['expand']]);
+    });
+
+    it('mounts the panel a controlled parent selects without a click', () => {
+      const { rerender } = render(
+        <Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="block" />,
+      );
+      expect(
+        screen.getAllByRole('tabpanel', { hidden: true }).map((panel) => panel.textContent),
+      ).toEqual(['Block list', '', '']);
+
+      rerender(<Tabs label="Keyword actions" tabs={KEYWORD_TABS} selectedKey="review" />);
+
+      expect(selectedStates()).toEqual(['false', 'false', 'true']);
+      expect(visiblePanelText()).toBe('Review list');
+      expect(
+        screen.getAllByRole('tabpanel', { hidden: true }).map((panel) => panel.textContent),
+      ).toEqual(['Block list', '', 'Review list']);
+    });
+
+    it('names a panel by its tab id, which the tab controls, even before its content mounts', () => {
+      render(
+        <Tabs
+          label="Keyword actions"
+          tabs={[
+            { ...tabFixture('block'), id: 'group-keywords-block' },
+            { ...tabFixture('expand'), id: 'group-keywords-expand' },
+            { ...tabFixture('review'), id: '' },
+          ]}
+        />,
+      );
+
+      const expand = document.getElementById('group-keywords-expand');
+      expect(expand?.getAttribute('role')).toBe('tabpanel');
+      expect(expand?.hidden).toBe(true);
+      expect(expand?.textContent).toBe('');
+      expect(tabAt(1).getAttribute('aria-controls')).toBe('group-keywords-expand');
+      expect(expand?.getAttribute('aria-labelledby')).toBe(tabAt(1).id);
+      expect(tabAt(0).getAttribute('aria-controls')).toBe('group-keywords-block');
+      // An empty id falls back to the generated one, which still resolves.
+      const reviewPanelId = tabAt(2).getAttribute('aria-controls') ?? '';
+      expect(reviewPanelId).not.toBe('');
+      expect(document.getElementById(reviewPanelId)?.getAttribute('role')).toBe('tabpanel');
+
+      fireEvent.keyDown(tabAt(0), { key: 'ArrowRight' });
+      expect(document.activeElement).toBe(tabAt(1));
+      expect(expand?.hidden).toBe(false);
+      expect(expand?.textContent).toBe('expand list');
     });
 
     it('gives two tab sets on one page distinct ids', () => {

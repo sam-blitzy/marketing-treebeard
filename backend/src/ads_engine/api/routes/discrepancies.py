@@ -1,7 +1,8 @@
 """``/discrepancies``: list C0 discrepancies and apply their resolutions.
 
 AAP 0.5.3 (``GET /discrepancies?state=open``, paged oldest first by ``limit`` and the
-``after`` keyset cursor, with the next page named in a ``Link: rel="next"`` header;
+``after`` keyset cursor, with the next page named in a ``Link: rel="next"`` header and the
+number of listed rows in the requested states in ``X-Total-Count``;
 ``POST /discrepancies/{id}/resolve``), 0.5.4.4 ("C0 resolutions by kind and subject type")
 and 0.5.5 (the ``/decisions`` screen's ``DiscrepancyResolver``, which lists open and
 awaiting-platform discrepancies and renders exactly the resolutions valid for each one's kind
@@ -49,7 +50,7 @@ from datetime import datetime
 from typing import Annotated, Final, TypeIs, get_args
 
 from fastapi import APIRouter, Path, Query, Request, Response
-from sqlalchemy import select, tuple_
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine.api import schemas
@@ -69,7 +70,14 @@ from ads_engine.decisions import (
 )
 from ads_engine.logging import get_logger
 
-__all__ = ["DEFAULT_LIMIT", "MAX_LIMIT", "list_discrepancies", "resolve", "router"]
+__all__ = [
+    "DEFAULT_LIMIT",
+    "MAX_LIMIT",
+    "TOTAL_COUNT_HEADER",
+    "list_discrepancies",
+    "resolve",
+    "router",
+]
 
 router = APIRouter(tags=["discrepancies"])
 """The discrepancy routes; ``api/app.py`` mounts them under ``/api/v1``."""
@@ -81,6 +89,10 @@ DEFAULT_LIMIT: Final = 200
 
 MAX_LIMIT: Final = 500
 """The largest ``limit`` ``GET /discrepancies`` accepts."""
+
+TOTAL_COUNT_HEADER: Final = "X-Total-Count"
+"""The ``GET /discrepancies`` response header that carries how many discrepancy rows of the
+active datasets are in the requested states, on every page."""
 
 _INVALID_CURSOR_MESSAGE: Final = (
     "The after cursor names no discrepancy; list again from the first page"
@@ -226,6 +238,32 @@ async def _cursor_position(session: AsyncSession, after: int) -> tuple[datetime,
     return detected_at, after
 
 
+async def _total(session: AsyncSession, dataset_ids: Sequence[int], states: Sequence[str]) -> int:
+    """Return how many discrepancy rows of ``dataset_ids`` are in one of ``states``.
+
+    The count applies the list's dataset and state filters and ignores its cursor and
+    ``limit``. It counts every row, those whose subject cannot be loaded included, the way
+    the ``/actions`` overlay counts ``open_discrepancies`` for its banner, so for the default
+    unresolved states the two numbers agree.
+
+    Args:
+        session: The request's session.
+        dataset_ids: The active primary datasets; empty means no row can be listed.
+        states: The requested states.
+
+    Returns:
+        The row count, ``0`` when ``dataset_ids`` is empty.
+    """
+    if not dataset_ids:
+        return 0
+    count = await session.scalar(
+        select(func.count())
+        .select_from(Discrepancy)
+        .where(Discrepancy.dataset_id.in_(dataset_ids), Discrepancy.state.in_(states))
+    )
+    return 0 if count is None else count
+
+
 def _next_link(request: Request, after: int) -> str:
     """Return the RFC 8288 ``Link`` header value that names the next page.
 
@@ -319,9 +357,18 @@ async def list_discrepancies(
     therefore hold fewer than ``limit`` discrepancies while its ``Link`` header still
     announces more.
 
+    **Total.** Every page, the first and each later one, carries an ``X-Total-Count``
+    header: the number of discrepancy rows of the active datasets whose state is one of
+    ``state``, read when the page is served and independent of ``after`` and ``limit``, or
+    ``0`` when no dataset is active. It counts the rows whose subject cannot be loaded as
+    well, exactly as the ``/actions`` overlay counts ``open_discrepancies`` for its
+    discrepancy banner, so a client can show "{shown} of {total}" without reading every
+    page, and the two screens report the same number. The body stays the page's
+    ``Discrepancy[]``.
+
     Args:
         request: The current request; its path and query build the ``Link`` header.
-        response: The response that carries the ``Link`` header.
+        response: The response that carries the ``Link`` and ``X-Total-Count`` headers.
         user: The signed-in user; the route requires a session and reads nothing else from it.
         session: The request's session.
         state: The states to list; ``open`` and ``awaiting_platform`` by default.
@@ -339,11 +386,13 @@ async def list_discrepancies(
     """
     cursor = None if after is None else await _cursor_position(session, after)
     dataset_ids = sorted(dataset.id for dataset in (await active_datasets(session)).values())
+    states = sorted(set(state))
+    response.headers[TOTAL_COUNT_HEADER] = str(await _total(session, dataset_ids, states))
     if not dataset_ids:
         return []
     statement = select(Discrepancy).where(
         Discrepancy.dataset_id.in_(dataset_ids),
-        Discrepancy.state.in_(sorted(set(state))),
+        Discrepancy.state.in_(states),
     )
     if cursor is not None:
         # The row comparison is the keyset bound; PostgreSQL also derives its leading

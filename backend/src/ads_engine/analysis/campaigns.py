@@ -1421,6 +1421,9 @@ def _c2_candidate(
             else (*C2_THRESHOLD_KEYS, *VETO_THRESHOLD_KEYS)
         ),
         extra=extra,
+        # Scale rests on the capped budget's utilization; Hold on the Qualified Leads the veto
+        # found missing.
+        headline="window_utilization" if scale else "ql",
     )
     return Candidate(
         rule_id=C2,
@@ -1672,6 +1675,8 @@ def _c1_candidate(
             C1_THRESHOLD_KEYS if view.veto is None else (*C1_THRESHOLD_KEYS, *VETO_THRESHOLD_KEYS)
         ),
         extra={"proposed_status": "paused", **_campaign_group_extra(ctx, campaign)},
+        # The pause rests on the spend that produced no outcome.
+        headline="spend",
     )
     reason = (
         f"Spent {_money_of(evidence, 'spend')} on {_value(evidence, 'spend_days')} of "
@@ -1846,6 +1851,8 @@ def _c1b_candidate(
             "matured_ql": veto.ql,
             **_campaign_group_extra(ctx, campaign),
         },
+        # The pipeline pause rests on the zero Qualified Leads.
+        headline="ql",
     )
     reason = (
         f"{_value(evidence, 'eligible_contacts')} eligible contacts from "
@@ -2105,6 +2112,8 @@ def _c3a_candidate(
             "segment_window": {"start": row.window_start, "end": row.window_end},
             **_campaign_group_extra(ctx, campaign),
         },
+        # The segment is proven by its cost per lead against the campaign's.
+        headline="segment_cpl",
     )
     share = _value(evidence, "impression_share")
     reason = (
@@ -2332,6 +2341,8 @@ def _c3b_candidate(
             "campaign_ids": campaign_ids,
             "source_label": "from your search-term report",
         },
+        # The uncovered cluster is proven by its conversions.
+        headline="conversions",
     )
     reason = (
         f"{_value(evidence, 'members')} converting search terms cluster around the words "

@@ -76,6 +76,7 @@ import { Button, EmptyState, PageShell, Spinner, Stack } from '../../design-syst
 import { CustomRunBanner } from '../status/CustomRunBanner';
 import { GlobalBanners } from '../status/GlobalBanners';
 import { StatusBar } from '../status/StatusBar';
+import { BlockingDiscrepanciesProvider } from './BlockingDiscrepancies';
 import { ActionOutcomeProvider } from './RecommendationCard';
 import { SectionNav } from './SectionNav';
 import { BudgetSection } from './sections/BudgetSection';
@@ -411,7 +412,9 @@ interface ActionsContentProps {
  * navigation and the five sections in {@link SECTION_ORDER}, each with the run and overlay of the
  * same response, so every part describes one moment. The sections sit inside one
  * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
- * section, announces each card's outcome even after the card has left the page.
+ * section, announces each card's outcome even after the card has left the page, and inside one
+ * {@link BlockingDiscrepanciesProvider}, through which each held card links the discrepancies
+ * that hold it.
  *
  * Memoized on `page`: the page re-renders whenever its read's fetch status changes, at the start
  * and the end of every poll, and this content renders again only for a newly delivered page.
@@ -428,15 +431,19 @@ const ActionsContent = memo(function ActionsContent({ page }: ActionsContentProp
       <GlobalBanners banners={banners} overlay={overlay} />
       <SectionNav sections={sections} />
       <ActionOutcomeProvider>
-        {SECTION_ORDER.map((key) => {
-          const section = sectionsByKey.get(key);
-          // The API always returns all five sections; a key it left out is skipped, never stubbed.
-          if (section === undefined) {
-            return null;
-          }
-          const SectionComponent = SECTION_RENDERERS[key];
-          return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
-        })}
+        {/* Held cards link the discrepancies that hold them: the run's C0 cards or /decisions. */}
+        <BlockingDiscrepanciesProvider sections={sections}>
+          {SECTION_ORDER.map((key) => {
+            const section = sectionsByKey.get(key);
+            // The API always returns all five sections; a key it left out is skipped, never
+            // stubbed.
+            if (section === undefined) {
+              return null;
+            }
+            const SectionComponent = SECTION_RENDERERS[key];
+            return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
+          })}
+        </BlockingDiscrepanciesProvider>
       </ActionOutcomeProvider>
     </ActionsFrame>
   );

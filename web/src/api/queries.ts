@@ -30,10 +30,14 @@
  *   historical marking) appear without a reload or a refocus. Without a run id they poll
  *   every {@link FIRST_RUN_POLL_MS} instead while no default run has succeeded yet, so the
  *   first-start screen fills in by itself. A transient failure keeps polling; an expired
- *   session (401) or any other error stops it. {@link useSources} polls every
- *   {@link SOURCES_POLL_MS}. Polling runs only while the page is visible and stops when the
- *   last component using the query unmounts. A prefetch ({@link usePrefetchActionsReads})
- *   registers no component, so it reads once and never polls.
+ *   session (401) or any other error stops it. {@link useDecisions}, {@link useDiscrepancies}
+ *   and {@link useDiscrepancyPages} refetch every {@link CURRENT_STATE_POLL_MS} with the same
+ *   error rule, because the worker writes baseline decisions and opens and auto-resolves
+ *   discrepancies on its own schedule; the paged list refetches only the pages already
+ *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. Polling runs only while
+ *   the page is visible and stops when the last component using the query unmounts. A
+ *   prefetch ({@link usePrefetchActionsReads}) registers no component, so it reads once and
+ *   never polls.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -68,14 +72,16 @@
 import {
   queryOptions,
   skipToken,
+  useInfiniteQuery,
   useMutation,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import type { QueryClient } from '@tanstack/react-query';
+import type { InfiniteData, QueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect } from 'react';
 
 import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
+import type { ApiPage } from './client';
 import type {
   ConfigView,
   CreateRunRequest,
@@ -195,6 +201,16 @@ const DEFAULT_CUSTOM_RUNS_LIMIT = 20;
  */
 const DISCREPANCY_PAGE_LIMIT = 500;
 
+/**
+ * How many discrepancy rows each page of {@link useDiscrepancyPages} asks `GET /discrepancies`
+ * for: the `limit` of its first request, which later pages carry in the `Link` header's next
+ * target. The resolver mounts one card per discrepancy, so it shows this many at first and this
+ * many more per "Show more", rather than downloading and mounting the whole list (AAP 0.1.1
+ * performance). A page can hold fewer discrepancies while more follow, because the API leaves
+ * out one whose subject it cannot load.
+ */
+export const DISCREPANCY_PAGE_SIZE = 50;
+
 /** The error codes that mean "no default run has succeeded yet" for a run read. */
 const AWAITING_FIRST_RUN_CODES: ReadonlySet<string> = new Set(['not_found', 'run_not_ready']);
 
@@ -271,6 +287,18 @@ export interface DecisionsFilter {
 }
 
 /**
+ * Options of {@link useDiscrepancies}. They never enter the query key, so every reader of the
+ * same states shares one cache entry and one request.
+ */
+export interface DiscrepanciesOptions {
+  /**
+   * Whether the hook may send `GET /discrepancies`; `true` when omitted. `false` sends nothing
+   * and returns only what the cache already holds for the key.
+   */
+  enabled?: boolean;
+}
+
+/**
  * Returns a copy of `filter` holding only its defined members, so `{}` and
  * `{ subject_id: undefined }` produce the same, deep-equal query key.
  */
@@ -311,7 +339,8 @@ function pathSegment(id: string | number): string {
  * | `runs.custom(limit)` | `GET /runs?kind=custom&limit=` |
  * | `recommendations(runId \| 'default')` | `GET /recommendations[?run_id=]` |
  * | `decisions(filter)` | `GET /decisions[?subject_type=&subject_id=]` |
- * | `discrepancies(states)` | `GET /discrepancies?state=…` |
+ * | `discrepancies(states)` | `GET /discrepancies?state=…`, every page |
+ * | `discrepancyPages(states)` | `GET /discrepancies?state=…&limit=50`, the pages loaded so far |
  * | `sources` | `GET /sources` |
  * | `config` | `GET /config` |
  *
@@ -353,6 +382,12 @@ export const queryKeys = {
   discrepanciesAll: ['discrepancies'] as const,
   /** The discrepancies in `states`, copied so a later change to the array cannot alter it. */
   discrepancies: (states: readonly DiscrepancyState[]) => ['discrepancies', [...states]] as const,
+  /**
+   * The paged discrepancy list in `states` ({@link useDiscrepancyPages}), under the same root,
+   * so every write that invalidates `discrepanciesAll` refreshes it; the states are copied.
+   */
+  discrepancyPages: (states: readonly DiscrepancyState[]) =>
+    ['discrepancies', 'pages', [...states]] as const,
   /** Every source's health, `GET /sources`. */
   sources: ['sources'] as const,
   /** The read-only configuration, `GET /config`. */
@@ -593,6 +628,12 @@ export function useRecommendations(runId?: RunId) {
  * Status codes: 200; 422 `invalid_query` when `subject_id` comes without `subject_type`.
  * Recording a decision or resolving a discrepancy invalidates every variant.
  *
+ * The worker writes decisions too (the baseline of each new dataset, AAP 0.5.2), and other
+ * sessions record them, so a shown log refetches every {@link CURRENT_STATE_POLL_MS} (AAP 0.3.2
+ * "Refresh after change"). A transient failure (unreachable server, 429, 5xx) keeps that
+ * cadence; a 401 or any other error stops polling. Polling runs only while the page is visible
+ * and ends when the last component using it unmounts.
+ *
  * @param filter - Restrict to one subject type, or to one subject (type and id).
  * @returns The query result, keyed by `queryKeys.decisions(filter)`.
  */
@@ -606,6 +647,7 @@ export function useDecisions(filter: DecisionsFilter = {}) {
         query: { subject_type: normalised.subject_type, subject_id: normalised.subject_id },
         signal,
       }),
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, false),
   });
 }
 
@@ -682,15 +724,301 @@ async function fetchAllDiscrepancies(
  * when the paging link cannot be parsed, leaves `/api/v1` or repeats a page already read.
  * Recording a decision or resolving a discrepancy invalidates every variant.
  *
+ * The worker opens discrepancies after each entity sync and resolves awaiting-platform ones
+ * when a snapshot matches, so a shown list refetches every {@link CURRENT_STATE_POLL_MS}
+ * (AAP 0.3.2 "Refresh after change"). A transient failure keeps that cadence; a 401 or any
+ * other error stops polling. Polling runs only while the page is visible and ends when the last
+ * component using it unmounts. A screen that shows the list itself rather than looking entries
+ * up in it reads {@link useDiscrepancyPages} instead, a page at a time.
+ *
+ * With `options.enabled` set to `false` the hook neither sends a request nor polls, yet still
+ * returns the list that an enabled reader of the same states has cached, and each refetch that
+ * reader makes. `/actions` uses this to read the list only when a held card's blocker cannot be
+ * named from the run itself (`BlockingDiscrepancies`). The C0 card lookups in `CampaignsSection`
+ * read the same `queryKeys.discrepancies(states)` entry. The `/decisions` resolver does not: it
+ * reads {@link useDiscrepancyPages}, keyed by `queryKeys.discrepancyPages(states)` under the
+ * same `discrepanciesAll` root, so one invalidation refreshes both.
+ *
  * @param states - The states to list; `open` and `awaiting_platform` when omitted.
- * @returns The query result, keyed by `queryKeys.discrepancies(states)`.
+ * @param options - See {@link DiscrepanciesOptions}; the read is enabled when omitted.
+ * @returns The query result, keyed by `queryKeys.discrepancies(states)`, whatever `options`.
  */
 export function useDiscrepancies(
   states: readonly DiscrepancyState[] = DEFAULT_DISCREPANCY_STATES,
+  options: DiscrepanciesOptions = {},
 ) {
   return useQuery({
     queryKey: queryKeys.discrepancies(states),
     queryFn: ({ signal }) => fetchAllDiscrepancies(states, signal),
+    enabled: options.enabled ?? true,
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, false),
+  });
+}
+
+/**
+ * What {@link useDiscrepancyPages} resolves `data` to: the discrepancies of the pages loaded so
+ * far and the size of the whole list.
+ */
+export interface DiscrepancyList {
+  /** The discrepancies loaded so far, oldest `detected_at` first, each once. */
+  discrepancies: Discrepancy[];
+  /**
+   * How many discrepancy rows of the active datasets are in the requested states, from the
+   * `X-Total-Count` header of the most recently read page. It includes rows the API leaves out
+   * of the list because their subject cannot be loaded, as the `/actions` banner counts them.
+   * `undefined` when the API sent no count.
+   */
+  total: number | undefined;
+}
+
+/**
+ * One load of {@link useDiscrepancyPages}, as its infinite query caches it: what one "Show more"
+ * (or the first read) added. Kept private; consumers read the flattened {@link DiscrepancyList}.
+ */
+interface DiscrepancyPage {
+  /** The discrepancies this load read, oldest first. */
+  discrepancies: Discrepancy[];
+  /** The `Link: rel="next"` page after this load, relative to `/api/v1`; `undefined` at the end. */
+  next: string | undefined;
+  /** The `X-Total-Count` of the last response this load read. */
+  total: number | undefined;
+  /**
+   * Every next link the read has followed up to and including this load, since its first page,
+   * so a later load can refuse a link already followed however many loads ago.
+   */
+  followed: readonly string[];
+  /**
+   * Whether this load re-read the list from its first page after a 422 `invalid_cursor`, so it
+   * holds every discrepancy shown before it as well as the new ones, and replaces the loads
+   * before it.
+   */
+  restarted: boolean;
+}
+
+/** Where one load of {@link useDiscrepancyPages} starts: its infinite query's page param. */
+interface DiscrepancyPageParam {
+  /** The previous load's next link, or `null` for the first page. */
+  next: string | null;
+  /** The next links the read followed before this load ({@link DiscrepancyPage.followed}). */
+  followed: readonly string[];
+  /** How many discrepancies are shown before this load, for a restart to re-read past them. */
+  shown: number;
+}
+
+/** The page param of the first load: the first page, nothing followed or shown yet. */
+const FIRST_DISCREPANCY_PAGE: DiscrepancyPageParam = Object.freeze({
+  next: null,
+  followed: Object.freeze([]),
+  shown: 0,
+});
+
+/**
+ * A 422 `invalid_cursor` on a followed link, inside one load of {@link useDiscrepancyPages}:
+ * the row the cursor names was purged between pages. {@link fetchDiscrepancyPage} catches it
+ * and restarts once from the first page, so it never leaves the query function.
+ */
+class ExpiredCursorError extends Error {
+  /** The API's own error, rethrown when the restart meets an expired cursor too. */
+  readonly apiError: ApiError;
+
+  /** @param apiError - The 422 `invalid_cursor` the followed link answered with. */
+  constructor(apiError: ApiError) {
+    super(apiError.message);
+    this.name = 'ExpiredCursorError';
+    this.apiError = apiError;
+  }
+}
+
+/**
+ * Reads one load of {@link useDiscrepancyPages}, starting at `start`: the first page
+ * (`state` repeated, `limit` {@link DISCREPANCY_PAGE_SIZE}) when `start` is `null`, otherwise
+ * the next link exactly as the API named it.
+ *
+ * The load keeps following the API's next link while it holds `shown` discrepancies or fewer
+ * and a next page exists. For a normal load `shown` is 0, so a load never ends empty while the
+ * API leaves out discrepancies whose subject it cannot load and more follow; "Show more" then
+ * always adds something or ends the list. A restart passes the count already shown, so it
+ * re-reads past them and adds at least one more.
+ *
+ * A next link in `followedBefore`, or followed earlier in this load, means the paging loops:
+ * the load rejects with an `invalid_response` {@link ApiError}. A 422 `invalid_cursor` on a
+ * followed link rejects with {@link ExpiredCursorError}; on the first page's own request it is
+ * the API's error unchanged. Every request carries `signal`.
+ */
+async function readDiscrepancyLoad(
+  states: readonly DiscrepancyState[],
+  start: string | null,
+  followedBefore: readonly string[],
+  shown: number,
+  signal: AbortSignal,
+): Promise<DiscrepancyPage> {
+  const followed = new Set(followedBefore);
+  const follow = async (next: string): Promise<ApiPage<Discrepancy[]>> => {
+    if (followed.has(next)) {
+      // GET /discrepancies answers every page with 200, the status this link came with.
+      throw new ApiError(200, 'invalid_response', REPEATED_PAGE_MESSAGE);
+    }
+    followed.add(next);
+    try {
+      return await apiFetchPage<Discrepancy[]>(next, { signal });
+    } catch (error) {
+      if (isApiError(error) && error.code === 'invalid_cursor') {
+        throw new ExpiredCursorError(error);
+      }
+      throw error;
+    }
+  };
+  let page =
+    start === null
+      ? await apiFetchPage<Discrepancy[]>('/discrepancies', {
+          query: { state: states, limit: DISCREPANCY_PAGE_SIZE },
+          signal,
+        })
+      : await follow(start);
+  const discrepancies: Discrepancy[] = [...page.data];
+  while (discrepancies.length <= shown && page.next !== undefined) {
+    page = await follow(page.next);
+    discrepancies.push(...page.data);
+  }
+  return {
+    discrepancies,
+    next: page.next,
+    total: page.total,
+    followed: [...followed],
+    restarted: false,
+  };
+}
+
+/**
+ * The query function of {@link useDiscrepancyPages}: one load from `param`
+ * ({@link readDiscrepancyLoad}).
+ *
+ * A 422 `invalid_cursor` on a followed link means the cursor's row was purged between pages,
+ * and the API says to list again from the first page. The load then restarts once from the
+ * first page, re-reads past the `param.shown` discrepancies already on screen and returns them
+ * with the new ones as a `restarted` load, which replaces the loads before it, so the list is
+ * never ended short and holds no row twice. A second `invalid_cursor` rejects with it.
+ */
+async function fetchDiscrepancyPage(
+  states: readonly DiscrepancyState[],
+  param: DiscrepancyPageParam,
+  signal: AbortSignal,
+): Promise<DiscrepancyPage> {
+  try {
+    return await readDiscrepancyLoad(states, param.next, param.followed, 0, signal);
+  } catch (error) {
+    if (!(error instanceof ExpiredCursorError)) {
+      throw error;
+    }
+  }
+  try {
+    const restart = await readDiscrepancyLoad(states, null, [], param.shown, signal);
+    return { ...restart, restarted: true };
+  } catch (error) {
+    throw error instanceof ExpiredCursorError ? error.apiError : error;
+  }
+}
+
+/**
+ * How many discrepancies `pages` show together: every load's since the last `restarted` load,
+ * which holds all those before it.
+ */
+function shownDiscrepancyCount(pages: readonly DiscrepancyPage[]): number {
+  let count = 0;
+  for (const page of pages) {
+    count = page.restarted ? page.discrepancies.length : count + page.discrepancies.length;
+  }
+  return count;
+}
+
+/**
+ * The `getNextPageParam` of {@link useDiscrepancyPages}: the last load's next link, the links
+ * the read followed so far and the count shown, or `undefined` once the API names no next page,
+ * which ends the list (`hasNextPage` false).
+ */
+function nextDiscrepancyPageParam(
+  lastPage: DiscrepancyPage,
+  allPages: DiscrepancyPage[],
+): DiscrepancyPageParam | undefined {
+  if (lastPage.next === undefined) {
+    return undefined;
+  }
+  return {
+    next: lastPage.next,
+    followed: lastPage.followed,
+    shown: shownDiscrepancyCount(allPages),
+  };
+}
+
+/**
+ * The `select` of {@link useDiscrepancyPages}: the loaded discrepancies in order, from the last
+ * `restarted` load on, and the total of the most recently read load, which is the last one
+ * (a refetch reads the loads in order, and "Show more" appends).
+ */
+function selectDiscrepancyList(
+  data: InfiniteData<DiscrepancyPage, DiscrepancyPageParam>,
+): DiscrepancyList {
+  let first = 0;
+  data.pages.forEach((page, index) => {
+    if (page.restarted) {
+      first = index;
+    }
+  });
+  const last = data.pages[data.pages.length - 1];
+  return {
+    discrepancies: data.pages.slice(first).flatMap((page) => page.discrepancies),
+    total: last?.total,
+  };
+}
+
+/**
+ * The discrepancies of the active datasets in `states`, oldest `detected_at` first, a page at a
+ * time: `GET /discrepancies?state=…&limit=50`, then each `Link: rel="next"` page exactly as the
+ * API names it (AAP 0.5.5 `DiscrepancyResolver`, AAP 0.1.1 performance).
+ *
+ * The first read loads {@link DISCREPANCY_PAGE_SIZE} rows' worth; `fetchNextPage()` loads the
+ * next while `hasNextPage` is true, so the screen never downloads or mounts more than the user
+ * asked to see, and every discrepancy stays reachable. `data` is a {@link DiscrepancyList}: the
+ * loaded discrepancies and the list's total from the API's `X-Total-Count`, so "{n} of {total}"
+ * can be shown without reading every page.
+ *
+ * Paging rules, as {@link useDiscrepancies} keeps them for the whole list:
+ *
+ * - A load keeps following the next link while it has read no discrepancy, because the API
+ *   leaves out one whose subject it cannot load, so "Show more" never adds nothing while more
+ *   exist.
+ * - A next link the read has already followed, in this load or an earlier one, rejects with an
+ *   `invalid_response` {@link ApiError} rather than loop.
+ * - A 422 `invalid_cursor` on a followed link restarts the load once from the first page,
+ *   re-reading past what is shown ({@link fetchDiscrepancyPage}); a second one rejects.
+ * - Every request carries TanStack's `signal`, so unmounting the screen aborts the page in
+ *   flight.
+ *
+ * A shown list refetches every {@link CURRENT_STATE_POLL_MS} (AAP 0.3.2): TanStack re-reads the
+ * pages already loaded, from the first, following fresh links, so new and auto-resolved
+ * discrepancies appear without a reload. A transient failure keeps that cadence; a 401 or any
+ * other error stops polling. A failed refetch or `fetchNextPage` keeps the loaded `data`.
+ * Recording a decision or resolving a discrepancy invalidates it through
+ * `queryKeys.discrepanciesAll`.
+ *
+ * Status codes: 200; 422 `validation_error` for an unknown state; 422 `invalid_cursor` only when
+ * it recurs after the restart; and `invalid_response` when a paging link or the total cannot be
+ * parsed, a link leaves `/api/v1`, or a link repeats.
+ *
+ * @param states - The states to list; `open` and `awaiting_platform` when omitted.
+ * @returns The infinite query result, keyed by `queryKeys.discrepancyPages(states)`, whose
+ *   `data` is a {@link DiscrepancyList}.
+ */
+export function useDiscrepancyPages(
+  states: readonly DiscrepancyState[] = DEFAULT_DISCREPANCY_STATES,
+) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.discrepancyPages(states),
+    queryFn: ({ pageParam, signal }) => fetchDiscrepancyPage(states, pageParam, signal),
+    initialPageParam: FIRST_DISCREPANCY_PAGE,
+    getNextPageParam: nextDiscrepancyPageParam,
+    select: selectDiscrepancyList,
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, false),
   });
 }
 

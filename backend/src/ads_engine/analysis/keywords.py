@@ -1292,6 +1292,8 @@ def _k1_candidate(
         sample=Sample(observed=row.clicks, required=n_star, unit="clicks"),
         threshold_keys=K1_THRESHOLD_KEYS,
         extra=extra,
+        # AAP 0.1.2: K1's headline number is the wasted spend.
+        headline="wasted_spend",
     )
     return Candidate(
         rule_id=K1,
@@ -1707,6 +1709,8 @@ def _k2_candidate(
         ),
         threshold_keys=K2_THRESHOLD_KEYS,
         extra=extra,
+        # An expansion rests on the term's conversions.
+        headline="conversions",
     )
     return Candidate(
         rule_id=K2,
@@ -2278,6 +2282,8 @@ def _k3_candidate(
         ),
         threshold_keys=K3_THRESHOLD_KEYS,
         extra=extra,
+        # The branch that fired: the latest quality score when it dropped, else the CPC rise.
+        headline="qs_last" if "quality_score" in triggers else "cpc_ratio",
     )
     return Candidate(
         rule_id=K3,

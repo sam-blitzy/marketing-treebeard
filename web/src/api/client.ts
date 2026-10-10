@@ -30,7 +30,8 @@
  *   `Link: <…>; rel="next"` header. {@link apiFetchPage} returns that target as a path
  *   relative to {@link API_BASE}, query included, which is passed back unchanged to read the
  *   next page. A page can hold fewer rows than its `limit` while more follow, so only a
- *   missing `rel="next"` ends a list.
+ *   missing `rel="next"` ends a list. The page's `X-Total-Count` header, the size of the whole
+ *   list, becomes {@link ApiPage.total}; a malformed one is an `invalid_response`.
  *
  * The module has no state and no side effects at load time. It calls the global `fetch` at
  * request time, so `vi.stubGlobal('fetch', impl)` replaces it in tests. It never logs: request
@@ -93,6 +94,19 @@ const INVALID_RESPONSE_MESSAGE = 'The server returned an unreadable response.';
 
 /** Message for a paged response whose `Link` header is malformed or names an invalid next page. */
 const INVALID_LINK_MESSAGE = 'The server returned an invalid link to the next page.';
+
+/**
+ * The header a paged list sends with the size of the whole list on every page, for example
+ * `GET /discrepancies` (`TOTAL_COUNT_HEADER` in
+ * `backend/src/ads_engine/api/routes/discrepancies.py`).
+ */
+const TOTAL_COUNT_HEADER = 'X-Total-Count';
+
+/** Message for a paged response whose `X-Total-Count` header is not a non-negative integer. */
+const INVALID_TOTAL_MESSAGE = 'The server returned an invalid total count.';
+
+/** A non-negative decimal integer as an HTTP header carries it: digits only, no sign. */
+const TOTAL_COUNT_PATTERN = /^\d+$/;
 
 /**
  * Origin used only to resolve a `Link` target and check that it stays on the SPA's origin. The
@@ -172,6 +186,13 @@ export interface ApiPage<T> {
    * `Link` header or names no next page, which means the list is complete.
    */
   next: string | undefined;
+  /**
+   * The size of the whole list from the response's `X-Total-Count` header, read when this page
+   * was served and independent of its cursor and `limit`; for `GET /discrepancies` the rows of
+   * the active datasets in the requested states, including any the page leaves out. `undefined`
+   * when the response has no such header.
+   */
+  total: number | undefined;
 }
 
 /**
@@ -312,7 +333,8 @@ export type ApiErrorCode =
   /**
    * A 2xx response whose body could not be read or is not JSON, or a paged response whose
    * `Link` header cannot be parsed or names a `rel="next"` page that is not a path under
-   * {@link API_BASE}, or that repeats a page already read.
+   * {@link API_BASE}, or that repeats a page already read, or whose `X-Total-Count` header is
+   * not a non-negative integer.
    */
   | 'invalid_response'
   /** Status 0: the body cannot be encoded as JSON, or a `GET` was given one; nothing was sent. */
@@ -760,6 +782,28 @@ function nextPage(response: Response): string | undefined {
   return next;
 }
 
+/**
+ * The size of the whole list a paged response's `X-Total-Count` header states, or `undefined`
+ * when the response has no such header.
+ *
+ * Throws an `invalid_response` {@link ApiError} with the response's status when the header is
+ * present but is not a non-negative safe integer in plain decimal digits: empty, signed,
+ * fractional, in exponent form, larger than `Number.MAX_SAFE_INTEGER`, or several values joined
+ * by `, `. Showing a guessed total would misstate how much of the list is still unread.
+ */
+function totalCount(response: Response): number | undefined {
+  const header = response.headers.get(TOTAL_COUNT_HEADER);
+  if (header === null) {
+    return undefined;
+  }
+  const text = header.trim();
+  const total = Number(text);
+  if (!TOTAL_COUNT_PATTERN.test(text) || !Number.isSafeInteger(total)) {
+    throw new ApiError(response.status, 'invalid_response', INVALID_TOTAL_MESSAGE);
+  }
+  return total;
+}
+
 /** A successful response and its parsed body, as {@link send} resolves them. */
 interface Received<T> {
   /** The 2xx response. Its body has been read; its headers can still be read. */
@@ -899,6 +943,11 @@ export async function apiFetch<T>(path: string, init: ApiFetchInit = {}): Promis
  * {@link API_BASE}. Ending the list there would hide its remaining pages, and following such
  * a target could leave the API.
  *
+ * The response's `X-Total-Count` header, which the API sends on every page of
+ * `GET /discrepancies`, is read into {@link ApiPage.total}: `undefined` without the header,
+ * and the same `invalid_response` rejection when it is present but not a non-negative safe
+ * integer in plain digits.
+ *
  * A page can hold fewer rows than the `limit` it asked for while a next page follows, for
  * example when the API leaves out a discrepancy whose subject it cannot load, so only an
  * `undefined` {@link ApiPage.next} ends a list.
@@ -908,8 +957,8 @@ export async function apiFetch<T>(path: string, init: ApiFetchInit = {}): Promis
  *   For a later page, the previous page's {@link ApiPage.next}, unchanged.
  * @param init - Method, JSON body, query parameters and abort signal; all optional. A later
  *   page takes no `query`, because its `next` already carries it.
- * @returns The page's parsed body and its next page, which is `undefined` when the list is
- *   complete.
+ * @returns The page's parsed body, its next page, which is `undefined` when the list is
+ *   complete, and the list's total, `undefined` when the response states none.
  *
  * @example
  * ```ts
@@ -929,6 +978,6 @@ export async function apiFetchPage<T>(
   init: ApiFetchInit = {},
 ): Promise<ApiPage<T>> {
   const { response, data } = await send<T>(path, init);
-  return { data, next: nextPage(response) };
+  return { data, next: nextPage(response), total: totalCount(response) };
 }
 

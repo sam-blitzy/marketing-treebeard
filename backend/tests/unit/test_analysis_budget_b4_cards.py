@@ -587,7 +587,14 @@ def test_b4_history_metrics_are_the_ones_b1_to_b3_show(name: str) -> None:
     subject = ("campaign", 1)
     history = budget_history(ctx, subject)
     shared = budget.budget_evidence(
-        ctx, subject, history, under_utilized(history), outcomes=None, cpo=None, baseline=None
+        ctx,
+        subject,
+        history,
+        under_utilized(history),
+        outcomes=None,
+        cpo=None,
+        baseline=None,
+        headline=None,
     )
     reference = {metric.key: metric for metric in shared.metrics}
     for key in HISTORY_KEYS:

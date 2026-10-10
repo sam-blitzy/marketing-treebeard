@@ -616,10 +616,11 @@ export interface ProvenanceEntry {
  * read and their provenance.
  *
  * `extra` carries rule-specific detail and stays `unknown`-typed; features narrow it where they
- * read it. White-paper items put their per-creative rows in `extra.rows`, expansion items (K2)
- * their adjacent terms in `extra.adjacent_terms`, and C0 items `extra.discrepancy_id`,
- * `extra.kind`, `extra.shape`, `extra.state`, `extra.decided`, `extra.platform` and
- * `extra.resolutions`.
+ * read it. `extra.headline_metric` names the `key` of the one metric in `metrics` the card leads
+ * with (AAP 0.1.2; K1's is `wasted_spend`), and is absent on evidence that selects none.
+ * White-paper items put their per-creative rows in `extra.rows`, expansion items (K2) their
+ * adjacent terms in `extra.adjacent_terms`, and C0 items `extra.discrepancy_id`, `extra.kind`,
+ * `extra.shape`, `extra.state`, `extra.decided`, `extra.platform` and `extra.resolutions`.
  */
 export interface Evidence {
   /** The exact window and each source's day boundary. */

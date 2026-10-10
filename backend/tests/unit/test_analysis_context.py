@@ -1816,6 +1816,7 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
         sample=Sample(25, 20, "eligible contacts"),
         threshold_keys=("crm.veto_min_leads", "attribution.floor_share"),
         extra={"matured": 25},
+        headline=None,
     )
     assert json_value(evidence.window) == window.to_json()
     assert evidence.thresholds == {"crm.veto_min_leads": 20, "attribution.floor_share": 0.1}
@@ -1839,15 +1840,182 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
         required_datasets=("google.metrics_daily", "hubspot.contacts"),
         crm_scope="google",
         metrics=(),
+        headline=None,
     )
     assert [entry.dataset_id for entry in google.provenance] == [11, 13]
     missing = _context(thresholds, window, datasets={}).make_evidence(
-        required_datasets=("google.entities",), crm_scope=None, metrics=()
+        required_datasets=("google.entities",), crm_scope=None, metrics=(), headline=None
     )
     assert missing.datasets == (DatasetStatus("google.entities", "unknown", None),)
     assert missing.provenance == ()
     with pytest.raises(ValueError, match="dataset name"):
-        context.make_evidence(required_datasets=("google.facts",), crm_scope=None, metrics=())
+        context.make_evidence(
+            required_datasets=("google.facts",), crm_scope=None, metrics=(), headline=None
+        )
+
+
+def test_make_evidence_stores_the_headline_metric_it_is_given(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """AAP 0.1.2: a card's headline number is named in ``extra.headline_metric``."""
+    assert "EXTRA_HEADLINE_METRIC" in ctx_module.__all__
+    assert ctx_module.EXTRA_HEADLINE_METRIC == "headline_metric"
+    metrics = (
+        Metric("spend", "Spend", Decimal("120.00"), "currency", currency="USD"),
+        Metric("wasted_spend", "Wasted spend", Decimal("120.00"), "currency", currency="USD"),
+    )
+    evidence = _context(thresholds, window).make_evidence(
+        required_datasets=("google.metrics_daily",),
+        crm_scope=None,
+        metrics=metrics,
+        extra={"term_status": "NONE"},
+        headline="wasted_spend",
+    )
+    assert evidence.extra == {"term_status": "NONE", "headline_metric": "wasted_spend"}
+    assert evidence.metric(evidence.extra["headline_metric"]).label == "Wasted spend"
+    # The metrics themselves, and their order, are exactly those given.
+    assert evidence.metrics == metrics
+    assert evidence.to_json()["extra"]["headline_metric"] == "wasted_spend"
+
+
+def test_make_evidence_writes_no_headline_metric_for_none(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """An item that is not a card (a white-paper row) names no headline metric at all."""
+    evidence = _context(thresholds, window).make_evidence(
+        required_datasets=("google.metrics_daily",),
+        crm_scope=None,
+        metrics=(Metric("spend", "Spend", Decimal("1.00"), "currency", currency="USD"),),
+        extra={"rows": []},
+        headline=None,
+    )
+    assert "headline_metric" not in evidence.extra
+    assert evidence.extra == {"rows": ()}
+    bare = _context(thresholds, window).make_evidence(
+        required_datasets=("google.metrics_daily",), crm_scope=None, metrics=(), headline=None
+    )
+    assert bare.extra == {}
+    assert "extra" not in bare.to_json()
+
+
+def test_make_evidence_rejects_a_headline_that_names_no_metric(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """The headline must be one of the evidence's own metric keys, named in the error."""
+    context = _context(thresholds, window)
+    metrics = (
+        Metric("spend", "Spend", Decimal("1.00"), "currency", currency="USD"),
+        Metric("clicks", "Clicks", 12, "clicks"),
+    )
+    with pytest.raises(ValueError, match=r"'wasted_spend'.*\['spend', 'clicks'\]"):
+        context.make_evidence(
+            required_datasets=("google.metrics_daily",),
+            crm_scope=None,
+            metrics=metrics,
+            headline="wasted_spend",
+        )
+    with pytest.raises(ValueError, match=r"'spend'.*\[\]"):
+        context.make_evidence(
+            required_datasets=("google.metrics_daily",),
+            crm_scope=None,
+            metrics=(),
+            headline="spend",
+        )
+
+
+def test_make_evidence_rejects_extra_that_sets_the_headline_metric(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """``headline=`` is the one source of the selection: ``extra`` may not set it too."""
+    context = _context(thresholds, window)
+    metrics = (Metric("spend", "Spend", Decimal("1.00"), "currency", currency="USD"),)
+    for headline in ("spend", None):
+        with pytest.raises(ValueError, match="must not set 'headline_metric'"):
+            context.make_evidence(
+                required_datasets=("google.metrics_daily",),
+                crm_scope=None,
+                metrics=metrics,
+                extra={"headline_metric": "spend"},
+                headline=headline,
+            )
+
+
+def test_with_headline_appends_the_metric_and_names_it_as_the_headline() -> None:
+    """``with_headline`` appends one metric last and names it, leaving the original unchanged.
+
+    Precedence uses it for C0, whose headline is only known once every hold is final.
+    """
+    evidence = _evidence(discrepancy_id=4, depends_on=[{"type": "campaign", "id": 7}])
+    held = Metric(
+        "held_recommendations", "Recommendations held until resolved", 2, "recommendations"
+    )
+    led = evidence.with_headline(held)
+    assert [metric.key for metric in led.metrics] == ["spend", "held_recommendations"]
+    assert led.metrics[0] == evidence.metrics[0]
+    assert led.metrics[-1] is held
+    assert led.extra == {
+        "discrepancy_id": 4,
+        "depends_on": ({"type": "campaign", "id": 7},),
+        "headline_metric": "held_recommendations",
+    }
+    assert led.metric(led.extra["headline_metric"]).value == 2
+    assert led.to_json()["metrics"][-1] == {
+        "key": "held_recommendations",
+        "label": "Recommendations held until resolved",
+        "value": 2,
+        "unit": "recommendations",
+    }
+    assert led.to_json()["extra"]["headline_metric"] == "held_recommendations"
+    # Everything else is carried over, and the original evidence is unchanged.
+    assert (led.window, led.baselines, led.thresholds) == (
+        evidence.window,
+        evidence.baselines,
+        evidence.thresholds,
+    )
+    assert [metric.key for metric in evidence.metrics] == ["spend"]
+    assert "headline_metric" not in evidence.extra
+    assert led.extra is not evidence.extra
+    with pytest.raises(TypeError):
+        led.extra["depends_on"][0]["id"] = 9
+    # A zero count is a number like any other.
+    assert _evidence().with_headline(dataclasses.replace(held, value=0)).metrics[-1].value == 0
+
+
+def test_with_headline_rejects_an_evidence_that_already_names_a_headline(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    """A headline is chosen once: by the rule (``make_evidence``) or later by precedence."""
+    chosen = _context(thresholds, window).make_evidence(
+        required_datasets=("google.metrics_daily",),
+        crm_scope=None,
+        metrics=(Metric("spend", "Spend", Decimal("1.00"), "currency", currency="USD"),),
+        headline="spend",
+    )
+    held = Metric(
+        "held_recommendations", "Recommendations held until resolved", 1, "recommendations"
+    )
+    with pytest.raises(ValueError, match=r"already names the headline metric 'spend'"):
+        chosen.with_headline(held)
+    led = _evidence().with_headline(held)
+    other = Metric("held_items", "Held items", 1, "recommendations")
+    with pytest.raises(ValueError, match=r"'held_recommendations'.*'held_items' cannot replace"):
+        led.with_headline(other)
+    assert chosen.extra == {"headline_metric": "spend"}
+    assert [metric.key for metric in chosen.metrics] == ["spend"]
+
+
+def test_with_headline_rejects_a_metric_key_the_evidence_already_has() -> None:
+    """The appended metric must have its own key: the evidence's metric keys stay unique."""
+    evidence = _evidence()
+    duplicate = Metric("spend", "Spend again", Decimal("2.00"), "currency", currency="USD")
+    with pytest.raises(ValueError, match=r"repeats the keys \['spend'\]"):
+        evidence.with_headline(duplicate)
+    with pytest.raises(TypeError, match="needs a Metric"):
+        evidence.with_headline("spend")  # type: ignore[arg-type]
+    assert evidence.metrics == (
+        Metric("spend", "Spend", Decimal("12.340000"), "currency", currency="USD"),
+    )
+    assert "headline_metric" not in evidence.extra
 
 
 # -- the Google-to-CRM link (AAP 0.3.3, 0.5.4.1) ---------------------------------------------

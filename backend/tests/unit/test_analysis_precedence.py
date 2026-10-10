@@ -86,6 +86,7 @@ from ads_engine.analysis.context import (
     Finding,
     Flag,
     Freshness,
+    Metric,
     ProvenanceEntry,
     RuleResult,
     Sample,
@@ -614,8 +615,9 @@ def funding_card(
         evidence=ctx.make_evidence(
             required_datasets=datasets,
             crm_scope=None,
-            metrics=(),
+            metrics=(Metric(key, key.capitalize(), amount, "currency", currency=currency),),
             extra={key: amount, "currency": currency},
+            headline=key,
         ),
         rank_key=(Decimal(0),),
         flags=(),
@@ -1131,8 +1133,9 @@ def test_feedback_suppresses_with_counts(kind: str) -> None:
 
 
 def test_feedback_never_suppresses_c0_and_the_latest_entry_wins() -> None:
-    ctx, out = run("p1.c0_exempt.case")
-    c0 = of_rule(out, CAMPAIGNS, C0)[0]
+    ctx = build("p1.c0_exempt.case")
+    # The rule's own C0 item: precedence adds its headline, so it never takes one twice.
+    c0 = discrepancy.evaluate(ctx).candidates[0]
     _, k1 = sample_candidate()
     snooze = SCENARIOS["feedback.snooze.case"].build_context().feedback[0]
     dismiss = replace(snooze, kind="dismiss")
@@ -1146,6 +1149,182 @@ def test_feedback_never_suppresses_c0_and_the_latest_entry_wins() -> None:
     result = apply_precedence(RuleResult(candidates=(c0, target)), variant)
     assert [c.rule_id for c in of_rule(result, CAMPAIGNS)] == [C0]
     assert result.suppressed[KEYWORDS] == {SUPPRESS_FEEDBACK_DISMISS: 1}
+
+
+# ---------------------------------------------------------------------------
+# Headline numbers: C0 leads with the recommendations its discrepancy holds
+# ---------------------------------------------------------------------------
+
+
+HELD_METRIC = ("held_recommendations", "Recommendations held until resolved", "recommendations")
+"""A C0 item's headline metric: key, label and unit."""
+
+
+def held_count(candidate: Candidate) -> int:
+    """A stored C0 item's headline value, checked to be its last ``held_recommendations`` metric."""
+    assert candidate.rule_id == C0
+    assert candidate.evidence.extra["headline_metric"] == HELD_METRIC[0]
+    metric = candidate.evidence.metrics[-1]
+    assert (metric.key, metric.label, metric.unit) == HELD_METRIC
+    assert isinstance(metric.value, int)
+    assert not isinstance(metric.value, bool)
+    return metric.value
+
+
+def held_by(ctx: AnalysisContext) -> tuple[list[Candidate], Candidate, Candidate, Candidate]:
+    """``p1.holds.case``'s own C0 items and K1, a K1 twin on its ad group and an unrelated K1.
+
+    The scenario's discrepancy holds its K1 item; the twin, on the same ad group, is held
+    alike; the third item names an ad group of no campaign and depends on nothing.
+    """
+    results = evaluate(ctx)
+    c0 = [c for result in results for c in result.candidates if c.rule_id == C0]
+    (k1,) = [c for result in results for c in result.candidates if c.rule_id == K1]
+    ad_group, criterion, _ = k1.entity_ref.external_id.split("|", 2)
+    twin = replace(
+        k1,
+        entity_ref=replace(
+            k1.entity_ref,
+            external_id=f"{ad_group}|{criterion}|crm alternatives",
+            name="crm alternatives",
+        ),
+    )
+    loose = plain(k1, entity_ref=replace(k1.entity_ref, external_id="zz|1|other", name="other"))
+    return c0, k1, twin, loose
+
+
+def test_c0_leads_with_the_number_of_items_its_discrepancy_holds() -> None:
+    """Two held items give 2; an unrelated item is not counted; nothing else on C0 changes."""
+    ctx = build("p1.holds.case")
+    (info,) = ctx.discrepancies
+    c0, k1, twin, loose = held_by(ctx)
+    (built,) = c0
+    out = apply_precedence(RuleResult(candidates=(built, k1, twin, loose)), ctx)
+    (stored,) = of_rule(out, CAMPAIGNS, C0)
+    assert held_count(stored) == 2
+    held = [c for c in of_rule(out, KEYWORDS) if c.held]
+    assert sorted(c.entity_ref.name for c in held) == sorted(
+        [k1.entity_ref.name, "crm alternatives"]
+    )
+    assert all(c.evidence.extra["blocking_discrepancies"] == (info.id,) for c in held)
+    assert [c.held for c in of_rule(out, KEYWORDS) if c.entity_ref.name == "other"] == [False]
+    # The rule's metrics come first, unchanged and in their order; the action and reason
+    # still state the platform and decided values.
+    assert stored.evidence.metrics[:-1] == built.evidence.metrics
+    assert [metric.key for metric in stored.evidence.metrics] == [
+        "platform",
+        "decided",
+        "held_recommendations",
+    ]
+    assert (stored.action, stored.reason) == (built.action, built.reason)
+    assert "headline_metric" not in built.evidence.extra
+    # The count depends only on which items survive, never their order.
+    shuffled = apply_precedence(RuleResult(candidates=(loose, twin, built, k1)), ctx)
+    assert held_count(of_rule(shuffled, CAMPAIGNS, C0)[0]) == 2
+
+
+def test_c0_does_not_count_a_held_item_feedback_drops() -> None:
+    """A held item that feedback hides is not stored, so its discrepancy no longer counts it."""
+    ctx = build("p1.holds.case")
+    c0, k1, twin, loose = held_by(ctx)
+    dismiss = FeedbackInfo(
+        rule_id=K1,
+        entity_type=twin.entity_ref.type,
+        entity_key=twin.entity_ref.key,
+        kind="dismiss",
+        until=ctx.now + timedelta(days=30),
+    )
+    dismissed = replace(ctx, feedback=(dismiss,), cache={})
+    out = apply_precedence(RuleResult(candidates=(*c0, k1, twin, loose)), dismissed)
+    assert out.suppressed[KEYWORDS] == {SUPPRESS_FEEDBACK_DISMISS: 1}
+    assert "crm alternatives" not in {c.entity_ref.name for c in of_rule(out, KEYWORDS)}
+    (stored,) = of_rule(out, CAMPAIGNS, C0)
+    assert held_count(stored) == 1
+
+
+def test_c0_leads_with_zero_when_nothing_depends_on_its_subject() -> None:
+    """0 is a valid count: a discrepancy no stored item depends on still leads with a number."""
+    ctx = build("p1.holds.case")
+    c0, _, _, loose = held_by(ctx)
+    out = apply_precedence(RuleResult(candidates=(*c0, loose)), ctx)
+    (stored,) = of_rule(out, CAMPAIGNS, C0)
+    assert held_count(stored) == 0
+    assert stored.evidence.metrics[-1].to_json()["value"] == 0
+    alone = apply_precedence(RuleResult(candidates=tuple(c0)), ctx)
+    assert held_count(of_rule(alone, CAMPAIGNS, C0)[0]) == 0
+
+
+def test_an_item_held_by_two_discrepancies_counts_for_both() -> None:
+    """Each discrepancy counts every stored item it holds, shared ones included."""
+    ctx = build("p1.holds.case")
+    (status,) = ctx.discrepancies
+    assert status.subject_type == "campaign"
+    budget_change = replace(
+        status,
+        id=status.id + 1,
+        kind="budget",
+        decided_value={"daily_budget": "100.00"},
+        platform_value={"daily_budget": "120.00"},
+        detected_at=status.detected_at + timedelta(hours=1),
+    )
+    both = replace(ctx, discrepancies=(status, budget_change), cache={})
+    c0, k1, twin, loose = held_by(both)
+    assert len(c0) == 2
+    out = apply_precedence(RuleResult(candidates=(*c0, k1, twin, loose)), both)
+    held = [c for c in of_rule(out, KEYWORDS) if c.held]
+    assert len(held) == 2
+    assert all(
+        c.evidence.extra["blocking_discrepancies"] == (status.id, budget_change.id) for c in held
+    )
+    stored = of_rule(out, CAMPAIGNS, C0)
+    assert [c.evidence.extra["discrepancy_id"] for c in stored] == [status.id, budget_change.id]
+    assert [held_count(c) for c in stored] == [2, 2]
+
+
+def test_every_card_leaves_precedence_with_a_headline_of_its_own_metrics() -> None:
+    """The headline post-check: a card without its headline metric fails the run."""
+    ctx, out = run("default")
+    for item in out.all_items():
+        evidence = item.candidate.evidence
+        if item.candidate.section == WHITE_PAPERS:
+            assert "headline_metric" not in evidence.extra
+        else:
+            assert evidence.metric(evidence.extra["headline_metric"])
+    _, k1 = sample_candidate(ctx)
+    unnamed = replace(
+        k1.evidence,
+        extra={key: value for key, value in k1.evidence.extra.items() if key != "headline_metric"},
+    )
+    with pytest.raises(PrecedenceInvariantError, match=r"headline: K1 .* leads with None"):
+        apply_precedence(RuleResult(candidates=(replace(k1, evidence=unnamed),)), ctx)
+    missing = replace(
+        k1.evidence,
+        metrics=tuple(m for m in k1.evidence.metrics if m.key != "wasted_spend"),
+    )
+    with pytest.raises(PrecedenceInvariantError, match="leads with 'wasted_spend', which is not"):
+        apply_precedence(RuleResult(candidates=(replace(k1, evidence=missing),)), ctx)
+    # A white-paper row is a table row, not a card, and names no headline.
+    (paper, *_) = of_rule(out, WHITE_PAPERS)
+    assert "headline_metric" not in paper.evidence.extra
+
+
+def test_a_c0_item_that_already_leads_with_a_number_is_refused() -> None:
+    """Only precedence sets C0's headline, once: a C0 arriving with one is a broken contract."""
+    ctx, out = run("p1.c0_exempt.case")
+    (stored,) = of_rule(out, CAMPAIGNS, C0)
+    with pytest.raises(
+        ValueError, match="already names the headline metric 'held_recommendations'"
+    ):
+        apply_precedence(RuleResult(candidates=(stored,)), ctx)
+    no_id = replace(
+        stored,
+        evidence=replace(
+            discrepancy.evaluate(ctx).candidates[0].evidence,
+            extra={"kind": "status"},
+        ),
+    )
+    with pytest.raises(ValueError, match=r"no integer extra\.discrepancy_id"):
+        apply_precedence(RuleResult(candidates=(no_id,)), ctx)
 
 
 # ---------------------------------------------------------------------------

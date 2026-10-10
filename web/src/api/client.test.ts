@@ -16,7 +16,9 @@
  *   anything without one, the 502/503/504 message, `Retry-After` in seconds or as an HTTP-date,
  *   `network_error` for a rejected `fetch`, and aborts passed through unchanged;
  * - `apiFetchPage`: RFC 8288 `Link` parsing, the `rel="next"` target relative to `/api/v1`,
- *   and every malformed or off-base link rejected as `invalid_response`.
+ *   and every malformed or off-base link rejected as `invalid_response`; the `X-Total-Count`
+ *   header read into `total`, `undefined` without it, and every malformed count rejected as
+ *   `invalid_response`.
  *
  * The file is self-contained: it builds its own responses and imports no shared test helper.
  */
@@ -70,6 +72,7 @@ const MESSAGES = {
   network: 'The server could not be reached. Check your connection and try again.',
   unreadable: 'The server returned an unreadable response.',
   invalidLink: 'The server returned an invalid link to the next page.',
+  invalidTotal: 'The server returned an invalid total count.',
   invalidRequest: 'The request could not be sent: its body cannot be encoded.',
   unavailable: 'The server is temporarily unavailable. Try again shortly.',
 } as const;
@@ -1090,5 +1093,68 @@ describe('apiFetchPage', () => {
     const error = await apiErrorOf(apiFetchPage('/discrepancies'));
     expect(error.status).toBe(0);
     expect(error.code).toBe('network_error');
+  });
+
+  it('resolves total undefined without an X-Total-Count header', async () => {
+    stubPage('</api/v1/d?after=1>; rel=next');
+    const page = await apiFetchPage('/d');
+    expect(Object.hasOwn(page, 'total')).toBe(true);
+    expect(page.total).toBeUndefined();
+    expect(page.next).toBe('/d?after=1');
+  });
+
+  it.each([
+    ['zero', '0', 0],
+    ['a count', '64', 64],
+    ['surrounding whitespace', ' 12 ', 12],
+    ['leading zeros', '007', 7],
+    ['the largest safe integer', String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ])('reads an X-Total-Count of %s into total, next page or not', async (_label, header, total) => {
+    stubFetch(() =>
+      json([{ id: 1 }], 200, { 'X-Total-Count': header, Link: '</api/v1/d?after=1>; rel=next' }),
+    );
+    await expect(apiFetchPage('/d')).resolves.toStrictEqual({
+      data: [{ id: 1 }],
+      next: '/d?after=1',
+      total,
+    });
+    stubFetch(() => json([], 200, { 'X-Total-Count': header }));
+    await expect(apiFetchPage('/d?after=1')).resolves.toStrictEqual({
+      data: [],
+      next: undefined,
+      total,
+    });
+  });
+
+  it.each([
+    ['an empty value', ''],
+    ['a negative count', '-1'],
+    ['a signed count', '+3'],
+    ['a fraction', '1.5'],
+    ['exponent form', '1e3'],
+    ['a hexadecimal literal', '0x10'],
+    ['text', 'many'],
+    ['two values joined', '5, 5'],
+    ['a count beyond the safe integers', '9007199254740993'],
+  ])('rejects an X-Total-Count of %s as invalid_response', async (_label, header) => {
+    stubFetch(() => json([{ id: 1 }], 200, { 'X-Total-Count': header }));
+    const error = await apiErrorOf(apiFetchPage('/d'));
+    expect(fields(error)).toEqual({
+      name: 'ApiError',
+      status: 200,
+      code: 'invalid_response',
+      message: MESSAGES.invalidTotal,
+      retryAfter: undefined,
+    });
+  });
+
+  it('never reads the X-Total-Count of a failure', async () => {
+    stubFetch(() =>
+      json(envelope('invalid_cursor', 'The after cursor names no discrepancy.'), 422, {
+        'X-Total-Count': 'garbage',
+      }),
+    );
+    const error = await apiErrorOf(apiFetchPage('/discrepancies?after=9'));
+    expect(error.code).toBe('invalid_cursor');
   });
 });

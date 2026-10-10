@@ -18,9 +18,9 @@
  *   since replaced, shows instead the resolutions it froze with the run, all disabled, with
  *   "Resolution disabled: this discrepancy belongs to data that has since been replaced"
  *   (AAP 0.3.2, 0.5.5). C0 is exempt from holds too, so a historical C0 stays pinned in place
- *   rather than collapsed with the held cards. Each card's resolver keeps one polite status
- *   line, which carries every outcome of its reads and takes focus when the controls leave
- *   while focus went with them.
+ *   rather than moved below the group's other cards with the ones computed from replaced data.
+ *   Each card's resolver keeps one polite status line, which carries every outcome of its reads
+ *   and takes focus when the controls leave while focus went with them.
  * - **C1 Pause, C1b Pipeline pause, C2 Scale or Hold**: a "Campaign evidence" list of spend,
  *   outcomes, expected outcomes and CRM Qualified Leads, each metric that the evidence carries.
  * - **C1b and C2 "Hold"**: a one-row "Pipeline evidence" table of matured leads, matched and
@@ -58,7 +58,6 @@
  * @packageDocumentation
  */
 import {
-  Fragment,
   createContext,
   useContext,
   useEffect,
@@ -94,7 +93,15 @@ import {
   scaleOutcome,
 } from '../evidenceExtra';
 import type { DiscrepancyRef, LaunchGap, LaunchGapTerm } from '../evidenceExtra';
-import { FieldList, HeldDisclosure, SectionFrame, isHeld, isHidden } from './SectionFrame';
+import {
+  CardList,
+  FieldList,
+  HeldDisclosure,
+  HistoricalItems,
+  SectionFrame,
+  isHidden,
+  partitionGroup,
+} from './SectionFrame';
 import type { FieldItem, SectionComponentProps } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
@@ -871,6 +878,11 @@ function CampaignCard({ item }: ItemProps): ReactElement {
   }
 }
 
+/** One item as its {@link CampaignCard}, for the discrepancy group's card lists. */
+function renderCampaignCard(item: Item): ReactElement {
+  return <CampaignCard item={item} />;
+}
+
 /**
  * The discrepancy ids, as strings and in item order, of the current C0 cards among `items`:
  * those that are not historical and name a discrepancy. A historical C0 reads no list, and one
@@ -894,43 +906,51 @@ function currentDiscrepancyIds(items: readonly Item[]): string[] {
 interface DiscrepancyGroupBodyProps {
   /** The discrepancy group, as the API returned it. */
   group: Group;
-  /** The group's anchor id, from which the held region's id is derived. */
+  /** The group's anchor id, from which the replaced-data block's and held region's ids derive. */
   anchorId: string;
 }
 
 /**
- * The body of the discrepancy group: every C0 card in API order (oldest `detected_at` first),
- * none of them behind the held disclosure, then any other held item behind it.
+ * The body of the discrepancy group, top to bottom: every C0 card in API order (oldest
+ * `detected_at` first), current or historical; then every other item as the frame partitions
+ * it ({@link partitionGroup}): the visible cards, the cards computed from replaced data in the
+ * {@link HistoricalItems} block, and the cards a discrepancy holds behind the held disclosure.
  *
- * C0 is exempt from holds and pinned first (AAP 0.5.4.2 P1), yet the overlay sets `held_now` on
- * every item computed from replaced data (AAP 0.3.2), C0 included. The frame's default body
- * would then collapse a historical C0 under "Held until discrepancies are resolved", a hold C0
- * never has, while AAP 0.5.5 shows it in place with its resolver disabled. So C0 cards stay
- * pinned here, and the card itself shows the historical badge and disables the resolver. Items
- * feedback hides are skipped, as the frame does (the frame counts them).
+ * C0 is exempt from holds and pinned first (AAP 0.5.4.2 P1), and the overlay marks a C0
+ * computed from replaced data historical like any other item (AAP 0.3.2). The frame's default
+ * body would then move that C0 into the replaced-data block below the group's other cards,
+ * while AAP 0.5.5 shows it in place with its resolver disabled. So C0 cards stay pinned here,
+ * and the card itself shows the historical badge and disables the resolver. Items feedback
+ * hides are skipped, as the frame does (the frame counts them).
+ *
+ * Each list is a {@link CardList}, bounded like the frame's own: the C0 and visible cards form
+ * one list in that order, so a long discrepancy group mounts one batch at a time and still shows
+ * every C0 card before any other card. A held card's link to a C0 card not shown yet
+ * (`#item-{id}`) reveals it.
  *
  * The group's C0 cards share one {@link LiveDiscrepancyLookup}: the live discrepancies are read
  * once for the group, and only while it shows a current C0 card naming a discrepancy
  * ({@link currentDiscrepancyIds}).
  */
 function DiscrepancyGroupBody({ group, anchorId }: DiscrepancyGroupBodyProps): ReactElement {
-  const shown = group.items.filter((item) => !isHidden(item));
-  const pinned = shown.filter((item) => item.rule_id === RULE.discrepancy || !isHeld(item));
-  const held = shown.filter((item) => item.rule_id !== RULE.discrepancy && isHeld(item));
+  const pinned = group.items.filter(
+    (item) => item.rule_id === RULE.discrepancy && !isHidden(item),
+  );
+  const { visible, historical, held } = partitionGroup({
+    ...group,
+    items: group.items.filter((item) => item.rule_id !== RULE.discrepancy),
+  });
+  // The pinned C0 cards and the visible cards are one bounded list, so its batches reveal every
+  // C0 card before the first other card, however many C0 cards there are.
   return (
-    <LiveDiscrepancyLookup discrepancyIds={currentDiscrepancyIds(shown)}>
+    <LiveDiscrepancyLookup discrepancyIds={currentDiscrepancyIds(pinned)}>
       <Stack>
-        {pinned.map((item) => (
-          <Fragment key={item.id}>
-            <CampaignCard item={item} />
-          </Fragment>
-        ))}
+        <CardList items={[...pinned, ...visible]} renderCard={renderCampaignCard} />
+        <HistoricalItems id={`${anchorId}-historical`} count={historical.length}>
+          <CardList items={historical} renderCard={renderCampaignCard} />
+        </HistoricalItems>
         <HeldDisclosure id={`${anchorId}-held`} count={held.length}>
-          {held.map((item) => (
-            <Fragment key={item.id}>
-              <CampaignCard item={item} />
-            </Fragment>
-          ))}
+          <CardList items={held} renderCard={renderCampaignCard} />
         </HeldDisclosure>
       </Stack>
     </LiveDiscrepancyLookup>
@@ -942,10 +962,12 @@ function DiscrepancyGroupBody({ group, anchorId }: DiscrepancyGroupBodyProps): R
  * ideas, in the API's order, each card with its rule's field set (see the module overview).
  *
  * C0 cards stay pinned at the top of the discrepancy group even when the overlay marks them
- * historical ({@link DiscrepancyGroupBody}); every other group uses the frame's default body.
+ * historical ({@link DiscrepancyGroupBody}); every other group uses the frame's default body:
+ * visible cards, then the cards computed from replaced data, then the held disclosure.
  *
  * The discrepancy group stays on the page while it is empty in the run but the overlay counts
- * open discrepancies now: the open-discrepancies banner and every held card link to its anchor
+ * open discrepancies now: the open-discrepancies banner, and a held card's "View open
+ * discrepancies" link when no specific blocker can be named, point to its anchor
  * (`#group-campaigns-discrepancies`), and a discrepancy detected after the run holds items at
  * once (AAP 0.5.4.2 P1). The group then shows the live count and a link to `/decisions`. Every
  * other empty group is left out, as `SectionFrame` does by default.
@@ -973,9 +995,9 @@ export function CampaignsSection({ section, overlay }: SectionComponentProps): R
         )
       }
       // The run's discrepancy group can be empty while discrepancies detected after it are
-      // open; it is kept, with a notice instead of cards, so the banner's and held cards'
-      // links never point at nothing. The notice reads no list, so a section without C0 cards
-      // sends no GET /discrepancies.
+      // open; it is kept, with a notice instead of cards, so the banner's link and a held
+      // card's "View open discrepancies" link never point at nothing. The notice reads no
+      // list, so a section without C0 cards sends no GET /discrepancies.
       renderEmptyGroup={(group) =>
         group.key === DISCREPANCY_GROUP_KEY && openNow > 0 ? (
           <LateDiscrepancyNotice count={openNow} />

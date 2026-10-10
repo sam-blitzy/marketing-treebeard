@@ -322,16 +322,47 @@ describe('BudgetSection layout', () => {
     });
     const region = document.getElementById('group-budget-changes-held');
     expect(region?.hidden).toBe(true);
-    expect(region?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.b1)}`)).not.toBeNull();
-    expect(region?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.b3)}`)).toBeNull();
+    // The held card mounts only once the disclosure is first opened.
+    expect(region?.querySelector('article')).toBeNull();
 
     fireEvent.click(toggle);
     expect(region?.hidden).toBe(false);
+    expect(region?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.b1)}`)).not.toBeNull();
+    expect(region?.querySelector(`#item-${String(FIXTURE_ITEM_IDS.b3)}`)).toBeNull();
+    // Held by the overlay alone, with no blocker recorded or listed here: the list link.
     expect(
       within(card(B1_ACTION))
-        .getByRole('link', { name: 'View blocking discrepancy' })
+        .getByRole('link', { name: 'View open discrepancies' })
         .getAttribute('href'),
     ).toBe('#group-campaigns-discrepancies');
+  });
+
+  it('shows a card computed from replaced data openly after the current ones, outside the held disclosure', async () => {
+    const historical: Item = {
+      ...pageItem(FIXTURE_ITEM_IDS.b1),
+      current: makeItemOverlay({
+        historical: true,
+        held_now: true,
+        held_reason_now: 'Computed from data that has since been replaced',
+        data_status_now: 'live',
+      }),
+    };
+    await renderBudget(budgetWith([historical, pageItem(FIXTURE_ITEM_IDS.b3)]));
+
+    // Replaced data is no discrepancy hold: no disclosure, and the card is readable at once.
+    expect(
+      screen.queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
+    ).toBeNull();
+    const block = screen.getByRole('group', { name: 'Computed from replaced data (1)' });
+    expect(block.id).toBe('group-budget-changes-historical');
+    const replaced = within(block).getByRole('article', { name: B1_ACTION });
+    expect(within(replaced).getByText('Computed from replaced data')).toBeTruthy();
+    expect(
+      within(replaced).getByRole('button', { name: 'Record decision' }).hasAttribute('disabled'),
+    ).toBe(true);
+    expect(
+      card(B3_ACTION).compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });
 

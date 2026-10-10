@@ -203,6 +203,14 @@ def test_no_candidate_carries_a_failed_sample(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", [*CATALOGUE, *CUSTOM])
+def test_no_white_paper_row_names_a_headline_metric(name: str) -> None:
+    """White-paper items are table rows with fixed columns, not cards: no headline number."""
+    _, result = _evaluated(name)
+    assert result.candidates
+    assert all("headline_metric" not in item.evidence.extra for item in result.candidates)
+
+
+@pytest.mark.parametrize("name", [*CATALOGUE, *CUSTOM])
 def test_every_item_records_the_configured_values_it_applied(name: str) -> None:
     """``evidence.thresholds`` is the configured value of every key it lists, the W keys first."""
     ctx, result = _evaluated(name)

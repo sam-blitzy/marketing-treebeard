@@ -531,14 +531,21 @@ def _candidate(
 
     Precedence judges candidates by what they declare (``increases_spend_on``, the decision
     subject, ``extra.increase`` / ``extra.freed`` and ``extra.currency``), so a candidate
-    carrying those fields stands for any rule output of its kind.
+    carrying those fields stands for any rule output of its kind. Like the C2 Scale, B1 and
+    B3 cards, a card outside White papers leads with its window utilization, appended after
+    ``metrics_shown``; a white-paper row names no headline.
     """
     datasets = ("linkedin.entities", "linkedin.analytics_daily")
+    card = section != WHITE_PAPERS
+    utilization = Metric(
+        "window_utilization", "Window utilization (spend vs cap)", Decimal("0.95"), "ratio"
+    )
     evidence = ctx.make_evidence(
         required_datasets=datasets,
         crm_scope=None,
-        metrics=tuple(metrics_shown),
+        metrics=(*metrics_shown, *((utilization,) if card else ())),
         extra=dict(extra or {}),
+        headline=utilization.key if card else None,
     )
     return Candidate(
         rule_id=rule_id,
@@ -640,6 +647,9 @@ def test_b1_raises_the_latest_effective_daily_budget_by_the_configured_step(
     assert shown["proposed_daily_budget"] == proposed == item.evidence.extra["proposed"]
     assert shown["increase"] == proposed - current == item.evidence.extra["increase"]
     assert item.evidence.extra["step"] == step
+    # The increase card leads with the capped budget's utilization.
+    assert item.evidence.extra["headline_metric"] == "window_utilization"
+    assert "window_utilization" in shown
     assert item.evidence.thresholds["b1.step"] == ctx.thresholds.value("b1.step")
     assert item.action == (
         f"Raise daily budget from {_money(current, currency)} to {_money(proposed, currency)}"
@@ -889,6 +899,9 @@ def test_b3_fires_on_eight_under_utilized_of_ten_known_days_with_four_idle(
     assert item.action == f"Lower daily budget to {_money(proposed)}"
     assert shown["freed"] == current - proposed == item.evidence.extra["freed"]
     assert (shown["idle_days"], shown["under_utilized_days"]) == (4, 8)
+    # The decrease card leads with the budget's low utilization.
+    assert item.evidence.extra["headline_metric"] == "window_utilization"
+    assert "window_utilization" in shown
     assert item.decision_subject == DecisionSubject("campaign", _campaign_id(scenario, "slack"))
     assert item.increases_spend_on == ()
 
@@ -942,6 +955,9 @@ def test_b2_needs_high_utilization_on_the_sustained_share_of_known_days(
     assert item.action == "Do not increase. Lower daily budget by 20% or fix efficiency first"
     assert item.evidence.extra["branch"] == "poor_efficiency"
     shown = evidence_metrics(item)
+    # The poor-efficiency branch leads with the cost per outcome that is poor.
+    assert item.evidence.extra["headline_metric"] == "cost_per_outcome"
+    assert shown["cost_per_outcome"] is not None
     assert shown["high_utilization_days"] == high_days
     assert shown["proposed_daily_budget"] == round_to_minor_unit(
         shown["daily_budget"] * (1 - step), "USD"
@@ -968,6 +984,8 @@ def test_b2_zero_outcome_branch_needs_the_expected_outcome_minimum(
     (item,) = _on(_items(out, BUDGET, B2), ("campaign", hot))
     shown = evidence_metrics(item)
     assert item.evidence.extra["branch"] == "zero_outcomes"
+    # Zero outcomes have no cost per outcome, so the card leads with the outcomes themselves.
+    assert item.evidence.extra["headline_metric"] == "outcomes"
     assert shown["outcomes"] == 0
     assert shown["cost_per_outcome"] is None
     assert shown["expected_outcomes"] >= ctx.thresholds.ratio("b2.min_expected_outcomes")
@@ -2013,11 +2031,14 @@ def _cohort_party(
             ),
         )
     datasets = _AD_DATASETS[source]
+    extra = dict(party.evidence.extra)
+    headline = extra.pop("headline_metric")
     evidence = ctx.make_evidence(
         required_datasets=datasets,
         crm_scope=None,
         metrics=party.evidence.metrics,
-        extra=party.evidence.extra,
+        extra=extra,
+        headline=headline,
     )
     return replace(party, evidence=evidence, required_datasets=datasets)
 
@@ -2333,6 +2354,9 @@ def test_b4_runs_the_rate_test_on_linkedin_leads(make_context: ContextFactory) -
         f"{_money(shown['weekend_cpo'])} vs weekday {_money(shown['weekday_cpo'])}"
     )
     assert item.action.endswith("weekend cost/outcome USD 50.00 vs weekday USD 10.00")
+    # The pattern's card leads with the weekend cost per outcome its action cites first.
+    assert item.evidence.extra["headline_metric"] == "weekend_cpo"
+    assert shown["weekend_cpo"] == Decimal("50.00")
     _check_rate_test(ctx, item)
     assert item.evidence.extra["contract"] == "LinkedIn leads are unweighted event counts"
     assert item.evidence.extra["day_boundary"] == {"source": "linkedin", "boundary": "UTC"}

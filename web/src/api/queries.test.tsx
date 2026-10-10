@@ -22,8 +22,15 @@
  *   the `/actions` prefetch, which reads the configuration and sources (and the latest default
  *   run only for an addressed run) without polling and never reads the custom-run list;
  * - `useDiscrepancies` paging: a first page at `limit=500`, every `Link: rel="next"` page
- *   followed exactly as named however short the page, a repeated page rejected, and one
- *   restart from the first page after a 422 `invalid_cursor`;
+ *   followed exactly as named however short the page, a repeated page rejected, one restart
+ *   from the first page after a 422 `invalid_cursor`, and its `enabled: false` option, which
+ *   sends nothing and never polls yet returns what another reader cached under the same key;
+ * - `useDiscrepancyPages`: a first page at `limit=50` with its `X-Total-Count`, each "Show more"
+ *   following the `Link` exactly as named, empty pages followed within one load, a link repeated
+ *   within one load or across loads rejected, one restart after `invalid_cursor` that re-reads
+ *   what was shown, polling that re-reads only the loaded pages, a failed refetch keeping them,
+ *   abort on unmount, and invalidation by both decision-state mutations;
+ * - the current-state polling of `useDecisions` and `useDiscrepancies`;
  * - every mutation's request (CSRF header, JSON body, encoded path) and its cache effects: the
  *   exact `invalidateQueries` keys (spied), the seeded and invalidated entries, the keys left
  *   alone, and nothing touched on failure.
@@ -45,6 +52,7 @@ import {
   ApiError,
   CURRENT_STATE_POLL_MS,
   DEFAULT_DISCREPANCY_STATES,
+  DISCREPANCY_PAGE_SIZE,
   FIRST_RUN_POLL_MS,
   SOURCES_POLL_MS,
   configQueryOptions,
@@ -60,6 +68,7 @@ import {
   useDecisions,
   useDefaultRun,
   useDiscrepancies,
+  useDiscrepancyPages,
   useFeedback,
   useForgetCustomRuns,
   useHasCachedCustomRuns,
@@ -504,6 +513,25 @@ function discrepancyLink(after: number): string {
   return `</api/v1/discrepancies?${query}&limit=500&after=${String(after)}>; rel="next"`;
 }
 
+/** The first request of every `useDiscrepancyPages` load from the start of the list. */
+const FIRST_PAGED = '/api/v1/discrepancies?state=open&state=awaiting_platform&limit=50';
+
+/**
+ * The headers of one `useDiscrepancyPages` page: its `X-Total-Count`, and the `Link` to the
+ * next page when `after` is given.
+ *
+ * @param total - The list's total.
+ * @param after - The id of the last row the page read, or `undefined` for the last page.
+ * @returns The response headers.
+ */
+function pagedHeaders(total: number, after?: number): Record<string, string> {
+  const headers: Record<string, string> = { 'X-Total-Count': String(total) };
+  if (after !== undefined) {
+    headers.Link = `<${FIRST_PAGED}&after=${String(after)}>; rel="next"`;
+  }
+  return headers;
+}
+
 afterEach(() => {
   for (const client of clients.splice(0)) {
     client.clear();
@@ -551,6 +579,7 @@ describe('queryKeys', () => {
     expect(queryKeys.recommendations(CUSTOM_RUN_ID)).toEqual(['recommendations', CUSTOM_RUN_ID]);
     expect(queryKeys.decisionsAll).toEqual(['decisions']);
     expect(queryKeys.discrepanciesAll).toEqual(['discrepancies']);
+    expect(queryKeys.discrepancyPages(['open'])).toEqual(['discrepancies', 'pages', ['open']]);
     expect(queryKeys.sources).toEqual(['sources']);
     expect(queryKeys.config).toEqual(['config']);
   });
@@ -567,6 +596,7 @@ describe('queryKeys', () => {
     expect(queryKeys.recommendations(7).slice(0, 1)).toEqual(queryKeys.recommendationsAll);
     expect(queryKeys.decisions({}).slice(0, 1)).toEqual(queryKeys.decisionsAll);
     expect(queryKeys.discrepancies(['open']).slice(0, 1)).toEqual(queryKeys.discrepanciesAll);
+    expect(queryKeys.discrepancyPages(['open']).slice(0, 1)).toEqual(queryKeys.discrepanciesAll);
   });
 
   it('drop undefined decision filter members, so equal filters share one key', () => {
@@ -588,6 +618,10 @@ describe('queryKeys', () => {
     states.push('resolved');
     expect(key).toEqual(['discrepancies', ['open']]);
     expect(key[1]).not.toBe(states);
+    const pages = queryKeys.discrepancyPages(states);
+    states.push('awaiting_platform');
+    expect(pages).toEqual(['discrepancies', 'pages', ['open', 'resolved']]);
+    expect(pages[2]).not.toBe(states);
   });
 });
 
@@ -1210,6 +1244,36 @@ describe('useDecisions', () => {
     expect(result.current.error).toBeInstanceOf(ApiError);
     expect(result.current.error?.code).toBe('invalid_query');
   });
+
+  it.each([
+    ['a success', CURRENT_STATE_POLL_MS, () => json(200, [decisionPayload(1)])],
+    ['a 502', CURRENT_STATE_POLL_MS, () => new Response('Bad Gateway', { status: 502 })],
+    ['an unreachable server', CURRENT_STATE_POLL_MS, () => Promise.reject(new TypeError('x'))],
+    ['an expired session', false, () => json(401, envelope('unauthenticated', 'Sign in again.'))],
+    ['a 422', false, () => json(422, envelope('invalid_query', 'Bad filter'))],
+  ] as const)('after %s polls at %s', async (_label, interval, respond) => {
+    stubFetch(respond);
+    const { result, queryClient } = renderWithWrapper(() => useDecisions());
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    expect(pollInterval(queryClient, queryKeys.decisions({}))).toBe(interval);
+  });
+
+  it('refetches the log after CURRENT_STATE_POLL_MS', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const before = [decisionPayload(1)];
+    const after = [decisionPayload(2, 'baseline'), ...before];
+    const mock = stubFetch(
+      sequence(
+        () => json(200, before),
+        () => json(200, after),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useDecisions());
+    await waitFor(() => expect(result.current.data).toEqual(before));
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data).toEqual(after));
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
 });
 
 
@@ -1236,6 +1300,79 @@ describe('useDiscrepancies', () => {
     expect(request.parsed.searchParams.get('limit')).toBe('500');
     expect(request.url).toBe(FIRST_PAGE);
     expect(request.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends nothing while disabled, yet returns the list another reader cached', async () => {
+    const rows = discrepancies(DISCREPANCY_ID, 2);
+    const mock = stubFetch(routes({ 'GET /api/v1/discrepancies': () => json(200, rows) }));
+    const setup = createWrapper();
+    const disabled = renderWithWrapper(
+      () => useDiscrepancies(DEFAULT_DISCREPANCY_STATES, { enabled: false }),
+      setup,
+    );
+    expect(disabled.result.current.fetchStatus).toBe('idle');
+    expect(disabled.result.current.data).toBeUndefined();
+    expect(mock).not.toHaveBeenCalled();
+
+    // An enabled reader of the same states (the C0 card lookup) fills the shared entry.
+    const enabled = renderWithWrapper(() => useDiscrepancies(), setup);
+    await waitFor(() => expect(enabled.result.current.isSuccess).toBe(true));
+    await waitFor(() => expect(disabled.result.current.data).toEqual(rows));
+    expect(onlyRequest(mock).url).toBe(FIRST_PAGE);
+  });
+
+  it('reads once it is enabled, under the same key', async () => {
+    const rows = discrepancies(DISCREPANCY_ID, 1);
+    const mock = stubFetch(routes({ 'GET /api/v1/discrepancies': () => json(200, rows) }));
+    const { wrapper, queryClient } = createWrapper();
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useDiscrepancies(DEFAULT_DISCREPANCY_STATES, { enabled }),
+      { wrapper, initialProps: { enabled: false } },
+    );
+    expect(mock).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(rows);
+    expect(queryClient.getQueryData(queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES))).toEqual(
+      rows,
+    );
+    expect(onlyRequest(mock).url).toBe(FIRST_PAGE);
+  });
+
+  it('never polls while disabled, even over a cached list, and polls only while enabled', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 2)),
+        () => json(200, discrepancies(51, 3)),
+      ),
+    );
+    const { wrapper, queryClient } = createWrapper();
+    queryClient.setQueryData(
+      queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
+      discrepancies(51, 1),
+    );
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useDiscrepancies(DEFAULT_DISCREPANCY_STATES, { enabled }),
+      { wrapper, initialProps: { enabled: false } },
+    );
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).not.toHaveBeenCalled();
+    expect(result.current.data).toHaveLength(1);
+
+    rerender({ enabled: true });
+    await waitFor(() => expect(result.current.data).toHaveLength(2));
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data).toHaveLength(3));
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    rerender({ enabled: false });
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toHaveLength(3);
   });
 
   it('sends only the states it is given, and no state for an empty list', async () => {
@@ -1368,6 +1505,368 @@ describe('useDiscrepancies', () => {
     expect(result.current.error?.code).toBe(code);
     expect(result.current.data).toBeUndefined();
     expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['a success', CURRENT_STATE_POLL_MS, () => json(200, [])],
+    ['a 503', CURRENT_STATE_POLL_MS, () => json(503, envelope('internal_error', 'Restarting'))],
+    ['an expired session', false, () => json(401, envelope('unauthenticated', 'Sign in again.'))],
+    ['a 422', false, () => json(422, envelope('validation_error', 'Bad state'))],
+  ] as const)('after %s polls at %s', async (_label, interval, respond) => {
+    stubFetch(respond);
+    const { result, queryClient } = renderWithWrapper(() => useDiscrepancies());
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    expect(pollInterval(queryClient, queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES))).toBe(
+      interval,
+    );
+  });
+
+  it('refetches the whole list after CURRENT_STATE_POLL_MS', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1)),
+        () => json(200, discrepancies(51, 2)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useDiscrepancies());
+    await waitFor(() => expect(result.current.data).toHaveLength(1));
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data).toHaveLength(2));
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('useDiscrepancyPages', () => {
+  const KEY = queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES);
+
+  /**
+   * `useDiscrepancyPages`, reading during render every result property the tests assert on.
+   * TanStack re-renders a hook only when a property read from its result changes, so a
+   * property first read after a `fetchNextPage` would otherwise still show its old value.
+   *
+   * @returns The hook's result.
+   */
+  function useTrackedPages() {
+    const query = useDiscrepancyPages();
+    void [
+      query.data,
+      query.error,
+      query.hasNextPage,
+      query.isError,
+      query.isFetchNextPageError,
+      query.isRefetchError,
+      query.isSuccess,
+    ];
+    return query;
+  }
+
+  /**
+   * Runs `work` (a `fetchNextPage` or `refetch`) inside `act`, then lets TanStack's batched
+   * notification, scheduled on a zero-delay timer, re-render the hook.
+   *
+   * @param work - The call to settle.
+   */
+  async function settle(work: () => Promise<unknown>): Promise<void> {
+    await act(async () => {
+      await work();
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  it('reads the first page of the default states at the page size, with its total', async () => {
+    const rows = discrepancies(DISCREPANCY_ID, 2);
+    const mock = stubFetch(() => json(200, rows, pagedHeaders(2)));
+    const { result, queryClient } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(DISCREPANCY_PAGE_SIZE).toBe(50);
+    expect(result.current.data).toEqual({ discrepancies: rows, total: 2 });
+    expect(result.current.hasNextPage).toBe(false);
+    expect(KEY).toEqual(['discrepancies', 'pages', ['open', 'awaiting_platform']]);
+    expect(queryClient.getQueryState(KEY)?.status).toBe('success');
+    const request = onlyRequest(mock);
+    expect(request.method).toBe('GET');
+    expect(request.url).toBe(FIRST_PAGED);
+    expect(request.parsed.searchParams.getAll('state')).toEqual(DEFAULT_DISCREPANCY_STATES);
+    expect(request.parsed.searchParams.get('limit')).toBe(String(DISCREPANCY_PAGE_SIZE));
+    expect(request.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends only the states it is given under their own key', async () => {
+    const mock = stubFetch(() => json(200, [], pagedHeaders(0)));
+    const { result, queryClient } = renderWithWrapper(() => useDiscrepancyPages(['resolved']));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual({ discrepancies: [], total: 0 });
+    expect(queryClient.getQueryState(queryKeys.discrepancyPages(['resolved']))?.status).toBe(
+      'success',
+    );
+    expect(params(onlyRequest(mock))).toEqual([
+      ['state', 'resolved'],
+      ['limit', '50'],
+    ]);
+  });
+
+  it('loads the next page from the Link exactly as named, taking the newest total', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 3), pagedHeaders(5, 53)),
+        () => json(200, discrepancies(60, 2), pagedHeaders(6)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51, 52, 53]);
+    expect(result.current.data?.total).toBe(5);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51, 52, 53, 60, 61]);
+    expect(result.current.data?.total).toBe(6);
+    expect(result.current.hasNextPage).toBe(false);
+    const requests = sent(mock);
+    expect(requests.map((request) => request.url)).toEqual([
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=53`,
+    ]);
+    expect(requests.every((request) => request.signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it('keeps following next links within one load while it has read no discrepancy', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, [], pagedHeaders(3, 50)),
+        () => json(200, [], pagedHeaders(3, 55)),
+        () => json(200, discrepancies(56, 1), pagedHeaders(3, 56)),
+        () => json(200, [], pagedHeaders(3, 60)),
+        () => json(200, discrepancies(61, 1), pagedHeaders(3)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([56]);
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([56, 61]);
+    expect(result.current.hasNextPage).toBe(false);
+    expect(sent(mock).map((request) => request.url)).toEqual([
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=50`,
+      `${FIRST_PAGED}&after=55`,
+      `${FIRST_PAGED}&after=56`,
+      `${FIRST_PAGED}&after=60`,
+    ]);
+  });
+
+  it('ends an empty list after one request', async () => {
+    const mock = stubFetch(() => json(200, [], pagedHeaders(0)));
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual({ discrepancies: [], total: 0 });
+    expect(result.current.hasNextPage).toBe(false);
+    expect(mock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a next link followed in an earlier load, keeping the loaded pages', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1), pagedHeaders(3, 51)),
+        () => json(200, discrepancies(52, 1), pagedHeaders(3, 51)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51, 52]);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.isFetchNextPageError).toBe(true);
+    expect(result.current.error?.status).toBe(200);
+    expect(result.current.error?.code).toBe('invalid_response');
+    expect(result.current.error?.message).toBe(
+      'The server returned a link to a page it had already sent.',
+    );
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51, 52]);
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a next link repeated within one load rather than loop', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, [], pagedHeaders(1, 51)),
+        () => json(200, [], pagedHeaders(1, 51)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.code).toBe('invalid_response');
+    expect(result.current.data).toBeUndefined();
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it('restarts once from the first page on invalid_cursor, re-reading what it showed', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 2), pagedHeaders(4, 52)),
+        () => json(422, envelope('invalid_cursor', 'List again from the first page')),
+        () => json(200, discrepancies(53, 2), pagedHeaders(3, 54)),
+        () => json(200, discrepancies(55, 1), pagedHeaders(3)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.fetchNextPage());
+
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data).toEqual({
+      discrepancies: discrepancies(53, 3),
+      total: 3,
+    });
+    expect(result.current.hasNextPage).toBe(false);
+    expect(sent(mock).map((request) => request.url)).toEqual([
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=52`,
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=54`,
+    ]);
+  });
+
+  it('continues after a restarted load from its own next link', async () => {
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1), pagedHeaders(9, 51)),
+        () => json(422, envelope('invalid_cursor', 'List again')),
+        () => json(200, discrepancies(60, 2), pagedHeaders(9, 61)),
+        () => json(200, discrepancies(70, 1), pagedHeaders(9)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([60, 61]);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([60, 61, 70]);
+    expect(sent(mock).map((request) => request.url).slice(2)).toEqual([
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=61`,
+    ]);
+  });
+
+  it('rejects a second invalid_cursor, and never restarts for the first page itself', async () => {
+    stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1), pagedHeaders(2, 51)),
+        () => json(422, envelope('invalid_cursor', 'List again')),
+        () => json(200, [], pagedHeaders(2, 51)),
+        () => json(422, envelope('invalid_cursor', 'List again')),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.fetchNextPage());
+    expect(result.current.isFetchNextPageError).toBe(true);
+    expect(result.current.error?.status).toBe(422);
+    expect(result.current.error?.code).toBe('invalid_cursor');
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51]);
+
+    const first = stubFetch(() => json(422, envelope('invalid_cursor', 'List again')));
+    const fresh = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(fresh.result.current.isError).toBe(true));
+    expect(fresh.result.current.error?.code).toBe('invalid_cursor');
+    expect(first).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a malformed X-Total-Count as invalid_response', async () => {
+    stubFetch(() => json(200, discrepancies(51, 1), { 'X-Total-Count': '-1' }));
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.code).toBe('invalid_response');
+  });
+
+  it('leaves the total undefined when the API sends none', async () => {
+    stubFetch(() => json(200, discrepancies(51, 1)));
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.total).toBeUndefined();
+  });
+
+  it.each([
+    ['a success', CURRENT_STATE_POLL_MS, () => json(200, [], pagedHeaders(0))],
+    ['an unreachable server', CURRENT_STATE_POLL_MS, () => Promise.reject(new TypeError('x'))],
+    ['a 429', CURRENT_STATE_POLL_MS, () => json(429, envelope('rate_limited', 'Slow down'))],
+    ['an expired session', false, () => json(401, envelope('unauthenticated', 'Sign in again.'))],
+    ['a 422', false, () => json(422, envelope('validation_error', 'Bad state'))],
+  ] as const)('after %s polls at %s', async (_label, interval, respond) => {
+    stubFetch(respond);
+    const { result, queryClient } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isFetching).toBe(false));
+    expect(pollInterval(queryClient, KEY)).toBe(interval);
+  });
+
+  it('polls by re-reading only the pages already loaded, from the first', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mock = stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1), pagedHeaders(3, 51)),
+        () => json(200, discrepancies(52, 1), pagedHeaders(3, 52)),
+        () => json(200, discrepancies(50, 2), pagedHeaders(4, 51)),
+        () => json(200, discrepancies(52, 1), pagedHeaders(4, 52)),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.fetchNextPage());
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data?.total).toBe(4));
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([50, 51, 52]);
+    expect(result.current.hasNextPage).toBe(true);
+    expect(sent(mock).map((request) => request.url)).toEqual([
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=51`,
+      FIRST_PAGED,
+      `${FIRST_PAGED}&after=51`,
+    ]);
+  });
+
+  it('keeps the loaded list when a refetch fails', async () => {
+    stubFetch(
+      sequence(
+        () => json(200, discrepancies(51, 1), pagedHeaders(1)),
+        () => json(503, envelope('internal_error', 'Restarting')),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await settle(() => result.current.refetch());
+    expect(result.current.isRefetchError).toBe(true);
+    expect(result.current.error?.code).toBe('internal_error');
+    expect(result.current.data?.discrepancies.map((row) => row.id)).toEqual([51]);
+  });
+
+  it('aborts the page in flight when the last component unmounts', async () => {
+    const mock = stubFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }),
+    );
+    const { unmount } = renderWithWrapper(() => useTrackedPages());
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(1));
+    const { signal } = onlyRequest(mock);
+    expect(signal?.aborted).toBe(false);
+    unmount();
+    expect(signal?.aborted).toBe(true);
   });
 });
 
@@ -1566,6 +2065,7 @@ const DECISION_STATE_KEYS: readonly QueryKey[] = [
   queryKeys.recommendations(CUSTOM_RUN_ID),
   queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
   queryKeys.discrepancies(['resolved']),
+  queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES),
   queryKeys.decisions({}),
   queryKeys.decisions({ subject_type: 'campaign', subject_id: CAMPAIGN_ID }),
 ];
@@ -1807,6 +2307,30 @@ describe('useRecordDecision', () => {
     await waitFor(() => expect(result.current.log.data).toEqual(after));
   });
 
+  it('refetches a shown paged discrepancy list through the discrepanciesAll prefix', async () => {
+    let saved = false;
+    const mock = stubFetch(
+      routes({
+        'GET /api/v1/discrepancies': () =>
+          json(200, saved ? [] : [discrepancyPayload(DISCREPANCY_ID)], pagedHeaders(saved ? 0 : 1)),
+        'POST /api/v1/decisions': () => {
+          saved = true;
+          return json(201, decisionPayload(12, 'user'));
+        },
+      }),
+    );
+    const { result } = renderWithWrapper(() => ({
+      list: useDiscrepancyPages(),
+      record: useRecordDecision(),
+    }));
+    await waitFor(() => expect(result.current.list.data?.total).toBe(1));
+    await act(async () => {
+      await result.current.record.mutateAsync(body);
+    });
+    expect(sent(mock).filter((request) => request.method === 'GET')).toHaveLength(2);
+    await waitFor(() => expect(result.current.list.data?.total).toBe(0));
+  });
+
   it('refetches a filtered decision log through the decisionsAll prefix', async () => {
     const budgetBody: DecisionRequest = {
       subject: { type: 'budget', id: BUDGET_ID },
@@ -1897,6 +2421,38 @@ describe('useResolveDiscrepancy', () => {
     expect(request.parsed.pathname).toBe(path);
     expect(request.headers).toEqual(JSON_MUTATION_HEADERS);
     expect(request.body).toBe(JSON.stringify(body));
+  });
+
+  it('has refetched a shown paged discrepancy list by the time mutateAsync resolves', async () => {
+    const path = `/api/v1/discrepancies/${String(DISCREPANCY_ID)}/resolve`;
+    let resolved = false;
+    const mock = stubFetch(
+      routes({
+        'GET /api/v1/discrepancies': () =>
+          resolved
+            ? json(200, [], pagedHeaders(0))
+            : json(200, [discrepancyPayload(DISCREPANCY_ID)], pagedHeaders(1)),
+        [`POST ${path}`]: () => {
+          resolved = true;
+          return json(200, discrepancyPayload(DISCREPANCY_ID, 'resolved'));
+        },
+      }),
+    );
+    const { result } = renderWithWrapper(() => ({
+      list: useDiscrepancyPages(),
+      resolve: useResolveDiscrepancy(),
+    }));
+    await waitFor(() => expect(result.current.list.data?.total).toBe(1));
+    await act(async () => {
+      await result.current.resolve.mutateAsync({
+        id: DISCREPANCY_ID,
+        body: { resolution: 'platform_correct' },
+      });
+    });
+    const calls = sent(mock).map((request) => `${request.method ?? ''} ${request.parsed.pathname}`);
+    const list = 'GET /api/v1/discrepancies';
+    expect(calls).toEqual([list, `POST ${path}`, list]);
+    await waitFor(() => expect(result.current.list.data).toEqual({ discrepancies: [], total: 0 }));
   });
 
   it('invalidates nothing on 409 discrepancy_resolved', async () => {

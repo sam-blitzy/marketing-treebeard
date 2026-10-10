@@ -1245,6 +1245,9 @@ def _pair_candidate(
             "campaign_spend": campaign.spend,
             "currency": campaign.currency,
         },
+        # The end-to-end rate of the variant the title names first: the observed leader, or
+        # the first variant of a level pair. P7: a rate, never a winner label.
+        headline="rate_a" if first is pair.a else "rate_b",
     )
     flags: tuple[Flag, ...] = ()
     if not distinguishable:
@@ -1445,6 +1448,8 @@ def _test_candidate(
             "campaign_spend": campaign.spend,
             "currency": campaign.currency,
         },
+        # The tested stage's rate: click_rate, open_rate or completion_rate.
+        headline=selected.stage.key,
     )
     return Candidate(
         rule_id=CR3,

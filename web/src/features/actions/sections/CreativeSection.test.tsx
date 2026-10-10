@@ -10,7 +10,8 @@
  *   only for a stage the campaign's objective does not use, "not estimable" for a missing rate
  *   over a zero denominator, "unavailable" for any other missing rate and for an absent count),
  *   then the cards in API order: the CR3 next test with the CR2 weak stage as its reason, then
- *   the CR1 pairs, held ones behind the held disclosure.
+ *   the CR1 pairs, those computed from replaced data shown openly under their label, held ones
+ *   behind the held disclosure.
  * - **Distinguishability (CR1, P7).** Pair labels are the API's own words, "Distinguishable
  *   (adjusted p = …)" or "{A} ahead, not yet distinguishable …", and the "Not yet
  *   distinguishable" badge is the API's flag; the section never declares a winner.
@@ -202,12 +203,18 @@ describe('CreativeSection', () => {
         within(card).getByText('Click rate is below account baseline: 0.42% [0.35%–0.51%] vs 0.61%'),
       ).toBeTruthy();
 
-      // The historical CR1 pair is held by its replaced data, so it sits behind the disclosure.
-      const toggle = within(block).getByRole('button', {
-        name: 'Held until discrepancies are resolved (1)',
+      // The historical CR1 pair was computed from replaced data: it follows the CR3 card openly,
+      // under its replaced-data label, and no discrepancy hold collapses it.
+      const replaced = within(block).getByRole('group', {
+        name: 'Computed from replaced data (1)',
       });
+      const cr1 = pageItem(FIXTURE_ITEM_IDS.cr1Historical);
+      expect(within(replaced).getByRole('article', { name: cr1.action })).toBeTruthy();
+      expect(
+        within(block).queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
+      ).toBeNull();
       expect(precedes(table, card)).toBe(true);
-      expect(precedes(card, toggle)).toBe(true);
+      expect(precedes(card, replaced)).toBe(true);
     });
 
     it('renders one captioned variants table per campaign, each inside its own group anchor', async () => {
@@ -327,14 +334,14 @@ describe('CreativeSection', () => {
       expect(bodyRows(firstTable)[0]).toEqual(['A1', '4,000', '0.44%', '1.25%', '24%', '12']);
     });
 
-    it('shows the held historical CR1 pair with its API wording, badge and disabled actions', async () => {
+    it('shows the historical CR1 pair openly with its API wording, badge and disabled actions', async () => {
       await renderCreative(defaultCreative());
 
       const cr1 = pageItem(FIXTURE_ITEM_IDS.cr1Historical);
-      expect(screen.queryByRole('article', { name: cr1.action })).toBeNull();
-      fireEvent.click(screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }));
-
-      const card = screen.getByRole('article', { name: cr1.action });
+      // Readable without operating any control: replaced data is not a discrepancy hold.
+      const card = within(
+        screen.getByRole('group', { name: 'Computed from replaced data (1)' }),
+      ).getByRole('article', { name: cr1.action });
       expect(within(card).getByRole('heading', { level: 4 }).textContent).toBe(
         'Variant A vs Variant B: Variant A ahead, not yet distinguishable (adjusted p = 0.21); ' +
           'about 41,800 more impressions per variant needed at the observed difference',
@@ -671,6 +678,122 @@ describe('CreativeSection', () => {
 
       expect(container.childElementCount).toBe(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Bounded batches: variants, pair cards and campaign blocks
+// ---------------------------------------------------------------------------------------------
+
+describe('long copy blocks', () => {
+  /** One `extra.variants` entry for "Variant {n}", in the backend's shape. */
+  function variantEntry(n: number): Record<string, unknown> {
+    return {
+      creative_id: 40000 + n,
+      urn: `urn:li:sponsoredCreative:${String(40000 + n)}`,
+      name: `Variant ${String(n)}`,
+      impressions: 1000 + n,
+      leads: n,
+      click_rate: '0.004377',
+      open_rate: '0.395062',
+      completion_rate: '0.5',
+    };
+  }
+
+  /** The batch statuses inside `scope` ("Showing …"), told apart from the cards' own regions. */
+  function batchStatuses(scope: HTMLElement): string[] {
+    return within(scope)
+      .queryAllByRole('status')
+      .map((status) => status.textContent)
+      .filter((text) => text.startsWith('Showing '));
+  }
+
+  /** The row headers of a table. */
+  function rowHeaders(table: HTMLElement): string[] {
+    return within(table)
+      .getAllByRole('rowheader')
+      .map((cell) => cell.textContent);
+  }
+
+  /** "Variant {n}" for n = 1…count. */
+  function variantNames(count: number): string[] {
+    return Array.from({ length: count }, (_, index) => `Variant ${String(index + 1)}`);
+  }
+
+  it('bounds a campaign’s variants table and its pair cards, keeping their order', async () => {
+    const nextTest = testItemWith(
+      8000,
+      Array.from({ length: 64 }, (_, index) => variantEntry(index + 1)),
+    );
+    // 64 variants make 2,016 pairs; 45 cards of full evidence cross every batch boundary (the
+    // bound itself is exercised past 200 entries in batches.test.tsx and SectionFrame.test.tsx).
+    const pairs = Array.from({ length: 45 }, (_, index) =>
+      pairItem(
+        8001 + index,
+        `Variant ${String(index + 1)} vs Variant ${String(index + 2)}`,
+        'Not yet distinguishable at the configured α and power',
+      ),
+    );
+    await renderCreative(
+      creativeWith(
+        makeGroup({ key: 'campaign:1', title: 'Many variants', items: [nextTest, ...pairs] }),
+      ),
+    );
+    const block = screen.getByRole('region', { name: 'Many variants' });
+    const variantsTable = within(block).getByRole('table', { name: 'Variants in Many variants' });
+
+    expect(rowHeaders(variantsTable)).toEqual(variantNames(50));
+    expect(batchStatuses(block)).toEqual(['Showing 50 of 64 variants', 'Showing 20 of 46 actions']);
+    fireEvent.click(within(block).getByRole('button', { name: 'Show 14 more variants' }));
+    expect(rowHeaders(variantsTable)).toEqual(variantNames(64));
+    expect(document.activeElement?.textContent).toBe('Variant 51');
+
+    const cardIds = () =>
+      within(block)
+        .getAllByRole('article')
+        .map((article) => article.id);
+    const itemIds = (count: number) =>
+      Array.from({ length: count }, (_, index) => `item-${String(8000 + index)}`);
+    expect(cardIds()).toEqual(itemIds(20));
+    fireEvent.click(within(block).getByRole('button', { name: 'Show 20 more actions' }));
+    expect(cardIds()).toEqual(itemIds(40));
+    fireEvent.click(within(block).getByRole('button', { name: 'Show 6 more actions' }));
+    expect(cardIds()).toEqual(itemIds(46));
+    expect(document.activeElement?.id).toBe('item-8040');
+    // Every pair card keeps its own "not distinguishable" flag.
+    expect(
+      within(screen.getByRole('article', { name: 'Variant 45 vs Variant 46' })).getByText(
+        /Not yet distinguishable/u,
+      ),
+    ).toBeTruthy();
+    expect(batchStatuses(block)).toEqual(['Showing all 64 variants', 'Showing all 46 actions']);
+  });
+
+  it('shows ten campaign blocks at a time, in API order', async () => {
+    const groups = Array.from({ length: 12 }, (_, index) =>
+      makeGroup({
+        key: `campaign:${String(index + 1)}`,
+        title: `Campaign ${String(index + 1)}`,
+        items: [testItemWith(8500 + index, [variantEntry(1), variantEntry(2)])],
+      }),
+    );
+    await renderCreative(creativeWith(...groups));
+    const section = screen.getByRole('region', { name: 'Copy/creative changes' });
+    // The block regions, without the table regions inside them.
+    const blocks = () =>
+      within(section)
+        .getAllByRole('region')
+        .map((region) => region.id)
+        .filter((id) => id.startsWith('group-creative-'));
+
+    expect(blocks()).toEqual(
+      Array.from({ length: 10 }, (_, index) =>
+        groupAnchorId('creative', `campaign:${String(index + 1)}`),
+      ),
+    );
+    fireEvent.click(within(section).getByRole('button', { name: 'Show 2 more groups' }));
+    expect(blocks()).toHaveLength(12);
+    expect(document.activeElement?.id).toBe(groupAnchorId('creative', 'campaign:11'));
   });
 });
 

@@ -30,6 +30,7 @@ import asyncio
 import dataclasses
 import itertools
 import os
+import re
 import threading
 import time
 import uuid
@@ -51,6 +52,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 import ads_engine.db.models  # noqa: F401 - registers every table on the metadata
 from ads_engine.analysis import keywords, metrics, precedence, runner
 from ads_engine.analysis.context import (
+    C0,
     ENTITY_BUDGET,
     ENTITY_CAMPAIGN,
     ENTITY_CONTENT_ASSET,
@@ -60,10 +62,13 @@ from ads_engine.analysis.context import (
     ENTITY_SEARCH_TERM,
     ENTITY_SEGMENT,
     ENTITY_TERM_CLUSTER,
+    K1,
     K3,
     KEYWORDS,
     SECTION_ORDER,
+    WHITE_PAPERS,
     AnalysisContext,
+    DiscrepancyInfo,
     EntityRef,
     Withheld,
     creative_pair_external_id,
@@ -681,6 +686,33 @@ def _shape(rows: list[Any]) -> list[tuple[Any, ...]]:
     ]
 
 
+_DECIMAL_TEXT = re.compile(r"-?\d+(?:\.\d+)?")
+"""How stored evidence renders a ``Decimal``: a fixed-point string (``json_value``)."""
+
+
+def _assert_card_leads_with_a_number(row: Recommendation) -> None:
+    """A stored card leads with a number among its own metrics (AAP 0.1.2).
+
+    "Every card leads with one headline number": ``extra.headline_metric`` names exactly one
+    of the row's stored metrics, whose value is an integer, a fixed-point decimal string or
+    ``null`` for an unavailable number, never text such as a status. White-paper rows are
+    table rows with fixed columns and name no headline.
+    """
+    evidence = row.evidence
+    headline = evidence["extra"].get("headline_metric")
+    if row.section == WHITE_PAPERS:
+        assert headline is None, row.rule_id
+        return
+    (metric,) = [item for item in evidence["metrics"] if item["key"] == headline]
+    value = metric["value"]
+    if value is None:
+        assert metric.get("unavailable") is True, (row.rule_id, headline)
+        return
+    number = isinstance(value, int) and not isinstance(value, bool)
+    decimal = isinstance(value, str) and _DECIMAL_TEXT.fullmatch(value) is not None
+    assert number or decimal, (row.rule_id, headline, value)
+
+
 @pytest.mark.anyio
 async def test_default_world_persists_all_five_sections_deterministically(
     app_db: str, monkeypatch: pytest.MonkeyPatch, default_ctx: AnalysisContext
@@ -718,6 +750,11 @@ async def test_default_world_persists_all_five_sections_deterministically(
         assert entity["type"] == row.entity_type
         assert row.entity_id == f"{entity['source']}:{entity['type']}:{entity['id']}"
         assert entity["name"]
+        # Every card leads with a number among its own stored metrics (K1: the wasted
+        # spend); white-paper rows are table rows and name none.
+        _assert_card_leads_with_a_number(row)
+        if row.rule_id == K1:
+            assert extra["headline_metric"] == "wasted_spend"
         # The pure context's ids name no stored row, so every typed key stays NULL.
         assert all(getattr(row, column) is None for column in _KEY_COLUMNS)
     assert first.data_modes == {
@@ -769,6 +806,92 @@ async def test_default_world_persists_all_five_sections_deterministically(
     assert [(row.section, row.reason, row.count) for row in suppressions] == [
         (row.section, row.reason, row.count) for row in await _rows(RunSuppression, second.id)
     ]
+
+
+def _most_depended_on_campaign(ctx: AnalysisContext, source: str) -> int:
+    """The ``source`` campaign the most of the context's items depend on (ties: lowest id)."""
+    out = precedence.apply_precedence([evaluate(ctx) for _, evaluate in runner._RULES], ctx)
+    counts: dict[int, int] = {}
+    for item in out.all_items():
+        for subject in item.candidate.depends_on:
+            if subject.type == "campaign" and ctx.campaigns[subject.id].source == source:
+                counts[subject.id] = counts.get(subject.id, 0) + 1
+    return min(counts, key=lambda campaign_id: (-counts[campaign_id], campaign_id))
+
+
+def _status_discrepancy(
+    ctx: AnalysisContext, campaign_id: int, number: int, age: timedelta
+) -> DiscrepancyInfo:
+    """An open ``status`` discrepancy on a campaign: decided active, platform paused."""
+    campaign = ctx.campaigns[campaign_id]
+    budget_id = campaign.budget_id
+    shared = budget_id is not None and ctx.budgets[budget_id].explicitly_shared
+    return DiscrepancyInfo(
+        id=number,
+        subject_type="campaign",
+        subject_id=campaign_id,
+        subject_name=campaign.name,
+        source=campaign.source,
+        shape="shared_member" if shared else "own_budget",
+        kind="status",
+        decided_value={"status": "active"},
+        platform_value={"status": "paused"},
+        detected_at=ctx.now - age,
+        state="open",
+    )
+
+
+@pytest.mark.anyio
+async def test_stored_c0_cards_lead_with_the_recommendations_they_hold(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, default_ctx: AnalysisContext
+) -> None:
+    """AAP 0.1.2 and P1: a stored C0 card leads with the number of stored items it holds.
+
+    The default world gets an open ``status`` discrepancy on the Google and on the LinkedIn
+    campaign the most items depend on. Every stored card still leads with a number among its
+    own metrics, and each C0 card's headline is ``held_recommendations``, appended after its
+    ``platform`` and ``decided`` metrics, whose value is the number of stored non-C0 items
+    whose ``blocking_discrepancies`` names its discrepancy.
+    """
+    google = _status_discrepancy(
+        default_ctx, _most_depended_on_campaign(default_ctx, "google"), 1, timedelta(days=1)
+    )
+    linkedin = _status_discrepancy(
+        default_ctx, _most_depended_on_campaign(default_ctx, "linkedin"), 2, timedelta(days=3)
+    )
+    ctx = dataclasses.replace(default_ctx, discrepancies=(google, linkedin), cache={})
+    _patch_context(monkeypatch, ctx)
+    run = await runner.run_analysis(
+        ctx.window, "default", "scheduled", thresholds=ctx.thresholds, now=ctx.now
+    )
+    rows = await _rows(Recommendation, run.id)
+    for row in rows:
+        _assert_card_leads_with_a_number(row)
+    held: dict[int, int] = {google.id: 0, linkedin.id: 0}
+    for row in rows:
+        if row.rule_id != C0:
+            for discrepancy_id in row.evidence["extra"].get("blocking_discrepancies", ()):
+                held[discrepancy_id] += 1
+    cards = [row for row in rows if row.rule_id == C0]
+    assert [card.evidence["extra"]["discrepancy_id"] for card in cards] == [linkedin.id, google.id]
+    for card in cards:
+        discrepancy_id = card.evidence["extra"]["discrepancy_id"]
+        assert card.evidence["extra"]["headline_metric"] == "held_recommendations"
+        assert [metric["key"] for metric in card.evidence["metrics"]] == [
+            "platform",
+            "decided",
+            "held_recommendations",
+        ]
+        assert card.evidence["metrics"][-1] == {
+            "key": "held_recommendations",
+            "label": "Recommendations held until resolved",
+            "value": held[discrepancy_id],
+            "unit": "recommendations",
+        }
+        # Both campaigns were chosen because items depend on them, so each holds some.
+        assert held[discrepancy_id] > 0, discrepancy_id
+        # The action and reason still state the platform and decided values.
+        assert card.action == "Resolve: platform shows paused, last decided active"
 
 
 @pytest.mark.anyio

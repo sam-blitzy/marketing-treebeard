@@ -100,6 +100,7 @@ import {
   type SelectOption,
 } from '../../design-system';
 import { currencyMinorDigits, currencyStep, formatCount, formatMoney } from '../../lib/format';
+import { useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
 // Public API
@@ -578,8 +579,9 @@ function isResolvedError(error: unknown): boolean {
  * same id keeps the user's edits.
  *
  * States: a `Spinner` while the decision log loads; a critical `Banner` with the API message
- * when it fails; a warning `Banner` with no submit when the subject has no decided state and no
- * discrepancy to start from, or when its removal was acknowledged.
+ * when it fails, kept while the polled log is read again; a warning `Banner` with no submit
+ * when the subject has no decided state and no discrepancy to start from, or when its removal
+ * was acknowledged.
  */
 export function DecisionForm(props: DecisionFormProps) {
   return <DecisionFormBody key={formIdentity(props)} {...props} />;
@@ -628,6 +630,13 @@ function DecisionFormBody(props: DecisionFormProps) {
   } = props;
 
   const decisions = useDecisions({ subject_type: subject.type, subject_id: subject.id });
+  // The log polls, so a failed first read is kept while it runs again instead of flickering
+  // back to the spinner on every poll.
+  const loadFailure = useSettledFailure(
+    decisions.error,
+    decisions.fetchStatus !== 'idle',
+    decisions.data !== undefined,
+  );
   const recordDecision = useRecordDecision();
   const resolveDiscrepancy = useResolveDiscrepancy();
 
@@ -657,8 +666,8 @@ function DecisionFormBody(props: DecisionFormProps) {
   }, [saveError]);
 
   if (decisions.data === undefined) {
-    if (decisions.isError) {
-      return <Banner tone="critical" title={saveErrorMessage(decisions.error)} />;
+    if (loadFailure !== null) {
+      return <Banner tone="critical" title={saveErrorMessage(loadFailure)} />;
     }
     return <Spinner label="Loading decision" />;
   }

@@ -907,6 +907,8 @@ def _candidate(
             "cohort": _cohort_extra(cohort, settings),
             **decision.extra,
         },
+        # White-paper items render as table rows whose columns AAP 0.5.5 fixes, not as cards.
+        headline=None,
     )
     return Candidate(
         rule_id=decision.rule_id,

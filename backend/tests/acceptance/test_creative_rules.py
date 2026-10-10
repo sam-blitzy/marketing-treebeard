@@ -603,6 +603,10 @@ def test_cr1_ahead_but_not_distinguishable_states_the_impressions_still_needed(
         f"about {needed:,} more impressions per variant needed at the observed difference"
     )
     assert extra["ahead"] == run.urn("cr-a")
+    # The card leads with the leader's end-to-end rate: a rate, never a winner label (P7).
+    headline = "rate_a" if extra["pair"][0] == extra["ahead"] else "rate_b"
+    assert extra["headline_metric"] == headline
+    assert item.evidence.metric(headline).label.startswith(f"{leader} ")
     assert extra["label"] == label
     assert item.action == f"{leader} vs {other}: {label}"
     assert extra["sample_needed"] == needed
@@ -977,6 +981,9 @@ def test_cr3_next_test_changes_exactly_one_variable_for_its_stage(
     item = run.cr3()
     next_test = item.evidence.extra["next_test"]
     assert next_test["stage"] == item.evidence.extra["weak_stage"]["stage"] == stage
+    # The card leads with the tested stage's own rate metric.
+    assert item.evidence.extra["headline_metric"] == stage
+    assert item.evidence.metric(stage).unit == "ratio"
     variable = AAP_STAGE_VARIABLE[stage]
     assert (next_test["variable"], next_test["variable_label"]) == (
         STAGE_VARIABLE_KEY[stage],
@@ -1012,6 +1019,8 @@ def test_cr3_without_a_weak_stage_tests_the_lowest_stage_relative_to_baseline_as
     lowest = min(relative, key=lambda stage: (relative[stage], order.index(stage)))
     next_test = item.evidence.extra["next_test"]
     assert next_test["stage"] == lowest
+    # An exploratory test leads with the rate of the stage it tests, too.
+    assert item.evidence.extra["headline_metric"] == lowest
     assert next_test["exploratory"] is True
     assert item.evidence.extra["weak_stage"]["exploratory"] is True
     assert item.reason == NO_WEAK_STAGE_TEXT

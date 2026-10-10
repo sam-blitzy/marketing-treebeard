@@ -19,8 +19,16 @@
  * - 409 `subject_retired` and 409 `discrepancy_resolved` lock every control; 409
  *   `platform_state_unknown`, 422 `resolution_not_allowed` and 422 `intended_state_invalid` show
  *   the API's own message and leave the controls usable; `disabled` locks every control;
- * - the list's loading, empty, failed and failed-refresh states, every page of the `Link`
- *   cursor, and each side of a discrepancy rendered from its stored keys by kind and shape.
+ * - the list's loading, empty, failed and failed-refresh states, announced in one polite status
+ *   region kept from the first render (never an alert), with Retry and the last-loaded instant;
+ *   the first page of `DISCREPANCY_PAGE_SIZE` with its `X-Total-Count` summary, the line on
+ *   discrepancies a fully read list cannot show because their subject could not be loaded (never
+ *   the empty state while the total is positive), later `Link`
+ *   cursor pages on "Show more discrepancies", polling, the closure announcement, and each side
+ *   of a discrepancy rendered from its stored keys by kind and shape;
+ * - a `#discrepancy-{id}` hash, on arrival or changed later: the pages it needs loaded one at a
+ *   time, the card scrolled into view once, and the region's line when the complete list lacks
+ *   it.
  *
  * `../../test/mockApi` is imported first so its `afterEach` check runs after Testing Library's
  * cleanup (Vitest skips later hooks once one throws).
@@ -30,9 +38,10 @@ import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../te
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 
-import { queryKeys } from '../../api/queries';
+import { CURRENT_STATE_POLL_MS, DISCREPANCY_PAGE_SIZE, queryKeys } from '../../api/queries';
 import type { Discrepancy, SubjectView } from '../../api/types';
 import { Button } from '../../design-system';
+import { formatInstant } from '../../lib/format';
 import {
   FIXTURE_BUDGET_IDS,
   FIXTURE_CAMPAIGN_IDS,
@@ -57,9 +66,13 @@ const LIST_KEY = 'GET /discrepancies?state=open&state=awaiting_platform';
 /** The handler key of every resolution. */
 const RESOLVE_KEY = 'POST /discrepancies/:id/resolve';
 
+/** The label of the button that loads the resolver's next page. */
+const SHOW_MORE = 'Show more discrepancies';
+
 /** The `Link` header of a default-state page whose last read row is `after`. */
 function nextLink(after: number): string {
-  const query = `state=open&state=awaiting_platform&limit=500&after=${String(after)}`;
+  const limit = String(DISCREPANCY_PAGE_SIZE);
+  const query = `state=open&state=awaiting_platform&limit=${limit}&after=${String(after)}`;
   return `</api/v1/discrepancies?${query}>; rel="next"`;
 }
 
@@ -130,6 +143,21 @@ function outcomeRegion(scope: HTMLElement = document.body): HTMLElement {
   return region;
 }
 
+/**
+ * The resolver's own polite status region: the one `div` status element outside every card.
+ * `hidden` is set so the region is found while it is still empty.
+ */
+function listRegion(): HTMLElement {
+  const regions = screen
+    .getAllByRole('status', { hidden: true })
+    .filter((element) => element.tagName === 'DIV' && element.closest('article') === null);
+  const [region] = regions;
+  if (region === undefined || regions.length !== 1) {
+    throw new Error(`Expected one list status region, found ${String(regions.length)}`);
+  }
+  return region;
+}
+
 /** Renders the controls of one discrepancy, with a spy for `onResolved`. */
 async function renderResolution(discrepancy: Discrepancy, disabled?: boolean) {
   const onResolved = vi.fn<(updated: Discrepancy) => void>();
@@ -164,6 +192,8 @@ describe('DiscrepancyResolver list', () => {
 
     expect(screen.getByText('Loading discrepancies')).toBeTruthy();
     expect(screen.queryByRole('article')).toBeNull();
+    // The spinner is a status element of its own, outside the list's region, never nested in it.
+    expect(listRegion().contains(screen.getByText('Loading discrepancies'))).toBe(false);
 
     page.resolve(json(200, [makeDiscrepancy('status')]));
 
@@ -172,7 +202,7 @@ describe('DiscrepancyResolver list', () => {
     expect(screen.queryByText('Loading discrepancies')).toBeNull();
   });
 
-  it('reads the open and awaiting-platform states at the largest page size', async () => {
+  it('reads the open and awaiting-platform states one page at a time', async () => {
     const api = mockApi(listHandlers([makeDiscrepancy('status')]));
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
@@ -180,10 +210,80 @@ describe('DiscrepancyResolver list', () => {
 
     const [first] = listCalls(api);
     expect(first?.search.getAll('state')).toEqual(['open', 'awaiting_platform']);
-    expect(first?.search.get('limit')).toBe('500');
+    expect(first?.search.get('limit')).toBe(String(DISCREPANCY_PAGE_SIZE));
+    expect(listCalls(api)).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
   });
 
-  it('lists every Link cursor page, oldest first, each card under its own anchor', async () => {
+  it('keeps one polite status region, never an alert, from loading to data', async () => {
+    const page = deferred<MockResponse>();
+    let reads = 0;
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: () => {
+        reads += 1;
+        if (reads === 1) {
+          return apiError(500, 'internal_error', 'Database unavailable');
+        }
+        return page.promise;
+      },
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const region = listRegion();
+    expect(region.textContent).toBe('');
+
+    await waitFor(() => {
+      expect(within(region).getByText('Discrepancies could not be loaded')).toBeTruthy();
+    });
+    expect(within(region).getByText('Database unavailable')).toBeTruthy();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    const retry = buttonNamed('Retry', region);
+    retry.focus();
+    fireEvent.click(retry);
+    // The failure stays in place while the read runs again: no spinner, the button is loading.
+    await waitFor(() => {
+      expect(retry.getAttribute('aria-busy')).toBe('true');
+    });
+    expect(screen.queryByText('Loading discrepancies')).toBeNull();
+    expect(within(region).getByText('Discrepancies could not be loaded')).toBeTruthy();
+
+    page.resolve(
+      json(200, [makeDiscrepancy('status')], { 'X-Total-Count': '1' }),
+    );
+    await findCard('Brand Search — US');
+    expect(listRegion()).toBe(region);
+    expect(region.textContent).toBe('Showing 1 of 1 unresolved discrepancy');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(listCalls(api)).toHaveLength(2);
+  });
+
+  it('returns focus to Retry when a retry the user started fails again', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: apiError(503, 'internal_error', 'Database unavailable'),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const region = listRegion();
+    const retry = await within(region).findByRole('button', { name: 'Retry' });
+    // A browser drops focus to the body when the focused button turns disabled while loading;
+    // jsdom keeps it, so the click is made with focus already on the body.
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(retry);
+
+    await waitFor(() => {
+      expect(listCalls(api)).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(region).getByRole('button', { name: 'Retry' }));
+    });
+    expect(within(region).getByText('Database unavailable')).toBeTruthy();
+  });
+
+  it('shows the first page with its total, then the next one on "Show more"', async () => {
     const oldest = makeDiscrepancy('status');
     const member = makeDiscrepancy('budget', {
       id: 52,
@@ -198,13 +298,21 @@ describe('DiscrepancyResolver list', () => {
     });
     const api = mockApi({
       'GET /runs/latest': json(200, makeRun()),
-      [LIST_KEY]: json(200, [oldest, member], { Link: nextLink(52) }),
-      [`${LIST_KEY}&after=52`]: json(200, [budget]),
+      [LIST_KEY]: json(200, [oldest, member], { Link: nextLink(52), 'X-Total-Count': '3' }),
+      [`${LIST_KEY}&after=52`]: json(200, [budget], { 'X-Total-Count': '3' }),
     });
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
 
     const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+    const region = listRegion();
+    expect(region.textContent).toBe('Showing 2 of 3 unresolved discrepancies');
+    expect(listCalls(api)).toHaveLength(1);
+
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(buttonNamed(SHOW_MORE));
+
     await waitFor(() => {
       expect(within(list).getAllByRole('listitem')).toHaveLength(3);
     });
@@ -217,8 +325,61 @@ describe('DiscrepancyResolver list', () => {
       'Search Shared Budget',
     ]);
     expect(listCalls(api).map((call) => call.search.get('after'))).toEqual([null, '52']);
+    expect(region.textContent).toBe('Showing 3 of 3 unresolved discrepancies');
+    expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+    // The last page removed the button, so focus moves to the first discrepancy it added.
+    const added = within(list).getAllByRole('listitem')[2];
+    await waitFor(() => {
+      expect(document.activeElement).toBe(added);
+    });
     expect(document.getElementById('discrepancy-52')).toBe(await findCard('Search Partners — US'));
     expect(document.getElementById('discrepancy-60')).toBe(await findCard('Search Shared Budget'));
+  });
+
+  it('keeps focus on "Show more" while further pages remain', async () => {
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], { Link: nextLink(51) }),
+      [`${LIST_KEY}&after=51`]: json(200, [makeDiscrepancy('budget', { id: 52 })], {
+        Link: nextLink(52),
+      }),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+    // As in a browser, where the loading (disabled) button drops focus to the body.
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(buttonNamed(SHOW_MORE));
+
+    await waitFor(() => {
+      expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(buttonNamed(SHOW_MORE));
+    });
+    expect(listRegion().textContent).toBe('Showing 2 unresolved discrepancies');
+  });
+
+  it('keeps the loaded list and "Show more" when the next page fails', async () => {
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], { Link: nextLink(51) }),
+      [`${LIST_KEY}&after=51`]: apiError(503, 'internal_error', 'The database is restarting'),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    await findCard('Brand Search — US');
+    fireEvent.click(buttonNamed(SHOW_MORE));
+
+    const region = listRegion();
+    await waitFor(() => {
+      expect(within(region).getByText('More discrepancies could not be loaded')).toBeTruthy();
+    });
+    expect(within(region).getByText('The database is restarting')).toBeTruthy();
+    expect(within(region).queryByText('Discrepancies could not be refreshed')).toBeNull();
+    expect(screen.getByRole('article', { name: 'Brand Search — US' })).toBeTruthy();
+    expect(buttonNamed(SHOW_MORE).disabled).toBe(false);
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('shows the state, the comparison and the detection instant in the run time zone', async () => {
@@ -307,17 +468,139 @@ describe('DiscrepancyResolver list', () => {
     expect(within(budget).getByText('Google · Shared budget · Budget mismatch')).toBeTruthy();
   });
 
-  it('says so when there is no open discrepancy', async () => {
+  it('says so in its status region when there is no open discrepancy', async () => {
     mockApi(listHandlers([]));
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
 
-    expect(await screen.findByText('No open discrepancies')).toBeTruthy();
-    expect(screen.getByText('Platform state matches every last decision.')).toBeTruthy();
+    const region = listRegion();
+    await waitFor(() => {
+      expect(within(region).getByText('No open discrepancies')).toBeTruthy();
+    });
+    expect(within(region).getByText('Platform state matches every last decision.')).toBeTruthy();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+  });
+
+  it.each([
+    ['an X-Total-Count of 0', { 'X-Total-Count': '0' }],
+    ['no X-Total-Count', {}],
+  ])('shows the empty state for an empty list with %s', async (_description, headers) => {
+    mockApi({ 'GET /runs/latest': json(200, makeRun()), [LIST_KEY]: json(200, [], headers) });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+
+    const region = listRegion();
+    await waitFor(() => {
+      expect(region.textContent).toBe(
+        'No open discrepanciesPlatform state matches every last decision.',
+      );
+    });
     expect(screen.queryByRole('list')).toBeNull();
   });
 
-  it('shows the API message when the first read fails', async () => {
+  it.each([
+    [
+      '1',
+      '1 unresolved discrepancy cannot be shown' +
+        ' because its campaign or shared budget could not be loaded.',
+    ],
+    [
+      '2',
+      '2 unresolved discrepancies cannot be shown' +
+        ' because their campaigns or shared budgets could not be loaded.',
+    ],
+  ])(
+    'never reports an empty list with an X-Total-Count of %s as matching every decision',
+    async (total, line) => {
+      mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LIST_KEY]: json(200, [], { 'X-Total-Count': total }),
+      });
+
+      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+
+      // The API counts discrepancies whose subject cannot be loaded but leaves them out of the
+      // list, so the region keeps the total and says why nothing is listed.
+      const region = listRegion();
+      await waitFor(() => {
+        expect(region.textContent).toBe(line);
+      });
+      expect(screen.queryByText('No open discrepancies')).toBeNull();
+      expect(screen.queryByText('Platform state matches every last decision.')).toBeNull();
+      expect(screen.queryByRole('list')).toBeNull();
+      expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it.each([
+    [
+      '2 of 3',
+      [makeDiscrepancy('status'), makeDiscrepancy('budget', { id: 52 })],
+      'Showing 2 of 3 unresolved discrepancies',
+      '1 cannot be shown because its campaign or shared budget could not be loaded.',
+    ],
+    [
+      '1 of 3',
+      [makeDiscrepancy('status')],
+      'Showing 1 of 3 unresolved discrepancies',
+      '2 cannot be shown because their campaigns or shared budgets could not be loaded.',
+    ],
+  ])(
+    'explains beneath the summary what a complete list of %s cannot show',
+    async (_description, discrepancies, summary, line) => {
+      mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LIST_KEY]: json(200, discrepancies, { 'X-Total-Count': '3' }),
+      });
+
+      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+
+      const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+      expect(within(list).getAllByRole('listitem')).toHaveLength(discrepancies.length);
+      const region = listRegion();
+      expect(within(region).getByText(summary)).toBeTruthy();
+      expect(within(region).getByText(line)).toBeTruthy();
+      expect(region.textContent).toBe(`${summary}${line}`);
+      expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it('says nothing of unavailable discrepancies until the last page is read', async () => {
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status'), makeDiscrepancy('budget', { id: 52 })], {
+        Link: nextLink(52),
+        'X-Total-Count': '4',
+      }),
+      [`${LIST_KEY}&after=52`]: json(200, [makeDiscrepancy('untracked', { id: 60 })], {
+        'X-Total-Count': '4',
+      }),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+
+    // The next page may still hold the rest, so only the summary is shown.
+    const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+    const region = listRegion();
+    expect(region.textContent).toBe('Showing 2 of 4 unresolved discrepancies');
+    expect(within(region).queryByText(/cannot be shown/)).toBeNull();
+
+    fireEvent.click(buttonNamed(SHOW_MORE));
+
+    await waitFor(() => {
+      expect(within(list).getAllByRole('listitem')).toHaveLength(3);
+    });
+    expect(region.textContent).toBe(
+      'Showing 3 of 4 unresolved discrepancies' +
+        '1 cannot be shown because its campaign or shared budget could not be loaded.',
+    );
+    expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+  });
+
+  it('shows the API message and Retry when the first read fails', async () => {
     mockApi({
       'GET /runs/latest': json(200, makeRun()),
       [LIST_KEY]: apiError(500, 'internal_error', 'Database unavailable'),
@@ -325,29 +608,102 @@ describe('DiscrepancyResolver list', () => {
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
 
-    expect(await screen.findByText('Discrepancies could not be loaded')).toBeTruthy();
-    expect(screen.getByText('Database unavailable')).toBeTruthy();
+    const region = listRegion();
+    expect(await within(region).findByText('Discrepancies could not be loaded')).toBeTruthy();
+    expect(within(region).getByText('Database unavailable')).toBeTruthy();
+    expect(buttonNamed('Retry', region)).toBeTruthy();
     expect(screen.queryByRole('list')).toBeNull();
   });
 
-  it('keeps the list shown and warns when a refresh fails', async () => {
+  it('keeps the list shown as last loaded, with Retry, when a refresh fails', async () => {
     const api = mockApi(listHandlers([makeDiscrepancy('status')]));
     const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
       path: '/decisions',
     });
     await findCard('Brand Search — US');
+    const loadedAt = queryClient.getQueryState(
+      queryKeys.discrepancyPages(['open', 'awaiting_platform']),
+    )?.dataUpdatedAt;
 
     api.use({ [LIST_KEY]: apiError(503, 'unavailable', 'The database is restarting') });
     await act(async () => {
       await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
     });
 
-    expect(await screen.findByText('Discrepancies could not be refreshed')).toBeTruthy();
-    expect(screen.getByText('The database is restarting')).toBeTruthy();
+    const region = listRegion();
+    expect(await within(region).findByText('Discrepancies could not be refreshed')).toBeTruthy();
+    expect(within(region).getByText('The database is restarting')).toBeTruthy();
+    expect(loadedAt).toBeDefined();
+    const loadedText = formatInstant(new Date(loadedAt ?? 0).toISOString(), 'UTC');
+    expect(within(region).getByText(`Showing the list as last loaded ${loadedText}.`)).toBeTruthy();
     expect(screen.getByRole('article', { name: 'Brand Search — US' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    api.use(listHandlers([makeDiscrepancy('status'), makeDiscrepancy('budget', { id: 52 })]));
+    fireEvent.click(buttonNamed('Retry', region));
+    await waitFor(() => {
+      expect(within(region).queryByText('Discrepancies could not be refreshed')).toBeNull();
+    });
+    expect(screen.getAllByRole('article')).toHaveLength(2);
   });
 
-  it('drops a discrepancy the resolution closed when the list refetches', async () => {
+  it('never presents a cached empty list as current when its refresh fails', async () => {
+    const api = mockApi(listHandlers([]));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const region = listRegion();
+    await waitFor(() => {
+      expect(within(region).getByText('No open discrepancies')).toBeTruthy();
+    });
+
+    api.use({ [LIST_KEY]: apiError(502, 'http_502', 'Bad gateway') });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+
+    expect(await within(region).findByText('Discrepancies could not be refreshed')).toBeTruthy();
+    expect(within(region).getByText('Bad gateway')).toBeTruthy();
+    expect(
+      within(region).getByText(/^No discrepancies were open when the list was last loaded .+\.$/),
+    ).toBeTruthy();
+    expect(within(region).queryByText('No open discrepancies')).toBeNull();
+    expect(within(region).queryByText('Platform state matches every last decision.')).toBeNull();
+    expect(buttonNamed('Retry', region)).toBeTruthy();
+  });
+
+  it('never says none were open when an empty list with a total fails to refresh', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [], { 'X-Total-Count': '1' }),
+    });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const region = listRegion();
+    const line =
+      '1 unresolved discrepancy cannot be shown' +
+      ' because its campaign or shared budget could not be loaded.';
+    await waitFor(() => {
+      expect(region.textContent).toBe(line);
+    });
+
+    api.use({ [LIST_KEY]: apiError(502, 'http_502', 'Bad gateway') });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+
+    expect(await within(region).findByText('Discrepancies could not be refreshed')).toBeTruthy();
+    expect(within(region).getByText('Bad gateway')).toBeTruthy();
+    expect(within(region).getByText(/^Showing the list as last loaded .+\.$/)).toBeTruthy();
+    expect(within(region).getByText(line)).toBeTruthy();
+    expect(within(region).queryByText(/^No discrepancies were open/)).toBeNull();
+    expect(within(region).queryByText('No open discrepancies')).toBeNull();
+    expect(buttonNamed('Retry', region)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('drops a discrepancy the resolution closed and announces the closure', async () => {
     let resolved = false;
     const api = mockApi({
       'GET /runs/latest': json(200, makeRun()),
@@ -363,9 +719,12 @@ describe('DiscrepancyResolver list', () => {
 
     await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
     const card = await findCard('Brand Search — US');
+    const region = listRegion();
     fireEvent.click(buttonNamed('Platform is correct', card));
 
-    expect(await screen.findByText('No open discrepancies')).toBeTruthy();
+    expect(await within(region).findByText('No open discrepancies')).toBeTruthy();
+    expect(await within(region).findByText('Brand Search — US resolved')).toBeTruthy();
+    expect(listRegion()).toBe(region);
     expect(resolveCalls(api).map((call) => call.body)).toEqual([
       { resolution: 'platform_correct' },
     ]);
@@ -400,6 +759,298 @@ describe('DiscrepancyResolver list', () => {
       );
     });
     expect(within(card).getByText('Awaiting platform')).toBeTruthy();
+    expect(within(listRegion()).queryByText(/resolved$/)).toBeNull();
+  });
+
+  it('refreshes itself while shown, picking up a discrepancy the worker raised', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let raised = false;
+      mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LIST_KEY]: () =>
+          json(
+            200,
+            raised
+              ? [makeDiscrepancy('status'), makeDiscrepancy('budget', { id: 52 })]
+              : [makeDiscrepancy('status')],
+            { 'X-Total-Count': raised ? '2' : '1' },
+          ),
+      });
+
+      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+      await findCard('Brand Search — US');
+      expect(screen.getAllByRole('article')).toHaveLength(1);
+
+      raised = true;
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(screen.getAllByRole('article')).toHaveLength(2);
+      });
+      expect(listRegion().textContent).toBe('Showing 2 of 2 unresolved discrepancies');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The linked discrepancy (`/decisions#discrepancy-{id}`)
+// ---------------------------------------------------------------------------------------------
+
+/** Lets pending requests, query notifications and effects run, to assert nothing more happens. */
+async function settle(): Promise<void> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
+      }),
+  );
+}
+
+/** The `after` cursor of every `GET /discrepancies` page the stub received, in order. */
+function pageCursors(api: ApiMock): (string | null)[] {
+  return listCalls(api).map((call) => call.search.get('after'));
+}
+
+/** The resolver card of a discrepancy, found by the element id links name as their hash. */
+function cardById(id: number): HTMLElement {
+  const card = document.getElementById(`discrepancy-${String(id)}`);
+  if (card === null) {
+    throw new Error(`No card for discrepancy ${String(id)} is rendered`);
+  }
+  return card;
+}
+
+describe('DiscrepancyResolver linked discrepancy', () => {
+  /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  });
+
+  it('scrolls a linked card on the first page into view once loaded, and only once', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const page = deferred<MockResponse>();
+      let reads = 0;
+      const discrepancies = [makeDiscrepancy('status'), makeDiscrepancy('budget', { id: 52 })];
+      const api = mockApi({
+        'GET /runs/latest': json(200, makeRun()),
+        [LIST_KEY]: () => {
+          reads += 1;
+          return reads === 1
+            ? page.promise
+            : json(200, discrepancies, { 'X-Total-Count': '2' });
+        },
+      });
+
+      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-52' });
+      const region = listRegion();
+      expect(screen.getByText('Loading discrepancies')).toBeTruthy();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      page.resolve(json(200, discrepancies, { 'X-Total-Count': '2' }));
+      await waitFor(() => {
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      });
+      expect(scrollIntoView.mock.contexts[0]).toBe(cardById(52));
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'start' });
+      expect(pageCursors(api)).toEqual([null]);
+      expect(region.textContent).toBe('Showing 2 of 2 unresolved discrepancies');
+      // The card is scrolled to, not focused.
+      expect(document.activeElement).toBe(document.body);
+
+      // The 30 s poll re-reads the list, and the card is not scrolled to again.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(listCalls(api)).toHaveLength(2);
+      });
+      await settle();
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(listRegion()).toBe(region);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('loads pages 2 and 3 to reach a linked card on page 3, then scrolls to it', async () => {
+    const second = deferred<MockResponse>();
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], {
+        Link: nextLink(51),
+        'X-Total-Count': '4',
+      }),
+      [`${LIST_KEY}&after=51`]: () => second.promise,
+      [`${LIST_KEY}&after=52`]: json(200, [makeDiscrepancy('untracked', { id: 60 })], {
+        Link: nextLink(60),
+        'X-Total-Count': '4',
+      }),
+      [`${LIST_KEY}&after=60`]: json(200, [makeDiscrepancy('missing', { id: 61 })], {
+        'X-Total-Count': '4',
+      }),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-60' });
+
+    // Page 1 is shown and page 2 is loading: "Show more" shows that load.
+    await waitFor(() => {
+      expect(pageCursors(api)).toEqual([null, '51']);
+    });
+    expect(cardById(51)).toBeTruthy();
+    await waitFor(() => {
+      expect(buttonNamed(SHOW_MORE).getAttribute('aria-busy')).toBe('true');
+    });
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    second.resolve(
+      json(200, [makeDiscrepancy('budget', { id: 52 })], {
+        Link: nextLink(52),
+        'X-Total-Count': '4',
+      }),
+    );
+    await waitFor(() => {
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    });
+    expect(scrollIntoView.mock.contexts[0]).toBe(cardById(60));
+    expect(pageCursors(api)).toEqual([null, '51', '52']);
+    for (const call of listCalls(api)) {
+      expect(call.search.get('limit')).toBe(String(DISCREPANCY_PAGE_SIZE));
+    }
+    expect(listRegion().textContent).toBe('Showing 3 of 4 unresolved discrepancies');
+
+    // Page 4 is left for "Show more", and no focus was moved.
+    await settle();
+    expect(pageCursors(api)).toEqual([null, '51', '52']);
+    expect(buttonNamed(SHOW_MORE).disabled).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+    expect(document.getElementById('discrepancy-61')).toBeNull();
+  });
+
+  it('follows a hash that changes after mount, loading only what the target needs', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], { Link: nextLink(51) }),
+      [`${LIST_KEY}&after=51`]: json(200, [makeDiscrepancy('budget', { id: 52 })], {
+        Link: nextLink(52),
+      }),
+      [`${LIST_KEY}&after=52`]: json(200, [makeDiscrepancy('untracked', { id: 60 })]),
+    });
+
+    const { router } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    await findCard('Brand Search — US');
+    await settle();
+    expect(pageCursors(api)).toEqual([null]);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    // A card already loaded is scrolled to without a request.
+    await act(() => router.navigate({ to: '/decisions', hash: 'discrepancy-51' }));
+    await waitFor(() => {
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    });
+    expect(scrollIntoView.mock.contexts[0]).toBe(cardById(51));
+    expect(pageCursors(api)).toEqual([null]);
+
+    // A card on a later page is loaded first, then scrolled to.
+    await act(() => router.navigate({ to: '/decisions', hash: 'discrepancy-52' }));
+    await waitFor(() => {
+      expect(scrollIntoView).toHaveBeenCalledTimes(2);
+    });
+    expect(scrollIntoView.mock.contexts[1]).toBe(cardById(52));
+    expect(pageCursors(api)).toEqual([null, '51']);
+
+    await settle();
+    expect(pageCursors(api)).toEqual([null, '51']);
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it('says a linked discrepancy the complete list lacks is no longer unresolved', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], {
+        Link: nextLink(51),
+        'X-Total-Count': '2',
+      }),
+      [`${LIST_KEY}&after=51`]: json(200, [makeDiscrepancy('budget', { id: 52 })], {
+        'X-Total-Count': '2',
+      }),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-77' });
+    const region = listRegion();
+
+    await waitFor(() => {
+      expect(within(region).getByText('Discrepancy 77 is no longer unresolved.')).toBeTruthy();
+    });
+    expect(within(region).getByText('Showing 2 of 2 unresolved discrepancies')).toBeTruthy();
+    expect(pageCursors(api)).toEqual([null, '51']);
+    expect(listRegion()).toBe(region);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
+
+    // The list has ended: nothing more is read, and nothing is scrolled.
+    await settle();
+    expect(pageCursors(api)).toEqual([null, '51']);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it('names an unloadable subject as a possible reason when the total is larger', async () => {
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], { 'X-Total-Count': '2' }),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-77' });
+
+    const region = listRegion();
+    await waitFor(() => {
+      expect(
+        within(region).getByText(
+          'Discrepancy 77 is not listed: it is no longer unresolved, or its campaign or shared ' +
+            'budget could not be loaded.',
+        ),
+      ).toBeTruthy();
+    });
+    expect(within(region).getByText('Showing 1 of 2 unresolved discrepancies')).toBeTruthy();
+  });
+
+  it('reports a failed page load toward the linked card as "Show more" would, once', async () => {
+    const api = mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: json(200, [makeDiscrepancy('status')], { Link: nextLink(51) }),
+      [`${LIST_KEY}&after=51`]: apiError(503, 'internal_error', 'The database is restarting'),
+    });
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-60' });
+
+    const region = listRegion();
+    await waitFor(() => {
+      expect(within(region).getByText('More discrepancies could not be loaded')).toBeTruthy();
+    });
+    expect(within(region).getByText('The database is restarting')).toBeTruthy();
+    expect(within(region).queryByText('Discrepancies could not be refreshed')).toBeNull();
+    expect(within(region).queryByText(/no longer unresolved/u)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    // The failed load is not repeated on its own; "Show more" stays to try again.
+    await settle();
+    expect(pageCursors(api)).toEqual([null, '51']);
+    expect(buttonNamed(SHOW_MORE).disabled).toBe(false);
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 });
 

@@ -309,6 +309,26 @@ export function metricsByKeys(
 }
 
 /**
+ * The item's headline number: the metric its rule selected to lead the card (AAP 0.1.2: every
+ * card leads with one headline number, and its full evidence follows; K1's is the wasted spend).
+ *
+ * The backend freezes the selection as `extra.headline_metric`, the key of one metric in
+ * `evidence.metrics` (for example `wasted_spend` on K1). The browser only looks that metric up:
+ * it never computes a figure and never falls back to another metric, so evidence frozen before
+ * the key existed, or by a rule that selects none, leads with no number. The metric is returned
+ * as the evidence holds it, `unavailable` and `floor` markers included, so `formatMetric`
+ * renders it ("unavailable", never `0`).
+ *
+ * @param source - The item or its evidence.
+ * @returns A guarded copy of the selected metric, or `null` when `extra.headline_metric` is
+ *   missing, is not a non-blank string, or names no well-formed metric of the evidence.
+ */
+export function headlineMetric(source: MaybeSource): Metric | null {
+  const key = readString(readExtra(source)?.headline_metric);
+  return key === null ? null : metricByKey(source, key);
+}
+
+/**
  * The first baseline of `evidence.baselines` with this key (for example
  * `baseline_cost_per_outcome` of C1/C2/B1–B3, `cohort_median_cost_per_ql` of W1/W2).
  *

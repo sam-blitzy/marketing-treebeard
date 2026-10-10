@@ -914,6 +914,7 @@ def budget_evidence(
     baselines: Sequence[Baseline] = (),
     threshold_keys: Sequence[str] = (),
     extra: Mapping[str, Any] | None = None,
+    headline: str | None,
 ) -> Evidence:
     """Build the evidence every budget card shows side by side (AAP 0.5.4.5, 0.5.4.8).
 
@@ -954,13 +955,16 @@ def budget_evidence(
         threshold_keys: The rule's own threshold keys, added to the ``budget.*`` gate keys
             (and the CRM keys when CRM counts are shown).
         extra: Rule-specific detail, merged over the shared ``extra``.
+        headline: The key of the shared or rule metric the card leads with, stored as
+            ``extra.headline_metric`` (:meth:`AnalysisContext.make_evidence`); ``None`` for
+            none.
 
     Returns:
         The frozen evidence.
 
     Raises:
-        ValueError: When ``history`` belongs to another subject, or a rule metric repeats a
-            shared metric's key.
+        ValueError: When ``history`` belongs to another subject, a rule metric repeats a
+            shared metric's key, or ``headline`` names no metric of the card.
         KeyError: When the subject is not in the context.
         ConfigError: When a threshold key is missing.
     """
@@ -1051,6 +1055,7 @@ def budget_evidence(
             VETO_THRESHOLD_KEYS if view.linked else (),
         ),
         extra={**shared_extra, **(extra or {})},
+        headline=headline,
     )
 
 
@@ -1261,6 +1266,8 @@ def _b1_candidate(ctx: AnalysisContext, settings: _Settings, outcome: ScaleOutco
         ),
         threshold_keys=B1_THRESHOLD_KEYS,
         extra=extra,
+        # The increase rests on the capped budget's utilization.
+        headline="window_utilization",
     )
     label = _outcome_label(ctx, outcome.members)
     step = evidence.extra["step"]
@@ -1415,6 +1422,8 @@ def _b2(
             "decrease_step": settings.b1_step,
             "poor_efficiency_ratio": settings.poor_ratio,
         },
+        # The poor efficiency that fired: zero outcomes have no cost per outcome to lead with.
+        headline="outcomes" if assessment.branch == "zero_outcomes" else "cost_per_outcome",
     )
     step = _percent(evidence.extra["decrease_step"])
     high = (
@@ -1540,6 +1549,8 @@ def _b3(
             "headroom": settings.b3_headroom,
             "under_utilization": history.config.under_utilization,
         },
+        # The decrease rests on the budget's low utilization.
+        headline="window_utilization",
     )
     reason = (
         f"Under-utilized on {_value(evidence, 'under_utilized_days')} of "
@@ -1984,6 +1995,8 @@ def _b4_candidate(
             },
             **_b4_history_extra(ctx, subject, history),
         },
+        # The pattern's weekend cost per outcome, which the action sets against the weekday's.
+        headline="weekend_cpo",
     )
     weekend_text = _cost_of(evidence, "weekend_cpo")
     weekday_text = _cost_of(evidence, "weekday_cpo")

@@ -1100,6 +1100,8 @@ def test_k1_evidence_shows_wasted_spend_clicks_matched_keyword_and_n_star(
             sample = item.evidence.sample
             assert sample is not None
             assert evidence_metric(item, "wasted_spend") == evidence_metric(item, "spend")
+            # AAP 0.1.2: K1's headline number is the wasted spend.
+            assert item.evidence.extra["headline_metric"] == "wasted_spend"
             assert _exact(evidence_metric(item, "spend")) == Fraction(_cents(Fraction(row.cost)))
             assert evidence_metric(item, "clicks") == row.clicks == sample.observed
             assert evidence_metric(item, "min_clicks") == sample.required == _n_star(run.ctx)
@@ -1136,6 +1138,8 @@ def _assert_k2_item(run: _Run, item: Candidate, row: SearchTermRow) -> None:
     assert item.action.startswith("Add as phrase-match keyword in ")
     assert item.evidence.extra["ad_group"] == ad_group
     assert item.evidence.extra["suggested_match_type"] == "PHRASE"
+    # The expansion card leads with the term's conversions.
+    assert item.evidence.extra["headline_metric"] == "conversions"
     assert Fraction(row.conversions) >= Fraction(ctx.thresholds.decimal("k2.min_conversions"))
     term_cpa = Fraction(row.cost) / Fraction(row.conversions)
     campaign_cpa = _campaign_cost_per_conversion(ctx, row.campaign_id)
@@ -1287,6 +1291,8 @@ def test_k3_a_one_point_quality_score_drop_fires_and_half_a_point_does_not(
     extra = item.evidence.extra
     assert extra["qs_basis"] == "daily"
     assert "quality_score" in extra["triggers"]
+    # The quality-score branch fired, so the card leads with the latest quality score.
+    assert extra["headline_metric"] == "qs_last"
     first, last = _quality_score_means(fires.ctx, keyword)
     assert (first, last) == (Fraction(7), Fraction(6))
     assert first - last == 1 >= drop
@@ -1368,6 +1374,9 @@ def test_k3_cpc_rise_without_a_matching_conversion_rise_fires(make_context: Cont
     assert halves.first_conversions == halves.second_conversions, "conversions stayed flat"
     extra = item.evidence.extra
     assert "cpc" in extra["triggers"]
+    # Only the CPC branch fired, so the card leads with the CPC rise.
+    assert list(extra["triggers"]) == ["cpc"]
+    assert extra["headline_metric"] == "cpc_ratio"
     assert extra["conversions_fell"] is False
     assert _exact(evidence_metric(item, "cpc_ratio")) == halves.cpc_ratio
     assert _exact(evidence_metric(item, "cpa_ratio")) == halves.cpa_ratio
@@ -1543,6 +1552,12 @@ def test_k3_evidence_shows_quality_score_cpc_and_cost_per_conversion_by_half(
                 # Present on every item; known whenever the quality-score branch fired.
                 value = item.evidence.metric(key).value
                 assert value is not None or "quality_score" not in item.evidence.extra["triggers"]
+            # The headline is the fired branch's number: the latest quality score when it
+            # dropped (whether or not CPC rose too), else the CPC rise.
+            triggers = item.evidence.extra["triggers"]
+            assert item.evidence.extra["headline_metric"] == (
+                "qs_last" if "quality_score" in triggers else "cpc_ratio"
+            ), name
             for key, conversions_key in (
                 ("cost_per_conversion_first_half", "conversions_first_half"),
                 ("cost_per_conversion_second_half", "conversions_second_half"),
