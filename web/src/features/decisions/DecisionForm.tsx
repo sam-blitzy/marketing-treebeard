@@ -36,11 +36,15 @@
  * - **Errors are the API's.** 422 messages are shown as returned. A 409 `subject_retired`
  *   locks the form for as long as it records about that subject (AAP 0.3.2) and is reported
  *   through `onRetired`, so the consumer locks its own actions too; a 409
- *   `discrepancy_resolved` reads "Already resolved". Error banners never take `role="alert"`,
- *   which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
- * - **Outcomes outlive the form.** `onDone` and `onRetired` reach the consumer even when the
- *   form unmounted while its request ran, as it does when its dialog is closed mid-save. A
- *   consumer that can reopen its dialog therefore closes only the opening that saved.
+ *   `discrepancy_resolved` reads "Already resolved". Every failure but `subject_retired` is
+ *   reported through `onFailed` with the text the form shows. Error banners never take
+ *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
+ * - **Outcomes outlive the form.** `onPendingChange`, `onDone`, `onRetired` and `onFailed`
+ *   reach the consumer even when the form unmounted while its request ran, as it does when its
+ *   dialog is closed mid-save. The consumer learns that a save started and when it settled, so
+ *   it can refuse a second, overlapping save, and it learns every failure, so it can show one
+ *   whose form is gone. A consumer that can reopen its dialog closes only the opening that
+ *   saved.
  * - **One form per identity.** Edits, the note, the save outcome and those locks belong to
  *   what the form records about and posts: the subject, the mode, the discrepancy and the
  *   recommendation. A change to any of them starts a fresh form, so one subject's edits are
@@ -162,6 +166,22 @@ export interface DecisionFormProps {
    * called even when the form unmounted while the request ran.
    */
   onRetired?: () => void;
+  /**
+   * Called with `true` when a save request is sent and with `false` once it settles, whatever
+   * its outcome, before `onDone`, `onRetired` or `onFailed`. Like `onDone`, it is the callback
+   * the form had when the user saved, and it is called even when the form unmounted while the
+   * request ran, so a consumer whose dialog was closed mid-save still knows a save is running
+   * and can refuse to start another one.
+   */
+  onPendingChange?: (pending: boolean) => void;
+  /**
+   * Called when a save fails for any reason other than 409 `subject_retired`, which calls
+   * `onRetired` only: a 404, a 409 such as `discrepancy_resolved` or `platform_state_unknown`, a
+   * 422, a 429, a server or a network failure. `message` is the text the form shows for it, and
+   * `error` is what the request rejected with. Like `onDone`, it is called even when the form
+   * unmounted while the request ran, so the consumer can show a failure whose form is gone.
+   */
+  onFailed?: (message: string, error: unknown) => void;
   /** Called by the "Cancel" button, which is rendered only when this is given. */
   onCancel?: () => void;
   /** Disables every field and the submit button, for example on a historical item. */
@@ -245,8 +265,12 @@ interface BaseState {
   daily_budget: Money | null;
   /** The lifetime or custom-period budget; `null` when the subject has none. */
   total_budget: Money | null;
-  /** How a shared member's budget is named on the form; `null` when unknown. */
-  sharedBudgetLabel: string | null;
+  /**
+   * How a shared member's budget assignment is named on the form, as a noun phrase: "shared
+   * budget {Google id}" or "shared budget id {id}" when shared ownership is established, else
+   * "budget (internal id {id})"; `null` when unknown.
+   */
+  budgetLabel: string | null;
 }
 
 /** The subject's shape and the state the form starts from. */
@@ -407,7 +431,11 @@ function noteError(note: string): string | null {
 // Subject state
 // ---------------------------------------------------------------------------------------------
 
-/** The subject state a decision row records: its shape and complete expected state. */
+/**
+ * The subject state a decision row records: its shape and complete expected state. A decision
+ * carries `budget_id` only in the `shared_member` shape, where it names the shared budget the
+ * member is assigned to, so that budget is "shared budget id {id}".
+ */
 function stateFromDecision(decision: Decision): SubjectState {
   return {
     shape: decision.shape,
@@ -415,15 +443,36 @@ function stateFromDecision(decision: Decision): SubjectState {
       status: decision.status,
       daily_budget: decision.daily_budget,
       total_budget: decision.total_budget,
-      sharedBudgetLabel: decision.budget_id === null ? null : `id ${decision.budget_id}`,
+      budgetLabel: decision.budget_id === null ? null : `shared budget id ${decision.budget_id}`,
     },
   };
 }
 
 /**
+ * How a discrepancy side names its budget assignment, as `DiscrepancyResolver` and the
+ * backend's C0 text word it: "shared budget {Google id}" when the side carries
+ * `budget_external_id`, which the API fills only for a shared budget the subject knows, and
+ * "budget (internal id {id})" for a `budget_id` without it. The id alone does not establish
+ * shared ownership: a member moved onto a budget that is not shared reports that budget's
+ * internal id with `budget_external_id: null`.
+ *
+ * @param value - The discrepancy side.
+ * @returns The noun phrase, or `null` when the side names no budget.
+ */
+function discrepancyBudgetLabel(value: DiscrepancyValue): string | null {
+  const externalId = textOrNull(value.budget_external_id);
+  if (externalId !== null) {
+    return `shared budget ${externalId}`;
+  }
+  const budgetId = value.budget_id ?? null;
+  return budgetId === null ? null : `budget (internal id ${budgetId})`;
+}
+
+/**
  * The subject state a discrepancy carries: its shape and the platform side, which for an
  * `untracked` discrepancy is the subject's complete current state. A discrepancy without a
- * platform side (`missing`) falls back to its decided side.
+ * platform side (`missing`) falls back to its decided side. The side's budget is named by
+ * {@link discrepancyBudgetLabel}.
  *
  * @returns `null` when the discrepancy carries neither side.
  */
@@ -432,15 +481,13 @@ function stateFromDiscrepancy(discrepancy: Discrepancy): SubjectState | null {
   if (value === null) {
     return null;
   }
-  const externalId = textOrNull(value.budget_external_id);
-  const budgetId = value.budget_id ?? null;
   return {
     shape: discrepancy.shape,
     base: {
       status: value.status ?? null,
       daily_budget: value.daily_budget ?? null,
       total_budget: value.total_budget ?? null,
-      sharedBudgetLabel: externalId ?? (budgetId === null ? null : `id ${budgetId}`),
+      budgetLabel: discrepancyBudgetLabel(value),
     },
   };
 }
@@ -493,7 +540,8 @@ function shapeFields(state: SubjectState): ShapeFields {
 
 /**
  * A state as one line, for the read-only "Last decided" summary: the status label, then each
- * amount in the subject's currency, or the shared budget a member draws from.
+ * amount in the subject's currency, or the budget a member draws from, named by its
+ * `budgetLabel` ("shared budget 31000402", "budget (internal id 401)").
  */
 function describeState(state: SubjectState, currency: string | null): string {
   const { shape, base } = state;
@@ -502,8 +550,8 @@ function describeState(state: SubjectState, currency: string | null): string {
     parts.push(base.status === null ? 'status not reported' : CAMPAIGN_STATUS_LABELS[base.status]);
   }
   if (shape === 'shared_member') {
-    if (base.sharedBudgetLabel !== null) {
-      parts.push(`shared budget ${base.sharedBudgetLabel}`);
+    if (base.budgetLabel !== null) {
+      parts.push(base.budgetLabel);
     }
   } else {
     if (base.daily_budget !== null) {
@@ -561,16 +609,21 @@ function isResolvedError(error: unknown): boolean {
  * `prefill` fields:
  *
  * - `own_budget`: "Status", plus "Daily budget" and/or "Total budget" where the subject has one;
- * - `shared_member`: "Status" only, noting the shared budget that owns the amount;
+ * - `shared_member`: "Status" only, noting the budget that owns the amount: its shared budget,
+ *   or "budget (internal id {id})" when a discrepancy names it by internal id alone, which does
+ *   not establish that it is shared;
  * - `budget`: its one amount ("Daily budget" or "Total budget") and no status, listing the
  *   `members` that draw from it.
  *
  * Decision mode posts `{ subject, patch, recommendation_id?, note? }` with only the changed
  * fields and is disabled while nothing changed. Intended-state mode posts
  * `{ resolution: 'record_intended', intended_state, note? }` with the complete state for the
- * shape. Success calls `onDone`. A 409 `subject_retired` disables every control while the form
- * records about that subject and calls `onRetired`; the enclosing `Dialog` keeps its own Close
- * button. Both callbacks are called even when the form unmounted while the request ran.
+ * shape. Sending the request calls `onPendingChange(true)`, and its settling calls
+ * `onPendingChange(false)` before the outcome's callback. Success calls `onDone`. A 409
+ * `subject_retired` disables every control while the form records about that subject and calls
+ * `onRetired`; the enclosing `Dialog` keeps its own Close button. Every other failure calls
+ * `onFailed` with the message the form shows. Each callback is the one the form had when the
+ * user saved, and each is called even when the form unmounted while the request ran.
  *
  * The form's edits, note, save outcome and locks belong to its identity: the subject's type
  * and id, the mode, the discrepancy's id and `recommendationId`. When any of them changes, even
@@ -625,6 +678,8 @@ function DecisionFormBody(props: DecisionFormProps) {
     members,
     onDone,
     onRetired,
+    onPendingChange,
+    onFailed,
     onCancel,
     disabled = false,
   } = props;
@@ -777,15 +832,22 @@ function DecisionFormBody(props: DecisionFormProps) {
 
   const noteText = note.trim();
 
+  // Both handlers belong to the render the user saved from, so they report to the callbacks
+  // the form had then: the request has settled before its outcome is reported.
   const handleError = (error: unknown) => {
+    onPendingChange?.(false);
     if (isRetiredError(error)) {
       setRetired(true);
       onRetired?.();
-    } else if (isResolvedError(error)) {
+      return;
+    }
+    if (isResolvedError(error)) {
       setClosed(true);
     }
+    onFailed?.(saveErrorMessage(error), error);
   };
   const handleSaved = () => {
+    onPendingChange?.(false);
     onDone?.();
   };
 
@@ -806,6 +868,7 @@ function DecisionFormBody(props: DecisionFormProps) {
       // has unmounted, as it does when its dialog is closed while the request runs, and the
       // outcome must still reach the consumer. The rejection is handled here in full; the
       // form's own error banner reads `activeMutation.error`.
+      onPendingChange?.(true);
       void recordDecision.mutateAsync(body).then(handleSaved, handleError);
       return;
     }
@@ -817,6 +880,7 @@ function DecisionFormBody(props: DecisionFormProps) {
       body.note = noteText;
     }
     // As above: the outcome reaches the consumer even after the form has unmounted.
+    onPendingChange?.(true);
     void resolveDiscrepancy
       .mutateAsync({ id: discrepancy.id, body })
       .then(handleSaved, handleError);
@@ -862,9 +926,9 @@ function DecisionFormBody(props: DecisionFormProps) {
         <div>{summary}</div>
         {state.shape === 'shared_member' ? (
           <div>
-            {base.sharedBudgetLabel === null
+            {base.budgetLabel === null
               ? 'The amount is set on its shared budget'
-              : `The amount is set on shared budget ${base.sharedBudgetLabel}`}
+              : `The amount is set on ${base.budgetLabel}`}
           </div>
         ) : null}
         {state.shape === 'budget' && memberNames.length > 0 ? (

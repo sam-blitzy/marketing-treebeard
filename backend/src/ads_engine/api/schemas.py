@@ -1823,8 +1823,12 @@ class DiscrepancyValue(TypedDict, total=False):
       subject): ``{"daily_budget", "total_budget", "currency"}``, an amount ``null`` where
       the side has none, plus ``"amount_micros"`` on Google subjects only.
     * **Assignment** (``_assignment_value``; a ``budget`` discrepancy on a shared member, or
-      on a campaign that moved onto a shared budget): ``{"budget_id", "budget_external_id"}``,
-      each ``null`` for no shared budget or one the subject does not know.
+      on a campaign that moved onto a shared budget): ``{"budget_id", "budget_external_id"}``.
+      ``budget_id`` is ``null`` where the side names the campaign's own budget (an
+      own-budget decided state) or reports no budget; on the platform side it is the
+      snapshot's budget id, shared or not. ``budget_external_id`` is set only for a shared
+      budget the subject knows, so a ``budget_id`` without it, as a member moved onto an
+      unshared budget reports, does not establish that the budget is shared.
     * **Tombstone reappearance** (``_compare_tombstone``): a campaign's decided side is
       ``{"status", "tombstone": true}`` and its platform side ``{"status"}``, ``null`` when
       unreported; a shared budget's sides are the money variant, the decided one with
@@ -1844,8 +1848,16 @@ class DiscrepancyValue(TypedDict, total=False):
         currency: The ISO 4217 code of the subject account's currency.
         amount_micros: Google only: the amount in micros, Google's native precision; ``None``
             when the side has no amount.
-        budget_id: The internal id of the assigned shared budget; ``None`` for none.
-        budget_external_id: That shared budget's Google id; ``None`` when unknown.
+        budget_id: The internal id of the budget the campaign is assigned to on this side: on
+            the platform side the snapshot's budget id, shared or not (against an own-budget
+            decision, the subject's current shared budget when the snapshot names none); on
+            the decided side the budget a ``shared_member`` decision assigns. ``None`` where
+            the side names the campaign's own budget (an own-budget decided state) or reports
+            no budget.
+        budget_external_id: That budget's Google id, set only when it is a shared budget the
+            subject knows (its current one or the one its decision assigns); ``None``
+            otherwise. A ``budget_id`` with this ``None`` does not establish that the budget
+            is shared.
         tombstone: Present, and ``True``, only on a side describing an ``acknowledge_removal``
             tombstone.
     """
@@ -2302,7 +2314,10 @@ class ResolvedBindingView(ApiModel):
         available: Whether the count can be computed.
         property: The contact date property the count reads; set when available.
         stage_id: The lifecycle stage id the label resolved to, in ``stage_label`` mode.
-        label: The label that matched, which heads the white-paper MQL column.
+        label: The label this binding resolved: the lifecycle stage label that matched in
+            ``stage_label`` mode, or the configured display label kept in ``property`` mode,
+            when one is set. Only the MQL binding's label heads the white-paper MQL column,
+            e.g. "MQL (First meeting booked)".
         reason: Why the binding is unavailable; set when unavailable.
     """
 

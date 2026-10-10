@@ -14,19 +14,23 @@
  *   reading "unavailable" with its reason and never `0`;
  * - the white paper registry and `config_hash`;
  * - the read-only contract (no control, no request but `GET /config`), loading, failure, and a
- *   failed background refresh that keeps the last configuration.
+ *   failed background refresh that keeps the last configuration under a non-alert "Settings
+ *   could not be refreshed" notice with the reason and the last-loaded instant in the default
+ *   run's display time zone (UTC before the first run), which leaves once a refresh succeeds.
  *
  * @packageDocumentation
  */
 import { apiError, json, mockApi } from '../../test/mockApi';
-import type { MockHandler, MockResponse } from '../../test/mockApi';
+import type { ApiMock, MockHandler, MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
+import type { QueryClient } from '@tanstack/react-query';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { ConfigView, CrmBindingsView, WindowConfig } from '../../api/types';
-import { FIXTURE_CONFIG_HASH, makeConfig } from '../../test/fixtures';
+import { formatInstant } from '../../lib/format';
+import { FIXTURE_CONFIG_HASH, makeConfig, makeRun } from '../../test/fixtures';
 import { SettingsPage } from './SettingsPage';
 
 // ---------------------------------------------------------------------------------------------
@@ -136,6 +140,57 @@ function heldResponse(): {
     release = resolve;
   });
   return { promise, release };
+}
+
+/** The five level-2 section headings of the loaded page, in order. */
+const SECTION_TITLES = [
+  'Analysis window',
+  'Thresholds',
+  'HubSpot mapping',
+  'White paper registry',
+  'Configuration hash',
+];
+
+/** The message of the failed background refresh the refresh tests stub. */
+const REFRESH_FAILURE_MESSAGE = 'Database unavailable';
+
+/**
+ * Renders the loaded page, then refetches `GET /config` against a 503 while `GET /runs/latest`
+ * answers `defaultRun`, as a background refresh on window focus or remount would.
+ *
+ * @param defaultRun - the answer to the notice's `GET /runs/latest`
+ * @returns the request log and the page's query client
+ */
+async function renderFailedRefresh(
+  defaultRun: MockResponse,
+): Promise<{ api: ApiMock; queryClient: QueryClient }> {
+  const api = stubConfig();
+  const { queryClient } = await renderLoaded();
+  api.use({
+    'GET /config': apiError(503, 'service_unavailable', REFRESH_FAILURE_MESSAGE),
+    'GET /runs/latest': defaultRun,
+  });
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: queryKeys.config });
+  });
+  return { api, queryClient };
+}
+
+/**
+ * The refresh notice's last-loaded line: when the cached configuration was loaded, as
+ * `formatInstant` shows it in `zone`.
+ *
+ * @param queryClient - the page's query client
+ * @param zone - the IANA zone the instant is expected in
+ * @returns the expected line
+ */
+function lastLoadedLine(queryClient: QueryClient, zone: string): string {
+  const updatedAt = queryClient.getQueryState(queryKeys.config)?.dataUpdatedAt;
+  if (updatedAt === undefined || updatedAt === 0) {
+    throw new Error('The configuration was never loaded.');
+  }
+  const loadedAt = formatInstant(new Date(updatedAt).toISOString(), zone);
+  return `Showing the configuration as last loaded ${loadedAt}.`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -618,19 +673,75 @@ describe('SettingsPage', () => {
       expect(screen.queryAllByRole('table')).toHaveLength(0);
     });
 
-    it('keeps the last configuration when a background refresh fails', async () => {
-      const api = stubConfig();
-      const { queryClient } = await renderLoaded();
-      api.use({ 'GET /config': apiError(503, 'service_unavailable', 'Database unavailable') });
+    it('keeps the last configuration and announces a failed background refresh', async () => {
+      const { api, queryClient } = await renderFailedRefresh(
+        json(200, makeRun({ display_timezone: 'America/New_York' })),
+      );
 
+      const status = screen.getByRole('status');
+      const line = lastLoadedLine(queryClient, 'America/New_York');
+      expect(line).toMatch(/ America\/New_York\.$/);
+      expect(await within(status).findByText(line)).toBeTruthy();
+      expect(within(status).getByText('Settings could not be refreshed')).toBeTruthy();
+      expect(within(status).getByText(REFRESH_FAILURE_MESSAGE)).toBeTruthy();
+      expect(
+        screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
+      ).toEqual(SECTION_TITLES);
+      expect(within(status).queryByRole('table')).toBeNull();
+      expect(screen.queryByText('Settings unavailable')).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      // The page has no controls, so the notice offers no Retry.
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+      expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+        'GET /config',
+        'GET /config',
+        'GET /runs/latest',
+      ]);
+    });
+
+    it.each([
+      ['before the first run (404)', apiError(404, 'not_found', 'No analysis run yet')],
+      ['while the run names no zone', json(200, makeRun({ display_timezone: '  ' }))],
+    ])('labels the last-loaded instant UTC %s', async (_case, defaultRun) => {
+      const { queryClient } = await renderFailedRefresh(defaultRun);
+
+      // The notice's read of the default run has settled, so the fallback is not just pending.
+      await waitFor(() => {
+        const run = queryClient.getQueryState(queryKeys.runs.latest);
+        expect(['success', 'error']).toContain(run?.status);
+        expect(run?.fetchStatus).toBe('idle');
+      });
+      const status = screen.getByRole('status');
+      const line = lastLoadedLine(queryClient, 'UTC');
+      expect(line).toMatch(/ UTC\.$/);
+      expect(within(status).getByText(line)).toBeTruthy();
+      expect(within(status).getByText(REFRESH_FAILURE_MESSAGE)).toBeTruthy();
+      expect(screen.getByRole('region', { name: 'Analysis window' })).toBeTruthy();
+    });
+
+    it('drops the refresh notice once a later refresh succeeds', async () => {
+      const { api, queryClient } = await renderFailedRefresh(
+        json(200, makeRun({ display_timezone: 'America/New_York' })),
+      );
+      await within(screen.getByRole('status')).findByText('Settings could not be refreshed');
+
+      const refreshedHash = 'f'.repeat(64);
+      api.use({ 'GET /config': json(200, makeConfig({ config_hash: refreshedHash })) });
       await act(async () => {
         await queryClient.refetchQueries({ queryKey: queryKeys.config });
       });
 
-      expect(api.calls.filter((call) => call.path === '/config')).toHaveLength(2);
-      expect(screen.getByRole('region', { name: 'Analysis window' })).toBeTruthy();
-      expect(screen.queryByText('Settings unavailable')).toBeNull();
-      expect(screen.queryByText('Database unavailable')).toBeNull();
+      await waitFor(() => {
+        expect(screen.queryByText('Settings could not be refreshed')).toBeNull();
+      });
+      expect(screen.queryByText(REFRESH_FAILURE_MESSAGE)).toBeNull();
+      expect(screen.getByRole('status').childNodes).toHaveLength(0);
+      expect(
+        screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
+      ).toEqual(SECTION_TITLES);
+      const hashSection = screen.getByRole('region', { name: 'Configuration hash' });
+      expect(within(hashSection).getByText(refreshedHash)).toBeTruthy();
+      expect(api.calls.filter((call) => call.path === '/config')).toHaveLength(3);
     });
   });
 });

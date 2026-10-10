@@ -18,6 +18,9 @@
  * - **Errors.** A 422 shows the API's message and takes focus; a 409 `subject_retired` locks
  *   the form as "Computed from replaced data"; a 409 `discrepancy_resolved` reads "Already
  *   resolved". No error takes `role="alert"`.
+ * - **Outcomes.** `onPendingChange` reports `true` when a save is sent and `false` when it
+ *   settles, before `onDone`, `onRetired` or `onFailed`; `onFailed` receives every failure but
+ *   `subject_retired`, with the form's message; each reaches the consumer after an unmount too.
  */
 // mockApi registers its afterEach check first, so it runs after Testing Library's cleanup.
 import { apiError, json, mockApi } from '../../test/mockApi';
@@ -986,6 +989,45 @@ describe('DecisionForm', () => {
       });
     });
 
+    it('names a budget known only by internal id neutrally and posts status only', async () => {
+      // The API fills budget_external_id only for a shared budget the subject knows, so an
+      // internal id alone does not establish shared ownership (DiscrepancyResolver words it so).
+      const discrepancy = makeDiscrepancy('untracked', {
+        shape: 'shared_member',
+        platform_value: {
+          status: 'active',
+          budget_id: FIXTURE_BUDGET_IDS.display,
+          budget_external_id: null,
+        },
+      });
+      const api = mockApi({
+        [logKey(SHARED_MEMBER)]: json(200, []),
+        'POST /discrepancies/:id/resolve': json(
+          200,
+          makeDiscrepancy('untracked', { shape: 'shared_member', state: 'awaiting_platform' }),
+        ),
+      });
+      const onDone = vi.fn<() => void>();
+      await renderForm({ subject: SHARED_MEMBER, mode: 'intended_state', discrepancy, onDone });
+
+      const budgetLabel = `budget (internal id ${String(FIXTURE_BUDGET_IDS.display)})`;
+      expect(
+        screen.getByText(`No decision recorded yet · platform shows Active · ${budgetLabel}`),
+      ).toBeDefined();
+      expect(screen.getByText(`The amount is set on ${budgetLabel}`)).toBeDefined();
+      expect(screen.queryByText(/shared budget/)).toBeNull();
+      expect(screen.queryByRole('spinbutton')).toBeNull();
+      fireEvent.click(saveButton('Save intended state'));
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      expect(onlyCall(api, 'POST', RESOLVE_PATH).body).toEqual({
+        resolution: 'record_intended',
+        intended_state: { status: 'active' },
+      });
+    });
+
     it('requires a status when the platform reported none, and every amount', async () => {
       const discrepancy: Discrepancy = makeDiscrepancy('untracked', {
         platform_value: {
@@ -1123,14 +1165,167 @@ describe('DecisionForm', () => {
       expect(onRetired).not.toHaveBeenCalled();
     });
 
+    /** One save whose request settles when the test says, and what the consumer is told. */
+    interface SaveCase {
+      /** How the case is named in the test title. */
+      name: string;
+      /** The form's props, without the callbacks the test adds. */
+      props: DecisionFormProps;
+      /** The subject's decision log. */
+      log: Decision[];
+      /** The handler key of the save's request. */
+      request: 'POST /decisions' | 'POST /discrepancies/:id/resolve';
+      /** The submit button. */
+      save: 'Save decision' | 'Save intended state';
+      /** The response the save settles with. */
+      response: MockResponse;
+      /** What the consumer is told after the save settled. */
+      outcome: string;
+    }
+
+    const SAVE_CASES: SaveCase[] = [
+      {
+        name: 'decision saved',
+        props: { subject: OWN_BUDGET, prefill: { status: 'paused' } },
+        log: [makeDecision('own_budget')],
+        request: 'POST /decisions',
+        save: 'Save decision',
+        response: json(201, makeDecision('own_budget', { status: 'paused' })),
+        outcome: 'done',
+      },
+      {
+        name: 'intended state saved',
+        props: INTENDED,
+        log: [],
+        request: 'POST /discrepancies/:id/resolve',
+        save: 'Save intended state',
+        response: json(200, { ...makeDiscrepancy('untracked'), state: 'awaiting_platform' }),
+        outcome: 'done',
+      },
+      {
+        name: 'decision refused with 422',
+        props: { subject: OWN_BUDGET, prefill: { status: 'paused' } },
+        log: [makeDecision('own_budget')],
+        request: 'POST /decisions',
+        save: 'Save decision',
+        response: apiError(422, 'no_change', 'The patch changes nothing.'),
+        outcome: 'failed: The patch changes nothing.',
+      },
+      {
+        name: 'intended state refused as retired',
+        props: INTENDED,
+        log: [],
+        request: 'POST /discrepancies/:id/resolve',
+        save: 'Save intended state',
+        response: apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+        outcome: 'retired',
+      },
+      {
+        name: 'intended state already resolved',
+        props: INTENDED,
+        log: [],
+        request: 'POST /discrepancies/:id/resolve',
+        save: 'Save intended state',
+        response: apiError(409, 'discrepancy_resolved', 'The discrepancy is already resolved.'),
+        outcome: 'failed: Already resolved',
+      },
+    ];
+
+    it.each(SAVE_CASES)(
+      'reports a save ($name) as pending until it settles, then its outcome',
+      async ({ props, log, request, save, response, outcome }) => {
+        const events: string[] = [];
+        const pending = deferredResponse();
+        mockApi({ [logKey(OWN_BUDGET)]: json(200, log), [request]: () => pending.promise });
+        await renderForm({
+          ...props,
+          onPendingChange: (saving) => {
+            events.push(saving ? 'pending' : 'settled');
+          },
+          onDone: () => {
+            events.push('done');
+          },
+          onRetired: () => {
+            events.push('retired');
+          },
+          onFailed: (message) => {
+            events.push(`failed: ${message}`);
+          },
+        });
+        // Rendering the form reports nothing; sending the save reports it pending at once.
+        expect(events).toEqual([]);
+
+        fireEvent.click(saveButton(save));
+        expect(events).toEqual(['pending']);
+
+        pending.resolve(response);
+
+        await waitFor(() => {
+          expect(events).toEqual(['pending', 'settled', outcome]);
+        });
+      },
+    );
+
+    it('passes onFailed the shown message and the error, never a subject_retired', async () => {
+      const onFailed = vi.fn<(message: string, error: unknown) => void>();
+      const onRetired = vi.fn<() => void>();
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': apiError(422, 'invalid_patch', 'A daily budget needs whole cents.'),
+      });
+      const { unmount } = await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { status: 'paused' },
+        onFailed,
+        onRetired,
+      });
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText('A daily budget needs whole cents.')).toBeDefined();
+      await waitFor(() => {
+        expect(onFailed).toHaveBeenCalledTimes(1);
+      });
+      expect(onFailed).toHaveBeenCalledWith(
+        'A daily budget needs whole cents.',
+        expect.objectContaining({ status: 422, code: 'invalid_patch' }),
+      );
+      expect(onRetired).not.toHaveBeenCalled();
+      unmount();
+
+      mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+        'POST /decisions': apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+      });
+      await renderForm({ subject: OWN_BUDGET, prefill: { status: 'paused' }, onFailed, onRetired });
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText('Computed from replaced data')).toBeDefined();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      expect(onFailed).toHaveBeenCalledTimes(1);
+    });
+
     it.each([
-      ['onDone', json(201, makeDecision('own_budget', { status: 'paused' }))],
-      ['onRetired', apiError(409, 'subject_retired', 'The dataset is no longer active.')],
+      ['onDone', json(201, makeDecision('own_budget', { status: 'paused' })), []],
+      ['onRetired', apiError(409, 'subject_retired', 'The dataset is no longer active.'), []],
+      [
+        'onFailed',
+        apiError(422, 'no_change', 'The patch changes nothing.'),
+        [
+          'The patch changes nothing.',
+          expect.objectContaining({ status: 422, code: 'no_change' }) as unknown,
+        ],
+      ],
     ] as const)(
       'calls %s even when the form unmounted while its save ran',
-      async (callback, response) => {
-        const onDone = vi.fn<() => void>();
-        const onRetired = vi.fn<() => void>();
+      async (callback, response, args) => {
+        const outcomes = {
+          onDone: vi.fn<() => void>(),
+          onRetired: vi.fn<() => void>(),
+          onFailed: vi.fn<(message: string, error: unknown) => void>(),
+        };
+        const onPendingChange = vi.fn<(pending: boolean) => void>();
         const pending = deferredResponse();
         const api = mockApi({
           [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
@@ -1153,8 +1348,8 @@ describe('DecisionForm', () => {
                 <DecisionForm
                   subject={OWN_BUDGET}
                   prefill={{ status: 'paused' }}
-                  onDone={onDone}
-                  onRetired={onRetired}
+                  {...outcomes}
+                  onPendingChange={onPendingChange}
                 />
               ) : null}
             </>
@@ -1167,15 +1362,21 @@ describe('DecisionForm', () => {
         });
         fireEvent.click(screen.getByRole('button', { name: 'Close form' }));
         expect(screen.queryByRole('button', { name: 'Save decision' })).toBeNull();
+        expect(onPendingChange.mock.calls).toEqual([[true]]);
 
         pending.resolve(response);
 
-        const called = callback === 'onDone' ? onDone : onRetired;
-        const other = callback === 'onDone' ? onRetired : onDone;
         await waitFor(() => {
-          expect(called).toHaveBeenCalledTimes(1);
+          expect(outcomes[callback]).toHaveBeenCalledTimes(1);
         });
-        expect(other).not.toHaveBeenCalled();
+        expect(outcomes[callback]).toHaveBeenCalledWith(...args);
+        for (const [name, spy] of Object.entries(outcomes)) {
+          if (name !== callback) {
+            expect(spy).not.toHaveBeenCalled();
+          }
+        }
+        // The settled save is reported to the consumer although the form is gone.
+        expect(onPendingChange.mock.calls).toEqual([[true], [false]]);
       },
     );
   });

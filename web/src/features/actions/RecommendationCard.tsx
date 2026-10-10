@@ -40,7 +40,9 @@
  * A historical item keeps its card readable, but every footer action is disabled, the C0
  * resolver too (`resolver({ disabled: true })`). A 409 `subject_retired` from a screen that
  * went stale before its refetch, whether a feedback or the decision form received it, locks the
- * actions the same way for as long as the item is rendered and shows the same message.
+ * actions the same way for as long as the item is rendered and shows the same message. A
+ * decision save keeps every footer action disabled until it settles, even once its dialog is
+ * closed, and its failure is shown on the card.
  *
  * A recorded feedback can remove its own card: the refetched item carries `current.hidden_by`
  * and its section drops it. The outcome is therefore announced in the polite region of an
@@ -109,6 +111,12 @@ export const RECORD_DECISION_LABEL = 'Record decision';
 
 /** The status line a card shows after its decision form saved a decision. */
 export const DECISION_RECORDED_MESSAGE = 'Decision recorded';
+
+/**
+ * The status line a card shows while a decision save runs with its dialog closed, until the
+ * save settles.
+ */
+export const DECISION_SAVING_MESSAGE = 'Saving decision';
 
 /**
  * The text a held card's link to a specific blocking discrepancy starts with (AAP 0.5.5),
@@ -593,9 +601,14 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   prefilled as a patch with the item's proposed change (status `paused` for C1 and C1b; the
  *   proposed daily budget for B1, B2, B3 and C2 "Scale", written on the budget subject when the
  *   budget is shared, with every member listed). The form posts only the changed fields the
- *   subject's decision shape allows, and closes the dialog once the decision is saved. A save
- *   that ends after its dialog was closed and reopened is still reported, and leaves the
- *   reopened dialog open with its edits.
+ *   subject's decision shape allows, and closes the dialog once the decision is saved. The
+ *   dialog can be closed while the save runs (Cancel, Close, Escape or the backdrop); until the
+ *   save settles, every action stays disabled and "Record decision" shows its loading state, so
+ *   the dialog cannot be reopened and no second decision can be posted, and with the dialog
+ *   closed the card's status line reads "Saving decision". A save that ends after its dialog
+ *   was closed is still reported: a success as "Decision recorded", a failure in the warning
+ *   `Banner`. Focus, which the closed dialog could not return to the disabled button, then
+ *   goes back to "Record decision" when nothing else has taken it.
  * - **Mark done** on every other action: feedback `done`, which never writes a decision.
  * - **Dismiss** and **Snooze for 7 days** (quiet) on every item: feedback `dismiss` and
  *   `snooze`, posted as `POST /recommendations/{id}/feedback`.
@@ -613,10 +626,11 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * announced in the provider's region, which outlives the card, instead of in the card's own
  * line. Keyboard focus, lost with the disabled or removed button, then moves to the next card's
  * first enabled action, else the previous card's, else the enclosing section's heading, else
- * `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Any other failure shows
- * the API's message in the warning `Banner`. The banner takes focus when it appears, or once the
- * decision dialog closes, so keyboard and screen-reader users land on it; `role="alert"` stays
- * reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
+ * `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Any other failure, of a
+ * feedback or of a decision save (the form's `onFailed`), shows the API's message in the
+ * warning `Banner`, until the next action starts. The banner takes focus when it appears, or
+ * once the decision dialog closes, so keyboard and screen-reader users land on it;
+ * `role="alert"` stays reserved for the discrepancy banner (AAP 0.5.5 Behaviour).
  *
  * @param props - see {@link RecommendationActionsProps}
  * @returns the actions, or `null` for a C0 item
@@ -653,12 +667,19 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
   const dialogOpen = dialog.open;
   const [decisionSaved, setDecisionSaved] = useState(false);
+  // Whether a decision save is running. The form reports it even once its dialog was closed,
+  // so the card keeps every action disabled until the save settles: a reopened dialog would
+  // start a fresh form, and with it a second, overlapping save.
+  const [decisionPending, setDecisionPending] = useState(false);
+  // Set when a decision save settles, and consumed by the first commit after it.
+  const [refocusOpener, setRefocusOpener] = useState(false);
   const rowRef = useRef<HTMLDivElement>(null);
   const messageRef = useRef<HTMLDivElement>(null);
+  const openerRef = useRef<HTMLButtonElement>(null);
 
   // A retirement learned from any write, a feedback's or the decision form's, shows the
-  // historical message (AAP 0.5.5: "shown as the same message"); otherwise a failed feedback
-  // shows its own text.
+  // historical message (AAP 0.5.5: "shown as the same message"); otherwise a failed feedback or
+  // decision save shows its own text.
   const message = retired ? HISTORICAL_LABEL : errorText;
 
   // A pressed button is disabled while its request runs, which drops keyboard focus to the
@@ -673,11 +694,32 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     }
   }, [message, dialogOpen]);
 
+  // A dialog closed while its save runs cannot return focus to "Record decision", which stays
+  // disabled until the save settles, so focus drops to the page. Once the save has settled and
+  // the button is enabled again, focus goes back to it (WCAG 2.2 SC 2.4.3): only when focus is
+  // still lost, never while the dialog is open and owns focus, and never over a message, which
+  // takes focus itself (the effect above).
+  useEffect(() => {
+    if (!refocusOpener) {
+      return;
+    }
+    setRefocusOpener(false);
+    const opener = openerRef.current;
+    const row = rowRef.current;
+    if (dialogOpen || message !== null || opener === null || row === null || opener.disabled) {
+      return;
+    }
+    if (focusIsLostOrWithin(row)) {
+      opener.focus();
+    }
+  }, [refocusOpener, dialogOpen, message]);
+
   const locked = item.current.historical || retired;
   const pending = feedback.isPending;
   const pendingKind = pending ? feedback.variables?.body.kind : undefined;
-  // A recorded feedback ends the card's actions: a second post would only repeat it.
-  const actionsDisabled = locked || pending || recorded !== null;
+  // A recorded feedback ends the card's actions: a second post would only repeat it. A running
+  // decision save holds them until it settles.
+  const actionsDisabled = locked || pending || recorded !== null || decisionPending;
 
   const sendFeedback = (kind: FeedbackKind) => {
     if (actionsDisabled) {
@@ -740,8 +782,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     const context: DecisionContext = { ...decisionContextFor(item), ...decisionContext };
     // The opening this render's form belongs to. DecisionForm calls the onDone it had when the
     // user saved, even after its dialog was closed, so a save that ends late closes only its
-    // own opening: a dialog reopened in the meantime keeps its edits. The decision is recorded
-    // either way, so the outcome is still shown and announced.
+    // own opening and never a dialog opened since. No opening starts while a save runs
+    // (`decisionPending`), and the decision is recorded either way, so the outcome is still
+    // shown and announced.
     const formSession = dialog.session;
     decisionDialog = (
       <Dialog open={dialogOpen} title={RECORD_DECISION_LABEL} onClose={closeDialog}>
@@ -763,6 +806,23 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
             // only the form, so closing and reopening the dialog cannot lift the lock.
             setRetired(true);
           }}
+          onPendingChange={(saving) => {
+            setDecisionPending(saving);
+            if (saving) {
+              // A new save: an earlier outcome no longer describes it.
+              setErrorText(null);
+              setDecisionSaved(false);
+              setRefocusOpener(false);
+            } else {
+              setRefocusOpener(true);
+            }
+          }}
+          onFailed={(failure) => {
+            // Shown on the card as well as in the form, so a failure whose dialog was closed
+            // mid-save, unmounting the form, is still shown, and takes focus once the dialog is
+            // closed.
+            setErrorText(failure);
+          }}
           onCancel={closeDialog}
           disabled={locked}
         />
@@ -773,11 +833,16 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   const primaryAction =
     subject !== null && subject !== undefined ? (
       <Button
+        ref={openerRef}
         variant="primary"
         size="sm"
+        loading={decisionPending}
         disabled={actionsDisabled}
         aria-haspopup="dialog"
         onClick={() => {
+          if (actionsDisabled) {
+            return;
+          }
           setErrorText(null);
           setDecisionSaved(false);
           setDialog(openDialogSession);
@@ -794,7 +859,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
       ? FEEDBACK_STATUS_MESSAGES[recorded]
       : decisionSaved
         ? DECISION_RECORDED_MESSAGE
-        : null;
+        : decisionPending && !dialogOpen
+          ? DECISION_SAVING_MESSAGE
+          : null;
 
   return (
     // The unstyled row root focus recovery finds the card's actions by (ACTIONS_ROW_SELECTOR);

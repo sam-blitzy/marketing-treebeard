@@ -1138,8 +1138,10 @@ class ResolvedBinding:
         property: The contact date property the count reads, ``hs_v2_date_entered_{stage id}``
             or the configured property; required when available.
         stage_id: The lifecycle stage id the label resolved to, in ``stage_label`` mode.
-        label: The label that matched, which heads the white-paper MQL column as
-            "MQL (First meeting booked)".
+        label: The label this binding resolved: the lifecycle stage label that matched in
+            ``stage_label`` mode, or the configured display label kept in ``property`` mode,
+            when one is set. Only the MQL binding's label heads the white-paper MQL column,
+            e.g. "MQL (First meeting booked)".
         reason: Why the binding is unavailable, for example "stage label 'First meeting
             booked' not found in lifecyclestage options"; required when unavailable.
 

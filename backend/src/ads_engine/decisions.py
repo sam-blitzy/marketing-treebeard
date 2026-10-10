@@ -1414,7 +1414,7 @@ def _decided_micros(expected: ExpectedState) -> int | None:
 
 
 def _assignment_value(budget_id: int | None, state: SubjectState) -> dict[str, Any]:
-    """Return the JSON of a shared-budget assignment."""
+    """Return the JSON of a budget assignment, shared or not (:func:`_budget_external_id`)."""
     return {"budget_id": budget_id, "budget_external_id": _budget_external_id(budget_id, state)}
 
 

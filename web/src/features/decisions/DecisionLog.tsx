@@ -34,8 +34,11 @@
  * - **Server state only through `../../api/queries`** (AAP 0.11.1) and UI only from the
  *   design-system index, with no styles of this module's own (AAP 0.4.4).
  * - **Outcomes go to one polite status region** kept from the first render: load failure,
- *   failed refresh, empty log and "Decision recorded" (WCAG 2.2 SC 4.1.3), never `role="alert"`
- *   (AAP 0.5.5), with Retry on a failed read (helpers in `./readState`).
+ *   failed refresh, empty log, "Decision recorded" and each failed save whose form is no longer
+ *   shown (WCAG 2.2 SC 4.1.3), never `role="alert"` (AAP 0.5.5), with Retry on a failed read
+ *   (helpers in `./readState`).
+ * - **One save per subject at a time.** A save outlives its dialog, so a subject whose save
+ *   runs cannot reopen the dialog until it settles; other subjects stay usable.
  *
  * @example
  * ```tsx
@@ -46,7 +49,7 @@
  *
  * @packageDocumentation
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import { useDecisions, useDefaultRun } from '../../api/queries';
@@ -152,6 +155,13 @@ const EMPTY_REASON = 'Baseline decisions appear after the first entity sync.';
 const RECORDED_TEXT = 'Decision recorded';
 
 /**
+ * Shown for a save refused with 409 `subject_retired`: the subject's dataset was replaced
+ * after the log was read, the message the recommendation card shows for the same refusal
+ * (AAP 0.3.2, 0.5.5 "shown as the same message").
+ */
+const RETIRED_MESSAGE = 'Computed from replaced data';
+
+/**
  * A budget name as the API builds it for a shared budget subject ("Shared budget {external
  * id}", `_SHARED_BUDGET_NAME` in `api/routes/decisions.py`). Its prefix is dropped where the
  * text already says "shared budget", so a member reads "shared budget 4455", not
@@ -201,12 +211,25 @@ interface SubjectGroup {
  * its identity tells a save that ends late which opening it was made in.
  */
 interface DialogTarget {
+  /** The subject's grouping key ({@link subjectKey}), which its save state is kept under. */
+  key: string;
   /** The subject, as `DecisionForm` posts it. */
   subject: SubjectIn;
   /** The subject's account currency, so the form formats and validates amounts in it. */
   currency: string | null;
   /** The subject title, shown above the form so the dialog names what it records about. */
   title: string;
+}
+
+/**
+ * A subject's failed save, kept by the log because the form that showed it unmounts with its
+ * dialog.
+ */
+interface SaveFailure {
+  /** The subject title, so the failure names what it was about once its dialog is gone. */
+  title: string;
+  /** The text the form showed for it: the API's message, or {@link RETIRED_MESSAGE}. */
+  message: string;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -491,6 +514,66 @@ function decisionRowKey(decision: Decision): string {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Save state
+// ---------------------------------------------------------------------------------------------
+
+/** `keys` with `key` added, or `keys` itself when it already holds it, so no render is added. */
+function withKey(keys: ReadonlySet<string>, key: string): ReadonlySet<string> {
+  return keys.has(key) ? keys : new Set([...keys, key]);
+}
+
+/** `keys` without `key`, or `keys` itself when it does not hold it. */
+function withoutKey(keys: ReadonlySet<string>, key: string): ReadonlySet<string> {
+  if (!keys.has(key)) {
+    return keys;
+  }
+  const next = new Set(keys);
+  next.delete(key);
+  return next;
+}
+
+/** `failures` with `failure` as the subject's latest, listed after every earlier one. */
+function withFailure(
+  failures: ReadonlyMap<string, SaveFailure>,
+  key: string,
+  failure: SaveFailure,
+): ReadonlyMap<string, SaveFailure> {
+  const next = new Map(failures);
+  next.delete(key);
+  next.set(key, failure);
+  return next;
+}
+
+/** `failures` without the subject's, or `failures` itself when it holds none. */
+function withoutFailure(
+  failures: ReadonlyMap<string, SaveFailure>,
+  key: string,
+): ReadonlyMap<string, SaveFailure> {
+  if (!failures.has(key)) {
+    return failures;
+  }
+  const next = new Map(failures);
+  next.delete(key);
+  return next;
+}
+
+/** The title of a subject's failed save in the log's region: "Decision not recorded for …". */
+function saveFailureTitle(title: string): string {
+  return `Decision not recorded for ${title}`;
+}
+
+/**
+ * Whether keyboard focus is lost: on no element, on the body, where a browser leaves it once
+ * the focused element is disabled or removed (as a dialog closed mid-save leaves it, unable to
+ * return focus to its disabled opener), or on an element no longer in the document. Anywhere
+ * else the user has put it, and it stays there.
+ */
+function focusIsLost(): boolean {
+  const { activeElement, body } = document;
+  return activeElement === null || activeElement === body || !activeElement.isConnected;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------------------------
 
@@ -500,6 +583,15 @@ interface SubjectDecisionsProps {
   group: SubjectGroup;
   /** The table columns, shared by every subject. */
   columns: readonly DataTableColumn<Decision>[];
+  /** Whether a save of a decision on this subject runs, even with its dialog closed. */
+  saving: boolean;
+  /** Whether a save on this subject was refused with 409 `subject_retired`. */
+  retired: boolean;
+  /**
+   * Attaches the "Record decision" button, so focus can go back to it once a save that ran
+   * after its dialog closed has settled; the returned cleanup detaches it.
+   */
+  openerRef: (element: HTMLButtonElement) => () => void;
   /** Opens the "Record decision" dialog for this subject. */
   onRecord: (target: DialogTarget) => void;
 }
@@ -509,8 +601,20 @@ interface SubjectDecisionsProps {
  * action and the table captioned "Decisions for {name}". The action keeps the visible label as
  * its accessible name, which the e2e suite clicks, and is described by the section heading, so
  * a screen reader announces which subject it records for.
+ *
+ * While a save on the subject runs (`saving`), the action shows its loading state
+ * (`aria-busy="true"`) and is disabled, so the dialog cannot be reopened and no second,
+ * overlapping save can start. After a 409 `subject_retired` (`retired`) it stays disabled: the
+ * server refuses every decision on the subject from then on.
  */
-function SubjectDecisions({ group, columns, onRecord }: SubjectDecisionsProps) {
+function SubjectDecisions({
+  group,
+  columns,
+  saving,
+  retired,
+  openerRef,
+  onRecord,
+}: SubjectDecisionsProps) {
   const { subject } = group;
   const sectionId = subjectSectionId(subject);
   const title = subjectTitle(subject);
@@ -521,10 +625,14 @@ function SubjectDecisions({ group, columns, onRecord }: SubjectDecisionsProps) {
       headingLevel={3}
       actions={
         <Button
+          ref={openerRef}
           variant="secondary"
           aria-describedby={`${sectionId}-title`}
+          loading={saving}
+          disabled={retired}
           onClick={() => {
             onRecord({
+              key: group.key,
               subject: { type: subject.type, id: subject.id },
               currency: textOrNull(subject.currency),
               title,
@@ -573,6 +681,9 @@ function SubjectDecisions({ group, columns, onRecord }: SubjectDecisionsProps) {
  *   as the current state;
  * - the latest read succeeded with no row: an `EmptyState` "No decisions recorded yet", because
  *   baseline decisions appear after the first entity sync;
+ * - a failed save, per subject, in the order they failed: a warning `Banner` "Decision not
+ *   recorded for {subject title}" with the message the form showed for it, while that
+ *   subject's dialog is not open (an open one shows the failure in its form);
  * - "Decision recorded", once the dialog's form has saved, until a dialog opens again.
  *
  * A loaded log shows one section per subject, preceded by a note when the log reached the API's
@@ -583,12 +694,52 @@ function SubjectDecisions({ group, columns, onRecord }: SubjectDecisionsProps) {
  * `Dialog` returns focus to the button that opened it. The form's save invalidates the log, so
  * the new row appears at the top of its subject, and the form's own success message leaves with
  * the dialog, so the region announces "Decision recorded".
+ *
+ * **Saves outlive their dialog.** The dialog can be closed while its save runs (Cancel, Close,
+ * Escape or the backdrop), which unmounts the form; the request has no client timeout, so a
+ * dialog that could not close might trap the user. The form reports the save's progress and
+ * outcome to the log even then (`onPendingChange`, `onDone`, `onFailed`, `onRetired`), and the
+ * log keeps them per subject, by subject type and id:
+ *
+ * - **Saving.** Until the save settles, that subject's "Record decision" shows its loading state
+ *   and is disabled, so its dialog cannot reopen and no second, overlapping save can be posted.
+ *   Every other subject's action stays usable.
+ * - **Saved.** Only the dialog of the opening that saved closes: a dialog opened meanwhile for
+ *   another subject stays open with its edits. The region announces "Decision recorded".
+ * - **Failed** (a 404, a 409 such as `platform_state_unknown`, a 422, a 429, a server or a
+ *   network failure): the subject's warning `Banner` in the region, as above. It stands until
+ *   the subject's dialog opens again or a later save of it starts, so it never outlives a
+ *   later success.
+ * - **Refused with 409 `subject_retired`**: the subject's dataset was replaced after the log was
+ *   read, and the server refuses every later decision on it (AAP 0.3.2). Its banner reads
+ *   "Computed from replaced data", the recommendation card's message for the same refusal, and
+ *   its "Record decision" stays disabled while the page is shown. The next refresh of the log,
+ *   which lists active datasets only, drops the subject; the banner stays, so the refusal is
+ *   not lost with it.
+ *
+ * Focus (WCAG 2.2 SC 2.4.3): a dialog closed mid-save cannot return focus to its disabled
+ * opener, so focus drops to the page. Once that save settles with no dialog open, and while
+ * focus is still lost, it moves to the subject's failure banner, which is focusable by script
+ * only, or after a success back to "Record decision". Focus the user has moved elsewhere stays
+ * there, and an open dialog keeps the focus it owns.
  */
 export function DecisionLog() {
   const decisions = useDecisions();
   const defaultRun = useDefaultRun();
   const [dialogTarget, setDialogTarget] = useState<DialogTarget | null>(null);
   const [recorded, setRecorded] = useState(false);
+  // What each subject's form reports about its save, by subject key. The form posts through a
+  // mutation of its own, which unmounts with it when its dialog is closed, so a save that
+  // settles after that leaves its outcome here: whether it still runs, its failure, and the
+  // lock a 409 subject_retired sets.
+  const [savingKeys, setSavingKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const [retiredKeys, setRetiredKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const [failures, setFailures] = useState<ReadonlyMap<string, SaveFailure>>(() => new Map());
+  // The subject whose save settled last, until focus has been placed for it.
+  const [settledKey, setSettledKey] = useState<string | null>(null);
+  const openerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const failureRefs = useRef(new Map<string, HTMLDivElement>());
+  const dialogOpen = dialogTarget !== null;
   const log = decisions.data;
   const failure = useSettledFailure(
     decisions.error,
@@ -597,9 +748,41 @@ export function DecisionLog() {
   );
   const { retrying, buttonRef: retryButtonRef, retry } = useRetry(decisions.refetch);
 
+  // Once a save has settled and no dialog owns focus, focus that the closed dialog could not
+  // return to the disabled opener goes to the subject's failure, or back to "Record decision"
+  // after a success (WCAG 2.2 SC 2.4.3, 3.3.1). The region announces the failure politely; the
+  // banner itself carries no role, as role="alert" stays reserved for the discrepancy banner
+  // (AAP 0.5.5). React runs a closing dialog's cleanup, which returns focus to its opener when
+  // it can, before this effect.
+  useEffect(() => {
+    if (settledKey === null || dialogOpen) {
+      return;
+    }
+    setSettledKey(null);
+    if (!focusIsLost()) {
+      return;
+    }
+    const failureBanner = failureRefs.current.get(settledKey);
+    if (failureBanner !== undefined) {
+      failureBanner.focus();
+      return;
+    }
+    const opener = openerRefs.current.get(settledKey);
+    if (opener !== undefined && opener.isConnected && !opener.disabled) {
+      opener.focus();
+    }
+  }, [settledKey, dialogOpen]);
+
   const displayTimezone = textOrNull(defaultRun.data?.display_timezone) ?? FALLBACK_TIMEZONE;
   const openDialog = (target: DialogTarget) => {
+    // A fresh form while the subject's save runs would post a second, overlapping decision,
+    // and the server refuses every decision on a retired subject.
+    if (savingKeys.has(target.key) || retiredKeys.has(target.key)) {
+      return;
+    }
     setRecorded(false);
+    // The new opening's form shows its own outcome.
+    setFailures((current) => withoutFailure(current, target.key));
     setDialogTarget(target);
   };
   const closeDialog = () => {
@@ -608,10 +791,31 @@ export function DecisionLog() {
   const handleDone = (savedTarget: DialogTarget) => {
     // DecisionForm reports a save even after its dialog was closed mid-request, so only the
     // dialog of the target that saved closes. Every opening builds a fresh target, so a dialog
-    // opened in the meantime, for another subject or reopened for this one, keeps its edits.
-    // The decision was recorded either way, so the region says so.
+    // opened in the meantime for another subject keeps its edits; this subject cannot reopen
+    // while its save runs. The decision was recorded either way, so the region says so.
     setDialogTarget((current) => (current === savedTarget ? null : current));
+    setFailures((current) => withoutFailure(current, savedTarget.key));
     setRecorded(true);
+  };
+  const handlePendingChange = (target: DialogTarget, saving: boolean) => {
+    if (saving) {
+      setSavingKeys((current) => withKey(current, target.key));
+      // A new save: an earlier failure of the subject no longer describes it.
+      setFailures((current) => withoutFailure(current, target.key));
+      setSettledKey((current) => (current === target.key ? null : current));
+      return;
+    }
+    setSavingKeys((current) => withoutKey(current, target.key));
+    setSettledKey(target.key);
+  };
+  const handleFailed = (target: DialogTarget, message: string) => {
+    setFailures((current) => withFailure(current, target.key, { title: target.title, message }));
+  };
+  const handleRetired = (target: DialogTarget) => {
+    setRetiredKeys((current) => withKey(current, target.key));
+    setFailures((current) =>
+      withFailure(current, target.key, { title: target.title, message: RETIRED_MESSAGE }),
+    );
   };
 
   const retryButton = (
@@ -656,6 +860,30 @@ export function DecisionLog() {
       </EmptyState>,
     );
   }
+  for (const [key, saveFailure] of failures) {
+    // The subject's open dialog shows the failure in its form; shown here too, it would repeat.
+    if (dialogTarget?.key === key) {
+      continue;
+    }
+    notices.push(
+      // Unstyled focus target for the failure once its save has settled with focus lost; the
+      // Banner carries no live-region role of its own, as the region announces it.
+      <div
+        key={`save-failure-${key}`}
+        ref={(element: HTMLDivElement) => {
+          failureRefs.current.set(key, element);
+          return () => {
+            failureRefs.current.delete(key);
+          };
+        }}
+        tabIndex={-1}
+      >
+        <Banner tone="warning" title={saveFailureTitle(saveFailure.title)}>
+          {saveFailure.message}
+        </Banner>
+      </div>,
+    );
+  }
   if (recorded) {
     notices.push(<div key="recorded">{RECORDED_TEXT}</div>);
   }
@@ -680,6 +908,14 @@ export function DecisionLog() {
             key={group.key}
             group={group}
             columns={columns}
+            saving={savingKeys.has(group.key)}
+            retired={retiredKeys.has(group.key)}
+            openerRef={(element: HTMLButtonElement) => {
+              openerRefs.current.set(group.key, element);
+              return () => {
+                openerRefs.current.delete(group.key);
+              };
+            }}
             onRecord={openDialog}
           />
         ))}
@@ -699,15 +935,28 @@ export function DecisionLog() {
         <div role="status">{notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}</div>
         {content}
       </Stack>
-      <Dialog open={dialogTarget !== null} title={DIALOG_TITLE} onClose={closeDialog}>
+      <Dialog open={dialogOpen} title={DIALOG_TITLE} onClose={closeDialog}>
         {dialogTarget === null ? null : (
           <Stack gap={4}>
             <div>{dialogTarget.title}</div>
+            {/*
+              The form calls the callbacks it had when the user saved, even once this dialog
+              was closed and the form unmounted, so each reports to the opening it saved from.
+            */}
             <DecisionForm
               subject={dialogTarget.subject}
               currency={dialogTarget.currency}
               onDone={() => {
                 handleDone(dialogTarget);
+              }}
+              onPendingChange={(saving) => {
+                handlePendingChange(dialogTarget, saving);
+              }}
+              onFailed={(message) => {
+                handleFailed(dialogTarget, message);
+              }}
+              onRetired={() => {
+                handleRetired(dialogTarget);
               }}
               onCancel={closeDialog}
             />

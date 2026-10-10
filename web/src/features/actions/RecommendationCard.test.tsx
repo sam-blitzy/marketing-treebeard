@@ -25,8 +25,12 @@
  * - **Outcomes and focus**: inside an `ActionOutcomeProvider`, a recorded feedback or decision is
  *   announced in the provider's polite region, which outlives the card a refetch removes, and
  *   focus moves to the next card's first enabled action, else the previous card's, else the
- *   section heading, unless the user has moved it elsewhere. A decision saved after its dialog
- *   was closed and reopened is reported too, and leaves the reopened dialog open with its edits.
+ *   section heading, unless the user has moved it elsewhere.
+ * - **Decision saves**: the dialog may close while its save runs, but every action stays
+ *   disabled and "Record decision" loading until the save settles, so nothing reopens it or
+ *   posts again. A late success is reported and announced, a late failure of any kind is shown
+ *   on the card and takes focus, and focus otherwise returns to "Record decision" when it was
+ *   lost.
  * - **Holds**: a held item states why and links its recorded blocking discrepancy on
  *   `/decisions` (rendered alone, the card has no run C0 card to link), or, with no blocker to
  *   name, "View open discrepancies" to the Campaigns discrepancy group.
@@ -36,7 +40,7 @@
  * Library so its `afterEach` runs first. Items come from `../../test/fixtures`: the default
  * page's C1, C0 and historical CR1 cards, or `makeItem` for a single variant.
  */
-import { apiError, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
+import { apiError, html, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState, type ReactNode } from 'react';
@@ -73,6 +77,7 @@ import {
   ActionOutcomeProvider,
   BLOCKING_DISCREPANCY_LINK_LABEL,
   DECISION_RECORDED_MESSAGE,
+  DECISION_SAVING_MESSAGE,
   FEEDBACK_LABELS,
   FEEDBACK_STATUS_MESSAGES,
   HISTORICAL_LABEL,
@@ -1094,12 +1099,15 @@ describe('RecommendationCard: record decision', () => {
     await waitFor(() => {
       expect(posts(api)).toHaveLength(1);
     });
-    // Closing the dialog unmounts the form while its request runs.
+    // Closing the dialog unmounts the form while its request runs; the card holds every action
+    // until the save settles, so the dialog cannot be reopened meanwhile.
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(
-      within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }),
-    ).toHaveProperty('disabled', false);
+    const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+    expect(opener.getAttribute('aria-busy')).toBe('true');
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', true);
+    }
 
     release(apiError(409, 'subject_retired', 'The dataset is no longer active.'));
 
@@ -1107,9 +1115,13 @@ describe('RecommendationCard: record decision', () => {
     await waitFor(() => {
       expect(document.activeElement?.contains(message)).toBe(true);
     });
+    expect(opener.getAttribute('aria-busy')).toBeNull();
     for (const button of cardButtons(item)) {
       expect(button).toHaveProperty('disabled', true);
+      fireEvent.click(button);
     }
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts(api)).toHaveLength(1);
   });
 
   it('announces a recorded decision in the provider region, outside the card', async () => {
@@ -1143,7 +1155,7 @@ describe('RecommendationCard: record decision', () => {
     );
   });
 
-  it('keeps a reopened dialog and its edits when an earlier save ends late, and reports it', async () => {
+  it('refuses to reopen the dialog while its save runs, then reports it and opens a fresh form', async () => {
     let release: (response: MockResponse) => void = () => {
       throw new Error('the pending decision response was never created');
     };
@@ -1172,45 +1184,178 @@ describe('RecommendationCard: record decision', () => {
       </ActionOutcomeProvider>,
     );
 
+    const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+    // A click focuses the button in a browser; fireEvent does not.
+    opener.focus();
     const first = await openDecisionDialog(item);
+    const noteText = 'Pause until the CRM sync is fixed';
+    fireEvent.change(within(first).getByRole('textbox', { name: 'Note' }), {
+      target: { value: noteText },
+    });
     fireEvent.click(within(first).getByRole('button', { name: 'Save decision' }));
     await waitFor(() => {
       expect(posts(api)).toHaveLength(1);
     });
-    // Closing the dialog unmounts the form while its request runs; reopening starts a new one.
+    // Closing the dialog unmounts the form while its request runs.
     fireEvent.click(within(first).getByRole('button', { name: 'Close' }));
-    const second = await openDecisionDialog(item);
-    const noteText = 'Pause until the CRM sync is fixed';
-    fireEvent.change(within(second).getByRole('textbox', { name: 'Note' }), {
-      target: { value: noteText },
-    });
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // Until the save settles, nothing on the card reopens the dialog or posts again.
+    expect(opener.getAttribute('aria-busy')).toBe('true');
+    expect(within(cardOf(item)).getByText(DECISION_SAVING_MESSAGE)).toBeDefined();
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', true);
+      fireEvent.click(button);
+    }
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts(api)).toHaveLength(1);
 
     release(json(201, saved));
 
-    // The first save is reported on the card and in the provider's region...
+    // The late save is reported on the card and in the provider's region...
     expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(within(cardOf(item)).queryByText(DECISION_SAVING_MESSAGE)).toBeNull();
     expect(outcomeRegion().textContent).toBe(
       `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
     );
-    // ...and the reopened dialog stays open with the edit it was given.
-    expect(screen.getByRole('dialog', { name: RECORD_DECISION_LABEL })).toBe(second);
-    expect(within(second).getByRole('textbox', { name: 'Note' })).toHaveProperty(
-      'value',
-      noteText,
-    );
+    // ...the actions are usable again, and focus, which the closed dialog could not return to
+    // the disabled button, is back on "Record decision".
+    await waitFor(() => {
+      expect(document.activeElement).toBe(opener);
+    });
+    expect(opener.getAttribute('aria-busy')).toBeNull();
+    for (const button of cardButtons(item)) {
+      expect(button).toHaveProperty('disabled', false);
+    }
 
-    // The reopened dialog's own save still closes it.
+    // Reopening now starts a fresh form, without the closed one's note, whose save closes it.
+    const second = await openDecisionDialog(item);
+    expect(within(second).getByRole('textbox', { name: 'Note' })).toHaveProperty('value', '');
     fireEvent.click(within(second).getByRole('button', { name: 'Save decision' }));
     await waitFor(() => {
       expect(screen.queryByRole('dialog')).toBeNull();
     });
-    expect(posts(api)).toHaveLength(2);
-    expect(posts(api)[1]?.body).toEqual({
+    const decisionPost = {
       subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm },
       patch: { status: 'paused' },
       recommendation_id: FIXTURE_ITEM_IDS.c1,
-      note: noteText,
+    };
+    expect(posts(api).map((call) => call.body)).toEqual([
+      { ...decisionPost, note: noteText },
+      decisionPost,
+    ]);
+  });
+
+  it.each([
+    [
+      'a 422',
+      apiError(422, 'invalid_patch', 'A daily budget needs whole cents.'),
+      'A daily budget needs whole cents.',
+    ],
+    [
+      'a 409 platform_state_unknown',
+      apiError(409, 'platform_state_unknown', 'No entity sync has reported Generic CRM — US yet.'),
+      'No entity sync has reported Generic CRM — US yet.',
+    ],
+    [
+      'a 429',
+      apiError(429, 'rate_limited', 'Too many requests. Try again shortly.'),
+      'Too many requests. Try again shortly.',
+    ],
+    [
+      'a server failure',
+      html(502, '<html><body>Bad Gateway</body></html>'),
+      'The server is temporarily unavailable. Try again shortly.',
+    ],
+  ] as const)(
+    'shows %s that ends after the dialog was closed on the card, focused',
+    async (_failure, response, text) => {
+      let release: (response: MockResponse) => void = () => {
+        throw new Error('the pending decision response was never created');
+      };
+      const pending = new Promise<MockResponse>((resolve) => {
+        release = resolve;
+      });
+      api.use({
+        'GET /decisions': json(200, [genericCrmDecision()]),
+        'POST /decisions': () => pending,
+      });
+      const item = c1Item();
+      await renderCard(<RecommendationCard item={item} />);
+
+      const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+      opener.focus();
+      const dialog = await openDecisionDialog(item);
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(opener).toHaveProperty('disabled', true);
+      // Outside a provider the card's own polite line says the save is still running.
+      expect(within(cardOf(item)).getByRole('status').textContent).toBe(DECISION_SAVING_MESSAGE);
+
+      release(response);
+
+      // The form that would have shown the failure is gone, so the card shows it, focused.
+      const message = await within(cardOf(item)).findByText(text);
+      await waitFor(() => {
+        expect(document.activeElement?.contains(message)).toBe(true);
+      });
+      expect(document.activeElement?.getAttribute('tabindex')).toBe('-1');
+      expect(within(cardOf(item)).queryByRole('alert')).toBeNull();
+      expect(within(cardOf(item)).queryByText(HISTORICAL_LABEL)).toBeNull();
+      expect(within(cardOf(item)).queryByText(DECISION_SAVING_MESSAGE)).toBeNull();
+      // Unlike a retirement, the failure leaves every action usable, and nothing posted twice.
+      for (const button of cardButtons(item)) {
+        expect(button).toHaveProperty('disabled', false);
+      }
+      expect(posts(api)).toHaveLength(1);
+
+      // A new opening clears the failure.
+      await openDecisionDialog(item);
+      expect(within(cardOf(item)).queryByText(text)).toBeNull();
+    },
+  );
+
+  it("leaves focus where the user moved it when a closed dialog's save ends", async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending decision response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
     });
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': () => pending,
+    });
+    const item = c1Item();
+    await renderCard(
+      <>
+        <Button>Elsewhere</Button>
+        <RecommendationCard item={item} />
+      </>,
+    );
+
+    const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+    opener.focus();
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+
+    release(json(201, genericCrmDecision({ id: 811, origin: 'user', status: 'paused' })));
+
+    expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    await waitFor(() => {
+      expect(opener).toHaveProperty('disabled', false);
+    });
+    expect(document.activeElement).toBe(elsewhere);
   });
 });
 

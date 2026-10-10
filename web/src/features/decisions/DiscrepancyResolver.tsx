@@ -28,7 +28,11 @@
  *   the server immediately, so the refetched lists drop it.
  * - **Errors are the API's.** A 409 `subject_retired` reads "Computed from replaced data" and
  *   locks every control of that discrepancy (AAP 0.3.2); a 409 `discrepancy_resolved` reads
- *   "Already resolved"; any other failure, a 422 included, shows the API's own message.
+ *   "Already resolved" and locks them too; any other failure, a 422 included, shows the API's
+ *   own message. This holds whether a resolution posted here or the intended-state form
+ *   received the error, and the form's error stays shown outside its dialog once that closes.
+ * - **One resolution at a time.** While a resolution runs, an intended-state save included
+ *   after its dialog was closed, no other resolution starts and the dialog does not reopen.
  * - **No `alert` role.** AAP 0.5.5 reserves `role="alert"` for the discrepancy banner on
  *   `/actions`. Errors are plain critical banners that take focus; the outcome is a polite
  *   status message, and the list's own notices go to its polite status region.
@@ -277,14 +281,22 @@ function statusText(value: DiscrepancyValue): string {
   return Object.hasOwn(CAMPAIGN_STATUS_LABELS, status) ? CAMPAIGN_STATUS_LABELS[status] : status;
 }
 
-/** Whether a side describes a shared-budget assignment rather than an amount. */
+/** Whether a side describes a budget assignment, shared or not, rather than an amount. */
 function hasAssignment(value: DiscrepancyValue): boolean {
   return value.budget_id !== undefined || value.budget_external_id !== undefined;
 }
 
 /**
- * A campaign's budget assignment: "shared budget {Google id}", the internal id when the Google
- * id is unknown, or "own budget (not shared)" when the side names no shared budget.
+ * A campaign's budget assignment, worded as the backend's C0 text words it:
+ *
+ * - "shared budget {Google id}" when the side carries `budget_external_id`, which the API fills
+ *   only for a shared budget the subject knows;
+ * - "budget (internal id {id})" for a `budget_id` without a Google id. The id alone does not
+ *   establish shared ownership: a member moved onto a budget that is not shared reports the new
+ *   budget's internal id with `budget_external_id: null`, so calling it shared would misstate
+ *   the platform state;
+ * - "own budget (not shared)" for a `null` `budget_id`;
+ * - "budget assignment unavailable" when the side has neither assignment key.
  */
 function assignmentText(value: DiscrepancyValue): string {
   if (!hasAssignment(value)) {
@@ -296,7 +308,7 @@ function assignmentText(value: DiscrepancyValue): string {
   }
   const budgetId = value.budget_id;
   if (typeof budgetId === 'number') {
-    return `shared budget (internal id ${budgetId})`;
+    return `budget (internal id ${budgetId})`;
   }
   return 'own budget (not shared)';
 }
@@ -332,7 +344,7 @@ function moneyParts(value: DiscrepancyValue, currency: string | null): string[] 
 
 /**
  * One side of a discrepancy as one line: the status label, then each amount in the subject's
- * currency, or the shared budget a member draws from, joined by " · ".
+ * currency, or the budget a member is assigned to, joined by " · ".
  *
  * - `status`: the status alone.
  * - `budget`: the assignment of a shared member (or of any side carrying assignment keys),
@@ -478,8 +490,12 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * - "Record intended state" opens a `Dialog` titled "Record intended state" holding
  *   `DecisionForm` (`mode="intended_state"`) for the discrepancy's subject, with its own Save and
  *   Cancel buttons. Saving closes the dialog; Cancel, Escape, the Close button and the backdrop
- *   close it without posting. A save that ends after its dialog was closed and reopened is
- *   still reported, and leaves the reopened dialog open with its edits.
+ *   close it without posting, and may close it while its save runs. Until that save settles,
+ *   "Record intended state" shows its loading state and every other resolution is disabled, so
+ *   neither a second intended state nor another resolution can be posted. A save that ends
+ *   after its dialog was closed is still reported, and focus, which the closed dialog could not
+ *   return to the disabled button, goes back to "Record intended state" when nothing else has
+ *   taken it.
  * - Every other resolution posts `POST /discrepancies/{id}/resolve` with `{ resolution }` at
  *   once. While it runs, the clicked button shows its loading state and the others are disabled.
  * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
@@ -487,7 +503,11 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * - A failure shows a critical banner, which takes focus, with "Computed from replaced data"
  *   (409 `subject_retired`), "Already resolved" (409 `discrepancy_resolved`) or the API's
  *   message. Either 409 disables every control while this discrepancy is shown, because the
- *   server would refuse any resolution of it again.
+ *   server would refuse any resolution of it again. A failure of the intended-state save, which
+ *   the form reports through `onRetired` and `onFailed`, is shown and locks the same way, in this
+ *   banner outside the dialog, so it stays once the dialog is closed, even when the save settled
+ *   after that; the banner takes focus once the dialog is closed. Any other failure stands until
+ *   the next resolution starts or the dialog opens again.
  *
  * The controls' state (the dialog, the outcome and those locks) belongs to the discrepancy's id:
  * a mount reused for another discrepancy starts fresh, so one subject's lock never disables
@@ -511,14 +531,29 @@ function DiscrepancyResolutionBody({
   const resolve = useResolveDiscrepancy();
   const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
   const [outcome, setOutcome] = useState<DiscrepancyState | null>(null);
+  // What the intended-state form reports about its save. The form posts through a mutation of
+  // its own, which unmounts with it when its dialog is closed, so a save that settles after
+  // that leaves its outcome here: whether it still runs, its failure, and either 409's lock.
+  const [formPending, setFormPending] = useState(false);
+  const [formFailure, setFormFailure] = useState<string | null>(null);
+  const [formRetired, setFormRetired] = useState(false);
+  const [formClosed, setFormClosed] = useState(false);
 
   const error = resolve.error;
-  // A 409 subject_retired is final for this discrepancy (AAP 0.3.2), and so is a closed one: the
-  // server refuses every further resolution of it, so no control stays enabled. Every control
-  // is disabled from then on, so no later attempt can reset the error that set the lock.
-  const lockedByServer = isRetiredError(error) || isResolvedError(error);
+  // A 409 subject_retired is final for this discrepancy (AAP 0.3.2), and so is a closed one,
+  // whether a resolution posted here or the intended-state form received it: the server refuses
+  // every further resolution of it, so no control stays enabled. Every control is disabled from
+  // then on, so no later attempt can reset the error that set the lock.
+  const lockedByServer =
+    isRetiredError(error) || isResolvedError(error) || formRetired || formClosed;
   const locked = disabled || lockedByServer;
   const pendingResolution = resolve.isPending ? resolve.variables.body.resolution : null;
+  // The resolution whose request runs: one posted here, or the intended state the form posts,
+  // even with its dialog closed. While one runs, no other resolution starts.
+  const busyResolution: Resolution | null = formPending ? 'record_intended' : pendingResolution;
+  // The form's lock or failure, shown here as well, because the form that showed it is gone
+  // once its dialog closes.
+  const formMessage = formRetired ? RETIRED_MESSAGE : formFailure;
 
   // A clicked button is disabled while its request runs, which drops keyboard focus to the page.
   // When the request fails, focus moves to the error instead, so keyboard and screen-reader users
@@ -530,16 +565,26 @@ function DiscrepancyResolutionBody({
       errorRef.current?.focus();
     }
   }, [error]);
+  // A failure or lock the intended-state form reports takes the same focus, once its dialog is
+  // closed: while the dialog is open its focus trap owns focus, and the form shows the message
+  // itself. React runs the dialog's cleanup, which returns focus to its opener, before this.
+  useEffect(() => {
+    if (formMessage !== null && !dialog.open) {
+      errorRef.current?.focus();
+    }
+  }, [formMessage, dialog.open]);
 
   // A success that leaves this discrepancy on screen (awaiting_platform) re-enables the clicked
   // button; focus goes back to it when the loading state dropped focus to the page, so keyboard
-  // and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). A closed
-  // discrepancy leaves the lists, and the browser's focus navigation starting point then keeps
-  // the user's place, so nothing is focused for it.
+  // and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). So does an
+  // intended-state save that settles after its dialog was closed, which could not return focus
+  // to the disabled "Record intended state". A failure's banner takes focus first (the effects
+  // above), and a closed discrepancy leaves the lists, where the browser's focus navigation
+  // starting point keeps the user's place, so nothing is focused for either.
   const buttonRefs = useRef(new Map<Resolution, HTMLButtonElement>());
   const [refocus, setRefocus] = useState<Resolution | null>(null);
   useEffect(() => {
-    if (refocus === null || resolve.isPending) {
+    if (refocus === null || resolve.isPending || formPending) {
       return;
     }
     setRefocus(null);
@@ -549,10 +594,12 @@ function DiscrepancyResolutionBody({
     if (button !== undefined && button.isConnected && !button.disabled && focusLost) {
       button.focus();
     }
-  }, [refocus, resolve.isPending]);
+  }, [refocus, resolve.isPending, formPending]);
 
   const post = (resolution: Resolution) => {
     setOutcome(null);
+    // An earlier intended-state failure no longer describes what is posted now.
+    setFormFailure(null);
     // mutateAsync, unlike mutate's per-call callbacks, settles even when this card unmounts
     // first: a resolution that closes the discrepancy refetches the list without it before the
     // request settles here, and onResolved must still be told. A failure is already held in
@@ -570,11 +617,13 @@ function DiscrepancyResolutionBody({
   };
 
   const openIntendedState = () => {
-    if (locked) {
+    // A fresh form while an earlier save runs would post a second intended state.
+    if (locked || busyResolution !== null) {
       return;
     }
     // A failure of an earlier resolution no longer describes what the dialog is about to post.
     resolve.reset();
+    setFormFailure(null);
     setOutcome(null);
     setDialog(openDialogSession);
   };
@@ -584,9 +633,9 @@ function DiscrepancyResolutionBody({
   };
 
   // DecisionForm calls the onDone it had when the user saved, even after its dialog was closed,
-  // so a save that ends late closes only the opening it was made in (`session`): a dialog
-  // reopened in the meantime keeps its edits. The intended state is recorded either way, so the
-  // outcome is still shown and reported.
+  // so a save that ends late closes only the opening it was made in (`session`), never a dialog
+  // opened since. No opening starts while a save runs (`busyResolution`), and the intended
+  // state is recorded either way, so the outcome is still shown and reported.
   const handleIntendedSaved = (session: number) => {
     setDialog((current) => (current.session === session ? closeDialogSession(current) : current));
     // The API moves a record_intended discrepancy to awaiting_platform (decisions.py
@@ -597,7 +646,7 @@ function DiscrepancyResolutionBody({
   };
 
   const handleClick = (resolution: Resolution) => {
-    if (locked || pendingResolution !== null) {
+    if (locked || busyResolution !== null) {
       return;
     }
     if (resolution === 'record_intended') {
@@ -607,7 +656,7 @@ function DiscrepancyResolutionBody({
     post(resolution);
   };
 
-  const errorText = error === null ? null : resolveErrorMessage(error);
+  const errorText = formMessage ?? (error === null ? null : resolveErrorMessage(error));
   const outcomeText = outcome === null ? null : OUTCOME_TEXT[outcome];
   // The opening this render's intended-state form belongs to.
   const formSession = dialog.session;
@@ -634,8 +683,8 @@ function DiscrepancyResolutionBody({
               };
             }}
             variant={index === 0 ? 'primary' : 'secondary'}
-            loading={pendingResolution === resolution}
-            disabled={locked || (pendingResolution !== null && pendingResolution !== resolution)}
+            loading={busyResolution === resolution}
+            disabled={locked || (busyResolution !== null && busyResolution !== resolution)}
             onClick={() => {
               handleClick(resolution);
             }}
@@ -663,6 +712,27 @@ function DiscrepancyResolutionBody({
           currency={discrepancy.subject.currency}
           onDone={() => {
             handleIntendedSaved(formSession);
+          }}
+          onRetired={() => {
+            // The subject's dataset was replaced: lock every control of this discrepancy, not
+            // only the form, so closing and reopening the dialog cannot lift the lock.
+            setFormRetired(true);
+          }}
+          onPendingChange={(saving) => {
+            setFormPending(saving);
+            if (saving) {
+              // A new save: an earlier failure no longer describes it.
+              setFormFailure(null);
+            } else {
+              setRefocus('record_intended');
+            }
+          }}
+          onFailed={(message, failure) => {
+            setFormFailure(message);
+            // Already closed on the server, which refuses any resolution of it again.
+            if (isResolvedError(failure)) {
+              setFormClosed(true);
+            }
           }}
           onCancel={closeIntendedState}
           disabled={locked}

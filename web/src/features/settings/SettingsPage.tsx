@@ -20,13 +20,22 @@
  * 5. **Configuration hash**: `config_hash`, stored on every analysis run (AAP 0.1.1
  *    reproducibility).
  *
+ * Data sources: `GET /config` through `useConfig`, and, only while the refresh-failure notice
+ * shows, the latest default run's `display_timezone` through `useDefaultRun`, the zone of that
+ * notice's last-loaded instant.
+ *
+ * States: a spinner until the first response settles; the five sections once it has loaded; the
+ * sections with a "Settings could not be refreshed" notice while a later refetch has failed; and
+ * "Settings unavailable" when the first read failed.
+ *
  * Rules this file keeps:
  * - **Read-only**: the page renders no input, button or other control and calls no mutation.
  *   `DataTable` is never given `renderExpanded`, which would add toggle buttons.
  * - **No literals the API owns** (AAP 0.5.4.1): every threshold, window length, preset, stage
  *   label and asset shown comes from the response. Only the labels are fixed English text.
  * - **Values verbatim**: configured values are shown as configured (`0.95` stays "0.95"), never
- *   reformatted as percentages or money, so this file needs no formatting helpers.
+ *   reformatted as percentages or money. The only formatted value is the refresh notice's
+ *   last-loaded instant, through `formatInstant` in `DISPLAY_TIMEZONE` (AAP 0.5.5).
  * - **Server state only through `../../api/queries`** (AAP 0.11.1); nothing here fetches.
  * - **Design system only** (AAP 0.4.4): UI comes from the design-system index and layout only
  *   from `Stack` and `Inline`, with no raw tables or headings, no styles and no stylesheet.
@@ -40,7 +49,7 @@
  */
 import type { ReactElement, ReactNode } from 'react';
 
-import { isApiError, useConfig } from '../../api/queries';
+import { isApiError, useConfig, useDefaultRun } from '../../api/queries';
 import type {
   ConfigView,
   ContentAssetView,
@@ -51,6 +60,7 @@ import type {
 } from '../../api/types';
 import {
   Badge,
+  Banner,
   DataTable,
   EmptyState,
   Inline,
@@ -59,6 +69,7 @@ import {
   Stack,
   type DataTableColumn,
 } from '../../design-system';
+import { formatInstant } from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // Texts
@@ -78,6 +89,17 @@ const LOAD_ERROR_TITLE = 'Settings unavailable';
 
 /** Reason shown for a failure that carries no usable message of its own. */
 const GENERIC_ERROR_MESSAGE = 'The configuration could not be loaded.';
+
+/** Title of the notice shown while the cached configuration stays after a failed refetch. */
+const REFRESH_ERROR_TITLE = 'Settings could not be refreshed';
+
+/**
+ * The zone the refresh notice's last-loaded instant is shown in until the latest default run
+ * reports `display_timezone` (`GET /runs/latest` answers 404 `not_found` before the first
+ * analysis). `formatInstant` labels every instant with its zone, so the fallback is never
+ * mistaken for the configured one.
+ */
+const FALLBACK_TIMEZONE = 'UTC';
 
 /** Shown for an absent value: a label, property or stage id the configuration does not set. */
 const EM_DASH = '—';
@@ -420,8 +442,9 @@ interface MappingRow {
 
 /**
  * The configured bindings' columns. MQL's single `stage_label` arrives as a one-element
- * `stage_labels` list, so both rows render their labels the same way; a binding in `property`
- * mode has no labels and shows "—".
+ * `stage_labels` list, so both rows render their labels the same way. In `stage_label` mode the
+ * labels are tried in order; in `property` mode any configured labels are kept for display only
+ * and shown as configured. The cell shows "—" only when the binding has no label.
  */
 const MAPPING_COLUMNS: readonly DataTableColumn<MappingRow>[] = [
   { key: 'count', header: 'Count', isRowHeader: true },
@@ -442,7 +465,10 @@ interface BindingRow {
   binding: string;
   /** Whether the binding resolved, so its count or link can be computed. */
   available: boolean;
-  /** The lifecycle stage label that matched; `null` for property bindings and the Google link. */
+  /**
+   * The stage label this row's own binding resolved: the matched label in `stage_label` mode, or a
+   * configured display label kept in `property` mode; `null` when none and for Google link rows.
+   */
   matchedLabel: string | null;
   /** The lifecycle stage id the label resolved to; `null` when there is none. */
   stageId: string | null;
@@ -508,9 +534,12 @@ function bindingRows(bindings: CrmBindingsView): readonly BindingRow[] {
  * "—" for the matched label, stage id and property, and the API's reason: never `0` and never an
  * empty cell (AAP 0.5.4.7).
  *
- * The "Matched label" column goes beyond the five columns the screen's plan lists: Qualified
- * Lead tries its labels in order, and the label that matched is what heads the white-paper MQL
- * column, so the screen states which one the portal resolved.
+ * The "Matched label" column goes beyond the five columns the screen's plan lists. Each row shows
+ * the label its own binding resolved: MQL's for MQL and Qualified Lead's for Qualified Lead, or
+ * "—" for the Google link and for a property binding that keeps no display label. Qualified Lead
+ * tries its configured labels in order, so its row states which one the portal resolved. The two
+ * bindings resolve independently, and only the MQL binding's label heads the white-paper MQL
+ * column.
  */
 const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
   { key: 'binding', header: 'Binding', isRowHeader: true },
@@ -798,6 +827,48 @@ function SettingsContent({ config }: { config: ConfigView }): ReactElement {
   );
 }
 
+/** Props of {@link RefreshFailureNotice}. */
+interface RefreshFailureNoticeProps {
+  /** The error of the refetch that failed while the last configuration stays on screen. */
+  error: unknown;
+  /** When the configuration on screen was loaded: the query's `dataUpdatedAt`, epoch ms. */
+  dataUpdatedAt: number;
+}
+
+/**
+ * The notice shown while a background refetch of `GET /config` has failed and the last
+ * configuration stays on screen, so cached settings never read as current: a warning `Banner`
+ * "Settings could not be refreshed" with the failure's reason and when the configuration on
+ * screen was loaded, as an instant in `DISPLAY_TIMEZONE` (AAP 0.5.5 Behaviour).
+ *
+ * - The zone is the latest default run's `display_timezone`, read here rather than by the page,
+ *   so the loaded page sends no request but `GET /config`. Until that run reports a non-blank
+ *   zone (while its read is pending, or on its 404 before the first analysis), the instant is
+ *   shown in {@link FALLBACK_TIMEZONE}, labelled as such.
+ * - The banner is not an alert (AAP 0.5.5 reserves `role="alert"` for discrepancies). The page
+ *   renders it inside its polite status region, which announces it.
+ * - It offers no Retry, because the page has no controls. The query reads again by itself on
+ *   window focus or when the page mounts again, and the notice leaves once a read succeeds.
+ */
+function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProps): ReactElement {
+  const configuredZone = useDefaultRun().data?.display_timezone;
+  const displayTimezone =
+    configuredZone !== undefined && hasText(configuredZone)
+      ? configuredZone.trim()
+      : FALLBACK_TIMEZONE;
+  const loadedAt = formatInstant(new Date(dataUpdatedAt).toISOString(), displayTimezone);
+  return (
+    <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
+      {/* Lines, not paragraphs: feature code carries no CSS (AAP 0.4.4), so the Stack gap token
+          alone spaces them, where a <p>'s user-agent margins no spacing token sets. */}
+      <Stack gap={1}>
+        <div>{failureReason(error)}</div>
+        <div>{`Showing the configuration as last loaded ${loadedAt}.`}</div>
+      </Stack>
+    </Banner>
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------------------------
@@ -811,11 +882,17 @@ function SettingsContent({ config }: { config: ConfigView }): ReactElement {
  * services.":
  *
  * - the five sections (analysis window, thresholds, HubSpot mapping, white paper registry and
- *   configuration hash) whenever the configuration is loaded, including after a failed
- *   background refetch, which keeps the last response;
+ *   configuration hash) whenever the configuration is loaded;
+ * - while a background refetch has failed and the last response stays on screen, above those
+ *   sections the warning notice "Settings could not be refreshed" with the API's message and
+ *   when the configuration on screen was loaded ({@link RefreshFailureNotice}), announced
+ *   through a polite status region. It leaves once a later read succeeds;
  * - a `Spinner` labelled "Loading settings" until the first response settles;
  * - otherwise an `EmptyState` "Settings unavailable" with the API's message, announced through
- *   a polite status region. It offers no action, because the page has no controls.
+ *   the same region.
+ *
+ * Neither failure offers an action, because the page has no controls: the query reads again by
+ * itself on window focus or when the page mounts again, once its 5-minute freshness has passed.
  *
  * The component must render inside the app's `QueryClientProvider`, as every authenticated page
  * does; `src/router.tsx` renders it inside the page frame at `/settings`.
@@ -829,19 +906,25 @@ function SettingsContent({ config }: { config: ConfigView }): ReactElement {
  * ```
  */
 export function SettingsPage(): ReactElement {
-  const { data, error, isPending } = useConfig();
+  const { data, dataUpdatedAt, error, isPending } = useConfig();
 
   const failed = data === undefined && !isPending;
+  // TanStack Query keeps the last data when a refetch fails and sets `error` beside it.
+  const refreshFailed = data !== undefined && error !== null;
 
   return (
     <Stack gap={6}>
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
       <p>{READ_ONLY_NOTE}</p>
-      {/* One polite region rendered in every state, so a failure that replaces the spinner is
-          announced (WCAG 2.2 SC 4.1.3); while empty, Stack takes it out of the column. */}
+      {/* One polite region rendered in every state, so a failure that replaces the spinner, or a
+          failed refetch behind the cached sections, is announced (WCAG 2.2 SC 4.1.3); while
+          empty, Stack takes it out of the column. */}
       <div role="status">
         {failed ? (
           <EmptyState title={LOAD_ERROR_TITLE}>{failureReason(error)}</EmptyState>
+        ) : null}
+        {refreshFailed ? (
+          <RefreshFailureNotice error={error} dataUpdatedAt={dataUpdatedAt} />
         ) : null}
       </div>
       {data !== undefined ? (

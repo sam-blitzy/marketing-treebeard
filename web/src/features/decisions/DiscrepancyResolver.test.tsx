@@ -14,11 +14,13 @@
  *   `{ resolution }` alone and the CSRF header, shows its outcome in a polite status region and
  *   reports the API's response to `onResolved`;
  * - "Record intended state" opens a dialog holding `DecisionForm` with exactly the fields of the
- *   subject's decision shape, and posts the complete intended state; a save that ends after its
- *   dialog was closed and reopened is reported and leaves the reopened dialog open with its edits;
- * - 409 `subject_retired` and 409 `discrepancy_resolved` lock every control; 409
- *   `platform_state_unknown`, 422 `resolution_not_allowed` and 422 `intended_state_invalid` show
- *   the API's own message and leave the controls usable; `disabled` locks every control;
+ *   subject's decision shape, and posts the complete intended state; the dialog may close while
+ *   its save runs, but until the save settles every resolution stays disabled and the dialog
+ *   does not reopen, and a late outcome is still reported, shown and focused outside the dialog;
+ * - 409 `subject_retired` and 409 `discrepancy_resolved` lock every control, whether a resolution
+ *   or the intended-state form received them; 409 `platform_state_unknown`, 422
+ *   `resolution_not_allowed` and 422 `intended_state_invalid` show the API's own message and
+ *   leave the controls usable; `disabled` locks every control;
  * - the list's loading, empty, failed and failed-refresh states, announced in one polite status
  *   region kept from the first render (never an alert), with Retry and the last-loaded instant;
  *   the first page of `DISCREPANCY_PAGE_SIZE` with its `X-Total-Count` summary, the line on
@@ -33,7 +35,7 @@
  * `../../test/mockApi` is imported first so its `afterEach` check runs after Testing Library's
  * cleanup (Vitest skips later hooks once one throws).
  */
-import { apiError, json, mockApi } from '../../test/mockApi';
+import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
@@ -1171,12 +1173,14 @@ const COMPARISONS: readonly ComparisonCase[] = [
     'Platform shows status not reported, last decided Active',
   ],
   [
-    'a member assigned to a budget known only by internal id',
+    // The API names no Google id for a budget it does not know as shared, such as the unshared
+    // budget a member moved onto, so the id alone is worded neutrally, never as shared.
+    'a member moved onto a budget known only by internal id',
     makeDiscrepancy('budget', {
       shape: 'shared_member',
       platform_value: { budget_id: FIXTURE_BUDGET_IDS.display, budget_external_id: null },
     }),
-    'Platform shows shared budget (internal id 401), last decided shared budget 31000402',
+    'Platform shows budget (internal id 401), last decided shared budget 31000402',
   ],
   [
     'a member moved to a budget of its own',
@@ -1770,7 +1774,7 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     expect(screen.queryByText('The platform state is not known yet.')).toBeNull();
   });
 
-  it('keeps a reopened dialog and its edits when an earlier save ends late, and reports it', async () => {
+  it('refuses another resolution while its save runs, then reports it and opens a fresh form', async () => {
     const discrepancy = makeDiscrepancy('untracked');
     const updated: Discrepancy = {
       ...discrepancy,
@@ -1789,41 +1793,228 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     });
     const { onResolved } = await renderResolution(discrepancy);
 
+    const opener = buttonNamed('Record intended state');
+    // A click focuses the button in a browser; fireEvent does not.
+    opener.focus();
     const first = await openIntendedState();
+    const noteText = 'Budget raised on the platform by the agency';
+    fireEvent.change(within(first).getByLabelText('Daily budget'), { target: { value: '240' } });
+    fireEvent.change(within(first).getByLabelText('Note'), { target: { value: noteText } });
     saveIntendedState(first);
     await waitFor(() => {
       expect(resolveCalls(api)).toHaveLength(1);
     });
-    // Closing the dialog unmounts the form while its request runs; reopening starts a new one.
+    expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+    // Closing the dialog unmounts the form while its request runs.
     fireEvent.click(buttonNamed('Close', first));
-    const second = await openIntendedState();
-    const noteText = 'Budget raised on the platform by the agency';
-    fireEvent.change(within(second).getByLabelText('Daily budget'), { target: { value: '240' } });
-    fireEvent.change(within(second).getByLabelText('Note'), { target: { value: noteText } });
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // Until the save settles, no control reopens the dialog or posts another resolution.
+    expect(opener.getAttribute('aria-busy')).toBe('true');
+    expect(opener.disabled).toBe(true);
+    expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+    fireEvent.click(buttonNamed('Adopt platform state'));
+    fireEvent.click(opener);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(resolveCalls(api)).toHaveLength(1);
 
     firstSave.resolve(json(200, updated));
 
-    // The first save is reported in the status line and to onResolved...
+    // The late save is reported in the status line and to onResolved...
     await waitFor(() => {
       expect(onResolved).toHaveBeenCalledTimes(1);
     });
     expect(onResolved).toHaveBeenCalledWith(updated);
     expect(outcomeRegion().textContent).toBe('Waiting for the platform to match the decision');
-    // ...and the reopened dialog stays open with the edits it was given.
-    expect(screen.getByRole('dialog', { name: 'Record intended state' })).toBe(second);
-    expect((within(second).getByLabelText('Daily budget') as HTMLInputElement).value).toBe('240');
-    expect((within(second).getByLabelText('Note') as HTMLTextAreaElement).value).toBe(noteText);
+    // ...the controls are usable again, and focus, which the closed dialog could not return to
+    // the disabled button, is back on "Record intended state".
+    await waitFor(() => {
+      expect(document.activeElement).toBe(opener);
+    });
+    expect(opener.getAttribute('aria-busy')).toBeNull();
+    expect(buttonNamed('Adopt platform state').disabled).toBe(false);
 
-    // The reopened dialog's own save still closes it.
+    // Reopening now starts a fresh form, without the closed one's edits, whose save closes it.
+    const second = await openIntendedState();
+    expect((within(second).getByLabelText('Daily budget') as HTMLInputElement).value).toBe(
+      '200.00',
+    );
+    expect((within(second).getByLabelText('Note') as HTMLTextAreaElement).value).toBe('');
     saveIntendedState(second);
     await waitFor(() => {
       expect(screen.queryByRole('dialog')).toBeNull();
     });
-    expect(resolveCalls(api)[1]?.body).toEqual({
-      resolution: 'record_intended',
-      intended_state: { status: 'active', daily_budget: '240' },
-      note: noteText,
-    });
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      {
+        resolution: 'record_intended',
+        intended_state: { status: 'active', daily_budget: '240' },
+        note: noteText,
+      },
+      { resolution: 'record_intended', intended_state: { status: 'active', daily_budget: '200.00' } },
+    ]);
     expect(onResolved).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [
+      '409 subject_retired',
+      apiError(409, 'subject_retired', 'The subject belongs to a retired dataset.'),
+      'Computed from replaced data',
+    ],
+    [
+      '409 discrepancy_resolved',
+      apiError(409, 'discrepancy_resolved', 'Discrepancy 51 is already resolved.'),
+      'Already resolved',
+    ],
+  ] as const)(
+    'locks every control on a %s to the intended state, after the dialog closes',
+    async (_refusal, response, text) => {
+      const api = mockApi(intendedHandlers(response));
+      const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
+
+      buttonNamed('Record intended state').focus();
+      const dialog = await openIntendedState();
+      saveIntendedState(dialog);
+
+      // The form shows the refusal itself while its dialog is open.
+      expect(await within(dialog).findByText(text)).toBeTruthy();
+      fireEvent.click(buttonNamed('Close', dialog));
+      expect(screen.queryByRole('dialog')).toBeNull();
+
+      // The lock is the controls' own now: the same message outside the dialog, focused, and
+      // every resolution disabled, so no fresh, unlocked form can open.
+      const title = screen.getByText(text);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+      });
+      expect(screen.queryByText('The subject belongs to a retired dataset.')).toBeNull();
+      expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+      expect(buttonNamed('Record intended state').disabled).toBe(true);
+      fireEvent.click(buttonNamed('Adopt platform state'));
+      fireEvent.click(buttonNamed('Record intended state'));
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(resolveCalls(api)).toHaveLength(1);
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(onResolved).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still locks every control when the 409 subject_retired ends a save after its dialog closed', async () => {
+    const response = deferred<MockResponse>();
+    const api = mockApi({ 'GET /decisions': json(200, []), [RESOLVE_KEY]: () => response.promise });
+    await renderResolution(makeDiscrepancy('untracked'));
+
+    const opener = buttonNamed('Record intended state');
+    opener.focus();
+    const dialog = await openIntendedState();
+    saveIntendedState(dialog);
+    await waitFor(() => {
+      expect(resolveCalls(api)).toHaveLength(1);
+    });
+    fireEvent.click(buttonNamed('Close', dialog));
+    expect(opener.getAttribute('aria-busy')).toBe('true');
+    expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+
+    response.resolve(apiError(409, 'subject_retired', 'The subject belongs to a retired dataset.'));
+
+    const title = await screen.findByText('Computed from replaced data');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+    });
+    expect(opener.getAttribute('aria-busy')).toBeNull();
+    expect(opener.disabled).toBe(true);
+    expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+    fireEvent.click(buttonNamed('Adopt platform state'));
+    fireEvent.click(opener);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(resolveCalls(api)).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      'a 422 intended_state_invalid',
+      apiError(422, 'intended_state_invalid', 'The intended state needs the daily budget.'),
+      'The intended state needs the daily budget.',
+    ],
+    [
+      'a server failure',
+      html(502, '<html><body>Bad Gateway</body></html>'),
+      'The server is temporarily unavailable. Try again shortly.',
+    ],
+  ] as const)(
+    'shows %s that ends after the dialog was closed outside it, focused',
+    async (_failure, failure, text) => {
+      const response = deferred<MockResponse>();
+      const api = mockApi({
+        'GET /decisions': json(200, []),
+        [RESOLVE_KEY]: () => response.promise,
+      });
+      const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
+
+      buttonNamed('Record intended state').focus();
+      const dialog = await openIntendedState();
+      saveIntendedState(dialog);
+      await waitFor(() => {
+        expect(resolveCalls(api)).toHaveLength(1);
+      });
+      fireEvent.click(buttonNamed('Close', dialog));
+
+      response.resolve(failure);
+
+      // The form that would have shown the failure is gone, so the controls show it, focused.
+      const title = await screen.findByText(text);
+      expect(screen.queryByRole('dialog')).toBeNull();
+      await waitFor(() => {
+        expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+      });
+      expect(screen.queryByRole('alert')).toBeNull();
+      // The failure locks nothing, and nothing was posted twice.
+      expect(buttonNamed('Record intended state').disabled).toBe(false);
+      expect(buttonNamed('Adopt platform state').disabled).toBe(false);
+      expect(resolveCalls(api)).toHaveLength(1);
+      expect(onResolved).not.toHaveBeenCalled();
+      expect(outcomeRegion().textContent).toBe('');
+
+      // Opening the dialog again clears it.
+      await openIntendedState();
+      expect(screen.queryByText(text)).toBeNull();
+    },
+  );
+
+  it('keeps an intended-state failure outside the closed dialog until another resolution', async () => {
+    const INVALID_MESSAGE = 'The intended state needs the daily budget.';
+    let attempts = 0;
+    const api = mockApi({
+      'GET /decisions': json(200, []),
+      [RESOLVE_KEY]: () => {
+        attempts += 1;
+        return attempts === 1
+          ? apiError(422, 'intended_state_invalid', INVALID_MESSAGE)
+          : json(200, makeDiscrepancy('untracked', { state: 'resolved' }));
+      },
+    });
+    await renderResolution(makeDiscrepancy('untracked'));
+
+    const dialog = await openIntendedState();
+    saveIntendedState(dialog);
+    expect(await within(dialog).findByText(INVALID_MESSAGE)).toBeTruthy();
+    fireEvent.click(buttonNamed('Cancel', dialog));
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    const title = screen.getByText(INVALID_MESSAGE);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+    });
+
+    fireEvent.click(buttonNamed('Adopt platform state'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    expect(screen.queryByText(INVALID_MESSAGE)).toBeNull();
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      { resolution: 'record_intended', intended_state: { status: 'active', daily_budget: '200.00' } },
+      { resolution: 'adopt_platform' },
+    ]);
   });
 });

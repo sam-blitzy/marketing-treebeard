@@ -210,7 +210,7 @@ def _status_text(value: Mapping[str, Any]) -> str:
 
 
 def _has_assignment(value: Mapping[str, Any]) -> bool:
-    """Whether a value describes a shared-budget assignment rather than an amount."""
+    """Whether a value describes a budget assignment, shared or not, rather than an amount."""
     return not _ASSIGNMENT_KEYS.isdisjoint(value)
 
 
