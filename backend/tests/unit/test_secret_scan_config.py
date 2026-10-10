@@ -145,7 +145,18 @@ SIMULATED_LOOKALIKES: Mapping[str, str] = {
 
 # Short stand-in credentials three unit tests committed, which history keeps, and the three stub
 # test files the historical-stub allowlist confines them to.
-HISTORICAL_STUBS = ("4242", "ABC", "abc", "a/b+c", "café", "red", "short", "short7x", "xyz")
+HISTORICAL_STUBS = (
+    "4242",
+    "ABC",
+    "abc",
+    "a/b+c",
+    "café",
+    "red",
+    "sec/ret=1",
+    "short",
+    "short7x",
+    "xyz",
+)
 STUB_PATHS = (
     "backend/tests/unit/test_cli.py",
     "backend/tests/unit/test_connector_http.py",

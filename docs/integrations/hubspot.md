@@ -990,9 +990,11 @@ uv run --frozen ads-engine capture-fixtures --source hubspot
 Inside the backend image the same command runs as `ads-engine capture-fixtures --source hubspot`
 from `/app`. The captures then land in `/app/tests/contracts/hubspot/captured/`, which only the
 runtime user (UID 10001) can write. On the host as in the image, the command is refused, with
-nothing sent, when that directory is not writable by the user running it or is a symbolic link.
-To keep the files, bind-mount the checkout's `backend/tests/contracts/hubspot/captured/` there,
-writable by UID 10001, or run the container with `--user` set to that directory's owner.
+nothing sent, when that directory is not writable by the user running it, or it or a directory on
+its path below the working directory (`tests`, `tests/contracts` or `tests/contracts/hubspot`) is
+a symbolic link. To keep the files, bind-mount the checkout's
+`backend/tests/contracts/hubspot/captured/` there, writable by UID 10001, or run the container
+with `--user` set to that directory's owner.
 
 - It sends minimal reads: the `lifecyclestage` property with binding verification, a
   one-result deal search over the last 30 days, that deal's contacts (or one input when there

@@ -685,8 +685,9 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
 
 - **Refusals**: the command is refused, with nothing sent or written, under
   `DATA_MODE=simulated`, without LinkedIn credentials, or when
-  `tests/contracts/linkedin/captured/` is not writable by the user running it or is a symbolic
-  link.
+  `tests/contracts/linkedin/captured/` is not writable by the user running it, or it or a
+  directory on its path below the working directory (`tests`, `tests/contracts` or
+  `tests/contracts/linkedin`) is a symbolic link.
 - **Bounds**: each surface is bounded to one request. Only the transport retries of a transient
   failure, the token exchange and one retry that follow a 401 in refresh mode, and the
   `adAccounts/{id}` read that `list_campaign_groups` makes when the `ad_account` call failed
@@ -723,13 +724,17 @@ uv run --frozen ads-engine capture-fixtures --source linkedin
   - any email address, and every configured secret, `LINKEDIN_CLIENT_ID` included, in any
     string whatever its length, in plain text or in any percent-encoded spelling.
 
+  The access token the token exchange issues, any refresh token it rotates to and every
+  `Authorization` credential sent are redacted the same way wherever they occur, such as in
+  the token response's `scope`, a key, a percent-encoded string or a later response.
   Configured ad account ids become zeros of the same length, and so does the id of every
   organization URN (`urn:li:organization:`, `urn:li:organizationBrand:` and `urn:li:company:`,
   plain or percent-encoded), such as an account's `reference`, a campaign group's
   `beneficiaryReference`, a campaign's `associatedEntity` and employer targeting, and a post's
-  `author`. The URN prefix is kept, and a bare number is never changed. A capture that still
-  holds a configured secret, however many times it was percent-encoded, is not written, and
-  the command exits with status 1. The `LEAD_FIELDS` projection does not request
-  `submitter`, the member URN, so captures of lead responses do not carry it.
+  `author`. The URN prefix is kept, and a bare number equal to an organization id is never
+  changed. A capture that still holds a configured secret or one of these tokens, however many
+  times it was percent-encoded, is not written, and the command exits with status 1. The
+  `LEAD_FIELDS` projection does not request `submitter`, the member URN, so captures of lead
+  responses do not carry it.
 - **Use in tests**: the contract tests then validate the parsers against the captured payloads
   as well as the documented samples.

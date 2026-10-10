@@ -71,14 +71,14 @@ import re
 import secrets
 import stat
 import sys
-from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from secrets import token_hex
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Protocol, cast, overload
-from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit
 
 import httpx
 from argon2 import Parameters, PasswordHasher, extract_parameters
@@ -87,7 +87,15 @@ from pydantic import ValidationError
 
 from ads_engine import __version__
 from ads_engine.db.models.ops import SOURCES, AppUser
-from ads_engine.logging import EMAIL_RE, configure_logging, get_logger, logged_as, redact
+from ads_engine.logging import (
+    configure_logging,
+    email_spans,
+    get_logger,
+    is_email_key,
+    logged_as,
+    redact,
+    redact_emails,
+)
 from ads_engine.settings import SOURCES as SETTINGS_SOURCES
 from ads_engine.settings import ConfigurationError, Settings, Source, get_settings
 
@@ -642,7 +650,6 @@ async def _ensure_admin() -> int:
 
 
 def _cmd_ensure_admin(_args: argparse.Namespace) -> int:
-    """``ensure-admin``: create or update the admin from the environment; idempotent."""
     return _run_async(_ensure_admin)
 
 
@@ -885,7 +892,6 @@ async def _seed_simulated() -> int:
 
 
 def _cmd_seed_simulated(_args: argparse.Namespace) -> int:
-    """``seed-simulated``: seed simulated datasets for every source and analyse them."""
     return _run_async(_seed_simulated)
 
 
@@ -1130,6 +1136,11 @@ _CREDENTIAL_KEYS: Final = frozenset({"access_token", "refresh_token", "client_se
 # An OAuth authorization code is a request parameter only; HubSpot and LinkedIn error and
 # multi-status bodies use `code` for error codes, which the contracts need intact.
 _REQUEST_CREDENTIAL_KEYS: Final = _CREDENTIAL_KEYS | {"code"}
+# Response keys whose values are credentials a platform issued during the run, such as the
+# LinkedIn token exchange's access token and rotated refresh token. Once collected
+# (:func:`_run_credentials`), every copy of such a value is redacted, so `id_token` needs no
+# blanking key of its own.
+_ISSUED_CREDENTIAL_KEYS: Final = _CREDENTIAL_KEYS | {"id_token"}
 # Person-name and contact keys, in LinkedIn (camelCase) and HubSpot (lowercase) spelling.
 _PERSON_KEYS: Final = frozenset(
     {"firstName", "lastName", "firstname", "lastname", "fullName", "phone", "mobilephone", "email"}
@@ -1147,6 +1158,28 @@ _INSERTED_TEXT: Final = re.compile(
 # secret encoded any number of times, or in a spelling the secret pattern does not match, is
 # found.
 _DECODERS: Final[tuple[Callable[[str], str], ...]] = (unquote, unquote_plus)
+# What separates the components of a URL, query or form body, and the blanks, double quotes
+# and brackets around a URL in prose. A percent-encoded email address is removed with the one
+# component between them that carries it, so the URL or form around it stays parseable. The
+# `atext` characters an address's local part may hold and no URL delimits with (`'`, `{`, `}`
+# and `|`) belong to the component, so no part of `o'brien%40example.com` or
+# `{user}%40x.com` is left behind.
+_COMPONENT_DELIMITERS: Final = r"\s/?#&=;,:\"<>()\[\]\\"
+# A double-quoted string glued before a component, which the email scanner reads as a quoted
+# local part (RFC 5322 section 3.4.1): `"`, then any characters but `"`, `\`, CR and LF, or
+# `\`-escaped pairs, then `"`. It belongs to the component, so no part of
+# `"用户"%40example.com` is left behind. `\` delimits components too, so a `"` right after
+# one opens no quoted string here: the escaped quotes inside one never start a scan of their
+# own.
+_QUOTED_PREFIX: Final = r'(?<!\\)"(?:[^"\\\r\n]|\\[^\r\n])*+"'
+# One component holding a `%`, with any quoted string glued before it. A match starts only
+# where a component or such a quoted string starts, the quoted strings scanned from different
+# opening quotes share at most a quote, and every quantifier is possessive, so the scan runs
+# in linear time.
+_ENCODED_COMPONENT: Final = re.compile(
+    rf"(?<![^{_COMPONENT_DELIMITERS}])(?:{_QUOTED_PREFIX})?+"
+    rf"[^{_COMPONENT_DELIMITERS}%]*+%[^{_COMPONENT_DELIMITERS}]*+"
+)
 # One colon of a URN: literal, or percent-encoded any number of times in either hex case
 # (`%3A`, `%3a`, `%253A`, …), as request URLs and `next` links carry it.
 _URN_COLON: Final = r"(?::|%(?:25)*3[Aa])"
@@ -1173,7 +1206,7 @@ def _secret_spelling(secret: str) -> str:
     and ``a%62c``, and ``a/b+c`` as ``a%2fb%2bc``. Plain characters match case-sensitively.
 
     Args:
-        secret: The plaintext of one configured secret.
+        secret: The plaintext of one secret.
 
     Returns:
         The pattern, without anchors or groups that capture.
@@ -1225,25 +1258,67 @@ def _blank(node: JSONValue, *, numbers: bool) -> JSONValue:
     return node
 
 
+def _decodes_to_email(component: str) -> bool:
+    """Whether percent-decoding ``component`` reveals an email address.
+
+    Each decoder of ``_DECODERS`` (``+`` kept, or read as a space) is applied again and again
+    until the text no longer changes, and every decoded form is searched with the shared
+    scanner (:func:`ads_engine.logging.email_spans`), so ``lead%40example.com``,
+    ``lead%2540example.com`` and the UTF-8 escapes of ``用户@例子.公司`` are all found,
+    however many times they were encoded. As in :meth:`_RedactionPolicy._decodes_to_secret`,
+    no round cap is needed: every round that changes the text shortens it, except
+    ``unquote_plus`` turning ``+`` into spaces, which leaves nothing more to decode.
+    """
+    for decode in _DECODERS:
+        decoded, previous = decode(component), component
+        while decoded != previous:
+            if email_spans(decoded):
+                return True
+            decoded, previous = decode(decoded), decoded
+    return False
+
+
+def _redact_encoded_email(match: re.Match[str]) -> str:
+    """Return ``%3Credacted%3E`` for an :data:`_ENCODED_COMPONENT` that hides an email address.
+
+    Any other component is kept as it is.
+    """
+    component = match.group(0)
+    return _ENCODED_MARKER if _decodes_to_email(component) else component
+
+
+def _holds_email(text: str) -> bool:
+    """Whether ``text`` holds an email address, plain or in a percent-encoded component."""
+    return bool(email_spans(text)) or (
+        "%" in text
+        and any(_decodes_to_email(match.group(0)) for match in _ENCODED_COMPONENT.finditer(text))
+    )
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _RedactionPolicy:
     """What a capture must lose before it is written: secrets, tokens, people and accounts.
 
-    Every configured secret is removed wherever it occurs, whatever its length: in any string
-    or dict key, in plain text or in any percent-encoded spelling, and as a JSON number equal
-    to it. Capture fidelity gives way to that guarantee, and :meth:`holds_secret` confirms it
-    on each finished document, percent-decoded however many times it was encoded too, so a
-    capture that still holds a secret is never written. The id of every LinkedIn
+    Every secret of the policy, configured or added by :meth:`with_secrets` (the credentials a
+    capture run sent or was issued), is removed wherever it occurs, whatever its length: in
+    any string or dict key, in plain text or in any percent-encoded spelling, and as a JSON
+    number equal to it. Capture fidelity gives way to that guarantee, and :meth:`holds_secret`
+    confirms it on each finished document, percent-decoded however many times it was encoded
+    too, so a capture that still holds a secret is never written. The id of every LinkedIn
     organization URN (``urn:li:organization:``, ``urn:li:organizationBrand:`` and
     ``urn:li:company:``, plain or percent-encoded) becomes zeros of the same length in any
-    string or dict key, whatever organization it names (:data:`_ORGANIZATION_URN`).
+    string or dict key, whatever organization it names (:data:`_ORGANIZATION_URN`). Every
+    email address, in any script and plain or percent-encoded, and every value under a key
+    that names one, is removed too (:meth:`text`, :meth:`value`), and :meth:`holds_email`
+    confirms that on each finished document.
 
     Attributes:
         secrets: The plaintext of every configured secret, the n8n webhook URL and the
-            LinkedIn client id, longest first.
+            LinkedIn client id, and of every credential :meth:`with_secrets` added, longest
+            first.
         secret_pattern: One alternation of those secrets, longest plaintext first, each
             matching its plain text and any percent-encoded spelling (see
-            :func:`_secret_spelling`), or ``None`` when nothing is configured. A single pass
+            :func:`_secret_spelling`), or ``None`` when there are none. A single pass
             replaces every occurrence and never rescans the marker it wrote, so a secret
             such as ``red`` cannot loop or survive.
         header_names: Lower-cased request headers whose values are credentials:
@@ -1263,7 +1338,11 @@ class _RedactionPolicy:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> _RedactionPolicy:
-        """Build the policy from the configured secrets, header name and account ids."""
+        """Build the policy from the configured secrets, header name and account ids.
+
+        Credentials that exist only once a capture runs, such as the access token the
+        LinkedIn token exchange issues, are added afterwards with :meth:`with_secrets`.
+        """
         secrets = set(settings.secret_values())
         if settings.n8n_google_ads_webhook_url:
             secrets.add(settings.n8n_google_ads_webhook_url)
@@ -1271,8 +1350,6 @@ class _RedactionPolicy:
         client_id = (settings.linkedin_client_id or "").strip()
         if client_id:
             secrets.add(client_id)
-        ordered = tuple(sorted(secrets, key=len, reverse=True))
-        alternation = "|".join(_secret_spelling(secret) for secret in ordered)
         ids = list(settings.linkedin_ad_account_ids)
         if settings.google_ads_customer_id:
             ids.append(settings.google_ads_customer_id)
@@ -1280,14 +1357,38 @@ class _RedactionPolicy:
             (re.compile(rf"(?<![0-9]){re.escape(value)}(?![0-9])"), "0" * len(value))
             for value in sorted(set(ids), key=len, reverse=True)
         )
-        return cls(
-            secrets=ordered,
-            secret_pattern=re.compile(alternation) if ordered else None,
+        policy = cls(
+            secrets=(),
+            secret_pattern=None,
             header_names=frozenset(
                 {_AUTHORIZATION, settings.n8n_webhook_secret_header.strip().lower()}
             ),
             identifiers=identifiers,
             identifier_values=frozenset(ids),
+        )
+        return policy.with_secrets(secrets)
+
+    def with_secrets(self, secrets: Iterable[str]) -> _RedactionPolicy:
+        """This policy with ``secrets`` added to the secrets it removes and checks for.
+
+        The merged plaintexts are ordered longest first again and :attr:`secret_pattern` is
+        recompiled from them, so :meth:`text`, :meth:`value`, :meth:`url`, :meth:`headers` and
+        :meth:`form` remove an added secret wherever it occurs, as they remove a configured
+        one, and :meth:`holds_secret` refuses a document that still holds it.
+
+        Args:
+            secrets: Plaintexts to add. An empty string is ignored, because it would match
+                between every two characters.
+
+        Returns:
+            A new policy; this one is unchanged.
+        """
+        merged = set(self.secrets)
+        merged.update(secret for secret in secrets if secret)
+        ordered = tuple(sorted(merged, key=len, reverse=True))
+        alternation = "|".join(_secret_spelling(secret) for secret in ordered)
+        return dataclasses.replace(
+            self, secrets=ordered, secret_pattern=re.compile(alternation) if ordered else None
         )
 
     def text(self, value: str) -> str:
@@ -1298,27 +1399,51 @@ class _RedactionPolicy:
         or literal characters in any mix, ``+`` for a space) by ``%3Credacted%3E``, so a URL
         or form body stays parseable. Configured account ids, and the id of every LinkedIn
         organization URN, become zeros of the same length.
+
+        Every email address in any script (:func:`ads_engine.logging.email_spans`) becomes
+        ``<redacted>``, with the text glued to it that its fail-closed local part takes
+        (``contact=x!@y.com``). A percent-encoded one is found by decoding each URL, query or
+        form component that holds a ``%``, with and without ``+`` as a space, again while
+        that still changes it (:func:`_decodes_to_email`); the whole component, between the
+        delimiters of :data:`_COMPONENT_DELIMITERS` and with any quoted string glued before
+        it (a quoted local part, ``"用户"%40example.com``), then becomes ``%3Credacted%3E``,
+        so ``?email=lead%2540example.com&limit=1`` keeps its shape as
+        ``?email=%3Credacted%3E&limit=1``. An encoded address is cut only at a URL delimiter
+        (``/``, ``?``, ``#``, ``&``, ``=``) that its local part holds literally, which the
+        URL's shape keeps: ``a=b%40x.com`` becomes ``a=%3Credacted%3E``.
         """
+        return self._without_emails(self._without_secrets(value))
+
+    def _without_secrets(self, value: str) -> str:
+        """Replace the secrets, account ids and organization URN ids of :meth:`text`."""
         if self.secret_pattern is not None:
             value = self.secret_pattern.sub(self._secret_marker, value)
         for pattern, replacement in self.identifiers:
             value = pattern.sub(replacement, value)
-        value = _ORGANIZATION_URN.sub(_zero_organization_id, value)
-        return EMAIL_RE.sub(_MARKER, value)
+        return _ORGANIZATION_URN.sub(_zero_organization_id, value)
+
+    @staticmethod
+    def _without_emails(value: str) -> str:
+        """Replace the plain and percent-encoded email addresses of :meth:`text`."""
+        value = redact_emails(value, _MARKER)
+        if "%" in value:
+            value = _ENCODED_COMPONENT.sub(_redact_encoded_email, value)
+        return value
 
     def _secret_marker(self, match: re.Match[str]) -> str:
         """The marker for one matched secret: plain for its plaintext, else percent-encoded."""
         return _MARKER if match.group(0) in self.secrets else _ENCODED_MARKER
 
     def holds_secret(self, node: JSONValue) -> bool:
-        """Whether a redacted capture still holds a configured secret: the fail-closed check.
+        """Whether a redacted capture still holds one of the secrets: the fail-closed check.
 
-        Every dict key, every string and every number (by its JSON text) is searched for a
-        configured secret, outside the markers and the webhook placeholder that redaction
-        writes. Each stretch between them is searched for its plain text and every
-        percent-encoded spelling and, independently of that pattern, percent-decoded until it
-        stops changing, with and without ``+`` as a space, each decoded form being searched
-        for any secret's plaintext, so a secret encoded any number of times is found too.
+        Every dict key, every string and every number (by its JSON text) is searched for each
+        of :attr:`secrets`, configured or added by :meth:`with_secrets`, outside the markers
+        and the webhook placeholder that redaction writes. Each stretch between them is
+        searched for its plain text and every percent-encoded spelling and, independently of
+        that pattern, percent-decoded until it stops changing, with and without ``+`` as a
+        space, each decoded form being searched for any secret's plaintext, so a secret
+        encoded any number of times is found too.
         Values redaction keeps as recorded, such as ``captured_at`` and header names, are
         searched too.
 
@@ -1326,7 +1451,7 @@ class _RedactionPolicy:
             node: The redacted capture document, or a part of it.
 
         Returns:
-            ``True`` when a configured secret survives; the capture must not be written.
+            ``True`` when a secret survives; the capture must not be written.
         """
         if isinstance(node, dict):
             return any(self._holds(key) or self.holds_secret(item) for key, item in node.items())
@@ -1338,8 +1463,30 @@ class _RedactionPolicy:
             return self._holds(json.dumps(node))
         return False
 
+    def holds_email(self, node: JSONValue) -> bool:
+        """Whether a redacted capture still holds an email address: the fail-closed check.
+
+        Every dict key and every string is searched with the scanner :meth:`text` uses, in
+        plain text and in every percent-encoded component, decoded as :meth:`text` decodes
+        it, so whatever part of the document carries an address, including the values
+        redaction keeps as recorded such as ``captured_at``, header names and form field
+        names, a capture that would commit one is never written. Numbers, booleans and
+        ``null`` hold no address.
+
+        Args:
+            node: The redacted capture document, or a part of it.
+
+        Returns:
+            ``True`` when an email address survives; the capture must not be written.
+        """
+        if isinstance(node, dict):
+            return any(_holds_email(key) or self.holds_email(item) for key, item in node.items())
+        if isinstance(node, list):
+            return any(self.holds_email(item) for item in node)
+        return isinstance(node, str) and _holds_email(node)
+
     def _holds(self, text: str) -> bool:
-        """Whether ``text`` holds a configured secret outside the text redaction inserted."""
+        """Whether ``text`` holds one of the secrets outside the text redaction inserted."""
         pattern = self.secret_pattern
         return pattern is not None and any(
             pattern.search(segment) is not None or self._decodes_to_secret(segment)
@@ -1347,7 +1494,7 @@ class _RedactionPolicy:
         )
 
     def _decodes_to_secret(self, segment: str) -> bool:
-        """Whether percent-decoding ``segment`` reveals a configured secret's plaintext.
+        """Whether percent-decoding ``segment`` reveals the plaintext of one of the secrets.
 
         Each decoder of ``_DECODERS`` is applied again and again until the text no longer
         changes, with no cap on the number of rounds, and every decoded form is searched.
@@ -1369,15 +1516,17 @@ class _RedactionPolicy:
     def value(self, node: JSONValue, keys: frozenset[str]) -> JSONValue:
         """Redact a JSON body recursively.
 
-        Values under ``keys`` (credentials and person keys) are blanked, numbers included;
-        every ``answerDetails`` is blanked whole; dict keys and every other string go through
-        :meth:`text`, which removes every configured secret wherever it occurs; a number equal
-        to a configured account id becomes ``0``, and one whose JSON text equals a configured
-        secret becomes the marker.
+        Values under ``keys`` (credentials and person keys) and under every key that names an
+        email address (:func:`ads_engine.logging.is_email_key`: ``email``, ``emailAddress``,
+        ``work_email``, ``hs_additional_emails``) are blanked, numbers included; every
+        ``answerDetails`` is blanked whole; dict keys and every other string go through
+        :meth:`text`, which removes every configured secret and every email address wherever
+        it occurs; a number equal to a configured account id becomes ``0``, and one whose JSON
+        text equals a configured secret becomes the marker.
 
         Args:
             node: The decoded JSON body or a part of it.
-            keys: The keys whose values are blanked.
+            keys: The keys whose values are blanked, besides the email keys.
 
         Returns:
             The redacted copy.
@@ -1385,7 +1534,7 @@ class _RedactionPolicy:
         if isinstance(node, dict):
             redacted: dict[str, JSONValue] = {}
             for key, item in node.items():
-                if key in keys:
+                if key in keys or is_email_key(key):
                     redacted[self.text(key)] = _blank(item, numbers=True)
                 elif key == _ANSWER_DETAILS_KEY:
                     redacted[key] = _blank(item, numbers=False)
@@ -1413,7 +1562,15 @@ class _RedactionPolicy:
         return node
 
     def url(self, url: str, source: Source) -> str:
-        """Redact a request URL: the webhook URL, credential query values, ids and secrets."""
+        """Redact a request URL: the webhook URL, credential query values, ids, secrets, emails.
+
+        Secrets, account ids and organization URN ids are replaced across the whole URL, as
+        :meth:`text` replaces them. Email addresses are replaced component by component:
+        each path segment, query name and query value on its own, so an address takes only
+        the component that holds it, whatever its local part, and the URL keeps its shape
+        (``/contacts/用户!@example.com?email=o'brien@example.com&limit=1`` becomes
+        ``/contacts/<redacted>?email=<redacted>&limit=1``).
+        """
         if source == "google":
             return _REDACTED_WEBHOOK_URL
         base, separator, query = url.partition("?")
@@ -1424,8 +1581,16 @@ class _RedactionPolicy:
                 pairs.append(f"{name}={_ENCODED_MARKER}")
             else:
                 pairs.append(pair)
-        rebuilt = base + (separator + "&".join(pairs) if separator else "")
-        return self.text(rebuilt)
+        rebuilt = self._without_secrets(base + (separator + "&".join(pairs) if separator else ""))
+        base, separator, query = rebuilt.partition("?")
+        path = "/".join(self._without_emails(segment) for segment in base.split("/"))
+        if not separator:
+            return path
+        components: list[str] = []
+        for pair in query.split("&"):
+            name, equals, value = pair.partition("=")
+            components.append(f"{self._without_emails(name)}{equals}{self._without_emails(value)}")
+        return f"{path}?{'&'.join(components)}"
 
     def headers(self, headers: Sequence[tuple[str, str]]) -> dict[str, JSONValue]:
         """Redact request headers; framing headers are dropped.
@@ -1514,33 +1679,67 @@ def _capture_document(
 def _redact_capture(
     capture: dict[str, JSONValue], policy: _RedactionPolicy, source: Source
 ) -> dict[str, JSONValue]:
-    """Return the redacted copy of a capture document; nothing raw survives it.
+    """Return a copy of ``capture`` with the secrets and personal data listed below redacted.
 
-    Redacted, with the marker ``<redacted>``:
+    The secrets are those of ``policy``: the configured ones (the n8n webhook URL and the
+    LinkedIn client id included) and, as :func:`_build_captures` adds them, every credential
+    the run sent or was issued (:func:`_run_credentials`). Those are, in every recorded
+    exchange, the ``Authorization`` credential and the n8n secret-header value, the query,
+    form and JSON request values under the credential keys below (``code`` included), and
+    the JSON response values under the first four of them or ``id_token``, such as the
+    access token the LinkedIn token exchange issues and a refresh token it rotates to.
 
-    * request header values of ``Authorization`` (scheme kept) and the n8n secret header;
+    Replaced by the marker ``<redacted>``, written ``%3Credacted%3E`` for a credential query
+    value, throughout a form body and in place of a percent-encoded spelling:
+
+    * request header values of ``Authorization`` (scheme kept: ``Bearer <redacted>``) and
+      the n8n secret header;
     * query and body values of ``access_token``, ``refresh_token``, ``client_secret``,
-      ``client_id`` and, in requests, ``code``; token responses lose the first four too;
-    * person-name and contact keys (``firstName``, ``lastName``, ``firstname``,
-      ``lastname``, ``fullName``, ``phone``, ``mobilephone``, ``email``);
-    * every LinkedIn ``formResponse.answers[].answerDetails`` whole, keys kept;
-    * any email address, and every configured secret (the LinkedIn client id included)
-      wherever it occurs in a body string, dict key, URL or header value, whatever its length,
-      in plain text or in any percent-encoded spelling (the latter as ``%3Credacted%3E``); a
-      JSON number equal to a secret becomes the marker too;
-    * the n8n webhook URL (a placeholder URL) and the configured Google customer id and
-      LinkedIn ad account ids (same-length zeros);
+      ``client_id`` and, in requests, ``code``; response bodies lose the first four too;
+    * in JSON bodies, the values under the person-name and contact keys (``firstName``,
+      ``lastName``, ``firstname``, ``lastname``, ``fullName``, ``phone``, ``mobilephone``,
+      ``email``) and under every key :func:`ads_engine.logging.is_email_key` accepts
+      (``emailAddress``, ``work_email``, ``hs_additional_emails``, …), strings and numbers;
+    * every ``answerDetails`` (LinkedIn's ``formResponse.answers[].answerDetails``): each
+      string in it, its numbers (multiple-choice option ids) kept;
+    * every secret wherever it occurs in a body string, a body dict key, the URL or a header
+      value, whatever its length, in plain text or in any percent-encoded spelling, and a
+      JSON number whose text equals one;
+    * every email address in any script (:func:`ads_engine.logging.email_spans`) in those
+      same places, its local part read fail-closed (RFC 5322 ``atext`` specials and any
+      non-ASCII character included), with the text glued to it in a body string or header
+      value, and only its own path segment, query name or query value in the URL; a URL,
+      query or form component that percent-decodes to one, however many times it was
+      encoded, becomes ``%3Credacted%3E`` whole.
+
+    Host secrets, replaced so that URLs, ids and URNs stay well-formed:
+
+    * every Google request URL (the n8n webhook URL) by
+      ``https://redacted.invalid/webhook/redacted``;
+    * the configured Google customer id and LinkedIn ad account ids by zeros of the same
+      length in any of those strings, and a JSON number equal to one by ``0``;
     * the id of every LinkedIn organization URN (``urn:li:organization:``,
       ``urn:li:organizationBrand:`` and ``urn:li:company:``), plain or percent-encoded, in
-      any body string, dict key, URL or header value (same-length zeros, prefix kept).
+      any of those strings, by zeros of the same length, prefix kept.
 
-    :func:`_build_captures` then checks the result with
-    :meth:`_RedactionPolicy.holds_secret` and never writes one that still holds a secret,
-    however many times it was percent-encoded.
+    Everything else is kept as recorded: the document's structure, ``surface``,
+    ``captured_at``, the method, the response status, header names (framing headers are
+    dropped), form field names and the keys inside blanked values; booleans, ``null``,
+    metrics and other numbers; and the text of every other key and value (timestamps,
+    statuses, other identifiers and names under any other key included), less the secrets,
+    ids and addresses above.
+
+    :func:`_build_captures` then refuses, failing closed, a result in which
+    :meth:`_RedactionPolicy.holds_secret` still finds a secret, or
+    :meth:`_RedactionPolicy.holds_email` an email address, however many times it was
+    percent-encoded: it is not written, and ``"<surface>: not written: a secret survived
+    redaction"`` or ``"<surface>: not written: an email address survived redaction"`` makes
+    the command exit 1.
 
     Args:
         capture: The document from :func:`_capture_document`.
-        policy: The redaction policy of the current settings.
+        policy: The redaction policy of the current settings, which :func:`_build_captures`
+            extends with the run's credentials.
         source: The capture's source.
 
     Returns:
@@ -1619,7 +1818,8 @@ class _CaptureRun:
         recorder: The transport every call went through.
         failures: ``"<surface>: <reason>"`` for each call that failed, where reasons are the
             connectors' sanitised reasons, and for each capture left unwritten because a
-            configured secret survived its redaction.
+            secret (configured, or a credential the run sent or was issued) survived its
+            redaction.
         skipped: Surfaces not called, or (Google) whose every answered query returned no
             rows, with why.
         rows: Google only: ``(row surface, exchange)`` of each GAQL query that answered.
@@ -1801,7 +2001,6 @@ class _GoogleTargets:
         return None
 
     def _is_search(self, campaign_id: int | None) -> bool:
-        """Whether Q-G2 listed ``campaign_id`` as a Search campaign."""
         return campaign_id is not None and self.channels.get(campaign_id) == _SEARCH_CHANNEL
 
     def _choose_campaign(self, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -2280,8 +2479,100 @@ async def _capture(
 # ---------------------------------------------------------------------------------------------
 
 
+def _keyed_credentials(node: JSONValue, keys: frozenset[str]) -> Iterator[str]:
+    """Every value held under one of ``keys`` anywhere in a JSON value, as text.
+
+    The value under such a key is a credential whole, as :func:`_blank` treats it: each of its
+    strings, and each of its numbers by its JSON text, at any depth. Elsewhere only the keys
+    are looked at, so no other field is ever taken for a credential.
+    """
+    if isinstance(node, dict):
+        for key, item in node.items():
+            if key in keys:
+                yield from _json_leaves(item)
+            else:
+                yield from _keyed_credentials(item, keys)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _keyed_credentials(item, keys)
+
+
+def _json_leaves(node: JSONValue) -> Iterator[str]:
+    """The strings of a JSON value, and its numbers as JSON text, at any depth."""
+    if isinstance(node, dict):
+        for item in node.values():
+            yield from _json_leaves(item)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _json_leaves(item)
+    elif isinstance(node, str):
+        yield node
+    elif isinstance(node, int | float) and not isinstance(node, bool):
+        yield json.dumps(node)
+
+
+def _exchange_credentials(exchange: _Exchange, header_names: frozenset[str]) -> Iterator[str]:
+    """The credentials one recorded exchange sent or was issued, unstripped and maybe blank.
+
+    Read: the credential of an ``Authorization`` header (what follows its scheme, or the whole
+    value when it has none, as :meth:`_RedactionPolicy.headers` blanks it), the value of every
+    other header in ``header_names``, query, form and JSON body values under
+    :data:`_REQUEST_CREDENTIAL_KEYS`, and JSON response values under
+    :data:`_ISSUED_CREDENTIAL_KEYS`.
+    """
+    for name, value in exchange.headers:
+        lowered = name.lower()
+        if lowered == _AUTHORIZATION:
+            parts = value.split(maxsplit=1)
+            if parts:
+                yield parts[-1]
+        elif lowered in header_names:
+            yield value
+    pairs = parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True)
+    body = _request_body(exchange)
+    if isinstance(body, str):
+        # A form body, or text that is not JSON: read as form fields, which finds a credential
+        # field even when the Content-Type header does not say the body is a form.
+        pairs += parse_qsl(body, keep_blank_values=True)
+    else:
+        yield from _keyed_credentials(body, _REQUEST_CREDENTIAL_KEYS)
+    yield from (value for name, value in pairs if name in _REQUEST_CREDENTIAL_KEYS)
+    response, is_json = _decode_json(exchange.content)
+    if is_json:
+        yield from _keyed_credentials(response, _ISSUED_CREDENTIAL_KEYS)
+
+
+def _run_credentials(run: _CaptureRun, header_names: frozenset[str]) -> set[str]:
+    """The plaintext of every credential a capture run sent or was issued.
+
+    Settings know only the configured credentials. A run also uses, and may be issued, others:
+    the access token the LinkedIn token exchange returns (sent as ``Authorization: Bearer``
+    on every later call) and a refresh token the exchange rotates. They are read from every
+    recorded exchange, whatever its status, and from ``run.rows``, by
+    :func:`_exchange_credentials`; only credential headers and credential-keyed values are
+    read. Each value is stripped, as the LinkedIn token provider strips the tokens it adopts,
+    and a blank one is left out.
+
+    Args:
+        run: The finished capture run.
+        header_names: The lower-cased credential headers
+            (:attr:`_RedactionPolicy.header_names`).
+
+    Returns:
+        The non-blank credentials, configured ones included when the run sent them.
+    """
+    exchanges = [*run.recorder.exchanges, *(exchange for _surface, exchange in run.rows)]
+    return {
+        credential.strip()
+        for exchange in exchanges
+        for credential in _exchange_credentials(exchange, header_names)
+        if credential.strip()
+    }
+
+
 # The failure reported for a capture that fails closed; it never carries the value.
-_FAIL_CLOSED_REASON: Final = "not written: a configured secret survived redaction"
+_FAIL_CLOSED_REASON: Final = "not written: a secret survived redaction"
+_FAIL_CLOSED_EMAIL_REASON: Final = "not written: an email address survived redaction"
 
 
 def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dict[str, JSONValue]]:
@@ -2292,27 +2583,45 @@ def _build_captures(run: _CaptureRun, policy: _RedactionPolicy) -> dict[str, dic
     a query that returned no rows adds none (:func:`_capture_google` reports its surface in
     ``run.skipped``).
 
-    Each redacted capture is checked with :meth:`_RedactionPolicy.holds_secret`, failing
-    closed: one that still holds a configured secret is left out, so it is never written, and
-    ``"<surface>: not written: a configured secret survived redaction"`` is added to
-    ``run.failures``, which makes the command exit 1. A surface is decided by its first
-    exchange either way. A capture that only breaks its contract is kept.
+    Before any capture is redacted, ``policy`` is extended with the credentials the run sent
+    or was issued (:func:`_run_credentials`, :meth:`_RedactionPolicy.with_secrets`), such as
+    the access token and any rotated refresh token of the LinkedIn token exchange. Every copy
+    of one, in any capture, is then removed as a configured secret is: in another field or a
+    dict key, percent-encoded, or echoed by a later response.
+
+    Each redacted capture is checked with :meth:`_RedactionPolicy.holds_secret` against that
+    extended policy, failing closed: one that still holds a secret is left out, so it is
+    never written, and ``"<surface>: not written: a secret survived redaction"`` is added to
+    ``run.failures``, which makes the command exit 1. It is then checked with
+    :meth:`_RedactionPolicy.holds_email` the same way: one that still holds an email address
+    in any script, plain or percent-encoded, is left out with ``"<surface>: not written: an
+    email address survived redaction"``. A surface is decided by its first exchange either
+    way. A capture that only breaks its contract is kept.
+
+    Args:
+        run: The finished capture run.
+        policy: The redaction policy of the current settings.
 
     Returns:
-        Redacted capture documents keyed by surface name, none holding a configured secret.
+        Redacted capture documents keyed by surface name, none holding a secret or an email
+        address.
     """
     from ads_engine.simulation.payloads import UnknownSurface, identify_surface
 
     source = run.source
+    policy = policy.with_secrets(_run_credentials(run, policy.header_names))
     documents: dict[str, dict[str, JSONValue]] = {}
     refused: set[str] = set()
 
     def admit(surface: str, raw: dict[str, JSONValue]) -> None:
-        """Keep the redacted ``raw`` as ``surface``, unless a configured secret survived."""
+        """Keep the redacted ``raw`` as ``surface``, unless a secret or an email survived."""
         document = _redact_capture(raw, policy, source)
         if policy.holds_secret(document):
             refused.add(surface)
             run.failures.append(f"{surface}: {_FAIL_CLOSED_REASON}")
+        elif policy.holds_email(document):
+            refused.add(surface)
+            run.failures.append(f"{surface}: {_FAIL_CLOSED_EMAIL_REASON}")
         else:
             documents[surface] = document
 
@@ -2432,6 +2741,46 @@ def _open_directory(parent_fd: int, name: str, path: Path) -> int:
         raise _OutputRefusedError(f"{_display_path(path)} {reason}") from None
 
 
+def _open_from_working_directory(path: Path) -> int:
+    """Open the directory ``path`` by walking down to it from the working directory.
+
+    The walk starts at a descriptor of the working directory, the one directory trusted as it
+    is, and opens each component below it in turn through :func:`_open_directory`. A symbolic
+    link or a non-directory anywhere below the working directory is therefore refused instead
+    of followed, and each intermediate descriptor is closed once its child is open or the walk
+    fails.
+
+    Args:
+        path: The directory, absolute or relative to the working directory.
+
+    Returns:
+        A read-only descriptor of ``path``, which the caller closes.
+
+    Raises:
+        _OutputRefusedError: When ``path`` is not under the working directory (a ``..``
+            component included), the working directory cannot be opened, or a directory on
+            the way is a symbolic link, is not a directory or cannot be opened.
+    """
+    cwd = Path.cwd()
+    target = cwd / path
+    if not target.is_relative_to(cwd) or os.pardir in target.parts:
+        raise _OutputRefusedError(f"{path} is not under the working directory {cwd}")
+    try:
+        fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        reason = _directory_problem(exc, writing=False)
+        raise _OutputRefusedError(f"the working directory {cwd} {reason}") from None
+    walked = cwd
+    for name in target.relative_to(cwd).parts:
+        walked /= name
+        try:
+            child_fd = _open_directory(fd, name, walked)
+        finally:
+            os.close(fd)
+        fd = child_fd
+    return fd
+
+
 def _create_temporary(dir_fd: int, stem: str) -> tuple[str, int]:
     """Create a new, empty temporary file ``.{stem}.{16 hex digits}.tmp`` in a directory.
 
@@ -2457,8 +2806,10 @@ def _create_temporary(dir_fd: int, stem: str) -> tuple[str, int]:
 class _CaptureOutput:
     """The verified ``tests/contracts/{source}/captured/`` directory of one capture, held open.
 
-    :meth:`open` runs before any request is sent. Every later write goes through its open
-    descriptor, so replacing a directory on the path afterwards cannot redirect a capture.
+    :meth:`open` runs before any request is sent and reaches the directory from the working
+    directory without following a symbolic link, so a link already on the path cannot redirect
+    a capture. Every later write goes through its open descriptor, so replacing a directory on
+    the path afterwards cannot either.
 
     Attributes:
         path: The directory's path; written files are displayed relative to the working
@@ -2473,8 +2824,9 @@ class _CaptureOutput:
     def open(cls, root: Path, source: Source) -> _CaptureOutput:
         """Open ``{root}/{source}/captured/`` and prove this user can write into it.
 
-        The walk from ``root`` takes one component at a time with ``O_NOFOLLOW`` and
-        ``O_DIRECTORY``, so a symbolic link or a non-directory at ``{source}`` or
+        The walk starts at the working directory and takes one component at a time with
+        ``O_NOFOLLOW`` and ``O_DIRECTORY`` (:func:`_open_from_working_directory`), so a
+        symbolic link or a non-directory at ``tests``, ``contracts``, ``{source}`` or
         ``captured`` is refused instead of followed. A missing ``captured/`` is created.
         Writability is proved by creating and removing a real temporary file, because
         permission bits alone miss read-only mounts and ACLs.
@@ -2487,34 +2839,27 @@ class _CaptureOutput:
             The open output directory; the caller closes it.
 
         Raises:
-            _OutputRefusedError: When ``{source}`` or ``captured`` is a symbolic link or not a
-                directory, or ``captured/`` cannot be created or written by this user.
+            _OutputRefusedError: When ``root`` is not under the working directory, a directory
+                on the path from the working directory to ``captured`` is a symbolic link or
+                not a directory, or ``captured/`` cannot be created or written by this user.
         """
         source_path = root / source
         path = source_path / _CAPTURED_DIR
+        source_fd = _open_from_working_directory(source_path)
         try:
-            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        except OSError as exc:
-            reason = _directory_problem(exc, writing=False)
-            raise _OutputRefusedError(f"{_display_path(root)} {reason}") from None
-        try:
-            source_fd = _open_directory(root_fd, source, source_path)
             try:
-                try:
-                    os.mkdir(_CAPTURED_DIR, dir_fd=source_fd)
-                except FileExistsError:
-                    pass
-                except OSError as exc:
-                    reason = _directory_problem(exc, writing=True)
-                    raise _OutputRefusedError(
-                        f"{_display_path(path)} is missing and cannot be created: "
-                        f"{_display_path(source_path)} {reason}"
-                    ) from None
-                fd = _open_directory(source_fd, _CAPTURED_DIR, path)
-            finally:
-                os.close(source_fd)
+                os.mkdir(_CAPTURED_DIR, dir_fd=source_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                reason = _directory_problem(exc, writing=True)
+                raise _OutputRefusedError(
+                    f"{_display_path(path)} is missing and cannot be created: "
+                    f"{_display_path(source_path)} {reason}"
+                ) from None
+            fd = _open_directory(source_fd, _CAPTURED_DIR, path)
         finally:
-            os.close(root_fd)
+            os.close(source_fd)
         output = cls(fd, path)
         try:
             output._probe()
@@ -2658,20 +3003,21 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
     """``capture-fixtures --source S``: record redacted live contract captures.
 
     Refused (exit 1, nothing sent or written) under ``DATA_MODE=simulated``, without the
-    source's credentials, when the output directory cannot be written safely:
-    ``tests/contracts/{source}`` or its ``captured/`` is a symbolic link or not a directory,
-    or this user cannot create files in ``captured/`` (:meth:`_CaptureOutput.open`; a missing
-    ``captured/`` is created), and for Google when the shared call budget in the database
-    cannot be read: every Google call is reserved in ``source_connection.calls_24h`` before
-    it is sent, never counted locally. The output goes to
+    source's credentials, when the output directory cannot be written safely: ``tests``,
+    ``tests/contracts``, ``tests/contracts/{source}`` or its ``captured/`` is a symbolic link
+    or not a directory, or this user cannot create files in ``captured/``
+    (:meth:`_CaptureOutput.open`; a missing ``captured/`` is created), and for Google when the
+    shared call budget in the database cannot be read: every Google call is reserved in
+    ``source_connection.calls_24h`` before it is sent, never counted locally. The output goes to
     ``tests/contracts/{source}/captured/`` under the working directory, so run it from
     ``backend/``.
 
     Returns:
         :data:`EXIT_OK` when every surface was either captured or reported on stderr as not
         captured with its data reason (such as no sponsored LinkedIn lead to re-fetch, or a
-        Google query that answered with no rows), no call failed, no capture held a
-        configured secret, and every capture satisfies its contract. A surface reported as
+        Google query that answered with no rows), no call failed, no capture held a secret
+        (configured, or a credential the run sent or was issued) or an email address, and
+        every capture satisfies its contract. A surface reported as
         not captured gets one ``cli_warning`` line (:func:`_warning`), not a ``cli_error``
         line, is counted in ``capture_fixtures_finished`` ``skipped`` and does not by itself
         make the exit non-zero. Every refusal and failure (a failed call, a capture left
@@ -2679,12 +3025,14 @@ def _cmd_capture_fixtures(args: argparse.Namespace) -> int:
         (:func:`_error`).
         :data:`EXIT_FAILURE` when a refusal applies, a call failed (a Google call the shared
         budget refused or could not reserve included), nothing was captured, a capture still
-        held a configured secret after redaction (that capture is not written), or a capture
-        breaks its contract (the captures read are still written, because they are the live
-        truth the contract tests must flag).
+        held such a secret or an email address after redaction (that capture is not
+        written), or a capture breaks its contract (the captures read are still written,
+        because they are the live truth the contract tests must flag).
 
     Raises:
-        _UsageError: When ``tests/contracts/{source}/`` is not under the working directory.
+        _UsageError: When no ``tests/contracts/{source}/`` directory is found under the
+            working directory. That lookup follows symbolic links, so a directory found only
+            through one is refused as above instead.
     """
     from ads_engine.analysis.thresholds import Thresholds
     from ads_engine.simulation.payloads import contracts_root
@@ -3092,8 +3440,9 @@ exit codes:
      every capture satisfies its contract
   1  refused before sending (DATA_MODE=simulated, credentials missing, an
      unsafe output directory, or google's call budget unreadable), a call
-     failed, nothing was captured, a capture still held a secret after
-     redaction (it is not written), or a capture breaks its contract
+     failed, nothing was captured, a capture still held a secret or an
+     email address after redaction (it is not written), or a capture
+     breaks its contract
   2  tests/contracts/{source}/ is not under the working directory
 
 example:

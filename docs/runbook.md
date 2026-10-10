@@ -737,8 +737,10 @@ before relying on the captures.
 
 It runs only when that source's credentials work, and it is refused, with nothing sent or written,
 under `DATA_MODE=simulated`, without the source's credentials, or when the output directory is not
-writable or is a symbolic link. Google captures reserve every call in the shared call budget in the
-database, so they count against `GOOGLE_DAILY_CALL_BUDGET` like the worker's calls.
+writable, or it or a directory on its path below the working directory (`tests`, `tests/contracts`
+or `tests/contracts/<source>`) is a symbolic link. Google captures reserve every call in the shared
+call budget in the database, so they count against `GOOGLE_DAILY_CALL_BUDGET` like the worker's
+calls.
 
 With the stack running and `DATA_MODE=auto`, run it in a one-off `worker` container that writes
 straight into the checkout:
@@ -759,8 +761,9 @@ docker compose run --rm --no-deps --user "$(id -u):$(id -g)" \
   `message` reads `ads-engine: capture-fixtures <source>: not captured: <reason>`, the reason
   naming the surface or query and why, such as no sponsored LinkedIn lead to re-fetch or a Google
   query that answered with no rows. Exit 1 means a call failed, nothing was captured, a capture
-  broke its contract, or a capture still held a configured secret after redaction; that capture is
-  not written.
+  broke its contract, or a capture still held a secret after redaction (a configured one, or a
+  token the run sent or was issued, such as LinkedIn's new access token) or an email address in
+  any script, plain or percent-encoded; that capture is not written.
 - Redaction replaces tokens, secrets, emails, names and form answers with `"<redacted>"`, ad
   account and customer ids with zeros of the same length, and the webhook URL with a reserved
   placeholder URL.

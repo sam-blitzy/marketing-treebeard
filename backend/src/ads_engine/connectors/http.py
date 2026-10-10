@@ -88,11 +88,10 @@ from ads_engine.connectors.errors import (
 )
 from ads_engine.db.models.ops import SOURCES
 from ads_engine.logging import (
-    EMAIL_RE,
     REDACTED,
-    REDACTED_EMAIL,
     get_logger,
     redact,
+    redact_emails,
     redact_secret_matches,
 )
 from ads_engine.settings import Settings, Source, get_settings
@@ -158,7 +157,7 @@ _REDACTED_PATH: Final = "<redacted>"
 # `refreshtoken` and `xapikey`), is a listed name or ends with a suffix, each with `_`
 # removed.
 _SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
-    {"access_token", "token", "client_secret", "refresh_token", "hapikey", "code"}
+    {"access_token", "token", "client_id", "client_secret", "refresh_token", "hapikey", "code"}
 )
 # Fail-closed widening, matching the key rule of ads_engine.logging: any parameter whose
 # name ends like a credential in any form is redacted too. That includes LinkedIn's
@@ -268,9 +267,10 @@ def _require_source(source: object) -> None:
 
 
 def _url_secrets(settings: Settings | None) -> tuple[str, ...]:
-    """Collect the configured secret plaintexts to strip from logged URLs, longest first.
+    """Collect the configured credential plaintexts to strip from logged URLs, longest first.
 
-    Every non-empty secret is collected, whatever its length. Connectors never put a
+    Every non-empty value of ``Settings.credential_values()``, each set secret and the
+    LinkedIn client id, is collected, whatever its length. Connectors never put a
     credential in a URL; this guards against one that arrives there anyway, for example a
     token pasted into a configured URL.
     """
@@ -281,7 +281,7 @@ def _url_secrets(settings: Settings | None) -> tuple[str, ...]:
             # pydantic's ValidationError is a ValueError. The client still works; its hooks
             # keep the key and email rules, and the logging processors keep theirs.
             return ()
-    plaintexts = {plaintext for plaintext in settings.secret_values() if plaintext}
+    plaintexts = {plaintext for plaintext in settings.credential_values() if plaintext}
     return tuple(sorted(plaintexts, key=lambda plaintext: (-len(plaintext), plaintext)))
 
 
@@ -298,21 +298,24 @@ def redact_url(url: httpx.URL, *, source: Source, secrets: Collection[str] = ())
     * ``linkedin`` and ``hubspot``: the raw path and query, with the value of every
       credential parameter replaced by ``[REDACTED]`` and its name kept as sent. A
       credential parameter's name, percent-decoded and in any letter case, is
-      ``access_token``, ``token``, ``client_secret``, ``refresh_token``, ``hapikey`` or
-      ``code``, or ends in ``_token``, ``_secret``, ``_password`` or ``_api_key``. The
-      name is compared case-folded as written, with camelCase split, and with every
-      ``_`` and ``-`` removed against those names and suffixes with ``_`` removed, so
-      ``ACCESS_TOKEN``, ``AcCeSs_ToKeN``, ``access%5Ftoken``, ``pageToken``,
-      ``ACCESSTOKEN``, ``rEfReShToKeN`` and ``XAPIKEY`` all match.
+      ``access_token``, ``token``, ``client_id``, ``client_secret``, ``refresh_token``,
+      ``hapikey`` or ``code``, or ends in ``_token``, ``_secret``, ``_password`` or
+      ``_api_key``. The name is compared case-folded as written, with camelCase split,
+      and with every ``_`` and ``-`` removed against those names and suffixes with ``_``
+      removed, so ``ACCESS_TOKEN``, ``AcCeSs_ToKeN``, ``access%5Ftoken``, ``pageToken``,
+      ``clientId``, ``ACCESSTOKEN``, ``rEfReShToKeN`` and ``XAPIKEY`` all match.
       Beyond those names, a path segment, query name or query value that holds an email
-      address or one of ``secrets`` has ``[REDACTED_EMAIL]`` or ``[REDACTED]`` in its
-      place. It is checked percent-decoded, so ``lead%40example.com`` is caught and the
-      component is rendered decoded; a secret that itself holds ``%`` escapes is matched
-      as written.
+      address in any script (:func:`ads_engine.logging.email_spans`) or one of
+      ``secrets`` has ``[REDACTED_EMAIL]`` or ``[REDACTED]`` in its place. It is checked
+      percent-decoded, again while decoding still changes it, up to four times, so
+      ``lead%40example.com``, ``lead%2540example.com`` and the UTF-8 escapes of
+      ``用户@例子.公司`` are caught and the component is rendered decoded; one encoded more
+      deeply than that becomes ``[REDACTED]`` whole, and a secret that itself holds ``%``
+      escapes is matched as written.
 
     This is the first line of defence: the HTTP layer redacts the percent-encoded forms
-    itself, decoding each name and component once, rather than leaving them to the log.
-    The redaction processors of :mod:`ads_engine.logging` are the second line.
+    itself, decoding each name and component, rather than leaving them to the log. The
+    redaction processors of :mod:`ads_engine.logging` are the second line.
 
     Example::
 
@@ -415,34 +418,51 @@ def _secrets_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
 
 
 def _scrub_text(text: str, secrets: Collection[str]) -> str:
-    """Replace every secret, then each email address, inside ``text``.
+    """Replace every secret, then each email address in any script, inside ``text``.
 
     All secrets are replaced in one pass, so a short secret is never matched inside the
     ``[REDACTED]`` that took a longer one's place, and each takes every email address and
     every percent-encoded run holding a ``%XX`` escape that it overlaps with it
     (:func:`ads_engine.logging.redact_secret_matches`), so no part of an address, and no
-    broken escape or encoded credential, that holds a secret is left behind.
+    broken escape or encoded credential, that holds a secret is left behind. Addresses are
+    found by the logging module's shared scanner (:func:`ads_engine.logging.email_spans`),
+    so ``用户@例子.公司`` and ``jöe.smith@example.com`` become ``[REDACTED_EMAIL]`` whole.
     """
     pattern = _secrets_pattern(tuple(secrets))
     if pattern is not None:
         text = redact_secret_matches(text, pattern)
-    if "@" in text:
-        text = EMAIL_RE.sub(REDACTED_EMAIL, text)
-    return text
+    return redact_emails(text)
+
+
+# Decoding rounds of one URL component, as many as the logging redaction decodes: enough for
+# a value encoded and then re-encoded by every layer up to the request. A component that
+# still decodes after the last round is replaced whole, so the bound lets nothing through.
+_MAX_COMPONENT_DECODES: Final = 4
 
 
 def _scrub_component(component: str, secrets: Collection[str]) -> str:
-    """Return a path segment or query value, scrubbed of emails and secrets.
+    """Return a path segment or query name or value, scrubbed of emails and secrets.
 
-    The component is checked percent-decoded, where an encoded address becomes visible;
-    when that finds something the decoded, scrubbed form is returned. Otherwise the raw
-    form is checked as well, for a secret that itself contains ``%`` escapes, and the raw
-    bytes are returned unchanged when it is clean.
+    The component is percent-decoded, and decoded again while that still changes it, up
+    to :data:`_MAX_COMPONENT_DECODES` times, so an address encoded once or more becomes
+    visible (``lead%40example.com``, ``lead%2540example.com``, the UTF-8 escapes of
+    ``用户@例子.公司``). The first decoded form in which a secret or an address is found is
+    returned scrubbed. A component that would still decode after the last round becomes
+    ``[REDACTED]`` whole. Otherwise the raw form is checked as well, for a secret that
+    itself contains ``%`` escapes, and the raw bytes are returned unchanged when it is
+    clean.
     """
-    decoded = unquote(component)
-    scrubbed = _scrub_text(decoded, secrets)
-    if scrubbed != decoded:
-        return scrubbed
+    decoded = component
+    for _ in range(_MAX_COMPONENT_DECODES):
+        previous, decoded = decoded, unquote(decoded)
+        if decoded == previous:
+            break
+        scrubbed = _scrub_text(decoded, secrets)
+        if scrubbed != decoded:
+            return scrubbed
+    else:
+        if unquote(decoded) != decoded:
+            return REDACTED
     return _scrub_text(component, secrets)
 
 
@@ -855,9 +875,9 @@ def _request_secrets(request: httpx.Request) -> set[str]:
     the credential after its scheme (the token of ``Bearer <token>``), and the value of
     every header, query parameter and ``application/x-www-form-urlencoded`` body field
     whose name :func:`_is_sensitive_key` reads as a credential: the n8n secret header
-    (``X-Webhook-Secret``, ``X-Webhook-Token``), ``refresh_token``, ``client_secret``. A
-    streamed body that was never read is not inspected. Blank values and the simulated
-    placeholder are left out (:func:`_holdable`).
+    (``X-Webhook-Secret``, ``X-Webhook-Token``), ``refresh_token``, ``client_id``,
+    ``client_secret``. A streamed body that was never read is not inspected. Blank values
+    and the simulated placeholder are left out (:func:`_holdable`).
     """
     values: list[str] = []
     for name, value in request.headers.multi_items():

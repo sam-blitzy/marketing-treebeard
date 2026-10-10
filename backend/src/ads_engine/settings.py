@@ -603,6 +603,24 @@ class Settings(BaseSettings):
                     values.append(plaintext)
         return tuple(values)
 
+    def credential_values(self) -> tuple[str, ...]:
+        """Return the plaintext of every set credential, for log and error redaction.
+
+        That is every :meth:`secret_values` value and ``LINKEDIN_CLIENT_ID``. The client id
+        is a plain setting, not a :class:`~pydantic.SecretStr`, but it is a LinkedIn OAuth
+        credential sent with the client secret in every token exchange, so no log line,
+        error text or stored reason may carry it either.
+
+        Returns:
+            Each non-empty value once: the secret values in field order, then the
+            stripped client id when it is not blank and not already among them.
+        """
+        values = list(self.secret_values())
+        client_id = (self.linkedin_client_id or "").strip()
+        if client_id and client_id not in values:
+            values.append(client_id)
+        return tuple(values)
+
     def _missing_env_names(self, field_names: tuple[str, ...]) -> list[str]:
         """Return the environment names of the fields in ``field_names`` that are unset.
 

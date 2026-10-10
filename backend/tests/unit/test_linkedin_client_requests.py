@@ -1470,18 +1470,19 @@ def _exchanged(access: str, refresh: str) -> httpx.Response:
 async def test_held_secrets_cover_current_rotated_and_retired_tokens() -> None:
     """``held_secrets()`` lists every plaintext a provider holds or retired, read when called.
 
-    Refresh mode: the client secret and the configured refresh token before any exchange;
-    then the rotated refresh token, the cached access token and the refresh token rotated
-    away; after an invalidation and a second rotation, also the dropped access token and
-    the first rotated refresh token. Static mode, of the provider and of
+    Refresh mode: the client id, the client secret and the configured refresh token before
+    any exchange; then the rotated refresh token, the cached access token and the refresh
+    token rotated away; after an invalidation and a second rotation, also the dropped access
+    token and the first rotated refresh token. Static mode, of the provider and of
     ``StaticTokenProvider``: the static token alone. No ``repr`` shows any of them.
     """
+    client_id = "test-linkedin-held-client-id"
     client_secret = "test-linkedin-held-client-secret"
     configured = "test-linkedin-held-refresh-0"
     first_access, first_rotated = "test-linkedin-held-access-1", "test-linkedin-held-refresh-1"
     second_access, second_rotated = "test-linkedin-held-access-2", "test-linkedin-held-refresh-2"
     settings = Settings(
-        linkedin_client_id="test-linkedin-held-client-id",
+        linkedin_client_id=client_id,
         linkedin_client_secret=SecretStr(client_secret),
         linkedin_refresh_token=SecretStr(configured),
     )
@@ -1502,9 +1503,10 @@ async def test_held_secrets_cover_current_rotated_and_retired_tokens() -> None:
 
     assert tokens.mode == "refresh"
     assert len(server.requests) == 2
-    assert set(before) == {client_secret, configured}
-    assert set(after_first) == {client_secret, first_rotated, first_access, configured}
+    assert set(before) == {client_id, client_secret, configured}
+    assert set(after_first) == {client_id, client_secret, first_rotated, first_access, configured}
     assert set(after_second) == {
+        client_id,
         client_secret,
         second_rotated,
         second_access,

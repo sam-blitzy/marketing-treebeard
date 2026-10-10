@@ -1888,6 +1888,95 @@ async def test_invalid_grant_is_access_denied(
     assert all(surface_of(request) == "access_token" for request in served.requests)
 
 
+# The client id spelled with every character percent-encoded, as a URL-quoting layer would.
+ENCODED_CLIENT_ID: Final = "".join(f"%{ord(char):02X}" for char in REFRESH_CLIENT_ID)
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "description", "kind", "redacted"),
+    [
+        pytest.param(
+            400,
+            "invalid_request",
+            f"Unknown client {REFRESH_CLIENT_ID} for this redirect",
+            QueryDefect,
+            "Unknown client [REDACTED] for this redirect",
+            id="invalid-request-defect",
+        ),
+        pytest.param(
+            401,
+            "invalid_client",
+            f"Client authentication failed for {REFRESH_CLIENT_ID} ({ENCODED_CLIENT_ID})",
+            AccessDenied,
+            "Client authentication failed for [REDACTED] ([REDACTED])",
+            id="invalid-client-denied",
+        ),
+        pytest.param(
+            400,
+            "invalid_grant",
+            f"The grant was not issued to client_id={REFRESH_CLIENT_ID} or to {REFRESH_CLIENT_ID}",
+            AccessDenied,
+            "The grant was not issued to client_id=[REDACTED] or to [REDACTED]",
+            id="invalid-grant-denied",
+        ),
+    ],
+)
+async def test_an_echoed_client_id_never_reaches_a_token_error_or_its_log(
+    status: int,
+    error: str,
+    description: str,
+    kind: type[AccessDenied | QueryDefect],
+    redacted: str,
+    serve: Callable[[Responder], Served],
+    captured_logs: Any,
+) -> None:
+    """Credentials: the OAuth client id echoed by the token endpoint is stripped like a secret.
+
+    ``LINKEDIN_CLIENT_ID`` is a plain setting, yet a LinkedIn OAuth credential the exchange
+    sends. Logging is configured from the isolated environment, which holds no client id, so
+    only the provider's held secrets can strip it: plain, percent-encoded and assigned to
+    ``client_id`` alike, from the error's message, reason and log fields and from the
+    ``linkedin.token.failed`` line.
+    """
+    captured_logs.configure(level="DEBUG")
+
+    def rejecting(request: httpx.Request) -> httpx.Response:
+        """Reject the exchange with an OAuth 2.0 error echoing the presented client id."""
+        assert parse_qs(request.content.decode("ascii"))["client_id"] == [REFRESH_CLIENT_ID]
+        return httpx.Response(status, json={"error": error, "error_description": description})
+
+    served = serve(rejecting)
+    async with build_client("linkedin", transport=served.transport) as http:
+        tokens = LinkedInTokenProvider(refresh_settings(), http, retry=NO_SLEEP)
+        assert REFRESH_CLIENT_ID in tokens.held_secrets()
+        with pytest.raises(kind) as excinfo:
+            await tokens.get()
+
+    rejected = excinfo.value
+    verb = "rejected" if kind is AccessDenied else "failed"
+    assert rejected.message == f"LinkedIn token refresh {verb}: {error}: {redacted}"
+    assert (rejected.endpoint, rejected.code, rejected.http_status) == (
+        "access_token",
+        error,
+        status,
+    )
+    assert len(served.requests) == 1
+    (logged,) = [record for record in captured_logs() if record["event"] == "linkedin.token.failed"]
+    assert (logged["error_code"], logged["http_status"]) == (error, status)
+    shown = (
+        rejected.message,
+        rejected.reason,
+        str(rejected),
+        repr(rejected),
+        str(rejected.log_fields),
+        captured_logs.text,
+    )
+    for text in shown:
+        assert REFRESH_CLIENT_ID not in text
+        assert ENCODED_CLIENT_ID not in text
+        assert ENCODED_CLIENT_ID.lower() not in text
+
+
 async def test_tokens_never_logged(
     serve: Callable[[Responder], Served],
     sample: Callable[[str], dict[str, Any]],

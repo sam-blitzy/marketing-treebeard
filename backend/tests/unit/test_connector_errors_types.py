@@ -46,6 +46,7 @@ N8N_SECRET = "test-n8n-secret"
 SHORT_N8N_SECRET = "Zq7#k2p"
 LINKEDIN_TOKEN = "test-linkedin-access-token"
 HUBSPOT_TOKEN = "test-hubspot-token"
+LINKEDIN_CLIENT_ID = "test-linkedin-client-id"
 DEFAULT_DATABASE_URL = "postgresql+psycopg://ads:ads@db:5432/ads_engine"
 EMAIL = "alice@example.com"
 ELLIPSIS = errors._ELLIPSIS
@@ -650,6 +651,12 @@ def test_configured_secrets_hold_every_secret_and_the_webhook_url_and_path(
     }
 
 
+def test_configured_secrets_hold_the_linkedin_client_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The client id is a plain setting, yet an OAuth credential: it is collected, stripped."""
+    _configure(monkeypatch, {"LINKEDIN_CLIENT_ID": f"  {LINKEDIN_CLIENT_ID} "})
+    assert set(errors._configured_secrets()) == {DEFAULT_DATABASE_URL, LINKEDIN_CLIENT_ID}
+
+
 @pytest.mark.parametrize(
     "webhook_url",
     [
@@ -779,8 +786,8 @@ def test_sanitize_message_removes_emails_and_configured_secrets(
             id="double-encoded-email",
         ),
         pytest.param(
-            "q=alice%40Example.COM",
-            "q=[REDACTED_EMAIL]",
+            "No contact alice%40Example.COM",
+            "No contact [REDACTED_EMAIL]",
             id="mixed-case-encoded-email",
         ),
         pytest.param(
@@ -818,6 +825,46 @@ def test_sanitize_message_redacts_encoded_values_and_textual_credentials(
     assert sanitize_message(text) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            f"Client {LINKEDIN_CLIENT_ID} is not registered",
+            "Client [REDACTED] is not registered",
+            id="client-id-in-prose",
+        ),
+        pytest.param(
+            "Client %74%65%73%74-linkedin-client-id refused",
+            "Client [REDACTED] refused",
+            id="percent-encoded-client-id",
+        ),
+        pytest.param(
+            "grant_type=refresh_token&client_id=test-other-client&scope=r_ads",
+            "grant_type=refresh_token&client_id=[REDACTED]&scope=r_ads",
+            id="unconfigured-client-id-assignment",
+        ),
+        pytest.param(
+            '{"clientId": "test-other-client", "status": 400}',
+            '{"clientId": "[REDACTED]", "status": 400}',
+            id="unconfigured-client-id-json-key",
+        ),
+    ],
+)
+def test_sanitize_message_removes_the_configured_and_assigned_client_id(
+    monkeypatch: pytest.MonkeyPatch, text: str, expected: str
+) -> None:
+    """``LINKEDIN_CLIENT_ID`` never reaches an error text or stored reason, nor any client id.
+
+    The configured one is stripped wherever it occurs, plain or percent-encoded; any value
+    assigned to a ``client_id`` key, in any spelling, is stripped whole.
+    """
+    _configure(monkeypatch, {"LINKEDIN_CLIENT_ID": LINKEDIN_CLIENT_ID})
+    assert sanitize_message(text) == expected
+    error = AccessDenied(text, source="linkedin", endpoint="access_token")
+    assert error.message == expected
+    assert LINKEDIN_CLIENT_ID not in error.reason
+
+
 def _layered(layers: int) -> str:
     """Return a provider message whose email and ``N8N_SECRET`` are encoded ``layers`` times."""
     email, secret = "alice%40example.com", "%74est-n8n-secret"
@@ -837,8 +884,9 @@ def _fully_decoded(text: str) -> str:
     ("layers", "expected"),
     [
         pytest.param(4, "email=[REDACTED_EMAIL] s=[REDACTED] rejected", id="at-the-limit"),
-        pytest.param(5, "[REDACTED] [REDACTED] rejected", id="one-beyond"),
-        pytest.param(6, "[REDACTED] [REDACTED] rejected", id="two-beyond"),
+        # The email key's value is replaced whatever it holds, before the decode pass.
+        pytest.param(5, "email=[REDACTED_EMAIL] [REDACTED] rejected", id="one-beyond"),
+        pytest.param(6, "email=[REDACTED_EMAIL] [REDACTED] rejected", id="two-beyond"),
     ],
 )
 def test_sanitize_message_leaves_no_deeply_encoded_email_or_secret(

@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote, unquote
 
 import httpx
 import pytest
@@ -790,6 +791,140 @@ def test_error_built_from_an_echoing_body_carries_no_email_or_token() -> None:
     for rendered in (error.message, error.reason, str(error), repr(error)):
         assert "bob@example.com" not in rendered
         assert "hs-echoed-token-1" not in rendered
+
+
+# Synthetic addresses in other scripts and their identifying fragments: none may survive.
+UNICODE_ADDRESSES: Mapping[str, tuple[str, ...]] = {
+    "用户@例子.公司": ("用户", "例子", "公司"),
+    "lead@例子.公司": ("lead", "例子"),
+    "jöe.smith@example.com": ("jö", "smith"),
+    "josé@example.com": ("josé", "example.com"),
+    "jo\u0301se@example.com": ("jo\u0301", "example.com"),
+    "राम@उदाहरण.भारत": ("राम", "उदाहरण"),
+}
+
+
+@pytest.mark.parametrize("address", sorted(UNICODE_ADDRESSES))
+def test_sanitize_message_removes_addresses_in_any_script(address: str) -> None:
+    """HubSpot echoes the address it looked up; a non-ASCII one is redacted whole too."""
+    cleaned = sanitize_message(f"No contact with email {address}\n  found")
+
+    assert cleaned == "No contact with email [REDACTED_EMAIL] found"
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        pytest.param(quote("用户@例子.公司", safe=""), id="utf-8-cjk"),
+        pytest.param(quote("jöe.smith@example.com", safe=""), id="utf-8-mixed-script"),
+        pytest.param(quote(quote("josé@example.com", safe=""), safe=""), id="utf-8-twice"),
+        pytest.param("lead%40example.com", id="encoded-at"),
+        pytest.param("lead%2540example.com", id="encoded-at-twice"),
+    ],
+)
+def test_sanitize_message_removes_percent_encoded_addresses(encoded: str) -> None:
+    """A URL echoed in error prose carries the address percent-encoded, in UTF-8."""
+    cleaned = sanitize_message(f"GET /crm/contacts?email={encoded} returned 404")
+
+    assert cleaned == "GET /crm/contacts?email=[REDACTED_EMAIL] returned 404"
+
+
+@pytest.mark.parametrize("address", sorted(UNICODE_ADDRESSES))
+def test_error_built_from_a_unicode_echo_carries_no_address(address: str) -> None:
+    """The reason ``sync/mode.py`` persists and the log fields carry no trace of the address."""
+    body = {
+        "status": "error",
+        "message": f"No contact with email {address} found",
+        "category": "OBJECT_NOT_FOUND",
+    }
+    error = _classify(400, body, source="hubspot")
+
+    assert isinstance(error, QueryDefect)
+    assert "[REDACTED_EMAIL]" in error.reason
+    rendered = (error.message, error.reason, str(error), repr(error), str(error.log_fields))
+    for text in rendered:
+        for fragment in UNICODE_ADDRESSES[address]:
+            assert fragment not in text, (fragment, text)
+
+
+# Addresses whose local parts hold RFC 5322 `atext` specials, symbols or emoji, beside letters
+# in any script, and their identifying fragments: none may survive.
+FAIL_CLOSED_ADDRESSES: Mapping[str, tuple[str, ...]] = {
+    "用户!@example.com": ("用户!", "用户"),
+    "用户😀@example.com": ("用户", "😀"),
+    "用户!a@example.com": ("用户!", "用户"),
+    "o'brien@example.com": ("o'", "brien"),
+    "patrick.o'brien@example.com": ("patrick", "brien"),
+    "a=b@x.com": ("a=b", "a="),
+    "{user}@x.com": ("{user}", "user}"),
+    "😀@example.com": ("😀",),
+    # Quoted local parts and domain labels holding symbols or emoji.
+    '"用户"@example.com': ('"用户"', "用户"),
+    '"john doe"@example.com': ("john doe", "john"),
+    '"a\\"b"@example.com': ('a\\"b', '\\"b'),
+    "用户@例子😀.com": ("用户", "例子", "😀"),
+    "user@i❤.ws": ("user@", "i❤"),
+}
+
+
+def _spelled(address: str, spelling: str) -> str:
+    """``address`` as error prose may echo it: plain, or percent-encoded once or twice."""
+    return {
+        "plain": address,
+        "utf-8": quote(address, safe=""),
+        "at-sign": address.replace("@", "%40"),
+        "at-sign-twice": address.replace("@", "%2540"),
+    }[spelling]
+
+
+@pytest.mark.parametrize("spelling", ["plain", "utf-8", "at-sign", "at-sign-twice"])
+@pytest.mark.parametrize("address", sorted(FAIL_CLOSED_ADDRESSES))
+def test_sanitize_message_removes_fail_closed_local_parts_whole(
+    address: str, spelling: str
+) -> None:
+    """No piece of an address survives, whatever ``atext`` special or symbol it holds."""
+    cleaned = sanitize_message(f"No contact with {_spelled(address, spelling)}\n  found")
+
+    assert cleaned == "No contact with [REDACTED_EMAIL] found"
+    for fragment in FAIL_CLOSED_ADDRESSES[address]:
+        assert fragment not in unquote(unquote(cleaned)), fragment
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param('No contact with "john\ndoe"@example.com found', id="line-feed"),
+        pytest.param('No contact with "john\r\n doe"@example.com found', id="folded"),
+        pytest.param('No contact with "用户\\\n"@example.com found', id="escaped-line-feed"),
+    ],
+)
+def test_sanitize_message_removes_a_quoted_local_part_its_collapse_joins(text: str) -> None:
+    """A quoted local part holds no line break, but collapsing whitespace joins its halves
+    into one; the single-line text the sync persists still loses the whole address."""
+    cleaned = sanitize_message(text)
+
+    assert cleaned == "No contact with [REDACTED_EMAIL] found"
+    assert sanitize_message(cleaned) == cleaned
+
+
+@pytest.mark.parametrize("address", sorted(FAIL_CLOSED_ADDRESSES))
+def test_error_built_from_a_fail_closed_echo_carries_no_address(address: str) -> None:
+    """The reason the sync persists and the log fields hold no piece of the address."""
+    body = {
+        "status": "error",
+        "message": f"No contact with email {address} found; email={address}",
+        "category": "OBJECT_NOT_FOUND",
+    }
+    error = _classify(400, body, source="hubspot")
+
+    assert isinstance(error, QueryDefect)
+    assert error.reason.endswith(
+        "No contact with email [REDACTED_EMAIL] found; email=[REDACTED_EMAIL]"
+    )
+    rendered = (error.message, error.reason, str(error), repr(error), str(error.log_fields))
+    for text in rendered:
+        for fragment in FAIL_CLOSED_ADDRESSES[address]:
+            assert fragment not in text, (fragment, text)
 
 
 @pytest.mark.parametrize("source", SOURCES)

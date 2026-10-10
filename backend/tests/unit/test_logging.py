@@ -11,6 +11,7 @@ reserved example domain.
 import copy
 import dataclasses
 import datetime as dt
+import hashlib
 import io
 import json
 import logging
@@ -22,11 +23,13 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import uuid
 from collections import UserList, deque
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
 from pathlib import Path
+from string import ascii_letters, digits
 from types import MappingProxyType, TracebackType
 from typing import Any, Final, cast
 from urllib.parse import quote, unquote
@@ -37,17 +40,19 @@ from pydantic import SecretBytes, SecretStr
 
 import ads_engine.logging as ads_logging
 from ads_engine.logging import (
-    EMAIL_RE,
     REDACTED,
     REDACTED_EMAIL,
     SENSITIVE_KEYS,
     URL_CREDENTIALS_RE,
     configure_logging,
+    email_spans,
     get_logger,
     install_excepthook,
+    is_email_key,
     logged_as,
     mark_logged,
     redact,
+    redact_emails,
     redact_processor,
     redact_secret_matches,
 )
@@ -216,6 +221,9 @@ def test_every_sensitive_key_loses_its_whole_value(key: str) -> None:
         "accessToken",
         "refreshToken",
         "clientSecret",
+        "clientId",
+        "Client-Id",
+        "LINKEDIN_CLIENT_ID",
         "idToken",
         "sessionSecret",
         "passwordHash",
@@ -269,6 +277,9 @@ def test_mixed_case_header_names_are_sensitive(key: str) -> None:
         "XWEBHOOKSECRET",
         "XWEBHOOKTOKEN",
         "linkedinclientsecret",
+        "clientid",
+        "CLIENTID",
+        "linkedinclientid",
         "dbpassword",
         "hubspotapikey",
     ],
@@ -628,8 +639,8 @@ def test_exported_patterns_match_their_documented_shapes() -> None:
     match = URL_CREDENTIALS_RE.search(DB_URL)
     assert match is not None
     assert match.group("password") == "test-db-password"
-    assert EMAIL_RE.fullmatch(LEAD_EMAIL) is not None
-    assert EMAIL_RE.search(DB_URL_REDACTED) is None
+    assert email_spans(LEAD_EMAIL) == [(0, len(LEAD_EMAIL))]
+    assert email_spans(DB_URL_REDACTED) == []
 
 
 @pytest.mark.parametrize(
@@ -648,7 +659,636 @@ def test_email_addresses_are_redacted(text: str, expected: str) -> None:
 @pytest.mark.parametrize("text", ["a@b.c+d@e.f", "a@b.c_d@e.f", "a@b.c..d@e.f", "a@b.c%d@e.f"])
 def test_glued_email_addresses_leave_no_address_behind(text: str) -> None:
     assert redact(text) == REDACTED_EMAIL
-    assert EMAIL_RE.sub(REDACTED_EMAIL, f"to {text}.") == f"to {REDACTED_EMAIL}."
+    assert redact_emails(f"to {text}.") == f"to {REDACTED_EMAIL}."
+
+
+def _fullwidth(text: str) -> str:
+    """Return ``text`` with every printable ASCII character in its fullwidth form."""
+    return "".join(chr(ord(char) + 0xFEE0) for char in text)
+
+
+# Synthetic addresses in other scripts, on reserved example domains where the script allows.
+UNICODE_EMAILS: Final = (
+    pytest.param("用户@例子.公司", id="cjk-local-and-domain"),
+    pytest.param("lead@例子.公司", id="ascii-local-unicode-domain"),
+    pytest.param("jöe.smith@example.com", id="mixed-script-local"),
+    pytest.param("josé@example.com", id="accented-local"),
+    pytest.param("jo\u0301se@example.com", id="combining-acute"),
+    pytest.param("राम@उदाहरण.भारत", id="devanagari-vowel-signs"),
+    pytest.param("ли́да@пример.рф", id="cyrillic-with-stress-mark"),
+    pytest.param("mi\u200cna@مثال.ایران", id="zero-width-non-joiner"),
+    pytest.param("用户@例子。公司", id="ideographic-full-stop"),
+    pytest.param("用户@例子\uff0e公司", id="fullwidth-full-stop"),
+    pytest.param("用户@例子｡公司", id="halfwidth-ideographic-full-stop"),
+    pytest.param(_fullwidth("lead@example.com"), id="fullwidth-at-and-letters"),
+    pytest.param("lead﹫example.com", id="small-at"),
+    pytest.param("lead@xn--fsqu00a.xn--55qx5d", id="punycode-domain"),
+    pytest.param(f"lead{_fullwidth('2026')}@例子.公司", id="fullwidth-digits"),
+)
+
+
+@pytest.mark.parametrize("address", UNICODE_EMAILS)
+def test_addresses_in_any_script_are_redacted_whole(address: str) -> None:
+    text = f"No contact with email {address} found"
+    assert email_spans(text) == [(22, 22 + len(address))]
+    assert redact(text) == f"No contact with email {REDACTED_EMAIL} found"
+    assert redact_emails(f"<{address}>", "X") == "<X>"
+    # Nothing of the address survives, not even the prefix before a change of script.
+    assert address.partition("@")[0][:2] not in str(redact(f"x {address}"))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "already contacted.用户@例子.公司, retry",
+            f"already {REDACTED_EMAIL}, retry",
+            id="ascii-full-stop-joins-the-local-part",
+        ),
+        pytest.param(
+            "已联系。用户@例子.公司 稍后重试",
+            f"{REDACTED_EMAIL} 稍后重试",
+            id="cjk-text-before-joins-the-local-part-and-a-blank-after-ends-the-domain",
+        ),
+        # The fail-closed price on the domain side: non-ASCII text glued after it goes too.
+        pytest.param(
+            "已联系。用户@例子.公司\uff0c稍后重试。",
+            f"{REDACTED_EMAIL}。",
+            id="glued-cjk-text-after",
+        ),
+        pytest.param(
+            "用户@例子.公司\u3000稍后", f"{REDACTED_EMAIL}\u3000稍后", id="ideographic-space"
+        ),
+        pytest.param("用户@例子.公司@x", f"{REDACTED_EMAIL}@x", id="trailing-at"),
+        pytest.param("用户@例子.公司+次@例子.公司", REDACTED_EMAIL, id="glued-unicode"),
+        pytest.param("用户@例子", "用户@例子", id="no-dot-no-address"),
+        pytest.param("用户@.公司", "用户@.公司", id="empty-label"),
+        pytest.param("@例子.公司", "@例子.公司", id="no-local-part"),
+        pytest.param("価格\uff205", "価格\uff205", id="fullwidth-at-without-domain"),
+    ],
+)
+def test_unicode_address_boundaries(text: str, expected: str) -> None:
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A key that names no address is glued to the address's local part and goes with it;
+        # an email key is kept.
+        pytest.param("contact=j%C3%B6e.smith%40example.com", REDACTED_EMAIL, id="utf-8-mixed"),
+        pytest.param(
+            "email=j%C3%B6e.smith%40example.com", "email=[REDACTED_EMAIL]", id="utf-8-email-key"
+        ),
+        pytest.param(
+            "q=" + quote("用户@例子.公司", safe=""), REDACTED_EMAIL, id="utf-8-cjk-address"
+        ),
+        pytest.param(
+            "q " + quote(quote("用户@例子.公司", safe=""), safe=""),
+            f"q {REDACTED_EMAIL}",
+            id="utf-8-cjk-address-encoded-twice",
+        ),
+        pytest.param(
+            "q lead%EF%BC%A0example.com", f"q {REDACTED_EMAIL}", id="encoded-fullwidth-at"
+        ),
+        pytest.param("q=lead%2540example.com", REDACTED_EMAIL, id="encoded-twice"),
+        pytest.param(
+            "q %22%E7%94%A8%E6%88%B7%22%40example.com", f"q {REDACTED_EMAIL}", id="quoted-local"
+        ),
+        pytest.param('q "用户"%40example.com', f"q {REDACTED_EMAIL}", id="quoted-local-at-sign"),
+        pytest.param(
+            'q "john doe"%2540example.com', f"q {REDACTED_EMAIL}", id="quoted-blank-twice"
+        ),
+        pytest.param(
+            "q " + quote("用户@例子😀.com", safe=""), f"q {REDACTED_EMAIL}", id="emoji-domain"
+        ),
+        pytest.param("q user%40i%E2%9D%A4.ws", f"q {REDACTED_EMAIL}", id="symbol-domain"),
+    ],
+)
+def test_percent_encoded_unicode_addresses_are_redacted(text: str, expected: str) -> None:
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+def test_email_scanner_classes_follow_the_unicode_database() -> None:
+    """A local part's run takes exactly ASCII letters and digits, ``.``, the RFC 5322
+    ``atext`` specials and every non-ASCII code point but whitespace, separators, controls,
+    lone surrogates and at signs; a quoted local part takes every code point but ``"``,
+    ``\\``, CR and LF; a domain label takes exactly ASCII letters, digits and ``-`` and every
+    non-ASCII code point but whitespace, separators, controls, lone surrogates, at signs and
+    label stops; and the stops are ``.``, ``。`` and every code point whose NFKC form is one
+    of them, as the scanner's docstring states for the running interpreter."""
+    pattern = ads_logging._email_scanner().pattern
+
+    def is_address(text: str) -> bool:
+        found = pattern.fullmatch(text)
+        return found is not None and found.group("address") is not None
+
+    at_signs: set[str] = set()
+    stops: set[str] = set()
+    for code in range(sys.maxunicode + 1):
+        form = unicodedata.normalize("NFKC", chr(code))
+        if form == "@":
+            at_signs.add(chr(code))
+        elif form in {".", "\u3002"}:
+            stops.add(chr(code))
+    local_ascii = set(ascii_letters + digits + ".!#$%&'*+-/=?^_`{|}~")
+    label_ascii = set(ascii_letters + digits + "-")
+    excluded = {"Zs", "Zl", "Zp", "Cc", "Cs"}
+    for code in range(sys.maxunicode + 1):
+        char = chr(code)
+        category = unicodedata.category(char)
+        other = category not in excluded and char not in at_signs
+        local = char in local_ascii if code < 0x80 else other
+        label = char in label_ascii if code < 0x80 else other and char not in stops
+        quoted = char not in '"\\\r\n'
+        assert is_address(f"{char}@b.c") == local, hex(code)
+        assert is_address(f'"{char}"@b.c') == quoted, hex(code)
+        assert is_address(f"a@b{char}.c") == label, hex(code)
+        assert is_address(f"a@b{char}c") == (char in stops), hex(code)
+    assert set(ads_logging._email_scanner().at_signs) == at_signs == {"@", "\ufe6b", "\uff20"}
+    assert stops == {".", "\u2024", "\ufe52", "\uff0e", "\u3002", "\ufe12", "\uff61"}
+
+
+# Local parts holding RFC 5322 `atext` specials, symbols or emoji, beside letters in any
+# script: a scanner reading only letters, marks, digits and `._%+-` missed or cut each one.
+FAIL_CLOSED_EMAILS: Final = (
+    pytest.param("用户!@example.com", ("用户!", "用户"), id="cjk-and-bang"),
+    pytest.param("用户😀@example.com", ("用户😀", "用户", "😀"), id="cjk-and-emoji"),
+    pytest.param("用户!a@example.com", ("用户!a", "用户!", "用户"), id="cjk-bang-and-letter"),
+    pytest.param("o'brien@example.com", ("o'brien", "o'", "brien"), id="apostrophe"),
+    pytest.param(
+        "patrick.o'brien@example.com", ("patrick", "o'brien", "brien"), id="dotted-apostrophe"
+    ),
+    pytest.param("a=b@x.com", ("a=b", "a="), id="equals-sign"),
+    pytest.param("{user}@x.com", ("{user}", "user}"), id="braces"),
+    pytest.param("😀@example.com", ("😀",), id="emoji-only"),
+    pytest.param("用户😀@例子.公司", ("用户", "😀", "例子"), id="emoji-before-an-idn-domain"),
+    pytest.param("a!#$%&'*+-/=?^_`{|}~z@example.com", ("a!#", "|}~z"), id="every-atext-special"),
+    # Quoted local parts (RFC 5322 quoted strings, RFC 6531 `qtext`) and domain labels holding
+    # symbols or emoji: a scanner reading only `atext` runs and letter, mark and digit labels
+    # left each one whole.
+    pytest.param('"用户"@example.com', ('"用户"', "用户"), id="quoted-cjk-local-part"),
+    pytest.param('"john doe"@example.com', ("john doe", "john", "doe"), id="quoted-blank"),
+    pytest.param('"a\\"b"@example.com', ('a\\"b', '\\"b'), id="quoted-escaped-quote"),
+    pytest.param("用户@例子😀.com", ("用户", "例子", "😀"), id="emoji-in-a-domain-label"),
+    pytest.param("user@i❤.ws", ("user@", "i❤", "❤"), id="symbol-in-a-domain-label"),
+)
+
+
+def _encodings(address: str) -> dict[str, str]:
+    """``address`` percent-encoded as a URL, query or form carries it, once or twice."""
+    return {
+        "utf-8": quote(address, safe=""),
+        "utf-8-twice": quote(quote(address, safe=""), safe=""),
+        "at-sign": address.replace("@", "%40"),
+        "at-sign-twice": address.replace("@", "%2540"),
+    }
+
+
+@pytest.mark.parametrize(("address", "fragments"), FAIL_CLOSED_EMAILS)
+def test_local_parts_fail_closed_and_are_redacted_whole(
+    address: str, fragments: tuple[str, ...]
+) -> None:
+    text = f"No contact with {address} found"
+    assert email_spans(text) == [(16, 16 + len(address))]
+    assert redact(text) == f"No contact with {REDACTED_EMAIL} found"
+    assert redact_emails(f"<{address}>", "X") == "<X>"
+    for name, encoded in _encodings(address).items():
+        redacted = str(redact(f"No contact with {encoded} found"))
+        assert redacted == f"No contact with {REDACTED_EMAIL} found", name
+        assert redact(redacted) == redacted
+        for fragment in fragments:
+            assert fragment not in _fully_decoded(redacted), (name, fragment)
+
+
+@pytest.mark.parametrize(("address", "fragments"), FAIL_CLOSED_EMAILS)
+def test_fail_closed_local_parts_leave_no_fragment_in_rendered_json_lines(
+    address: str, fragments: tuple[str, ...]
+) -> None:
+    stream = _configure()
+    encoded = _encodings(address)
+    get_logger("tests.fail_closed").warning(
+        "connector_failure",
+        reason=f"No contact with {address} found",
+        detail={"note": f"{encoded['at-sign']} and {encoded['utf-8']} rejected"},
+    )
+    logging.getLogger("tests.third_party").warning("lookup failed for %s", encoded["at-sign-twice"])
+    lines = _lines(stream)
+    # The lines escape non-ASCII characters; their parsed text is searched, fully decoded.
+    output = _fully_decoded(json.dumps(lines, ensure_ascii=False))
+    for fragment in fragments:
+        assert fragment not in output, fragment
+    event, foreign = lines
+    assert event["reason"] == f"No contact with {REDACTED_EMAIL} found"
+    assert event["detail"] == {"note": f"{REDACTED_EMAIL} and {REDACTED_EMAIL} rejected"}
+    assert foreign["event"] == f"lookup failed for {REDACTED_EMAIL}"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A domain label takes every non-ASCII character but blanks, controls, at signs and
+        # stops, so an emoji glued to the domain goes with it; ASCII punctuation ends it.
+        pytest.param("user@example.com😀", REDACTED_EMAIL, id="emoji-after-the-domain"),
+        pytest.param("用户@例子.公司😀!", f"{REDACTED_EMAIL}!", id="emoji-after-an-idn-domain"),
+        pytest.param("😀用户@例子.公司", REDACTED_EMAIL, id="emoji-before-the-local-part"),
+        pytest.param("user\uff20example.com", REDACTED_EMAIL, id="fullwidth-at-ends-the-local"),
+        pytest.param(
+            "a\u3000用户!@example.com", f"a\u3000{REDACTED_EMAIL}", id="ideographic-space"
+        ),
+        pytest.param("a\u0085用户!@example.com", f"a\u0085{REDACTED_EMAIL}", id="c1-control"),
+        # Quotes that open an address stay; the address inside them goes whole.
+        pytest.param("KeyError: 'lead@example.com'", f"KeyError: '{REDACTED_EMAIL}'", id="repr"),
+        pytest.param(
+            "['o'brien@example.com', 'x']", f"['{REDACTED_EMAIL}', 'x']", id="repr-apostrophe"
+        ),
+        pytest.param("`用户!@example.com`", f"`{REDACTED_EMAIL}`", id="backquoted"),
+        pytest.param("''@example.com", REDACTED_EMAIL, id="quotes-alone-are-the-local-part"),
+        # The fail-closed price: text glued to an address goes with it.
+        pytest.param("contact=x!@y.com", REDACTED_EMAIL, id="glued-key"),
+        pytest.param("/path/a@b.co", REDACTED_EMAIL, id="glued-path"),
+        pytest.param("a=b@x.com in prose", f"{REDACTED_EMAIL} in prose", id="glued-equals"),
+    ],
+)
+def test_fail_closed_local_part_boundaries(text: str, expected: str) -> None:
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "email=用户!@example.com next", "email=[REDACTED_EMAIL] next", id="assignment"
+        ),
+        pytest.param(
+            "workEmail: 用户😀@example.com found", "workEmail: [REDACTED_EMAIL] found", id="prose"
+        ),
+        pytest.param(
+            '{"email": "用户!a@example.com", "n": 1}',
+            '{"email": "[REDACTED_EMAIL]", "n": 1}',
+            id="json-member",
+        ),
+        pytest.param(
+            "('work_email', '{user}@x.com')", "('work_email', '[REDACTED_EMAIL]')", id="pair"
+        ),
+        pytest.param("email=not-an-address", "email=[REDACTED_EMAIL]", id="any-value"),
+        pytest.param(
+            "email=o'brien@example.com", "email=[REDACTED_EMAIL]", id="address-past-the-token"
+        ),
+        pytest.param(
+            "GET /x?access_token=abc&email=" + quote("用户!@example.com", safe=""),
+            "GET /x?access_token=[REDACTED]&email=[REDACTED_EMAIL]",
+            id="encoded-query",
+        ),
+        pytest.param(
+            "access_token=abc'x@y.com/path", "access_token=[REDACTED]", id="credential-run-on"
+        ),
+        pytest.param("no_email: 3 email_count=4", "no_email: 3 email_count=4", id="flags-kept"),
+        # A quoted local part's quotes are not the value's: the whole address goes.
+        pytest.param(
+            'email="john doe"@example.com next', "email=[REDACTED_EMAIL] next", id="quoted-local"
+        ),
+        pytest.param(
+            'workEmail: "用户"@例子😀.com found',
+            "workEmail: [REDACTED_EMAIL] found",
+            id="quoted-local-in-prose",
+        ),
+        pytest.param(
+            '{"email": "a\\"b"@example.com, "n": 1}',
+            '{"email": [REDACTED_EMAIL], "n": 1}',
+            id="quoted-local-json-member",
+        ),
+        pytest.param('email=""@example.com', "email=[REDACTED_EMAIL]", id="empty-quoted-local"),
+        pytest.param(
+            "GET /x?email=" + quote('"john doe"@example.com', safe="") + "&limit=1",
+            "GET /x?email=[REDACTED_EMAIL]&limit=1",
+            id="encoded-quoted-local",
+        ),
+        pytest.param('email="x" next', 'email="[REDACTED_EMAIL]" next', id="quoted-value-kept"),
+    ],
+)
+def test_email_key_assignments_keep_their_key(text: str, expected: str) -> None:
+    """A key that names an address keeps its place; its value becomes the marker whole."""
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param('"用户"@example.com', REDACTED_EMAIL, id="cjk"),
+        pytest.param(
+            'to "john doe"@example.com, then', f"to {REDACTED_EMAIL}, then", id="blank-inside"
+        ),
+        pytest.param('"a\\"b"@example.com', REDACTED_EMAIL, id="escaped-quote"),
+        pytest.param('"a\\\\"@example.com', REDACTED_EMAIL, id="escaped-backslash"),
+        pytest.param('""@example.com', REDACTED_EMAIL, id="empty"),
+        pytest.param('"a@b c"@example.com', REDACTED_EMAIL, id="at-sign-inside"),
+        pytest.param('"[REDACTED] x"@example.com', REDACTED_EMAIL, id="marker-inside"),
+        pytest.param('x"y z"@example.com ok', f"{REDACTED_EMAIL} ok", id="run-glued-before"),
+        pytest.param('用户"测 试"@例子.公司', REDACTED_EMAIL, id="cjk-run-glued-before"),
+        pytest.param('"用户"\uff20例子.公司', REDACTED_EMAIL, id="fullwidth-at"),
+        pytest.param('"x"@a.b+"y"@c.d', REDACTED_EMAIL, id="glued-quoted-addresses"),
+        pytest.param('a@b.co"y"@c.d', REDACTED_EMAIL, id="quoted-glued-after-an-address"),
+        pytest.param('<"用户"@example.com>', f"<{REDACTED_EMAIL}>", id="angle-brackets"),
+        # A JSON string's quotes are not an address's: the address inside goes, they stay.
+        pytest.param(
+            '{"contact": "user@x.com"}', f'{{"contact": "{REDACTED_EMAIL}"}}', id="json-string"
+        ),
+        pytest.param('wrote "user@x.com', f'wrote "{REDACTED_EMAIL}', id="unclosed-quote"),
+        pytest.param('a"b@x.com', f'a"{REDACTED_EMAIL}', id="unclosed-quote-glued"),
+        pytest.param('"x y@a.com', f'"x {REDACTED_EMAIL}', id="address-after-an-unclosed-quote"),
+        pytest.param('"x\ny@a.com', f'"x\n{REDACTED_EMAIL}', id="unclosed-quote-ends-its-line"),
+        pytest.param('"a@b.c\\', f'"{REDACTED_EMAIL}\\', id="unclosed-quote-ending-in-backslash"),
+        pytest.param(
+            '{"m": "a \\"b\\" c@x.com"}',
+            f'{{"m": "a \\"b\\" {REDACTED_EMAIL}"}}',
+            id="escaped-quotes-in-a-json-string",
+        ),
+        # Outside a quoted string a backslash escapes nothing: the quote after it opens one.
+        pytest.param('a\\"b"@x.com', f"a\\{REDACTED_EMAIL}", id="quote-after-a-backslash"),
+        pytest.param(
+            'x\\\\"用户"@x.com', f"x\\\\{REDACTED_EMAIL}", id="quote-after-two-backslashes"
+        ),
+        # Quotes pair from left to right: the closing quote of `"x "` opens nothing, so the
+        # address is the one that `b"@c.com y"` begins.
+        pytest.param(
+            'He said "x "b"@c.com y"@d.com', f'He said "x "{REDACTED_EMAIL}', id="paired-quotes"
+        ),
+        # Ordinary text is not over-matched.
+        pytest.param('{"a": "b"}', '{"a": "b"}', id="json-object"),
+        pytest.param('{"a": "b", "c": "@d"}', '{"a": "b", "c": "@d"}', id="json-at-value"),
+        pytest.param("    @property\n    def x(self):", None, id="decorator"),
+        pytest.param('"quoted" @ text', None, id="blank-before-the-at-sign"),
+        pytest.param('"quoted"\t@example.com', None, id="tab-before-the-at-sign"),
+        pytest.param('say "hi"@ noon', None, id="blank-after-the-at-sign"),
+        pytest.param('"x"@localhost', None, id="one-label"),
+        pytest.param('"@example.com', None, id="lone-quote"),
+    ],
+)
+def test_quoted_local_parts_are_redacted_whole_and_nothing_else(
+    text: str, expected: str | None
+) -> None:
+    """RFC 5322 quoted strings (RFC 6531 ``qtext``) right before the at sign are local parts.
+
+    ``None`` stands for the text itself: nothing in it is an address.
+    """
+    expected = text if expected is None else expected
+    assert redact(text) == expected
+    assert redact(expected) == expected
+    assert redact_emails(text, "<M>").count("<M>") == expected.count(REDACTED_EMAIL)
+
+
+# Pieces of quote-heavy text: quotes, escapes, line breaks, at signs, stops, markers and
+# percent-encoded quotes and at signs, among letters in several scripts. A scanner that let a
+# closing quote open another quoted string fails the test below on dozens of these texts.
+_QUOTE_HEAVY_PIECES: Final = (
+    *('"@x.co', ' "', '"', '"', "\\", "@", "@", ".", " ", "\t", "\n", "\r", "a", "b", "用"),
+    *("😀", "❤", "+"),
+    *("%40", "%22", "x.co", "例子", "\uff20", "。", "<", ">", ",", REDACTED_EMAIL, REDACTED),
+)
+
+
+def _quote_heavy_texts(count: int) -> Iterator[str]:
+    """Yield ``count`` texts of :data:`_QUOTE_HEAVY_PIECES`, each spelled by a SHA-256 digest.
+
+    The digest of the text's index picks its length and each of its pieces, so the texts are
+    the same on every run.
+    """
+    for index in range(count):
+        digest = hashlib.sha256(f"quote-heavy:{index}".encode()).digest()
+        picks = digest[1 : 2 + digest[0] % 30]
+        yield "".join(_QUOTE_HEAVY_PIECES[pick % len(_QUOTE_HEAVY_PIECES)] for pick in picks)
+
+
+def test_quote_heavy_text_is_redacted_whole_idempotently() -> None:
+    """Quotes pair from left to right, so no redaction pairs them differently on a second pass.
+
+    For each text: redacting it leaves no address, redacting the result changes nothing, and
+    no address span starts or ends inside a marker.
+    """
+    for text in _quote_heavy_texts(4000):
+        once = str(redact(text))
+        assert email_spans(once) == [], (text, once)
+        assert redact(once) == once, text
+        scanned = redact_emails(text, "<M>")
+        assert redact_emails(scanned, "<M>") == scanned, text
+        markers = [match.span() for match in re.finditer(r"\[REDACTED(?:_EMAIL)?\]", text)]
+        for start, end in email_spans(text):
+            for left, right in markers:
+                assert not left < start < right, (text, start, end)
+                assert not left < end < right, (text, start, end)
+
+
+_SCANNER_BUILD_PROGRAM: Final = textwrap.dedent(
+    """
+    import resource
+    import sys
+
+    import ads_engine.logging as ads_logging
+
+    # ru_maxrss counts bytes on macOS and kibibytes elsewhere.
+    unit = 1 if sys.platform == "darwin" else 1024
+    assert ads_logging._email_scanner.cache_info().currsize == 0, "built at import"
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    scanner = ads_logging._email_scanner()
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert ads_logging._email_scanner() is scanner, "not cached"
+    print((after - before) * unit)
+    """
+)
+"""Builds the email scanner in a fresh interpreter and prints the peak-memory growth, in bytes."""
+
+
+def test_building_the_email_scanner_keeps_peak_memory_bounded() -> None:
+    """Every API, worker and CLI process that logs a possible address builds the scanner, so
+    the build must not hold a table of all 1.1 million code points, which raised the peak by
+    about 60 MB."""
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and program, no user input
+        [sys.executable, "-c", _SCANNER_BUILD_PROGRAM],
+        cwd=Path(__file__).resolve().parents[2],
+        env=dict(os.environ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert int(completed.stdout) < 20 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("ö" * 200_000 + "@x", id="long-unicode-local-part"),
+        pytest.param("a" * 200_000 + "@x", id="long-ascii-local-part"),
+        pytest.param("a@" * 100_000, id="at-dense"),
+        pytest.param("用@" * 100_000, id="at-dense-cjk"),
+        pytest.param("a@b" + "。c" * 100_000 + "!", id="many-ideographic-labels"),
+        pytest.param("\u0301" * 200_000 + "@x", id="combining-marks"),
+        pytest.param("\U0001d167" * 200_000 + "@x", id="supplementary-plane-marks"),
+        pytest.param("😀" * 200_000 + "\uff20", id="emoji-and-fullwidth-at"),
+        pytest.param("a@b.c" * 40_000, id="dense-addresses"),
+        pytest.param("!" * 200_000 + "@x", id="long-atext-special-local-part"),
+        pytest.param("a'" * 100_000, id="apostrophe-run-without-at"),
+        pytest.param("a'" * 100_000 + "@x", id="apostrophe-run"),
+        pytest.param("'" * 200_000 + "a@b.c", id="opening-quotes"),
+        pytest.param("=a@" * 70_000, id="assignment-like-at-dense"),
+        pytest.param("email=a'" * 20_000 + "x@y.z", id="email-keys-and-apostrophes"),
+        pytest.param("a'%41" * 50_000 + " x", id="apostrophes-in-encoded-run"),
+        pytest.param("'%" * 100_000, id="apostrophes-and-bare-percents"),
+        pytest.param("用!" * 100_000 + "@例子", id="cjk-and-specials-without-domain"),
+        # Quoted strings: each opening quote is scanned once, a closing one never reopens, and
+        # one that no quote closes is taken to the end of its line, so no quote it holds opens.
+        pytest.param('"' * 200_000, id="quotes"),
+        pytest.param('"a' * 100_000 + "@x.co", id="quote-letter-pairs"),
+        pytest.param('"' + "a" * 200_000, id="unclosed-quote"),
+        pytest.param('\\"' * 100_000, id="escaped-quotes"),
+        pytest.param('"' + '\\"' * 100_000 + '"@x.co', id="one-quoted-string-of-escapes"),
+        # Text without an at sign is never scanned, so these hold one where no quote follows.
+        pytest.param("@" + '"' * 200_000, id="at-and-quotes"),
+        pytest.param('"' + "a" * 200_000 + "@", id="unclosed-quote-and-at"),
+        pytest.param("@" + '\\"' * 100_000, id="at-and-escaped-quotes"),
+        pytest.param("@" + 'a\\"' * 70_000, id="at-letters-and-escaped-quotes"),
+        pytest.param("@" + '"\\"' * 70_000, id="at-quotes-and-escaped-quotes"),
+        pytest.param(("@" + '\\"' * 1_000 + "\n") * 200, id="lines-of-escaped-quotes"),
+        pytest.param('"a"' * 70_000 + "@", id="quoted-strings-and-a-trailing-at"),
+        pytest.param('"a"@b' * 40_000, id="quoted-strings-at-one-label-domains"),
+        pytest.param('" a@' * 50_000, id="quotes-blanks-and-ats"),
+        pytest.param('"x "' * 50_000 + 'b"@c.com', id="paired-quotes-before-an-address"),
+        pytest.param('"' * 200_000 + "%40x.co", id="quotes-before-an-encoded-at"),
+        pytest.param("a@b" + ".😀" * 100_000, id="emoji-labels"),
+        pytest.param("用户@例子" + "😀" * 200_000, id="emoji-run-in-a-label"),
+    ],
+)
+def test_unicode_email_scanner_runs_in_linear_time(text: str) -> None:
+    email_spans("a@b.c")  # The scanner is built once per process, outside the timing.
+    started = time.perf_counter()
+    redacted = str(redact(text, secrets=[N8N_SECRET]))
+    assert time.perf_counter() - started < 1.0
+    assert redact(redacted, secrets=[N8N_SECRET]) == redacted
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "email",
+        "Email",
+        "EMAIL",
+        "emails",
+        "E-Mail",
+        "e_mail",
+        "eMail",
+        "emailAddress",
+        "email_address",
+        "EmailAddresses",
+        "EMAILADDRESS",
+        "work_email",
+        "workEmail",
+        "app_admin_email",
+        "hs_additional_emails",
+        "contactEmailAddress",
+        b"email",
+    ],
+)
+def test_keys_that_name_an_email_address(key: str | bytes) -> None:
+    assert is_email_key(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "no_email",
+        "noEmail",
+        "has_email",
+        "is_email",
+        "missing_email",
+        "without_emails",
+        "email_count",
+        "emailCount",
+        "email_sha256",
+        "email_hash",
+        "email_question_ids",
+        "email_status",
+        "no_email_reason",
+        "voicemail",
+        "WORKEMAIL",
+        "mail",
+        42,
+    ],
+)
+def test_keys_about_an_address_are_not_email_keys(key: object) -> None:
+    assert not is_email_key(key)
+
+
+def test_values_under_email_keys_are_redacted_whatever_they_hold() -> None:
+    value = {
+        "email": "not-an-address",
+        "workEmail": {"value": "jane at example dot com", "verified": True},
+        "emails": ["lead"],
+        "email_address": 12345,
+        "contact": {"E-Mail": None, "name": "x", "pairs": [("email", "z"), ["Email", ["z"]]]},
+        "no_email": 3,
+        "email_sha256": "ab" * 32,
+    }
+    assert redact(value) == {
+        "email": REDACTED_EMAIL,
+        "workEmail": REDACTED_EMAIL,
+        "emails": REDACTED_EMAIL,
+        "email_address": REDACTED_EMAIL,
+        "contact": {
+            "E-Mail": REDACTED_EMAIL,
+            "name": "x",
+            "pairs": [("email", REDACTED_EMAIL), ["Email", REDACTED_EMAIL]],
+        },
+        "no_email": 3,
+        "email_sha256": "ab" * 32,
+    }
+    assert redact(redact(value)) == redact(value)
+
+
+def test_email_keys_are_redacted_in_rendered_json_lines() -> None:
+    stream = _configure()
+    log = get_logger("tests.email_keys")
+    log.warning(
+        "contact_lookup_failed",
+        email="jane at example dot com",
+        workEmail=["用户@例子.公司"],
+        reason="No contact with email 用户@例子.公司 found",
+        detail={"emailAddress": 7, "note": "jöe.smith@example.com replied"},
+        no_email=2,
+    )
+    logging.getLogger("tests.third_party").warning(
+        "lookup %s failed for %s", "contact", "j%C3%B6e.smith%40example.com"
+    )
+    output = stream.getvalue()
+    for fragment in ("用户", "例子", "jane at", "jöe", "j%C3%B6e", "smith"):
+        assert fragment not in output
+    event, foreign = _lines(stream)
+    assert event["email"] == event["workEmail"] == REDACTED_EMAIL
+    assert event["reason"] == f"No contact with email {REDACTED_EMAIL} found"
+    assert event["detail"] == {"emailAddress": REDACTED_EMAIL, "note": f"{REDACTED_EMAIL} replied"}
+    assert event["no_email"] == 2
+    assert foreign["event"] == f"lookup contact failed for {REDACTED_EMAIL}"
+
+
+def test_exception_arguments_under_email_keys_are_redacted() -> None:
+    stream = _configure()
+    try:
+        raise KeyError({"email": "jane at example dot com", "id": 7})
+    except KeyError:
+        get_logger("tests.email_keys").exception("lookup_failed")
+    try:
+        raise ValueError("work_email", "jane at example dot com")
+    except ValueError:
+        get_logger("tests.email_keys").exception("lookup_failed")
+    output = stream.getvalue()
+    assert "jane at" not in output
+    assert output.count(REDACTED_EMAIL) == 2
 
 
 @pytest.mark.parametrize(
@@ -715,6 +1355,21 @@ def test_long_text_keeps_its_length_and_loses_only_the_address() -> None:
             "grant_type=refresh_token&refresh_token=test-r&client_secret=test-c",
             "grant_type=refresh_token&refresh_token=[REDACTED]&client_secret=[REDACTED]",
             id="form-body",
+        ),
+        pytest.param(
+            "grant_type=refresh_token&client_id=test-i&client_secret=test-c",
+            "grant_type=refresh_token&client_id=[REDACTED]&client_secret=[REDACTED]",
+            id="form-body-client-id",
+        ),
+        pytest.param(
+            '{"clientId": "test-i", "status": 400}',
+            '{"clientId": "[REDACTED]", "status": 400}',
+            id="json-client-id",
+        ),
+        pytest.param(
+            "LINKEDIN_CLIENT_ID=test-i rejected",
+            "LINKEDIN_CLIENT_ID=[REDACTED] rejected",
+            id="client-id-setting-assignment",
         ),
         pytest.param(
             '{"access_token": "test-a", "expires_in": 5184000}',
@@ -951,8 +1606,8 @@ ENCODED_SECRET_LOWER = ENCODED_SECRET.lower()
             id="double-encoded-email",
         ),
         pytest.param(
-            "q=lead%40Example.COM and LEAD%40example.com",
-            "q=[REDACTED_EMAIL] and [REDACTED_EMAIL]",
+            "q lead%40Example.COM and LEAD%40example.com",
+            "q [REDACTED_EMAIL] and [REDACTED_EMAIL]",
             id="mixed-case-email",
         ),
         pytest.param(
@@ -1013,12 +1668,12 @@ def test_foreign_records_with_encoded_values_are_redacted() -> None:
     )
 
 
-def _layered(text: str, layers: int) -> str:
-    """Return ``email=<LEAD_EMAIL> s=<N8N_SECRET> <text>``, both values encoded ``layers`` times."""
+def _layered(text: str, layers: int, key: str = "email") -> str:
+    """Return ``<key>=<LEAD_EMAIL> s=<N8N_SECRET> <text>``, both values encoded ``layers`` times."""
     email, secret = "lead%40example.com", "%74est-n8n-secret-value"
     for _ in range(layers - 1):
         email, secret = email.replace("%", "%25"), secret.replace("%", "%25")
-    return f"email={email} s={secret} {text}"
+    return f"{key}={email} s={secret} {text}"
 
 
 def _fully_decoded(text: str) -> str:
@@ -1035,9 +1690,19 @@ def test_values_encoded_up_to_the_decode_limit_are_redacted(layers: int) -> None
 
 
 @pytest.mark.parametrize("layers", [5, 6])
-def test_values_encoded_beyond_the_decode_limit_fail_closed(layers: int) -> None:
-    result = str(redact(_layered("rejected", layers), secrets=[N8N_SECRET]))
-    assert result == "[REDACTED] [REDACTED] rejected"
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        # An email key's value is replaced whatever it holds, before the decode pass.
+        pytest.param("email", "email=[REDACTED_EMAIL] [REDACTED] rejected", id="email-key"),
+        pytest.param("note", "[REDACTED] [REDACTED] rejected", id="other-key"),
+    ],
+)
+def test_values_encoded_beyond_the_decode_limit_fail_closed(
+    layers: int, key: str, expected: str
+) -> None:
+    result = str(redact(_layered("rejected", layers, key), secrets=[N8N_SECRET]))
+    assert result == expected
     decoded = _fully_decoded(result)
     assert LEAD_EMAIL not in decoded
     assert N8N_SECRET not in decoded
@@ -1047,8 +1712,8 @@ def test_values_encoded_beyond_the_decode_limit_fail_closed(layers: int) -> None
     ("layers", "expected"),
     [
         pytest.param(4, "email=[REDACTED_EMAIL] s=[REDACTED] rejected", id="at-the-limit"),
-        pytest.param(5, "[REDACTED] [REDACTED] rejected", id="one-beyond"),
-        pytest.param(6, "[REDACTED] [REDACTED] rejected", id="two-beyond"),
+        pytest.param(5, "email=[REDACTED_EMAIL] [REDACTED] rejected", id="one-beyond"),
+        pytest.param(6, "email=[REDACTED_EMAIL] [REDACTED] rejected", id="two-beyond"),
     ],
 )
 def test_deeply_encoded_values_in_foreign_records_and_exception_text_never_leak(
@@ -1103,12 +1768,13 @@ def test_safe_scalars_are_returned_unchanged(value: object) -> None:
 
 
 def test_input_is_copied_and_never_mutated() -> None:
-    original = {"headers": {"Authorization": BEARER}, "emails": [LEAD_EMAIL], "pair": ("a", 1)}
+    # `contacts` is no email key (`emails` would be replaced whole), so its list is copied.
+    original = {"headers": {"Authorization": BEARER}, "contacts": [LEAD_EMAIL], "pair": ("a", 1)}
     snapshot = copy.deepcopy(original)
     result = redact(original)
     assert result == {
         "headers": {"Authorization": REDACTED},
-        "emails": [REDACTED_EMAIL],
+        "contacts": [REDACTED_EMAIL],
         "pair": ("a", 1),
     }
     assert original == snapshot
@@ -1372,6 +2038,29 @@ def test_short_url_passwords_are_not_substring_rules_but_short_secrets_are() -> 
     assert record["event"] == "ads_engine_started"
     assert record["url"] == DEFAULT_DB_URL_REDACTED
     assert record["note"] == "ads up"
+
+
+def test_the_configured_linkedin_client_id_is_redacted_wherever_it_occurs() -> None:
+    # A plain setting rather than a SecretStr, yet an OAuth credential: it is collected,
+    # stripped, with the secrets, and logged in no string, plain or percent-encoded.
+    client_id = "test-logged-client-id"
+    settings = Settings(linkedin_client_id=f" {client_id}  ")
+    assert client_id in ads_logging._settings_secrets(settings)
+    assert ads_logging._settings_secrets(Settings()) == (DEFAULT_DB_URL,)
+
+    stream = _configure(settings)
+    get_logger("tests.logging.client_id").warning(
+        "linkedin.token.failed",
+        reason=f"Client {client_id} is not registered",
+        detail={"echo": [f"for {quote(client_id, safe='')}"]},
+        encoded="%74%65%73%74-logged-client-id",
+    )
+    output = stream.getvalue()
+    assert client_id not in output
+    (record,) = _lines(stream)
+    assert record["reason"] == "Client [REDACTED] is not registered"
+    assert record["detail"] == {"echo": ["for [REDACTED]"]}
+    assert record["encoded"] == REDACTED
 
 
 def test_secret_that_is_not_a_parseable_url_is_still_redacted() -> None:

@@ -43,6 +43,7 @@ from urllib.parse import parse_qsl, unquote, urlencode
 import httpx
 import pytest
 
+from ads_engine.logging import email_spans
 from ads_engine.simulation import (
     DEFAULT_SCENARIO,
     DEFAULT_SEED,
@@ -159,7 +160,6 @@ TOKEN_FORM_SECRETS: Final = ("client_id", "client_secret", "refresh_token")
 # How many unified-diff lines a snapshot mismatch shows before truncating.
 DIFF_LINES_SHOWN: Final = 80
 
-EMAIL_RE: Final = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
 GAQL_DATE_RANGE_RE: Final = re.compile(
     r"segments\.date BETWEEN '(\d{4}-\d{2}-\d{2})' AND '(\d{4}-\d{2}-\d{2})'"
 )
@@ -704,7 +704,9 @@ def test_every_email_is_on_the_reserved_domain() -> None:
     offenders: set[str] = set()
     for path in sorted(FIXTURES_DIR.glob("*.json")):
         for text in _decoded_texts(path):
-            for match in EMAIL_RE.findall(text):
+            # The shared scanner of every redaction path, so an address in any script counts.
+            for start, end in email_spans(text):
+                match = text[start:end]
                 found += 1
                 if not (match.endswith(f"@{SIM_EMAIL_DOMAIN}") and is_simulated_email(match)):
                     offenders.add(f"{path.name}: an address on {match.rpartition('@')[2]!r}")

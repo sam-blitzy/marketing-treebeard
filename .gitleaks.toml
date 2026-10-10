@@ -147,7 +147,8 @@ regexes = [
 
 # Short stand-in credentials three unit tests committed. Two redaction tests assign short secrets
 # to setting names to prove that a short secret is redacted too: test_cli.py (its short-secret
-# redaction policy) and test_connector_errors_types.py (the error-message sanitizer).
+# redaction policy, whose URL-redaction test also configures `sec/ret=1`, a secret holding the
+# URL delimiters `/` and `=`) and test_connector_errors_types.py (the error-message sanitizer).
 # test_connector_http.py gives the X-Webhook-Secret request header the non-ASCII value
 # `caf\u00e9`, written as a Python escape, so that building the request raises
 # UnicodeEncodeError; gitleaks decodes the escape and reports `café`. They are in committed
@@ -163,7 +164,7 @@ paths = [
   '''(?:^|/)backend/tests/unit/test_(?:cli|connector_errors_types|connector_http)\.py$''',
 ]
 regexes = [
-  '''^(?:4242|ABC|abc|a/b\+c|café|red|short|short7x|xyz)$''',
+  '''^(?:4242|ABC|abc|a/b\+c|café|red|sec/ret=1|short|short7x|xyz)$''',
 ]
 
 # Redacted live captures and simulator fixtures. `ads-engine capture-fixtures` redacts emails,

@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -2004,6 +2005,243 @@ def test_policy_text_redacts_secrets_ids_and_emails() -> None:
     assert policy.value(True, frozenset()) is True
 
 
+# Synthetic addresses in other scripts; the fullwidth at sign is written as its escape.
+UNICODE_ADDRESSES = (
+    "用户@例子.公司",
+    "lead@例子.公司",
+    "jöe.smith@example.com",
+    "josé@example.com",
+    "jo\u0301se@example.com",
+    "राम@उदाहरण.भारत",
+    "lead\uff20example.com",
+)
+
+
+@pytest.mark.parametrize("address", UNICODE_ADDRESSES)
+def test_policy_text_redacts_addresses_in_any_script(address: str) -> None:
+    policy = _policy()
+    assert policy.text(f"No contact with email {address} found") == (
+        "No contact with email <redacted> found"
+    )
+    assert policy.holds_email({"message": address})
+    assert not policy.holds_email({"message": policy.text(address)})
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param("user%40example.com", "%3Credacted%3E", id="encoded-at"),
+        pytest.param(
+            "?email=lead%2540example.com&limit=1", "?email=%3Credacted%3E&limit=1", id="twice"
+        ),
+        pytest.param(
+            f"q={quote('用户@例子.公司', safe='')}&x=1", "q=%3Credacted%3E&x=1", id="utf-8-cjk"
+        ),
+        pytest.param(
+            f"contact {quote('jöe.smith@example.com', safe='')} replied",
+            "contact %3Credacted%3E replied",
+            id="utf-8-mixed-script-in-prose",
+        ),
+        pytest.param("q=a+b%40example.com", "q=%3Credacted%3E", id="plus-for-space"),
+        pytest.param("q=lead%EF%BC%A0example.com", "q=%3Credacted%3E", id="encoded-fullwidth-at"),
+        pytest.param(
+            "next=%2Fcrm%3Fq%3Dlead%2540example.com%26limit%3D1",
+            "next=%3Credacted%3E",
+            id="encoded-url-inside-a-value",
+        ),
+        pytest.param(
+            "ids=List(urn%3Ali%3AsponsoredAccount%3A0)&q=100%25",
+            "ids=List(urn%3Ali%3AsponsoredAccount%3A0)&q=100%25",
+            id="clean-components-kept",
+        ),
+    ],
+)
+def test_policy_text_redacts_percent_encoded_addresses_by_component(
+    text: str, expected: str
+) -> None:
+    """An encoded address takes only its own component; the URL or form stays parseable."""
+    policy = _policy()
+    assert policy.text(text) == expected
+    assert policy.text(expected) == expected
+    assert not policy.holds_email(expected)
+    assert policy.holds_email(text) is (text != expected)
+
+
+# Addresses whose local parts hold RFC 5322 `atext` specials, symbols or emoji, with the
+# pieces of each that must not survive a capture.
+FAIL_CLOSED_ADDRESSES = (
+    pytest.param("用户!@example.com", ("用户!", "用户"), id="cjk-and-bang"),
+    pytest.param("用户😀@example.com", ("用户", "😀"), id="cjk-and-emoji"),
+    pytest.param("用户!a@example.com", ("用户!", "用户"), id="cjk-bang-and-letter"),
+    pytest.param("o'brien@example.com", ("o'", "brien"), id="apostrophe"),
+    pytest.param("patrick.o'brien@example.com", ("patrick", "brien"), id="dotted-apostrophe"),
+    pytest.param("{user}@x.com", ("{user}", "user}"), id="braces"),
+    pytest.param("😀@example.com", ("😀",), id="emoji-only"),
+    # Quoted local parts and domain labels holding symbols or emoji.
+    pytest.param('"用户"@example.com', ('"用户"', "用户"), id="quoted-cjk-local-part"),
+    pytest.param('"john doe"@example.com', ("john doe", "john"), id="quoted-blank"),
+    pytest.param('"a\\"b"@example.com', ('a\\"b', '\\"b'), id="quoted-escaped-quote"),
+    pytest.param("用户@例子😀.com", ("用户", "例子", "😀"), id="emoji-in-a-domain-label"),
+    pytest.param("user@i❤.ws", ("user@", "i❤"), id="symbol-in-a-domain-label"),
+)
+
+
+def _encoded_forms(address: str) -> dict[str, str]:
+    """``address`` plain and percent-encoded as URLs, queries and forms carry it."""
+    return {
+        "plain": address,
+        "utf-8": quote(address, safe=""),
+        "at-sign": address.replace("@", "%40"),
+        "at-sign-twice": address.replace("@", "%2540"),
+    }
+
+
+@pytest.mark.parametrize(("address", "fragments"), FAIL_CLOSED_ADDRESSES)
+def test_policy_text_redacts_fail_closed_local_parts_plain_and_encoded(
+    address: str, fragments: tuple[str, ...]
+) -> None:
+    policy = _policy()
+    for name, form in _encoded_forms(address).items():
+        marker = "<redacted>" if name == "plain" else "%3Credacted%3E"
+        redacted = policy.text(f"No contact with {form} found")
+        assert redacted == f"No contact with {marker} found", name
+        assert policy.text(redacted) == redacted
+        assert policy.holds_email({"message": form}), name
+        assert not policy.holds_email({"message": redacted}), name
+        for fragment in fragments:
+            assert fragment not in unquote(unquote(redacted)), (name, fragment)
+
+
+def test_policy_redacts_the_fully_encoded_quoted_local_part_and_keeps_the_url_shape() -> None:
+    """``%22`` spells the quotes of a quoted local part; the whole component still goes."""
+    policy = _policy()
+    encoded = "%22%E7%94%A8%E6%88%B7%22%40example.com"
+    assert policy.text(encoded) == "%3Credacted%3E"
+    assert policy.holds_email(encoded)
+    assert policy.holds_email({encoded: 1})
+    base = "https://api.hubapi.com/crm/objects/2026-09/contacts"
+    assert policy.url(f"{base}/{encoded}?idProperty=email&q={encoded}&limit=1", "hubspot") == (
+        f"{base}/%3Credacted%3E?idProperty=email&q=%3Credacted%3E&limit=1"
+    )
+    assert policy.form(f"grant_type=refresh_token&login_hint={encoded}") == (
+        "grant_type=refresh_token&login_hint=%3Credacted%3E"
+    )
+    # A JSON string's quotes stay; a quoted string with a blank before the at sign is kept.
+    assert policy.text('{"contact": "user@x.com"}') == '{"contact": "<redacted>"}'
+    assert policy.text('"quoted" @ text') == '"quoted" @ text'
+    assert not policy.holds_email('"quoted" @ text and @property')
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param('"' * 200_000, id="quotes"),
+        pytest.param('"a' * 100_000 + "@x.co", id="quote-letter-pairs"),
+        pytest.param('"' + "a" * 200_000, id="unclosed-quote"),
+        pytest.param('\\"' * 100_000, id="escaped-quotes"),
+        pytest.param('"a"' * 70_000 + "@", id="quoted-strings-and-a-trailing-at"),
+        pytest.param('"' * 200_000 + "%40x.co", id="quotes-before-an-encoded-at"),
+        pytest.param('\\"' * 100_000 + "%40x.co", id="escaped-quotes-before-an-encoded-at"),
+        pytest.param("%22" * 60_000 + "%40x.co", id="encoded-quotes"),
+        # Text without an at sign is never scanned, so these hold one where no quote follows.
+        pytest.param("@" + '"' * 200_000, id="at-and-quotes"),
+        pytest.param("@" + '\\"' * 100_000, id="at-and-escaped-quotes"),
+        pytest.param("@" + 'a\\"' * 70_000, id="at-letters-and-escaped-quotes"),
+    ],
+)
+def test_policy_email_redaction_runs_in_linear_time_on_quotes(text: str) -> None:
+    policy = _policy()
+    policy.text("a@b.c")  # The shared scanner is built once per process, outside the timing.
+    started = time.perf_counter()
+    redacted = policy.text(text)
+    policy.holds_email(redacted)
+    assert time.perf_counter() - started < 1.0
+    assert policy.text(redacted) == redacted
+
+
+def test_policy_text_cuts_an_encoded_address_only_at_a_url_delimiter() -> None:
+    """``=`` delimits a query value, so the URL keeps its shape; the address goes whole."""
+    policy = _policy()
+    assert policy.text("No contact with a=b@x.com found") == "No contact with <redacted> found"
+    assert policy.text("q a%3Db%40x.com") == "q %3Credacted%3E"
+    assert policy.text("a=b%40x.com") == "a=%3Credacted%3E"
+    assert not policy.holds_email("a=%3Credacted%3E")
+
+
+@pytest.mark.parametrize(("address", "fragments"), FAIL_CLOSED_ADDRESSES)
+def test_policy_url_redacts_each_component_and_keeps_the_shape(
+    address: str, fragments: tuple[str, ...]
+) -> None:
+    policy = _policy()
+    base = "https://api.hubapi.com/crm/objects/2026-09/contacts"
+    for name, form in _encoded_forms(address).items():
+        marker = "<redacted>" if name == "plain" else "%3Credacted%3E"
+        redacted = policy.url(f"{base}/{form}?idProperty=email&email={form}&limit=1", "hubspot")
+        assert redacted == f"{base}/{marker}?idProperty=email&email={marker}&limit=1", name
+        assert not policy.holds_email(redacted), name
+        for fragment in fragments:
+            assert fragment not in unquote(unquote(redacted)), (name, fragment)
+    # Secrets and ids are still replaced across the whole URL, even one holding a delimiter.
+    assert (
+        policy.url(f"{base}/1234567890?token={HUBSPOT_TOKEN}&q={address}", "hubspot")
+        == f"{base}/0000000000?token=<redacted>&q=<redacted>"
+    )
+    spanning = _short_policy(hubspot_access_token="sec/ret=1")
+    assert spanning.url(f"{base}/sec/ret=1?email={address}", "hubspot") == (
+        f"{base}/<redacted>?email=<redacted>"
+    )
+
+
+def test_build_captures_refuses_or_redacts_every_fail_closed_address() -> None:
+    policy = _short_policy(hubspot_access_token="abc")
+    addresses = [str(param.values[0]) for param in FAIL_CLOSED_ADDRESSES]
+    echoed = " ; ".join(form for address in addresses for form in _encoded_forms(address).values())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "COMPLETE", "results": [], "message": echoed})
+
+    recorder = cli._RecordingTransport(httpx.MockTransport(handler))
+    objects = "https://api.hubapi.com/crm/objects/2026-09/contacts/batch/read"
+    associations = "https://api.hubapi.com/crm/associations/2026-09/deals/contacts/batch/read"
+
+    async def calls() -> None:
+        async with httpx.AsyncClient(transport=recorder) as http:
+            auth = {"Authorization": "Bearer abc"}
+            # The header name is kept as sent, so the encoded address in it survives redaction.
+            await http.post(
+                objects,
+                json={"inputs": [{"id": "1"}]},
+                headers={**auth, "X-{user}%40x.com": "1"},
+            )
+            await http.post(associations, json={"inputs": [{"id": addresses[0]}]}, headers=auth)
+
+    asyncio.run(calls())
+    run = cli._CaptureRun(source="hubspot", recorder=recorder)
+    documents = cli._build_captures(run, policy)
+    assert set(documents) == {"associations_batch_read"}
+    assert run.failures == ["objects_batch_read: not written: an email address survived redaction"]
+    document = documents["associations_batch_read"]
+    assert document["request"]["body"] == {"inputs": [{"id": "<redacted>"}]}
+    message = document["response"]["body"]["message"]
+    assert set(message.split(" ; ")) == {"<redacted>", "%3Credacted%3E"}
+    assert not policy.holds_email(document)
+    text = unquote(unquote(json.dumps(document, ensure_ascii=False)))
+    for param in FAIL_CLOSED_ADDRESSES:
+        for fragment in param.values[1]:
+            assert fragment not in text, fragment
+
+
+def test_policy_url_and_form_redact_encoded_unicode_addresses() -> None:
+    policy = _policy()
+    address = quote("用户@例子.公司", safe="")
+    url = f"https://api.hubapi.com/crm/objects/2026-09/contacts/{address}?idProperty=email"
+    assert policy.url(url, "hubspot") == (
+        "https://api.hubapi.com/crm/objects/2026-09/contacts/%3Credacted%3E?idProperty=email"
+    )
+    form = f"grant_type=refresh_token&login_hint={quote('jöe.smith@example.com', safe='')}"
+    assert policy.form(form) == "grant_type=refresh_token&login_hint=%3Credacted%3E"
+
+
 def test_policy_value_blanks_people_credentials_and_answers() -> None:
     policy = _policy()
     body = {
@@ -2054,6 +2292,33 @@ def test_policy_value_blanks_people_credentials_and_answers() -> None:
         cli._REQUEST_CREDENTIAL_KEYS | cli._PERSON_KEYS,
     )
     assert request == {"code": "<redacted>", "inputs": [{"id": "<redacted>"}]}
+
+
+def test_policy_value_blanks_every_key_that_names_an_email_address() -> None:
+    """Beyond the exact ``email`` person key, every email key loses its value, numbers too."""
+    policy = _short_policy()
+    body = {
+        "properties": {
+            "work_email": "jane at example dot com",
+            "hs_additional_emails": "a;b",
+            "no_email": 3,
+            "email_sha256": "ab" * 32,
+            "hs_email_optout": False,
+        },
+        "emailAddress": 5551234,
+        "contact": {"E-Mail": ["x", {"v": 1.5}]},
+    }
+    assert policy.value(body, frozenset()) == {
+        "properties": {
+            "work_email": "<redacted>",
+            "hs_additional_emails": "<redacted>",
+            "no_email": 3,
+            "email_sha256": "ab" * 32,
+            "hs_email_optout": False,
+        },
+        "emailAddress": "<redacted>",
+        "contact": {"E-Mail": ["<redacted>", {"v": "<redacted>"}]},
+    }
 
 
 def test_policy_url_headers_and_form() -> None:
@@ -2337,6 +2602,20 @@ def test_policy_finds_a_secret_where_redaction_does_not_reach() -> None:
     assert not _short_policy().holds_secret({**document, "captured_at": "abc"})
 
 
+def test_policy_finds_an_email_where_redaction_does_not_reach() -> None:
+    policy = _short_policy()
+    document = {
+        "surface": "hubspot.properties",
+        "captured_at": "2026-09-01T00:00:00+00:00",
+        "request": {"headers": {"Authorization": "Bearer <redacted>"}, "body": None},
+        "response": {"status": 200, "body": {"labels": ["<redacted>", "%3Credacted%3E", 7]}},
+    }
+    assert not policy.holds_email(document)
+    assert policy.holds_email({**document, "request": {"headers": {"X-用户@例子.公司": "1"}}})
+    assert policy.holds_email({**document, "captured_at": "lead%2540example.com"})
+    assert policy.holds_email({**document, "surface": quote("jöe.smith@example.com")})
+
+
 def test_policy_redacts_the_linkedin_client_id_wherever_it_occurs() -> None:
     # A plain setting rather than a secret value, yet a LinkedIn OAuth credential.
     policy = _short_policy(linkedin_client_id=" LIC-xyz ")
@@ -2384,13 +2663,317 @@ def test_build_captures_leaves_out_a_capture_that_still_holds_a_secret() -> None
     documents = cli._build_captures(run, policy)
     # The surface is decided by its first exchange: the later clean one is not taken instead.
     assert set(documents) == {"associations_batch_read"}
-    assert run.failures == [
-        "objects_batch_read: not written: a configured secret survived redaction"
-    ]
+    assert run.failures == ["objects_batch_read: not written: a secret survived redaction"]
     request = documents["associations_batch_read"]["request"]
     headers = {name.lower(): value for name, value in request["headers"].items()}
     assert headers["authorization"] == "Bearer <redacted>"
     assert request["body"] == {"inputs": [{"id": "<redacted>"}]}
+
+
+def test_build_captures_leaves_out_a_capture_that_still_holds_an_email() -> None:
+    policy = _short_policy(hubspot_access_token="abc")
+    echoed = "No contact with email 用户@例子.公司 or " + quote("jöe.smith@example.com", safe="")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "COMPLETE", "results": [], "message": echoed})
+
+    recorder = cli._RecordingTransport(httpx.MockTransport(handler))
+    objects = "https://api.hubapi.com/crm/objects/2026-09/contacts/batch/read"
+    associations = "https://api.hubapi.com/crm/associations/2026-09/deals/contacts/batch/read"
+
+    async def calls() -> None:
+        async with httpx.AsyncClient(transport=recorder) as http:
+            auth = {"Authorization": "Bearer abc"}
+            # The header name is kept as sent, so the address in it survives redaction.
+            await http.post(
+                objects, json={"inputs": [{"id": "1"}]}, headers={**auth, "X-lead@example.com": "1"}
+            )
+            await http.post(associations, json={"inputs": [{"id": "用户@例子.公司"}]}, headers=auth)
+
+    asyncio.run(calls())
+    run = cli._CaptureRun(source="hubspot", recorder=recorder)
+    documents = cli._build_captures(run, policy)
+    assert set(documents) == {"associations_batch_read"}
+    assert run.failures == ["objects_batch_read: not written: an email address survived redaction"]
+    document = documents["associations_batch_read"]
+    assert document["request"]["body"] == {"inputs": [{"id": "<redacted>"}]}
+    assert document["response"]["body"]["message"] == (
+        "No contact with email <redacted> or %3Credacted%3E"
+    )
+    text = json.dumps(document, ensure_ascii=False)
+    for fragment in ("用户", "例子", "jö", "smith", "%C3%B6"):
+        assert fragment not in text
+
+
+def test_redact_capture_leaves_no_address_in_any_script_or_encoding() -> None:
+    policy = _short_policy()
+    twice = quote(quote("用户@例子.公司", safe=""), safe="")
+    capture: dict[str, Any] = {
+        "surface": "hubspot.crm_search",
+        "captured_at": "2026-09-01T00:00:00+00:00",
+        "request": {
+            "method": "POST",
+            "url": f"https://api.hubapi.com/crm/objects/2026-09/contacts/search?after={twice}",
+            "headers": {"Content-Type": "application/json", "X-Lookup": "jöe.smith@example.com"},
+            "body": {
+                "filterGroups": [
+                    {
+                        "filters": [
+                            {"propertyName": "email", "operator": "EQ", "value": "用户@例子.公司"}
+                        ]
+                    }
+                ]
+            },
+        },
+        "response": {
+            "status": 200,
+            "body": {
+                "results": [
+                    {
+                        "id": "1",
+                        "properties": {
+                            "work_email": "josé@example.com",
+                            "notes": "reply to " + quote("jöe.smith@example.com", safe=""),
+                        },
+                    }
+                ],
+                "message": "No contact with email राम@उदाहरण.भारत",
+            },
+        },
+    }
+    redacted = cli._redact_capture(capture, policy, "hubspot")
+    assert redacted["request"]["url"] == (
+        "https://api.hubapi.com/crm/objects/2026-09/contacts/search?after=%3Credacted%3E"
+    )
+    assert redacted["request"]["headers"]["X-Lookup"] == "<redacted>"
+    filters = redacted["request"]["body"]["filterGroups"][0]["filters"]
+    assert filters == [{"propertyName": "email", "operator": "EQ", "value": "<redacted>"}]
+    properties = redacted["response"]["body"]["results"][0]["properties"]
+    assert properties == {"work_email": "<redacted>", "notes": "reply to %3Credacted%3E"}
+    assert redacted["response"]["body"]["message"] == "No contact with email <redacted>"
+    assert not policy.holds_email(redacted)
+    text = json.dumps(redacted, ensure_ascii=False)
+    for fragment in ("用户", "例子", "jö", "smith", "josé", "राम", "%25E7", "%C3%B6"):
+        assert fragment not in text
+
+
+# Credentials only a capture run knows: the access token the LinkedIn token exchange issues and
+# the refresh token it rotates to. No setting holds either.
+ISSUED_TOKEN = "issued-sentinel"
+ROTATED_REFRESH = "rotated-sentinel"
+TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+AD_ACCOUNT_URL = "https://api.linkedin.com/rest/adAccounts/512345678"
+
+
+def _escaped(text: str) -> str:
+    """``text`` with every byte percent-encoded, so no plain-text match can find it."""
+    return "".join(f"%{byte:02X}" for byte in text.encode())
+
+
+def _issuing_exchange(
+    handler: Callable[[httpx.Request], httpx.Response], headers: dict[str, str] | None = None
+) -> Any:
+    """Record a LinkedIn token exchange and one ad account read, each answered by ``handler``.
+
+    The exchange sends the configured trio; the read sends the issued token as its Bearer,
+    with ``headers`` besides.
+    """
+    recorder = cli._RecordingTransport(httpx.MockTransport(handler))
+
+    async def calls() -> None:
+        async with httpx.AsyncClient(transport=recorder) as http:
+            await http.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": LINKEDIN_REFRESH,
+                    "client_id": LINKEDIN_CLIENT_ID,
+                    "client_secret": LINKEDIN_CLIENT_SECRET,
+                },
+            )
+            bearer = {"Authorization": f"Bearer {ISSUED_TOKEN}"}
+            await http.get(AD_ACCOUNT_URL, headers={**bearer, **(headers or {})})
+
+    asyncio.run(calls())
+    return cli._CaptureRun(source="linkedin", recorder=recorder)
+
+
+def test_run_credentials_reads_every_credential_the_run_sent_or_was_issued() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "www.linkedin.com":
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": f" {ISSUED_TOKEN} ",
+                    "expires_in": 3600,
+                    "refresh_token": ROTATED_REFRESH,
+                    "id_token": "id-sentinel",
+                    "scope": "r_ads",
+                },
+            )
+        # A failed call is read too; its blank token and its error `code` are not credentials.
+        return httpx.Response(401, json={"code": "EXPIRED_TOKEN", "access_token": " "})
+
+    recorder = cli._RecordingTransport(httpx.MockTransport(handler))
+
+    async def calls() -> None:
+        async with httpx.AsyncClient(transport=recorder) as http:
+            await http.post(
+                TOKEN_URL,
+                data={"grant_type": "refresh_token", "refresh_token": "form-sentinel"},
+            )
+            await http.get(
+                f"{AD_ACCOUNT_URL}?q=x&access_token=query%2Fsentinel",
+                headers={"Authorization": f"Bearer  {ISSUED_TOKEN}"},
+            )
+            await http.post(
+                "https://api.hubapi.com/crm/objects/2026-09/contacts/search",
+                json={
+                    "query": "plain",
+                    "code": "code-sentinel",
+                    "nested": [{"client_secret": ["list-sentinel", 4242, True, None]}],
+                },
+                headers={"Authorization": "bare-sentinel", "X-Webhook-Token": " header-sentinel"},
+            )
+
+    asyncio.run(calls())
+    row = cli._Exchange(
+        method="POST",
+        url=WEBHOOK_URL,
+        headers=(("Authorization", "Bearer row-sentinel"),),
+        body=b"",
+        status=200,
+        content=b"{}",
+        captured_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    run = cli._CaptureRun(source="linkedin", recorder=recorder, rows=[("row_customer", row)])
+    assert cli._run_credentials(run, frozenset({"authorization", "x-webhook-token"})) == {
+        ISSUED_TOKEN,
+        ROTATED_REFRESH,
+        "id-sentinel",
+        "form-sentinel",
+        "query/sentinel",
+        "code-sentinel",
+        "list-sentinel",
+        "4242",
+        "bare-sentinel",
+        "header-sentinel",
+        "row-sentinel",
+    }
+
+
+def test_build_captures_redacts_every_copy_of_an_issued_or_rotated_token() -> None:
+    # The finding's bypass: the provider accepts a token response repeating its token in `scope`.
+    token_body = {
+        "access_token": ISSUED_TOKEN,
+        "expires_in": 3600,
+        "refresh_token": ROTATED_REFRESH,
+        "scope": ISSUED_TOKEN,
+    }
+    account_body = {
+        "id": 512345678,
+        "name": f"echo {ISSUED_TOKEN} and {ROTATED_REFRESH}",
+        ISSUED_TOKEN: {ROTATED_REFRESH: 1},
+        "reference": f"q=1&t={_escaped(ISSUED_TOKEN)}&r={_escaped(ROTATED_REFRESH)}",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=token_body if request.method == "POST" else account_body)
+
+    run = _issuing_exchange(handler)
+    # No setting holds the issued or rotated token: only the recorded run does.
+    policy = _short_policy(linkedin_refresh_token=LINKEDIN_REFRESH)
+    documents = cli._build_captures(run, policy)
+    assert run.failures == []
+    assert set(documents) == {"access_token", "ad_account"}
+    assert documents["access_token"]["response"]["body"] == {
+        "access_token": "<redacted>",
+        "expires_in": 3600,
+        "refresh_token": "<redacted>",
+        "scope": "<redacted>",
+    }
+    account = documents["ad_account"]
+    assert account["response"]["body"] == {
+        "id": 512345678,
+        "name": "echo <redacted> and <redacted>",
+        "<redacted>": {"<redacted>": 1},
+        "reference": "q=1&t=%3Credacted%3E&r=%3Credacted%3E",
+    }
+    headers = {name.lower(): value for name, value in account["request"]["headers"].items()}
+    assert headers["authorization"] == "Bearer <redacted>"
+    text = json.dumps(documents)
+    for token in (ISSUED_TOKEN, ROTATED_REFRESH):
+        assert token not in _fully_decoded(text)
+    # The policy passed in is left as it was; the run's credentials extend a copy of it.
+    assert LINKEDIN_REFRESH in policy.secrets
+    assert not {ISSUED_TOKEN, ROTATED_REFRESH, LINKEDIN_CLIENT_SECRET} & set(policy.secrets)
+
+
+def test_build_captures_redacts_a_bearer_credential_a_later_body_echoes() -> None:
+    properties = "https://api.hubapi.com/crm/properties/2026-09/contacts/lifecyclestage"
+    objects = "https://api.hubapi.com/crm/objects/2026-09/contacts/batch/read"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch/read"):
+            return httpx.Response(401, json={"status": "error", "message": "expired"})
+        body = {
+            "name": "lifecyclestage",
+            "description": f"credentials bearer-sentinel and {failed} accepted",
+            "options": [{"label": "bearer-sentinel", "value": "lead"}],
+            "displayOrder": int(failed),
+        }
+        return httpx.Response(200, json=body)
+
+    recorder = cli._RecordingTransport(httpx.MockTransport(handler))
+    # A digits-only credential, which a body can echo as a JSON number.
+    failed = "8675309123"
+
+    async def calls() -> None:
+        async with httpx.AsyncClient(transport=recorder) as http:
+            # A refused call's Bearer is collected too, though that call is never captured.
+            await http.post(
+                objects,
+                json={"inputs": [{"id": "1"}]},
+                headers={"Authorization": f"Bearer {failed}"},
+            )
+            await http.get(properties, headers={"Authorization": "Bearer bearer-sentinel"})
+
+    asyncio.run(calls())
+    run = cli._CaptureRun(source="hubspot", recorder=recorder)
+    documents = cli._build_captures(run, _short_policy())
+    assert run.failures == []
+    assert set(documents) == {"properties"}
+    assert documents["properties"]["response"]["body"] == {
+        "name": "lifecyclestage",
+        "description": "credentials <redacted> and <redacted> accepted",
+        "options": [{"label": "<redacted>", "value": "lead"}],
+        "displayOrder": "<redacted>",
+    }
+    text = json.dumps(documents)
+    assert "sentinel" not in text
+    assert failed not in text
+
+
+def test_build_captures_leaves_out_a_capture_that_still_holds_an_issued_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": ISSUED_TOKEN,
+                    "expires_in": 3600,
+                    "refresh_token": ROTATED_REFRESH,
+                },
+            )
+        return httpx.Response(200, json={"id": 512345678, "name": "Account"})
+
+    # The read's header name, kept as sent, holds the rotated refresh token.
+    run = _issuing_exchange(handler, {f"X-{ROTATED_REFRESH}": "1"})
+    documents = cli._build_captures(run, _short_policy())
+    assert set(documents) == {"access_token"}
+    assert run.failures == ["ad_account: not written: a secret survived redaction"]
+    for failure in run.failures:
+        assert "sentinel" not in failure
 
 
 def _embed_short_secret(
@@ -2461,15 +3044,102 @@ def test_capture_fails_closed_when_a_secret_survives_redaction(
     assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["hubspot"] - {
         "properties"
     }
-    assert (
-        "capture-fixtures hubspot: properties: not written: a configured secret survived "
-        "redaction" in err
-    )
+    assert "capture-fixtures hubspot: properties: not written: a secret survived redaction" in err
     captured = capture_dir / "tests" / "contracts" / "hubspot" / "captured"
     assert not (captured / "properties.json").exists()
     for path in captured.iterdir():
         assert SHORT_SECRET not in path.read_text(encoding="utf-8"), path
     assert SHORT_SECRET not in out + err
+
+
+def _issuing_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve the CLI from the simulator, with a token exchange whose credentials recur.
+
+    The exchange issues :data:`ISSUED_TOKEN`, repeats it in ``scope`` (the token provider
+    accepts that) and rotates the refresh token to :data:`ROTATED_REFRESH`. Each later ad
+    account response echoes both in its ``name``, and carries the issued token as a
+    ``referenceInfo`` key whose value is the rotated one percent-encoded.
+    """
+    from ads_engine.simulation.payloads import identify_surface
+
+    settings = get_settings()
+    inner = mock_transport("linkedin", _capture_world(settings), settings=settings)
+    token_body = {
+        "access_token": ISSUED_TOKEN,
+        "expires_in": 3600,
+        "refresh_token": ROTATED_REFRESH,
+        "scope": ISSUED_TOKEN,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        surface = identify_surface("linkedin", request)
+        if surface == "access_token":
+            return httpx.Response(200, json=token_body)
+        response = await inner.handle_async_request(request)
+        if surface != "ad_account" or response.status_code != 200:
+            return response
+        body = json.loads(await response.aread())
+        body["name"] = f"echo {ISSUED_TOKEN} and {ROTATED_REFRESH}"
+        body["referenceInfo"] = {ISSUED_TOKEN: _escaped(ROTATED_REFRESH)}
+        return httpx.Response(response.status_code, json=body)
+
+    _live(monkeypatch, httpx.MockTransport(handler))
+
+
+def test_capture_writes_no_issued_or_rotated_token(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _issuing_live(monkeypatch)
+    code = cli.main(["capture-fixtures", "--source", "linkedin"])
+    out, err = capsys.readouterr()
+    assert code == cli.EXIT_OK, err[-2000:]
+    paths = _written(out)
+    assert {Path(path).stem for path in paths} == EXPECTED_SURFACES["linkedin"]
+    for path in paths:
+        text = _fully_decoded((capture_dir / path).read_text(encoding="utf-8"))
+        for token in (ISSUED_TOKEN, ROTATED_REFRESH):
+            assert token not in text, (path, token)
+    documents = _captured_documents(capture_dir, "linkedin")
+    assert documents["access_token"]["response"]["body"] == {
+        "access_token": "<redacted>",
+        "expires_in": 3600,
+        "refresh_token": "<redacted>",
+        "scope": "<redacted>",
+    }
+    account = documents["ad_account"]["response"]["body"]
+    assert account["name"] == "echo <redacted> and <redacted>"
+    assert account["referenceInfo"] == {"<redacted>": "%3Credacted%3E"}
+    assert "sentinel" not in _fully_decoded(out + err)
+
+
+def test_capture_fails_closed_when_an_issued_token_survives_redaction(
+    capture_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _issuing_live(monkeypatch)
+    redact_capture = cli._redact_capture
+
+    def leaky(capture: dict[str, Any], policy: Any, source: Any) -> dict[str, Any]:
+        """Redact as usual, then let the issued token through where redaction does not reach."""
+        document = redact_capture(capture, policy, source)
+        if document["surface"] == "linkedin.ad_account":
+            document["captured_at"] = f"{document['captured_at']} {ISSUED_TOKEN}"
+        return document
+
+    monkeypatch.setattr(cli, "_redact_capture", leaky)
+    assert cli.main(["capture-fixtures", "--source", "linkedin"]) == cli.EXIT_FAILURE
+    out, err = capsys.readouterr()
+    assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["linkedin"] - {
+        "ad_account"
+    }
+    assert _cli_errors(err) == [
+        "ads-engine: capture-fixtures linkedin: ad_account: not written: a secret survived "
+        "redaction"
+    ]
+    captured = capture_dir / "tests" / "contracts" / "linkedin" / "captured"
+    assert not (captured / "ad_account.json").exists()
+    for path in captured.iterdir():
+        assert "sentinel" not in _fully_decoded(path.read_text(encoding="utf-8")), path
+    assert "sentinel" not in _fully_decoded(out + err)
 
 
 @pytest.mark.parametrize(
@@ -2533,10 +3203,7 @@ def test_capture_fails_closed_on_a_short_secret_encoded_more_than_once(
     assert {Path(path).stem for path in _written(out)} == EXPECTED_SURFACES["hubspot"] - {
         "properties"
     }
-    assert (
-        "capture-fixtures hubspot: properties: not written: a configured secret survived "
-        "redaction" in err
-    )
+    assert "capture-fixtures hubspot: properties: not written: a secret survived redaction" in err
     captured = capture_dir / "tests" / "contracts" / "hubspot" / "captured"
     assert not (captured / "properties.json").exists()
     for path in captured.iterdir():
@@ -2735,7 +3402,8 @@ def test_capture_writes_every_surface_redacted(
         assert document["captured_at"].endswith("+00:00")
         assert text == json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         validate_capture(document, root=capture_dir / "tests" / "contracts")
-        assert cli.EMAIL_RE.search(text) is None, path
+        assert cli.email_spans(text) == [], path
+        assert not cli._holds_email(text), path
         for secret in leaks:
             assert secret not in text, (path, secret)
         headers = {name.lower(): value for name, value in document["request"]["headers"].items()}
@@ -3834,6 +4502,97 @@ def test_capture_refuses_a_redirected_output_directory_before_any_request(
     assert error.endswith("; nothing was sent")
     assert calls == []
     assert sorted(outside.rglob("*")) == before
+
+
+def _open_descriptor_count() -> int:
+    """How many file descriptors this process holds open, from Linux ``/proc``."""
+    return len(os.listdir("/proc/self/fd"))
+
+
+def _tree_state(directory: Path) -> dict[str, bytes | None]:
+    """Every entry under ``directory`` by relative path: a file's bytes, ``None`` otherwise."""
+    return {
+        str(path.relative_to(directory)): path.read_bytes() if path.is_file() else None
+        for path in sorted(directory.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("link", ["tests", "tests/contracts"])
+def test_capture_refuses_a_symbolic_link_above_the_source_directory_before_any_request(
+    capture_dir: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    link: str,
+) -> None:
+    """A link at an ancestor of ``{source}`` would carry every later write out of the tree.
+
+    The link's target elsewhere holds a complete ``contracts/google/captured/`` layout, so
+    only the refusal to follow the link keeps the capture out of it.
+    """
+    linked = capture_dir / link
+    outside = tmp_path_factory.mktemp("elsewhere") / linked.name
+    linked.rename(outside)
+    linked.symlink_to(outside, target_is_directory=True)
+    assert (capture_dir / "tests" / "contracts" / "google" / "captured").is_dir()
+    before = _tree_state(outside)
+    calls: list[httpx.Request] = []
+    _live(monkeypatch, _counting_transport(calls))
+    assert cli.main(["capture-fixtures", "--source", "google"]) == cli.EXIT_FAILURE
+    out, err = capsys.readouterr()
+    assert out == ""
+    (error,) = _cli_errors(err)
+    assert error.endswith(
+        f"capture-fixtures google: {link} is a symbolic link; captures are written only into "
+        "a real directory; nothing was sent"
+    )
+    assert calls == []
+    descriptors = _open_descriptor_count()
+    with pytest.raises(cli._OutputRefusedError, match=f"^{link} is a symbolic link"):
+        _open_output(capture_dir, "google")
+    assert _open_descriptor_count() == descriptors
+    assert _tree_state(outside) == before
+
+
+@pytest.mark.parametrize("how", ["elsewhere", "parent_component"])
+def test_the_output_directory_must_lie_under_the_working_directory(
+    capture_dir: Path, tmp_path_factory: pytest.TempPathFactory, how: str
+) -> None:
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    shutil.copytree(capture_dir / "tests", elsewhere / "tests")
+    shutil.rmtree(elsewhere / "tests" / "contracts" / "google" / "captured")
+    before = _tree_state(elsewhere)
+    if how == "elsewhere":
+        root = elsewhere / "tests" / "contracts"
+    else:
+        # Lexically under the working directory, but `..` climbs out of it.
+        climb = elsewhere.relative_to(capture_dir, walk_up=True)
+        root = capture_dir / climb / "tests" / "contracts"
+        assert root.is_relative_to(capture_dir)
+    descriptors = _open_descriptor_count()
+    with pytest.raises(cli._OutputRefusedError, match="is not under the working directory"):
+        cli._CaptureOutput.open(root, "google")
+    assert _open_descriptor_count() == descriptors
+    assert _tree_state(elsewhere) == before
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute_root", "relative_root"])
+def test_the_output_directory_is_written_through_real_directories(
+    capture_dir: Path, relative: bool
+) -> None:
+    captured = _captured(capture_dir, "google")
+    root = Path("tests", "contracts") if relative else capture_dir / "tests" / "contracts"
+    document: Any = {"surface": "google.search", "request": {}, "response": {}}
+    descriptors = _open_descriptor_count()
+    output = cli._CaptureOutput.open(root, "google")
+    try:
+        (written,) = cli._write_captures(output, {"search": document})
+    finally:
+        output.close()
+    assert _open_descriptor_count() == descriptors
+    assert cli._display_path(written) == "tests/contracts/google/captured/search.json"
+    assert (captured / "search.json").read_text(encoding="utf-8") == canonical_json(document)
+    assert sorted(path.name for path in captured.iterdir()) == [".gitkeep", "search.json"]
 
 
 @pytest.mark.parametrize(

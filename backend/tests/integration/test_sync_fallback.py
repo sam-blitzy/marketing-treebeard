@@ -2663,6 +2663,121 @@ async def test_query_defect_fails_job_without_retry(rig: Rig) -> None:
         )
 
 
+UNICODE_ECHO: Final = "No contact with email 用户@例子.公司 or jöe.smith@example.com found"
+"""Platform error prose echoing two synthetic addresses: one in CJK script, one mixed-script."""
+
+UNICODE_ECHO_FRAGMENTS: Final = ("用户", "例子", "公司", "jö", "smith")
+"""Pieces of :data:`UNICODE_ECHO`'s addresses; none may reach a stored reason or a log."""
+
+UNICODE_ECHOES: Final = (
+    pytest.param(UNICODE_ECHO, UNICODE_ECHO_FRAGMENTS, id="cjk-and-mixed-script"),
+    pytest.param(
+        "No contact with email 用户!@example.com found", ("用户!", "用户"), id="cjk-and-bang"
+    ),
+    pytest.param(
+        "No contact with email 用户😀@example.com found", ("用户", "😀"), id="cjk-and-emoji"
+    ),
+    pytest.param(
+        "No contact with email 用户!a@example.com found", ("用户!", "用户"), id="cjk-bang-letter"
+    ),
+    pytest.param(
+        'No contact with email "用户"@example.com found',
+        ('"用户"', "用户", "example.com"),
+        id="quoted-local-part",
+    ),
+    pytest.param(
+        "No contact with email 用户@例子😀.com found",
+        ("用户", "例子😀", "例子", "😀"),
+        id="emoji-domain-label",
+    ),
+)
+"""Echoes whose addresses hold letters in any script, ``atext`` specials, emoji, a quoted
+local part or a domain label with an emoji, each with the pieces of its address that may
+reach no stored reason or log."""
+
+
+@pytest.mark.parametrize(("echo", "fragments"), UNICODE_ECHOES)
+@pytest.mark.parametrize(
+    ("source", "fault", "disposition"),
+    [
+        pytest.param(
+            "linkedin",
+            Fault("linkedin", "ad_analytics", "http_status", status=503, message=UNICODE_ECHO),
+            "stale",
+            id="linkedin-transient",
+        ),
+        pytest.param(
+            "google",
+            Fault(
+                "google",
+                "search",
+                "http_status",
+                status=400,
+                message=UNICODE_ECHO,
+                match={"query_id": "Q-G3"},
+            ),
+            "defect",
+            id="google-defect",
+        ),
+    ],
+)
+async def test_a_failure_echoing_unicode_emails_stores_and_logs_no_address(
+    rig: Rig,
+    source: Source,
+    fault: Fault,
+    disposition: str,
+    echo: str,
+    fragments: tuple[str, ...],
+) -> None:
+    """Transient and defects: error prose that echoes an address in any script reaches no sink.
+
+    AAP 0.3.2 (lead emails persisted only as SHA-256 hashes) and 0.11.1 (logs never contain
+    emails): the platform's error message names synthetic addresses in CJK and mixed script,
+    with ``atext`` specials or emoji in their local parts, with a quoted local part and with
+    an emoji in a domain label. The failure is classified and recorded as usual (stale, or a
+    defect), yet the job result, ``sync_run.error``, ``dataset_freshness.reason``,
+    ``source_connection.reason`` and every structured log event of the run carry
+    ``[REDACTED_EMAIL]`` in their place and no piece of any address, such as the ``用户!``
+    before a ``!a@example.com`` a narrower scanner would have cut off.
+    """
+    dataset_id = await (_live_linkedin(rig) if source == "linkedin" else _live_google(rig))
+    failing = rig.live(source, rig.world(faults=(dataclasses.replace(fault, message=echo),)))
+
+    with capture_logs() as logs:
+        report = await jobs.run_source_jobs(
+            source,
+            trigger="manual",
+            jobs=[jobs.JOB_METRICS],
+            controller=rig.controller({source: failing}, at=T1),
+        )
+
+    (result,) = report.results
+    assert (result.status, result.disposition) == ("failed", disposition)
+    connection = await rig.connection(source)
+    runs = await rig.all(SyncRun, SyncRun.source == source, SyncRun.started_at == T1)
+    attempts = await rig.all(
+        DatasetFreshness,
+        DatasetFreshness.dataset_id == dataset_id,
+        DatasetFreshness.last_attempt_at == T1,
+    )
+    run_errors = [run.error for run in runs if run.error is not None]
+    freshness_reasons = [row.reason for row in attempts if row.reason is not None]
+    assert result.error is not None
+    assert connection.reason is not None
+    assert run_errors, "the failed job recorded its sync_run rows"
+    if disposition == "stale":
+        assert freshness_reasons, "the interrupted datasets recorded the failure"
+    for stored in (result.error, connection.reason, *run_errors, *freshness_reasons):
+        assert "[REDACTED_EMAIL]" in stored, stored
+        for fragment in fragments:
+            assert fragment not in stored, (fragment, stored)
+    classified = [entry for entry in logs if entry.get("event") == "sync.classification"]
+    assert classified, "the failure was classified and logged"
+    rendered = repr(logs)
+    for fragment in fragments:
+        assert fragment not in rendered, fragment
+
+
 @pytest.mark.parametrize(
     ("source", "job", "fault"),
     [

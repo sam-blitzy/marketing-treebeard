@@ -65,6 +65,7 @@ from ads_engine.connectors.http import (
     JsonResponse,
     RetryPolicy,
     _failed_with,
+    _scrub_text,
     build_client,
     redact_url,
     send_json,
@@ -457,7 +458,7 @@ def test_google_urls_keep_only_scheme_and_host(url: str, expected: str) -> None:
             "https://www.linkedin.com/oauth/v2/accessToken"
             "?grant_type=refresh_token&refresh_token=abc&client_id=id&client_secret=xyz",
             "/oauth/v2/accessToken?grant_type=refresh_token"
-            f"&refresh_token={REDACTED}&client_id=id&client_secret={REDACTED}",
+            f"&refresh_token={REDACTED}&client_id={REDACTED}&client_secret={REDACTED}",
         ),
         (
             "linkedin",
@@ -518,6 +519,10 @@ def test_credential_query_values_are_redacted(source: Source, url: str, expected
         "hApIkEy",
         "CLIENT_SECRET",
         "ClIeNt_SeCrEt",
+        "CLIENT_ID",
+        "ClIeNt_Id",
+        "clientId",
+        "client-id",
         "CoDe",
         "ToKeN",
         "X_API_KEY",
@@ -548,6 +553,8 @@ def test_credential_query_keys_are_matched_in_any_letter_case(source: Source, ke
         "rEfReShToKeN",
         "clientsecret",
         "CLIENTSECRET",
+        "clientid",
+        "CLIENTID",
         "apikey",
         "XAPIKEY",
         "idtoken",
@@ -623,6 +630,107 @@ def test_percent_encoded_and_plain_emails_are_redacted(url: str, expected: str) 
     redacted = redact_url(httpx.URL(url), source="hubspot")
     assert redacted == expected
     assert "lead" not in redacted
+
+
+# Synthetic addresses in other scripts, with the fragments of each that must not survive.
+UNICODE_ADDRESSES: Mapping[str, tuple[str, ...]] = {
+    "用户@例子.公司": ("用户", "例子"),
+    "lead@例子.公司": ("lead", "例子"),
+    "jöe.smith@example.com": ("jö", "smith"),
+    "josé@example.com": ("jos", "example"),
+    "jo\u0301se@example.com": ("jo", "example"),
+}
+
+
+@pytest.mark.parametrize("address", sorted(UNICODE_ADDRESSES))
+@pytest.mark.parametrize("layers", [0, 1, 2, 3], ids=["plain", "encoded", "twice", "thrice"])
+def test_unicode_and_multiply_encoded_emails_are_redacted(address: str, layers: int) -> None:
+    encoded = address
+    for _layer in range(layers):
+        encoded = quote(encoded, safe="")
+    url = f"https://api.hubapi.com/crm/objects/2026-09/contacts/{encoded}?email={encoded}&limit=1"
+    redacted = redact_url(httpx.URL(url), source="hubspot")
+    assert redacted == (
+        f"/crm/objects/2026-09/contacts/{REDACTED_EMAIL}?email={REDACTED_EMAIL}&limit=1"
+    )
+    for fragment in UNICODE_ADDRESSES[address]:
+        assert fragment not in unquote(unquote(unquote(redacted)))
+
+
+# Addresses whose local parts hold RFC 5322 `atext` specials, symbols or emoji, with the
+# fragments of each that must not survive.
+FAIL_CLOSED_ADDRESSES: Mapping[str, tuple[str, ...]] = {
+    "用户!@example.com": ("用户!", "用户"),
+    "用户😀@example.com": ("用户", "😀"),
+    "用户!a@example.com": ("用户!", "用户"),
+    "o'brien@example.com": ("o'", "brien"),
+    "patrick.o'brien@example.com": ("patrick", "brien"),
+    "a=b@x.com": ("a=b", "a="),
+    "{user}@x.com": ("{user}", "user}"),
+    "😀@example.com": ("😀",),
+    # Quoted local parts and domain labels holding symbols or emoji.
+    '"用户"@example.com': ('"用户"', "用户"),
+    '"john doe"@example.com': ("john doe", "john"),
+    '"a\\"b"@example.com': ('a\\"b', '\\"b'),
+    "用户@例子😀.com": ("用户", "例子", "😀"),
+    "user@i❤.ws": ("user@", "i❤"),
+}
+
+
+@pytest.mark.parametrize("address", sorted(FAIL_CLOSED_ADDRESSES))
+@pytest.mark.parametrize("spelling", ["plain", "utf-8", "utf-8-twice", "at-sign", "at-sign-twice"])
+def test_fail_closed_local_parts_are_redacted_per_component(address: str, spelling: str) -> None:
+    """Each path segment and query value loses its address whole and keeps its place."""
+    encoded = {
+        "plain": address,
+        "utf-8": quote(address, safe=""),
+        "utf-8-twice": quote(quote(address, safe=""), safe=""),
+        "at-sign": address.replace("@", "%40"),
+        "at-sign-twice": address.replace("@", "%2540"),
+    }[spelling]
+    url = f"https://api.hubapi.com/crm/objects/2026-09/contacts/{encoded}?email={encoded}&limit=1"
+    redacted = redact_url(httpx.URL(url), source="hubspot")
+    assert redacted == (
+        f"/crm/objects/2026-09/contacts/{REDACTED_EMAIL}?email={REDACTED_EMAIL}&limit=1"
+    )
+    for fragment in FAIL_CLOSED_ADDRESSES[address]:
+        assert fragment not in unquote(unquote(unquote(redacted))), fragment
+
+
+def test_a_component_encoded_beyond_the_decode_limit_is_redacted_whole() -> None:
+    deep = LEAD_EMAIL
+    for _layer in range(5):
+        deep = quote(deep, safe="")
+    url = httpx.URL(f"https://api.hubapi.com/crm/x/{deep}?email={deep}&limit=1")
+    assert redact_url(url, source="hubspot") == f"/crm/x/{REDACTED}?email={REDACTED}&limit=1"
+
+
+def test_scrub_text_redacts_addresses_in_any_script() -> None:
+    text = "No contact 用户@例子.公司, jöe.smith@example.com or lead@example.com"
+    assert _scrub_text(text, ()) == (
+        f"No contact {REDACTED_EMAIL}, {REDACTED_EMAIL} or {REDACTED_EMAIL}"
+    )
+    # A secret inside an address takes the whole address with it.
+    assert _scrub_text("for jöe2024@example.com", ("2024",)) == f"for {REDACTED}"
+    # Quoted local parts and domain labels holding symbols or emoji go whole too.
+    text = 'No contact "用户"@example.com, "john doe"@例子😀.com or user@i❤.ws'
+    assert _scrub_text(text, ()) == (
+        f"No contact {REDACTED_EMAIL}, {REDACTED_EMAIL} or {REDACTED_EMAIL}"
+    )
+    assert _scrub_text('for "jöe2024"@example.com', ("2024",)) == f"for {REDACTED}"
+
+
+async def test_logged_urls_carry_no_unicode_email(captured: list[EventDict]) -> None:
+    encoded = quote("用户@例子.公司", safe="")
+    harness = Harness(_json(200, {"results": []}))
+    async with build_client("hubspot", harness.transport(), settings=Settings()) as client:
+        response = await client.get(f"/crm/objects/2026-09/contacts/{encoded}?idProperty=email")
+    assert response.status_code == 200
+    expected_url = f"/crm/objects/2026-09/contacts/{REDACTED_EMAIL}?idProperty=email"
+    for event in ("http.request", "http.response"):
+        (logged,) = _events(captured, event)
+        assert logged["url"] == expected_url
+    _assert_logs_exclude(captured, encoded, "用户", "例子", "%E7%94%A8")
 
 
 def test_configured_secrets_are_redacted_from_path_and_query() -> None:
@@ -745,6 +853,18 @@ async def test_hubspot_logs_strip_configured_secrets_longest_first(
     (logged_request,) = _events(captured, "http.request")
     assert logged_request["url"] == f"/crm/{REDACTED}/{REDACTED}/{REDACTED}?properties={REDACTED}"
     _assert_logs_exclude(captured, HUBSPOT_TOKEN, "extended", "short")
+
+
+async def test_linkedin_logs_strip_the_configured_client_id(captured: list[EventDict]) -> None:
+    # LINKEDIN_CLIENT_ID is a plain setting rather than a SecretStr, yet an OAuth credential:
+    # a logged URL carrying it in a path segment or an ordinary query value loses it too.
+    client_id = "test-configured-client-id"
+    settings = Settings(linkedin_client_id=f"  {client_id} ")
+    target = f"adAccounts/{client_id}?q=search&note={client_id}"
+    await _send_one("linkedin", target, settings=settings)
+    (logged_request,) = _events(captured, "http.request")
+    assert logged_request["url"] == f"/rest/adAccounts/{REDACTED}?q=search&note={REDACTED}"
+    _assert_logs_exclude(captured, client_id)
 
 
 async def test_configured_secrets_are_stripped_in_one_pass(captured: list[EventDict]) -> None:
@@ -2290,7 +2410,7 @@ async def test_the_tokens_of_every_attempt_stay_held_through_the_retries(
                 },
             ),
             f"grant {FORM_REFRESH_TOKEN} of {FORM_CLIENT_ID} with {FORM_CLIENT_SECRET} refused",
-            f"grant {REDACTED} of {FORM_CLIENT_ID} with {REDACTED} refused",
+            f"grant {REDACTED} of {REDACTED} with {REDACTED} refused",
             id="form-body-fields",
         ),
         pytest.param(
@@ -2331,6 +2451,7 @@ async def test_credentials_a_request_carries_are_held_wherever_they_travel(
         denial,
         captured,
         FORM_REFRESH_TOKEN,
+        FORM_CLIENT_ID,
         FORM_CLIENT_SECRET,
         QUERY_CREDENTIAL,
         HEADER_CREDENTIAL,

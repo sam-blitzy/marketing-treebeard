@@ -6,10 +6,15 @@ third-party standard-library loggers (``uvicorn``, ``uvicorn.access``, ``sqlalch
 ``alembic``, ``httpx``) are written as one JSON object per line, and every line passes
 through the same redaction before it is rendered:
 
-* values under sensitive keys (``Authorization``, cookies, passwords, tokens, client
-  secrets, the n8n secret header, and the configured ``N8N_WEBHOOK_SECRET_HEADER``,
-  matched in any letter case, with or without ``_``, ``-`` and camelCase separators)
-  become ``[REDACTED]``, including ``(name, value)`` header pairs and ``bytes`` names;
+* values under sensitive keys (``Authorization``, cookies, passwords, tokens, OAuth
+  client ids and client secrets, the n8n secret header, and the configured
+  ``N8N_WEBHOOK_SECRET_HEADER``, matched in any letter case, with or without ``_``, ``-``
+  and camelCase separators) become ``[REDACTED]``, including ``(name, value)`` header
+  pairs and ``bytes`` names;
+* values under keys that name an email address (``email``, ``emailAddress``,
+  ``work_email``, ``hs_additional_emails``, in the same forms; see :func:`is_email_key`)
+  become ``[REDACTED_EMAIL]`` whatever they hold, in event dicts, nested mappings and
+  ``(name, value)`` pairs;
 * :class:`pydantic.SecretStr` values become ``[REDACTED]``;
 * inside any string, whatever secrets are configured: ``scheme://user:password@host``
   URLs keep the user and lose the password; values assigned to sensitive keys
@@ -17,15 +22,31 @@ through the same redaction before it is rendered:
   and of sensitive pair reprs, and standalone ``Bearer`` tokens, become ``[REDACTED]``,
   each value whole: a header's to the end of its line (``Cookie: a="b"; c=d``), a
   container member's up to the next member (``{'token': {'value': '...'}, 'n': 1}``);
-* the plaintext of every configured secret, whatever its length, is replaced inside any
+* the plaintext of every configured secret (each ``SecretStr`` setting, the LinkedIn
+  client id and the n8n webhook URL), whatever its length, is replaced inside any
   string, longest first, together with any email address and any percent-encoded run
   holding a ``%XX`` escape that it overlaps, so a short secret never breaks an address,
   an escape or an encoded key apart (``3D`` in ``access_token%3Dtok``); a secret is
   never matched inside a redaction marker, and one that overlaps a marker's end (``]x``
   in ``[REDACTED]x``) is replaced together with it;
-* email addresses become ``[REDACTED_EMAIL]``;
-* the same rules apply to percent-encoded text (``lead%40example.com``, encoded up to
-  four times or in mixed case), so foreign records and exception text are covered too;
+* inside any string, the value assigned to a key that names an email address
+  (``email=...``, ``workEmail: ...``, ``{"email": "..."}``, ``('email', '...')``) becomes
+  ``[REDACTED_EMAIL]`` whatever it holds, its key kept;
+* email addresses in any script become ``[REDACTED_EMAIL]`` whole: ``lead@example.com``,
+  ``用户@例子.公司``, ``jöe.smith@example.com``, ``用户!@example.com``, ``用户😀@example.com``,
+  ``"用户"@example.com``, ``"john doe"@example.com``, ``用户@例子😀.com``, also with the
+  fullwidth at sign U+FF20 or the IDNA full stops (:func:`email_spans`). A local part fails
+  closed: it takes ASCII letters and digits, ``.``, every RFC 5322 ``atext`` special and
+  every non-ASCII character but whitespace, separators, controls, lone surrogates and at
+  signs, so text glued to an address (``contact=x!@y.com``, ``/path/a@b.co``) is replaced
+  with it; or it is an RFC 5322 quoted string right before the at sign, any characters but
+  ``"``, backslash, CR and LF, or backslash-escaped pairs, between double quotes. A domain
+  label fails closed too: it takes ASCII letters, digits and ``-`` and every non-ASCII
+  character, symbols and emoji included, but whitespace, separators, controls, lone
+  surrogates, at signs and the IDNA full stops that separate labels;
+* the same rules apply to percent-encoded text (``lead%40example.com``, the UTF-8 escapes
+  of ``用户@例子.公司``, encoded up to four times or in mixed case), so foreign records,
+  uvicorn access lines and exception text are covered too;
   text encoded more deeply than that becomes ``[REDACTED]`` whole;
 * an exception that a built-in ``__str__`` renders from its arguments (``KeyError``'s
   repr of its key, ``OSError``'s ``[Errno n] ...`` and the like) is rendered again from
@@ -56,17 +77,19 @@ its own directory first on ``sys.path``.
 
 import datetime as dt
 import functools
+import itertools
 import json
 import logging
 import math
 import numbers
 import os
 import re
+import string
 import sys
 import threading
 import unicodedata
 import uuid
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from decimal import Decimal
 from types import TracebackType
@@ -81,17 +104,19 @@ from structlog.typing import EventDict, ExcInfo, Processor, WrappedLogger
 from ads_engine.settings import Settings, get_settings
 
 __all__ = [
-    "EMAIL_RE",
     "REDACTED",
     "REDACTED_EMAIL",
     "SENSITIVE_KEYS",
     "URL_CREDENTIALS_RE",
     "configure_logging",
+    "email_spans",
     "get_logger",
     "install_excepthook",
+    "is_email_key",
     "logged_as",
     "mark_logged",
     "redact",
+    "redact_emails",
     "redact_processor",
     "redact_secret_matches",
 ]
@@ -100,23 +125,329 @@ REDACTED: Final = "[REDACTED]"
 """Replacement for a secret value, a sensitive key's value or a URL password."""
 
 REDACTED_EMAIL: Final = "[REDACTED_EMAIL]"
-"""Replacement for an email address found inside any logged string."""
+"""Replacement for an email address inside any logged string, and for the whole value of a
+key that names one (:func:`is_email_key`)."""
 
-EMAIL_RE: Final = re.compile(
-    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]++@[A-Za-z0-9-]++(?:\.[A-Za-z0-9-]++)++"
-    r"(?:[A-Za-z0-9._%+-]++@[A-Za-z0-9-]++(?:\.[A-Za-z0-9-]++)++)*+"
+# The email scanner (see `email_spans`). A local part fails closed: it is a run of ASCII
+# letters and digits, `.` and every RFC 5322 `atext` special of `_EMAIL_LOCAL_SPECIALS`, and
+# of every non-ASCII character (RFC 6531 `UTF8-non-ascii`) except those of
+# `_EMAIL_EXCLUDED_CATEGORIES` and the at signs, or a quoted string (`_EMAIL_QUOTED`) right
+# before the at sign, with or without such a run glued before it. A domain label fails
+# closed too: it holds the ASCII characters of `_EMAIL_LABEL_ASCII` and every non-ASCII
+# character except those of `_EMAIL_EXCLUDED_CATEGORIES`, the at signs and the label stops,
+# and labels are separated by the full stops of `_EMAIL_LABEL_STOPS`. Each at sign and stop
+# also stands for every character whose NFKC compatibility form it is (the fullwidth and
+# small at signs U+FF20 and U+FE6B, the fullwidth and small full stops U+FF0E and U+FE52,
+# the halfwidth ideographic full stop U+FF61 and the like), found in the Unicode database
+# when the scanner is first built.
+_EMAIL_AT: Final = "@"
+_EMAIL_LOCAL_SPECIALS: Final = ".!#$%&'*+-/=?^_`{|}~"
+_EMAIL_LOCAL_ASCII: Final = string.ascii_letters + string.digits + _EMAIL_LOCAL_SPECIALS
+_EMAIL_LABEL_ASCII: Final = string.ascii_letters + string.digits + "-"
+# Unicode whitespace and separators, controls and lone surrogates end a local part and a
+# domain label.
+_EMAIL_EXCLUDED_CATEGORIES: Final = frozenset({"Zs", "Zl", "Zp", "Cc", "Cs"})
+# An RFC 5322 quoted string (section 3.4.1), its `qtext` extended with every non-ASCII
+# character as RFC 6531 extends it: `"`, then any characters but `"`, `\`, CR and LF, or a
+# `\`-escaped pair (`_EMAIL_QUOTED_CONTENT`), then `"`.
+_EMAIL_QUOTED_CONTENT: Final = r'(?:[^"\\\r\n]|\\[^\r\n])*+'
+_EMAIL_QUOTED: Final = f'"{_EMAIL_QUOTED_CONTENT}"'
+# `.` and the ideographic full stop, which IDNA reads as a label separator too (RFC 3490
+# section 3.1). Both are local-part characters as well, so CJK text run on before an address
+# (`已联系。用户@例子.公司`) is taken with it.
+_EMAIL_LABEL_STOPS: Final = ".\u3002"
+# Local-part characters that also quote text: those opening an address where a quoted string
+# opens (after a blank or one of `_EMAIL_QUOTE_OPENERS`) are left out of its span, so a quoted
+# address keeps its quotes (`'lead@x.io'` in a Python repr, a backquoted one in Markdown)
+# rather than losing the opening one.
+_EMAIL_OPENING_QUOTES: Final = "'`"
+_EMAIL_QUOTE_OPENERS: Final = "([<,:;"
+# Unicode general categories of the characters whose NFKC form can be an at sign or a label
+# stop (punctuation, symbols and separators).
+_FOLDABLE_CATEGORIES: Final = frozenset(
+    {"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp"}
 )
-"""A conservative email pattern: ``local@domain.tld``, including ``@sim.invalid`` addresses.
 
-Matching runs in linear time on any input (CWE-1333): a match starts only where a run of
-local-part characters starts, and every quantifier is possessive, so a long malformed
-address such as ``"a" * 100_000 + "@x"`` is rejected in one pass instead of being retried
-from every position. Addresses glued directly after one another (``a@b.c+d@e.f``) are
-consumed by the same match, so none is left behind. It is applied after
-:data:`URL_CREDENTIALS_RE`, so the ``user:password@host`` part of a database URL is handled
-by the URL rule rather than read as an address. ``cli.py`` reuses it to redact captured
-live payloads.
-"""
+
+class _EmailScanner:
+    """The compiled email patterns and the at signs they read; see :func:`_email_scanner`.
+
+    ``inner`` matches the addresses inside a quoted string's content, where every quote
+    follows a backslash and so opens nothing: those whose local part is a run, glued to one
+    another. ``quoted_address`` matches, where its opening quote is, an address whose local
+    part is a quoted string, with every address glued after it: the extent of an email key's
+    quoted value that only the local part's quotes delimit (``email="john doe"@example.com``).
+    """
+
+    __slots__ = ("at_signs", "inner", "pattern", "quoted_address")
+
+    def __init__(
+        self,
+        at_signs: str,
+        pattern: re.Pattern[str],
+        inner: re.Pattern[str],
+        quoted_address: re.Pattern[str],
+    ) -> None:
+        self.at_signs = at_signs
+        self.pattern = pattern
+        self.inner = inner
+        self.quoted_address = quoted_address
+
+
+def _class_body(codes: Collection[int]) -> str:
+    """Return the body of a regex character class matching exactly ``codes``, as ranges."""
+    ranges: list[list[int]] = []
+    for code in sorted(codes):
+        if ranges and ranges[-1][1] == code - 1:
+            ranges[-1][1] = code
+        else:
+            ranges.append([code, code])
+    return "".join(
+        f"\\U{start:08x}" if start == end else f"\\U{start:08x}-\\U{end:08x}"
+        for start, end in ranges
+    )
+
+
+@functools.cache
+def _email_scanner() -> _EmailScanner:
+    r"""Build the email scanner from the running interpreter's Unicode database, once.
+
+    One pass over every code point reads its general category: the non-ASCII characters
+    that end a local part and a domain label (``Zs``, ``Zl``, ``Zp``, ``Cc`` and ``Cs``) are
+    collected, and every punctuation, symbol or separator character is NFKC-normalised, so
+    each one whose compatibility form is ``@`` or a label stop joins that character's set.
+    The local part's run and the domain label are each one negated class: every code point
+    but the ASCII characters outside :data:`_EMAIL_LOCAL_ASCII` (or
+    :data:`_EMAIL_LABEL_ASCII`), the excluded ones and the at signs, and for a label the
+    stops too, so a label holds symbols and emoji (``例子😀``). A local part is such a run, a
+    quoted string (:data:`_EMAIL_QUOTED`), or a run with a quoted string glued after it,
+    right before the at sign. The pass reads each category and drops it at once, visiting
+    only the eleven thousand or so code points of those categories and keeping under three
+    thousand, so the build raises the process's peak memory by about 2 MB at most, rather
+    than the 60 MB a table of every code point would take. It takes about 0.1 s, so it runs
+    on the first string that may hold an address rather than at import, and
+    :func:`functools.cache` keeps the result for the process.
+
+    The pattern has two alternatives, tried in this order at each position. The first is an
+    address run (``address``): a local part, an at sign and a domain, then every address
+    glued to it. The second is a quoted string that is no local part (``quoted``, its
+    content): one that no at sign follows, or one that no closing quote ends before its line
+    does, which then runs to the end of the line. It is matched so that every quote it holds,
+    its closing one included, is consumed with it and never opens a quoted string of its
+    own; ``inner`` then finds the addresses in its content. Quotes are thus paired from left
+    to right, as a reader pairs them, and replacing an address, whose quotes are paired
+    among themselves, never pairs the quotes around it differently, so redacting redacted
+    text finds nothing new.
+
+    Returns:
+        The at signs (every character whose NFKC form is ``@``), the pattern that
+        :func:`email_spans` documents, and the content and anchored quoted-local-part
+        address patterns of :class:`_EmailScanner`.
+    """
+    forms: dict[str, set[int]] = {
+        target: {ord(target)} for target in _EMAIL_AT + _EMAIL_LABEL_STOPS
+    }
+    excluded: set[int] = set()
+    count = range(sys.maxunicode + 1)
+    wanted = _FOLDABLE_CATEGORIES | _EMAIL_EXCLUDED_CATEGORIES
+    for code in itertools.compress(
+        count, map(wanted.__contains__, map(unicodedata.category, map(chr, count)))
+    ):
+        char = chr(code)
+        category = unicodedata.category(char)
+        if category in _EMAIL_EXCLUDED_CATEGORIES:
+            excluded.add(code)
+        if category in _FOLDABLE_CATEGORIES:
+            folded = unicodedata.normalize("NFKC", char)
+            if folded in forms:
+                forms[folded].add(code)
+    at_signs = forms[_EMAIL_AT]
+    stops = set().union(*(forms[char] for char in _EMAIL_LABEL_STOPS))
+    outside_local = {code for code in range(128) if chr(code) not in _EMAIL_LOCAL_ASCII}
+    outside_label = {code for code in range(128) if chr(code) not in _EMAIL_LABEL_ASCII}
+    local = f"[^{_class_body(outside_local | excluded | at_signs)}]"
+    label = f"[^{_class_body(outside_label | excluded | at_signs | stops)}]"
+    at_sign = f"[{_class_body(at_signs)}]"
+    domain = rf"{label}++(?:[{_class_body(stops)}]{label}++)++"
+    address = rf"(?:{local}++(?:{_EMAIL_QUOTED})?+|{_EMAIL_QUOTED}){at_sign}{domain}"
+    glued = rf"(?:{address})*+"
+    run_address = rf"{local}++{at_sign}{domain}"
+    return _EmailScanner(
+        at_signs="".join(sorted(map(chr, at_signs))),
+        pattern=re.compile(
+            rf'(?<!{local})(?P<address>{address}{glued})|"(?P<quoted>{_EMAIL_QUOTED_CONTENT})"?+'
+        ),
+        inner=re.compile(rf"(?<!{local}){run_address}(?:{run_address})*+"),
+        quoted_address=re.compile(rf"{_EMAIL_QUOTED}{at_sign}{domain}{glued}"),
+    )
+
+
+def _email_scanner_for(text: str) -> _EmailScanner | None:
+    """Return the email scanner when ``text`` holds an at sign, else ``None``.
+
+    ASCII text without ``@`` is answered without building the scanner; other text is
+    checked for each at sign the scanner reads.
+    """
+    if _EMAIL_AT not in text and text.isascii():
+        return None
+    scanner = _email_scanner()
+    return scanner if any(sign in text for sign in scanner.at_signs) else None
+
+
+def email_spans(text: str) -> list[tuple[int, int]]:
+    r"""Return the span of every email address in ``text``: in order, disjoint and whole.
+
+    This is the one email scanner of every redaction path: log lines (:func:`redact`),
+    connector error reasons and logged URLs (:mod:`ads_engine.connectors`) and
+    ``capture-fixtures`` captures. An address is a local part, an at sign and a domain of
+    two or more labels, in any script:
+
+    * a local part fails closed: it is a run of ASCII letters and digits, ``.``, the RFC 5322
+      ``atext`` specials ``!#$%&'*+-/=?^_`{|}~`` and every non-ASCII character (RFC 6531),
+      combining marks, symbols and emoji included, except Unicode whitespace and separators
+      (general categories ``Zs``, ``Zl`` and ``Zp``), controls (``Cc``), lone surrogates
+      (``Cs``) and the at signs below; or it is a quoted string (RFC 5322 section 3.4.1, its
+      ``qtext`` extended with every non-ASCII character as RFC 6531 extends it): ``"``, then
+      any characters but ``"``, ``\``, CR and LF, or ``\``-escaped pairs, then ``"``, right
+      before the at sign, with or without such a run glued before it (``"用户"@example.com``,
+      ``"john doe"@example.com``, ``"a\"b"@example.com``, ``x"y z"@example.com``). A quoted
+      string that a blank or anything else separates from the at sign is no local part
+      (``"quoted" @ text``);
+    * a domain label fails closed as well: it is a run of ASCII letters, digits and ``-`` and
+      of every non-ASCII character, combining marks, joiners, symbols and emoji included
+      (``例子😀``, ``i❤``), except Unicode whitespace and separators, controls, lone
+      surrogates, the at signs and the label stops; labels are separated by ``.`` or by the
+      ideographic full stop ``。``, which IDNA reads as one (RFC 3490, section 3.1);
+    * a character whose NFKC compatibility form is ``@`` or one of those full stops counts as
+      it, so fullwidth and small forms are read like the character they stand for: the at
+      signs U+FF20 and U+FE6B, the fullwidth and small full stops U+FF0E and U+FE52, and the
+      halfwidth ideographic full stop U+FF61.
+
+    So ``用户@例子.公司``, ``josé@example.com``, ``jöe.smith@example.com``, ``राम@उदाहरण.भारत``,
+    ``user@例子。公司``, ``用户!@example.com``, ``用户😀@example.com``, ``用户@例子😀.com``,
+    ``"用户"@example.com`` and ``patrick.o'brien@example.com`` are each found whole: no
+    address is cut where its script or its character class changes, which would leave an
+    identifying prefix behind. The price of failing closed is that text glued to an
+    address, with no blank, backslash or one of ``"(),:;<>[]`` between them, is read as part
+    of its local part and replaced with it: a key (``contact=x!@y.com``), a path
+    (``/path/a@b.co``) or CJK text run on before the address (``已联系。用户@例子.公司``);
+    and non-ASCII text glued after it, such as a fullwidth comma (U+FF0C), is read as part
+    of its last label. :func:`redact` keeps the key of an assignment whose key names an
+    address (``email=...``, see :func:`is_email_key`), and the HTTP layer and
+    ``capture-fixtures`` scan URLs component by component, so those keep their structure. A
+    ``'`` or a backquote that opens a span at the start of the text or after a blank or one
+    of ``([<,:;`` is left out of it when the local part goes on after it, so
+    ``'lead@example.com'`` in a Python repr keeps both quotes and ``'o'brien@example.com'``
+    keeps its outer ones.
+
+    A match starts only where a run of local-part characters starts or at a ``"``, and
+    quotes are paired from left to right: a quoted string that no at sign follows is taken
+    whole, and so is one that no closing quote ends before its line does, up to the end of
+    the line, so no quote it holds opens another one; its content is scanned again on its
+    own for the addresses it holds, whose local parts are runs (``"lead@example.com"`` in a
+    JSON string). Inside a quoted string a backslash escapes the quote after it, so
+    ``\"用户\"@example.com``, a quoted local part as JSON text writes it, holds no address,
+    while ``a\"b"@x.com`` holds ``"b"@x.com``. The quoted strings scanned from different
+    opening quotes never overlap, and every quantifier is
+    possessive, so the scan runs in linear time on any input (CWE-1333),
+    ``"a" * 200_000 + "@x"``, ``"!" * 200_000 + "@x"``, ``"a@" * 100_000``,
+    ``'"' * 200_000``, ``'\\"' * 100_000`` and ``'"a"' * 70_000 + "@"`` included.
+    Addresses glued to one another (``a@b.c+d@e.f``) form one span, so none is left behind.
+    A redaction marker holds no at sign and no quote, and its brackets end every run and
+    label, so no span starts or ends inside one: a span takes a marker only whole, inside a
+    quoted local part. Replacing an address never pairs the quotes around it differently,
+    so redacting redacted text changes nothing. :func:`redact` applies this scanner after
+    :data:`URL_CREDENTIALS_RE`, so the ``user:password@host`` part of a URL is handled by the
+    URL rule rather than read as an address.
+
+    Example::
+
+        >>> email_spans("from 用户@例子.公司 and lead@example.com")
+        [(5, 13), (18, 34)]
+        >>> email_spans('to "john doe"@example.com, not "quoted" @ text')
+        [(3, 25)]
+
+    Args:
+        text: Any text.
+
+    Returns:
+        ``(start, end)`` of each address; empty when ``text`` holds none.
+    """
+    text = str.__str__(text)
+    scanner = _email_scanner_for(text)
+    if scanner is None:
+        return []
+    return list(_address_spans(scanner, text))
+
+
+def _address_spans(scanner: _EmailScanner, text: str) -> Iterator[tuple[int, int]]:
+    """Yield the span of each address in ``text``, less its opening quotes.
+
+    A match of the scanner's quoted-string alternative is no address: its content, between
+    its quotes or up to the end of its line, is scanned again, on its own, with the
+    scanner's ``inner`` pattern for the addresses it holds. Every quote inside that content
+    follows a backslash and so opens nothing, and the content is read once more only, so
+    the work stays linear.
+    """
+    for match in scanner.pattern.finditer(text):
+        if match.group("address") is not None:
+            yield _unquoted_span(scanner, text, match)
+            continue
+        start, end = match.span("quoted")
+        for found in scanner.inner.finditer(text, start, end):
+            yield _unquoted_span(scanner, text, found)
+
+
+def _unquoted_span(scanner: _EmailScanner, text: str, match: re.Match[str]) -> tuple[int, int]:
+    """Return the span of the address ``match`` found, less its opening quotes.
+
+    The quotes of :data:`_EMAIL_OPENING_QUOTES` that open a match where a quoted string can
+    open, at the start of ``text`` or after a blank or one of :data:`_EMAIL_QUOTE_OPENERS`,
+    are left out of its span when a local-part character, not the at sign, follows them, so
+    the quotes of a quoted address stay in place. After anything else, such as the ``]`` of
+    a marker, the quote is no opening one and stays in the span.
+    """
+    start, end = match.span()
+    if text[start] in _EMAIL_OPENING_QUOTES and (
+        start == 0 or text[start - 1].isspace() or text[start - 1] in _EMAIL_QUOTE_OPENERS
+    ):
+        found = match.group()
+        address = found.lstrip(_EMAIL_OPENING_QUOTES)
+        if address[0] not in scanner.at_signs:
+            start += len(found) - len(address)
+    return start, end
+
+
+def redact_emails(text: str, replacement: str = REDACTED_EMAIL) -> str:
+    """Replace every email address :func:`email_spans` finds in ``text`` with ``replacement``.
+
+    Example::
+
+        >>> redact_emails("No contact with email 用户@例子.公司 found")
+        'No contact with email [REDACTED_EMAIL] found'
+
+    Args:
+        text: Any text.
+        replacement: The text written, as it is, in each address's place; captures use
+            their own marker.
+
+    Returns:
+        ``text`` with every address replaced, or ``text`` unchanged when it holds none.
+    """
+    text = str.__str__(text)
+    scanner = _email_scanner_for(text)
+    if scanner is None:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in _address_spans(scanner, text):
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
 
 URL_CREDENTIALS_RE: Final = re.compile(
     r"(?P<prefix>(?<![A-Za-z0-9+.-])[0-9+.-]*+[A-Za-z][A-Za-z0-9+.-]*+://[^\s:/?#@]*+:)"
@@ -125,9 +456,9 @@ URL_CREDENTIALS_RE: Final = re.compile(
 """The password of a ``scheme://user:password@host`` URL, for example ``DATABASE_URL``.
 
 The substitution keeps the scheme and user: ``postgresql+psycopg://ads:pw@db:5432/x``
-becomes ``postgresql+psycopg://ads:[REDACTED]@db:5432/x``. Like :data:`EMAIL_RE`, it runs
-in linear time: a match starts only where a run of scheme characters starts, and every
-quantifier is possessive.
+becomes ``postgresql+psycopg://ads:[REDACTED]@db:5432/x``. Like the email scanner
+(:func:`email_spans`), it runs in linear time: a match starts only where a run of scheme
+characters starts, and every quantifier is possessive.
 """
 
 SENSITIVE_KEYS: Final[frozenset[str]] = frozenset(
@@ -141,6 +472,10 @@ SENSITIVE_KEYS: Final[frozenset[str]] = frozenset(
         "app_admin_password_hash",
         "session_secret",
         "secret",
+        # The LinkedIn OAuth client id is a credential too: it is sent with the client
+        # secret in every token exchange.
+        "client_id",
+        "linkedin_client_id",
         "client_secret",
         "access_token",
         "refresh_token",
@@ -183,6 +518,21 @@ _SEPARATOR_FREE_SENSITIVE_KEYS: Final[frozenset[str]] = frozenset(
 )
 _SEPARATOR_FREE_KEY_SUFFIXES: Final[tuple[str, ...]] = tuple(
     suffix.replace("_", "") for suffix in _SENSITIVE_KEY_SUFFIXES
+)
+
+# Normalised key names that hold an email address (see `is_email_key`), and the qualifiers
+# that turn one into the name of a flag or count about an address (`no_email`, a lead-match
+# status the sync logs as a count; `has_email`).
+_EMAIL_KEYS: Final[frozenset[str]] = frozenset(
+    {"email", "emails", "e_mail", "e_mails", "email_address", "email_addresses"}
+)
+_EMAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = tuple(f"_{key}" for key in sorted(_EMAIL_KEYS))
+_SEPARATOR_FREE_EMAIL_KEYS: Final[frozenset[str]] = frozenset(
+    key.replace("_", "") for key in _EMAIL_KEYS
+)
+_EMAIL_FLAG_QUALIFIERS: Final[tuple[str, ...]] = ("has", "is", "missing", "no", "without")
+_EMAIL_FLAG_KEYS: Final[frozenset[str]] = frozenset(
+    f"{qualifier}_{key}" for qualifier in _EMAIL_FLAG_QUALIFIERS for key in _EMAIL_KEYS
 )
 
 # A URL password taken out of a URL-shaped secret becomes a substring rule of its own only
@@ -259,10 +609,15 @@ _BEARER_RE: Final = re.compile(
 )
 _BEARER_REPLACEMENT: Final = r"\g<prefix>" + REDACTED
 
-# A maximal run of characters other than blanks, quotes and angle brackets that holds a
-# `%`: a URL, query or form value that may hide a percent-encoded address, secret or
-# credential assignment. A match starts only where such a run starts.
-_ENCODED_RUN_RE: Final = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>%]*+%[^\s\"'<>]*+")
+# A maximal run of characters other than blanks, double quotes and angle brackets that holds
+# a `%`: a URL, query or form value that may hide a percent-encoded address, secret or
+# credential assignment. `'` belongs to the run, as it may belong to an address's local part
+# (`o'brien%40example.com`). A quoted string glued before such a run belongs to it too, as it
+# may be an address's quoted local part (`"用户"%40example.com`). A match starts only where
+# such a run, or such a quoted string, starts: after a blank, a double quote or an angle
+# bracket, never after a backslash, so no quote a backslash escapes opens one, and the
+# quoted strings scanned from different opening quotes share at most a quote.
+_ENCODED_RUN_RE: Final = re.compile(rf"(?<![^\s\"<>])(?:{_EMAIL_QUOTED})?+[^\s\"<>%]*+%[^\s\"<>]*+")
 _PERCENT_ESCAPE_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}")
 # Decoding stops after this many rounds, enough for a value encoded and then re-encoded
 # by every layer between a source and the log; a run that would still decode further is
@@ -313,6 +668,52 @@ def _key_forms(name: str) -> tuple[str, str, str]:
     raw = stripped.casefold().replace("-", "_")
     camel = _CAMEL_BOUNDARY_RE.sub("_", stripped).casefold().replace("-", "_")
     return raw, camel, raw.replace("_", "")
+
+
+def is_email_key(key: object) -> bool:
+    """Whether ``key`` names an email address, so its value is redacted whatever it holds.
+
+    The name is compared in the three forms of :func:`_key_forms`, so letter case, ``-``,
+    ``_`` and camelCase do not matter. It names an address when:
+
+    * its raw or camelCase form is ``email``, ``emails``, ``e_mail``, ``e_mails``,
+      ``email_address`` or ``email_addresses`` (``Email``, ``E-Mail``, ``emailAddress``),
+      or ends with ``_`` and one of those (``work_email``, ``app_admin_email``,
+      ``hs_additional_emails``, ``contactEmailAddress``); or
+    * its separator-free form is one of those names with ``_`` removed (``EMAILADDRESS``).
+
+    A name about an address rather than of one does not count: one that only begins or
+    goes on with ``email`` (``email_count``, ``email_sha256``, ``email_hash``,
+    ``email_question_ids``, ``email_status``), and a qualifier with one of those names
+    (``no_email``, ``has_email``, ``is_email``, ``missing_email``, ``without_email``), which
+    the sync logs as a count or flag. A run-together name with a prefix (``WORKEMAIL``) is
+    left to the text rules, which find any address its value holds: reading every name
+    that ends in ``email`` would take ``voicemail`` too.
+
+    Args:
+        key: A mapping key or pair name; ``str`` and ``bytes`` names are checked (``bytes``
+            read as Latin-1) and any other type never names an address.
+
+    Returns:
+        ``True`` when the name denotes an email address, and when reading the name raises,
+        so its value fails closed.
+    """
+    try:
+        if isinstance(key, str):
+            name = str.__str__(key)
+        elif isinstance(key, bytes | bytearray):
+            name = bytes(memoryview(key)).decode("latin-1")
+        else:
+            return False
+        raw, camel, separator_free = _key_forms(name)
+        return separator_free in _SEPARATOR_FREE_EMAIL_KEYS or any(
+            (form in _EMAIL_KEYS or form.endswith(_EMAIL_KEY_SUFFIXES))
+            and form not in _EMAIL_FLAG_KEYS
+            for form in (raw, camel)
+        )
+    # No-blind-except yields: a str or bytes subclass can raise anything; fail closed.
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _unique_key(existing: Mapping[Any, object], key: Any) -> Any:
@@ -464,6 +865,33 @@ def _value_span(
     return start, start + len(text[start:end].rstrip(" \t"))
 
 
+def _quoted_address_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Widen an email key's quoted value to the address when the quotes are its local part's.
+
+    In ``email="john doe"@example.com`` the quotes delimit the local part, not the value: a
+    double-quoted value ``text[start:end]`` whose closing quote an at sign follows is
+    widened, from its opening quote, over the address the scanner's ``quoted_address``
+    pattern matches there, so the key keeps its place and no domain is left behind. Any
+    other value is returned as it is.
+
+    Args:
+        text: The text being redacted.
+        start: Index of the value's first character, after its opening quote if quoted.
+        end: Index just past the value, its closing quote if quoted.
+
+    Returns:
+        ``(start, end)`` of the value to replace.
+    """
+    if start == 0 or text[start - 1] != '"' or text[end : end + 1] != '"':
+        return start, end
+    after = text[end + 1 : end + 2]
+    if not after or (after != _EMAIL_AT and after.isascii()):
+        return start, end
+    scanner = _email_scanner()
+    found = scanner.quoted_address.match(text, start - 1) if after in scanner.at_signs else None
+    return (start - 1, found.end()) if found is not None else (start, end)
+
+
 def _escape_controls(text: str) -> str:
     """Percent-encode every control, format and line or paragraph separator in ``text``."""
     return "".join(
@@ -519,7 +947,7 @@ def redact_secret_matches(text: str, pattern: re.Pattern[str]) -> str:
 
     A secret replaced on its own would cut what contains it, or what it runs into, into
     pieces the later rules no longer recognise, and the rest would stay behind: an email
-    address :data:`EMAIL_RE` no longer matches (``jane[REDACTED]@x.io`` for the secret
+    address :func:`email_spans` no longer finds (``jane[REDACTED]@x.io`` for the secret
     ``2024`` in ``jane2024@x.io``), or a percent-encoded run whose escape or key the
     decode pass can no longer read (``access_token%[REDACTED]tok`` for the secret ``3D``
     in ``access_token%3Dtok``). So each match, widened over every email address and every
@@ -527,7 +955,7 @@ def redact_secret_matches(text: str, pattern: re.Pattern[str]) -> str:
     :func:`_whole_spans`), becomes one ``[REDACTED]``, and matches joined by such a span
     become one too. Spans that overlap no secret are left for the email rule and the
     decode pass, which run afterwards. A match of a group named ``marker`` (see
-    :func:`_compile_secret_pattern`) is kept as it is. ``pattern``, :data:`EMAIL_RE` and
+    :func:`_compile_secret_pattern`) is kept as it is. ``pattern``, the email scanner and
     :data:`_ENCODED_RUN_RE` each scan ``text`` once, so the work stays linear.
 
     Example::
@@ -574,14 +1002,14 @@ def redact_secret_matches(text: str, pattern: re.Pattern[str]) -> str:
 def _whole_spans(text: str) -> list[tuple[int, int]]:
     """Return the sorted, disjoint spans of ``text`` that a secret match takes whole.
 
-    That is every :data:`EMAIL_RE` match, and every percent-encoded run
-    (:data:`_ENCODED_RUN_RE`) holding at least one valid ``%XX`` escape
+    That is every email address :func:`email_spans` finds, in any script, and every
+    percent-encoded run (:data:`_ENCODED_RUN_RE`) holding at least one valid ``%XX`` escape
     (:data:`_PERCENT_ESCAPE_RE`): exactly the runs the decode pass of
     :meth:`_Redactor.text` decodes, whatever they decode to. A run without a valid escape
     (``100%``, ``%ZZ``) is never decoded, so it is not included. Overlapping spans are
     joined.
     """
-    spans = [match.span() for match in EMAIL_RE.finditer(text)] if "@" in text else []
+    spans = email_spans(text)
     if "%" in text:
         spans.extend(
             run.span()
@@ -662,27 +1090,48 @@ class _Redactor:
         except Exception:  # noqa: BLE001
             return True
 
+    def key_marker(self, key: object) -> str | None:
+        """Return what replaces the whole value under ``key``, or ``None`` to redact it as data.
+
+        Args:
+            key: A mapping key or pair name.
+
+        Returns:
+            ``[REDACTED]`` for a sensitive key (:meth:`is_sensitive_key`),
+            ``[REDACTED_EMAIL]`` for a key that names an email address
+            (:func:`is_email_key`), whatever the value holds; ``None`` for any other key.
+        """
+        if self.is_sensitive_key(key):
+            return REDACTED
+        if is_email_key(key):
+            return REDACTED_EMAIL
+        return None
+
     def text(self, text: str) -> str:
         """Redact every credential, configured secret and email address in ``text``.
 
-        The rules run in this order: URL passwords; values assigned to sensitive keys
-        (``key=value``, ``key: value``, quoted JSON and repr keys); values of sensitive
-        ``(name, value)`` pair reprs; standalone ``Bearer`` tokens; configured secrets;
-        email addresses. A sensitive value is replaced whole, however it is quoted or
-        nested: a header's value to the end of its line, a container member's value up
-        to the next member, a bracketed value to its matching closer (see
-        :func:`_value_span`). URL credentials go first, so a full ``DATABASE_URL`` that is
-        itself a configured secret keeps its readable ``scheme://user:[REDACTED]@host/db``
-        form. Emails go last, after the URL rule has consumed any ``user:password@host``
-        part.
+        The rules run in this order: URL passwords; values assigned to sensitive keys and
+        to keys that name an email address (``key=value``, ``key: value``, quoted JSON and
+        repr keys); values of such ``(name, value)`` pair reprs; standalone ``Bearer``
+        tokens; configured secrets; email addresses in any script (:func:`email_spans`). A
+        sensitive value is replaced whole, however it is quoted or nested: a header's value
+        to the end of its line, a container member's value up to the next member, a
+        bracketed value to its matching closer (see :func:`_value_span`); an email key's
+        value becomes ``[REDACTED_EMAIL]`` the same way, its key kept, except that in prose
+        it is one token. URL credentials go first, so a full
+        ``DATABASE_URL`` that is itself a configured secret keeps its readable
+        ``scheme://user:[REDACTED]@host/db`` form. Emails go last, after the URL rule has
+        consumed any ``user:password@host`` part; when they replaced anything, the key rules
+        run once more and take whole a value whose address ran on past its token
+        (``email=o'brien@x.io``).
 
         Then every run of URL-like text holding a ``%XX`` escape is percent-decoded, up to
         four times, and the same rules run on each decoded form. Where they find something
-        (``lead%40example.com``, an encoded secret, ``access_token%3D...``), the decoded,
-        redacted run replaces the raw one, with control characters encoded again;
-        otherwise the raw run is kept byte for byte. A run that would still decode after
-        the fourth round is replaced by ``[REDACTED]`` whole. Text that is already
-        redacted is returned unchanged.
+        (``lead%40example.com``, the UTF-8 escapes of ``jöe@example.com``, an encoded
+        secret, ``access_token%3D...``), the decoded, redacted run replaces the raw one,
+        with control characters encoded again; otherwise the raw run is kept byte for byte.
+        A run that would still decode after the fourth round is replaced by ``[REDACTED]``
+        whole. Text that is already redacted is returned unchanged.
         """
         # A str subclass is read as its plain characters, so none of its methods runs.
         redacted = self._plain(str.__str__(text))
@@ -714,30 +1163,54 @@ class _Redactor:
         return _escape_controls(current) if changed else run
 
     def _plain(self, text: str) -> str:
-        """Apply the plaintext rules of :meth:`text`, in its order, to ``text``."""
-        has_at = "@" in text
-        redacted = URL_CREDENTIALS_RE.sub(_URL_REPLACEMENT, text) if has_at else text
-        if ":" in redacted or "=" in redacted:
-            redacted = self._assigned_values(redacted, _ASSIGNMENT_RE)
-        if "," in redacted and ("'" in redacted or '"' in redacted):
-            redacted = self._assigned_values(redacted, _PAIR_RE)
+        """Apply the plaintext rules of :meth:`text`, in its order, to ``text``.
+
+        An address glued to an assigned value past the end of its token
+        (``email=o'brien@x.io``, whose token ends at ``'``) is replaced by the email rule on
+        its own, after which the value's token reaches past its marker. So when the email
+        rule replaced anything, the assignment rules run once more and take such a value
+        whole, and redacting the result changes nothing.
+        """
+        redacted = URL_CREDENTIALS_RE.sub(_URL_REPLACEMENT, text) if "@" in text else text
+        redacted = self._assignments(redacted)
         redacted = _BEARER_RE.sub(_BEARER_REPLACEMENT, redacted)
         if self._secret_pattern is not None:
             redacted = redact_secret_matches(redacted, self._secret_pattern)
-        return EMAIL_RE.sub(REDACTED_EMAIL, redacted) if has_at else redacted
+        scanned = redact_emails(redacted)
+        return redacted if scanned == redacted else self._assignments(scanned)
+
+    def _assignments(self, text: str) -> str:
+        """Replace the values of sensitive and email keys and pair reprs in ``text``."""
+        if ":" in text or "=" in text:
+            text = self._assigned_values(text, _ASSIGNMENT_RE)
+        if "," in text and ("'" in text or '"' in text):
+            text = self._assigned_values(text, _PAIR_RE)
+        return text
 
     def _assigned_values(self, text: str, head: re.Pattern[str]) -> str:
-        """Replace the value after each sensitive key that ``head`` finds in ``text``.
+        """Replace the value after each sensitive or email key that ``head`` finds in ``text``.
 
         ``head`` matches a key and its separator only. The value's extent
-        (:func:`_value_span`) is read for sensitive keys alone, and matches inside a
-        replaced value are skipped, so the scan stays linear and an ordinary key never
-        hides the assignment that follows it.
+        (:func:`_value_span`) is read for those keys alone, and matches inside a replaced
+        value are skipped, so the scan stays linear and an ordinary key never hides the
+        assignment that follows it. A sensitive key's value becomes ``[REDACTED]`` and an
+        email key's (:func:`is_email_key`) ``[REDACTED_EMAIL]``, whatever it holds
+        (:meth:`key_marker`), before the email scanner runs, so the key is kept even where
+        the address's local part would take it (``email=用户!@example.com`` becomes
+        ``email=[REDACTED_EMAIL]``). An email key's value in prose after ``:`` is one token
+        or quoted string, as after ``=``: unlike a header credential, an address does not run
+        to the end of its line. An email key's double-quoted value that an at sign follows is
+        a quoted local part, so the whole address goes, quotes included
+        (``email="john doe"@example.com`` becomes ``email=[REDACTED_EMAIL]``; see
+        :func:`_quoted_address_span`).
         """
         pieces: list[str] = []
         cursor = 0
         for match in head.finditer(text):
-            if match.start() < cursor or not self.is_sensitive_key(match.group("key")):
+            if match.start() < cursor:
+                continue
+            marker = self.key_marker(match.group("key"))
+            if marker is None:
                 continue
             groups = match.groupdict()
             separator = groups.get("sep")
@@ -745,12 +1218,16 @@ class _Redactor:
             if groups.get("kq") and text[key_start - 1 : key_start] == "b":
                 key_start -= 1
             container = separator is None or _in_container(text, key_start)
+            if marker == REDACTED_EMAIL and separator == ":" and not container:
+                separator = "="
             start, end = _value_span(text, match.end(), separator, container=container)
+            if marker == REDACTED_EMAIL:
+                start, end = _quoted_address_span(text, start, end)
             value = text[start:end]
             if not value or _REDACTION_MARKER_RE.fullmatch(value) is not None:
                 continue
             pieces.append(text[cursor:start])
-            pieces.append(REDACTED)
+            pieces.append(marker)
             cursor = end
         if not pieces:
             return text
@@ -811,9 +1288,10 @@ class _Redactor:
         """Redact every key and value of a structlog event dict.
 
         The event dict's own level does not count towards the nesting limit, so each of
-        its values is walked from depth 0. Keys become strings: a non-string key is
-        rendered through its redacted ``repr``, and a key that cannot be rendered becomes
-        ``[UNRENDERABLE]``. It never raises.
+        its values is walked from depth 0. The value of a sensitive key, or of a key that
+        names an email address, is replaced whole (:meth:`key_marker`). Keys become
+        strings: a non-string key is rendered through its redacted ``repr``, and a key that
+        cannot be rendered becomes ``[UNRENDERABLE]``. It never raises.
         """
         result: dict[str, Any] = {}
         try:
@@ -824,7 +1302,8 @@ class _Redactor:
                 except Exception:  # noqa: BLE001
                     rendered = _UNRENDERABLE
                 new_key = _unique_key(result, rendered)
-                result[new_key] = REDACTED if self.is_sensitive_key(key) else self.value(item, 0)
+                marker = self.key_marker(key)
+                result[new_key] = marker if marker is not None else self.value(item, 0)
         # No-blind-except yields: a mapping's iteration can raise anything; fail closed.
         except Exception:  # noqa: BLE001
             result.setdefault("event", _UNRENDERABLE)
@@ -848,7 +1327,7 @@ class _Redactor:
             return _UNRENDERABLE
 
     def _mapping(self, value: Mapping[Any, Any], depth: int) -> dict[Any, object]:
-        """Copy a mapping into a dict, redacting keys and values."""
+        """Copy a mapping into a dict, redacting keys and values (see :meth:`key_marker`)."""
         result: dict[Any, object] = {}
         for key, item in value.items():
             try:
@@ -856,15 +1335,16 @@ class _Redactor:
             # No-blind-except yields: a redacted key's __eq__ can raise anything; fail closed.
             except Exception:  # noqa: BLE001
                 new_key = _unique_key(result, _UNRENDERABLE)
-            result[new_key] = (
-                REDACTED if self.is_sensitive_key(key) else self.value(item, depth + 1)
-            )
+            marker = self.key_marker(key)
+            result[new_key] = marker if marker is not None else self.value(item, depth + 1)
         return result
 
     def _sequence(self, value: Sequence[Any], depth: int) -> list[object] | tuple[object, ...]:
-        """Copy a sequence, redacting items and sensitive ``(name, value)`` header pairs.
+        """Copy a sequence, redacting items and the values of ``(name, value)`` pairs.
 
-        Tuples stay tuples; lists and every other sequence become lists.
+        A pair whose name is sensitive, such as a header pair, or names an email address
+        keeps its redacted name and loses its value (:meth:`key_marker`). Tuples stay
+        tuples; lists and every other sequence become lists.
         """
         items: list[object] = []
         for item in value:
@@ -874,8 +1354,9 @@ class _Redactor:
             except Exception:  # noqa: BLE001
                 items.append(_UNRENDERABLE)
                 continue
-            if name is not None and self.is_sensitive_key(name) and depth + 1 < _MAX_DEPTH:
-                pair = (self.value(name, depth + 2), REDACTED)
+            marker = self.key_marker(name) if name is not None else None
+            if marker is not None and depth + 1 < _MAX_DEPTH:
+                pair = (self.value(name, depth + 2), marker)
                 items.append(pair if isinstance(item, tuple) else list(pair))
             else:
                 items.append(self.value(item, depth + 1))
@@ -925,13 +1406,17 @@ def redact(
 
     The rules are those of the module docstring: sensitive keys (:data:`SENSITIVE_KEYS`
     plus ``header_names``, compared after normalisation in any letter case) and sensitive
-    ``(name, value)`` pairs lose their values; ``SecretStr`` values are replaced; inside
-    every string, plain or percent-encoded, URL passwords, values assigned to sensitive
-    keys, sensitive pair reprs and ``Bearer`` tokens, each secret whatever its length
-    (longest first, with any email address and any percent-encoded run holding a ``%XX``
-    escape that it overlaps) and email addresses are replaced. NaN and infinite floats
-    become ``None``, and a value that cannot be rendered becomes ``[UNRENDERABLE]``.
-    Containers are walked to a depth of 8. Redacting the result again changes nothing.
+    ``(name, value)`` pairs lose their values, and so do keys and pairs that name an email
+    address (:func:`is_email_key`); ``SecretStr`` values are replaced; inside every string,
+    plain or percent-encoded, URL passwords, values assigned to sensitive keys or to keys
+    that name an address (``email=...`` keeps ``email=``), such pair reprs and ``Bearer``
+    tokens, each secret whatever its length (longest first, with any email address and any
+    percent-encoded run holding a ``%XX`` escape that it overlaps) and email addresses in
+    any script (:func:`email_spans`) are replaced. An address's local part fails closed, so
+    text glued to it without a blank or delimiter (``contact=x!@y.com``, ``/path/a@b.co``)
+    is replaced with it. NaN and infinite floats become ``None``, and a value that cannot
+    be rendered becomes ``[UNRENDERABLE]``. Containers are walked to a depth of 8.
+    Redacting the result again changes nothing.
 
     Example::
 
@@ -939,8 +1424,12 @@ def redact(
         {'headers': {'Authorization': '[REDACTED]', 'X-Webhook-Secret': '[REDACTED]'}}
         >>> redact("contact lead@example.com via postgresql://ads:hunter22@db/x")
         'contact [REDACTED_EMAIL] via postgresql://ads:[REDACTED]@db/x'
+        >>> redact({"workEmail": None, "note": "从 用户@例子.公司 收到"})
+        {'workEmail': '[REDACTED_EMAIL]', 'note': '从 [REDACTED_EMAIL] 收到'}
         >>> redact("GET /x?access_token=abc&email=lead%40example.com")
         'GET /x?access_token=[REDACTED]&email=[REDACTED_EMAIL]'
+        >>> redact("No contact with 用户!@example.com; email=用户😀@example.com")
+        'No contact with [REDACTED_EMAIL]; email=[REDACTED_EMAIL]'
 
     Args:
         value: Any value: a string, a container, a secret or another object.
@@ -1159,12 +1648,13 @@ def _exception_text(exc: BaseException, redactor: _Redactor) -> str | None:
 
     An exception whose ``__str__`` is a built-in one (``BaseException``'s, ``KeyError``'s,
     ``OSError``'s and the like) renders its arguments, so those are redacted as data
-    first: a dict argument loses the values of its sensitive keys however they are
-    nested, and so does ``KeyError``'s repr of its key. The text is then rendered by that
-    ``__str__`` from the redacted arguments (:func:`_builtin_text`). A single string
-    argument, and every exception with a ``__str__`` of its own, is left to the text
-    rules. An exception whose ``__str__`` raises renders as the marker, never as the error
-    text structlog would quote.
+    first: a dict argument loses the values of its sensitive keys and of its keys that name
+    an email address however they are nested, two arguments read as a ``(name, value)``
+    pair lose the value the same way, and so does ``KeyError``'s repr of its key. The text
+    is then rendered by that ``__str__`` from the redacted arguments
+    (:func:`_builtin_text`). A single string argument, and every exception with a
+    ``__str__`` of its own, is left to the text rules. An exception whose ``__str__``
+    raises renders as the marker, never as the error text structlog would quote.
     """
     try:
         owner = _str_owner(type(exc))
@@ -1176,9 +1666,10 @@ def _exception_text(exc: BaseException, redactor: _Redactor) -> str | None:
             if not isinstance(redacted, tuple):
                 return str(redacted)
             originals = tuple(args)
-            if len(args) == 2 and redactor.is_sensitive_key(args[0]):
-                redacted = (redacted[0], REDACTED)
-                originals = (args[0], REDACTED)
+            marker = redactor.key_marker(args[0]) if len(args) == 2 else None
+            if marker is not None:
+                redacted = (redacted[0], marker)
+                originals = (args[0], marker)
             return _builtin_text(owner, exc, originals, redacted, redactor)
         str(exc)
     # No-blind-except yields: __str__ or an argument's repr can raise anything; fail closed.
@@ -1487,15 +1978,17 @@ def _url_secret_parts(value: str) -> tuple[str, ...]:
 def _settings_secrets(settings: Settings) -> tuple[str, ...]:
     """Collect every plaintext to remove from log strings for ``settings``.
 
-    That is every value of :meth:`Settings.secret_values` and the n8n webhook URL with its
-    path, whatever their length: the webhook URL is not a ``SecretStr``, but it is a
-    capability URL that is never logged. The password of each URL-shaped secret, raw and
-    percent-decoded, is added too when it has at least :data:`_MIN_SECRET_LENGTH`
-    characters; a shorter one, such as the local default database password ``ads``, is
-    left to the URL-credential rule, which removes it from its URL.
+    That is every value of :meth:`Settings.credential_values` (each set ``SecretStr`` and
+    the LinkedIn client id) and the n8n webhook URL with its path, whatever their length:
+    neither the client id nor the webhook URL is a ``SecretStr``, but one is an OAuth
+    credential and the other a capability URL, and neither is ever logged. The password
+    of each URL-shaped secret, raw and percent-decoded, is added too when it has at least
+    :data:`_MIN_SECRET_LENGTH` characters; a shorter one, such as the local default
+    database password ``ads``, is left to the URL-credential rule, which removes it from
+    its URL.
     """
     values: list[str] = []
-    for plaintext in settings.secret_values():
+    for plaintext in settings.credential_values():
         values.append(plaintext)
         values.extend(
             part for part in _url_secret_parts(plaintext) if len(part) >= _MIN_SECRET_LENGTH

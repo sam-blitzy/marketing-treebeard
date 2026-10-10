@@ -67,7 +67,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from ads_engine.logging import REDACTED, redact
+from ads_engine.logging import REDACTED, redact, redact_emails
 from ads_engine.settings import ConfigurationError, Source, get_settings
 
 __all__ = [
@@ -286,7 +286,6 @@ class ConnectorError(Exception):
         }
 
     def _init_kwargs(self) -> dict[str, Any]:
-        """Return the constructor arguments that rebuild this error."""
         return {
             "message": self.message,
             "source": self.source,
@@ -354,7 +353,6 @@ class TransientError(ConnectorError):
         return {**super().log_fields, "retry_after": self.retry_after}
 
     def _init_kwargs(self) -> dict[str, Any]:
-        """Return the constructor arguments that rebuild this error."""
         return {**super()._init_kwargs(), "retry_after": self.retry_after}
 
 
@@ -423,12 +421,10 @@ class QueryDefect(ConnectorError):  # noqa: N818 - name fixed by the connector c
         return {**super().log_fields, "query_id": self.query_id}
 
     def _init_kwargs(self) -> dict[str, Any]:
-        """Return the constructor arguments that rebuild this error."""
         return {**super()._init_kwargs(), "query_id": self.query_id}
 
 
 def _restore_error(cls: type[ConnectorError], kwargs: dict[str, Any]) -> ConnectorError:
-    """Rebuild a pickled or copied error from its constructor arguments."""
     return cls(**kwargs)
 
 
@@ -465,17 +461,18 @@ def _clean_seconds(value: float | None) -> float | None:
 def _configured_secrets() -> tuple[str, ...]:
     """Collect the plaintexts to strip from messages, from the loaded settings.
 
-    That is every set ``SecretStr`` and, beyond them, the n8n webhook URL and its path:
-    the URL is a capability URL that ``ads_engine.logging`` never logs either. When the
-    settings cannot load, nothing is collected, and only the rules that need no
-    configured secret apply: emails, URL passwords, sensitive assignments and ``Bearer``
-    tokens, plain or percent-encoded.
+    That is every value of ``Settings.credential_values()``, each set ``SecretStr`` and the
+    LinkedIn client id, and beyond them the n8n webhook URL and its path: the URL is a
+    capability URL that ``ads_engine.logging`` never logs either. When the settings cannot
+    load, nothing is collected, and only the rules that need no configured secret apply:
+    emails, URL passwords, sensitive assignments and ``Bearer`` tokens, plain or
+    percent-encoded.
     """
     try:
         settings = get_settings()
     except ValidationError, ConfigurationError:
         return ()
-    values = list(settings.secret_values())
+    values = list(settings.credential_values())
     webhook_url = settings.n8n_google_ads_webhook_url
     if webhook_url:
         values.append(webhook_url)
@@ -561,17 +558,22 @@ def _redact_held_fragment(text: str, held: frozenset[str]) -> str:
 def sanitize_message(text: str) -> str:
     r"""Make platform or exception text safe to persist and log.
 
-    Email addresses become ``[REDACTED_EMAIL]``; URL passwords, every configured secret
-    and every secret held by :func:`holding_secrets` (whatever its length), values
-    assigned to sensitive keys (``access_token=...``, ``Authorization: ...``,
-    ``{"refresh_token": "..."}``) and ``Bearer`` tokens become ``[REDACTED]``, exactly as
+    Email addresses in any script, their local parts read fail-closed (``用户!@example.com``
+    whole), and values assigned to keys that name one (``email=...``) become
+    ``[REDACTED_EMAIL]``; URL passwords, every configured secret and every secret held by
+    :func:`holding_secrets` (whatever its length), values assigned to sensitive keys
+    (``access_token=...``, ``Authorization: ...``, ``{"refresh_token": "..."}``) and
+    ``Bearer`` tokens become ``[REDACTED]``, exactly as
     :func:`ads_engine.logging.redact` does for log lines; the n8n webhook URL is removed
     too. Percent-encoded forms are covered as well, also when encoded twice:
     ``lead%40example.com`` and ``lead%2540example.com`` become ``[REDACTED_EMAIL]``.
     Whitespace runs collapse to one space, and the result is cut to 300 characters.
-    Redaction runs before the cut, so a secret is never left half-matched. Text that was
-    already cut, and so ends in ``…``, also loses a start of a held secret right before
-    that ellipsis, of 4 characters or more: what an earlier cut through the secret left.
+    Redaction runs before the collapse, so a header value still ends at its line, and the
+    email scanner runs again after it, so no quoted local part that the collapse joins
+    across a line break (``"john\ndoe"@example.com``) survives; both run before the cut, so
+    a secret is never left half-matched. Text that was already cut, and so ends in ``…``,
+    also loses a start of a held secret right before that ellipsis, of 4 characters or
+    more: what an earlier cut through the secret left.
 
     Example::
 
@@ -585,9 +587,13 @@ def sanitize_message(text: str) -> str:
         The sanitised single-line text.
     """
     held = _HELD_SECRETS.get()
-    redacted = redact(text, secrets=(*_configured_secrets(), *sorted(held)))
-    collapsed = " ".join(str(redacted).split())
-    return _truncate(_redact_held_fragment(collapsed, held), _MESSAGE_MAX)
+    secrets = (*_configured_secrets(), *sorted(held))
+    collapsed = " ".join(str(redact(text, secrets=secrets)).split())
+    # A quoted local part may hold blanks but no line break, so collapsing can join the two
+    # halves of one that a line break kept apart (`"john` and `doe"@example.com`): the
+    # single-line text is scanned for addresses again.
+    redacted = redact_emails(collapsed)
+    return _truncate(_redact_held_fragment(redacted, held), _MESSAGE_MAX)
 
 
 def unwrap_single_item(body: object) -> object:

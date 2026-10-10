@@ -1315,6 +1315,38 @@ def test_secret_values_skips_unset_secrets() -> None:
     assert Settings().secret_values() == (DEFAULT_DATABASE_URL,)
 
 
+def test_credential_values_add_the_stripped_linkedin_client_id_to_the_secret_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in LINKEDIN_TRIO_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LINKEDIN_CLIENT_ID", f"  {LINKEDIN_CLIENT_ID} ")
+
+    settings = Settings()
+    # The client id stays a plain string and never joins the SecretStr values.
+    assert settings.linkedin_client_id == LINKEDIN_CLIENT_ID
+    assert settings.secret_values() == (
+        DEFAULT_DATABASE_URL,
+        LINKEDIN_CLIENT_SECRET,
+        LINKEDIN_REFRESH_TOKEN,
+    )
+    assert settings.credential_values() == (*settings.secret_values(), LINKEDIN_CLIENT_ID)
+
+
+def test_credential_values_without_a_client_id_equal_the_secret_values() -> None:
+    assert Settings().credential_values() == (DEFAULT_DATABASE_URL,)
+    blank = Settings.model_construct(linkedin_client_id="   ")
+    assert blank.credential_values() == blank.secret_values()
+
+
+def test_credential_values_list_a_client_id_equal_to_a_secret_once() -> None:
+    settings = Settings(
+        linkedin_client_id=LINKEDIN_CLIENT_SECRET,
+        linkedin_client_secret=SecretStr(LINKEDIN_CLIENT_SECRET),
+    )
+    assert settings.credential_values() == (DEFAULT_DATABASE_URL, LINKEDIN_CLIENT_SECRET)
+
+
 # ---------------------------------------------------------------------------
 # get_settings
 # ---------------------------------------------------------------------------

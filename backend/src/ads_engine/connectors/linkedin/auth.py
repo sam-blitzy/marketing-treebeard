@@ -197,9 +197,9 @@ class HoldsSecrets(Protocol):
     """The optional capability of a :class:`TokenSource` to name every secret it holds.
 
     A token source offering it lists the plaintexts it holds in memory, or held before,
-    that no error or log may carry: the client secret, the current and rotated refresh
-    tokens, the cached access token and the tokens it retired, or a static token.
-    ``LinkedInClient`` checks for it with ``isinstance`` on every REST call and has
+    that no error or log may carry: the client id and client secret, the current and
+    rotated refresh tokens, the cached access token and the tokens it retired, or a static
+    token. ``LinkedInClient`` checks for it with ``isinstance`` on every REST call and has
     ``send_json`` hold what :meth:`held_secrets` returns at that moment, so a platform
     error echoing a token the source rotated since an earlier call never carries it.
 
@@ -404,12 +404,12 @@ class LinkedInTokenProvider:
     def held_secrets(self) -> tuple[str, ...]:
         """Return every plaintext this provider holds or retired, read at this moment.
 
-        In refresh mode: the client secret, the current refresh token (a rotated one once
-        LinkedIn rotates it), the cached access token and every retired token, both refresh
-        tokens rotated away and access tokens dropped. In static mode: the configured
-        access token. ``LinkedInClient`` holds them on every REST call and the exchange on
-        every attempt, so no error or log carries one. They are returned for that stripping
-        only and never persisted or logged.
+        In refresh mode: the client id, the client secret, the current refresh token (a
+        rotated one once LinkedIn rotates it), the cached access token and every retired
+        token, both refresh tokens rotated away and access tokens dropped. In static mode:
+        the configured access token. ``LinkedInClient`` holds them on every REST call and
+        the exchange on every attempt, so no error or log carries one. They are returned
+        for that stripping only and never persisted or logged.
         """
         credentials = self._credentials
         if isinstance(credentials, SecretStr):
@@ -450,14 +450,19 @@ class LinkedInTokenProvider:
     def _held_secrets(self, credentials: _RefreshCredentials) -> tuple[str, ...]:
         """Return the plaintexts held in memory that an error text must never carry.
 
-        ``sanitize_message`` strips the configured secrets; a rotated refresh token, an
+        ``sanitize_message`` strips the configured credentials; a rotated refresh token, an
         exchanged access token and every retired token exist only here, so they are
-        stripped explicitly as well.
+        stripped explicitly as well. The client id is a plain string, not a
+        :class:`~pydantic.SecretStr`, yet the exchange sends it with the client secret and
+        an OAuth ``error_description`` can echo it, so it is held whenever it is not blank.
         """
         held = [
             credentials.client_secret.get_secret_value(),
             credentials.refresh_token.get_secret_value(),
         ]
+        client_id = credentials.client_id.strip()
+        if client_id:
+            held.append(client_id)
         if self._access_token is not None:
             held.append(self._access_token.get_secret_value())
         held.extend(retired.get_secret_value() for retired in self._retired)
