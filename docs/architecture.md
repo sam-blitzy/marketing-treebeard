@@ -222,9 +222,9 @@ Inside one run (`analysis/runner.py`):
   fetched per preset window in `window.presets` (default `[14, 28, 56, 90]`), each ending on the
   default window end, into `fact_segment_window`, keyed by the exact window.
 - **C3a** uses segments only when the run window exactly matches a fetched segment window, with
-  the same start and end dates. Otherwise C3a is withheld with the finding
-  `segment_window_unavailable` and never reuses another window's segments
-  ([recommendation rules](recommendation-rules.md)).
+  the same start and end dates. Otherwise, while at least one LinkedIn campaign is active, C3a
+  is withheld with the finding `segment_window_unavailable` and never reuses another window's
+  segments ([recommendation rules](recommendation-rules.md)).
 - **Entity state** is fetched in full every entity sync, because the data is small and full
   state is what the discrepancy check compares.
 - **Snapshots** of the active dataset are never purged, so status, budget and quality-score

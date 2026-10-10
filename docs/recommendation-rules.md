@@ -871,6 +871,9 @@ subject, and never one on its members.
 ### C3a Launch: underused proven segment (LinkedIn)
 
 - **Section and group**: `campaigns` → `launch`.
+- **Scope**: `C3a` is evaluated only while at least one LinkedIn campaign is active (status
+  `active`, any objective). With none, it produces nothing at all: no card, no withheld line and
+  no `segment_window_unavailable` finding, even when no segment window matches the run window.
 - **Fires when** a demographic value (job function, seniority or industry) inside an active
   LinkedIn campaign with the `LEAD_GENERATION` objective has all of:
   - segment leads ≥ `c3a.min_leads` (default 5);
@@ -880,13 +883,24 @@ subject, and never one on its members.
   It does not fire when the pivot returns no lead metric. Only lead-generation campaigns are
   evaluated, because the campaign's cost per lead is its window spend ÷ its `oneClickLeads`:
   segments of a campaign with any other objective are skipped, with no card and no withheld line.
+  An active campaign of another objective still brings `C3a` into scope, so the segment window
+  check below still applies.
+- **Skipped**, with no card and no withheld line:
+  - a segment row whose leads are unavailable or 0, or whose cost or impressions are
+    unavailable; a pivot without a lead metric gives such rows;
+  - every segment of a campaign whose cost per lead is unavailable, because its window
+    `oneClickLeads` are unavailable or 0, or whose window impressions are 0. Window totals
+    report leads only when every counted daily row reports them, so one unreported day, or no
+    daily row in the window, makes them unavailable.
 - **Segment windows**: LinkedIn approximates and privacy-thresholds demographic values, so
   segments are fetched as aggregates for each preset in `window.presets`, each ending on the
   default window end. `C3a` is evaluated only when the run window equals one of those fetched
-  windows. Otherwise it is withheld with the `segment_window_unavailable` finding and one of two
-  labels, and never reuses another window's segments:
+  windows. Otherwise, within the scope above, it is withheld with the
+  `segment_window_unavailable` finding and one of two labels, and never reuses another window's
+  segments:
   - a preset not yet fetched for the current end date: "Segment data for the {n}-day window
-    ending {end} not yet available; latest available ends {date}";
+    ending {end} not yet available; latest available ends {date}", where {date} is `none` when
+    no segment window has been fetched;
   - a custom window whose length is not a preset or whose end is not the default end: "Segment
     data exists only for the preset windows {list} ending {end}".
 - **Action**: "Launch a campaign targeting {facet}: {value} with {campaign}'s offer".
@@ -894,8 +908,24 @@ subject, and never one on its members.
   per lead; segment and campaign impressions and the impression share; campaign spend and leads;
   the campaign group in `extra.campaign_group`.
 - **Ranking**: segment leads, descending.
-- **Withheld or suppressed**: a segment otherwise underused and efficient but below the lead
-  minimum is withheld ("segment leads 4 of 5 required").
+- **Withheld or suppressed**:
+  - a run window with no matching segment data withholds `C3a` for the run: one
+    `segment_window_unavailable` finding and one withheld line, each carrying its case's label.
+    Neither names an entity, and the line has no sample size: its `observed` and `required` are
+    null and its unit is `segment windows`;
+  - otherwise each segment not skipped above meets three gates in order and stops at the first
+    it fails. First, a cost per lead above `c3a.max_cpl_ratio` × the campaign's, or an
+    impression share at or above `c3a.max_impression_share`, leaves the segment unlisted;
+  - second, a segment otherwise underused and efficient but below the lead minimum is withheld
+    with leads observed and required ("segment leads 4 of 5 required");
+  - third, a campaign with window leads but zero window spend has a cost per lead of 0, which
+    gives no cost baseline, and the segment-to-campaign ratio is never fabricated. A zero-cost
+    segment that meets the share and lead minimums is withheld with "no exposure: zero campaign
+    spend in the window, so segment cost per lead cannot be compared", observed 0 of 1 required
+    in the unit `campaign days with spend`. A segment with any cost is dearer than the zero
+    baseline, so it fails the first gate and is not listed. A zero-cost segment below the lead
+    minimum gets the lead-minimum line instead, for example "segment leads 20 of 21 required" at
+    `c3a.min_leads` 21.
 - **Required datasets**: `linkedin.segments`, `linkedin.analytics_daily`, `linkedin.entities`.
 - **Decision subject**: no ("Mark done").
 - **Acceptance tests**: `backend/tests/acceptance/test_campaign_rules.py`.
@@ -1340,7 +1370,9 @@ Binding rules:
   stage is later. The `skipped_stage` finding reports "N contacts skipped this stage (not
   counted)", and no other date stands in.
 - The white paper table heads its MQL column with the bound label, for example "MQL (First
-  meeting booked)".
+  meeting booked)". The label is the one frozen in the run's evidence, that of the binding the
+  run computed its counts with, so a later binding change never relabels an earlier run
+  ([HubSpot integration](integrations/hubspot.md#where-the-resolved-bindings-appear)).
 
 ### Cohort and currency
 

@@ -287,8 +287,19 @@ unresolved QL binding and no Google link as the example:
   against HubSpot's active primary portal; `null` until verified) and
   `companion_crm_bindings` (the active companion's; `null` when there is none). The
   `/settings` screen shows them read-only.
-- The white-paper table heads its MQL column with the matched label, for example
-  "MQL (First meeting booked)".
+- The white-paper table heads its MQL column "MQL ({label})". The label is that of the MQL
+  binding the run computed its counts with, in the effective CRM dataset (the companion while
+  LinkedIn is simulated). It is frozen in each row's evidence, so a later binding change never
+  relabels an earlier run.
+  - `stage_label` mode: the matched lifecycle-stage option's label, for example
+    "MQL (First meeting booked)", or the configured label while no option matches.
+  - `property` mode: the configured label kept for display, else the bound property name, for
+    example "MQL (date_first_meeting_was_booked)".
+  - Only a table none of whose rows records a label takes the current one from
+    `GET /api/v1/config`, chosen the same way from `companion_crm_bindings` (else
+    `crm_bindings`) and `hubspot_mapping`. While that read loads or fails, the header is "MQL".
+  - The header is plain "MQL" when a table's rows record different labels (each row keeps its
+    own in its details), or when the label is blank or only repeats "MQL".
 - Contact reads request only the stage-date properties of available bindings. An unavailable
   count therefore reads as unavailable, never as a skipped stage.
 

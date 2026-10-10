@@ -300,8 +300,9 @@ Professional-demographic pivots are documented only for the Analytics Finder `pi
   incomplete with the reason "result limit reached". The window must stay exact, so it is never
   split by date.
 - **Use by C3a**: C3a runs only on a run whose window exactly equals a fetched segment window.
-  Otherwise it is withheld with `segment_window_unavailable` and never reuses another window's
-  segments (see [recommendation rules](../recommendation-rules.md)).
+  Otherwise, while at least one LinkedIn campaign is active, it is withheld with
+  `segment_window_unavailable` and never reuses another window's segments (see
+  [recommendation rules](../recommendation-rules.md)).
 
 ## When each call runs
 
