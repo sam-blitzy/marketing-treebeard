@@ -148,8 +148,19 @@ function normalBatchSize(size: number): number {
 /**
  * The element id `location.hash` names, decoded, or `null` when the hash is empty or `#`. A
  * fragment that is not valid percent-encoding is used as written ({@link idFromHash}).
+ *
+ * Exported so a disclosure that holds in-page link targets (`HeldDisclosure`) reads the hash
+ * exactly as a batched list does.
+ *
+ * @returns the id, or `null` without one
+ *
+ * @example
+ * ```ts
+ * // at /actions#item-1201
+ * hashTarget(); // "item-1201"
+ * ```
  */
-function hashTarget(): string | null {
+export function hashTarget(): string | null {
   return idFromHash(window.location.hash);
 }
 
@@ -172,11 +183,21 @@ function limitThrough(index: number, batchSize: number): number {
 
 /**
  * Scrolls the element with this id into view, aligned to the top of the viewport. Nothing
- * happens when no such element exists, or where the environment implements no scrolling.
+ * happens when no such element exists, or where the environment implements no scrolling. Focus
+ * never moves.
  *
+ * Exported so a disclosure that reveals the element a hash names (`HeldDisclosure`) scrolls to
+ * it exactly as a batched list does.
+ *
+ * @param id - the element's id, such as `item-1201`
  * @returns whether the element exists
+ *
+ * @example
+ * ```ts
+ * scrollToId('item-1201'); // true once the card is rendered
+ * ```
  */
-function scrollToId(id: string): boolean {
+export function scrollToId(id: string): boolean {
   const element = document.getElementById(id);
   if (element === null) {
     return false;

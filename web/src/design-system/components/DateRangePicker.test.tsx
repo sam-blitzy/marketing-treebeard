@@ -8,13 +8,22 @@
  *   configured preset in order, the default one marked "(default)", and no window length of the
  *   picker's own;
  * - a "Custom range" disclosure (`aria-expanded`, `aria-controls`) over a form with required
- *   Start date and End date fields bounded by `maxDate`, and Apply;
+ *   Start date and End date fields bounded by `maxDate`, and an md Apply in its own grid
+ *   wrapper after them;
  * - custom-range validation mirroring `POST /runs`: required fields, real calendar dates (an
  *   impossible date such as 2026-02-30 is rejected), start on or before end, end on or before
  *   `maxDate`, and at most `maxDays` days, both ends inclusive. Messages appear on the field
  *   (`aria-invalid`, `aria-describedby`) only after the first Apply and follow later edits;
- *   focus moves to the first invalid field and a polite `status` region announces a summary;
+ *   focus moves to the first invalid field and a polite `status` region announces a summary,
+ *   which clears as soon as an edit changes what it reports (a field fixed or a message
+ *   changed), stays while edits leave the errors as they were, and returns only with the next
+ *   Apply;
  * - the caller owns the selection: callbacks fire, the picker follows `value`;
+ * - the caller's `actions` sit on the preset row after the preset group, never inside it, and
+ *   survive an invalid configuration; its `statusMessage` is announced by a picker-level polite
+ *   `status` region outside the custom panel, committed empty and filled shortly after, never in
+ *   the commit's task, with only the latest of several quick messages shown and a cleared one
+ *   removed at once;
  * - `disabled` disables every control, and an invalid window configuration fails closed with a
  *   static error naming each problem and no control.
  *
@@ -36,7 +45,7 @@
  * type into a date input either, so field values are still entered with `change` events.
  */
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DateRangePicker, type DateRangePickerProps, type DateRangeValue } from './DateRangePicker';
 
@@ -98,9 +107,54 @@ function customToggle(): HTMLElement {
   return screen.getByRole('button', { name: 'Custom range' });
 }
 
-/** The polite status region of the custom form, visible or not. */
+/**
+ * The polite submit-summary status region of the custom form, visible or not. It is found
+ * inside the form of the Start date field, so the picker-level region that announces
+ * `statusMessage` is never mistaken for it.
+ */
 function statusRegion(): HTMLElement {
-  return screen.getByRole('status', { hidden: true });
+  const form = startField().form;
+  if (form === null) {
+    throw new Error('Start date is not inside the custom range form.');
+  }
+  return within(form).getByRole('status', { hidden: true });
+}
+
+/**
+ * The picker-level polite status region that announces `statusMessage`, visible or not: the one
+ * status region outside the custom form.
+ *
+ * @throws when there is not exactly one such region
+ */
+function windowStatusRegion(): HTMLElement {
+  const regions = screen
+    .getAllByRole('status', { hidden: true })
+    .filter((region) => region.closest('form') === null);
+  const [region] = regions;
+  if (regions.length !== 1 || region === undefined) {
+    throw new Error(`Expected one picker-level status region, found ${regions.length}.`);
+  }
+  return region;
+}
+
+/**
+ * The longest a `statusMessage` may take to reach the picker-level status region: the picker
+ * holds a message back this long after the commit (its `STATUS_MESSAGE_DELAY_MS`), so the region
+ * is in the accessibility tree before its text changes.
+ */
+const STATUS_MESSAGE_DELAY_MS = 100;
+
+/**
+ * One rendered frame at 60 Hz, rounded up to whole milliseconds: a message must not land within
+ * it, so a browser renders the empty region at least once before its text arrives.
+ */
+const ONE_FRAME_MS = 17;
+
+/** Advances the fake clock by `ms`, flushing every render the timers that fire cause. */
+function elapse(ms: number): void {
+  act(() => {
+    vi.advanceTimersByTime(ms);
+  });
 }
 
 /** Presses Apply. */
@@ -473,6 +527,27 @@ describe('DateRangePicker', () => {
       expect(panel?.hidden).toBe(true);
     });
 
+    it('lays out the two fields, then an md primary Apply in its own wrapper, on one grid', () => {
+      renderPicker({ value: { kind: 'custom', start: '2026-09-01', end: '2026-09-30' } });
+
+      const applyButton = screen.getByRole('button', { name: 'Apply' });
+      const wrapper = applyButton.parentElement;
+      const fields = wrapper?.parentElement;
+      expect(wrapper?.className).toBe('ds-daterange__apply');
+      expect(wrapper?.children).toHaveLength(1);
+      expect(applyButton.classList.contains('ds-button--md')).toBe(true);
+      expect(applyButton.classList.contains('ds-button--sm')).toBe(false);
+      expect(applyButton.classList.contains('ds-button--primary')).toBe(true);
+      expect(fields?.className).toBe('ds-daterange__custom-fields');
+      expect(Array.from(fields?.children ?? [], (child) => child.className)).toEqual([
+        'ds-field',
+        'ds-field',
+        'ds-daterange__apply',
+      ]);
+      expect(fields?.children[0]?.contains(startField())).toBe(true);
+      expect(fields?.children[1]?.contains(endField())).toBe(true);
+    });
+
     it('renders required date fields bounded by maxDate, empty for a preset value', () => {
       renderPicker();
       fireEvent.click(customToggle());
@@ -667,23 +742,152 @@ describe('DateRangePicker', () => {
       expect(messageOf(endField())).toBe('Range must be at most 1 day');
     });
 
-    it('updates messages on every edit after a failed Apply, but not the summary', () => {
+    it('updates messages on every edit; an edit empties the summary until the next Apply', () => {
       renderPicker();
       fireEvent.click(customToggle());
       apply();
-      const summary = statusRegion().textContent;
+      expect(statusRegion().textContent).toBe(
+        '2 errors: Start date: Enter a start date. End date: Enter an end date.',
+      );
 
       fireEvent.change(startField(), { target: { value: '2026-09-01' } });
 
       expect(startField().hasAttribute('aria-invalid')).toBe(false);
       expect(messageOf(startField())).toBeNull();
       expect(messageOf(endField())).toBe('Enter an end date');
+      expect(statusRegion().textContent).toBe('');
 
       fireEvent.change(endField(), { target: { value: '2026-08-01' } });
 
       expect(messageOf(startField())).toBe('Start date must be on or before the end date');
       expect(endField().hasAttribute('aria-invalid')).toBe(false);
+      expect(statusRegion().textContent).toBe('');
+      expect(statusRegion().children).toHaveLength(0);
+
+      apply();
+
+      expect(statusRegion().textContent).toBe(
+        '1 error: Start date: Start date must be on or before the end date.',
+      );
+    });
+
+    it('empties the summary on a partial fix, and Apply announces the error left', () => {
+      const { onSelectCustom } = renderPicker();
+      fireEvent.click(customToggle());
+      apply();
+      expect(statusRegion().textContent).toBe(
+        '2 errors: Start date: Enter a start date. End date: Enter an end date.',
+      );
+
+      fireEvent.change(startField(), { target: { value: '2026-09-20' } });
+
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(messageOf(startField())).toBeNull();
+      expect(endField().getAttribute('aria-invalid')).toBe('true');
+      expect(messageOf(endField())).toBe('Enter an end date');
+      expect(statusRegion().textContent).toBe('');
+      expect(statusRegion().children).toHaveLength(0);
+
+      apply();
+
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(endField());
+      expect(statusRegion().textContent).toBe('1 error: End date: Enter an end date.');
+    });
+
+    it('keeps the summary, unannounced again, while edits leave the errors as they were', () => {
+      renderPicker();
+      fireEvent.click(customToggle());
+      fireEvent.change(startField(), { target: { value: '2026-09-20' } });
+      fireEvent.change(endField(), { target: { value: '2026-09-10' } });
+      apply();
+      const summary = '1 error: Start date: Start date must be on or before the end date.';
+      const announced = statusRegion().firstElementChild;
+      expect(announced?.textContent).toBe(summary);
+
+      fireEvent.change(startField(), { target: { value: '2026-09-25' } });
+      fireEvent.change(endField(), { target: { value: '2026-09-15' } });
+
+      expect(messageOf(startField())).toBe('Start date must be on or before the end date');
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
       expect(statusRegion().textContent).toBe(summary);
+      expect(statusRegion().firstElementChild).toBe(announced);
+    });
+
+    it('empties the summary when an edit changes a message without fixing its field', () => {
+      renderPicker();
+      fireEvent.click(customToggle());
+      fireEvent.change(startField(), { target: { value: '2026-09-20' } });
+      fireEvent.change(endField(), { target: { value: '2026-09-10' } });
+      apply();
+      expect(statusRegion().textContent).toBe(
+        '1 error: Start date: Start date must be on or before the end date.',
+      );
+
+      fireEvent.change(startField(), { target: { value: '' } });
+
+      expect(startField().getAttribute('aria-invalid')).toBe('true');
+      expect(messageOf(startField())).toBe('Enter a start date');
+      expect(statusRegion().textContent).toBe('');
+
+      apply();
+
+      expect(statusRegion().textContent).toBe('1 error: Start date: Enter a start date.');
+    });
+
+    it('keeps the summary empty and focus where it is as edits fix every field', () => {
+      const { onSelectCustom } = renderPicker();
+      fireEvent.click(customToggle());
+      apply();
+      expect(document.activeElement).toBe(startField());
+
+      fireEvent.change(startField(), { target: { value: '2026-09-20' } });
+
+      expect(messageOf(endField())).toBe('Enter an end date');
+      expect(statusRegion().textContent).toBe('');
+      expect(document.activeElement).toBe(startField());
+
+      const end = endField();
+      end.focus();
+      fireEvent.change(end, { target: { value: '2026-10-01' } });
+
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
+      expect(statusRegion().textContent).toBe('');
+      expect(statusRegion().children).toHaveLength(0);
+      expect(document.activeElement).toBe(end);
+      expect(onSelectCustom).not.toHaveBeenCalled();
+    });
+
+    it('adds no summary for a field broken again after it cleared, until the next Apply', () => {
+      const { onSelectCustom } = renderPicker();
+      fireEvent.click(customToggle());
+      apply();
+      fireEvent.change(startField(), { target: { value: '2026-09-20' } });
+      fireEvent.change(endField(), { target: { value: '2026-10-01' } });
+      expect(statusRegion().textContent).toBe('');
+
+      fireEvent.change(endField(), { target: { value: '2026-09-10' } });
+
+      expect(startField().getAttribute('aria-invalid')).toBe('true');
+      expect(messageOf(startField())).toBe('Start date must be on or before the end date');
+      expect(statusRegion().textContent).toBe('');
+
+      apply();
+
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(startField());
+      expect(statusRegion().textContent).toBe(
+        '1 error: Start date: Start date must be on or before the end date.',
+      );
+
+      fireEvent.change(endField(), { target: { value: '2026-10-01' } });
+      expect(statusRegion().textContent).toBe('');
+      apply();
+
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
+      expect(onSelectCustom).toHaveBeenCalledWith('2026-09-20', '2026-10-01');
+      expect(statusRegion().textContent).toBe('');
     });
 
     it('focuses again and re-announces a repeated identical failure', () => {
@@ -790,6 +994,243 @@ describe('DateRangePicker', () => {
       expect(customToggle().getAttribute('aria-expanded')).toBe('true');
       expect(startField().value).toBe('2026-09-01');
       expect(pressedStates()).toEqual(['false', 'false', 'true']);
+    });
+  });
+
+  describe('actions', () => {
+    /** A caller control, as the status bar's recent custom windows disclosure would pass. */
+    const ACTION = <button type="button">Recent custom windows</button>;
+
+    it('places the actions on the preset row after the group, outside it', () => {
+      renderPicker({ actions: ACTION });
+
+      const group = screen.getByRole('group', { name: 'Analysis window' });
+      const action = screen.getByRole('button', { name: 'Recent custom windows' });
+      const row = group.parentElement;
+      expect(group.contains(action)).toBe(false);
+      expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
+        '7 days',
+        '21 days (default)',
+        '35 days',
+        'Custom range',
+      ]);
+      expect(row?.className).toBe('ds-daterange__row');
+      expect(Array.from(row?.children ?? [])).toEqual([group, action]);
+    });
+
+    it.each([
+      ['no actions', undefined],
+      ['null', null],
+      ['false', false],
+      ['an empty string', ''],
+    ])('adds no element for %s', (_case, actions) => {
+      renderPicker({ actions });
+
+      const group = screen.getByRole('group', { name: 'Analysis window' });
+      expect(group.parentElement?.className).toBe('ds-daterange__row');
+      expect(Array.from(group.parentElement?.children ?? [])).toEqual([group]);
+      expect(group.parentElement?.childNodes).toHaveLength(1);
+    });
+
+    it('keeps the actions after the configuration error when the configuration is invalid', () => {
+      const { container, rerenderWith } = renderPicker({
+        defaultPreset: 28,
+        actions: ACTION,
+        statusMessage: 'Custom window 2026-09-01 – 2026-09-30 opened',
+      });
+
+      const picker = container.firstElementChild;
+      const row = picker?.lastElementChild;
+      expect(row?.className).toBe('ds-daterange__row');
+      expect(row?.previousElementSibling?.classList.contains('ds-banner')).toBe(true);
+      expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([
+        'Recent custom windows',
+      ]);
+      expect(row?.contains(screen.getByRole('button', { name: 'Recent custom windows' }))).toBe(
+        true,
+      );
+      expect(screen.queryByRole('group')).toBeNull();
+      expect(screen.queryByRole('status', { hidden: true })).toBeNull();
+      expect(document.querySelector('input')).toBeNull();
+
+      rerenderWith({ actions: undefined });
+
+      expect(container.querySelector('.ds-daterange__row')).toBeNull();
+      expect(picker?.lastElementChild?.classList.contains('ds-banner')).toBe(true);
+    });
+  });
+
+  describe('status message', () => {
+    /** A message the status bar might pass once a custom run is shown. */
+    const OPENED = 'Custom window 2026-09-20 – 2026-10-01 opened';
+
+    /** The message of another custom window, which replaces {@link OPENED}. */
+    const REOPENED = 'Custom window 2026-08-01 – 2026-08-31 opened';
+
+    // A message lands a moment after the commit, so these cases run on a fake clock and let that
+    // moment pass explicitly with `elapse`.
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('renders an empty picker-level region last, outside the custom panel', () => {
+      const { container } = renderPicker();
+
+      const region = windowStatusRegion();
+      const panel = document.getElementById(customToggle().getAttribute('aria-controls') ?? '');
+      expect(region.textContent).toBe('');
+      expect(region.className).toBe('ds-visually-hidden');
+      expect(container.firstElementChild?.lastElementChild).toBe(region);
+      expect(panel?.contains(region)).toBe(false);
+    });
+
+    it('announces a trimmed message shortly after, while the custom panel is collapsed, never as an alert', () => {
+      renderPicker({ statusMessage: `  ${OPENED}  ` });
+      const region = windowStatusRegion();
+      expect(region.textContent).toBe('');
+
+      elapse(STATUS_MESSAGE_DELAY_MS);
+
+      expect(windowStatusRegion()).toBe(region);
+      expect(customToggle().getAttribute('aria-expanded')).toBe('false');
+      expect(region.textContent).toBe(OPENED);
+      // The submit summary is inside the collapsed panel, so this is the one exposed region.
+      expect(screen.getByRole('status')).toBe(region);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('commits its region empty and fills it after a rendered frame, so a first message is announced', () => {
+      const host = document.createElement('div');
+      document.body.append(host);
+      const records: MutationRecord[] = [];
+      const observer = new MutationObserver((batch) => {
+        records.push(...batch);
+      });
+      observer.observe(host, { childList: true, subtree: true, characterData: true });
+      const { props } = pickerProps({ statusMessage: OPENED });
+
+      // render() runs the commit and flushes its effects, as React may do in the commit's own
+      // task, so nothing the region holds now could have been rendered before it was filled.
+      render(<DateRangePicker {...props} />, { container: host });
+      records.push(...observer.takeRecords());
+      const region = windowStatusRegion();
+      expect(region.textContent).toBe('');
+      expect(records.some((record) => record.target === region)).toBe(false);
+
+      elapse(ONE_FRAME_MS);
+      expect(region.textContent).toBe('');
+
+      elapse(STATUS_MESSAGE_DELAY_MS - ONE_FRAME_MS);
+      records.push(...observer.takeRecords());
+      observer.disconnect();
+
+      expect(windowStatusRegion()).toBe(region);
+      expect(region.textContent).toBe(OPENED);
+      // A mutation inside the region means it was already in the document, empty, when its
+      // text arrived; text rendered on the first commit would arrive with the region itself.
+      expect(records.some((record) => record.target === region)).toBe(true);
+    });
+
+    it('replaces a message with a different one, in the same region, once its delay has passed', () => {
+      const { rerenderWith } = renderPicker({ statusMessage: OPENED });
+      const region = windowStatusRegion();
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(region.textContent).toBe(OPENED);
+
+      rerenderWith({ statusMessage: REOPENED });
+
+      // The message shown stays until the new one lands, so the region is never blanked.
+      expect(region.textContent).toBe(OPENED);
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(windowStatusRegion()).toBe(region);
+      expect(region.textContent).toBe(REOPENED);
+    });
+
+    it('never shows a message replaced before its delay passed', () => {
+      const half = STATUS_MESSAGE_DELAY_MS / 2;
+      const { rerenderWith } = renderPicker({ statusMessage: OPENED });
+      const region = windowStatusRegion();
+      elapse(half);
+      expect(region.textContent).toBe('');
+
+      rerenderWith({ statusMessage: REOPENED });
+      // The first message's delay passes here: it was cancelled, so it never lands.
+      elapse(half);
+      expect(region.textContent).toBe('');
+
+      elapse(half);
+      expect(windowStatusRegion()).toBe(region);
+      expect(region.textContent).toBe(REOPENED);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('empties the region at once when the message is cleared or blank, dropping one still pending', () => {
+      const { rerenderWith } = renderPicker({ statusMessage: OPENED });
+      const region = windowStatusRegion();
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(region.textContent).toBe(OPENED);
+
+      rerenderWith({ statusMessage: undefined });
+
+      // No time passes: removing text is silent, so it is not held back.
+      expect(windowStatusRegion()).toBe(region);
+      expect(region.textContent).toBe('');
+
+      rerenderWith({ statusMessage: OPENED });
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(region.textContent).toBe(OPENED);
+
+      rerenderWith({ statusMessage: '   ' });
+      expect(region.textContent).toBe('');
+
+      rerenderWith({ statusMessage: REOPENED });
+      rerenderWith({ statusMessage: undefined });
+      elapse(STATUS_MESSAGE_DELAY_MS);
+
+      expect(region.textContent).toBe('');
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('cancels a pending message when the picker unmounts', () => {
+      const { unmount } = renderPicker({ statusMessage: OPENED });
+      expect(vi.getTimerCount()).toBe(1);
+
+      unmount();
+
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('commits its region empty again when a fixed configuration brings it back', () => {
+      // 28 is not one of the fixture presets, so the configuration is invalid.
+      const { rerenderWith } = renderPicker({ defaultPreset: 28, statusMessage: OPENED });
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(screen.queryByRole('status', { hidden: true })).toBeNull();
+
+      rerenderWith({ defaultPreset: DEFAULT_PRESET });
+
+      const region = windowStatusRegion();
+      expect(region.textContent).toBe('');
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      expect(windowStatusRegion()).toBe(region);
+      expect(region.textContent).toBe(OPENED);
+    });
+
+    it('keeps the status message apart from the submit summary of a failed Apply', () => {
+      renderPicker({ statusMessage: OPENED });
+      elapse(STATUS_MESSAGE_DELAY_MS);
+      fireEvent.click(customToggle());
+
+      apply();
+
+      expect(statusRegion()).not.toBe(windowStatusRegion());
+      expect(statusRegion().textContent).toBe(
+        '2 errors: Start date: Enter a start date. End date: Enter an end date.',
+      );
+      expect(windowStatusRegion().textContent).toBe(OPENED);
     });
   });
 

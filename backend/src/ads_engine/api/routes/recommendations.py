@@ -56,6 +56,9 @@ entity key, suppressing the same rule and entity in later runs until ``until`` (
 from ``config/thresholds.yaml``). It is refused with 422 ``feedback_not_allowed`` on a C0 item and
 409 ``subject_retired`` on an item computed from data that has since been replaced. It never
 writes a decision and never touches a discrepancy: "Mark done" is feedback only (AAP 0.5.5).
+It is idempotent per item: requests for one item are serialised on its row, and a request that
+repeats the item's most recent feedback still in force (same kind and note), such as the second
+half of a double click, is answered with that feedback and writes nothing.
 
 The module imports nothing from ``connectors``, ``sync`` or ``simulation``, and its logs carry
 ids, rule ids and kinds only, never the user's email or the note.
@@ -76,7 +79,7 @@ Example::
 """
 
 from collections.abc import Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Annotated, Any, Final
 
@@ -661,6 +664,53 @@ async def _hold_item_current(session: AsyncSession, recommendation: Recommendati
         raise conflict("subject_retired", HISTORICAL_REASON)
 
 
+async def _hold_item_row(session: AsyncSession, recommendation: Recommendation) -> None:
+    """Lock the item's own row until the caller's transaction ends, serialising its feedback.
+
+    Two feedback requests for one item, such as the two halves of a double click, would
+    otherwise both find no earlier feedback and both insert one. The row is locked ``FOR NO
+    KEY UPDATE``, so the second request waits here until the first commits and then, under
+    READ COMMITTED, sees its feedback. The ``FOR KEY SHARE`` check of a feedback or decision
+    insert that references the item still passes, and the stored item itself is never
+    changed. Called after :func:`_hold_item_current`, because writers lock datasets before
+    rows (:func:`~ads_engine.db.repositories.lock_dataset`).
+
+    Args:
+        session: The request's session; its transaction holds the lock.
+        recommendation: The stored item.
+
+    Raises:
+        ApiError: 404 ``not_found`` when the row is gone by the time it is locked, as it is
+            only once its run has been deleted.
+    """
+    locked = await session.scalar(
+        select(Recommendation.id)
+        .where(Recommendation.id == recommendation.id)
+        .with_for_update(key_share=True)
+    )
+    if locked is None:
+        raise not_found(f"Recommendation {recommendation.id}")
+
+
+async def _latest_feedback_in_force(
+    session: AsyncSession, recommendation_id: int, now: datetime
+) -> RecommendationFeedback | None:
+    """Return the item's most recent feedback still in force at ``now``, or ``None``.
+
+    "Most recent" is the order the overlay applies feedback in, ``created_at`` then id, so
+    the row returned is the one that hides the item now (``hidden_by``). Only feedback given
+    on this item counts; feedback on another run's item of the same rule and entity is not
+    a repeat of this request.
+    """
+    feedback = RecommendationFeedback
+    return await session.scalar(
+        select(feedback)
+        .where(feedback.recommendation_id == recommendation_id, feedback.until > now)
+        .order_by(feedback.created_at.desc(), feedback.id.desc())
+        .limit(1)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -773,6 +823,14 @@ async def post_feedback(
     default-window rerun is requested in the same transaction. "Mark done" is feedback only:
     no decision is written and no discrepancy is touched.
 
+    A repeat is answered with the feedback it repeats, so a double submit records one row.
+    Feedback requests for one item are serialised on the item's row (:func:`_hold_item_row`);
+    when the item's most recent feedback still in force has the requested kind and note, that
+    row is returned unchanged, with 201 and the same ``Feedback`` body, and nothing is written:
+    no second row, no later ``until`` and no second rerun request. Any other request is
+    recorded as a new row, a different kind included (a dismiss after a snooze becomes the
+    item's latest feedback), and so is one after the earlier feedback has expired.
+
     Args:
         rec_id: The recommendation id.
         body: The feedback kind and an optional note.
@@ -782,12 +840,12 @@ async def post_feedback(
         now: The feedback instant, from which ``until`` is counted.
 
     Returns:
-        The recorded feedback.
+        The recorded feedback, or the one this request repeats.
 
     Raises:
         ApiError: 404 ``not_found`` for an unknown item; 422 ``feedback_not_allowed`` for a C0
             item, which is exempt and must be resolved instead; 409 ``subject_retired`` for an
-            item computed from data that has since been replaced.
+            item computed from data that has since been replaced, a repeat included.
     """
     recommendation = await session.get(Recommendation, rec_id)
     if recommendation is None:
@@ -795,6 +853,21 @@ async def post_feedback(
     if recommendation.rule_id == C0:
         raise ApiError(422, "feedback_not_allowed", _C0_FEEDBACK_MESSAGE)
     await _hold_item_current(session, recommendation)
+    await _hold_item_row(session, recommendation)
+    latest = await _latest_feedback_in_force(session, recommendation.id, now)
+    if latest is not None and (latest.kind, latest.note) == (body.kind, body.note):
+        view = schemas.Feedback.from_row(latest)
+        # Nothing was written; ending the transaction releases the dataset and row locks.
+        await session.commit()
+        _log.info(
+            "recommendations.feedback_replayed",
+            recommendation_id=recommendation.id,
+            rule_id=recommendation.rule_id,
+            kind=body.kind,
+            feedback_id=latest.id,
+            user_id=user.id,
+        )
+        return view
     days = thresholds.int(FEEDBACK_DAYS_KEYS[body.kind])
     row = RecommendationFeedback(
         recommendation_id=recommendation.id,

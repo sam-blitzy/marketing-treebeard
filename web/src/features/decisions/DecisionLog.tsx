@@ -437,9 +437,14 @@ function amountParts(decision: Decision): string[] {
   return parts;
 }
 
+/** No shared budget names: a member's budget is then named by its id. */
+const NO_BUDGET_NAMES: ReadonlyMap<number, string> = new Map<number, string>();
+
 /**
- * The "Resulting expected state" cell: the complete state the row holds, by its decision shape
- * (AAP 0.5.2), the rule `DiscrepancyResolver` renders decided states with.
+ * The complete expected state a decision row holds, by its decision shape (AAP 0.5.2), the rule
+ * `DiscrepancyResolver` renders decided states with. It is the log's "Resulting expected state"
+ * cell, and the recommendation card states a decision it has just recorded with it, from the
+ * `POST /decisions` response, so both read the same.
  *
  * - `own_budget`: "{Status} · daily budget {amount} · total budget {amount}", with only the
  *   amounts the row holds;
@@ -449,13 +454,22 @@ function amountParts(decision: Decision): string[] {
  * - an acknowledged removal (`tombstone`): "Removal acknowledged", followed by the campaign's
  *   decided status (" · Ended") on campaign subjects.
  *
+ * Statuses read as `CAMPAIGN_STATUS_LABELS` labels, and amounts are formatted by `formatMoney`
+ * in the subject's own currency.
+ *
  * @param decision - The decision row.
  * @param budgetNames - Shared budget names by internal id, from {@link sharedBudgetNames}.
- * @returns The cell text.
+ *   Omitted, a member's shared budget is named by its id ("shared budget id 401").
+ * @returns The state, as one line.
+ *
+ * @example
+ * ```ts
+ * describeExpectedState(savedDecision); // "Active · daily budget $160.00"
+ * ```
  */
-function describeExpectedState(
+export function describeExpectedState(
   decision: Decision,
-  budgetNames: ReadonlyMap<number, string>,
+  budgetNames: ReadonlyMap<number, string> = NO_BUDGET_NAMES,
 ): string {
   if (decision.tombstone) {
     return decision.subject.type === 'campaign'

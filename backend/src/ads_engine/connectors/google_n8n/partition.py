@@ -95,7 +95,8 @@ Reason strings:
     :data:`REASON_FINEST_PARTITION` and :data:`REASON_RESULT_LIMIT` are the platform's own limits.
     A repairable reason always comes first, so a deferred shortfall is never masked. Reasons and
     logs never carry GAQL text or id lists; a finest-partition reason names at most three
-    (day, ad group) partitions.
+    (day, ad group) partitions and counts the rest with the days they are on, so every day at
+    the limit is named.
 
 Example:
     ``sync`` reads a metrics range and records its completeness::
@@ -116,7 +117,7 @@ this package's ``queries``, ``parser`` and ``client`` are imported. Nothing here
 """
 
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -193,8 +194,9 @@ REASON_INTERRUPTED: Final = "interrupted"
 
 REASON_FINEST_PARTITION: Final = "result limit reached at finest partition"
 """Prefix of a Q-G6 fetch in which a single (day, ad group) still returned 10,000 rows:
-``"result limit reached at finest partition (2026-09-14, ad group 123)"``. Equals
-``ads_engine.sync.freshness.REASON_FINEST_PARTITION`` (permanent)."""
+``"result limit reached at finest partition (2026-09-14, ad group 123)"``; partitions after
+the third are counted with their days (``"…; and 2 more on 2026-09-14 to 2026-09-15)"``).
+Equals ``ads_engine.sync.freshness.REASON_FINEST_PARTITION`` (permanent)."""
 
 REASON_RESULT_LIMIT: Final = "result limit reached"
 """Reason of a capped ``single`` query (Q-G1, Q-G8), which has nothing to partition by."""
@@ -1288,21 +1290,48 @@ def interruption_reason(exc: TransientError, deferred: int) -> str:
     return f"{REASON_INTERRUPTED}: {exc.reason}; {count}"
 
 
+def _day_spans(days: Iterable[date]) -> str:
+    """Render distinct days ascending, consecutive ones joined as ``first to last``."""
+    spans: list[tuple[date, date]] = []
+    for day in sorted(set(days)):
+        if spans and day - spans[-1][1] == _ONE_DAY:
+            spans[-1] = (spans[-1][0], day)
+        else:
+            spans.append((day, day))
+    return ", ".join(
+        first.isoformat() if first == last else f"{first.isoformat()} to {last.isoformat()}"
+        for first, last in spans
+    )
+
+
 def _finest_partition_reason(overflows: Sequence[tuple[date, int]]) -> str:
     """Return the reason naming up to three (day, ad group) partitions kept at the limit.
+
+    The partitions after the third are counted with the days they are on, so the reason
+    names every day at the limit: ``sync.freshness`` ends the shortfall for a day once a later
+    read of it finishes, and the analysis flags a window incomplete only when it holds one of
+    those days. The format is the dated-shortfall grammar of
+    ``ads_engine.analysis.shortfall``, which this package cannot import.
 
     Example::
 
         _finest_partition_reason([(date(2026, 9, 14), 123)])
         # "result limit reached at finest partition (2026-09-14, ad group 123)"
+        _finest_partition_reason(
+            [(date(2026, 9, 14), group) for group in (1, 2, 3, 4)]
+            + [(date(2026, 9, 15), 5), (date(2026, 9, 18), 5)]
+        )
+        # "result limit reached at finest partition (2026-09-14, ad group 1; 2026-09-14,
+        # ad group 2; 2026-09-14, ad group 3; and 3 more on 2026-09-14 to 2026-09-15,
+        # 2026-09-18)"
     """
     named = [
         f"{day.isoformat()}, ad group {ad_group_id}"
         for day, ad_group_id in overflows[:_MAX_NAMED_PARTITIONS]
     ]
-    more = len(overflows) - len(named)
-    if more > 0:
-        named.append(f"and {more} more")
+    rest = overflows[_MAX_NAMED_PARTITIONS:]
+    if rest:
+        named.append(f"and {len(rest)} more on {_day_spans(day for day, _ in rest)}")
     return f"{REASON_FINEST_PARTITION} ({'; '.join(named)})"
 
 

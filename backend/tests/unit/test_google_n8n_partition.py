@@ -951,7 +951,10 @@ async def test_q_g6_finest_partition_at_the_limit_is_kept_and_incomplete() -> No
 
 @pytest.mark.anyio
 async def test_q_g6_reason_names_three_finest_partitions_then_counts_the_rest() -> None:
-    """Halving reaches each capped ad group; the reason names three and counts the others."""
+    """Halving reaches each capped ad group; the reason names three and counts the others.
+
+    The others are counted with the days they are on, so every day at the limit is named.
+    """
     groups = range(HEAVY_AD_GROUP, HEAVY_AD_GROUP + 4)
     fake = FakeGoogle(_heavy_search_terms(*groups))
 
@@ -967,7 +970,9 @@ async def test_q_g6_reason_names_three_finest_partitions_then_counts_the_rest() 
         groups[3],
     ]
     named = "; ".join(f"{DAY1.isoformat()}, ad group {group}" for group in groups[:3])
-    assert outcome.reason == f"{REASON_FINEST_PARTITION} ({named}; and 1 more)"
+    assert (
+        outcome.reason == f"{REASON_FINEST_PARTITION} ({named}; and 1 more on {DAY1.isoformat()})"
+    )
     assert sorted(set(_ids(outcome.rows, "ad_group.id"))) == list(groups)
     assert len(outcome.rows) == len(groups) * PAGE_SIZE
 

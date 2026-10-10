@@ -50,13 +50,15 @@ Decisions taken in this module, each stated where its code lives:
 * **Required ranges** (P4, AAP 0.3.2): an item is ``stale`` when a required dataset is old
   or covers less than the window end, and ``incomplete`` when one is not ``complete`` over
   its required range: coverage starting after the range start or ending before the window
-  end is incomplete, so an end shortfall is both stale and incomplete. The range is the
-  run's window, widened where the item's rule reads further back (``_RULE_LOOKBACKS``): a K1
-  item's ``google.metrics_daily`` must cover its frozen ``evidence.extra.baseline_window``
-  from its start, because K1's baseline rate reads the trailing ``k1.baseline_days``
-  (AAP 0.5.4.3). A missing or malformed baseline start fails closed to that many days back
-  from the window end (the frozen ``k1.baseline_days``, else the configured one), never to
-  the window start. Full-state entity datasets are judged by completeness and age alone.
+  end is incomplete, so an end shortfall is both stale and incomplete. A dated Q-G6
+  finest-partition shortfall counts, and is named, only for its days inside the range. The
+  range is the run's window, widened where the item's rule reads further back
+  (``_RULE_LOOKBACKS``): a K1 item's ``google.metrics_daily`` must cover its frozen
+  ``evidence.extra.baseline_window`` from its start, because K1's baseline rate reads the
+  trailing ``k1.baseline_days`` (AAP 0.5.4.3). A missing or malformed baseline start fails
+  closed to that many days back from the window end (the frozen ``k1.baseline_days``, else
+  the configured one), never to the window start. Full-state entity datasets are judged by
+  completeness and age alone.
 * **Missing freshness rows**: a required dataset with no ``dataset_freshness`` row (or no
   active dataset at all) has never succeeded, so it is both stale and incomplete, never
   silently fresh: on its cards, in ``stale_datasets`` and ``incomplete_datasets``, and in
@@ -1187,25 +1189,30 @@ def _stale_flag(
 def _incomplete_reasons(check: _DatasetCheck) -> tuple[str, ...]:
     """Say why an incomplete dataset is not ``complete`` over its required range.
 
-    Every shortfall is named once, in this order: a row that is not ``complete`` gives its
-    recorded reason (else its completeness); a dated dataset also names coverage starting
-    after the required start ("covers from 2026-09-04, after the K1 baseline start
-    2026-07-04", or "after the window start …" for the plain window) and coverage ending
-    before the window end ("covers through 2026-09-30, before the window end 2026-10-01").
-    A ``complete`` row reaches this only through a range shortfall
+    Every shortfall is named once, in this order: a row that is not ``complete`` over the
+    required range gives what it lacks there
+    (:meth:`~ads_engine.analysis.context.Freshness.incomplete_reason_over`: its recorded
+    reason, else its completeness, and of a dated Q-G6 shortfall only the days inside the
+    range); a dated dataset also names coverage starting after the required start ("covers
+    from 2026-09-04, after the K1 baseline start 2026-07-04", or "after the window start …"
+    for the plain window) and coverage ending before the window end ("covers through
+    2026-09-30, before the window end 2026-10-01"). A ``complete`` row, or one whose dated
+    shortfall lies outside the range, reaches this only through a range shortfall
     (:meth:`~ads_engine.analysis.context.Freshness.is_complete_over`), so the text never
-    reads "(complete)". Called only for checks judged incomplete, so never empty.
+    reads "(complete)" or names a day outside the range. Called only for checks judged
+    incomplete, so never empty.
     """
     row = check.row
     if row is None:
         return ("no freshness record",)
+    required = check.required
     reasons: list[str] = []
-    if row.completeness != "complete":
-        reasons.append(row.reason or row.completeness)
+    shortfall = row.incomplete_reason_over(window_start=required.start, window_end=required.end)
+    if shortfall is not None:
+        reasons.append(shortfall)
     if row.dataset in FULL_STATE_DATASETS:
         # A full-state read records no date range; its completeness alone decides.
         return tuple(reasons)
-    required = check.required
     if row.covered_from is None and row.covered_through is None:
         reasons.append("covers no dates")
         return tuple(reasons)

@@ -35,12 +35,16 @@
  *
  * The styling lives in `DataTable.css`, whose class names are the contract this component
  * renders: `ds-datatable__region` and, on an expandable table's region,
- * `ds-datatable__region--expandable`, `ds-datatable`, `ds-datatable__caption`,
+ * `ds-datatable__region--expandable`, `ds-datatable` and, on a table laid out at fixed column
+ * widths, `ds-datatable--fixed` with one `ds-datatable__col` per column, `ds-datatable__caption`,
  * `ds-datatable__header`, `ds-datatable__cell`, `ds-datatable__cell--start` and `--end`,
  * `ds-datatable__toggle-cell`, `ds-datatable__detail-row`, `ds-datatable__detail-cell`,
  * `ds-datatable__detail-content` and `ds-datatable__empty`. The visually hidden "Details"
  * header of the expand column uses `ds-visually-hidden` from `shared.css`, and the
- * configuration state is styled by `EmptyState.css`.
+ * configuration state is styled by `EmptyState.css`. The only inline style is the
+ * component-private `--ds-datatable-col-steps` property of each fixed-width column, which
+ * `.ds-datatable__col` reads; React writes it through the CSSOM, which the `default-src 'self'`
+ * CSP permits.
  *
  * The table deliberately has no sorting, pagination or selection: rows arrive already ranked by
  * the analysis run (AAP 0.5.4), and no screen in AAP 0.5.5 asks for any of the three.
@@ -59,10 +63,39 @@ import './shared.css';
 import './DataTable.css';
 
 import { Fragment, isValidElement, useId, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
+
+/** The steps of the column width scale, {@link DataTableColumnWidth}, from narrowest to widest. */
+const COLUMN_WIDTH_STEPS = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] as const;
+
+/**
+ * A column width on the table's width scale, in `--space-4` steps: `7` is seven `--space-4`
+ * steps (7rem, 112 CSS px at the placeholder scale and a 16 px root). The scale runs from 4 to 16
+ * steps, so every width is a multiple of a spacing token.
+ *
+ * When every column of a table has a width and the table is not expandable, the table is laid
+ * out at fixed column widths (`table-layout: fixed`, the columns sized by a `<colgroup>`):
+ * - the table is as wide as the larger of its region and the sum of its column widths, so a
+ *   narrower region scrolls the table on the inline axis (WCAG 2.2 SC 1.4.10 Reflow) and a wider
+ *   one shares the extra space out over the columns;
+ * - content never widens a column, so two tables whose columns carry the same widths put each
+ *   column at the same offset in regions of the same width;
+ * - headers wrap between words, and a word longer than its column breaks instead of overflowing
+ *   into the next one. Status chips keep their words whole and end-aligned cells stay on one
+ *   line, so a column holding either is sized for its longest value.
+ *
+ * A table whose columns are only partly sized keeps the automatic layout and ignores the widths:
+ * in a fixed layout an unsized column gets only the space the sized ones leave, which is none
+ * once the region is narrower than their sum. An expandable table keeps it as well, because its
+ * toggle column is sized by its button label, which no width on the scale can anticipate.
+ *
+ * GAP: bind to Blitzy OS on source arrival. This is a product scale, not a Blitzy OS one; on
+ * binding, it maps onto the Blitzy OS column sizing.
+ */
+export type DataTableColumnWidth = (typeof COLUMN_WIDTH_STEPS)[number];
 
 /**
  * One column of a {@link DataTable}, typed by the row it reads.
@@ -77,6 +110,9 @@ import { EmptyState } from './EmptyState';
  * - Without `render`, a cell shows `row[key]` when that property is a string or a number, and is
  *   empty otherwise, so `null` or `undefined` never appear as visible text. Columns that format a
  *   value (currency, percentages, floors such as "≥ 12", "unavailable") pass `render`.
+ * - `width` fixes the column's width on the table's width scale. Tables that share a column set
+ *   and give every column the same width line up column for column; see
+ *   {@link DataTableColumnWidth} for when the widths apply and how the table is then laid out.
  *
  * GAP: bind to Blitzy OS on source arrival. These are product-level column props, not Blitzy OS
  * props; on binding, they map onto the Blitzy OS table column definition.
@@ -92,6 +128,13 @@ export interface DataTableColumn<Row> {
   render?: (row: Row) => ReactNode;
   /** Renders the cells as row headers (`<th scope="row">`). Defaults to `false`. */
   isRowHeader?: boolean;
+  /**
+   * The column's width on the table's width scale. It applies only when every column of the
+   * table has one and the table is not expandable ({@link DataTableColumnWidth}). Omitted, the
+   * column is sized from its content, as is every column of a table that keeps the automatic
+   * layout.
+   */
+  width?: DataTableColumnWidth;
 }
 
 /**
@@ -222,6 +265,62 @@ function defaultCell(row: unknown, key: string): ReactNode {
   }
   return null;
 }
+
+/** The steps of {@link DataTableColumnWidth}, to check a width at run time. */
+const COLUMN_WIDTHS: ReadonlySet<unknown> = new Set(COLUMN_WIDTH_STEPS);
+
+/**
+ * Whether a value is a step of the column width scale. The check runs on the value itself, so a
+ * JavaScript caller or an untyped spread that passes a width off the scale, such as `7.5`, `40`
+ * or `'7'`, is caught as well.
+ *
+ * @param value the `width` of a column
+ * @returns `true` when the value is one of {@link COLUMN_WIDTH_STEPS}
+ */
+function isColumnWidth(value: unknown): value is DataTableColumnWidth {
+  return COLUMN_WIDTHS.has(value);
+}
+
+/** One `<col>` of a table laid out at fixed column widths. */
+interface FixedColumn {
+  /** The column's key: the React key of its `<col>`. */
+  readonly key: string;
+  /** The column's width on the scale. */
+  readonly width: DataTableColumnWidth;
+}
+
+/**
+ * The columns of a table laid out at fixed widths, in display order, or `null` when the table
+ * keeps the automatic layout: when it has no columns, is expandable, or has a column without a
+ * width on the scale (see {@link DataTableColumnWidth} for why a partly sized table is not fixed).
+ *
+ * @param columns the table's columns
+ * @param expandable whether the table has a toggle column (`renderExpanded` is given)
+ * @returns one entry per column, or `null` for the automatic layout
+ */
+function fixedColumns<Row>(
+  columns: readonly DataTableColumn<Row>[],
+  expandable: boolean,
+): readonly FixedColumn[] | null {
+  if (expandable || columns.length === 0) {
+    return null;
+  }
+  const fixed: FixedColumn[] = [];
+  for (const column of columns) {
+    const width: unknown = column.width;
+    if (!isColumnWidth(width)) {
+      return null;
+    }
+    fixed.push({ key: column.key, width });
+  }
+  return fixed;
+}
+
+/**
+ * Inline style of a fixed-width `<col>`. It holds only the component-private custom property
+ * that `.ds-datatable__col` reads, typed without a cast and still assignable to `CSSProperties`.
+ */
+type ColumnStyle = CSSProperties & Record<'--ds-datatable-col-steps', string>;
 
 /** The title of the configuration state rendered in place of a table that cannot be shown. */
 const UNAVAILABLE_TITLE = 'Table unavailable';
@@ -371,6 +470,12 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  * columns scroll sideways; a nested table wider than that scrolls in its own region. A table
  * without `renderExpanded` renders neither class.
  *
+ * When every column has a `width` and the table is not expandable, the table carries
+ * `ds-datatable--fixed` and a `<colgroup>` after its caption, with one `ds-datatable__col` per
+ * column whose `--ds-datatable-col-steps` property holds the column's width in `--space-4` steps;
+ * `DataTable.css` lays the table out at those widths ({@link DataTableColumnWidth}). Otherwise
+ * it renders neither, and the columns are sized from their content.
+ *
  * The only state is the set of expanded row keys; the component has no effects.
  *
  * GAP: bind to Blitzy OS on source arrival.
@@ -432,6 +537,7 @@ export function DataTable<Row>({
   const label = naming.kind === 'label' ? naming.label : undefined;
   const expandable = renderExpanded !== undefined;
   const totalColumns = columns.length + (expandable ? 1 : 0);
+  const fixed = fixedColumns(columns, expandable);
 
   /** Opens a collapsed row or closes an open one, replacing the set so React sees a change. */
   const toggle = (key: string): void => {
@@ -456,10 +562,21 @@ export function DataTable<Row>({
       aria-labelledby={label === undefined ? captionId : undefined}
       tabIndex={0}
     >
-      <table className="ds-datatable" aria-label={label}>
+      <table
+        className={fixed === null ? 'ds-datatable' : 'ds-datatable ds-datatable--fixed'}
+        aria-label={label}
+      >
         <caption id={captionId} className="ds-datatable__caption">
           {caption}
         </caption>
+        {fixed === null ? null : (
+          <colgroup>
+            {fixed.map((column) => {
+              const style: ColumnStyle = { '--ds-datatable-col-steps': String(column.width) };
+              return <col key={column.key} className="ds-datatable__col" style={style} />;
+            })}
+          </colgroup>
+        )}
         <thead>
           <tr>
             {expandable ? (

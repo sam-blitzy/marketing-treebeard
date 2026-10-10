@@ -239,19 +239,27 @@ describe('BudgetSection layout', () => {
     expect(
       within(section as HTMLElement).getByRole('heading', { level: 2, name: 'Budget changes' }),
     ).toBeTruthy();
+    // The only group repeats the section's title, so the title is shown once: the <h2>. The
+    // group keeps its anchor on a container that is neither a heading nor a region.
+    expect(screen.getAllByRole('heading', { name: 'Budget changes' })).toHaveLength(1);
+    expect(screen.getAllByRole('region', { name: 'Budget changes' })).toEqual([section]);
     const group = document.getElementById('group-budget-changes');
-    expect(within(group as HTMLElement).getByRole('heading', { level: 3 }).textContent).toBe(
-      'Budget changes',
-    );
+    expect(group?.tagName).toBe('DIV');
+    expect(group?.getAttribute('role')).toBeNull();
+    expect(
+      within(group as HTMLElement).queryByRole('heading', { level: 3, name: 'Budget changes' }),
+    ).toBeNull();
 
-    // Ranked by window spend: the B1 first, then the B3, each heading at level 4.
+    // Ranked by window spend: the B1 first, then the B3, each heading at level 3, directly
+    // under the section's <h2>, so no level is skipped.
     const articles = [...(group?.querySelectorAll('article') ?? [])];
     expect(articles.map((article) => article.id)).toEqual([
       `item-${String(FIXTURE_ITEM_IDS.b1)}`,
       `item-${String(FIXTURE_ITEM_IDS.b3)}`,
     ]);
-    expect(screen.getByRole('heading', { level: 4, name: B1_ACTION })).toBeTruthy();
-    expect(screen.getByRole('heading', { level: 4, name: B3_ACTION })).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 3, name: B1_ACTION })).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 3, name: B3_ACTION })).toBeTruthy();
+    expect(screen.queryAllByRole('heading', { level: 4 })).toHaveLength(0);
 
     // Items, then "Patterns withheld for sample size" (AAP 0.5.5), with the sample sizes.
     const withheld = screen.getByRole('list', { name: 'Patterns withheld for sample size' });
@@ -269,6 +277,26 @@ describe('BudgetSection layout', () => {
 
     expect(screen.queryByRole('alert')).toBeNull();
     expect(api.calls).toHaveLength(0);
+  });
+
+  it('puts the cards at level 4 below a group whose title differs from the section', async () => {
+    await renderBudget(
+      makeSection('budget', {
+        groups: [
+          makeGroup({
+            key: 'changes',
+            title: 'Shared budgets',
+            items: [pageItem(FIXTURE_ITEM_IDS.b1)],
+          }),
+        ],
+      }),
+    );
+
+    const group = screen.getByRole('region', { name: 'Shared budgets' });
+    expect(group.id).toBe('group-budget-changes');
+    expect(within(group).getByRole('heading', { level: 3 }).textContent).toBe('Shared budgets');
+    expect(within(group).getByRole('heading', { level: 4, name: B1_ACTION })).toBeTruthy();
+    expect(screen.getAllByRole('heading', { name: 'Budget changes' })).toHaveLength(1);
   });
 
   it('states why the section is empty: the G1 count and the withheld patterns', async () => {
@@ -874,7 +902,7 @@ describe('other budget cards', () => {
       'Adjust weekend schedule or bids: weekend cost/outcome $90.00 vs weekday $45.00',
     );
     expect(groupFields(article, 'Utilization')).toEqual(['Window utilization (spend vs cap): n/a']);
-    // B4 is not gated on budget history, so no requirement is shown.
+    // Neither B4's gate nor any budget-history minimum requires these days here, so none is shown.
     expect(tableOf(article, 'Budget days').rows).toEqual([['Budget-active days', '0', '—']]);
     expect(listLines(article, 'Budget details')).toEqual([
       'Window conversions: 30',
@@ -887,6 +915,80 @@ describe('other budget cards', () => {
     // No decision subject: the card offers "Mark done" (AAP 0.5.5).
     expect(within(article).getByRole('button', { name: 'Mark done' })).toBeTruthy();
     expect(within(article).queryByRole('button', { name: 'Record decision' })).toBeNull();
+  });
+
+  it('shows a B4 card every day count against its gate or budget-history minimum', async () => {
+    // budget._b4_candidate in API order: the pattern's day counts come before the history's
+    // (_history_metrics(history, None)); extra.gate is B4's own gate and
+    // extra.budget_history.minimums the history's minimums.
+    const action = 'Adjust weekend schedule or bids: weekend cost/outcome $24.10 vs weekday $19.80';
+    const built = budgetItem({
+      id: 6006,
+      rule_id: 'B4',
+      action,
+      metrics: [
+        usd('spend', 'Window spend', '8600.00'),
+        days('window_days', 'Window days', 28),
+        metric('outcomes', 'Window conversions', 397, 'conversions'),
+        usd('cost_per_outcome', 'Cost per conversion', '21.66'),
+        days('weekend_days', 'Weekend days with spend', 8),
+        days('weekdays', 'Weekdays with spend', 20),
+        usd('daily_budget', 'Latest effective daily budget', '400.00'),
+        metric('window_utilization', 'Window utilization (spend vs cap)', '0.77', 'ratio'),
+        days('known_days', 'Known-budget days', 28),
+        days('spending_days', 'Spending days', 28),
+        metric('spending_day_share', 'Share of known-budget days with spend', '1', 'ratio'),
+        days('idle_days', 'Known idle days', 0),
+        days('changed_intraday_days', 'Changed-intraday days (unknown budget)', 0),
+        days('unobserved_days', 'Unobserved days (unknown budget)', 0),
+      ],
+      extra: {
+        currency: 'USD',
+        gate: {
+          weekend_days: { observed: 8, required: 4 },
+          weekdays: { observed: 20, required: 10 },
+          outcomes: { observed: 397, required: 10 },
+        },
+        budget_history: {
+          subject: { type: 'campaign', id: 6006 },
+          name: 'Campaign 6006',
+          shared: false,
+          known_label: 'known-budget days',
+          minimums: {
+            known_budget_days: { observed: 28, required: 7 },
+            spending_days: { observed: 28, required: 5 },
+          },
+          note: 'shown beside the pattern; B4 is not gated on budget history',
+        },
+      },
+    });
+    const b4: Item = {
+      ...built,
+      evidence: makeEvidence({
+        ...built.evidence,
+        sample: { observed: 397, required: 10, unit: 'outcomes', projected: null },
+      }),
+    };
+    await renderBudget(budgetWith([b4]));
+
+    const article = card(action);
+    expect(groupFields(article, 'Utilization')).toEqual([
+      'Window utilization (spend vs cap): 77%',
+      'Days (observed / required): Spending days 28 / 5 · Weekend days with spend 8 / 4 · ' +
+        'Weekdays with spend 20 / 10',
+    ]);
+    // AAP 0.5.4.1 order, whatever the API's metric order.
+    expect(tableOf(article, 'Budget days').rows).toEqual([
+      ['Known-budget days', '28', '7'],
+      ['Spending days', '28', '5'],
+      ['Weekend days with spend', '8', '4'],
+      ['Weekdays with spend', '20', '10'],
+      ['Known idle days', '0', '—'],
+      ['Changed-intraday days (unknown budget)', '0', '—'],
+      ['Unobserved days (unknown budget)', '0', '—'],
+    ]);
+    // The outcome gate, observed against b4.min_outcomes, is the evidence table's sample line.
+    expect(within(article).getByText('Sample: 397 / 10 outcomes')).toBeTruthy();
   });
 
   it('says the members are unavailable on a shared budget whose evidence lists none', async () => {

@@ -39,6 +39,10 @@
  *    hold reason and the link to its blocking discrepancy in the Action cell
  *    ({@link ActionCell}), so neither waits on the row being expanded.
  *
+ * A row a feedback recorded on this page has hidden ("Mark done", "Dismiss" or "Snooze for 7
+ * days" in its details) leaves the frame's confirmation directly after the table that held it,
+ * since a table row cannot hold it, for as long as the run still lists the asset.
+ *
  * Each asset table and each per-creative table shows `ROW_BATCH_SIZE` rows at a time, in the
  * API's order, followed by a "Show {n} more" control when it holds more (`../batches`;
  * AAP 0.1.1 "the five sections render from precomputed runs in under 2 s"), so a cohort of
@@ -116,6 +120,7 @@ import {
   historicalProvenanceText,
 } from '../RecommendationCard';
 import {
+  ConfirmedItems,
   FieldList,
   HeldDisclosure,
   SectionFrame,
@@ -1061,17 +1066,23 @@ interface CohortTablesProps {
  * the held rows' table behind the held disclosure. Every amount is in the cohort's one currency.
  * The spend total is the backend's (`extra.cohort.spend_total`), shown as "unavailable" when
  * absent and never summed here; no other total is shown, because counts overlap across assets.
+ *
+ * A row a feedback recorded on this page has hidden leaves its confirmation ("Dismissed:
+ * {action} ({asset})") directly after the table that held it ({@link ConfirmedItems}), because a
+ * `DataTable` row cannot hold one, or in the table's place when no row of it is left.
  */
 function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const summary = findCohortSummary(parts.group.items);
   const currency = cohortCurrency(parts, summary);
   const overlapNote = textOrNull(summary?.overlapNote) ?? OVERLAP_NOTE_FALLBACK;
+  const { placed, confirmations } = parts;
 
   return (
     <Stack gap={4}>
       {parts.visible.length > 0 ? (
         <AssetTable caption={`White papers (${currency})`} items={parts.visible} mql={mql} />
       ) : null}
+      <ConfirmedItems items={placed.visible} confirmations={confirmations} />
       {parts.historical.length > 0 ? (
         <AssetTable
           caption={`White papers (${currency}) computed from replaced data`}
@@ -1079,6 +1090,7 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
           mql={mql}
         />
       ) : null}
+      <ConfirmedItems items={placed.historical} confirmations={confirmations} />
       <Stack as="ul" gap={1} aria-label={`Notes on the ${currency} white papers`}>
         <li>{`Spend total (${currency}): ${formatMoney(summary?.spendTotal, currency)}`}</li>
         <li>{overlapNote}</li>
@@ -1095,7 +1107,11 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
           items={parts.held}
           mql={mql}
         />
+        <ConfirmedItems items={placed.held} confirmations={confirmations} />
       </HeldDisclosure>
+      {parts.held.length === 0 ? (
+        <ConfirmedItems items={placed.held} confirmations={confirmations} />
+      ) : null}
     </Stack>
   );
 }

@@ -4,8 +4,9 @@
  * Class contract with DataTable.tsx, which renders:
  *
  *   div.ds-datatable__region           role="region", tabindex="0", named by the caption
- *     table.ds-datatable
+ *     table.ds-datatable [+ .ds-datatable--fixed]          fixed: every column has a width
  *       caption.ds-datatable__caption  every table has one
+ *       colgroup > col.ds-datatable__col                    fixed tables only, one per column
  *       thead > tr > th.ds-datatable__header + .ds-datatable__cell--start | --end
  *       tbody > tr > td | th[scope=row].ds-datatable__cell + .ds-datatable__cell--start | --end
  *       tbody > tr.ds-datatable__detail-row[hidden] > td.ds-datatable__detail-cell
@@ -57,6 +58,39 @@
   font-size: var(--font-size-sm);
   line-height: var(--line-height-normal);
   color: var(--color-text);
+}
+
+/*
+ * Fixed column widths, for a table whose every column has a width (DataTable.tsx). Each col is a
+ * whole number of --space-4 steps, from 4 to 16, held by the component-private
+ * --ds-datatable-col-steps property that DataTable.tsx sets, so every width is a token multiple.
+ * Under table-layout: fixed the columns take those widths whatever their content, so tables that
+ * share a column set line up column for column. The table keeps its full inline size above, and
+ * a fixed table is the larger of that and the sum of its columns: a narrower region scrolls it
+ * (SC 1.4.10), and a wider one shares the extra space out over the columns.
+ */
+.ds-datatable--fixed {
+  table-layout: fixed;
+}
+
+.ds-datatable__col {
+  inline-size: calc(var(--space-4) * var(--ds-datatable-col-steps));
+}
+
+/*
+ * In a fixed table content no longer sets a column's minimum width, so content wider than its
+ * column would spill into the next one. Headers therefore wrap between words, and a word longer
+ * than its column, in a header or a cell, breaks instead. The status chip rule below still keeps
+ * a chip's words whole, and numeric cells stay on one line, so a column holding either is sized
+ * for its longest value.
+ */
+.ds-datatable--fixed .ds-datatable__header {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ds-datatable--fixed .ds-datatable__cell {
+  overflow-wrap: anywhere;
 }
 
 .ds-datatable__caption {

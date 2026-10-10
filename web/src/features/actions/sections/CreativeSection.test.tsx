@@ -22,12 +22,17 @@
  *   whose next test was withheld or suppressed by feedback), and it is left out only for a block
  *   none of whose items carries variants.
  *
+ * - **A card hidden on the page** by its own Dismiss, Snooze or Mark done leaves its
+ *   confirmation where it stood in the campaign block, after the variants table and before the
+ *   cards computed from replaced data, until a rerun no longer lists it.
+ *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
- * the test.
+ * the test. The feedback-flow tests alone render the section from a stubbed
+ * `GET /recommendations` (`../../../test/feedbackFlow`), whose feedback post hides the item.
  */
 import { mockApi } from '../../../test/mockApi';
 
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -50,7 +55,9 @@ import {
 } from '../../../test/fixtures';
 import * as formatModule from '../../../lib/format';
 import { formatCount, formatPercent } from '../../../lib/format';
+import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
 import * as evidenceExtraModule from '../evidenceExtra';
 import {
   CreativeSection,
@@ -554,6 +561,33 @@ describe('CreativeSection', () => {
       ).toBeTruthy();
     });
 
+    it('renders a block titled as the section with no <h3>, its cards at level 3 and its table captioned', async () => {
+      const repeating = makeGroup({
+        key: 'campaign:779',
+        title: 'Copy/creative changes',
+        items: [
+          testItemWith(58, [
+            { creative_id: 9002, name: 'Same-name variant', impressions: 1800, click_rate: '0.02' },
+          ]),
+        ],
+      });
+      await renderCreative(creativeWith(repeating));
+
+      const section = screen.getByRole('region', { name: 'Copy/creative changes' });
+      expect(screen.getAllByRole('heading', { name: 'Copy/creative changes' })).toHaveLength(1);
+      expect(screen.getAllByRole('region', { name: 'Copy/creative changes' })).toEqual([section]);
+      const block = elementById(groupAnchorId('creative', 'campaign:779'));
+      expect(block.tagName).toBe('DIV');
+      expect(block.parentElement?.closest('section')).toBe(section);
+      // No heading level is skipped: the card sits directly under the section's <h2>.
+      expect(within(block).getByRole('heading', { level: 3, name: 'Next test 58' })).toBeTruthy();
+      expect(within(block).queryAllByRole('heading', { level: 4 })).toHaveLength(0);
+      expect(
+        within(block).getByRole('table', { name: 'Variants in Copy/creative changes' }),
+      ).toBeTruthy();
+    });
+
+
     it('shows the empty state, and no block, when no rule fired', async () => {
       await renderCreative(makeSection('creative'));
 
@@ -842,7 +876,7 @@ describe('long copy blocks', () => {
       ),
     ).toBeTruthy();
     expect(batchStatuses(block)).toEqual(['Showing all 64 variants', 'Showing all 46 actions']);
-  });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 
   it('shows ten campaign blocks at a time, in API order', async () => {
     const groups = Array.from({ length: 12 }, (_, index) =>
@@ -968,4 +1002,76 @@ describe('CreativeSection rendered again', () => {
     const table = screen.getByRole('table', { name: `Variants in ${PIPELINE_EMEA}` });
     expect(bodyRows(table).map((row) => row[5])).toEqual(['64', '51']);
   });
+});
+
+describe('CreativeSection: the confirmation of a card hidden on the page', () => {
+  /** Whether `first` precedes `second` in document order. */
+  function precedes(first: Element, second: Element): boolean {
+    return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  }
+
+  it.each(['dismiss', 'snooze', 'done'] as const)(
+    'shows a %s where the CR3 card stood, in its campaign block, until a rerun drops it',
+    async (kind) => {
+      const flow = feedbackFlow();
+      const api = mockApi(flow.handlers);
+      const { queryClient } = await renderWithProviders(
+        <LiveSection sectionKey="creative" component={CreativeSection} />,
+        { path: '/actions' },
+      );
+      const cr3 = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.cr3);
+      const card = await screen.findByRole('article', { name: cr3.action });
+      const label = { dismiss: 'Dismiss', snooze: 'Snooze for 7 days', done: 'Mark done' }[kind];
+      const button = within(card).getByRole('button', { name: label });
+      button.focus();
+      fireEvent.click(button);
+
+      await waitFor(() => {
+        expect(screen.queryByRole('article', { name: cr3.action })).toBeNull();
+      });
+      const block = document.getElementById(
+        groupAnchorId('creative', `campaign:${String(FIXTURE_CAMPAIGN_IDS.pipelineEmea)}`),
+      );
+      if (block === null) {
+        throw new Error('the campaign block left the page with its card');
+      }
+      const text = feedbackConfirmationText(kind, cr3);
+      const confirmation = within(block).getByText(text);
+      // Plain content: neither a live region (the provider announces it) nor an alert, nor a
+      // Tab stop.
+      expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+      expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+      expect(within(block).queryAllByRole('alert')).toEqual([]);
+      // Where the card stood: after the variants table, before the replaced-data cards.
+      const variants = within(block).getByRole('table', { name: /^Variants in / });
+      const replaced = within(block).getByRole('group', {
+        name: 'Computed from replaced data (1)',
+      });
+      expect(precedes(variants, confirmation)).toBe(true);
+      expect(precedes(confirmation, replaced)).toBe(true);
+      // The item still counts as hidden.
+      const section = screen.getByRole('region', { name: 'Copy/creative changes' });
+      expect(within(section).getByRole('list', { name: 'Not shown' }).textContent).toContain(
+        '1 hidden since this run',
+      );
+      // Focus did not fall to the page: the next card offers no enabled action (computed from
+      // replaced data), so it is on the block's heading.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(
+          within(block).getByRole('heading', { name: 'Lead Gen — Pipeline Report EMEA' }),
+        );
+      });
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+
+      // A rerun that no longer lists the item removes its confirmation.
+      flow.drop(cr3.id);
+      await act(async () => {
+        await queryClient.refetchQueries();
+      });
+      await waitFor(() => {
+        expect(within(section).queryByText(text)).toBeNull();
+      });
+      expect(within(section).queryByRole('list', { name: 'Not shown' })).toBeNull();
+    },
+  );
 });

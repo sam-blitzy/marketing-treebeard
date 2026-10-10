@@ -17,10 +17,16 @@
  * - the C1, C1b and C2 field sets ("Campaign evidence", and the "Pipeline evidence" table with
  *   MQL and QL in separate columns for C1b and C2 "Hold" only);
  * - the C2 "Scale" decision workflow posting its B1 amount, own or shared; "Hold" marks done;
+ * - the C2 "Scale" link to the B1 card for its subject, inside a `B1CardsProvider`, named by
+ *   the B1 action, kept while that B1 card is held or computed from replaced data, and no link
+ *   without a B1 card rendered for that subject (absent or hidden by feedback), outside the
+ *   provider, or on a "Hold";
  * - the C3a segment gap and the C3b keyword-cluster gap;
  * - the empty discrepancy group kept, with the live count and a link to `/decisions`, while the
  *   overlay counts discrepancies detected after the run;
- * - no `role="alert"` anywhere in the section.
+ * - no `role="alert"` anywhere in the section;
+ * - a card hidden by its own feedback leaves its confirmation where it stood, in the discrepancy
+ *   group after the pinned C0 cards as in any other group, until a rerun drops it.
  *
  * The network is stubbed with `mockApi`, which fails a test on any request it does not expect,
  * so a section without a C0 card is also shown to send no request at all. Loading states are
@@ -30,9 +36,10 @@
  */
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandlers, MockResponse, RecordedCall } from '../../../test/mockApi';
+import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -67,8 +74,11 @@ import {
   makeRun,
   makeSection,
 } from '../../../test/fixtures';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
+import { B1CardsProvider } from '../B1Cards';
 import { DECISION_RECORDED_MESSAGE, RECORD_DECISION_LABEL } from '../RecommendationCard';
 import {
+  B1_LINK_LABEL,
   CAMPAIGN_EVIDENCE_LABEL,
   CLUSTER_GAP_LABEL,
   CLUSTER_TERMS_CAPTION,
@@ -1663,7 +1673,10 @@ describe('pause and scale cards', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    const recorded = await within(article).findByText(DECISION_RECORDED_MESSAGE);
+    // The card states what the saved decision recorded, its status kept and the new amount.
+    const recorded = await within(article).findByText(
+      `${DECISION_RECORDED_MESSAGE}: Active · daily budget $72.00`,
+    );
     expect(recorded.getAttribute('role')).toBe('status');
     expect(screen.queryByRole('dialog')).toBeNull();
     // One patch with the changed field only: the unchanged status is not sent (AAP 0.5.2).
@@ -1731,7 +1744,10 @@ describe('pause and scale cards', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    const recorded = await within(article).findByText(DECISION_RECORDED_MESSAGE);
+    // A shared budget has no status: the card states the amount the decision recorded on it.
+    const recorded = await within(article).findByText(
+      `${DECISION_RECORDED_MESSAGE}: daily budget $600.00`,
+    );
     expect(recorded.getAttribute('role')).toBe('status');
     expect(screen.queryByRole('dialog')).toBeNull();
     const posts = decisionPosts(api.calls);
@@ -1859,6 +1875,288 @@ describe('pause and scale cards', () => {
     const article = card('Pause or rework targeting');
     expect(within(article).queryByRole('table', { name: PIPELINE_EVIDENCE_CAPTION })).toBeNull();
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual(['Window spend: $10.00']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The C2 "Scale" link to its B1 item
+// ---------------------------------------------------------------------------------------------
+
+/** The id of {@link benchmarksUsB1Item}, outside {@link FIXTURE_ITEM_IDS}. */
+const BENCHMARKS_US_B1_ID = 3204;
+
+/** The id of {@link searchBudgetB1Item}, outside {@link FIXTURE_ITEM_IDS}. */
+const SEARCH_BUDGET_B1_ID = 3214;
+
+/** The action of {@link benchmarksUsB1Item}: the B1 of {@link ownBudgetScaleItem}, +20%. */
+const BENCHMARKS_US_B1_ACTION = 'Raise daily budget from USD 60.00 to USD 72.00';
+
+/** The action of {@link searchBudgetB1Item}: the B1 of {@link sharedBudgetScaleItem}, +20%. */
+const SEARCH_BUDGET_B1_ACTION = 'Raise daily budget from USD 500.00 to USD 600.00';
+
+/**
+ * The B1 item of {@link ownBudgetScaleItem}: the default page's B1 card moved onto the scale's
+ * subject, "Lead Gen — Benchmarks US", with the read-time overlay `current` applied.
+ */
+function benchmarksUsB1Item(current: Partial<Item['current']> = {}): Item {
+  const b1 = pageItem(FIXTURE_ITEM_IDS.b1);
+  return {
+    ...b1,
+    id: BENCHMARKS_US_B1_ID,
+    action: BENCHMARKS_US_B1_ACTION,
+    entity: ownBudgetScaleItem().entity,
+    decision_subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs },
+    current: makeItemOverlay(current),
+  };
+}
+
+/** The B1 item of {@link sharedBudgetScaleItem}, on the "Search Shared Budget" itself. */
+function searchBudgetB1Item(): Item {
+  return {
+    ...pageItem(FIXTURE_ITEM_IDS.b1),
+    id: SEARCH_BUDGET_B1_ID,
+    action: SEARCH_BUDGET_B1_ACTION,
+    entity: sharedBudgetScaleItem().entity,
+    decision_subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+  };
+}
+
+/** A Budget section whose one group, "changes", holds `items`. */
+function budgetWith(items: Item[]): Section {
+  return makeSection('budget', {
+    groups: [makeGroup({ key: 'changes', title: 'Budget changes', items })],
+  });
+}
+
+/**
+ * Renders the Campaigns section as `/actions` does, inside a `B1CardsProvider` given the page's
+ * sections: `campaigns` and a Budget section holding `budgetItems`.
+ */
+async function renderLinked(campaigns: Section, budgetItems: Item[]) {
+  return renderWithProviders(
+    <B1CardsProvider sections={[campaigns, budgetWith(budgetItems)]}>
+      <CampaignsSection section={campaigns} run={makeRun()} overlay={makeOverlay()} />
+    </B1CardsProvider>,
+  );
+}
+
+/** The text of every link inside `scope`, in document order. */
+function linkNames(scope: HTMLElement): string[] {
+  return within(scope)
+    .queryAllByRole('link')
+    .map((link) => link.textContent);
+}
+
+/** The Campaigns section memoized as `/actions` renders it, so only the provider can update it. */
+const MemoizedCampaignsSection = memo(CampaignsSection);
+
+/** Where {@link LinkedCampaigns} publishes how to replace the page's Budget section. */
+interface BudgetSwap {
+  /** Replaces the Budget section the provider indexes, as a newer page does. */
+  swap?: (next: Section) => void;
+}
+
+/** Props of {@link LinkedCampaigns}. */
+interface LinkedCampaignsProps {
+  /** The Campaigns section, kept the same object for the harness's lifetime. */
+  campaigns: Section;
+  /** The Budget section the provider indexes first. */
+  initialBudget: Section;
+  /** Receives the function that replaces the Budget section once the harness has mounted. */
+  handle: BudgetSwap;
+}
+
+/**
+ * The memoized Campaigns section inside a `B1CardsProvider` whose Budget section a test replaces
+ * while the Campaigns section's own props stay the same objects, as a poll that changed only a
+ * B1 card leaves them.
+ */
+function LinkedCampaigns({ campaigns, initialBudget, handle }: LinkedCampaignsProps): ReactElement {
+  const [budget, setBudget] = useState(initialBudget);
+  const [run] = useState(makeRun);
+  const [overlay] = useState(makeOverlay);
+  useEffect(() => {
+    handle.swap = setBudget;
+  }, [handle]);
+  const sections = useMemo(() => [campaigns, budget], [campaigns, budget]);
+  return (
+    <B1CardsProvider sections={sections}>
+      <MemoizedCampaignsSection section={campaigns} run={run} overlay={overlay} />
+    </B1CardsProvider>
+  );
+}
+
+describe('the C2 "Scale" link to its B1 item', () => {
+  it('links a "Scale" card to the B1 card for its subject, named by the B1 action', async () => {
+    const api = mockApi({});
+    await renderLinked(oneGroup('scale', 'Scale', [ownBudgetScaleItem()]), [
+      pageItem(FIXTURE_ITEM_IDS.b1),
+      benchmarksUsB1Item(),
+    ]);
+
+    const article = card('Scale');
+    // "'Scale', with a link to its B1 item, which carries the amount" (AAP 0.5.4.4); the name
+    // says where the link leads without the card around it (WCAG 2.2 SC 2.4.4).
+    const link = within(article).getByRole('link', {
+      name: `${B1_LINK_LABEL}: ${BENCHMARKS_US_B1_ACTION}`,
+    });
+    expect(link.getAttribute('href')).toBe(`#item-${String(BENCHMARKS_US_B1_ID)}`);
+    expect(linkNames(article)).toEqual([`${B1_LINK_LABEL}: ${BENCHMARKS_US_B1_ACTION}`]);
+    // Beside the card's fields: after its campaign evidence.
+    const fields = within(article).getByRole('list', { name: CAMPAIGN_EVIDENCE_LABEL });
+    expect(fields.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The B1 card is found in the page's own response: nothing is fetched for it.
+    await settle();
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it('links a shared-budget "Scale" to the B1 on the budget subject, never a same-id campaign', async () => {
+    mockApi({});
+    const sameIdCampaign: Item = {
+      ...pageItem(FIXTURE_ITEM_IDS.b1),
+      decision_subject: { type: 'campaign', id: FIXTURE_BUDGET_IDS.search },
+    };
+    const campaigns = oneGroup('scale', 'Scale', [sharedBudgetScaleItem()]);
+    await renderLinked(campaigns, [sameIdCampaign, searchBudgetB1Item()]);
+
+    const link = within(card('Scale')).getByRole('link', {
+      name: `${B1_LINK_LABEL}: ${SEARCH_BUDGET_B1_ACTION}`,
+    });
+    expect(link.getAttribute('href')).toBe(`#item-${String(SEARCH_BUDGET_B1_ID)}`);
+  });
+
+  it('shows no link when the page has no B1 card for its subject, or outside the provider', async () => {
+    mockApi({});
+    // The default page's B1 is on "Pipeline Search — US", another subject.
+    const { unmount } = await renderLinked(oneGroup('scale', 'Scale', [ownBudgetScaleItem()]), [
+      pageItem(FIXTURE_ITEM_IDS.b1),
+    ]);
+    expect(linkNames(card('Scale'))).toEqual([]);
+    unmount();
+
+    await renderCampaigns(oneGroup('scale', 'Scale', [ownBudgetScaleItem()]));
+    expect(linkNames(card('Scale'))).toEqual([]);
+  });
+
+  it('links a B1 card a discrepancy holds or from replaced data, never one feedback hides', async () => {
+    mockApi({});
+    const campaigns = oneGroup('scale', 'Scale', [ownBudgetScaleItem()]);
+    const name = `${B1_LINK_LABEL}: ${BENCHMARKS_US_B1_ACTION}`;
+    const href = `#item-${String(BENCHMARKS_US_B1_ID)}`;
+    const hidden = await renderLinked(campaigns, [benchmarksUsB1Item({ hidden_by: 'dismiss' })]);
+    expect(linkNames(card('Scale'))).toEqual([]);
+    hidden.unmount();
+    // Hidden by feedback while held: counted, never rendered, so never linked.
+    const hiddenHeld = await renderLinked(campaigns, [
+      { ...benchmarksUsB1Item({ held_now: true, hidden_by: 'snooze' }), held: true },
+    ]);
+    expect(linkNames(card('Scale'))).toEqual([]);
+    hiddenHeld.unmount();
+
+    // A held B1 sits in its group's held disclosure, which the link's hash expands: held when
+    // the run computed it, or held now by a discrepancy detected since.
+    const frozenHold: Item = { ...benchmarksUsB1Item(), held: true };
+    const held = await renderLinked(campaigns, [frozenHold]);
+    const heldLink = within(card('Scale')).getByRole('link', { name });
+    expect(heldLink.getAttribute('href')).toBe(href);
+    held.unmount();
+    const heldNow = await renderLinked(campaigns, [benchmarksUsB1Item({ held_now: true })]);
+    expect(within(card('Scale')).getByRole('link', { name }).getAttribute('href')).toBe(href);
+    heldNow.unmount();
+
+    // A held "Scale" links its held B1 too: one discrepancy on their shared subject holds both.
+    const heldScale = oneGroup('scale', 'Scale', [{ ...ownBudgetScaleItem(), held: true }]);
+    const bothHeld = await renderLinked(heldScale, [frozenHold]);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
+    );
+    expect(within(card('Scale')).getByRole('link', { name }).getAttribute('href')).toBe(href);
+    bothHeld.unmount();
+
+    // A B1 computed from replaced data is still shown openly, under "Computed from replaced
+    // data", so the link stays.
+    await renderLinked(campaigns, [benchmarksUsB1Item({ historical: true, held_now: true })]);
+    expect(linkNames(card('Scale'))).toEqual([`${B1_LINK_LABEL}: ${BENCHMARKS_US_B1_ACTION}`]);
+  });
+
+  it('gives a "Hold" no link, even beside a B1 card for its subject', async () => {
+    mockApi({});
+    const hold = pageItem(FIXTURE_ITEM_IDS.c2Hold);
+    // A Hold names no B1; one that did would still get no link, because a Hold has no B1.
+    const holdWithLink: Item = {
+      ...hold,
+      evidence: makeEvidence({
+        ...hold.evidence,
+        extra: {
+          ...hold.evidence.extra,
+          b1_link: {
+            rule_id: 'B1',
+            subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs },
+          },
+        },
+      }),
+    };
+    await renderLinked(oneGroup('scale', 'Scale', [holdWithLink]), [benchmarksUsB1Item()]);
+
+    expect(linkNames(card('Hold: platform outcomes are not reaching Qualified Lead'))).toEqual([]);
+  });
+
+  it('shows no link for a link to another rule or one without a subject', async () => {
+    mockApi({});
+    const scale = ownBudgetScaleItem();
+    const withLink = (b1Link: unknown, id: Item['id']): Item => ({
+      ...scale,
+      id,
+      evidence: makeEvidence({
+        ...scale.evidence,
+        extra: { ...scale.evidence.extra, b1_link: b1Link },
+      }),
+    });
+    const subject = { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs };
+    await renderLinked(
+      oneGroup('scale', 'Scale', [
+        withLink({ rule_id: 'B3', subject }, 3221),
+        withLink({ rule_id: 'B1' }, 3222),
+      ]),
+      [benchmarksUsB1Item()],
+    );
+
+    for (const article of screen.getAllByRole('article', { name: 'Scale' })) {
+      expect(linkNames(article)).toEqual([]);
+    }
+  });
+
+  it('names the link "View B1 budget increase" alone when the B1 action is blank', async () => {
+    mockApi({});
+    const blank: Item = { ...benchmarksUsB1Item(), action: ' ' };
+    await renderLinked(oneGroup('scale', 'Scale', [ownBudgetScaleItem()]), [blank]);
+
+    const link = within(card('Scale')).getByRole('link', { name: B1_LINK_LABEL });
+    expect(link.getAttribute('href')).toBe(`#item-${String(BENCHMARKS_US_B1_ID)}`);
+  });
+
+  it('follows the B1 card as a newer page hides and restores it, through the section memo', async () => {
+    mockApi({});
+    const handle: BudgetSwap = {};
+    await renderWithProviders(
+      <LinkedCampaigns
+        campaigns={oneGroup('scale', 'Scale', [ownBudgetScaleItem()])}
+        initialBudget={budgetWith([benchmarksUsB1Item()])}
+        handle={handle}
+      />,
+    );
+    const name = `${B1_LINK_LABEL}: ${BENCHMARKS_US_B1_ACTION}`;
+    expect(linkNames(card('Scale'))).toEqual([name]);
+
+    act(() => {
+      handle.swap?.(budgetWith([benchmarksUsB1Item({ hidden_by: 'snooze' })]));
+    });
+    expect(linkNames(card('Scale'))).toEqual([]);
+
+    act(() => {
+      handle.swap?.(budgetWith([benchmarksUsB1Item()]));
+    });
+    expect(linkNames(card('Scale'))).toEqual([name]);
   });
 });
 
@@ -2097,7 +2395,7 @@ describe('a long discrepancy group', () => {
     // Every C0 card keeps its live resolver; none is an alert.
     expect(within(group).getAllByRole('button', { name: 'Platform is correct' })).toHaveLength(45);
     expect(screen.queryByRole('alert')).toBeNull();
-  });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 
   it('reveals the C0 card a held card links to when it lies beyond the first batch', async () => {
     mockApi({ 'GET /discrepancies': openDiscrepancies() });
@@ -2124,5 +2422,82 @@ describe('a long discrepancy group', () => {
     expect(cardIds()).toEqual(itemIds(7001, 7045).concat(itemIds(7101, 7105)));
     expect(scrollIntoView.mock.contexts).toEqual([document.getElementById('item-7044')]);
     await screen.findAllByRole('button', { name: 'Platform is correct' });
+  });
+});
+
+describe('CampaignsSection: the confirmation of a card hidden on the page', () => {
+  /** Whether `first` precedes `second` in document order. */
+  function precedes(first: Element, second: Element): boolean {
+    return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  }
+
+  /** A C1 "Pause" in the discrepancy group, after the pinned C0 card. */
+  const DISCREPANCY_GROUP_PAUSE = makeItem({
+    id: 1190,
+    rank: 2,
+    rule_id: 'C1',
+    action: 'Pause Partner Search — US',
+    entity: { source: 'google', type: 'campaign', id: '61000990', name: 'Partner Search — US' },
+  });
+
+  /** The default page with {@link DISCREPANCY_GROUP_PAUSE} after its C0 card. */
+  function pageWithDiscrepancyGroupPause() {
+    const page = makeRecommendationsPage();
+    const campaigns = page.sections.find((section) => section.key === 'campaigns');
+    const discrepancies = campaigns?.groups.find((group) => group.key === 'discrepancies');
+    if (discrepancies === undefined) {
+      throw new Error('the fixture page has no discrepancy group');
+    }
+    discrepancies.items = [...discrepancies.items, structuredClone(DISCREPANCY_GROUP_PAUSE)];
+    return page;
+  }
+
+  it('shows it after the pinned C0 card in the discrepancy group, which keeps its resolver', async () => {
+    const flow = feedbackFlow(pageWithDiscrepancyGroupPause);
+    mockApi({ ...flow.handlers, 'GET /discrepancies': openDiscrepancies() });
+    await renderWithProviders(<LiveSection sectionKey="campaigns" component={CampaignsSection} />, {
+      path: '/actions',
+    });
+    const pause = await screen.findByRole('article', { name: DISCREPANCY_GROUP_PAUSE.action });
+    fireEvent.click(within(pause).getByRole('button', { name: 'Snooze for 7 days' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('article', { name: DISCREPANCY_GROUP_PAUSE.action })).toBeNull();
+    });
+    const group = screen.getByRole('region', { name: 'Discrepancies' });
+    const confirmation = within(group).getByText(
+      feedbackConfirmationText('snooze', DISCREPANCY_GROUP_PAUSE),
+    );
+    const c0 = within(group).getByRole('article', { name: C0_ACTION });
+    expect(precedes(c0, confirmation)).toBe(true);
+    expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    expect(flow.hidden.get(DISCREPANCY_GROUP_PAUSE.id)).toBe('snooze');
+  });
+
+  it('shows it in a Pause group before the held disclosure, whose count is unchanged', async () => {
+    const flow = feedbackFlow();
+    mockApi({ ...flow.handlers, 'GET /discrepancies': openDiscrepancies() });
+    await renderWithProviders(<LiveSection sectionKey="campaigns" component={CampaignsSection} />, {
+      path: '/actions',
+    });
+    const c1 = pageItem(FIXTURE_ITEM_IDS.c1);
+    const card = await screen.findByRole('article', { name: c1.action });
+    fireEvent.click(within(card).getByRole('button', { name: 'Dismiss' }));
+
+    await waitFor(() => {
+      expect(document.getElementById(`item-${String(c1.id)}`)).toBeNull();
+    });
+    // The group's only visible card was hidden here: the group stays, with the confirmation.
+    const group = screen.getByRole('region', { name: 'Pause' });
+    const confirmation = within(group).getByText(feedbackConfirmationText('dismiss', c1));
+    const held = within(group).getByRole('button', {
+      name: 'Held until discrepancies are resolved (1)',
+    });
+    expect(precedes(confirmation, held)).toBe(true);
+    const section = screen.getByRole('region', { name: 'Campaigns to pause or launch' });
+    expect(within(section).getByRole('list', { name: 'Not shown' }).textContent).toContain(
+      '1 hidden since this run',
+    );
+    expect(within(section).queryAllByRole('alert')).toEqual([]);
   });
 });

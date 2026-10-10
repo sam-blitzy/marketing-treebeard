@@ -7,8 +7,9 @@
  * `../../test/mockApi`, so the real hooks read `GET /sources` and `GET /runs/latest` (the
  * display time zone) and the real client posts "Sync now". The cases cover, per source:
  *
- * - the status line: mode (Live, Simulated, or none yet) with its reason, connection status,
- *   the derived "Stale" badge and the last attempt in the display time zone;
+ * - the status line: mode (Live, Simulated, or none yet, including a source that never went
+ *   live) with its reason, connection status, the derived "Stale" badge and the last attempt in
+ *   the display time zone;
  * - the Google webhook call count of the last 24 h against the product's own cap: its
  *   conservative reservation counter, an upper bound rather than the exact calls dispatched;
  * - the active primary and companion datasets, and each dataset's freshness, coverage and
@@ -18,19 +19,25 @@
  *   the display time zone of instants;
  * - the recent sync runs, finished, running and failed;
  * - "Sync now": the POST with its CSRF header, the 202, 409 `sync_pending` and failure outcomes
- *   kept to their own section, the pending hint, and focus returned to the button;
+ *   kept to their own section, one POST for two presses within one frame, the button disabled
+ *   and described by its outcome or the pending hint while the API reports a pending request,
+ *   the 202 and 409 banners cleared for good by the poll that reports the request picked up,
+ *   and focus kept on a focused button, returned to the button or, while it stays disabled,
+ *   moved to the outcome;
  * - the page states: loading, failure with Retry, no sources, and a failed background refresh.
  *
  * @packageDocumentation
  */
 import { apiError, json, mockApi } from '../../test/mockApi';
-import type { MockHandler, MockHandlers, MockResponse } from '../../test/mockApi';
+import type { ApiMock, MockHandler, MockHandlers, MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
 import type { QueryClient } from '@tanstack/react-query';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { SOURCES_POLL_MS } from '../../api/queries';
 import type {
+  Completeness,
   ConnectionStatus,
   DataMode,
   DatasetFreshnessView,
@@ -166,6 +173,23 @@ function withStaleRow(
   return rows.map((row, at) => (at === index ? { ...row, stale: true } : { ...row }));
 }
 
+/**
+ * A copy of a source's freshness rows with the row at `index` set to `completeness`, or every
+ * row set to it when `index` is `'all'`. `incomplete` follows the completeness, as the API
+ * derives it (`incomplete` or `unknown`).
+ */
+function withCompleteness(
+  rows: readonly DatasetFreshnessView[],
+  index: number | 'all',
+  completeness: Completeness,
+): DatasetFreshnessView[] {
+  return rows.map((row, at) =>
+    index === 'all' || at === index
+      ? { ...row, completeness, incomplete: completeness !== 'complete' }
+      : { ...row },
+  );
+}
+
 /** A response a test releases by hand, to hold the request pending in between. */
 function heldResponse(): {
   promise: Promise<MockResponse>;
@@ -207,9 +231,15 @@ describe('SourcesPage', () => {
       ).toEqual(['Google', 'LinkedIn', 'HubSpot']);
       expect(screen.queryAllByRole('alert')).toHaveLength(0);
 
-      for (const label of ['Google', 'LinkedIn', 'HubSpot']) {
+      // Google's search terms are incomplete and HubSpot's Google contacts unknown in the
+      // fixture world, so both also show the Incomplete badge.
+      for (const [label, incomplete] of [
+        ['Google', ['Incomplete (warning)']],
+        ['LinkedIn', []],
+        ['HubSpot', ['Incomplete (warning)']],
+      ] as const) {
         const line = statusLine(section(label));
-        expect(badges(line)).toEqual(['Simulated (info)', 'OK (success)']);
+        expect(badges(line)).toEqual(['Simulated (info)', 'OK (success)', ...incomplete]);
         expect(within(line).getByText(`Reason: ${NO_CREDENTIALS}`)).toBeTruthy();
         expect(within(line).getByText(`Last attempt ${LAST_SYNC_UTC}`)).toBeTruthy();
       }
@@ -264,6 +294,32 @@ describe('SourcesPage', () => {
       ]);
     });
 
+    it('shows "No data yet", never Live, beside the error of a source that never went live', async () => {
+      // A Google source whose first live query hit a defect has no active dataset, so the API
+      // reports no mode beside its error and reason: there is no live data to call Live.
+      const reason = 'QueryError in Q-G1: UNRECOGNIZED_FIELD';
+      stubPage(
+        json(200, [
+          makeSource('google', {
+            mode: null,
+            status: 'error',
+            reason,
+            day_boundary: null,
+            active_dataset: null,
+            datasets: [],
+          }),
+        ]),
+      );
+      await renderLoaded('Google');
+
+      const google = section('Google');
+      const line = statusLine(google);
+      expect(badges(line)).toEqual(['No data yet (neutral)', 'Error (critical)']);
+      expect(within(line).getByText(`Reason: ${reason}`)).toBeTruthy();
+      expect(within(google).queryByText('Live')).toBeNull();
+      expect(within(google).getByText('No active dataset yet')).toBeTruthy();
+    });
+
     it('adds a Stale badge when a dataset is stale while the connection reports OK', async () => {
       const linkedin = makeSource('linkedin');
       stubPage(
@@ -301,17 +357,105 @@ describe('SourcesPage', () => {
       );
       await renderLoaded('HubSpot');
 
+      // Both fixture sources also keep a dataset that is not complete.
       expect(badges(statusLine(section('HubSpot')))).toEqual([
         'Simulated (info)',
         'OK (success)',
         'Stale (warning)',
+        'Incomplete (warning)',
       ]);
       // The connection already reports Stale, so no second badge is added.
       expect(badges(statusLine(section('Google')))).toEqual([
         'Simulated (info)',
         'Stale (warning)',
+        'Incomplete (warning)',
       ]);
     });
+
+    it('adds an Incomplete badge right after Stale for an incomplete Google search_terms row', async () => {
+      const google = makeSource('google');
+      const datasets = withStaleRow(
+        withCompleteness(withCompleteness(google.datasets, 'all', 'complete'), 2, 'incomplete'),
+        0,
+      );
+      stubPage(json(200, [makeSource('google', { datasets })]));
+      await renderLoaded();
+
+      const region = section('Google');
+      // Worded and toned as the "Incomplete" source chip on /actions.
+      expect(badges(statusLine(region))).toEqual([
+        'Simulated (info)',
+        'OK (success)',
+        'Stale (warning)',
+        'Incomplete (warning)',
+      ]);
+      const rows = bodyRows(table(region, 'Google dataset freshness'));
+      expect(rows.map((row) => row.slice(0, 2))).toEqual([
+        ['google.entitiesStale', 'complete'],
+        ['google.metrics_daily', 'complete'],
+        ['google.search_terms', 'incomplete'],
+      ]);
+    });
+
+    it('shows no Incomplete badge while every dataset, primary and companion, is complete', async () => {
+      const google = makeSource('google');
+      const hubspot = makeSource('hubspot');
+      stubPage(
+        json(200, [
+          makeSource('google', {
+            datasets: withCompleteness(google.datasets, 'all', 'complete'),
+          }),
+          makeSource('hubspot', {
+            datasets: withCompleteness(hubspot.datasets, 'all', 'complete'),
+            companion_datasets: withCompleteness(hubspot.companion_datasets, 'all', 'complete'),
+          }),
+        ]),
+      );
+      await renderLoaded();
+
+      for (const label of ['Google', 'HubSpot']) {
+        expect(badges(statusLine(section(label)))).toEqual(['Simulated (info)', 'OK (success)']);
+      }
+    });
+
+    it.each<[string, Completeness]>([
+      ['incomplete', 'incomplete'],
+      ['unknown', 'unknown'],
+    ])(
+      'derives the Incomplete badge from a companion row whose completeness is %s',
+      async (_case, completeness) => {
+        const hubspot = makeSource('hubspot');
+        stubPage(
+          json(200, [
+            makeSource('hubspot', {
+              datasets: withCompleteness(hubspot.datasets, 'all', 'complete'),
+              companion_datasets: withCompleteness(
+                withCompleteness(hubspot.companion_datasets, 'all', 'complete'),
+                1,
+                completeness,
+              ),
+            }),
+          ]),
+        );
+        await renderLoaded('HubSpot');
+
+        // An unknown completeness counts too, as it does for the /actions chip.
+        expect(badges(statusLine(section('HubSpot')))).toEqual([
+          'Simulated (info)',
+          'OK (success)',
+          'Incomplete (warning)',
+        ]);
+        const companion = table(
+          section('HubSpot'),
+          'HubSpot companion dataset freshness (simulated LinkedIn)',
+        );
+        expect(bodyRows(companion).map((row) => row.slice(0, 2))).toEqual([
+          ['hubspot.contacts', 'complete'],
+          ['hubspot.associations', completeness],
+          ['hubspot.deal_search', 'complete'],
+        ]);
+      },
+    );
 
     it('shows instants in the display time zone of the latest default run', async () => {
       mockApi({
@@ -398,6 +542,30 @@ describe('SourcesPage', () => {
       expect(bodyRows(datasets)).toEqual([
         ['Primary', '11', 'simulated', 'active', ACTIVATED_UTC, NO_CREDENTIALS],
       ]);
+    });
+
+    it('end-aligns the numeric ID, header and cells, as Rows is in the sync runs table', async () => {
+      stubPage();
+      await renderLoaded();
+
+      const END = 'ds-datatable__cell--end';
+      const hubspot = table(section('HubSpot'), 'HubSpot active datasets');
+      const idHeader = within(hubspot).getByRole('columnheader', { name: 'ID' });
+      expect(idHeader.classList.contains(END)).toBe(true);
+      const idCells = within(hubspot)
+        .getAllByRole('row')
+        .slice(1)
+        .map((row) => row.children[1]);
+      expect(idCells.map((cell) => cell?.textContent)).toEqual(['13', '14']);
+      expect(idCells.every((cell) => cell?.classList.contains(END) === true)).toBe(true);
+      // Text columns keep the start alignment.
+      const modeHeader = within(hubspot).getByRole('columnheader', { name: 'Mode' });
+      expect(modeHeader.classList.contains(END)).toBe(false);
+      const rowsHeader = within(table(section('HubSpot'), 'Recent sync runs (HubSpot)')).getByRole(
+        'columnheader',
+        { name: 'Rows' },
+      );
+      expect(rowsHeader.classList.contains(END)).toBe(true);
     });
 
     it("lists each dataset's completeness, coverage, last success, last attempt and reason as stored", async () => {
@@ -488,6 +656,33 @@ describe('SourcesPage', () => {
       expect(
         within(section('LinkedIn')).queryByRole('table', { name: /companion dataset freshness/u }),
       ).toBeNull();
+    });
+
+    it('gives every freshness table, primary and companion, the same fixed column widths', async () => {
+      stubPage();
+      await renderLoaded();
+
+      const hubspot = section('HubSpot');
+      const freshnessTables = [
+        table(section('Google'), 'Google dataset freshness'),
+        table(section('LinkedIn'), 'LinkedIn dataset freshness'),
+        table(hubspot, 'HubSpot dataset freshness'),
+        table(hubspot, 'HubSpot companion dataset freshness (simulated LinkedIn)'),
+      ];
+      // The design-system table lays a table out at fixed widths from one col per column.
+      const widths = freshnessTables.map((element) =>
+        Array.from(element.querySelectorAll<HTMLElement>('colgroup > col'), (col) =>
+          col.style.getPropertyValue('--ds-datatable-col-steps'),
+        ),
+      );
+      const expected = ['13', '8', '7', '7', '7', '7', '12'];
+      expect(widths).toEqual(freshnessTables.map(() => expected));
+      expect(
+        freshnessTables.every((element) => element.classList.contains('ds-datatable--fixed')),
+      ).toBe(true);
+      // The other tables keep sizing their columns from their content.
+      expect(table(hubspot, 'HubSpot active datasets').querySelector('colgroup')).toBeNull();
+      expect(table(hubspot, 'Recent sync runs (HubSpot)').querySelector('colgroup')).toBeNull();
     });
 
     it('shows a dataset that is not active yet as not activated, without a reason', async () => {
@@ -595,6 +790,37 @@ describe('SourcesPage', () => {
         `2026-10-05 ${GOOGLE_DAY}`,
         'Oct 6, 2026, 7:30 AM Europe/Berlin',
       ]);
+    });
+
+    it('lets a zone wrap after its slash in the fixed-width columns, its text unchanged', async () => {
+      mockApi({
+        'GET /sources': json(200, makeSources()),
+        'GET /runs/latest': json(200, makeRun({ display_timezone: 'Europe/Berlin' })),
+      });
+      await renderLoaded();
+      await screen.findByText('Times shown in Europe/Berlin');
+
+      const metrics = within(table(section('Google'), 'Google dataset freshness')).getAllByRole(
+        'row',
+      )[2];
+      const cells = Array.from(metrics?.children ?? []);
+      // Covered from, Covered through, Last success and Last attempt.
+      for (const cell of cells.slice(2, 6)) {
+        const breaks = cell.querySelectorAll('wbr');
+        expect(breaks).toHaveLength(1);
+        expect(breaks[0]?.previousSibling?.textContent?.endsWith('/')).toBe(true);
+      }
+      expect(cells.slice(2, 6).map((cell) => cell.textContent)).toEqual([
+        `2026-04-09 ${GOOGLE_DAY}`,
+        `2026-10-05 ${GOOGLE_DAY}`,
+        'Oct 6, 2026, 7:30 AM Europe/Berlin',
+        'Oct 6, 2026, 7:30 AM Europe/Berlin',
+      ]);
+      // A text without a slash is rendered as given.
+      const linkedinTable = table(section('LinkedIn'), 'LinkedIn dataset freshness');
+      const linkedinCovered = within(linkedinTable).getAllByRole('row')[2]?.children[2];
+      expect(linkedinCovered?.querySelector('wbr')).toBeNull();
+      expect(linkedinCovered?.textContent).toBe(`2026-04-09 ${LINKEDIN_DAY}`);
     });
 
     it.each<[string, string | null]>([
@@ -729,6 +955,28 @@ describe('SourcesPage', () => {
   });
 
   describe('Sync now', () => {
+    /** How many times the page has read `GET /sources` so far. */
+    function sourceReads(api: ApiMock): number {
+      return api.calls.filter((call) => call.method === 'GET' && call.path === '/sources').length;
+    }
+
+    /**
+     * Lets one poll interval of `useSources` pass under fake timers, then waits until the read
+     * it starts has been sent and every read has settled, so the page shows the poll's answer.
+     */
+    async function nextPoll(api: ApiMock, queryClient: QueryClient): Promise<void> {
+      const readsBefore = sourceReads(api);
+      await act(() => vi.advanceTimersByTimeAsync(SOURCES_POLL_MS));
+      await waitFor(() => {
+        expect(sourceReads(api)).toBeGreaterThan(readsBefore);
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      // TanStack Query notifies its observers on a zero-delay timer, and the reset an answer
+      // can cause notifies on another, so two timer turns render all the answer changes.
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+    }
+
     it('posts the sync request with the CSRF header and confirms it in its own section', async () => {
       const api = stubPage(json(200, makeSources()), {
         'POST /sources/:source/sync': (call) =>
@@ -761,38 +1009,255 @@ describe('SourcesPage', () => {
       expect(screen.queryByRole('alert')).toBeNull();
     });
 
-    it('keeps the outcome and the button available once the API reports the request pending', async () => {
+    it('keeps the outcome and disables the button, described by it, while the request is pending', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        let requested = false;
+        let picked = false;
+        // After the POST, the API reports the queued request (and a newer attempt, so the
+        // re-read is visible on screen) until the worker picks it up.
+        const api = stubPage(
+          () =>
+            json(200, [
+              makeSource(
+                'google',
+                requested
+                  ? { sync_pending: !picked, last_attempt_at: '2026-10-06T06:01:00Z' }
+                  : {},
+              ),
+              makeSource('linkedin'),
+            ]),
+          {
+            'POST /sources/:source/sync': () => {
+              requested = true;
+              return json(202, syncRequest('google'));
+            },
+          },
+        );
+        const { queryClient } = await renderLoaded();
+
+        fireEvent.click(syncButton('Google'));
+        await within(outcomeRegion('Google')).findByText('Sync requested');
+        expect(
+          await within(section('Google')).findByText('Last attempt Oct 6, 2026, 6:01 AM UTC'),
+        ).toBeTruthy();
+
+        // One pending request per source (AAP 0.5.3): another press could only answer 409, so
+        // the button stays disabled. The banner is the visible text that says why; no hint
+        // repeats it.
+        const button = syncButton('Google');
+        expect(button.disabled).toBe(true);
+        const reasonId = button.getAttribute('aria-describedby');
+        expect(reasonId).toBe('source-google-sync-outcome');
+        const reason = document.getElementById(reasonId ?? '');
+        expect(reason !== null && outcomeRegion('Google').contains(reason)).toBe(true);
+        expect(reason?.textContent).toBe(
+          'Sync requestedThe worker picks it up on its next scheduled wake.',
+        );
+        expect(within(outcomeRegion('Google')).queryByText('A sync is already pending')).toBeNull();
+
+        // A press on the disabled button sends nothing, so no 409 can follow.
+        fireEvent.click(button);
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+        expect(syncButton('LinkedIn').disabled).toBe(false);
+
+        // The worker claims the request: the next poll no longer reports it pending, so the
+        // button is enabled again, with no description, and the banner is cleared.
+        picked = true;
+        await nextPoll(api, queryClient);
+        expect(syncButton('Google').disabled).toBe(false);
+        expect(syncButton('Google').getAttribute('aria-describedby')).toBeNull();
+        expect(outcomeRegion('Google').childNodes).toHaveLength(0);
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('clears "Sync requested" for good on the poll that reports the request picked up', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        let pending = false;
+        const api = stubPage(
+          () =>
+            json(200, [makeSource('google', { sync_pending: pending }), makeSource('linkedin')]),
+          {
+            'POST /sources/:source/sync': () => {
+              pending = true;
+              return json(202, syncRequest('google'));
+            },
+          },
+        );
+        const { queryClient } = await renderLoaded();
+
+        fireEvent.click(syncButton('Google'));
+        const outcome = outcomeRegion('Google');
+        expect(await within(outcome).findByText('Sync requested')).toBeTruthy();
+        expect(syncButton('Google').disabled).toBe(true);
+
+        // A poll while the request is still queued keeps the banner and the button disabled.
+        await nextPoll(api, queryClient);
+        expect(within(outcome).getByText('Sync requested')).toBeTruthy();
+        expect(syncButton('Google').disabled).toBe(true);
+
+        // The worker picks the request up: the next poll clears the banner and enables Sync now.
+        pending = false;
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+        expect(syncButton('Google').disabled).toBe(false);
+        expect(syncButton('Google').getAttribute('aria-describedby')).toBeNull();
+
+        // A later request from elsewhere makes the source pending again: the hint says so, and
+        // the cleared banner does not come back.
+        pending = true;
+        await nextPoll(api, queryClient);
+        expect(syncButton('Google').disabled).toBe(true);
+        expect(syncButton('Google').getAttribute('aria-describedby')).toBe(
+          'source-google-sync-pending',
+        );
+        expect(within(outcome).getByText('A sync is already pending')).toBeTruthy();
+        expect(within(outcome).queryByText('Sync requested')).toBeNull();
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps "Sync requested" until a poll after the press, even when no read saw it pending', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        // The worker picks the request up before the read the 202 starts, so every answer
+        // reports nothing pending.
+        const api = stubPage(json(200, makeSources()), {
+          'POST /sources/:source/sync': json(202, syncRequest('google')),
+        });
+        const { queryClient } = await renderLoaded();
+
+        fireEvent.click(syncButton('Google'));
+        const outcome = outcomeRegion('Google');
+        expect(await within(outcome).findByText('Sync requested')).toBeTruthy();
+        expect(syncButton('Google').disabled).toBe(false);
+
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('posts once when it is pressed twice within one frame, and again on a later press', async () => {
+      const api = stubPage(json(200, makeSources()), {
+        'POST /sources/:source/sync': (call) =>
+          json(202, syncRequest(call.params.source as Source['source'])),
+      });
+      await renderLoaded();
+
+      // Back to back, as a double click or a script's `click(); click();` delivers them, before
+      // React renders the first press as loading.
+      fireEvent.click(syncButton('Google'));
+      fireEvent.click(syncButton('Google'));
+
+      expect(await within(outcomeRegion('Google')).findByText('Sync requested')).toBeTruthy();
+      await waitFor(() => {
+        expect(syncButton('Google').getAttribute('aria-busy')).toBeNull();
+      });
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      expect(within(outcomeRegion('Google')).queryByText('A sync is already pending')).toBeNull();
+
+      // The stub never reports the request pending, so a deliberate press later posts again.
+      expect(syncButton('Google').disabled).toBe(false);
+      fireEvent.click(syncButton('Google'));
+      await waitFor(() => {
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(2);
+      });
+    });
+
+    it('frees the button after a failed request, so a retry posts again', async () => {
+      const api = stubPage(json(200, makeSources()), {
+        'POST /sources/:source/sync': apiError(503, 'service_unavailable', 'Database unavailable'),
+      });
+      await renderLoaded();
+
+      fireEvent.click(syncButton('Google'));
+      fireEvent.click(syncButton('Google'));
+
+      expect(await within(outcomeRegion('Google')).findByText('Sync request failed')).toBeTruthy();
+      await waitFor(() => {
+        expect(syncButton('Google').disabled).toBe(false);
+      });
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+
+      api.use({
+        'POST /sources/:source/sync': json(202, syncRequest('google')),
+      });
+      fireEvent.click(syncButton('Google'));
+
+      expect(await within(outcomeRegion('Google')).findByText('Sync requested')).toBeTruthy();
+      expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(2);
+    });
+
+    it('moves focus to the status region, not the heading, when the settled press leaves the button disabled', async () => {
+      const response = heldResponse();
       let requested = false;
-      // After the POST, the API reports the queued request (and a newer attempt, so the
-      // re-read is visible on screen).
       stubPage(
         () =>
-          json(200, [
-            makeSource(
-              'google',
-              requested ? { sync_pending: true, last_attempt_at: '2026-10-06T06:01:00Z' } : {},
-            ),
-            makeSource('linkedin'),
-          ]),
+          json(200, [makeSource('google', { sync_pending: requested }), makeSource('linkedin')]),
         {
           'POST /sources/:source/sync': () => {
             requested = true;
-            return json(202, syncRequest('google'));
+            return response.promise;
           },
         },
       );
       await renderLoaded();
+      const button = syncButton('Google');
+
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(button.getAttribute('aria-busy')).toBe('true');
+      });
+      // fireEvent does not focus the button, so focus rests on the page body while the request
+      // runs, as if it had been lost there.
+      expect(document.activeElement).toBe(document.body);
+      response.release(json(202, syncRequest('google')));
+
+      // The status region, which holds the outcome that says why the button is disabled, takes
+      // focus by script; the heading is left as it is, never made focusable.
+      const outcome = outcomeRegion('Google');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(outcome);
+      });
+      expect(outcome.tabIndex).toBe(-1);
+      expect(within(outcome).getByText('Sync requested')).toBeTruthy();
+      const heading = within(section('Google')).getByRole('heading', { level: 2, name: 'Google' });
+      expect(heading.hasAttribute('tabindex')).toBe(false);
+      expect(button.disabled).toBe(true);
+    });
+
+    it('explains a disabled button with the hint when a failure is shown and a request is pending', async () => {
+      const api = stubPage(json(200, makeSources()), {
+        'POST /sources/:source/sync': apiError(503, 'service_unavailable', 'Database unavailable'),
+      });
+      const { queryClient } = await renderLoaded();
 
       fireEvent.click(syncButton('Google'));
-      await within(outcomeRegion('Google')).findByText('Sync requested');
-      expect(
-        await within(section('Google')).findByText('Last attempt Oct 6, 2026, 6:01 AM UTC'),
-      ).toBeTruthy();
+      expect(await within(outcomeRegion('Google')).findByText('Sync request failed')).toBeTruthy();
 
-      expect(syncButton('Google').disabled).toBe(false);
-      expect(syncButton('Google').getAttribute('aria-describedby')).toBeNull();
-      expect(within(outcomeRegion('Google')).getByText('Sync requested')).toBeTruthy();
-      expect(within(outcomeRegion('Google')).queryByText('A sync is already pending')).toBeNull();
+      // Another session's request is queued meanwhile; the next read reports it.
+      api.use({
+        'GET /sources': json(200, [makeSource('google', { sync_pending: true })]),
+      });
+      await act(async () => {
+        await queryClient.refetchQueries({ type: 'active' });
+      });
+
+      await waitFor(() => {
+        expect(syncButton('Google').disabled).toBe(true);
+      });
+      const hintId = syncButton('Google').getAttribute('aria-describedby');
+      expect(hintId).toBe('source-google-sync-pending');
+      expect(document.getElementById(hintId ?? '')?.textContent).toBe('A sync is already pending');
+      expect(within(outcomeRegion('Google')).getByText('Sync request failed')).toBeTruthy();
     });
 
     it('is busy while the request is in flight', async () => {
@@ -855,30 +1320,237 @@ describe('SourcesPage', () => {
         expect(google.getAttribute('aria-busy')).toBe('true');
       });
       const hubspot = syncButton('HubSpot');
-      hubspot.focus();
+      // The design-system Button tracks its own focus in state, so focusing it renders.
+      act(() => {
+        hubspot.focus();
+      });
       response.release(json(202, syncRequest('google')));
 
       expect(await within(outcomeRegion('Google')).findByText('Sync requested')).toBeTruthy();
       expect(document.activeElement).toBe(hubspot);
     });
 
-    it('says a sync is already pending for 409 sync_pending', async () => {
-      stubPage(json(200, makeSources()), {
-        'POST /sources/:source/sync': apiError(
-          409,
-          'sync_pending',
-          'A sync request for hubspot is already pending',
-        ),
+    /**
+     * Presses Google "Sync now" with its 202 held, lets the API queue the request so the read the
+     * 202 starts reports it pending, releases the 202 and waits until focus has moved to the
+     * Google status region, because the button stays disabled.
+     *
+     * @returns the mock, the query client, the button, the status region and `pickUp`, after
+     *   which every read reports the request picked up
+     */
+    async function pressIntoPendingGoogleSync(): Promise<{
+      api: ApiMock;
+      queryClient: QueryClient;
+      button: HTMLButtonElement;
+      outcome: HTMLElement;
+      pickUp: () => void;
+    }> {
+      const response = heldResponse();
+      let pending = false;
+      const api = stubPage(
+        () => json(200, [makeSource('google', { sync_pending: pending }), makeSource('linkedin')]),
+        { 'POST /sources/:source/sync': () => response.promise },
+      );
+      const { queryClient } = await renderLoaded();
+      const button = syncButton('Google');
+
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(button.getAttribute('aria-busy')).toBe('true');
       });
-      await renderLoaded();
+      // fireEvent does not focus the button, so focus rests on the page body while the request
+      // runs, as if it had been lost there.
+      expect(document.activeElement).toBe(document.body);
+      pending = true;
+      response.release(json(202, syncRequest('google')));
+
+      const outcome = outcomeRegion('Google');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(outcome);
+      });
+      return {
+        api,
+        queryClient,
+        button,
+        outcome,
+        pickUp: () => {
+          pending = false;
+        },
+      };
+    }
+
+    it('moves focus to the outcome while Sync now stays disabled, then back to the button', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { api, queryClient, button, outcome, pickUp } = await pressIntoPendingGoogleSync();
+
+        // The button stays disabled, so the status region that says why holds focus.
+        expect(within(outcome).getByText('Sync requested')).toBeTruthy();
+        expect(button.disabled).toBe(true);
+        expect(outcome.tabIndex).toBe(-1);
+
+        // A poll while the request is still queued moves nothing.
+        await nextPoll(api, queryClient);
+        expect(document.activeElement).toBe(outcome);
+
+        // The poll that reports the request picked up empties the region and enables the
+        // button, so focus moves on to the button instead of resting on an empty region.
+        pickUp();
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+        expect(button.disabled).toBe(false);
+        expect(document.activeElement).toBe(button);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('leaves focus the user moved while the request waited for pickup', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { api, queryClient, button, outcome, pickUp } = await pressIntoPendingGoogleSync();
+        const linkedin = syncButton('LinkedIn');
+        act(() => {
+          linkedin.focus();
+        });
+
+        pickUp();
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+        expect(button.disabled).toBe(false);
+        expect(document.activeElement).toBe(linkedin);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps focus on a focused Sync now the settled press leaves disabled, through the pickup', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const response = heldResponse();
+        let pending = false;
+        const api = stubPage(
+          () => json(200, [makeSource('google', { sync_pending: pending }), makeSource('linkedin')]),
+          { 'POST /sources/:source/sync': () => response.promise },
+        );
+        const { queryClient } = await renderLoaded();
+        const button = syncButton('Google');
+        const outcome = outcomeRegion('Google');
+
+        // A keyboard press: the button holds focus, and keeps it while it loads.
+        act(() => {
+          button.focus();
+        });
+        fireEvent.click(button);
+        await waitFor(() => {
+          expect(button.getAttribute('aria-busy')).toBe('true');
+        });
+        expect(document.activeElement).toBe(button);
+        pending = true;
+        response.release(json(202, syncRequest('google')));
+
+        // Settled with the request pending: the design-system Button keeps the focused button
+        // focusable as `aria-disabled` rather than natively disabled, so focus stays on it,
+        // described by the outcome, and a press on it sends nothing.
+        expect(await within(outcome).findByText('Sync requested')).toBeTruthy();
+        await waitFor(() => {
+          expect(button.getAttribute('aria-busy')).toBeNull();
+        });
+        expect(document.activeElement).toBe(button);
+        expect(button.disabled).toBe(false);
+        expect(button.getAttribute('aria-disabled')).toBe('true');
+        expect(button.getAttribute('aria-describedby')).toBe('source-google-sync-outcome');
+        fireEvent.click(button);
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+
+        // The pickup clears the banner and enables the button where focus already rests.
+        pending = false;
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+        expect(document.activeElement).toBe(button);
+        expect(button.getAttribute('aria-disabled')).toBeNull();
+        expect(button.getAttribute('aria-describedby')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('says a sync is already pending for 409 sync_pending, reads the sources and disables the button', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        // Another session queued a request after this page's last read, so the page still
+        // shows HubSpot with nothing pending when the 409 answers.
+        let pending = false;
+        const api = stubPage(
+          () => json(200, [makeSource('google'), makeSource('hubspot', { sync_pending: pending })]),
+          {
+            'POST /sources/:source/sync': () => {
+              pending = true;
+              return apiError(409, 'sync_pending', 'A sync request for hubspot is already pending');
+            },
+          },
+        );
+        const { queryClient } = await renderLoaded();
+        const readsBefore = sourceReads(api);
+
+        fireEvent.click(syncButton('HubSpot'));
+
+        const outcome = outcomeRegion('HubSpot');
+        expect(await within(outcome).findByText('A sync is already pending')).toBeTruthy();
+        expect(bannerTone(outcome)).toBe('info');
+        expect(within(outcome).queryByText('Sync requested')).toBeNull();
+        // The 409 reads the sources again, so the button learns of the pending request.
+        expect(sourceReads(api)).toBeGreaterThan(readsBefore);
+        const button = syncButton('HubSpot');
+        expect(button.disabled).toBe(true);
+        expect(button.getAttribute('aria-describedby')).toBe('source-hubspot-sync-outcome');
+        // Said once: the banner, with no hint repeating it.
+        expect(within(section('HubSpot')).getAllByText('A sync is already pending')).toHaveLength(
+          1,
+        );
+
+        // The worker picks the request up: the next poll clears the banner and enables Sync now.
+        pending = false;
+        await nextPoll(api, queryClient);
+        expect(outcome.childNodes).toHaveLength(0);
+        expect(syncButton('HubSpot').disabled).toBe(false);
+        expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('disables the button after a 409 once a read reports the pending request, saying it once', async () => {
+      let pending = false;
+      stubPage(
+        () =>
+          json(200, [makeSource('google'), makeSource('hubspot', { sync_pending: pending })]),
+        {
+          'POST /sources/:source/sync': () => {
+            pending = true;
+            return apiError(409, 'sync_pending', 'A sync request for hubspot is already pending');
+          },
+        },
+      );
+      const { queryClient } = await renderLoaded();
 
       fireEvent.click(syncButton('HubSpot'));
+      expect(
+        await within(outcomeRegion('HubSpot')).findByText('A sync is already pending'),
+      ).toBeTruthy();
+      await act(async () => {
+        await queryClient.refetchQueries({ type: 'active' });
+      });
 
-      const outcome = outcomeRegion('HubSpot');
-      expect(await within(outcome).findByText('A sync is already pending')).toBeTruthy();
-      expect(bannerTone(outcome)).toBe('info');
-      expect(within(outcome).queryByText('Sync requested')).toBeNull();
-      expect(syncButton('HubSpot').disabled).toBe(false);
+      await waitFor(() => {
+        expect(syncButton('HubSpot').disabled).toBe(true);
+      });
+      expect(syncButton('HubSpot').getAttribute('aria-describedby')).toBe(
+        'source-hubspot-sync-outcome',
+      );
+      expect(
+        within(outcomeRegion('HubSpot')).getAllByText('A sync is already pending'),
+      ).toHaveLength(1);
     });
 
     it("reports any other failure with the API's message", async () => {
@@ -894,6 +1566,35 @@ describe('SourcesPage', () => {
       expect(within(outcome).getByText('Database unavailable')).toBeTruthy();
       expect(bannerTone(outcome)).toBe('critical');
       expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('keeps a failure across polls until the next press', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        let failing = true;
+        const api = stubPage(json(200, makeSources()), {
+          'POST /sources/:source/sync': () =>
+            failing
+              ? apiError(503, 'service_unavailable', 'Database unavailable')
+              : json(202, syncRequest('google')),
+        });
+        const { queryClient } = await renderLoaded();
+
+        fireEvent.click(syncButton('Google'));
+        const outcome = outcomeRegion('Google');
+        expect(await within(outcome).findByText('Sync request failed')).toBeTruthy();
+
+        await nextPoll(api, queryClient);
+        expect(within(outcome).getByText('Sync request failed')).toBeTruthy();
+        expect(syncButton('Google').disabled).toBe(false);
+
+        failing = false;
+        fireEvent.click(syncButton('Google'));
+        expect(await within(outcome).findByText('Sync requested')).toBeTruthy();
+        expect(within(outcome).queryByText('Sync request failed')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('is disabled with a visible hint while the API reports a pending request', async () => {

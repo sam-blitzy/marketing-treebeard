@@ -841,7 +841,8 @@ test('first start: sign in and see five populated sections on simulated data', a
           shownItemCount(section),
           `the "${title}" section of ${runLabel} has at least one action to show`,
         ).toBeGreaterThanOrEqual(1);
-        // Scoped by id as well: a group inside a section may carry the section's own title.
+        // Scoped by id as well: the region named by the title must be the section itself. A
+        // group whose title repeats its section's renders no region of its own.
         await expect(
           page.getByRole('region', { name: title, exact: true }).and(region),
           `the "${title}" section is a region named by its title`,

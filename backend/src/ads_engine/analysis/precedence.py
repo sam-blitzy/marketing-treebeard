@@ -1564,13 +1564,19 @@ def _stale_flag(checks: Sequence[_Check], window_end: date, *, display_timezone:
 
 
 def _incomplete_reasons(check: _Check, window_end: date) -> tuple[str, ...]:
-    """Why an incomplete dataset is not ``complete`` over its required range, each once."""
+    """Why an incomplete dataset is not ``complete`` over its required range, each once.
+
+    What the row lacks over that range comes first
+    (:meth:`~ads_engine.analysis.context.Freshness.incomplete_reason_over`), so a dated Q-G6
+    shortfall names only its days inside the range, then any coverage shortfall.
+    """
     row = check.row
     if row is None:
         return ("no freshness record",)
     reasons: list[str] = []
-    if row.completeness != "complete":
-        reasons.append(row.reason or row.completeness)
+    shortfall = row.incomplete_reason_over(window_start=check.start, window_end=window_end)
+    if shortfall is not None:
+        reasons.append(shortfall)
     if row.dataset in FULL_STATE_DATASETS:
         return tuple(reasons)
     if row.covered_from is None and row.covered_through is None:

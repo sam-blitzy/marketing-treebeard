@@ -21,9 +21,12 @@
  *
  * Every colour, spacing and typography value is a token from ../tokens.css, so binding Blitzy OS
  * touches tokens.css alone (web/.stylelintrc.json enforces this). The literals, each listed in
- * ../GAPS.md, are the body row's and main's flex: 1 1 auto factors, the viewport-height unit on
- * the frame and the documented Grid breakpoint at the end of this file, which Grid.css holds in
- * identical form, so the page frame and Grid stack to one column at the same width.
+ * ../GAPS.md, are the flex factors (1 on the body row and the side navigation, 999 on main),
+ * the 999 width-switch multiplier in the side-navigation and main caps, the viewport-height
+ * unit on the frame and the documented Grid breakpoint at the end of this file, which Grid.css
+ * holds in identical form, so the page frame and Grid are both a single column from that width
+ * down. The column, row and cap sizes are whole multiples of --space-8, and the caps' switch
+ * width adds the body gap token, so they all rebind with the spacing scale.
  */
 
 /*
@@ -45,39 +48,85 @@
 }
 
 /*
- * Body row: side navigation beside main content. flex-start keeps the side navigation at its
- * own height instead of stretching it to the height of main, which position: sticky needs.
+ * Body row: side navigation beside main content when both fit on one line, stacked above it
+ * when they do not. The row wraps, so the side navigation moves onto a line of its own as soon
+ * as main would fall below its single-column width at the Grid breakpoint. While they are
+ * stacked from the breakpoint up, both keep that width (see main's cap below), so main holds it
+ * until the line fits both columns and widens from there: it never narrows as the viewport
+ * widens.
+ * align-content: flex-start packs the lines at the top, and the items keep the default stretch,
+ * so beside main the side-navigation column is as tall as main and its navigation can stick
+ * inside it.
+ *
+ * The inline padding matches the top bar's at every width, so the product name, the page
+ * heading and the content share one inline-start edge. The row stops widening at 40 --space-8
+ * steps (1280px at the 16px root), which keeps lines, banners and empty states at a readable
+ * width; it stays at the inline start, under the product name.
  */
 .ds-pageshell__body {
   display: flex;
   flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-content: flex-start;
   gap: var(--space-6);
-  align-items: flex-start;
+  max-inline-size: calc(var(--space-8) * 40);
   padding-block: var(--space-6);
   padding-inline: var(--space-4);
 }
 
 /*
- * Side navigation column: a fixed track seven --space-8 steps wide, derived from the spacing
- * scale so it rebinds with it. It stays in view while main scrolls.
+ * Side navigation column: seven --space-8 steps wide beside main (224px at the 16px root),
+ * derived from the spacing scale so it rebinds with it. It grows only when it is alone on its
+ * line above main; beside main, main's far larger grow factor takes almost all the free space.
+ * It carries main's cap (see main below), so stacked above main it is exactly as wide as main
+ * beneath it.
  */
 .ds-pageshell__sidenav {
-  flex: 0 0 calc(var(--space-8) * 7);
+  flex: 1 1 calc(var(--space-8) * 7);
+  max-inline-size: max(
+    calc(var(--space-8) * 23),
+    (var(--size-full) - var(--space-8) * 30 - var(--space-6)) * 999
+  );
+}
+
+/*
+ * The navigation stays in view while main scrolls. It sticks inside the side-navigation column,
+ * which beside main is as tall as main. Stacked above main, the column is exactly the
+ * navigation's height, so the navigation has no room to stick and scrolls away with the page.
+ */
+.ds-pageshell__sidenav > * {
   position: sticky;
   inset-block-start: var(--space-4);
 }
 
 /*
- * Main content: takes the rest of the row. min-inline-size: 0 lets it shrink below the
- * intrinsic width of long content, so text and tables wrap inside it instead of widening the
- * page. The gap spaces the title bar and the sections.
+ * Main content: takes the rest of its line. Its basis, 23 --space-8 steps (736px at the 16px
+ * root), is its single-column width at the Grid breakpoint, so the side navigation sits beside
+ * main only where main still gets at least that width, and stacks above it otherwise.
+ *
+ * The cap is a width switch on the body line. 30 --space-8 steps plus --space-6 (984px at the
+ * 16px root) is the side column's basis, the body gap and main's basis together: the narrowest
+ * line that holds both columns. On a narrower line the second argument of max() is negative, so
+ * main is capped at its single-column width and stays at the inline start, as wide as at the
+ * breakpoint; on a line at least one pixel wider, the 999 multiplier makes the second argument
+ * wider than the whole line, so the cap never binds and main takes the rest of its line. From
+ * the breakpoint up, main therefore keeps its single-column width until the side navigation
+ * fits beside it, then widens with the viewport.
+ *
+ * min-inline-size: 0 lets it shrink below the intrinsic width of long content, so text and
+ * tables wrap inside it instead of widening the page. The gap spaces the title bar and the
+ * sections.
  */
 .ds-pageshell__main {
   display: flex;
-  flex: 1 1 auto;
+  flex: 999 1 calc(var(--space-8) * 23);
   flex-direction: column;
   gap: var(--space-6);
   min-inline-size: 0;
+  max-inline-size: max(
+    calc(var(--space-8) * 23),
+    (var(--size-full) - var(--space-8) * 30 - var(--space-6)) * 999
+  );
 }
 
 /*
@@ -155,20 +204,20 @@
 
 /*
  * Single-column collapse, last so it wins at equal specificity. Below the Grid breakpoint the
- * side navigation stacks above main at full width and stops sticking, and the body padding
- * steps down one notch on each axis.
+ * side navigation takes a full line of its own, so it stacks above main whatever the token
+ * values, and the body's block padding and gap step down from --space-6 to --space-4, so the
+ * page heading sits closer to the top of a small screen. The gap is the space between the
+ * stacked navigation and main. The inline padding does not step down, so the content stays in
+ * line with the top bar.
  */
 /* GAP: breakpoint literal (custom properties cannot be used in @media), see GAPS.md */
 @media (max-width: 48rem) {
   .ds-pageshell__body {
-    flex-direction: column;
-    align-items: stretch;
+    gap: var(--space-4);
     padding-block: var(--space-4);
-    padding-inline: var(--space-3);
   }
 
   .ds-pageshell__sidenav {
-    flex-basis: auto;
-    position: static;
+    flex-basis: var(--size-full);
   }
 }

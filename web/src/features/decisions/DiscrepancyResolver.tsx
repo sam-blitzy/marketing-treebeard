@@ -510,6 +510,9 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   settles goes back to it when nothing else has taken it.
  * - Every other resolution posts `POST /discrepancies/{id}/resolve` with `{ resolution }` at
  *   once. While it runs, the clicked button shows its loading state and the others are disabled.
+ *   From the press itself, before that state renders, no further resolution posts and "Record
+ *   intended state" opens nothing, so a double click posts once; once the request settles,
+ *   either way, a later press posts again.
  * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
  *   platform to match the decision" for `awaiting_platform`. Then `onResolved` is called.
  * - A failure shows a critical banner, which takes focus, with "Computed from replaced data"
@@ -609,7 +612,15 @@ function DiscrepancyResolutionBody({
     }
   }, [refocus, resolve.isPending, formPending]);
 
+  // Whether a resolution posted here is running, set synchronously on the press and cleared
+  // when it settles, either way. The rendered `busyResolution` cannot stop a second press before
+  // React renders again (a double click, or `click(); click();` from a script): TanStack Query
+  // reports the mutation pending only from a timer after the press, and a second post of a
+  // closing resolution would only draw 409 `discrepancy_resolved`.
+  const postingRef = useRef(false);
+
   const post = (resolution: Resolution) => {
+    postingRef.current = true;
     setOutcome(null);
     // An earlier intended-state failure no longer describes what is posted now.
     setFormFailure(null);
@@ -617,21 +628,28 @@ function DiscrepancyResolutionBody({
     // first: a resolution that closes the discrepancy refetches the list without it before the
     // request settles here, and onResolved must still be told. A failure is already held in
     // resolve.error, which renders the banner, so the rejection needs no handling beyond that.
+    // The lock is lifted before React renders the settled state, while the clicked button still
+    // renders as loading, so no press lands in between; once it renders, an awaiting_platform
+    // outcome leaves every control usable for a later, deliberate resolution.
     void resolve.mutateAsync({ id: discrepancy.id, body: { resolution } }).then(
       (updated) => {
+        postingRef.current = false;
         setOutcome(updated.state);
         if (updated.state !== 'resolved') {
           setRefocus(resolution);
         }
         onResolved?.(updated);
       },
-      () => undefined,
+      () => {
+        postingRef.current = false;
+      },
     );
   };
 
   const openIntendedState = () => {
-    // A fresh form while an earlier save runs would post a second intended state.
-    if (locked || busyResolution !== null) {
+    // A fresh form while an earlier save runs would post a second intended state, and one
+    // opened in the frame of a resolution posted here would post beside it.
+    if (locked || busyResolution !== null || postingRef.current) {
       return;
     }
     // A failure of an earlier resolution no longer describes what the dialog is about to post.
@@ -659,7 +677,7 @@ function DiscrepancyResolutionBody({
   };
 
   const handleClick = (resolution: Resolution) => {
-    if (locked || busyResolution !== null) {
+    if (locked || busyResolution !== null || postingRef.current) {
       return;
     }
     if (resolution === 'record_intended') {

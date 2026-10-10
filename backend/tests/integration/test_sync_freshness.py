@@ -15,6 +15,7 @@ database fails the database tests; it never skips them. Each database test creat
 disposes its own ``AsyncEngine`` inside its own event loop.
 """
 
+import doctest
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -30,6 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
+from ads_engine.analysis import shortfall as shortfall_module
+from ads_engine.connectors.google_n8n import partition
 from ads_engine.db.base import Base
 from ads_engine.db.models.ops import COMPLETENESS, DATASETS, DatasetFreshness, SourceDataset
 from ads_engine.db.repositories import DatasetNotWritable
@@ -50,6 +53,9 @@ from ads_engine.sync.freshness import (
     needs_repair,
     record_freshness,
     recorded_shortfall,
+    shortfall_outside,
+    shortfall_spans,
+    shortfall_within,
     source_of,
     write_checkpoint,
 )
@@ -67,6 +73,7 @@ LINKEDIN_503 = "linkedin lead_forms: HTTP 503 after 3 attempts"
 """A LinkedIn interruption's reason: the error's own text, with no repairable prefix."""
 FAILURE_MARKER = freshness._FAILURE_MARKER
 METRICS = "google.metrics_daily"
+SEARCH_TERMS = "google.search_terms"
 
 
 def _at(hour: int) -> datetime:
@@ -864,6 +871,625 @@ def test_a_full_read_after_a_cut_short_one_moves_the_last_success_again() -> Non
 
 
 # ---------------------------------------------------------------------------------------
+# Dated finest-partition shortfalls: the reason grammar
+# ---------------------------------------------------------------------------------------
+
+
+def _iso(n: int) -> str:
+    """Return native day ``n`` as ``YYYY-MM-DD``."""
+    return _day(n).isoformat()
+
+
+def _pair(day: int, ad_group: int = 1) -> str:
+    """Return one named (day, ad group) partition of a dated shortfall."""
+    return f"{_iso(day)}, ad group {ad_group}"
+
+
+def _dated(*entries: str) -> str:
+    """Return one ``result limit reached at finest partition (…)`` part with ``entries``."""
+    return f"{REASON_FINEST_PARTITION} ({'; '.join(entries)})"
+
+
+def _spans(*spans: tuple[int, int]) -> tuple[tuple[date, date], ...]:
+    """Turn ``(first, last)`` day numbers into native date spans."""
+    return tuple((_day(first), _day(last)) for first, last in spans)
+
+
+@pytest.mark.parametrize(
+    ("reason", "spans"),
+    [
+        pytest.param(_dated(_pair(27)), ((27, 27),), id="one-pair"),
+        pytest.param(
+            _dated(
+                _pair(10, 5),
+                _pair(10, 6),
+                _pair(12, 5),
+                f"and 4 more on {_iso(12)} to {_iso(14)}, {_iso(20)}",
+            ),
+            ((10, 10), (12, 14), (20, 20)),
+            id="three-pairs-then-a-counted-bucket",
+        ),
+        pytest.param(
+            _dated(_pair(3), f"and more on {_iso(5)}"), ((3, 3), (5, 5)), id="uncounted-bucket"
+        ),
+        pytest.param(_dated(f"1 partition on {_iso(9)}"), ((9, 9),), id="one-partition"),
+        pytest.param(
+            _dated(f"3 partitions on {_iso(9)}, {_iso(11)} to {_iso(12)}"),
+            ((9, 9), (11, 12)),
+            id="counted-partitions",
+        ),
+        pytest.param(
+            _dated(f"partitions on {_iso(9)} to {_iso(10)}"), ((9, 10),), id="uncounted-partitions"
+        ),
+        pytest.param(
+            f"{_dated(_pair(27))}; {_dated(_pair(4))}", ((4, 4), (27, 27)), id="two-parts"
+        ),
+        pytest.param(f"{_dated(_pair(27))}{FAILURE_MARKER}timeout", ((27, 27),), id="failure-note"),
+        pytest.param(
+            _dated(_pair(27), f"and 1 more on {_iso(28)}"), ((27, 28),), id="adjacent-days-merge"
+        ),
+    ],
+)
+def test_a_dated_shortfall_names_its_days_and_re_renders_exactly(
+    reason: str, spans: tuple[tuple[int, int], ...]
+) -> None:
+    """Every dated form parses to its days, and an untouched one is re-rendered unchanged."""
+    assert shortfall_spans(reason) == _spans(*spans)
+    assert shortfall_outside(reason, start=_day(40), end=_day(41)) == reason
+    assert shortfall_within(reason, start=_day(1), end=_day(31)) == reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("", id="empty"),
+        pytest.param(REASON_FINEST_PARTITION, id="bare-prefix"),
+        pytest.param(_dated(_pair(27), "and 1 more"), id="legacy-count-without-days"),
+        pytest.param(f"{REASON_FINEST_PARTITION} (one day)", id="linkedin-one-day"),
+        pytest.param(f"{REASON_SEARCH_CEILING}: 2026-09-14T10:00Z", id="hubspot-ceiling"),
+        pytest.param(DEFERRED, id="deferred"),
+        pytest.param(INTERRUPTED, id="interrupted"),
+        pytest.param(freshness._UNSPECIFIED_SHORTFALL, id="unspecified"),
+        pytest.param(f"{DEFERRED}; {_dated(_pair(27))}", id="repairable-first"),
+        pytest.param(f"{_dated(_pair(27))}; result limit reached", id="mixed-with-undated-part"),
+        pytest.param(f"{_dated(_pair(27))}; ", id="trailing-separator"),
+        pytest.param(
+            f"{_dated(_pair(27))}, {_dated(_pair(4))}", id="parts-not-joined-by-semicolon"
+        ),
+        pytest.param(_dated(f"partitions on {_iso(9)} and {_iso(12)}"), id="days-not-a-span-list"),
+        pytest.param(f"{FAILURE_MARKER}timeout", id="note-only"),
+        pytest.param(f"{REASON_FINEST_PARTITION} ()", id="no-entries"),
+        pytest.param(_dated("2026-9-27, ad group 1"), id="not-iso"),
+        pytest.param(_dated("2026-02-30, ad group 1"), id="no-calendar-date"),
+        pytest.param(_dated(f"{_iso(27)}, ad group 01"), id="leading-zero"),
+        pytest.param(_dated(f"1 partitions on {_iso(9)}"), id="plural-for-one"),
+        pytest.param(_dated(f"partition on {_iso(9)}"), id="singular-without-count"),
+        pytest.param(_dated(f"2 partitions on {_iso(9)}, {_iso(10)}"), id="adjacent-spans"),
+        pytest.param(_dated(f"2 partitions on {_iso(9)} to {_iso(9)}"), id="one-day-to-itself"),
+        pytest.param(_dated(f"2 partitions on {_iso(10)} to {_iso(9)}"), id="reversed-span"),
+        pytest.param(_dated(f"2 partitions on {_iso(12)}, {_iso(9)}"), id="descending-spans"),
+        pytest.param(_dated(f"1 partition on {_iso(9)} to {_iso(10)}"), id="count-below-days"),
+        pytest.param(_dated(_pair(3), f"and 0 more on {_iso(5)}"), id="zero-count"),
+        pytest.param(_dated(f"and 1 more on {_iso(5)}"), id="more-without-a-pair"),
+        pytest.param(_dated(_pair(3), f"1 partition on {_iso(5)}"), id="alone-after-a-pair"),
+        pytest.param(_dated(f"1 partition on {_iso(5)}", _pair(3)), id="bucket-not-last"),
+    ],
+)
+def test_any_other_reason_is_undated_and_left_unchanged(reason: str | None) -> None:
+    """An undated reason names no day, so no helper changes it, whatever the range."""
+    assert shortfall_spans(reason) is None
+    assert shortfall_outside(reason, start=_day(1), end=_day(31)) == reason
+    assert shortfall_within(reason, start=_day(40), end=_day(41)) == reason
+
+
+@pytest.mark.parametrize(
+    ("reason", "span", "expected"),
+    [
+        pytest.param(_dated(_pair(10), _pair(27)), (26, 30), _dated(_pair(10)), id="pair-removed"),
+        pytest.param(_dated(_pair(27)), (26, 30), None, id="nothing-left"),
+        pytest.param(
+            _dated(_pair(26), _pair(31), _pair(30), _pair(25)),
+            (26, 30),
+            _dated(_pair(31), _pair(25)),
+            id="bounds-inclusive-order-kept",
+        ),
+        pytest.param(
+            _dated(_pair(10), _pair(27), f"and 2 more on {_iso(12)} to {_iso(13)}"),
+            (26, 30),
+            _dated(_pair(10), f"and 2 more on {_iso(12)} to {_iso(13)}"),
+            id="untouched-bucket-keeps-its-count",
+        ),
+        pytest.param(
+            _dated(_pair(10), f"and 3 more on {_iso(12)} to {_iso(13)}, {_iso(27)}"),
+            (26, 30),
+            _dated(_pair(10), f"and more on {_iso(12)} to {_iso(13)}"),
+            id="bucket-that-lost-days-loses-its-count",
+        ),
+        pytest.param(
+            _dated(_pair(27), _pair(28), f"and 2 more on {_iso(5)} to {_iso(6)}"),
+            (26, 30),
+            _dated(f"2 partitions on {_iso(5)} to {_iso(6)}"),
+            id="counted-bucket-alone",
+        ),
+        pytest.param(
+            _dated(_pair(27), f"and 1 more on {_iso(5)}"),
+            (26, 30),
+            _dated(f"1 partition on {_iso(5)}"),
+            id="one-partition-alone",
+        ),
+        pytest.param(
+            _dated(_pair(27), f"and 3 more on {_iso(5)}, {_iso(28)} to {_iso(29)}"),
+            (26, 30),
+            _dated(f"partitions on {_iso(5)}"),
+            id="uncounted-bucket-alone",
+        ),
+        pytest.param(
+            _dated(f"10 partitions on {_iso(1)} to {_iso(10)}"),
+            (4, 6),
+            _dated(f"partitions on {_iso(1)} to {_iso(3)}, {_iso(7)} to {_iso(10)}"),
+            id="span-split-by-the-range",
+        ),
+        pytest.param(
+            f"{_dated(_pair(27))}; {_dated(_pair(4))}",
+            (26, 30),
+            _dated(_pair(4)),
+            id="empty-part-dropped",
+        ),
+        pytest.param(
+            f"{_dated(_pair(4), _pair(27))}{FAILURE_MARKER}timeout",
+            (26, 30),
+            f"{_dated(_pair(4))}{FAILURE_MARKER}timeout",
+            id="failure-note-kept",
+        ),
+        pytest.param(
+            f"{_dated(_pair(27))}{FAILURE_MARKER}timeout", (26, 30), None, id="note-goes-with-all"
+        ),
+    ],
+)
+def test_shortfall_outside_removes_the_days_of_a_range(
+    reason: str, span: tuple[int, int], expected: str | None
+) -> None:
+    """Days inside the range leave the shortfall; the rest is re-rendered in canonical form."""
+    start, end = _span(span)
+    assert start is not None
+    assert end is not None
+    assert shortfall_outside(reason, start=start, end=end) == expected
+    if expected is not None:
+        assert shortfall_spans(expected) is not None
+
+
+@pytest.mark.parametrize(
+    ("reason", "span", "expected"),
+    [
+        pytest.param(_dated(_pair(10), _pair(27)), (26, 30), _dated(_pair(27)), id="pair-kept"),
+        pytest.param(_dated(_pair(10)), (26, 30), None, id="no-day-inside"),
+        pytest.param(
+            _dated(_pair(27), f"and 2 more on {_iso(26)} to {_iso(27)}"),
+            (26, 30),
+            _dated(_pair(27), f"and 2 more on {_iso(26)} to {_iso(27)}"),
+            id="bucket-inside-keeps-its-count",
+        ),
+        pytest.param(
+            _dated(_pair(27), f"and 3 more on {_iso(5)}, {_iso(28)} to {_iso(29)}"),
+            (26, 30),
+            _dated(_pair(27), f"and more on {_iso(28)} to {_iso(29)}"),
+            id="bucket-restricted",
+        ),
+        pytest.param(
+            _dated(_pair(5), f"and 3 more on {_iso(5)}, {_iso(28)} to {_iso(29)}"),
+            (26, 30),
+            _dated(f"partitions on {_iso(28)} to {_iso(29)}"),
+            id="bucket-alone",
+        ),
+        pytest.param(
+            f"{_dated(_pair(4))}; {_dated(_pair(27))}{FAILURE_MARKER}timeout",
+            (26, 30),
+            f"{_dated(_pair(27))}{FAILURE_MARKER}timeout",
+            id="failure-note-kept",
+        ),
+    ],
+)
+def test_shortfall_within_keeps_only_the_days_of_a_range(
+    reason: str, span: tuple[int, int], expected: str | None
+) -> None:
+    """Only the partitions on the range's days are named; a range without any names none."""
+    start, end = _span(span)
+    assert start is not None
+    assert end is not None
+    assert shortfall_within(reason, start=start, end=end) == expected
+
+
+def test_the_connector_reason_is_a_dated_shortfall_naming_every_day() -> None:
+    """The Q-G6 connector renders the grammar the merge and the analysis parse.
+
+    Three partitions are named; the others are counted with their days, ascending and with
+    consecutive days joined into one span, whatever order and repeats they were read in.
+    """
+    overflows = [
+        (_day(14), 1),
+        (_day(14), 2),
+        (_day(20), 3),
+        (_day(18), 4),
+        (_day(15), 5),
+        (_day(14), 6),
+        (_day(18), 7),
+    ]
+    reason = partition._finest_partition_reason(overflows)
+    assert reason == _dated(
+        _pair(14, 1),
+        _pair(14, 2),
+        _pair(20, 3),
+        f"and 4 more on {_iso(14)} to {_iso(15)}, {_iso(18)}",
+    )
+    assert shortfall_spans(reason) == _spans((14, 15), (18, 18), (20, 20))
+    assert shortfall_outside(reason, start=_day(14), end=_day(15)) == _dated(
+        _pair(20, 3), f"and more on {_iso(18)}"
+    )
+    named_only = partition._finest_partition_reason(overflows[:3])
+    assert named_only == _dated(_pair(14, 1), _pair(14, 2), _pair(20, 3))
+    assert shortfall_spans(named_only) == _spans((14, 14), (20, 20))
+
+
+def test_the_shortfall_helpers_reject_a_reversed_range() -> None:
+    """A range whose start is after its end is a caller error, never an empty range."""
+    reason = _dated(_pair(27))
+    with pytest.raises(ValueError, match="is after end"):
+        shortfall_outside(reason, start=_day(3), end=_day(2))
+    with pytest.raises(ValueError, match="is after end"):
+        shortfall_within(reason, start=_day(3), end=_day(2))
+
+
+def test_freshness_re_exports_the_one_shortfall_grammar() -> None:
+    """The writer re-exports the analysis grammar: one prefix, one marker, one parser."""
+    assert REASON_FINEST_PARTITION == shortfall_module.FINEST_PARTITION
+    assert FAILURE_MARKER == shortfall_module.FAILURE_MARKER
+    for name in ("DaySpan", "shortfall_outside", "shortfall_spans", "shortfall_within"):
+        assert name in freshness.__all__
+        assert getattr(freshness, name) is getattr(shortfall_module, name)
+    results = doctest.testmod(shortfall_module, report=False)
+    assert results.attempted > 0
+    assert results.failed == 0
+
+
+# ---------------------------------------------------------------------------------------
+# Merge rules: dated finest-partition shortfalls are settled per day
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _success(1, (26, 30)),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "complete", None),
+            id="re-read-of-the-day-clears-it",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10), _pair(27))),
+            _success(1, (26, 30)),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "incomplete", _dated(_pair(10))),
+            id="days-not-re-read-stay-named",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(27, 5))),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "incomplete", _dated(_pair(27, 5))),
+            id="limit-met-again-on-the-day-names-its-own",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10))),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(28))),
+            freshness._State(
+                _at(1),
+                _at(1),
+                _day(1),
+                _day(30),
+                "incomplete",
+                f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            ),
+            id="limit-met-on-other-days-keeps-both",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10), _pair(27))),
+            _success(1, (26, 30), complete=False, reason=REASON_FINEST_PARTITION),
+            freshness._State(
+                _at(1),
+                _at(1),
+                _day(1),
+                _day(30),
+                "incomplete",
+                f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            ),
+            id="undated-own-shortfall-follows",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _deferred(1, (26, 30)),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "incomplete", DEFERRED),
+            id="repairable-read-keeps-todays-rule",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _cut_short(1, (26, 30), DEFERRED),
+            freshness._State(_at(1), _at(0), _day(1), _day(30), "incomplete", DEFERRED),
+            id="cut-short-deferral-keeps-todays-rule",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _cut_short(1, (26, 30), LINKEDIN_503),
+            freshness._State(_at(1), _at(0), _day(1), _day(30), "incomplete", _dated(_pair(27))),
+            id="cut-short-read-removes-no-day",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27), "and 1 more")),
+            _success(1, (26, 30)),
+            freshness._State(
+                _at(1), _at(1), _day(1), _day(30), "incomplete", _dated(_pair(27), "and 1 more")
+            ),
+            id="undated-legacy-form-stays",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(27))),
+            _success(1, (1, 30)),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "complete", None),
+            id="whole-range-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "complete"),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(27))),
+            freshness._State(_at(1), _at(1), _day(1), _day(30), "incomplete", _dated(_pair(27))),
+            id="complete-row-takes-the-new-shortfall",
+        ),
+    ],
+)
+def test_merge_settles_a_dated_shortfall_per_day(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """A finished partial re-read removes the days it re-read, and only those.
+
+    A cut-short or repairable read, an undated shortfall and a whole-range read keep the
+    rules every other shortfall follows.
+    """
+    assert freshness._merge(stored, outcome) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(28))),
+            freshness._State(
+                _at(2),
+                _at(2),
+                _day(1),
+                _day(30),
+                "incomplete",
+                f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            ),
+            id="older-shortfall-added",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (5, 15)),
+            freshness._State(_at(2), _at(2), _day(1), _day(28), "incomplete", _dated(_pair(10))),
+            id="older-read-removes-no-day",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (5, 15), complete=False, reason=_dated(_pair(10))),
+            freshness._State(_at(2), _at(2), _day(1), _day(28), "incomplete", _dated(_pair(10))),
+            id="same-shortfall-named-once",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", REASON_FINEST_PARTITION, attempt=2, success=2),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(28))),
+            freshness._State(
+                _at(2), _at(2), _day(1), _day(30), "incomplete", REASON_FINEST_PARTITION
+            ),
+            id="undated-stored-shortfall-stays",
+        ),
+    ],
+)
+def test_an_older_read_never_removes_a_dated_day_but_adds_its_own(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """An attempt that started before the stored success is merged conservatively.
+
+    It re-read nothing the newer success did not, so it removes no day, but the days at the
+    limit that it met still count: both shortfalls stay named.
+    """
+    assert freshness._merge(stored, outcome) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "reason"),
+    [
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(28))),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="obsolete-dated",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (5, 30), complete=False, reason=_dated(_pair(10, 5), _pair(28))),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="obsolete-dated-sharing-a-day",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10)), attempt=2, success=2),
+            _success(1, (26, 30), complete=False, reason=REASON_FINEST_PARTITION),
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            id="obsolete-undated",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10), _pair(27))),
+            _success(1, (26, 30), complete=False, reason=_dated(_pair(28))),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="current-partial-re-read",
+        ),
+        pytest.param(
+            _stored((1, 28), "incomplete", _dated(_pair(10), _pair(27))),
+            _success(1, (26, 30), complete=False, reason=REASON_FINEST_PARTITION),
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            id="current-undated",
+        ),
+    ],
+)
+def test_merging_the_same_shortfall_outcome_again_changes_nothing(
+    stored: freshness._State, outcome: FreshnessOutcome, reason: str
+) -> None:
+    """A replayed outcome adds nothing the row already names.
+
+    :func:`record_freshness` promises that recording the same outcome again changes nothing.
+    An obsolete or a current partial read joins its own shortfall after the dated stored one;
+    replaying it once or twice more must not append it again, whether it is dated (its days
+    already named) or undated (already one of the reason's parts).
+    """
+    once = freshness._merge(stored, outcome)
+    twice = freshness._merge(once, outcome)
+    thrice = freshness._merge(twice, outcome)
+
+    assert (once.completeness, once.reason) == ("incomplete", reason)
+    assert once == twice == thrice
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        pytest.param(_dated(_pair(10)), None, _dated(_pair(10)), id="nothing-to-add"),
+        pytest.param(_dated(_pair(10)), _dated(_pair(10)), _dated(_pair(10)), id="the-same"),
+        pytest.param(
+            _dated(_pair(10)),
+            _dated(_pair(28)),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="other-days-added",
+        ),
+        pytest.param(
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            _dated(_pair(28)),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="already-joined",
+        ),
+        pytest.param(
+            _dated(_pair(10)),
+            _dated(_pair(10, 5), _pair(28)),
+            f"{_dated(_pair(10))}; {_dated(_pair(28))}",
+            id="a-named-day-left-out",
+        ),
+        pytest.param(
+            _dated(_pair(11)),
+            _dated(f"3 partitions on {_iso(10)} to {_iso(12)}"),
+            f"{_dated(_pair(11))}; {_dated(f'partitions on {_iso(10)}, {_iso(12)}')}",
+            id="a-bucket-loses-the-named-day",
+        ),
+        pytest.param(
+            _dated(_pair(10)),
+            REASON_FINEST_PARTITION,
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            id="undated-added",
+        ),
+        pytest.param(
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            REASON_FINEST_PARTITION,
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            id="undated-already-a-part",
+        ),
+        pytest.param(
+            f"{_dated(_pair(10))}; {DEFERRED}",
+            DEFERRED,
+            f"{_dated(_pair(10))}; {DEFERRED}",
+            id="undated-parts-already-in-order",
+        ),
+        pytest.param(
+            f"{_dated(_pair(10))}; {REASON_DEFERRED}; {REASON_SEARCH_CEILING}",
+            f"{REASON_DEFERRED}; {REASON_FINEST_PARTITION}",
+            f"{_dated(_pair(10))}; {REASON_DEFERRED}; {REASON_SEARCH_CEILING}; "
+            f"{REASON_DEFERRED}; {REASON_FINEST_PARTITION}",
+            id="undated-parts-not-together-added",
+        ),
+        pytest.param(
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            _dated(_pair(10)),
+            f"{_dated(_pair(10))}; {REASON_FINEST_PARTITION}",
+            id="dated-already-a-part-of-an-undated-reason",
+        ),
+    ],
+)
+def test_joined_adds_only_what_the_first_reason_does_not_name(
+    first: str, second: str | None, expected: str
+) -> None:
+    """A dated reason loses the days already named; an undated one standing is skipped."""
+    assert freshness._joined(first, second) == expected
+    assert freshness._joined(expected, second) == expected, "joining it again changes nothing"
+
+
+def test_top_level_parts_keep_a_dated_part_whole() -> None:
+    """Only a ``"; "`` outside parentheses separates the reasons a join put together."""
+    reason = f"{_dated(_pair(10), _pair(11, 2))}; {DEFERRED}; {REASON_SEARCH_CEILING}"
+
+    assert freshness._top_level_parts(reason) == (
+        _dated(_pair(10), _pair(11, 2)),
+        REASON_DEFERRED,
+        "3 partitions deferred",
+        REASON_SEARCH_CEILING,
+    )
+    assert freshness._top_level_parts(REASON_FINEST_PARTITION) == (REASON_FINEST_PARTITION,)
+
+
+@pytest.mark.parametrize(
+    ("stored", "outcome", "expected"),
+    [
+        pytest.param(
+            _stored(
+                (1, 28), "incomplete", f"{_dated(_pair(27))}{FAILURE_MARKER}timeout", attempt=2
+            ),
+            _success(1, (26, 30)),
+            freshness._State(_at(2), _at(1), _day(1), _day(30), "complete", "timeout"),
+            id="newer-failure-on-a-cleared-row",
+        ),
+        pytest.param(
+            _stored(
+                (1, 28),
+                "incomplete",
+                f"{_dated(_pair(10), _pair(27))}{FAILURE_MARKER}timeout",
+                attempt=2,
+            ),
+            _success(1, (26, 30)),
+            freshness._State(
+                _at(2),
+                _at(1),
+                _day(1),
+                _day(30),
+                "incomplete",
+                f"{_dated(_pair(10))}{FAILURE_MARKER}timeout",
+            ),
+            id="newer-failure-note-kept",
+        ),
+        pytest.param(
+            _stored(
+                (1, 28),
+                "incomplete",
+                f"{_dated(_pair(10), _pair(27))}{FAILURE_MARKER}timeout",
+                attempt=1,
+            ),
+            _success(2, (26, 30)),
+            freshness._State(_at(2), _at(2), _day(1), _day(30), "incomplete", _dated(_pair(10))),
+            id="older-failure-note-dropped",
+        ),
+    ],
+)
+def test_a_dated_shortfall_keeps_the_failure_note_rules(
+    stored: freshness._State, outcome: FreshnessOutcome, expected: freshness._State
+) -> None:
+    """The days are settled on the shortfall alone; a newer failure's note follows as before."""
+    assert freshness._merge(stored, outcome) == expected
+
+
+# ---------------------------------------------------------------------------------------
 # Merge rules: chronology (outcomes committed out of start order)
 # ---------------------------------------------------------------------------------------
 
@@ -1552,6 +2178,68 @@ async def test_completeness_downgrades_and_recovers(sessions: Sessions) -> None:
 
     recovered = await _record(sessions, dataset_id, METRICS, _success(3, (1, 30)))
     assert _state(recovered) == _expected(3, 3, (1, 30), "complete")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_complete_re_read_of_the_capped_day_clears_the_finest_partition_shortfall(
+    sessions: Sessions,
+) -> None:
+    """A trailing re-read of the day at the result limit turns the row complete.
+
+    The reproduction: Q-G6 hit the limit at one (day, ad group); an incremental read that
+    misses that day keeps the shortfall, and the next one that re-reads it completely ends it,
+    with no full-range read in between.
+    """
+    dataset_id = await _create_dataset(sessions)
+    capped_reason = _dated(_pair(28, 990200000000))
+    capped = await _record(
+        sessions,
+        dataset_id,
+        SEARCH_TERMS,
+        _success(0, (1, 30), complete=False, reason=capped_reason),
+    )
+    assert _state(capped) == _expected(0, 0, (1, 30), "incomplete", capped_reason)
+    assert needs_repair(capped) is False
+
+    elsewhere = await _record(sessions, dataset_id, SEARCH_TERMS, _success(1, (29, 31)))
+    assert _state(elsewhere) == _expected(1, 1, (1, 31), "incomplete", capped_reason)
+
+    cleared = await _record(sessions, dataset_id, SEARCH_TERMS, _success(2, (28, 31)))
+    assert _state(cleared) == _expected(2, 2, (1, 31), "complete")
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("older", "joined"),
+    [
+        pytest.param(_dated(_pair(29)), f"{_dated(_pair(28))}; {_dated(_pair(29))}", id="dated"),
+        pytest.param(
+            REASON_FINEST_PARTITION, f"{_dated(_pair(28))}; {REASON_FINEST_PARTITION}", id="undated"
+        ),
+    ],
+)
+async def test_replaying_an_obsolete_shortfall_outcome_changes_nothing(
+    sessions: Sessions, older: str, joined: str
+) -> None:
+    """An obsolete incomplete outcome recorded twice publishes the same row twice.
+
+    The newer read names one capped day; the older one, committed later, adds its own
+    shortfall after it. Recording that older outcome again (an idempotent upsert retried)
+    leaves every column as the first time, instead of appending its shortfall once more.
+    """
+    dataset_id = await _create_dataset(sessions)
+    newer = _success(2, (28, 30), complete=False, reason=_dated(_pair(28)))
+    obsolete = _success(1, (28, 30), complete=False, reason=older)
+    await _record(sessions, dataset_id, SEARCH_TERMS, newer)
+
+    first = await _record(sessions, dataset_id, SEARCH_TERMS, obsolete)
+    replayed = await _record(sessions, dataset_id, SEARCH_TERMS, obsolete)
+
+    assert _state(first) == _expected(2, 2, (28, 30), "incomplete", joined)
+    assert _state(replayed) == _state(first)
+    assert await _count(sessions, dataset_id) == 1
 
 
 @pytest.mark.anyio

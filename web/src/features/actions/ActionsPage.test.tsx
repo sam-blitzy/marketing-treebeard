@@ -22,7 +22,14 @@
  *   card outcomes are announced in, then all five sections in the user's order, from one
  *   `GET /recommendations` response. A section the API omits is skipped and a repeated key
  *   renders once. A recorded feedback whose refetch hides its card is still announced there,
- *   and focus moves to the next card's action.
+ *   and focus moves to the next card's action. A C2 "Scale" card links the B1 card for its
+ *   subject in Budget changes, found in the same response, also while a discrepancy holds both:
+ *   following the link expands the Budget held disclosure, scrolls to the still-held B1 and
+ *   moves focus to it.
+ * - **The confirmation where a card stood.** That feedback's outcome also shows, as plain
+ *   content (no second live region, no alert), in the hidden card's place inside its own
+ *   section and group, right before the action focus moves to, while the navigation counts and
+ *   "Not shown" count the item as hidden.
  * - **States.** "Loading actions" until the first response; "No analysis run yet" (404
  *   `not_found` or 409 `run_not_ready` for the default run) that fills in by itself; "Run not
  *   found" with "Back to default" for an unknown custom run (404 or 422); otherwise "Actions
@@ -44,7 +51,7 @@ import type { QueryClient } from '@tanstack/react-query';
 import { useSearch } from '@tanstack/react-router';
 import { Profiler } from 'react';
 import type { ReactElement } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
@@ -53,18 +60,22 @@ import {
   CUSTOM_RUN_ID,
   DEFAULT_RUN_ID,
   FIXTURE_BANNERS,
+  FIXTURE_CAMPAIGN_IDS,
   FIXTURE_ITEM_IDS,
   FIXTURE_SECTION_TITLES,
   findPageItem,
   makeConfig,
   makeDiscrepancy,
+  makeEvidence,
   makeFeedback,
+  makeItem,
   makeOverlay,
   makeRecommendationsPage,
   makeRun,
   makeSection,
   makeSources,
 } from '../../test/fixtures';
+import { feedbackConfirmationText, feedbackFlow } from '../../test/feedbackFlow';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
 import * as statusBarModule from '../status/StatusBar';
 import { ActionsPage, SECTION_COMPONENTS } from './ActionsPage';
@@ -227,6 +238,48 @@ function noticeRegion(): HTMLElement {
     throw new Error('the page has no notice region');
   }
   return region;
+}
+
+/** The id of the C2 "Scale" item {@link pageWithScale} adds, outside `FIXTURE_ITEM_IDS`. */
+const SCALE_ITEM_ID = 1190;
+
+/**
+ * The default page with a C2 "Scale" on "Pipeline Search — US" added to the Campaigns Scale
+ * group: the scale whose B1 item is the page's own B1 card ("Raise daily budget from USD 200.00
+ * to USD 240.00"), linked by subject in `extra.b1_link` as `campaigns._c2_candidate` writes it.
+ */
+function pageWithScale(): RecommendationsPage {
+  const page = makeRecommendationsPage();
+  const b1 = findPageItem(page, FIXTURE_ITEM_IDS.b1);
+  const scale = makeItem({
+    id: SCALE_ITEM_ID,
+    rank: 1,
+    rule_id: 'C2',
+    action: 'Scale',
+    reason: 'Capped on 22 of 28 known-budget days: raise the daily budget (B1).',
+    entity: b1.entity,
+    evidence: makeEvidence({
+      extra: {
+        outcome: 'Scale',
+        b1: true,
+        b1_link: {
+          rule_id: 'B1',
+          subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineSearch },
+          current_daily_budget: '200.00',
+          proposed_daily_budget: '240.00',
+        },
+      },
+    }),
+    decision_subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineSearch },
+  });
+  const scaleGroup = page.sections
+    .find((section) => section.key === 'campaigns')
+    ?.groups.find((group) => group.key === 'scale');
+  if (scaleGroup === undefined) {
+    throw new Error('the default fixture page has no Campaigns Scale group');
+  }
+  scaleGroup.items = [scale, ...scaleGroup.items];
+  return page;
 }
 
 /** Whether `first` precedes `second` in document order. */
@@ -555,6 +608,103 @@ describe('ActionsPage', () => {
       await waitFor(() => {
         expect(document.activeElement).toBe(next);
       });
+    });
+
+    it('links a C2 "Scale" card to its B1 card in Budget changes, from the one page read', async () => {
+      const { api } = await renderPage(
+        defaultHandlers({ 'GET /recommendations': json(200, pageWithScale()) }),
+      );
+      await loadedPage();
+
+      const b1 = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.b1);
+      const scale = document.getElementById(`item-${String(SCALE_ITEM_ID)}`);
+      if (scale === null) {
+        throw new Error('the C2 Scale card is not on the page');
+      }
+      const campaigns = screen.getByRole('region', { name: FIXTURE_SECTION_TITLES.campaigns });
+      expect(campaigns.contains(scale)).toBe(true);
+      const link = within(scale).getByRole('link', {
+        name: `View B1 budget increase: ${b1.action}`,
+      });
+      const href = link.getAttribute('href');
+      expect(href).toBe(`#item-${String(b1.id)}`);
+      // The link names the B1 card itself, shown openly in Budget changes.
+      const target = document.getElementById(href?.slice(1) ?? '');
+      const budget = screen.getByRole('region', { name: FIXTURE_SECTION_TITLES.budget });
+      expect(target).toBe(within(budget).getByRole('article', { name: b1.action }));
+      // The B1 card is found in the page's own response: no read beyond the page's usual ones.
+      expect(recommendationReads(api)).toHaveLength(1);
+      expect(api.calls.some((call) => /^\/recommendations\/./u.test(call.path))).toBe(false);
+    });
+
+    it('links a held C2 "Scale" to its held B1 card, and following the link reveals and focuses it held', async () => {
+      // One discrepancy on the shared subject holds both the Scale and its B1.
+      const page = pageWithScale();
+      const b1 = findPageItem(page, FIXTURE_ITEM_IDS.b1);
+      const scaleItem = findPageItem(page, SCALE_ITEM_ID);
+      for (const item of [b1, scaleItem]) {
+        item.held = true;
+        item.held_reason = 'Resolve discrepancy first';
+      }
+      const scrollIntoView = vi.fn();
+      Object.defineProperty(Element.prototype, 'scrollIntoView', {
+        configurable: true,
+        writable: true,
+        value: scrollIntoView,
+      });
+      onTestFinished(() => {
+        window.history.replaceState(null, '', window.location.pathname);
+        Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+      });
+      await renderPage(defaultHandlers({ 'GET /recommendations': json(200, page) }));
+      await loadedPage();
+
+      const campaigns = screen.getByRole('region', { name: FIXTURE_SECTION_TITLES.campaigns });
+      const budget = screen.getByRole('region', { name: FIXTURE_SECTION_TITLES.budget });
+      const heldToggle = (region: HTMLElement): HTMLElement => {
+        const [button] = within(region).getAllByRole('button', {
+          name: /^Held until discrepancies are resolved \(\d+\)$/u,
+        });
+        if (button === undefined) {
+          throw new Error('the region has no held disclosure');
+        }
+        return button;
+      };
+      // Both start collapsed; the B1 card is not mounted yet.
+      expect(heldToggle(budget).getAttribute('aria-expanded')).toBe('false');
+      expect(document.getElementById(`item-${String(b1.id)}`)).toBeNull();
+
+      // The Scale group's held disclosure holds the Scale card, which links its held B1 card.
+      const scaleGroup = within(campaigns).getByRole('region', { name: 'Scale' });
+      fireEvent.click(heldToggle(scaleGroup));
+      const scale = document.getElementById(`item-${String(SCALE_ITEM_ID)}`);
+      if (scale === null) {
+        throw new Error('the held C2 Scale card is not on the page');
+      }
+      const link = within(scale).getByRole('link', {
+        name: `View B1 budget increase: ${b1.action}`,
+      });
+      expect(link.getAttribute('href')).toBe(`#item-${String(b1.id)}`);
+
+      // Following the link from the keyboard (the browser's fragment navigation and its
+      // `hashchange`) expands the Budget held disclosure, scrolls to the B1 card and moves focus
+      // from the link to it, so the next Tab continues inside the card.
+      link.focus();
+      fireEvent.click(link);
+      await waitFor(() => {
+        expect(heldToggle(budget).getAttribute('aria-expanded')).toBe('true');
+      });
+      expect(window.location.hash).toBe(`#item-${String(b1.id)}`);
+      const target = within(budget).getByRole('article', { name: b1.action });
+      expect(target.id).toBe(`item-${String(b1.id)}`);
+      expect(scrollIntoView.mock.contexts).toContain(target);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(target);
+      });
+      expect(target.getAttribute('tabindex')).toBe('-1');
+      // The hold is not released: the card stays under the held disclosure.
+      const region = document.getElementById(heldToggle(budget).getAttribute('aria-controls') ?? '');
+      expect(region?.contains(target)).toBe(true);
     });
   });
 
@@ -1262,5 +1412,69 @@ describe('ActionsPage polls', () => {
     await settle({ queryClient, commits });
     expect(shownPage(queryClient).sections).toBe(shown.sections);
     expect(frames.mock.calls).toHaveLength(sectionRenders + SECTION_ORDER.length);
+  });
+});
+
+describe('ActionsPage: the confirmation where a card stood', () => {
+  it("shows a recorded feedback in the hidden card's place, beside the announcement and the next card's action", async () => {
+    const flow = feedbackFlow();
+    const { api } = await renderPage(defaultHandlers(flow.handlers));
+    await loadedPage();
+    const pause = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.c1);
+    const hold = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.c2Hold);
+    const nav = screen.getByRole('navigation', { name: 'Sections' });
+    const campaignsLink = () =>
+      within(nav).getByRole('link', { name: /^Campaigns to pause or launch/u });
+    expect(campaignsLink().textContent).toBe('Campaigns to pause or launch 5');
+    const pauseCard = document.getElementById(`item-${String(pause.id)}`);
+    if (pauseCard === null) {
+      throw new Error('the C1 card is not on the page');
+    }
+
+    const snooze = within(pauseCard).getByRole('button', { name: 'Snooze for 7 days' });
+    snooze.focus();
+    fireEvent.click(snooze);
+
+    const text = feedbackConfirmationText('snooze', pause);
+    await waitFor(() => {
+      expect(document.getElementById(`item-${String(pause.id)}`)).toBeNull();
+    });
+    // The announcement stays in the polite region above the sections.
+    expect(outcomeRegion().textContent).toBe(text);
+    // The visible confirmation stands where the card did: in Campaigns' Pause group, before the
+    // group's held disclosure, and it is no live region, alert or Tab stop.
+    const campaigns = screen.getByRole('region', { name: 'Campaigns to pause or launch' });
+    const group = within(campaigns).getByRole('region', { name: 'Pause' });
+    const confirmation = within(group).getByText(text);
+    expect(outcomeRegion().contains(confirmation)).toBe(false);
+    expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+    expect(
+      precedes(
+        confirmation,
+        within(group).getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
+      ),
+    ).toBe(true);
+    expect(screen.getAllByText(text)).toHaveLength(2);
+    // Focus moves to the next card's action, which follows the confirmation.
+    const holdCard = document.getElementById(`item-${String(hold.id)}`);
+    if (holdCard === null) {
+      throw new Error('the C2 Hold card is not on the page');
+    }
+    const next = within(holdCard).getByRole('button', { name: 'Mark done' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(precedes(confirmation, next)).toBe(true);
+    // Every count still counts the item as hidden.
+    expect(campaignsLink().textContent).toBe('Campaigns to pause or launch 4');
+    expect(within(campaigns).getByRole('list', { name: 'Not shown' }).textContent).toContain(
+      '1 hidden since this run',
+    );
+    expect(flow.hidden.get(pause.id)).toBe('snooze');
+    const feedbackPath = `/recommendations/${String(pause.id)}/feedback`;
+    expect(
+      api.calls.filter((call) => call.method === 'POST' && call.path === feedbackPath),
+    ).toHaveLength(1);
   });
 });

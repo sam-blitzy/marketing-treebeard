@@ -38,7 +38,8 @@ dataset, plus the effective CRM dataset for LinkedIn-attributed evidence (the co
 LinkedIn is simulated), so live and simulated rows never join within one source.
 
 Purity: dataclasses, constants and pure helpers only. No database, network, settings or
-logging access, and no import of another analysis module except ``thresholds`` and ``window``.
+logging access, and no import of another analysis module except ``thresholds``, ``window`` and
+``shortfall`` (the dated Q-G6 reason grammar :class:`Freshness` judges a window by).
 
 Example:
     >>> ref = EntityRef("google", "campaign", 7, "123", "Brand")
@@ -60,6 +61,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Final, Literal, Protocol, get_args, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ads_engine.analysis.shortfall import shortfall_spans, shortfall_within
 from ads_engine.analysis.thresholds import ContentAsset, CrmBindings, Thresholds
 from ads_engine.analysis.window import AnalysisWindow
 from ads_engine.db.models.analysis import DATA_STATUSES, FEEDBACK_KINDS, RECOMMENDATION_SECTIONS
@@ -2414,13 +2416,17 @@ class Freshness:
 
         AAP 0.3.2 (P4): an item is incomplete "when any of its datasets is not ``complete``
         over the window". :attr:`completeness` describes only the covered range, so a dated
-        dataset is complete over the required range only when it is ``complete``, its
-        coverage starts on or before ``window_start`` and it ends on or after ``window_end``.
-        The range is the run's window, or wider where a rule reads further back: the overlay
-        passes a K1 item's ``google.metrics_daily`` the start of its frozen baseline window.
-        Coverage that stops before ``window_end`` is therefore incomplete as well as stale
-        (:meth:`is_stale`). A full-state dataset (:data:`FULL_STATE_DATASETS`) has no date
-        range, so its completeness alone decides.
+        dataset is complete over the required range only when its coverage starts on or
+        before ``window_start`` and ends on or after ``window_end``, and it is ``complete``, or
+        ``incomplete`` only for a dated shortfall none of whose days lies in the range: a Q-G6
+        finest-partition reason names the days of its partitions at the result limit
+        (:func:`~ads_engine.analysis.shortfall.shortfall_spans`), so a range without them
+        lacks nothing. An ``unknown`` row, and an ``incomplete`` one whose reason names no day,
+        is incomplete over every range. The range is the run's window, or wider where a rule
+        reads further back: the overlay passes a K1 item's ``google.metrics_daily`` the start
+        of its frozen baseline window. Coverage that stops before ``window_end`` is therefore
+        incomplete as well as stale (:meth:`is_stale`). A full-state dataset
+        (:data:`FULL_STATE_DATASETS`) has no date range, so its completeness alone decides.
 
         Example:
             >>> covered = (date(2026, 9, 20), date(2026, 10, 1))
@@ -2431,17 +2437,95 @@ class Freshness:
             False
             >>> row.is_complete_over(window_start=date(2026, 9, 20), window_end=date(2026, 10, 2))
             False
+            >>> capped = replace(
+            ...     row,
+            ...     dataset="google.search_terms",
+            ...     completeness="incomplete",
+            ...     reason="result limit reached at finest partition (2026-09-24, ad group 7)",
+            ... )
+            >>> capped.is_complete_over(
+            ...     window_start=date(2026, 9, 25), window_end=date(2026, 10, 1)
+            ... )
+            True
+            >>> capped.is_complete_over(
+            ...     window_start=date(2026, 9, 20), window_end=date(2026, 10, 1)
+            ... )
+            False
         """
-        if self.completeness != "complete":
-            return False
         if self.dataset in FULL_STATE_DATASETS:
-            return True
-        return (
-            self.covered_from is not None
-            and self.covered_from <= window_start
-            and self.covered_through is not None
-            and self.covered_through >= window_end
+            return self.completeness == "complete"
+        if (
+            self.covered_from is None
+            or self.covered_from > window_start
+            or self.covered_through is None
+            or self.covered_through < window_end
+        ):
+            return False
+        if self.completeness != "incomplete":
+            return self.completeness == "complete"
+        spans = shortfall_spans(self.reason)
+        return spans is not None and all(
+            last < window_start or first > window_end for first, last in spans
         )
+
+    def incomplete_reason_over(self, *, window_start: date, window_end: date) -> str | None:
+        """Return what the row's completeness lacks over ``[window_start, window_end]`` (P4).
+
+        For the message of an item or a finding judged by :meth:`is_complete_over`: ``None``
+        for a ``complete`` row. A dated shortfall (an ``incomplete`` dated dataset whose reason
+        names its days) is restricted to the range's days
+        (:func:`~ads_engine.analysis.shortfall.shortfall_within`), keeping a failure note, and
+        is ``None`` when none of its days is inside, so a message never names a day outside the
+        range. Any other row gives its reason, else its completeness. Coverage short of the
+        range is not named here; callers name it from :attr:`covered_from` and
+        :attr:`covered_through`, so a row :meth:`is_complete_over` judges incomplete always
+        has something to name.
+
+        Example:
+            >>> row = Freshness(
+            ...     3,
+            ...     "google.search_terms",
+            ...     None,
+            ...     None,
+            ...     date(2026, 9, 1),
+            ...     date(2026, 10, 1),
+            ...     "incomplete",
+            ...     "result limit reached at finest partition (2026-09-24, ad group 7; "
+            ...     "2026-09-28, ad group 8)",
+            ... )
+            >>> row.incomplete_reason_over(
+            ...     window_start=date(2026, 9, 25), window_end=date(2026, 10, 1)
+            ... )
+            'result limit reached at finest partition (2026-09-28, ad group 8)'
+            >>> row.incomplete_reason_over(
+            ...     window_start=date(2026, 9, 29), window_end=date(2026, 10, 1)
+            ... )
+            >>> replace(row, reason=None).incomplete_reason_over(
+            ...     window_start=date(2026, 9, 29), window_end=date(2026, 10, 1)
+            ... )
+            'incomplete'
+
+        Args:
+            window_start: The first native date of the required range.
+            window_end: The last native date of the required range.
+
+        Returns:
+            The shortfall to name over the range, or ``None`` when the row's completeness
+            lacks nothing there.
+
+        Raises:
+            ValueError: If ``window_start`` is after ``window_end`` and the row holds a dated
+                shortfall.
+        """
+        if self.completeness == "complete":
+            return None
+        if (
+            self.completeness == "incomplete"
+            and self.dataset not in FULL_STATE_DATASETS
+            and shortfall_spans(self.reason) is not None
+        ):
+            return shortfall_within(self.reason, start=window_start, end=window_end)
+        return self.reason or self.completeness
 
     def status(self) -> DatasetStatus:
         """Return the dataset's frozen :class:`DatasetStatus` for evidence."""

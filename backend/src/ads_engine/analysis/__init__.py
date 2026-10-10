@@ -12,6 +12,7 @@ Module map:
     context: rule contract (`evaluate(ctx: AnalysisContext) -> RuleResult`) and constants.
     thresholds: loader for config/*.yaml, `config_hash`, and the CRM stage-binding types.
     window: analysis windows as calendar-date ranges on each source's native day boundary.
+    shortfall: the dated Q-G6 finest-partition reason grammar, shared with sync.freshness.
     stats: Fisher's exact, two-proportion z-test, Holm, Wilson, power, Poisson rate test.
     text: search-term tokeniser, token Jaccard similarity, single-linkage clustering.
     metrics: SQL aggregation into `AnalysisContext`, budget days, utilization, efficiency, G1.

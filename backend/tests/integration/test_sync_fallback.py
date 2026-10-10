@@ -3833,73 +3833,293 @@ async def test_an_unusable_checkpoint_is_ignored_and_the_run_falls_back_to_the_w
     assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
 
 
-async def test_a_drained_checkpoint_still_reports_a_permanent_shortfall(rig: Rig) -> None:
-    """A result-limit shortfall of a deferred cycle survives the drain of its checkpoint.
+def _capped_on(day: date) -> str:
+    """The dated Q-G6 shortfall of one (day, ad group) partition kept at the result limit."""
+    return f"{freshness.REASON_FINEST_PARTITION} ({day.isoformat()}, ad group 7)"
 
-    AAP 0.3.3: a Q-G6 (day, ad group) kept at the result limit leaves ``google.search_terms``
-    ``incomplete``, and re-reading cannot remove it. Draining a checkpoint lets the run vouch
-    for the whole stored range, so the shortfall must outlive the deferral: whether the
-    checkpoint carries it (met earlier in the cycle) or the stored row does (met before the
-    deferral), the drained dataset stays ``incomplete`` with that reason, not ``complete``.
+
+async def _store_capped_checkpoint(
+    rig: Rig,
+    dataset_id: int,
+    *,
+    capped: date,
+    pending: Mapping[str, object],
+    carried_by: str,
+) -> None:
+    """Leave ``google.search_terms`` with one pending Q-G6 scope and a shortfall on ``capped``.
+
+    ``carried_by`` names who holds the shortfall: ``"checkpoint"``, its ``reasons`` (met
+    earlier in the cycle, the row recording the deferral followed by it), or ``"row"``, the
+    stored reason alone (met before the deferral, the checkpoint's ``reasons`` empty).
+    """
+    built = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert built is not None
+    assert built.covered_from is not None
+    shortfall = _capped_on(capped)
+    in_checkpoint = carried_by == "checkpoint"
+    async with rig.sessions() as session, session.begin():
+        await session.execute(
+            update(DatasetFreshness)
+            .where(
+                DatasetFreshness.dataset_id == dataset_id,
+                DatasetFreshness.dataset == "google.search_terms",
+            )
+            .values(
+                completeness="incomplete",
+                reason=(
+                    f"{freshness.REASON_DEFERRED}; 1 partition deferred; {shortfall}"
+                    if in_checkpoint
+                    else shortfall
+                ),
+                checkpoint={
+                    "version": 1,
+                    "pending": {"Q-G6": [{"scope": dict(pending), "deferred_at": T0.isoformat()}]},
+                    "covered_from": built.covered_from.isoformat(),
+                    "reasons": [shortfall] if in_checkpoint else [],
+                },
+            )
+        )
+
+
+async def _drain_search_terms(
+    rig: Rig, dataset_id: int, at: datetime
+) -> tuple[DatasetFreshness, list[dict[str, object]]]:
+    """Run the incremental metrics job at ``at``; return the search-terms row and Q-G6 reads."""
+    recorder = rig.recording(rig.live("google"))
+    report = await jobs.run_source_jobs(
+        "google",
+        trigger="manual",
+        jobs=[jobs.JOB_METRICS],
+        controller=rig.controller({"google": recorder}, at=at),
+    )
+    (result,) = report.results
+    assert result.status == "succeeded"
+    row = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert row is not None
+    return row, [scope for query_id, scope in _google_reads(recorder) if query_id == "Q-G6"]
+
+
+def _read_in_full(day: date, scopes: Sequence[Mapping[str, object]]) -> bool:
+    """Whether a Q-G6 read was a date range alone spanning ``day``."""
+    for scope in scopes:
+        start, end = scope.get(START), scope.get(END)
+        if (
+            set(scope) == {START, END}
+            and isinstance(start, date)
+            and isinstance(end, date)
+            and start <= day <= end
+        ):
+            return True
+    return False
+
+
+@pytest.mark.parametrize(
+    ("carried_by", "capped_from_end", "pending_from_end"),
+    [
+        pytest.param("checkpoint", None, None, id="checkpoint-carried"),
+        pytest.param("row", None, None, id="row-carried-full-deferred"),
+        pytest.param("checkpoint", 2, 1, id="inherited-own"),
+    ],
+)
+async def test_a_drain_that_re_reads_the_capped_day_in_full_clears_its_shortfall(
+    rig: Rig, carried_by: str, capped_from_end: int | None, pending_from_end: int | None
+) -> None:
+    """A drained checkpoint no longer reports a limit on a day it re-read completely.
+
+    AAP 0.3.3 and 0.3.2: a Q-G6 (day, ad group) kept at the result limit leaves
+    ``google.search_terms`` ``incomplete``; the finding requires a later complete re-read of
+    that day to clear it. The drain re-reads the capped day in full and meets no limit, so the
+    dataset turns ``complete`` with no reason and no checkpoint, whoever carried the
+    shortfall and whichever read covered the day:
+
+    * ``checkpoint-carried``: the checkpoint's ``reasons`` hold it, and its pending date-range
+      scope is the capped day (the first stored day, outside the run's own range);
+    * ``row-carried-full-deferred``: the stored row's reason holds it, and the same stored
+      full-date scope, outside the own range, re-reads it;
+    * ``inherited-own``: the checkpoint's ``reasons`` hold a limit on a day of the run's own
+      range, re-read by an own segment, while the pending scope is the next day.
+
+    ``None`` offsets mean the first stored day; otherwise days before the last stored day.
     """
     dataset_id = await _live_google(rig)
     built = await rig.freshness_row(dataset_id, "google.search_terms")
     assert built is not None
     assert built.covered_from is not None
-    first_day = built.covered_from
-    shortfall = f"{freshness.REASON_FINEST_PARTITION} ({first_day.isoformat()}, ad group 1)"
-    unread_day = {"start": first_day.isoformat(), "end": first_day.isoformat()}
+    assert built.covered_through is not None
+    first, last = built.covered_from, built.covered_through
 
-    async def store(reason: str, reasons: list[str]) -> None:
-        async with rig.sessions() as session, session.begin():
-            await session.execute(
-                update(DatasetFreshness)
-                .where(
-                    DatasetFreshness.dataset_id == dataset_id,
-                    DatasetFreshness.dataset == "google.search_terms",
-                )
-                .values(
-                    completeness="incomplete",
-                    reason=reason,
-                    checkpoint={
-                        "version": 1,
-                        "pending": {"Q-G6": [{"scope": unread_day, "deferred_at": T0.isoformat()}]},
-                        "covered_from": first_day.isoformat(),
-                        "reasons": reasons,
-                    },
-                )
-            )
+    def stored_day(from_end: int | None) -> date:
+        return first if from_end is None else last - timedelta(days=from_end)
 
-    async def drain(at: datetime) -> DatasetFreshness:
-        report = await jobs.run_source_jobs(
-            "google",
-            trigger="manual",
-            jobs=[jobs.JOB_METRICS],
-            controller=rig.controller({"google": rig.live("google")}, at=at),
-        )
-        (result,) = report.results
-        assert result.status == "succeeded"
-        row = await rig.freshness_row(dataset_id, "google.search_terms")
-        assert row is not None
-        return row
+    capped, pending = stored_day(capped_from_end), stored_day(pending_from_end)
+    scope = {"start": pending.isoformat(), "end": pending.isoformat()}
+    await _store_capped_checkpoint(
+        rig, dataset_id, capped=capped, pending=scope, carried_by=carried_by
+    )
 
-    await store(f"{freshness.REASON_DEFERRED}; 1 partition deferred", [shortfall])
-    carried_by_checkpoint = await drain(T1)
-    assert (
-        carried_by_checkpoint.completeness,
-        carried_by_checkpoint.reason,
-        carried_by_checkpoint.checkpoint,
-    ) == ("incomplete", shortfall, None)
-    assert carried_by_checkpoint.covered_from == first_day
+    row, scopes = await _drain_search_terms(rig, dataset_id, T1)
 
-    await store(shortfall, [])
-    carried_by_row = await drain(T2)
-    assert (carried_by_row.completeness, carried_by_row.reason, carried_by_row.checkpoint) == (
+    assert {START: pending, END: pending} in scopes, "the pending scope is read as stored"
+    assert _read_in_full(capped, scopes), "the capped day was re-read in full"
+    assert (row.completeness, row.reason, row.checkpoint) == ("complete", None, None)
+    assert row.covered_from == first
+
+
+@pytest.mark.parametrize("carried_by", ["checkpoint", "row"])
+@pytest.mark.parametrize("unread", ["other-day", "narrowed-on-the-capped-day"])
+async def test_a_drained_checkpoint_still_reports_a_limit_on_a_day_it_did_not_re_read(
+    rig: Rig, carried_by: str, unread: str
+) -> None:
+    """A result limit of a deferred cycle survives the drain when its day was not re-read.
+
+    AAP 0.3.3: a Q-G6 (day, ad group) kept at the result limit leaves ``google.search_terms``
+    ``incomplete``. Draining a checkpoint lets the run vouch for the whole stored range, so a
+    limit on a day the drain did not re-read in full must outlive the deferral: whether the
+    checkpoint carries it or the stored row does, and whether the pending scope is another
+    day or a campaign range narrowed inside the capped day (which reads only part of it), the
+    drained dataset stays ``incomplete`` with exactly that shortfall and no checkpoint.
+    """
+    dataset_id = await _live_google(rig)
+    built = await rig.freshness_row(dataset_id, "google.search_terms")
+    assert built is not None
+    assert built.covered_from is not None
+    capped = built.covered_from
+    if unread == "other-day":
+        other = capped + timedelta(days=1)
+        scope: dict[str, object] = {"start": other.isoformat(), "end": other.isoformat()}
+    else:
+        scope = {
+            "start": capped.isoformat(),
+            "end": capped.isoformat(),
+            "campaign_lo": 0,
+            "campaign_hi": INT64_MAX,
+        }
+    await _store_capped_checkpoint(
+        rig, dataset_id, capped=capped, pending=scope, carried_by=carried_by
+    )
+
+    row, scopes = await _drain_search_terms(rig, dataset_id, T1)
+
+    assert dict(scope_from_json("Q-G6", scope)) in scopes, "the pending scope is read as stored"
+    assert not _read_in_full(capped, scopes), "the capped day was not re-read in full"
+    assert (row.completeness, row.reason, row.checkpoint) == (
         "incomplete",
-        shortfall,
+        _capped_on(capped),
         None,
     )
-    assert carried_by_row.covered_from == first_day
+    assert row.covered_from == capped
+
+
+_CARRIED_DAY: Final = date(2026, 9, 1)
+"""Native day 0 of the carried-shortfall cases; stored coverage spans days 0 to 27."""
+
+
+def _carried_days(*days: int) -> str:
+    """A dated Q-G6 shortfall naming one ad group on each of ``days`` (offsets of day 0)."""
+    named = "; ".join(
+        f"{(_CARRIED_DAY + timedelta(days=day)).isoformat()}, ad group {day + 1}" for day in days
+    )
+    return f"{freshness.REASON_FINEST_PARTITION} ({named})"
+
+
+@pytest.mark.parametrize(
+    ("reason", "own", "read", "expected"),
+    [
+        pytest.param(_carried_days(26), (25, 27), ((25, 27),), (), id="dated-day-re-read"),
+        pytest.param(
+            _carried_days(9, 26),
+            (25, 27),
+            ((25, 27),),
+            (_carried_days(9),),
+            id="days-outside-own-carried",
+        ),
+        pytest.param(
+            f"{_carried_days(9, 26)}; last attempt failed: timeout",
+            (25, 27),
+            ((25, 27),),
+            (_carried_days(9),),
+            id="failure-note-dropped",
+        ),
+        pytest.param(
+            _carried_days(9), (25, 27), ((25, 27),), (_carried_days(9),), id="day-not-re-read"
+        ),
+        pytest.param(
+            _carried_days(9, 26),
+            (25, 27),
+            ((9, 9), (25, 27)),
+            (),
+            id="stored-scope-outside-own-re-read",
+        ),
+        pytest.param(
+            _carried_days(26),
+            (25, 27),
+            ((25, 25), (27, 27)),
+            (_carried_days(26),),
+            id="own-day-left-to-an-unread-scope",
+        ),
+        pytest.param(
+            _carried_days(9),
+            (0, 27),
+            ((0, 8), (10, 27)),
+            (_carried_days(9),),
+            id="own-covers-the-range-but-not-the-day",
+        ),
+        pytest.param(_carried_days(9), (0, 27), ((0, 27),), (), id="own-re-read-the-whole-range"),
+        pytest.param(
+            freshness.REASON_FINEST_PARTITION,
+            (25, 27),
+            ((0, 27),),
+            (freshness.REASON_FINEST_PARTITION,),
+            id="undated-carried-whole",
+        ),
+        pytest.param(
+            freshness.REASON_FINEST_PARTITION,
+            (0, 27),
+            ((0, 8), (10, 27)),
+            (),
+            id="undated-own-covers-the-stored-range",
+        ),
+        pytest.param(
+            f"{freshness.REASON_DEFERRED}; 2 partitions deferred",
+            (25, 27),
+            (),
+            (),
+            id="repairable",
+        ),
+    ],
+)
+async def test_a_carried_shortfall_leaves_out_the_days_the_run_re_read(
+    reason: str,
+    own: tuple[int, int],
+    read: tuple[tuple[int, int], ...],
+    expected: tuple[str, ...],
+) -> None:
+    """A checkpointed run carries a stored Q-G6 shortfall only for days it did not read.
+
+    ``read`` holds the ranges the run's fetches read in full (date ranges alone, not
+    interrupted): an own segment or a stored full-date scope, inside the own range or not. A
+    limit still met on those days is in the run's own reads, so a stored day inside them is
+    not carried; the other days are, a day of the own range left to a pending or narrowed
+    scope included, so the drained row stays ``incomplete`` for them. An undated shortfall
+    names no day: it is carried whole unless the own range covers the stored range.
+    """
+
+    def day(offset: int) -> date:
+        return _CARRIED_DAY + timedelta(days=offset)
+
+    row = DatasetFreshness(
+        source="google",
+        dataset_id=1,
+        dataset="google.search_terms",
+        covered_from=day(0),
+        covered_through=day(27),
+        completeness="incomplete",
+        reason=reason,
+    )
+    recorded = (day(0), day(27))
+    read_in_full = tuple((day(start), day(end)) for start, end in read)
+    carried = jobs._carried_shortfall(row, (day(own[0]), day(own[1])), recorded, read_in_full)
+    assert carried == expected
 
 
 _METRICS_QUERIES: Final[Mapping[str, tuple[str, ...]]] = {

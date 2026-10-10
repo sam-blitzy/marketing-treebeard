@@ -4,20 +4,30 @@
  * Layout and grouping for the analysis-window picker in the status bar. DateRangePicker.tsx
  * renders this structure; the class names are a contract with it and with its tests:
  *
- *   div.ds-daterange                      the whole picker: label, presets, custom panel
+ *   div.ds-daterange                      the whole picker: label, preset row, custom panel and
+ *                                         the picker's status region
  *     p.ds-daterange__label#{id}          visible label naming the preset group
- *     div.ds-daterange__presets           role="group", aria-labelledby the label: one toggle
+ *     div.ds-daterange__row               the preset group, then the caller's optional actions
+ *       div.ds-daterange__presets         role="group", aria-labelledby the label: one toggle
  *                                         Button per configured preset, then "Custom range"
+ *       {actions}                         optional caller controls, outside the group
  *     div.ds-daterange__custom#{id}       the custom-range panel, [hidden] while collapsed,
  *                                         controlled by the "Custom range" toggle
  *       form
- *         div.ds-daterange__custom-fields start and end TextFields, then the Apply Button
+ *         div.ds-daterange__custom-fields grid: the start and end TextFields (div.ds-field),
+ *                                         then div.ds-daterange__apply around the Apply Button
+ *         div.ds-visually-hidden          role="status": the latest failed Apply's summary
+ *     div.ds-visually-hidden              role="status": the caller's statusMessage
+ *
+ * With an invalid window configuration, div.ds-daterange holds the label, a critical Banner
+ * and, when the caller passes actions, a div.ds-daterange__row holding them.
  *
  * Only layout and grouping live here. The preset toggles and Apply are Buttons and the dates
  * are TextFields, each styled by its own stylesheet. Every colour, spacing, typography and
  * radius value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone.
- * The picker has no breakpoint of its own: presets and fields wrap onto new lines, so the
- * picker reflows down to a 320 CSS px viewport without horizontal scrolling (WCAG 1.4.10).
+ * The picker has no breakpoint of its own: the preset row wraps onto new lines, and the custom
+ * fields fill as many grid columns as fit and wrap onto further grid lines, so the picker
+ * reflows down to a 320 CSS px viewport without horizontal scrolling (WCAG 1.4.10).
  */
 
 /*
@@ -38,6 +48,20 @@
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-semibold);
   color: var(--color-text);
+}
+
+/*
+ * The preset row: the preset group, then the caller's optional actions beside it, outside the
+ * group. It wraps, so on a narrow viewport the actions move onto a line below the presets, and
+ * centred alignment keeps a control of another height level with the toggles. min-inline-size:
+ * 0 lets the row shrink inside the picker's column instead of widening it.
+ */
+.ds-daterange__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-inline-size: 0;
 }
 
 /* One row of preset toggles plus the "Custom range" toggle, wrapping on narrow viewports. */
@@ -68,12 +92,59 @@
 }
 
 /*
- * Start date, end date and Apply on one wrapping row. Items align to the line's end edge, so
- * Apply sits level with the bottom of the date fields rather than beside their labels.
+ * Start date, end date and Apply on a grid whose label, control and message rows are shared
+ * across the fields, so a field-level error never moves a label, a date input or Apply.
+ *
+ * The columns are auto-filled: as many as fit the panel, each at least five --space-8 steps
+ * (160px at the 16px root, wide enough for a date input) and at most its content's max-content
+ * width. The min() with --size-full caps that minimum at the grid's own width, so on a narrow
+ * viewport one column never overflows the panel. Fields that do not fit wrap onto further grid
+ * lines, and each line keeps its own label, control and message rows, so the picker still
+ * reflows down to a 320 CSS px viewport without horizontal scrolling (WCAG 1.4.10). The row gap
+ * matches the label-to-control gap of .ds-field.
  */
 .ds-daterange__custom-fields {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-3);
+  display: grid;
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(min(var(--size-full), calc(var(--space-8) * 5)), max-content)
+  );
+  column-gap: var(--space-3);
+  row-gap: var(--space-1);
+}
+
+/*
+ * Each field (div.ds-field: label, control, optional error) and the Apply wrapper spans three
+ * rows of the grid and lays its children out on those same rows through subgrid: the label in
+ * row 1, the control in row 2 and the message in row 3. Because the rows belong to the parent
+ * grid, labels stay level, inputs stay level, and an error that appears under one field only
+ * grows the shared message row below every control instead of shifting its neighbours.
+ * The single column is exactly the width the parent column gives the item (a zero minimum, so
+ * no child's own minimum, such as a date input's intrinsic width, can push it wider): the
+ * full-width date input then fills its column and never runs into the gap beside it.
+ */
+.ds-daterange__custom-fields > .ds-field,
+.ds-daterange__apply {
+  display: grid;
+  grid-row: span 3;
+  grid-template-rows: subgrid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/*
+ * An error message wraps inside its field's column and never widens it: inline-size
+ * containment gives the message no intrinsic width of its own, so the column is sized by the
+ * label and the control alone and the panel keeps its width when a message appears.
+ */
+.ds-daterange__custom-fields .ds-field__error {
+  contain: inline-size;
+}
+
+/*
+ * Apply sits in the control row, so it lines up with the date inputs and, stretched by the
+ * grid, takes exactly their height; justify-self keeps it at its own width.
+ */
+.ds-daterange__apply > .ds-button {
+  grid-row: 2;
+  justify-self: start;
 }

@@ -3,10 +3,11 @@
  * URL fragment names, and moving keyboard focus to an element that may not be focusable by
  * itself, such as a section region or a card's `<article>`.
  *
- * The root route focuses the target of a same-document link with them (`src/router.tsx`), and
- * the bounded batches of `/actions` focus the entry a reveal or a hash change shows
- * (`features/actions/batches.tsx`). The module imports nothing, so any module can use it
- * without an import cycle.
+ * The root route focuses the target of a same-document link with them (`src/router.tsx`), the
+ * bounded batches of `/actions` focus the entry a reveal or a hash change shows
+ * (`features/actions/batches.tsx`), and the held disclosure focuses the held card a hash change
+ * reveals (`features/actions/sections/SectionFrame.tsx`). The module imports nothing, so any
+ * module can use it without an import cycle.
  *
  * @packageDocumentation
  */

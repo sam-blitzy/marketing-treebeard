@@ -1932,8 +1932,11 @@ describe('DecisionForm', () => {
       expect(document.body.innerHTML).not.toContain('ENOENT');
     });
 
+    /** The saved decision a late success answers with, which `onDone` receives. */
+    const savedPaused = makeDecision('own_budget', { status: 'paused' });
+
     it.each([
-      ['onDone', json(201, makeDecision('own_budget', { status: 'paused' })), []],
+      ['onDone', json(201, savedPaused), [savedPaused]],
       ['onRetired', apiError(409, 'subject_retired', 'The dataset is no longer active.'), []],
       [
         'onFailed',
@@ -2055,5 +2058,62 @@ describe('DecisionForm', () => {
       expect(amountInput('Daily budget')).toHaveProperty('value', '150.00');
       expect(saveButton()).toHaveProperty('disabled', true);
     });
+  });
+});
+
+describe('DecisionForm: the outcome onDone reports', () => {
+  it('passes onDone the saved decision, the POST /decisions response, in decision mode', async () => {
+    const onDone = vi.fn<(decision?: Decision) => void>();
+    const saved = makeDecision('own_budget', {
+      id: 921,
+      origin: 'recommendation',
+      decided_by: 'admin@example.com',
+      status: 'active',
+      daily_budget: '160.00',
+      patch: { daily_budget: '160.00' },
+      recommendation_id: FIXTURE_ITEM_IDS.c1,
+    });
+    mockApi({
+      [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+      'POST /decisions': json(201, saved),
+    });
+    await renderForm({
+      subject: OWN_BUDGET,
+      prefill: { daily_budget: '160.00' },
+      recommendationId: FIXTURE_ITEM_IDS.c1,
+      onDone,
+    });
+
+    fireEvent.click(saveButton());
+
+    await waitFor(() => {
+      expect(onDone).toHaveBeenCalledTimes(1);
+    });
+    // The whole materialised row, shape and expected state included, reaches the consumer.
+    expect(onDone).toHaveBeenCalledWith(saved);
+  });
+
+  it('passes onDone nothing for an intended state, whose resolution returns no decision', async () => {
+    const onDone = vi.fn<(decision?: Decision) => void>();
+    mockApi({
+      [logKey(OWN_BUDGET)]: json(200, []),
+      'POST /discrepancies/:id/resolve': json(
+        200,
+        makeDiscrepancy('untracked', { state: 'awaiting_platform' }),
+      ),
+    });
+    await renderForm({
+      subject: OWN_BUDGET,
+      mode: 'intended_state',
+      discrepancy: makeDiscrepancy('untracked'),
+      onDone,
+    });
+
+    fireEvent.click(saveButton('Save intended state'));
+
+    await waitFor(() => {
+      expect(onDone).toHaveBeenCalledTimes(1);
+    });
+    expect(onDone.mock.calls).toEqual([[]]);
   });
 });

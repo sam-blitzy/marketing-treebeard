@@ -3208,16 +3208,89 @@ describe('useRequestSync', () => {
     expect(request.body).toBeUndefined();
   });
 
-  it('surfaces 409 sync_pending and leaves the sources valid', async () => {
+  it('surfaces 409 sync_pending and invalidates only sources', async () => {
     stubFetch(() => json(409, envelope('sync_pending', 'A sync is already pending')));
     const { result, queryClient } = renderWithWrapper(() => useRequestSync());
-    seed(queryClient, [queryKeys.sources]);
+    const others = [
+      queryKeys.recommendations('default'),
+      queryKeys.decisions({}),
+      queryKeys.config,
+    ];
+    seed(queryClient, [queryKeys.sources, ...others]);
     const invalidate = spyOnInvalidate(queryClient);
     await act(async () => {
       await rejection(result.current.mutateAsync('linkedin'));
     });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.code).toBe('sync_pending');
+    expect(invalidatedKeys(invalidate)).toEqual([queryKeys.sources]);
+    expect(invalidated(queryClient, queryKeys.sources)).toBe(true);
+    for (const key of others) {
+      expect(invalidated(queryClient, key)).toBe(false);
+    }
+  });
+
+  it('turns to error on 409 sync_pending only once a shown sources query has refetched', async () => {
+    const pending = [{ source: 'linkedin', sync_pending: true }] satisfies Pick<
+      Source,
+      'source' | 'sync_pending'
+    >[];
+    const refetch = deferred<Response>();
+    const mock = stubFetch(
+      sequence(
+        () => json(200, sourcesPayload()),
+        () => json(409, envelope('sync_pending', 'A sync is already pending')),
+        () => refetch.promise,
+      ),
+    );
+    const { result, queryClient } = renderWithWrapper(() => ({
+      sources: useSources(),
+      sync: useRequestSync(),
+    }));
+    await waitFor(() => expect(result.current.sources.isSuccess).toBe(true));
+
+    let settled = false;
+    let cachedOnReject: unknown;
+    const requesting = rejection(
+      result.current.sync.mutateAsync('linkedin').finally(() => {
+        cachedOnReject = queryClient.getQueryData(queryKeys.sources);
+        settled = true;
+      }),
+    );
+    const order = [
+      'GET /api/v1/sources',
+      'POST /api/v1/sources/linkedin/sync',
+      'GET /api/v1/sources',
+    ];
+    await waitFor(() => expect(sentPaths(mock)).toEqual(order));
+    await nextMacrotask();
+
+    // The 409 has answered and the refetch is held: the mutation must still be waiting on it.
+    expect(settled).toBe(false);
+    expect(result.current.sync.isPending).toBe(true);
+    expect(queryClient.getQueryState(queryKeys.sources)?.fetchStatus).toBe('fetching');
+
+    refetch.resolve(json(200, pending));
+    let rejected: unknown;
+    await act(async () => {
+      rejected = await requesting;
+    });
+    expect(isApiError(rejected) && rejected.code).toBe('sync_pending');
+    expect(cachedOnReject).toEqual(pending);
+    expect(sentPaths(mock)).toEqual(order);
+    await waitFor(() => expect(result.current.sync.isError).toBe(true));
+  });
+
+  it('invalidates nothing for any other failure', async () => {
+    stubFetch(() => json(503, envelope('service_unavailable', 'Database unavailable')));
+    const { result, queryClient } = renderWithWrapper(() => useRequestSync());
+    seed(queryClient, [queryKeys.sources]);
+    const invalidate = spyOnInvalidate(queryClient);
+    await act(async () => {
+      await rejection(result.current.mutateAsync('google'));
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.code).toBe('service_unavailable');
     expect(invalidate).not.toHaveBeenCalled();
     expect(invalidated(queryClient, queryKeys.sources)).toBe(false);
   });

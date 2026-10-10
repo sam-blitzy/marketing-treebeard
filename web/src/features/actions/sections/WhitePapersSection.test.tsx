@@ -37,9 +37,13 @@
  *   banner prefixed "{asset} ({currency}): "; every other finding stays a banner at the top of
  *   the section. The fallback renderer shows the same notes in its details.
  *
+ * - **A row hidden on the page** by its own feedback leaves its confirmation directly after the
+ *   cohort table that held it, or in the table's place when no row of it is left.
+ *
  * The section reads `GET /config` (for the fallback MQL label) and nothing else; any other
  * request fails the test. Only the "Mark done" case also answers
- * `POST /recommendations/:id/feedback`.
+ * `POST /recommendations/:id/feedback`, and the feedback-flow tests render the section from a
+ * stubbed `GET /recommendations` (`../../../test/feedbackFlow`), whose feedback post hides it.
  */
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandler, MockResponse } from '../../../test/mockApi';
@@ -75,7 +79,9 @@ import {
   makeRun,
   makeSection,
 } from '../../../test/fixtures';
+import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
 import { formatMetric } from '../../../lib/format';
 import { flagText } from '../FlagList';
 import * as evidenceExtraModule from '../evidenceExtra';
@@ -2166,7 +2172,7 @@ describe('long white-paper tables', () => {
     expect(batchStatuses(details)).toEqual(['Showing all 131 creatives']);
     // The evidence after the table is the asset's own, complete.
     expect(within(details).getByText('Floor: 12% of leads unmatched in HubSpot')).toBeTruthy();
-  });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 
   it('renders a cohort at the batch size with every row and no control', async () => {
     await renderWhitePapers(
@@ -2338,5 +2344,63 @@ describe('WhitePapersSection rendered again', () => {
     expect(within(details).getByText('Variant A (refreshed)')).toBeTruthy();
     expect(within(details).queryByText('Variant A')).toBeNull();
     expect(within(details).getByText('unknown creative')).toBeTruthy();
+  });
+});
+
+describe('WhitePapersSection: the confirmation of a row hidden on the page', () => {
+  /** Whether `first` precedes `second` in document order. */
+  function precedes(first: Element, second: Element): boolean {
+    return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  }
+
+  /** Renders the live section and presses `action` in the details of the row of `item`. */
+  async function pressInDetails(item: Item, action: string) {
+    const flow = feedbackFlow();
+    mockApi({ ...flow.handlers, 'GET /config': json(200, makeConfig()) });
+    await renderWithProviders(
+      <LiveSection sectionKey="white_papers" component={WhitePapersSection} />,
+      { path: '/actions' },
+    );
+    const name = String(item.entity.name);
+    fireEvent.click(await screen.findByRole('button', { name: `Details for ${name}` }));
+    fireEvent.click(await screen.findByRole('button', { name: action }));
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: `Details for ${name}` })).toBeNull();
+    });
+    return flow;
+  }
+
+  it('shows it directly after the cohort table that held the row', async () => {
+    const dismissed = pageItem(FIXTURE_ITEM_IDS.wEur);
+    await pressInDetails(dismissed, 'Dismiss');
+
+    const cohort = screen.getByRole('region', { name: 'EUR' });
+    const table = within(cohort).getByRole('table', { name: 'White papers (EUR)' });
+    // The table keeps its other row.
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    const confirmation = within(cohort).getByText(feedbackConfirmationText('dismiss', dismissed));
+    const notes = within(cohort).getByRole('list', { name: 'Notes on the EUR white papers' });
+    expect(precedes(table, confirmation)).toBe(true);
+    expect(precedes(confirmation, notes)).toBe(true);
+    expect(confirmation.closest('table')).toBeNull();
+    expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    // Focus stays in the section rather than falling to the page.
+    const section = screen.getByRole('region', { name: 'White papers' });
+    await waitFor(() => {
+      expect(section.contains(document.activeElement)).toBe(true);
+    });
+  });
+
+  it("takes the table's place when the cohort's only row was hidden", async () => {
+    const done = pageItem(FIXTURE_ITEM_IDS.wUsd);
+    await pressInDetails(done, 'Mark done');
+
+    const cohort = screen.getByRole('region', { name: 'USD' });
+    expect(within(cohort).queryByRole('table', { name: 'White papers (USD)' })).toBeNull();
+    expect(within(cohort).getByText(feedbackConfirmationText('done', done))).toBeDefined();
+    const section = screen.getByRole('region', { name: 'White papers' });
+    expect(within(section).getByRole('list', { name: 'Not shown' }).textContent).toContain(
+      '1 hidden since this run',
+    );
   });
 });

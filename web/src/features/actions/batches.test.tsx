@@ -26,6 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Button, DataTable } from '../../design-system';
 import type { DataTableColumn } from '../../design-system';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../test/timeouts';
 import {
   ACTION_NOUN,
   BatchControl,
@@ -218,7 +219,7 @@ describe('BatchedList', () => {
     expect(showMore()).toBeNull();
     expect(screen.getByRole('status').textContent).toBe('Showing all 250 actions');
     expect(screen.queryByRole('alert')).toBeNull();
-  });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 
   it('moves focus to the first revealed card, focusable only while it holds focus', () => {
     render(<CardList items={entries(45)} />);

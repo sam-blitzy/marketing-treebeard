@@ -56,6 +56,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from ads_engine.analysis.shortfall import shortfall_spans
 from ads_engine.connectors.errors import (
     AccessDenied,
     CallBudgetExhausted,
@@ -994,6 +995,45 @@ async def test_q_g6_at_a_capped_finest_partition_keeps_its_rows_and_is_incomplet
     assert outcome.reason == f"{REASON_FINEST_PARTITION} ({DAY4.isoformat()}, ad group {ad_group})"
     assert (outcome.deferred, outcome.interrupted_by) == ((), None)
     assert outcome.calls == 1
+
+
+async def test_q_g6_reason_counts_the_partitions_after_the_third_with_their_days(
+    connect: Connect,
+) -> None:
+    """AAP 0.3.3: the finest-partition reason names every day at the result limit.
+
+    Two ad groups of one campaign are capped on each of three days. The reason names the first
+    three (day, ad group) partitions and counts the other three with the days they are on, in
+    the dated-shortfall grammar ``sync.freshness`` reads, so each day can be cleared once a
+    later read of it finishes and a window without any of them is not flagged incomplete.
+    """
+    campaign, ad_group = 61, 62
+    fake = FakeGoogle({SEARCH_TERMS: []}, cap=lambda parsed: True)
+    scope = day_scope(
+        DAY1,
+        DAY3,
+        {
+            CAMPAIGN_LO: campaign,
+            CAMPAIGN_HI: campaign,
+            AD_GROUP_LO: ad_group,
+            AD_GROUP_HI: ad_group + 1,
+        },
+    )
+
+    outcome = await fetch(connect, fake, "Q-G6", scope)
+
+    named = "; ".join(
+        f"{day.isoformat()}, ad group {group}"
+        for day, group in ((DAY1, ad_group), (DAY1, ad_group + 1), (DAY2, ad_group))
+    )
+    assert outcome.reason == (
+        f"{REASON_FINEST_PARTITION} ({named}; and 3 more on {DAY2.isoformat()} to "
+        f"{DAY3.isoformat()})"
+    )
+    assert outcome.completeness == "incomplete"
+    assert len(outcome.rows) == 6 * PAGE_SIZE
+    assert (outcome.deferred, outcome.interrupted_by) == ((), None)
+    assert shortfall_spans(outcome.reason) == ((DAY1, DAY3),)
 
 
 def coarser_than_a_campaign_day(parsed: ParsedQuery) -> bool:

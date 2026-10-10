@@ -130,8 +130,10 @@ date the interrupted metrics cycle vouches for, ``started_at`` when the entity c
 Q-G2b re-read keeps its unread chunks, the raw rows of the chunks already re-read and every
 candidate, so the next sync reads only those chunks), and ``reasons``
 the permanent shortfalls (result limits) met so far, which a drained checkpoint still
-reports. A checkpoint that cannot be read is logged and ignored: the job then falls back to
-a full read (metrics widen to the recorded range when it needs repair).
+reports, except for the days of a dated one that a later run of the cycle re-read in full
+(:meth:`MetricsSyncJob._record_google`). A checkpoint that cannot be read is logged and
+ignored: the job then falls back to a full read (metrics widen to the recorded range when it
+needs repair).
 
 Entry points: :func:`run_source_jobs` (the scheduler's due jobs and ``sync_request`` rows, and
 ``ads-engine sync``), :func:`backfill_dataset` (the build in ``sync/mode.py``) and
@@ -3870,8 +3872,35 @@ def _resumed_coverage(
     return min(low, own[0]), max(high, own[1])
 
 
+def _left_unread(reason: str, read_in_full: Sequence[tuple[date, date]]) -> str | None:
+    """Return a permanent shortfall without the native days a run re-read in full.
+
+    A dated shortfall (:func:`~ads_engine.sync.freshness.shortfall_spans`, the Q-G6
+    finest-partition reason) loses every day of every range in ``read_in_full``
+    (:func:`~ads_engine.sync.freshness.shortfall_outside`), so ``None`` is returned once none
+    of its days is left. An undated one names no day and is returned unchanged.
+
+    Args:
+        reason: A permanent shortfall reason, with no failure note.
+        read_in_full: The native ranges the run's fetches read in full
+            (:meth:`MetricsSyncJob._record_google`).
+
+    Returns:
+        The shortfall on the days not re-read, or ``None`` when no named day is left.
+    """
+    remaining: str | None = reason
+    for start, end in read_in_full:
+        remaining = freshness.shortfall_outside(remaining, start=start, end=end)
+        if remaining is None:
+            return None
+    return remaining
+
+
 def _carried_shortfall(
-    row: DatasetFreshness | None, own: tuple[date, date], recorded: tuple[date, date]
+    row: DatasetFreshness | None,
+    own: tuple[date, date],
+    recorded: tuple[date, date],
+    read_in_full: Sequence[tuple[date, date]],
 ) -> tuple[str, ...]:
     """Return the stored permanent shortfall a checkpointed run must keep reporting.
 
@@ -3879,9 +3908,26 @@ def _carried_shortfall(
     stored row holds (a repairable shortfall is never masked), and once its checkpoint
     drains, the range it vouches for (``recorded``) can span the stored range, so the row
     would read complete although the permanent shortfall (a Q-G6 day at the result limit)
-    was never re-read. The shortfall is kept when ``recorded`` merges into the stored range
-    and the run's ``own`` read did not re-read all of it; otherwise nothing is carried,
-    because the run either replaces the stored range or meets the limit again itself.
+    was never re-read. Nothing is carried when ``recorded`` does not merge into the stored
+    range, because the run's range then replaces it. Otherwise:
+
+    * a dated shortfall is carried without the days the run re-read in full
+      (:func:`_left_unread`), by an own segment or by a stored date-range scope alike: a
+      limit still met on those days is in the run's own reads. The days it did not re-read
+      in full (a scope still pending, one narrowed inside its day) stay, so nothing is
+      carried only once none of its days is left;
+    * an undated one names no day: it is carried whole unless the run's ``own`` range covers
+      the whole stored range, so that the run replaces it or meets the limit again itself.
+
+    Args:
+        row: The dataset's freshness row as loaded, or ``None``.
+        own: The run's own native range.
+        recorded: The range the run's outcome records.
+        read_in_full: The native ranges of the run's fetches of the dataset that were a date
+            range alone and not interrupted, capped ones included.
+
+    Returns:
+        The shortfall to carry, or nothing.
     """
     shortfall = freshness.recorded_shortfall(row)
     if (
@@ -3893,9 +3939,12 @@ def _carried_shortfall(
     ):
         return ()
     stored = (row.covered_from, row.covered_through)
-    if not _touches(recorded, stored) or (own[0] <= stored[0] and own[1] >= stored[1]):
+    if not _touches(recorded, stored):
         return ()
-    return (shortfall,)
+    if freshness.shortfall_spans(shortfall) is None:
+        return () if own[0] <= stored[0] and own[1] >= stored[1] else (shortfall,)
+    remaining = _left_unread(shortfall, read_in_full)
+    return () if remaining is None else (remaining,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4388,6 +4437,20 @@ class MetricsSyncJob(_JobBase):
         The recorded range is the full own range (or the resumed cycle's), whatever days the
         own read left to stored scopes: those days are vouched for once nothing is pending.
 
+        The permanent shortfalls reported are this run's own (each read's ``shortfalls``),
+        then the loaded checkpoint's ``reasons`` when the run continues its cycle, then the
+        stored row's (:func:`_carried_shortfall`). The inherited and the carried ones are
+        settled against the native days the run re-read in full: the ranges of its fetches of
+        the dataset whose scope was a date range alone (:attr:`_Fetched.covered`) and that no
+        interruption stopped, a capped fetch included, because any limit it met is in its own
+        ``shortfalls``. A dated shortfall loses those days (:func:`_left_unread`), so a
+        drained cycle that re-read a capped day completely, by an own segment or a stored
+        scope, no longer reports it; the days left unread (a scope still pending, one narrowed
+        inside its day) and every undated shortfall are kept. The reasons a concurrent run
+        stored meanwhile (:meth:`_MetricsCheckpoint.merged_with`) are kept as stored: this run
+        cannot order its reads against that run's, so a limit that run met stands until a
+        later run, resuming the merged checkpoint, re-reads its day.
+
         Args:
             plan: What the run read for the dataset.
             reads: The reads of the dataset's queries.
@@ -4408,10 +4471,25 @@ class MetricsSyncJob(_JobBase):
             for read in reads
             if read.pending
         }
-        carried = (
-            _carried_shortfall(row, plan.own, recorded) if pending or loaded is not None else ()
+        read_in_full = tuple(
+            covered
+            for entry in fetched
+            if (covered := entry.covered) is not None and entry.outcome.interrupted_by is None
         )
-        inherited = () if loaded is None or plan.resumed is None else loaded.reasons
+        carried = (
+            _carried_shortfall(row, plan.own, recorded, read_in_full)
+            if pending or loaded is not None
+            else ()
+        )
+        inherited = (
+            ()
+            if loaded is None or plan.resumed is None
+            else tuple(
+                remaining
+                for reason in loaded.reasons
+                if (remaining := _left_unread(reason, read_in_full)) is not None
+            )
+        )
         mine = _MetricsCheckpoint(
             pending=pending,
             covered_from=recorded[0],

@@ -1773,6 +1773,79 @@ async def test_coverage_starting_after_the_window_start_is_incomplete_over_the_w
     assert BANNER_INCOMPLETE_DATASETS not in {banner.code for banner in exact.banners}
 
 
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_finest_partition_day_outside_the_window_flags_nothing(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    """A Q-G6 shortfall flags only windows that hold one of its days.
+
+    ``google.search_terms`` is incomplete for two (day, ad group) partitions at the result
+    limit, 2026-09-01 and 2026-10-08. The default window (2026-09-09 to 2026-10-06) holds
+    neither, so its items and page carry no ``incomplete`` flag or banner; a window ending
+    2026-10-08 is flagged, naming that day alone.
+    """
+    finest = "result limit reached at finest partition"
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        await _freshness(session, google, "google.entities", through=None)
+        await _freshness(session, google, "google.metrics_daily", through=date(2026, 10, 8))
+        await _freshness(
+            session,
+            google,
+            "google.search_terms",
+            through=date(2026, 10, 8),
+            completeness="incomplete",
+            reason=(
+                f"{finest} (2026-09-01, ad group 990200000000; 2026-10-08, ad group 990200000000)"
+            ),
+        )
+        excluding = await _run(session)
+        outside = await _item(
+            session,
+            excluding,
+            rule_id=K2,
+            provenance=_prov(google),
+            required=("google.search_terms", "google.metrics_daily"),
+        )
+        including = await _run(
+            session, start=date(2026, 9, 11), end=date(2026, 10, 8), kind="custom"
+        )
+        inside = await _item(
+            session,
+            including,
+            rule_id=K2,
+            provenance=_prov(google),
+            required=("google.search_terms", "google.metrics_daily"),
+        )
+
+    clear = await _page(sessions, excluding.id, thresholds=shipped)
+    assert clear.items[outside.id] == ItemOverlayView(
+        held_now=False, historical=False, data_status_now="live"
+    )
+    assert clear.overlay.incomplete_datasets == ()
+    assert clear.banners == ()
+
+    named = f"google.search_terms ({finest} (2026-10-08, ad group 990200000000))"
+    flagged = await _page(sessions, including.id, thresholds=shipped)
+    assert flagged.items[inside.id] == ItemOverlayView(
+        held_now=False,
+        historical=False,
+        data_status_now="live",
+        flags_now=(Flag(FLAG_INCOMPLETE, f"Incomplete: {named}"),),
+    )
+    assert flagged.overlay.incomplete_datasets == ("google.search_terms",)
+    assert flagged.banners == (
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message=f"Incomplete data: {named}",
+            count=1,
+        ),
+    )
+    assert "2026-09-01" not in str(flagged.to_json())
+
+
 def _k1_evidence(
     run: AnalysisRun,
     provenance: list[dict[str, Any]],

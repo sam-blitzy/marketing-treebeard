@@ -5,23 +5,34 @@
  * One `GET /sources` response (AAP 0.5.3) drives the page. For each source, in the order the API
  * returns them (Google, LinkedIn, HubSpot), it renders one section with:
  *
- * 1. a status line: the connection's mode ("Live" or "Simulated"), its status ("OK", "Stale",
- *    "Access denied" or "Error"), a "Stale" badge when one of the source's datasets is stale while
- *    the connection reports another status, the reason exactly as the API returns it (for example
- *    "credentials not configured", AAP 0.3.3) and the time of the last attempt;
- * 2. a polite status region with the outcome of this session's "Sync now" request;
+ * 1. a status line: the connection's mode ("Live", "Simulated" or "No data yet" while the API
+ *    reports none), its status ("OK", "Stale", "Access denied" or "Error"), a "Stale" badge when
+ *    one of the source's datasets is stale while the connection reports another status, an
+ *    "Incomplete" badge when one of its datasets, primary or companion, is not complete over the
+ *    range it covers (the status bar's source chip on `/actions` judges the run's window instead,
+ *    so the two can differ; see {@link hasIncompleteDataset}), the reason exactly as the API
+ *    returns it (for example "credentials not configured", AAP 0.3.3) and the time of the last
+ *    attempt;
+ * 2. a polite status region with the outcome of this session's "Sync now" request: "Sync
+ *    requested" (202) or "A sync is already pending" (409) until a `GET /sources` poll after it
+ *    reports the request picked up (`sync_pending` false again), "Sync request failed" until the
+ *    next press, and, while the API reports a pending request that neither banner announces,
+ *    the hint "A sync is already pending";
  * 3. Google only: the webhook calls of the last 24 h against the product's own cap
  *    (`GOOGLE_DAILY_CALL_BUDGET`), which is separate from the Google Ads quota other n8n
  *    workflows share (AAP 0.2.4, 0.3.3);
  * 4. the active datasets: the primary dataset and, for HubSpot while LinkedIn is simulated, the
- *    companion CRM dataset (AAP 0.3.3);
+ *    companion CRM dataset (AAP 0.3.3), with the numeric ID end-aligned;
  * 5. "Dataset freshness": the source's native day boundary ("Google days: America/New_York",
  *    "LinkedIn days: UTC", or "day boundary not yet known" while the API reports none), then one
  *    table per dataset, primary and companion kept apart, with each named dataset's completeness,
  *    covered range, last success, last attempt and reason (AAP 0.3.2). The covered dates are
- *    labelled with that boundary (AAP 0.5.5);
+ *    labelled with that boundary (AAP 0.5.5). Every freshness table on the page shares one set
+ *    of fixed column widths, so its columns line up with every other's;
  * 6. "Recent sync runs": the newest `sync_run` rows, newest first;
- * 7. a "Sync now" button beside the section heading (`POST /sources/{source}/sync`).
+ * 7. a "Sync now" button beside the section heading (`POST /sources/{source}/sync`), posting
+ *    once per press, inert while its request runs and disabled while the API reports a pending
+ *    request for the source.
  *
  * Rules this file keeps:
  * - **Server state only through `../../api/queries`** (AAP 0.11.1). `useSources` already polls and
@@ -42,7 +53,7 @@
  *
  * @packageDocumentation
  */
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import type { ReactElement, ReactNode, RefObject } from 'react';
 
 import { isApiError, useDefaultRun, useRequestSync, useSources } from '../../api/queries';
@@ -120,7 +131,7 @@ const SYNC_REQUESTED_BODY = 'The worker picks it up on its next scheduled wake.'
 
 /**
  * Title of the banner for 409 `sync_pending`, and the hint beside a disabled "Sync now" while the
- * API reports a pending request.
+ * API reports a pending request that no banner of the section already announces.
  */
 const SYNC_PENDING_TEXT = 'A sync is already pending';
 
@@ -163,6 +174,12 @@ const NO_ATTEMPT_TEXT = 'No attempt yet';
 /** Text of the "Stale" badges: a dataset never succeeded or last succeeded too long ago. */
 const STALE_LABEL = 'Stale';
 
+/**
+ * Text of the status line's "Incomplete" badge, shown in the warning tone: a dataset is not
+ * complete. Worded and toned as the status bar's "Incomplete" source chip on `/actions`.
+ */
+const INCOMPLETE_LABEL = 'Incomplete';
+
 /** Explains the Google call count: the product's own cap, not Google's token-wide quota. */
 const CALL_CAP_NOTE =
   "This cap is the product's own limit on webhook calls (GOOGLE_DAILY_CALL_BUDGET), separate from the Google Ads quota shared with other n8n workflows.";
@@ -185,8 +202,10 @@ const MODE_BADGES: Readonly<Record<DataMode, BadgeSpec>> = Object.freeze({
 });
 
 /**
- * The mode badge before the worker's first attempt (`Source.mode` is `null`): neither live nor
- * simulated yet, worded as the status bar's source chips word it.
+ * The mode badge while `Source.mode` is `null`: before the worker's first attempt, and while no
+ * mode is established because live access was never verified (no active dataset yet, for example
+ * after a first live query failed). Neither live nor simulated yet, it is worded as the status
+ * bar's source chips word a source without a dataset.
  */
 const MODE_UNKNOWN_BADGE: BadgeSpec = Object.freeze({ label: 'No data yet', tone: 'neutral' });
 
@@ -275,19 +294,27 @@ function useSettledError(error: ApiError | null, hasData: boolean): ApiError | n
  * Returns keyboard focus to a button once the work it started has settled.
  *
  * A design-system `Button` keeps focus while `loading` (it is `aria-disabled`, never natively
- * disabled), but focus can still be lost to the page body while the work runs. Call the
- * returned `arm` function when the user presses the button; once `busy` turns `false` again,
- * focus on the body goes back to it, provided it is still on the page and enabled; focus moved
- * elsewhere in the meantime stays there (WCAG 2.2 SC 2.4.3). Background
- * work the user did not start never moves focus.
+ * disabled), and a button that becomes disabled while it holds focus stays focusable as
+ * `aria-disabled` until focus leaves it; focus can still be lost to the page body while the
+ * work runs. Call the returned `arm` function when the user presses the button; once `busy`
+ * turns `false` again, focus goes back to it, provided it is still on the page and not natively
+ * disabled and focus has not been moved elsewhere in the meantime (WCAG 2.2 SC 2.4.3). When the
+ * button is natively disabled once the work has settled, focus goes to `fallbackRef` instead,
+ * when one is given and on the page, so it never stays lost on the body while the element
+ * explaining the disabled button is there to take it. Focus counts as not moved while it rests
+ * on the page body or on the button itself. Background work the user did not start never moves
+ * focus.
  *
  * @param busy - whether the work the button started is still running
  * @param buttonRef - the button to refocus
+ * @param fallbackRef - what takes focus while the button stays disabled; `tabIndex={-1}` makes
+ *   a non-interactive element focusable by script
  * @returns `arm`, to call from the button's click handler
  */
 function useFocusReturn(
   busy: boolean,
   buttonRef: RefObject<HTMLButtonElement | null>,
+  fallbackRef?: RefObject<HTMLElement | null>,
 ): () => void {
   const armedRef = useRef(false);
 
@@ -298,15 +325,18 @@ function useFocusReturn(
     armedRef.current = false;
     const button = buttonRef.current;
     const active = document.activeElement;
-    if (
-      button !== null &&
-      button.isConnected &&
-      !button.disabled &&
-      (active === null || active === document.body)
-    ) {
-      button.focus();
+    if (active !== null && active !== document.body && active !== button) {
+      return;
     }
-  }, [busy, buttonRef]);
+    if (button !== null && button.isConnected && !button.disabled) {
+      button.focus();
+      return;
+    }
+    const fallback = fallbackRef?.current ?? null;
+    if (fallback !== null && fallback.isConnected) {
+      fallback.focus();
+    }
+  }, [busy, buttonRef, fallbackRef]);
 
   return () => {
     armedRef.current = true;
@@ -326,6 +356,31 @@ function useFocusReturn(
 function hasStaleDataset(source: Source): boolean {
   return (
     source.datasets.some((row) => row.stale) || source.companion_datasets.some((row) => row.stale)
+  );
+}
+
+/**
+ * Whether any dataset shown in a source's section is not complete: its completeness is
+ * `incomplete` or `unknown` (`DatasetFreshnessView.incomplete`), primary and companion alike,
+ * whatever window a run judges it over. This screen has no analysis window, so, as for
+ * {@link hasStaleDataset}, each row is judged as recorded; testing for completeness
+ * `incomplete` alone would miss an `unknown` row.
+ *
+ * The status bar's "Incomplete" chip on `/actions` can differ for the same rows, because
+ * `Overlay.incomplete_datasets` judges each one over the run's window, or an item's wider
+ * required range: a `complete` row whose covered dates miss part of that range counts there,
+ * as does a dataset a recommendation needs but no row records, while a Q-G6 "result limit
+ * reached at finest partition (…)" shortfall counts only when the range includes one of the
+ * days its reason names. The companion CRM dataset's rows count as HubSpot's there too, while
+ * LinkedIn is simulated, which is when `GET /sources` reports them.
+ *
+ * @param source - one source of `GET /sources`
+ * @returns `true` when at least one freshness row is not complete
+ */
+function hasIncompleteDataset(source: Source): boolean {
+  return (
+    source.datasets.some((row) => row.incomplete) ||
+    source.companion_datasets.some((row) => row.incomplete)
   );
 }
 
@@ -370,14 +425,15 @@ function activeDatasetRows(source: Source): ActiveDatasetRow[] {
 
 /**
  * The columns of the active-datasets table. Mode and state are printed as the API returns them.
+ * The numeric ID is end-aligned in tabular figures, as Rows is in the recent sync runs table.
  *
  * @param displayTimezone - the IANA zone instants are shown in
- * @returns Dataset (row header), ID, Mode, State, Activated and Reason
+ * @returns Dataset (row header), ID (end-aligned), Mode, State, Activated and Reason
  */
 function activeDatasetColumns(displayTimezone: string): DataTableColumn<ActiveDatasetRow>[] {
   return [
     { key: 'label', header: 'Dataset', isRowHeader: true, render: (row) => row.label },
-    { key: 'id', header: 'ID', render: (row) => String(row.dataset.id) },
+    { key: 'id', header: 'ID', align: 'end', render: (row) => String(row.dataset.id) },
     { key: 'mode', header: 'Mode', render: (row) => row.dataset.mode },
     { key: 'state', header: 'State', render: (row) => row.dataset.state },
     {
@@ -424,6 +480,31 @@ function coveredDate(date: string | null, source: SourceName, dayBoundary: strin
 }
 
 /**
+ * A freshness cell's text with a line-break opportunity (`<wbr>`) after each slash, so an IANA
+ * zone such as `America/New_York`, in a covered date's day-boundary label or in an instant,
+ * wraps between its parts in the table's fixed-width columns instead of being broken inside a
+ * word. `<wbr>` adds no character: the text, the cell's accessible name and what a copy picks
+ * up stay exactly as given.
+ *
+ * @param text - the cell text, for example `"2026-10-05 (Google day, America/New_York)"`
+ * @returns the text as given when it has no slash before its end, otherwise its parts, each
+ *   slash ending one, with a `<wbr>` between them
+ */
+function wrapAtSlashes(text: string): ReactNode {
+  const parts = text.split(/(?<=\/)(?=.)/u);
+  if (parts.length === 1) {
+    return text;
+  }
+  return parts.map((part, index) => (
+    // The parts of one fixed text never reorder, so their positions are stable keys.
+    <Fragment key={index}>
+      {index > 0 && <wbr />}
+      {part}
+    </Fragment>
+  ));
+}
+
+/**
  * The day-boundary line above a source's freshness tables, worded as the status bar words a
  * boundary (`"{Label} days: {boundary}"`, for example "Google days: America/New_York" or
  * "HubSpot days: UTC"), or "{Label} days: day boundary not yet known" while the API reports
@@ -447,6 +528,21 @@ function dayBoundaryLine(source: SourceName, dayBoundary: string | null): string
  * badge beside its name. A source's primary and companion tables share its boundary: the
  * companion is a HubSpot dataset too.
  *
+ * Every column has a fixed width on the `DataTable` width scale, the same for every freshness
+ * table, primary and companion, of every source, so their columns start at the same offset in
+ * each section instead of following each table's content. The widths add up to 61 steps, which
+ * fit the section at a 1280 px viewport, and a wider section shares the extra space out:
+ * - Dataset (13): the longest dataset name, `hubspot.google_contacts`, on one line;
+ * - Completeness (8): its one-word header, which also holds the widest completeness badge;
+ * - Covered from and Covered through (7 each): a labelled date on three lines, four for a zone
+ *   with a slash, which {@link wrapAtSlashes} lets wrap after the slash rather than inside a
+ *   word;
+ * - Last success and Last attempt (7 each): an instant on two lines, wrapping likewise when the
+ *   display zone has a slash;
+ * - Reason (12): a reason of about 45 characters on two lines.
+ *
+ * Headers wrap between words in these columns.
+ *
  * @param displayTimezone - the IANA zone instants are shown in
  * @param source - the source whose datasets the table lists
  * @param dayBoundary - the IANA zone that ends the source's days, or `null` while unknown
@@ -463,6 +559,7 @@ function freshnessColumns(
       key: 'dataset',
       header: 'Dataset',
       isRowHeader: true,
+      width: 13,
       render: (row) =>
         row.stale ? (
           <Inline gap={2} align="center">
@@ -476,29 +573,39 @@ function freshnessColumns(
     {
       key: 'completeness',
       header: 'Completeness',
+      width: 8,
       render: (row) => completenessBadge(row.completeness),
     },
     {
       key: 'covered_from',
       header: 'Covered from',
-      render: (row) => coveredDate(row.covered_from, source, dayBoundary),
+      width: 7,
+      render: (row) => wrapAtSlashes(coveredDate(row.covered_from, source, dayBoundary)),
     },
     {
       key: 'covered_through',
       header: 'Covered through',
-      render: (row) => coveredDate(row.covered_through, source, dayBoundary),
+      width: 7,
+      render: (row) => wrapAtSlashes(coveredDate(row.covered_through, source, dayBoundary)),
     },
     {
       key: 'last_success_at',
       header: 'Last success',
-      render: (row) => freshnessInstant(row.last_success_at, displayTimezone),
+      width: 7,
+      render: (row) => wrapAtSlashes(freshnessInstant(row.last_success_at, displayTimezone)),
     },
     {
       key: 'last_attempt_at',
       header: 'Last attempt',
-      render: (row) => freshnessInstant(row.last_attempt_at, displayTimezone),
+      width: 7,
+      render: (row) => wrapAtSlashes(freshnessInstant(row.last_attempt_at, displayTimezone)),
     },
-    { key: 'reason', header: 'Reason', render: (row) => visibleText(row.reason) ?? EM_DASH },
+    {
+      key: 'reason',
+      header: 'Reason',
+      width: 12,
+      render: (row) => visibleText(row.reason) ?? EM_DASH,
+    },
   ];
 }
 
@@ -544,6 +651,9 @@ function syncRunColumns(displayTimezone: string): DataTableColumn<SyncRunView>[]
  * - `requested`: 202, a `sync_request` is queued;
  * - `pending`: 409 `sync_pending`, a request for the source was already queued;
  * - `failed`: any other error, with the API's message.
+ *
+ * `requested` and `pending` both report a request waiting for the worker, so they last only
+ * until the API reports it picked up; `failed` lasts until the next press.
  */
 type SyncOutcome =
   | { readonly kind: 'requested' }
@@ -551,12 +661,15 @@ type SyncOutcome =
   | { readonly kind: 'failed'; readonly message: string };
 
 /**
- * The outcome to show, derived from the section's own mutation state, so it lasts until the
- * next press and never leaks into another source's section. While a request is in flight there
- * is none, so each settled outcome enters the status region afresh and is announced.
+ * The outcome of the section's own mutation state, so it never leaks into another source's
+ * section. It lasts until the next press, or, for `requested` and `pending`, until
+ * {@link SourceSection} resets the mutation because a `GET /sources` response received after
+ * the press settled reports the request picked up. While a request is in flight there is none,
+ * so each settled outcome enters the status region afresh and is announced.
  *
  * @param mutation - the status and error of the section's `useRequestSync()` mutation
- * @returns the outcome, or `null` before the first press and while a request is in flight
+ * @returns the outcome, or `null` before the first press, while a request is in flight and
+ *   after a reset
  */
 function syncOutcome(mutation: {
   readonly isSuccess: boolean;
@@ -579,21 +692,22 @@ function syncOutcome(mutation: {
  * `role="alert"` for discrepancies, and the section's status region announces the outcome.
  *
  * @param outcome - the settled outcome
+ * @param id - the banner's `id`, which a disabled "Sync now" names as its description
  * @returns the banner
  */
-function syncOutcomeBanner(outcome: SyncOutcome): ReactElement {
+function syncOutcomeBanner(outcome: SyncOutcome, id: string): ReactElement {
   switch (outcome.kind) {
     case 'requested':
       return (
-        <Banner tone="success" title={SYNC_REQUESTED_TITLE}>
+        <Banner id={id} tone="success" title={SYNC_REQUESTED_TITLE}>
           {SYNC_REQUESTED_BODY}
         </Banner>
       );
     case 'pending':
-      return <Banner tone="info" title={SYNC_PENDING_TEXT} />;
+      return <Banner id={id} tone="info" title={SYNC_PENDING_TEXT} />;
     case 'failed':
       return (
-        <Banner tone="critical" title={SYNC_FAILED_TITLE}>
+        <Banner id={id} tone="critical" title={SYNC_FAILED_TITLE}>
           {outcome.message}
         </Banner>
       );
@@ -608,6 +722,12 @@ function syncOutcomeBanner(outcome: SyncOutcome): ReactElement {
 interface SourceSectionProps {
   /** One source of `GET /sources`. */
   source: Source;
+  /**
+   * When the `GET /sources` response `source` comes from was received: the `dataUpdatedAt` of
+   * `useSources()`, in epoch milliseconds. It tells a poll after a settled "Sync now" from the
+   * response that settled it.
+   */
+  sourcesUpdatedAt: number;
   /** The IANA zone every instant of the section is shown in. */
   displayTimezone: string;
 }
@@ -623,27 +743,102 @@ interface SourceSectionProps {
  * "LinkedIn" or "HubSpot". Each section owns its `useRequestSync()` mutation: a request pending
  * or failing for one source never changes another source's button or message.
  *
- * "Sync now" is disabled, with the visible hint "A sync is already pending" as its description,
- * while the API reports a pending request and no outcome of this session is shown. Once a press
- * has settled, its outcome stays and the button stays available: a second press while the first
- * request is still queued answers 409 and shows "A sync is already pending".
+ * "Sync now" posts once per press: a second press before React renders the first as loading (a
+ * double click, or `click(); click();` from a script) sends nothing, because a lock taken
+ * synchronously on the press holds until the request settles. The button is inert while its
+ * request is in flight (`loading`) and disabled whenever the API reports a pending request for
+ * the source (`sync_pending`), whether or not an outcome of this session is shown: the API keeps
+ * one pending request per source (AAP 0.5.3), so another press could only answer 409. It is
+ * enabled again once a `GET /sources` poll reports `sync_pending` false. A screen that has not
+ * yet read a pending request keeps the button available: that press answers 409, shows "A sync
+ * is already pending" and reads the sources again, which disables the button. While it is
+ * disabled for a pending request, its description (`aria-describedby`) is the visible text that
+ * says why: this session's "Sync requested" or "A sync is already pending" banner or, when
+ * neither is shown, the hint "A sync is already pending". The banner and the hint never show
+ * together.
+ *
+ * The 202 and 409 banners stay until a `GET /sources` response received after the press settled
+ * reports `sync_pending` false, that is, until the worker has picked the request up. The section
+ * then resets its mutation, so neither banner comes back when a later request makes the source
+ * pending again. Comparing the response time with the settle time, rather than reading the flag
+ * alone, keeps a banner up at least until the next poll, even when the response that settled
+ * the press already reported the request picked up. The failure banner stays until the next
+ * press.
+ *
+ * Focus (WCAG 2.2 SC 2.4.3): a "Sync now" that holds focus keeps it while its request runs and,
+ * when the settled press leaves it disabled, keeps it as an `aria-disabled` button described by
+ * the outcome until focus leaves it, as the design-system `Button` does. Where focus was lost
+ * to the page body meanwhile, it returns to "Sync now" once the press settles when the button is
+ * enabled. When the request is now pending and the button stays disabled, focus moves instead to
+ * the section's status region, which holds the outcome that says why, so it is never left on the
+ * page body. When the pickup clears that outcome while focus still rests on the region, which
+ * then empties to nothing visible, focus goes on to "Sync now", enabled again by the same
+ * response. A poll never moves focus from anywhere else: focus the user has moved stays put.
  */
-function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactElement {
+function SourceSection({
+  source,
+  sourcesUpdatedAt,
+  displayTimezone,
+}: SourceSectionProps): ReactElement {
   const requestSync = useRequestSync();
+  const { reset: resetSync } = requestSync;
   const syncButtonRef = useRef<HTMLButtonElement>(null);
-  const armSyncFocus = useFocusReturn(requestSync.isPending, syncButtonRef);
+  const syncStatusRef = useRef<HTMLDivElement>(null);
+  const armSyncFocus = useFocusReturn(requestSync.isPending, syncButtonRef, syncStatusRef);
+  // When this section's last press settled, in epoch milliseconds; `null` from each press on
+  // until it settles. A ref, not state: the mutation settles only once the sources read it
+  // started is in the cache, but the page renders that read a moment later, so a state update
+  // at the settle would render the settled outcome against the earlier sources, enabling the
+  // button and returning focus to it while the request is pending.
+  const syncSettledAtRef = useRef<number | null>(null);
+  // Whether a press of "Sync now" is running, set synchronously on the press and cleared when
+  // the request settles, either way. The rendered `loading` state cannot stop a second press
+  // before React renders again: TanStack Query reports the mutation pending only from a timer
+  // after the press.
+  const syncSentRef = useRef(false);
 
   const name = source.source;
   const label = sourceLabel(name);
   const sectionId = `source-${name}`;
   const pendingHintId = `${sectionId}-sync-pending`;
+  const outcomeId = `${sectionId}-sync-outcome`;
 
   const outcome = syncOutcome(requestSync);
-  const showPendingHint = source.sync_pending && outcome === null && !requestSync.isPending;
+  const awaitsPickup = outcome !== null && outcome.kind !== 'failed';
+  // Disabled for a pending request rather than for the press's own request in flight, which
+  // `loading` conveys.
+  const pendingDisabled = source.sync_pending && !requestSync.isPending;
+  const showPendingHint = pendingDisabled && (outcome === null || outcome.kind === 'failed');
+  const pendingReasonId = showPendingHint ? pendingHintId : outcomeId;
+
+  // The worker has picked up the request a 202 or 409 reported once a `GET /sources` response
+  // received after the press settled reports none pending. Resetting the mutation clears the
+  // banner for good, so a later pending request shows the hint instead. Focus the settled press
+  // left on the status region moves on to the button, enabled by this response; focus anywhere
+  // else is left where it is.
+  useEffect(() => {
+    const settledAt = syncSettledAtRef.current;
+    if (
+      !awaitsPickup ||
+      settledAt === null ||
+      sourcesUpdatedAt <= settledAt ||
+      source.sync_pending
+    ) {
+      return;
+    }
+    const status = syncStatusRef.current;
+    const focusOnOutcome = status !== null && status.contains(document.activeElement);
+    resetSync();
+    const button = syncButtonRef.current;
+    if (focusOnOutcome && button !== null && button.isConnected && !button.disabled) {
+      button.focus();
+    }
+  }, [awaitsPickup, sourcesUpdatedAt, source.sync_pending, resetSync]);
 
   const modeBadge = source.mode === null ? MODE_UNKNOWN_BADGE : MODE_BADGES[source.mode];
   const statusBadge = source.status === null ? STATUS_UNKNOWN_BADGE : STATUS_BADGES[source.status];
   const showStaleBadge = source.status !== 'stale' && hasStaleDataset(source);
+  const showIncompleteBadge = hasIncompleteDataset(source);
   const reason = visibleText(source.reason);
 
   const datasetRows = activeDatasetRows(source);
@@ -656,11 +851,25 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
       ref={syncButtonRef}
       variant="secondary"
       loading={requestSync.isPending}
-      disabled={showPendingHint}
-      aria-describedby={showPendingHint ? pendingHintId : undefined}
+      disabled={source.sync_pending}
+      aria-describedby={pendingDisabled ? pendingReasonId : undefined}
       onClick={() => {
+        if (syncSentRef.current) {
+          return;
+        }
+        syncSentRef.current = true;
         armSyncFocus();
-        requestSync.mutate(name);
+        syncSettledAtRef.current = null;
+        // The per-call `onSettled` runs as the request settles, before React renders it, while
+        // the button still renders as loading: it frees the lock and records the settle time
+        // together. TanStack Query calls it while this section, which owns the mutation, is
+        // mounted; an unmounted section takes the lock with it.
+        requestSync.mutate(name, {
+          onSettled: () => {
+            syncSentRef.current = false;
+            syncSettledAtRef.current = Date.now();
+          },
+        });
       }}
     >
       {SYNC_NOW_LABEL}
@@ -674,6 +883,7 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
           <Badge tone={modeBadge.tone}>{modeBadge.label}</Badge>
           <Badge tone={statusBadge.tone}>{statusBadge.label}</Badge>
           {showStaleBadge && <Badge tone="warning">{STALE_LABEL}</Badge>}
+          {showIncompleteBadge && <Badge tone="warning">{INCOMPLETE_LABEL}</Badge>}
           {reason !== null && <span>{`Reason: ${reason}`}</span>}
           <span>
             {source.last_attempt_at === null
@@ -686,10 +896,11 @@ function SourceSection({ source, displayTimezone }: SourceSectionProps): ReactEl
           The outcome region is rendered in every state, empty until a request settles, so the
           outcome lands in a region that already exists and is announced politely
           (WCAG 2.2 SC 4.1.3). Stack takes the empty region out of the column, so it adds no
-          space. It is a plain region, never an alert (AAP 0.5.5).
+          space. It is a plain region, never an alert (AAP 0.5.5). `tabIndex={-1}` lets it take
+          focus by script, never by Tab, when a press settles with "Sync now" disabled.
         */}
-        <div role="status" aria-live="polite">
-          {outcome !== null && syncOutcomeBanner(outcome)}
+        <div ref={syncStatusRef} role="status" aria-live="polite" tabIndex={-1}>
+          {outcome !== null && syncOutcomeBanner(outcome, outcomeId)}
           {showPendingHint && <div id={pendingHintId}>{SYNC_PENDING_TEXT}</div>}
         </div>
 
@@ -836,7 +1047,12 @@ export function SourcesPage(): ReactElement {
         <EmptyState title={NO_SOURCES_TITLE} />
       ) : (
         list.map((source) => (
-          <SourceSection key={source.source} source={source} displayTimezone={displayTimezone} />
+          <SourceSection
+            key={source.source}
+            source={source}
+            sourcesUpdatedAt={sources.dataUpdatedAt}
+            displayTimezone={displayTimezone}
+          />
         ))
       );
   } else if (failure === null) {

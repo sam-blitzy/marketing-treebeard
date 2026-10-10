@@ -1,8 +1,8 @@
 /**
  * The per-source chips in the `/actions` status bar (AAP 0.5.5): for Google, LinkedIn and
  * HubSpot, in that order, the source's current mode (Live or Simulated), a Stale and an
- * Incomplete chip when any of its datasets is stale or not complete now, and the time of its
- * last successful sync.
+ * Incomplete chip when any of its datasets is stale now or not complete over the run's window,
+ * and the time of its last successful sync.
  *
  * Where each part comes from:
  *
@@ -195,7 +195,7 @@ interface SourceChipProps {
   mode: DataMode | null;
   /** Whether any of its datasets is stale now. */
   stale: boolean;
-  /** Whether any of its datasets is not complete now. */
+  /** Whether any of its datasets is not complete over the run's window or an item's range. */
   incomplete: boolean;
   /** Its last-sync text, or `null` to show none. */
   lastSync: string | null;

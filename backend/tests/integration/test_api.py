@@ -39,6 +39,10 @@ test database; nothing reaches the network. The guarantees proven here:
   uvicorn the process then exits 1 with no line that is not JSON.
 * **Every route returns its schema** (AAP 0.5.3 endpoint table), on simulated data seeded the
   way the worker seeds a first start.
+* **Feedback is idempotent per item** (AAP 0.5.3 ``POST /recommendations/{id}/feedback``,
+  0.3.2 rerun requests): a repeat of the item's latest feedback in force, sequential or
+  concurrent, is answered with it and writes no row and no rerun request; another kind or note
+  is recorded; the C0 422 and the historical 409 still come first.
 * **Boundaries and redaction** (AAP 0.3.2, 0.11.1): a failed login is logged without the email,
   the password or the session secret, and the API process never imports the connectors, the sync
   jobs or the simulator.
@@ -2571,6 +2575,200 @@ async def test_feedback_route_returns_feedback_and_refuses_c0(seeded: Seeded) ->
     assert_error(unknown, 404, "not_found")
 
 
+_ITEM_ROW_LOCK_WAITERS: Final = text(
+    """
+    SELECT count(*) FROM pg_stat_activity
+    WHERE datname = current_database() AND pid <> pg_backend_pid()
+      AND wait_event_type = 'Lock' AND query LIKE '%FROM recommendation%FOR NO KEY UPDATE%'
+    """
+)
+"""The backends waiting for an item's row lock in ``post_feedback`` (``_hold_item_row``)."""
+
+_ACTIVITY: Final = text(
+    """
+    SELECT state, wait_event_type, wait_event, left(query, 160) FROM pg_stat_activity
+    WHERE datname = current_database() AND pid <> pg_backend_pid()
+    """
+)
+"""The other backends on the test database, reported when the lock wait never forms."""
+
+LOCK_WAIT_LIMIT_S: Final = 15.0
+"""How long the concurrency test waits for both requests to queue on the item's row lock."""
+
+
+def read_activity(engine: Engine, statement: Any) -> list[Any]:
+    """Run a ``pg_stat_activity`` query in a transaction of its own and return its rows.
+
+    PostgreSQL reads the activity view once per transaction and serves that snapshot until
+    the transaction ends, so a poll that reuses one transaction never sees a change.
+    """
+    with engine.connect() as connection:
+        return list(connection.execute(statement).all())
+
+
+def feedback_counts(engine: Engine, rec_id: int) -> tuple[int, int]:
+    """Return the item's ``recommendation_feedback`` rows and the ``feedback`` rerun requests."""
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text("SELECT count(*) FROM recommendation_feedback WHERE recommendation_id = :id"),
+            {"id": rec_id},
+        ).scalar_one()
+        requests = connection.execute(
+            text("SELECT count(*) FROM analysis_request WHERE reason = 'feedback'")
+        ).scalar_one()
+    return int(rows), int(requests)
+
+
+async def post_item_feedback(
+    client: httpx.AsyncClient, rec_id: int, body: Mapping[str, object]
+) -> schemas.Feedback:
+    """Post feedback on one item, assert 201 with exactly the ``Feedback`` keys, return it."""
+    response = await client.post(api(f"/recommendations/{rec_id}/feedback"), json=dict(body))
+    assert response.status_code == 201, response.text
+    assert set(response.json()) == set(schemas.Feedback.model_fields)
+    return schemas.Feedback.model_validate(response.json())
+
+
+async def test_feedback_route_answers_a_repeat_with_the_feedback_it_repeats(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
+    """A repeated identical feedback is answered with the first one and writes nothing.
+
+    The second half of a double click returns 201 with the same ``Feedback``, id and
+    ``until`` included: one ``recommendation_feedback`` row and one ``feedback`` rerun
+    request (AAP 0.3.2) stand for both.
+    """
+    client, facts = seeded.client, seeded.facts
+    rows_before, requests_before = feedback_counts(sync_engine, facts.item_id)
+    assert rows_before == 0
+
+    first = await post_item_feedback(client, facts.item_id, {"kind": "snooze"})
+    repeat = await post_item_feedback(client, facts.item_id, {"kind": "snooze"})
+
+    assert repeat == first
+    assert feedback_counts(sync_engine, facts.item_id) == (1, requests_before + 1)
+    page = (await client.get(api("/recommendations"))).json()
+    hidden = next(item for item in page_items(page) if item["id"] == facts.item_id)
+    assert hidden["current"]["hidden_by"] == "snooze"
+
+
+async def test_feedback_route_records_a_different_kind_or_note_as_new_feedback(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
+    """Only a repeat of the item's latest feedback in force is replayed; anything else is new.
+
+    A dismiss after a snooze is a second row and hides the item as ``dismiss``; repeating it
+    is replayed. A snooze after that dismiss is new again, because the dismiss is now the
+    latest; a snooze with a note differs from the one without, so it is new too.
+    """
+    client, facts = seeded.client, seeded.facts
+    _, requests_before = feedback_counts(sync_engine, facts.item_id)
+
+    snooze = await post_item_feedback(client, facts.item_id, {"kind": "snooze"})
+    dismiss = await post_item_feedback(client, facts.item_id, {"kind": "dismiss"})
+    dismiss_again = await post_item_feedback(client, facts.item_id, {"kind": "dismiss"})
+    snooze_again = await post_item_feedback(client, facts.item_id, {"kind": "snooze"})
+    noted = await post_item_feedback(
+        client, facts.item_id, {"kind": "snooze", "note": "Revisit after the launch"}
+    )
+
+    assert dismiss.id != snooze.id
+    assert dismiss_again == dismiss
+    assert len({snooze.id, dismiss.id, snooze_again.id, noted.id}) == 4
+    assert (snooze_again.kind, noted.kind, noted.note) == (
+        "snooze",
+        "snooze",
+        "Revisit after the launch",
+    )
+    assert feedback_counts(sync_engine, facts.item_id) == (4, requests_before + 4)
+
+
+async def test_feedback_route_records_one_row_for_concurrent_identical_requests(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
+    """Two identical feedback requests in flight together write one row: the second waits.
+
+    An outside transaction holds the item's row until both requests queue on its lock, which
+    proves they overlap; released, one records the feedback and the other, under READ
+    COMMITTED, finds it and answers with it. Both answer 201 with the same ``Feedback``.
+    """
+    client, facts = seeded.client, seeded.facts
+    _, requests_before = feedback_counts(sync_engine, facts.item_id)
+
+    with sync_engine.connect() as blocker:
+        blocker.execute(
+            text("SELECT id FROM recommendation WHERE id = :id FOR NO KEY UPDATE"),
+            {"id": facts.item_id},
+        )
+        requests = [
+            asyncio.ensure_future(post_item_feedback(client, facts.item_id, {"kind": "done"}))
+            for _ in range(2)
+        ]
+        try:
+            deadline = asyncio.get_running_loop().time() + LOCK_WAIT_LIMIT_S
+            while read_activity(sync_engine, _ITEM_ROW_LOCK_WAITERS)[0][0] < len(requests):
+                assert not any(request.done() for request in requests), (
+                    "a feedback request finished without waiting for the item's row lock"
+                )
+                assert asyncio.get_running_loop().time() < deadline, (
+                    "the feedback requests never queued on the item's row lock: "
+                    f"{read_activity(sync_engine, _ACTIVITY)}"
+                )
+                await asyncio.sleep(0.05)
+        except BaseException:
+            blocker.rollback()
+            for request in requests:
+                request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            raise
+        blocker.rollback()
+        first, second = await asyncio.gather(*requests)
+
+    assert first == second
+    assert first.kind == "done"
+    assert feedback_counts(sync_engine, facts.item_id) == (1, requests_before + 1)
+
+
+async def test_feedback_route_refuses_c0_and_historical_items_before_any_repeat(
+    seeded: Seeded, sync_engine: Engine
+) -> None:
+    """The 422 for C0 and the 409 for a historical item come first, repeats included.
+
+    Feedback on the C0 item is 422 ``feedback_not_allowed`` every time and stores nothing.
+    Once a dataset the item read is retired, a repeat of the feedback it already carries is
+    409 ``subject_retired``, never a replay, and nothing more is stored.
+    """
+    client, facts = seeded.client, seeded.facts
+    for _ in range(2):
+        c0 = await client.post(
+            api(f"/recommendations/{facts.c0_item_id}/feedback"), json={"kind": "dismiss"}
+        )
+        assert_error(c0, 422, "feedback_not_allowed")
+    assert feedback_counts(sync_engine, facts.c0_item_id)[0] == 0
+
+    await post_item_feedback(client, facts.item_id, {"kind": "snooze"})
+    counts = feedback_counts(sync_engine, facts.item_id)
+    page = (await client.get(api("/recommendations"))).json()
+    item = next(item for item in page_items(page) if item["id"] == facts.item_id)
+    provenance_ids = sorted({entry["dataset_id"] for entry in item["evidence"]["provenance"]})
+    assert provenance_ids
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE source_dataset SET state = 'retired', retired_at = now() "
+                "WHERE id = ANY(:ids)"
+            ),
+            {"ids": provenance_ids},
+        )
+
+    for kind in ("snooze", "dismiss"):
+        refused = await client.post(
+            api(f"/recommendations/{facts.item_id}/feedback"), json={"kind": kind}
+        )
+        assert_error(refused, 409, "subject_retired")
+    assert feedback_counts(sync_engine, facts.item_id) == counts
+
+
 async def test_decision_routes_return_the_decision_schema(seeded: Seeded) -> None:
     """AAP 0.5.3 ``GET /decisions`` → ``Decision[]``; ``POST /decisions`` → 201 ``Decision``.
 
@@ -2798,6 +2996,56 @@ async def test_sources_route_google_day_boundary_unknown_without_a_dataset(
         "linkedin": "UTC",
         "hubspot": "UTC",
     }
+
+
+async def test_sources_route_reports_no_mode_for_a_live_placeholder(
+    authed_client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """A ``live`` connection row with no active dataset reports ``mode`` ``null``, never live.
+
+    Such a row never verified live access: here a Google source whose first live query hit a
+    defect, so it holds status ``error`` with the defect as its reason and has no dataset.
+    ``GET /sources`` reports that status and reason with no mode, as the overlay's
+    ``source_modes`` does. Once a live dataset activates (the row's mode and active dataset set
+    together), the same row reports ``live``.
+    """
+    reason = "QueryError in Q-G1: UNRECOGNIZED_FIELD"
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO source_connection (source, mode, status, reason, last_attempt_at) "
+                "VALUES ('google', 'live', 'error', :reason, now())"
+            ),
+            {"reason": reason},
+        )
+
+    response = await authed_client.get(api("/sources"))
+    assert response.status_code == 200, response.text
+    google = schemas.Source.model_validate(response.json()[SOURCES.index("google")])
+    assert (google.mode, google.status, google.reason) == (None, "error", reason)
+    assert (google.active_dataset, google.datasets) == (None, [])
+
+    with sync_engine.begin() as connection:
+        dataset_id = connection.execute(
+            text(
+                "INSERT INTO source_dataset (source, mode, state, role, activated_at) "
+                "VALUES ('google', 'live', 'active', 'primary', now()) RETURNING id"
+            )
+        ).scalar_one()
+        connection.execute(
+            text(
+                "UPDATE source_connection SET status = 'ok', reason = NULL, "
+                "active_dataset_id = :dataset_id WHERE source = 'google'"
+            ),
+            {"dataset_id": dataset_id},
+        )
+
+    activated = await authed_client.get(api("/sources"))
+    assert activated.status_code == 200, activated.text
+    google = schemas.Source.model_validate(activated.json()[SOURCES.index("google")])
+    assert (google.mode, google.status) == ("live", "ok")
+    assert google.active_dataset is not None
+    assert (google.active_dataset.id, google.active_dataset.mode) == (dataset_id, "live")
 
 
 async def test_sync_request_202_then_409(authed_client: httpx.AsyncClient) -> None:

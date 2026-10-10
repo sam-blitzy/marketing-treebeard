@@ -12,7 +12,8 @@
  *   is correct" and "Acknowledge removal";
  * - every resolution but "Record intended state" posts `POST /discrepancies/{id}/resolve` with
  *   `{ resolution }` alone and the CSRF header, shows its outcome in a polite status region and
- *   reports the API's response to `onResolved`;
+ *   reports the API's response to `onResolved`; two presses before React renders again post
+ *   once and open no dialog, and a settled request, either way, frees a later press;
  * - "Record intended state" opens a dialog holding `DecisionForm` with exactly the fields of the
  *   subject's decision shape, and posts the complete intended state; the dialog may close while
  *   its save runs, but until the save settles every resolution stays disabled and the dialog
@@ -2132,3 +2133,144 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Double submits
+// ---------------------------------------------------------------------------------------------
+
+// Two presses before React renders again, as a double click or a script's `click(); click();`
+// delivers them: TanStack Query reports the first resolution pending only from a timer after
+// the press, so the rendered `disabled` state cannot stop the second one. Each pair is fired
+// back to back, with nothing awaited between the two.
+describe('DiscrepancyResolution double submits', () => {
+  it('posts a resolution once when it is pressed twice within one frame', async () => {
+    const updated = makeDiscrepancy('status', {
+      state: 'resolved',
+      resolution: 'platform_correct',
+    });
+    const api = mockApi({ [RESOLVE_KEY]: json(200, updated) });
+    const { onResolved } = await renderResolution(makeDiscrepancy('status'));
+
+    fireEvent.click(buttonNamed('Platform is correct'));
+    fireEvent.click(buttonNamed('Platform is correct'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      { resolution: 'platform_correct' },
+    ]);
+    expect(onResolved).toHaveBeenCalledTimes(1);
+    // The 409 discrepancy_resolved a second post would draw never arrives, so nothing locks.
+    expect(screen.queryByText('Already resolved')).toBeNull();
+  });
+
+  it('posts only the first of two resolutions pressed within one frame', async () => {
+    const api = mockApi({
+      [RESOLVE_KEY]: json(200, makeDiscrepancy('status', { state: 'resolved' })),
+    });
+    await renderResolution(makeDiscrepancy('status'));
+
+    fireEvent.click(buttonNamed('Platform is correct'));
+    fireEvent.click(buttonNamed('Decision is correct'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      { resolution: 'platform_correct' },
+    ]);
+  });
+
+  it('keeps the intended-state dialog closed when it is pressed in the frame of a resolution', async () => {
+    const api = mockApi({
+      [RESOLVE_KEY]: json(
+        200,
+        makeDiscrepancy('untracked', { state: 'resolved', resolution: 'adopt_platform' }),
+      ),
+    });
+    await renderResolution(makeDiscrepancy('untracked'));
+
+    fireEvent.click(buttonNamed('Adopt platform state'));
+    fireEvent.click(buttonNamed('Record intended state'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    // An opened form would also read the subject's decision log, which the stub refuses.
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      `POST /discrepancies/${String(FIXTURE_DISCREPANCY_ID)}/resolve`,
+    ]);
+  });
+
+  it('lets a later press post again once an awaiting-platform outcome has settled', async () => {
+    const api = mockApi({
+      [RESOLVE_KEY]: (call) =>
+        json(
+          200,
+          makeDiscrepancy('status', {
+            state:
+              (call.body as { resolution?: string } | undefined)?.resolution === 'decision_correct'
+                ? 'awaiting_platform'
+                : 'resolved',
+          }),
+        ),
+    });
+    await renderResolution(makeDiscrepancy('status'));
+
+    fireEvent.click(buttonNamed('Decision is correct'));
+    fireEvent.click(buttonNamed('Decision is correct'));
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Waiting for the platform to match the decision');
+    });
+    await waitFor(() => {
+      expect(buttonNamed('Platform is correct').disabled).toBe(false);
+    });
+
+    fireEvent.click(buttonNamed('Platform is correct'));
+    fireEvent.click(buttonNamed('Platform is correct'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      { resolution: 'decision_correct' },
+      { resolution: 'platform_correct' },
+    ]);
+  });
+
+  it('frees the controls after a failed resolution, so a retry posts again, once', async () => {
+    const NOT_ALLOWED_MESSAGE = 'decision_correct is not valid for this discrepancy.';
+    let attempts = 0;
+    const api = mockApi({
+      [RESOLVE_KEY]: () => {
+        attempts += 1;
+        return attempts === 1
+          ? apiError(422, 'resolution_not_allowed', NOT_ALLOWED_MESSAGE)
+          : json(200, makeDiscrepancy('status', { state: 'resolved' }));
+      },
+    });
+    await renderResolution(makeDiscrepancy('status'));
+
+    fireEvent.click(buttonNamed('Decision is correct'));
+    fireEvent.click(buttonNamed('Decision is correct'));
+    expect(await screen.findByText(NOT_ALLOWED_MESSAGE)).toBeTruthy();
+    await waitFor(() => {
+      expect(buttonNamed('Decision is correct').disabled).toBe(false);
+    });
+    expect(resolveCalls(api)).toHaveLength(1);
+
+    fireEvent.click(buttonNamed('Platform is correct'));
+    fireEvent.click(buttonNamed('Platform is correct'));
+
+    await waitFor(() => {
+      expect(outcomeRegion().textContent).toBe('Resolved');
+    });
+    expect(resolveCalls(api).map((call) => call.body)).toEqual([
+      { resolution: 'decision_correct' },
+      { resolution: 'platform_correct' },
+    ]);
+  });
+});
+

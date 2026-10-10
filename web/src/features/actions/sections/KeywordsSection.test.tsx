@@ -5,7 +5,9 @@
  * They hold the section to its TSDoc contract and to the AAP's field set:
  * - **Sub-lists as tabs.** One `Tabs` named "Keyword actions" with one tab per API group (Block,
  *   Expand and Review: K1, K2, K3) in API order, each labelled with the group title and its count
- *   of the cards shown openly (visible, and computed from replaced data). The section opens on
+ *   of every card its panel holds (visible, computed from replaced data and held; never one
+ *   hidden by feedback), so the tab counts add up to the section's navigation count. A held
+ *   card stays collapsed behind "Held until discrepancies are resolved". The section opens on
  *   the first sub-list with a visible card, else one with a card computed from replaced data,
  *   else one with a held card; an empty sub-list says "No items"; a chosen tab survives a
  *   refetch and falls back to the default when its group disappears. A section with no card to
@@ -14,21 +16,27 @@
  * - **The coverage finding.** The `search_term_coverage` finding (search-term spend ÷ keyword
  *   spend, below 80%) sits above the tabs as a banner, never an alert, and every keyword card
  *   carries the low-coverage flag.
- * - **Keyword cards.** Exactly five fields, Term, Spend, Conversions, Cost/conversion and Reason,
- *   displayed in that order with nothing between them (AAP 0.1.2); the Term entry is the term
- *   alone, and the reason sentence appears once on the card, as the last field. A separate
- *   "Keyword context" list, "Campaign and ad group: …", follows the five fields. Cost/conversion
- *   reads "—" at a known 0 conversions (any decimal form) and fractional conversions count as
- *   converting; a missing value reads "unavailable", never 0. K2 cards add up to five adjacent
- *   terms "from your search-term report"; K3 cards add the quality score first → last and CPC
- *   and cost/conversion by half; both follow the context, before the evidence table.
+ * - **Keyword cards.** One "Keyword details" list of exactly six fields, Term, Campaign and ad
+ *   group, Spend, Conversions, Cost/conversion and Reason, displayed in that order with nothing
+ *   between them (AAP 0.5.5, AAP 0.5.4.3; the other five keep AAP 0.1.2's order), and no other
+ *   field list before them; the Term entry is the term alone, the Campaign and ad group entry
+ *   reads "{campaign} · {ad group}", and the reason sentence appears once on the card, as the
+ *   last field. Cost/conversion reads "—" at a known 0 conversions (any decimal form) and
+ *   fractional conversions count as converting; a missing value reads "unavailable", never 0.
+ *   K2 cards add up to five adjacent terms "from your search-term report"; K3 cards add the
+ *   quality score first → last and CPC and cost/conversion by half; both follow the six fields,
+ *   before the evidence table.
+ *
+ * - **A card hidden on the page.** Dismissing a sub-list's only card leaves its confirmation in
+ *   the tab's panel, not "No items", and the tab stays selected with its count of 0.
  *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
- * the test.
+ * the test. The feedback-flow test alone renders the section from a stubbed
+ * `GET /recommendations` (`../../../test/feedbackFlow`), whose feedback post hides the item.
  */
 import { mockApi } from '../../../test/mockApi';
 
-import { act, fireEvent, screen, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -48,11 +56,12 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
+import { visibleItemCount } from '../SectionNav';
 import {
   ADJACENT_TERMS_TITLE,
   EMPTY_GROUP_TITLE,
-  KEYWORD_CONTEXT_LABEL,
   KEYWORD_DETAILS_LABEL,
   KEYWORD_TABS_LABEL,
   KeywordsSection,
@@ -156,6 +165,15 @@ function tabNames(): (string | null)[] {
   return screen.getAllByRole('tab').map(tabText);
 }
 
+/** The sum of the counts the tabs show, each read from the end of its tab's name. */
+function tabCountTotal(): number {
+  return tabNames().reduce((total, name) => {
+    const count = /(\d+)$/u.exec(name ?? '')?.[1];
+    expect(count, `tab "${name ?? ''}" shows a count`).toBeDefined();
+    return total + Number(count);
+  }, 0);
+}
+
 /** The name of the selected tab. */
 function selectedTabName(): string | null {
   const selected = screen
@@ -202,35 +220,51 @@ function occurrences(container: HTMLElement, text: string): number {
   return (container.textContent ?? '').split(text).length - 1;
 }
 
-/** The context entry every default-page keyword card shows after its five fields. */
-const CORE_CRM_CONTEXT = 'Campaign and ad group: Core CRM — US · CRM Software';
+/** The campaign and ad group every default-page keyword card names, "{campaign} · {ad group}". */
+const CORE_CRM_CAMPAIGN_AND_AD_GROUP = 'Core CRM — US · CRM Software';
 
-/** The label that starts the context entry. */
-const CONTEXT_ENTRY_PREFIX = 'Campaign and ad group: ';
+/** The second field of every default-page keyword card. */
+const CORE_CRM_ENTRY = `Campaign and ad group: ${CORE_CRM_CAMPAIGN_AND_AD_GROUP}`;
+
+/** The label that starts every keyword card's second field. */
+const CAMPAIGN_ENTRY_PREFIX = 'Campaign and ad group: ';
+
+/** The accessible name of the separate list a keyword card once had; no card may render it. */
+const RETIRED_CONTEXT_LIST = 'Keyword context';
 
 /**
  * Asserts the card body's displayed text, as a reader meets it: it starts with
- * "Term: {term}", then "Spend: ", "Conversions: ", "Cost/conversion: " and
- * "Reason: {reason}" at strictly increasing positions, with no campaign and ad group anywhere
- * among the five; the context entry starts exactly where the Reason entry ends and appears once;
- * and `followers` (the K2 adjacent-terms title or the K3 review evidence) come after it.
+ * "Term: {term}", then "Campaign and ad group: {campaignAndAdGroup}", "Spend: ",
+ * "Conversions: ", "Cost/conversion: " and "Reason: {reason}" at strictly increasing
+ * positions; the Term and Campaign and ad group entries hold exactly their values, the
+ * campaign and ad group appear once, and `followers` (the K2 adjacent-terms title or the K3
+ * review evidence) come after the Reason entry.
  *
  * @param card - the keyword card
  * @param term - the term the Term entry must hold, alone
+ * @param campaignAndAdGroup - the "{campaign} · {ad group}" the second entry must hold
  * @param reason - the item's reason sentence
- * @param followers - texts that must appear after the context entry, in this order
+ * @param followers - texts that must appear after the Reason entry, in this order
  */
 function expectDisplayedSequence(
   card: HTMLElement,
   term: string,
+  campaignAndAdGroup: string,
   reason: string,
   followers: readonly string[] = [],
 ): void {
   const text = card.querySelector('.ds-card__body')?.textContent ?? '';
   const reasonEntry = `Reason: ${reason}`;
-  const labels = ['Term: ', 'Spend: ', 'Conversions: ', 'Cost/conversion: ', reasonEntry];
+  const labels = [
+    'Term: ',
+    CAMPAIGN_ENTRY_PREFIX,
+    'Spend: ',
+    'Conversions: ',
+    'Cost/conversion: ',
+    reasonEntry,
+  ];
   const positions = labels.map((label) => text.indexOf(label));
-  // Nothing (no reason line, no context) precedes the Term entry.
+  // Nothing (no reason line, no other list) precedes the Term entry.
   expect(positions[0]).toBe(0);
   positions.forEach((position, index) => {
     expect(position, `"${labels[index] ?? ''}" is displayed`).toBeGreaterThanOrEqual(0);
@@ -240,20 +274,31 @@ function expectDisplayedSequence(
       );
     }
   });
-  // The Term entry is the term alone: the next thing displayed is the Spend entry.
+  // The Term entry is the term alone: the next thing displayed is the campaign and ad group.
   expect(text.slice(positions[0], positions[1])).toBe(`Term: ${term}`);
-  // Nothing about the campaign or ad group is displayed among the five fields.
-  const reasonEnd = (positions[4] ?? 0) + reasonEntry.length;
-  expect(text.slice(0, reasonEnd)).not.toContain('Campaign and ad group');
-  // The separate context follows the Reason entry directly, and appears once.
-  expect(text.indexOf(CONTEXT_ENTRY_PREFIX)).toBe(reasonEnd);
-  expect(occurrences(card, CONTEXT_ENTRY_PREFIX)).toBe(1);
-  let previous = reasonEnd;
+  // The second entry is the campaign and ad group alone: the next thing is the Spend entry.
+  expect(text.slice(positions[1], positions[2])).toBe(
+    `${CAMPAIGN_ENTRY_PREFIX}${campaignAndAdGroup}`,
+  );
+  // The campaign and ad group are displayed once, second, never again after the reason.
+  expect(occurrences(card, CAMPAIGN_ENTRY_PREFIX)).toBe(1);
+  let previous = (positions[5] ?? 0) + reasonEntry.length;
   for (const follower of followers) {
     const position = text.indexOf(follower, previous);
-    expect(position, `"${follower}" follows the context`).toBeGreaterThan(previous);
-    previous = position;
+    expect(position, `"${follower}" follows the reason`).toBeGreaterThanOrEqual(previous);
+    previous = position + follower.length;
   }
+}
+
+/**
+ * Asserts that `card` renders its six fields as one "Keyword details" list and no separate
+ * campaign-and-ad-group list.
+ *
+ * @param card - the keyword card
+ */
+function expectOneDetailsList(card: HTMLElement): void {
+  expect(within(card).getAllByRole('list', { name: KEYWORD_DETAILS_LABEL })).toHaveLength(1);
+  expect(within(card).queryByRole('list', { name: RETIRED_CONTEXT_LIST })).toBeNull();
 }
 
 /**
@@ -312,6 +357,8 @@ describe('KeywordsSection', () => {
       expect(screen.queryByRole('alert')).toBeNull();
 
       expect(tabNames()).toEqual(DEFAULT_TAB_NAMES);
+      // The tab counts add up to the section's navigation count.
+      expect(tabCountTotal()).toBe(visibleItemCount(defaultKeywords()));
       expect(selectedTabName()).toBe('Block / negative-keyword candidates 1');
       // Each panel element is its group's anchor and always exists, so #group-keywords-{key}
       // resolves, and the tab controls it, even before the panel first mounts its cards.
@@ -349,7 +396,7 @@ describe('KeywordsSection', () => {
       expect(review?.querySelector('article')?.textContent).toContain(action);
     });
 
-    it('shows the K1 block card\'s five fields in order (term, spend, conversions, cost/conversion "—", reason), then its campaign and ad group', async () => {
+    it('shows the K1 block card\'s six fields in order (term, campaign and ad group, spend, conversions, cost/conversion "—", reason)', async () => {
       await renderKeywords(defaultKeywords());
 
       const card = within(visiblePanel()).getByRole('article', {
@@ -361,6 +408,7 @@ describe('KeywordsSection', () => {
       const reason = pageItem(FIXTURE_ITEM_IDS.k1).reason;
       expect(keywordDetails('Add as exact-match negative')).toEqual([
         'Term: free crm template',
+        CORE_CRM_ENTRY,
         'Spend: $186.40',
         'Conversions: 0',
         'Cost/conversion: —',
@@ -369,13 +417,12 @@ describe('KeywordsSection', () => {
       ]);
       // The reason is the last field and the card prints no second copy above the fields.
       expect(occurrences(card, reason)).toBe(1);
-      // The campaign and ad group are separate context, displayed after the five fields and
-      // before the evidence table.
-      expect(listEntries(card, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
-      expectDisplayedSequence(card, 'free crm template', reason);
+      // The campaign and ad group are the second field of the one list, before the evidence
+      // table, with no separate list for them.
+      expectOneDetailsList(card);
+      expectDisplayedSequence(card, 'free crm template', CORE_CRM_CAMPAIGN_AND_AD_GROUP, reason);
       expectInOrder(
         within(card).getByRole('list', { name: KEYWORD_DETAILS_LABEL }),
-        within(card).getByRole('list', { name: KEYWORD_CONTEXT_LABEL }),
         within(card).getByRole('table', { name: 'Evidence' }),
       );
       // A block candidate shows its wasted spend (AAP 0.5.4.3 K1) in the card's evidence.
@@ -400,6 +447,7 @@ describe('KeywordsSection', () => {
       const reason = pageItem(FIXTURE_ITEM_IDS.k2).reason;
       expect(keywordDetails(action)).toEqual([
         'Term: crm for small business',
+        CORE_CRM_ENTRY,
         'Spend: $240.00',
         'Conversions: 4',
         'Cost/conversion: $60.00',
@@ -407,13 +455,18 @@ describe('KeywordsSection', () => {
       ]);
       const card = within(visiblePanel()).getByRole('article', { name: action });
       expect(occurrences(card, reason)).toBe(1);
-      expect(listEntries(card, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
-      // The five fields, then the campaign and ad group, then the adjacent terms, displayed in
-      // that order, all before the evidence table.
-      expectDisplayedSequence(card, 'crm for small business', reason, [ADJACENT_TERMS_TITLE]);
+      expectOneDetailsList(card);
+      // The six fields, then the adjacent terms, displayed in that order, all before the
+      // evidence table.
+      expectDisplayedSequence(
+        card,
+        'crm for small business',
+        CORE_CRM_CAMPAIGN_AND_AD_GROUP,
+        reason,
+        [ADJACENT_TERMS_TITLE],
+      );
       expectInOrder(
         within(card).getByRole('list', { name: KEYWORD_DETAILS_LABEL }),
-        within(card).getByRole('list', { name: KEYWORD_CONTEXT_LABEL }),
         within(card).getByText(ADJACENT_TERMS_TITLE),
         within(card).getByRole('list', { name: ADJACENT_TERMS_TITLE }),
         within(card).getByRole('table', { name: 'Evidence' }),
@@ -438,6 +491,7 @@ describe('KeywordsSection', () => {
       const reason = pageItem(FIXTURE_ITEM_IDS.k3).reason;
       expect(keywordDetails(action)).toEqual([
         'Term: crm software',
+        CORE_CRM_ENTRY,
         'Spend: $1,205.40',
         'Conversions: 14',
         'Cost/conversion: $86.10',
@@ -445,17 +499,16 @@ describe('KeywordsSection', () => {
       ]);
       const card = within(visiblePanel()).getByRole('article', { name: action });
       expect(occurrences(card, reason)).toBe(1);
-      expect(listEntries(card, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
-      // The five fields, then the campaign and ad group, then the review evidence, displayed in
-      // that order, all before the evidence table.
-      expectDisplayedSequence(card, 'crm software', reason, [
+      expectOneDetailsList(card);
+      // The six fields, then the review evidence, displayed in that order, all before the
+      // evidence table.
+      expectDisplayedSequence(card, 'crm software', CORE_CRM_CAMPAIGN_AND_AD_GROUP, reason, [
         'Quality score: ',
         'CPC by half: ',
         'Cost/conversion by half: ',
       ]);
       expectInOrder(
         within(card).getByRole('list', { name: KEYWORD_DETAILS_LABEL }),
-        within(card).getByRole('list', { name: KEYWORD_CONTEXT_LABEL }),
         within(card).getByRole('list', { name: REVIEW_EVIDENCE_LABEL }),
         within(card).getByRole('table', { name: 'Evidence' }),
       );
@@ -541,26 +594,27 @@ describe('KeywordsSection', () => {
       expect(panel.id).toBe('group-keywords-review');
     });
 
-    it('opens on a sub-list with only a held card, which the tab does not count', async () => {
+    it('opens on a sub-list with only a held card, which the tab counts, and leaves a hidden card out of its count', async () => {
       const heldK2 = { ...pageItem(FIXTURE_ITEM_IDS.k2), held: true };
       const hiddenK3 = {
         ...pageItem(FIXTURE_ITEM_IDS.k3),
         current: makeItemOverlay({ hidden_by: 'snooze' }),
       };
-      await renderKeywords(
-        keywordsWith(
-          makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
-          makeGroup({ key: 'expand', title: 'Expansion candidates', items: [heldK2] }),
-          makeGroup({ key: 'review', title: 'Review', items: [hiddenK3] }),
-        ),
+      const section = keywordsWith(
+        makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+        makeGroup({ key: 'expand', title: 'Expansion candidates', items: [heldK2] }),
+        makeGroup({ key: 'review', title: 'Review', items: [hiddenK3] }),
       );
+      await renderKeywords(section);
 
+      // The held card is counted, as the section's navigation counts it; the snoozed one is not.
       expect(tabNames()).toEqual([
         'Block / negative-keyword candidates 0',
-        'Expansion candidates 0',
+        'Expansion candidates 1',
         'Review 0',
       ]);
-      expect(selectedTabName()).toBe('Expansion candidates 0');
+      expect(tabCountTotal()).toBe(visibleItemCount(section));
+      expect(selectedTabName()).toBe('Expansion candidates 1');
       const toggle = within(visiblePanel()).getByRole('button', {
         name: 'Held until discrepancies are resolved (1)',
       });
@@ -568,17 +622,18 @@ describe('KeywordsSection', () => {
       fireEvent.click(toggle);
       const heldAction = 'Add as phrase-match keyword in CRM Software';
       const heldCard = within(visiblePanel()).getByRole('article', { name: heldAction });
-      // Held behind the disclosure, the card keeps the five fields in order with the reason once
-      // and last, then its campaign and ad group.
+      // Held behind the disclosure, the card keeps the six fields in order, the campaign and ad
+      // group second and the reason once and last.
       expect(keywordDetails(heldAction)).toEqual([
         'Term: crm for small business',
+        CORE_CRM_ENTRY,
         'Spend: $240.00',
         'Conversions: 4',
         'Cost/conversion: $60.00',
         `Reason: ${heldK2.reason}`,
       ]);
       expect(occurrences(heldCard, heldK2.reason)).toBe(1);
-      expect(listEntries(heldCard, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
+      expectOneDetailsList(heldCard);
       // The snoozed K3 is counted under "Not shown", never rendered.
       expect(listEntries(document.body, 'Not shown')).toEqual(['1 hidden since this run']);
       fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
@@ -596,19 +651,19 @@ describe('KeywordsSection', () => {
           data_status_now: 'live',
         }),
       };
-      await renderKeywords(
-        keywordsWith(
-          makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
-          makeGroup({ key: 'expand', title: 'Expansion candidates', items: [heldK2] }),
-          makeGroup({ key: 'review', title: 'Review', items: [historicalK3] }),
-        ),
+      const section = keywordsWith(
+        makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+        makeGroup({ key: 'expand', title: 'Expansion candidates', items: [heldK2] }),
+        makeGroup({ key: 'review', title: 'Review', items: [historicalK3] }),
       );
+      await renderKeywords(section);
 
       expect(tabNames()).toEqual([
         'Block / negative-keyword candidates 0',
-        'Expansion candidates 0',
+        'Expansion candidates 1',
         'Review 1',
       ]);
+      expect(tabCountTotal()).toBe(visibleItemCount(section));
       expect(selectedTabName()).toBe('Review 1');
       const panel = visiblePanel();
       // Readable at once, never behind "Held until discrepancies are resolved".
@@ -621,17 +676,69 @@ describe('KeywordsSection', () => {
       for (const name of ['Mark done', 'Dismiss', 'Snooze for 7 days']) {
         expect(within(card).getByRole('button', { name }).hasAttribute('disabled')).toBe(true);
       }
-      // In the replaced-data block, the card keeps the five fields in order with the reason
-      // once and last, then its campaign and ad group.
+      // In the replaced-data block, the card keeps the six fields in order, the campaign and ad
+      // group second and the reason once and last.
       expect(listEntries(card, KEYWORD_DETAILS_LABEL)).toEqual([
         'Term: crm software',
+        CORE_CRM_ENTRY,
         'Spend: $1,205.40',
         'Conversions: 14',
         'Cost/conversion: $86.10',
         `Reason: ${historicalK3.reason}`,
       ]);
       expect(occurrences(card, historicalK3.reason)).toBe(1);
-      expect(listEntries(card, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
+      expectOneDetailsList(card);
+    });
+
+    it('counts every held card when open discrepancies hold every sub-list (3, 4, 2), matching the section count, and keeps them collapsed', async () => {
+      const heldNow = (item: Item): Item => ({
+        ...item,
+        current: makeItemOverlay({
+          held_now: true,
+          held_reason_now: 'Held until discrepancies are resolved',
+        }),
+      });
+      const block = [61, 62, 63].map((id) => heldNow(k1With(id, [], null)));
+      const expand = [71, 72, 73, 74].map((id) => heldNow(k2With(id, [])));
+      const review = [81, 82].map((id) =>
+        heldNow(makeItem({ id, rule_id: 'K3', action: `Review keyword ${String(id)}` })),
+      );
+      const section = keywordsWith(
+        makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: block }),
+        makeGroup({ key: 'expand', title: 'Expansion candidates', items: expand }),
+        makeGroup({ key: 'review', title: 'Review', items: review }),
+      );
+      await renderKeywords(section);
+
+      // Each tab counts its held cards, and the three counts add up to the section's count.
+      expect(tabNames()).toEqual([
+        'Block / negative-keyword candidates 3',
+        'Expansion candidates 4',
+        'Review 2',
+      ]);
+      expect(visibleItemCount(section)).toBe(9);
+      expect(tabCountTotal()).toBe(visibleItemCount(section));
+      // With nothing visible, the section opens on the first sub-list holding a held card.
+      expect(selectedTabName()).toBe('Block / negative-keyword candidates 3');
+
+      for (const [tab, count] of [
+        ['Block / negative-keyword candidates 3', 3],
+        ['Expansion candidates 4', 4],
+        ['Review 2', 2],
+      ] as const) {
+        fireEvent.click(screen.getByRole('tab', { name: tab }));
+        const panel = visiblePanel();
+        // The counted cards stay collapsed behind the held disclosure until it is expanded.
+        expect(within(panel).queryByText(EMPTY_GROUP_TITLE)).toBeNull();
+        expect(within(panel).queryAllByRole('article')).toHaveLength(0);
+        const toggle = within(panel).getByRole('button', {
+          name: `Held until discrepancies are resolved (${String(count)})`,
+        });
+        expect(toggle.getAttribute('aria-expanded')).toBe('false');
+        fireEvent.click(toggle);
+        expect(toggle.getAttribute('aria-expanded')).toBe('true');
+        expect(within(panel).getAllByRole('article')).toHaveLength(count);
+      }
     });
 
     it('keeps the chosen tab across a refetch and falls back to the default when its group goes', async () => {
@@ -728,7 +835,7 @@ describe('KeywordsSection', () => {
   });
 
   describe('keyword card field order', () => {
-    it('displays exactly Term, Spend, Conversions, Cost/conversion and Reason on every K1, K2 and K3 card, nothing between them, the reason once, then the campaign and ad group', async () => {
+    it('displays exactly Term, Campaign and ad group, Spend, Conversions, Cost/conversion and Reason in one list on every K1, K2 and K3 card, nothing between them, the reason once and last', async () => {
       await renderKeywords(defaultKeywords());
 
       const cards: readonly (readonly [string, number, string, readonly string[]])[] = [
@@ -747,28 +854,39 @@ describe('KeywordsSection', () => {
         const card = within(visiblePanel()).getByRole('article', { name: item.action });
         const entries = keywordDetails(item.action);
 
-        // AAP 0.1.2: term → spend → conversions → cost/conversion → reason, and nothing else.
-        expect(entries.map((entry) => entry.slice(0, entry.indexOf(':')))).toEqual([
+        // AAP 0.5.5: term → campaign and ad group → spend → conversions → cost/conversion →
+        // reason, and nothing else.
+        const labels = entries.map((entry) => entry.slice(0, entry.indexOf(':')));
+        expect(labels).toEqual([
+          'Term',
+          'Campaign and ad group',
+          'Spend',
+          'Conversions',
+          'Cost/conversion',
+          'Reason',
+        ]);
+        // AAP 0.1.2's five keep their order around the campaign and ad group.
+        expect(labels.filter((label) => label !== 'Campaign and ad group')).toEqual([
           'Term',
           'Spend',
           'Conversions',
           'Cost/conversion',
           'Reason',
         ]);
-        // The Term entry is the term alone; the reason is the last of the five.
+        // The Term entry is the term alone, the campaign and ad group come second, and the
+        // reason is the last of the six.
         expect(entries[0]).toBe(`Term: ${term}`);
-        expect(entries[4]).toBe(`Reason: ${item.reason}`);
-        // The campaign and ad group are a separate list, never one of the five fields.
-        expect(entries.some((entry) => entry.includes('Campaign and ad group'))).toBe(false);
-        expect(listEntries(card, KEYWORD_CONTEXT_LABEL)).toEqual([CORE_CRM_CONTEXT]);
+        expect(entries[1]).toBe(CORE_CRM_ENTRY);
+        expect(entries[5]).toBe(`Reason: ${item.reason}`);
+        // One list holds all six: there is no separate campaign-and-ad-group list.
+        expectOneDetailsList(card);
         // The reason is printed once, as the last field, and no reason line precedes the fields.
         expect(occurrences(card, item.reason)).toBe(1);
-        // As displayed: the five in order with nothing between them, then the context, then the
-        // rule's extras, all before the evidence table.
-        expectDisplayedSequence(card, term, item.reason, followers);
+        // As displayed: the six in order with nothing between them, then the rule's extras, all
+        // before the evidence table.
+        expectDisplayedSequence(card, term, CORE_CRM_CAMPAIGN_AND_AD_GROUP, item.reason, followers);
         expectInOrder(
           within(card).getByRole('list', { name: KEYWORD_DETAILS_LABEL }),
-          within(card).getByRole('list', { name: KEYWORD_CONTEXT_LABEL }),
           within(card).getByRole('table', { name: 'Evidence' }),
         );
       }
@@ -791,9 +909,9 @@ describe('KeywordsSection', () => {
       ];
       await renderKeywords(keywordsWith(makeGroup({ items })));
 
-      // Cost/conversion is the fourth of the five fields, before the reason.
+      // Cost/conversion is the fifth of the six fields, before the reason.
       const costLines = cardLists(visiblePanel(), KEYWORD_DETAILS_LABEL).map(
-        (entries) => entries[3],
+        (entries) => entries[4],
       );
       expect(costLines).toEqual([
         'Cost/conversion: —',
@@ -832,10 +950,13 @@ describe('KeywordsSection', () => {
       );
 
       const reason = makeItem().reason;
+      // The second field names the unknown part, or reads "unavailable" alone when the evidence
+      // names neither the campaign nor the ad group.
       expect(cardLists(visiblePanel(), KEYWORD_DETAILS_LABEL)).toEqual([
         [
           // The term falls back to the entity name when the evidence names none.
           'Term: term 21',
+          'Campaign and ad group: Core CRM — US · unavailable',
           'Spend: unavailable',
           'Conversions: unavailable',
           'Cost/conversion: unavailable',
@@ -843,6 +964,7 @@ describe('KeywordsSection', () => {
         ],
         [
           'Term: term 22',
+          'Campaign and ad group: unavailable · CRM Software',
           'Spend: unavailable',
           'Conversions: unavailable',
           'Cost/conversion: unavailable',
@@ -850,6 +972,7 @@ describe('KeywordsSection', () => {
         ],
         [
           'Term: term 23',
+          'Campaign and ad group: unavailable',
           'Spend: unavailable',
           'Conversions: unavailable',
           'Cost/conversion: unavailable',
@@ -857,30 +980,24 @@ describe('KeywordsSection', () => {
         ],
         [
           'Term: unavailable',
+          'Campaign and ad group: unavailable',
           'Spend: unavailable',
           'Conversions: unavailable',
           'Cost/conversion: unavailable',
           'Reason: unavailable',
         ],
       ]);
-      // Each card's separate context names the unknown part, or reads "unavailable" alone when
-      // the evidence names neither the campaign nor the ad group.
-      expect(cardLists(visiblePanel(), KEYWORD_CONTEXT_LABEL)).toEqual([
-        ['Campaign and ad group: Core CRM — US · unavailable'],
-        ['Campaign and ad group: unavailable · CRM Software'],
-        ['Campaign and ad group: unavailable'],
-        ['Campaign and ad group: unavailable'],
-      ]);
       // A blank reason leaves no empty reason line on the card either: the body starts with
-      // the five fields.
+      // the six fields.
       const unnamedCard = within(visiblePanel()).getByRole('article', {
         name: 'Add as exact-match negative 24',
       });
       expect(
         unnamedCard.querySelector('.ds-card__body')?.textContent?.startsWith('Term: unavailable'),
       ).toBe(true);
-      // Missing values keep the displayed order: the five fields, then the context.
-      expectDisplayedSequence(unnamedCard, 'unavailable', 'unavailable');
+      // Missing values keep the displayed order of the six fields, in one list.
+      expectOneDetailsList(unnamedCard);
+      expectDisplayedSequence(unnamedCard, 'unavailable', 'unavailable', 'unavailable');
     });
 
     it('lists at most five adjacent terms, plain or with counts, and none when there are none', async () => {
@@ -937,5 +1054,43 @@ describe('KeywordsSection', () => {
         'Cost/conversion by half: unavailable / unavailable',
       ]);
     });
+  });
+});
+
+describe('KeywordsSection: the confirmation of a card hidden on the page', () => {
+  it("keeps a sub-list whose only card was dismissed selected, with the card's confirmation", async () => {
+    const flow = feedbackFlow();
+    mockApi(flow.handlers);
+    await renderWithProviders(<LiveSection sectionKey="keywords" component={KeywordsSection} />, {
+      path: '/actions',
+    });
+    const k1 = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.k1);
+    const card = await screen.findByRole('article', { name: k1.action });
+    const dismiss = within(card).getByRole('button', { name: 'Dismiss' });
+    dismiss.focus();
+    fireEvent.click(dismiss);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('article', { name: k1.action })).toBeNull();
+    });
+    // The Block tab stays selected; its count still leaves the hidden card out.
+    const block = screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' });
+    expect(block.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: 'Expansion candidates 1' })).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'Review 1' })).toBeDefined();
+    // Its panel shows the confirmation where the card stood, not "No items".
+    const panel = screen.getByRole('tabpanel');
+    expect(within(panel).getByText(feedbackConfirmationText('dismiss', k1))).toBeDefined();
+    expect(within(panel).queryByText(EMPTY_GROUP_TITLE)).toBeNull();
+    // The other sub-lists' cards sit in hidden panels, so focus goes to the section heading.
+    const region = screen.getByRole('region', { name: 'Keywords to adjust' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(region).getByRole('heading', { level: 2, name: 'Keywords to adjust' }),
+      );
+    });
+    expect(within(region).getByRole('list', { name: 'Not shown' }).textContent).toContain(
+      '1 hidden since this run',
+    );
   });
 });

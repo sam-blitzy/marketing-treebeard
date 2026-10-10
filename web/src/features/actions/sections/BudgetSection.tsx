@@ -9,8 +9,11 @@
  * G1 guard blocked. Withheld B-rule shortfalls ("spending days 3 of 5 required") reach the user
  * through that frame list only and are never rendered a second time here.
  *
- * Each card is a {@link RecommendationCard} at heading level 4 (below the group's `<h3>`). The
- * card already shows the reason, the evidence table (which carries B4's weekend and weekday
+ * Each card is a {@link RecommendationCard} at heading level 3, directly under the section's
+ * `<h2>`: the section's only group, "Budget changes", repeats the section's title, so the frame
+ * gives it no `<h3>` ({@link groupRepeatsSectionTitle}). A card in a group with a title of its
+ * own sits at level 4, below that group's `<h3>`, so no heading level is skipped. The card
+ * already shows the reason, the evidence table (which carries B4's weekend and weekday
  * counts and its p-value), the window chip, the flags (including `shared_budget`) and the
  * "Record decision" footer for B1, B2 and B3. This section adds the budget field set of
  * AAP 0.5.5 as the card's children, in this order:
@@ -18,13 +21,18 @@
  * 1. **Utilization beside efficiency** (AAP 0.5.4.5 "side by side"): a two-column `Grid` whose
  *    "Utilization" cell holds the window utilization ("n/a" for a lifetime or custom-period
  *    budget, as the API marks it, AAP 0.5.4.1) and a one-line summary of the spending days and
- *    the rule's predicate days against what the gate requires, and whose "Efficiency" cell holds
- *    cost per outcome against the account baseline. The grid stacks to one column below its
- *    breakpoint (design system).
- * 2. **Budget days**: a captioned table of every day count against its requirement, in API
- *    order: known-budget (or budget-active) days, spending days, the predicate days, known idle,
- *    changed-intraday and unobserved days (AAP 0.5.4.1 Evidence). A count no gate requires shows
- *    "—". Shares are the backend's metrics and are never computed here.
+ *    the rule's predicate days (B4: weekend days, then weekdays, with spend) against what the
+ *    evidence requires, and whose "Efficiency" cell holds cost per outcome against the account
+ *    baseline. The grid stacks to one column below its breakpoint (design system).
+ * 2. **Budget days**: a captioned table of every day count against its requirement, in the
+ *    order of AAP 0.5.4.1 Evidence whatever the API's metric order: known-budget (or
+ *    budget-active) days, spending days, the predicate days (capped, high-utilization or
+ *    under-utilized days; B4's weekend days, then weekdays, with spend), known idle,
+ *    changed-intraday and unobserved days. Each requirement is the API's: the rule's gate, or
+ *    for a B4 card's known-budget and spending days the budget-history minimums it carries
+ *    beside the pattern. A count nothing requires (known idle, changed-intraday, unobserved)
+ *    shows "—". Shares are the backend's metrics and are never computed here. B4's outcome
+ *    minimum appears, observed against required, as the evidence table's sample line.
  * 3. **Budget details**: outcomes, CRM Qualified Leads (only when linked), the latest effective
  *    daily budget and the proposed daily budget.
  * 4. **Shared budget members**: every member campaign with its member days (AAP 0.5.4.5 dated
@@ -73,7 +81,7 @@ import {
   unallocatedAmount,
 } from '../evidenceExtra';
 import type { Allocation, DayCount, Funding, SharedMember } from '../evidenceExtra';
-import { FieldList, SectionFrame } from './SectionFrame';
+import { FieldList, SectionFrame, groupRepeatsSectionTitle } from './SectionFrame';
 import type { FieldItem, SectionComponentProps } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
@@ -102,13 +110,17 @@ const KEYS = Object.freeze({
 } as const);
 
 /**
- * The day-count keys of the daily predicate a budget rule counts (`analysis.budget._PREDICATES`):
- * capped days (C2/B1), high-utilization days (B2) and under-utilized days (B3).
+ * The day-count keys of the predicate a budget rule counts: the daily predicates of
+ * `analysis.budget._PREDICATES`, capped days (C2/B1), high-utilization days (B2) and
+ * under-utilized days (B3), and B4's weekend days and weekdays with spend
+ * (`budget._b4_candidate`, gated on `b4.min_weekend_days` and `b4.min_weekdays`).
  */
 const PREDICATE_DAY_KEYS: ReadonlySet<string> = new Set([
   'capped_days',
   'high_utilization_days',
   'under_utilized_days',
+  'weekend_days',
+  'weekdays',
 ]);
 
 /** The rule whose card shows how its increase is funded (AAP 0.5.4.2). */
@@ -146,8 +158,9 @@ function dayRatio(count: DayCount): string {
 
 /**
  * The one-line summary of the utilization cell: the spending days and the rule's predicate days,
- * each observed against required, in API order, for example "Spending days 26 / 5 · Capped days
- * 22 / 5". `null` when the evidence has neither count.
+ * each observed against required, in {@link dayCounts} order, for example "Spending days 26 / 5 ·
+ * Capped days 22 / 5", or for B4 "Spending days 28 / 5 · Weekend days with spend 8 / 4 ·
+ * Weekdays with spend 20 / 10". `null` when the evidence has neither count.
  */
 function daySummary(counts: readonly DayCount[]): string | null {
   const parts = counts
@@ -292,9 +305,10 @@ const DAY_COLUMNS: readonly DataTableColumn<DayRow>[] = Object.freeze([
 ]);
 
 /**
- * Every day count of the card against its requirement, in API order (AAP 0.5.4.1 Evidence:
- * known-budget or budget-active, spending, predicate, idle, changed-intraday and unobserved
- * days). `null` when the evidence has no day counts.
+ * Every day count of the card against its requirement, in {@link dayCounts} order (AAP 0.5.4.1
+ * Evidence: known-budget or budget-active, spending, predicate, idle, changed-intraday and
+ * unobserved days), with "—" for a count nothing requires. `null` when the evidence has no day
+ * counts.
  */
 function BudgetDays({ counts }: { counts: readonly DayCount[] }): ReactElement | null {
   if (counts.length === 0) {
@@ -549,11 +563,13 @@ function BudgetCardDetails({ item }: { item: Item }): ReactElement {
  * The "Budget changes" section of `/actions` (AAP 0.5.5 Budget; AAP 0.5.4.5 B1–B4).
  *
  * Renders the section through {@link SectionFrame} with the withheld list titled "Patterns
- * withheld for sample size". Every item becomes a {@link RecommendationCard} at heading level 4,
- * in API rank order, whose children are the budget field set: utilization beside efficiency,
- * the "Budget days" table, the budget details, the shared-budget members, the B1 funding line
- * and the B3 allocation lines (see the module overview). Withheld patterns, findings, held cards
- * and suppression counts are the frame's.
+ * withheld for sample size". Every item becomes a {@link RecommendationCard}, in API rank order:
+ * at heading level 3 in a group whose title repeats the section's, which has no `<h3>`
+ * ({@link groupRepeatsSectionTitle}), and at level 4 below any other group's `<h3>`. Its
+ * children are the budget field set: utilization beside efficiency, the "Budget days" table,
+ * the budget details, the shared-budget members, the B1 funding line and the B3 allocation
+ * lines (see the module overview). Withheld patterns, findings, held cards and suppression
+ * counts are the frame's.
  *
  * Fetches nothing and holds no state: everything shown comes from `section`, as
  * `GET /recommendations` returned it.
@@ -574,8 +590,11 @@ export function BudgetSection({ section }: SectionComponentProps): ReactElement 
     <SectionFrame
       section={section}
       withheldTitle={WITHHELD_TITLE}
-      renderItem={(item) => (
-        <RecommendationCard item={item} headingLevel={4}>
+      renderItem={(item, group) => (
+        <RecommendationCard
+          item={item}
+          headingLevel={groupRepeatsSectionTitle(section, group) ? 3 : 4}
+        >
           <BudgetCardDetails item={item} />
         </RecommendationCard>
       )}

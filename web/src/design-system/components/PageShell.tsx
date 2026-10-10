@@ -9,7 +9,10 @@
  *    Blocks), that moves focus to the main region;
  * 2. the `<header>` (banner) landmark, holding `TopBar`;
  * 3. the body row: an optional side-navigation column, holding `SideNav`, which supplies its own
- *    `<nav>` landmark, beside the `<main>` landmark that holds the page content.
+ *    `<nav>` landmark, beside the `<main>` landmark that holds the page content. The column
+ *    stacks above main whenever main would otherwise fall below its single-column width, and
+ *    always below the `48rem` Grid breakpoint. Stacked from the breakpoint up, the column and
+ *    main both keep that single-column width, so main never narrows as the viewport widens.
  *
  * Feature code never renders raw heading elements (AAP 0.4.4). It uses the two heading slots:
  *
@@ -23,10 +26,12 @@
  * The styling lives in `PageShell.css`, whose class names are the contract this file renders,
  * and the skip link's hide-until-focused behaviour in `shared.css`. The Blitzy OS source is not
  * available, so this is a product wrapper at the last graceful-degradation step: semantic HTML
- * styled by semantic tokens, except for the frame's `100vh` minimum height, its `flex: 1 1 auto`
- * factors, the `48rem` breakpoint and the skip link's visually hidden `1px` box and `inset(50%)`
- * clip, which `../GAPS.md` lists. Binding Blitzy OS later changes only this file and its
- * stylesheet, never the feature code that uses it (AAP 0.4.5, `../GAPS.md`).
+ * styled by semantic tokens, except for the frame's `100vh` minimum height, its flex factors (1
+ * on the body row and the side navigation, 999 on main), the `999` width-switch multiplier in
+ * the side-navigation and main caps, the `48rem` breakpoint and the skip link's visually hidden
+ * `1px` box and `inset(50%)` clip, which `../GAPS.md` lists. Binding Blitzy OS later changes
+ * only this file and its stylesheet, never the feature code that uses it (AAP 0.4.5,
+ * `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -45,9 +50,9 @@ const MAIN_ID = 'ds-main';
  * Whether an optional slot was given something to render. `undefined`, `null`, booleans and the
  * empty string render nothing in React, so a slot passed `cond && <SideNav />` that evaluates to
  * `false`, `null` or `''` gets no container either: an empty side-navigation column would still
- * take its fixed track width and the body gap and push main content aside, and an empty actions
- * container would still take a gap step beside its heading. Any other value, including `0`,
- * renders and keeps its container.
+ * take its track beside main (or a line of its own above main when stacked) plus the body gap,
+ * pushing main content aside or down, and an empty actions container would still take a gap
+ * step beside its heading. Any other value, including `0`, renders and keeps its container.
  *
  * @param node the slot's content
  * @returns `true` when the slot's container should be rendered

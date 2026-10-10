@@ -1736,6 +1736,55 @@ def dismissing(ctx: AnalysisContext, items: Sequence[Candidate]) -> AnalysisCont
     return replace(ctx, feedback=feedback, cache={})
 
 
+def test_p4_a_finest_partition_day_outside_the_window_is_not_incomplete_over_it() -> None:
+    """A dated Q-G6 shortfall flags only the windows that hold one of its days.
+
+    Day at the result limit before the window: no item reads ``google.search_terms``
+    incomplete and no section gets its ``incomplete_dataset`` finding. Add a day inside the
+    window: every reader is flagged, and the flag and the finding name that day alone.
+    """
+    ctx = build("default")
+    before = (ctx.window.start - timedelta(days=1)).isoformat()
+    within = (ctx.window.start + timedelta(days=3)).isoformat()
+    excluded = with_google_freshness(
+        ctx,
+        SEARCH_TERMS,
+        completeness="incomplete",
+        reason=f"{RESULT_LIMIT} ({before}, ad group 990200000000)",
+    )
+    clear = apply_precedence(evaluate(excluded), excluded)
+    for section in SECTION_ORDER:
+        assert not incomplete_readers(clear, section, SEARCH_TERMS)
+        assert all(
+            finding.evidence["dataset"] != SEARCH_TERMS
+            for finding in incomplete_dataset_findings(clear)[section]
+        )
+
+    included = with_google_freshness(
+        ctx,
+        SEARCH_TERMS,
+        completeness="incomplete",
+        reason=f"{RESULT_LIMIT} ({before}, ad group 990200000000; {within}, ad group 5)",
+    )
+    flagged = apply_precedence(evaluate(included), included)
+    named = f"{RESULT_LIMIT} ({within}, ad group 5)"
+    readers = incomplete_readers(flagged, KEYWORDS, SEARCH_TERMS)
+    assert readers
+    assert readers == [
+        candidate
+        for candidate in of_rule(flagged, KEYWORDS)
+        if SEARCH_TERMS in candidate.required_datasets
+    ]
+    for candidate in readers:
+        message = flag_message(candidate, FLAG_INCOMPLETE)
+        assert f"{SEARCH_TERMS} ({named})" in message
+        assert before not in message
+    finding = incomplete_dataset_finding(flagged, KEYWORDS, SEARCH_TERMS)
+    assert finding.message == f"{SEARCH_TERMS} is not complete over the window: {named}"
+    assert finding.evidence["reasons"] == (named,)
+    assert finding.evidence["items"] == len(readers)
+
+
 def test_incomplete_dataset_items_drop_by_one_for_a_dismissed_reader() -> None:
     ctx = incomplete_world("search_terms")
     before = apply_precedence(evaluate(ctx), ctx)

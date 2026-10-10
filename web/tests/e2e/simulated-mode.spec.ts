@@ -813,7 +813,8 @@ async function checkKeywordsSection(region: Locator, section: Section): Promise<
   let checked = 0;
   for (const group of section.groups) {
     const title = groupTitle(group);
-    // The tab's name is its title, followed by the count of the cards it shows openly.
+    // The tab's name is its title, followed by the count of every item feedback does not hide:
+    // visible, computed from replaced data and held, as the section navigation counts them.
     const tab = tabList.getByRole('tab', {
       name: new RegExp(`^${escapeRegExp(title)}(?: \\d[\\d,]*)?$`, 'u'),
     });

@@ -20,6 +20,11 @@
  *   its row while focus stays on it. jsdom performs no sequential navigation or key activation
  *   of its own, so the helpers dispatch the key events and simulate the browser's default action
  *   (the focus move, or the native button's click) only when no handler prevented the key;
+ * - fixed column widths: a table that does not expand and whose every column has a width on the
+ *   scale carries the fixed modifier and one `col` per column after its caption, holding the
+ *   column's steps, with its headers, cells and name unchanged; without widths, with only some,
+ *   with one off the scale or on an expandable table, it renders exactly as before, with no
+ *   column group;
  * - an unnamed or column-less table renders the static "Table unavailable" state naming what is
  *   missing, and no table or region.
  */
@@ -28,7 +33,7 @@ import { createPortal } from 'react-dom';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { DataTable, type DataTableColumn } from './DataTable';
+import { DataTable, type DataTableColumn, type DataTableColumnWidth } from './DataTable';
 
 /** A white-paper row, with properties of every kind the default cell must handle. */
 interface AssetRow {
@@ -775,6 +780,141 @@ describe('DataTable', () => {
       );
       expect(document.querySelector('.ds-datatable__region--expandable')).toBeNull();
       expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
+    });
+  });
+
+  describe('fixed column widths', () => {
+    /** A width on the scale for each of the white-paper columns, in their order. */
+    const WIDTHS: readonly DataTableColumnWidth[] = [12, 7, 8, 8, 4, 6, 16];
+
+    /** The white-paper columns, each with its width from {@link WIDTHS}. */
+    const SIZED_COLUMNS: readonly DataTableColumn<AssetRow>[] = COLUMNS.map((column, index) => ({
+      ...column,
+      width: at(WIDTHS, index),
+    }));
+
+    /** The table captioned "White papers · EUR". */
+    function assetTable(): HTMLElement {
+      return screen.getByRole('table', { name: 'White papers · EUR' });
+    }
+
+    /** The tag names of a table's children, in order. */
+    function childTags(table: HTMLElement): string[] {
+      return Array.from(table.children, (child) => child.tagName);
+    }
+
+    /** The width steps every `<col>` of a table holds, in order. */
+    function colSteps(table: HTMLElement): string[] {
+      return Array.from(table.querySelectorAll<HTMLElement>('col'), (col) =>
+        col.style.getPropertyValue('--ds-datatable-col-steps'),
+      );
+    }
+
+    /** Asserts the automatic layout: the plain table class and no column group. */
+    function expectAutomaticLayout(table: HTMLElement): void {
+      expect(table.className).toBe('ds-datatable');
+      expect(table.querySelector('colgroup, col')).toBeNull();
+    }
+
+    it('keeps the automatic layout, with no column group, when no column has a width', () => {
+      renderAssets();
+
+      const table = assetTable();
+      expectAutomaticLayout(table);
+      expect(childTags(table)).toEqual(['CAPTION', 'THEAD', 'TBODY']);
+    });
+
+    it('lays the table out at fixed widths, one col per column, when every column has one', () => {
+      renderAssets({ columns: SIZED_COLUMNS });
+
+      const table = assetTable();
+      expect(table.className).toBe('ds-datatable ds-datatable--fixed');
+      // The column group follows the caption and precedes the header row, as HTML requires.
+      expect(childTags(table)).toEqual(['CAPTION', 'COLGROUP', 'THEAD', 'TBODY']);
+      const cols = Array.from(table.querySelectorAll<HTMLElement>('colgroup > col'));
+      expect(cols.map((col) => col.className)).toEqual(
+        Array.from(COLUMNS, () => 'ds-datatable__col'),
+      );
+      expect(colSteps(table)).toEqual(['12', '7', '8', '8', '4', '6', '16']);
+      // The inline style holds the component-private width property and nothing else.
+      expect(cols.every((col) => col.style.length === 1)).toBe(true);
+    });
+
+    it('keeps the headers, cells, alignment and name of the table unchanged', () => {
+      renderAssets({ columns: SIZED_COLUMNS });
+
+      const headers = screen.getAllByRole('columnheader');
+      expect(headers.map((header) => header.textContent)).toEqual(
+        COLUMNS.map((column) => column.header),
+      );
+      const ends = headers.map((header) => header.classList.contains('ds-datatable__cell--end'));
+      expect(ends).toEqual([false, true, true, true, false, false, false]);
+      expect(screen.getAllByRole('rowheader').map((cell) => cell.textContent)).toEqual([
+        'Buyer guide',
+        'State report',
+      ]);
+      expect(cellTexts(at(screen.getAllByRole('row'), 1))).toEqual([
+        'Buyer guide',
+        '€1200.00',
+        '4',
+        '2',
+        '',
+        '',
+        '',
+      ]);
+      expect(screen.getByRole('region', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable__region',
+      );
+    });
+
+    it('gives tables with the same widths the same columns, whatever their rows', () => {
+      render(
+        <>
+          <DataTable caption="First" columns={SIZED_COLUMNS} rows={ROWS} getRowKey={slugOf} />
+          <DataTable caption="Second" columns={SIZED_COLUMNS} rows={[]} getRowKey={slugOf} />
+        </>,
+      );
+
+      const first = screen.getByRole('table', { name: 'First' });
+      const second = screen.getByRole('table', { name: 'Second' });
+      expect(colSteps(second)).toEqual(colSteps(first));
+      expect(second.className).toBe('ds-datatable ds-datatable--fixed');
+      // The empty-state cell still spans every column.
+      expect(screen.getByRole('cell', { name: 'No rows' }).getAttribute('colspan')).toBe(
+        String(COLUMNS.length),
+      );
+    });
+
+    it('ignores the widths when only some columns have one', () => {
+      renderAssets({
+        columns: COLUMNS.map((column, index) =>
+          index === 0 ? { ...column, width: 12 as const } : column,
+        ),
+      });
+
+      expectAutomaticLayout(assetTable());
+    });
+
+    it('ignores the widths of an expandable table, whose toggle column has none', () => {
+      renderAssets({ columns: SIZED_COLUMNS, renderExpanded: () => 'detail' });
+
+      expectAutomaticLayout(assetTable());
+      expect(screen.getAllByRole('button')).toHaveLength(ROWS.length);
+    });
+
+    it.each([
+      ['a fraction', 7.5],
+      ['a step below the scale', 3],
+      ['a step above the scale', 17],
+      ['a numeric string', '7'],
+    ])('ignores the widths when one column has %s from an untyped caller', (_kind, width) => {
+      renderAssets({
+        columns: SIZED_COLUMNS.map((column, index) =>
+          index === 1 ? { ...column, width: width as unknown as DataTableColumnWidth } : column,
+        ),
+      });
+
+      expectAutomaticLayout(assetTable());
     });
   });
 

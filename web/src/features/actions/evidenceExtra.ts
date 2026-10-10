@@ -862,6 +862,46 @@ export function proposedDailyBudget(source: MaybeSource): Money | null {
   );
 }
 
+/** The subject a C2 "Scale" item and its B1 item both decide on: a campaign or shared budget. */
+export interface B1LinkSubject {
+  /** The subject type, `campaign` or `budget` (a Google explicitly shared budget). */
+  readonly type: string;
+  /** The subject's internal id, as a string. */
+  readonly id: string;
+}
+
+/** A C2 "Scale" item's link to its B1 item (AAP 0.5.4.4: "Scale", with a link to its B1 item). */
+export interface B1Link {
+  /** The rule of the linked item, as the backend wrote it (`B1`). */
+  readonly ruleId: string;
+  /** The linked item's decision subject, the same as the C2 item's own. */
+  readonly subject: B1LinkSubject;
+}
+
+/**
+ * Reads a C2 "Scale" item's link to its B1 item (`campaigns._c2_candidate`, `extra.b1_link` as
+ * `{rule_id, subject: {type, id}, current_daily_budget, proposed_daily_budget}`): the linked
+ * rule and the subject both items decide on, by which the run's B1 card is found. The run
+ * assigns item ids only when it persists the items, so the link names the subject, never the B1
+ * item's id. The amounts are read by {@link proposedDailyBudget}.
+ *
+ * @param source - The C2 item or its evidence.
+ * @returns The link, or `null` when `extra.b1_link` is absent (a C2 "Hold" has none) or lacks a
+ *   non-blank `rule_id`, a non-blank `subject.type` or a `subject.id` that is an integer or a
+ *   non-blank string.
+ */
+export function b1Link(source: MaybeSource): B1Link | null {
+  const link = extraRecord(readExtra(source), 'b1_link');
+  const subject = extraRecord(link, 'subject');
+  const ruleId = readString(link?.rule_id);
+  const type = readString(subject?.type);
+  const id = readId(subject?.id);
+  if (ruleId === null || type === null || id === null) {
+    return null;
+  }
+  return { ruleId, subject: { type, id } };
+}
+
 /** One member campaign of a Google shared budget (AAP 0.5.4.5). */
 export interface SharedMember {
   /** The member campaign's internal id, as a string. */
@@ -1039,21 +1079,44 @@ export function allocations(source: MaybeSource): readonly Allocation[] {
 
 /** One budget-card day count against its requirement (AAP 0.5.4.1 "Evidence"). */
 export interface DayCount {
-  /** The metric key, for example `known_days`, `spending_days` or `capped_days`. */
+  /**
+   * The metric key, for example `known_days`, `spending_days`, `capped_days`, or B4's
+   * `weekend_days` and `weekdays`.
+   */
   readonly key: string;
-  /** The backend's label, for example "Known-budget days" or "Budget-active days". */
+  /**
+   * The backend's label, for example "Known-budget days", "Budget-active days" or "Weekend days
+   * with spend".
+   */
   readonly label: string;
   /** The days observed. */
   readonly observed: number;
-  /** The days the rule's gate requires; `null` for counts no gate requires (idle, unknown). */
+  /**
+   * The days required, exactly as the API states them: the rule's gate (`extra.gate`), else the
+   * budget-history minimums a B4 card carries (`extra.budget_history.minimums`). `null` for a
+   * count nothing requires (known idle, changed-intraday and unobserved days) or whose
+   * requirement the evidence does not give as a whole number of days.
+   */
   readonly required: number | null;
 }
 
 /**
- * The day-count metrics of budget cards (`budget._history_metrics`), mapped to the gate checks
- * (`metrics.cap_constrained`, `high_utilization`, `under_utilized`) that require them. A count
- * two checks require (spending days: a minimum and a share of known-budget days; capped days:
- * a minimum and a share) shows the stricter of the two, which is the one the gate binds on.
+ * The day-count metrics of budget cards, in the order AAP 0.5.4.1 "Evidence" lists them, which is
+ * the order {@link dayCounts} returns them: known-budget (or budget-active) days, spending days,
+ * the rule's predicate days, known idle, changed-intraday and unobserved days. Each maps to the
+ * checks that require it.
+ *
+ * - B1–B3 and C2 take their counts from `budget._history_metrics` and their checks from the gate
+ *   frozen in `extra.gate` (`metrics.cap_constrained`, `high_utilization`, `under_utilized`),
+ *   whose predicate is capped, high-utilization or under-utilized days.
+ * - B4's predicate days are its weekend days and weekdays with spend (`budget._b4_candidate`),
+ *   required by B4's own gate in `extra.gate` (`b4.min_weekend_days`, `b4.min_weekdays`). Its
+ *   known-budget and spending days are required by the budget-history minimums in
+ *   `extra.budget_history.minimums` (`budget._b4_history_extra`: `budget.min_known_days`,
+ *   `budget.min_spending_days`), which use the same check keys as the gates.
+ *
+ * A count two checks require (spending days: a minimum and a share of known-budget days; capped
+ * days: a minimum and a share) shows the stricter of the two, which is the one the gate binds on.
  * Known idle, changed-intraday and unobserved days have no requirement.
  */
 const DAY_COUNT_CHECKS: ReadonlyMap<string, readonly string[]> = new Map([
@@ -1062,20 +1125,29 @@ const DAY_COUNT_CHECKS: ReadonlyMap<string, readonly string[]> = new Map([
   ['capped_days', ['capped_days', 'capped_share']],
   ['high_utilization_days', ['high_utilization_days']],
   ['under_utilized_days', ['under_utilized_days']],
+  ['weekend_days', ['weekend_days']],
+  ['weekdays', ['weekdays']],
   ['idle_days', []],
   ['changed_intraday_days', []],
   ['unobserved_days', []],
 ]);
 
-/** The stricter whole-day requirement of `checks` in `extra.gate`; `null` when none is given. */
+/**
+ * The stricter whole-day requirement of `checks`. Each check's requirement is its `required` in
+ * `gate` (`extra.gate`), or, when the gate gives that check no whole-day value, its `required`
+ * in `minimums` (`extra.budget_history.minimums`). `null` when neither source gives one for any
+ * check.
+ */
 function dayRequirement(
   gate: Record<string, unknown> | null,
+  minimums: Record<string, unknown> | null,
   checks: readonly string[],
 ): number | null {
   let required: number | null = null;
   for (const check of checks) {
-    const entry = extraRecord(gate, check);
-    const value = readInteger(entry?.required);
+    const value =
+      readInteger(extraRecord(gate, check)?.required) ??
+      readInteger(extraRecord(minimums, check)?.required);
     if (value !== null && (required === null || value > required)) {
       required = value;
     }
@@ -1084,31 +1156,43 @@ function dayRequirement(
 }
 
 /**
- * Reads a budget card's day counts (B1–B4, C2; `budget.budget_evidence`): the metrics
- * `known_days` (known-budget days, or budget-active days for a shared budget), `spending_days`,
- * the rule's predicate (`capped_days`, `high_utilization_days` or `under_utilized_days`),
- * `idle_days`, `changed_intraday_days` and `unobserved_days`, in API order, each with its
- * requirement from `extra.gate` (`{check: {observed, required}}`). Shares are the backend's
- * metrics and are not recomputed here.
+ * Reads a budget card's day counts (B1–B4, C2; `budget.budget_evidence`, `budget._b4_candidate`):
+ * the metrics `known_days` (known-budget days, or budget-active days for a shared budget),
+ * `spending_days`, the rule's predicate days (`capped_days`, `high_utilization_days` or
+ * `under_utilized_days`; for B4 `weekend_days`, then `weekdays`), `idle_days`,
+ * `changed_intraday_days` and `unobserved_days`.
+ *
+ * The counts come in that order (AAP 0.5.4.1 "Evidence"), whatever the API's metric order; two
+ * metrics with the same key keep their API order. Each count carries its requirement from
+ * `extra.gate` (`{check: {observed, required}}`), falling back, check by check, to
+ * `extra.budget_history.minimums` (same shape) where the gate gives none, so a B4 card shows its
+ * known-budget and spending days against the budget-history minimums. Every requirement is the
+ * API's, never a client constant. Shares are the backend's metrics and are not recomputed here.
+ * B4's outcome gate (`extra.gate.outcomes`) is not a day count: the card's sample line
+ * (`evidence.sample`, total outcomes against `b4.min_outcomes`) shows it.
  *
  * @param source - The budget item or its evidence.
  * @returns The counts; `[]` for an item without budget history.
  */
 export function dayCounts(source: MaybeSource): readonly DayCount[] {
-  const gate = extraRecord(readExtra(source), 'gate');
+  const extra = readExtra(source);
+  const gate = extraRecord(extra, 'gate');
+  const minimums = extraRecord(extraRecord(extra, 'budget_history'), 'minimums');
+  const metrics = metricsOf(source);
   const counts: DayCount[] = [];
-  for (const metric of metricsOf(source)) {
-    const checks = DAY_COUNT_CHECKS.get(metric.key);
-    const observed = readInteger(metric.value);
-    if (checks === undefined || observed === null) {
-      continue;
+  for (const [key, checks] of DAY_COUNT_CHECKS) {
+    for (const metric of metrics) {
+      const observed = metric.key === key ? readInteger(metric.value) : null;
+      if (observed === null) {
+        continue;
+      }
+      counts.push({
+        key,
+        label: metric.label,
+        observed,
+        required: dayRequirement(gate, minimums, checks),
+      });
     }
-    counts.push({
-      key: metric.key,
-      label: metric.label,
-      observed,
-      required: dayRequirement(gate, checks),
-    });
   }
   return counts;
 }

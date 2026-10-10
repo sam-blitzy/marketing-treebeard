@@ -8,26 +8,30 @@
  *
  * 1. **Sub-lists as tabs.** The API's groups (`block`, `expand`, `review`: K1, K2 and K3) become
  *    one design-system `Tabs` named "Keyword actions", one tab per group in API order. Each tab
- *    is labelled with the API's group title and counts the cards its panel shows openly: the
- *    visible ones and those computed from replaced data, not the held ones collapsed behind
- *    their disclosure. Every tab the API returns is shown, an empty one included, whose panel
- *    says "No items".
+ *    is labelled with the API's group title and counts every card its panel holds: the visible
+ *    ones, those computed from replaced data and the held ones collapsed behind their "Held
+ *    until discrepancies are resolved" disclosure; only items hidden by feedback are left out.
+ *    That is the rule the section's navigation count follows, so the tab counts add up to it.
+ *    Every tab the API returns is shown, an empty one included, whose panel says "No items",
+ *    unless it holds the confirmation of a card a feedback recorded on this page has hidden,
+ *    which stays in the card's place.
  * 2. **Keyword cards.** Each item is a {@link RecommendationCard} whose body reads, in order:
- *    - **The five fields.** The "Keyword details" list holds exactly five fields, in the user's
- *      order (AAP 0.1.2 "Each item shows: term, spend, conversions, cost/conversion, and the
- *      specific reason it's flagged"): Term, Spend, Conversions, Cost/conversion and Reason.
- *      Nothing is interposed between them: the Term entry is the term alone.
- *    - **The campaign and ad group.** A separate "Keyword context" list follows the five fields
- *      with one entry, "Campaign and ad group: {campaign} · {ad group}" (AAP 0.5.4.3, 0.5.5),
- *      so the card keeps the term's context without breaking the user's order.
+ *    - **The six fields.** The "Keyword details" list holds exactly six fields, in the keyword
+ *      field set's order (AAP 0.5.5 "Keywords: term, campaign and ad group, spend, conversions,
+ *      cost/conversion, reason"; AAP 0.5.4.3): Term, Campaign and ad group, Spend, Conversions,
+ *      Cost/conversion and Reason. The Term entry is the term alone, and the Campaign and ad
+ *      group entry reads "{campaign} · {ad group}". Without that second entry the list is the
+ *      user's five, in their order (AAP 0.1.2 "Each item shows: term, spend, conversions,
+ *      cost/conversion, and the specific reason it's flagged").
  *    - **Rule extras.** K2 expansion cards add up to five adjacent terms, "from your
  *      search-term report"; K3 review cards add the quality score first → last and CPC and
- *      cost/conversion by half. Both come after the context, before the card's evidence table.
+ *      cost/conversion by half. Both come after the six fields, before the card's evidence
+ *      table.
  *
- *    Within the five fields:
+ *    Within the six fields:
  *    - The Reason entry is the API's reason sentence. The card is told the fields carry it
  *      (`reasonPlacement="fields"`), so it prints no reason line of its own and the reason
- *      appears once, last of the five.
+ *      appears once, last of the six.
  *    - Cost/conversion reads "—" at a known 0 conversions (AAP 0.5.4.3).
  *    - Fractional conversions (data-driven attribution) are shown as returned, never rounded
  *      to 0.
@@ -72,14 +76,11 @@ import type { FieldItem, GroupParts, SectionComponentProps } from './SectionFram
 /** The accessible name of the tab list that switches between the keyword sub-lists. */
 export const KEYWORD_TABS_LABEL = 'Keyword actions';
 
-/** The accessible name of every keyword card's field list (term, spend, conversions, …). */
-export const KEYWORD_DETAILS_LABEL = 'Keyword details';
-
 /**
- * The accessible name of every keyword card's context list, which follows the five fields and
- * names the term's campaign and ad group.
+ * The accessible name of every keyword card's field list (term, campaign and ad group, spend,
+ * conversions, cost/conversion, reason).
  */
-export const KEYWORD_CONTEXT_LABEL = 'Keyword context';
+export const KEYWORD_DETAILS_LABEL = 'Keyword details';
 
 /**
  * The visible title, and the accessible name, of a K2 card's adjacent terms. They are derived
@@ -94,7 +95,7 @@ export const REVIEW_EVIDENCE_LABEL = 'Review evidence';
 /** The title of the empty state a tab shows when its group has no card to show. */
 export const EMPTY_GROUP_TITLE = 'No items';
 
-/** The label of the context list's one entry, which names the term's campaign and ad group. */
+/** The label of a keyword card's second field: the term's campaign and ad group. */
 const CAMPAIGN_AND_AD_GROUP_LABEL = 'Campaign and ad group';
 
 /** The separator between the campaign and ad group names: "Core CRM — US · CRM Software". */
@@ -184,10 +185,12 @@ function reasonText(item: Item): string | null {
 }
 
 /**
- * The five fields every keyword card lists, in the user's order (AAP 0.1.2, FR-4): the search
- * term (K1, K2) or keyword text (K3), spend, conversions, cost/conversion and the reason. The
- * Term entry holds the term alone, "unavailable" when nothing names it; the campaign and ad
- * group are listed after the five ({@link keywordContextFields}).
+ * The six fields every keyword card lists, in the keyword field set's order (AAP 0.5.5, AAP
+ * 0.5.4.3, FR-4): the search term (K1, K2) or keyword text (K3), the campaign and ad group,
+ * spend, conversions, cost/conversion and the reason. The Term entry holds the term alone,
+ * "unavailable" when nothing names it; the Campaign and ad group entry reads
+ * "{campaign} · {ad group}", a missing name reading "unavailable". The other five keep the
+ * user's order (AAP 0.1.2: term, spend, conversions, cost/conversion, reason).
  *
  * @param fields - the item's keyword fields
  * @param item - the K1, K2 or K3 item, whose reason sentence is the last field
@@ -196,27 +199,15 @@ function reasonText(item: Item): string | null {
 function keywordDetailFields(fields: KeywordFields, item: Item): FieldItem[] {
   return [
     { key: 'term', label: 'Term', value: textOr(fields.term, UNAVAILABLE) },
-    { key: 'spend', label: 'Spend', value: metricText(fields.spend) },
-    { key: 'conversions', label: 'Conversions', value: metricText(fields.conversions) },
-    { key: 'cost_per_conversion', label: 'Cost/conversion', value: costPerConversionText(fields) },
-    { key: 'reason', label: 'Reason', value: reasonText(item) },
-  ];
-}
-
-/**
- * The context every keyword card lists after its five fields (AAP 0.5.4.3, 0.5.5): one entry,
- * "Campaign and ad group: {campaign} · {ad group}", where a missing name reads "unavailable".
- *
- * @param fields - the item's keyword fields
- * @returns the one context field
- */
-function keywordContextFields(fields: KeywordFields): FieldItem[] {
-  return [
     {
       key: 'campaign_and_ad_group',
       label: CAMPAIGN_AND_AD_GROUP_LABEL,
       value: campaignAndAdGroupText(fields),
     },
+    { key: 'spend', label: 'Spend', value: metricText(fields.spend) },
+    { key: 'conversions', label: 'Conversions', value: metricText(fields.conversions) },
+    { key: 'cost_per_conversion', label: 'Cost/conversion', value: costPerConversionText(fields) },
+    { key: 'reason', label: 'Reason', value: reasonText(item) },
   ];
 }
 
@@ -324,13 +315,11 @@ interface KeywordCardProps {
  *
  * - The headline is an `<h3>`: inside the tabs there is no group heading, so the card sits
  *   directly below the section's `<h2>`.
- * - The "Keyword details" list holds the five fields in the user's order (term, spend,
- *   conversions, cost/conversion, reason) and nothing else. The reason is the list's last
- *   entry, so the card is passed `reasonPlacement="fields"` and prints no reason line of its
- *   own above the list.
- * - The "Keyword context" list follows the five fields, as separate context: the term's
- *   campaign and ad group.
- * - K2 adjacent terms and K3 review evidence follow the context, before the card's evidence
+ * - The "Keyword details" list holds the six fields in the keyword field set's order (AAP
+ *   0.5.5: term, campaign and ad group, spend, conversions, cost/conversion, reason) and
+ *   nothing else. The reason is the list's last entry, so the card is passed
+ *   `reasonPlacement="fields"` and prints no reason line of its own above the list.
+ * - K2 adjacent terms and K3 review evidence follow the six fields, before the card's evidence
  *   table.
  * - `breakLongWords` lets long search terms, keyword texts and campaign names wrap inside the
  *   card instead of widening it (WCAG 2.2 SC 1.4.10 Reflow).
@@ -343,7 +332,6 @@ function KeywordCard({ item }: KeywordCardProps): ReactElement {
     <RecommendationCard item={item} headingLevel={3} reasonPlacement="fields">
       <Stack gap={3} breakLongWords>
         <FieldList label={KEYWORD_DETAILS_LABEL} fields={keywordDetailFields(fields, item)} />
-        <FieldList label={KEYWORD_CONTEXT_LABEL} fields={keywordContextFields(fields)} />
         {item.rule_id === EXPANSION_RULE_ID ? <AdjacentTermsList item={item} /> : null}
         {item.rule_id === REVIEW_RULE_ID ? (
           <FieldList label={REVIEW_EVIDENCE_LABEL} fields={reviewEvidenceFields(item)} />
@@ -365,15 +353,32 @@ function renderKeywordCard(item: Item): ReactNode {
 // Tabs
 // ---------------------------------------------------------------------------------------------
 
-/** Whether a group has a card to show: at least one visible, historical or held item. */
+/**
+ * How many cards a group's panel holds: every item feedback does not hide, whether visible,
+ * computed from replaced data or held behind the disclosure. It is the per-group share of the
+ * section's navigation count (`visibleItemCount` in `../SectionNav`), so the tabs add up to it.
+ * A confirmation is never counted: its hidden item is counted as hidden.
+ */
+function shownItemCount(parts: GroupParts): number {
+  return parts.visible.length + parts.historical.length + parts.held.length;
+}
+
+/**
+ * Whether a group has something to show: at least one visible, historical or held item (a
+ * {@link shownItemCount} above 0), or the confirmation of an item a feedback recorded on this
+ * page has hidden, which the tab shows in place of its "No items" state while the run still
+ * lists the item.
+ */
 function hasShownItems(parts: GroupParts): boolean {
-  return parts.visible.length > 0 || parts.historical.length > 0 || parts.held.length > 0;
+  return shownItemCount(parts) > 0 || parts.placed.confirmed > 0;
 }
 
 /**
  * The tab selected until the user picks one: the first group, in API order, with a visible
- * card, else the first with a card computed from replaced data, else the first with a held
- * card, else the first group.
+ * card or a confirmation, else the first with a card computed from replaced data, else the
+ * first with a held card, else the first group. A tab whose last visible card the user has just
+ * dismissed, snoozed or marked done therefore stays selected with its confirmation, rather than
+ * the selection jumping to another sub-list.
  *
  * The design-system `Tabs` would otherwise always open on the first tab. Opening on the first
  * sub-list with something to act on keeps a section whose Block list is empty from greeting
@@ -385,7 +390,7 @@ function hasShownItems(parts: GroupParts): boolean {
  */
 function defaultTabKey(parts: readonly GroupParts[]): string | undefined {
   const first =
-    parts.find((part) => part.visible.length > 0) ??
+    parts.find((part) => part.visible.length > 0 || part.placed.confirmed > 0) ??
     parts.find((part) => part.historical.length > 0) ??
     parts.find((part) => part.held.length > 0) ??
     parts[0];
@@ -393,11 +398,13 @@ function defaultTabKey(parts: readonly GroupParts[]): string | undefined {
 }
 
 /**
- * One group as a tab: the API's key and title, the count of the cards its panel shows openly
- * (visible and computed from replaced data; held cards sit collapsed and are not counted), and
- * as its panel either the frame's default body (visible cards, the cards computed from replaced
- * data, then the held disclosure) or, for a group with nothing to show, an empty state that
- * says so.
+ * One group as a tab: the API's key and title, the count of every card its panel holds
+ * ({@link shownItemCount}: visible, computed from replaced data and held, so a group whose
+ * items are all held counts them rather than reading 0), and as its panel either the frame's
+ * default body (visible cards, the cards computed from replaced data, then the held disclosure,
+ * collapsed, each card a feedback recorded on this page has hidden leaving its confirmation in
+ * its place) or, for a group with nothing to show, an empty state that says so. The count
+ * never includes a confirmation: the hidden item is counted as hidden.
  *
  * The group's anchor id is the id of the tab's panel element, which `Tabs` always renders, so
  * `#group-keywords-{key}` resolves to the element that holds the group even while a tab never
@@ -413,8 +420,13 @@ function groupTab(parts: GroupParts): TabItem {
   ) : (
     <EmptyState title={EMPTY_GROUP_TITLE}>{`No ${title} actions in this window`}</EmptyState>
   );
-  const count = parts.visible.length + parts.historical.length;
-  return { key: parts.group.key, label: title, count, content, id: parts.anchorId };
+  return {
+    key: parts.group.key,
+    label: title,
+    count: shownItemCount(parts),
+    content,
+    id: parts.anchorId,
+  };
 }
 
 /**

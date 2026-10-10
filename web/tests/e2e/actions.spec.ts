@@ -3140,7 +3140,8 @@ test.describe('actions page', () => {
       'each section is titled as the API titles it',
     ).toEqual(recommendations.sections.map((section) => section.title.trim()));
     for (const section of recommendations.sections) {
-      // Scoped by id: a group inside a section may carry the section's own title.
+      // Scoped by id: the region named by the title must be the section itself. A group whose
+      // title repeats its section's renders no region of its own, so this region is unique.
       await expect(
         page
           .getByRole('region', { name: section.title.trim(), exact: true })

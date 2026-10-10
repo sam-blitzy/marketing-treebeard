@@ -56,7 +56,7 @@ export type { BannerProps } from './components/Banner';
 
 // Evidence and white-paper tables. GAP: bind to Blitzy OS on source arrival.
 export { DataTable } from './components/DataTable';
-export type { DataTableColumn, DataTableProps } from './components/DataTable';
+export type { DataTableColumn, DataTableColumnWidth, DataTableProps } from './components/DataTable';
 
 // Section navigation. GAP: bind to Blitzy OS on source arrival.
 export { SideNav } from './components/SideNav';

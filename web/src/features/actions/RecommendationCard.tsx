@@ -26,8 +26,8 @@
  *    - the reason sentence, then the section-specific fields the caller passes as `children`.
  *      A section whose own fields list the reason in a fixed position passes
  *      `reasonPlacement="fields"`, and the card prints no reason line of its own, so the reason
- *      appears once: the keyword cards, whose five fields end with it (AAP 0.1.2: term, spend,
- *      conversions, cost/conversion, reason);
+ *      appears once: the keyword cards, whose six fields end with it (AAP 0.5.5: term,
+ *      campaign and ad group, spend, conversions, cost/conversion, reason);
  *    - the {@link EvidenceTable}, the window chip "{start} – {end} · {N} days · {source
  *      boundaries}" and the flags row ({@link FlagList}: recorded plus current flags).
  * 3. **Footer** (`Card.Footer`):
@@ -52,7 +52,9 @@
  * A recorded feedback can remove its own card: the refetched item carries `current.hidden_by`
  * and its section drops it. The outcome is therefore announced in the polite region of an
  * {@link ActionOutcomeProvider} above the cards, which outlives them (WCAG 2.2 SC 4.1.3), and
- * keyboard focus, which the disabled or removed button lost, moves to the next card's first
+ * recorded there under the item's recommendation identity, so the section shows the same
+ * confirmation ("Dismissed: {action} ({entity})") where the card stood (`./ActionOutcomes`).
+ * Keyboard focus, which the disabled or removed button lost, moves to the next card's first
  * enabled action, else the previous card's, else the section heading (WCAG 2.2 SC 2.4.3).
  *
  * Every text on the card (action, headline metric label, reason, flag messages, held reason,
@@ -65,20 +67,13 @@
  *
  * @packageDocumentation
  */
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { isApiError, useFeedback } from '../../api/queries';
 import type {
   DataStatus,
+  Decision,
   DecisionSubjectRef,
   EntityView,
   FeedbackKind,
@@ -89,6 +84,8 @@ import { Badge, Banner, Button, Card, Dialog, Inline, Stack } from '../../design
 import type { CardHeaderProps } from '../../design-system';
 import { formatMetric, formatWindowChip, sourceLabel } from '../../lib/format';
 import { DecisionForm } from '../decisions/DecisionForm';
+import { describeExpectedState } from '../decisions/DecisionLog';
+import { useActionOutcome, useRecordFeedbackConfirmation } from './ActionOutcomes';
 import { BlockingDiscrepancyLinks } from './BlockingDiscrepancies';
 import { EvidenceTable } from './EvidenceTable';
 import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
@@ -131,7 +128,11 @@ export const FEEDBACK_STATUS_MESSAGES: Readonly<Record<FeedbackKind, string>> = 
 /** The footer action, and the dialog title, that records a decision (AAP 0.5.5). */
 export const RECORD_DECISION_LABEL = 'Record decision';
 
-/** The status line a card shows after its decision form saved a decision. */
+/**
+ * The status a card shows after its decision form saved a decision. The card's line follows it
+ * with the expected state the decision recorded, "Decision recorded: Active · daily budget
+ * $160.00" ({@link decisionRecordedLine}).
+ */
 export const DECISION_RECORDED_MESSAGE = 'Decision recorded';
 
 /**
@@ -164,6 +165,12 @@ const FEEDBACK_ERROR_FALLBACK = 'The action could not be recorded. Try again.';
 
 /** The separator between the entity name and its source on the header's entity line. */
 const META_SEPARATOR = ' · ';
+
+/** The entity type of a CR1 card: two creatives compared, named "{variant} vs {variant}". */
+const CREATIVE_PAIR_TYPE = 'creative_pair';
+
+/** The separator between the variant names of a creative pair's entity name. */
+const PAIR_NAME_SEPARATOR = ' vs ';
 
 // ---------------------------------------------------------------------------------------------
 // Text helpers
@@ -293,9 +300,41 @@ function isRetiredError(error: unknown): boolean {
 }
 
 /**
+ * Whether an action already states its entity's name, so a confirmation need not repeat it: the
+ * action contains the name, compared case-sensitively, or, on a creative pair, every variant
+ * the name lists. A CR1 action names the observed leader first ("B vs A: B ahead, …") while
+ * the pair's name keeps the pair's own order ("A vs B"), so either order states the pair.
+ *
+ * @param action - the item's trimmed action
+ * @param name - the entity's trimmed name
+ * @param entityType - the entity's type, `creative_pair` on a CR1 card
+ * @returns `true` when the action states the name
+ */
+function actionStatesName(action: string, name: string, entityType: string | null): boolean {
+  if (action.includes(name)) {
+    return true;
+  }
+  if (entityType !== CREATIVE_PAIR_TYPE) {
+    return false;
+  }
+  const variants = name
+    .split(PAIR_NAME_SEPARATOR)
+    .map((variant) => variant.trim())
+    .filter((variant) => variant !== '');
+  return variants.length > 1 && variants.every((variant) => action.includes(variant));
+}
+
+/**
  * The confirmation an outcome announces, naming the card it belongs to, because that card may
  * be gone by the time it is read: "{status}: {action} ({entity name})", for example
  * "Dismissed: Pause (Generic CRM — US)". A part the item does not carry is left out.
+ *
+ * The " ({entity name})" suffix is also left out when the action already states the entity's
+ * name ({@link actionStatesName}, both trimmed), because the message then names the card once:
+ * a CR1 action begins with its variant pair, which is the entity's name, so its confirmation
+ * reads "Marked done: Variant A vs Variant B: Variant A ahead, …", not the pair twice. An
+ * action that does not state the name keeps the suffix, for example "Marked done: Add as
+ * phrase-match keyword in CRM Software (crm for small business)".
  *
  * @param status - the outcome, for example `FEEDBACK_STATUS_MESSAGES.dismiss` or
  *   {@link DECISION_RECORDED_MESSAGE}
@@ -308,7 +347,48 @@ function outcomeMessage(status: string, item: Item): string {
   if (action === null) {
     return name === null ? status : `${status}: ${name}`;
   }
-  return name === null ? `${status}: ${action}` : `${status}: ${action} (${name})`;
+  return name === null || actionStatesName(action, name, item.entity.type)
+    ? `${status}: ${action}`
+    : `${status}: ${action} (${name})`;
+}
+
+/**
+ * The card's status line once its decision form saved `decision`: "Decision recorded: {state}",
+ * where the state is what the decision recorded, the complete expected state the server
+ * materialised from the patch, worded as the decision log's "Resulting expected state" cell
+ * ({@link describeExpectedState}): for example "Decision recorded: Active · daily budget
+ * $160.00" after Active and 160 were recorded on a C1 card, never the recommendation's own
+ * action. Amounts are in the subject's currency.
+ *
+ * @param decision - the saved decision, the `POST /decisions` response the form reported, or
+ *   `null` when it reported none
+ * @returns the line; "Decision recorded" alone without a decision
+ */
+function decisionRecordedLine(decision: Decision | null): string {
+  return decision === null
+    ? DECISION_RECORDED_MESSAGE
+    : `${DECISION_RECORDED_MESSAGE}: ${describeExpectedState(decision)}`;
+}
+
+/**
+ * The confirmation a saved decision announces: its {@link decisionRecordedLine} naming the
+ * card's entity, because the card may be scrolled away when it is read, for example "Decision
+ * recorded: Active · daily budget $160.00 (Competitor - Conquest)". The entity is left out when
+ * the item carries no name. Unlike {@link outcomeMessage}'s action, the state line never states
+ * the entity's name, so the name follows it whenever the item carries one.
+ *
+ * @param decision - the saved decision, or `null` when the form reported none, which announces
+ *   {@link outcomeMessage} of {@link DECISION_RECORDED_MESSAGE}
+ * @param item - the item the decision was recorded from
+ * @returns the message for {@link ActionOutcomeProvider}'s region
+ */
+function decisionRecordedMessage(decision: Decision | null, item: Item): string {
+  if (decision === null) {
+    return outcomeMessage(DECISION_RECORDED_MESSAGE, item);
+  }
+  const line = decisionRecordedLine(decision);
+  const name = textOrNull(item.entity.name);
+  return name === null ? line : `${line} (${name})`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -316,104 +396,12 @@ function outcomeMessage(status: string, item: Item): string {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Announces one outcome in the polite region of the nearest {@link ActionOutcomeProvider}.
- * Blank text is ignored.
- *
- * @param message - the confirmation, for example "Marked done: Add "crm demo" as exact-match
- *   negative (Generic CRM — US)"
+ * The polite outcome region and the feedback confirmations the card reports to, defined in
+ * `./ActionOutcomes` so the sections can read the confirmations without importing this module,
+ * and re-exported here for the card's callers.
  */
-export type AnnounceActionOutcome = (message: string) => void;
-
-/** The announcer of the nearest {@link ActionOutcomeProvider}; `null` outside one. */
-const ActionOutcomeContext = createContext<AnnounceActionOutcome | null>(null);
-
-/** The latest announced outcome. */
-interface ActionOutcome {
-  /** The text announced. */
-  message: string;
-  /** Increases with every announcement, so each one renders as a new node. */
-  sequence: number;
-}
-
-/** Props of {@link ActionOutcomeProvider}. */
-export interface ActionOutcomeProviderProps {
-  /** The content whose card actions announce their outcomes here: on `/actions`, the sections. */
-  children?: ReactNode;
-}
-
-/**
- * A polite live region for the outcomes of the card actions inside it (WCAG 2.2 SC 4.1.3),
- * placed above those cards so that it outlives every one of them.
- *
- * A recorded feedback can unmount the card that recorded it: the refetched recommendations
- * carry `current.hidden_by`, and the section drops the item. A status line inside that card
- * would leave with it, unread. Every {@link RecommendationActions} inside this provider
- * therefore announces "Marked done", "Dismissed", "Snoozed" or "Decision recorded", with the
- * action and the entity name, here; its own status line stays visible but is no second live
- * region, so nothing is announced twice.
- *
- * The region is a `<div role="status">` rendered before the children from the first render, so
- * every message lands in a region that already exists. It is never `role="alert"`, which
- * AAP 0.5.5 reserves for the discrepancy banner. It stays empty until the first outcome, and a
- * `Stack` takes an empty status child out of its column, so it adds no space until then. Each
- * message is a new child node, so the same text twice in a row (two cards dismissed with the
- * same action on the same entity) is announced twice. The latest message stays until the next
- * one replaces it.
- *
- * The provider renders no element around its children: place it among the children of a
- * `Stack`, where the region and the children each take the column's gap.
- *
- * @param props - see {@link ActionOutcomeProviderProps}
- * @returns the live region, followed by the children
- *
- * @example
- * ```tsx
- * <Stack gap={6}>
- *   <SectionNav sections={sections} />
- *   <ActionOutcomeProvider>
- *     <KeywordsSection section={keywords} run={run} overlay={overlay} />
- *     <BudgetSection section={budget} run={run} overlay={overlay} />
- *   </ActionOutcomeProvider>
- * </Stack>
- * ```
- */
-export function ActionOutcomeProvider({ children }: ActionOutcomeProviderProps): ReactElement {
-  const [outcome, setOutcome] = useState<ActionOutcome | null>(null);
-  // Stable for the provider's lifetime, so a card may call the announcer it captured from a
-  // request that settles after the card itself has unmounted.
-  const announce = useCallback<AnnounceActionOutcome>((message) => {
-    const text = message.trim();
-    if (text === '') {
-      return;
-    }
-    setOutcome((previous) => ({ message: text, sequence: (previous?.sequence ?? 0) + 1 }));
-  }, []);
-  return (
-    <ActionOutcomeContext value={announce}>
-      <div role="status">
-        {outcome === null ? null : <span key={outcome.sequence}>{outcome.message}</span>}
-      </div>
-      {children}
-    </ActionOutcomeContext>
-  );
-}
-
-/**
- * The announcer of the nearest {@link ActionOutcomeProvider}, which {@link RecommendationActions}
- * uses to confirm its outcomes outside the card.
- *
- * @returns the announcer, or `null` outside a provider, where each card keeps its own polite
- *   status line
- *
- * @example
- * ```tsx
- * const announce = useActionOutcome();
- * announce?.('Dismissed: Pause (Generic CRM — US)');
- * ```
- */
-export function useActionOutcome(): AnnounceActionOutcome | null {
-  return useContext(ActionOutcomeContext);
-}
+export { ActionOutcomeProvider, useActionOutcome } from './ActionOutcomes';
+export type { ActionOutcomeProviderProps, AnnounceActionOutcome } from './ActionOutcomes';
 
 // ---------------------------------------------------------------------------------------------
 // Focus recovery after a recorded feedback
@@ -661,8 +649,10 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   dialog can be closed while the save runs (Cancel, Close, Escape or the backdrop); until the
  *   save settles, every action stays disabled and "Record decision" shows its loading state, so
  *   the dialog cannot be reopened and no second decision can be posted, and with the dialog
- *   closed the card's status line reads "Saving decision". A save that ends after its dialog
- *   was closed is still reported: a success as "Decision recorded", a failure in the warning
+ *   closed the card's status line reads "Saving decision". Every success, also one that ends
+ *   after its dialog was closed, is reported by the status line "Decision recorded: {state}",
+ *   the expected state the saved decision holds as the decision log words it, for example
+ *   "Decision recorded: Active · daily budget $160.00"; a failure shows in the warning
  *   `Banner`. The closed dialog returns focus to "Record decision", which stays focusable while
  *   it loads; once the save settles, focus that has been lost goes back to it when nothing else
  *   has taken it.
@@ -678,14 +668,19 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * same way, including after the dialog closes, while the recommendation the refused request
  * submitted (the feedback's item at the click, the id the form posted) is the item shown. While
  * a feedback request is pending, its button shows the loading state and every action is
- * disabled; once it succeeds, the actions stay disabled and a status line ("Marked done",
+ * disabled, and from the press itself, before that state renders, no further feedback starts
+ * and "Record decision" opens nothing, so a double click posts once; a failed feedback frees
+ * the actions again. Once it succeeds, the actions stay disabled and a status line ("Marked done",
  * "Dismissed", "Snoozed") stands until the refetched recommendations hide the item. Inside an
  * {@link ActionOutcomeProvider} that outcome, and a recorded decision, is announced in the
- * provider's region, which outlives the card, instead of in the card's own line. Keyboard
- * focus, which the pressed button keeps while its request runs and after it is disabled, or
- * which is lost with a removed card, then moves to the next card's first enabled
- * action, else the previous card's, else the enclosing section's heading, else `<main>`, unless
- * the user has moved it elsewhere (WCAG 2.2 SC 2.4.3). Every refused action, of a feedback or
+ * provider's region, which outlives the card, instead of in the card's own line; a recorded
+ * feedback is also recorded there under the item's recommendation identity
+ * ({@link itemIdentity}), so its section shows the same confirmation in the item's place once
+ * the refetched recommendations hide it. Keyboard focus, which the pressed button keeps while
+ * its request runs and after it is disabled, or which is lost with a removed card, then moves
+ * to the next card's first enabled action, else the previous card's, else the enclosing
+ * section's heading, else `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3).
+ * Every refused action, of a feedback or
  * of a decision save, shows its explanation in a warning `Banner` until the next action starts:
  * {@link HISTORICAL_LABEL} for every 409 `subject_retired`, whether or not it locked the item
  * shown; for any other failure (the form's `onFailed`), the API's message, or a generic text
@@ -741,12 +736,16 @@ export function RecommendationActions(props: RecommendationActionsProps): ReactE
 function RecommendationActionsBody({ item, decisionContext }: RecommendationActionsProps) {
   const feedback = useFeedback();
   const announce = useActionOutcome();
+  const recordConfirmation = useRecordFeedbackConfirmation();
   const [retired, setRetired] = useState(false);
   const [recorded, setRecorded] = useState<FeedbackKind | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
   const dialogOpen = dialog.open;
   const [decisionSaved, setDecisionSaved] = useState(false);
+  // The decision the latest save recorded, which the status line states while `decisionSaved`
+  // holds; `null` when the form reported none.
+  const [savedDecision, setSavedDecision] = useState<Decision | null>(null);
   // Whether a decision save is running. The form reports it even once its dialog was closed,
   // so the card keeps every action disabled until the save settles: a reopened dialog would
   // start a fresh form, and with it a second, overlapping save.
@@ -760,6 +759,12 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   // while the recommendation its request submitted is still the item shown
   // ({@link learnRetirement}).
   const shownIdRef = useRef(item.id);
+  // Whether a feedback has been sent and not failed, set synchronously on the press. The
+  // rendered `disabled` state cannot stop a second press before React renders again (a double
+  // click, or `click(); click();` from a script): TanStack Query reports the mutation pending
+  // only from a timer after the press. Only a failure clears it; a success keeps it, as
+  // `recorded` ends the card's actions for good.
+  const feedbackSentRef = useRef(false);
   // Set when an open dialog's item lost its decision subject; consumed by the first commit
   // after it.
   const [refocusRow, setRefocusRow] = useState(false);
@@ -862,9 +867,10 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   const actionsDisabled = locked || pending || recorded !== null || decisionPending;
 
   const sendFeedback = (kind: FeedbackKind) => {
-    if (actionsDisabled) {
+    if (actionsDisabled || feedbackSentRef.current) {
       return;
     }
+    feedbackSentRef.current = true;
     setErrorText(null);
     setDecisionSaved(false);
     // Captured on the click, while this card and its neighbours are on the page: a success can
@@ -876,7 +882,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     void feedback.mutateAsync({ recommendationId: item.id, body: { kind } }).then(
       () => {
         setRecorded(kind);
-        announce?.(outcomeMessage(FEEDBACK_STATUS_MESSAGES[kind], item));
+        const confirmation = outcomeMessage(FEEDBACK_STATUS_MESSAGES[kind], item);
+        announce?.(confirmation);
+        // Recorded before the refetched page commits, so the section that drops the hidden
+        // item shows this confirmation in its place from that commit on.
+        recordConfirmation?.(itemIdentity(item), confirmation);
         if (origin !== null) {
           // This continuation runs before React commits the refetched page, because TanStack
           // Query notifies its observers from a zero-delay timer scheduled before it. A timer
@@ -887,6 +897,10 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         }
       },
       (error: unknown) => {
+        // Nothing was recorded, so the actions may be pressed again: a retirement that locks
+        // the item shown disables them through `locked`, and one learned on an item a newer
+        // run has replaced since leaves the item shown free to try again.
+        feedbackSentRef.current = false;
         // `item` is the item shown on the click, the one the request was sent for.
         if (isRetiredError(error)) {
           learnRetirement(item.id);
@@ -945,12 +959,15 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
           prefill={context.prefill}
           members={context.members}
           currency={context.currency}
-          onDone={() => {
+          onDone={(decision) => {
             setDialog((current) =>
               current.session === formSession ? closeDialogSession(current) : current,
             );
+            // The saved decision states what was recorded, on the card and in the announcement.
+            const saved = decision ?? null;
+            setSavedDecision(saved);
             setDecisionSaved(true);
-            announce?.(outcomeMessage(DECISION_RECORDED_MESSAGE, item));
+            announce?.(decisionRecordedMessage(saved, item));
           }}
           onRetired={() => {
             // The subject's dataset was replaced. The form calls the onRetired it had when the
@@ -993,7 +1010,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         disabled={actionsDisabled}
         aria-haspopup="dialog"
         onClick={() => {
-          if (actionsDisabled) {
+          // A feedback pressed in the same frame is running already, before React has
+          // rendered it pending: the dialog stays closed, as it does once that render lands.
+          if (actionsDisabled || feedbackSentRef.current) {
             return;
           }
           setErrorText(null);
@@ -1011,7 +1030,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     recorded !== null
       ? FEEDBACK_STATUS_MESSAGES[recorded]
       : decisionSaved
-        ? DECISION_RECORDED_MESSAGE
+        ? decisionRecordedLine(savedDecision)
         : decisionPending && !dialogOpen
           ? DECISION_SAVING_MESSAGE
           : null;
@@ -1061,8 +1080,8 @@ export interface RecommendationCardProps {
    * The section-specific fields (AAP 0.5.5 field sets), rendered after the reason sentence and
    * before the evidence table: for example a budget card's utilization beside its efficiency.
    * With `reasonPlacement="fields"` the card prints no reason sentence and the fields carry the
-   * reason themselves, as a keyword card's term, spend, conversions, cost/conversion and reason
-   * fields do.
+   * reason themselves, as a keyword card's term, campaign and ad group, spend, conversions,
+   * cost/conversion and reason fields do.
    */
   children?: ReactNode;
   /**
@@ -1072,8 +1091,8 @@ export interface RecommendationCardProps {
    *   the Campaigns, Budget and Copy/creative cards show it;
    * - `'fields'`: within the section's own fields (`children`), which list the reason in their
    *   fixed order, so the card prints no reason line and the reason appears once. Keyword cards
-   *   use it, because their five fields end with the reason (AAP 0.1.2: term, spend,
-   *   conversions, cost/conversion, reason).
+   *   use it, because their six fields end with the reason (AAP 0.5.5: term, campaign and ad
+   *   group, spend, conversions, cost/conversion, reason).
    */
   reasonPlacement?: 'card' | 'fields';
   /**

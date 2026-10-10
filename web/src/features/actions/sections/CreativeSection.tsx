@@ -52,7 +52,7 @@ import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../b
 import type { BatchNoun } from '../batches';
 import { variants } from '../evidenceExtra';
 import type { VariantRow } from '../evidenceExtra';
-import { SectionFrame } from './SectionFrame';
+import { SectionFrame, groupRepeatsSectionTitle } from './SectionFrame';
 import type { GroupParts, SectionComponentProps } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
@@ -355,7 +355,8 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
  * disclosure, empty state, withheld lines and suppression counts.
  *
  * Cards render with `headingLevel={4}`, below each block's `<h3>`, so no heading level is
- * skipped.
+ * skipped. A block whose title repeats the section's (a campaign named "Copy/creative changes")
+ * has no `<h3>` ({@link groupRepeatsSectionTitle}), so its cards render at level 3 instead.
  *
  * @param props - see {@link SectionComponentProps}; only `section` is read
  * @returns the section region
@@ -369,7 +370,12 @@ export function CreativeSection({ section }: SectionComponentProps): ReactElemen
   return (
     <SectionFrame
       section={section}
-      renderItem={(item) => <RecommendationCard item={item} headingLevel={4} />}
+      renderItem={(item, group) => (
+        <RecommendationCard
+          item={item}
+          headingLevel={groupRepeatsSectionTitle(section, group) ? 3 : 4}
+        />
+      )}
       renderGroup={renderCampaignBlock}
     />
   );

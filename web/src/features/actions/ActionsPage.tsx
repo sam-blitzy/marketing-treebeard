@@ -14,7 +14,9 @@
  * 4. the {@link SectionNav}: anchor links with item counts for the five sections;
  * 5. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
  *    card confirms an outcome there, such as "Dismissed: Pause (Generic CRM — US)": it outlives
- *    the card a recorded feedback removes;
+ *    the card a recorded feedback removes and announces the outcome. The visible confirmation
+ *    of a feedback stands where the card stood, inside its section, so the user sees it where
+ *    they acted;
  * 6. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
  *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
@@ -84,6 +86,7 @@ import {
 } from '../status/CustomRunBanner';
 import { GlobalBanners } from '../status/GlobalBanners';
 import { StatusBar } from '../status/StatusBar';
+import { B1CardsProvider } from './B1Cards';
 import { BlockingDiscrepanciesProvider } from './BlockingDiscrepancies';
 import { ActionOutcomeProvider } from './RecommendationCard';
 import { SectionNav } from './SectionNav';
@@ -454,9 +457,12 @@ function runNoticeFor(
  * {@link SECTION_ORDER}, each with the run and overlay of the same response, so every part
  * describes one moment. The sections sit inside one
  * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
- * section, announces each card's outcome even after the card has left the page, and inside one
+ * section, announces each card's outcome even after the card has left the page, and whose
+ * record of each feedback by recommendation lets the section show that outcome in the hidden
+ * card's place for as long as the page's run still lists it; inside one
  * {@link BlockingDiscrepanciesProvider}, through which each held card links the discrepancies
- * that hold it.
+ * that hold it, and inside one {@link B1CardsProvider}, through which each C2 "Scale" card links
+ * the B1 card that carries its amount.
  *
  * Memoized on `page` and `runAddressed`: the page re-renders whenever its read's fetch status
  * changes, at the start and the end of every poll, and this content renders again only for a
@@ -485,16 +491,19 @@ const ActionsContent = memo(function ActionsContent({
       <ActionOutcomeProvider>
         {/* Held cards link the discrepancies that hold them: the run's C0 cards or /decisions. */}
         <BlockingDiscrepanciesProvider sections={sections}>
-          {SECTION_ORDER.map((key) => {
-            const section = sectionsByKey.get(key);
-            // The API always returns all five sections; a key it left out is skipped, never
-            // stubbed.
-            if (section === undefined) {
-              return null;
-            }
-            const SectionComponent = SECTION_RENDERERS[key];
-            return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
-          })}
+          {/* C2 "Scale" cards link the run's B1 card for their subject, in Budget changes. */}
+          <B1CardsProvider sections={sections}>
+            {SECTION_ORDER.map((key) => {
+              const section = sectionsByKey.get(key);
+              // The API always returns all five sections; a key it left out is skipped, never
+              // stubbed.
+              if (section === undefined) {
+                return null;
+              }
+              const SectionComponent = SECTION_RENDERERS[key];
+              return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
+            })}
+          </B1CardsProvider>
         </BlockingDiscrepanciesProvider>
       </ActionOutcomeProvider>
     </ActionsFrame>

@@ -1397,7 +1397,9 @@ class Overlay(ApiModel):
             the run.
         source_modes: Each source's mode now.
         stale_datasets: Dataset names that are stale now.
-        incomplete_datasets: Dataset names that are not complete now.
+        incomplete_datasets: Dataset names that are not complete over the run's window or an
+            item's required range: a complete row whose coverage misses that range counts, a
+            Q-G6 finest-partition shortfall only when the range includes one of its days.
         computed_at: When the overlay was computed.
     """
 
@@ -2141,7 +2143,9 @@ class Source(ApiModel):
 
     Attributes:
         source: The source.
-        mode: ``live`` or ``simulated``; ``None`` before the worker's first attempt.
+        mode: ``live`` or ``simulated``; ``None`` before the worker's first attempt and
+            while no mode is established (live access never verified: a stored ``live``
+            with no active dataset).
         status: ``ok``, ``stale``, ``denied`` or ``error``; ``None`` before the first attempt.
         reason: Why the source is in its mode or status.
         day_boundary: The IANA zone whose midnight ends the native dates of this source's

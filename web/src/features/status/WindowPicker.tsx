@@ -11,8 +11,13 @@
  * - **Any other preset** posts `POST /runs` with the preset's window ending on the default
  *   window end ({@link presetWindow}), then opens the created run at `/actions?run=<id>`.
  * - **A custom range** posts its own start and end, then opens the created run the same way.
- * - **A recent custom run** can be reopened from a select behind the "Recent custom windows"
- *   disclosure, which navigates to it by id.
+ * - **A recent custom run** can be reopened from behind the "Recent custom windows" disclosure:
+ *   choosing it in a select and pressing "Reopen" navigates to it by id.
+ *
+ * Layout: the picker keeps its own width; the "Recent custom windows" toggle sits on its preset
+ * row right after "Custom range"; below the picker come the disclosed recent custom windows,
+ * then the status region with the computing spinner and the warnings. Everything that opens
+ * opens below the preset row, so nothing moves a control on it.
  *
  * A custom run is computed synchronously and can take up to about half a minute (AAP 0.1.1), so
  * the picker is disabled and a spinner shows while it computes. A failure is stated in a
@@ -40,12 +45,19 @@
  *   while the session still holds the list: the user has opened it and not closed it since.
  *   Closing it forgets the list, so it stays closed and unread until the user opens it again.
  *   Reading it on every load of `/actions` would add a request the five sections do not need to
- *   render within two seconds, so reopening a custom run stays one press away instead.
- * - **Messages are announced politely.** Every warning banner of a failed computation or read
- *   sits in one `role="status"` region that every state of the picker renders in the same
- *   place, so a message is announced when it appears (WCAG 2.2 SC 4.1.3) without
- *   `role="alert"`, which AAP 0.5.5 reserves for discrepancies. While it is empty, `Stack` takes
- *   the region out of the column, so it adds no space.
+ *   render within two seconds, so reopening a custom run stays one press away instead. Moving
+ *   through the select's options only chooses; the "Reopen" button opens the choice, so the
+ *   page never changes on input (WCAG 2.2 SC 3.2.2). Each option names the run's window, its
+ *   length, the instant it finished in the run's display time zone and its id, so runs of the
+ *   same window read differently.
+ * - **Messages are announced politely.** The "Computing custom window" spinner and every
+ *   warning banner of a failed computation or read sit in one `role="status"` region that
+ *   every state of the picker renders in the same place, so each is announced when it appears
+ *   (WCAG 2.2 SC 4.1.3) without `role="alert"`, which AAP 0.5.5 reserves for discrepancies.
+ *   While it is empty, `Stack` takes the region out of the column, so it adds no space. A
+ *   custom run on screen is announced as "Custom window {start} – {end} opened, {days}, run
+ *   {id}" through the date-range picker's own hidden status region, which receives the text
+ *   only after it exists, so the run is announced however it came on screen.
  * - **Boundaries.** UI comes only from the design-system index and is laid out with `Stack` and
  *   `Inline`, with no styles of its own (AAP 0.4.4); server state comes only from the TanStack
  *   Query hooks (AAP 0.11.1); navigation goes through TanStack Router's `useNavigate`.
@@ -80,7 +92,7 @@ import {
   Stack,
 } from '../../design-system';
 import type { DateRangeValue, SelectOption } from '../../design-system';
-import { formatDateRange, formatDays } from '../../lib/format';
+import { formatDateRange, formatDays, formatInstant } from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // Calendar-date arithmetic (UTC only)
@@ -212,6 +224,9 @@ const CUSTOM_RUNS_LOADING_LABEL = 'Loading recent custom windows';
 /** Shown in place of the reopen select when no succeeded custom run can be reopened. */
 const NO_CUSTOM_RUNS_TEXT = 'No custom windows yet';
 
+/** The label of the button that opens the custom run chosen in the reopen select. */
+const REOPEN_LABEL = 'Reopen';
+
 /**
  * The text that states a failed `POST /runs`:
  *
@@ -243,12 +258,15 @@ function readErrorMessage(error: unknown): string {
 }
 
 /**
- * The reopen-select label of a custom run: "{window_start} – {window_end} · {days}", for
- * example "2026-09-25 – 2026-10-01 · 7 days". The dates are shown exactly as stored and the
- * length is the run's own `days`.
+ * The reopen-select label of a custom run: "{window_start} – {window_end} · {days} · computed
+ * {finished_at} · run {id}", for example "2026-09-25 – 2026-10-01 · 7 days · computed Oct 6,
+ * 2026, 11:22 AM UTC · run 203". The dates are shown exactly as stored and the length is the
+ * run's own `days`. The instant the run finished is formatted in the run's
+ * `display_timezone` (AAP 0.5.5), and the run id keeps the labels of two runs of the same
+ * window distinct even when they finished in the same minute.
  */
 function customRunLabel(run: Run): string {
-  return `${formatDateRange(run.window_start, run.window_end)} · ${formatDays(run.days)}`;
+  return `${formatDateRange(run.window_start, run.window_end)} · ${formatDays(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)} · run ${run.id}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -287,31 +305,57 @@ function useSettledError(
   return settled;
 }
 
+/**
+ * A choice made in the reopen select and not yet opened. Changing the select only records it,
+ * so moving through the options never changes the page (WCAG 2.2 SC 3.2.2 On Input); the
+ * "Reopen" button opens it.
+ */
+interface ReopenDraft {
+  /** The id of the run on screen when the choice was made: the choice belongs to that run. */
+  runId: Run['id'];
+  /** The chosen option's value: a custom run's id as text, or the empty choice. */
+  value: string;
+}
+
 /** Props of {@link PickerFrame}. */
 interface PickerFrameProps {
   /** What the picker shows: a loading spinner, the missing-configuration warning or controls. */
   children: ReactNode;
+  /**
+   * Progress of work the picker started, such as the "Computing custom window" spinner, shown
+   * first in the live region, before the notices. Omitted or `undefined`: none.
+   */
+  progress?: ReactElement | undefined;
   /** The warnings to announce, each a keyed `Banner`, in order. Omitted or empty: none. */
   notices?: readonly ReactElement[];
 }
 
 /**
  * The one root of every picker state: a column of the state's content followed by the picker's
- * polite live region.
+ * polite live region, which holds the progress of work the picker started and then its notices.
  *
  * Every state renders this frame, so the root element and the region's place in it never change
- * and React keeps the same region element from the first render. A message that appears later
- * therefore lands in a live region that already exists, and is announced politely
- * (WCAG 2.2 SC 4.1.3) without `role="alert"`, which AAP 0.5.5 reserves for discrepancies.
+ * and React keeps the same region element from the first render. Progress or a message that
+ * appears later therefore lands in a live region that already exists, and is announced
+ * politely (WCAG 2.2 SC 4.1.3) without `role="alert"`, which AAP 0.5.5 reserves for
+ * discrepancies.
  */
-function PickerFrame({ children, notices = [] }: PickerFrameProps) {
+function PickerFrame({ children, progress, notices = [] }: PickerFrameProps) {
+  const announced = progress !== undefined || notices.length > 0;
   return (
     <Stack gap={3}>
       {children}
-      {/* Always rendered, and always the frame's last child. With no notice nothing is rendered
-          inside it, so it stays empty, and Stack takes an empty status region out of the
-          column: it adds no space and no gap until a notice appears. */}
-      <div role="status">{notices.length > 0 && <Stack gap={2}>{notices}</Stack>}</div>
+      {/* Always rendered, and always the frame's last child. With no progress and no notice
+          nothing is rendered inside it, so it stays empty, and Stack takes an empty status
+          region out of the column: it adds no space and no gap until something appears. */}
+      <div role="status">
+        {announced && (
+          <Stack gap={2}>
+            {progress}
+            {notices}
+          </Stack>
+        )}
+      </div>
     </Stack>
   );
 }
@@ -329,7 +373,8 @@ export interface WindowPickerProps {
 
 /**
  * The status bar's window picker: the configured presets plus a custom range, and, behind a
- * "Recent custom windows" disclosure, a select that reopens a recent custom run.
+ * "Recent custom windows" disclosure, a select and a "Reopen" button that reopen a recent custom
+ * run.
  *
  * - **Loading**: a "Loading windows" spinner until `GET /config` and `GET /runs/latest` have
  *   answered. Once the default `/actions` page has loaded, the latest default run is already
@@ -341,8 +386,9 @@ export interface WindowPickerProps {
  * - **Choosing**: the default preset navigates to `/actions` with no search params; any other
  *   preset or a valid custom range posts `POST /runs` and, once the run is created, navigates to
  *   `/actions?run=<id>`. While it computes, every control is disabled and a "Computing custom
- *   window" spinner shows after the controls, beside them or, where the row has no room, below
- *   them; afterwards focus returns to the control that started it.
+ *   window" spinner shows in the picker's status region below the controls, before any
+ *   warning, so it is announced and moves no control; afterwards focus returns to the control
+ *   that started it.
  * - **Failure to compute**: a warning banner states it ({@link createRunErrorMessage}) until the
  *   next choice clears it.
  * - **Failure to read the default run**: when `GET /runs/latest` fails with anything but "no
@@ -356,21 +402,28 @@ export interface WindowPickerProps {
  *   disabled while a run computes, and shows a spinner while its read runs, with the warning
  *   kept in place ({@link useSettledError}); when the read fails again, focus returns to it, and
  *   when the read succeeds the warning goes.
- * - **Announcing**: every warning is a polite status message, never an alert, and the warnings
- *   appear in the order above.
- * - **Reopening**: a quiet "Recent custom windows" button discloses the recent custom runs. It
- *   carries `aria-expanded` and `aria-controls`, naming a region whose content exists only while
- *   the list is open. The list starts closed, and only opening it reads `GET /runs?kind=custom`.
- *   It starts open while the session still holds the list, so moving between runs keeps it in
- *   view with the run on screen selected. Closing it forgets the list
+ * - **Announcing**: the computing spinner and every warning are polite status messages, never
+ *   alerts, and the warnings appear in the order above. A custom run on screen is announced as
+ *   "Custom window {start} – {end} opened, {days}, run {id}" through `DateRangePicker`'s
+ *   `statusMessage`, whenever the picker shows it: after a choice here, a reopen, Back or
+ *   Forward, or a direct load. The default run announces nothing.
+ * - **Reopening**: a quiet "Recent custom windows" button on the preset row, right after
+ *   "Custom range" and outside the preset group, discloses the recent custom runs below the
+ *   picker. It carries `aria-expanded` and `aria-controls`, naming a region whose content
+ *   exists only while the list is open. The list starts closed, and only opening it reads
+ *   `GET /runs?kind=custom`. It starts open while the session still holds the list, so moving
+ *   between runs keeps it in view with the run on screen selected. Closing it forgets the list
  *   ({@link useForgetCustomRuns}), so it starts closed and unread on every later mount until it
  *   is opened again, which reads the list once. While open, the region shows a "Loading recent
  *   custom windows" spinner until the first read answers; then "Reopen a custom window" lists
- *   the succeeded custom runs newest first, and choosing one navigates to it by id, or "No
- *   custom windows yet" says there is none to reopen. After a failed first read the region
- *   stays empty and hidden, and the warning below the controls states the failure. The button
- *   is disabled while a run computes, like every other control, and pressing it leaves focus
- *   on it.
+ *   the succeeded custom runs newest first ({@link customRunLabel}), with a "Reopen" button
+ *   below it, or "No custom windows yet" says there is none to reopen. Choosing an option only
+ *   records it; "Reopen" navigates to the chosen run by id. The select shows the run on screen
+ *   until a choice is made, and a choice is dropped once another run is on screen. "Reopen" is
+ *   disabled on the empty choice and while a run computes. After a failed first read the region
+ *   stays empty and hidden, and the warning below the controls states the failure. The
+ *   "Recent custom windows" button is disabled while a run computes, like every other control,
+ *   and pressing it leaves focus on it.
  *
  * The component must render inside a TanStack `RouterProvider` and a `QueryClientProvider`, as
  * every `/actions` screen does.
@@ -398,6 +451,13 @@ export function WindowPicker({ run }: WindowPickerProps) {
   // the two validations ever disagree; it is still shown rather than thrown from a handler.
   const [inputError, setInputError] = useState<string | null>(null);
   const pending = createRun.isPending;
+  // The reopen select's choice not yet opened (ReopenDraft). It belongs to the run on screen
+  // when it was made, so it is dropped as soon as another run is on screen, and the select then
+  // shows that run. State adjusted while rendering, as in useSettledError.
+  const [reopenDraft, setReopenDraft] = useState<ReopenDraft | null>(null);
+  if (reopenDraft !== null && reopenDraft.runId !== run.id) {
+    setReopenDraft(null);
+  }
 
   // The reads whose failure is stated in a warning with a Retry button, kept while they run
   // again (useSettledError). A 404 `not_found` or 409 `run_not_ready` from GET /runs/latest is
@@ -499,6 +559,21 @@ export function WindowPicker({ run }: WindowPickerProps) {
   const reopenValue = reopenable.some((custom) => custom.id === run.id)
     ? String(run.id)
     : NO_CUSTOM_RUN.value;
+  // The select shows the choice made on the run on screen while it is still listed; otherwise
+  // the run on screen, or the empty choice when that run is not listed.
+  const reopenSelection =
+    reopenDraft !== null &&
+    reopenDraft.runId === run.id &&
+    reopenOptions.some((option) => option.value === reopenDraft.value)
+      ? reopenDraft.value
+      : reopenValue;
+
+  // A custom run on screen is announced politely by the picker whenever it shows one: after a
+  // choice in the picker, a reopen, Back or Forward, or a direct load (WCAG 2.2 SC 4.1.3).
+  const openedMessage =
+    run.kind === 'custom'
+      ? `Custom window ${formatDateRange(run.window_start, run.window_end)} opened, ${formatDays(run.days)}, run ${run.id}`
+      : undefined;
 
   const errorMessage =
     inputError ?? (createRun.isError ? createRunErrorMessage(createRun.error) : null);
@@ -559,11 +634,14 @@ export function WindowPicker({ run }: WindowPickerProps) {
     compute({ window_start: start, window_end: end });
   };
 
-  const reopen = (selected: string) => {
-    if (selected === NO_CUSTOM_RUN.value) {
-      return;
-    }
-    const found = reopenable.find((custom) => String(custom.id) === selected);
+  /** Records a choice of the reopen select; nothing opens until "Reopen" is pressed. */
+  const chooseReopen = (selected: string) => {
+    setReopenDraft({ runId: run.id, value: selected });
+  };
+
+  /** Opens the custom run the reopen select shows, by id; the empty choice opens nothing. */
+  const reopen = () => {
+    const found = reopenable.find((custom) => String(custom.id) === reopenSelection);
     if (found === undefined) {
       return;
     }
@@ -644,14 +722,29 @@ export function WindowPicker({ run }: WindowPickerProps) {
   let recentCustomRuns: ReactNode = null;
   if (customRunsOpen) {
     if (reopenable.length > 0) {
+      // A change of the select only records a choice, and "Reopen" opens it (WCAG 2.2 SC 3.2.2
+      // On Input). The outer Inline keeps the select at its own width, and the button sits on
+      // its own line below it, so no row pairs controls of different heights.
       recentCustomRuns = (
-        <Select
-          label="Reopen a custom window"
-          options={reopenOptions}
-          value={reopenValue}
-          onChange={reopen}
-          disabled={pending}
-        />
+        <Inline>
+          <Stack gap={2}>
+            <Select
+              label="Reopen a custom window"
+              options={reopenOptions}
+              value={reopenSelection}
+              onChange={chooseReopen}
+              disabled={pending}
+            />
+            <Inline>
+              <Button
+                disabled={pending || reopenSelection === NO_CUSTOM_RUN.value}
+                onClick={reopen}
+              >
+                {REOPEN_LABEL}
+              </Button>
+            </Inline>
+          </Stack>
+        </Inline>
       );
     } else if (customRuns.data !== undefined) {
       recentCustomRuns = <span>{NO_CUSTOM_RUNS_TEXT}</span>;
@@ -660,13 +753,37 @@ export function WindowPicker({ run }: WindowPickerProps) {
     }
   }
 
+  // The disclosure's toggle, on the picker's preset row right after "Custom range" and outside
+  // the preset group, so it shares the toggles' line and height at every width.
+  const recentCustomRunsToggle = (
+    <Button
+      variant="quiet"
+      size="sm"
+      aria-expanded={customRunsOpen}
+      aria-controls={customRunsRegionId}
+      disabled={pending}
+      onClick={() => {
+        // A closed list is no longer needed: forgetting it keeps every later mount closed and
+        // unread until the user opens it again, which reads it afresh.
+        if (customRunsOpen) {
+          forgetCustomRuns();
+        }
+        setCustomRunsOpen(!customRunsOpen);
+      }}
+    >
+      {RECENT_CUSTOM_RUNS_LABEL}
+    </Button>
+  );
+
   return (
-    <PickerFrame notices={notices}>
-      {/* Top-aligned, so the picker's label and the disclosure button share a line and opening
-          the custom range or the recent custom windows never moves the controls beside it. The
-          spinner follows the controls, so showing it never moves them; where the row has no
-          room left for it, it wraps onto a line below them for as long as the run computes. */}
-      <Inline gap={4} align="start">
+    <PickerFrame
+      notices={notices}
+      progress={pending ? <Spinner label="Computing custom window" /> : undefined}
+    >
+      {/* The Inline keeps the picker and its custom panel at their own width rather than the
+          column's. Everything that opens (the custom panel, the recent custom windows and the
+          computing spinner) opens below the preset row, so none of it moves a control on it. */}
+      <Inline>
         <DateRangePicker
           label="Analysis window"
           presets={windowConfig.presets}
@@ -677,36 +794,15 @@ export function WindowPicker({ run }: WindowPickerProps) {
           maxDate={defaultEnd}
           maxDays={windowConfig.max_days}
           disabled={pending}
+          actions={recentCustomRunsToggle}
+          statusMessage={openedMessage}
         />
-        {/* The disclosure: its button in an Inline row keeps its own width, and the region it
-            controls is always in place, hidden while it has nothing to show, so the button's
-            aria-controls always names an element. */}
-        <Stack gap={2}>
-          <Inline>
-            <Button
-              variant="quiet"
-              size="sm"
-              aria-expanded={customRunsOpen}
-              aria-controls={customRunsRegionId}
-              disabled={pending}
-              onClick={() => {
-                // A closed list is no longer needed: forgetting it keeps every later mount
-                // closed and unread until the user opens it again, which reads it afresh.
-                if (customRunsOpen) {
-                  forgetCustomRuns();
-                }
-                setCustomRunsOpen(!customRunsOpen);
-              }}
-            >
-              {RECENT_CUSTOM_RUNS_LABEL}
-            </Button>
-          </Inline>
-          <div id={customRunsRegionId} hidden={recentCustomRuns === null}>
-            {recentCustomRuns}
-          </div>
-        </Stack>
-        {pending && <Spinner label="Computing custom window" />}
       </Inline>
+      {/* The region the toggle controls, below the picker: always in place, hidden while it has
+          nothing to show, so the toggle's aria-controls always names an element. */}
+      <div id={customRunsRegionId} hidden={recentCustomRuns === null}>
+        {recentCustomRuns}
+      </div>
     </PickerFrame>
   );
 }

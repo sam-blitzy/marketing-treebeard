@@ -17,7 +17,9 @@
  *   `DecisionForm` prefilled with the proposed change (status `paused` for C1; the proposed daily
  *   budget on a shared budget, with every member listed); "Mark done" on every other action;
  *   "Dismiss" and "Snooze for 7 days" on all but C0, whose resolver renders instead. Each
- *   feedback posts once to `POST /recommendations/{id}/feedback` with the CSRF header.
+ *   feedback posts once to `POST /recommendations/{id}/feedback` with the CSRF header, also
+ *   when pressed twice, or with another action, before React renders again; a failed one
+ *   frees the actions for one retry.
  * - **Failures and locks**: a 409 `subject_retired` shows "Computed from replaced data" and locks
  *   every action, whether a feedback or the decision form received it, also once the dialog has
  *   closed and when it was closed while the save ran; any other failure shows the API's
@@ -25,7 +27,9 @@
  *   a historical item shows the badge and its frozen provenance with every action disabled,
  *   the C0 resolver too.
  * - **Outcomes and focus**: inside an `ActionOutcomeProvider`, a recorded feedback or decision is
- *   announced in the provider's polite region, which outlives the card a refetch removes, and
+ *   announced in the provider's polite region, which outlives the card a refetch removes, naming
+ *   the entity once: after the action unless the action already contains its name, and always
+ *   after a decision's recorded state; and
  *   focus moves to the next card's first enabled action, else the previous card's, else the
  *   section heading, unless the user has moved it elsewhere.
  * - **Decision saves**: the dialog may close while its save runs, but every action stays
@@ -138,6 +142,16 @@ function genericCrmDecision(overrides: Partial<Decision> = {}): Decision {
     ...overrides,
   });
 }
+
+/**
+ * The card's status line once a "Generic CRM — US" decision with status `paused` is saved, its
+ * daily budget kept at USD 200.00: what the saved decision recorded, as the decision log words
+ * it, never the recommendation's action.
+ */
+const PAUSED_RECORDED_LINE = `${DECISION_RECORDED_MESSAGE}: Paused · daily budget $200.00`;
+
+/** Any recorded-decision status line, whatever state it names. */
+const RECORDED_LINE_PATTERN = new RegExp(`^${DECISION_RECORDED_MESSAGE}`, 'u');
 
 /**
  * Members of the shared "Search Shared Budget", as `budget._members_extra` records them:
@@ -1073,7 +1087,7 @@ describe('RecommendationCard: record decision', () => {
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     const [post] = posts(api);
     expect(posts(api)).toHaveLength(1);
@@ -1102,7 +1116,7 @@ describe('RecommendationCard: record decision', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
 
     expect(posts(api)).toEqual([]);
-    expect(within(cardOf(item)).queryByText(DECISION_RECORDED_MESSAGE)).toBeNull();
+    expect(within(cardOf(item)).queryByText(RECORDED_LINE_PATTERN)).toBeNull();
   });
 
   it('prefills the proposed daily budget on a shared budget and lists every member', async () => {
@@ -1262,11 +1276,11 @@ describe('RecommendationCard: record decision', () => {
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    const line = await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE);
+    const line = await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE);
     // Inside a provider the card's own line is visible but no second live region.
     expect(line.getAttribute('role')).toBeNull();
     expect(outcomeRegion().textContent).toBe(
-      `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
+      `${PAUSED_RECORDED_LINE} (Generic CRM — US)`,
     );
   });
 
@@ -1331,10 +1345,10 @@ describe('RecommendationCard: record decision', () => {
     release(json(201, saved));
 
     // The late save is reported on the card and in the provider's region...
-    expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
     expect(within(cardOf(item)).queryByText(DECISION_SAVING_MESSAGE)).toBeNull();
     expect(outcomeRegion().textContent).toBe(
-      `${DECISION_RECORDED_MESSAGE}: ${item.action} (Generic CRM — US)`,
+      `${PAUSED_RECORDED_LINE} (Generic CRM — US)`,
     );
     // ...the actions are usable again, and focus is still on "Record decision".
     await waitFor(() => {
@@ -1471,7 +1485,7 @@ describe('RecommendationCard: record decision', () => {
 
     release(json(201, genericCrmDecision({ id: 811, origin: 'user', status: 'paused' })));
 
-    expect(await within(cardOf(item)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
     await waitFor(() => {
       expect(opener).toHaveProperty('disabled', false);
     });
@@ -1781,7 +1795,7 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
     expect(within(cardOf(next)).queryByText(HISTORICAL_LABEL)).toBeNull();
     fireEvent.click(within(reopened).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(next)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(posts(api).map((call) => call.body)).toEqual([
       { ...decisionBody, recommendation_id: item.id },
@@ -1820,7 +1834,7 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(next)).findByText(DECISION_RECORDED_MESSAGE)).toBeDefined();
+    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     // The form posts the recommendation it was opened for, whose subject is the same.
     expect(posts(api).map((call) => call.body)).toEqual([
@@ -2187,6 +2201,180 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
 });
 
 // ---------------------------------------------------------------------------------------------
+// How a confirmation names the card's entity
+// ---------------------------------------------------------------------------------------------
+
+/** A CR1 card's variant pair, which is also its entity's name. */
+const CR1_PAIR = 'Is your EMEA pipeline on track? vs Seven in ten EMEA deals start with content';
+
+/** A CR1 action, which begins with the variant pair its entity is named after. */
+const CR1_ACTION =
+  `${CR1_PAIR}: Is your EMEA pipeline on track? ahead, not yet distinguishable (adjusted p = ` +
+  '0.21); about 41,800 more impressions per variant needed at the observed difference';
+
+/**
+ * {@link makeItem}'s default item, which offers "Mark done", with `action` and an entity named
+ * `name`, of `type` (a CR1 creative pair unless given), so only the parts a confirmation names
+ * vary.
+ */
+function namedItem(action: string, name: string | null, type = 'creative_pair'): Item {
+  return makeItem({
+    action,
+    entity: { source: 'linkedin', type, id: '990001101|990001102', name },
+  });
+}
+
+/**
+ * Renders `item` alone inside an `ActionOutcomeProvider`, records "Mark done" on it, and waits
+ * for the card's own status line, by which time the provider's region holds the confirmation.
+ *
+ * @returns the provider's region
+ */
+async function markDoneOutcome(item: Item): Promise<HTMLElement> {
+  api.use({
+    'POST /recommendations/:id/feedback': json(
+      201,
+      makeFeedback('done', { recommendation_id: item.id }),
+    ),
+  });
+  await renderCard(
+    <ActionOutcomeProvider>
+      <RecommendationCard item={item} />
+    </ActionOutcomeProvider>,
+  );
+  // The only card, found by role alone because a blank action leaves it without a name.
+  const card = screen.getByRole('article');
+  const button = within(card).getByRole('button', { name: FEEDBACK_LABELS.done });
+  button.focus();
+  fireEvent.click(button);
+  await within(card).findByText(FEEDBACK_STATUS_MESSAGES.done);
+  return outcomeRegion();
+}
+
+describe('RecommendationActions: the confirmation names the entity once', () => {
+  it('leaves out the entity name the action already contains, so a CR1 pair reads once', async () => {
+    const region = await markDoneOutcome(namedItem(CR1_ACTION, CR1_PAIR));
+
+    expect(region.textContent).toBe(`Marked done: ${CR1_ACTION}`);
+    expect(region.textContent).not.toContain(`(${CR1_PAIR})`);
+  });
+
+  it('compares the trimmed name with the trimmed action', async () => {
+    const region = await markDoneOutcome(namedItem(`  ${CR1_ACTION} `, ` ${CR1_PAIR}  `));
+
+    expect(region.textContent).toBe(`Marked done: ${CR1_ACTION}`);
+  });
+
+  it('leaves out a creative pair the action names leader first, in the other order', async () => {
+    // The pair is named in its own order; the action names the observed leader first.
+    const action =
+      'The Attribution Playbook vs Stop guessing which channel works: The Attribution ' +
+      'Playbook ahead, not yet distinguishable (adjusted p = 0.1019)';
+    const region = await markDoneOutcome(
+      namedItem(action, 'Stop guessing which channel works vs The Attribution Playbook'),
+    );
+
+    expect(region.textContent).toBe(`Marked done: ${action}`);
+  });
+
+  it.each([
+    [
+      'a creative pair the action names one variant of',
+      'Pause The Attribution Playbook',
+      'Stop guessing which channel works vs The Attribution Playbook',
+      'creative_pair',
+    ],
+    // Only a creative pair's name lists variants; any other name must appear whole.
+    [
+      'another entity whose name parts the action contains apart',
+      'Double down: increase spend on Them and Us',
+      'Us vs Them',
+      'campaign',
+    ],
+  ])('keeps the name the action does not state whole (%s)', async (_label, action, name, type) => {
+    const region = await markDoneOutcome(namedItem(action, name, type));
+
+    expect(region.textContent).toBe(`Marked done: ${action} (${name})`);
+  });
+
+  it.each([
+    [
+      'a K2 keyword',
+      'Add as phrase-match keyword in Attribution software',
+      'marketing attribution software',
+      'search_term',
+    ],
+    [
+      'a W1 white paper',
+      'Double down: increase spend on Benchmarks - Lead gen (NA)',
+      'Paid Media Benchmarks 2026',
+      'content_asset',
+    ],
+    // Case-sensitive: "CRM Software" in the action does not contain the name "crm software".
+    [
+      'a name in another case',
+      'Add as phrase-match keyword in CRM Software',
+      'crm software',
+      'search_term',
+    ],
+  ])(
+    'keeps the entity name the action does not contain (%s)',
+    async (_label, action, name, type) => {
+      const region = await markDoneOutcome(namedItem(action, name, type));
+
+      expect(region.textContent).toBe(`Marked done: ${action} (${name})`);
+    },
+  );
+
+  it('states the action alone when the item carries no entity name', async () => {
+    const region = await markDoneOutcome(namedItem('Add as exact-match negative', null));
+
+    expect(region.textContent).toBe('Marked done: Add as exact-match negative');
+  });
+
+  it('states the entity name alone when the action is blank', async () => {
+    const region = await markDoneOutcome(namedItem('   ', 'crm demo'));
+
+    expect(region.textContent).toBe('Marked done: crm demo');
+  });
+
+  it('states the status alone when the item carries neither an action nor a name', async () => {
+    const region = await markDoneOutcome(namedItem('', null));
+
+    expect(region.textContent).toBe('Marked done');
+  });
+
+  it("names the entity after a recorded decision's state, even when the action contains it", async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': json(
+        201,
+        genericCrmDecision({
+          id: 815,
+          origin: 'recommendation',
+          status: 'paused',
+          patch: { status: 'paused' },
+          recommendation_id: FIXTURE_ITEM_IDS.c1,
+        }),
+      ),
+    });
+    const item = { ...c1Item(), action: 'Pause Generic CRM — US' };
+    await renderCard(
+      <ActionOutcomeProvider>
+        <RecommendationCard item={item} />
+      </ActionOutcomeProvider>,
+    );
+
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    // The state names no entity, so the name still follows it.
+    expect(outcomeRegion().textContent).toBe(`${PAUSED_RECORDED_LINE} (Generic CRM — US)`);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // C0 discrepancies
 // ---------------------------------------------------------------------------------------------
 
@@ -2241,5 +2429,233 @@ describe('RecommendationCard: C0 discrepancies', () => {
 
     expect(screen.queryAllByRole('button')).toEqual([]);
     expect(container.textContent).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Double submits
+// ---------------------------------------------------------------------------------------------
+
+// Two presses before React renders again, as a double click or a script's `click(); click();`
+// delivers them: TanStack Query reports the first request pending only from a timer after the
+// press, so the render-time `disabled` state cannot stop the second one. Each pair is fired back
+// to back, with nothing awaited between the two.
+describe('RecommendationActions: double submits', () => {
+  /** Waits until the card's feedback has settled: no button busy, every action disabled. */
+  async function waitForRecorded(item: Item): Promise<void> {
+    await waitFor(() => {
+      for (const button of cardButtons(item)) {
+        expect(button.getAttribute('aria-busy')).toBeNull();
+        expect(button).toHaveProperty('disabled', true);
+      }
+    });
+  }
+
+  it.each(FEEDBACK_KINDS)(
+    'posts "%s" once when it is pressed twice within one frame',
+    async (kind) => {
+      const item = makeItem();
+      api.use({
+        'POST /recommendations/:id/feedback': json(
+          201,
+          makeFeedback(kind, { recommendation_id: item.id }),
+        ),
+      });
+      await renderCard(<RecommendationCard item={item} />);
+      const button = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS[kind] });
+
+      fireEvent.click(button);
+      fireEvent.click(button);
+
+      await waitForRecorded(item);
+      expect(posts(api).map((call) => call.body)).toEqual([{ kind }]);
+    },
+  );
+
+  it('posts only the first of two different feedback actions pressed within one frame', async () => {
+    const item = makeItem();
+    api.use({
+      'POST /recommendations/:id/feedback': json(
+        201,
+        makeFeedback('snooze', { recommendation_id: item.id }),
+      ),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.snooze }));
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.done }));
+
+    await waitForRecorded(item);
+    expect(posts(api).map((call) => call.body)).toEqual([{ kind: 'snooze' }]);
+  });
+
+  it('keeps "Record decision" closed when it is pressed in the frame of a running feedback', async () => {
+    const item = c1Item();
+    api.use({
+      'POST /recommendations/:id/feedback': json(
+        201,
+        makeFeedback('dismiss', { recommendation_id: item.id }),
+      ),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+    fireEvent.click(within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }));
+
+    await waitForRecorded(item);
+    // An opened dialog would also read the subject's decision log, which the stub refuses.
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts(api).map((call) => call.body)).toEqual([{ kind: 'dismiss' }]);
+    expect(api.calls.filter((call) => call.method === 'GET')).toEqual([]);
+  });
+
+  it('frees the actions after a failed feedback, so a retry posts again, once', async () => {
+    const item = makeItem();
+    api.use({
+      'POST /recommendations/:id/feedback': apiError(503, 'service_unavailable', 'Try later.'),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+    const done = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.done });
+
+    fireEvent.click(done);
+    fireEvent.click(done);
+
+    expect(await within(cardOf(item)).findByText('Try later.')).toBeDefined();
+    await waitFor(() => {
+      cardButtons(item).forEach((button) => {
+        expect(button).toHaveProperty('disabled', false);
+      });
+    });
+    expect(posts(api)).toHaveLength(1);
+
+    api.use({
+      'POST /recommendations/:id/feedback': json(
+        201,
+        makeFeedback('done', { recommendation_id: item.id }),
+      ),
+    });
+    fireEvent.click(done);
+    fireEvent.click(done);
+
+    await waitForRecorded(item);
+    expect(posts(api).map((call) => call.body)).toEqual([{ kind: 'done' }, { kind: 'done' }]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// What a recorded decision states
+// ---------------------------------------------------------------------------------------------
+
+describe("RecommendationActions: the recorded decision's state", () => {
+  it('states the recorded state, not the recommendation, on the card and in the announcement', async () => {
+    api.use({
+      'GET /decisions': json(200, [genericCrmDecision()]),
+      'POST /decisions': json(
+        201,
+        genericCrmDecision({
+          id: 812,
+          origin: 'recommendation',
+          decided_by: 'admin@example.com',
+          status: 'active',
+          daily_budget: '160.00',
+          patch: { daily_budget: '160.00' },
+          recommendation_id: FIXTURE_ITEM_IDS.c1,
+        }),
+      ),
+    });
+    const item = c1Item();
+    await renderCard(
+      <ActionOutcomeProvider>
+        <RecommendationCard item={item} />
+      </ActionOutcomeProvider>,
+    );
+
+    // The C1 card proposes "Pause"; the user records Active with a daily budget of 160 instead.
+    const dialog = await openDecisionDialog(item);
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Status' }), {
+      target: { value: 'active' },
+    });
+    fireEvent.change(within(dialog).getByRole('spinbutton', { name: 'Daily budget' }), {
+      target: { value: '160.00' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    const line = await within(cardOf(item)).findByText(
+      'Decision recorded: Active · daily budget $160.00',
+    );
+    expect(line.getAttribute('role')).toBeNull();
+    expect(outcomeRegion().textContent).toBe(
+      'Decision recorded: Active · daily budget $160.00 (Generic CRM — US)',
+    );
+    expect(outcomeRegion().textContent).not.toContain(item.action);
+    expect(posts(api).map((call) => call.body)).toEqual([
+      {
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm },
+        patch: { daily_budget: '160.00' },
+        recommendation_id: FIXTURE_ITEM_IDS.c1,
+      },
+    ]);
+  });
+
+  it("states a shared budget's recorded amount, in its currency, with no status", async () => {
+    api.use({
+      'GET /decisions': json(200, [makeDecision('budget')]),
+      'POST /decisions': json(
+        201,
+        makeDecision('budget', {
+          id: 813,
+          origin: 'recommendation',
+          daily_budget: '600.00',
+          patch: { daily_budget: '600.00' },
+          recommendation_id: 1250,
+        }),
+      ),
+    });
+    const item = sharedB1Item();
+    await renderCard(<RecommendationCard item={item} />);
+
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    // Outside a provider the card's own line is the polite region.
+    const line = await within(cardOf(item)).findByText('Decision recorded: daily budget $600.00');
+    expect(line.getAttribute('role')).toBe('status');
+  });
+
+  it("states a shared member's recorded status and its budget, never an amount", async () => {
+    const member = {
+      type: 'campaign' as const,
+      id: FIXTURE_CAMPAIGN_IDS.genericCrm,
+      name: 'Generic CRM — US',
+      source: 'google' as const,
+      currency: 'USD',
+    };
+    api.use({
+      'GET /decisions': json(200, [makeDecision('shared_member', { subject: member })]),
+      'POST /decisions': json(
+        201,
+        makeDecision('shared_member', {
+          id: 814,
+          subject: member,
+          origin: 'recommendation',
+          status: 'paused',
+          patch: { status: 'paused' },
+          recommendation_id: FIXTURE_ITEM_IDS.c1,
+        }),
+      ),
+    });
+    const item = c1Item();
+    await renderCard(<RecommendationCard item={item} />);
+
+    const dialog = await openDecisionDialog(item);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    // The member's shared budget is named by the Google id its decision carries
+    // (`budget_external_id` 31000402 for FIXTURE_BUDGET_IDS.search), as the decision log names it.
+    expect(
+      await within(cardOf(item)).findByText('Decision recorded: Paused · shared budget 31000402'),
+    ).toBeDefined();
   });
 });

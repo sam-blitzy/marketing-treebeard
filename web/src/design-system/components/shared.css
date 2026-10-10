@@ -5,9 +5,10 @@
  * - .ds-visually-hidden: content that assistive technology reads, or that keyboard focus can
  *   land on, but the screen does not show. Used by Spinner (the label inside role="status"), Card
  *   (the "Rank " prefix before the rank number), DataTable (the "Details" header of the expand
- *   column), DateRangePicker (the role="status" region that announces a failed Apply), Dialog
- *   (the empty leading and trailing focus sentinels around the panel) and PageShell (the skip
- *   link, together with the modifier below).
+ *   column), DateRangePicker (two role="status" regions: the one that announces a failed
+ *   Apply's summary and the picker-level one that announces the caller's status message),
+ *   Dialog (the empty leading and trailing focus sentinels around the panel) and PageShell (the
+ *   skip link, together with the modifier below).
  * - .ds-visually-hidden--focusable: combined with .ds-visually-hidden, the element stays hidden
  *   until it receives focus, then appears. Used by the PageShell skip link "Skip to main content"
  *   (WCAG 2.2 SC 2.4.1 Bypass Blocks).

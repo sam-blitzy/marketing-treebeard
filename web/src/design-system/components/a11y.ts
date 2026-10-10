@@ -1,6 +1,7 @@
 /**
- * Accessibility helpers shared by the design-system wrappers `TextField`, `Select` and
- * `Tooltip`, so the content rule and the `aria-describedby` assembly they all depend on are
+ * Accessibility helpers shared by the design-system wrappers `TextField`, `Select`, `Tooltip`
+ * and `DateRangePicker`, so the content rule they all depend on (`DateRangePicker` applies
+ * `hasContent` to its `actions`) and the `aria-describedby` assembly the other three share are
  * defined once and cannot drift apart.
  *
  * This module is internal to `src/design-system/components`: it is not re-exported from the

@@ -543,7 +543,9 @@ function sameDocumentLinkHash(event: MouseEvent): string | null {
  *
  * A hash that names no element leaves focus where it is. A target the page has not rendered
  * yet, such as a card beyond the shown batch, is revealed, scrolled to and focused by its list
- * on `hashchange` (`features/actions/batches.tsx`). A page load with a hash moves no focus.
+ * on `hashchange` (`features/actions/batches.tsx`), and a held card behind its collapsed
+ * disclosure by that disclosure (`HeldDisclosure`, `features/actions/sections/SectionFrame.tsx`).
+ * A page load with a hash moves no focus.
  *
  * Called from the root route's component, which stays mounted on every screen.
  */

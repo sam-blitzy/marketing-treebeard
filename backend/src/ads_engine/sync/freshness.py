@@ -19,7 +19,11 @@ outcome into the stored row:
 * ``completeness`` is ``complete``, ``incomplete`` or ``unknown``. A success writes
   ``complete`` or ``incomplete``, never ``unknown``. An incremental success that re-reads
   only part of the stored range never turns an ``incomplete`` row ``complete``: only an
-  attempt that re-covers the whole stored range may do that.
+  attempt that re-covers the whole stored range may do that, unless the row's only
+  shortfalls are dated finest-partition days that the attempt re-read. A Q-G6 reason names
+  the days of its partitions at the result limit (:func:`shortfall_spans`), so a finished
+  read (neither cut short nor repairable) of part of the range removes the days it re-read
+  and keeps the rest, and the row turns ``complete`` once no day is left.
 * A failure changes only ``last_attempt_at`` and ``reason``; the last good data, its
   coverage and its completeness stand (AAP 0.3.3, transient row of the fallback table).
 * :func:`mark_unknown` turns a row ``unknown`` when data was added after the success it
@@ -81,6 +85,14 @@ from sqlalchemy import null, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ads_engine.analysis.shortfall import (
+    FAILURE_MARKER,
+    FINEST_PARTITION,
+    DaySpan,
+    shortfall_outside,
+    shortfall_spans,
+    shortfall_within,
+)
 from ads_engine.db import repositories
 from ads_engine.db.models.ops import COMPLETENESS, DATASETS, DatasetFreshness, SourceDataset
 from ads_engine.logging import get_logger
@@ -95,6 +107,7 @@ __all__ = [
     "REPAIRABLE_REASONS",
     "SOURCE_DATASETS",
     "Completeness",
+    "DaySpan",
     "FreshnessOutcome",
     "is_repairable_reason",
     "load_freshness",
@@ -103,6 +116,9 @@ __all__ = [
     "needs_repair",
     "record_freshness",
     "recorded_shortfall",
+    "shortfall_outside",
+    "shortfall_spans",
+    "shortfall_within",
     "source_of",
     "write_checkpoint",
 ]
@@ -124,8 +140,12 @@ REASON_DEFERRED: Final = "call budget exhausted"
 REASON_INTERRUPTED: Final = "interrupted"
 """Repairable: a transient error survived its retries part-way through a fetch."""
 
-REASON_FINEST_PARTITION: Final = "result limit reached at finest partition"
-"""Permanent: a single (day, ad group) Q-G6 partition still returned 10,000 rows."""
+REASON_FINEST_PARTITION: Final = FINEST_PARTITION
+"""Permanent: a single (day, ad group) Q-G6 partition still returned 10,000 rows.
+
+Its detail names the days of those partitions (:func:`shortfall_spans`, re-exported with
+:func:`shortfall_outside` and :func:`shortfall_within` from :mod:`ads_engine.analysis.shortfall`),
+so a later finished read of those days ends the shortfall for them (:func:`record_freshness`)."""
 
 REASON_SEARCH_CEILING: Final = "search result ceiling reached"
 """Permanent: a one-hour HubSpot CRM Search partition still held more than 10,000 results."""
@@ -134,12 +154,14 @@ REPAIRABLE_REASONS: Final[tuple[str, ...]] = (REASON_DEFERRED, REASON_INTERRUPTE
 """Prefixes of shortfalls that refetching the recorded range can make good."""
 
 PERMANENT_REASONS: Final[tuple[str, ...]] = (REASON_FINEST_PARTITION, REASON_SEARCH_CEILING)
-"""Prefixes of shortfalls inherent to the platform's limits; refetching cannot remove them."""
+"""Prefixes of shortfalls inherent to the platform's limits; a refetch meets them again, so they
+never trigger a repair (:func:`needs_repair`)."""
 
 # A failure on an incomplete row appends its own reason after this marker, so the original
 # shortfall (and its repairable prefix) survives the failure, and a later success can drop
-# the failure note again without guessing where it starts.
-_FAILURE_MARKER: Final = "; last attempt failed: "
+# the failure note again without guessing where it starts. The dated-shortfall grammar
+# ignores the note through the same marker.
+_FAILURE_MARKER: Final = FAILURE_MARKER
 
 # Recorded when an incomplete row is carried forward but no reason was ever stored for it
 # (a row written outside this module), so ``incomplete`` is never left without a reason.
@@ -561,15 +583,88 @@ def _merge_coverage(
     return min(new_from, old_from), max(new_through, old_through), recovered_all
 
 
-def _worse(stored: _State, outcome: FreshnessOutcome) -> tuple[Completeness, str | None]:
+def _top_level_parts(reason: str) -> tuple[str, ...]:
+    """Split a reason at every ``"; "`` outside parentheses: the reasons a join put together.
+
+    A dated part keeps the ``"; "`` between its entries, because they are inside its
+    parentheses.
+    """
+    parts: list[str] = []
+    depth = start = index = 0
+    while index < len(reason):
+        if reason[index] == "(":
+            depth += 1
+        elif reason[index] == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and reason.startswith("; ", index):
+            parts.append(reason[start:index])
+            start = index + 2
+            index = start
+            continue
+        index += 1
+    parts.append(reason[start:])
+    return tuple(parts)
+
+
+def _joined(first: str, second: str | None) -> str:
+    """Join a shortfall reason after another with ``"; "``, adding only what it does not say.
+
+    What ``first`` already represents is left out of ``second``, so joining the same reason
+    again changes nothing and replaying an outcome leaves the row as it was
+    (:func:`record_freshness`):
+
+    * both dated (:func:`shortfall_spans`): ``second`` loses every day ``first`` names
+      (:func:`shortfall_outside`, per span), and nothing is added once no day is left; a day
+      both name stays flagged through ``first``;
+    * otherwise ``second`` is left out when its top-level parts already stand, in order and
+      together, among those of ``first`` (:func:`_top_level_parts`), ``first`` itself
+      included.
+
+    Args:
+        first: The reason kept first, with no failure note.
+        second: The reason to add, or ``None``.
+
+    Returns:
+        ``first``, followed by what ``second`` adds to it.
+    """
+    if second is None:
+        return first
+    days = shortfall_spans(first)
+    if days is not None and shortfall_spans(second) is not None:
+        added: str | None = second
+        for start, end in days:
+            added = shortfall_outside(added, start=start, end=end)
+            if added is None:
+                return first
+        return f"{first}; {added}"
+    held, adding = _top_level_parts(first), _top_level_parts(second)
+    width = len(adding)
+    if any(held[index : index + width] == adding for index in range(len(held) - width + 1)):
+        return first
+    return f"{first}; {second}"
+
+
+def _worse(
+    stored: _State, outcome: FreshnessOutcome, *, reread: bool = True
+) -> tuple[Completeness, str | None]:
     """Combine completeness when the attempt's own completeness may not replace the stored one.
 
-    That is when the attempt re-read only part of the stored range, or when it started
-    before the stored latest success. ``incomplete`` beats ``complete``. When the stored
-    row is the worse one its shortfall reason is kept, because the attempt did not re-read
-    the part that fell short. When both are incomplete, a repairable reason wins over a
-    permanent one, so a deferred shortfall is never masked by one refetching cannot remove;
-    otherwise the stored shortfall stays.
+    That is when the attempt re-read only part of the stored range (``reread``), or when it
+    started before the stored latest success (an obsolete attempt: ``reread`` false).
+    ``incomplete`` beats ``complete``. When the stored row is the worse one its shortfall
+    reason is kept, because the attempt did not re-read the part that fell short. When both
+    are incomplete, a repairable reason wins over a permanent one, so a deferred shortfall is
+    never masked by one refetching cannot remove; otherwise the stored shortfall stays.
+
+    A stored shortfall that names its days (:func:`shortfall_spans`: the Q-G6
+    finest-partition reason) is judged per day instead, when the attempt is a finished read
+    of a date range, neither cut short nor repairable. A current attempt removes the days it
+    re-read (:func:`shortfall_outside`): with none left its own completeness and reason
+    apply, otherwise the row stays ``incomplete`` with the days left followed by the
+    attempt's own shortfall. An obsolete attempt removes no day, because a newer read already
+    stands, but an incomplete one adds its own shortfall after the stored one. Either way
+    the attempt's shortfall adds only what the kept one does not already name
+    (:func:`_joined`), so the same outcome merged again changes nothing.
     """
     shortfall = _without_failure_note(stored.reason)
     if stored.completeness != "incomplete":
@@ -580,6 +675,28 @@ def _worse(stored: _State, outcome: FreshnessOutcome) -> tuple[Completeness, str
         and not is_repairable_reason(shortfall)
     ):
         return "incomplete", outcome.reason
+    first, last = outcome.covered_from, outcome.covered_through
+    if (
+        shortfall is not None
+        and shortfall_spans(shortfall) is not None
+        and first is not None
+        and last is not None
+        and not outcome.cut_short
+        and not outcome.repairable
+    ):
+        # A dated shortfall names the days it lacks, so it is settled per day: a finished
+        # read of those days ends it, and one that met the limit on other days adds to it.
+        # The stored shortfall therefore no longer wins a tie with the attempt's: keeping it
+        # would flag days that were re-read, and dropping the attempt's would hide days that
+        # were not. Undated shortfalls name no day and still yield only to a whole-range read.
+        own = outcome.reason if outcome.completeness == "incomplete" else None
+        if reread:
+            remaining = shortfall_outside(shortfall, start=first, end=last)
+            if remaining is None:
+                return outcome.completeness, outcome.reason
+            return "incomplete", _joined(remaining, own)
+        if own is not None:
+            return "incomplete", _joined(shortfall, own)
     return "incomplete", shortfall or outcome.reason or _UNSPECIFIED_SHORTFALL
 
 
@@ -599,12 +716,14 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
       attempt (:func:`_newer_cut_short`), is obsolete for the data and never makes the row
       look better or newer. A range that leaves a gap to the stored one changes nothing;
       otherwise the coverage merges with :func:`_merge_coverage` and the completeness and
-      reason come from :func:`_worse`. One that started after the stored latest success
-      still moves ``last_success_at`` to its own start, as in start order.
+      reason come from :func:`_worse`, which removes no day of a dated shortfall. One that
+      started after the stored latest success still moves ``last_success_at`` to its own
+      start, as in start order.
     * Any other success merges coverage with :func:`_merge_coverage` and takes the
       attempt's completeness when it re-read the whole stored range, or :func:`_worse`
-      otherwise. A cut-short success merges its coverage, completeness and reason the same
-      way.
+      otherwise, which ends the days of a dated shortfall a finished read re-read. A
+      cut-short success merges its coverage, completeness and reason the same way, and
+      removes no day.
     * A success that started before a stored failed attempt keeps that failure's reason
       (:func:`_failure_reason`), so the row reads as if both had committed in start order.
     """
@@ -628,13 +747,13 @@ def _merge(stored: _State, outcome: FreshnessOutcome) -> _State:
             # across the gap, so the stored coverage, completeness and reason stand.
             return replace(stored, last_attempt_at=last_attempt_at)
         covered_from, covered_through, _ = _merge_coverage(stored, outcome)
-        completeness, reason = _worse(stored, outcome)
+        completeness, reason = _worse(stored, outcome, reread=False)
     else:
         covered_from, covered_through, recovered_all = _merge_coverage(stored, outcome)
         if recovered_all:
             completeness, reason = outcome.completeness, outcome.reason
         else:
-            completeness, reason = _worse(stored, outcome)
+            completeness, reason = _worse(stored, outcome, reread=True)
     merged = _State(
         last_attempt_at=last_attempt_at,
         last_success_at=(
@@ -699,8 +818,10 @@ async def record_freshness(
       stored and new ranges when they overlap or are adjacent, and the new range
       otherwise. The attempt's completeness and reason apply when it re-read the whole
       stored range; otherwise the worse of stored and new is kept, so a trailing-days
-      refresh never turns a backfill-incomplete row complete. ``unknown`` is never
-      written on success.
+      refresh never turns a backfill-incomplete row complete, unless the row's only
+      shortfalls are dated finest-partition days the refresh re-read: a finished read
+      (neither cut short nor repairable) removes those days from the reason, and the row
+      turns complete once none is left. ``unknown`` is never written on success.
     * **Cut-short success** (:attr:`FreshnessOutcome.cut_short`: a transient error or a
       call-budget deferral stopped the read): merged like any success, so its coverage,
       ``incomplete`` and reason are recorded and a repairable reason still drives
@@ -715,10 +836,12 @@ async def record_freshness(
       before a stored cut-short attempt, is merged conservatively and never makes the row
       look better or newer: a range that leaves a gap to the stored one changes nothing,
       and otherwise the coverage merges as above while the worse completeness and its
-      reason are kept (one that started after the stored ``last_success_at`` still moves it
-      to its own start). A success that started before a stored failed attempt keeps that
-      failure's reason, as if the two had committed in start order. Recording the same
-      outcome again changes nothing.
+      reason are kept, no dated day is removed, and an incomplete attempt's shortfall is
+      added after a dated stored one, without the days that one already names (one that
+      started after the stored ``last_success_at`` still moves it to its own start). A
+      success that started before a stored failed attempt keeps that failure's reason, as
+      if the two had committed in start order. Recording the same outcome again changes
+      nothing.
 
     Concurrent writers of the same row serialize: an empty row is first inserted with
     ``ON CONFLICT DO NOTHING`` so that the following ``SELECT ... FOR UPDATE`` always has
@@ -1061,8 +1184,9 @@ def needs_repair(row: DatasetFreshness | None) -> bool:
     resumes the stored scopes instead and widens nothing; the widening is its fallback.
 
     Permanent shortfalls (:data:`REASON_FINEST_PARTITION`,
-    :data:`REASON_SEARCH_CEILING`) come from the platform's own result limits, so
-    refetching cannot remove them and they never trigger a repair. Neither does a
+    :data:`REASON_SEARCH_CEILING`) come from the platform's own result limits, so a
+    refetch meets them again and they never trigger a repair; a dated Q-G6 shortfall ends
+    for the days a later finished read re-reads (:func:`record_freshness`). Neither does a
     ``complete`` or ``unknown`` row, or an absent one.
 
     Args:

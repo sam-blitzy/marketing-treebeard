@@ -1,6 +1,9 @@
 /**
- * `SideNav`: the product's vertical navigation list with optional item counts (AAP 0.4.2,
- * "Section navigation: `SideNav` with anchor items and counts", status GAP).
+ * `SideNav`: the product's navigation list with optional item counts (AAP 0.4.2, "Section
+ * navigation: `SideNav` with anchor items and counts", status GAP). It is a single column in a
+ * narrow container, such as `PageShell`'s side column, and a compact wrapping row of
+ * content-sized items in a wide one, such as the primary navigation stacked above main or the
+ * `/actions` section navigation, with each count right after its label.
  *
  * Three places render it (AAP 0.5.5): the app's primary navigation in the router layout, the
  * sign-in screen's own primary navigation in `LoginPage`, and the `/actions` section navigation,
@@ -247,8 +250,9 @@ function buildLinkContent(item: SideNavItem): SideNavLinkContent {
 }
 
 /**
- * Vertical navigation list: a `<nav>` landmark named by `label`, holding one link per item with
- * its optional count, in the order given.
+ * Navigation list: a `<nav>` landmark named by `label`, holding one link per item with its
+ * optional count, in the order given. The items form one column in a narrow container and a
+ * compact wrapping row of content-sized items in a wide one, each count right after its label.
  *
  * Each item's `href` is validated before it is rendered or handed to `renderLink`. An item with
  * an unsafe `href` renders an inert placeholder `<a>` without `href`, and `renderLink` is not

@@ -1423,6 +1423,215 @@ def test_coverage_short_of_the_window_end_is_both_stale_and_incomplete() -> None
     assert covered.is_complete_over(window_start=date(2026, 9, 4), window_end=date(2026, 10, 1))
 
 
+FINEST = "result limit reached at finest partition"
+"""The Q-G6 finest-partition prefix (``sync.freshness.REASON_FINEST_PARTITION``)."""
+
+NOTE = "; last attempt failed: HTTP 503 after 3 attempts"
+"""A failed attempt's note after a shortfall (``sync.freshness`` failure marker)."""
+
+
+@pytest.mark.parametrize(
+    ("dataset", "completeness", "covered_through", "reason", "complete", "named"),
+    [
+        # A day at the result limit outside the window leaves the window complete.
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7)",
+            True,
+            None,
+            id="day-before-the-window",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 5),
+            f"{FINEST} (2026-10-02, ad group 7)",
+            True,
+            None,
+            id="day-after-the-window",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-20, ad group 7)",
+            False,
+            f"{FINEST} (2026-09-20, ad group 7)",
+            id="day-inside-the-window",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7; 2026-09-04, ad group 8; 2026-10-01, ad group 9)",
+            False,
+            f"{FINEST} (2026-09-04, ad group 8; 2026-10-01, ad group 9)",
+            id="only-the-days-inside-are-named",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7; and 5 more on 2026-09-01 to 2026-09-05)",
+            False,
+            f"{FINEST} (partitions on 2026-09-04 to 2026-09-05)",
+            id="bucket-span-reaching-into-the-window",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (4 partitions on 2026-08-30 to 2026-09-01, 2026-10-03)",
+            True,
+            None,
+            id="bucket-spans-around-the-window",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7){NOTE}",
+            True,
+            None,
+            id="failure-note-ignored",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7; 2026-09-20, ad group 8){NOTE}",
+            False,
+            f"{FINEST} (2026-09-20, ad group 8){NOTE}",
+            id="failure-note-kept-on-the-named-days",
+        ),
+        # Coverage short of the window end decides on its own; the caller names it.
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 9, 30),
+            f"{FINEST} (2026-09-03, ad group 7)",
+            False,
+            None,
+            id="coverage-short-of-the-window",
+        ),
+        # Undated shortfalls stay incomplete over every range.
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            FINEST,
+            False,
+            FINEST,
+            id="undated-bare-prefix",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7; and 1 more)",
+            False,
+            f"{FINEST} (2026-09-03, ad group 7; and 1 more)",
+            id="undated-legacy-count",
+        ),
+        pytest.param(
+            "linkedin.analytics_daily",
+            "incomplete",
+            date(2026, 10, 1),
+            f"{FINEST} (one day)",
+            False,
+            f"{FINEST} (one day)",
+            id="undated-linkedin",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "incomplete",
+            date(2026, 10, 1),
+            None,
+            False,
+            "incomplete",
+            id="no-reason",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "unknown",
+            date(2026, 10, 1),
+            f"{FINEST} (2026-09-03, ad group 7)",
+            False,
+            f"{FINEST} (2026-09-03, ad group 7)",
+            id="unknown-names-its-reason",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "unknown",
+            date(2026, 10, 1),
+            None,
+            False,
+            "unknown",
+            id="unknown",
+        ),
+        pytest.param(
+            "google.search_terms",
+            "complete",
+            date(2026, 10, 1),
+            "earlier failure",
+            True,
+            None,
+            id="complete",
+        ),
+        # A full-state dataset's completeness alone decides, whatever its reason says.
+        pytest.param(
+            "google.entities",
+            "incomplete",
+            None,
+            f"{FINEST} (2026-09-03, ad group 7)",
+            False,
+            f"{FINEST} (2026-09-03, ad group 7)",
+            id="full-state",
+        ),
+    ],
+)
+def test_a_dated_shortfall_is_judged_and_named_over_the_window_days_only(
+    dataset: str,
+    completeness: str,
+    covered_through: date | None,
+    reason: str | None,
+    complete: bool,
+    named: str | None,
+) -> None:
+    window = {"window_start": date(2026, 9, 4), "window_end": date(2026, 10, 1)}
+    row = Freshness(
+        3,
+        dataset,
+        NOW,
+        NOW - timedelta(hours=1),
+        None if covered_through is None else date(2026, 4, 1),
+        covered_through,
+        completeness,  # type: ignore[arg-type]
+        reason,
+    )
+    assert row.is_complete_over(**window) is complete
+    assert row.incomplete_reason_over(**window) == named
+    # The covered-range verdict other callers read is unchanged.
+    assert row.is_complete is (completeness == "complete")
+
+
+def test_a_reversed_range_is_refused_for_a_dated_shortfall() -> None:
+    row = Freshness(
+        3,
+        "google.search_terms",
+        NOW,
+        NOW,
+        date(2026, 4, 1),
+        date(2026, 10, 1),
+        "incomplete",
+        f"{FINEST} (2026-09-03, ad group 7)",
+    )
+    with pytest.raises(ValueError, match="is after end"):
+        row.incomplete_reason_over(window_start=date(2026, 10, 1), window_end=date(2026, 9, 4))
+
+
 @pytest.mark.parametrize("dataset", sorted(FULL_STATE_DATASETS))
 def test_full_state_datasets_are_stale_by_age_alone(dataset: str) -> None:
     day = timedelta(hours=24)

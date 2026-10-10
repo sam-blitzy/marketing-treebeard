@@ -23,12 +23,16 @@
 /*
  * Field: label, control, hint and error in one column spaced by the gap alone.
  * min-inline-size: 0 lets the field shrink inside a flex or grid track instead of widening it.
+ * The field stops widening at a form measure of 15 --space-8 steps (480px at the 16px root), so
+ * a control in a wide column keeps a readable width instead of spanning the page; in a narrower
+ * container, such as a dialog, it still fills the container.
  */
 .ds-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   min-inline-size: 0;
+  max-inline-size: calc(var(--space-8) * 15);
 }
 
 /* Visible label (WCAG 2.2 SC 3.3.2): long labels wrap instead of overflowing a narrow track. */

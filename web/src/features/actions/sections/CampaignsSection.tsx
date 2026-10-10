@@ -26,6 +26,14 @@
  * - **C1b and C2 "Hold"**: a one-row "Pipeline evidence" table of matured leads, matched and
  *   unresolved matured leads, eligible contacts, MQL, QL and meetings, MQL and QL in separate
  *   columns and never combined (AAP 0.5.4.7).
+ * - **C2 "Scale"**: after its campaign evidence, an in-page link to its B1 item, which carries
+ *   the amount (AAP 0.5.4.4): "View B1 budget increase: {B1 action}" to the B1 card
+ *   (`#item-{id}`) for the subject both decide on (`extra.b1_link`). The B1 card is found
+ *   through the page's `B1CardsProvider`, so no request is sent. The link stays while the B1
+ *   card is held until discrepancies are resolved: following it expands the Budget group's held
+ *   disclosure, scrolls to the card and moves focus to it; the card stays held. With no B1 card
+ *   rendered for that subject (outside the provider, or the B1 hidden by feedback or absent),
+ *   the card shows no link. A "Hold" has no B1 and no link.
  * - **C3a and C3b launch ideas**: the gap evidence. A segment gap lists the segment with its
  *   leads, cost per lead and impression share; a keyword-cluster gap lists the head tokens and a
  *   "Cluster member terms" table of each member term's spend and conversions.
@@ -82,10 +90,14 @@ import { Button, DataTable, Inline, Spinner, Stack } from '../../../design-syste
 import type { DataTableColumn } from '../../../design-system';
 import { formatCount, formatMetric, formatMoney } from '../../../lib/format';
 import { DiscrepancyResolution, RESOLUTION_LABELS } from '../../decisions/DiscrepancyResolver';
+import type { FeedbackConfirmations } from '../ActionOutcomes';
+import { useLinkedB1Card } from '../B1Cards';
+import type { B1Card } from '../B1Cards';
 import { RecommendationCard } from '../RecommendationCard';
 import {
   PAUSE_SCALE_METRIC_KEYS,
   PIPELINE_METRIC_KEYS,
+  b1Link,
   discrepancyRef,
   evidenceCurrency,
   launchGap,
@@ -100,7 +112,9 @@ import {
   HistoricalItems,
   SectionFrame,
   isHidden,
+  itemAnchorId,
   partitionGroup,
+  placeConfirmations,
 } from './SectionFrame';
 import type { FieldItem, SectionComponentProps } from './SectionFrame';
 
@@ -122,6 +136,12 @@ export const SEGMENT_GAP_LABEL = 'Segment gap';
 
 /** The accessible name of a C3b card's cluster-gap list. */
 export const CLUSTER_GAP_LABEL = 'Cluster gap';
+
+/**
+ * The text a C2 "Scale" card's link to its B1 card starts with, followed by the B1 item's
+ * action: "View B1 budget increase: Raise daily budget from USD 200.00 to USD 240.00".
+ */
+export const B1_LINK_LABEL = 'View B1 budget increase';
 
 /** The `Spinner` label while a C0 card reads its live discrepancy. */
 export const LOADING_DISCREPANCY_LABEL = 'Loading discrepancy';
@@ -346,6 +366,41 @@ function PipelineEvidence({ item }: ItemProps): ReactElement | null {
       rows={PIPELINE_ROWS}
       getRowKey={(row) => row.key}
     />
+  );
+}
+
+/**
+ * The link text naming a B1 card by what it recommends: "View B1 budget increase: {action}", or
+ * "View B1 budget increase" alone when its action is blank.
+ */
+function b1LinkText(target: B1Card): string {
+  return target.action === null ? B1_LINK_LABEL : `${B1_LINK_LABEL}: ${target.action}`;
+}
+
+/**
+ * The link from a C2 "Scale" card to its B1 item, which carries the amount (AAP 0.5.4.4): an
+ * in-page link to the run's B1 card for the subject both decide on (`#item-{id}`), named by what
+ * that card recommends, so the link says where it leads without its card around it (WCAG 2.2
+ * SC 2.4.4). It sits in an `Inline` row, so it keeps its own width instead of stretching across
+ * the card.
+ *
+ * The link is rendered whether the B1 card is shown openly, computed from replaced data, or held
+ * until discrepancies are resolved: a held B1 card sits behind its group's held disclosure,
+ * which expands, scrolls to the card and focuses it when the link is followed (`HeldDisclosure`),
+ * with the hold left in place. A C2 "Scale" and its B1 share a subject, so they are normally held
+ * together. Nothing is rendered when the item carries no B1 link, or when the page renders no
+ * B1 card for its subject ({@link useLinkedB1Card}): outside a `B1CardsProvider`, or while that
+ * card is hidden by feedback or absent from the run.
+ */
+function ScaleB1Link({ item }: ItemProps): ReactElement | null {
+  const target = useLinkedB1Card(b1Link(item));
+  if (target === null) {
+    return null;
+  }
+  return (
+    <Inline>
+      <a href={`#${itemAnchorId(target.itemId)}`}>{b1LinkText(target)}</a>
+    </Inline>
   );
 }
 
@@ -857,15 +912,18 @@ function CampaignCard({ item }: ItemProps): ReactElement {
           <PipelineEvidence item={item} />
         </RecommendationCard>
       );
-    case RULE.scaleOrHold:
+    case RULE.scaleOrHold: {
       // "Hold" (the pipeline veto fired) is told apart by the frozen outcome, not by the
       // missing decision subject: a Scale item keeps its subject even when the overlay holds it.
+      const outcome = scaleOutcome(item);
       return (
         <RecommendationCard item={item} headingLevel={4}>
           <CampaignEvidence item={item} />
-          {scaleOutcome(item) === 'Hold' ? <PipelineEvidence item={item} /> : null}
+          {outcome === 'Hold' ? <PipelineEvidence item={item} /> : null}
+          {outcome === 'Scale' ? <ScaleB1Link item={item} /> : null}
         </RecommendationCard>
       );
+    }
     case RULE.segmentLaunch:
     case RULE.clusterLaunch:
       return (
@@ -908,6 +966,11 @@ interface DiscrepancyGroupBodyProps {
   group: Group;
   /** The group's anchor id, from which the replaced-data block's and held region's ids derive. */
   anchorId: string;
+  /**
+   * The feedback confirmations recorded on this page for the section's hidden items, as the
+   * frame read them (`GroupParts.confirmations`).
+   */
+  confirmations: FeedbackConfirmations;
 }
 
 /**
@@ -921,37 +984,58 @@ interface DiscrepancyGroupBodyProps {
  * body would then move that C0 into the replaced-data block below the group's other cards,
  * while AAP 0.5.5 shows it in place with its resolver disabled. So C0 cards stay pinned here,
  * and the card itself shows the historical badge and disables the resolver. Items feedback
- * hides are skipped, as the frame does (the frame counts them).
+ * hides are skipped, as the frame does (the frame counts them), except one hidden by a feedback
+ * recorded on this page, which shows its confirmation where its card stood
+ * ({@link placeConfirmations}), in a block emptied by it in the block's place. C0 itself is
+ * exempt from feedback (AAP 0.5.4.2), so no C0 card is ever replaced by one.
  *
  * Each list is a {@link CardList}, bounded like the frame's own: the C0 and visible cards form
  * one list in that order, so a long discrepancy group mounts one batch at a time and still shows
  * every C0 card before any other card. A held card's link to a C0 card not shown yet
- * (`#item-{id}`) reveals it.
+ * (`#item-{id}`) reveals it, and a hash naming one of the group's held cards expands the held
+ * disclosure ({@link HeldDisclosure} `anchors`).
  *
  * The group's C0 cards share one {@link LiveDiscrepancyLookup}: the live discrepancies are read
  * once for the group, and only while it shows a current C0 card naming a discrepancy
  * ({@link currentDiscrepancyIds}).
  */
-function DiscrepancyGroupBody({ group, anchorId }: DiscrepancyGroupBodyProps): ReactElement {
+function DiscrepancyGroupBody({
+  group,
+  anchorId,
+  confirmations,
+}: DiscrepancyGroupBodyProps): ReactElement {
   const pinned = group.items.filter(
     (item) => item.rule_id === RULE.discrepancy && !isHidden(item),
   );
-  const { visible, historical, held } = partitionGroup({
+  const others: Group = {
     ...group,
     items: group.items.filter((item) => item.rule_id !== RULE.discrepancy),
-  });
+  };
+  const { historical, held } = partitionGroup(others);
+  // The lists with the confirmations of the items a feedback recorded on this page has hidden.
+  const placed = placeConfirmations(others, confirmations);
+  const cards = (items: readonly Item[]) => (
+    <CardList items={items} renderCard={renderCampaignCard} confirmations={confirmations} />
+  );
   // The pinned C0 cards and the visible cards are one bounded list, so its batches reveal every
-  // C0 card before the first other card, however many C0 cards there are.
+  // C0 card before the first other card, however many C0 cards there are. A block emptied by a
+  // feedback renders nothing, so its confirmations take its place.
   return (
     <LiveDiscrepancyLookup discrepancyIds={currentDiscrepancyIds(pinned)}>
       <Stack>
-        <CardList items={[...pinned, ...visible]} renderCard={renderCampaignCard} />
+        {cards([...pinned, ...placed.visible])}
         <HistoricalItems id={`${anchorId}-historical`} count={historical.length}>
-          <CardList items={historical} renderCard={renderCampaignCard} />
+          {cards(placed.historical)}
         </HistoricalItems>
-        <HeldDisclosure id={`${anchorId}-held`} count={held.length}>
-          <CardList items={held} renderCard={renderCampaignCard} />
+        {historical.length === 0 && placed.historical.length > 0 ? cards(placed.historical) : null}
+        <HeldDisclosure
+          id={`${anchorId}-held`}
+          count={held.length}
+          anchors={held.map((item) => itemAnchorId(item.id))}
+        >
+          {cards(placed.held)}
         </HeldDisclosure>
+        {held.length === 0 && placed.held.length > 0 ? cards(placed.held) : null}
       </Stack>
     </LiveDiscrepancyLookup>
   );
@@ -989,7 +1073,11 @@ export function CampaignsSection({ section, overlay }: SectionComponentProps): R
       renderItem={(item) => <CampaignCard item={item} />}
       renderGroup={(group, parts) =>
         group.key === DISCREPANCY_GROUP_KEY ? (
-          <DiscrepancyGroupBody group={group} anchorId={parts.anchorId} />
+          <DiscrepancyGroupBody
+            group={group}
+            anchorId={parts.anchorId}
+            confirmations={parts.confirmations}
+          />
         ) : (
           parts.body
         )

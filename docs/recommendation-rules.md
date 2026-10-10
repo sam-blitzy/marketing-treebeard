@@ -262,9 +262,24 @@ Every budget card (`C2`, `B1`–`B4`) shows known-budget active days, spending d
 days, changed-intraday days and unobserved days; `B1`–`B4` add the spending days' share. `C2`
 and `B1`–`B3` also show the days meeting the rule's predicate (with their share on `B1`–`B3`),
 and `extra.gate` holds each check of their gate observed against required. `B4` is not gated
-on budget history: its card has no predicate-day count, and `extra.budget_history` shows its
-known-budget and spending days beside `budget.min_known_days` and `budget.min_spending_days`,
-which do not gate it.
+on budget history: its evidence has no capped, high-utilization or under-utilized day count,
+and `extra.budget_history.minimums` shows its known-budget and spending days beside
+`budget.min_known_days` and `budget.min_spending_days`, which do not gate it. Its own
+`extra.gate` holds its weekend days and weekdays with spend against `b4.min_weekend_days` and
+`b4.min_weekdays`, and its outcomes against `b4.min_outcomes`.
+
+The "Budget days" table of a Budget changes card lists every day count against its
+requirement, in this order: known-budget (or budget-active) days, spending days, the rule's
+predicate days, known idle days, changed-intraday days and unobserved days. `B1`–`B3` take each
+requirement from `extra.gate`. `B4` lists its weekend days, then weekdays, with spend as its
+predicate days, against `b4.min_weekend_days` and `b4.min_weekdays` from `extra.gate`, and its
+known-budget and spending days against `budget.min_known_days` and `budget.min_spending_days`
+from `extra.budget_history.minimums`. A count checked against both a minimum and a share shows
+the stricter requirement. Known idle, changed-intraday and unobserved days have no requirement
+and read "—", so every day count a gate or the budget history requires is shown observed
+against required. The utilization cell repeats the spending and predicate days on one line,
+"Days (observed / required)". `B4`'s outcome minimum is not a day count: the evidence sample
+line shows it ("Sample: {outcomes} / {`b4.min_outcomes`} outcomes").
 
 ### CRM pipeline link and veto
 
@@ -409,7 +424,10 @@ Donor A, Donor B, USD 0.00 from new budget".
 - Every other item whose subject or input depends on a discrepant campaign or budget gets
   `held=true` with the reason "Resolve discrepancy first". Dependents are the campaign itself,
   its budget, its keywords and creatives, a shared budget containing it, and a white paper row
-  whose spend comes from it. Held cards appear collapsed at the end of their group.
+  whose spend comes from it. Held cards appear collapsed at the end of their group; following
+  an in-page link to a held card (`#item-{id}`) expands its group's held cards, scrolls to it
+  and moves focus to it, without releasing the hold. A page loaded at that link expands and
+  scrolls the same way but leaves focus where it is.
 - The read-time overlay applies the same holds to discrepancies detected after the run
   ([Read-time overlay](#read-time-overlay)).
 - While any discrepancy is unresolved, every other item carries `unverified_discrepancies`
@@ -433,7 +451,9 @@ acting on zero-outcome rules". For that source, `K1`, `C1`, the zero-outcome bra
     `sources.stale_after_hours` (default 24) hours ago, or its coverage stops short of the window
     end. A live item with a stale dataset gets `data_status = stale`.
   - `incomplete` when a required dataset is not `complete` over the window. Each section gets one
-    `incomplete_dataset` finding per incomplete dataset it uses.
+    `incomplete_dataset` finding per incomplete dataset it uses. A `google.search_terms` shortfall
+    at the Q-G6 result limit names its days, so it counts only when the window includes one of
+    them, and the flag and the finding name only those days.
   - A successful sync of one dataset never clears the flag of another.
 - **P5 short window**: the `short_window` flag on every item and the short-window banner when the
   window is below `window.trusted_min_days` (default 14).
@@ -459,6 +479,10 @@ acting on zero-outcome rules". For that source, `K1`, `C1`, the zero-outcome bra
 - `C0` is exempt: feedback on a `C0` item is refused with 422 `feedback_not_allowed`. A
   discrepancy is closed only by its resolution.
 - Feedback on a historical item is refused with 409 `subject_retired`.
+- Feedback is idempotent per item. A request that repeats the item's latest feedback still in
+  force, with the same kind and note (a double click, for example), is answered with that
+  feedback: no second entry, no later expiry and no second rerun request. Another kind or note is
+  recorded as a new entry and becomes the item's latest.
 
 ### Item actions
 
@@ -487,9 +511,10 @@ rewriting it:
 Section `keywords`. Search terms come from the `search_term_view` report and keywords from the
 account's keyword list and `keyword_view` daily facts.
 
-**Every keyword card shows**, in this order: the term (or keyword text), spend, conversions,
-cost per conversion ("—" when conversions are 0) and the reason. The campaign and ad group sit
-beside them in `evidence.extra`. Conversions are decimals throughout, because data-driven
+**Every keyword card shows**, in this order: the term (or keyword text), the campaign and ad
+group, spend, conversions, cost per conversion ("—" when conversions are 0) and the reason. The
+campaign and ad group names come from `evidence.extra` (`campaign`, `ad_group`) and read
+"{campaign} · {ad group}". Conversions are decimals throughout, because data-driven
 attribution makes them fractional. Reasons, findings and withheld lines put a count's noun in
 the singular only at exactly 1 ("1 conversion", "1 click", "window 1 day of 14 required").
 
@@ -852,7 +877,13 @@ subject, and never one on its members.
   - Scale: "Capped on {capped} of {known} known-budget days with {outcomes} {outcomes label} at
     {cost} per {outcome} (account {baseline}): raise the daily budget from {current} to
     {proposed} (B1)." A shared budget counts budget-active days instead of known-budget days.
-    `extra.b1_link` points to the `B1` item.
+    `extra.b1_link` points to the `B1` item by the subject both decide on, and the card links
+    to that `B1` card in Budget changes ("View B1 budget increase: {B1 action}") whenever the
+    page renders it: shown openly, computed from replaced data, or held. A held `B1` card sits
+    collapsed under "Held until discrepancies are resolved"; following the link expands that
+    disclosure, scrolls to the card and moves focus to it, and the card stays held. A `Scale`
+    and its `B1` share a subject, so one discrepancy normally holds both. Only a `B1` card
+    hidden by feedback, or none in the run, leaves the `Scale` card without a link.
   - Hold: "…, but {eligible} eligible contacts from matured leads reached 0 Qualified Leads: hold
     the budget." The card shows matured, matched and unresolved leads, eligible contacts, MQL, QL
     and meetings.
@@ -976,10 +1007,12 @@ withheld patterns follow the items.
 
 - utilization: the window percentage plus every day count from
   [Utilization and history gates](#utilization-and-history-gates), each observed against
-  required where the rule's gate sets a requirement (known-budget or budget-active days,
-  spending days, days meeting the rule's predicate, idle days, changed-intraday days,
-  unobserved days). `B4` shows the same counts beside its pattern but no days meeting a
-  predicate, because it is not gated on budget history;
+  required where the rule's gate or the budget history sets a requirement (known-budget or
+  budget-active days, spending days, days meeting the rule's predicate, idle days,
+  changed-intraday days, unobserved days). `B4` is not gated on budget history: its predicate
+  days are its weekend days and weekdays with spend, against `b4.min_weekend_days` and
+  `b4.min_weekdays`, and its known-budget and spending days stand against the budget-history
+  minimums `budget.min_known_days` and `budget.min_spending_days`;
 - efficiency: cost per outcome against the account baseline. A cost per outcome, or the account
   baseline, over a known 0 outcomes reads "—" (a zero denominator, never a finite cost), and over
   unreported outcomes "unavailable";
@@ -1155,7 +1188,13 @@ member days.
   card shows the utilization block of the campaign's budget history (the shared budget's for a
   Google campaign on an explicitly shared budget) with its latest effective daily budget,
   efficiency against the account baseline, outcomes and CRM Qualified Leads where linked. `B4`
-  is not gated on that history (`extra.budget_history`), so the block has no predicate-day count.
+  is not gated on that history, so its evidence has no capped, high-utilization or
+  under-utilized day count. The card's "Budget days" table lists the weekend days and weekdays
+  with spend as its predicate days, against `b4.min_weekend_days` and `b4.min_weekdays` from
+  `extra.gate`, and the history's known-budget and spending days against
+  `budget.min_known_days` and `budget.min_spending_days` from
+  `extra.budget_history.minimums`, so each day count that has a requirement is shown observed
+  against it; the outcome minimum is the sample line.
 - **Ranking**: window spend, descending.
 - **Withheld or suppressed**: the pattern goes to the withheld lines with its sample sizes:
   - "weighted attribution: rate test not valid" when any included action is data-driven or

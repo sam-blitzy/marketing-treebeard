@@ -30,11 +30,14 @@
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { useRouterState } from '@tanstack/react-router';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { ConfigView, Run } from '../../api/types';
+import { formatInstant } from '../../lib/format';
 import {
   CUSTOM_RUN_ID,
   DEFAULT_RUN_ID,
@@ -83,9 +86,12 @@ function presetLabels(window: ConfigView['window'] = fixtureWindow): string[] {
   return window.presets.map((days) => presetLabel(days, window.default_days));
 }
 
-/** The reopen-select label of a custom run: "{start} – {end} · {days} days". */
+/**
+ * The reopen-select label of a custom run: "{start} – {end} · {days} days · computed
+ * {finished_at in the run's display time zone} · run {id}".
+ */
 function reopenLabel(run: Run): string {
-  return `${run.window_start} – ${run.window_end} · ${daysLabel(run.days)}`;
+  return `${run.window_start} – ${run.window_end} · ${daysLabel(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)} · run ${String(run.id)}`;
 }
 
 /**
@@ -170,6 +176,26 @@ function renderPicker(run: Run = makeRun(), path = '/actions') {
   return renderWithProviders(<WindowPicker run={run} />, { path });
 }
 
+/** Props of {@link RunFromUrl}. */
+interface RunFromUrlProps {
+  /** The runs `?run=<id>` can show. */
+  runs: readonly Run[];
+}
+
+/**
+ * One picker that stays mounted while the run on screen follows the URL, as on `/actions`: the
+ * entry of `runs` whose id is `?run=`, or else the fixture default run.
+ */
+function RunFromUrl({ runs }: RunFromUrlProps): ReactElement {
+  const runId = useRouterState({ select: (state) => state.location.search.run });
+  return <WindowPicker run={runs.find((candidate) => candidate.id === runId) ?? defaultRun} />;
+}
+
+/** Renders {@link RunFromUrl} for `runs` at `path`. */
+function renderRunFromUrl(runs: readonly Run[], path = '/actions') {
+  return renderWithProviders(<RunFromUrl runs={runs} />, { path });
+}
+
 /** A preset or picker button by its accessible name. */
 function button(name: string): HTMLElement {
   return screen.getByRole('button', { name });
@@ -200,6 +226,64 @@ function recentCustomRunsRegion(): HTMLElement {
     throw new Error('The "Recent custom windows" button controls no element.');
   }
   return region;
+}
+
+/**
+ * The picker's own polite status region, which holds the "Computing custom window" spinner and
+ * every warning: the last child of the picker's frame, below the recent custom windows region.
+ */
+function frameStatusRegion(): HTMLElement {
+  const region = recentCustomRunsRegion().parentElement?.lastElementChild;
+  if (!(region instanceof HTMLElement) || region.getAttribute('role') !== 'status') {
+    throw new Error('The picker’s frame ends in no status region.');
+  }
+  return region;
+}
+
+/**
+ * The visually hidden status region at the end of the date-range picker, which announces the
+ * window the picker shows (`DateRangePicker`'s `statusMessage`).
+ */
+function openedStatusRegion(): HTMLElement {
+  const picker = screen.getByRole('group', { name: 'Analysis window' }).closest('.ds-daterange');
+  const region = picker?.lastElementChild;
+  if (!(region instanceof HTMLElement) || region.getAttribute('role') !== 'status') {
+    throw new Error('The date-range picker ends in no status region.');
+  }
+  return region;
+}
+
+/**
+ * The text the picker announces once a custom run is on screen. It lands in
+ * {@link openedStatusRegion} shortly after the region is committed, never in the same task, so an
+ * expectation of it waits for it.
+ */
+function openedMessage(run: Run): string {
+  return `Custom window ${run.window_start} – ${run.window_end} opened, ${daysLabel(run.days)}, run ${String(run.id)}`;
+}
+
+/**
+ * How long `DateRangePicker` holds a status message back after the commit (its
+ * `STATUS_MESSAGE_DELAY_MS`), so its region is in the accessibility tree before the text changes.
+ */
+const OPENED_MESSAGE_DELAY_MS = 100;
+
+/**
+ * Waits until a status message the picker still holds back would have landed, so an expectation
+ * that {@link openedStatusRegion} stays empty cannot pass merely because a message is pending.
+ */
+async function openedMessageSettled(): Promise<void> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        window.setTimeout(resolve, OPENED_MESSAGE_DELAY_MS);
+      }),
+  );
+}
+
+/** The "Reopen" button below the reopen select, which opens the custom run it shows. */
+function reopenButton(): HTMLElement {
+  return button('Reopen');
 }
 
 /** Waits until the picker's controls are on screen. */
@@ -591,6 +675,9 @@ describe('WindowPicker', () => {
         expect(screen.getByRole('combobox', { name: 'Reopen a custom window' })).toBeTruthy();
       });
       expect(statusWithText('Computing custom window')).toBeUndefined();
+      // The picker's own status region is in place, empty, before the run starts.
+      const statusRegion = frameStatusRegion();
+      expect(statusRegion.childNodes).toHaveLength(0);
 
       fireEvent.click(button(presetLabel(days)));
 
@@ -599,16 +686,27 @@ describe('WindowPicker', () => {
       });
       expect(posts(api)[0]?.body).toEqual(presetWindow(days, defaultRun.window_end));
 
-      // While the run computes, a polite status says so and every control is disabled.
+      // While the run computes, a polite status says so and every control is disabled. The
+      // spinner lands inside the status region that existed before, so it is announced.
       await waitFor(() => {
         expect(statusWithText('Computing custom window')).toBeDefined();
       });
+      expect(frameStatusRegion()).toBe(statusRegion);
+      expect((statusRegion.textContent ?? '').trim()).toBe('Computing custom window');
+      // The spinner's own status sits inside the region, not beside it.
+      expect(
+        within(statusRegion)
+          .getAllByRole('status')
+          .map((inner) => (inner.textContent ?? '').trim()),
+      ).toEqual(['Computing custom window']);
+      expect(screen.queryByRole('alert')).toBeNull();
       for (const name of [...presetLabels(), 'Custom range']) {
         expect(button(name).hasAttribute('disabled')).toBe(true);
       }
       expect(
         screen.getByRole('combobox', { name: 'Reopen a custom window' }).hasAttribute('disabled'),
       ).toBe(true);
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
       expect(toggle.hasAttribute('disabled')).toBe(true);
       expect(router.state.location.search).toEqual({});
 
@@ -621,10 +719,51 @@ describe('WindowPicker', () => {
       await waitFor(() => {
         expect(statusWithText('Computing custom window')).toBeUndefined();
       });
+      // The same region stays, empty again.
+      expect(frameStatusRegion()).toBe(statusRegion);
+      expect(statusRegion.childNodes).toHaveLength(0);
       for (const name of [...presetLabels(), 'Custom range']) {
         expect(button(name).hasAttribute('disabled')).toBe(false);
       }
       expect(toggle.hasAttribute('disabled')).toBe(false);
+    });
+
+    it('shows the computing spinner before any warning, in the same status region', async () => {
+      const created = deferred();
+      stubApi({
+        'GET /runs/latest': apiError(500, 'internal', 'The server failed.'),
+        'POST /runs': created.handler,
+      });
+      await renderPicker();
+      await presetsShown();
+      await waitFor(() => {
+        expect(noticeTitles()).toEqual(['Could not read the latest default run']);
+      });
+      const statusRegion = frameStatusRegion();
+      expect(noticeRegion()).toBe(statusRegion);
+
+      fireEvent.click(button('56 days'));
+
+      await waitFor(() => {
+        expect(statusWithText('Computing custom window')).toBeDefined();
+      });
+      expect(frameStatusRegion()).toBe(statusRegion);
+      const spinner = within(statusRegion)
+        .getAllByRole('status')
+        .find((inner) => (inner.textContent ?? '').trim() === 'Computing custom window');
+      const banner = statusRegion.querySelector('.ds-banner');
+      // The spinner comes first, then the warning it does not replace.
+      expect(
+        banner !== null &&
+          spinner !== undefined &&
+          (spinner.compareDocumentPosition(banner) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+      ).toBe(true);
+      expect(noticeTitles()).toEqual(['Could not read the latest default run']);
+
+      created.resolve(apiError(409, 'run_in_progress', 'An analysis is already running.'));
+      await waitFor(() => {
+        expect(statusWithText('Computing custom window')).toBeUndefined();
+      });
     });
 
     it('ends every preset on the latest default run, not on an older run on screen', async () => {
@@ -1029,7 +1168,7 @@ describe('WindowPicker', () => {
       status: 'failed',
     });
 
-    it('lists the custom runs as "{start} – {end} · {days} days" and opens the chosen one by id', async () => {
+    it('lists the custom runs as "{start} – {end} · {days} days · computed {instant} · run {id}" and opens the chosen one by id on Reopen', async () => {
       const runs = [september, customRun] as const;
       const api = stubApi({ 'GET /runs': json(200, runs) });
       const { router } = await renderPicker();
@@ -1056,12 +1195,129 @@ describe('WindowPicker', () => {
       const [, second] = runs;
       fireEvent.change(select, { target: { value: String(second.id) } });
 
+      // Choosing only records the choice; "Reopen" opens it.
+      expect(select.value).toBe(String(second.id));
+      expect(router.state.location.search).toEqual({});
+      fireEvent.click(reopenButton());
+
       await waitFor(() => {
         expect(router.state.location.search).toEqual({ run: second.id });
       });
       expect(router.state.location.pathname).toBe('/actions');
       // Reopening navigates by id; it never computes a run.
       expect(posts(api)).toHaveLength(0);
+    });
+
+    it('never navigates while the user moves through the options (WCAG 2.2 SC 3.2.2)', async () => {
+      const runs = [september, customRun] as const;
+      const api = stubApi({ 'GET /runs': json(200, runs) });
+      const { router, queryClient } = await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+
+      // Each change is what ArrowDown, then ArrowDown again, then ArrowUp fire on a native select.
+      for (const value of [String(september.id), String(customRun.id), String(september.id)]) {
+        fireEvent.change(select, { target: { value } });
+        expect(select.value).toBe(value);
+        expect(reopenButton().hasAttribute('disabled')).toBe(false);
+      }
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(router.state.location.pathname).toBe('/actions');
+      expect(router.state.location.search).toEqual({});
+      expect(posts(api)).toHaveLength(0);
+      // Nothing was opened, so the select is the same element, still showing the last choice.
+      expect(screen.getByRole('combobox', { name: 'Reopen a custom window' })).toBe(select);
+      expect(select.value).toBe(String(september.id));
+    });
+
+    it('disables Reopen on the empty choice, and enables it once a custom run is chosen', async () => {
+      stubApi({ 'GET /runs': json(200, [september, customRun]) });
+      const { router } = await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+
+      // The default run is on screen: the select starts on the empty choice.
+      expect(select.value).toBe('');
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
+
+      fireEvent.change(select, { target: { value: String(september.id) } });
+      expect(reopenButton().hasAttribute('disabled')).toBe(false);
+
+      fireEvent.change(select, { target: { value: '' } });
+      expect(select.value).toBe('');
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
+      // A disabled button fires no click.
+      fireEvent.click(reopenButton());
+      expect(router.state.location.search).toEqual({});
+    });
+
+    it('disables the select and Reopen while a run computes', async () => {
+      const created = deferred();
+      const api = stubApi({
+        'GET /runs': json(200, [september, customRun]),
+        'POST /runs': created.handler,
+      });
+      const { router } = await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      fireEvent.change(select, { target: { value: String(september.id) } });
+      expect(reopenButton().hasAttribute('disabled')).toBe(false);
+
+      fireEvent.click(button('56 days'));
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(reopenButton().hasAttribute('disabled')).toBe(true);
+      });
+      expect(select.hasAttribute('disabled')).toBe(true);
+      fireEvent.click(reopenButton());
+      expect(router.state.location.search).toEqual({});
+
+      created.resolve(apiError(409, 'run_in_progress', 'An analysis is already running.'));
+      await waitFor(() => {
+        expect(reopenButton().hasAttribute('disabled')).toBe(false);
+      });
+      expect(select.hasAttribute('disabled')).toBe(false);
+      // The choice made before the computation is kept.
+      expect(select.value).toBe(String(september.id));
+    });
+
+    it('drops a choice not yet opened once another run is on screen', async () => {
+      stubApi({ 'GET /runs': json(200, [september, customRun]) });
+      const { router } = await renderRunFromUrl([september, customRun]);
+      await presetsShown();
+      openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      fireEvent.change(select, { target: { value: String(september.id) } });
+
+      // Another run comes on screen without Reopen, for example through a preset or Back.
+      await act(() => router.navigate({ to: '/actions', search: { run: customRun.id } }));
+
+      await waitFor(() => {
+        expect(select.value).toBe(String(customRun.id));
+      });
+      expect(reopenButton().hasAttribute('disabled')).toBe(false);
+
+      // Back on the default run, the earlier choice does not return: the empty choice shows.
+      await act(() => router.navigate({ to: '/actions', search: {} }));
+      await waitFor(() => {
+        expect(select.value).toBe('');
+      });
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
     });
 
     it('lists only succeeded custom runs, newest first as the API orders them', async () => {
@@ -1073,17 +1329,60 @@ describe('WindowPicker', () => {
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
       });
+      // The finished instant is derived from the fixture, so only the window, the length and
+      // the id are pinned here.
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        '2026-09-01 – 2026-09-30 · 30 days',
-        '2026-07-08 – 2026-10-05 · 90 days',
+        `2026-09-01 – 2026-09-30 · 30 days · computed ${formatInstant(september.finished_at, september.display_timezone)} · run 203`,
+        `2026-07-08 – 2026-10-05 · 90 days · computed ${formatInstant(customRun.finished_at, customRun.display_timezone)} · run ${String(CUSTOM_RUN_ID)}`,
       ]);
       expect(Array.from(select.options, (option) => option.value)).not.toContain(
         String(failed.id),
       );
     });
 
-    it('selects the custom run on screen, and ignores the empty choice', async () => {
+    it('tells runs of the same window apart by the instant they finished and their id', async () => {
+      /** A succeeded ten-day custom run of one shared window, finished at `finishedAt`. */
+      const sameWindow = (id: number, finishedAt: string): Run =>
+        makeRun({
+          id,
+          kind: 'custom',
+          trigger: 'manual',
+          window_start: '2026-09-30',
+          window_end: '2026-10-09',
+          days: 10,
+          display_timezone: 'America/New_York',
+          finished_at: finishedAt,
+        });
+      const later = sameWindow(303, '2026-10-10T13:00:00Z');
+      // Two runs finished within the same minute: only their ids tell them apart.
+      const second = sameWindow(302, '2026-10-09T14:05:40Z');
+      const first = sameWindow(301, '2026-10-09T14:05:10Z');
+      const runs = [later, second, first] as const;
+      stubApi({ 'GET /runs': json(200, runs) });
+      await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      const labels = Array.from(select.options, (option) => option.textContent ?? '').slice(1);
+      expect(labels).toEqual(runs.map(reopenLabel));
+      expect(new Set(labels).size).toBe(runs.length);
+      runs.forEach((run, index) => {
+        const instant = formatInstant(run.finished_at, run.display_timezone);
+        // The instant is shown in the run's display time zone, which the label names.
+        expect(instant.endsWith('America/New_York')).toBe(true);
+        expect(labels[index]).toContain(`computed ${instant}`);
+        expect(labels[index]?.endsWith(` · run ${String(run.id)}`)).toBe(true);
+      });
+      expect(formatInstant(first.finished_at, first.display_timezone)).toBe(
+        formatInstant(second.finished_at, second.display_timezone),
+      );
+    });
+
+    it('selects the custom run on screen, and opens nothing for the empty choice', async () => {
       stubApi({ 'GET /runs': json(200, [september, customRun]) });
       const { router } = await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
       await presetsShown();
@@ -1093,9 +1392,13 @@ describe('WindowPicker', () => {
         name: 'Reopen a custom window',
       });
       expect(select.value).toBe(String(CUSTOM_RUN_ID));
+      expect(reopenButton().hasAttribute('disabled')).toBe(false);
 
       fireEvent.change(select, { target: { value: '' } });
 
+      expect(select.value).toBe('');
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
+      fireEvent.click(reopenButton());
       expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
     });
 
@@ -1139,7 +1442,115 @@ describe('WindowPicker', () => {
     });
   });
 
+  describe('announcing the custom run on screen', () => {
+    it('announces a custom run on screen in the picker’s hidden status region, never as an alert', async () => {
+      stubApi();
+      await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
+      await presetsShown();
+
+      const region = openedStatusRegion();
+      expect(region.classList.contains('ds-visually-hidden')).toBe(true);
+      // The message lands a moment after the region is committed, in that same region.
+      await waitFor(() => {
+        expect(region.textContent).toBe(openedMessage(customRun));
+      });
+      expect(openedStatusRegion()).toBe(region);
+      expect(region.textContent).toBe(
+        `Custom window 2026-07-08 – 2026-10-05 opened, 90 days, run ${String(CUSTOM_RUN_ID)}`,
+      );
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('announces nothing for the default run', async () => {
+      stubApi();
+      const { queryClient } = await renderPicker();
+      await presetsShown();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      await openedMessageSettled();
+
+      expect(openedStatusRegion().textContent).toBe('');
+    });
+
+    it('follows the run on screen: a new message for each custom run, none for the default', async () => {
+      const september = makeRun({
+        id: 203,
+        kind: 'custom',
+        trigger: 'manual',
+        window_start: '2026-09-01',
+        window_end: '2026-09-30',
+        days: 30,
+      });
+      stubApi();
+      const { router } = await renderRunFromUrl([customRun, september]);
+      await presetsShown();
+      const region = openedStatusRegion();
+      await openedMessageSettled();
+      expect(region.textContent).toBe('');
+
+      await act(() => router.navigate({ to: '/actions', search: { run: customRun.id } }));
+      await waitFor(() => {
+        expect(region.textContent).toBe(openedMessage(customRun));
+      });
+
+      await act(() => router.navigate({ to: '/actions', search: { run: september.id } }));
+      await waitFor(() => {
+        expect(region.textContent).toBe(openedMessage(september));
+      });
+      // The same region throughout, so every message lands in a live region that exists.
+      expect(openedStatusRegion()).toBe(region);
+
+      await act(() => router.navigate({ to: '/actions', search: {} }));
+      await waitFor(() => {
+        expect(region.textContent).toBe('');
+      });
+      // Nothing is pending for the default run either, so the region stays empty.
+      await openedMessageSettled();
+      expect(region.textContent).toBe('');
+      expect(openedStatusRegion()).toBe(region);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  });
+
   describe('the recent custom windows disclosure', () => {
+    it('sits on the preset row right after "Custom range", outside the preset group, with its region below the picker', async () => {
+      stubApi({ 'GET /runs': json(200, [customRun]) });
+      await renderPicker();
+      await presetsShown();
+
+      const group = screen.getByRole('group', { name: 'Analysis window' });
+      const toggle = button('Recent custom windows');
+      const row = group.closest('.ds-daterange__row');
+      expect(row).not.toBeNull();
+      // On the same row as the presets, never inside their group.
+      expect(toggle.closest('.ds-daterange__row')).toBe(row);
+      expect(group.contains(toggle)).toBe(false);
+      // Directly after the group, whose last button is "Custom range".
+      expect(group.nextElementSibling).toBe(toggle);
+      expect(within(group).getAllByRole('button').at(-1)).toBe(button('Custom range'));
+
+      // The region it controls is outside the picker, after it, so opening it moves no control
+      // of the preset row.
+      const picker = group.closest('.ds-daterange');
+      const region = recentCustomRunsRegion();
+      expect(picker?.contains(region)).toBe(false);
+      expect(
+        (picker?.compareDocumentPosition(region) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+
+      fireEvent.click(toggle);
+      const select = await within(region).findByRole('combobox', {
+        name: 'Reopen a custom window',
+      });
+      // Reopen follows the select, below it, inside the same region.
+      const reopen = within(region).getByRole('button', { name: 'Reopen' });
+      expect(
+        select.compareDocumentPosition(reopen) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+      expect(group.nextElementSibling).toBe(toggle);
+    });
+
     it('starts closed and reads no GET /runs?kind=custom on mount', async () => {
       const api = stubApi({ 'GET /runs': json(200, [customRun]) });
       const { queryClient } = await renderPicker();
@@ -1306,6 +1717,7 @@ describe('WindowPicker', () => {
       });
 
       fireEvent.change(select, { target: { value: String(CUSTOM_RUN_ID) } });
+      fireEvent.click(reopenButton());
 
       await waitFor(() => {
         expect(first.router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });

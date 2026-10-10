@@ -164,8 +164,13 @@ export interface DecisionFormProps {
    * it can carry which dialog opening it belongs to: a consumer that can reopen its dialog while
    * a save runs must close only the opening that saved, never whichever dialog is open when
    * `onDone` runs, or a late save discards the reopened dialog's edits.
+   *
+   * In decision mode it receives the saved `Decision`, the `POST /decisions` 201 response, which
+   * carries the subject's shape and the complete expected state the server materialised from the
+   * patch (AAP 0.5.2, 0.5.3), so the consumer can state what was recorded. In intended-state
+   * mode it receives nothing: the resolution answers with the discrepancy, not a decision.
    */
-  onDone?: () => void;
+  onDone?: (decision?: Decision) => void;
   /**
    * Called when a save is refused with 409 `subject_retired`, so the consumer can lock what
    * else it shows for that subject (AAP 0.3.2): the form locks only itself. Like `onDone`, it is
@@ -679,12 +684,13 @@ function isResolvedError(error: unknown): boolean {
  * fields and is disabled while nothing changed. Intended-state mode posts
  * `{ resolution: 'record_intended', intended_state, note? }` with the complete state for the
  * shape. Sending the request calls `onPendingChange(true)`, and its settling calls
- * `onPendingChange(false)` before the outcome's callback. Success calls `onDone` and puts
- * "Decision saved" or "Intended state saved" in the form's polite status region. A 409
- * `subject_retired` disables every control while the form records about that subject and calls
- * `onRetired`; the enclosing `Dialog` keeps its own Close button. Every other failure calls
- * `onFailed` with the message the form shows. Each callback is the one the form had when the
- * user saved, and each is called even when the form unmounted while the request ran.
+ * `onPendingChange(false)` before the outcome's callback. Success calls `onDone`, with the saved
+ * `Decision` in decision mode, and puts "Decision saved" or "Intended state saved" in the form's
+ * polite status region. A 409 `subject_retired` disables every control while the form records
+ * about that subject and calls `onRetired`; the enclosing `Dialog` keeps its own Close button.
+ * Every other failure calls `onFailed` with the message the form shows. Each callback is the one
+ * the form had when the user saved, and each is called even when the form unmounted while the
+ * request ran.
  *
  * The form's edits, note, save outcome and locks belong to its identity: the subject's type
  * and id, the mode, the discrepancy's id and `recommendationId`. When any of them changes, even
@@ -932,9 +938,14 @@ function DecisionFormBody(props: DecisionFormProps) {
     }
     onFailed?.(saveErrorMessage(error), error);
   };
-  const handleSaved = () => {
+  // `decision` is the saved row in decision mode; an intended state is reported without one.
+  const handleSaved = (decision?: Decision) => {
     onPendingChange?.(false);
-    onDone?.();
+    if (decision === undefined) {
+      onDone?.();
+    } else {
+      onDone?.(decision);
+    }
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -955,7 +966,9 @@ function DecisionFormBody(props: DecisionFormProps) {
       // outcome must still reach the consumer. The rejection is handled here in full; the
       // form's own error banner reads `activeMutation.error`.
       onPendingChange?.(true);
-      void recordDecision.mutateAsync(body).then(handleSaved, handleError);
+      void recordDecision.mutateAsync(body).then((decision) => {
+        handleSaved(decision);
+      }, handleError);
       return;
     }
     if (discrepancy === undefined) {
@@ -965,11 +978,12 @@ function DecisionFormBody(props: DecisionFormProps) {
     if (noteText !== '') {
       body.note = noteText;
     }
-    // As above: the outcome reaches the consumer even after the form has unmounted.
+    // As above: the outcome reaches the consumer even after the form has unmounted. The
+    // resolution answers with the discrepancy, which is no decision, so onDone gets nothing.
     onPendingChange?.(true);
-    void resolveDiscrepancy
-      .mutateAsync({ id: discrepancy.id, body })
-      .then(handleSaved, handleError);
+    void resolveDiscrepancy.mutateAsync({ id: discrepancy.id, body }).then(() => {
+      handleSaved();
+    }, handleError);
   };
 
   const statusOptions: SelectOption<StatusChoice>[] = CAMPAIGN_STATUSES.map((status) => ({

@@ -11,18 +11,26 @@
  *    each affected section (AAP 0.5.5). None carries `alert`: the `alert` role is reserved for
  *    the open-discrepancies banner in `GlobalBanners` (AAP 0.5.5 Behaviour);
  * 3. the groups in API order, each a `PageShell.Section` (`<h3>`) with the anchor id
- *    `group-{sectionKey}-{groupKey}`. Visible cards come first, in API rank order; cards
- *    computed from replaced data follow, readable and never collapsed, under "Computed from
- *    replaced data" (AAP 0.3.2: a historical card stays readable with every action disabled,
- *    and no discrepancy resolution makes it current); cards held by a discrepancy come last,
- *    collapsed behind a "Held until discrepancies are resolved" disclosure (AAP 0.5.5
- *    "Placement of items that must be resolved first"); cards hidden by feedback are counted,
- *    never rendered (AAP 0.3.2: `current.held_now`, `current.historical` and
- *    `current.hidden_by` are read live);
- * 4. an `EmptyState` with its reason when no group has a card to show (AAP 0.5.5): the cards
- *    feedback has hidden since the run, the run's suppression counts, the first withheld lines
- *    and the finding messages, so a section emptied by feedback or suppression says so. "No rule
- *    fired for this window" is reserved for a section with none of these;
+ *    `group-{sectionKey}-{groupKey}`, except a group whose title repeats the section's
+ *    ({@link groupRepeatsSectionTitle}), such as Budget's "Budget changes": it keeps that anchor
+ *    on a `Stack` with no heading, so the section shows its title once. Visible cards come
+ *    first, in API rank order; cards computed from replaced data follow, readable and never
+ *    collapsed, under "Computed from replaced data" (AAP 0.3.2: a historical card stays
+ *    readable with every action disabled, and no discrepancy resolution makes it current);
+ *    cards held by a discrepancy come last, collapsed behind a "Held until discrepancies are
+ *    resolved" disclosure (AAP 0.5.5 "Placement of items that must be resolved first"), which
+ *    expands when the hash names one of them (`#item-{id}`); cards
+ *    hidden by feedback are counted, never rendered (AAP 0.3.2: `current.held_now`,
+ *    `current.historical` and `current.hidden_by` are read live). A card hidden by a feedback
+ *    recorded on this page leaves its confirmation ("Dismissed: {action} ({entity})",
+ *    `../ActionOutcomes`) in its place, between the same neighbours, for as long as the run
+ *    still lists the item, so the outcome shows where the user acted; it is counted as hidden
+ *    all the same;
+ * 4. an `EmptyState` with its reason when no group has a card or a confirmation to show
+ *    (AAP 0.5.5): the cards feedback has hidden since the run, the run's suppression counts, the
+ *    first withheld lines and the finding messages, so a section emptied by feedback or
+ *    suppression says so. "No rule fired for this window" is reserved for a section with none
+ *    of these;
  * 5. the patterns withheld for sample size, with observed and required sizes (AAP 0.5.4.2 P6);
  * 6. the counts of what the run did not show, by suppression reason (`run_suppression`,
  *    AAP 0.5.4.2), plus the cards hidden by feedback given since the run.
@@ -51,7 +59,7 @@
  *
  * @packageDocumentation
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import type {
@@ -65,7 +73,14 @@ import type {
 } from '../../../api/types';
 import { Banner, Button, EmptyState, Inline, PageShell, Stack } from '../../../design-system';
 import type { Tone } from '../../../design-system';
+import { focusElement } from '../../../lib/focus';
 import { UNAVAILABLE, formatCount } from '../../../lib/format';
+import {
+  FeedbackConfirmation,
+  NO_FEEDBACK_CONFIRMATIONS,
+  useFeedbackConfirmations,
+  type FeedbackConfirmations,
+} from '../ActionOutcomes';
 import { WithheldList, withheldLine } from '../WithheldList';
 import { discrepancyRef } from '../evidenceExtra';
 import {
@@ -74,6 +89,8 @@ import {
   CARD_BATCH_SIZE,
   GROUP_BATCH_SIZE,
   GROUP_NOUN,
+  hashTarget,
+  scrollToId,
 } from '../batches';
 
 // ---------------------------------------------------------------------------------------------
@@ -256,6 +273,78 @@ export function partitionGroup(group: Group): GroupPartition {
 }
 
 /**
+ * Whether the page shows a confirmation in an item's place: feedback hides the item now, and
+ * that feedback was recorded on this page, so `confirmations` holds its recommendation's
+ * message (`../ActionOutcomes`).
+ *
+ * @param item - the item
+ * @param confirmations - the feedback confirmations recorded on this page, by
+ *   {@link itemIdentity}
+ * @returns `true` for a hidden item with a recorded confirmation
+ */
+export function isConfirmed(item: Item, confirmations: FeedbackConfirmations): boolean {
+  return isHidden(item) && confirmations.has(itemIdentity(item));
+}
+
+/** A group's three card lists with their confirmations in place ({@link placeConfirmations}). */
+export interface PlacedLists {
+  /** The visible items, and the confirmed items neither historical nor held, in API order. */
+  visible: Item[];
+  /** The items computed from replaced data, and the confirmed ones among them, in API order. */
+  historical: Item[];
+  /** The held items, and the confirmed ones a discrepancy holds, in API order. */
+  held: Item[];
+  /** How many confirmed items ({@link isConfirmed}) the three lists hold. */
+  confirmed: number;
+}
+
+/**
+ * The lists {@link partitionGroup} makes, with each confirmed item ({@link isConfirmed}) placed
+ * in the list it would stand in were it not hidden, at its API position: computed from replaced
+ * data, else held, else visible. A {@link CardList} given such a list renders the confirmation
+ * where the card stood, between the same neighbours. Every other hidden item is left out, as
+ * the partition leaves it out, and the partition's own lists and `hiddenCount` are unchanged,
+ * so every count the page shows still counts the item as hidden.
+ *
+ * @param group - the group, as the API returned it
+ * @param confirmations - the feedback confirmations recorded on this page, by
+ *   {@link itemIdentity}
+ * @returns the placed lists
+ *
+ * @example
+ * ```ts
+ * // A group [visible 1, hidden 2 (dismissed on this page), visible 3]:
+ * placeConfirmations(group, confirmations).visible; // [item 1, item 2, item 3]
+ * partitionGroup(group).visible; // [item 1, item 3]
+ * ```
+ */
+export function placeConfirmations(
+  group: Group,
+  confirmations: FeedbackConfirmations,
+): PlacedLists {
+  const visible: Item[] = [];
+  const historical: Item[] = [];
+  const held: Item[] = [];
+  let confirmed = 0;
+  for (const item of group.items) {
+    if (isHidden(item)) {
+      if (!isConfirmed(item, confirmations)) {
+        continue;
+      }
+      confirmed += 1;
+    }
+    if (isHistorical(item)) {
+      historical.push(item);
+    } else if (isHeld(item)) {
+      held.push(item);
+    } else {
+      visible.push(item);
+    }
+  }
+  return { visible, historical, held, confirmed };
+}
+
+/**
  * One group as the frame prepared it, handed to `renderGroup` and `renderGroups` so an override
  * can reuse the frame's partition, anchor and default body.
  */
@@ -273,10 +362,26 @@ export interface GroupParts {
   /** How many of the group's items feedback hides now. */
   hiddenCount: number;
   /**
+   * The feedback confirmations recorded on this page for the section's hidden items, by
+   * {@link itemIdentity}: what a {@link CardList} or {@link ConfirmedItems} of an override
+   * needs to show a confirmation where a hidden card stood.
+   */
+  confirmations: FeedbackConfirmations;
+  /**
+   * The group's lists with each confirmed item in place ({@link placeConfirmations}); `placed`
+   * `.confirmed` counts them. `visible`, `historical`, `held` and `hiddenCount` never include
+   * them, so every count keeps counting the item as hidden.
+   */
+  placed: PlacedLists;
+  /**
    * The frame's default group body: a `Stack` of `renderItem` for each visible item, then the
    * {@link HistoricalItems} block holding `renderItem` for each historical item, then the
-   * {@link HeldDisclosure} holding `renderItem` for each held item. Each of the three is a
-   * {@link CardList}, so a long one mounts `CARD_BATCH_SIZE` cards at a time.
+   * {@link HeldDisclosure} holding `renderItem` for each held item, which expands when the hash
+   * names one of the held cards (`#item-{id}`). Each of the three is a {@link CardList} of the
+   * `placed` list, so a long one mounts `CARD_BATCH_SIZE` cards at a time and an item a
+   * feedback recorded on this page has hidden shows its confirmation where its card stood; when
+   * the block it stood in is gone with it (no historical or held item is left), the
+   * confirmation takes the block's place.
    */
   body: ReactNode;
 }
@@ -375,10 +480,96 @@ function itemFocusId(item: Item): string {
 
 /** Props of {@link CardList}. */
 export interface CardListProps {
-  /** The items, in API order; never re-sorted. */
+  /**
+   * The items, in API order; never re-sorted. An item feedback hides ({@link isHidden}) shows
+   * its confirmation from `confirmations` in its place, or nothing when it has none, such as a
+   * `placed` list of {@link placeConfirmations}.
+   */
   items: readonly Item[];
   /** Renders one item as its card, such as a `RecommendationCard`. */
   renderCard: (item: Item) => ReactNode;
+  /**
+   * The feedback confirmations recorded on this page, by {@link itemIdentity}
+   * (`GroupParts.confirmations`). Omitted, a hidden item shows nothing.
+   */
+  confirmations?: FeedbackConfirmations;
+}
+
+/** One confirmation a card list shows in a hidden card's place, with its React key. */
+interface ListConfirmation {
+  /** Unique among the confirmations shown at the same place. */
+  readonly key: string;
+  /** The confirmation, for example "Dismissed: Pause (Generic CRM — US)". */
+  readonly message: string;
+}
+
+/** No confirmations at a place in a card list. */
+const NO_LIST_CONFIRMATIONS: readonly ListConfirmation[] = Object.freeze([]);
+
+/** How a card list lays out its items ({@link cardListLayout}). */
+interface CardListLayout {
+  /** The items shown as cards: those feedback does not hide, in API order. */
+  readonly cards: readonly Item[];
+  /** The confirmations of hidden items that come before every card, in API order. */
+  readonly leading: readonly ListConfirmation[];
+  /** The confirmations of hidden items that follow each card, before the next card. */
+  readonly after: ReadonlyMap<Item, readonly ListConfirmation[]>;
+}
+
+/**
+ * Splits a card list into its cards and the confirmations of its confirmed items
+ * ({@link isConfirmed}), each placed directly after the card before it, or before every card,
+ * so it stands exactly where its card did. A hidden item without a confirmation is left out.
+ *
+ * Only the cards are the batched entries: a confirmation never counts as an action in the
+ * list's "Showing {n} of {total} actions" status, and it always shows, because the card before
+ * it was shown when the user acted on the card it replaces. Each confirmation is keyed by its
+ * recommendation identity, with `#{n}` after a repeat, so its key is unique where it stands.
+ */
+function cardListLayout(
+  items: readonly Item[],
+  confirmations: FeedbackConfirmations,
+): CardListLayout {
+  const cards: Item[] = [];
+  const leading: ListConfirmation[] = [];
+  const after = new Map<Item, ListConfirmation[]>();
+  const occurrences = new Map<string, number>();
+  for (const item of items) {
+    if (!isHidden(item)) {
+      cards.push(item);
+      continue;
+    }
+    const identity = itemIdentity(item);
+    const message = confirmations.get(identity);
+    if (message === undefined) {
+      continue;
+    }
+    const seen = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, seen + 1);
+    const confirmation: ListConfirmation = {
+      key: seen === 0 ? `confirmation:${identity}` : `confirmation:${identity}#${String(seen)}`,
+      message,
+    };
+    const previous = cards.at(-1);
+    if (previous === undefined) {
+      leading.push(confirmation);
+    } else {
+      const following = after.get(previous);
+      if (following === undefined) {
+        after.set(previous, [confirmation]);
+      } else {
+        following.push(confirmation);
+      }
+    }
+  }
+  return { cards, leading, after };
+}
+
+/** Each confirmation as its {@link FeedbackConfirmation}, keyed. */
+function renderConfirmations(confirmations: readonly ListConfirmation[]): ReactNode {
+  return confirmations.map(({ key, message }) => (
+    <FeedbackConfirmation key={key} message={message} />
+  ));
 }
 
 /**
@@ -399,32 +590,87 @@ export interface CardListProps {
  * its blocking C0 card), the list reveals the batches through it and scrolls it into view, on
  * mount and on `hashchange`; a `hashchange` also moves focus to it.
  *
+ * An item a feedback recorded on this page has hidden ({@link isConfirmed}) shows, in its card's
+ * place, its {@link FeedbackConfirmation} from `confirmations`: "Dismissed: {action}
+ * ({entity})", directly after the card before it, so the outcome is visible where the user
+ * acted (WCAG 2.2 SC 4.1.3, beside the polite announcement of `../ActionOutcomes`). It is no
+ * card: it is no batched entry, counts in no status, holds no control and takes no focus, so
+ * keyboard focus, recovered to the next card's first action, lands right after it. A list that
+ * holds only confirmations renders them alone. Any other hidden item is left out.
+ *
  * Exported so a section that builds a group body of its own (Campaigns' discrepancy group)
  * bounds its lists the same way.
  *
  * @param props - see {@link CardListProps}
- * @returns the shown cards, then the control when the list is batched
+ * @returns the shown cards with their confirmations, then the control when the list is batched
  *
  * @example
  * ```tsx
  * <Stack>
- *   <CardList items={parts.visible} renderCard={(item) => <RecommendationCard item={item} />} />
+ *   <CardList
+ *     items={parts.placed.visible}
+ *     confirmations={parts.confirmations}
+ *     renderCard={(item) => <RecommendationCard item={item} />}
+ *   />
  * </Stack>
  * ```
  */
-export function CardList({ items, renderCard }: CardListProps): ReactElement {
-  const keys = useMemo(() => itemKeys(items), [items]);
+export function CardList({
+  items,
+  renderCard,
+  confirmations = NO_FEEDBACK_CONFIRMATIONS,
+}: CardListProps): ReactElement {
+  const layout = useMemo(() => cardListLayout(items, confirmations), [items, confirmations]);
+  const keys = useMemo(() => itemKeys(layout.cards), [layout.cards]);
   return (
-    <BatchedList
-      entries={items}
-      batchSize={CARD_BATCH_SIZE}
-      noun={ACTION_NOUN}
-      getKey={(item) => keys.get(item) ?? itemIdentity(item)}
-      renderEntry={renderCard}
-      anchorsOf={itemAnchors}
-      focusIdOf={itemFocusId}
-    />
+    <>
+      {renderConfirmations(layout.leading)}
+      <BatchedList
+        entries={layout.cards}
+        batchSize={CARD_BATCH_SIZE}
+        noun={ACTION_NOUN}
+        getKey={(item) => keys.get(item) ?? itemIdentity(item)}
+        // Every card renders in the same two-part fragment, so a confirmation appearing after it
+        // never remounts the card, and keyboard focus and its local state stay.
+        renderEntry={(item) => (
+          <>
+            {renderCard(item)}
+            {renderConfirmations(layout.after.get(item) ?? NO_LIST_CONFIRMATIONS)}
+          </>
+        )}
+        anchorsOf={itemAnchors}
+        focusIdOf={itemFocusId}
+      />
+    </>
   );
+}
+
+/** Props of {@link ConfirmedItems}. */
+export interface ConfirmedItemsProps {
+  /** The items, in API order, such as a `placed` list; only the confirmed ones render. */
+  items: readonly Item[];
+  /** The feedback confirmations recorded on this page (`GroupParts.confirmations`). */
+  confirmations: FeedbackConfirmations;
+}
+
+/**
+ * The {@link FeedbackConfirmation} of each confirmed item among `items` ({@link isConfirmed}),
+ * in API order, for a section whose items stand where no confirmation can: the rows of a
+ * `DataTable`, such as the white-paper asset tables. The section renders them directly after
+ * the table that held the rows, so each outcome shows beside where it was given.
+ *
+ * @param props - see {@link ConfirmedItemsProps}
+ * @returns the confirmations, or `null` when there is none
+ *
+ * @example
+ * ```tsx
+ * <AssetTable items={parts.visible} />
+ * <ConfirmedItems items={parts.placed.visible} confirmations={parts.confirmations} />
+ * ```
+ */
+export function ConfirmedItems({ items, confirmations }: ConfirmedItemsProps): ReactElement | null {
+  const { leading } = cardListLayout(items.filter(isHidden), confirmations);
+  return leading.length === 0 ? null : <>{renderConfirmations(leading)}</>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -511,10 +757,36 @@ export interface HeldDisclosureProps {
   /** How many held items the region holds; shown in the toggle's label. */
   count: number;
   /**
+   * The ids of the in-page link targets the held content renders, such as the `item-{id}` of
+   * each held card ({@link itemAnchorId}). When `location.hash` names one of them, on mount or
+   * on a `hashchange`, the region expands and, once its content has rendered, the named element
+   * is scrolled into view; after a `hashchange` (the link followed) it also takes focus. A link
+   * to a held card (such as a C2 "Scale" card's link to its held B1 card) therefore reveals it
+   * and puts focus on it. Omitted, the disclosure ignores the hash.
+   */
+  anchors?: readonly string[];
+  /**
    * The held content, such as the held cards or a table of held rows. It mounts the first time
    * the region is expanded, never before.
    */
   children: ReactNode;
+}
+
+/** A held element a hash names, revealed once the expanded region's content has rendered. */
+interface HeldReveal {
+  /** The id the hash names: one of the disclosure's `anchors`. */
+  readonly target: string;
+  /**
+   * Whether the element then takes focus: after a `hashchange` (the link followed), never for
+   * the hash the disclosure mounted with (a page load).
+   */
+  readonly focus: boolean;
+}
+
+/** The id `location.hash` names when it is one of `anchors`, else `null`. */
+function heldHashTarget(anchors: readonly string[] | undefined): string | null {
+  const target = hashTarget();
+  return target !== null && anchors?.includes(target) === true ? target : null;
 }
 
 /**
@@ -523,15 +795,29 @@ export interface HeldDisclosureProps {
  *
  * Renders a quiet `Button` labelled "Held until discrepancies are resolved ({count})" that
  * carries `aria-expanded` and `aria-controls={id}`, and a region with that `id` that is
- * `hidden` until the button expands it. The region is collapsed on first render. It is a real
- * button, so it is reachable with Tab and operated with Enter or Space (WCAG 2.2 SC 2.1.1,
- * 4.1.2). The button sits in an `Inline` row, so it keeps its own width instead of stretching
- * across the column.
+ * `hidden` until the button expands it. The region is collapsed on first render, unless the
+ * hash names one of its `anchors`. It is a real button, so it is reachable with Tab and operated
+ * with Enter or Space (WCAG 2.2 SC 2.1.1, 4.1.2). The button sits in an `Inline` row, so it
+ * keeps its own width instead of stretching across the column.
  *
  * The region element is always rendered, so `aria-controls` always resolves, but the children
  * mount only the first time the region is expanded: a disclosure nobody opens formats and mounts
  * none of its cards. Once mounted they stay mounted, hidden, while the region is collapsed
  * again, so a held card keeps its local state across a collapse.
+ *
+ * An in-page link to a held card opens the disclosure: when `location.hash` names one of
+ * `anchors`, as the disclosure mounts (a page loaded at `#item-{id}`) or on a `hashchange` (the
+ * link followed), the region expands, mounting its content if it was never opened, and once that
+ * content has rendered the named element is scrolled into view, as a batched list reveals an
+ * entry a hash names (`../batches`). After a `hashchange`, focus then moves to the element
+ * without scrolling again ({@link focusElement}, a temporary `tabindex="-1"`), as the root route
+ * focuses a link target already rendered (`src/router.tsx`), so the next Tab continues from the
+ * card, not from the link the page scrolled away from (WCAG 2.2 SC 2.4.3). An element that
+ * already holds focus, such as a card the list inside has just revealed and focused, keeps it.
+ * A hash present as the disclosure mounts, as on a page load, moves no focus. The button can
+ * collapse the region again. Expanding releases no hold: the cards stay under "Held until
+ * discrepancies are resolved". The card list inside reveals its later batches through the named
+ * card itself ({@link CardList}).
  *
  * Only non-historical items a discrepancy holds ({@link isHeld}) belong here: they wait on that
  * discrepancy's resolution, and the rerun it triggers, before they can be trusted. Items computed
@@ -545,15 +831,75 @@ export interface HeldDisclosureProps {
  *
  * @example
  * ```tsx
- * <HeldDisclosure id={`${parts.anchorId}-held`} count={parts.held.length}>
+ * <HeldDisclosure
+ *   id={`${parts.anchorId}-held`}
+ *   count={parts.held.length}
+ *   anchors={parts.held.map((item) => itemAnchorId(item.id))}
+ * >
  *   <CardList items={parts.held} renderCard={(item) => <RecommendationCard item={item} />} />
  * </HeldDisclosure>
  * ```
  */
-export function HeldDisclosure({ id, count, children }: HeldDisclosureProps): ReactElement | null {
-  const [expanded, setExpanded] = useState(false);
+export function HeldDisclosure({
+  id,
+  count,
+  anchors,
+  children,
+}: HeldDisclosureProps): ReactElement | null {
+  // The held target the hash names as the disclosure mounts: it then starts expanded.
+  const [mountTarget] = useState(() => heldHashTarget(anchors));
+  const [expanded, setExpanded] = useState(mountTarget !== null);
   // Whether the region has ever been expanded: its children mount then and stay mounted.
-  const [opened, setOpened] = useState(false);
+  const [opened, setOpened] = useState(mountTarget !== null);
+  // How many expansions a `hashchange` asked for, so each one renders, then scrolls and focuses.
+  const [hashReveals, setHashReveals] = useState(0);
+  /** The hash target to reveal once the expanded region's content has rendered. */
+  const pendingReveal = useRef<HeldReveal | null>(
+    mountTarget === null ? null : { target: mountTarget, focus: false },
+  );
+  /** The latest render's anchors, read by the `hashchange` listener. */
+  const latestAnchors = useRef(anchors);
+
+  useLayoutEffect(() => {
+    latestAnchors.current = anchors;
+  });
+
+  const hashAware = anchors !== undefined;
+  useEffect(() => {
+    if (!hashAware) {
+      return undefined;
+    }
+    const onHashChange = (): void => {
+      const target = heldHashTarget(latestAnchors.current);
+      if (target === null) {
+        return;
+      }
+      pendingReveal.current = { target, focus: true };
+      setExpanded(true);
+      setOpened(true);
+      setHashReveals((reveals) => reveals + 1);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, [hashAware]);
+
+  // Once the expansion a hash asked for has rendered, on mount or after a `hashchange`, the
+  // named element exists and is shown: scroll it into view and, after a `hashchange`, focus it
+  // without scrolling again. The card list inside runs its effects first, so an element it has
+  // just revealed and focused already holds focus and is not focused a second time.
+  useEffect(() => {
+    const reveal = pendingReveal.current;
+    pendingReveal.current = null;
+    if (reveal === null || !scrollToId(reveal.target) || !reveal.focus) {
+      return;
+    }
+    const element = document.getElementById(reveal.target);
+    if (element !== null && element.ownerDocument.activeElement !== element) {
+      focusElement(element, { preventScroll: true });
+    }
+  }, [hashReveals]);
 
   // `!(count > 0)` also rejects NaN, so a malformed count never renders an empty disclosure.
   if (!(count > 0)) {
@@ -769,21 +1115,25 @@ export interface SectionFrameProps {
   /**
    * Replaces one group's body inside its group region, for example a table of white-paper rows.
    * `parts.body` holds the default body for an override that wraps rather than replaces it.
-   * Called only for groups with at least one visible, historical or held item.
+   * Called only for groups with at least one visible, historical or held item, or a
+   * confirmation of a feedback recorded on this page (`parts.placed.confirmed`), which an
+   * override shows where the hidden item stood (`parts.placed`, `parts.confirmations`).
    */
   renderGroup?: (group: Group, parts: GroupParts) => ReactNode;
   /**
    * Replaces the whole groups area, for example one tab set across the Keywords groups. It is
    * called once, with the parts of every API group, empty ones included, and only when the
-   * section has at least one visible, historical or held item. The frame then renders no group
-   * regions of its own, so each part's `anchorId` is the override's to place.
+   * section has at least one visible, historical or held item, or a confirmation. The frame
+   * then renders no group regions of its own, so each part's `anchorId` is the override's to
+   * place.
    */
   renderGroups?: (parts: readonly GroupParts[]) => ReactNode;
   /**
-   * Content for a group with no visible, historical or held item. Omitted, or returning nothing
-   * (`null`, `undefined`, a boolean or an empty string), such a group is left out, which is the
-   * default. Returning content keeps the group region, with its anchor, and shows that content
-   * in it. Not used with `renderGroups`, which receives every group itself.
+   * Content for a group with no visible, historical or held item and no confirmation. Omitted,
+   * or returning nothing (`null`, `undefined`, a boolean or an empty string), such a group is
+   * left out, which is the default. Returning content keeps the group region, with its anchor,
+   * and shows that content in it. Not used with `renderGroups`, which receives every group
+   * itself.
    */
   renderEmptyGroup?: (group: Group, parts: GroupParts) => ReactNode;
   /**
@@ -822,19 +1172,30 @@ function textOr(text: unknown, fallback: string): string {
   return trimmed === '' ? fallback : trimmed;
 }
 
-/** Whether a group has something to show: at least one visible, historical or held item. */
+/**
+ * Whether a group has something to show: at least one visible, historical or held item, or the
+ * confirmation of an item a feedback recorded on this page has hidden, which a group whose
+ * every item was hidden here shows instead of an empty state while it lasts.
+ */
 function hasShownItems(parts: GroupParts): boolean {
-  return parts.visible.length > 0 || parts.historical.length > 0 || parts.held.length > 0;
+  return (
+    parts.visible.length > 0 ||
+    parts.historical.length > 0 ||
+    parts.held.length > 0 ||
+    parts.placed.confirmed > 0
+  );
 }
 
 /** Props of {@link ItemCards}. */
 interface ItemCardsProps {
-  /** The items to render, in API order. */
+  /** The items to render, in API order, confirmed hidden items included. */
   items: readonly Item[];
   /** The group the items belong to, passed on to `renderItem`. */
   group: Group;
   /** The section's `renderItem`. */
   renderItem: SectionFrameProps['renderItem'];
+  /** The feedback confirmations recorded on this page, passed on to the {@link CardList}. */
+  confirmations: FeedbackConfirmations;
 }
 
 /**
@@ -848,30 +1209,68 @@ interface ItemCardsProps {
  * held cards of a {@link HeldDisclosure} nobody has opened are never even built, and a card
  * beyond the shown batches is built only once it is revealed.
  */
-function ItemCards({ items, group, renderItem }: ItemCardsProps): ReactElement {
-  return <CardList items={items} renderCard={(item) => renderItem(item, group)} />;
+function ItemCards({ items, group, renderItem, confirmations }: ItemCardsProps): ReactElement {
+  return (
+    <CardList
+      items={items}
+      renderCard={(item) => renderItem(item, group)}
+      confirmations={confirmations}
+    />
+  );
 }
 
-/** Prepares one group: partitions its items, derives its anchor and builds the default body. */
+/**
+ * The recommendation identities ({@link itemIdentity}) of every item of the section feedback
+ * hides now, in API order: the only items that can show a confirmation.
+ */
+function hiddenItemIdentities(section: Section): string[] {
+  return section.groups.flatMap((group) => group.items.filter(isHidden).map(itemIdentity));
+}
+
+/**
+ * Prepares one group: partitions its items, places the confirmations of the items a feedback
+ * recorded on this page has hidden, derives its anchor and builds the default body.
+ */
 function buildGroupParts(
   sectionKey: SectionKey,
   group: Group,
   renderItem: SectionFrameProps['renderItem'],
+  confirmations: FeedbackConfirmations,
 ): GroupParts {
   const { visible, historical, held, hiddenCount } = partitionGroup(group);
+  // Without a confirmation on the page, the placed lists are the partition's own.
+  const placed =
+    confirmations.size === 0
+      ? { visible, historical, held, confirmed: 0 }
+      : placeConfirmations(group, confirmations);
   const anchorId = groupAnchorId(sectionKey, group.key);
+  const cards = (items: readonly Item[]) => (
+    <ItemCards
+      items={items}
+      group={group}
+      renderItem={renderItem}
+      confirmations={confirmations}
+    />
+  );
+  // A block emptied by the feedback renders nothing, so its confirmations take its place.
   const body = (
     <Stack>
-      <ItemCards items={visible} group={group} renderItem={renderItem} />
+      {cards(placed.visible)}
       <HistoricalItems id={`${anchorId}-historical`} count={historical.length}>
-        <ItemCards items={historical} group={group} renderItem={renderItem} />
+        {cards(placed.historical)}
       </HistoricalItems>
-      <HeldDisclosure id={`${anchorId}-held`} count={held.length}>
-        <ItemCards items={held} group={group} renderItem={renderItem} />
+      {historical.length === 0 && placed.historical.length > 0 ? cards(placed.historical) : null}
+      <HeldDisclosure
+        id={`${anchorId}-held`}
+        count={held.length}
+        anchors={held.map((item) => itemAnchorId(item.id))}
+      >
+        {cards(placed.held)}
       </HeldDisclosure>
+      {held.length === 0 && placed.held.length > 0 ? cards(placed.held) : null}
     </Stack>
   );
-  return { group, anchorId, visible, historical, held, hiddenCount, body };
+  return { group, anchorId, visible, historical, held, hiddenCount, confirmations, placed, body };
 }
 
 /** One group region the frame's groups area renders: the group and the content it holds. */
@@ -880,6 +1279,8 @@ interface GroupEntry {
   readonly part: GroupParts;
   /** `renderGroup`'s output, the default body, or `renderEmptyGroup`'s content. */
   readonly content: ReactNode;
+  /** Whether the group's title repeats its section's ({@link groupRepeatsSectionTitle}). */
+  readonly repeatsSectionTitle: boolean;
 }
 
 /** The React key of a group region: the group key, unique within a section. */
@@ -901,8 +1302,45 @@ function groupEntryFocusId(entry: GroupEntry): string {
   return entry.part.anchorId;
 }
 
-/** A group region: a `PageShell.Section` (`<h3>`) anchored at the group's anchor id. */
-function renderGroupEntry({ part, content }: GroupEntry): ReactNode {
+/**
+ * Whether a group's title repeats its section's title, such as the Budget section's only group,
+ * "Budget changes", inside the "Budget changes" section. Both titles are trimmed and compared
+ * case-insensitively, each as its heading shows it: a blank or missing title as the key it
+ * falls back to.
+ *
+ * Such a group renders no heading of its own: its cards sit directly under the section's `<h2>`,
+ * so a section never shows the same heading twice. A section passing `headingLevel` to its
+ * cards reads this to put them at level 3 in such a group and at level 4 below a group's
+ * `<h3>`, so no heading level is skipped (WCAG 2.2 SC 1.3.1).
+ *
+ * @param section - the section the group belongs to
+ * @param group - the group, as the API returned it
+ * @returns `true` when the group's title equals the section's
+ *
+ * @example
+ * ```ts
+ * groupRepeatsSectionTitle(budgetSection, { key: 'changes', title: 'Budget changes', items });
+ * // true
+ * groupRepeatsSectionTitle(campaignsSection, { key: 'pause', title: 'Pause', items }); // false
+ * ```
+ */
+export function groupRepeatsSectionTitle(section: Section, group: Group): boolean {
+  const sectionTitle = textOr(section.title, section.key);
+  const groupTitle = textOr(group.title, group.key);
+  return groupTitle.toLowerCase() === sectionTitle.toLowerCase();
+}
+
+/**
+ * A group region: a `PageShell.Section` (`<h3>`) anchored at the group's anchor id, or, for a
+ * group whose title repeats its section's ({@link groupRepeatsSectionTitle}), a `Stack` with no
+ * heading carrying that anchor id. The anchor stays the target of in-page links, of the
+ * revealing hash and of the focus a revealed batch of groups moves to; the `Stack` is a plain
+ * container, never an unnamed region.
+ */
+function renderGroupEntry({ part, content, repeatsSectionTitle }: GroupEntry): ReactNode {
+  if (repeatsSectionTitle) {
+    return <Stack id={part.anchorId}>{content}</Stack>;
+  }
   return (
     <PageShell.Section
       id={part.anchorId}
@@ -954,21 +1392,31 @@ function emptyReasonLines(
  *    `PageShell.Section` (`<h3>`) anchored at {@link groupAnchorId}, holding `renderGroup`'s
  *    output or the default body (visible cards, then the {@link HistoricalItems} block with the
  *    cards computed from replaced data, then the {@link HeldDisclosure} with the held ones). A
- *    group with none of these is left out unless `renderEmptyGroup` supplies content for it.
+ *    group whose title repeats the section's ({@link groupRepeatsSectionTitle}) gets no `<h3>`:
+ *    the same content sits in a `Stack` anchored at {@link groupAnchorId}, directly under the
+ *    section's `<h2>`, so the title is never shown twice. A group with no visible, historical
+ *    or held item and no confirmation is left out unless `renderEmptyGroup` supplies content
+ *    for it.
  *    The groups mount `GROUP_BATCH_SIZE` at a time, followed by a "Show {n} more groups"
  *    control when there are more, and each card list inside them `CARD_BATCH_SIZE` cards at a
- *    time ({@link CardList}). With `renderGroups`, its output replaces this whole step;
- * 4. when no group has a visible, historical or held item, an `EmptyState` "No actions in this
- *    section" whose reason states why: "{n} hidden by feedback since this run (dismissed,
- *    snoozed or done)" when feedback hides items now, one "{count} {label}" line per
- *    suppression reason in API order, the first three withheld lines and the finding messages.
- *    "No rule fired for this window" appears only when there are none of these;
+ *    time ({@link CardList}). With `renderGroups`, its output replaces this whole step. An item
+ *    a feedback recorded on this page has hidden shows its {@link FeedbackConfirmation} where
+ *    its card stood ({@link placeConfirmations}), and a group whose items were all hidden here
+ *    keeps its region with the confirmations while the run still lists them;
+ * 4. when no group has a visible, historical or held item or a confirmation, an `EmptyState`
+ *    "No actions in this section" whose reason states why: "{n} hidden by feedback since this
+ *    run (dismissed, snoozed or done)" when feedback hides items now, one "{count} {label}" line
+ *    per suppression reason in API order, the first three withheld lines and the finding
+ *    messages. "No rule fired for this window" appears only when there are none of these;
  * 5. the `WithheldList` of the section's withheld patterns;
  * 6. a list named "Not shown": one "{count} {label}" line per suppression reason, in API order,
- *    and "{n} hidden since this run" for items feedback hides now. Nothing when both are empty.
+ *    and "{n} hidden since this run" for items feedback hides now, confirmed ones included.
+ *    Nothing when both are empty.
  *
  * The frame holds no state of its own (each held disclosure keeps its open state, and each
- * batched list how many batches it shows) and fetches nothing.
+ * batched list how many batches it shows) and fetches nothing. It reads the confirmations of
+ * its own hidden items from the nearest `ActionOutcomeProvider` (`../ActionOutcomes`), and
+ * none outside one.
  *
  * @param props - see {@link SectionFrameProps}
  * @returns the section region
@@ -980,7 +1428,12 @@ function emptyReasonLines(
  *     <SectionFrame
  *       section={section}
  *       withheldTitle="Patterns withheld for sample size"
- *       renderItem={(item) => <RecommendationCard item={item} headingLevel={4} />}
+ *       renderItem={(item, group) => (
+ *         <RecommendationCard
+ *           item={item}
+ *           headingLevel={groupRepeatsSectionTitle(section, group) ? 3 : 4}
+ *         />
+ *       )}
  *     />
  *   );
  * }
@@ -995,7 +1448,13 @@ export function SectionFrame({
   withheldTitle,
   beforeGroups,
 }: SectionFrameProps): ReactElement {
-  const parts = section.groups.map((group) => buildGroupParts(section.key, group, renderItem));
+  // Only this section's hidden items can show a confirmation, so the frame reads theirs alone,
+  // and a feedback recorded in another section does not render this one again.
+  const hiddenIdentities = useMemo(() => hiddenItemIdentities(section), [section]);
+  const confirmations = useFeedbackConfirmations(hiddenIdentities);
+  const parts = section.groups.map((group) =>
+    buildGroupParts(section.key, group, renderItem, confirmations),
+  );
   const anyShown = parts.some(hasShownItems);
   const hiddenTotal = parts.reduce((sum, part) => sum + part.hiddenCount, 0);
 
@@ -1005,9 +1464,10 @@ export function SectionFrame({
   } else {
     const shownGroups: GroupEntry[] = [];
     for (const part of parts) {
+      const repeatsSectionTitle = groupRepeatsSectionTitle(section, part.group);
       if (hasShownItems(part)) {
         const content = renderGroup === undefined ? part.body : renderGroup(part.group, part);
-        shownGroups.push({ part, content });
+        shownGroups.push({ part, content, repeatsSectionTitle });
       } else {
         // Empty groups are left out by default; renderEmptyGroup lets a section render one anyway.
         // The overlay can report a discrepancy detected after the run while the run's discrepancy
@@ -1016,7 +1476,7 @@ export function SectionFrame({
         // leaving them pointing at nothing.
         const fallback = renderEmptyGroup?.(part.group, part);
         if (hasContent(fallback)) {
-          shownGroups.push({ part, content: fallback });
+          shownGroups.push({ part, content: fallback, repeatsSectionTitle });
         }
       }
     }

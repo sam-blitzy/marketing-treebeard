@@ -1380,7 +1380,11 @@ export function useFeedback() {
  * with an earlier pass such as a long backfill or Google request, can defer it. The API itself
  * calls no platform.
  *
- * On success it invalidates `queryKeys.sources`, so the source shows its pending request.
+ * On success it invalidates `queryKeys.sources`, so the source shows its pending request. A
+ * 409 `sync_pending` invalidates it too, because the screen that pressed "Sync now" had not yet
+ * read the request already pending; any other error invalidates nothing. Both callbacks wait
+ * for the invalidation, so the mutation settles, as success or as error, only once the refetch
+ * of a shown sources query has settled: the refetched `sync_pending` is in the cache by then.
  *
  * Status codes: 202; 409 `sync_pending` while a request for that source is already pending;
  * 422 `validation_error` for an unknown source.
@@ -1393,5 +1397,10 @@ export function useRequestSync() {
     mutationFn: (source: SourceName) =>
       apiFetch<SyncRequestView>(`/sources/${pathSegment(source)}/sync`, { method: 'POST' }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.sources }),
+    onError: async (error) => {
+      if (isApiError(error) && error.code === 'sync_pending') {
+        await queryClient.invalidateQueries({ queryKey: queryKeys.sources });
+      }
+    },
   });
 }

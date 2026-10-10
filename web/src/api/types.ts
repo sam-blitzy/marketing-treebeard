@@ -813,7 +813,11 @@ export interface Overlay {
   source_modes: SourceModes;
   /** Dataset names that are stale now. */
   stale_datasets: string[];
-  /** Dataset names that are not complete now. */
+  /**
+   * Dataset names that are not complete over the run's window or an item's required range: a
+   * complete row whose coverage misses that range counts, a Q-G6 finest-partition shortfall only
+   * when the range includes one of its days.
+   */
   incomplete_datasets: string[];
   /** When the overlay was computed. */
   computed_at: IsoDateTime;
@@ -1232,7 +1236,10 @@ export interface SyncRunView {
 export interface Source {
   /** The source. */
   source: SourceName;
-  /** `live` or `simulated`; `null` before the worker's first attempt. */
+  /**
+   * `live` or `simulated`; `null` before the worker's first attempt and while no mode is
+   * established (live access never verified: a stored `live` with no active dataset).
+   */
   mode: DataMode | null;
   /** `ok`, `stale`, `denied` or `error`; `null` before the first attempt. */
   status: ConnectionStatus | null;

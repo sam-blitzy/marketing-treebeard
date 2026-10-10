@@ -606,13 +606,20 @@ verified.
 - Reason prefixes are stable: "call budget exhausted" and "interrupted" are repairable by a
   re-fetch; "result limit reached at finest partition" (Google Q-G6) and "search result ceiling
   reached" (HubSpot CRM Search) are permanent platform limits.
+- An incremental success that re-reads only part of the stored range never turns an incomplete
+  row complete, with one exception: the Q-G6 reason names the days of its partitions at the
+  limit, so a later read that finishes (neither cut short nor deferred) drops the days it
+  re-read, and the row turns complete once no day is left. The grammar of that reason lives in
+  `analysis/shortfall.py`, shared by `sync/freshness.py` and the analysis.
 
 Each rule declares the datasets it reads (`required_datasets`), and the runner and the overlay
 derive each item's flags from those datasets only:
 
 - An item is `stale` when a required dataset last succeeded more than `sources.stale_after_hours`
   (default 24) ago, or its coverage stops short of the window end.
-- An item is `incomplete` when a required dataset is not `complete` over the window.
+- An item is `incomplete` when a required dataset is not `complete` over the window. A Q-G6
+  shortfall counts only when the window includes one of the days it names, and the flag names
+  only those days.
 - A required dataset with no freshness row has never succeeded, so it is both stale and
   incomplete.
 - A successful sync of one dataset never hides a failed refresh of another, because every write
@@ -704,7 +711,10 @@ restart go live through the same probe-then-build path at startup, with no code 
 ### Labelling
 
 - `source_connection` records each source's mode, status, reason and active dataset.
-  `GET /api/v1/sources` and the `/sources` screen show them with per-dataset freshness.
+  `GET /api/v1/sources` and the `/sources` screen show them with per-dataset freshness. Only an
+  activation stores `live` with an active dataset; a `live` row with none is a placeholder that
+  never verified live access, so the API reports its `mode` as `null` ("No data yet"), as the
+  overlay's `source_modes` does.
 - Every `recommendation` stores `data_status`: `live`, `simulated`, `stale` or `mixed`.
 - The UI shows a per-source "Simulated" chip, a global banner naming the simulated sources and
   their reasons, and a "Simulated data" flag on each affected item.

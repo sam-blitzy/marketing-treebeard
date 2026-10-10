@@ -33,6 +33,11 @@ Decisions taken in this module, each stated where its code lives:
   coverage as stored beside the age verdict.
 * **A source with no ``source_connection`` row yet** (before the worker's first attempt)
   reports ``mode`` and ``status`` as ``None``, never an invented ``live``.
+* **A mode is reported only once established** (:func:`_reported_mode`): a ``live`` row
+  with no active primary dataset is a placeholder that never verified live access (for
+  example a Google source whose first live query hit a defect), so it reports ``mode`` as
+  ``None`` beside its stored status and reason, never ``live``; ``simulated`` is reported as
+  stored.
 * **Native day boundaries** (AAP 0.5.4.1, 0.5.5 "Daily dates are shown as stored, labelled
   with their source's day boundary"): each source reports the IANA zone whose midnight ends
   the ``covered_from`` and ``covered_through`` dates of its freshness rows, so the screen
@@ -354,6 +359,35 @@ def _day_boundary(source: str, google_day_boundary: str | None) -> str | None:
     return UTC_BOUNDARY
 
 
+def _reported_mode(stored_mode: str | None, active_dataset_id: int | None) -> str | None:
+    """Return the mode a source has established, or ``None`` while it has none.
+
+    Only a dataset activation stores ``live`` on the ``source_connection`` row, in the
+    transaction that makes a live dataset the source's active primary. Any other ``live`` is
+    a placeholder written before live access was verified: the row a live resolution
+    creates, a new row's default mode while fallback is possible, or the row the Google call
+    budget creates at its first metered call. A Google source whose first live query hit a
+    defect thus holds ``live``, status ``error`` and no dataset. So a ``live`` row with no
+    active primary dataset reports no mode, as the worker's mode controller judges such a
+    row (``sync.mode._established_mode``, which this module does not import) and as
+    ``Overlay.source_modes`` (the active dataset's mode) reports the source.
+    ``simulated`` is decided as soon as the worker resolves the source to simulated data,
+    before its dataset activates, so it is reported as stored.
+
+    Args:
+        stored_mode: The ``source_connection`` row's mode; ``None`` when the source has no
+            row yet (before the worker's first attempt).
+        active_dataset_id: The id of the source's active primary dataset, if any.
+
+    Returns:
+        ``stored_mode``, or ``None`` when there is no row or the row's ``live`` is a
+        placeholder.
+    """
+    if stored_mode == "live" and active_dataset_id is None:
+        return None
+    return stored_mode
+
+
 def _source_view(
     source: str,
     *,
@@ -373,7 +407,9 @@ def _source_view(
     Args:
         source: The source.
         connection: Its ``source_connection`` row; ``None`` before the worker's first
-            attempt, in which case mode, status, reason and last attempt are ``None``.
+            attempt, in which case mode, status, reason and last attempt are ``None``. A
+            ``live`` mode with no active dataset is reported as ``None`` too
+            (:func:`_reported_mode`).
         google_day_boundary: Google's account time zone, if known; it is the Google entry's
             ``day_boundary`` (:func:`_day_boundary`).
         active: Its active primary dataset, if any.
@@ -402,7 +438,10 @@ def _source_view(
     return schemas.Source.model_validate(
         {
             "source": source,
-            "mode": None if connection is None else connection.mode,
+            "mode": _reported_mode(
+                None if connection is None else connection.mode,
+                None if active is None else active.id,
+            ),
             "status": None if connection is None else connection.status,
             "reason": None if connection is None else connection.reason,
             "day_boundary": _day_boundary(source, google_day_boundary),
@@ -473,9 +512,10 @@ async def list_sources(
     """List every source's mode, health, datasets, freshness, call budget and recent syncs.
 
     One entry per source, in the order google, linkedin, hubspot. Each carries the mode,
-    status and reason the worker recorded (``null`` before its first attempt), the native day
-    boundary of its coverage dates (Google's account time zone, ``null`` while unknown;
-    ``UTC`` for LinkedIn and HubSpot), the active primary dataset with the freshness,
+    status and reason the worker recorded (``null`` before its first attempt; the mode is
+    also ``null`` while no mode is established, a ``live`` with no active dataset), the
+    native day boundary of its coverage dates (Google's account time zone, ``null`` while
+    unknown; ``UTC`` for LinkedIn and HubSpot), the active primary dataset with the freshness,
     coverage and completeness of each named dataset (``stale`` when it last succeeded more
     than ``sources.stale_after_hours`` ago or never; ``incomplete`` when not ``complete``),
     whether a "Sync now" request is pending, and the newest sync runs. Google adds the

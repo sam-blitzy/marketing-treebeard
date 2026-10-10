@@ -39,6 +39,7 @@ import {
   WHITE_PAPER_METRIC_KEYS,
   adjacentTerms,
   allocations,
+  b1Link,
   baselineByKey,
   blockingDiscrepancies,
   cohortSummary,
@@ -1038,6 +1039,83 @@ describe('proposedDailyBudget', () => {
   });
 });
 
+describe('b1Link', () => {
+  /** A C2 "Scale" `extra.b1_link` as `campaigns._c2_candidate` writes it, with `overrides`. */
+  function scaleLink(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      rule_id: 'B1',
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineSearch },
+      current_daily_budget: '200.00',
+      proposed_daily_budget: '240.00',
+      ...overrides,
+    };
+  }
+
+  it("reads a C2 \"Scale\" item's B1 rule and subject, the integer id as a string", () => {
+    const own = makeItem({
+      rule_id: 'C2',
+      evidence: withExtra({ outcome: 'Scale', b1: true, b1_link: scaleLink() }),
+    });
+    expect(b1Link(own)).toStrictEqual({
+      ruleId: 'B1',
+      subject: { type: 'campaign', id: String(FIXTURE_CAMPAIGN_IDS.pipelineSearch) },
+    });
+    const shared = withExtra({
+      b1_link: scaleLink({ subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search } }),
+    });
+    expect(b1Link(shared)).toStrictEqual({
+      ruleId: 'B1',
+      subject: { type: 'budget', id: String(FIXTURE_BUDGET_IDS.search) },
+    });
+    // A string id is kept as given; the amounts are proposedDailyBudget's, not the link's.
+    const stringId = withExtra({ b1_link: scaleLink({ subject: { type: 'campaign', id: '7' } }) });
+    expect(b1Link(stringId)).toStrictEqual({
+      ruleId: 'B1',
+      subject: { type: 'campaign', id: '7' },
+    });
+  });
+
+  it('returns null for a C2 "Hold" and for items that carry no link', () => {
+    expect(b1Link(pageItem(FIXTURE_ITEM_IDS.c2Hold))).toBeNull();
+    expect(b1Link(pageItem(FIXTURE_ITEM_IDS.b1))).toBeNull();
+    expect(b1Link(withExtra(null))).toBeNull();
+    expect(b1Link(null)).toBeNull();
+    expect(b1Link(undefined)).toBeNull();
+  });
+
+  it('returns null for a malformed link rather than guessing a subject', () => {
+    const malformed: readonly unknown[] = [
+      'B1',
+      ['B1'],
+      42,
+      scaleLink({ rule_id: undefined }),
+      scaleLink({ rule_id: '  ' }),
+      scaleLink({ rule_id: 1 }),
+      scaleLink({ subject: undefined }),
+      scaleLink({ subject: 'campaign:305' }),
+      scaleLink({ subject: [FIXTURE_CAMPAIGN_IDS.pipelineSearch] }),
+      scaleLink({ subject: { id: FIXTURE_CAMPAIGN_IDS.pipelineSearch } }),
+      scaleLink({ subject: { type: '', id: FIXTURE_CAMPAIGN_IDS.pipelineSearch } }),
+      scaleLink({ subject: { type: 'campaign' } }),
+      scaleLink({ subject: { type: 'campaign', id: 305.5 } }),
+      scaleLink({ subject: { type: 'campaign', id: ' ' } }),
+      scaleLink({ subject: { type: 'campaign', id: true } }),
+      scaleLink({ subject: { type: 'campaign', id: null } }),
+    ];
+    for (const link of malformed) {
+      const evidence = withExtra({ outcome: 'Scale', b1_link: link });
+      expect(b1Link(evidence), JSON.stringify(link)).toBeNull();
+    }
+    expect(b1Link(rawEvidence({ extra: 'b1_link' }))).toBeNull();
+  });
+
+  it('leaves the Scale prefill to proposedDailyBudget, which still reads the linked amount', () => {
+    const scale = withExtra({ outcome: 'Scale', b1_link: scaleLink() });
+    expect(b1Link(scale)?.subject.id).toBe(String(FIXTURE_CAMPAIGN_IDS.pipelineSearch));
+    expect(proposedDailyBudget(scale)).toBe('240.00');
+  });
+});
+
 describe('sharedMembers', () => {
   it("lists the B3 shared budget's member campaigns with their member days", () => {
     expect(sharedMembers(pageItem(FIXTURE_ITEM_IDS.b3))).toEqual([
@@ -1325,6 +1403,148 @@ describe('dayCounts', () => {
     );
     expect(dayCounts(malformed).map((count) => count.required)).toEqual([null, 6, null]);
     expect(dayCounts(withExtra({ gate: 'cap_constrained' }, metrics))[0]?.required).toBeNull();
+  });
+
+  it("reads a B4 card's weekend and weekday gates and its budget-history minimums", () => {
+    // budget._b4_candidate: the pattern's day counts come before _history_metrics(history, None)
+    // in API order; extra.gate holds B4's own gate, extra.budget_history.minimums the history's.
+    const evidence = withExtra(
+      {
+        gate: {
+          weekend_days: { observed: 8, required: 4 },
+          weekdays: { observed: 20, required: 10 },
+          outcomes: { observed: 30, required: 10 },
+        },
+        budget_history: {
+          known_label: 'known-budget days',
+          minimums: {
+            known_budget_days: { observed: 28, required: 7 },
+            spending_days: { observed: 28, required: 5 },
+          },
+        },
+      },
+      [
+        metric('window_days', 28),
+        metric('outcomes', 30),
+        metric('weekend_days', 8, { label: 'Weekend days with spend' }),
+        metric('weekdays', 20, { label: 'Weekdays with spend' }),
+        metric('window_utilization', '0.82'),
+        metric('known_days', 28, { label: 'Known-budget days' }),
+        metric('spending_days', 28, { label: 'Spending days' }),
+        metric('spending_day_share', '1'),
+        metric('idle_days', 0, { label: 'Known idle days' }),
+        metric('changed_intraday_days', 0, { label: 'Changed-intraday days' }),
+        metric('unobserved_days', 0, { label: 'Unobserved days' }),
+      ],
+    );
+    // AAP 0.5.4.1 order: known-budget, spending, the predicate (weekend days, then weekdays),
+    // idle, changed-intraday, unobserved. The outcome gate is no day count.
+    expect(dayCounts(evidence)).toEqual([
+      { key: 'known_days', label: 'Known-budget days', observed: 28, required: 7 },
+      { key: 'spending_days', label: 'Spending days', observed: 28, required: 5 },
+      { key: 'weekend_days', label: 'Weekend days with spend', observed: 8, required: 4 },
+      { key: 'weekdays', label: 'Weekdays with spend', observed: 20, required: 10 },
+      { key: 'idle_days', label: 'Known idle days', observed: 0, required: null },
+      { key: 'changed_intraday_days', label: 'Changed-intraday days', observed: 0, required: null },
+      { key: 'unobserved_days', label: 'Unobserved days', observed: 0, required: null },
+    ]);
+  });
+
+  it('takes each check from the gate first and from the budget-history minimums otherwise', () => {
+    const metrics = [metric('known_days', 9), metric('spending_days', 6), metric('weekdays', 12)];
+    const evidence = withExtra(
+      {
+        gate: {
+          // The gate wins over the minimums for the same check, even when it asks for less.
+          known_budget_days: { observed: 9, required: 7 },
+          // Not whole days, so this check falls back to the minimums (5) ...
+          spending_days: { observed: 6, required: 4.5 },
+          // ... and the stricter of the two checks on spending days binds.
+          spending_share: { observed: 6, required: 6 },
+        },
+        budget_history: {
+          minimums: {
+            known_budget_days: { observed: 9, required: 9 },
+            spending_days: { observed: 6, required: 5 },
+            // Minimums never stand in for a check of another count.
+            weekend_days: { observed: 12, required: 4 },
+          },
+        },
+      },
+      metrics,
+    );
+    expect(dayCounts(evidence).map((count) => [count.key, count.required])).toEqual([
+      ['known_days', 7],
+      ['spending_days', 6],
+      ['weekdays', null],
+    ]);
+    const minimumsOnly = withExtra(
+      {
+        budget_history: {
+          minimums: {
+            known_budget_days: { observed: 9, required: '7' },
+            spending_days: { observed: 6, required: 5 },
+          },
+        },
+      },
+      metrics,
+    );
+    expect(dayCounts(minimumsOnly).map((count) => count.required)).toEqual([7, 5, null]);
+  });
+
+  it('reads a requirement only from whole-day budget-history minimums', () => {
+    const metrics = [metric('known_days', 28), metric('spending_days', 28)];
+    for (const budgetHistory of [
+      null,
+      'minimums',
+      [{ minimums: {} }],
+      { minimums: null },
+      { minimums: [{ known_budget_days: { required: 7 } }] },
+      { minimums: { known_budget_days: 7, spending_days: [5] } },
+      { minimums: { known_budget_days: { required: 6.5 }, spending_days: { required: 'five' } } },
+      { minimums: { known_budget_days: { observed: 28 }, spending_days: { required: null } } },
+      { known_budget_days: { required: 7 }, spending_days: { required: 5 } },
+    ]) {
+      const evidence = withExtra({ budget_history: budgetHistory }, metrics);
+      expect(
+        dayCounts(evidence).map((count) => count.required),
+        JSON.stringify(budgetHistory),
+      ).toEqual([null, null]);
+    }
+  });
+
+  it('lists the counts in AAP 0.5.4.1 order whatever the API order, repeats in API order', () => {
+    const evidence = withExtra(
+      {
+        gate: {
+          capped_days: { observed: 5, required: 5 },
+          weekend_days: { observed: 4, required: 4 },
+        },
+      },
+      [
+        metric('unobserved_days', 3, { label: 'Unobserved A' }),
+        metric('weekdays', 11),
+        metric('changed_intraday_days', 2),
+        metric('idle_days', 1),
+        metric('weekend_days', 4),
+        metric('capped_days', 5),
+        metric('unobserved_days', 4, { label: 'Unobserved B' }),
+        metric('spending_days', 6),
+        metric('weekend_days', 2.5),
+        metric('known_days', 7),
+      ],
+    );
+    expect(dayCounts(evidence).map((count) => [count.label, count.observed])).toEqual([
+      ['known_days', 7],
+      ['spending_days', 6],
+      ['capped_days', 5],
+      ['weekend_days', 4],
+      ['weekdays', 11],
+      ['idle_days', 1],
+      ['changed_intraday_days', 2],
+      ['Unobserved A', 3],
+      ['Unobserved B', 4],
+    ]);
   });
 
   it('returns [] for an item without budget history', () => {
@@ -2239,6 +2459,8 @@ describe('readers over every card of the default page', () => {
       expect(launchGap(item).kind === 'cluster', rule).toBe(rule === 'C3b');
       expect(funding(item) !== null, rule).toBe(rule === 'B1');
       expect(allocations(item).length > 0, rule).toBe(rule === 'B3');
+      // The default page has no C2 "Scale", the only rule that links a B1 item.
+      expect(b1Link(item), rule).toBeNull();
       expect(variants(item).length > 0, rule).toBe(rule === 'CR3');
       expect(creativeRows(item).length > 0, rule).toBe(rule.startsWith('W'));
       expect(cohortSummary(item) !== null, rule).toBe(rule.startsWith('W'));
@@ -2257,6 +2479,7 @@ describe('readers over every card of the default page', () => {
       expect(dayCounts(item.evidence)).toEqual(dayCounts(item));
       expect(creativeRows(item.evidence)).toEqual(creativeRows(item));
       expect(proposedDailyBudget(item.evidence)).toBe(proposedDailyBudget(item));
+      expect(b1Link(item.evidence)).toEqual(b1Link(item));
       expect(evidenceCurrency(item.evidence)).toBe(evidenceCurrency(item));
       expect(dependsOn(item.evidence)).toEqual(dependsOn(item));
     }

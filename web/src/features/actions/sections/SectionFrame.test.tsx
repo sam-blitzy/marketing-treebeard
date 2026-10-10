@@ -11,24 +11,32 @@
  *   historical, held and hidden items in API order;
  * - the held disclosure: collapsed on first render, a real button with `aria-expanded` and
  *   `aria-controls` over a region that always exists but mounts its content only from the first
- *   expansion on, nothing at all for a count that is not positive;
+ *   expansion on, nothing at all for a count that is not positive; a hash naming a held card
+ *   expands it and scrolls to the card, and a hash change (a link followed) also focuses the
+ *   card, once, while a page loaded at the hash moves no focus;
  * - the replaced-data block: open, named "Computed from replaced data ({count})" like the
  *   historical card badge, between the visible cards and the held disclosure;
  * - labelled fields, suppression labels and finding tones;
  * - the frame itself: the section region and its `<h2>`, findings first as banners that are never
  *   alerts, groups in API order as anchored `<h3>` regions, the `renderGroup`, `renderGroups` and
  *   `renderEmptyGroup` hooks, the empty state and its reason lines, the withheld list and the
- *   "Not shown" counts.
+ *   "Not shown" counts;
+ * - the confirmations of items a feedback recorded on the page has hidden: placed in the hidden
+ *   card's own position in API order (also in an emptied replaced-data or held block), never a
+ *   batched entry, a live region or a Tab stop, keeping a group whose every item was hidden on
+ *   the page in place of the empty state, every hidden count unchanged, and gone once a rerun
+ *   drops the item or shows it again.
  *
  * The frame fetches nothing and never renders a card itself, so every test passes a plain
- * `renderItem` and renders without providers or a network stub.
+ * `renderItem` and renders without a network stub; only the confirmation tests wrap the frame
+ * in the `ActionOutcomeProvider` that records them.
  */
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { FindingCode, Group, Item, Section } from '../../../api/types';
+import type { FindingCode, Group, Item, ItemOverlay, Section } from '../../../api/types';
 import { Button } from '../../../design-system';
 import {
   makeEvidence,
@@ -39,11 +47,14 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
+import { ActionOutcomeProvider, useRecordFeedbackConfirmation } from '../ActionOutcomes';
 import { HISTORICAL_LABEL } from '../RecommendationCard';
 import { withheldLine } from '../WithheldList';
 import { CARD_BATCH_SIZE, GROUP_BATCH_SIZE } from '../batches';
 import {
   CardList,
+  ConfirmedItems,
   DISCREPANCY_GROUP_ANCHOR,
   FieldList,
   HeldDisclosure,
@@ -53,6 +64,8 @@ import {
   SectionFrame,
   findingTone,
   groupAnchorId,
+  groupRepeatsSectionTitle,
+  isConfirmed,
   isHeld,
   isHidden,
   isHistorical,
@@ -60,6 +73,7 @@ import {
   itemIdentity,
   itemKeys,
   partitionGroup,
+  placeConfirmations,
   sectionAnchorId,
   suppressionLabel,
 } from './SectionFrame';
@@ -168,6 +182,44 @@ describe('anchors', () => {
     expect(groupAnchorId('campaigns', 'discrepancies')).toBe(DISCREPANCY_GROUP_ANCHOR);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Group titles
+// ---------------------------------------------------------------------------------------------
+
+describe('groupRepeatsSectionTitle', () => {
+  it('matches a group titled as its section, trimmed and ignoring case', () => {
+    const budget = makeSection('budget');
+    const exact = makeGroup({ key: 'changes', title: 'Budget changes' });
+    const padded = makeGroup({ key: 'changes', title: ' BUDGET changes ' });
+    expect(groupRepeatsSectionTitle(budget, exact)).toBe(true);
+    expect(groupRepeatsSectionTitle(budget, padded)).toBe(true);
+  });
+
+  it('does not match a group with a title of its own', () => {
+    const pause = makeGroup({ key: 'pause', title: 'Pause' });
+    expect(groupRepeatsSectionTitle(makeSection('campaigns'), pause)).toBe(false);
+    expect(
+      groupRepeatsSectionTitle(
+        makeSection('budget'),
+        makeGroup({ key: 'changes', title: 'Budget changes (shared)' }),
+      ),
+    ).toBe(false);
+  });
+
+  it('compares a blank title as the key its heading falls back to', () => {
+    expect(
+      groupRepeatsSectionTitle(makeSection('budget'), makeGroup({ key: 'changes', title: ' ' })),
+    ).toBe(false);
+    expect(
+      groupRepeatsSectionTitle(
+        makeSection('budget', { title: '' }),
+        makeGroup({ key: 'budget', title: '' }),
+      ),
+    ).toBe(true);
+  });
+});
+
 
 // ---------------------------------------------------------------------------------------------
 // Item state
@@ -351,6 +403,231 @@ describe('HeldDisclosure', () => {
     );
     expect(container.childElementCount).toBe(0);
     expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  describe('a hash naming a held card', () => {
+    /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+    let scrollIntoView: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      scrollIntoView = vi.fn();
+      Object.defineProperty(Element.prototype, 'scrollIntoView', {
+        configurable: true,
+        writable: true,
+        value: scrollIntoView,
+      });
+    });
+
+    afterEach(() => {
+      window.history.replaceState(null, '', window.location.pathname);
+      Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+    });
+
+    /** Sets the hash as following an in-page link does, and dispatches its `hashchange`. */
+    function followHash(hash: string): void {
+      act(() => {
+        window.history.replaceState(null, '', hash);
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+    }
+
+    /** A disclosure holding the cards `item-501` and `item-502`, as a group's held cards. */
+    function renderHeldCards(anchors?: readonly string[]) {
+      return render(
+        <HeldDisclosure id="group-budget-changes-held" count={2} anchors={anchors}>
+          <article id="item-501" aria-label="Held B1">
+            Held B1
+          </article>
+          <article id="item-502" aria-label="Held B3">
+            Held B3
+          </article>
+        </HeldDisclosure>,
+      );
+    }
+
+    /** The disclosure's toggle. */
+    function toggle(): HTMLElement {
+      return screen.getByRole('button', { name: 'Held until discrepancies are resolved (2)' });
+    }
+
+    it('starts expanded when the page loads at one, and scrolls the card into view without focusing it', () => {
+      window.history.replaceState(null, '', '#item-502');
+      const focused = document.activeElement;
+      renderHeldCards(['item-501', 'item-502']);
+
+      expect(toggle().getAttribute('aria-expanded')).toBe('true');
+      expect(document.getElementById('group-budget-changes-held')?.hidden).toBe(false);
+      const target = screen.getByRole('article', { name: 'Held B3' });
+      expect(scrollIntoView.mock.contexts).toEqual([target]);
+      expect(scrollIntoView.mock.calls[0]?.[0]).toEqual({ block: 'start' });
+      // Scrolling only: a hash present on mount, as on a page load, moves no focus, as with a
+      // batched list's hash reveal.
+      expect(document.activeElement).toBe(focused);
+      expect(target.hasAttribute('tabindex')).toBe(false);
+    });
+
+    it('expands on a hash change naming one, scrolls the card into view, then focuses it', () => {
+      renderHeldCards(['item-501', 'item-502']);
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByRole('article')).toBeNull();
+      const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+
+      // Never opened: the cards mount on this expansion.
+      followHash('#item-501');
+      expect(toggle().getAttribute('aria-expanded')).toBe('true');
+      const target = screen.getByRole('article', { name: 'Held B1' });
+      expect(scrollIntoView.mock.contexts).toEqual([target]);
+      // Focus follows the link onto the card, after the scroll and without scrolling again; the
+      // card is focusable only while it holds focus.
+      expect(document.activeElement).toBe(target);
+      expect(target.getAttribute('tabindex')).toBe('-1');
+      expect(focus.mock.contexts).toEqual([target]);
+      expect(focus.mock.calls).toEqual([[{ preventScroll: true }]]);
+      expect(scrollIntoView.mock.invocationCallOrder[0]).toBeLessThan(
+        focus.mock.invocationCallOrder[0] ?? 0,
+      );
+      focus.mockRestore();
+      target.blur();
+      expect(target.hasAttribute('tabindex')).toBe(false);
+    });
+
+    it('can collapse again, and a later hash change shows, scrolls to and focuses the card still mounted', () => {
+      renderHeldCards(['item-501', 'item-502']);
+      // Opened with the button, then collapsed again: the cards stay mounted, hidden.
+      fireEvent.click(toggle());
+      const b3 = screen.getByRole('article', { name: 'Held B3' });
+      fireEvent.click(toggle());
+      expect(document.getElementById('group-budget-changes-held')?.hidden).toBe(true);
+      act(() => {
+        toggle().focus();
+      });
+      expect(document.activeElement).toBe(toggle());
+
+      followHash('#item-502');
+      expect(toggle().getAttribute('aria-expanded')).toBe('true');
+      // The same card, kept mounted while collapsed, is shown again, scrolled to and focused.
+      expect(screen.getByRole('article', { name: 'Held B3' })).toBe(b3);
+      expect(scrollIntoView.mock.contexts).toEqual([b3]);
+      expect(document.activeElement).toBe(b3);
+
+      // The hold is not released: the cards stay behind the same control, which collapses them.
+      fireEvent.click(toggle());
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+      expect(document.getElementById('group-budget-changes-held')?.hidden).toBe(true);
+
+      // A later link to the other card, collapsed again, expands, scrolls and focuses once more.
+      followHash('#item-501');
+      expect(toggle().getAttribute('aria-expanded')).toBe('true');
+      const b1 = screen.getByRole('article', { name: 'Held B1' });
+      expect(scrollIntoView.mock.contexts).toEqual([b3, b1]);
+      expect(document.activeElement).toBe(b1);
+      expect(b3.hasAttribute('tabindex')).toBe(false);
+    });
+
+    it('stays collapsed for a hash naming no held card, on mount and on a hash change', () => {
+      window.history.replaceState(null, '', '#item-999');
+      renderHeldCards(['item-501', 'item-502']);
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+
+      followHash('#group-campaigns-discrepancies');
+      followHash('#');
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+      expect(document.getElementById('group-budget-changes-held')?.childElementCount).toBe(0);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(document.body);
+    });
+
+    it('ignores the hash without anchors', () => {
+      window.history.replaceState(null, '', '#item-501');
+      renderHeldCards();
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+
+      followHash('#item-502');
+      expect(toggle().getAttribute('aria-expanded')).toBe('false');
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(document.body);
+    });
+
+    it("expands a frame group's held cards for a hash naming one, beyond their first batch", () => {
+      const held = Array.from({ length: CARD_BATCH_SIZE + 5 }, (_, index) =>
+        heldItem(700 + index, `Held action ${String(700 + index)}`),
+      );
+      const others = makeGroup({ key: 'pause', title: 'Pause', items: [heldItem(800, 'Other')] });
+      window.history.replaceState(null, '', `#${itemAnchorId(722)}`);
+      renderFrame({
+        section: makeSection('budget', {
+          groups: [makeGroup({ key: 'changes', title: 'Changes', items: held }), others],
+        }),
+        renderItem: (item) => (
+          <article id={itemAnchorId(item.id)} aria-label={item.action}>
+            {item.action}
+          </article>
+        ),
+      });
+
+      const changes = screen.getByRole('region', { name: 'Changes' });
+      const heldToggle = within(changes).getByRole('button', {
+        name: `Held until discrepancies are resolved (${String(CARD_BATCH_SIZE + 5)})`,
+      });
+      expect(heldToggle.getAttribute('aria-expanded')).toBe('true');
+      // The held card list reveals its batches through the named card, which is scrolled to.
+      const target = within(changes).getByRole('article', { name: 'Held action 722' });
+      expect(scrollIntoView.mock.contexts).toContain(target);
+      // A page load at the card moves no focus.
+      expect(document.activeElement).toBe(document.body);
+      // Another group's held cards, which the hash does not name, stay collapsed and unmounted.
+      const pause = screen.getByRole('region', { name: 'Pause' });
+      expect(
+        within(pause)
+          .getByRole('button', { name: 'Held until discrepancies are resolved (1)' })
+          .getAttribute('aria-expanded'),
+      ).toBe('false');
+      expect(within(pause).queryByRole('article')).toBeNull();
+    });
+
+    it.each([
+      ['never opened', false],
+      ['opened and collapsed again', true],
+    ])(
+      "focuses a frame group's held card a hash change names beyond their first batch once, %s",
+      (_label, openedBefore) => {
+        const held = Array.from({ length: CARD_BATCH_SIZE + 5 }, (_, index) =>
+          heldItem(700 + index, `Held action ${String(700 + index)}`),
+        );
+        renderFrame({
+          section: makeSection('budget', {
+            groups: [makeGroup({ key: 'changes', title: 'Changes', items: held })],
+          }),
+          renderItem: (item) => (
+            <article id={itemAnchorId(item.id)} aria-label={item.action}>
+              {item.action}
+            </article>
+          ),
+        });
+        const changes = screen.getByRole('region', { name: 'Changes' });
+        const heldToggle = within(changes).getByRole('button', {
+          name: `Held until discrepancies are resolved (${String(CARD_BATCH_SIZE + 5)})`,
+        });
+        if (openedBefore) {
+          fireEvent.click(heldToggle);
+          // Only the first batch is mounted, without the card the hash will name.
+          expect(document.getElementById(itemAnchorId(722))).toBeNull();
+          fireEvent.click(heldToggle);
+        }
+        const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+
+        followHash(`#${itemAnchorId(722)}`);
+
+        expect(heldToggle.getAttribute('aria-expanded')).toBe('true');
+        const target = within(changes).getByRole('article', { name: 'Held action 722' });
+        expect(scrollIntoView.mock.contexts).toContain(target);
+        // The card list, which reveals the batch holding the card, and the disclosure both act
+        // on the hash, yet the card takes focus exactly once.
+        expect(document.activeElement).toBe(target);
+        expect(focus.mock.contexts).toEqual([target]);
+        focus.mockRestore();
+      },
+    );
   });
 });
 
@@ -675,6 +952,82 @@ describe('SectionFrame', () => {
 
     // renderItem receives the item's own group.
     expect(within(discrepancies).getByTestId('item-1').textContent).toBe('discrepancies: C0');
+  });
+
+  it('renders a group whose title repeats the section title with no heading, keeping its anchor', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [
+          makeGroup({
+            key: 'changes',
+            title: ' budget CHANGES ',
+            items: [visibleItem(1, 'B1'), heldItem(2, 'B3')],
+          }),
+          makeGroup({ key: 'shared', title: 'Shared budgets', items: [visibleItem(3, 'B2')] }),
+        ],
+      }),
+    });
+
+    // The section title is shown once, as the <h2>; only the differing group has an <h3>.
+    const section = screen.getByRole('region', { name: 'Budget changes' });
+    expect(section.id).toBe('section-budget');
+    expect(screen.getAllByRole('heading', { name: /^budget changes$/iu })).toEqual([
+      within(section).getByRole('heading', { level: 2 }),
+    ]);
+    expect(
+      within(section)
+        .getAllByRole('heading', { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual(['Shared budgets']);
+    expect(within(section).getAllByRole('region').map((region) => region.id)).toEqual([
+      'group-budget-shared',
+    ]);
+
+    // The heading-less group keeps its anchor on a plain container holding its cards in order,
+    // then its held disclosure, ahead of the next group.
+    const group = document.getElementById('group-budget-changes');
+    if (group === null) {
+      throw new Error('the group anchor is missing');
+    }
+    expect(group.tagName).toBe('DIV');
+    expect(group.getAttribute('role')).toBeNull();
+    expect(group.getAttribute('aria-label')).toBeNull();
+    expect(within(group).getByTestId('item-1').textContent).toBe('changes: B1');
+    expect(
+      within(group).getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
+    ).toBeTruthy();
+    expect(document.getElementById('group-budget-changes-held')).not.toBeNull();
+    expect(within(group).queryByTestId('item-3')).toBeNull();
+    expect(follows(group, screen.getByRole('region', { name: 'Shared budgets' }))).toBe(true);
+  });
+
+  it('keeps the <h3> region of a group whose title differs from the section title', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [makeGroup({ key: 'changes', title: 'Changes', items: [visibleItem(1, 'B1')] })],
+      }),
+    });
+
+    const group = screen.getByRole('region', { name: 'Changes' });
+    expect(group.tagName).toBe('SECTION');
+    expect(group.id).toBe('group-budget-changes');
+    const heading = within(group).getByRole('heading', { level: 3, name: 'Changes' });
+    expect(group.getAttribute('aria-labelledby')).toBe(heading.id);
+    expect(within(group).getByTestId('item-1').textContent).toBe('changes: B1');
+  });
+
+  it('keeps the anchor of an empty group renderEmptyGroup fills when its title repeats', () => {
+    renderFrame({
+      section: makeSection('budget', {
+        groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+      }),
+      renderEmptyGroup: () => <div data-testid="empty-group">Nothing to change</div>,
+    });
+
+    const group = document.getElementById('group-budget-changes');
+    expect(group?.tagName).toBe('DIV');
+    expect(group?.contains(screen.getByTestId('empty-group'))).toBe(true);
+    expect(screen.getAllByRole('heading', { name: 'Budget changes' })).toHaveLength(1);
   });
 
   it('shows visible cards in API order, then held cards collapsed at the end', () => {
@@ -1277,7 +1630,7 @@ describe('bounded batches', () => {
     expect(within(group).queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
     expect(within(group).getByRole('status').textContent).toBe('Showing all 250 actions');
     expect(screen.queryByRole('alert')).toBeNull();
-  });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 
   it('bounds the replaced-data block and the held cards on their own', () => {
     renderFrame({
@@ -1379,6 +1732,51 @@ describe('bounded batches', () => {
 
     const group = screen.getByRole('region', { name: 'Group 23' });
     expect(scrollIntoView.mock.contexts).toEqual([group]);
+  });
+
+  it('reveals and scrolls to a heading-less group a hash change names', () => {
+    const repeating = makeGroup({
+      key: 'campaign:99',
+      title: 'Copy/creative changes',
+      items: [visibleItem(99_001, 'Action 99001')],
+    });
+    renderFrame({
+      section: makeSection('creative', { groups: [...manyGroups(GROUP_BATCH_SIZE, 1), repeating] }),
+      renderItem: renderCard,
+    });
+    const anchor = 'group-creative-campaign-99';
+    expect(document.getElementById(anchor)).toBeNull();
+
+    // A hash naming the group's anchor reveals the batch holding it and scrolls the group to view.
+    act(() => {
+      window.history.replaceState(null, '', `#${anchor}`);
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    const group = document.getElementById(anchor);
+    expect(group?.tagName).toBe('DIV');
+    expect(scrollIntoView.mock.contexts).toEqual([group]);
+    expect(screen.queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
+  });
+
+  it('moves focus to a heading-less group that leads a revealed batch', () => {
+    const repeating = makeGroup({
+      key: 'campaign:99',
+      title: 'Copy/creative changes',
+      items: [visibleItem(99_001, 'Action 99001')],
+    });
+    renderFrame({
+      section: makeSection('creative', { groups: [...manyGroups(GROUP_BATCH_SIZE, 1), repeating] }),
+      renderItem: renderCard,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 1 more group' }));
+    const group = document.getElementById('group-creative-campaign-99');
+    expect(group).not.toBeNull();
+    expect(document.activeElement).toBe(group);
+    // Focusable by script while it holds focus, never a Tab stop.
+    expect(group?.getAttribute('tabindex')).toBe('-1');
+    const card = within(group as HTMLElement).getByRole('article', { name: 'Action 99001' });
+    expect(card.id).toBe(itemAnchorId(99_001));
   });
 
   it('hands renderGroups every group, unbatched, for the override to place', () => {
@@ -1620,5 +2018,531 @@ describe('card keys across runs', () => {
       'item-8',
     ]);
     expect(consoleError).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Confirmations of items hidden on the page
+// ---------------------------------------------------------------------------------------------
+
+describe('confirmations of items hidden on the page', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A card as `RecommendationCard` anchors it, at `item-{id}`, holding one action. */
+  function actionCard(item: Item): ReactNode {
+    return (
+      <article id={itemAnchorId(item.id)} aria-label={item.action}>
+        <Button>{`Mark done: ${item.action}`}</Button>
+      </article>
+    );
+  }
+
+  /**
+   * A C1 item on a campaign of its own, so every item of a test has its own recommendation
+   * identity, with the overlay fields given and, with `held`, held by the run.
+   */
+  function campaignItem(
+    id: number,
+    action: string,
+    overlay: Partial<ItemOverlay> = {},
+    held = false,
+  ): Item {
+    return makeItem({
+      id,
+      rank: id,
+      rule_id: 'C1',
+      action,
+      held,
+      held_reason: held ? 'Resolve discrepancy first' : null,
+      entity: {
+        source: 'google',
+        type: 'campaign',
+        id: `6100${String(id)}`,
+        name: `Campaign ${String(id)}`,
+      },
+      current: makeItemOverlay(overlay),
+    });
+  }
+
+  /** An item computed from data that has since been replaced, on a campaign of its own. */
+  function replacedItem(id: number, action: string): Item {
+    return campaignItem(id, action, {
+      historical: true,
+      held_now: true,
+      held_reason_now: 'Computed from data that has since been replaced',
+      data_status_now: 'live',
+    });
+  }
+
+  /** The item as a refetch shows it after a dismissal: hidden by feedback since the run. */
+  function dismissed(item: Item): Item {
+    return { ...item, current: { ...item.current, hidden_by: 'dismiss' } };
+  }
+
+  /** The confirmation a card records for the dismissal of `item`. */
+  function dismissal(item: Item): string {
+    return `Dismissed: ${item.action} (${item.entity.name ?? ''})`;
+  }
+
+  /** The confirmations of dismissing `items`, keyed as the provider keys them. */
+  function confirmationsOf(...items: Item[]): Map<string, string> {
+    return new Map(items.map((item) => [itemIdentity(item), dismissal(item)]));
+  }
+
+  /** Whether the elements stand in this document order. */
+  function inOrder(...elements: Element[]): boolean {
+    let previous: Element | undefined;
+    for (const element of elements) {
+      if (previous !== undefined && !follows(previous, element)) {
+        return false;
+      }
+      previous = element;
+    }
+    return true;
+  }
+
+  /** Asserts the confirmation is plain content: no live region, no alert and no Tab stop. */
+  function expectPlainContent(confirmation: Element): void {
+    expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+  }
+
+  /** Records the dismissal of `item` in the nearest provider when pressed, as a card does. */
+  function Recorder({ item }: { item: Item }): ReactNode {
+    const record = useRecordFeedbackConfirmation();
+    return (
+      <Button
+        onClick={() => {
+          record?.(itemIdentity(item), dismissal(item));
+        }}
+      >
+        {`Record ${item.action}`}
+      </Button>
+    );
+  }
+
+  /**
+   * Renders the frame over `initial` inside an `ActionOutcomeProvider`, beside a recorder for
+   * each of `recorded`, and returns `show`, which hands the frame the section as a refetch does.
+   */
+  function renderOnPage(
+    initial: Section,
+    recorded: readonly Item[],
+    props: Partial<SectionFrameProps> = {},
+  ): (next: Section) => void {
+    const control: { show?: (next: Section) => void } = {};
+    function Host(): ReactNode {
+      const [section, setSection] = useState(initial);
+      control.show = setSection;
+      return (
+        <ActionOutcomeProvider>
+          {recorded.map((item) => (
+            <Recorder key={item.id} item={item} />
+          ))}
+          <SectionFrame section={section} renderItem={actionCard} {...props} />
+        </ActionOutcomeProvider>
+      );
+    }
+    render(<Host />);
+    return (next) => {
+      act(() => {
+        control.show?.(next);
+      });
+    };
+  }
+
+  /** Presses the recorder of `item`, as its card does once its feedback is recorded. */
+  function record(item: Item): void {
+    fireEvent.click(screen.getByRole('button', { name: `Record ${item.action}` }));
+  }
+
+  it('confirms only an item feedback hides now, with a confirmation recorded on the page', () => {
+    const item = campaignItem(1, 'Pause');
+    const confirmations = confirmationsOf(item);
+
+    expect(isConfirmed(dismissed(item), confirmations)).toBe(true);
+    // Shown again by a newer run, or never hidden: the card shows, not its confirmation.
+    expect(isConfirmed(item, confirmations)).toBe(false);
+    // Hidden by feedback given elsewhere, such as another tab: nothing to confirm here.
+    expect(isConfirmed(dismissed(campaignItem(2, 'Pause')), confirmations)).toBe(false);
+    expect(isConfirmed(dismissed(item), new Map())).toBe(false);
+  });
+
+  it('places each confirmed item in the list it stood in, at its API position, and leaves the partition as it was', () => {
+    const first = campaignItem(1, 'Visible first');
+    const confirmedVisible = dismissed(campaignItem(2, 'Dismissed here'));
+    const elsewhere = dismissed(campaignItem(3, 'Dismissed elsewhere'));
+    const confirmedReplaced = dismissed(replacedItem(4, 'Replaced and dismissed here'));
+    const held = campaignItem(5, 'Held', {}, true);
+    const confirmedHeld = dismissed(campaignItem(6, 'Held and dismissed here', {}, true));
+    const last = campaignItem(7, 'Visible last');
+    const group = makeGroup({
+      key: 'pause',
+      title: 'Pause',
+      items: [first, confirmedVisible, elsewhere, confirmedReplaced, held, confirmedHeld, last],
+    });
+    const confirmations = confirmationsOf(confirmedVisible, confirmedReplaced, confirmedHeld);
+
+    expect(placeConfirmations(group, confirmations)).toEqual({
+      visible: [first, confirmedVisible, last],
+      historical: [confirmedReplaced],
+      held: [held, confirmedHeld],
+      confirmed: 3,
+    });
+    // Every count still counts all four hidden items, the confirmed ones included.
+    expect(partitionGroup(group)).toEqual({
+      visible: [first, last],
+      historical: [],
+      held: [held],
+      hiddenCount: 4,
+    });
+    expect(placeConfirmations(group, new Map())).toEqual({
+      visible: [first, last],
+      historical: [],
+      held: [held],
+      confirmed: 0,
+    });
+  });
+
+  it('renders each confirmation where its card stood in a card list, as plain content', () => {
+    const leading = dismissed(campaignItem(1, 'Leading'));
+    const second = campaignItem(2, 'Second');
+    const third = dismissed(campaignItem(3, 'Third'));
+    const fourth = dismissed(campaignItem(4, 'Fourth'));
+    const fifth = campaignItem(5, 'Fifth');
+    const elsewhere = dismissed(campaignItem(6, 'Elsewhere'));
+    render(
+      <CardList
+        items={[leading, second, third, fourth, fifth, elsewhere]}
+        renderCard={actionCard}
+        confirmations={confirmationsOf(leading, third, fourth)}
+      />,
+    );
+
+    const places = [
+      screen.getByText(dismissal(leading)),
+      screen.getByRole('article', { name: 'Second' }),
+      screen.getByText(dismissal(third)),
+      screen.getByText(dismissal(fourth)),
+      screen.getByRole('article', { name: 'Fifth' }),
+    ];
+    expect(inOrder(...places)).toBe(true);
+    for (const message of [dismissal(leading), dismissal(third), dismissal(fourth)]) {
+      expectPlainContent(screen.getByText(message));
+    }
+    // A hidden item without a confirmation on this page shows nothing, and no hidden card renders.
+    expect(screen.queryByText(dismissal(elsewhere))).toBeNull();
+    expect(screen.getAllByRole('article').map((card) => card.getAttribute('aria-label'))).toEqual([
+      'Second',
+      'Fifth',
+    ]);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('never counts a confirmation as an action of a batched list', () => {
+    const cards = Array.from({ length: CARD_BATCH_SIZE + 1 }, (_, index) =>
+      campaignItem(index + 1, `Action ${String(index + 1)}`),
+    );
+    const hidden = dismissed(campaignItem(100, 'Dismissed here'));
+    render(
+      <CardList
+        items={[hidden, ...cards]}
+        renderCard={actionCard}
+        confirmations={confirmationsOf(hidden)}
+      />,
+    );
+
+    expect(screen.getByRole('status').textContent).toBe(
+      `Showing ${String(CARD_BATCH_SIZE)} of ${String(CARD_BATCH_SIZE + 1)} actions`,
+    );
+    expect(screen.getAllByRole('article')).toHaveLength(CARD_BATCH_SIZE);
+    expect(screen.getByText(dismissal(hidden))).toBeTruthy();
+  });
+
+  it('renders a list of confirmations alone, with no batch status', () => {
+    const one = dismissed(campaignItem(1, 'One'));
+    const two = dismissed(campaignItem(2, 'Two'));
+    render(
+      <CardList
+        items={[one, two]}
+        renderCard={actionCard}
+        confirmations={confirmationsOf(one, two)}
+      />,
+    );
+
+    expect(inOrder(screen.getByText(dismissal(one)), screen.getByText(dismissal(two)))).toBe(true);
+    expect(screen.queryByRole('article')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('keeps the card before a confirmation mounted, and focus on its action, when its neighbour turns into one', () => {
+    const first = campaignItem(1, 'First');
+    const second = campaignItem(2, 'Second');
+    const control: { show?: (next: readonly Item[]) => void } = {};
+    function Host(): ReactNode {
+      const [items, setItems] = useState<readonly Item[]>([first, second]);
+      control.show = setItems;
+      return (
+        <CardList
+          items={items}
+          renderCard={actionCard}
+          confirmations={confirmationsOf(dismissed(second))}
+        />
+      );
+    }
+    render(<Host />);
+    const card = screen.getByRole('article', { name: 'First' });
+    const action = within(card).getByRole('button');
+    action.focus();
+    const consoleError = vi.spyOn(console, 'error');
+
+    act(() => {
+      control.show?.([first, dismissed(second)]);
+    });
+
+    expect(screen.getByRole('article', { name: 'First' })).toBe(card);
+    expect(document.activeElement).toBe(action);
+    expect(follows(card, screen.getByText(dismissal(second)))).toBe(true);
+    expect(screen.queryByRole('article', { name: 'Second' })).toBeNull();
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('renders the confirmations of confirmed items alone for a table, or nothing', () => {
+    const shown = campaignItem(1, 'Shown');
+    const hidden = dismissed(campaignItem(2, 'Hidden here'));
+    const elsewhere = dismissed(campaignItem(3, 'Hidden elsewhere'));
+    const confirmations = confirmationsOf(shown, hidden);
+
+    const { container, unmount } = render(
+      <ConfirmedItems items={[shown, hidden, elsewhere]} confirmations={confirmations} />,
+    );
+    expect(screen.getByText(dismissal(hidden))).toBeTruthy();
+    // A visible item is its own row; a confirmation recorded for it shows nothing here.
+    expect(screen.queryByText(dismissal(shown))).toBeNull();
+    expect(screen.queryByText(dismissal(elsewhere))).toBeNull();
+    unmount();
+
+    const { container: empty } = render(
+      <ConfirmedItems items={[shown, elsewhere]} confirmations={confirmations} />,
+    );
+    expect(empty.childElementCount).toBe(0);
+    expect(container.childElementCount).toBe(0);
+  });
+
+  it('keeps the region of a group whose every item was hidden on the page, with the confirmation in place of the empty state', () => {
+    const c1 = campaignItem(1, 'Pause Generic CRM');
+    const launch = campaignItem(2, 'Launch Partner Search');
+    const show = renderOnPage(
+      makeSection('campaigns', {
+        groups: [
+          makeGroup({ key: 'pause', title: 'Pause', items: [c1] }),
+          makeGroup({ key: 'launch', title: 'Launch ideas', items: [launch] }),
+        ],
+      }),
+      [c1, launch],
+    );
+
+    record(c1);
+    // Recorded before the refetch hides it: the card still shows, and no confirmation.
+    expect(screen.getByRole('article', { name: c1.action })).toBeTruthy();
+    expect(screen.queryByText(dismissal(c1))).toBeNull();
+
+    show(
+      makeSection('campaigns', {
+        groups: [
+          makeGroup({ key: 'pause', title: 'Pause', items: [dismissed(c1)] }),
+          makeGroup({ key: 'launch', title: 'Launch ideas', items: [launch] }),
+        ],
+      }),
+    );
+
+    const pause = screen.getByRole('region', { name: 'Pause' });
+    expect(pause.id).toBe('group-campaigns-pause');
+    const confirmation = within(pause).getByText(dismissal(c1));
+    expectPlainContent(confirmation);
+    expect(within(pause).queryByRole('article')).toBeNull();
+    expect(
+      screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent),
+    ).toEqual(['Pause', 'Launch ideas']);
+    // The item still counts as hidden, and only the polite provider region is a status.
+    expect(listLines('Not shown')).toEqual(['1 hidden since this run']);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    // The section's last shown card hidden the same way: the confirmations replace the empty state.
+    record(launch);
+    show(
+      makeSection('campaigns', {
+        groups: [
+          makeGroup({ key: 'pause', title: 'Pause', items: [dismissed(c1)] }),
+          makeGroup({ key: 'launch', title: 'Launch ideas', items: [dismissed(launch)] }),
+        ],
+      }),
+    );
+    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(
+      within(screen.getByRole('region', { name: 'Launch ideas' })).getByText(dismissal(launch)),
+    ).toBeTruthy();
+    expect(listLines('Not shown')).toEqual(['2 hidden since this run']);
+  });
+
+  it('shows nothing for a hidden item without a confirmation on the page, and the empty state when nothing else shows', () => {
+    const c1 = campaignItem(1, 'Pause Generic CRM');
+    renderOnPage(
+      makeSection('campaigns', {
+        groups: [makeGroup({ key: 'pause', title: 'Pause', items: [dismissed(c1)] })],
+      }),
+      [],
+    );
+
+    expect(screen.queryByRole('region', { name: 'Pause' })).toBeNull();
+    expect(screen.queryByText(dismissal(c1))).toBeNull();
+    expect(screen.getByText('No actions in this section')).toBeTruthy();
+  });
+
+  it('shows the confirmation in place of a replaced-data block or held disclosure the feedback emptied', () => {
+    const visible = campaignItem(1, 'Visible');
+    const replaced = replacedItem(2, 'Replaced');
+    const held = campaignItem(3, 'Held', {}, true);
+    const group = (items: Item[]) => makeGroup({ key: 'pause', title: 'Pause', items });
+    const show = renderOnPage(
+      makeSection('campaigns', { groups: [group([visible, replaced, held])] }),
+      [replaced, held],
+    );
+    expect(screen.getByRole('group', { name: 'Computed from replaced data (1)' })).toBeTruthy();
+
+    record(replaced);
+    record(held);
+    show(
+      makeSection('campaigns', {
+        groups: [group([visible, dismissed(replaced), dismissed(held)])],
+      }),
+    );
+
+    const pause = screen.getByRole('region', { name: 'Pause' });
+    const replacedConfirmation = within(pause).getByText(dismissal(replaced));
+    const heldConfirmation = within(pause).getByText(dismissal(held));
+    expect(
+      inOrder(
+        within(pause).getByRole('article', { name: 'Visible' }),
+        replacedConfirmation,
+        heldConfirmation,
+      ),
+    ).toBe(true);
+    // Both blocks are empty now, so neither renders; the confirmations take their place.
+    expect(
+      within(pause).queryByRole('group', { name: /^Computed from replaced data/u }),
+    ).toBeNull();
+    expect(
+      within(pause).queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
+    ).toBeNull();
+    expectPlainContent(replacedConfirmation);
+    expectPlainContent(heldConfirmation);
+    expect(listLines('Not shown')).toEqual(['2 hidden since this run']);
+  });
+
+  it('keeps a confirmation inside the replaced-data block and the held disclosure that still hold cards', () => {
+    const replaced = replacedItem(1, 'Replaced');
+    const replacedNext = replacedItem(2, 'Replaced next');
+    const held = campaignItem(3, 'Held', {}, true);
+    const heldNext = campaignItem(4, 'Held next', {}, true);
+    const group = (items: Item[]) => makeGroup({ key: 'pause', title: 'Pause', items });
+    const show = renderOnPage(
+      makeSection('campaigns', { groups: [group([replaced, replacedNext, held, heldNext])] }),
+      [replaced, held],
+    );
+
+    record(replaced);
+    record(held);
+    show(
+      makeSection('campaigns', {
+        groups: [group([dismissed(replaced), replacedNext, dismissed(held), heldNext])],
+      }),
+    );
+
+    const block = screen.getByRole('group', { name: 'Computed from replaced data (1)' });
+    expect(
+      inOrder(
+        within(block).getByText(dismissal(replaced)),
+        within(block).getByRole('article', { name: 'Replaced next' }),
+      ),
+    ).toBe(true);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
+    );
+    const heldRegion = document.getElementById('group-campaigns-pause-held');
+    if (heldRegion === null) {
+      throw new Error('the held region left the group');
+    }
+    expect(
+      inOrder(
+        within(heldRegion).getByText(dismissal(held)),
+        within(heldRegion).getByRole('article', { name: 'Held next' }),
+      ),
+    ).toBe(true);
+  });
+
+  it('removes a confirmation once a rerun drops the item, and shows the card again once it is no longer hidden', () => {
+    const c1 = campaignItem(1, 'Pause Generic CRM');
+    const other = campaignItem(2, 'Pause Brand');
+    const section = (items: Item[]) =>
+      makeSection('campaigns', { groups: [makeGroup({ key: 'pause', title: 'Pause', items })] });
+    const show = renderOnPage(section([c1, other]), [c1]);
+    record(c1);
+    show(section([dismissed(c1), other]));
+    expect(screen.getByText(dismissal(c1))).toBeTruthy();
+
+    // A rerun lists the recommendation unhidden, under a new id: the card, not the confirmation.
+    show(section([{ ...c1, id: 1001 }, other]));
+    expect(screen.queryByText(dismissal(c1))).toBeNull();
+    expect(screen.getByRole('article', { name: c1.action }).id).toBe('item-1001');
+
+    // A rerun that no longer lists it removes it entirely.
+    show(section([dismissed(c1), other]));
+    expect(screen.getByText(dismissal(c1))).toBeTruthy();
+    show(section([other]));
+    expect(screen.queryByText(dismissal(c1))).toBeNull();
+    expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
+  });
+
+  it('hands renderGroup and renderGroups the placed lists and the confirmations', () => {
+    const c1 = campaignItem(1, 'Pause Generic CRM');
+    const other = campaignItem(2, 'Pause Brand');
+    const renderGroup = vi.fn((_group: Group, parts: GroupParts) => (
+      <CardList
+        items={parts.placed.visible}
+        renderCard={actionCard}
+        confirmations={parts.confirmations}
+      />
+    ));
+    const show = renderOnPage(
+      makeSection('campaigns', {
+        groups: [makeGroup({ key: 'pause', title: 'Pause', items: [c1, other] })],
+      }),
+      [c1],
+      { renderGroup },
+    );
+    record(c1);
+    show(
+      makeSection('campaigns', {
+        groups: [makeGroup({ key: 'pause', title: 'Pause', items: [dismissed(c1), other] })],
+      }),
+    );
+
+    const parts = renderGroup.mock.lastCall?.[1];
+    expect(parts?.visible.map((item) => item.id)).toEqual([2]);
+    expect(parts?.hiddenCount).toBe(1);
+    expect(parts?.placed.visible.map((item) => item.id)).toEqual([1, 2]);
+    expect(parts?.placed.confirmed).toBe(1);
+    expect(parts?.confirmations.get(itemIdentity(c1))).toBe(dismissal(c1));
+    expect(
+      inOrder(
+        screen.getByText(dismissal(c1)),
+        screen.getByRole('article', { name: other.action }),
+      ),
+    ).toBe(true);
   });
 });

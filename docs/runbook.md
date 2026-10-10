@@ -612,7 +612,11 @@ What the labels mean:
 
 - **Status line**: the mode ("Live" or "Simulated"), the connection status ("OK", "Stale",
   "Access denied" or "Error", for `ok`, `stale`, `denied` and `error`), the reason exactly as
-  recorded (for example "credentials not configured") and the time of the last attempt.
+  recorded (for example "credentials not configured") and the time of the last attempt. The
+  mode reads "No data yet" while none is established: before the worker's first attempt, and
+  while a source with credentials has never verified live access and has no active dataset, for
+  example when its first live query failed ("Error" with the failing query's reason). It turns
+  "Live" only once a live dataset activates.
 - **Google call budget** (Google only): "Google calls in the last 24 h: N of M". N is
   `calls_24h`, the reserved webhook calls still counting in the sliding 24 h, and M is the cap,
   `GOOGLE_DAILY_CALL_BUDGET` (default 1000). N is a conservative upper bound and can exceed the
@@ -643,8 +647,9 @@ What the labels mean:
   [lanes](architecture.md#lanes): `google`, or `linkedin_hubspot`, which serialises LinkedIn and
   HubSpot. When the source's lane is idle, the pass the next wake dispatches serves the request;
   when the lane is busy, the request is served once its running pass ends, so a long sync or
-  backfill in that lane delays it. While one is pending, the button is disabled with "A sync is
-  already pending", and the API answers a second request with 409 `sync_pending`.
+  backfill in that lane delays it. While one is pending, the button is disabled, described by
+  "Sync requested" after your own press or by "A sync is already pending" otherwise, and the API
+  answers a second request with 409 `sync_pending`. A double click sends one request.
 
 How the freshness rows turn into item flags:
 
@@ -654,7 +659,11 @@ How the freshness rows turn into item flags:
 - A failed attempt alone flags nothing: the last good data, its coverage and its completeness stand.
 - Reasons starting "call budget exhausted" or "interrupted" clear with a later fetch. "result limit
   reached at finest partition" (Google search terms) and "search result ceiling reached" (HubSpot
-  CRM Search) are platform limits that stay flagged for the range they cover.
+  CRM Search) are platform limits. The Google search-terms reason names the days at the limit:
+  they stay flagged until a later sync re-reads them without meeting the limit again, and only
+  items whose window includes one of them are flagged. The HubSpot reason names no day, so it
+  flags every window until a sync re-reads the dataset's whole recorded range without meeting
+  the ceiling again.
 
 ## Troubleshooting
 

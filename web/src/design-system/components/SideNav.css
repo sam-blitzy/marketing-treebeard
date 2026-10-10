@@ -1,9 +1,9 @@
 /* SideNav: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
 
 /*
- * Vertical navigation list with optional item counts: the app's primary navigation in the router
- * layout and the /actions section navigation (anchor links with item counts). SideNav.tsx
- * renders, and router links built through its renderLink prop must keep, this class contract:
+ * Navigation list with optional item counts: the app's primary navigation in the router layout
+ * and the /actions section navigation (anchor links with item counts). SideNav.tsx renders, and
+ * router links built through its renderLink prop must keep, this class contract:
  *
  *   <nav class="ds-sidenav" aria-label="…">
  *     <ul class="ds-sidenav__list">
@@ -20,8 +20,14 @@
  * Blitzy OS touches tokens.css alone. The current item is marked by a heavier weight and an
  * accent bar on its inline-start edge, never by colour alone (WCAG 2.2 SC 1.4.1), and either
  * the --current modifier or aria-current="page" applies that state, so a router link that only
- * sets aria-current is styled identically. The ds-sidenav__item hook carries no style of its
- * own: the list gap spaces the items.
+ * sets aria-current is styled identically.
+ *
+ * The layout follows the width of the list, with no breakpoint of its own: in a list narrower
+ * than eight --space-8 steps, such as PageShell's side column, every item takes a whole line and
+ * the items form one vertical column; in a wider one, such as the navigation stacked above main
+ * or the section navigation inside main, the items are sized to their content and form a
+ * compact row that wraps, each growing to fill its line. Each count follows its label at the
+ * link gap, so it always reads with its label.
  */
 
 /* Root: the navigation text size, inherited by every link. */
@@ -29,21 +35,45 @@
   font-size: var(--font-size-sm);
 }
 
-/* List: user-agent bullets, indent and outer margin cleared; the gap alone spaces the links. */
+/*
+ * List: user-agent bullets, indent and outer margin cleared; the gap alone spaces the links. The
+ * items wrap onto as many lines as the container's width needs.
+ */
 .ds-sidenav__list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: var(--space-1);
 }
 
 /*
- * Link: the label on the inline-start side and the count pushed to the inline-end side. The
- * transparent inline-start border reserves the accent bar's width on every link, so marking the
- * current item never shifts its text. The colour overrides the global accent link colour from
- * tokens.css, because a navigation list reads as text, not as a run of inline links.
+ * Item: sized to its content and growing to share its line with the other items. The minimum
+ * inline size is a width switch on the list. In a list a pixel or more narrower than eight
+ * --space-8 steps (256px at the 16px root), such as PageShell's 224px side column, the 999
+ * multiplier makes the clamp() middle argument wider than the list, so the full-width ceiling
+ * applies: every item takes a whole line and the items form one column. In a list at least that
+ * wide the middle argument is zero or negative, so the 0px floor applies: the items keep their
+ * content width, share each line and wrap onto as many lines as they need. The floor also lets
+ * an item with an unbroken long label shrink to its line, so the label wraps instead of pushing
+ * the item out of the navigation. The item is a flex box so its link fills it, which keeps the
+ * links of one line equally tall when their labels wrap to different heights.
+ */
+.ds-sidenav__item {
+  display: flex;
+  flex: 1 1 auto;
+  min-inline-size: clamp(0px, (var(--space-8) * 8 - var(--size-full)) * 999, var(--size-full));
+}
+
+/*
+ * Link: fills its item, with the label on the inline-start side and the count right after it,
+ * at the gap. The transparent inline-start border reserves the accent bar's width on every link,
+ * so marking the current item never shifts its text. The colour overrides the global accent link
+ * colour from tokens.css, because a navigation list reads as text, not as a run of inline links.
+ * min-inline-size: 0 lets it shrink with its item, so a long label wraps inside it. The padding
+ * is one --space-2 step on every side, which keeps content-sized links compact, so as many as
+ * possible share a line when the navigation is a row above or inside main.
  *
  * The minimum block size is 44px at the 16px root (--space-8 + --space-3 = 2.75rem), the touch
  * target minimum that applies when no design source specifies a smaller target; the Blitzy OS
@@ -52,11 +82,13 @@
  */
 .ds-sidenav__link {
   display: flex;
+  flex-grow: 1;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: var(--space-2);
+  min-inline-size: 0;
   min-block-size: calc(var(--space-8) + var(--space-3));
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-2);
   border-inline-start: var(--space-1) solid transparent;
   border-radius: var(--radius-sm);
   color: var(--color-text);
@@ -72,7 +104,7 @@
   overflow-wrap: break-word;
 }
 
-/* Count: visible text read as part of the link name; tabular figures keep counts aligned. */
+/* Count: visible text read as part of the link name; tabular figures give every digit one width. */
 .ds-sidenav__count {
   flex-shrink: 0;
   font-size: var(--font-size-xs);
@@ -136,17 +168,17 @@
  * Forced colours (for example Windows High Contrast): the browser paints every border in a
  * system colour, transparent ones included, which would draw the accent bar on every link.
  * Only the current link keeps its bar here; the others drop the border and take its width
- * back as padding (--space-3 + --space-1 = --space-4), so the text still never shifts.
+ * back as padding (--space-2 + --space-1 = --space-3), so the text still never shifts.
  */
 @media (forced-colors: active) {
   .ds-sidenav__link {
     border-inline-start-style: none;
-    padding-inline-start: var(--space-4);
+    padding-inline-start: var(--space-3);
   }
 
   .ds-sidenav__link--current,
   .ds-sidenav__link[aria-current="page"] {
     border-inline-start-style: solid;
-    padding-inline-start: var(--space-3);
+    padding-inline-start: var(--space-2);
   }
 }
