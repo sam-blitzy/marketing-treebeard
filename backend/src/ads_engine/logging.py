@@ -21,7 +21,11 @@ through the same redaction before it is rendered:
   (``Authorization: Bearer ...``, ``?access_token=...``, ``{"refresh_token": "..."}``)
   and of sensitive pair reprs, and standalone ``Bearer`` tokens, become ``[REDACTED]``,
   each value whole: a header's to the end of its line (``Cookie: a="b"; c=d``), a
-  container member's up to the next member (``{'token': {'value': '...'}, 'n': 1}``);
+  container member's up to the next member (``{'token': {'value': '...'}, 'n': 1}``).
+  Whitespace around the separator or between a scheme and its credentials, line breaks
+  included, raw or JSON-escaped, does not split a value from its key, and an escaped line
+  break or tab right before a key or a ``Bearer`` does not hide it, so each value is still
+  replaced whole;
 * the plaintext of every configured secret (each ``SecretStr`` setting, the LinkedIn
   client id and the n8n webhook URL), whatever its length, is replaced inside any
   string, longest first, together with any email address and any percent-encoded run
@@ -561,21 +565,38 @@ _CAMEL_BOUNDARY_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 # Textual credential rules. They apply inside every string whatever secrets are configured,
 # so a refreshed or never-configured token in a header line, URL query, form or JSON body,
 # container repr or exception text is still removed. Every pattern runs in linear time: a
-# match starts only where its run of name characters starts, and quantifiers are
-# possessive.
+# match starts only where its run of name characters starts, or right after an escaped
+# line break glued to it, and quantifiers are possessive.
 #
+# The gap allowed between a key, its separator and its value, between a pair's name and
+# its value, and between an authentication scheme and its credentials: any whitespace
+# character, line breaks included, or a line break or tab escaped once as JSON and Python
+# reprs write it (`\n`, `\r`, `\t`). `\s` matches exactly what `str.isspace()` accepts, so a
+# whitespace collapse such as `str.split()` can never join a key to a value these rules
+# did not already see. The two alternatives are disjoint (`\s` never matches a
+# backslash), so a possessive repetition of the gap stays linear.
+_GAP: Final = r"(?:\s|\\[nrt])"
+# The gap after a key's separator. `_value_span` skips it where the value is read, so it is
+# never part of a key's match and the scan for the next key resumes right after the
+# separator.
+_GAP_RUN_RE: Final = re.compile(rf"{_GAP}*+")
 # `key=value` and `key: value`, the key optionally quoted (JSON, Python repr), the quote
 # optionally backslash-escaped (JSON inside a JSON string). Only the key and separator are
 # matched; the value's extent is read afterwards for sensitive keys alone, so an ordinary
-# key never swallows a sensitive assignment that follows it.
+# key never swallows a sensitive assignment that follows it. An unquoted key that follows
+# an escaped line break or tab starts at the escape's letter (`nCookie` in `x\nCookie:`),
+# and `_Redactor._assigned_values` checks the name without that letter too. A lone
+# escape letter is never a key, so a run of escaped line breaks is scanned once and the
+# match stays linear.
 _ASSIGNMENT_RE: Final = re.compile(
-    r"(?P<kq>\\?[\"'])?(?<![A-Za-z0-9_-])(?P<key>[A-Za-z0-9_-]++)(?(kq)(?P=kq))"
-    r"[ \t]*+(?P<sep>[:=])[ \t]*+"
+    r"(?P<kq>\\?[\"'])?(?<![A-Za-z0-9_-])(?!(?<=\\)[nrt](?![A-Za-z0-9_-]))"
+    r"(?P<key>[A-Za-z0-9_-]++)(?(kq)(?P=kq))"
+    rf"{_GAP}*+(?P<sep>[:=])"
 )
 # A `('name', 'value')`, `(b'name', b'value')`, `['name', 'value']` or
 # `('name', ['value'])` pair repr, up to the opening quote or bracket of its value.
 _PAIR_RE: Final = re.compile(
-    r"[(\[][ \t]*+b?(?P<nq>[\"'])(?P<key>[A-Za-z0-9_-]++)(?P=nq)[ \t]*+,[ \t]*+"
+    rf"[(\[]{_GAP}*+b?(?P<nq>[\"'])(?P<key>[A-Za-z0-9_-]++)(?P=nq){_GAP}*+,{_GAP}*+"
     r"(?=b?[\"']|[(\[{])"
 )
 # A quoted value; its content is replaced and its quotes kept. An unterminated string runs
@@ -587,10 +608,11 @@ _QUOTED_VALUE_RE: Final = re.compile(
 # username="u", nonce="n"` runs up to it, whatever quotes, brackets or commas it holds.
 _LINE_BREAK_RE: Final = re.compile(r"[\r\n]")
 # An authentication scheme followed by its credentials (`Bearer <token>`, `Digest
-# username="u", nonce="n"`); a value that starts with one runs to the end of the line.
+# username="u", nonce="n"`), on the same line or after a line break; a value that starts
+# with one runs to the end of the line on which its credentials start.
 _AUTH_SCHEME_RE: Final = re.compile(
     r"(?i:bearer|basic|digest|negotiate|ntlm|token|dpop|hoba|mutual|aws4-hmac-sha256)"
-    r"[ \t]++(?=\S)"
+    rf"{_GAP}++(?=\S)"
 )
 # One token of a `key=value` text, URL query or form body.
 _TOKEN_RUN_RE: Final = re.compile(r"[^\s&;,\"'<>(){}\[\]]*+")
@@ -603,9 +625,15 @@ _QUOTES: Final = "'\""
 _CONTAINER_STARTS: Final = "{[(,"
 # Where an unquoted container member's value ends at nesting depth 0, outside strings.
 _CONTAINER_STOPS: Final = ",)]}\r\n"
-# A standalone `Bearer <token>` credential anywhere in the text.
+# A standalone `Bearer <token>` credential anywhere in the text, the token on the same line
+# or after a line break. It starts where a name does, or right after an escaped line break
+# or tab whose letter is glued to it (`x\nBearer <token>` in a repr); both lookbehinds have
+# a fixed width, so the match stays linear. The token holds at least one character other
+# than a backslash, since a run of backslashes alone is never a credential and may be what
+# an earlier pass left of an escape before a marker (`Bearer \[REDACTED_EMAIL]`).
 _BEARER_RE: Final = re.compile(
-    r"(?P<prefix>(?<![A-Za-z0-9_-])(?i:bearer)[ \t]++)[^\s,;\"'<>(){}\[\]]++"
+    rf"(?P<prefix>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?i:bearer){_GAP}++)"
+    r"\\*+[^\s,;\"'<>(){}\[\]\\][^\s,;\"'<>(){}\[\]]*+"
 )
 _BEARER_REPLACEMENT: Final = r"\g<prefix>" + REDACTED
 
@@ -817,7 +845,7 @@ def _in_container(text: str, key_start: int) -> bool:
 def _value_span(
     text: str, start: int, separator: str | None, *, container: bool
 ) -> tuple[int, int]:
-    """Return the span of the credential value that starts at ``text[start]``.
+    r"""Return the span of the credential value that starts at ``text[start]``.
 
     The extent depends on where the key sits, so that no part of a credential is left
     behind, however it is quoted, nested or split:
@@ -833,12 +861,20 @@ def _value_span(
       including each bracketed group glued to it (``token=Token(value='x')``).
 
     An unquoted value that starts with an authentication scheme (``Bearer``, ``Digest``
-    and the like) runs to the end of the line wherever it sits, so scheme parameters
-    separated by commas go with it.
+    and the like) runs, wherever it sits, to the end of the line on which its credentials
+    start, so scheme parameters separated by commas go with it, and so do credentials that
+    a line break puts after the scheme (``Authorization: Bearer\n<token>``).
+
+    The value starts after any whitespace or line breaks, raw or escaped, that follow the
+    separator, so a sensitive value left empty at the end of its line fails closed and
+    takes the next line's text (``access_token=\nnext=1`` becomes
+    ``access_token=\n[REDACTED]``).
 
     Args:
         text: The text being redacted.
-        start: Index just after the key, its separator and any blanks.
+        start: Index just after the key's separator, or after a pair repr's comma and the
+            gap that follows it; whitespace and escaped line breaks at ``start`` are
+            skipped.
         separator: ``":"`` or ``"="`` for an assignment; ``None`` for a pair repr.
         container: Whether the key is a container member (see :func:`_in_container`);
             pair reprs always are.
@@ -847,17 +883,24 @@ def _value_span(
         ``(start, end)`` of the value to replace, trailing blanks excluded. An unclosed
         bracket or string extends it to the end of the text.
     """
+    gap = _GAP_RUN_RE.match(text, start)
+    if gap is not None:
+        start = gap.end()
     if start >= len(text):
         return start, start
+    scheme = _AUTH_SCHEME_RE.match(text, start)
     if separator == ":" and not container:
-        group_end = _scan_value(text, start, None) if text[start] in _BRACKETS else start
-        end = _line_end(text, group_end)
+        if text[start] in _BRACKETS:
+            line_from = _scan_value(text, start, None)
+        else:
+            line_from = scheme.end() if scheme is not None else start
+        end = _line_end(text, line_from)
     else:
         quoted = _QUOTED_VALUE_RE.match(text, start)
         if quoted is not None:
             return quoted.span("content")
-        if _AUTH_SCHEME_RE.match(text, start) is not None:
-            end = _line_end(text, start)
+        if scheme is not None:
+            end = _line_end(text, scheme.end())
         elif container:
             end = _scan_value(text, start, _CONTAINER_STOPS)
         else:
@@ -1188,13 +1231,17 @@ class _Redactor:
         return text
 
     def _assigned_values(self, text: str, head: re.Pattern[str]) -> str:
-        """Replace the value after each sensitive or email key that ``head`` finds in ``text``.
+        r"""Replace the value after each sensitive or email key that ``head`` finds in ``text``.
 
         ``head`` matches a key and its separator only. The value's extent
         (:func:`_value_span`) is read for those keys alone, and matches inside a replaced
         value are skipped, so the scan stays linear and an ordinary key never hides the
-        assignment that follows it. A sensitive key's value becomes ``[REDACTED]`` and an
-        email key's (:func:`is_email_key`) ``[REDACTED_EMAIL]``, whatever it holds
+        assignment that follows it. An unquoted key right after a backslash whose name
+        starts with ``n``, ``r`` or ``t`` may carry the letter of an escaped line break or
+        tab (``x\nCookie: a=b`` in a repr reads ``nCookie``), so when it is not sensitive
+        as written, the name without that letter is checked too; the key is kept as
+        written. A sensitive key's value becomes ``[REDACTED]`` and an email key's
+        (:func:`is_email_key`) ``[REDACTED_EMAIL]``, whatever it holds
         (:meth:`key_marker`), before the email scanner runs, so the key is kept even where
         the address's local part would take it (``email=用户!@example.com`` becomes
         ``email=[REDACTED_EMAIL]``). An email key's value in prose after ``:`` is one token
@@ -1209,7 +1256,13 @@ class _Redactor:
         for match in head.finditer(text):
             if match.start() < cursor:
                 continue
-            marker = self.key_marker(match.group("key"))
+            key = match.group("key")
+            marker = self.key_marker(key)
+            key_at = match.start("key")
+            if marker is None and text[key_at - 1 : key_at] == "\\" and key[0] in "nrt":
+                # An escape's letter glued to the name (`x\nCookie` reads `nCookie`). A
+                # quoted key follows its quote, so only an unquoted key gets here.
+                marker = self.key_marker(key[1:])
             if marker is None:
                 continue
             groups = match.groupdict()

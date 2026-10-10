@@ -10,11 +10,12 @@
  * 1. the variants table ({@link VariantsTable}): one row per variant (a creative of the campaign
  *    with at least the configured impression minimum) with its impressions, click rate, open
  *    rate, completion rate and leads (AAP 0.5.5 Copy field set). The rows are the frozen
- *    `extra.variants` of the group's first item. Only the CR3 next test carries them, and when
- *    the campaign has one the analysis ranks it first. A group that holds only CR1 pairs (no
- *    stage could be measured against a baseline, or feedback dropped the CR3 before the run)
- *    shows no table. The table is evidence, so it is read even when feedback given since the
- *    run hides that card;
+ *    `extra.variants` of the first item in API order that carries them. Every copy item of the
+ *    campaign, the CR3 next test and each CR1 pair, freezes the same campaign variants table,
+ *    so a group that holds only CR1 pairs (no stage could be measured against a baseline, or
+ *    feedback dropped the CR3 before the run) keeps its table; only a group none of whose items
+ *    carries variants shows no table. The table is evidence, so it is read even when feedback
+ *    given since the run hides that card;
  * 2. the frame's default body: the cards in API order. When the campaign has a CR3 next test,
  *    that card comes first, carrying the CR2 weak stage as its reason and the next test as its
  *    action; then one CR1 card per variant pair, then held cards behind the "Held until
@@ -121,25 +122,19 @@ export function formatVariantRate(
 // Variants table
 // ---------------------------------------------------------------------------------------------
 
-/** The variants of a block without a first item: none, so it shows no table. */
+/** The variants of a block none of whose items carries variants: none, so it shows no table. */
 const NO_VARIANTS: readonly VariantRow[] = Object.freeze([]);
 
 /**
- * Each block's variants, read from its first item, kept while the item object lives. Items from
- * `GET /recommendations` are never changed in place: a refetch that leaves an item unchanged
- * hands back the same object, and a changed item arrives as a new one, so kept rows always
- * match their item.
+ * Each item's variants (`variants()`, empty for an item that carries none), kept while the item
+ * object lives. Items from `GET /recommendations` are never changed in place: a refetch that
+ * leaves an item unchanged hands back the same object, and a changed item arrives as a new one,
+ * so kept rows always match their item.
  */
 const VARIANT_ROWS = new WeakMap<Item, readonly VariantRow[]>();
 
-/**
- * The variants table rows of a block (`variants()` of its first item), read once per item
- * object, so a block that renders again keeps the same rows unless its first item changed.
- */
-function variantRowsOf(item: Item | undefined): readonly VariantRow[] {
-  if (item === undefined) {
-    return NO_VARIANTS;
-  }
+/** The variants of one item (`variants()`), read once per item object. */
+function variantsOfItem(item: Item): readonly VariantRow[] {
   const kept = VARIANT_ROWS.get(item);
   if (kept !== undefined) {
     return kept;
@@ -147,6 +142,23 @@ function variantRowsOf(item: Item | undefined): readonly VariantRow[] {
   const rows = variants(item);
   VARIANT_ROWS.set(item, rows);
   return rows;
+}
+
+/**
+ * The variants table rows of a block: the variants of the first item in API order that carries
+ * any. Every copy item of a campaign, the CR3 next test and each CR1 pair, freezes the same
+ * campaign variants table, so a block keeps its table when it holds no CR3 item. Each item is
+ * read once per item object, so a block that renders again keeps the same rows unless the item
+ * they come from changed; {@link NO_VARIANTS} when no item carries variants.
+ */
+function variantRowsOf(group: Group): readonly VariantRow[] {
+  for (const item of group.items) {
+    const rows = variantsOfItem(item);
+    if (rows.length > 0) {
+      return rows;
+    }
+  }
+  return NO_VARIANTS;
 }
 
 /** One variants-table row: the variant and its React key, unique within the table. */
@@ -272,7 +284,7 @@ export interface VariantsTableProps {
  *
  * @example
  * ```tsx
- * <VariantsTable campaignName="Lead Gen — Pipeline Report EMEA" rows={variants(group.items[0])} />
+ * <VariantsTable campaignName="Lead Gen — Pipeline Report EMEA" rows={variants(item)} />
  * ```
  */
 export const VariantsTable = memo(function VariantsTable({
@@ -319,16 +331,17 @@ function campaignNameOf(group: Group): string {
 /**
  * One campaign block's body: the variants table, then the frame's cards in API order.
  *
- * The rows come from the group's first item in API order, whether or not that card is visible
- * now: feedback hides an action, not the evidence the block's numbers rest on. When the
- * campaign has a CR3 next test, the analysis ranks it first and its evidence carries the
- * variants. A group without variants rows, such as a campaign whose only items are CR1 pairs,
- * shows its cards without a table.
+ * The rows come from the first item in API order that carries variants, whether or not that
+ * card is visible now: feedback hides an action, not the evidence the block's numbers rest on.
+ * Every copy item of the campaign, the CR3 next test and each CR1 pair, carries the same
+ * variants, so a campaign whose only items are CR1 pairs (no stage could be measured against a
+ * baseline, or feedback dropped the CR3 before the run) keeps its table. Only a group none of
+ * whose items carries variants shows its cards without a table.
  */
 function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
   return (
     <Stack>
-      <VariantsTable campaignName={campaignNameOf(group)} rows={variantRowsOf(group.items[0])} />
+      <VariantsTable campaignName={campaignNameOf(group)} rows={variantRowsOf(group)} />
       {parts.body}
     </Stack>
   );
@@ -336,7 +349,7 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
 
 /**
  * The "Copy/creative changes" section (AAP 0.5.5): one block per LinkedIn campaign, each with
- * its variants table when its first item carries variants, followed by its cards in API order
+ * its variants table when any of its items carries variants, followed by its cards in API order
  * (the CR3 next test with the CR2 weak stage first when the campaign has one, then the CR1 pair
  * labels), inside the shared {@link SectionFrame}, which adds the section's findings, held
  * disclosure, empty state, withheld lines and suppression counts.

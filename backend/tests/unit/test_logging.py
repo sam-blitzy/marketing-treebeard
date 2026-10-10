@@ -1301,6 +1301,12 @@ def test_exception_arguments_under_email_keys_are_redacted() -> None:
         pytest.param("http://" + "u" * 100000 + "@x", id="url-without-password"),
         pytest.param("token=" * 20000 + "Bearer " * 20000, id="assignments-and-bearer"),
         pytest.param("%41" * 40000 + " " + "('a', '" * 10000, id="encoded-and-pairs"),
+        pytest.param("token" + "\n" * 100000, id="key-before-a-line-break-run"),
+        pytest.param("token" + "\\n" * 50000, id="key-before-an-escaped-line-break-run"),
+        pytest.param("(" + "\n" * 100000 + "'token'", id="pair-opening-before-a-line-break-run"),
+        pytest.param("Bearer" + "\r\n" * 50000, id="bearer-before-a-line-break-run"),
+        pytest.param("\\n" * 50000 + "a:", id="escaped-line-break-run-before-a-key"),
+        pytest.param("\\r\\n" * 30000 + "x=", id="escaped-crlf-run-before-a-key"),
     ],
 )
 def test_malformed_input_is_redacted_in_linear_time(text: str) -> None:
@@ -1505,6 +1511,167 @@ def test_sensitive_values_are_replaced_whole_however_quoted_or_nested(
     assert redact(text) == expected
 
 
+# Credentials whose key, separator, value or scheme a line break or another whitespace
+# character splits, raw or JSON-escaped once, or that an escaped line break directly
+# precedes, with their exact redacted form.
+LINE_BREAK_SPLIT_CREDENTIALS = [
+    pytest.param(
+        f"access_token\n={ROTATED}", "access_token\n=[REDACTED]", id="line-break-before-="
+    ),
+    pytest.param(f"access_token:\n{ROTATED}", "access_token:\n[REDACTED]", id="line-break-after-:"),
+    pytest.param(f"access_token=\n{ROTATED}", "access_token=\n[REDACTED]", id="line-break-after-="),
+    pytest.param(f"access_token=\r\n{ROTATED}", "access_token=\r\n[REDACTED]", id="crlf-after-="),
+    pytest.param(
+        f'{{"access_token":\n "{ROTATED}"}}',
+        '{"access_token":\n "[REDACTED]"}',
+        id="json-member-value-on-the-next-line",
+    ),
+    pytest.param(
+        f'"refresh_token":\n "{ROTATED}"',
+        '"refresh_token":\n [REDACTED]',
+        id="quoted-key-value-on-the-next-line",
+    ),
+    pytest.param(
+        f"client_secret\r\n: {ROTATED}", "client_secret\r\n: [REDACTED]", id="crlf-before-:"
+    ),
+    pytest.param(
+        f"f(access_token=\n{ROTATED}, n=1)",
+        "f(access_token=\n[REDACTED], n=1)",
+        id="keyword-argument-on-the-next-line",
+    ),
+    pytest.param(
+        f"{{'token':\n '{ROTATED}', 'n': 1}}",
+        "{'token':\n '[REDACTED]', 'n': 1}",
+        id="dict-repr-value-on-the-next-line",
+    ),
+    pytest.param(
+        f'{{\n  "access_token":\n    "{ROTATED}",\n  "n": 1\n}}',
+        '{\n  "access_token":\n    [REDACTED]\n  "n": 1\n}',
+        id="pretty-printed-json",
+    ),
+    pytest.param(
+        f"access_token\x0b={ROTATED}", "access_token\x0b=[REDACTED]", id="vertical-tab-before-="
+    ),
+    pytest.param(
+        f"password\x0c=\x0c{ROTATED}", "password\x0c=\x0c[REDACTED]", id="form-feeds-around-="
+    ),
+    pytest.param(
+        f"access_token\u2028: {ROTATED}",
+        "access_token\u2028: [REDACTED]",
+        id="line-separator-before-:",
+    ),
+    pytest.param(
+        f"('access_token',\n '{ROTATED}')",
+        "('access_token',\n '[REDACTED]')",
+        id="pair-repr-value-on-the-next-line",
+    ),
+    pytest.param(
+        f"[('x-webhook-secret',\n  '{ROTATED}'), ('Accept', 'json')]",
+        "[('x-webhook-secret',\n  '[REDACTED]'), ('Accept', 'json')]",
+        id="pretty-printed-header-pairs",
+    ),
+    pytest.param(
+        f'[\n "access_token",\n "{ROTATED}"\n]',
+        '[\n "access_token",\n "[REDACTED]"\n]',
+        id="pretty-printed-json-pair",
+    ),
+    pytest.param(
+        f"Authorization: Bearer\n{ROTATED}",
+        "Authorization: [REDACTED]",
+        id="bearer-credentials-on-the-next-line",
+    ),
+    pytest.param(
+        f"Authorization: Bearer\r\n {ROTATED}\r\nAccept: json",
+        "Authorization: [REDACTED]\r\nAccept: json",
+        id="bearer-credentials-after-crlf-keep-the-next-header",
+    ),
+    pytest.param(
+        f"Authorization:\nBearer {ROTATED}",
+        "Authorization:\n[REDACTED]",
+        id="scheme-on-the-next-line",
+    ),
+    pytest.param(
+        f"Bearer\n{ROTATED}", "Bearer\n[REDACTED]", id="standalone-bearer-on-the-next-line"
+    ),
+    pytest.param(
+        f"access_token\\n={ROTATED}",
+        "access_token\\n=[REDACTED]",
+        id="escaped-line-break-before-=",
+    ),
+    pytest.param(
+        f'{{\\"access_token\\"\\n:\\"{ROTATED}\\"}}',
+        '{\\"access_token\\"\\n:\\"[REDACTED]\\"}',
+        id="escaped-json-with-an-escaped-line-break",
+    ),
+    pytest.param(
+        f"sent Bearer\\t{ROTATED} upstream",
+        "sent Bearer\\t[REDACTED] upstream",
+        id="escaped-tab-after-bearer",
+    ),
+    # An escaped line break or tab right before a key or `Bearer` glues its letter to the
+    # name (`nCookie`); the key is still found and kept as written.
+    pytest.param(
+        f"x\\nCookie: session={ROTATED}",
+        "x\\nCookie: [REDACTED]",
+        id="escaped-line-break-before-a-header",
+    ),
+    pytest.param(
+        f"GET / HTTP/1.1\\r\\nAuthorization: Basic {ROTATED}\\r\\n",
+        "GET / HTTP/1.1\\r\\nAuthorization: [REDACTED]",
+        id="escaped-crlf-before-authorization-in-a-request-repr",
+    ),
+    pytest.param(
+        f"x\\r\\nclient_id={ROTATED}&n=1",
+        "x\\r\\nclient_id=[REDACTED]&n=1",
+        id="escaped-crlf-before-a-query-key",
+    ),
+    pytest.param(
+        f"x\\nBearer {ROTATED}", "x\\nBearer [REDACTED]", id="escaped-line-break-before-bearer"
+    ),
+    pytest.param(
+        f"x\\temail={ROTATED}", "x\\temail=[REDACTED_EMAIL]", id="escaped-tab-before-an-email-key"
+    ),
+    pytest.param(
+        f"X-Empty:\\r\\nCookie: sid={ROTATED}",
+        "X-Empty:\\r\\nCookie: [REDACTED]",
+        id="escaped-crlf-after-an-empty-header",
+    ),
+    pytest.param(
+        f"C:\\token={ROTATED}", "C:\\token=[REDACTED]", id="escape-letter-that-starts-the-key"
+    ),
+    # An ordinary key after an escaped line break is left as it is.
+    pytest.param("x\\nlimit=5", "x\\nlimit=5", id="ordinary-key-after-an-escaped-line-break"),
+    # Fail closed: a value left empty at the end of its line takes the next line's text.
+    pytest.param(
+        "access_token=\nnext=1", "access_token=\n[REDACTED]", id="empty-value-fails-closed"
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), LINE_BREAK_SPLIT_CREDENTIALS)
+def test_whitespace_and_line_breaks_never_split_a_value_from_its_key(
+    text: str, expected: str
+) -> None:
+    once = redact(text)
+    assert once == expected
+    assert ROTATED not in once
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize(("text", "expected"), LINE_BREAK_SPLIT_CREDENTIALS)
+def test_line_break_split_credentials_never_reach_rendered_json_lines(
+    text: str, expected: str
+) -> None:
+    stream = _configure()
+    get_logger("tests.line_breaks").warning(text, detail=text, body={"errors": [text]})
+    logging.getLogger("tests.third_party").warning("upstream said %s", text)
+    assert ROTATED not in stream.getvalue()
+    event, foreign = _lines(stream)
+    assert event["event"] == event["detail"] == expected
+    assert event["body"] == {"errors": [expected]}
+    assert foreign["event"] == f"upstream said {expected}"
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -1517,6 +1684,17 @@ def test_sensitive_values_are_replaced_whole_however_quoted_or_nested(
         "token=a(",
         "token: {'",
         "[('token', [",
+        "token=\n",
+        "token:\n ",
+        "('token',\n",
+        "[\n 'token',\n",
+        "Bearer\n",
+        "token\\n",
+        "Bearer\\n",
+        "Authorization: Bearer\n",
+        "x\\nCookie: ",
+        "\\nBearer ",
+        "a=\\n",
     ],
 )
 def test_value_extent_scan_runs_in_linear_time(text: str) -> None:
@@ -1582,6 +1760,45 @@ def test_redacted_text_survives_a_second_pass_unchanged(text: str) -> None:
 def test_redaction_is_idempotent_on(text: str) -> None:
     once = redact(text, secrets=[N8N_SECRET])
     assert redact(once, secrets=[N8N_SECRET]) == once
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(",,Bearer\\n\\t{x@y.iox@y.io[", id="escaped-line-break-and-tab"),
+        pytest.param(
+            "\\r{\x0b\x0b(\n=Bearer\\t\\t\\t{x@y.io\t\u2028[REDACTED]\r",
+            id="escaped-tab-run-after-an-assignment",
+        ),
+        pytest.param("\\:\r\x0b\t,Bearer \\t{x@y.io{ a}", id="blank-then-escaped-tab"),
+        pytest.param(
+            "n\n{)\\x@y.io['n)'\\r'Bearer \\t{Cookiex@y.io\x0btoken",
+            id="escaped-tab-before-a-glued-key",
+        ),
+        pytest.param("Bearer\\t{x@y.io", id="escaped-tab-alone"),
+    ],
+)
+def test_bearer_before_an_escaped_gap_and_an_address_is_idempotent(text: str) -> None:
+    """An address after `Bearer` and an escaped gap leaves no lone backslash token behind.
+
+    The email rule takes the escape's letter into the local part (`t{x@y.io`), so the
+    first pass leaves `Bearer \\[REDACTED_EMAIL]`; that backslash is not a Bearer token.
+    """
+    once = redact(text)
+    assert email_spans(once) == [], (text, once)
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param("Bearer \\abc", "Bearer [REDACTED]", id="token-starting-with-a-backslash"),
+        pytest.param("Bearer abc\\", "Bearer [REDACTED]", id="token-ending-with-a-backslash"),
+        pytest.param("Bearer \\", "Bearer \\", id="backslash-run-alone-is-not-a-token"),
+    ],
+)
+def test_bearer_tokens_holding_backslashes_are_replaced_whole(text: str, expected: str) -> None:
+    assert redact(text) == expected
 
 
 # ---------------------------------------------------------------------------

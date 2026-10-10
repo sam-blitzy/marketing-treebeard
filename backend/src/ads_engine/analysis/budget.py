@@ -65,6 +65,7 @@ from ads_engine.analysis.campaigns import (
     VETO_THRESHOLD_KEYS,
     ScaleOutcome,
     ScaleWithheld,
+    cost_per_outcome_value,
     scale_outcomes,
 )
 from ads_engine.analysis.context import (
@@ -119,6 +120,7 @@ from ads_engine.analysis.metrics import (
     counting_contract,
     native_day_zone,
     subject_baseline,
+    subject_baseline_outcomes,
     subject_campaigns,
     subject_objective_groups,
     subject_totals,
@@ -368,11 +370,6 @@ def _money(amount: Decimal | int | str | None, currency: str) -> str:
     places = minor_unit_exponent(code)
     rendered = format(round_to_minor_unit(Decimal(amount), code), f",.{places}f")
     return f"{code} {rendered}" if code else rendered
-
-
-def _cost(amount: Decimal | int | str | None, currency: str) -> str:
-    """Render a cost per outcome; "—" when the outcome count is zero (no finite cost)."""
-    return "—" if amount is None else _money(amount, currency)
 
 
 def _percent(share: Decimal) -> str:
@@ -923,7 +920,9 @@ def budget_evidence(
       ``extra.observation_assumption`` ("unchanged across N observations, at most 6 h apart")
       state what the counts rest on.
     * **Efficiency**: cost per outcome beside the account baseline for the same source and
-      objective group.
+      objective group. Each reads "—" when its known outcome count is 0 (a zero denominator,
+      never a finite cost) and is ``None``, shown "unavailable", only when that count is
+      unreported (:func:`~ads_engine.analysis.campaigns.cost_per_outcome_value`).
     * **Outcomes** and, where linked, the CRM eligible contacts and Qualified Leads of the
       veto population (:func:`budget_crm`), never blended with platform outcomes.
     * **Amounts**: the latest effective daily budget and, when given, the proposed one.
@@ -941,8 +940,11 @@ def budget_evidence(
         history: The subject's budget history (``history.subject`` must equal ``subject``).
         gate: The gate the rule applied; its checks name the daily predicate shown.
         outcomes: Window outcomes (member days for a shared budget); ``None`` when unavailable.
-        cpo: Window cost per outcome; ``None`` at zero or unavailable outcomes.
-        baseline: The account baseline cost per outcome; ``None`` when unavailable.
+        cpo: The exact window cost per outcome; ``None`` at zero or unavailable outcomes,
+            which ``outcomes`` tells apart in the evidence ("—" or unavailable).
+        baseline: The exact account baseline cost per outcome; ``None`` at zero or unavailable
+            account outcomes, told apart by
+            :func:`~ads_engine.analysis.metrics.subject_baseline_outcomes`.
         proposed: The proposed daily budget, already at the currency's minor unit.
         spend: Window spend; the history's spend (member days only) when omitted.
         crm: The CRM evidence to show; :func:`budget_crm` of the subject when omitted.
@@ -984,7 +986,7 @@ def budget_evidence(
         Metric(
             "cost_per_outcome",
             f"Cost per {_singular(label)}",
-            None if cpo is None else _q(cpo),
+            cost_per_outcome_value(cpo, outcomes),
             "currency",
             currency,
         ),
@@ -1040,7 +1042,7 @@ def budget_evidence(
             Baseline(
                 "baseline_cost_per_outcome",
                 f"Account cost per {_singular(label)} (same source and objective)",
-                None if baseline is None else _q(baseline),
+                cost_per_outcome_value(baseline, subject_baseline_outcomes(ctx, subject)),
             ),
             *baselines,
         ),
@@ -1078,9 +1080,14 @@ def _money_of(evidence: Evidence, key: str) -> str:
 
 
 def _cost_of(evidence: Evidence, key: str) -> str:
-    """One of an item's own cost-per-outcome metrics; "—" when it is unavailable."""
-    metric = evidence.metric(key)
-    return _cost(metric.value, metric.currency or "")
+    """One of an item's own cost-per-outcome metrics, as its evidence records it.
+
+    "—" at a known zero outcome count, "unavailable" when the count is unreported, otherwise
+    the cost in the item's currency
+    (:func:`~ads_engine.analysis.campaigns.cost_per_outcome_value`), so the reason and action
+    never state a cost the evidence does not.
+    """
+    return _money_of(evidence, key)
 
 
 def _utilization_text(evidence: Evidence) -> str:
@@ -1090,7 +1097,7 @@ def _utilization_text(evidence: Evidence) -> str:
 
 
 def _baseline_text(evidence: Evidence) -> str:
-    """The account baseline cost per outcome in the item's currency; "unavailable" when unknown."""
+    """The account baseline cost per outcome in the item's currency; "—" or "unavailable"."""
     currency = evidence.metric("spend").currency or ""
     return _money(evidence.baselines[0].value, currency)
 
@@ -1915,6 +1922,9 @@ def _b4_candidate(
     latest effective daily budget from that history, efficiency against the account
     baseline, outcomes and, where linked, CRM Qualified Leads. The sample is the outcome
     total against ``b4.min_outcomes``; the item has no decision subject ("Mark done" only).
+    A side, or the window, with a known 0 outcomes has the cost per outcome "—" in the
+    evidence, the reason and the action
+    (:func:`~ads_engine.analysis.campaigns.cost_per_outcome_value`).
     """
     weekend, weekday = sides
     currency = ctx.account_currency(campaign.id)
@@ -1937,7 +1947,7 @@ def _b4_candidate(
         Metric(
             "cost_per_outcome",
             f"Cost per {singular}",
-            None if cpo is None else _q(cpo),
+            cost_per_outcome_value(cpo, totals.outcomes),
             "currency",
             currency,
         ),
@@ -1950,14 +1960,14 @@ def _b4_candidate(
         Metric(
             "weekend_cpo",
             f"Weekend cost per {singular}",
-            None if weekend_cpo is None else _q(weekend_cpo),
+            cost_per_outcome_value(weekend_cpo, weekend.outcomes),
             "currency",
             currency,
         ),
         Metric(
             "weekday_cpo",
             f"Weekday cost per {singular}",
-            None if weekday_cpo is None else _q(weekday_cpo),
+            cost_per_outcome_value(weekday_cpo, weekday.outcomes),
             "currency",
             currency,
         ),

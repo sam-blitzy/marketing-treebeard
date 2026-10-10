@@ -2665,7 +2665,9 @@ function creativeSection(): Section {
           role: 'primary',
         },
       ],
-      // mirrors backend/src/ads_engine/analysis/creative.py (CR1 pair candidate)
+      // mirrors backend/src/ads_engine/analysis/creative.py (CR1 pair candidate), less its
+      // `variants` table, which the CR3 item ahead of it carries: tests read this item as a copy
+      // item that carries no variants.
       extra: {
         campaign: pipelineEmeaSummary(),
         outcome: 'leads',

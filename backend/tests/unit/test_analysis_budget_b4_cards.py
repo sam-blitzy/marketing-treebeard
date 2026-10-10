@@ -127,6 +127,12 @@ AAP_REASONS: Final = {
 
 _P_TEXT: Final = re.compile(r"p (=|<) (\d+\.\d+)")
 
+ZERO_RATE_RATIO_WARNING = pytest.mark.filterwarnings(
+    "ignore:divide by zero encountered in scalar divide:RuntimeWarning:statsmodels"
+)
+"""With 0 weekday outcomes, statsmodels' own rate-ratio estimate (weekend ÷ weekday) divides by a
+zero rate; that ratio never reaches the score test's p-value, as in ``test_stats.py``."""
+
 
 # ---------------------------------------------------------------------------
 # Builders and lookups
@@ -529,6 +535,42 @@ def test_a_b4_item_states_its_day_counts_with_their_nouns_in_number() -> None:
     assert (metrics["weekend_days"].value, metrics["weekdays"].value) == (1, 1)
     assert " over 1 weekend day vs weekday " in item.reason, item.reason
     assert " over 1 weekday (30 weekend and 1 weekday leads; " in item.reason, item.reason
+
+
+@pytest.mark.parametrize(
+    "side", ["weekend", pytest.param("weekday", marks=ZERO_RATE_RATIO_WARNING)]
+)
+def test_a_side_with_known_zero_outcomes_reads_a_dash_never_unavailable(side: str) -> None:
+    """AAP 0.5.5: a side's cost per outcome over a known 0 outcomes is "—" in evidence and text.
+
+    The catalogue card's leads are removed from one side only. Its spend stays, so the rates
+    still differ at p < 0.05 and the item fires with a zero denominator on that side, while
+    the other side and the window keep their finite costs. Nothing reads "unavailable".
+    """
+    _scenario, ctx = _built(LINKEDIN_FIRES)
+    weekend = side == "weekend"
+    days = tuple(
+        replace(day, leads=0) if (day.date.weekday() >= 5) is weekend else day
+        for day in ctx.campaign_days[1]
+    )
+    item = _only_item(_fresh(ctx, campaign_days={**ctx.campaign_days, 1: days}))
+    metrics = _metrics(item)
+    assert metrics[f"{side}_outcomes"].value == 0
+    zero = metrics[f"{side}_cpo"]
+    assert zero.value == "—"
+    assert "unavailable" not in zero.to_json()
+    finite = metrics["weekday_cpo" if weekend else "weekend_cpo"]
+    assert isinstance(finite.value, Decimal)
+    assert isinstance(metrics["cost_per_outcome"].value, Decimal)
+    cost = budget._money(finite.value, finite.currency or "")
+    shown = {"weekend": "—", "weekday": cost} if weekend else {"weekend": cost, "weekday": "—"}
+    assert item.action == (
+        f"Adjust weekend schedule or bids: weekend cost/outcome {shown['weekend']} vs weekday "
+        f"{shown['weekday']}"
+    )
+    assert f"Weekend cost per lead {shown['weekend']} over " in item.reason, item.reason
+    assert f" vs weekday {shown['weekday']} over " in item.reason, item.reason
+    assert "unavailable" not in item.action + item.reason
 
 
 # ---------------------------------------------------------------------------

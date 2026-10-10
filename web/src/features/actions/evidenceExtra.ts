@@ -1165,16 +1165,17 @@ export interface VariantRow {
 }
 
 /**
- * Reads a campaign's variants table (`creative._variant_row`, `extra.variants` of the CR3
- * item: `{creative_id, urn, name, impressions, form_opens, leads, click_rate, open_rate,
- * completion_rate, …}`), with the campaign's frozen objective (`extra.campaign.objective_group`,
+ * Reads a campaign's variants table (`creative._variant_row`, `extra.variants` of any copy item,
+ * the CR3 next test or a CR1 pair, which all carry the same rows: `{creative_id, urn, name,
+ * impressions, form_opens, leads, click_rate, open_rate, completion_rate, …}`), with the
+ * campaign's frozen objective (`extra.campaign.objective_group`,
  * `creative._Campaign.summary`) stamped on every row as {@link VariantRow.leadGen}. Rates are
  * ratio decimal strings (a number is converted with `String`). A `null` rate is either a stage
  * the campaign does not use (open and completion outside lead generation) or one it cannot
  * state (unreported or inconsistent counts, or a zero denominator); `leadGen` and the
  * denominators (`impressions`, `formOpens`) tell the two apart.
  *
- * @param source - The CR3 item (the first item of a creative group) or its evidence.
+ * @param source - A copy item (the CR3 next test or a CR1 pair) or its evidence.
  * @returns The variants in stored order; `[]` when absent.
  */
 export function variants(source: MaybeSource): readonly VariantRow[] {

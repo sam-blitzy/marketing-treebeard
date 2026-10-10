@@ -1857,6 +1857,16 @@ def test_c1b_fires_on_twenty_eligible_contacts_without_ql_or_meetings(
     assert item.decision_subject == DecisionSubject("campaign", campaign)
     metrics = evidence_metrics(item)
     assert [key for key in VETO_COUNT_METRICS if key in metrics] == list(VETO_COUNT_METRICS)
+    # A pause card shows spend, outcomes, expected outcomes and CRM QL (AAP 0.5.5), the platform
+    # outcomes apart from the CRM counts; expected outcomes are the spend at the account's
+    # baseline cost per outcome (AAP 0.5.4.1).
+    assert {"spend", "outcomes", "expected_outcomes", "ql"} <= set(metrics)
+    (baseline,) = item.evidence.baselines
+    assert baseline.key == "baseline_cost_per_outcome"
+    spend = cast(Decimal, metrics["spend"])
+    expected = cast(Decimal, metrics["expected_outcomes"])
+    assert abs(spend / cast(Decimal, baseline.value) - expected) < Decimal("0.0001")
+    assert metrics["outcomes"] is not None
     assert (metrics["eligible_contacts"], metrics["ql"], metrics["meetings"]) == (minimum, 0, 0)
     assert metrics["matured_leads"] == metrics["matched_leads"] == minimum
     assert (metrics["unresolved"], metrics["unknown_evidence_share"]) == (0, Decimal("0.0000"))

@@ -984,10 +984,12 @@ def test_b2_zero_outcome_branch_needs_the_expected_outcome_minimum(
     (item,) = _on(_items(out, BUDGET, B2), ("campaign", hot))
     shown = evidence_metrics(item)
     assert item.evidence.extra["branch"] == "zero_outcomes"
-    # Zero outcomes have no cost per outcome, so the card leads with the outcomes themselves.
+    # Zero outcomes have no cost per outcome, so the card leads with the outcomes themselves;
+    # the cost of a known zero denominator reads "—", never unavailable (AAP 0.5.5).
     assert item.evidence.extra["headline_metric"] == "outcomes"
     assert shown["outcomes"] == 0
-    assert shown["cost_per_outcome"] is None
+    assert shown["cost_per_outcome"] == "—"
+    assert "unavailable" not in item.evidence.metric("cost_per_outcome").to_json()
     assert shown["expected_outcomes"] >= ctx.thresholds.ratio("b2.min_expected_outcomes")
     assert ("campaign", hot) in spend_increase_blocked(ctx)
 
@@ -1077,7 +1079,7 @@ def test_b2_zero_outcome_branch_fires_at_three_expected_outcomes_and_not_at_two_
     (item,) = found
     shown = evidence_metrics(item)
     assert item.evidence.extra["branch"] == "zero_outcomes"
-    assert (shown["outcomes"], shown["cost_per_outcome"]) == (0, None)
+    assert (shown["outcomes"], shown["cost_per_outcome"]) == (0, "—")
     assert shown["expected_outcomes"] == expected
     assert "with 0 leads where 3.0 leads were expected" in item.reason
     assert subject in spend_increase_blocked(ctx)

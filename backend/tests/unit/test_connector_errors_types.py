@@ -57,6 +57,8 @@ ELLIPSIS = errors._ELLIPSIS
 HELD_TOKEN = "-".join(("test", "held", "access", "token", "0123456789"))
 OTHER_HELD_TOKEN = "-".join(("test", "held", "rotated", "refresh", "token"))
 LONG_HELD_TOKEN = "".join(f"{index:04d}tokn" for index in range(50))
+# A token neither configured nor held, which only the credential key rules remove.
+UNHELD_TOKEN = "-".join(("test", "line", "split", "token"))
 
 # The reference instant of the HTTP-date cases: the docstring example's 12:00 UTC.
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
@@ -823,6 +825,79 @@ def test_sanitize_message_redacts_encoded_values_and_textual_credentials(
     """Percent-encoded emails and secrets, and unconfigured credentials, never persist."""
     _configure(monkeypatch, {"N8N_WEBHOOK_SECRET": N8N_SECRET})
     assert sanitize_message(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            f"access_token\n={UNHELD_TOKEN} rejected",
+            "access_token =[REDACTED] rejected",
+            id="line-break-before-=",
+        ),
+        pytest.param(
+            f'"refresh_token":\n "{UNHELD_TOKEN}"',
+            '"refresh_token": [REDACTED]',
+            id="quoted-key-value-on-the-next-line",
+        ),
+        pytest.param(
+            f"client_secret\r\n: {UNHELD_TOKEN}",
+            "client_secret : [REDACTED]",
+            id="crlf-before-:",
+        ),
+        pytest.param(
+            f"access_token=\r\n{UNHELD_TOKEN}&limit=1",
+            "access_token= [REDACTED]&limit=1",
+            id="crlf-after-=",
+        ),
+        pytest.param(
+            f'{{"access_token":\n "{UNHELD_TOKEN}", "n": 1}}',
+            '{"access_token": "[REDACTED]", "n": 1}',
+            id="json-member-value-on-the-next-line",
+        ),
+        pytest.param(
+            f"Authorization: Bearer\n{UNHELD_TOKEN}\nrejected",
+            "Authorization: [REDACTED] rejected",
+            id="bearer-credentials-on-the-next-line",
+        ),
+        pytest.param(
+            f"upstream said GET / HTTP/1.1\\r\\nCookie: sid={UNHELD_TOKEN}\\r\\n",
+            "upstream said GET / HTTP/1.1\\r\\nCookie: [REDACTED]",
+            id="escaped-crlf-before-a-header",
+        ),
+        pytest.param(
+            f"rejected x\\nBearer {UNHELD_TOKEN}",
+            "rejected x\\nBearer [REDACTED]",
+            id="escaped-line-break-before-bearer",
+        ),
+    ],
+)
+def test_sanitize_message_redacts_credentials_a_line_break_splits(text: str, expected: str) -> None:
+    """A line break between a key, its separator and its value never keeps the value."""
+    reason = sanitize_message(text)
+    assert reason == expected
+    assert UNHELD_TOKEN not in reason
+
+
+# Every character the whitespace collapse of `sanitize_message` (`str.split()`) joins.
+COLLAPSED_WHITESPACE = [chr(code) for code in range(0x110000) if chr(code).isspace()]
+
+
+@pytest.mark.parametrize("blank", COLLAPSED_WHITESPACE, ids=lambda blank: f"U+{ord(blank):04X}")
+def test_sanitize_message_collapse_never_joins_a_key_to_an_unredacted_value(blank: str) -> None:
+    """Redaction reads as a gap every character the collapse joins, so no value survives it.
+
+    Collapsing whitespace after redaction would otherwise turn a key and a value that
+    redaction left apart into ``access_token =...``, a stored reason holding the token.
+    """
+    for text, expected in (
+        (f"access_token{blank}={blank}{UNHELD_TOKEN}", "access_token = [REDACTED]"),
+        (f"client_secret{blank}:{blank}{UNHELD_TOKEN}", "client_secret : [REDACTED]"),
+        (f"Bearer{blank}{UNHELD_TOKEN}", "Bearer [REDACTED]"),
+    ):
+        reason = sanitize_message(text)
+        assert UNHELD_TOKEN not in reason, repr(text)
+        assert reason == expected, repr(text)
 
 
 @pytest.mark.parametrize(

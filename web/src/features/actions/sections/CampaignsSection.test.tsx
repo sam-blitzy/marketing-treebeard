@@ -1711,7 +1711,7 @@ describe('pause and scale cards', () => {
     expect(api.calls.some((call) => call.path.endsWith('/feedback'))).toBe(false);
   });
 
-  it('shows a C1b card its spend and the pipeline counts side by side', async () => {
+  it('shows a C1b card its spend, outcomes and the pipeline counts side by side', async () => {
     mockApi({});
     const c1b = makeItem({
       id: 3005,
@@ -1727,6 +1727,13 @@ describe('pause and scale cards', () => {
       evidence: makeEvidence({
         metrics: [
           metric('spend', 'Window spend', '2240.00', 'currency', 'EUR'),
+          metric('outcomes', 'Window leads', 40, 'leads'),
+          metric(
+            'expected_outcomes',
+            'Expected leads at the account baseline',
+            '32.000000',
+            'leads',
+          ),
           metric('leads', 'LinkedIn leads (platform)', 41, 'leads'),
           metric(
             'matured_leads',
@@ -1741,6 +1748,13 @@ describe('pause and scale cards', () => {
           metric('ql', 'Qualified Leads', 0, 'contacts'),
           metric('meetings', 'Meetings', 0, 'meetings'),
         ],
+        baselines: [
+          {
+            key: 'baseline_cost_per_outcome',
+            label: 'Account cost per lead (same source and objective)',
+            value: '70.000000',
+          },
+        ],
         extra: { proposed_status: 'paused' },
       }),
       decision_subject: { type: 'campaign', id: 12 },
@@ -1748,9 +1762,12 @@ describe('pause and scale cards', () => {
     await renderCampaigns(oneGroup('pause', 'Pause', [c1b]));
 
     const article = card('Pause or rework targeting: leads are not becoming Qualified Leads');
-    // C1b records no outcomes or expected outcomes, so only spend and QL are listed.
+    // A pause card lists spend, outcomes, expected outcomes and the CRM QL (AAP 0.5.5); the
+    // platform leads and the other pipeline counts stay out of this list.
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
       'Window spend: €2,240.00',
+      'Window leads: 40',
+      'Expected leads at the account baseline: 32',
       'Qualified Leads: 0',
     ]);
     const pipeline = tableOf(article, PIPELINE_EVIDENCE_CAPTION);

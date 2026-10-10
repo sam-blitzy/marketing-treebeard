@@ -277,8 +277,8 @@ interface ItemProps {
 /**
  * The "Campaign evidence" list of a C1, C1b or C2 card (AAP 0.5.5: "Pause and scale cards show
  * spend, outcomes, expected outcomes and CRM QL"): the `PAUSE_SCALE_METRIC_KEYS` metrics, in
- * that order. C1b records no outcomes or expected outcomes, and CRM QL exists only when the
- * campaign is linked to the CRM, so each absent metric is left out.
+ * that order. C1, C1b and C2 all record spend, outcomes and expected outcomes; CRM QL exists only
+ * when the campaign is linked to the CRM, so a metric the evidence lacks is left out.
  */
 function CampaignEvidence({ item }: ItemProps): ReactElement | null {
   return (

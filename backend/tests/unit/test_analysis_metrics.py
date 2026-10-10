@@ -80,6 +80,7 @@ from ads_engine.analysis.metrics import (
     spend_increase_blocked,
     status_value,
     subject_baseline,
+    subject_baseline_outcomes,
     subject_campaigns,
     subject_objective_groups,
     subject_totals,
@@ -440,6 +441,8 @@ def test_one_unreported_day_makes_totals_and_the_baseline_unavailable(
     assert window_totals(ctx, (1, 2)).unreported_days == 1
     assert baseline_cpo(ctx, LINKEDIN_ACCOUNT.id, "linkedin_lead_gen") is None
     assert subject_baseline(ctx, ("campaign", 2)) is None
+    # Unreported, never a known zero, so the baseline is unavailable rather than "—".
+    assert subject_baseline_outcomes(ctx, ("campaign", 2)) is None
     assert subject_totals(ctx, ("campaign", 1)) == totals
 
 
@@ -1481,6 +1484,9 @@ def test_shared_subject_totals_campaigns_and_baseline_follow_member_days(
     # The baseline is the account's Google average over the whole window: 7,490 / 315.
     assert subject_baseline(ctx, pool) == Decimal(7490) / Decimal(315)
     assert subject_baseline(ctx, pool) == baseline_cpo(ctx, GOOGLE_ACCOUNT.id, "google")
+    # The baseline's denominator: the account's Google outcomes, the same for a member.
+    assert subject_baseline_outcomes(ctx, pool) == Decimal(315)
+    assert subject_baseline_outcomes(ctx, ("campaign", 3)) == Decimal(315)
     assert budget_subjects(ctx) == [pool]
     assert subject_campaigns(ctx, ("campaign", 3)) == (3,)
     assert subject_objective_groups(ctx, ("campaign", 3)) == frozenset({"google"})
@@ -1627,6 +1633,7 @@ def test_a_budget_no_campaign_has_shown_has_no_member_and_no_baseline(
     # Campaign 6 draws from the pool now, so an increase would land on it.
     assert subject_campaigns(ctx, pool) == (6,)
     assert subject_baseline(ctx, pool) is None
+    assert subject_baseline_outcomes(ctx, pool) is None
     assert subject_totals(ctx, pool) == Totals(Decimal(0), None, 0, 0, 0, 0)
     assert member_poor_efficiency(ctx, POOL, 6) is False
 

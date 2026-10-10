@@ -38,7 +38,10 @@ completion rate = leads / form opens. Non-lead-gen campaigns use only click rate
   lowest rate relative to its baseline is tested, labelled "exploratory".
 
 Every item reads ``linkedin.analytics_daily`` and ``linkedin.entities``, depends on its
-campaign (P1 holds) and offers "Mark done" only (no decision subject). Within a campaign group
+campaign (P1 holds) and offers "Mark done" only (no decision subject). Every item, the CR3
+item and each CR1 pair, carries the campaign's variants table in ``evidence.extra.variants``,
+so the campaign block keeps its table when the campaign has no CR3 item or feedback
+suppresses it (AAP 0.5.5 Copy: "per campaign, a variants table"). Within a campaign group
 (:func:`~ads_engine.analysis.context.creative_group`) the CR3 item ranks first, then the CR1
 pairs by adjusted p-value; ``precedence.py`` orders the campaign groups by campaign spend
 within each account currency.
@@ -963,7 +966,10 @@ def _campaigns(ctx: AnalysisContext, config: CreativeConfig) -> list[_Campaign]:
 
 
 def _variant_row(creative: _Creative, objective: str, currency: str) -> dict[str, Any]:
-    """Return one row of ``evidence.extra.variants``, the card's variants table.
+    """Return one row of ``evidence.extra.variants``, the campaign's variants table.
+
+    :func:`_campaign_result` builds the table once per campaign and every copy item of the
+    campaign, the CR3 item and each CR1 pair, freezes the same rows.
 
     Rates a non-lead-gen campaign does not use, or whose counts are unreported or
     inconsistent, are ``None`` ("unavailable", never 0).
@@ -1129,6 +1135,8 @@ def _pair_candidate(
     pair: _Pair,
     comparisons: int,
     config: CreativeConfig,
+    *,
+    variants: Sequence[Mapping[str, Any]],
 ) -> Candidate:
     """Build one CR1 item: "Distinguishable (adjusted p = …)" or "{A} ahead, not yet …".
 
@@ -1138,6 +1146,10 @@ def _pair_candidate(
     if either is, with the additional impressions per variant the observed difference needs at
     ``cr.alpha`` and ``cr.power``, or "not estimable" with its reason. Its sample is the smaller
     variant's impressions against ``cr.min_impressions``.
+
+    ``variants`` is the campaign's variants table (:func:`_variant_row` per variant), frozen in
+    ``evidence.extra.variants`` exactly as the campaign's CR3 item freezes it, so the campaign
+    block keeps its table when it has no CR3 item or feedback hides that item (AAP 0.5.5 Copy).
 
     Rationale (AAP 0.5.4.6): a lead that is uncorrected or rests on a small sample is not a
     result, so it is reported as "ahead, not yet distinguishable" and never as a winner;
@@ -1260,6 +1272,7 @@ def _pair_candidate(
             ),
             "not_estimable_reason": not_estimable_reason,
             "variant_count": len(campaign.variants),
+            "variants": variants,
             "excluded": [_excluded_row(c) for c in campaign.excluded],
             "campaign_spend": campaign.spend,
             "currency": campaign.currency,
@@ -1377,11 +1390,15 @@ def _test_candidate(
     selected: _Measure,
     exploratory: bool,
     config: CreativeConfig,
+    *,
+    variants: Sequence[Mapping[str, Any]],
 ) -> Candidate:
     """Build the campaign's combined CR2 + CR3 item (``rule_id=CR3``).
 
     The reason is the CR2 sentence and the action the CR3 next test, so the card names the
-    weak stage and the one variable to change in the same place.
+    weak stage and the one variable to change in the same place. ``variants`` is the
+    campaign's variants table (:func:`_variant_row` per variant), frozen in
+    ``evidence.extra.variants`` exactly as each of the campaign's CR1 pairs freezes it.
     """
     by_key = {m.stage.key: m for m in measures}
     open_measure = by_key.get("open_rate")
@@ -1442,7 +1459,6 @@ def _test_candidate(
     metrics.append(
         Metric("campaign_spend", "Campaign spend", campaign.spend, "currency", campaign.currency)
     )
-    objective = campaign.info.objective_group
     evidence = ctx.make_evidence(
         required_datasets=REQUIRED_DATASETS,
         crm_scope=None,
@@ -1459,7 +1475,7 @@ def _test_candidate(
         extra={
             "campaign": campaign.summary(),
             "variant_count": len(campaign.variants),
-            "variants": [_variant_row(c, objective, campaign.currency) for c in campaign.variants],
+            "variants": variants,
             "excluded": [_excluded_row(c) for c in campaign.excluded],
             "stages": [m.to_json() for m in measures],
             "weak_stage": _weak_stage_json(selected, exploratory),
@@ -1523,10 +1539,21 @@ def _campaign_result(
     baselines: Mapping[_BaselineKey, Mapping[StageKey, tuple[int, int]]],
     config: CreativeConfig,
 ) -> RuleResult:
-    """Evaluate CR1, CR2 and CR3 for one campaign with enough variants."""
+    """Evaluate CR1, CR2 and CR3 for one campaign with enough variants.
+
+    The campaign's variants table is built once and frozen on every item it yields, the CR3
+    item and each CR1 pair, so the table survives a missing CR3 (no stage comparable with a
+    baseline) and a CR3 that feedback suppresses (AAP 0.5.5 Copy: "per campaign, a variants
+    table").
+    """
+    objective = campaign.info.objective_group
+    variants = [_variant_row(c, objective, campaign.currency) for c in campaign.variants]
     pairs = _pairs(campaign, config)
     comparisons = sum(1 for pair in pairs if pair.test is not None)
-    candidates = [_pair_candidate(ctx, campaign, pair, comparisons, config) for pair in pairs]
+    candidates = [
+        _pair_candidate(ctx, campaign, pair, comparisons, config, variants=variants)
+        for pair in pairs
+    ]
     account = baselines.get((campaign.info.account_id, campaign.info.objective_group), {})
     measures = [
         _measure(stage, campaign.variants, account.get(stage.key), config)
@@ -1536,7 +1563,9 @@ def _campaign_result(
     if selection is None:
         return RuleResult(candidates=tuple(candidates), withheld=(_no_stage_withheld(campaign),))
     selected, exploratory = selection
-    test = _test_candidate(ctx, campaign, measures, selected, exploratory, config)
+    test = _test_candidate(
+        ctx, campaign, measures, selected, exploratory, config, variants=variants
+    )
     return RuleResult(candidates=(test, *candidates))
 
 
@@ -1568,8 +1597,10 @@ def evaluate(ctx: AnalysisContext) -> RuleResult:
 
     Returns:
         Per analysed campaign, one CR3 item (``rank_key (0,)``) and one CR1 item per pair
-        (``rank_key (1, adjusted p, names)``) in the campaign's creative group; withheld lines
-        for delivering campaigns with too few variants; no findings or suppression counts.
+        (``rank_key (1, adjusted p, names)``) in the campaign's creative group, each carrying
+        the campaign's variants table in ``evidence.extra.variants``; a CR3 withheld line in
+        place of the CR3 item when no stage can be compared with an account baseline; withheld
+        lines for delivering campaigns with too few variants; no findings or suppression counts.
 
     Raises:
         ConfigError: When a ``cr.*`` key is missing from the configuration.

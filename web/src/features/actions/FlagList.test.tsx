@@ -11,6 +11,11 @@
  *   codes only the overlay carries; a code in both keeps its recorded place and takes the current
  *   message, a blank current message never replaces a recorded label, and a code blank in both is
  *   labelled with the code itself. Inputs are never mutated.
+ * - A live-only code ({@link LIVE_ONLY_FLAG_CODES}: exactly `unverified_discrepancies`, whose
+ *   count AAP 0.5.4.2 P1 reads from the overlay) is read from the current set alone: a recorded
+ *   one stays, at its recorded place, only while the overlay carries it, and its label is the
+ *   current message, else the code, never the frozen recorded text. A card recorded with one
+ *   open discrepancy therefore drops the flag once none is open.
  * - `FlagList` renders a list named "Flags" with one badge per merged code, labelled with the
  *   backend's own message, and renders nothing when no flag applies.
  *
@@ -34,7 +39,13 @@ import {
   makeRecommendationsPage,
 } from '../../test/fixtures';
 import { renderWithProviders } from '../../test/render';
-import { FlagList, WARNING_FLAG_CODES, flagTone, mergeFlags } from './FlagList';
+import {
+  FlagList,
+  LIVE_ONLY_FLAG_CODES,
+  WARNING_FLAG_CODES,
+  flagTone,
+  mergeFlags,
+} from './FlagList';
 
 /** The codes AAP 0.5.5 lists as trust warnings: data state, discrepancies, floors, pipeline. */
 const WARNING_CODES: readonly FlagCode[] = [
@@ -173,12 +184,63 @@ describe('mergeFlags', () => {
     expect(merged[0]).not.toBe(recorded[0]);
     expect(mergeFlags([], [])).toEqual([]);
   });
+
+  it('reads exactly the unverified-discrepancies code from the current set alone', () => {
+    expect([...LIVE_ONLY_FLAG_CODES]).toEqual(['unverified_discrepancies']);
+  });
+
+  it('drops a recorded unverified flag the current set no longer carries, keeping the rest', () => {
+    // Recorded while 1 discrepancy was open; 0 are open now, so the overlay omits the flag.
+    const recorded: readonly Flag[] = Object.freeze([
+      Object.freeze(makeFlag('simulated')),
+      Object.freeze(
+        makeFlag('unverified_discrepancies', {
+          message: 'Unverified while 1 discrepancies are open',
+        }),
+      ),
+      Object.freeze(makeFlag('no_crm_link')),
+    ]);
+    const current: readonly Flag[] = Object.freeze([Object.freeze(makeFlag('stale'))]);
+
+    expect(mergeFlags(recorded, current)).toEqual([
+      { code: 'simulated', message: 'Simulated data' },
+      { code: 'no_crm_link', message: FIXTURE_FLAGS.no_crm_link.message },
+      { code: 'stale', message: FIXTURE_FLAGS.stale.message },
+    ]);
+    expect(mergeFlags(recorded)).toEqual([
+      { code: 'simulated', message: 'Simulated data' },
+      { code: 'no_crm_link', message: FIXTURE_FLAGS.no_crm_link.message },
+    ]);
+    expect(recorded).toHaveLength(3);
+    expect(current).toHaveLength(1);
+  });
+
+  it('labels a live-only code with the code itself, never the frozen recorded text', () => {
+    const merged = mergeFlags(
+      [
+        makeFlag('unverified_discrepancies', {
+          message: 'Unverified while 1 discrepancies are open',
+        }),
+        makeFlag('simulated'),
+      ],
+      [makeFlag('unverified_discrepancies', { message: '  ' })],
+    );
+
+    expect(merged).toEqual([
+      { code: 'unverified_discrepancies', message: 'unverified_discrepancies' },
+      { code: 'simulated', message: 'Simulated data' },
+    ]);
+  });
 });
 
 describe('FlagList', () => {
   it('renders one badge per code, labelled with the backend message, toned by the code', () => {
     const flags = FIXTURE_FLAG_CODES.map((code) => makeFlag(code));
-    render(<FlagList flags={flags} />);
+    // A live-only code shows only while the overlay carries it, so the current set carries those.
+    const current = FIXTURE_FLAG_CODES.filter((code) => LIVE_ONLY_FLAG_CODES.has(code)).map(
+      (code) => makeFlag(code),
+    );
+    render(<FlagList flags={flags} current={current} />);
 
     const items = flagItems();
     expect(items.map((item) => item.textContent)).toEqual(
@@ -212,6 +274,50 @@ describe('FlagList', () => {
 
   it('renders nothing, not even an empty list, when no flag applies', () => {
     const { container } = render(<FlagList flags={[]} />);
+
+    expect(container.childElementCount).toBe(0);
+    expect(screen.queryByRole('list', { name: 'Flags' })).toBeNull();
+  });
+
+  it('drops the unverified badge once the overlay reports no open discrepancy', () => {
+    const recorded = [
+      makeFlag('simulated'),
+      makeFlag('unverified_discrepancies', {
+        message: 'Unverified while 1 discrepancies are open',
+      }),
+      makeFlag('no_crm_link'),
+    ];
+    const { rerender } = render(
+      <FlagList
+        flags={recorded}
+        current={[
+          makeFlag('unverified_discrepancies', {
+            message: 'Unverified while 1 discrepancies are open',
+          }),
+        ]}
+      />,
+    );
+
+    expect(flagItems().map((entry) => entry.textContent)).toEqual([
+      'Simulated data',
+      'Unverified while 1 discrepancies are open',
+      FIXTURE_FLAGS.no_crm_link.message,
+    ]);
+
+    // The discrepancy is resolved: 0 open, and the overlay no longer carries the flag.
+    rerender(<FlagList flags={recorded} current={[makeFlag('simulated')]} />);
+
+    expect(flagItems().map((entry) => entry.textContent)).toEqual([
+      'Simulated data',
+      FIXTURE_FLAGS.no_crm_link.message,
+    ]);
+    expect(screen.queryByText(/^Unverified while /u)).toBeNull();
+  });
+
+  it('renders nothing when the only recorded flag is a live-only code the overlay omits', () => {
+    const { container } = render(
+      <FlagList flags={[makeFlag('unverified_discrepancies')]} current={[]} />,
+    );
 
     expect(container.childElementCount).toBe(0);
     expect(screen.queryByRole('list', { name: 'Flags' })).toBeNull();

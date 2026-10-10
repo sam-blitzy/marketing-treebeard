@@ -760,7 +760,13 @@ def test_cr1_zero_impression_creative_is_excluded_and_its_comparison_not_estimab
     assert len(untestable) == 2
     assert {pair.unavailable for pair in untestable} == {NOT_ESTIMABLE_ZERO_IMPRESSIONS}
     compared = sum(1 for pair in pairs if pair.test is not None)
-    candidate = creative._pair_candidate(run.ctx, widened, untestable[0], compared, config)
+    rows = [
+        creative._variant_row(c, widened.info.objective_group, widened.currency)
+        for c in widened.variants
+    ]
+    candidate = creative._pair_candidate(
+        run.ctx, widened, untestable[0], compared, config, variants=rows
+    )
     detail = candidate.evidence.extra
     assert candidate.evidence.test is None
     assert detail["label"] == (
@@ -1374,6 +1380,32 @@ def test_variants_table_lists_impressions_stage_rates_and_leads_per_variant(
             assert row["completion_rate"] == _rate(totals.leads, totals.form_opens)
         else:
             assert (row["open_rate"], row["completion_rate"]) == (None, None)
+    # Every CR1 pair of the campaign freezes the same table, so the block keeps it without CR3.
+    pairs = run.items(CR1)
+    assert pairs
+    assert all(pair.evidence.extra["variants"] == rows for pair in pairs)
+
+
+@pytest.mark.parametrize("name", [DEFAULT, "cr1.holm_flip.case"])
+def test_every_copy_item_of_a_campaign_carries_the_campaign_variants_table(
+    make_context: ContextFactory, name: str
+) -> None:
+    """Variants table: the CR3 item and every CR1 pair of a campaign freeze the same rows."""
+    run = _evaluate(make_context, name)
+    groups: dict[str, list[Candidate]] = {}
+    for item in run.result.candidates:
+        groups.setdefault(item.group, []).append(item)
+    assert groups
+    for items in groups.values():
+        (test_item,) = (item for item in items if item.rule_id == CR3)
+        rows = test_item.evidence.extra["variants"]
+        assert len(rows) == test_item.evidence.extra["variant_count"] >= run.cr.min_variants
+        pairs = [item for item in items if item.rule_id == CR1]
+        assert pairs
+        for pair in pairs:
+            assert pair.evidence.extra["variants"] == rows
+            # The pair's own variants are rows of the table.
+            assert set(pair.evidence.extra["pair"]) <= {row["urn"] for row in rows}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1471,7 +1503,11 @@ def test_inconsistent_counts_are_never_compared(make_context: ContextFactory) ->
 def test_next_test_is_withheld_when_no_stage_can_be_compared_with_a_baseline(
     make_context: ContextFactory,
 ) -> None:
-    """CR3 withheld: no CR3 item when no stage can be measured against an account baseline."""
+    """CR3 withheld: no CR3 item when no stage can be measured against an account baseline.
+
+    The campaign's CR1 pair still carries the variants table, one row per variant, so the
+    campaign block keeps its table without a CR3 item (AAP 0.5.5 Copy).
+    """
     base = _evaluate(make_context, "cr1.distinguishable.fires")
     pooled_impressions = sum(row.impressions for row in base.variant_totals())
     run = _with_totals(base, {"cr-a": {"clicks": pooled_impressions + 1, "form_opens": None}})
@@ -1482,6 +1518,23 @@ def test_next_test_is_withheld_when_no_stage_can_be_compared_with_a_baseline(
     line = lines[0]
     assert line.reason == "no funnel stage could be measured against an account baseline"
     assert (line.observed, line.required, line.unit, line.section) == (0, 1, "stages", CREATIVE)
+    rows = run.single_pair().evidence.extra["variants"]
+    assert [row["urn"] for row in rows] == [run.urn("cr-a"), run.urn("cr-b")]
+    for key, row in zip(("cr-a", "cr-b"), rows, strict=True):
+        totals = run.totals(key)
+        assert row["name"] == run.name(key)
+        assert (row["impressions"], row["clicks"], row["form_opens"], row["leads"]) == (
+            totals.impressions,
+            totals.clicks,
+            totals.form_opens,
+            totals.leads,
+        )
+    # The inconsistent click count and the unreported form opens stay unavailable, never 0.
+    assert (rows[0]["click_rate"], rows[0]["open_rate"], rows[0]["completion_rate"]) == (
+        None,
+        None,
+        None,
+    )
 
 
 def test_delivery_projection_is_not_estimable_without_delivery_days(

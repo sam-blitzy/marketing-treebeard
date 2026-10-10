@@ -20,7 +20,8 @@ its twin.
   items; a pair that is not distinguishable names no winner; attribution floors pass through.
 * **Feedback**: dismiss, snooze and done hide a rule and entity until ``until``
   (``feedback.*_days``), C0 exempt; the counts are stored in ``run_suppression`` and served
-  from storage.
+  from storage. A hidden CR3 card leaves its campaign's CR1 pairs, each still carrying the
+  campaign's variants table.
 * **Historical-only items**: after a LinkedIn dataset activation, items computed from the old
   dataset are historical with every action refused (409 ``subject_retired``), an older custom
   run stays historical indefinitely, and frozen provenance keeps its simulated mode while
@@ -87,6 +88,7 @@ from ads_engine.analysis.context import (
     C2,
     CAMPAIGNS,
     CR1,
+    CR3,
     CREATIVE,
     DATA_LIVE,
     DATA_MIXED,
@@ -2376,6 +2378,43 @@ def test_feedback_never_hides_a_c0_discrepancy(make_context: ContextFactory) -> 
     assert (first.rank, first.candidate.rule_id) == (1, C0)
     assert first.candidate.entity_ref.key == c0.entity_ref.key
     assert not any(out.suppressed[section] for section in SECTION_ORDER)
+
+
+@pytest.mark.parametrize("kind", list(FEEDBACK_DAYS))
+def test_feedback_hiding_a_cr3_card_leaves_its_pairs_carrying_the_variants_table(
+    kind: FeedbackKind, make_context: ContextFactory
+) -> None:
+    """Feedback: a dismissed, snoozed or done CR3 card leaves its campaign's variants table.
+
+    ``cr1.holm_flip`` analyses one campaign with several variant pairs. Feedback on the CR3
+    next test hides only that rule and campaign: it is dropped and counted, while every CR1
+    pair of the campaign stays, in the same order, and still carries the variants table the
+    CR3 item froze, so the campaign block keeps its table (AAP 0.5.5 Copy).
+    """
+    ctx = make_context(SCENARIOS["cr1.holm_flip.case"])
+    shown = _precede(ctx)
+    (cr3,) = _candidates(shown, CREATIVE, CR3)
+    rows = cr3.evidence.extra["variants"]
+    assert len(rows) >= 2
+
+    def pairs(out: PrecedenceOutput) -> list[Candidate]:
+        return [c for c in _candidates(out, CREATIVE, CR1) if c.group == cr3.group]
+
+    assert len(pairs(shown)) >= 2
+    entry = FeedbackInfo(
+        rule_id=CR3,
+        entity_type=cr3.entity_ref.type,
+        entity_key=cr3.entity_ref.key,
+        kind=kind,
+        until=ctx.now + timedelta(days=FEEDBACK_DAYS[kind]),
+    )
+    hidden = _precede(replace(ctx, feedback=(entry,), cache={}))
+    assert _candidates(hidden, CREATIVE, CR3) == []
+    assert dict(hidden.suppressed[CREATIVE]) == {FEEDBACK_SUPPRESSION[kind]: 1}
+    survivors = pairs(hidden)
+    assert [c.entity_ref.key for c in survivors] == [c.entity_ref.key for c in pairs(shown)]
+    for pair in survivors:
+        assert pair.evidence.extra["variants"] == rows
 
 
 @pytest.mark.parametrize("kind", list(FEEDBACK_DAYS))

@@ -88,7 +88,13 @@ from ads_engine.analysis.context import (
     Withheld,
     google_link_gap,
 )
-from ads_engine.analysis.metrics import cap_constrained, native_day_zone
+from ads_engine.analysis.metrics import (
+    baseline_cpo,
+    cap_constrained,
+    native_day_zone,
+    subject_baseline_outcomes,
+    window_totals,
+)
 from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
 from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, ResolvedBinding
 from ads_engine.analysis.window import AnalysisWindow
@@ -746,9 +752,12 @@ def test_c1b_pauses_a_campaign_whose_matured_leads_reach_no_pipeline() -> None:
     assert set(item.evidence.thresholds) == set(C1B_THRESHOLD_KEYS)
     assert item.evidence.sample is not None
     assert (item.evidence.sample.observed, item.evidence.sample.required) == (20, 20)
-    # The pipeline counts sit side by side and are never blended (AAP 0.5.4.4 C1b).
+    # Spend, window outcomes and expected outcomes lead (AAP 0.5.5 pause cards); the pipeline
+    # counts follow side by side and are never blended (AAP 0.5.4.4 C1b).
     assert list(_metrics(item)) == [
         "spend",
+        "outcomes",
+        "expected_outcomes",
         "leads",
         "matured_leads",
         "matched_leads",
@@ -764,6 +773,73 @@ def test_c1b_pauses_a_campaign_whose_matured_leads_reach_no_pipeline() -> None:
     ]
     mql = item.evidence.metric("mql")
     assert mql.label == f"MQL ({attribution_for(ctx).mql_label})"
+    # Window outcomes are the campaign's platform leads; expected outcomes are its spend at the
+    # account's cost per lead for the same source and objective (AAP 0.5.4.1), at six places.
+    campaign = ctx.campaigns[campaign_id]
+    totals = window_totals(ctx, (campaign_id,))
+    baseline = baseline_cpo(ctx, campaign.account_id, campaign.objective_group)
+    assert (totals.spend, totals.outcomes, baseline) == (Decimal("2716.00"), 20, Decimal("135.80"))
+    outcomes = item.evidence.metric("outcomes")
+    assert (outcomes.label, outcomes.value, outcomes.unit) == ("Window leads", 20, "leads")
+    expected = item.evidence.metric("expected_outcomes")
+    assert (expected.label, expected.value, expected.unit) == (
+        "Expected leads at the account baseline",
+        campaigns._q(totals.spend / baseline),
+        "leads",
+    )
+    assert expected.value == Decimal("20.000000")
+    assert [(entry.key, entry.label, entry.value) for entry in item.evidence.baselines] == [
+        (
+            "baseline_cost_per_outcome",
+            "Account cost per lead (same source and objective)",
+            Decimal("135.800000"),
+        )
+    ]
+    assert item.reason == (
+        "20 eligible contacts from 20 matured leads reached 0 Qualified Leads and 0 meetings "
+        "(MQL 0) after USD 2,716.00 of spend in the window."
+    )
+    assert item.rank_key == (-Decimal("2716.00"),)
+
+
+@pytest.mark.parametrize(
+    ("leads", "outcomes", "baseline"),
+    [(0, 0, "—"), (None, None, None)],
+    ids=["zero-window-leads", "unreported-window-leads"],
+)
+def test_c1b_still_pauses_without_a_finite_account_baseline(
+    leads: int | None, outcomes: int | None, baseline: str | None
+) -> None:
+    # The campaign is the only one of its account and objective group, so its leads are the
+    # baseline's denominator. At a known 0 account leads the baseline cost per lead is a zero
+    # denominator and reads "—" (AAP 0.5.5); with unreported leads it is unavailable (None).
+    # Either way expected outcomes, a count rather than a cost, are unavailable, never 0, and
+    # the pipeline pause, which judges the CRM population, fires as before.
+    scenario, ctx = _built("c1b.eligible.fires")
+    campaign_id = _campaign_id(scenario, "linkedin", "li-pipeline")
+    days = tuple(replace(day, leads=leads) for day in ctx.campaign_days[campaign_id])
+    blind = _fresh(ctx, campaign_days={**ctx.campaign_days, campaign_id: days})
+    campaign = blind.campaigns[campaign_id]
+    assert baseline_cpo(blind, campaign.account_id, campaign.objective_group) is None
+    assert subject_baseline_outcomes(blind, ("campaign", campaign_id)) == outcomes
+    item = _only(campaigns.evaluate(blind), C1B)
+    assert item.action == PIPELINE_PAUSE_ACTION
+    metrics = _metrics(item)
+    assert (metrics["spend"], metrics["outcomes"], metrics["expected_outcomes"]) == (
+        Decimal("2716.00"),
+        outcomes,
+        None,
+    )
+    assert (metrics["eligible_contacts"], metrics["ql"], metrics["meetings"]) == (20, 0, 0)
+    (entry,) = item.evidence.baselines
+    assert (entry.key, entry.value) == ("baseline_cost_per_outcome", baseline)
+    rendered = item.evidence.to_json()
+    assert rendered["baselines"][0]["value"] == baseline
+    shown = {m["key"]: m for m in rendered["metrics"]}
+    assert shown["expected_outcomes"]["value"] is None
+    assert shown["expected_outcomes"]["unavailable"] is True
+    # Gate, reason, ranking and headline are those of the card with a finite baseline.
+    assert item.evidence.extra["headline_metric"] == "ql"
     assert item.reason == (
         "20 eligible contacts from 20 matured leads reached 0 Qualified Leads and 0 meetings "
         "(MQL 0) after USD 2,716.00 of spend in the window."

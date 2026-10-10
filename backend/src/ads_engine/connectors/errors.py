@@ -571,9 +571,12 @@ def sanitize_message(text: str) -> str:
     Redaction runs before the collapse, so a header value still ends at its line, and the
     email scanner runs again after it, so no quoted local part that the collapse joins
     across a line break (``"john\ndoe"@example.com``) survives; both run before the cut, so
-    a secret is never left half-matched. Text that was already cut, and so ends in ``…``,
-    also loses a start of a held secret right before that ellipsis, of 4 characters or
-    more: what an earlier cut through the secret left.
+    a secret is never left half-matched. The credential rules need no second pass: they
+    already read every character the collapse joins as whitespace between a key, its
+    separator and its value (``access_token\n=...``), so the collapse never puts a value
+    next to a key that redaction did not see. Text that was already cut, and so ends in
+    ``…``, also loses a start of a held secret right before that ellipsis, of 4 characters
+    or more: what an earlier cut through the secret left.
 
     Example::
 
@@ -588,6 +591,10 @@ def sanitize_message(text: str) -> str:
     """
     held = _HELD_SECRETS.get()
     secrets = (*_configured_secrets(), *sorted(held))
+    # `str.split()` collapses exactly the whitespace the credential rules of `redact` already
+    # accept around a separator and after an authentication scheme, so the collapse cannot
+    # bring a key and a value together that redaction left apart, and those rules need no
+    # second pass.
     collapsed = " ".join(str(redact(text, secrets=secrets)).split())
     # A quoted local part may hold blanks but no line break, so collapsing can join the two
     # halves of one that a line break kept apart (`"john` and `doe"@example.com`): the

@@ -806,8 +806,13 @@ subject, and never one on its members.
 - **Action**: "Pause or rework targeting: leads are not becoming Qualified Leads".
 - **Reason and extra output**: "{eligible} eligible contacts from {matured} matured leads reached
   0 Qualified Leads and 0 meetings (MQL {mql}) after {spend} of spend in the window." The card
-  shows leads, matured leads, matched and unresolved matured leads, eligible contacts, MQL, QL
-  and meetings side by side.
+  shows window spend, window outcomes and expected outcomes at the account baseline, with the
+  baseline cost per outcome, as every pause and scale card does; without an account baseline,
+  expected outcomes are unavailable, never 0, and the rule still fires. The baseline then reads
+  "—" when the account's known outcomes are 0 (a zero denominator) and "unavailable" only when
+  they are unreported. Beside them it shows leads, matured leads, matched and unresolved matured
+  leads, eligible contacts, MQL, QL and meetings side by side, each its own count and never
+  combined with the platform outcomes.
 - **Ranking**: spend, descending.
 - **Withheld or suppressed**: a zero under a floor or unknown evidence may be an artefact of
   unmatched contacts or failed association reads, so the campaign is withheld instead, with a
@@ -974,7 +979,9 @@ withheld patterns follow the items.
   spending days, days meeting the rule's predicate, idle days, changed-intraday days,
   unobserved days). `B4` shows the same counts beside its pattern but no days meeting a
   predicate, because it is not gated on budget history;
-- efficiency: cost per outcome against the account baseline;
+- efficiency: cost per outcome against the account baseline. A cost per outcome, or the account
+  baseline, over a known 0 outcomes reads "—" (a zero denominator, never a finite cost), and over
+  unreported outcomes "unavailable";
 - outcomes, and CRM Qualified Leads where linked;
 - the latest effective daily budget and the exact window with each source's day boundary. `B1`
   and `B3` cards also show the proposed daily budget, and a `B2` card shows it only when the
@@ -1136,6 +1143,9 @@ member days.
      `b4.alpha` (default 0.05).
 - **Action**: "Adjust weekend schedule or bids: weekend cost/outcome {x} vs weekday {y}", a
   schedule or bid-pattern observation rather than a budget change: it proposes no daily budget.
+  A side with a known 0 outcomes has its cost per outcome "—" in the action, the reason and the
+  evidence; outcomes are reported on every window day of an item (check 2), so neither side
+  reads "unavailable".
 - **Reason and extra output**: day counts, outcome counts and the p-value of the "two-sample
   Poisson rate test", the source's day boundary and, for Google, the counting contract ("all
   included actions last-click on all {N} days"). The evidence sample is the outcome total against
@@ -1185,7 +1195,11 @@ Campaigns without the `LEAD_GENERATION` objective use only click rate.
 
 **Every creative card**: reads `linkedin.analytics_daily` and `linkedin.entities`, depends on its
 campaign (P1 holds), has no decision subject ("Mark done") and is tested in
-`backend/tests/acceptance/test_creative_rules.py`.
+`backend/tests/acceptance/test_creative_rules.py`. Every creative card, the `CR3` card and each
+`CR1` pair, carries the campaign's variants table in `extra.variants`, the same rows on each:
+one row per variant, including its impressions, clicks, form opens, leads, click rate, open rate
+and completion rate. The campaign block therefore keeps its table when the campaign has no `CR3`
+card (no stage measurable against an account baseline) or feedback hides it.
 
 **Withheld**: a delivering campaign with too few variants is listed as a withheld `CR1` line,
 "variants 1 of 2 required (creatives with at least 1,000 window impressions); copy analysis

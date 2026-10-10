@@ -476,8 +476,20 @@ function chipFragments(window: EvidenceWindow): string[] {
 }
 
 /**
+ * The flag codes a card reads from `current.flags_now` alone (`LIVE_ONLY_FLAG_CODES` in
+ * `FlagList.tsx`, restated because that module imports the design system and its CSS, which this
+ * Node-side spec cannot load): the open-discrepancy count is read from the overlay.
+ */
+const LIVE_ONLY_FLAG_CODES: ReadonlySet<FlagCode> = new Set<FlagCode>([
+  'unverified_discrepancies',
+]);
+
+/**
  * The flag badges an item shows (`mergeFlags` in `FlagList.tsx`): every code once, recorded
- * codes first, each labelled with its current message, else its recorded one, else its code.
+ * codes first, each labelled with its current message, else its recorded one, else its code. A
+ * live-only code ({@link LIVE_ONLY_FLAG_CODES}) shows only while `item.current.flags_now`
+ * carries it, at its recorded place if recorded, labelled with its current message, else its
+ * code, never its recorded one.
  */
 function shownFlags(item: Item): Flag[] {
   const order: FlagCode[] = [];
@@ -495,10 +507,13 @@ function shownFlags(item: Item): Flag[] {
   };
   collect(item.flags, recorded);
   collect(item.current.flags_now, current);
-  return order.map((code) => ({
-    code,
-    message: current.get(code) ?? recorded.get(code) ?? code,
-  }));
+  const carriedNow = new Set(item.current.flags_now.map((flag) => flag.code));
+  return order.flatMap((code): Flag[] => {
+    if (LIVE_ONLY_FLAG_CODES.has(code)) {
+      return carriedNow.has(code) ? [{ code, message: current.get(code) ?? code }] : [];
+    }
+    return [{ code, message: current.get(code) ?? recorded.get(code) ?? code }];
+  });
 }
 
 /** The name a white-paper row shows (`assetName` in `WhitePapersSection.tsx`). */

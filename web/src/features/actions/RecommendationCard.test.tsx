@@ -9,7 +9,8 @@
  *   frozen evidence selects ("{label} {value}", outside the heading; none when it selects none)
  *   and "{entity name} · {Source}".
  * - **Body**: the reason, the caller's fields, the evidence table, the window chip
- *   "{start} – {end} · {N} days · {source boundaries}" and the flags (recorded plus current).
+ *   "{start} – {end} · {N} days · {source boundaries}" and the flags (recorded plus current,
+ *   with the open-discrepancy count read from the overlay alone).
  *   With `reasonPlacement="fields"` the card prints no reason line, so the caller's fields
  *   carry the reason once.
  * - **Footer**: "Record decision" only on items with a `decision_subject`, opening the
@@ -385,6 +386,59 @@ describe('RecommendationCard: header and body', () => {
       FIXTURE_FLAGS.search_term_coverage.message,
       FIXTURE_FLAGS.stale.message,
     ]);
+  });
+
+  it('drops the recorded unverified flag once no discrepancy is open now', async () => {
+    // Recorded while 1 discrepancy was open; the overlay omits the flag at 0 open.
+    const item = makeItem({
+      flags: [
+        makeFlag('simulated'),
+        makeFlag('unverified_discrepancies', {
+          message: 'Unverified while 1 discrepancies are open',
+        }),
+      ],
+      current: makeItemOverlay({ flags_now: [makeFlag('stale')] }),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    const flags = within(cardOf(item)).getByRole('list', { name: 'Flags' });
+    expect(
+      within(flags)
+        .getAllByRole('listitem')
+        .map((entry) => entry.textContent),
+    ).toEqual(['Simulated data', FIXTURE_FLAGS.stale.message]);
+    expect(within(flags).queryByText(/Unverified while/u)).toBeNull();
+    expect(within(cardOf(item)).queryByText(/Unverified while/u)).toBeNull();
+  });
+
+  it('shows the live open-discrepancy count once, in place of the recorded one', async () => {
+    const item = makeItem({
+      flags: [
+        makeFlag('simulated'),
+        makeFlag('unverified_discrepancies', {
+          message: 'Unverified while 1 discrepancies are open',
+        }),
+      ],
+      current: makeItemOverlay({
+        flags_now: [
+          makeFlag('unverified_discrepancies', {
+            message: 'Unverified while 2 discrepancies are open',
+          }),
+        ],
+      }),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    const flags = within(cardOf(item)).getByRole('list', { name: 'Flags' });
+    const unverified = within(flags).getAllByText(/Unverified while/u);
+    expect(unverified.map((badge) => badge.textContent)).toEqual([
+      'Unverified while 2 discrepancies are open',
+    ]);
+    expect(
+      within(flags)
+        .getAllByRole('listitem')
+        .map((entry) => entry.textContent),
+    ).toEqual(['Simulated data', 'Unverified while 2 discrepancies are open']);
   });
 
   it('renders no reason line when the reason is blank', async () => {

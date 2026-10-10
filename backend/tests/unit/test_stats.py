@@ -119,15 +119,25 @@ def expected_min_reference(table: list[list[int]]) -> Fraction:
     return min(Fraction(row * column, total) for row in rows for column in columns)
 
 
+def fisher_p(x_a: int, n_a: int, x_b: int, n_b: int) -> float:
+    """SciPy's two-sided Fisher exact p-value of the CR1 table, as the library float."""
+    return float(fisher_exact(table_of(x_a, n_a, x_b, n_b), alternative=TWO_SIDED).pvalue)
+
+
+def z_p(x_a: int, n_a: int, x_b: int, n_b: int) -> float:
+    """statsmodels' two-sided pooled two-proportion z-test p-value, as the library float."""
+    _, p_value = proportions_ztest([x_a, x_b], [n_a, n_b], alternative=TWO_SIDED)
+    return float(p_value)
+
+
 def fisher_reference(x_a: int, n_a: int, x_b: int, n_b: int) -> Decimal:
-    """SciPy's two-sided Fisher exact p-value of the CR1 table."""
-    return probability(fisher_exact(table_of(x_a, n_a, x_b, n_b), alternative=TWO_SIDED).pvalue)
+    """SciPy's two-sided Fisher exact p-value of the CR1 table, as :func:`p_value_probability`."""
+    return p_value_probability(fisher_p(x_a, n_a, x_b, n_b))
 
 
 def z_reference(x_a: int, n_a: int, x_b: int, n_b: int) -> Decimal:
-    """statsmodels' two-sided pooled two-proportion z-test p-value."""
-    _, p_value = proportions_ztest([x_a, x_b], [n_a, n_b], alternative=TWO_SIDED)
-    return probability(p_value)
+    """statsmodels' two-sided pooled z-test p-value, as :func:`p_value_probability`."""
+    return p_value_probability(z_p(x_a, n_a, x_b, n_b))
 
 
 def solver_n(rate_1: float, rate_2: float, *, alpha: float = 0.05, power: float = 0.8) -> int:
@@ -171,8 +181,8 @@ def library_solver_fails(rate_1: float, rate_2: float, *, alpha: float) -> bool:
     return math.isnan(float(solved)) and warned
 
 
-def rate_probability(value: SupportsFloat) -> Decimal:
-    """Reference conversion of a rate-test p-value: a positive value below the 6-place quantum
+def p_value_probability(value: SupportsFloat) -> Decimal:
+    """Reference conversion of a library p-value: a positive value below the 6-place quantum
     keeps 6 significant digits (half even), any other value is :func:`probability`."""
     exact = Decimal(repr(float(value)))
     if Decimal(0) < exact < QUANTUM:
@@ -196,8 +206,8 @@ def poisson_p(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) ->
 
 
 def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> Decimal:
-    """statsmodels' two-sided score test of a rate ratio of 1, as :func:`rate_probability`."""
-    return rate_probability(poisson_p(count_a, spend_a, count_b, spend_b))
+    """statsmodels' two-sided score test of a rate ratio of 1, as :func:`p_value_probability`."""
+    return p_value_probability(poisson_p(count_a, spend_a, count_b, spend_b))
 
 
 def type7_reference(values: Sequence[Decimal | int], q: Decimal) -> Decimal:
@@ -385,6 +395,69 @@ def test_identical_rates_with_a_small_expected_cell_use_fisher() -> None:
 
 
 @pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b", "method", "shown"),
+    [
+        # 1% against 0.5% at 20,000 impressions each: p about 6.8e-9, the evidence example.
+        (200, 20000, 100, 20000, "two_proportion_z", "6.82090E-9"),
+        (300, 20000, 100, 20000, "two_proportion_z", "9.15156E-24"),
+        (12, 1000, 0, 5000, "fisher_exact", "4.34702E-10"),  # expected cell 2
+        # Just below half the quantum, which 6 places alone would record as 0.000000.
+        (9, 1000, 0, 4000, "fisher_exact", "4.97416E-7"),  # expected cell 1.8
+    ],
+)
+def test_compare_proportions_keeps_six_significant_digits_below_the_quantum(
+    x_a: int, n_a: int, x_b: int, n_b: int, method: str, shown: str
+) -> None:
+    """CR1: a positive p-value below 0.000001 is recorded at 6 significant digits, never as 0.
+
+    The test choice, the rates and the rounded-down expected cell are unchanged.
+    """
+    library = fisher_p(x_a, n_a, x_b, n_b) if method == "fisher_exact" else z_p(x_a, n_a, x_b, n_b)
+
+    result = compare_proportions(x_a, n_a, x_b, n_b)
+
+    assert 0.0 < library < 5e-7
+    assert result is not None
+    assert result.method == method
+    assert str(result.p_value) == shown
+    assert result.p_value > 0
+    assert result.p_value == Decimal(f"{library:.5e}")
+    assert len(result.p_value.as_tuple().digits) == 6
+    assert math.isclose(float(result.p_value), library, rel_tol=5e-6)
+    assert format(result.p_value, "f") not in ("0.000000", "0.000001")
+    reference = fisher_reference if method == "fisher_exact" else z_reference
+    assert result.p_value == reference(x_a, n_a, x_b, n_b)
+    assert result.rate_a == exact_ratio(x_a, n_a)
+    assert result.rate_b == exact_ratio(x_b, n_b)
+    assert result.expected_min == floor_six(expected_min_reference(table_of(x_a, n_a, x_b, n_b)))
+    swapped = compare_proportions(x_b, n_b, x_a, n_a)
+    assert swapped is not None
+    assert swapped.p_value == result.p_value
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b", "method"),
+    [
+        (3000, 20000, 100, 20000, "two_proportion_z"),
+        (500, 1000, 0, 1000000, "fisher_exact"),  # expected cell 0.4995...
+    ],
+)
+def test_compare_proportions_keeps_a_library_p_value_of_exactly_zero(
+    x_a: int, n_a: int, x_b: int, n_b: int, method: str
+) -> None:
+    """CR1: a library p-value that underflowed to exactly 0.0 has no digit to keep: it is 0."""
+    library = fisher_p(x_a, n_a, x_b, n_b) if method == "fisher_exact" else z_p(x_a, n_a, x_b, n_b)
+
+    result = compare_proportions(x_a, n_a, x_b, n_b)
+
+    assert library == 0.0
+    assert result is not None
+    assert result.method == method
+    assert result.p_value == ZERO
+    assert str(result.p_value) == "0.000000"
+
+
+@pytest.mark.parametrize(
     ("x_a", "n_a", "x_b", "n_b"),
     [(1, 20, 4, 20), (5, 999, 5, 1000), (60, 1000, 90, 1000), (3, 1500, 9, 1200)],
 )
@@ -539,6 +612,63 @@ def test_holm_matches_statsmodels(p_values: list[str]) -> None:
     _, corrected, _, _ = multipletests([float(p) for p in raw], alpha=0.05, method="holm")
 
     assert holm(raw) == [probability(value) for value in corrected]
+
+
+@pytest.mark.parametrize(
+    ("p_values", "shown"),
+    [
+        # The three Fisher and z-test p-values of one campaign, at their recorded scale: the
+        # third adjusts to 1.49407e-05, which keeps 6 places.
+        (
+            ["4.34702E-10", "4.97416E-7", "1.49407E-5"],
+            ["1.30411E-9", "9.94832E-7", "0.000015"],
+        ),
+        (["6.82090E-9", "0.04"], ["1.36418E-8", "0.040000"]),
+        # 4e-7 times 3 is 1.2e-6, from the quantum up, so 6 places; the others cap at 1.
+        (["4E-7", "0.6", "0.9"], ["0.000001", "1.000000", "1.000000"]),
+        (["6.82090E-9", "0", "1"], ["1.36418E-8", "0.000000", "1.000000"]),
+    ],
+)
+def test_holm_keeps_six_significant_digits_below_the_quantum(
+    p_values: list[str], shown: list[str]
+) -> None:
+    """CR1: a positive adjusted p-value below 0.000001 keeps 6 significant digits, never 0.
+
+    Inputs in exponent notation validate like any other ``Decimal`` in [0, 1]; adjusted values
+    from 0.000001 up keep 6 places, values cap at exactly 1, and an exact 0 stays 0.
+    """
+    raw = [Decimal(p) for p in p_values]
+
+    adjusted = holm(raw)
+
+    _, corrected, _, _ = multipletests([float(p) for p in raw], alpha=0.05, method="holm")
+    assert [str(p) for p in adjusted] == shown
+    assert adjusted == [p_value_probability(value) for value in corrected]
+    for value, library in zip(adjusted, corrected, strict=True):
+        assert Decimal(0) <= value <= ONE
+        if 0.0 < float(library) < 1e-6:
+            assert value > 0
+            assert len(value.as_tuple().digits) == 6
+            assert math.isclose(float(value), float(library), rel_tol=5e-6)
+        else:
+            assert value.as_tuple().exponent == -6
+
+
+def test_holm_of_compare_proportions_p_values_below_the_quantum() -> None:
+    """CR1: tiny p-values from :func:`compare_proportions` pass through Holm and stay positive.
+
+    The single-pair adjustment returns the p-value unchanged, as a campaign of one pair does.
+    """
+    tests = [compare_proportions(200, 20000, 100, 20000), compare_proportions(12, 1000, 0, 5000)]
+    raw = [test.p_value for test in tests if test is not None]
+
+    adjusted = holm(raw)
+
+    # Sorted 4.34702e-10 and 6.82090e-9 times 2 and 1; the larger keeps its own value.
+    assert raw == [Decimal("6.82090E-9"), Decimal("4.34702E-10")]
+    assert adjusted == [Decimal("6.82090E-9"), Decimal("8.69404E-10")]
+    assert all(DEFAULT_ALPHA > p > 0 for p in adjusted)
+    assert holm(raw[:1]) == raw[:1]
 
 
 def test_holm_adjusted_values_do_not_depend_on_alpha() -> None:
@@ -1479,13 +1609,13 @@ def test_poisson_rate_test_keeps_six_places_from_the_quantum_up(
         (math.inf, None),
     ],
 )
-def test_rate_p_value_conversion(library: float, expected: str | None) -> None:
-    """The rate test's p-value conversion: 6 significant digits only for (0, 0.000001)."""
-    result = stats._rate_p_value_from_float(np.float64(library))
+def test_p_value_conversion(library: float, expected: str | None) -> None:
+    """The p-value conversion of CR1 and B4: 6 significant digits only for (0, 0.000001)."""
+    result = stats._p_value_from_float(np.float64(library))
 
     assert (None if result is None else str(result)) == expected
     if result is not None:
-        assert result == rate_probability(library)
+        assert result == p_value_probability(library)
         assert Decimal(0) <= result <= Decimal(1)
 
 

@@ -25,7 +25,11 @@ Rules, groups and ranking:
 The module is pure: it reads only the :class:`~ads_engine.analysis.context.AnalysisContext` and
 performs no I/O. Every threshold comes from ``config/thresholds.yaml`` through ``ctx.thresholds``
 and is copied into ``evidence.thresholds``; every reason sentence is filled from the item's own
-evidence values. Comparisons stay within one source, objective group and currency.
+evidence values. Comparisons stay within one source, objective group and currency. A cost per
+outcome or account baseline that may rest on a zero or unreported count (C1b's baseline here,
+and every budget card's in ``budget.py``) is recorded through :func:`cost_per_outcome_value`:
+"—" over a known 0 outcomes, unavailable over unreported ones. C1 needs a finite baseline, and
+C2 one plus at least ``scale.min_outcomes`` outcomes, so the costs they show are always finite.
 
 Example:
     >>> result = evaluate(ctx)  # doctest: +SKIP
@@ -109,6 +113,7 @@ from ads_engine.analysis.metrics import (
     native_day_zone,
     spend_increase_blocked,
     subject_baseline,
+    subject_baseline_outcomes,
     subject_campaigns,
     subject_objective_groups,
     subject_totals,
@@ -133,6 +138,7 @@ __all__ = [
     "ScaleEntry",
     "ScaleOutcome",
     "ScaleWithheld",
+    "cost_per_outcome_value",
     "evaluate",
     "scale_outcomes",
 ]
@@ -235,6 +241,11 @@ _ONE_PLACE: Final = Decimal("0.1")
 """Expected outcomes and percentages render with one decimal place in reason sentences."""
 
 _ZERO: Final = Decimal(0)
+
+_DASH: Final = "—"
+"""A cost per outcome whose known outcome count is 0 (AAP 0.5.4.3, 0.5.4.7, 0.5.5): a zero
+denominator, never a finite value and never "unavailable", which is reserved for unreported
+outcomes."""
 
 _FACET_LABELS: Final[Mapping[str, str]] = {
     "job_function": "job function",
@@ -339,6 +350,27 @@ class _Settings:
 def _q(value: Decimal) -> Decimal:
     """Record a ratio or cost in evidence with six places, half even."""
     return value.quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN, context=_EXACT)
+
+
+def cost_per_outcome_value(
+    cost: Decimal | None, outcomes: Decimal | int | None
+) -> Decimal | str | None:
+    """Return a cost per outcome for evidence (AAP 0.5.4.3, 0.5.4.7, 0.5.5 zero denominators).
+
+    The one rendering of a cost per outcome, or of the account baseline, that campaign cards
+    here and budget cards in ``budget.py`` record. ``cost`` is the exact ``spend ÷ outcomes``
+    (:func:`~ads_engine.analysis.metrics.cost_per_outcome`) and ``outcomes`` the count it
+    divides by. A known count of 0 gives "—", a zero denominator shown as such and never
+    flagged unavailable; an unreported count (``None``) gives ``None``, which
+    :meth:`Metric.to_json` marks unavailable (AAP 0.11.1: absent values are ``None``).
+    Otherwise the cost at six places, or ``None`` when no cost was computed. Only the
+    displayed value is built here: every comparison and gate keeps its exact ``Decimal``.
+    """
+    if outcomes is None:
+        return None
+    if outcomes == 0:
+        return _DASH
+    return None if cost is None else _q(cost)
 
 
 def _share(value: Decimal) -> Decimal:
@@ -1864,8 +1896,15 @@ def _c1b_candidate(
 ) -> Candidate:
     """The C1b item of one LinkedIn campaign whose eligible contacts produced no pipeline.
 
-    The card shows spend beside the veto counts and names the campaign's campaign group in
-    ``extra.campaign_group`` (:func:`_campaign_group_extra`).
+    The card shows window spend, window outcomes (``None``, unavailable, when a window day did
+    not report them) and expected outcomes at the account baseline (spend ÷ the account's cost
+    per outcome for the same source and objective group, AAP 0.5.4.1; ``None`` without a
+    baseline), and records that baseline (AAP 0.5.5: "Pause and scale cards show spend,
+    outcomes, expected outcomes and CRM QL"). The baseline reads "—" when the account's known
+    outcomes are 0, a zero denominator, and is ``None``, unavailable, only when they are
+    unreported (:func:`cost_per_outcome_value`). The veto counts follow as their own metrics,
+    never blended with the platform outcomes, and ``extra.campaign_group`` names the
+    campaign's campaign group (:func:`_campaign_group_extra`).
 
     Rule C1b Pipeline pause (AAP 0.5.4.4), for a campaign that passed :func:`_c1b` and
     :func:`_c1b_shortfall`: a window of at least ``c1b.min_window_days`` (28) and the
@@ -1886,15 +1925,35 @@ def _c1b_candidate(
     if veto is None:
         raise ValueError(f"C1b needs a pipeline population for campaign {campaign.id}")
     currency = ctx.account_currency(campaign.id)
-    spend = window_totals(ctx, (campaign.id,)).spend
+    totals = window_totals(ctx, (campaign.id,))
+    spend = totals.spend
+    label = OUTCOME_LABELS[campaign.objective_group]
+    baseline = baseline_cpo(ctx, campaign.account_id, campaign.objective_group)
+    expected = expected_outcomes(spend, baseline)
     metrics = [
         Metric("spend", "Window spend", spend, "currency", currency),
+        Metric("outcomes", f"Window {label}", totals.outcomes, label),
+        Metric(
+            "expected_outcomes",
+            f"Expected {label} at the account baseline",
+            None if expected is None else _q(expected),
+            label,
+        ),
         *_veto_metrics(ctx, settings, attribution, view),
     ]
     evidence = ctx.make_evidence(
         required_datasets=_C1B_DATASETS,
         crm_scope="linkedin",
         metrics=metrics,
+        baselines=(
+            Baseline(
+                "baseline_cost_per_outcome",
+                f"Account cost per {_singular(label)} (same source and objective)",
+                cost_per_outcome_value(
+                    baseline, subject_baseline_outcomes(ctx, ("campaign", campaign.id))
+                ),
+            ),
+        ),
         sample=Sample(veto.eligible_contacts, settings.veto_min, "contacts"),
         threshold_keys=C1B_THRESHOLD_KEYS,
         extra={

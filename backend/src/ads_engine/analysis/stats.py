@@ -35,9 +35,10 @@ Conventions:
   ``float`` exists only inside the library calls. Library results come back through
   ``Decimal(repr(float(value)))`` rounded to 6 decimal places with banker's rounding
   (``ROUND_HALF_EVEN``), independent of the caller's decimal context. The one exception is
-  a positive rate-test p-value below 0.000001, which keeps 6 significant digits instead, so
-  a vanishing p-value never reads as 0 (:func:`poisson_rate_test`). Threshold decisions
-  inside this module use exact counts, never the rounded values.
+  a positive p-value below 0.000001, which keeps 6 significant digits instead, so a
+  vanishing p-value never reads as 0 (:func:`compare_proportions`, :func:`holm` and
+  :func:`poisson_rate_test`). Threshold decisions inside this module use exact counts,
+  never the rounded values.
 * "Not estimable" is ``None``: degenerate input (zero trials, zero exposure, no observed
   difference, a baseline of 0 or a target above 100%) returns ``None``, which the rules
   render as "not estimable" with their reason. No result is ever NaN or infinite.
@@ -119,11 +120,11 @@ POISSON_RATE_METHOD: Final = "two_sample_poisson_score"
 """Method label of :func:`poisson_rate_test`: the score test of a rate ratio of 1."""
 
 # Every Decimal leaving this module carries 6 decimal places, the scale of the stored
-# numeric(18,6) money and conversion columns, except a positive rate-test p-value below this
-# quantum, which keeps _P_VALUE_DIGITS significant digits (see _rate_p_value_from_float).
+# numeric(18,6) money and conversion columns, except a positive p-value below this quantum,
+# which keeps _P_VALUE_DIGITS significant digits (see _p_value_from_float).
 _QUANTUM: Final = Decimal("0.000001")
-# Significant digits a positive rate-test p-value below _QUANTUM keeps, where 6 decimal places
-# would round it to 0: 5.7664369391539194e-12 becomes Decimal("5.76644E-12").
+# Significant digits a positive p-value below _QUANTUM keeps, where 6 decimal places would
+# round it to 0: 5.7664369391539194e-12 becomes Decimal("5.76644E-12").
 _P_VALUE_DIGITS: Final = 6
 # Working precision of the exact bookkeeping. 50 digits hold any count ratio or spend sum the
 # product stores (numeric(18,6) has at most 18 digits) with room for the 6-place quantum.
@@ -146,8 +147,10 @@ class ProportionTest:
     Attributes:
         method: ``"fisher_exact"`` when any expected cell is below the Fisher threshold,
             otherwise ``"two_proportion_z"``.
-        p_value: Two-sided p-value in [0, 1], unadjusted; pass a campaign's p-values
-            through :func:`holm` before calling a pair distinguishable.
+        p_value: Two-sided p-value in [0, 1], unadjusted: 6 decimal places from 0.000001 up,
+            6 significant digits below it (``Decimal("6.82090E-9")``), so a positive p-value
+            never reads as 0. Pass a campaign's p-values through :func:`holm` before calling
+            a pair distinguishable.
         rate_a: Observed rate ``x_a / n_a``.
         rate_b: Observed rate ``x_b / n_b``.
         expected_min: Smallest expected cell count of the 2x2 table under independence,
@@ -323,16 +326,19 @@ def _probability_from_float(value: SupportsFloat) -> Decimal | None:
     return min(max(result, _ZERO_6), _ONE_6)
 
 
-def _rate_p_value_from_float(value: SupportsFloat) -> Decimal | None:
-    """Convert the rate test's library p-value, clamped to [0, 1]; ``None`` when not finite.
+def _p_value_from_float(value: SupportsFloat) -> Decimal | None:
+    """Convert a library p-value, clamped to [0, 1]; ``None`` when not finite.
 
+    Used for every p-value this module returns: the CR1 test's (:func:`compare_proportions`),
+    the Holm-adjusted ones (:func:`holm`) and the B4 rate test's (:func:`poisson_rate_test`).
     From 0.000001 (the 6-place quantum) up, and at or below 0, the result is exactly that of
     :func:`_probability_from_float`: rounded half even to 6 decimal places, then clamped. A
     positive p-value below the quantum, which 6 places would round to 0, keeps
     :data:`_P_VALUE_DIGITS` significant digits instead, rounded half even:
-    ``5.7664369391539194e-12`` becomes ``Decimal("5.76644E-12")``. A strong B4 pattern thus
-    records its p-value rather than 0. A library result of exactly 0.0, a p-value that
-    underflowed below the smallest positive double, has no digit to keep and stays 0.
+    ``5.7664369391539194e-12`` becomes ``Decimal("5.76644E-12")``. A strongly separated
+    creative pair or a strong B4 pattern thus records its p-value rather than 0. A library
+    result of exactly 0.0, a p-value that underflowed below the smallest positive double, has
+    no digit to keep and stays 0.
     """
     number = float(value)
     if not math.isfinite(number):
@@ -460,7 +466,12 @@ def compare_proportions(
       Identical rates give p = 1 without calling the test.
 
     The p-value is unadjusted. CR1 calls a pair distinguishable only after :func:`holm`
-    across the campaign's pairs.
+    across the campaign's pairs. It is rounded half even to 6 decimal places from 0.000001
+    up, like every other output of this module. A positive p-value below 0.000001 keeps 6
+    significant digits instead, so a strongly separated pair never records p = 0: 1% against
+    0.5% at 20,000 impressions each gives ``Decimal("6.82090E-9")``. Only a library p-value
+    of exactly 0.0 stays 0. The choice of test uses the exact expected cell, never a rounded
+    figure.
 
     Args:
         x_a: Successes of variant A (leads or clicks).
@@ -470,7 +481,9 @@ def compare_proportions(
         fisher_min_expected: Expected-cell count below which Fisher's exact test is used.
 
     Returns:
-        The test result, or ``None`` ("not estimable") when either variant has zero trials.
+        The test result, with its p-value at 6 decimal places or, below 0.000001, at 6
+        significant digits; ``None`` ("not estimable") when either variant has zero trials
+        or the library p-value is not finite.
 
     Raises:
         TypeError: A count is not an ``int``, or the threshold is not a ``Decimal``/``int``.
@@ -480,6 +493,8 @@ def compare_proportions(
     Example:
         >>> compare_proportions(60, 1000, 90, 1000).method
         'two_proportion_z'
+        >>> compare_proportions(200, 20000, 100, 20000).p_value
+        Decimal('6.82090E-9')
     """
     successes_a, trials_a = _require_successes("x_a", x_a, "n_a", n_a)
     successes_b, trials_b = _require_successes("x_b", x_b, "n_b", n_b)
@@ -509,7 +524,7 @@ def compare_proportions(
                 [successes_a, successes_b], [trials_a, trials_b], alternative=_TWO_SIDED
             )
 
-    p_value = _probability_from_float(raw_p)
+    p_value = _p_value_from_float(raw_p)
     if p_value is None:
         return None
     shown_expected = _context().divide(
@@ -532,14 +547,19 @@ def holm(p_values: Sequence[Decimal], alpha: Decimal = DEFAULT_ALPHA) -> list[De
     family-wise error rate without assuming independence between the pairs. The adjustment
     is ``statsmodels.stats.multitest.multipletests(method="holm")``'s ``pvals_corrected``;
     ``alpha`` only sets the library's reject flags, which this function does not return, so
-    the adjusted values do not depend on it.
+    the adjusted values do not depend on it. Each adjusted value is rounded like
+    :func:`compare_proportions`' p-value: half even to 6 decimal places from 0.000001 up, 6
+    significant digits below it, so an adjusted p-value never reads as 0 unless the library
+    returned exactly 0.0.
 
     Args:
-        p_values: Unadjusted p-values, each in [0, 1].
+        p_values: Unadjusted p-values, each in [0, 1], at any scale (``Decimal("6.82090E-9")``
+            included).
         alpha: Family-wise significance level in (0, 1).
 
     Returns:
-        The adjusted p-values, capped at 1, in the order given; ``[]`` for no input.
+        The adjusted p-values, capped at 1, in the order given, at 6 decimal places or, below
+        0.000001, at 6 significant digits; ``[]`` for no input.
 
     Raises:
         TypeError: A p-value or ``alpha`` is not a ``Decimal``.
@@ -550,6 +570,8 @@ def holm(p_values: Sequence[Decimal], alpha: Decimal = DEFAULT_ALPHA) -> list[De
     Example:
         >>> holm([Decimal("0.04"), Decimal("0.03")])  # both below 0.05 before adjustment
         [Decimal('0.060000'), Decimal('0.060000')]
+        >>> holm([Decimal("6.82090E-9"), Decimal("0.04")])
+        [Decimal('1.36418E-8'), Decimal('0.040000')]
     """
     level = _float_level("alpha", _require_level("alpha", alpha))
     checked = [_require_probability(f"p_values[{i}]", p) for i, p in enumerate(p_values)]
@@ -557,7 +579,7 @@ def holm(p_values: Sequence[Decimal], alpha: Decimal = DEFAULT_ALPHA) -> list[De
         return []
     _, corrected, _, _ = multipletests([float(p) for p in checked], alpha=level, method="holm")
     return [
-        _require_finite(_probability_from_float(value), "multipletests(method='holm')")
+        _require_finite(_p_value_from_float(value), "multipletests(method='holm')")
         for value in corrected
     ]
 
@@ -797,9 +819,10 @@ def poisson_rate_test(
 
     The p-value is rounded half even to 6 decimal places from 0.000001 up, like every other
     output of this module. A positive p-value below 0.000001 keeps 6 significant digits
-    instead (``Decimal("5.76644E-12")``, which evidence renders as ``"0.00000000000576644"``),
-    so a strong pattern never records p = 0. Only a library p-value of exactly 0.0, a
-    p-value that underflowed below the smallest positive double, stays 0.
+    instead, as the CR1 p-values of :func:`compare_proportions` and :func:`holm` do
+    (``Decimal("5.76644E-12")``, which evidence renders as ``"0.00000000000576644"``), so a
+    strong pattern never records p = 0. Only a library p-value of exactly 0.0, a p-value that
+    underflowed below the smallest positive double, stays 0.
 
     Args:
         count_a: Outcomes on side A (for example weekend days), an unweighted event count.
@@ -840,7 +863,7 @@ def poisson_rate_test(
         compare="ratio",
         alternative=_TWO_SIDED,
     )
-    p_value = _rate_p_value_from_float(result.pvalue)
+    p_value = _p_value_from_float(result.pvalue)
     if p_value is None:
         return None
     return RateTest(

@@ -128,6 +128,15 @@ const SIMULATED_FLAG_CODE = 'simulated';
 /** The text the simulated flag's badge starts with ("Simulated data (Google, LinkedIn)"). */
 const SIMULATED_FLAG_TEXT = 'Simulated data';
 
+/**
+ * The flag codes a card reads from `current.flags_now` alone (`LIVE_ONLY_FLAG_CODES` in
+ * `FlagList.tsx`, restated because this spec imports only types): the open-discrepancy count is
+ * read from the overlay.
+ */
+const LIVE_ONLY_FLAG_CODES: ReadonlySet<FlagCode> = new Set<FlagCode>([
+  'unverified_discrepancies',
+]);
+
 /** The mode chip and badge of a simulated source (`SourceChips.tsx`, `SourcesPage.tsx`). */
 const SIMULATED_LABEL = 'Simulated';
 
@@ -522,7 +531,10 @@ function attributeSelector(attribute: string, value: string): string {
 /**
  * The flag badges an item's flags row shows (`mergeFlags` in `FlagList.tsx`), in their order:
  * every code once, the recorded codes first, then those only the overlay carries, each labelled
- * with its current message, else its recorded one, else its code.
+ * with its current message, else its recorded one, else its code. A live-only code
+ * ({@link LIVE_ONLY_FLAG_CODES}) shows only while `item.current.flags_now` carries it, at its
+ * recorded place if recorded, labelled with its current message, else its code, never its
+ * recorded one.
  *
  * @param item - One item.
  * @returns The flags as the row shows them.
@@ -543,10 +555,13 @@ function shownFlags(item: Item): Flag[] {
   };
   collect(item.flags, recorded);
   collect(item.current.flags_now, current);
-  return order.map((code) => ({
-    code,
-    message: current.get(code) ?? recorded.get(code) ?? code,
-  }));
+  const carriedNow = new Set(item.current.flags_now.map((flag) => flag.code));
+  return order.flatMap((code): Flag[] => {
+    if (LIVE_ONLY_FLAG_CODES.has(code)) {
+      return carriedNow.has(code) ? [{ code, message: current.get(code) ?? code }] : [];
+    }
+    return [{ code, message: current.get(code) ?? recorded.get(code) ?? code }];
+  });
 }
 
 /** An item's simulated-data label: the badge text and where its flags row shows it. */

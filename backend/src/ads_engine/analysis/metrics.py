@@ -204,6 +204,7 @@ __all__ = [
     "spend_increase_blocked",
     "status_value",
     "subject_baseline",
+    "subject_baseline_outcomes",
     "subject_campaigns",
     "subject_objective_groups",
     "subject_totals",
@@ -3666,6 +3667,22 @@ def subject_baseline(ctx: AnalysisContext, subject: SubjectKey) -> Decimal | Non
     """
     group = _baseline_group(ctx, subject)
     return None if group is None else baseline_cpo(ctx, *group)
+
+
+def subject_baseline_outcomes(ctx: AnalysisContext, subject: SubjectKey) -> Decimal | None:
+    """Return the outcome count :func:`subject_baseline` divides by (AAP 0.5.4.1 "Efficiency").
+
+    The window outcomes of the subject's account and objective group, so a card can tell a
+    baseline whose known denominator is 0 (no finite cost, shown as "—") from one that is
+    unavailable. ``None`` when the subject has no single account and objective group, or when
+    the group's outcomes are unavailable (:class:`Totals`).
+
+    Raises:
+        KeyError: When the subject is not in the context.
+        ValueError: For an unknown subject type or a budget that is not explicitly shared.
+    """
+    group = _baseline_group(ctx, subject)
+    return None if group is None else _baseline_totals(ctx, *group).outcomes
 
 
 def _baseline_group(ctx: AnalysisContext, subject: SubjectKey) -> tuple[int, str] | None:

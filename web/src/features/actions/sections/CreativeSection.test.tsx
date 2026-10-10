@@ -17,8 +17,10 @@
  *   distinguishable" badge is the API's flag; the section never declares a winner.
  * - **Completion-rate units (CR3).** A completion-rate next test is stated in form opens, the
  *   stage's own denominator, with its labelled projection to impressions.
- * - The variants table is evidence: it stays when feedback hides the CR3 card, and it is left out
- *   for a block whose first item carries no variants.
+ * - The variants table is evidence: it stays when feedback hides the CR3 card, it is read from
+ *   the first item in API order that carries variants (a CR1 pair when the block holds no CR3,
+ *   whose next test was withheld or suppressed by feedback), and it is left out only for a block
+ *   none of whose items carries variants.
  *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
  * the test.
@@ -101,9 +103,12 @@ function creativeWith(...groups: Group[]): Section {
 
 /**
  * A visible, live CR1 pair card with the API's action text. A pair that is not distinguishable
- * carries the API's `not_distinguishable` flag with `flagMessage`.
+ * carries the API's `not_distinguishable` flag with `flagMessage`. With `rows`, the pair carries
+ * them as the campaign's variants table (`extra.variants`), as `creative._pair_candidate` freezes
+ * it; without, it carries none.
  */
-function pairItem(id: number, action: string, flagMessage: string | null): Item {
+function pairItem(id: number, action: string, flagMessage: string | null, rows?: unknown[]): Item {
+  const distinguishable = flagMessage === null;
   return makeItem({
     id,
     rank: id,
@@ -111,7 +116,9 @@ function pairItem(id: number, action: string, flagMessage: string | null): Item 
     action,
     reason: `Pair ${String(id)} compared on leads per impression.`,
     flags: flagMessage === null ? [] : [makeFlag('not_distinguishable', { message: flagMessage })],
-    evidence: makeEvidence({ extra: { distinguishable: flagMessage === null } }),
+    evidence: makeEvidence({
+      extra: rows === undefined ? { distinguishable } : { distinguishable, variants: rows },
+    }),
   });
 }
 
@@ -450,11 +457,79 @@ describe('CreativeSection', () => {
       expect(within(block).getAllByRole('article')).toHaveLength(1);
     });
 
-    it('leaves the table out of a block whose first item has no variants, and captions by key when untitled', async () => {
-      const pairsOnly = makeGroup({
+    it('renders the variants table of a block holding only CR1 pairs, its CR3 withheld or suppressed', async () => {
+      // Every CR1 pair freezes the campaign's variants table (creative._pair_candidate).
+      const rows = [
+        { creative_id: 9011, name: 'Variant D', impressions: 6000, leads: 30, click_rate: '0.005' },
+        { creative_id: 9012, name: 'Variant E', impressions: 5500, leads: 11, click_rate: '0.004' },
+        { creative_id: 9013, name: 'Variant F', impressions: 5100, leads: 12, click_rate: '0.006' },
+      ];
+      const first = pairItem(
+        54,
+        'Variant D vs Variant E: Distinguishable (adjusted p = 0.03)',
+        null,
+        rows,
+      );
+      const second = pairItem(
+        57,
+        'Variant D vs Variant F: Variant D ahead, not yet distinguishable (adjusted p = 0.09)',
+        'Not yet distinguishable (adjusted p = 0.09)',
+        rows,
+      );
+      await renderCreative(
+        creativeWith(
+          makeGroup({ key: 'campaign:777', title: 'Pairs only', items: [first, second] }),
+        ),
+      );
+
+      const block = screen.getByRole('region', { name: 'Pairs only' });
+      const table = within(block).getByRole('table', { name: 'Variants in Pairs only' });
+      expect(headers(table)).toEqual(VARIANT_HEADERS);
+      expect(bodyRows(table).map((row) => [row[0], row[1], row[5]])).toEqual([
+        ['Variant D', '6,000', '30'],
+        ['Variant E', '5,500', '11'],
+        ['Variant F', '5,100', '12'],
+      ]);
+      expect(within(block).getAllByRole('table', { name: /^Variants in/u })).toHaveLength(1);
+      // The table leads the block, then the pair cards follow in API order.
+      const firstCard = within(block).getByRole('article', { name: first.action });
+      const secondCard = within(block).getByRole('article', { name: second.action });
+      expect(within(block).getAllByRole('article')).toEqual([firstCard, secondCard]);
+      expect(precedes(table, firstCard)).toBe(true);
+    });
+
+    it('reads the variants table from the first item that carries it when an earlier item carries none', async () => {
+      const bare = pairItem(
+        54,
+        'Variant D vs Variant E: Distinguishable (adjusted p = 0.03)',
+        null,
+      );
+      const carrying = pairItem(
+        57,
+        'Variant D vs Variant F: Distinguishable (adjusted p = 0.04)',
+        null,
+        [{ creative_id: 9021, name: 'Later variant', impressions: 2500, click_rate: '0.006' }],
+      );
+      await renderCreative(
+        creativeWith(
+          makeGroup({ key: 'campaign:780', title: 'Later rows', items: [bare, carrying] }),
+        ),
+      );
+
+      const block = screen.getByRole('region', { name: 'Later rows' });
+      const table = within(block).getByRole('table', { name: 'Variants in Later rows' });
+      expect(bodyRows(table).map((row) => [row[0], row[1]])).toEqual([['Later variant', '2,500']]);
+      expect(within(block).getAllByRole('article')).toHaveLength(2);
+    });
+
+    it('leaves the table out of a block none of whose items carries variants, and captions by key when untitled', async () => {
+      const bare = makeGroup({
         key: 'campaign:777',
-        title: 'Pairs only',
-        items: [pairItem(54, 'Variant D vs Variant E: Distinguishable (adjusted p = 0.03)', null)],
+        title: 'No variants',
+        items: [
+          pairItem(54, 'Variant D vs Variant E: Distinguishable (adjusted p = 0.03)', null),
+          pairItem(57, 'Variant D vs Variant F: Distinguishable (adjusted p = 0.04)', null, []),
+        ],
       });
       const untitled = makeGroup({
         key: 'campaign:778',
@@ -465,13 +540,13 @@ describe('CreativeSection', () => {
           ]),
         ],
       });
-      await renderCreative(creativeWith(pairsOnly, untitled));
+      await renderCreative(creativeWith(bare, untitled));
 
-      const pairsBlock = screen.getByRole('region', { name: 'Pairs only' });
-      expect(within(pairsBlock).queryByRole('table', { name: /^Variants in/u })).toBeNull();
-      // The card's own evidence table is still there.
-      expect(within(pairsBlock).getByRole('table', { name: 'Evidence' })).toBeTruthy();
-      expect(within(pairsBlock).getAllByRole('article')).toHaveLength(1);
+      const bareBlock = screen.getByRole('region', { name: 'No variants' });
+      expect(within(bareBlock).queryByRole('table', { name: /^Variants in/u })).toBeNull();
+      // The cards still render, each with its own evidence table.
+      expect(within(bareBlock).getAllByRole('article')).toHaveLength(2);
+      expect(within(bareBlock).getAllByRole('table', { name: 'Evidence' })).toHaveLength(2);
       // The caption names the same campaign as the heading: the key, for a blank title.
       const untitledBlock = screen.getByRole('region', { name: 'campaign:778' });
       expect(

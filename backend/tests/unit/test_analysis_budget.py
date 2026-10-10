@@ -43,7 +43,7 @@ from ads_engine.analysis.budget import (
     render_b1_funding,
     render_b3_allocation,
 )
-from ads_engine.analysis.campaigns import VETO_THRESHOLD_KEYS
+from ads_engine.analysis.campaigns import VETO_THRESHOLD_KEYS, cost_per_outcome_value
 from ads_engine.analysis.context import (
     B1,
     B2,
@@ -83,6 +83,7 @@ from ads_engine.analysis.metrics import (
     budget_subjects,
     high_utilization,
     member_poor_efficiency,
+    subject_baseline_outcomes,
     subject_campaigns,
     under_utilized,
 )
@@ -501,8 +502,15 @@ def test_formatting_helpers_render_amounts_counts_shares_and_p_values() -> None:
     assert budget._money(Decimal("1400"), "USD") == "USD 1,400.00"
     assert budget._money(Decimal("12.5"), "") == "12.50"
     assert budget._money(1000, "JPY") == "JPY 1,000"
-    assert budget._cost(None, "USD") == "—"
-    assert budget._cost(Decimal("12.345"), "USD") == "USD 12.35"
+    # A known zero outcome count is a zero denominator ("—"); an unreported one is unavailable.
+    # Budget cards record their costs through the campaigns module's one rendering of them.
+    assert cost_per_outcome_value(None, Decimal(0)) == "—"
+    assert cost_per_outcome_value(None, 0) == "—"
+    assert cost_per_outcome_value(None, None) is None
+    assert cost_per_outcome_value(Decimal(5), None) is None
+    assert cost_per_outcome_value(Decimal(10) / Decimal(3), Decimal(3)) == Decimal("3.333333")
+    assert cost_per_outcome_value(None, Decimal(3)) is None
+    assert budget._money("—", "USD") == "—"
     assert budget._percent(Decimal("0.1304")) == "13%"
     assert budget._percent(Decimal("0.0909")) == "9.1%"
     assert budget._number(None) == "unavailable"
@@ -830,7 +838,15 @@ def test_b2_zero_outcome_branch_fires_when_expected_outcomes_reach_the_minimum()
     metrics = _metrics(item)
     assert item.evidence.extra["branch"] == "zero_outcomes"
     assert metrics["outcomes"] == 0
-    assert metrics["cost_per_outcome"] is None
+    # A known 0 leads is a zero denominator: "—", never flagged unavailable (AAP 0.5.5), while
+    # the account baseline, whose leads are known and positive, keeps its finite cost.
+    assert metrics["cost_per_outcome"] == "—"
+    cost = item.evidence.metric("cost_per_outcome").to_json()
+    assert cost["value"] == "—"
+    assert "unavailable" not in cost
+    assert isinstance(item.evidence.baselines[0].value, Decimal)
+    assert item.evidence.extra["headline_metric"] == "outcomes"
+    assert "unavailable" not in item.reason
     expected = metrics["expected_outcomes"]
     assert isinstance(expected, Decimal)
     assert expected >= silent.thresholds.ratio("b2.min_expected_outcomes")
@@ -908,6 +924,51 @@ def test_b3_is_silent_when_headroom_lifts_the_proposal_to_the_current_budget() -
     assert isinstance(observed, Decimal)
     tuned = _tuned(scenario, ctx, {"b3.headroom": float(current / observed)})
     assert _items(budget.evaluate(tuned), B3) == []
+
+
+@pytest.mark.parametrize("leads", ["known_zero", "unreported"])
+def test_b3_costs_read_a_dash_at_known_zero_outcomes_and_unavailable_when_unreported(
+    leads: str,
+) -> None:
+    """AAP 0.5.5 and 0.11.1: a zero denominator reads "—"; only an unknown one is unavailable.
+
+    B3 is judged on utilization alone, so it fires whatever slack's leads are. slack is the only
+    campaign of its account and objective group, so its leads are also the account baseline's
+    denominator: at a known 0 leads both costs read "—" and neither is flagged unavailable;
+    with one day's leads unreported both are ``None``, which the card marks unavailable.
+    """
+    scenario, ctx = _built("b3.idle_known.fires")
+    slack = _campaign_id(scenario, "linkedin", "slack")
+    subject: SubjectKey = ("campaign", slack)
+    days = ctx.campaign_days[slack]
+    window = ctx.window
+    first = min(day.date for day in days if window.start <= day.date <= window.end)
+    unreported = first if leads == "unreported" else None
+    changed = _with_days(
+        ctx, slack, (replace(day, leads=None if day.date == unreported else 0) for day in days)
+    )
+    item = _only(budget.evaluate(changed), B3)
+    cost = item.evidence.metric("cost_per_outcome")
+    baseline = item.evidence.baselines[0]
+    assert baseline.key == "baseline_cost_per_outcome"
+    if leads == "known_zero":
+        assert _metrics(item)["outcomes"] == 0
+        assert subject_baseline_outcomes(changed, subject) == 0
+        assert (cost.value, baseline.value) == ("—", "—")
+        assert cost.to_json() == {
+            "key": "cost_per_outcome",
+            "label": "Cost per lead",
+            "value": "—",
+            "unit": "currency",
+            "currency": "USD",
+        }
+        assert baseline.to_json()["value"] == "—"
+        return
+    assert _metrics(item)["outcomes"] is None
+    assert subject_baseline_outcomes(changed, subject) is None
+    assert (cost.value, baseline.value) == (None, None)
+    assert cost.to_json()["unavailable"] is True
+    assert baseline.to_json()["value"] is None
 
 
 def test_b3_never_reallocates_from_a_budget_that_only_idles() -> None:
