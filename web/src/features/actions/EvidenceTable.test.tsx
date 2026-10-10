@@ -701,4 +701,3 @@ describe('EvidenceTable rendered again', () => {
     expect(tableTexts('Budget evidence')[1]).toEqual(['Spend', expected, '—']);
   });
 });
-

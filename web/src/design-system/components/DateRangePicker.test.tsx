@@ -26,8 +26,16 @@
  * jsdom, like a browser, sanitizes the value of an `<input type="date">`, so a malformed or
  * impossible date cannot be typed into a field. Such dates reach the picker's drafts the way a
  * reopened custom run does: through a custom `value`.
+ *
+ * Keyboard operation is exercised with Tab, Shift+Tab, Enter and Space. jsdom performs no
+ * sequential navigation, key activation or implicit submission of its own, so the local helpers
+ * dispatch each key to the focused element and take the browser's default step (moving focus,
+ * activating a focused button, or submitting the form from a date field through its default
+ * button) only when no handler prevented the key. One case wraps the picker in a handler that
+ * prevents Enter and Space, showing that the keyboard cases depend on that step. jsdom cannot
+ * type into a date input either, so field values are still entered with `change` events.
  */
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { DateRangePicker, type DateRangePickerProps, type DateRangeValue } from './DateRangePicker';
@@ -119,6 +127,226 @@ function pressedStates(): (string | null)[] {
     .getAllByRole('button')
     .filter((button) => button.textContent !== 'Custom range')
     .map((button) => button.getAttribute('aria-pressed'));
+}
+
+/**
+ * The `<input>` types that block implicit submission (HTML, "Implicit submission"): Enter in one
+ * of these fields submits its form.
+ */
+const IMPLICIT_SUBMISSION_TYPES: ReadonlySet<string> = new Set([
+  'text',
+  'search',
+  'url',
+  'tel',
+  'email',
+  'password',
+  'date',
+  'month',
+  'week',
+  'time',
+  'datetime-local',
+  'number',
+]);
+
+/**
+ * Whether `element` is a stop in the page's sequential focus navigation order, judged as a
+ * browser judges it and independently of the picker: a non-negative `tabIndex`, not a disabled
+ * form control or a hidden input, and not inside a `[hidden]`, `[inert]` or `display: none`
+ * subtree.
+ */
+function isTabStop(element: HTMLElement): boolean {
+  if (element.tabIndex < 0 || element.matches(':disabled')) {
+    return false;
+  }
+  if (element instanceof HTMLInputElement && element.type === 'hidden') {
+    return false;
+  }
+  if (element.closest('[hidden], [inert]') !== null) {
+    return false;
+  }
+  for (let node: Element | null = element; node !== null; node = node.parentElement) {
+    if (getComputedStyle(node).display === 'none') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The page's sequential focus navigation order: positive `tabIndex` stops in ascending order
+ * (ties in tree order), then the `tabIndex` 0 stops in tree order.
+ */
+function tabOrder(): HTMLElement[] {
+  const stops = Array.from(document.body.querySelectorAll('*')).filter(
+    (element): element is HTMLElement => element instanceof HTMLElement && isTabStop(element),
+  );
+  const positive = stops
+    .filter((stop) => stop.tabIndex > 0)
+    .sort((a, b) => a.tabIndex - b.tabIndex);
+  return [...positive, ...stops.filter((stop) => stop.tabIndex === 0)];
+}
+
+/**
+ * The stop a browser's Tab (or Shift+Tab) moves to from `from`: from the body, the first (last)
+ * stop; from a stop, the next (previous) one; from a focused element outside the order, the
+ * neighbouring stops of its place in tree order, as if it had `tabIndex` 0.
+ *
+ * @param from - the focused element
+ * @param backwards - `true` for Shift+Tab
+ * @returns the stop to focus, or `null` when the sequence is exhausted in that direction
+ */
+function nextTabStop(from: Element, backwards: boolean): HTMLElement | null {
+  const order = tabOrder();
+  if (from === document.body) {
+    return (backwards ? order.at(-1) : order[0]) ?? null;
+  }
+  const index = order.findIndex((stop) => stop === from);
+  if (index >= 0) {
+    return order[backwards ? index - 1 : index + 1] ?? null;
+  }
+  const following = order.findIndex(
+    (stop) =>
+      stop.tabIndex === 0 &&
+      (from.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+  );
+  const place = following >= 0 ? following : order.length;
+  return order[backwards ? place - 1 : place] ?? null;
+}
+
+/**
+ * Presses Tab (or Shift+Tab) on the focused element. A keydown that no handler prevents leaves the
+ * step to the browser, so the browser's step is simulated: focus moves to the next (previous)
+ * stop of the page's sequential focus navigation order. The keyup goes to the element focused
+ * afterwards, as in a browser.
+ *
+ * @param shiftKey - `true` for Shift+Tab
+ * @returns the newly focused element, or `null` when a handler prevented the keydown or the
+ * sequence is exhausted, in which case focus has not moved
+ */
+function pressTab(shiftKey = false): HTMLElement | null {
+  const from = document.activeElement ?? document.body;
+  const allowed = fireEvent.keyDown(from, { key: 'Tab', code: 'Tab', shiftKey });
+  const next = allowed ? nextTabStop(from, shiftKey) : null;
+  if (next !== null) {
+    act(() => {
+      next.focus();
+    });
+  }
+  fireEvent.keyUp(document.activeElement ?? document.body, { key: 'Tab', code: 'Tab', shiftKey });
+  return next;
+}
+
+/** Whether `element` is a native button, which Enter and Space activate. */
+function isNativeButton(element: Element): element is HTMLButtonElement | HTMLInputElement {
+  return (
+    element instanceof HTMLButtonElement ||
+    (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type))
+  );
+}
+
+/**
+ * Submits `form` implicitly, as Enter in one of its fields does (HTML, "Implicit submission"):
+ * a click on the form's default button, its first submit button in tree order, which does nothing
+ * while that button is disabled; with no submit button, the form is submitted only when at most
+ * one of its fields blocks implicit submission. The controls are read from the document rather
+ * than `form.elements`, which omits image buttons.
+ */
+function submitImplicitly(form: HTMLFormElement): void {
+  const controls = Array.from(form.ownerDocument.querySelectorAll('button, input')).filter(
+    (control): control is HTMLButtonElement | HTMLInputElement =>
+      (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) &&
+      control.form === form,
+  );
+  const defaultButton = controls.find(
+    (control) => control.type === 'submit' || control.type === 'image',
+  );
+  if (defaultButton !== undefined) {
+    act(() => {
+      defaultButton.click();
+    });
+    return;
+  }
+  const blocking = controls.filter(
+    (control) => control instanceof HTMLInputElement && IMPLICIT_SUBMISSION_TYPES.has(control.type),
+  );
+  if (blocking.length <= 1) {
+    act(() => {
+      form.requestSubmit();
+    });
+  }
+}
+
+/**
+ * Presses Enter on the focused element. When no handler prevents the keydown or the keypress,
+ * the browser's step is simulated: a native button is activated, and a text-like field of a form
+ * (a date field included) submits that form implicitly. The keyup goes to the element focused
+ * afterwards, since a failed Apply may move focus.
+ *
+ * @returns `true` when no handler prevented the key, so the browser's step was taken
+ */
+function pressEnter(): boolean {
+  const target = document.activeElement ?? document.body;
+  const allowed =
+    fireEvent.keyDown(target, { key: 'Enter', code: 'Enter' }) &&
+    fireEvent.keyPress(target, { key: 'Enter', code: 'Enter', charCode: 13 });
+  if (allowed) {
+    if (isNativeButton(target)) {
+      act(() => {
+        target.click();
+      });
+    } else if (
+      target instanceof HTMLInputElement &&
+      target.form !== null &&
+      IMPLICIT_SUBMISSION_TYPES.has(target.type)
+    ) {
+      submitImplicitly(target.form);
+    }
+  }
+  fireEvent.keyUp(document.activeElement ?? document.body, { key: 'Enter', code: 'Enter' });
+  return allowed;
+}
+
+/**
+ * Presses Space on the focused element. A native button activates on the keyup, so it is
+ * activated only when no handler prevented the keydown or the keyup.
+ *
+ * @returns `true` when no handler prevented the key, so the browser's step was taken
+ */
+function pressSpace(): boolean {
+  const target = document.activeElement ?? document.body;
+  const downAllowed = fireEvent.keyDown(target, { key: ' ', code: 'Space' });
+  const upAllowed = fireEvent.keyUp(target, { key: ' ', code: 'Space' });
+  const allowed = downAllowed && upAllowed;
+  if (allowed && isNativeButton(target)) {
+    act(() => {
+      target.click();
+    });
+  }
+  return allowed;
+}
+
+/**
+ * Presses Tab until `element` has focus.
+ *
+ * @throws when the Tab sequence ends before reaching `element`
+ */
+function tabTo(element: HTMLElement): void {
+  while (document.activeElement !== element) {
+    if (pressTab() === null) {
+      throw new Error(`Tab never reached ${element.outerHTML}`);
+    }
+  }
+}
+
+/**
+ * Presses Tab (or Shift+Tab) once per element of `stops`, asserting that focus lands on each in
+ * turn.
+ */
+function expectTabStops(stops: readonly HTMLElement[], shiftKey = false): void {
+  for (const stop of stops) {
+    expect(pressTab(shiftKey)).toBe(stop);
+    expect(document.activeElement).toBe(stop);
+  }
 }
 
 describe('DateRangePicker', () => {
@@ -476,7 +704,7 @@ describe('DateRangePicker', () => {
       expect(secondSummary).not.toBe(firstSummary);
     });
 
-    it('submits from a date field, as Enter does, and keeps focus there', () => {
+    it('validates a direct form submission from a date field and keeps focus there', () => {
       const { onSelectCustom } = renderPicker();
       fireEvent.click(customToggle());
       fireEvent.change(startField(), { target: { value: '2026-09-01' } });
@@ -598,6 +826,275 @@ describe('DateRangePicker', () => {
       expect(onSelectCustom).not.toHaveBeenCalled();
       expect(startField().hasAttribute('aria-invalid')).toBe(false);
       expect(statusRegion().textContent).toBe('');
+    });
+  });
+
+  describe('keyboard operation', () => {
+    /** A custom value whose range is valid for the fixture: it opens the panel prefilled. */
+    const CUSTOM_VALUE: DateRangeValue = { kind: 'custom', start: '2026-09-01', end: '2026-09-30' };
+
+    /**
+     * Renders a picker followed by a raw "After" button, the page's next stop, so a Tab past the
+     * picker's last stop shows where focus goes. With `blockKeys`, the picker sits inside a
+     * wrapper whose keydown handler prevents Enter and Space, as a page-level key handler might.
+     */
+    function renderInPage(overrides: Partial<DateRangePickerProps> = {}, blockKeys = false) {
+      const { props, onSelectPreset, onSelectCustom } = pickerProps(overrides);
+      const picker = <DateRangePicker {...props} />;
+      render(
+        <>
+          {blockKeys ? (
+            <div
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                }
+              }}
+            >
+              {picker}
+            </div>
+          ) : (
+            picker
+          )}
+          <button type="button">After</button>
+        </>,
+      );
+      return { onSelectPreset, onSelectCustom, after: button('After') };
+    }
+
+    /** The visible button named `name`. */
+    function button(name: string): HTMLElement {
+      return screen.getByRole('button', { name });
+    }
+
+    /** Tabs from where focus is to the "Custom range" toggle and opens its panel with Enter. */
+    function openCustomByKeyboard(): void {
+      tabTo(customToggle());
+      expect(pressEnter()).toBe(true);
+      expect(customToggle().getAttribute('aria-expanded')).toBe('true');
+    }
+
+    it('reaches the presets and Custom range in order with Tab, not the collapsed panel', () => {
+      const { after } = renderInPage();
+      const presets = ['7 days', '21 days (default)', '35 days'].map(button);
+      const panel = document.getElementById(customToggle().getAttribute('aria-controls') ?? '');
+      expect(panel?.hidden).toBe(true);
+      expect(document.activeElement).toBe(document.body);
+
+      expectTabStops([...presets, customToggle(), after]);
+      expect(pressTab()).toBeNull();
+      expect(document.activeElement).toBe(after);
+
+      expectTabStops([customToggle(), ...presets.toReversed()], true);
+      expect(pressTab(true)).toBeNull();
+      expect(document.activeElement).toBe(presets[0]);
+    });
+
+    it('toggles Custom range with Enter and Space, its fields Tab stops only while open', () => {
+      const { after } = renderInPage();
+      const toggle = customToggle();
+      const panel = document.getElementById(toggle.getAttribute('aria-controls') ?? '');
+      tabTo(toggle);
+
+      expect(pressEnter()).toBe(true);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(panel?.hidden).toBe(false);
+      expect(document.activeElement).toBe(toggle);
+      const applyButton = button('Apply');
+      expectTabStops([startField(), endField(), applyButton, after]);
+      expectTabStops([applyButton, endField(), startField(), toggle], true);
+
+      expect(pressSpace()).toBe(true);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(panel?.hidden).toBe(true);
+      expect(document.activeElement).toBe(toggle);
+      expectTabStops([after]);
+      expectTabStops([toggle], true);
+    });
+
+    it('reports a preset activated with Enter and one with Space, keeping focus on each', () => {
+      const { onSelectPreset, onSelectCustom } = renderInPage();
+      const longest = button('35 days');
+      const shortest = button('7 days');
+      tabTo(longest);
+
+      expect(pressEnter()).toBe(true);
+
+      expect(onSelectPreset).toHaveBeenCalledTimes(1);
+      expect(onSelectPreset).toHaveBeenNthCalledWith(1, 35);
+      expect(document.activeElement).toBe(longest);
+
+      expectTabStops([button('21 days (default)'), shortest], true);
+      expect(pressSpace()).toBe(true);
+
+      expect(onSelectPreset).toHaveBeenCalledTimes(2);
+      expect(onSelectPreset).toHaveBeenNthCalledWith(2, 7);
+      expect(document.activeElement).toBe(shortest);
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(pressedStates()).toEqual(['false', 'true', 'false']);
+    });
+
+    it('submits a valid range on Enter in End date and keeps focus there', () => {
+      const { onSelectCustom } = renderInPage();
+      openCustomByKeyboard();
+      expectTabStops([startField()]);
+      fireEvent.change(startField(), { target: { value: '2026-09-01' } });
+      expectTabStops([endField()]);
+      fireEvent.change(endField(), { target: { value: '2026-09-30' } });
+
+      expect(pressEnter()).toBe(true);
+
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
+      expect(onSelectCustom).toHaveBeenCalledWith('2026-09-01', '2026-09-30');
+      expect(statusRegion().textContent).toBe('');
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
+      expect(document.activeElement).toBe(endField());
+    });
+
+    it('submits a valid range on Enter in Start date and keeps focus there', () => {
+      const { onSelectCustom } = renderInPage();
+      openCustomByKeyboard();
+      expectTabStops([startField()]);
+      fireEvent.change(startField(), { target: { value: '2026-08-03' } });
+      expectTabStops([endField()]);
+      fireEvent.change(endField(), { target: { value: '2026-08-30' } });
+      expectTabStops([startField()], true);
+
+      expect(pressEnter()).toBe(true);
+
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
+      expect(onSelectCustom).toHaveBeenCalledWith('2026-08-03', '2026-08-30');
+      expect(statusRegion().textContent).toBe('');
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
+      expect(document.activeElement).toBe(startField());
+    });
+
+    it('names an empty End date on Enter there, keeps focus on it and announces the error', () => {
+      const { onSelectCustom } = renderInPage();
+      openCustomByKeyboard();
+      expectTabStops([startField()]);
+      fireEvent.change(startField(), { target: { value: '2026-09-01' } });
+      expectTabStops([endField()]);
+
+      expect(pressEnter()).toBe(true);
+
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(endField());
+      expect(endField().getAttribute('aria-invalid')).toBe('true');
+      expect(messageOf(endField())).toBe('Enter an end date');
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(statusRegion().textContent).toBe('1 error: End date: Enter an end date.');
+    });
+
+    it.each([
+      ['an empty Start date', '', '2026-09-30', 'Enter a start date'],
+      [
+        'a Start date after the End date',
+        '2026-09-20',
+        '2026-09-10',
+        'Start date must be on or before the end date',
+      ],
+    ])(
+      'moves focus to Start date for %s on Enter in End date and announces the error',
+      (_case, start, end, message) => {
+        const { onSelectCustom } = renderInPage();
+        openCustomByKeyboard();
+        tabTo(endField());
+        fireEvent.change(startField(), { target: { value: start } });
+        fireEvent.change(endField(), { target: { value: end } });
+
+        expect(pressEnter()).toBe(true);
+
+        expect(onSelectCustom).not.toHaveBeenCalled();
+        expect(document.activeElement).toBe(startField());
+        expect(startField().getAttribute('aria-invalid')).toBe('true');
+        expect(messageOf(startField())).toBe(message);
+        expect(endField().hasAttribute('aria-invalid')).toBe(false);
+        expect(statusRegion().textContent).toBe(`1 error: Start date: ${message}.`);
+      },
+    );
+
+    it.each([
+      ['Space', pressSpace],
+      ['Enter', pressEnter],
+    ])('applies a valid range with %s on Apply', (_key, press) => {
+      const { onSelectCustom } = renderInPage();
+      openCustomByKeyboard();
+      fireEvent.change(startField(), { target: { value: '2026-09-01' } });
+      fireEvent.change(endField(), { target: { value: '2026-09-30' } });
+      const applyButton = button('Apply');
+      tabTo(applyButton);
+
+      expect(press()).toBe(true);
+
+      expect(onSelectCustom).toHaveBeenCalledTimes(1);
+      expect(onSelectCustom).toHaveBeenCalledWith('2026-09-01', '2026-09-30');
+      expect(statusRegion().textContent).toBe('');
+      expect(document.activeElement).toBe(applyButton);
+    });
+
+    it('names both empty fields on Space on Apply and moves focus to Start date', () => {
+      const { onSelectCustom } = renderInPage();
+      openCustomByKeyboard();
+      tabTo(button('Apply'));
+
+      expect(pressSpace()).toBe(true);
+
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(startField());
+      expect(messageOf(startField())).toBe('Enter a start date');
+      expect(messageOf(endField())).toBe('Enter an end date');
+      expect(statusRegion().textContent).toBe(
+        '2 errors: Start date: Enter a start date. End date: Enter an end date.',
+      );
+    });
+
+    it('takes no keyboard action when a handler prevents Enter and Space', () => {
+      const { onSelectPreset, onSelectCustom } = renderInPage({ value: CUSTOM_VALUE }, true);
+      const toggle = customToggle();
+
+      tabTo(button('35 days'));
+      expect(pressEnter()).toBe(false);
+      expect(pressSpace()).toBe(false);
+      expect(onSelectPreset).not.toHaveBeenCalled();
+
+      tabTo(toggle);
+      expect(pressEnter()).toBe(false);
+      expect(pressSpace()).toBe(false);
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+      tabTo(endField());
+      expect(endField().value).toBe('2026-09-30');
+      expect(pressEnter()).toBe(false);
+      tabTo(button('Apply'));
+      expect(pressEnter()).toBe(false);
+      expect(pressSpace()).toBe(false);
+
+      expect(onSelectCustom).not.toHaveBeenCalled();
+      expect(onSelectPreset).not.toHaveBeenCalled();
+      expect(statusRegion().textContent).toBe('');
+      expect(startField().hasAttribute('aria-invalid')).toBe(false);
+      expect(endField().hasAttribute('aria-invalid')).toBe(false);
+    });
+
+    it('offers no Tab stop while disabled, even with its custom panel open', () => {
+      const { after } = renderInPage({ disabled: true, value: CUSTOM_VALUE });
+      expect(customToggle().getAttribute('aria-expanded')).toBe('true');
+
+      expectTabStops([after]);
+      expect(pressTab()).toBeNull();
+      expect(pressTab(true)).toBeNull();
+      expect(document.activeElement).toBe(after);
+
+      act(() => {
+        after.blur();
+      });
+      expect(document.activeElement).toBe(document.body);
+      expectTabStops([after], true);
     });
   });
 

@@ -36,11 +36,14 @@ failure message (``{"event": "cli_error", "level": "error", "logger": "ads_engin
 "message": "ads-engine: …", "timestamp": "…Z"}``) and one ``cli_warning`` line, the same keys
 with ``"level": "warning"``, per note that is not a failure (each surface ``capture-fixtures``
 reports as not captured, which on its own leaves the exit 0). Both are written whatever
-``--log-level`` is. stdout carries only command output: the password hash, JSON reports and
-written file paths. Neither stream ever carries a secret, a token or an email address. The
-boundary is argparse: its usage errors are written before logging is configured and stay plain
-usage text, and they never repeat the supplied text: they name only the arguments, commands and
-choices the parser defines.
+``--log-level`` is. stderr never carries a secret, a token or an email address. stdout carries
+only command output: the JSON reports of ``sync``, ``analyze`` and ``seed-simulated`` and the
+paths ``capture-fixtures`` writes, none of which carries a secret, a token or an email address.
+The exception is ``hash-password``, whose stdout is the argon2id password hash, the secret
+value of ``APP_ADMIN_PASSWORD_HASH``: a credential to capture straight into configuration,
+never to log. The boundary is argparse: its usage errors are written before logging is
+configured and stay plain usage text, and they never repeat the supplied text: they name only
+the arguments, commands and choices the parser defines.
 
 Imports: the analysis, sync, connector, simulation and Alembic modules are imported inside the
 command that needs them, so ``hash-password`` runs in a minimal environment and ``--help``

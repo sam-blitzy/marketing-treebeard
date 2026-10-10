@@ -48,9 +48,15 @@ Components, schedule, datasets and fallback: [docs/architecture.md](docs/archite
 ## Data sources
 
 - **Google Ads**, only through the existing n8n Cloud webhook. Each call is
-  `POST {N8N_GOOGLE_ADS_WEBHOOK_URL}` with the shared-secret header and the body
-  `{"customer_id", "query", "page_token"}`, carrying one GAQL query that n8n runs as
-  `googleAds:search` on API v25, never `searchStream`. No Google client ID, client secret,
+  `POST {N8N_GOOGLE_ADS_WEBHOOK_URL}` with the shared-secret header, carrying one GAQL query that
+  n8n runs as `googleAds:search` on API v25, never `searchStream`. The JSON body is:
+
+  ```json
+  {"customer_id": "<10 digits, no dashes>", "query": "<GAQL>", "page_token": null}
+  ```
+
+  `page_token` is `null` on a query's first call; when a response returns a `nextPageToken`, the
+  next call sends that string back as `page_token`. No Google client ID, client secret,
   refresh token or developer token exists in the product; they stay in n8n's credential store.
   The Google Ads quota is shared with every other n8n workflow on that credential, so the product
   caps its own webhook calls at `GOOGLE_DAILY_CALL_BUDGET` (default 1000) per sliding 24 h.
@@ -147,8 +153,11 @@ make check-tools
 With no source credentials, every source resolves to simulated data with the reason
 "credentials not configured". The worker builds and backfills a simulated dataset per source and
 runs the default analysis before its first scheduled cycle. Simulated data is seeded
-(`MOCK_SEED`, default 42), so it reproduces exactly, and it is rendered in each source's live
-wire contract, so the same clients, parsers and rules run unchanged. Everything simulated is
+(`MOCK_SEED`, default 42): the same seed, scenario, configuration and clock reproduce it exactly,
+and the tests fix the clock to pin their expected numbers. The running product sets no anchor date:
+its world is anchored to the current UTC date when it is built, so a stack first started on a later
+day gets its dates rolled forward and different numbers. Simulated data is rendered in each source's
+live wire contract, so the same clients, parsers and rules run unchanged. Everything simulated is
 labelled: a "Simulated" chip per source, a global banner naming each simulated source and its
 reason, and a "Simulated data" flag on every affected item.
 
@@ -189,43 +198,43 @@ Probes, failure handling, token bootstrap and HubSpot scopes:
 
 `.env.example` lists every variable; `make init` copies it to `.env`.
 
-| Group | Variable | Default in `.env.example` | Meaning |
-| --- | --- | --- | --- |
-| Runtime | `POSTGRES_DB` | `ads_engine` | Database the `db` service creates |
-| Runtime | `POSTGRES_USER` | `ads` | Database role the `db` service creates |
-| Runtime | `POSTGRES_PASSWORD` | `ads` (local only) | Role password; change it for any shared host |
-| Runtime | `DATABASE_URL` | `postgresql+psycopg://ads:ads@db:5432/ads_engine` | SQLAlchemy URL used by `migrate`, `api` and `worker`; must match `POSTGRES_*` |
-| Runtime | `APP_BASE_URL` | `http://localhost:8080` | Public origin; `http://` is accepted only for `localhost` or `127.0.0.1` |
-| Runtime | `DISPLAY_TIMEZONE` | `UTC` | IANA zone for the schedule and displayed instants; never moves a source's day boundary |
-| Runtime | `DATA_MODE` | `auto` | `auto`: each source live with automatic simulated fallback; `simulated`: every source simulated |
-| Runtime | `MOCK_SEED` | `42` | Seed of the simulated data |
-| Runtime | `BACKFILL_DAYS` | `180` | Initial backfill of every new dataset, in days, capped at 180 |
-| Resources | `DB_CPU_LIMIT` | `1` | CPU ceiling of `db`, in cores; read by Compose only |
-| Resources | `DB_MEMORY_LIMIT` | `1g` | Memory ceiling of `db`; read by Compose only |
-| Resources | `MIGRATE_CPU_LIMIT` | `1` | CPU ceiling of `migrate`, in cores; read by Compose only |
-| Resources | `MIGRATE_MEMORY_LIMIT` | `512m` | Memory ceiling of `migrate`; read by Compose only |
-| Resources | `API_CPU_LIMIT` | `1` | CPU ceiling of `api`, in cores; read by Compose only |
-| Resources | `API_MEMORY_LIMIT` | `1g` | Memory ceiling of `api`; read by Compose only |
-| Resources | `WORKER_CPU_LIMIT` | `1` | CPU ceiling of `worker`, in cores; read by Compose only |
-| Resources | `WORKER_MEMORY_LIMIT` | `2g` | Memory ceiling of `worker`; read by Compose only |
-| Resources | `WEB_CPU_LIMIT` | `1` | CPU ceiling of `web`, in cores; read by Compose only |
-| Resources | `WEB_MEMORY_LIMIT` | `256m` | Memory ceiling of `web`; read by Compose only |
-| Google | `N8N_GOOGLE_ADS_WEBHOOK_URL` | Empty | Production URL of the n8n webhook; `https://` except on `localhost` or `127.0.0.1` |
-| Google | `N8N_WEBHOOK_SECRET_HEADER` | `X-Webhook-Token` | Header that carries the secret; must equal the Name on n8n's Header Auth credential. A blank value falls back to the code default `X-Webhook-Secret` |
-| Google | `N8N_WEBHOOK_SECRET` | Empty (secret) | Value of that header |
-| Google | `GOOGLE_ADS_CUSTOMER_ID` | Empty | Google Ads customer id: 10 digits, no dashes |
-| Google | `GOOGLE_DAILY_CALL_BUDGET` | `1000` | The product's own cap on webhook calls per sliding 24 h |
-| LinkedIn | `LINKEDIN_AD_ACCOUNT_IDS` | Empty | Comma-separated numeric ad account ids |
-| LinkedIn | `LINKEDIN_CLIENT_ID` | Empty | OAuth client id of the refresh-token trio |
-| LinkedIn | `LINKEDIN_CLIENT_SECRET` | Empty (secret) | OAuth client secret of the trio |
-| LinkedIn | `LINKEDIN_REFRESH_TOKEN` | Empty (secret) | Refresh token of the trio, exchanged for access tokens held in memory only |
-| LinkedIn | `LINKEDIN_ACCESS_TOKEN` | Empty (secret) | Static access token, the alternative to the trio; the trio wins when both are set |
-| HubSpot | `HUBSPOT_ACCESS_TOKEN` | Empty (secret) | Service Key or private-app token with read scopes only |
-| HubSpot | `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY` | Empty | Optional contact property holding the Google campaign id |
-| HubSpot | `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | Empty | Optional datetime contact property holding when that Google touch happened |
-| Admin and session | `APP_ADMIN_EMAIL` | `admin@example.com` | The single admin login that `ensure-admin` creates or updates |
-| Admin and session | `APP_ADMIN_PASSWORD_HASH` | Empty; written by `make init` | argon2id hash of the admin password, single-quoted |
-| Admin and session | `SESSION_SECRET` | Empty; written by `make init` | Random key that signs the session cookie |
+| Group | Variable | Type / format | Default in `.env.example` | Meaning |
+| --- | --- | --- | --- | --- |
+| Runtime | `POSTGRES_DB` | Database name | `ads_engine` | Database the `db` service creates |
+| Runtime | `POSTGRES_USER` | Role name | `ads` | Database role the `db` service creates |
+| Runtime | `POSTGRES_PASSWORD` | Secret string | `ads` (local only) | Role password; change it for any shared host |
+| Runtime | `DATABASE_URL` | Secret SQLAlchemy URL with driver `postgresql+psycopg`; `postgresql://` and `postgres://` are rewritten to it, any other driver is refused | `postgresql+psycopg://ads:ads@db:5432/ads_engine` | Database that `migrate`, `api` and `worker` connect to; must match `POSTGRES_*` |
+| Runtime | `APP_BASE_URL` | Absolute `http://` or `https://` URL with a host; a trailing `/` is dropped | `http://localhost:8080` | Public origin; `http://` is accepted only for `localhost` or `127.0.0.1` |
+| Runtime | `DISPLAY_TIMEZONE` | IANA time zone name, such as `UTC` or `America/New_York` | `UTC` | Zone for the schedule and displayed instants; never moves a source's day boundary |
+| Runtime | `DATA_MODE` | `auto` or `simulated` (case-insensitive) | `auto` | `auto`: each source live with automatic simulated fallback; `simulated`: every source simulated |
+| Runtime | `MOCK_SEED` | Integer | `42` | Seed of the simulated data |
+| Runtime | `BACKFILL_DAYS` | Positive integer | `180` | Initial backfill of every new dataset, in days, capped at 180 |
+| Resources | `DB_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `db`; read by Compose only |
+| Resources | `DB_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `1g` | Memory ceiling of `db`; read by Compose only |
+| Resources | `MIGRATE_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `migrate`; read by Compose only |
+| Resources | `MIGRATE_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `512m` | Memory ceiling of `migrate`; read by Compose only |
+| Resources | `API_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `api`; read by Compose only |
+| Resources | `API_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `1g` | Memory ceiling of `api`; read by Compose only |
+| Resources | `WORKER_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `worker`; read by Compose only |
+| Resources | `WORKER_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `2g` | Memory ceiling of `worker`; read by Compose only |
+| Resources | `WEB_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `web`; read by Compose only |
+| Resources | `WEB_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `256m` | Memory ceiling of `web`; read by Compose only |
+| Google | `N8N_GOOGLE_ADS_WEBHOOK_URL` | Absolute `https://` URL; `http://` only on `localhost` or `127.0.0.1` | Empty | Production URL of the n8n webhook |
+| Google | `N8N_WEBHOOK_SECRET_HEADER` | HTTP header name (RFC 7230 token characters) | `X-Webhook-Token` | Header that carries the secret; must equal the Name on n8n's Header Auth credential. A blank value falls back to the code default `X-Webhook-Secret` |
+| Google | `N8N_WEBHOOK_SECRET` | Secret string | Empty (secret) | Value of that header |
+| Google | `GOOGLE_ADS_CUSTOMER_ID` | 10 digits; dashes are accepted and removed | Empty | Google Ads customer id, used without dashes |
+| Google | `GOOGLE_DAILY_CALL_BUDGET` | Positive integer | `1000` | The product's own cap on webhook calls per sliding 24 h |
+| LinkedIn | `LINKEDIN_AD_ACCOUNT_IDS` | Comma-separated numeric ids or `urn:li:sponsoredAccount:<id>` URNs; blank entries are dropped, duplicates removed | Empty | LinkedIn ad account ids |
+| LinkedIn | `LINKEDIN_CLIENT_ID` | String | Empty | OAuth client id of the refresh-token trio |
+| LinkedIn | `LINKEDIN_CLIENT_SECRET` | Secret string | Empty (secret) | OAuth client secret of the trio |
+| LinkedIn | `LINKEDIN_REFRESH_TOKEN` | Secret string | Empty (secret) | Refresh token of the trio, exchanged for access tokens held in memory only |
+| LinkedIn | `LINKEDIN_ACCESS_TOKEN` | Secret string | Empty (secret) | Static access token, the alternative to the trio; the trio wins when both are set |
+| HubSpot | `HUBSPOT_ACCESS_TOKEN` | Secret string | Empty (secret) | Service Key or private-app token with read scopes only |
+| HubSpot | `HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY` | Contact property name | Empty | Optional contact property holding the Google campaign id |
+| HubSpot | `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | Name of a `datetime` contact property; a `date` property leaves the Google link unavailable | Empty | Optional contact property holding when that Google touch happened |
+| Admin and session | `APP_ADMIN_EMAIL` | Email address (`local@domain`), lowercased | `admin@example.com` | The single admin login that `ensure-admin` creates or updates |
+| Admin and session | `APP_ADMIN_PASSWORD_HASH` | Secret argon2 PHC string, single-quoted because it contains `$` | Empty; written by `make init` | argon2id hash of the admin password |
+| Admin and session | `SESSION_SECRET` | Secret string; `make init` writes 64 hex characters (32 random bytes) | Empty; written by `make init` | Random key that signs the session cookie |
 
 - **Blank means unset**: a blank value takes the default.
 - **Database values travel together**: if you change any `POSTGRES_*` value, change
@@ -255,7 +264,7 @@ Who reads each variable, and how to rotate secrets:
 | `up` | Builds and starts the stack detached (`docker compose up -d --build`), then waits for `/api/v1/healthz` |
 | `down` | Stops and removes the containers; the database volume `pgdata` is kept (`docker compose down -v` deletes it) |
 | `migrate` | Runs the one-shot `migrate` service: `ads-engine migrate && ads-engine ensure-admin` |
-| `test` | Backend pytest against a disposable `postgres:18.6` container (always removed), then the web Vitest suite |
+| `test` | Backend pytest against a disposable `postgres:18.6` container, then the web Vitest suite. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains |
 | `lint` | `ruff format --check`, `ruff check` and `mypy --strict src`; ESLint, stylelint and `tsc --noEmit` |
 | `e2e` | Playwright against the Compose stack started with `DATA_MODE=simulated` (`make e2e ADMIN_PASSWORD=<value>`); leaves the stack running |
 | `seed-simulated` | Seeds simulated datasets for every source and computes the default-window run |
@@ -304,7 +313,19 @@ the worker queues a fresh default-window run. Every rule and threshold key is ex
 
 ## Development and CI
 
-Backend, from `backend/`:
+Backend, from the repository root:
+
+**Warning: the backend tests erase their database.** `uv run pytest` needs a PostgreSQL 18
+database at `TEST_DATABASE_URL` (default
+`postgresql+psycopg://ads:ads@localhost:55432/ads_engine_test`). Once per run it drops schema
+`public` with everything in it, then recreates and migrates it, and it truncates every table before
+each database test. Point it only at a dedicated, disposable database that you alone use, never at
+the application's database (`DATABASE_URL`, kept in the Compose `pgdata` volume), a production
+database, or one shared with other people or concurrent runs. With `TEST_DATABASE_URL` unset, the
+tests erase `ads_engine_test` on whatever server listens on `localhost:55432`. Prefer `make test`:
+it starts its own disposable `postgres:18.6` container on `127.0.0.1:TEST_DB_PORT` (default 55432;
+`0` lets Docker choose a free port), points `TEST_DATABASE_URL` at it in place of any value you
+set, and runs the backend suite and then the web unit tests.
 
 ```bash
 cd backend
@@ -315,12 +336,10 @@ uv run mypy --strict src
 uv run pytest
 ```
 
-`uv run pytest` needs a PostgreSQL 18 database at `TEST_DATABASE_URL` (default
-`postgresql+psycopg://ads:ads@localhost:55432/ads_engine_test`); `make test` starts a disposable
-one. The suite enforces at least 80% line coverage overall and 90% on `ads_engine/analysis/` and
-the connector parsers.
+The suite enforces at least 80% line coverage overall and 90% on `ads_engine/analysis/` and the
+connector parsers.
 
-Web, from `web/`:
+Web, from the repository root:
 
 ```bash
 cd web
@@ -340,8 +359,8 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 - type checks (`mypy --strict`; `tsc --noEmit`);
 - backend tests against a `postgres:18.6` service container, with the coverage gates;
 - web unit tests (Vitest), with the coverage thresholds;
-- the SPA build and both Compose images, after installing Compose 5.5.1 (SHA-256 checked) and
-  passing `make check-tools`;
+- the SPA build (`npm run build`), then both Compose images (`docker compose build`) once Compose
+  5.5.1 is installed (SHA-256 checked) and `make check-tools` passes;
 - Playwright end-to-end tests on the documented first start (`make init`, then
   `docker compose up -d --build`) with no source credentials, so every source runs on simulated
   data;

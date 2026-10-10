@@ -9,8 +9,9 @@
  * contract are asserted verbatim.
  *
  * Fixtures are typed against `../api/types` with `satisfies`, so a schema change fails the
- * typecheck. The suite mocks nothing and reads no clock, locale or `TZ`: it passes unchanged
- * under `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
+ * typecheck. The suite mocks nothing and reads no clock, locale or `TZ`, and no test measures
+ * elapsed time: the runner's per-test timeout is the only timing any test meets. It passes
+ * unchanged under `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -468,15 +469,17 @@ describe('formatCost', () => {
     expect(formatCost('-0.01', 3, null)).toBe('> -0.01');
   });
 
-  it('renders an out-of-range operand or quotient as unavailable, promptly', () => {
-    const started = performance.now();
+  it('renders an out-of-range operand or quotient as unavailable', () => {
+    // format.ts checks each operand's places against MAX_EXACT_PLACE on its digit text before
+    // any BigInt is built, so an out-of-range operand is refused after a scan and a quotient
+    // is only ever divided from in-range operands. No assertion reads a clock: building
+    // 10n ** 999999999n instead runs for over 20 s, and Vitest fails a test whose body
+    // outlasts its per-test timeout (5 s by default) even when the body is synchronous.
     expect(formatCost('1e999999999', 3, 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('300', '1e999999999', 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('1e-999999999', 3, 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('1e300', '1e-10', 'USD')).toBe(UNAVAILABLE);
     expect(formatCost(Number.MAX_VALUE, 1, 'USD')).toBe(UNAVAILABLE);
-    // Building 10n ** 999999999n alone takes over 20 s before it throws.
-    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it('renders unformattable spend as unavailable', () => {

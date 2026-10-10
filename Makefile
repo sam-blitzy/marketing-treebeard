@@ -342,7 +342,7 @@ seed-simulated: ## Seed simulated datasets for every source and compute the defa
 # Coverage gates live in backend/pyproject.toml and web/vite.config.ts, not here. Backend tools
 # run with `uv run --frozen` here and in lint, so a run never re-resolves or rewrites uv.lock:
 # the lock is used exactly as committed, as `uv sync --frozen` installed it.
-test: ## Backend tests on a disposable postgres:18.6 (always removed), then the web unit tests
+test: ## Backend tests on a disposable postgres:18.6 (removed on exit; an unconfirmed removal fails the target), then the web unit tests
 	@test_db_port=''
 	case "$${TEST_DB_PORT:-}" in
 		'' | *[!0-9]*) ;;

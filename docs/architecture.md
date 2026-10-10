@@ -634,7 +634,7 @@ No mode leaves an access-denied source without data.
 |-----------|----------------|-----------|
 | Required environment variables unset. Google needs `N8N_GOOGLE_ADS_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET` and `GOOGLE_ADS_CUSTOMER_ID`. LinkedIn needs `LINKEDIN_AD_ACCOUNT_IDS` plus either the refresh-token trio (`LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `LINKEDIN_REFRESH_TOKEN`) or `LINKEDIN_ACCESS_TOKEN`. HubSpot needs `HUBSPOT_ACCESS_TOKEN` | Access unavailable | The source is simulated, with the reason "credentials not configured" |
 | HTTP 401 or 403; for LinkedIn, 401 after one token refresh; a Google body carrying `PERMISSION_DENIED`, `UNAUTHENTICATED`, `AuthorizationError` or `AuthenticationError`, even inside an n8n HTTP 200 | Access denied | The whole source switches to simulated data. The platform's error code and the failing endpoint are the reason |
-| HTTP 429, 5xx, timeout, `RESOURCE_EXHAUSTED`, call budget exhausted | Transient | Retried by `connectors/http.py` (`DEFAULT_RETRY`): 3 attempts, exponential backoff from a 2 s base with up to 1 s of jitter, `Retry-After` (or Google `retryDelay`) honoured in full. Then the affected datasets turn stale and keep their last good data. Never mock. A call-budget refusal is never retried; it is a deferral ([Google call budget](#google-call-budget)) |
+| HTTP 429, 5xx, timeout, `RESOURCE_EXHAUSTED`, call budget exhausted | Transient | Retried by `connectors/http.py` (`DEFAULT_RETRY`): up to 3 attempts in total, with exponential backoff from a 2 s base (2 s, then 4 s, each plus up to 1 s of jitter, at most 30 s). A `Retry-After` (or Google `retryDelay`) of up to 120 s is honoured in full in place of the backoff; a longer one ends the call at once, so the work is deferred rather than sent early. When the call still fails, the connection's status becomes `stale` at once (a source in automatic fallback keeps `denied`), and a failed attempt is recorded on the freshness row of each affected dataset, whose last good data, `last_success_at`, coverage and completeness stand; an entity read cut short instead stores what it read as `incomplete`, which leaves `last_success_at` unmoved too. A failed attempt alone flags no item: items reading the dataset are flagged stale only once its last success is older than `sources.stale_after_hours` (default 24) or its coverage stops short of the window end ([Freshness and completeness](#freshness-and-completeness)). Never mock. A call-budget refusal is never retried; it is a deferral ([Google call budget](#google-call-budget)) |
 | HTTP 400, GAQL `QueryError`, validation error | Defect | The job fails and is logged with the query id. No mock, no retry |
 
 Per-call timeouts are 120 s for a Google webhook call, and 60 s for LinkedIn and HubSpot calls
@@ -692,8 +692,11 @@ restart go live through the same probe-then-build path at startup, with no code 
 - `simulation/transport.py` serves the payloads through an httpx `MockTransport`, so the live
   clients and parsers run unchanged in simulated mode. Simulated data is seeded, so tests and
   demos reproduce exactly.
-- Once credentials work, `ads-engine capture-fixtures --source <source>` records one redacted live
-  request and response per surface into `backend/tests/contracts/<source>/captured/`.
+- Once credentials work, `ads-engine capture-fixtures --source <source>` attempts every surface.
+  For each surface with data to read, it records one redacted live request and response into
+  `backend/tests/contracts/<source>/captured/`. A surface with no data is skipped with a
+  `cli_warning` line, and the exit can still be 0, so check the warnings before relying on the
+  captures ([Capturing live contract fixtures](runbook.md#capturing-live-contract-fixtures)).
 
 ### Labelling
 
@@ -712,11 +715,19 @@ therefore caps its own webhook calls (`sync/budget_guard.py`, `GoogleCallBudget`
 - `GOOGLE_DAILY_CALL_BUDGET` (default 1000) caps webhook calls per sliding 24 h, below the 2,880
   operations of Explorer, the smallest documented access level.
 - The cap counts every webhook POST attempt the product makes: first pages, next-page calls,
-  partition calls and retries. The client acquires the budget before each attempt.
-- State lives on the `google` row of `source_connection`, as per-UTC-minute call counts
+  partition calls and retries. The client books each attempt against the budget before sending
+  it, and a refusal sends nothing and books nothing.
+- State lives on the `google` row of `source_connection`, as call bookings per UTC minute
   (`calls_by_minute`) updated under `SELECT … FOR UPDATE`, so the worker, `ads-engine sync` and
-  `ads-engine capture-fixtures` share one cap. `calls_24h`, their sum over the counted window, is
-  shown on `/sources` against the cap and refreshed on every wake.
+  `ads-engine capture-fixtures` share one cap. `calls_24h`, the total of the bookings still
+  counting, is shown on `/sources` against the cap and refreshed on every wake. It is a
+  conservative upper bound on the POSTs of the trailing 24 h, not an exact count: a minute
+  bucket counts until 24 h after the minute ends; a call is booked in the minute holding its
+  admission instant plus the 140 s dispatch bound, the minute by which its POST has started, so
+  it counts from admission for up to 24 h plus the bound plus one minute; and a booking that
+  commits too late to cover its POST stays counted while the call is reserved again, so that
+  call can count twice. Every POST therefore counts for at least 24 h after it starts, and the
+  overcount only errs towards refusing a call: no sliding 24 h of POSTs exceeds the cap.
 - A refused call is a deferral, never a retry. The remaining pages and partitions are deferred to
   a later 24 h window, and the unread scopes are kept as the dataset's freshness `checkpoint`,
   which the next run reads first. The affected datasets stay `incomplete` (reason "call budget
@@ -839,8 +850,11 @@ The SPA is built only on `web/src/design-system/`, an indirection layer for the 
 system. Feature code imports UI building blocks only from its `index.ts`, and ESLint and
 stylelint rules keep feature code free of literal style values and raw HTML controls. The
 Blitzy OS source was not supplied, so all 19 wrappers and every token value are placeholders,
-listed in [`web/src/design-system/GAPS.md`](../web/src/design-system/GAPS.md). Binding the real
-system touches only that folder plus `web/package.json` and `web/package-lock.json`.
+listed in [`web/src/design-system/GAPS.md`](../web/src/design-system/GAPS.md). Its
+[binding procedure](../web/src/design-system/GAPS.md#binding-procedure) binds the real system
+and touches only `web/src/design-system/`, `web/package.json` and `web/package-lock.json`. The
+one exception is a Grid breakpoint other than `48rem`, which also changes its pin in
+`web/.stylelintrc.json` and `web/src/stylelint-config.test.ts`.
 
 ## Logging and health
 

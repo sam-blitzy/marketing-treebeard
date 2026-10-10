@@ -37,6 +37,7 @@
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
+import type { QueryClient } from '@tanstack/react-query';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 
@@ -800,14 +801,81 @@ describe('DiscrepancyResolver list', () => {
 // The linked discrepancy (`/decisions#discrepancy-{id}`)
 // ---------------------------------------------------------------------------------------------
 
-/** Lets pending requests, query notifications and effects run, to assert nothing more happens. */
-async function settle(): Promise<void> {
-  await act(
-    () =>
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, 50);
-      }),
-  );
+/**
+ * The most rounds {@link settle} runs. A round past the first follows one in which the query
+ * cache emitted an event or after which a read was in flight; the bound makes a resolver that
+ * keeps reading, or keeps changing its queries, fail inside {@link settle}, never at the test
+ * timeout.
+ */
+const SETTLE_ROUNDS = 10;
+
+/**
+ * Resolves once the resolver is quiescent, so a test can assert that nothing more happens: no
+ * read of `queryClient` is in flight, its observer notifications have been delivered, and the
+ * renders and effects they cause, where a further `fetchNextPage` or `scrollIntoView` would
+ * start, have run. It waits on these conditions, never on a delay.
+ *
+ * TanStack Query delivers each observer notification from a global `setTimeout(callback, 0)`,
+ * queued in the same synchronous batch that emits a query-cache event. A finished read queues
+ * its notifications as it sets its `fetchStatus` to `idle`, so once `queryClient.isFetching()`
+ * reads 0 the notifications of every finished read are queued. Each round waits for that, then
+ * flushes inside `act`, which commits the renders the notifications cause and runs their
+ * effects when it exits:
+ *
+ * - With real timers, the flush awaits a zero-delay timer created after the queued ones. Timers
+ *   of equal delay run in creation order, so the notifications run first.
+ * - Under `vi.useFakeTimers()` that `setTimeout` is fake: a timer runs when the fake clock
+ *   reaches its due time, and the flush moves the clock itself rather than waiting for real time
+ *   to move it. Fake-timers makes a zero-delay timer due at the clock's time when it is created,
+ *   plus 1 ms when it is created during a tick, that is while its `duringTick` flag is set.
+ *   `vi.advanceTimersByTimeAsync` and the `shouldAdvanceTime` auto-advance (a tick every 20 ms
+ *   of real time) both set that flag while they run timers. Every queued notification is
+ *   therefore due at most 1 ms after the clock. A notification queued as the 30 s poll's read
+ *   settles, inside the tick that fired the poll, can be due 1 ms after the clock, and
+ *   `vi.advanceTimersByTimeAsync(0)` would leave it to the auto-advance. The flush is
+ *   `vi.advanceTimersByTimeAsync(1)`: it runs every notification queued before the round, and
+ *   moves the clock 1 ms per round, far from the next {@link CURRENT_STATE_POLL_MS} poll.
+ *
+ * A notification or effect run by a round can change a query again or start a read, and every
+ * notification such a change queues comes with a query-cache event, so another round follows a
+ * round in which the query cache emitted an event or after which a read is in flight. The first
+ * round with neither ends the wait.
+ *
+ * @param queryClient - The client of the render, as {@link renderWithProviders} resolves it.
+ * @throws Error when the query cache still changed, or a read was still in flight, in the last
+ *   of {@link SETTLE_ROUNDS} rounds, or when Testing Library's `waitFor` times out before it sees
+ *   no read in flight, as when reads follow one another back to back.
+ */
+async function settle(queryClient: QueryClient): Promise<void> {
+  let cacheEvents = 0;
+  const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+    cacheEvents += 1;
+  });
+  try {
+    for (let round = 0; round < SETTLE_ROUNDS; round += 1) {
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      const cacheEventsBefore = cacheEvents;
+      await act(async () => {
+        if (vi.isFakeTimers()) {
+          await vi.advanceTimersByTimeAsync(1);
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      });
+      if (cacheEvents === cacheEventsBefore && queryClient.isFetching() === 0) {
+        return;
+      }
+    }
+    throw new Error(
+      `settle: the query cache still changed or a read was in flight after ${String(SETTLE_ROUNDS)} rounds, so the resolver kept reading`,
+    );
+  } finally {
+    unsubscribe();
+  }
 }
 
 /** The `after` cursor of every `GET /discrepancies` page the stub received, in order. */
@@ -857,7 +925,9 @@ describe('DiscrepancyResolver linked discrepancy', () => {
         },
       });
 
-      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-52' });
+      const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+        path: '/decisions#discrepancy-52',
+      });
       const region = listRegion();
       expect(screen.getByText('Loading discrepancies')).toBeTruthy();
       expect(scrollIntoView).not.toHaveBeenCalled();
@@ -878,7 +948,7 @@ describe('DiscrepancyResolver linked discrepancy', () => {
       await waitFor(() => {
         expect(listCalls(api)).toHaveLength(2);
       });
-      await settle();
+      await settle(queryClient);
       expect(scrollIntoView).toHaveBeenCalledTimes(1);
       expect(listRegion()).toBe(region);
     } finally {
@@ -904,7 +974,9 @@ describe('DiscrepancyResolver linked discrepancy', () => {
       }),
     });
 
-    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-60' });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions#discrepancy-60',
+    });
 
     // Page 1 is shown and page 2 is loading: "Show more" shows that load.
     await waitFor(() => {
@@ -933,7 +1005,7 @@ describe('DiscrepancyResolver linked discrepancy', () => {
     expect(listRegion().textContent).toBe('Showing 3 of 4 unresolved discrepancies');
 
     // Page 4 is left for "Show more", and no focus was moved.
-    await settle();
+    await settle(queryClient);
     expect(pageCursors(api)).toEqual([null, '51', '52']);
     expect(buttonNamed(SHOW_MORE).disabled).toBe(false);
     expect(document.activeElement).toBe(document.body);
@@ -950,11 +1022,11 @@ describe('DiscrepancyResolver linked discrepancy', () => {
       [`${LIST_KEY}&after=52`]: json(200, [makeDiscrepancy('untracked', { id: 60 })]),
     });
 
-    const { router } = await renderWithProviders(<DiscrepancyResolver />, {
+    const { queryClient, router } = await renderWithProviders(<DiscrepancyResolver />, {
       path: '/decisions',
     });
     await findCard('Brand Search — US');
-    await settle();
+    await settle(queryClient);
     expect(pageCursors(api)).toEqual([null]);
     expect(scrollIntoView).not.toHaveBeenCalled();
 
@@ -974,7 +1046,7 @@ describe('DiscrepancyResolver linked discrepancy', () => {
     expect(scrollIntoView.mock.contexts[1]).toBe(cardById(52));
     expect(pageCursors(api)).toEqual([null, '51']);
 
-    await settle();
+    await settle(queryClient);
     expect(pageCursors(api)).toEqual([null, '51']);
     expect(scrollIntoView).toHaveBeenCalledTimes(2);
     expect(document.activeElement).toBe(document.body);
@@ -992,7 +1064,9 @@ describe('DiscrepancyResolver linked discrepancy', () => {
       }),
     });
 
-    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-77' });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions#discrepancy-77',
+    });
     const region = listRegion();
 
     await waitFor(() => {
@@ -1005,7 +1079,7 @@ describe('DiscrepancyResolver linked discrepancy', () => {
     expect(screen.queryByRole('button', { name: SHOW_MORE })).toBeNull();
 
     // The list has ended: nothing more is read, and nothing is scrolled.
-    await settle();
+    await settle(queryClient);
     expect(pageCursors(api)).toEqual([null, '51']);
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
@@ -1037,7 +1111,9 @@ describe('DiscrepancyResolver linked discrepancy', () => {
       [`${LIST_KEY}&after=51`]: apiError(503, 'internal_error', 'The database is restarting'),
     });
 
-    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions#discrepancy-60' });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions#discrepancy-60',
+    });
 
     const region = listRegion();
     await waitFor(() => {
@@ -1049,7 +1125,7 @@ describe('DiscrepancyResolver linked discrepancy', () => {
     expect(screen.queryByRole('alert')).toBeNull();
 
     // The failed load is not repeated on its own; "Show more" stays to try again.
-    await settle();
+    await settle(queryClient);
     expect(pageCursors(api)).toEqual([null, '51']);
     expect(buttonNamed(SHOW_MORE).disabled).toBe(false);
     expect(scrollIntoView).not.toHaveBeenCalled();

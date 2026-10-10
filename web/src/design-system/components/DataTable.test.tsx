@@ -14,12 +14,18 @@
  *   pointing at its detail row, which is hidden and empty until expanded, remembered by row key;
  *   an expandable table's region carries the expandable modifier and an expanded row's content
  *   sits in the detail content wrapper, while a table that cannot expand renders neither;
+ * - keyboard operation, exercised with Tab, Shift+Tab, Enter and Space: the region and then each
+ *   toggle are stops in the Tab order, a collapsed detail row adds none and an expanded row's
+ *   focusable content follows its toggle, and Enter or Space on a toggle expands and collapses
+ *   its row while focus stays on it. jsdom performs no sequential navigation or key activation
+ *   of its own, so the helpers dispatch the key events and simulate the browser's default action
+ *   (the focus move, or the native button's click) only when no handler prevented the key;
  * - an unnamed or column-less table renders the static "Table unavailable" state naming what is
  *   missing, and no table or region.
  */
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { DataTable, type DataTableColumn } from './DataTable';
@@ -97,6 +103,159 @@ function renderAssets({
   return render(
     <DataTable caption={caption} columns={columns} rows={rows} getRowKey={slugOf} {...rest} />,
   );
+}
+
+/**
+ * Whether an element is a stop in sequential focus navigation, judged as a browser judges it and
+ * independently of the component: a non-negative `tabIndex`, not a disabled control, a hidden
+ * input or a link without `href` (which reports `tabIndex` 0 yet takes no focus), and not inside
+ * a `hidden`, `inert` or `display: none` element.
+ */
+function isTabStop(element: HTMLElement): boolean {
+  if (element.tabIndex < 0 || element.matches(':disabled, input[type="hidden"]')) {
+    return false;
+  }
+  if (
+    (element instanceof HTMLAnchorElement || element instanceof HTMLAreaElement) &&
+    !element.hasAttribute('href') &&
+    !element.hasAttribute('tabindex')
+  ) {
+    return false;
+  }
+  if (element.closest('[hidden], [inert]') !== null) {
+    return false;
+  }
+  for (let node: HTMLElement | null = element; node !== null; node = node.parentElement) {
+    if (getComputedStyle(node).display === 'none') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The document's sequential focus navigation order: stops with a positive `tabIndex` first, in
+ * ascending order and tree order among equals, then stops with `tabIndex` 0 in tree order.
+ */
+function tabSequence(): HTMLElement[] {
+  const stops = Array.from(document.body.querySelectorAll('*')).filter(
+    (element): element is HTMLElement => element instanceof HTMLElement && isTabStop(element),
+  );
+  const positive = stops
+    .filter((stop) => stop.tabIndex > 0)
+    .sort((left, right) => left.tabIndex - right.tabIndex);
+  return [...positive, ...stops.filter((stop) => stop.tabIndex === 0)];
+}
+
+/**
+ * The stop Tab (or Shift+Tab) moves focus to from an element, as a browser computes it.
+ *
+ * From the body the first stop is next (the last with Shift). From a stop it is the following
+ * stop in {@link tabSequence} (the preceding one with Shift). From a focused element that is not
+ * a stop it is the first stop in that sequence after it in tree order (the last before it).
+ *
+ * @param from - the focused element
+ * @param backwards - `true` for Shift+Tab
+ * @returns the next stop, or `null` when the sequence has none in that direction
+ */
+function nextTabStop(from: Element, backwards: boolean): HTMLElement | null {
+  const sequence = tabSequence();
+  if (from === document.body || from === document.documentElement) {
+    return (backwards ? sequence.at(-1) : sequence[0]) ?? null;
+  }
+  const index = sequence.findIndex((stop) => stop === from);
+  if (index >= 0) {
+    return sequence[index + (backwards ? -1 : 1)] ?? null;
+  }
+  const relation = backwards ? Node.DOCUMENT_POSITION_PRECEDING : Node.DOCUMENT_POSITION_FOLLOWING;
+  const inDirection = (stop: HTMLElement): boolean =>
+    (from.compareDocumentPosition(stop) & relation) !== 0;
+  return (backwards ? sequence.findLast(inDirection) : sequence.find(inDirection)) ?? null;
+}
+
+/**
+ * Presses Tab (or Shift+Tab) on the focused element (the body when nothing has focus).
+ *
+ * jsdom performs no sequential navigation, so when no handler prevented the keydown the
+ * browser's step is simulated: focus moves to {@link nextTabStop}. The keyup then goes to the
+ * element that has focus.
+ *
+ * @param shiftKey - `true` for Shift+Tab
+ * @returns the element that received focus, or `null` when a handler prevented the keydown or no
+ *   stop follows in that direction; focus then stays where it was
+ */
+function pressTab(shiftKey = false): HTMLElement | null {
+  const target = document.activeElement ?? document.body;
+  const next = fireEvent.keyDown(target, { key: 'Tab', code: 'Tab', shiftKey })
+    ? nextTabStop(target, shiftKey)
+    : null;
+  if (next !== null) {
+    act(() => {
+      next.focus();
+    });
+  }
+  fireEvent.keyUp(document.activeElement ?? document.body, { key: 'Tab', code: 'Tab', shiftKey });
+  return next;
+}
+
+/**
+ * Whether a key can activate an element as it activates a native button: an enabled `<button>`
+ * or an enabled `<input>` of type button, submit or reset.
+ */
+function isActivatableButton(element: Element): element is HTMLButtonElement | HTMLInputElement {
+  const native =
+    element instanceof HTMLButtonElement ||
+    (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type));
+  return native && !element.matches(':disabled');
+}
+
+/**
+ * Presses Enter on the focused element (the body when nothing has focus).
+ *
+ * jsdom turns no key into a click, so the browser's activation is simulated: when neither the
+ * keydown nor the keypress was prevented and the element is a native button, it is clicked.
+ * Other elements receive the key events alone. The keyup follows in every case, on the element
+ * that then has focus.
+ *
+ * @returns `true` when the element was activated
+ */
+function pressEnter(): boolean {
+  const target = document.activeElement ?? document.body;
+  let activated = false;
+  if (
+    fireEvent.keyDown(target, { key: 'Enter', code: 'Enter' }) &&
+    fireEvent.keyPress(target, { key: 'Enter', code: 'Enter', charCode: 13 }) &&
+    isActivatableButton(target)
+  ) {
+    act(() => {
+      target.click();
+    });
+    activated = true;
+  }
+  fireEvent.keyUp(document.activeElement ?? document.body, { key: 'Enter', code: 'Enter' });
+  return activated;
+}
+
+/**
+ * Presses Space on the focused element (the body when nothing has focus).
+ *
+ * A native button activates on the Space keyup, and a prevented keydown or keyup cancels it.
+ * jsdom turns no key into a click, so that activation is simulated: when neither event was
+ * prevented and the element is a native button, it is clicked after the keyup.
+ *
+ * @returns `true` when the element was activated
+ */
+function pressSpace(): boolean {
+  const target = document.activeElement ?? document.body;
+  const downAllowed = fireEvent.keyDown(target, { key: ' ', code: 'Space' });
+  const upAllowed = fireEvent.keyUp(target, { key: ' ', code: 'Space' });
+  if (downAllowed && upAllowed && isActivatableButton(target)) {
+    act(() => {
+      target.click();
+    });
+    return true;
+  }
+  return false;
 }
 
 describe('DataTable', () => {
@@ -310,6 +469,23 @@ describe('DataTable', () => {
     /** Detail content that names its row, so the test can see which row expanded. */
     const renderDetail = (row: AssetRow): ReactNode => <p>Creatives of {row.asset}</p>;
 
+    /** The detail row a toggle controls, found through its `aria-controls`. */
+    const detailOf = (toggle: HTMLElement): HTMLElement | null =>
+      document.getElementById(toggle.getAttribute('aria-controls') ?? '');
+
+    /**
+     * Asserts a default-labelled toggle and its detail row: expanded and showing exactly
+     * `content`, or, when `content` is `null`, collapsed with the detail row hidden and empty.
+     */
+    function expectRow(toggle: HTMLElement, content: string | null): void {
+      const expanded = content !== null;
+      expect(toggle.getAttribute('aria-expanded')).toBe(String(expanded));
+      expect(toggle.textContent).toBe(expanded ? 'Hide details' : 'Show details');
+      const detail = detailOf(toggle);
+      expect(detail?.hidden).toBe(!expanded);
+      expect(detail?.textContent).toBe(content ?? '');
+    }
+
     it('adds a visually hidden Details header and one collapsed toggle per row', () => {
       renderAssets({ renderExpanded: renderDetail });
 
@@ -396,17 +572,141 @@ describe('DataTable', () => {
       expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
     });
 
-    it('operates the toggle from the keyboard as a native button', () => {
+    it('puts the region and then each toggle in the Tab order, with no stop in a collapsed detail row', () => {
       renderAssets({ renderExpanded: renderDetail });
-      const toggle = at(screen.getAllByRole('button', { name: 'Show details' }), 1);
+      const region = screen.getByRole('region', { name: 'White papers · EUR' });
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      const first = at(toggles, 0);
+      const second = at(toggles, 1);
+      expect(region.getAttribute('tabindex')).toBe('0');
+      expect(document.activeElement).toBe(document.body);
 
-      toggle.focus();
-      expect(document.activeElement).toBe(toggle);
-      // A native button turns Enter and Space into a click; jsdom does not synthesise that.
-      fireEvent.click(toggle);
+      expect(pressTab()).toBe(region);
+      expect(document.activeElement).toBe(region);
+      expect(pressTab()).toBe(first);
+      expect(document.activeElement).toBe(first);
+      // The first detail row is collapsed, so Tab goes straight to the next row's toggle.
+      expect(pressTab()).toBe(second);
+      expect(document.activeElement).toBe(second);
+      expect(pressTab()).toBeNull();
+      expect(document.activeElement).toBe(second);
 
-      expect(toggle.getAttribute('aria-expanded')).toBe('true');
-      expect(screen.getByText('Creatives of State report')).toBeDefined();
+      expect(pressTab(true)).toBe(first);
+      expect(document.activeElement).toBe(first);
+      expect(pressTab(true)).toBe(region);
+      expect(document.activeElement).toBe(region);
+      expectRow(first, null);
+      expectRow(second, null);
+    });
+
+    it('expands and collapses the focused toggle with Enter and keeps focus on it', () => {
+      renderAssets({ renderExpanded: renderDetail });
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      const first = at(toggles, 0);
+      const second = at(toggles, 1);
+      expect(pressTab()).toBe(screen.getByRole('region', { name: 'White papers · EUR' }));
+      expect(pressTab()).toBe(first);
+
+      expect(pressEnter()).toBe(true);
+
+      expectRow(first, 'Creatives of Buyer guide');
+      expectRow(second, null);
+      expect(document.activeElement).toBe(first);
+
+      expect(pressEnter()).toBe(true);
+
+      expectRow(first, null);
+      expectRow(second, null);
+      expect(document.activeElement).toBe(first);
+    });
+
+    it('expands and collapses a toggle reached by Tab with Space and keeps focus on it', () => {
+      renderAssets({ renderExpanded: renderDetail });
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      const first = at(toggles, 0);
+      const second = at(toggles, 1);
+      expect(pressTab()).toBe(screen.getByRole('region', { name: 'White papers · EUR' }));
+      expect(pressTab()).toBe(first);
+      expect(pressTab()).toBe(second);
+
+      expect(pressSpace()).toBe(true);
+
+      expectRow(second, 'Creatives of State report');
+      expectRow(first, null);
+      expect(document.activeElement).toBe(second);
+
+      expect(pressSpace()).toBe(true);
+
+      expectRow(second, null);
+      expectRow(first, null);
+      expect(document.activeElement).toBe(second);
+    });
+
+    it("puts an expanded row's focusable content after its toggle in the Tab order, and drops it on collapse", () => {
+      renderAssets({
+        renderExpanded: (row) => <a href={`#creatives-${row.slug}`}>Creatives of {row.asset}</a>,
+      });
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      const first = at(toggles, 0);
+      const second = at(toggles, 1);
+      expect(pressTab()).toBe(screen.getByRole('region', { name: 'White papers · EUR' }));
+      expect(pressTab()).toBe(first);
+      expect(pressEnter()).toBe(true);
+      expectRow(first, 'Creatives of Buyer guide');
+      const link = screen.getByRole('link', { name: 'Creatives of Buyer guide' });
+      expect(detailOf(first)?.contains(link)).toBe(true);
+
+      expect(pressTab()).toBe(link);
+      expect(pressTab()).toBe(second);
+      expect(pressTab(true)).toBe(link);
+      expect(pressTab(true)).toBe(first);
+
+      expect(pressEnter()).toBe(true);
+
+      expectRow(first, null);
+      expect(screen.queryByRole('link')).toBeNull();
+      expect(document.activeElement).toBe(first);
+      expect(pressTab()).toBe(second);
+      expect(pressTab(true)).toBe(first);
+    });
+
+    it('leaves the row collapsed when a handler prevents the default of Enter or Space', () => {
+      render(
+        <div
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+            }
+          }}
+        >
+          <DataTable
+            caption="White papers · EUR"
+            columns={COLUMNS}
+            rows={ROWS}
+            getRowKey={slugOf}
+            renderExpanded={renderDetail}
+          />
+        </div>,
+      );
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      const first = at(toggles, 0);
+      const second = at(toggles, 1);
+      expect(pressTab()).toBe(screen.getByRole('region', { name: 'White papers · EUR' }));
+      expect(pressTab()).toBe(first);
+
+      expect(pressEnter()).toBe(false);
+
+      expectRow(first, null);
+      expect(document.activeElement).toBe(first);
+      expect(pressTab()).toBe(second);
+
+      expect(pressSpace()).toBe(false);
+
+      expectRow(second, null);
+      expect(document.activeElement).toBe(second);
+      // A pointer click still expands the row, so only the keys' default action was blocked.
+      fireEvent.click(second);
+      expectRow(second, 'Creatives of State report');
     });
 
     it('names each toggle with expandLabel, from its row and state', () => {

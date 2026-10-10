@@ -555,9 +555,14 @@ What the labels mean:
 - **Status line**: the mode ("Live" or "Simulated"), the connection status ("OK", "Stale",
   "Access denied" or "Error", for `ok`, `stale`, `denied` and `error`), the reason exactly as
   recorded (for example "credentials not configured") and the time of the last attempt.
-- **Google call budget** (Google only): webhook calls in the last 24 h against
-  `GOOGLE_DAILY_CALL_BUDGET` (default 1000). This is the product's own cap, separate from the
-  Google Ads quota other n8n workflows share.
+- **Google call budget** (Google only): "Google calls in the last 24 h: N of M". N is
+  `calls_24h`, the reserved webhook calls still counting in the sliding 24 h, and M is the cap,
+  `GOOGLE_DAILY_CALL_BUDGET` (default 1000). N is a conservative upper bound and can exceed the
+  POSTs actually sent: each call is booked two or three minutes ahead and counts until 24 h after
+  its booked minute ends, slightly over 24 h in all, and a call whose reservation had to be
+  renewed can count twice. The overcount only errs towards refusing a call, never towards
+  exceeding the cap. A refusal sends nothing and adds nothing to N. This is the product's own
+  cap, separate from the Google Ads quota other n8n workflows share.
 - **Active datasets**: the primary dataset with its id, mode, state, activation time and reason
   and, for HubSpot while LinkedIn is simulated, the companion CRM dataset.
 - **Dataset freshness**: per dataset, its completeness (`complete`, `incomplete` or `unknown`),
@@ -574,9 +579,14 @@ What the labels mean:
   | HubSpot | `hubspot.contacts`, `hubspot.associations`, `hubspot.deal_search`, `hubspot.google_contacts` (only when the Google-to-CRM link is configured and verified) |
 
 - **Recent sync runs**: the newest `sync_run` rows, probes included.
-- **Sync now**: queues a `sync_request` for that source. The worker picks it up at its next wake,
-  within 30 s. While one is pending, the button is disabled with "A sync is already pending", and
-  the API answers a second request with 409 `sync_pending`.
+- **Sync now**: queues a `sync_request` for that source. The worker checks for requests on every
+  30 s wake, a check cadence rather than a deadline, and serves none before its
+  [startup](architecture.md#worker-startup) has finished. Each source syncs in one of the worker's
+  [lanes](architecture.md#lanes): `google`, or `linkedin_hubspot`, which serialises LinkedIn and
+  HubSpot. When the source's lane is idle, the pass the next wake dispatches serves the request;
+  when the lane is busy, the request is served once its running pass ends, so a long sync or
+  backfill in that lane delays it. While one is pending, the button is disabled with "A sync is
+  already pending", and the API answers a second request with 409 `sync_pending`.
 
 How the freshness rows turn into item flags:
 
@@ -647,9 +657,13 @@ curl -fsS http://localhost:8080/api/v1/healthz
   `--end` is no later than the default window end, the earlier of yesterday in the Google account's
   time zone and yesterday UTC, and the span is 1 to `window.max_days` (default 180) days. The run is
   `kind=custom`; open it at `/actions?run=<run_id>` with the `run_id` from its JSON summary.
-- **Streams**: stdout carries only command output (hashes, JSON reports, written paths); stderr
-  carries JSON log lines, including one `cli_error` line that explains a failure. Neither carries
-  a secret, a token or an email.
+- **Streams**: stderr carries JSON log lines, including one `cli_error` line that explains a
+  failure, and never a secret, a token or an email. stdout carries only command output: the JSON
+  reports of `sync`, `analyze` and `seed-simulated` and the paths `capture-fixtures` writes, none
+  of which carries a secret, a token or an email. The exception is `hash-password`, whose stdout
+  is the argon2id password hash, the secret value of `APP_ADMIN_PASSWORD_HASH`. Capture it
+  straight into `.env` by command substitution, as `make init` and the [Admin login](#admin-login)
+  block do; never echo it, log it, paste it into a ticket or leave it in shell history or a CI log.
 
 Exit codes of every `ads-engine` command:
 
@@ -662,10 +676,14 @@ Exit codes of every `ads-engine` command:
 
 ## Capturing live contract fixtures
 
-`ads-engine capture-fixtures --source <google|linkedin|hubspot>` records one redacted live request
-and response per contract surface into `backend/tests/contracts/<source>/captured/<surface>.json`,
-each shaped `{surface, captured_at, request, response}`. The contract tests then validate the
-parsers against those captures as well as the documented samples.
+`ads-engine capture-fixtures --source <google|linkedin|hubspot>` attempts every contract surface of
+the source. For each surface that had data to read, it records one redacted live request and
+response into `backend/tests/contracts/<source>/captured/<surface>.json`, shaped
+`{surface, captured_at, request, response}`. The contract tests then validate the parsers against
+those captures as well as the documented samples. A surface without data is skipped with a
+warning, so an exit of 0 does not mean every surface was captured: read the `cli_warning` lines
+that say "not captured", or the `skipped` count in the `capture_fixtures_finished` log line,
+before relying on the captures.
 
 It runs only when that source's credentials work, and it is refused, with nothing sent or written,
 under `DATA_MODE=simulated`, without the source's credentials, or when the output directory is not
@@ -687,10 +705,12 @@ docker compose run --rm --no-deps --user "$(id -u):$(id -g)" \
 - `--user "$(id -u):$(id -g)"` runs the command as the owner of the checkout. The image's runtime
   user (UID 10001) owns only the image's own `captured/` directories, so without it a bind-mounted
   directory owned by another user is refused as "not writable by this user (uid 10001)".
-- Each written path is printed on stdout. A surface with no data to read, such as a LinkedIn
-  account with no sponsored lead to re-fetch, is reported in one `cli_warning` line and leaves the
-  exit at 0. Exit 1 means a call failed, nothing was captured, a capture broke its contract, or a
-  capture still held a configured secret after redaction; that capture is not written.
+- Each written path is printed on stdout. Each skipped surface gets one `cli_warning` line whose
+  `message` reads `ads-engine: capture-fixtures <source>: not captured: <reason>`, the reason
+  naming the surface or query and why, such as no sponsored LinkedIn lead to re-fetch or a Google
+  query that answered with no rows. Exit 1 means a call failed, nothing was captured, a capture
+  broke its contract, or a capture still held a configured secret after redaction; that capture is
+  not written.
 - Redaction replaces tokens, secrets, emails, names and form answers with `"<redacted>"`, ad
   account and customer ids with zeros of the same length, and the webhook URL with a reserved
   placeholder URL.
@@ -801,14 +821,35 @@ All state lives in the named volume `pgdata`: datasets, snapshots, decisions, di
 resolutions, feedback, analysis runs and the admin login. `make down` (`docker compose down`) keeps
 it.
 
-Back it up first, to a file outside the checkout:
+Back it up first, from the repository root, to a file outside the checkout. `mktemp` creates a new
+file with a unique name in your home directory, readable and writable only by you (mode 600)
+before `pg_dump` writes a byte, and never reuses an existing file. The block removes the file if
+the dump fails and lists it when the dump succeeds:
 
 ```bash
-docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$HOME/ads_engine.dump"
+if dump_file="$(mktemp "$HOME/ads_engine.dump.XXXXXX")"; then
+  if (umask 077 && docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$dump_file"); then
+    ls -l -- "$dump_file"
+  else
+    rm -f -- "$dump_file"
+    echo "pg_dump failed; no dump kept" >&2
+  fi
+else
+  echo "mktemp failed; nothing written" >&2
+fi
 ```
 
-A full reset deletes the volume. **Every recorded decision, resolution and feedback entry is lost**,
-and platform data older than the 180-day backfill cannot be fetched again:
+The dump holds the admin email and password hash and the private CRM, pipeline and decision
+data. Keep it owner-only (mode 600) outside the checkout, never commit or share it, copy it only
+to storage with the same protection, and delete it when you no longer need it.
+
+A full reset deletes the volume and everything stored in it. **Every recorded decision, resolution
+and feedback entry is lost**, and so is the history the product accumulated: the dated status,
+budget and quality-score snapshots, and all data older than the backfill. The rebuild backfills
+only `BACKFILL_DAYS`, capped at 180 days. Older data may still exist at the source, depending on
+its retention (LinkedIn keeps daily analytics for 6 months, Google keeps granular reporting data
+for 37 months), but the product never reads it back, so a dump is the only way to keep the older
+history:
 
 ```bash
 docker compose down -v
@@ -828,10 +869,11 @@ These targets run tools on the host, so they need uv, Python and Node in additio
   `ads-engine-testdb-<random token>`, on `127.0.0.1:TEST_DB_PORT` (default 55432;
   `TEST_DB_PORT=0` lets Docker pick a free port, so several checkouts can run it at once) and
   points `TEST_DATABASE_URL` at it. It runs the backend tests (`uv sync --frozen`, then
-  `uv run --frozen pytest`), runs the web unit tests (`npm ci`, then `npm test`), and always
-  removes the test database and its volume. A port already in use fails the run. It never reuses
-  or removes a container it did not create, and it fails when it cannot confirm that its own was
-  removed, printing the command that removes what is left. It never touches the stack's database.
+  `uv run --frozen pytest`) and the web unit tests (`npm ci`, then `npm test`). On exit, Ctrl-C
+  included, it removes that container and its volume and checks for up to about 10 s that they
+  are gone. A port already in use fails the run. It never reuses or removes a container it did not
+  create, and a removal it cannot confirm fails the run, even when the tests passed, printing the
+  `docker` command that finds or removes what is left. It never touches the stack's database.
 
   ```bash
   make test TEST_DB_PORT=55433 PYTEST_ARGS=tests/unit
@@ -870,7 +912,7 @@ at the first failing command.
 | `down` | `docker compose down`: stops and removes the containers and keeps the `pgdata` volume |
 | `migrate` | Requires `.env`; `docker compose run --rm migrate`, which runs `ads-engine migrate && ads-engine ensure-admin` |
 | `seed-simulated` | Requires `.env`; `docker compose run --rm migrate sh -c 'ads-engine migrate && ads-engine seed-simulated'` |
-| `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; always removed, and a removal it cannot confirm fails the run; a container it did not create is never reused or removed), then the web unit tests. `PYTEST_ARGS` passes extra pytest arguments |
+| `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; a container it did not create is never reused or removed), then the web unit tests. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
 | `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e`; leaves the stack running |
 | `secret-scan` | `zricethezav/gitleaks:v8.30.1` with `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |

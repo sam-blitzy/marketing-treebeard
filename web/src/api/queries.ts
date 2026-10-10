@@ -21,9 +21,9 @@
  *   every hook's `error` is `ApiError | null` (see the `Register` augmentation below).
  * - **Invalidation.** After a successful write, a mutation invalidates the `*All` roots of
  *   everything the write can change. Its `onSuccess` returns that promise, so `mutateAsync`
- *   resolves only after the refetch has started. Mutations set no `retry`. The app's
- *   `QueryClient` (`src/main.tsx`) does not retry them, because a POST is not idempotent from
- *   the UI's point of view.
+ *   resolves only once the refetch of every shown (active) entry it invalidated has settled.
+ *   Mutations set no `retry`. The app's `QueryClient` (`src/main.tsx`) does not retry them,
+ *   because a POST is not idempotent from the UI's point of view.
  * - **Polling.** {@link useDefaultRun} and {@link useRecommendations}, with or without a run
  *   id, refetch every {@link CURRENT_STATE_POLL_MS} while they are shown, so a new default
  *   run and the live overlay (holds, discrepancy count, source modes, freshness, feedback and
@@ -1146,7 +1146,7 @@ export interface FeedbackVariables {
  * Invalidates everything a decision write can change: the recommendations pages, whose
  * overlay holds, discrepancy banner and historical marking are read live; the discrepancy
  * lists, because a decision can open, close or await a discrepancy; and the decision log.
- * Resolves once every refetch has started.
+ * Resolves once the refetch of every shown (active) entry under those roots has settled.
  */
 function invalidateDecisionState(queryClient: QueryClient): Promise<unknown> {
   return Promise.all([

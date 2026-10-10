@@ -31,16 +31,22 @@
  *   what was shown, polling that re-reads only the loaded pages, a failed refetch keeping them,
  *   abort on unmount, and invalidation by both decision-state mutations;
  * - the current-state polling of `useDecisions` and `useDiscrepancies`;
+ * - the polling lifecycle of all six polling hooks: no request while the document is hidden or
+ *   `focusManager` reports the page unfocused, an immediate refetch and the usual cadence once
+ *   it is shown again, and no request once the last observing component has unmounted;
  * - every mutation's request (CSRF header, JSON body, encoded path) and its cache effects: the
  *   exact `invalidateQueries` keys (spied), the seeded and invalidated entries, the keys left
- *   alone, and nothing touched on failure.
+ *   alone, nothing touched on failure, and `mutateAsync` of a decision write or resolution
+ *   still pending while the refetch of a shown list is held, resolving only once it has landed.
  *
  * The file is self-contained. It imports only `./queries`, `./client` and `./types`: the shared
  * helpers in `src/test/` import this folder, so importing them here would close a cycle.
  * Payloads are minimal inline objects, because `apiFetch` does not validate response shapes;
  * each is checked with `satisfies` against the fields of its `./types` type that it carries.
+ * The discriminators a payload does carry stay ones the API can produce: a decision's shape fits
+ * its subject, and a discrepancy's kind and shape form a pair C0 raises.
  */
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query';
 import type { QueryKey } from '@tanstack/react-query';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -87,7 +93,9 @@ import type {
   ConfigView,
   Decision,
   DecisionRequest,
+  DecisionShape,
   Discrepancy,
+  DiscrepancyKind,
   DiscrepancyState,
   Feedback,
   FeedbackRequest,
@@ -406,6 +414,53 @@ function seed(client: QueryClient, keys: readonly QueryKey[]): void {
   }
 }
 
+/** A promise the test fulfils by hand, as {@link deferred} returns it. */
+interface Deferred<Value> {
+  /** Pending until {@link Deferred.resolve} is called. */
+  promise: Promise<Value>;
+  /** Fulfils {@link Deferred.promise} with `value`. */
+  resolve: (value: Value) => void;
+}
+
+/**
+ * A promise that stays pending until the test fulfils it, so a stubbed response can be held
+ * while the test asserts what is true with its request still in flight.
+ *
+ * @returns The pending promise and the function that fulfils it.
+ */
+function deferred<Value>(): Deferred<Value> {
+  // The Promise executor runs synchronously, so this is replaced before it can be returned.
+  let resolve: Deferred<Value>['resolve'] = () => {
+    throw new Error('the Promise executor has not run');
+  };
+  const promise = new Promise<Value>((fulfil) => {
+    resolve = fulfil;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Lets one macrotask turn pass inside `act`: every promise callback queued before it runs, and
+ * so does TanStack's batched notification on its zero-delay timer, which re-renders the hook.
+ */
+async function nextMacrotask(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+/**
+ * Every request the stub received as `METHOD pathname`, in order.
+ *
+ * @param mock - The stubbed fetch function.
+ * @returns One `GET /api/v1/decisions`-style line per request.
+ */
+function sentPaths(mock: FetchMock): string[] {
+  return sent(mock).map((request) => `${request.method ?? ''} ${request.parsed.pathname}`);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Inline payloads
 // ---------------------------------------------------------------------------------------------
@@ -440,26 +495,56 @@ function pagePayload(runId: Run['id'] = DEFAULT_RUN_ID, kind: Run['kind'] = 'def
   };
 }
 
+/** The decision shapes of a campaign subject; a Google shared budget is decided as `budget`. */
+type CampaignShape = Exclude<DecisionShape, 'budget'>;
+
 /**
- * A decision-log row.
+ * The trailing `kind` and `shape` arguments of {@link discrepancyPayload}, paired as C0 raises
+ * them (the backend's `RESOLUTIONS` table): a `status` discrepancy only on a campaign, because a
+ * shared budget has no status, and every other kind on any shape.
+ */
+type DiscrepancyKindAndShape =
+  | [kind?: 'status', shape?: CampaignShape]
+  | [kind: Exclude<DiscrepancyKind, 'status'>, shape?: DecisionShape];
+
+/**
+ * A decision-log row whose shape fits its subject: `own_budget` or `shared_member` for a
+ * campaign, and `budget` for a shared budget, whose row also carries its `null` status.
  *
  * @param id - The decision id.
  * @param origin - How the decision was written.
+ * @param shape - The subject's decision shape; an own-budget campaign's when omitted.
  * @returns A fresh decision payload.
  */
-function decisionPayload(id: Decision['id'], origin: Decision['origin'] = 'baseline') {
-  return { id, shape: 'own_budget', origin } satisfies Pick<Decision, 'id' | 'shape' | 'origin'>;
+function decisionPayload(
+  id: Decision['id'],
+  origin: Decision['origin'] = 'baseline',
+  shape: DecisionShape = 'own_budget',
+) {
+  if (shape === 'budget') {
+    return { id, shape, status: null, origin } satisfies Pick<
+      Decision,
+      'id' | 'shape' | 'status' | 'origin'
+    >;
+  }
+  return { id, shape, origin } satisfies Pick<Decision, 'id' | 'shape' | 'origin'>;
 }
 
 /**
- * A status discrepancy.
+ * A discrepancy of a kind its subject's shape can raise ({@link DiscrepancyKindAndShape}).
  *
  * @param id - The discrepancy id.
  * @param state - Its state.
+ * @param kind - `status`, `budget`, `untracked` or `missing`; `status` when omitted.
+ * @param shape - The subject's decision shape; an own-budget campaign's when omitted.
  * @returns A fresh discrepancy payload.
  */
-function discrepancyPayload(id: Discrepancy['id'], state: Discrepancy['state'] = 'open') {
-  return { id, kind: 'status', state } satisfies Pick<Discrepancy, 'id' | 'kind' | 'state'>;
+function discrepancyPayload(
+  id: Discrepancy['id'],
+  state: Discrepancy['state'] = 'open',
+  ...[kind = 'status', shape = 'own_budget']: DiscrepancyKindAndShape
+) {
+  return { id, kind, shape, state } satisfies Pick<Discrepancy, 'id' | 'kind' | 'shape' | 'state'>;
 }
 
 /**
@@ -467,7 +552,7 @@ function discrepancyPayload(id: Discrepancy['id'], state: Discrepancy['state'] =
  *
  * @param first - The first id.
  * @param count - How many to build.
- * @returns `count` fresh status discrepancies, ids `first` upwards.
+ * @returns `count` fresh open `status` discrepancies on own-budget campaigns, ids `first` upwards.
  */
 function discrepancies(first: Discrepancy['id'], count: number) {
   return Array.from({ length: count }, (_, offset) => discrepancyPayload(first + offset));
@@ -536,6 +621,11 @@ afterEach(() => {
   for (const client of clients.splice(0)) {
     client.clear();
   }
+  // The polling lifecycle cases take the page out of view through a spied
+  // `document.visibilityState` getter or TanStack's `focusManager`. Both go back to the
+  // browser's own state, so no later test starts with its polls suspended.
+  vi.restoreAllMocks();
+  focusManager.setFocused(undefined);
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -2034,6 +2124,240 @@ describe('usePrefetchActionsReads', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// Polling lifecycle
+// ---------------------------------------------------------------------------------------------
+
+describe('polling lifecycle', () => {
+  /** One polling hook and what a lifecycle case needs to drive it and check its requests. */
+  interface PollingHook {
+    /** The call as the test titles show it. */
+    label: string;
+    /** Calls the hook under test. */
+    hook: () => unknown;
+    /** The exact key of the query the hook observes. */
+    queryKey: QueryKey;
+    /** The interval, in milliseconds, at which the hook polls after a success. */
+    interval: number;
+    /** The path and query string of every request the hook sends. */
+    request: string;
+    /** Answers the hook's own `GET` with a minimal success, and any other request with a 418. */
+    respond: Responder;
+  }
+
+  /** One way the page leaves view, as TanStack Query's `focusManager` observes it. */
+  interface OutOfView {
+    /** The signal as the test titles show it. */
+    name: string;
+    /**
+     * Takes the page out of view.
+     *
+     * @returns The call that brings the page back into view.
+     */
+    hide: () => () => void;
+  }
+
+  /** How many poll intervals pass, in each case, while the hook may send nothing. */
+  const SILENT_INTERVALS = 3;
+
+  /** The six polling hooks, the default and the run-id recommendations page both included. */
+  const POLLING_HOOKS: readonly PollingHook[] = [
+    {
+      label: 'useDefaultRun()',
+      hook: () => useDefaultRun(),
+      queryKey: queryKeys.runs.latest,
+      interval: CURRENT_STATE_POLL_MS,
+      request: '/api/v1/runs/latest',
+      respond: routes({ 'GET /api/v1/runs/latest': () => json(200, runPayload()) }),
+    },
+    {
+      label: 'useRecommendations()',
+      hook: () => useRecommendations(),
+      queryKey: queryKeys.recommendations('default'),
+      interval: CURRENT_STATE_POLL_MS,
+      request: '/api/v1/recommendations',
+      respond: routes({ 'GET /api/v1/recommendations': () => json(200, pagePayload()) }),
+    },
+    {
+      label: 'useRecommendations(CUSTOM_RUN_ID)',
+      hook: () => useRecommendations(CUSTOM_RUN_ID),
+      queryKey: queryKeys.recommendations(CUSTOM_RUN_ID),
+      interval: CURRENT_STATE_POLL_MS,
+      request: `/api/v1/recommendations?run_id=${String(CUSTOM_RUN_ID)}`,
+      respond: routes({
+        'GET /api/v1/recommendations': () => json(200, pagePayload(CUSTOM_RUN_ID, 'custom')),
+      }),
+    },
+    {
+      label: 'useDecisions()',
+      hook: () => useDecisions(),
+      queryKey: queryKeys.decisions({}),
+      interval: CURRENT_STATE_POLL_MS,
+      request: '/api/v1/decisions',
+      respond: routes({ 'GET /api/v1/decisions': () => json(200, [decisionPayload(1)]) }),
+    },
+    {
+      label: 'useDiscrepancies()',
+      hook: () => useDiscrepancies(),
+      queryKey: queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
+      interval: CURRENT_STATE_POLL_MS,
+      request: '/api/v1/discrepancies?state=open&state=awaiting_platform&limit=500',
+      respond: routes({
+        'GET /api/v1/discrepancies': () => json(200, discrepancies(DISCREPANCY_ID, 1)),
+      }),
+    },
+    {
+      label: 'useDiscrepancyPages()',
+      hook: () => useDiscrepancyPages(),
+      queryKey: queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES),
+      interval: CURRENT_STATE_POLL_MS,
+      request: FIRST_PAGED,
+      respond: routes({
+        'GET /api/v1/discrepancies': () =>
+          json(200, discrepancies(DISCREPANCY_ID, 1), pagedHeaders(1)),
+      }),
+    },
+    {
+      label: 'useSources()',
+      hook: () => useSources(),
+      queryKey: queryKeys.sources,
+      interval: SOURCES_POLL_MS,
+      request: '/api/v1/sources',
+      respond: routes({ 'GET /api/v1/sources': () => json(200, sourcesPayload()) }),
+    },
+  ];
+
+  /** Tells the document's listeners, TanStack's `focusManager` among them, to re-read it. */
+  function dispatchVisibilityChange(): void {
+    document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
+  }
+
+  /** Both signals TanStack Query's `focusManager` reads to decide whether the page is shown. */
+  const OUT_OF_VIEW: readonly OutOfView[] = [
+    {
+      name: 'the document is hidden',
+      hide: () => {
+        const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+        dispatchVisibilityChange();
+        return () => {
+          visibility.mockRestore();
+          dispatchVisibilityChange();
+        };
+      },
+    },
+    {
+      name: 'focusManager reports it unfocused',
+      hide: () => {
+        focusManager.setFocused(false);
+        return () => {
+          focusManager.setFocused(true);
+        };
+      },
+    },
+  ];
+
+  /**
+   * Every request the stub received, as its path and query string.
+   *
+   * @param mock - The stubbed fetch function.
+   * @returns One `pathname` plus `search` per request, in order.
+   */
+  function requestPaths(mock: FetchMock): string[] {
+    return sent(mock).map((request) => `${request.parsed.pathname}${request.parsed.search}`);
+  }
+
+  /**
+   * The number of components observing the entry under `queryKey`.
+   *
+   * @param client - The query client.
+   * @param queryKey - The exact key.
+   * @returns The observer count, `undefined` when the key has no entry.
+   */
+  function observerCount(client: QueryClient, queryKey: QueryKey): number | undefined {
+    return client.getQueryCache().find({ queryKey, exact: true })?.getObserversCount();
+  }
+
+  /**
+   * Waits until the entry under `queryKey` has succeeded `count` times and is idle, so every
+   * request so far was answered and none is in flight.
+   *
+   * @param client - The query client.
+   * @param queryKey - The exact key.
+   * @param count - The expected number of successful fetches.
+   */
+  async function waitForSuccesses(
+    client: QueryClient,
+    queryKey: QueryKey,
+    count: number,
+  ): Promise<void> {
+    await waitFor(() => {
+      expect(client.getQueryState(queryKey)).toMatchObject({
+        status: 'success',
+        fetchStatus: 'idle',
+        dataUpdateCount: count,
+      });
+    });
+  }
+
+  describe.each(POLLING_HOOKS)('$label', (row) => {
+    it.each(OUT_OF_VIEW)(
+      'sends nothing while $name, then refetches at once and polls again when shown',
+      async ({ hide }) => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const mock = stubFetch(row.respond);
+        const { queryClient } = renderWithWrapper(row.hook, createWrapper(APP_STALE_MS));
+        await waitForSuccesses(queryClient, row.queryKey, 1);
+        expect(mock).toHaveBeenCalledTimes(1);
+
+        const show = hide();
+        expect(focusManager.isFocused()).toBe(false);
+        await act(() => vi.advanceTimersByTimeAsync(SILENT_INTERVALS * row.interval));
+        expect(mock).toHaveBeenCalledTimes(1);
+
+        // The entry went stale while hidden, so coming back refetches it at once, well before
+        // the next interval tick; polling then resumes at the hook's own cadence.
+        const shownAt = Date.now();
+        act(() => {
+          show();
+        });
+        expect(focusManager.isFocused()).toBe(true);
+        await waitForSuccesses(queryClient, row.queryKey, 2);
+        expect(Date.now() - shownAt).toBeLessThan(row.interval);
+        expect(mock).toHaveBeenCalledTimes(2);
+        await act(() => vi.advanceTimersByTimeAsync(row.interval));
+        await waitForSuccesses(queryClient, row.queryKey, 3);
+        expect(mock).toHaveBeenCalledTimes(3);
+        expect(requestPaths(mock)).toEqual([row.request, row.request, row.request]);
+      },
+    );
+
+    it('polls while one component still uses it, and sends nothing once the last unmounts', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const mock = stubFetch(row.respond);
+      const setup = createWrapper(APP_STALE_MS);
+      const first = renderWithWrapper(row.hook, setup);
+      await waitForSuccesses(setup.queryClient, row.queryKey, 1);
+      // The entry is fresh, so the second component reads it without a request.
+      const second = renderWithWrapper(row.hook, setup);
+      expect(observerCount(setup.queryClient, row.queryKey)).toBe(2);
+      expect(mock).toHaveBeenCalledTimes(1);
+
+      first.unmount();
+      expect(observerCount(setup.queryClient, row.queryKey)).toBe(1);
+      await act(() => vi.advanceTimersByTimeAsync(row.interval));
+      await waitForSuccesses(setup.queryClient, row.queryKey, 2);
+      expect(mock).toHaveBeenCalledTimes(2);
+
+      // The entry stays cached with no observer, so any timer left running would fetch it.
+      second.unmount();
+      expect(observerCount(setup.queryClient, row.queryKey)).toBe(0);
+      await act(() => vi.advanceTimersByTimeAsync(SILENT_INTERVALS * row.interval));
+      expect(mock).toHaveBeenCalledTimes(2);
+      expect(requestPaths(mock)).toEqual([row.request, row.request]);
+    });
+  });
+});
+
 
 // ---------------------------------------------------------------------------------------------
 // Mutations
@@ -2281,29 +2605,52 @@ describe('useRecordDecision', () => {
   });
 
   it('has refetched a shown decision log by the time mutateAsync resolves', async () => {
+    const saved = decisionPayload(2, 'recommendation');
     const before = [decisionPayload(1)];
-    const after = [decisionPayload(2, 'user'), ...before];
+    const after = [saved, ...before];
+    const refetch = deferred<Response>();
     const mock = stubFetch(
       sequence(
         () => json(200, before),
-        () => json(201, decisionPayload(2, 'user')),
-        () => json(200, after),
+        () => json(201, saved),
+        () => refetch.promise,
       ),
     );
-    const { result } = renderWithWrapper(() => ({
+    const { result, queryClient } = renderWithWrapper(() => ({
       log: useDecisions(),
       record: useRecordDecision(),
     }));
     await waitFor(() => expect(result.current.log.isSuccess).toBe(true));
+
+    const key = queryKeys.decisions({});
+    let settled = false;
+    let cachedOnResolve: unknown;
+    const recording = result.current.record
+      .mutateAsync(body)
+      .then((decision) => {
+        cachedOnResolve = queryClient.getQueryData(key);
+        return decision;
+      })
+      .finally(() => {
+        settled = true;
+      });
+    const order = ['GET /api/v1/decisions', 'POST /api/v1/decisions', 'GET /api/v1/decisions'];
+    await waitFor(() => expect(sentPaths(mock)).toEqual(order));
+    await nextMacrotask();
+
+    // The POST has answered and the refetch is held: the mutation must still be waiting on it.
+    expect(settled).toBe(false);
+    expect(result.current.record.isPending).toBe(true);
+    expect(queryClient.getQueryState(key)?.fetchStatus).toBe('fetching');
+
+    refetch.resolve(json(200, after));
+    let resolved: unknown;
     await act(async () => {
-      await result.current.record.mutateAsync(body);
+      resolved = await recording;
     });
-    const calls = sent(mock).map((request) => `${request.method ?? ''} ${request.parsed.pathname}`);
-    expect(calls).toEqual([
-      'GET /api/v1/decisions',
-      'POST /api/v1/decisions',
-      'GET /api/v1/decisions',
-    ]);
+    expect(resolved).toEqual(saved);
+    expect(cachedOnResolve).toEqual(after);
+    expect(sentPaths(mock)).toEqual(order);
     await waitFor(() => expect(result.current.log.data).toEqual(after));
   });
 
@@ -2315,7 +2662,7 @@ describe('useRecordDecision', () => {
           json(200, saved ? [] : [discrepancyPayload(DISCREPANCY_ID)], pagedHeaders(saved ? 0 : 1)),
         'POST /api/v1/decisions': () => {
           saved = true;
-          return json(201, decisionPayload(12, 'user'));
+          return json(201, decisionPayload(12, 'recommendation'));
         },
       }),
     );
@@ -2336,8 +2683,8 @@ describe('useRecordDecision', () => {
       subject: { type: 'budget', id: BUDGET_ID },
       patch: { daily_budget: '500.00' },
     };
-    const before = [decisionPayload(3)];
-    const after = [decisionPayload(4, 'user'), ...before];
+    const before = [decisionPayload(3, 'baseline', 'budget')];
+    const after = [decisionPayload(4, 'user', 'budget'), ...before];
     let logReads = 0;
     const mock = stubFetch(
       routes({
@@ -2345,7 +2692,7 @@ describe('useRecordDecision', () => {
           logReads += 1;
           return json(200, logReads === 1 ? before : after);
         },
-        'POST /api/v1/decisions': () => json(201, decisionPayload(4, 'user')),
+        'POST /api/v1/decisions': () => json(201, decisionPayload(4, 'user', 'budget')),
       }),
     );
     const filter = { subject_type: 'budget', subject_id: BUDGET_ID } as const;
@@ -2396,7 +2743,12 @@ describe('useResolveDiscrepancy', () => {
   };
 
   it('posts to /discrepancies/{id}/resolve and invalidates the decision state', async () => {
-    const updated = discrepancyPayload(DISCREPANCY_ID, 'awaiting_platform');
+    const updated = discrepancyPayload(
+      DISCREPANCY_ID,
+      'awaiting_platform',
+      'untracked',
+      'shared_member',
+    );
     const path = `/api/v1/discrepancies/${String(DISCREPANCY_ID)}/resolve`;
     const mock = stubFetch(routes({ [`POST ${path}`]: () => json(200, updated) }));
     const { result, queryClient } = renderWithWrapper(() => useResolveDiscrepancy());
@@ -2425,33 +2777,51 @@ describe('useResolveDiscrepancy', () => {
 
   it('has refetched a shown paged discrepancy list by the time mutateAsync resolves', async () => {
     const path = `/api/v1/discrepancies/${String(DISCREPANCY_ID)}/resolve`;
-    let resolved = false;
+    const closed = discrepancyPayload(DISCREPANCY_ID, 'resolved');
+    const refetch = deferred<Response>();
     const mock = stubFetch(
-      routes({
-        'GET /api/v1/discrepancies': () =>
-          resolved
-            ? json(200, [], pagedHeaders(0))
-            : json(200, [discrepancyPayload(DISCREPANCY_ID)], pagedHeaders(1)),
-        [`POST ${path}`]: () => {
-          resolved = true;
-          return json(200, discrepancyPayload(DISCREPANCY_ID, 'resolved'));
-        },
-      }),
+      sequence(
+        () => json(200, [discrepancyPayload(DISCREPANCY_ID)], pagedHeaders(1)),
+        () => json(200, closed),
+        () => refetch.promise,
+      ),
     );
-    const { result } = renderWithWrapper(() => ({
+    const { result, queryClient } = renderWithWrapper(() => ({
       list: useDiscrepancyPages(),
       resolve: useResolveDiscrepancy(),
     }));
     await waitFor(() => expect(result.current.list.data?.total).toBe(1));
-    await act(async () => {
-      await result.current.resolve.mutateAsync({
-        id: DISCREPANCY_ID,
-        body: { resolution: 'platform_correct' },
+
+    const key = queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES);
+    let settled = false;
+    let cachedOnResolve: unknown;
+    const resolving = result.current.resolve
+      .mutateAsync({ id: DISCREPANCY_ID, body: { resolution: 'platform_correct' } })
+      .then((discrepancy) => {
+        cachedOnResolve = queryClient.getQueryData(key);
+        return discrepancy;
+      })
+      .finally(() => {
+        settled = true;
       });
-    });
-    const calls = sent(mock).map((request) => `${request.method ?? ''} ${request.parsed.pathname}`);
     const list = 'GET /api/v1/discrepancies';
-    expect(calls).toEqual([list, `POST ${path}`, list]);
+    await waitFor(() => expect(sentPaths(mock)).toEqual([list, `POST ${path}`, list]));
+    await nextMacrotask();
+
+    // The POST has answered and the refetch is held: the mutation must still be waiting on it.
+    expect(settled).toBe(false);
+    expect(result.current.resolve.isPending).toBe(true);
+    expect(queryClient.getQueryState(key)?.fetchStatus).toBe('fetching');
+
+    refetch.resolve(json(200, [], pagedHeaders(0)));
+    let resolved: unknown;
+    await act(async () => {
+      resolved = await resolving;
+    });
+    expect(resolved).toEqual(closed);
+    // The one loaded page as the refetch re-read it, which the hook shows as an empty list.
+    expect(cachedOnResolve).toMatchObject({ pages: [{ discrepancies: [], total: 0 }] });
+    expect(sentPaths(mock)).toEqual([list, `POST ${path}`, list]);
     await waitFor(() => expect(result.current.list.data).toEqual({ discrepancies: [], total: 0 }));
   });
 

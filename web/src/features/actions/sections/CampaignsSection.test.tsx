@@ -16,6 +16,7 @@
  *   discrepancy group as "View open discrepancies";
  * - the C1, C1b and C2 field sets ("Campaign evidence", and the "Pipeline evidence" table with
  *   MQL and QL in separate columns for C1b and C2 "Hold" only);
+ * - the C2 "Scale" decision workflow posting its B1 amount, own or shared; "Hold" marks done;
  * - the C3a segment gap and the C3b keyword-cluster gap;
  * - the empty discrepancy group kept, with the live count and a link to `/decisions`, while the
  *   overlay counts discrepancies detected after the run;
@@ -36,14 +37,28 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_DISCREPANCY_STATES, queryKeys } from '../../../api/queries';
-import type { Discrepancy, Item, Metric, Overlay, Section } from '../../../api/types';
+import type {
+  DatasetCoverage,
+  Decision,
+  Discrepancy,
+  Item,
+  Metric,
+  Overlay,
+  Section,
+} from '../../../api/types';
 import {
+  FIXTURE_BUDGET_IDS,
+  FIXTURE_CAMPAIGN_IDS,
+  FIXTURE_DATASET_IDS,
   FIXTURE_DISCREPANCY_ID,
   FIXTURE_ITEM_IDS,
   FIXTURE_RESOLUTIONS,
+  FIXTURE_WINDOW,
   findPageItem,
+  makeDecision,
   makeDiscrepancy,
   makeEvidence,
+  makeFlag,
   makeGroup,
   makeItem,
   makeItemOverlay,
@@ -52,6 +67,7 @@ import {
   makeRun,
   makeSection,
 } from '../../../test/fixtures';
+import { DECISION_RECORDED_MESSAGE, RECORD_DECISION_LABEL } from '../RecommendationCard';
 import {
   CAMPAIGN_EVIDENCE_LABEL,
   CLUSTER_GAP_LABEL,
@@ -1138,6 +1154,340 @@ describe('the empty discrepancy group', () => {
 // Pause, scale and hold field sets (C1, C1b, C2)
 // ---------------------------------------------------------------------------------------------
 
+/** The CSRF header every mutating request carries (AAP 0.5.3). */
+const CSRF = ['X-Requested-With', 'ads-engine'] as const;
+
+/** The footer of a C2 "Scale" card, which records a decision (AAP 0.5.5 Footer actions). */
+const SCALE_FOOTER = [RECORD_DECISION_LABEL, 'Dismiss', 'Snooze for 7 days'] as const;
+
+/** The footer of a C2 "Hold" card, which writes no decision and is marked done instead. */
+const HOLD_FOOTER = ['Mark done', 'Dismiss', 'Snooze for 7 days'] as const;
+
+/** The id of {@link ownBudgetScaleItem}, outside {@link FIXTURE_ITEM_IDS}. */
+const OWN_BUDGET_SCALE_ID = 3004;
+
+/** The id of {@link sharedBudgetScaleItem}, outside {@link FIXTURE_ITEM_IDS}. */
+const SHARED_BUDGET_SCALE_ID = 3014;
+
+/** One complete dataset per name, covered through the window end, as of compute time. */
+function coverage(...names: readonly string[]): DatasetCoverage[] {
+  return names.map((dataset) => ({
+    dataset,
+    completeness: 'complete',
+    covered_through: FIXTURE_WINDOW.end,
+  }));
+}
+
+/**
+ * A C2 item's `evidence.thresholds`, built fresh on each call: `campaigns.C2_THRESHOLD_KEYS`
+ * and, when the pipeline veto was read, `VETO_THRESHOLD_KEYS`, with their configured values,
+ * then the policy keys precedence freezes into every item.
+ */
+function c2Thresholds(veto: boolean): Record<string, unknown> {
+  return {
+    'scale.min_outcomes': 5,
+    'scale.max_cpa_ratio': 1,
+    'b1.step': 0.2,
+    'window.sustained_min_days': 7,
+    'budget.max_observation_gap_hours': 6,
+    'budget.capped_day_ratio': 0.95,
+    'budget.capped_lost_is_share': 0.1,
+    'budget.high_utilization': 0.9,
+    'budget.under_utilization': 0.5,
+    'budget.min_known_days': 7,
+    'budget.min_spending_days': 5,
+    'budget.min_capped_days': 5,
+    'budget.sustained_share': 0.7,
+    ...(veto
+      ? {
+          'crm.veto_min_leads': 20,
+          'crm.lead_maturity_days': 14,
+          'attribution.floor_share': 0.1,
+          'crm.meeting_outcome_exclusions': ['CANCELED'],
+        }
+      : {}),
+    'sources.stale_after_hours': 24,
+    'window.trusted_min_days': 14,
+  };
+}
+
+/**
+ * A C2 "Scale" on the LinkedIn campaign "Lead Gen — Benchmarks US"
+ * ({@link FIXTURE_CAMPAIGN_IDS}.benchmarksUs, own daily budget USD 60.00), as
+ * `campaigns._c2_candidate` writes it when the cap gate holds and the pipeline veto passes
+ * (6 Qualified Leads): the veto counts beside the outcomes, its B1 item's proposed daily budget
+ * (USD 72.00, +20%) as a metric and in `extra.b1_link`, its campaign group, and the campaign as
+ * its decision subject.
+ */
+function ownBudgetScaleItem(): Item {
+  return makeItem({
+    id: OWN_BUDGET_SCALE_ID,
+    rank: 1,
+    rule_id: 'C2',
+    action: 'Scale',
+    reason:
+      'Capped on 21 of 26 known-budget days with 48 leads at USD 31.25 per lead (account ' +
+      'USD 40.00): raise the daily budget from USD 60.00 to USD 72.00 (B1).',
+    entity: {
+      source: 'linkedin',
+      type: 'campaign',
+      id: '700000601',
+      name: 'Lead Gen — Benchmarks US',
+    },
+    evidence: makeEvidence({
+      metrics: [
+        metric('spend', 'Window spend', '1500.00', 'currency', 'USD'),
+        metric('window_days', 'Window days', 28, 'days'),
+        metric('outcomes', 'Window leads', 48, 'leads'),
+        metric('expected_outcomes', 'Expected leads at the account baseline', '37.5', 'leads'),
+        metric('cost_per_outcome', 'Cost per lead', '31.25', 'currency', 'USD'),
+        metric('daily_budget', 'Latest effective daily budget', '60.00', 'currency', 'USD'),
+        metric('window_utilization', 'Window utilization (spend vs cap)', '0.96', 'ratio'),
+        metric('known_days', 'Known-budget days', 26, 'days'),
+        metric('spending_days', 'Spending days', 26, 'days'),
+        metric('capped_days', 'Capped days', 21, 'days'),
+        metric('idle_days', 'Known idle days', 0, 'days'),
+        metric('changed_intraday_days', 'Changed-intraday days (unknown budget)', 1, 'days'),
+        metric('unobserved_days', 'Unobserved days (unknown budget)', 1, 'days'),
+        metric('proposed_daily_budget', 'Proposed daily budget (B1)', '72.00', 'currency', 'USD'),
+        metric('leads', 'LinkedIn leads (platform)', 48, 'leads'),
+        metric('matured_leads', 'Matured leads (at least 14 days before window end)', 30, 'leads'),
+        metric('matched_leads', 'Matched matured leads', 28, 'leads'),
+        metric('unresolved', 'Unresolved matured leads', 2, 'leads'),
+        metric('unresolved_share', 'Unresolved share of matured leads', '0.0667', 'ratio'),
+        metric('eligible_contacts', 'Eligible contacts', 26, 'contacts'),
+        metric(
+          'unknown_evidence_share',
+          'Share of eligible contacts with unknown CRM evidence',
+          '0',
+          'ratio',
+        ),
+        metric('mql', 'MQL (First meeting booked)', 9, 'contacts'),
+        metric('ql', 'Qualified Leads', 6, 'contacts'),
+        metric('meetings', 'Meetings', 4, 'meetings'),
+        metric('young_leads', 'Leads younger than 14 days (not judged)', 18, 'leads'),
+        metric('young_ql', 'Qualified Leads from those leads (not judged)', 1, 'contacts'),
+      ],
+      baselines: [
+        {
+          key: 'baseline_cost_per_outcome',
+          label: 'Account cost per lead (same source and objective)',
+          value: '40.00',
+        },
+        {
+          key: 'max_cost_per_outcome',
+          label: 'Highest cost per outcome allowed to scale',
+          value: '40.00',
+        },
+      ],
+      sample: { observed: 26, required: 7, unit: 'known-budget days', projected: null },
+      thresholds: c2Thresholds(true),
+      datasets: coverage(
+        'linkedin.analytics_daily',
+        'linkedin.entities',
+        'linkedin.leads',
+        'hubspot.contacts',
+        'hubspot.associations',
+      ),
+      provenance: [
+        {
+          source: 'linkedin',
+          dataset_id: FIXTURE_DATASET_IDS.linkedin,
+          mode: 'simulated',
+          role: 'primary',
+        },
+        {
+          source: 'hubspot',
+          dataset_id: FIXTURE_DATASET_IDS.hubspotCompanion,
+          mode: 'simulated',
+          role: 'companion',
+        },
+      ],
+      // mirrors backend/src/ads_engine/analysis/campaigns.py (_c2_candidate, "Scale" outcome)
+      extra: {
+        outcome: 'Scale',
+        b1: true,
+        gate: {
+          known_budget_days: { observed: 26, required: 7 },
+          spending_days: { observed: 26, required: 5 },
+          capped_days: { observed: 21, required: 5 },
+          capped_share: { observed: '0.8077', required: '0.7' },
+        },
+        observation_assumption: 'unchanged across 216 observations, at most 6 h apart',
+        idle_dates: [],
+        changed_intraday_dates: ['2026-09-17'],
+        unobserved_dates: ['2026-09-08'],
+        b1_link: {
+          rule_id: 'B1',
+          subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs },
+          current_daily_budget: '60.00',
+          proposed_daily_budget: '72.00',
+        },
+        campaign_group: {
+          state: 'loaded',
+          id: 611,
+          external_id: '600000611',
+          name: 'Benchmarks — US',
+          status: 'ACTIVE',
+          daily_budget: null,
+          total_budget: null,
+          currency: 'USD',
+        },
+        matured_ql: 6,
+      },
+    }),
+    flags: [makeFlag('simulated')],
+    decision_subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs },
+  });
+}
+
+/**
+ * The members of the shared "Search Shared Budget" with their member days, as
+ * `campaigns._members_extra` records them: the fixture world's shared member and a second
+ * campaign built for this suite.
+ */
+const SEARCH_BUDGET_MEMBERS = [
+  {
+    campaign_id: FIXTURE_CAMPAIGN_IDS.searchPartners,
+    name: 'Search Partners — US',
+    member_days: 28,
+  },
+  { campaign_id: 309, name: 'Search Competitors — US', member_days: 21 },
+];
+
+/**
+ * A C2 "Scale" on the Google explicitly shared "Search Shared Budget"
+ * ({@link FIXTURE_BUDGET_IDS}.search, daily budget USD 500.00), as `campaigns._c2_candidate`
+ * writes it when the cap gate holds over its budget-active days and no Google CRM link exists
+ * (no veto read, flagged `no_crm_link`): its B1 item's proposed daily budget (USD 600.00, +20%),
+ * every member campaign, and the budget, never a member, as its decision subject (AAP 0.5.4.5).
+ */
+function sharedBudgetScaleItem(): Item {
+  return makeItem({
+    id: SHARED_BUDGET_SCALE_ID,
+    rank: 1,
+    rule_id: 'C2',
+    action: 'Scale',
+    reason:
+      'Capped on 16 of 20 budget-active days with 125 conversions at USD 76.00 per conversion ' +
+      '(account USD 95.00): raise the daily budget from USD 500.00 to USD 600.00 (B1).',
+    entity: { source: 'google', type: 'budget', id: '31000402', name: 'Search Shared Budget' },
+    evidence: makeEvidence({
+      metrics: [
+        metric('spend', 'Window spend', '9500.00', 'currency', 'USD'),
+        metric('window_days', 'Window days', 28, 'days'),
+        metric('outcomes', 'Window conversions', '125', 'conversions'),
+        metric(
+          'expected_outcomes',
+          'Expected conversions at the account baseline',
+          '100',
+          'conversions',
+        ),
+        metric('cost_per_outcome', 'Cost per conversion', '76.00', 'currency', 'USD'),
+        metric('daily_budget', 'Latest effective daily budget', '500.00', 'currency', 'USD'),
+        metric('window_utilization', 'Window utilization (spend vs cap)', '0.95', 'ratio'),
+        metric('known_days', 'Budget-active days', 20, 'days'),
+        metric('spending_days', 'Spending days', 20, 'days'),
+        metric('capped_days', 'Capped days', 16, 'days'),
+        metric('idle_days', 'Known idle days', 0, 'days'),
+        metric('changed_intraday_days', 'Changed-intraday days (unknown budget)', 2, 'days'),
+        metric('unobserved_days', 'Unobserved days (unknown budget)', 6, 'days'),
+        metric('proposed_daily_budget', 'Proposed daily budget (B1)', '600.00', 'currency', 'USD'),
+      ],
+      baselines: [
+        {
+          key: 'baseline_cost_per_outcome',
+          label: 'Account cost per conversion (same source and objective)',
+          value: '95.00',
+        },
+        {
+          key: 'max_cost_per_outcome',
+          label: 'Highest cost per outcome allowed to scale',
+          value: '95.00',
+        },
+      ],
+      sample: { observed: 20, required: 7, unit: 'budget-active days', projected: null },
+      thresholds: c2Thresholds(false),
+      datasets: coverage('google.metrics_daily', 'google.entities'),
+      // mirrors backend/src/ads_engine/analysis/campaigns.py (_c2_candidate, "Scale" outcome on a
+      // shared budget)
+      extra: {
+        outcome: 'Scale',
+        b1: true,
+        gate: {
+          known_budget_days: { observed: 20, required: 7 },
+          spending_days: { observed: 20, required: 5 },
+          capped_days: { observed: 16, required: 5 },
+          capped_share: { observed: '0.8', required: '0.7' },
+        },
+        observation_assumption: 'unchanged across 168 observations, at most 6 h apart',
+        idle_dates: [],
+        changed_intraday_dates: ['2026-09-15', '2026-09-22'],
+        unobserved_dates: [
+          '2026-09-08',
+          '2026-09-09',
+          '2026-09-10',
+          '2026-09-11',
+          '2026-09-12',
+          '2026-09-13',
+        ],
+        b1_link: {
+          rule_id: 'B1',
+          subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+          current_daily_budget: '500.00',
+          proposed_daily_budget: '600.00',
+        },
+        members: SEARCH_BUDGET_MEMBERS,
+      },
+    }),
+    flags: [makeFlag('simulated'), makeFlag('no_crm_link'), makeFlag('shared_budget')],
+    decision_subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+  });
+}
+
+/**
+ * The baseline decision of "Lead Gen — Benchmarks US", the subject of
+ * {@link ownBudgetScaleItem}: own budget, status `active`, daily budget USD 60.00, as
+ * `GET /decisions?subject_type=campaign&subject_id=601` lists it, with `overrides` applied
+ * (shallow).
+ */
+function benchmarksUsDecision(overrides: Partial<Decision> = {}): Decision {
+  return makeDecision('own_budget', {
+    subject: {
+      type: 'campaign',
+      id: FIXTURE_CAMPAIGN_IDS.benchmarksUs,
+      name: 'Lead Gen — Benchmarks US',
+      source: 'linkedin',
+      currency: 'USD',
+    },
+    daily_budget: '60.00',
+    ...overrides,
+  });
+}
+
+/** The `[subject_type, subject_id]` every `GET /decisions` the stub received carried, in order. */
+function decisionReads(calls: readonly RecordedCall[]): (string | null)[][] {
+  return calls
+    .filter((call) => call.method === 'GET' && call.path === '/decisions')
+    .map((call) => [call.search.get('subject_type'), call.search.get('subject_id')]);
+}
+
+/** Every `POST /decisions` the stub received, in order. */
+function decisionPosts(calls: readonly RecordedCall[]): RecordedCall[] {
+  return calls.filter((call) => call.method === 'POST' && call.path === '/decisions');
+}
+
+/**
+ * Opens the "Record decision" dialog of the card `scope` and returns it once its form has
+ * loaded the subject's decision log (its "Save decision" button is then rendered).
+ */
+async function openDecisionDialog(scope: HTMLElement): Promise<HTMLElement> {
+  fireEvent.click(within(scope).getByRole('button', { name: RECORD_DECISION_LABEL }));
+  const dialog = await screen.findByRole('dialog', { name: RECORD_DECISION_LABEL });
+  await within(dialog).findByRole('button', { name: 'Save decision' });
+  return dialog;
+}
+
 describe('pause and scale cards', () => {
   it('shows a C1 card spend, outcomes and expected outcomes, no pipeline', async () => {
     mockApi({});
@@ -1210,27 +1560,149 @@ describe('pause and scale cards', () => {
     }
   });
 
-  it('shows a C2 "Scale" no pipeline table', async () => {
-    mockApi({});
-    const hold = pageItem(FIXTURE_ITEM_IDS.c2Hold);
-    const scale: Item = {
-      ...hold,
-      id: 3004,
-      action: 'Scale',
-      evidence: makeEvidence({
-        ...hold.evidence,
-        extra: { ...hold.evidence.extra, outcome: 'Scale', veto: { fired: false } },
-      }),
-    };
-    await renderCampaigns(oneGroup('scale', 'Scale', [scale]));
+  it('offers a C2 "Hold" "Mark done", never "Record decision"', async () => {
+    const api = mockApi({});
+    await renderCampaigns(oneGroup('scale', 'Scale', [pageItem(FIXTURE_ITEM_IDS.c2Hold)]));
+
+    // A Hold has no decision subject: it writes no decision and is marked done (AAP 0.5.5).
+    const hold = card('Hold: platform outcomes are not reaching Qualified Lead');
+    expect(buttonNames(hold)).toEqual([...HOLD_FOOTER]);
+    expect(within(hold).queryByRole('button', { name: RECORD_DECISION_LABEL })).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it('shows a C2 "Scale" its evidence, no pipeline table, and records its B1 amount', async () => {
+    const api = mockApi({
+      'GET /decisions': json(200, [benchmarksUsDecision()]),
+      'POST /decisions': json(
+        201,
+        benchmarksUsDecision({
+          id: 812,
+          origin: 'recommendation',
+          decided_at: '2026-10-06T09:30:00Z',
+          decided_by: 'admin@example.com',
+          daily_budget: '72.00',
+          patch: { daily_budget: '72.00' },
+          recommendation_id: OWN_BUDGET_SCALE_ID,
+        }),
+      ),
+    });
+    await renderCampaigns(oneGroup('scale', 'Scale', [ownBudgetScaleItem()]));
 
     const article = card('Scale');
+    expect(article.id).toBe(`item-${String(OWN_BUDGET_SCALE_ID)}`);
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
       'Window spend: $1,500.00',
       'Window leads: 48',
-      'Qualified Leads: 0',
+      'Expected leads at the account baseline: 37.5',
+      'Qualified Leads: 6',
+    ]);
+    // The veto passed, so its counts stay in the evidence table: only a Hold gets the table.
+    expect(within(article).queryByRole('table', { name: PIPELINE_EVIDENCE_CAPTION })).toBeNull();
+    // A Scale has a decision subject: "Record decision", never "Mark done" (AAP 0.5.5).
+    expect(buttonNames(article)).toEqual([...SCALE_FOOTER]);
+    expect(within(article).queryByRole('button', { name: 'Mark done' })).toBeNull();
+
+    // The dialog reads the campaign's decision log and is prefilled with the linked B1 amount.
+    const dialog = await openDecisionDialog(article);
+    expect(within(dialog).getByRole('spinbutton', { name: 'Daily budget' })).toHaveProperty(
+      'value',
+      '72.00',
+    );
+    expect(within(dialog).getByRole('combobox', { name: 'Status' })).toHaveProperty(
+      'value',
+      'active',
+    );
+    expect(decisionReads(api.calls)).toEqual([
+      ['campaign', String(FIXTURE_CAMPAIGN_IDS.benchmarksUs)],
+    ]);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    const recorded = await within(article).findByText(DECISION_RECORDED_MESSAGE);
+    expect(recorded.getAttribute('role')).toBe('status');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // One patch with the changed field only: the unchanged status is not sent (AAP 0.5.2).
+    const posts = decisionPosts(api.calls);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.body).toEqual({
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.benchmarksUs },
+      patch: { daily_budget: '72.00' },
+      recommendation_id: OWN_BUDGET_SCALE_ID,
+    });
+    expect(posts[0]?.headers.get(CSRF[0])).toBe(CSRF[1]);
+    // Every read, the refetch after the save included, names the same subject.
+    for (const read of decisionReads(api.calls)) {
+      expect(read).toEqual(['campaign', String(FIXTURE_CAMPAIGN_IDS.benchmarksUs)]);
+    }
+    // Recording a decision is not feedback.
+    expect(api.calls.some((call) => call.path.endsWith('/feedback'))).toBe(false);
+  });
+
+  it('records a shared-budget C2 "Scale" on the budget subject, listing every member', async () => {
+    const api = mockApi({
+      'GET /decisions': json(200, [makeDecision('budget')]),
+      'POST /decisions': json(
+        201,
+        makeDecision('budget', {
+          id: 813,
+          origin: 'recommendation',
+          decided_at: '2026-10-06T09:30:00Z',
+          decided_by: 'admin@example.com',
+          daily_budget: '600.00',
+          patch: { daily_budget: '600.00' },
+          recommendation_id: SHARED_BUDGET_SCALE_ID,
+        }),
+      ),
+    });
+    await renderCampaigns(oneGroup('scale', 'Scale', [sharedBudgetScaleItem()]));
+
+    const article = card('Scale');
+    expect(article.textContent).toContain('Search Shared Budget');
+    // No Google CRM link, so no veto was read: no QL line and no pipeline table.
+    expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
+      'Window spend: $9,500.00',
+      'Window conversions: 125',
+      'Expected conversions at the account baseline: 100',
     ]);
     expect(within(article).queryByRole('table', { name: PIPELINE_EVIDENCE_CAPTION })).toBeNull();
+    expect(buttonNames(article)).toEqual([...SCALE_FOOTER]);
+    expect(within(article).queryByRole('button', { name: 'Mark done' })).toBeNull();
+
+    // The decision is written on the shared budget, with every member campaign listed.
+    const dialog = await openDecisionDialog(article);
+    expect(within(dialog).getByRole('spinbutton', { name: 'Daily budget' })).toHaveProperty(
+      'value',
+      '600.00',
+    );
+    // The one amount field a DAILY budget allows, and no status: a budget has none (AAP 0.5.2).
+    expect(within(dialog).getAllByRole('spinbutton')).toHaveLength(1);
+    expect(within(dialog).queryByRole('combobox', { name: 'Status' })).toBeNull();
+    expect(
+      within(dialog).getByText(
+        'Applies to the shared budget used by: Search Partners — US, Search Competitors — US',
+      ),
+    ).toBeDefined();
+    expect(decisionReads(api.calls)).toEqual([['budget', String(FIXTURE_BUDGET_IDS.search)]]);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
+
+    const recorded = await within(article).findByText(DECISION_RECORDED_MESSAGE);
+    expect(recorded.getAttribute('role')).toBe('status');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const posts = decisionPosts(api.calls);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.body).toEqual({
+      subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+      patch: { daily_budget: '600.00' },
+      recommendation_id: SHARED_BUDGET_SCALE_ID,
+    });
+    expect(posts[0]?.headers.get(CSRF[0])).toBe(CSRF[1]);
+    for (const read of decisionReads(api.calls)) {
+      expect(read).toEqual(['budget', String(FIXTURE_BUDGET_IDS.search)]);
+    }
+    expect(api.calls.some((call) => call.path.endsWith('/feedback'))).toBe(false);
   });
 
   it('shows a C1b card its spend and the pipeline counts side by side', async () => {

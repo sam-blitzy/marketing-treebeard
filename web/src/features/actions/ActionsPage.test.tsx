@@ -767,19 +767,56 @@ describe('ActionsPage polls', () => {
     return { ...result, api, commits };
   }
 
+  /** The flush passes {@link settle} runs before it fails the test as a page that never settles. */
+  const SETTLE_MAX_PASSES = 20;
+
   /**
-   * Waits until no read is in flight and every pending query notification has reached React,
-   * so render counts taken afterwards change only through the refetch under test.
+   * Waits until the page is idle, so render counts taken afterwards change only through the
+   * refetch under test. `page` is what {@link renderProfiledPage} returned: the client the page
+   * reads through and its commit counter.
+   *
+   * It never waits on elapsed time. TanStack Query delivers every observer notification from a
+   * zero-delay timer, scheduled in the same dispatch that ends a read, so once `isFetching()`
+   * reads 0 the notifications of that read are already queued. Equal-delay timers run in the
+   * order they were created, so a zero-delay timer created afterwards inside `act` runs after
+   * them, and `act` then commits the renders they caused and runs their effects. Those effects
+   * can start reads or change queries again, and a change whose notification is still queued
+   * has already shown as a query-cache event, so the flush repeats until a pass in which the
+   * page commits nothing, the query cache reports no event and no read is in flight.
    */
-  async function settle(queryClient: QueryClient): Promise<void> {
-    await waitFor(() => {
-      expect(queryClient.isFetching()).toBe(0);
+  async function settle(page: {
+    queryClient: QueryClient;
+    commits: { count: number };
+  }): Promise<void> {
+    const { queryClient, commits } = page;
+    let cacheEvents = 0;
+    const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+      cacheEvents += 1;
     });
-    await act(async () => {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
-    });
+    try {
+      for (let pass = 0; pass < SETTLE_MAX_PASSES; pass += 1) {
+        await waitFor(() => {
+          expect(queryClient.isFetching()).toBe(0);
+        });
+        const commitsBefore = commits.count;
+        const cacheEventsBefore = cacheEvents;
+        await act(async () => {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          });
+        });
+        if (
+          commits.count === commitsBefore &&
+          cacheEvents === cacheEventsBefore &&
+          queryClient.isFetching() === 0
+        ) {
+          return;
+        }
+      }
+      throw new Error(`the page did not settle within ${String(SETTLE_MAX_PASSES)} flush passes`);
+    } finally {
+      unsubscribe();
+    }
   }
 
   /**
@@ -908,7 +945,7 @@ describe('ActionsPage polls', () => {
     const statusBars = vi.spyOn(statusBarModule, 'StatusBar');
     const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
     await loadedPage();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     const sectionRenders = frames.mock.calls.length;
     const statusRenders = statusBars.mock.calls.length;
     expect(sectionRenders).toBeGreaterThanOrEqual(SECTION_ORDER.length);
@@ -944,18 +981,18 @@ describe('ActionsPage polls', () => {
     await waitFor(() => {
       expect(statusBars.mock.calls.length).toBeGreaterThan(statusRenders);
     });
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     expect(recommendationReads(api)).toHaveLength(3);
     expect(frames.mock.calls).toHaveLength(sectionRenders);
     expect(sectionHeadings()).toEqual(SECTION_TITLES);
   });
 
   it('shows a change in overlay.open_discrepancies in the Campaigns discrepancy group and the banner', async () => {
-    const { api, queryClient } = await renderProfiledPage(
+    const { api, queryClient, commits } = await renderProfiledPage(
       defaultHandlers({ 'GET /recommendations': json(200, pageWithoutDiscrepancyCards(0)) }),
     );
     await loadedPage();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     const campaigns = sectionRegion('campaigns');
     expect(within(campaigns).queryByText(/detected since this run was computed$/u)).toBeNull();
 
@@ -971,9 +1008,9 @@ describe('ActionsPage polls', () => {
 
   it("re-renders only the section whose item changed, and shows the item's new current state", async () => {
     const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
-    const { api, queryClient } = await renderProfiledPage(defaultHandlers());
+    const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
     await loadedPage();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     const itemId = `item-${String(FIXTURE_ITEM_IDS.b1)}`;
     expect(document.getElementById(itemId)).not.toBeNull();
     const budget = sectionRegion('budget');
@@ -989,7 +1026,7 @@ describe('ActionsPage polls', () => {
 
     expect(await within(budget).findByText('1 hidden since this run')).toBeTruthy();
     expect(document.getElementById(itemId)).toBeNull();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     // Only the Budget section renders again; the other four keep their output.
     expect(frames.mock.calls).toHaveLength(sectionRenders + 1);
   });
@@ -998,9 +1035,9 @@ describe('ActionsPage polls', () => {
     const staleDataset = 'google.metrics_daily';
     const staleMessage = `Stale data: ${staleDataset} (last success 2026-10-04 05:30 UTC)`;
     const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
-    const { api, queryClient } = await renderProfiledPage(defaultHandlers());
+    const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
     await loadedPage();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     expect(within(sourceChip('Google')).queryByText('Stale')).toBeNull();
     expect(screen.queryByText(staleMessage)).toBeNull();
     const sectionRenders = frames.mock.calls.length;
@@ -1029,7 +1066,7 @@ describe('ActionsPage polls', () => {
     expect(within(sourceChip('LinkedIn')).queryByText('Stale')).toBeNull();
     expect(within(sourceChip('HubSpot')).queryByText('Stale')).toBeNull();
     expect(screen.getByText(staleMessage)).toBeTruthy();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     // Every section takes the changed overlay: each renders exactly once more.
     expect(frames.mock.calls).toHaveLength(sectionRenders + SECTION_ORDER.length);
   });
@@ -1042,12 +1079,12 @@ describe('ActionsPage polls', () => {
       'before the window end 2026-10-05)';
     const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
     const statusBars = vi.spyOn(statusBarModule, 'StatusBar');
-    const { api, queryClient } = await renderProfiledPage(
+    const { api, queryClient, commits } = await renderProfiledPage(
       defaultHandlers(),
       freshOverlayListsClient(),
     );
     await loadedPage();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     const shown = shownPage(queryClient);
     const sectionRenders = frames.mock.calls.length;
     const statusRenders = statusBars.mock.calls.length;
@@ -1062,7 +1099,7 @@ describe('ActionsPage polls', () => {
     await waitFor(() => {
       expect(statusBars.mock.calls.length).toBeGreaterThan(statusRenders);
     });
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     const polled = shownPage(queryClient);
     // The sections keep their objects; each list is another array with the same entries.
     expect(polled.sections).toBe(shown.sections);
@@ -1097,7 +1134,7 @@ describe('ActionsPage polls', () => {
     expect(within(sourceChip('Google')).queryByText('Incomplete')).toBeNull();
     expect(screen.getByText(movedMessage)).toBeTruthy();
     expect(screen.queryByText(FIXTURE_BANNERS[3]?.message ?? '')).toBeNull();
-    await settle(queryClient);
+    await settle({ queryClient, commits });
     expect(shownPage(queryClient).sections).toBe(shown.sections);
     expect(frames.mock.calls).toHaveLength(sectionRenders + SECTION_ORDER.length);
   });

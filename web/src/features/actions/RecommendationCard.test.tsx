@@ -37,8 +37,9 @@
  *
  * The network is stubbed below the real API client by `../../test/mockApi`, which fails a test
  * on any request it has no handler for; it is imported before `../../test/render` and Testing
- * Library so its `afterEach` runs first. Items come from `../../test/fixtures`: the default
- * page's C1, C0 and historical CR1 cards, or `makeItem` for a single variant.
+ * Library so its `afterEach` runs after Testing Library's automatic cleanup (Vitest runs
+ * after-hooks in reverse order of registration). Items come from `../../test/fixtures`: the
+ * default page's C1, C0 and historical CR1 cards, or `makeItem` for a single variant.
  */
 import { apiError, html, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
@@ -1654,10 +1655,13 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
       expect(screen.queryByRole('article', { name: first.action })).toBeNull();
     });
     expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', first));
-    // Let the recovery timer run: it finds focus moved away from the card and leaves it.
+    // The announcement proves the feedback's success continuation has run, and that continuation
+    // queues the zero-delay focus-recovery timer right after announcing. The zero-delay timer
+    // below is queued after it, and equal-delay timers run in the order they were queued, so
+    // once it fires the recovery has run: it found focus moved away from the card and left it.
     await act(async () => {
       await new Promise<void>((resolve) => {
-        setTimeout(resolve, 20);
+        setTimeout(resolve, 0);
       });
     });
     expect(document.activeElement).toBe(elsewhere);

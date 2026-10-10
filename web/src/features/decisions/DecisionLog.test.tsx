@@ -1077,7 +1077,7 @@ describe('DecisionLog "Record decision"', () => {
       'POST /decisions': () => save.promise,
     });
 
-    await renderLog();
+    const { queryClient } = await renderLog();
     await findTable('Lead Gen — Pipeline Report EMEA');
     const [linkedin, budget] = screen.getAllByRole('button', { name: 'Record decision' });
     if (linkedin === undefined || budget === undefined) {
@@ -1109,13 +1109,25 @@ describe('DecisionLog "Record decision"', () => {
     const readsBefore = unfilteredReads().length;
     save.resolve(json(201, { ...emea, id: 830, origin: 'user', status: 'paused' }));
 
-    // The save settles once its invalidation has refetched the log; then its onDone runs.
+    // The form's save settles only once its onSuccess has awaited the invalidation, that is once
+    // every active decisions read, the log and the open dialog's own filtered read, has read
+    // again. The form then reports onPendingChange(false) and onDone, which free the subject
+    // and announce the save. Wait for that outcome, with no read or save left in flight.
     await waitFor(() => {
       expect(unfilteredReads().length).toBeGreaterThan(readsBefore);
+      expect(logRegion().textContent).toBe('Decision recorded');
+      expect(linkedin.getAttribute('aria-busy')).toBeNull();
+      expect(queryClient.isFetching()).toBe(0);
+      expect(queryClient.isMutating()).toBe(0);
     });
+    // TanStack Query hands each settled read to React from a zero-delay timer queued when the
+    // read settled, and timers of equal delay run in the order they were created. This later
+    // one therefore runs after all of them, and act renders their updates and runs the effects
+    // those renders schedule before it returns. Nothing left can close, reset or refocus the
+    // open dialog, so the assertions below are final.
     await act(async () => {
       await new Promise<void>((resolve) => {
-        setTimeout(resolve, 20);
+        setTimeout(resolve, 0);
       });
     });
     expect(screen.getByRole('dialog', { name: 'Record decision' })).toBe(second);
