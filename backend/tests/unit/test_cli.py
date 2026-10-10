@@ -66,6 +66,7 @@ import pytest
 import structlog
 from argon2 import PasswordHasher, Type
 from pydantic import BaseModel, ValidationError
+from pydantic_core import PydanticCustomError
 from sqlalchemy import Engine, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import OperationalError
@@ -886,13 +887,115 @@ def test_domain_error_messages() -> None:
     assert cli._domain_error_message(RuntimeError("boom")) is None
 
 
-def test_settings_validation_error_names_fields_only() -> None:
+def test_domain_error_message_redacts_exception_text() -> None:
+    """An exception's own text gets the full redaction: credential assignments and addresses."""
+    leaky = ConfigurationError("rejected password=hunter22-value for owner@example.com")
+    assert cli._domain_error_message(leaky) == (
+        "ConfigurationError: rejected password=[REDACTED] for [REDACTED_EMAIL]"
+    )
+
+
+def test_settings_validation_error_names_the_variable_and_problem_never_the_value() -> None:
     with pytest.raises(ValidationError) as caught:
         Settings(google_ads_customer_id="secret-value-12")
     message = cli._domain_error_message(caught.value)
-    assert message is not None
-    assert message.startswith("invalid settings: google_ads_customer_id (1 error)")
+    assert message == (
+        "invalid settings (1 error): "
+        "GOOGLE_ADS_CUSTOMER_ID: Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits"
+    )
     assert "secret-value-12" not in message
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "problem"),
+    [
+        pytest.param(
+            "GOOGLE_DAILY_CALL_BUDGET",
+            "abc",
+            "Input should be a valid integer, unable to parse string as an integer",
+            id="int-parsing",
+        ),
+        pytest.param(
+            "GOOGLE_DAILY_CALL_BUDGET",
+            "0",
+            "Input should be greater than or equal to 1",
+            id="greater-than-equal",
+        ),
+        pytest.param(
+            "DATA_MODE", "foo", "Input should be 'auto' or 'simulated'", id="literal-error"
+        ),
+        pytest.param(
+            "APP_ADMIN_EMAIL",
+            "notanemail",
+            # The validator's example address is replaced; the message stays readable.
+            "Value error, APP_ADMIN_EMAIL must be an email address such as [REDACTED_EMAIL]",
+            id="allowlisted-value-error",
+        ),
+    ],
+)
+def test_settings_validation_error_states_the_problem(
+    monkeypatch: pytest.MonkeyPatch, variable: str, value: str, problem: str
+) -> None:
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(ValidationError) as caught:
+        Settings()
+    message = cli._domain_error_message(caught.value)
+    assert message == f"invalid settings (1 error): {variable}: {problem}"
+    assert value not in message
+    assert "@" not in message
+
+
+def test_settings_validation_error_counts_every_error_in_field_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two bad variables: a plural count, and pydantic's field order rather than sorted names."""
+    monkeypatch.setenv("GOOGLE_DAILY_CALL_BUDGET", "abc")
+    monkeypatch.setenv("APP_ADMIN_EMAIL", "notanemail")
+    with pytest.raises(ValidationError) as caught:
+        Settings()
+    assert cli._domain_error_message(caught.value) == (
+        "invalid settings (2 errors): "
+        "GOOGLE_DAILY_CALL_BUDGET: Input should be a valid integer, unable to parse string as an "
+        "integer; "
+        "APP_ADMIN_EMAIL: Value error, APP_ADMIN_EMAIL must be an email address such as "
+        "[REDACTED_EMAIL]"
+    )
+
+
+def test_settings_validation_error_withholds_text_outside_the_allowlist() -> None:
+    """A message that is neither a pydantic template nor a known validator's may quote input."""
+    leaked = "secret-value-34"
+    error = ValidationError.from_exception_data(
+        Settings.__name__,
+        [
+            {
+                "type": "value_error",
+                "loc": ("app_base_url",),
+                "input": leaked,
+                "ctx": {"error": ValueError(f"{leaked} is not an allowed URL")},
+            },
+            {
+                "type": PydanticCustomError(
+                    "settings_check", "rejected {value}", {"value": leaked}
+                ),
+                "loc": (),
+                "input": leaked,
+            },
+            {
+                "type": "assertion_error",
+                "loc": ("linkedin_ad_account_ids", 0),
+                "input": leaked,
+                "ctx": {"error": AssertionError(leaked)},
+            },
+        ],
+    )
+    withheld = "Invalid value; its message is withheld because it may quote the value"
+    message = cli._domain_error_message(error)
+    assert message == (
+        f"invalid settings (3 errors): APP_BASE_URL: {withheld}; SETTINGS: {withheld}; "
+        f"LINKEDIN_AD_ACCOUNT_IDS.0: {withheld}"
+    )
+    assert leaked not in message
 
 
 def test_other_validation_errors_are_unexpected() -> None:
@@ -965,6 +1068,46 @@ def test_main_maps_domain_and_unexpected_errors(
     assert '"event": "cli_failed"' in err
     assert '"command": "migrate"' in err
     assert _cli_errors(err) == ["ads-engine: migrate failed (RuntimeError); see the log on stderr"]
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "problem"),
+    [
+        pytest.param(
+            "GOOGLE_DAILY_CALL_BUDGET",
+            "abc",
+            "Input should be a valid integer, unable to parse string as an integer",
+            id="int-parsing",
+        ),
+        pytest.param(
+            "DATA_MODE", "foo", "Input should be 'auto' or 'simulated'", id="literal-error"
+        ),
+        pytest.param(
+            "APP_ADMIN_EMAIL",
+            "notanemail",
+            "Value error, APP_ADMIN_EMAIL must be an email address such as [REDACTED_EMAIL]",
+            id="allowlisted-value-error",
+        ),
+    ],
+)
+def test_migrate_reports_an_invalid_setting_by_variable_and_problem(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str,
+    value: str,
+    problem: str,
+) -> None:
+    """The migrate one-shot, the first service to fail under Compose, names what is wrong."""
+    monkeypatch.chdir(BACKEND)
+    monkeypatch.setenv(variable, value)
+    get_settings.cache_clear()
+    assert cli.main(["migrate"]) == cli.EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert _cli_errors(err) == [
+        f"ads-engine: migrate: invalid settings (1 error): {variable}: {problem}"
+    ]
+    assert value not in err
+    assert "@" not in err
 
 
 def _cli_failed_records(err: str) -> list[dict[str, Any]]:
@@ -3782,7 +3925,7 @@ def test_capture_google_with_a_zero_cap_sends_nothing(
     assert seen == []
     assert _written(out) == []
     assert _google_captured(capture_dir) == set()
-    assert "invalid settings: google_daily_call_budget" in err
+    assert "GOOGLE_DAILY_CALL_BUDGET: Input should be greater than or equal to 1" in err
 
 
 @pytest.mark.parametrize("failure", ["OperationalError", "ConnectionRefusedError"])

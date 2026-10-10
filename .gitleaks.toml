@@ -1,7 +1,7 @@
 # Gitleaks secret-scan configuration for the Ads Action Engine.
 #
-# Run only through gitleaks v8.30.1 from the pinned image zricethezav/gitleaks:v8.30.1, by
-# `make secret-scan` and CI in a local image built on it with its Alpine security fixes applied;
+# Run only through gitleaks v8.30.1 from the pinned image zricethezav/gitleaks:v8.30.1, which
+# `make secret-scan` and CI run as published, never rebuilt or patched;
 # a finding fails the job. `gitleaks git` scans every commit, which is the gate. `gitleaks dir`
 # on a working tree also reads the gitignored `.env` that `make init` writes, and reports its
 # SESSION_SECRET and APP_ADMIN_PASSWORD_HASH by design: that file must never be committed.

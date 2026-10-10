@@ -269,7 +269,7 @@ Who reads each variable, and how to rotate secrets:
 | `lint` | `ruff format --check`, `ruff check` and `mypy --strict src`; ESLint, stylelint and `tsc --noEmit` |
 | `e2e` | Playwright against the Compose stack started with `DATA_MODE=simulated` (`make e2e ADMIN_PASSWORD=<value>`); leaves the stack running |
 | `seed-simulated` | Seeds simulated datasets for every source and computes the default-window run |
-| `secret-scan` | Builds the local scanner image `ads-engine-gitleaks:v8.30.1-patched` (never pushed) from the pinned `zricethezav/gitleaks:v8.30.1`, upgrading only the Alpine libraries that have published security fixes to at least the fixed versions, then runs gitleaks `v8.30.1` from it, with no network, and `.gitleaks.toml` over every commit; a finding fails it |
+| `secret-scan` | Runs the pinned `zricethezav/gitleaks:v8.30.1` image as published (pulled only when it is not present locally, never rebuilt or patched), checks that its gitleaks reports `v8.30.1`, then scans every commit with `.gitleaks.toml`, with no network and a read-only checkout; a finding fails it |
 
 Overridable variables (`COMPOSE`, `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`, `PYTEST_ARGS`,
 `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) are

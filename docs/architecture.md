@@ -844,12 +844,11 @@ Verified against `api/app.py`, `api/security.py`, `settings.py` and `web/nginx.c
 - **Log redaction.** structlog JSON logs redact the `Authorization` header, the n8n secret header,
   every configured secret value, database URL passwords and email addresses
   (`[REDACTED_EMAIL]`) before rendering (`logging.py`).
-- **Secret scanning.** CI runs `make secret-scan`, the same target as a local scan. It builds the
-  local image `ads-engine-gitleaks:v8.30.1-patched` (never pushed) on the pinned
-  `zricethezav/gitleaks:v8.30.1` with its Alpine security fixes applied, upgrading only the
-  libraries in `GITLEAKS_APK_FLOORS` to at least their fixed versions, and checks that its gitleaks
-  reports `v8.30.1`. It then scans every commit with `.gitleaks.toml`, with no network and a
-  read-only checkout (`gitleaks git --redact --exit-code 1`), and a finding fails the job
+- **Secret scanning.** CI runs `make secret-scan`, the same target as a local scan. It runs the
+  pinned `zricethezav/gitleaks:v8.30.1` image as published, pulling it only when it is not
+  present locally and never rebuilding or patching it, and checks that its gitleaks reports
+  `v8.30.1`. It then scans every commit with `.gitleaks.toml`, with no network and a read-only
+  checkout (`gitleaks git --redact --exit-code 1`), and a finding fails the job
   ([Make targets](runbook.md#make-targets)).
 - **Container hardening** (`docker-compose.yml`, `backend/Dockerfile`, `web/Dockerfile`). Every
   container runs as a fixed non-root user from its first process: 10001 for `migrate`, `api` and

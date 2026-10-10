@@ -17,8 +17,8 @@
 #                  documented first start (`make init`, then `docker compose up`) with no
 #                  source credentials, so every source runs on simulated data, then Playwright
 #   secret-scan    `make secret-scan`: gitleaks v8.30.1 over every commit, with .gitleaks.toml,
-#                  from a local image built on the pinned one with its Alpine security fixes
-#                  applied; independent of every other job
+#                  from the pinned zricethezav/gitleaks:v8.30.1 image as published;
+#                  independent of every other job
 #
 # Nothing is published or deployed: no image push, no registry login, no release, and no
 # repository secret is read. The only credential is the e2e admin password, generated in the job.
@@ -512,8 +512,8 @@ jobs:
           persist-credentials: false
 
       # The root Makefile's secret-scan recipe is the single source of the scanner image, its
-      # Alpine library floors, mounts and flags; CI runs it unchanged. It builds the local
-      # scanner image from the pinned zricethezav/gitleaks:v8.30.1 (never pushed), checks that
+      # mounts and flags; CI runs it unchanged. It runs the pinned zricethezav/gitleaks:v8.30.1
+      # image directly, as published (pulled by its tag, never rebuilt or patched), checks that
       # the binary reports v8.30.1, and scans the read-only checkout with --network none. A
       # finding fails the step.
       - name: Scan every commit (make secret-scan)

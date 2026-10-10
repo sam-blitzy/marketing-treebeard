@@ -10,8 +10,8 @@
 #   test            backend pytest on a disposable postgres:18.6, then the web unit tests
 #   lint            ruff format/check and mypy --strict; eslint, stylelint and tsc
 #   e2e             Playwright against the stack in DATA_MODE=simulated
-#   secret-scan     gitleaks v8.30.1 over every commit with .gitleaks.toml, from a local image
-#                   built on the pinned one with its Alpine security fixes applied
+#   secret-scan     gitleaks v8.30.1 over every commit with .gitleaks.toml, run from the pinned
+#                   zricethezav/gitleaks:v8.30.1 image as published
 #
 # First start:
 #   make init ADMIN_PASSWORD=<value>
@@ -48,9 +48,9 @@
 # gitignored. Recipes print "written" instead of a value.
 #
 # Requirements: GNU make 4.0 or newer and bash; POSIX awk, od and mktemp; curl or wget for the
-# health poll; for secret-scan, network access to pull the pinned gitleaks image and, until its
-# build is cached, the Alpine v3.22 package repositories (dl-cdn.alpinelinux.org). Every recipe
-# runs as one bash script (.ONESHELL) with -eu and pipefail, so any failing command stops it.
+# health poll; for secret-scan, network access only to pull the pinned gitleaks image once, when
+# it is not present locally. Every recipe runs as one bash script (.ONESHELL) with -eu and
+# pipefail, so any failing command stops it.
 # Inside recipes no line may begin with `-`, `+` or `@` once indented: GNU make strips those
 # prefix characters from every .ONESHELL line, so long docker invocations are assembled in bash
 # arrays instead.
@@ -86,44 +86,6 @@ ENGINE_MIN := 29
 
 # Pinned by tag, never `latest`.
 GITLEAKS_IMAGE := zricethezav/gitleaks:v8.30.1
-
-# secret-scan scans from GITLEAKS_SCAN_IMAGE, a local image it derives from GITLEAKS_IMAGE on
-# every run (the layer cache makes a repeat build cheap) and never pushes. The pinned image's
-# Alpine 3.22 libraries predate published security fixes, so the derivation upgrades only the
-# packages in GITLEAKS_APK_FLOORS, from the image's own v3.22 repositories with apk checking
-# every package against the image's Alpine signing keys. Every other package (unless an
-# upgraded one requires a newer dependency) and the gitleaks binary stay as pinned. Each entry
-# is a minimum, the fixed version that the advisories below name, not an exact pin: the
-# branch's index keeps only a package's newest revision, so an exact pin would fail the build
-# as soon as the next fix landed, while a floor still refuses anything older than the vetted
-# fix. A floor the index cannot meet fails the build, and with it the scan.
-#   c-ares             1.34.8-r0  CVE-2026-33630
-#   libcurl            8.14.1-r3  CVE-2026-5545
-#   libexpat           2.8.5-r0   CVE-2026-41080, -45186, -50219, -56131, -56132, -56403 to
-#                                 -56412, -66046, -76641, -76956, -76957, -93990
-#   nghttp2-libs       1.68.1-r0  CVE-2026-27135
-#   libcrypto3,        3.5.8-r0   OpenSSL: CVE-2026-2673, -7383, -9076, -14456, -14457, -18798,
-#   libssl3                       -28387 to -28390, -31789, -31790, -34180 to -34183, -42764,
-#                                 -42766 to -42770, -45445 to -45447, -54874, -63072 to -63076,
-#                                 -75803
-#   musl, musl-utils   1.2.5-r11  CVE-2026-6042
-#   zlib               1.3.2-r0   CVE-2026-27171
-GITLEAKS_SCAN_IMAGE := ads-engine-gitleaks:v8.30.1-patched
-GITLEAKS_APK_FLOORS := c-ares>=1.34.8-r0 libcurl>=8.14.1-r3 libexpat>=2.8.5-r0
-GITLEAKS_APK_FLOORS += nghttp2-libs>=1.68.1-r0 libcrypto3>=3.5.8-r0 libssl3>=3.5.8-r0
-GITLEAKS_APK_FLOORS += musl>=1.2.5-r11 musl-utils>=1.2.5-r11 zlib>=1.3.2-r0
-
-# The derivation, fed to `docker build` on stdin with no build context, so nothing from the
-# checkout enters the image. The base image and the floors arrive as build arguments, and a
-# build without the base image fails (`:?`). The floor list is split into words on purpose, one
-# apk constraint per word; apk installs the newest revision that meets each one, and without
-# --upgrade it moves no dependency that the new revisions do not require.
-define GITLEAKS_DOCKERFILE
-ARG GITLEAKS_IMAGE
-FROM $${GITLEAKS_IMAGE:?}
-ARG GITLEAKS_APK_FLOORS
-RUN apk add --no-cache $${GITLEAKS_APK_FLOORS}
-endef
 
 # The disposable database of `make test`. Every run creates its own container, named
 # TEST_DB_NAME-<random token> and labelled TEST_DB_LABEL=<token>, and removes, with its anonymous
@@ -681,35 +643,30 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 	$(if $(strip $(PLAYWRIGHT_INSTALL)),$(PLAYWRIGHT_INSTALL),echo "PLAYWRIGHT_INSTALL is empty; using the installed Playwright browsers")
 	E2E_BASE_URL="$$APP_URL" E2E_ADMIN_EMAIL="$$ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$$ADMIN_PASSWORD" npm run e2e
 
-# `gitleaks git` scans every commit: the committed history is the gate. The image's git refuses
-# a mounted repository owned by another uid ("dubious ownership"), so /repo is declared safe
-# first. A linked worktree keeps its git data in the main checkout, which is mounted read-only
-# at its own path so the worktree's .git file still resolves inside the container. The checkout
-# directory reaches bash as the environment variable CHECKOUT_DIR and is expanded in double
-# quotes, never spliced into the script as make text, so a path with spaces, quotes or dollar
-# signs is passed through as data. The image names, the floors and the Dockerfile reach it the
-# same way. The scan runs the image ID this run's build wrote, so a concurrent build that moves
-# the GITLEAKS_SCAN_IMAGE tag cannot swap the image between the version check and the scan; the
-# check refuses a binary whose version differs from the pinned image's tag. Both containers run
-# with --network none: the scan reads only the mounted repository, so the image's network
-# libraries have no network to reach.
+# `gitleaks git` scans every commit: the committed history is the gate. The pinned image runs as
+# published: it is pulled only when it is not present locally, and nothing is ever built,
+# patched or tagged from it. --network none on both containers and the read-only mount of the
+# checkout confine it to reading the repository. The tag is resolved to its local image ID once,
+# so a concurrent pull or retag cannot swap the image between the version check and the scan;
+# the check refuses a binary whose version differs from the pinned image's tag. The image's git
+# refuses a mounted repository owned by another uid ("dubious ownership"), so /repo is declared
+# safe first. A linked worktree keeps its git data in the main checkout, which is mounted
+# read-only at its own path so the worktree's .git file still resolves inside the container. The
+# checkout directory and the image name reach bash as the environment variables CHECKOUT_DIR and
+# GITLEAKS_IMAGE and are expanded in double quotes, never spliced into the script as make text,
+# so a path with spaces, quotes or dollar signs is passed through as data.
 secret-scan: export CHECKOUT_DIR := $(CURDIR)
 secret-scan: export GITLEAKS_IMAGE := $(GITLEAKS_IMAGE)
-secret-scan: export GITLEAKS_SCAN_IMAGE := $(GITLEAKS_SCAN_IMAGE)
-secret-scan: export GITLEAKS_APK_FLOORS := $(GITLEAKS_APK_FLOORS)
-secret-scan: export GITLEAKS_DOCKERFILE := $(GITLEAKS_DOCKERFILE)
-secret-scan: ## gitleaks v8.30.1 (pinned image, Alpine fixes applied) over every commit with .gitleaks.toml; a finding fails
-	@iid_file="$$(mktemp)"
-	trap 'rm -f "$$iid_file"' EXIT
-	trap 'exit 130' INT
-	trap 'exit 143' TERM
-	echo "Building $$GITLEAKS_SCAN_IMAGE from $$GITLEAKS_IMAGE with $$GITLEAKS_APK_FLOORS"
-	printf '%s\n' "$$GITLEAKS_DOCKERFILE" | docker build --iidfile "$$iid_file" --tag "$$GITLEAKS_SCAN_IMAGE" --build-arg "GITLEAKS_IMAGE=$$GITLEAKS_IMAGE" --build-arg "GITLEAKS_APK_FLOORS=$$GITLEAKS_APK_FLOORS" -
-	scan_image="$$(cat "$$iid_file")"
+secret-scan: ## gitleaks v8.30.1 from the pinned image, as published, over every commit with .gitleaks.toml; a finding fails
+	@if ! docker image inspect "$$GITLEAKS_IMAGE" >/dev/null 2>&1; then
+		echo "Pulling $$GITLEAKS_IMAGE"
+		docker pull "$$GITLEAKS_IMAGE"
+	fi
+	scan_image="$$(docker image inspect --format '{{.Id}}' "$$GITLEAKS_IMAGE")"
 	expected_version="$${GITLEAKS_IMAGE##*:}"
 	scan_version="$$(docker run --rm --network none --entrypoint gitleaks "$$scan_image" version)"
 	if [ "$$scan_version" != "$$expected_version" ]; then
-		echo "$$GITLEAKS_SCAN_IMAGE reports gitleaks $$scan_version, expected $$expected_version" >&2
+		echo "$$GITLEAKS_IMAGE reports gitleaks $$scan_version, expected $$expected_version" >&2
 		exit 1
 	fi
 	scan_args=(run --rm --network none --volume "$$CHECKOUT_DIR:/repo:ro" --workdir /repo --entrypoint sh)
@@ -718,6 +675,6 @@ secret-scan: ## gitleaks v8.30.1 (pinned image, Alpine fixes applied) over every
 		scan_args+=(--volume "$$git_common_dir:$$git_common_dir:ro")
 	fi
 	scan_args+=("$$scan_image" -c 'git config --global --add safe.directory /repo && exec gitleaks git /repo --config /repo/.gitleaks.toml --redact --exit-code 1 --verbose')
-	echo "Scanning every commit with $$GITLEAKS_SCAN_IMAGE (gitleaks $$scan_version) and .gitleaks.toml"
+	echo "Scanning every commit with $$GITLEAKS_IMAGE (gitleaks $$scan_version) and .gitleaks.toml"
 	docker "$${scan_args[@]}"
 	echo "No secrets found"

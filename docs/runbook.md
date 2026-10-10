@@ -306,9 +306,9 @@ what each command needs.
   `&&` or `||`, the subshell would run with `set -e` silently off; and the key reaches `awk` only
   through its environment, never its arguments, which other local users can read in `ps`.
 
-- **Before every push**: run the secret scan. It runs gitleaks v8.30.1 from a local image built on
-  the pinned `zricethezav/gitleaks:v8.30.1` with its Alpine security fixes applied, with
-  `.gitleaks.toml` over every commit, and any finding fails it. CI runs the same `make secret-scan`.
+- **Before every push**: run the secret scan. It runs gitleaks v8.30.1 from the pinned
+  `zricethezav/gitleaks:v8.30.1` image as published, with `.gitleaks.toml` over every commit, and
+  any finding fails it. CI runs the same `make secret-scan`.
 
   ```bash
   make secret-scan
@@ -768,15 +768,14 @@ docker compose run --rm --no-deps --user "$(id -u):$(id -g)" \
   account and customer ids with zeros of the same length, and the webhook URL with a reserved
   placeholder URL.
 
-Review the captures before committing them. Scan the working tree with the scanner image that
-`make secret-scan` builds from the pinned gitleaks image (run `make secret-scan` once first, so
-`ads-engine-gitleaks:v8.30.1-patched` exists), then commit, then run `make secret-scan` over the
-history before pushing:
+Review the captures before committing them. Scan the working tree with the pinned gitleaks image
+that `make secret-scan` runs, then commit, then run `make secret-scan` over the history before
+pushing:
 
 ```bash
 git status --short backend/tests/contracts
 git diff --stat -- backend/tests/contracts
-docker run --rm --network none -v "$PWD:/repo:ro" -w /repo ads-engine-gitleaks:v8.30.1-patched \
+docker run --rm --network none -v "$PWD:/repo:ro" -w /repo zricethezav/gitleaks:v8.30.1 \
   dir backend/tests/contracts --config /repo/.gitleaks.toml --redact --exit-code 1
 ```
 
@@ -1110,7 +1109,7 @@ at the first failing command.
 | `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; a container it did not create is never reused or removed), then the web unit tests. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
 | `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e` with `E2E_COMPOSE` set to `COMPOSE`; leaves the stack running |
-| `secret-scan` | Builds `ads-engine-gitleaks:v8.30.1-patched` from `zricethezav/gitleaks:v8.30.1`, upgrading only the Alpine libraries in `GITLEAKS_APK_FLOORS` to at least their fixed versions (a local image, never pushed); checks that its gitleaks reports `v8.30.1`; then runs it with `--network none` and `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
+| `secret-scan` | Runs the pinned `zricethezav/gitleaks:v8.30.1` image as published: pulls it only when it is not present locally, and never builds, patches or tags an image; checks that its gitleaks reports `v8.30.1`; then runs it with `--network none`, a read-only checkout and `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
 
 Overridable variables, on the command line or in the environment: `COMPOSE` (default
 `docker compose`; add `-p` or `-f` flags here), `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`,

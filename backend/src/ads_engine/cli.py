@@ -84,6 +84,7 @@ import httpx
 from argon2 import Parameters, PasswordHasher, extract_parameters
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from pydantic import ValidationError
+from pydantic_core import ErrorDetails
 
 from ads_engine import __version__
 from ads_engine.db.models.ops import SOURCES, AppUser
@@ -97,7 +98,13 @@ from ads_engine.logging import (
     redact_emails,
 )
 from ads_engine.settings import SOURCES as SETTINGS_SOURCES
-from ads_engine.settings import ConfigurationError, Settings, Source, get_settings
+from ads_engine.settings import (
+    VALIDATOR_MESSAGES,
+    ConfigurationError,
+    Settings,
+    Source,
+    get_settings,
+)
 
 if TYPE_CHECKING:
     from ads_engine.analysis.thresholds import Thresholds
@@ -142,6 +149,33 @@ _ALEMBIC_INI: Final = "alembic.ini"
 _ARGON2_PREFIX: Final = "$argon2"
 _NO_ADMIN_HASH_MESSAGE: Final = (
     "APP_ADMIN_PASSWORD_HASH is not set; run `make init ADMIN_PASSWORD=…`"
+)
+
+# The problem text of a settings validation error, built only from allowlisted, value-free
+# text. These match the worker's policy for its `worker_settings_invalid` line and are kept
+# here rather than imported: the worker module loads the analysis runner, the scheduler and
+# the sync modules, which the CLI imports only inside the commands that need them.
+# The pydantic error types a Settings field produces whose message pydantic renders from its
+# own template and the field's declared constraints alone (`ge`, the allowed literals), so it
+# never carries the input; for example "Input should be greater than or equal to 1".
+_SETTINGS_TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "missing",
+        "string_type",
+        "int_type",
+        "int_parsing",
+        "int_parsing_size",
+        "int_from_float",
+        "greater_than_equal",
+        "literal_error",
+        "list_type",
+    }
+)
+# Pydantic's prefix of a `value_error` message, kept so the text reads as pydantic writes it.
+_SETTINGS_VALUE_ERROR_PREFIX: Final = "Value error, "
+# The problem of any other error: a validator's own text that may quote the value it rejects.
+_SETTINGS_WITHHELD_PROBLEM: Final = (
+    "Invalid value; its message is withheld because it may quote the value"
 )
 
 if tuple(SOURCES) != tuple(SETTINGS_SOURCES):  # pragma: no cover - guarded by the model tests
@@ -204,7 +238,9 @@ def _write_cli_line(level: Literal["error", "warning"], message: str) -> None:
     never hides it, and the log redaction would rewrite the CLI's own hints (``make init
     ADMIN_PASSWORD=…`` reads as a credential assignment). Messages the CLI writes itself are
     therefore kept as written; text that comes from an exception or a platform passes through
-    :func:`_redacted` at the call site first.
+    :func:`_redacted` before it is passed in, except a settings validation error's, which
+    :func:`_invalid_settings_message` builds from allowlisted text and strips of email
+    addresses.
 
     Args:
         level: ``error`` for a failure (:func:`_error`), ``warning`` for a note
@@ -259,31 +295,90 @@ def _redacted(text: str) -> str:
     return str(redact(text))
 
 
+def _settings_problem(error: ErrorDetails) -> str:
+    """Return the value-free problem text of one settings validation error.
+
+    Only allowlisted text is returned, never an arbitrary message:
+
+    * pydantic's own message for a type in :data:`_SETTINGS_TEMPLATE_ERROR_TYPES`, rendered
+      from its template and the field's declared constraints;
+    * ``"Value error, "`` and the validator's message for a ``value_error`` whose message is
+      one of :data:`~ads_engine.settings.VALIDATOR_MESSAGES`;
+    * :data:`_SETTINGS_WITHHELD_PROBLEM` for anything else (another ``value_error``, an
+      ``assertion_error`` or a custom type), whose text may quote the value it rejects.
+
+    Example::
+
+        _settings_problem(error)  # 'Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits'
+
+    Args:
+        error: One entry of :meth:`pydantic.ValidationError.errors`.
+
+    Returns:
+        The problem to report for ``error``.
+    """
+    error_type = error["type"]
+    if error_type in _SETTINGS_TEMPLATE_ERROR_TYPES:
+        return error["msg"]
+    if error_type == "value_error":
+        context = error.get("ctx") or {}
+        message = str(context.get("error", ""))
+        if message in VALIDATOR_MESSAGES:
+            return _SETTINGS_VALUE_ERROR_PREFIX + message
+    return _SETTINGS_WITHHELD_PROBLEM
+
+
+def _invalid_settings_message(exc: ValidationError) -> str:
+    """Return the message of an invalid environment: each variable and its problem, no value.
+
+    The text is ``invalid settings (<N> error[s]): <VARIABLE>: <problem>; …``, with the errors
+    in pydantic's order (the fields' declaration order). Each variable is the error's ``loc``
+    joined with dots and upper-cased, as the environment spells it (``SETTINGS`` for an error
+    of the whole model), and its problem comes from :func:`_settings_problem`, so the text is
+    value-free by construction. It is therefore not passed through :func:`_redacted`, whose
+    credential-assignment pass reads ``APP_ADMIN_EMAIL: Value error`` as an address key's value
+    and would garble it; only the email addresses a validator's message names as an example
+    are replaced, so stderr still carries none.
+
+    Example::
+
+        invalid settings (1 error): DATA_MODE: Input should be 'auto' or 'simulated'
+
+    Args:
+        exc: A validation error of :class:`~ads_engine.settings.Settings`.
+
+    Returns:
+        The one-line message, without the program and command prefix.
+    """
+    problems = "; ".join(
+        f"{('.'.join(str(part) for part in error['loc']) or 'settings').upper()}: "
+        f"{_settings_problem(error)}"
+        for error in exc.errors(include_url=False, include_input=False)
+    )
+    count = exc.error_count()
+    errors = f"{count} error{'s' if count != 1 else ''}"
+    return redact_emails(f"invalid settings ({errors}): {problems}")
+
+
 def _domain_error_message(exc: Exception) -> str | None:
     """Return the one-line message of an expected domain error, or ``None`` for any other.
+
+    The message is ready for stderr as it is: it carries no secret, token or email address.
 
     Args:
         exc: The exception a command raised.
 
     Returns:
-        ``"<ClassName>: <message>"`` for an expected error. A settings ``ValidationError``
-        names the invalid fields only, never their values.
+        For a settings ``ValidationError``, each invalid environment variable with its
+        value-free problem (:func:`_invalid_settings_message`); for another expected error,
+        ``"<ClassName>: <message>"`` passed through :func:`_redacted`; ``None`` for any other
+        exception, a ``ValidationError`` of another model included.
     """
     if isinstance(exc, ValidationError):
         if exc.title != Settings.__name__:
             # Only the environment's validation is a user error; any other model's is a defect.
             return None
-        fields = sorted(
-            {
-                ".".join(str(part) for part in error["loc"]) or "settings"
-                for error in exc.errors(include_url=False, include_input=False)
-            }
-        )
-        count = exc.error_count()
-        return (
-            f"invalid settings: {', '.join(fields)} ({count} error{'s' if count != 1 else ''}); "
-            "check the environment variables of those names"
-        )
+        return _invalid_settings_message(exc)
     expected = isinstance(exc, _EAGER_DOMAIN_ERRORS)
     if not expected:
         for module_name, class_name in _LAZY_DOMAIN_ERRORS:
@@ -294,7 +389,7 @@ def _domain_error_message(exc: Exception) -> str | None:
                 break
     if not expected:
         return None
-    return f"{type(exc).__name__}: {exc}"
+    return _redacted(f"{type(exc).__name__}: {exc}")
 
 
 def _system_exit_code(exc: SystemExit) -> int:
@@ -3594,7 +3689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         message = _domain_error_message(exc)
         if message is not None:
-            _error(f"{name}: {_redacted(message)}")
+            _error(f"{name}: {message}")
             return EXIT_FAILURE
         owner = logged_as(exc)
         if owner is None:
